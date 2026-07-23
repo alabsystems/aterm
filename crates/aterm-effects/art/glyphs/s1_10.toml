@@ -1,0 +1,71 @@
+id = "s1_10"
+kind = "head"
+viewbox = [160, 136]
+anchor = { eye_y = 0.51, center_x = 0.5, word_top = 1.0 }
+
+# Storm: broad-cheeked, magnificently unimpressed, and still soft around the muzzle.
+[[layer]]
+role = "outline"
+ref_fill = "#302C36"
+recolor = "fixed"
+paths = ["M 15 80 C 13 67 17 55 25 46 L 22 22 C 21 16 26 13 31 17 L 52 31 C 70 25 91 25 108 32 L 131 18 C 136 15 140 18 138 24 L 135 47 C 143 56 147 69 145 82 C 143 106 126 123 103 129 C 87 133 70 132 54 128 C 31 122 17 105 15 80 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#5A535F"
+recolor = "coat"
+paths = ["M 20 79 C 18 67 22 57 30 49 L 27 25 L 52 38 C 70 31 91 31 108 39 L 133 24 L 130 50 C 138 58 142 69 140 82 C 138 102 123 118 102 124 C 87 128 71 127 56 123 C 36 118 22 102 20 79 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#A06E7E"
+recolor = "fixed"
+paths = ["M 27 24 L 47 37 L 30 42 Z", "M 132 24 L 112 38 L 129 43 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#3F3A45"
+recolor = "fixed"
+paths = ["M 69 31 L 80 27 L 91 32 L 87 48 L 80 42 L 73 48 Z", "M 38 54 C 47 48 60 48 69 54 L 65 61 C 57 57 49 57 41 62 Z", "M 122 54 C 113 48 100 48 91 54 L 95 61 C 103 57 111 57 119 62 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#94828A"
+recolor = "fixed"
+paths = ["M 59 83 C 59 75 68 72 79 77 C 80 78 80 79 80 80 C 81 79 81 78 82 77 C 93 72 102 75 102 83 C 102 96 92 102 80 102 C 68 102 59 96 59 83 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#87948E"
+recolor = "fixed"
+paths = ["M 42 65 C 49 61 61 61 67 65 C 62 71 48 71 42 65 Z", "M 93 65 C 99 61 111 61 118 65 C 112 71 98 71 93 65 Z"]
+
+[[layer]]
+role = "iris"
+ref_fill = "#303238"
+recolor = "fixed"
+paths = ["M 53 62 C 56 62 58 64 58 67 C 58 70 56 71 53 70 C 51 69 50 67 50 65 C 50 63 51 62 53 62 Z", "M 104 62 C 107 62 109 64 109 67 C 109 70 107 71 104 70 C 102 69 101 67 101 65 C 101 63 102 62 104 62 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#F4EEE8"
+recolor = "fixed"
+paths = ["M 52 63 L 55 63 L 55 65 L 52 65 Z", "M 103 63 L 106 63 L 106 65 L 103 65 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#9D586D"
+recolor = "fixed"
+paths = ["M 75 80 C 75 77 78 76 80 79 C 82 76 85 77 85 80 C 85 84 83 86 80 88 C 77 86 75 84 75 80 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#302C36"
+recolor = "fixed"
+paths = ["M 78 87 L 82 87 L 82 91 C 87 92 90 96 92 100 C 87 97 83 97 80 94 C 77 97 73 97 68 100 C 70 96 73 92 78 91 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#302C36"
+recolor = "fixed"
+paths = ["M 52 89 L 11 86 L 11 89 L 52 92 Z", "M 52 95 L 8 100 L 8 103 L 53 98 Z", "M 108 89 L 149 86 L 149 89 L 108 92 Z", "M 108 95 L 152 100 L 152 103 L 107 98 Z"]

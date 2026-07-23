@@ -1,0 +1,83 @@
+id = "s1_12"
+kind = "head"
+viewbox = [160, 136]
+anchor = { eye_y = 0.50, center_x = 0.5, word_top = 1.0 }
+
+# Ruffle: a compact calico framed by one deliberate ring of soft coat tufts.
+[[layer]]
+role = "outline"
+ref_fill = "#342E36"
+recolor = "fixed"
+paths = ["M 19 81 C 13 72 16 62 26 56 L 25 25 C 24 18 30 15 35 20 L 54 35 C 70 29 90 29 106 35 L 125 20 C 130 15 136 18 135 25 L 134 56 C 144 62 147 72 141 81 C 148 89 145 98 137 102 L 141 112 L 130 113 L 126 124 L 115 121 L 108 132 L 97 126 L 88 134 L 80 127 L 71 134 L 62 126 L 51 132 L 45 121 L 34 124 L 30 113 L 19 112 L 23 102 C 15 98 12 89 19 81 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#C6AE98"
+recolor = "coat"
+paths = ["M 24 80 C 18 73 22 65 31 60 L 30 29 L 54 42 C 70 36 90 36 106 42 L 130 29 L 129 60 C 138 65 142 73 136 80 C 143 88 139 95 131 98 L 135 106 L 125 107 L 122 117 L 112 114 L 106 125 L 97 119 L 88 128 L 80 120 L 71 128 L 63 119 L 53 125 L 48 114 L 38 117 L 35 107 L 25 106 L 29 98 C 21 95 17 88 24 80 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#514853"
+recolor = "fixed"
+paths = ["M 30 28 L 54 42 C 63 38 70 37 77 39 L 74 51 L 79 59 L 73 69 L 78 78 C 69 87 56 89 44 83 C 34 75 30 63 31 50 Z", "M 28 91 C 38 84 49 84 57 91 C 56 101 50 109 40 112 C 33 107 29 100 28 91 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#B87554"
+recolor = "fixed"
+paths = ["M 130 28 L 106 42 C 97 38 90 37 83 39 L 86 51 L 81 59 L 87 69 L 82 78 C 91 87 104 89 116 83 C 126 75 130 63 129 50 Z", "M 132 91 C 122 84 111 84 103 91 C 104 101 110 109 120 112 C 127 107 131 100 132 91 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#D98E9A"
+recolor = "fixed"
+paths = ["M 31 27 L 50 40 L 33 46 Z", "M 129 27 L 110 40 L 127 46 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#E7D8CB"
+recolor = "fixed"
+paths = ["M 43 65 C 48 59 61 59 66 65 C 61 71 48 71 43 65 Z", "M 94 65 C 99 59 112 59 117 65 C 112 71 99 71 94 65 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F0DDD0"
+recolor = "fixed"
+paths = ["M 59 82 C 59 74 68 71 79 77 C 80 78 80 79 80 80 C 81 79 81 78 82 77 C 93 71 102 74 102 82 C 102 95 92 102 80 102 C 68 102 59 95 59 82 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#34313A"
+recolor = "fixed"
+paths = ["M 53 60 C 56 60 58 63 58 66 C 58 69 56 71 53 70 C 50 69 49 67 49 64 C 49 62 51 60 53 60 Z", "M 104 60 C 107 60 109 63 109 66 C 109 69 107 71 104 70 C 101 69 100 67 100 64 C 100 62 102 60 104 60 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 52 61 L 55 61 L 55 64 L 52 64 Z", "M 103 61 L 106 61 L 106 64 L 103 64 Z"]
+
+[[layer]]
+role = "blush"
+ref_fill = "#CA7A87"
+recolor = "fixed"
+paths = ["M 31 82 C 36 78 44 78 48 82 C 45 87 36 88 31 85 Z", "M 129 82 C 124 78 116 78 112 82 C 115 87 124 88 129 85 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#A55A6D"
+recolor = "fixed"
+paths = ["M 75 79 C 75 76 78 75 80 78 C 82 75 85 76 85 79 C 85 83 83 85 80 87 C 77 85 75 83 75 79 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#342E36"
+recolor = "fixed"
+paths = ["M 78 86 L 82 86 L 82 90 C 86 93 90 91 92 88 C 91 96 85 99 80 94 C 75 99 69 96 68 88 C 70 91 74 93 78 90 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#342E36"
+recolor = "fixed"
+paths = ["M 52 89 L 12 85 L 12 88 L 52 92 Z", "M 52 95 L 8 100 L 8 103 L 53 98 Z", "M 108 89 L 148 85 L 148 88 L 108 92 Z", "M 108 95 L 152 100 L 152 103 L 107 98 Z"]

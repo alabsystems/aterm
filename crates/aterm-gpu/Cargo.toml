@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm GPU renderer (wgpu/Metal): glyph-atlas + instanced cell quads. Renders the terminal grid on the GPU; offscreen render-to-texture readback for headless verification."
+
+[features]
+default = []
+# TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]` anchors binding the
+# bg-instance build/slice path (→ external `GpuEncode.tla`). OFF by default
+# (byte-identical production renderer, no `aterm-spec`/`inventory`); aterm-gui's
+# `spec_xref_closure` gate enables it to COLLECT the anchors cross-crate.
+spec-anchors = ["dep:aterm-spec", "aterm-render/spec-anchors"]
+
+[dependencies]
+# Path (not `workspace = true`) with default-features = false so aterm-gpu never
+# FORCES the engine's default `disk-tier` cold scrollback (libc mmap + zstd-sys C),
+# which cannot target wasm32-unknown-unknown. A GPU renderer consumes a RenderInput
+# snapshot — it needs no disk tier. Native builds are unchanged: any other workspace
+# consumer (aterm-gui) that wants disk-tier re-enables it via Cargo feature
+# unification, so the native closure is byte-identical; this dep just stops the GPU
+# crate from pulling zstd into the wasm32 closure.
+aterm-core = { path = "../aterm-core", default-features = false }
+aterm-render = { path = "../aterm-render", default-features = false }
+aterm-render-api = { path = "../aterm-render-api", default-features = false }
+# Fast non-DoS hasher (FxHash) for the per-drawable-cell glyph atlas lookups.
+aterm-hash = { workspace = true }
+# `std::time::Instant::now()` PANICS on wasm32-unknown-unknown ("time not
+# implemented"); web-time shims it to performance.now() there and re-exports
+# std's Instant natively (byte-identical native). The shimmer/SDR-glow present
+# clocks below use it so GPU init/present never traps in the web renderer —
+# same clock aterm-effects already uses across this crate's wasm closure.
+web-time = { workspace = true }
+wgpu = { version = "29", default-features = false }
+bytemuck = { version = "1", features = ["derive"] }
+# Optional: only pulled in by the off-by-default `spec-anchors` feature.
+aterm-spec = { workspace = true, optional = true }
+
+# Native (non-wasm) GPU backends + the synchronous adapter/device init the native
+# renderer uses. `pollster::block_on` has no browser equivalent, so it is native-only;
+# the wasm WebGPU init path (the aterm-gpu-web crate) awaits the futures instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.3"
+wgpu = { version = "29", default-features = false, features = ["metal", "vulkan", "dx12", "gles", "wgsl"] }
+
+# wasm32: the WebGL2 backend (wgpu's `webgl` feature targets
+# wasm32-unknown-unknown via wasm-bindgen/web-sys) + WGSL. Orca's terminal
+# acceleration is deliberately WebGL in the renderer — production refuses
+# unsafe-WebGPU — and WebGL2 supports the instanced-quad + R8/Rgba8 atlas pipeline
+# unchanged. `fragile-send-sync-non-atomic-wasm` lets the non-Send GPU handles
+# satisfy wgpu's Send/Sync bounds on single-threaded wasm.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "29", default-features = false, features = ["webgl", "wgsl", "fragile-send-sync-non-atomic-wasm"] }
+
+# HDR-on-Windows (M3 phase B): tag the DX12 Rgba16Float swapchain scRGB
+# (`IDXGISwapChain3::SetColorSpace1`) so the EDR present composites as extended-
+# linear, not gamma-2.2 (washed out). Reached via wgpu's `as_hal::<Dx12>` ->
+# `swap_chain()` accessor. The `windows` crate is MANDATORY here (not hand-rolled
+# FFI): `IDXGISwapChain3` is a windows-crate COM type, so wgpu-hal returns exactly
+# that type and calling a method on it requires the SAME crate version wgpu-hal
+# resolved (0.62, already in the tree via wgpu-hal — this adds a direct dep, not a
+# new crate). This is the house-rule carve-out: `windows` behind cfg for a genuinely
+# COM surface. `dx12`-only; a no-op on Vulkan (which has no DXGI swapchain).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+] }
+
+[dev-dependencies]
+criterion = "0.5"
+# Inline-image (OSC 1337) parity tests: encode test PNGs + base64 payloads.
+png = "0.17"
+aterm-codec = { workspace = true }
+# Test-only: enable the engine's `sixel` feature in aterm-gpu's TEST build so the
+# RawRgba8 CPU/GPU parity gate (tests/inline_image_parity.rs
+# `sixel_rawrgba8_pixels_gpu_match_cpu`) can drive a REAL sixel DCS through the
+# Terminal and produce an `ImageData{RawRgba8}` image — the exact format the
+# shipped GUI renders. Cargo unifies this with the plain `[dependencies]`
+# aterm-core for the test build only; the production `cargo build -p aterm-gpu`
+# ignores dev-deps and stays byte-identical (no sixel, no `aterm-sixel`).
+aterm-core = { workspace = true, features = ["sixel"] }
+# Test-only: Tier-1 `GpuEncode.tla` conformance (`tests/conformance_gpuencode.rs`)
+# drives the real slice-precondition decision over the bg-instance count.
+aterm-spec = { workspace = true }
+aterm-spec-models = { workspace = true }
+# Test-only: build a TerminalConfig from a named ColorScheme for the named-theme
+# GPU/CPU parity test (tests/gpu_matches_cpu.rs).
+aterm-types = { workspace = true }
+# Test-only: the PURE supernova emitters (aterm-effects/src/supernova.rs) drive
+# the nova_parity supernova arm — emit_super/emit_super_decos are clockless
+# functions of (t, env), so the tests feed them straight into RenderInput
+# channels with no engine. Dev-only: the production aterm-gpu build is unchanged.
+aterm-effects = { workspace = true }
+
+[[bench]]
+name = "gpu_frame"
+harness = false
+
+[[bench]]
+name = "image_plane"
+harness = false
+
+[lints]
+workspace = true

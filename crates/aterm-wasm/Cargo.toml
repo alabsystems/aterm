@@ -1,0 +1,50 @@
+[package]
+name = "aterm-wasm"
+version = "0.0.1"
+edition = "2021"
+description = "wasm-bindgen binding: the aterm engine + CPU rasterizer (aterm-render) -> RGBA frames, for rendering a terminal on a <canvas> in the Electron renderer. The in-page replacement substrate for @xterm/xterm's rendering."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# aterm engine + pure-Rust CPU rasterizer (vendored under rust/aterm). aterm-render
+# is fontdue + rustybuzz + ttf-parser — all pure Rust, wasm32-safe. The engine's
+# default closure is no-platform (PTY/libc/zstd are opt-in, off), so it compiles to
+# wasm32-unknown-unknown.
+# default-features = false drops the disk-tier cold scrollback (libc mmap + zstd-sys
+# C), which cannot target wasm32; a renderer needs only the RAM/LZ4 tiers.
+# features = ["sixel"] compiles in aterm-sixel (a pure-Rust, zero-dep decoder) so
+# the in-page renderer decodes + blits Sixel DCS images alongside iTerm2 OSC 1337;
+# aterm-sixel has no libc/C, so it targets wasm32-unknown-unknown cleanly.
+aterm-core = { path = "../aterm-core", default-features = false, features = ["sixel"] }
+aterm-render = { path = "../aterm-render", default-features = false }
+aterm-render-api = { path = "../aterm-render-api", default-features = false }
+# The shared cursor-wake + sparkle-words engines (the SAME art the native app
+# runs — extracted from aterm-gui). Closure is wasm32-clean (web-time clock).
+aterm-effects = { path = "../aterm-effects" }
+# The shared mosh-style predictive-echo state machine (the SAME predictor the
+# native app runs — extracted from aterm-gui). Pure + clock-injected; the
+# predict_api module samples the real monotonic clock for it (web-time below).
+aterm-predict = { workspace = true }
+# Real monotonic clock for the predict_api host seam: std Instant on native,
+# performance.now() on wasm32 — the predictor's echo reconciliation runs on
+# REAL time (the glitch-expiry self-heal), unlike the deterministic effects clock.
+web-time = { workspace = true }
+# aterm_types::Appearance for the set_color_scheme binding (aterm-core does not
+# re-export it). default-features = false pins out serde/winit -> wasm32-clean.
+aterm-types = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Aligned to 0.2.108 (matches aterm-gpu-web) so both web crates can coexist in the
+# one workspace lock; 0.2.108 is newer than the old 0.2.100 pin and compatible.
+wasm-bindgen = "=0.2.108"
+console_error_panic_hook = "0.1"
+# Some transitive deps may pull getrandom; on wasm32-unknown-unknown it needs the
+# JS backend. Harmless if unused.
+getrandom = { version = "0.2", features = ["js"] }
+
+# NOTE: no per-crate [profile.release] — profiles only take effect from the
+# workspace root, which already sets lto/codegen-units=1/strip for release. A wasm
+# size build (opt-level="z") is driven by the build tool's --profile, not here.

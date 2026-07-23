@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+schema = 1
+
+[pack]
+id = "community.aterm.tiny-triumphs"
+name = "Tiny Triumphs"
+version = 1
+authors = ["aterm community"]
+license = "Apache-2.0"
+description = "Gentle, one-shot celebrations for flow-state milestones."
+
+[[toy]]
+id = "ship-it-spark"
+lang = "en"
+words = ["shipit", "shipped"]
+ink = { kind = "two_tone", colors = ["#58D8FF", "#FF73B9"] }
+burst = { kind = "starburst", chance_pct = 35 }
+
+[[toy]]
+id = "purrfect-review"
+lang = "en"
+words = ["purrfect"]
+ink = { kind = "self_glow", lift = 0.76, amplitude = 0.48, window_ms = 1350 }
+graphic = { collection = "cats", dwell_ms = [2300, 3400] }
+
+[[toy]]
+id = "deep-focus-ribbon"
+lang = "en"
+words = ["ultrathink", "deepthink"]
+ink = { kind = "rainbow", saturation = 0.82, value = 1.0, span_degrees = 280.0, drift_ms = 2400 }
+burst = { kind = "glow", chance_pct = 20 }

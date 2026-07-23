@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-cap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Owns-correctness capabilities (ATERM_DESIGN WS-G): an UNFORGEABLE sealed-mint capability + trust tier + effect-gating layer."
+
+[features]
+# `launcher-mint` seals the root-authority mint (ATERM_DESIGN §5.4): with it,
+# `Authority::root_authority()` exists ONLY for crates that enable this feature —
+# the trusted launcher binaries (aterm-gui, aterm-cli) and, via the `test` cfg, a
+# crate's own test build. Non-launcher crates cannot name the mint, so no
+# parser/handler/extension path can reach it (no-mint-reachability). Mirrors
+# `aterm-provenance`'s `internal-mint`; enforced by `mint_sites_are_launcher_only`.
+launcher-mint = []
+
+[lints]
+workspace = true

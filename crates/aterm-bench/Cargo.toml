@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm performance benchmarks (ROADMAP WS-K). Targets are RED until reproduced on the shipped binary."
+
+[dependencies]
+aterm-core = { workspace = true }
+# The resize/rewrap fence harness steps PendingScrollbackReflow directly (the
+# wasm pump's schedule) — the step types live in aterm-grid, not re-exported.
+aterm-grid = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+# CPU rasterizer for the deterministic end-to-end (bytes -> pixels) bench.
+aterm-render = { workspace = true }
+# Competitor engines for honest, in-process, apples-to-apples comparison.
+alacritty_terminal = "0.26"  # Alacritty's full engine (parser+grid+state)
+vte = "0.15"                 # Alacritty's VT parser (parser-only reference)
+# WezTerm's published VT parser (parser-only floor; its full engine `wezterm-term`
+# is NOT published on crates.io, so only the parser layer is comparable in-process).
+termwiz = { version = "0.23", default-features = false }
+# Differential oracle (tests/differential.rs): property-based byte-stream
+# generation, aterm vs alacritty on identical input.
+proptest = { workspace = true }
+
+[[bench]]
+name = "engine_throughput"
+harness = false
+
+[[bench]]
+name = "comparative"
+harness = false
+
+[[bench]]
+name = "end_to_end"
+harness = false
+
+[lints]
+workspace = true

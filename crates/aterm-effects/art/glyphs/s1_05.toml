@@ -1,0 +1,66 @@
+id = "s1_05"
+kind = "head"
+viewbox = [162, 136]
+anchor = { eye_y = 0.51, center_x = 0.5, word_top = 1.0 }
+
+# Shy colorpoint: a dark velvet mask with pale closed eyes, tiny blush, and a
+# small protected muzzle. The expression survives both terminal theme poles.
+[[layer]]
+role = "outline"
+ref_fill = "#302634"
+recolor = "fixed"
+paths = ["M 16 84 C 14 68 18 55 28 45 L 24 15 C 24 10 29 9 33 12 L 56 29 C 72 24 91 24 107 29 L 132 13 C 136 10 140 13 139 18 L 136 46 C 145 57 149 71 146 86 C 143 109 126 125 103 130 C 88 133 72 133 57 130 C 34 126 18 110 16 84 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#D9B6A3"
+recolor = "coat"
+paths = ["M 20 83 C 18 69 22 57 32 48 L 28 20 L 57 35 C 72 30 91 30 106 35 L 135 19 L 132 48 C 141 58 144 71 142 85 C 139 105 124 121 102 126 C 88 129 72 129 58 126 C 37 122 22 107 20 83 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#604757"
+recolor = "fixed"
+paths = ["M 33 58 C 38 42 55 34 80 35 C 106 34 124 43 130 60 C 136 78 126 99 110 108 C 94 117 67 117 50 108 C 34 99 27 78 33 58 Z", "M 29 21 L 55 35 L 34 47 Z", "M 135 20 L 107 35 L 130 48 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#D989A0"
+recolor = "fixed"
+paths = ["M 30 20 L 50 33 L 33 39 Z", "M 134 19 L 113 33 L 130 40 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F6D8C7"
+recolor = "fixed"
+paths = ["M 65 84 C 65 78 72 75 80 79 C 81 80 81 81 81 82 C 82 81 82 80 83 79 C 91 75 98 78 98 84 C 98 93 91 98 81 98 C 72 98 65 93 65 84 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#FFE9DA"
+recolor = "fixed"
+paths = ["M 40 68 C 47 58 62 58 69 68 L 64 73 C 59 66 52 66 46 73 Z", "M 93 68 C 100 58 115 58 122 68 L 116 73 C 111 66 104 66 99 73 Z"]
+
+[[layer]]
+role = "blush"
+ref_fill = "#EA8198"
+recolor = "fixed"
+paths = ["M 43 82 C 43 78 46 76 50 76 C 54 76 57 78 57 82 C 57 86 54 88 50 88 C 46 88 43 86 43 82 Z", "M 106 82 C 106 78 109 76 113 76 C 117 76 120 78 120 82 C 120 86 117 88 113 88 C 109 88 106 86 106 82 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#E58A9D"
+recolor = "fixed"
+paths = ["M 76 82 C 76 78 80 77 81 80 C 83 77 87 78 87 82 C 87 85 84 88 81 89 C 79 88 76 85 76 82 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#FFE9DA"
+recolor = "fixed"
+paths = ["M 79 88 L 84 88 C 83 92 87 94 91 91 C 89 97 84 99 81 95 C 78 99 73 97 71 91 C 75 94 79 92 79 88 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#302634"
+recolor = "fixed"
+paths = ["M 51 87 L 12 83 L 12 86 L 52 90 Z", "M 51 94 L 9 97 L 9 100 L 52 97 Z", "M 111 87 L 150 83 L 150 86 L 110 90 Z", "M 111 94 L 153 97 L 153 100 L 110 97 Z"]

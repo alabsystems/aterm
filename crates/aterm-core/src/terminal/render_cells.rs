@@ -1,0 +1,1419 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+// Author: Andrew Yates
+
+//! Render-ready per-cell extraction for CPU/GPU rasterizers.
+//!
+//! Bridges the grid's packed cell storage and the central color resolver
+//! ([`color_resolve`](super::color_resolve)) into a flat, render-ready row of
+//! [`RenderCell`]s. Each cell carries the resolved character plus final
+//! foreground/background RGB with every style attribute already applied:
+//! palette indices, RGB overflow, bold-to-bright, dim, inverse, hidden, and
+//! terminal-level reverse video (DECSCNM).
+
+use super::Terminal;
+use super::color_resolve::{StyleResolveOpts, resolve_colors_raw_opts};
+use crate::grid::{Cell, CellFlags};
+
+/// Out-params for the folded emoji-cluster + combining-mark extraction
+/// (`render_row_into_impl`): `(clusters, combining)`, where each entry is the
+/// cell column paired with its `(base+combining)` string / combining `char`s.
+/// Factored out to keep the per-cell pass signature readable.
+type ExtrasOut<'a> = (
+    &'a mut Vec<(usize, Box<str>)>,
+    &'a mut Vec<(usize, Box<[char]>)>,
+);
+
+/// The line-decoration style under a cell (SGR 4 / 4:n / 21). The terminal
+/// packs these as `UNDERLINE` / `DOUBLE_UNDERLINE` / `CURLY_UNDERLINE` bit
+/// combinations; [`RenderCell`] resolves them to one variant for the renderer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    /// No underline.
+    #[default]
+    None,
+    /// SGR 4 — a single straight line.
+    Single,
+    /// SGR 21 / 4:2 — two stacked straight lines.
+    Double,
+    /// SGR 4:3 — a wavy line (editors' squiggle for diagnostics).
+    Curly,
+    /// SGR 4:4 — a dotted line.
+    Dotted,
+    /// SGR 4:5 — a dashed line.
+    Dashed,
+}
+
+impl UnderlineStyle {
+    /// Resolve the packed underline bits to a single variant. The composite styles
+    /// share bits with the singletons (DOTTED = UNDERLINE|CURLY, DASHED =
+    /// DOUBLE|CURLY), so they are tested before the singletons.
+    fn from_flags(cflags: CellFlags) -> Self {
+        if cflags.contains(CellFlags::DOTTED_UNDERLINE) {
+            Self::Dotted
+        } else if cflags.contains(CellFlags::DASHED_UNDERLINE) {
+            Self::Dashed
+        } else if cflags.contains(CellFlags::CURLY_UNDERLINE) {
+            Self::Curly
+        } else if cflags.contains(CellFlags::DOUBLE_UNDERLINE) {
+            Self::Double
+        } else if cflags.contains(CellFlags::UNDERLINE) {
+            Self::Single
+        } else {
+            Self::None
+        }
+    }
+}
+
+/// A single render-ready terminal cell.
+///
+/// Colors are final RGB triples; the renderer can fill the cell rect with
+/// [`bg`](RenderCell::bg) and blit the glyph for [`ch`](RenderCell::ch) in
+/// [`fg`](RenderCell::fg) with no further attribute logic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent SGR/geometry rendition flag the renderer reads directly; a bitfield would obscure the public render API"
+)]
+pub struct RenderCell {
+    /// The character to draw (`' '` for empty / NUL cells).
+    pub ch: char,
+    /// Final foreground color as `[r, g, b]`.
+    pub fg: [u8; 3],
+    /// Final background color as `[r, g, b]`.
+    pub bg: [u8; 3],
+    /// True when this column is the right half (continuation) of a wide glyph.
+    ///
+    /// Such a column has no glyph of its own (`ch` is a space); renderers
+    /// should fill its background but leave drawing the glyph to the wide
+    /// lead cell, whose rasterized bitmap naturally overflows into it.
+    pub wide: bool,
+    /// True when this (lead) cell requested EMOJI presentation: a text-default
+    /// emoji base char (`is_vs16_emoji_capable`) that VS16 (U+FE0F) widened to
+    /// two cells. Such a char has a monochrome glyph in the text fonts but the
+    /// selector asks for the colour form, so the renderer must prefer the
+    /// colour-emoji face over the (otherwise-winning) mono primary/fallback.
+    /// `❤️` (U+2764 U+FE0F) is the canonical case. Bare `❤` (no VS16) stays
+    /// narrow and mono. SMP emoji (🚀) are already colour via the normal path.
+    pub emoji_presentation: bool,
+    /// SGR 1 bold: the renderer rasterizes the glyph with extra stroke weight.
+    /// (Bold-to-bright colour, when enabled, is already applied in `fg`.)
+    pub bold: bool,
+    /// SGR 3 italic: the renderer rasterizes the glyph with a synthetic slant.
+    pub italic: bool,
+    /// Underline decoration (SGR 4 family). Drawn as line(s) in
+    /// [`underline_color`](RenderCell::underline_color) (or [`fg`](RenderCell::fg)).
+    pub underline: UnderlineStyle,
+    /// Strikethrough (SGR 9): a line through the cell middle, in `fg`.
+    pub strikethrough: bool,
+    /// Overline (SGR 53): a line along the cell top, in `fg`.
+    pub overline: bool,
+    /// SGR 58 underline colour, when set; otherwise the underline uses `fg`.
+    pub underline_color: Option<[u8; 3]>,
+}
+
+impl Terminal {
+    /// Resolve a visible row into render-ready cells, one per stored column.
+    ///
+    /// Each returned [`RenderCell`] has its foreground/background fully
+    /// resolved through [`color_resolve`](super::color_resolve): palette
+    /// indices, RGB overflow (ring buffer + overflow map), bold-to-bright,
+    /// dim, inverse, hidden, and terminal-level reverse video (DECSCNM).
+    ///
+    /// Returns an empty vector for out-of-range rows.
+    #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single per-cell resolution pass (colors + all decorations) over a row"
+    )]
+    pub fn render_row(&self, row: usize) -> Vec<RenderCell> {
+        let mut out = Vec::new();
+        self.render_row_into(row, &mut out);
+        out
+    }
+
+    /// Like [`render_row`](Self::render_row), but fills a caller-owned `out`
+    /// buffer instead of allocating a fresh `Vec` each call — the per-frame
+    /// extract path reuses one buffer across rows/frames. `out` is `clear()`ed
+    /// first, then pushed exactly the cells [`render_row`](Self::render_row)
+    /// would return (it IS the one code path), so the result is byte-identical.
+    /// Out-of-range rows leave `out` empty.
+    ///
+    /// Used by the engine's own snapshot builder
+    /// [`cell_frame_into`](Self::cell_frame_into) (A-3) and by external callers
+    /// that scan many rows and reuse one buffer (e.g. the sparkle-words rescanner);
+    /// one-shot callers use the allocating [`render_row`](Self::render_row).
+    pub fn render_row_into(&self, row: usize, out: &mut Vec<RenderCell>) {
+        self.render_row_into_impl(row, out, None, false);
+    }
+
+    /// LIVE-frame twin of [`render_row`](Self::render_row): resolve the row at
+    /// `screen_row` IGNORING `display_offset`, so a socket introspection read
+    /// (`cell`/`screen`/`cells`) gets the live on-screen colours + decorations that
+    /// pair with the live [`cell_grapheme`](Self::cell_grapheme) glyph — never a
+    /// scrolled-back row's colours stitched onto a live glyph. Identical to
+    /// `render_row` at `display_offset == 0`; diverges only while the GUI is scrolled.
+    #[must_use]
+    pub fn render_row_at_screen(&self, screen_row: usize) -> Vec<RenderCell> {
+        let mut out = Vec::new();
+        self.render_row_into_impl(screen_row, &mut out, None, true);
+        out
+    }
+
+    /// Core of [`render_row_into`](Self::render_row_into), with an optional
+    /// `extras_out` sink for the emoji-cluster + combining-mark classification.
+    ///
+    /// `render_row_into` passes `None` (cells only). The per-frame snapshot
+    /// builder [`cell_frame_into`](Self::cell_frame_into) passes
+    /// `Some((clusters, combining))` so the cluster / combining extraction is
+    /// FOLDED into this single per-cell loop — sharing the one flag-gated
+    /// [`CellExtra`](aterm_grid::CellExtra) read this loop already does for the
+    /// underline colour, instead of running `cluster_row_into` /
+    /// `combining_row_into` as two extra full-grid passes that each re-probe the
+    /// extras map per cell. The pushed data is byte-identical to those accessors.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single per-cell resolution pass (colors + decorations + emoji/combining extraction) over a row"
+    )]
+    fn render_row_into_impl(
+        &self,
+        row: usize,
+        out: &mut Vec<RenderCell>,
+        mut extras_out: Option<ExtrasOut<'_>>,
+        screen: bool,
+    ) {
+        out.clear();
+        if let Some((clusters, combining)) = extras_out.as_mut() {
+            clusters.clear();
+            combining.clear();
+        }
+        let Ok(visible_row) = u16::try_from(row) else {
+            return;
+        };
+        let grid = self.grid();
+        // Row source. `screen`: the LIVE-frame (offset-INDEPENDENT) row — the socket
+        // introspection reads (`cell`/`screen`/`cells`) use this so their colours /
+        // decorations / wide flags pair with the LIVE `cell_grapheme` glyph, never a
+        // scrolled-back row's. Otherwise the display-offset-AWARE source the GUI
+        // renderer needs: a scrolled-back row supplies its MATERIALIZED cells + extras
+        // (correctly-paired emoji / combining / RGB from history). The two coincide at
+        // display_offset == 0.
+        let view = if screen {
+            grid.screen_row_view(visible_row)
+        } else {
+            grid.visible_row_view(visible_row)
+        };
+
+        let palette = self.color_palette();
+        let default_fg = self.default_foreground();
+        let default_bg = self.default_background();
+        let reverse_video = self.modes().reverse_video();
+        // Host style policy (W5): bold-to-bright promotion + faint opacity,
+        // set by `apply_config` (config `bold_is_bright` / `faint_opacity`).
+        let style_opts = StyleResolveOpts {
+            bold_is_bright: self.color.bold_is_bright,
+            faint_opacity: self.color.faint_opacity,
+        };
+
+        let cols = view.len();
+        out.reserve(cols as usize);
+        for col in 0..cols {
+            let Some(cell) = view.cell(col) else {
+                continue;
+            };
+
+            // Unified flag-gated overflow lookup: one coordinated probe replaces
+            // the separate fg_rgb_at / bg_rgb_at / resolved_char / cell_extra calls
+            // and no-ops for the common non-overflow / non-complex / no-extras cell.
+            // The view keys the LIVE probe on the display-mapped screen row (== the
+            // raw row when not scrolled) and swaps in materialized history extras
+            // for scrolled-back rows.
+            let data = view.cell_data(col, cell);
+
+            // Style-interned cells keep their colors in the StyleTable, so the
+            // raw `colors()` of the cell is a StyleId payload. Rehydrate it to
+            // an inline-colored cell (+ explicit RGB) before resolving, so the
+            // resolver sees real packed colors. Inline cells take the fast path.
+            let (eff_cell, fg_rgb, bg_rgb) = if cell.uses_style_id() {
+                let extra_flags = cell.flags().difference(CellFlags::USES_STYLE_ID);
+                let (fg, bg, flags) = grid.resolve_style_to_colors(cell.style_id(), extra_flags);
+                let fg_rgb = fg.is_rgb().then(|| {
+                    let (r, g, b) = fg.rgb_components();
+                    [r, g, b]
+                });
+                let bg_rgb = bg.is_rgb().then(|| {
+                    let (r, g, b) = bg.rgb_components();
+                    [r, g, b]
+                });
+                (Cell::with_style(cell.char(), fg, bg, flags), fg_rgb, bg_rgb)
+            } else {
+                (cell, data.fg_rgb(), data.bg_rgb())
+            };
+
+            let (fg, bg) = resolve_colors_raw_opts(
+                &eff_cell,
+                fg_rgb,
+                bg_rgb,
+                palette,
+                default_fg,
+                default_bg,
+                reverse_video,
+                style_opts,
+            );
+
+            // A TRUE wide continuation (the blank right half of a CJK glyph)
+            // must be disambiguated from a DECSCA-protected cell: `PROTECTED`
+            // and `WIDE_CONTINUATION` share bit 10, so the raw flag alone would
+            // blank every protected character. A real continuation has bit 10
+            // set, is not itself a WIDE main cell, and sits immediately right of
+            // a WIDE cell. (Same rule as `Row::is_cell_wide_continuation`, done
+            // inline here to reuse `grid_row` — render_row is a hot path.)
+            let wide = cell.is_wide_continuation()
+                && !cell.is_wide()
+                && col > 0
+                && view.cell(col - 1).is_some_and(|c| c.is_wide());
+            // Base codepoint for this cell (ring/HashMap complex char for complex
+            // cells, else the packed char), reused below for the render glyph, the
+            // emoji-cluster base, and the '\0' -> space mapping. For a live row this
+            // is the live complex char; for a scrolled-back row it is the
+            // materialized history base.
+            let raw = if cell.is_complex() {
+                data.complex_base().unwrap_or('\u{FFFD}')
+            } else {
+                cell.char()
+            };
+            let ch = if wide || raw == '\0' { ' ' } else { raw };
+
+            // Emoji presentation: a text-default emoji base that VS16 widened to
+            // 2 cells. Such a char is narrow by default, so a WIDE main cell
+            // holding an emoji-capable base can ONLY have been widened by VS16
+            // (`widen_previous_cell_for_vs16`). Lead cells only (`!wide`).
+            let emoji_presentation =
+                !wide && cell.is_wide() && super::handler::is_vs16_emoji_capable(ch);
+
+            // Line decorations (SGR 4 family / 9 / 53).
+            let cflags = eff_cell.flags();
+            let underline = UnderlineStyle::from_flags(cflags);
+            let strikethrough = cflags.contains(CellFlags::STRIKETHROUGH);
+            let overline = cflags.contains(CellFlags::OVERLINE);
+            let bold = cflags.contains(CellFlags::BOLD);
+            let italic = cflags.contains(CellFlags::ITALIC);
+            // Single CellExtra read (from the unified lookup above) serves the
+            // SGR 58 underline colour AND the emoji-cluster / combining-mark
+            // classification below. Live: the flag-gated live extra; history: the
+            // materialized extra (shape-identical, so combining()/hyperlink() read
+            // the same way; underline colour is not restored into scrollback).
+            let extra = data.cell_extra();
+            let underline_color = if underline == UnderlineStyle::None {
+                None
+            } else {
+                extra.and_then(|e| {
+                    // SGR 58:2 explicit RGB wins; SGR 58:5 stored a palette
+                    // INDEX for draw-time resolution (W5g) — resolve it here
+                    // against the LIVE palette (this extraction runs per frame,
+                    // so an OSC 4 palette change re-colors the underline on the
+                    // next frame, on both the CPU and GPU backends).
+                    e.underline_color().or_else(|| {
+                        e.underline_color_index().map(|i| {
+                            let c = palette.get(i);
+                            [c.r, c.g, c.b]
+                        })
+                    })
+                })
+            };
+
+            out.push(RenderCell {
+                ch,
+                fg: [fg.r, fg.g, fg.b],
+                bg: [bg.r, bg.g, bg.b],
+                wide,
+                emoji_presentation,
+                bold,
+                italic,
+                underline,
+                strikethrough,
+                overline,
+                underline_color,
+            });
+
+            // Emoji-cluster / combining-mark extraction, folded in from
+            // `cluster_row_into` / `combining_row_into` (byte-identical at
+            // display_offset == 0) so the per-frame snapshot probes the extras
+            // once per cell instead of in two extra full-grid passes. Only
+            // requested by `cell_frame_into`. `marks()` reads the live combining
+            // slice, or reconstructs a materialized cell's cluster tail.
+            if let Some((clusters, combining_out)) = extras_out.as_mut() {
+                let marks = data.marks();
+                if marks.iter().copied().any(is_emoji_sequence_marker) {
+                    // Multi-codepoint EMOJI sequence (ZWJ / skin-tone / keycap /
+                    // regional-indicator pair): surface the whole grapheme for
+                    // shaping. Skip a NUL base, matching `cluster_row_into`.
+                    if raw != '\0' {
+                        let mut s = String::with_capacity(2 + marks.len());
+                        s.push(raw);
+                        s.extend(marks.iter().copied());
+                        clusters.push((col as usize, s.into_boxed_str()));
+                    }
+                } else if !marks.is_empty() {
+                    // Plain combining diacritics: overlay every mark except the
+                    // VS15/VS16 presentation selectors, matching `combining_row_into`.
+                    let overlay: Box<[char]> = marks
+                        .iter()
+                        .copied()
+                        .filter(|&c| c != '\u{FE0E}' && c != '\u{FE0F}')
+                        .collect();
+                    if !overlay.is_empty() {
+                        combining_out.push((col as usize, overlay));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emoji grapheme-cluster strings for the visible `row`, sparse: one
+    /// `(col, cluster)` per cell whose combining marks form a multi-codepoint
+    /// EMOJI sequence — a ZWJ sequence (👨‍👩‍👧), a skin-tone modifier (👍🏽), or
+    /// an enclosing keycap (1️⃣). The renderer shapes each cluster to a single
+    /// colour glyph; without this it would only see the base codepoint and draw
+    /// just the first component.
+    ///
+    /// Deliberately EXCLUDES pure VS15/VS16 clusters (e.g. ❤️) — those keep the
+    /// presentation-selector path ([`RenderCell::emoji_presentation`]), which is
+    /// already CPU/GPU-consistent. `col` is the wide lead cell (the base char's
+    /// column), matching where the renderer blits the glyph.
+    #[must_use]
+    pub fn cluster_row(&self, row: usize) -> Vec<(usize, Box<str>)> {
+        let mut out = Vec::new();
+        self.cluster_row_into(row, &mut out);
+        out
+    }
+
+    /// Like [`cluster_row`](Self::cluster_row), but fills a caller-owned `out`
+    /// buffer instead of allocating a fresh `Vec`. `out` is `clear()`ed first,
+    /// then pushed exactly the `(col, cluster)` pairs
+    /// [`cluster_row`](Self::cluster_row) would return (the one code path), so
+    /// the result is byte-identical. The owned cluster strings (`Box<str>`) are
+    /// still allocated per cluster — only the per-row container Vec is reused.
+    ///
+    /// `pub(crate)`: consumed only by [`cell_frame_into`](Self::cell_frame_into).
+    pub(crate) fn cluster_row_into(&self, row: usize, out: &mut Vec<(usize, Box<str>)>) {
+        out.clear();
+        let Ok(visible_row) = u16::try_from(row) else {
+            return;
+        };
+        let grid = self.grid();
+        // Fast path: emoji clusters live in cell extras (combining marks). With
+        // no extras anywhere there is nothing to scan — the common case (plain
+        // text) pays a single bool check instead of a per-column probe.
+        if grid.extras().is_empty() {
+            return;
+        }
+        let Some(grid_row) = grid.row(visible_row) else {
+            return;
+        };
+        let cols = grid_row.len();
+        for col in 0..cols {
+            let Some(extra) = grid.cell_extra(visible_row, col) else {
+                continue;
+            };
+            let combining = extra.combining();
+            if !combining.iter().copied().any(is_emoji_sequence_marker) {
+                continue;
+            }
+            let Some(base) = grid.resolved_char(visible_row, col) else {
+                continue;
+            };
+            if base == '\0' {
+                continue;
+            }
+            let mut s = String::with_capacity(2 + combining.len());
+            s.push(base);
+            s.extend(combining.iter().copied());
+            out.push((col as usize, s.into_boxed_str()));
+        }
+    }
+
+    /// Combining MARKS to overlay per cell of the visible `row`, sparse: one
+    /// `(col, marks)` for each cell carrying combining diacritics (é = e + U+0301,
+    /// ñ = n + U+0303, …). The renderer blits each mark's glyph over the base so
+    /// the accent shows; without this only the base code point is drawn.
+    ///
+    /// Excludes cells handled elsewhere: emoji sequences (a sequence marker is
+    /// present — [`cluster_row`](Self::cluster_row) shapes those) and the bare
+    /// VS15/VS16 selectors ([`RenderCell::emoji_presentation`]). Marks are kept
+    /// in arrival order so stacked diacritics layer correctly.
+    #[must_use]
+    pub fn combining_row(&self, row: usize) -> Vec<(usize, Box<[char]>)> {
+        let mut out = Vec::new();
+        self.combining_row_into(row, &mut out);
+        out
+    }
+
+    /// Like [`combining_row`](Self::combining_row), but fills a caller-owned
+    /// `out` buffer instead of allocating a fresh `Vec`. `out` is `clear()`ed
+    /// first, then pushed exactly the `(col, marks)` pairs
+    /// [`combining_row`](Self::combining_row) would return (the one code path),
+    /// so the result is byte-identical. The owned mark slices (`Box<[char]>`)
+    /// are still allocated per cell — only the per-row container Vec is reused.
+    ///
+    /// `pub(crate)`: consumed only by [`cell_frame_into`](Self::cell_frame_into).
+    pub(crate) fn combining_row_into(&self, row: usize, out: &mut Vec<(usize, Box<[char]>)>) {
+        out.clear();
+        let Ok(visible_row) = u16::try_from(row) else {
+            return;
+        };
+        let grid = self.grid();
+        if grid.extras().is_empty() {
+            return;
+        }
+        let Some(grid_row) = grid.row(visible_row) else {
+            return;
+        };
+        for col in 0..grid_row.len() {
+            let Some(extra) = grid.cell_extra(visible_row, col) else {
+                continue;
+            };
+            let combining = extra.combining();
+            if combining.is_empty() || combining.iter().copied().any(is_emoji_sequence_marker) {
+                continue;
+            }
+            // Overlay every combining char except the presentation selectors,
+            // which only widen/narrow the base (no glyph of their own).
+            let marks: Box<[char]> = combining
+                .iter()
+                .copied()
+                .filter(|&c| c != '\u{FE0E}' && c != '\u{FE0F}')
+                .collect();
+            if marks.is_empty() {
+                continue;
+            }
+            out.push((col as usize, marks));
+        }
+    }
+
+    /// Inline-image placements for the visible `row`, sparse: one `(col,
+    /// ImageRef)` for every cell covered by an iTerm2 OSC 1337 `File=` image. The
+    /// renderer decodes each image once (keyed by the `Arc` inside the ref) and
+    /// blits the cell's tile; a covered cell skips its glyph (its background still
+    /// fills). Cells absent here take the ordinary glyph dispatch.
+    #[must_use]
+    pub fn images_row(&self, row: usize) -> Vec<(usize, aterm_grid::ImageRef)> {
+        let mut out = Vec::new();
+        self.images_row_into(row, &mut out);
+        out
+    }
+
+    /// Like [`images_row`](Self::images_row), but fills a caller-owned `out`
+    /// buffer instead of allocating a fresh `Vec`. `out` is `clear()`ed first,
+    /// then pushed exactly the `(col, ImageRef)` pairs
+    /// [`images_row`](Self::images_row) would return (the one code path), so the
+    /// result is byte-identical. Each pushed `ImageRef` is a cheap `Arc` clone +
+    /// two `u16`; the (large) image payload is shared, not copied.
+    ///
+    /// `pub(crate)`: the per-frame snapshot uses the batch
+    /// [`images_frame_into`](Self::images_frame_into) instead; this remains the
+    /// single-row reference path (and the parity oracle for the batch fill).
+    pub(crate) fn images_row_into(&self, row: usize, out: &mut Vec<(usize, aterm_grid::ImageRef)>) {
+        out.clear();
+        let Ok(visible_row) = u16::try_from(row) else {
+            return;
+        };
+        let grid = self.grid();
+        // Fast path: with no extras anywhere there are no image cells, so the
+        // common case (plain text) pays a single bool check.
+        if grid.extras().is_empty() {
+            return;
+        }
+        // Scan the FULL grid width, not `grid_row.len()`: an image cell carries
+        // only an extra (no glyph), so the row may not be materialized to full
+        // width — `Row::len()` can be 0 while the image extras live in the extras
+        // map. `cell_extra` reads that map directly, independent of materialization.
+        if visible_row >= grid.rows() {
+            return;
+        }
+        for col in 0..grid.cols() {
+            let Some(extra) = grid.cell_extra(visible_row, col) else {
+                continue;
+            };
+            if let Some(image) = extra.image() {
+                out.push((col as usize, image.clone()));
+            } else if let Some(iref) = self.placeholder_image_ref(visible_row, col, extra) {
+                // Kitty Unicode placeholder cell: synthesize an ImageRef so it rides
+                // the same (pixel-tested) render path as a direct placement.
+                out.push((col as usize, iref));
+            }
+        }
+    }
+
+    /// Batch equivalent of calling [`images_row_into`](Self::images_row_into)
+    /// for every row in `0..rows`, driven by ONE pass over the extras map
+    /// instead of `rows x cols` per-cell probes. The per-row scan's only
+    /// early-out is the map being EMPTY, so a single hyperlink, colored
+    /// underline, or the image itself anywhere on screen made every frame pay
+    /// ~rows*cols hash probes under the terminal lock; iterating the map is
+    /// proportional to the extras actually present instead.
+    ///
+    /// Output is byte-identical to the per-row accessor (see
+    /// `images_frame_into_matches_per_row`): entries are bounds-checked
+    /// against the CURRENT grid — stale rows/cols surviving a shrink are
+    /// dropped, exactly as the per-row `0..cols` / `row < rows()` scan drops
+    /// them implicitly — and each row is sorted by column afterwards (map
+    /// iteration order is arbitrary; the per-row scan emits ascending
+    /// columns, and per-frame consumers index into the row Vecs).
+    ///
+    /// Scratch-reuse contract matches the other `cell_frame_into` containers:
+    /// the outer Vec is resized keeping existing inner Vecs, and each inner
+    /// Vec is `clear()`ed in place so its capacity survives across frames.
+    fn images_frame_into(&self, images: &mut Vec<Vec<(usize, aterm_grid::ImageRef)>>, rows: usize) {
+        images.resize_with(rows, Vec::new);
+        for row in images.iter_mut() {
+            row.clear();
+        }
+        let grid = self.grid();
+        // Fast path: with no extras anywhere there are no image cells, so the
+        // common case (plain text) pays a single bool check.
+        if grid.extras().is_empty() {
+            return;
+        }
+        // `iter()` yields external coordinates with stale (scrolled-off)
+        // entries already filtered; clamp to both the caller's `rows` and the
+        // grid's own extent (they can differ during a resize).
+        let max_row = rows.min(usize::from(grid.rows()));
+        for (coord, extra) in grid.extras().iter() {
+            let r = usize::from(coord.row);
+            if r >= max_row || coord.col >= grid.cols() {
+                continue;
+            }
+            if let Some(image) = extra.image() {
+                images[r].push((usize::from(coord.col), image.clone()));
+            } else if let Some(iref) = self.placeholder_image_ref(coord.row, coord.col, extra) {
+                // Kitty Unicode placeholder cell: synthesize an ImageRef so it
+                // rides the same (pixel-tested) render path as a direct placement.
+                images[r].push((usize::from(coord.col), iref));
+            }
+        }
+        for row in images.iter_mut() {
+            row.sort_unstable_by_key(|&(col, _)| col);
+        }
+    }
+
+    /// If the cell at (`row`,`col`) is a Kitty Unicode placeholder (U+10EEEE),
+    /// decode its diacritics (row, col, image-id-high) + fg-color (image-id-low)
+    /// and return an [`ImageRef`](aterm_grid::ImageRef) into the stored image. The
+    /// pixel-exact sub-tile blit is the renderer's existing ImageRef job, so a
+    /// virtual placement reuses the proven direct-placement compositor. Returns
+    /// `None` for any non-placeholder cell or an unknown image id.
+    fn placeholder_image_ref(
+        &self,
+        row: u16,
+        col: u16,
+        extra: &aterm_grid::CellExtra,
+    ) -> Option<aterm_grid::ImageRef> {
+        use super::kitty_placeholder::{PLACEHOLDER, diacritic_value};
+        // The placeholder is non-BMP, so it always resolves via the overflow table.
+        if self.grid().resolved_char(row, col) != Some(PLACEHOLDER) {
+            return None;
+        }
+        let comb = extra.combining();
+        let row_val = comb.first().and_then(|&c| diacritic_value(c)).unwrap_or(0);
+        let col_val = comb.get(1).and_then(|&c| diacritic_value(c)).unwrap_or(0);
+        let id_high = comb.get(2).and_then(|&c| diacritic_value(c)).unwrap_or(0) & 0xFF;
+        let image_id = (id_high << 24) | self.cell_fg_image_id(row, col);
+        let image = self.transient.kitty_images.get(&image_id)?.clone();
+        Some(aterm_grid::ImageRef {
+            image,
+            cell_row: u16::try_from(row_val).unwrap_or(0),
+            cell_col: u16::try_from(col_val).unwrap_or(0),
+        })
+    }
+
+    /// The low 24 bits of a Kitty image id, encoded in a cell's foreground color:
+    /// an RGB fg is `(r<<16)|(g<<8)|b`; an indexed fg is the palette index; a
+    /// default fg is 0 (matching kitty's `colorToId`).
+    fn cell_fg_image_id(&self, row: u16, col: u16) -> u32 {
+        if let Some([r, g, b]) = self.grid().fg_rgb_at(row, col) {
+            return (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        }
+        if let Some(cell) = self.grid().cell(row, col) {
+            let colors = cell.colors();
+            if colors.fg_is_indexed() {
+                return u32::from(colors.fg_index());
+            }
+        }
+        0
+    }
+
+    /// Build the engine's render SNAPSHOT for one frame (`read_image`, REARCH A-3):
+    /// a plain-owned [`RenderInput`](crate::render::RenderInput) a renderer can
+    /// paint WITHOUT any `&Terminal` borrow, allocating a fresh value each call.
+    ///
+    /// This is the engine-side replacement for the renderer's old reach-in
+    /// (`aterm_render::Renderer::extract`): the engine now EMITS the snapshot, so
+    /// `aterm-render` / `aterm-gpu` consume only the value and never touch core
+    /// internals. The per-frame, allocation-reusing path is
+    /// [`cell_frame_into`](Self::cell_frame_into); this wrapper allocates then
+    /// delegates, so the two produce byte-identical snapshots.
+    ///
+    /// `&mut self` because the snapshot is stamped with
+    /// [`damage_epoch`](Self::damage_epoch) (which latches), not because the fill
+    /// mutates the grid.
+    #[must_use]
+    pub fn cell_frame(&mut self, rows: usize, cols: usize) -> crate::render::RenderInput {
+        let mut scratch = crate::render::RenderInput::empty();
+        self.cell_frame_into(&mut scratch, rows, cols);
+        scratch
+    }
+
+    /// Like [`cell_frame`](Self::cell_frame), but REFILLS a caller-owned `scratch`
+    /// [`RenderInput`](crate::render::RenderInput) in place instead of allocating a
+    /// fresh one each frame — the per-frame hot path the windowed frontend calls on
+    /// a kept scratch UNDER the `Terminal` lock.
+    ///
+    /// The three per-row container Vecs of Vecs (`cells`, `clusters`, `combining`)
+    /// are resized to `rows` REUSING their existing inner per-row Vecs in place
+    /// (truncating if shorter, pushing fresh empty Vecs if longer), then each row's
+    /// inner Vec is `clear()`ed + refilled by the matching `*_row_into` accessor. So
+    /// when the grid dimensions are stable (the common case: same window, frame
+    /// after frame) NEITHER the outer Vecs NOR the inner per-row Vecs reallocate.
+    /// `line_sizes` is `.clear()`ed (its elements are `Copy`, no inner allocation).
+    /// The data is byte-for-byte identical to what [`cell_frame`](Self::cell_frame)
+    /// produces.
+    ///
+    /// Per-frame allocation of the four containers AND the per-row inner Vecs is
+    /// elided. What still allocates is the owned cluster/mark CONTENT (`Box<str>`
+    /// per emoji cluster, `Box<[char]>` per combining cell) the `*_row_into`
+    /// accessors push — per-cluster owned data, only present for emoji/diacritic
+    /// cells. Plain ASCII rows push none of those, so they are allocation-free in
+    /// steady state.
+    ///
+    /// IMPORTANT: do NOT `.clear()` the outer container Vecs — that drops the inner
+    /// per-row Vecs, throwing away their grown capacity and forcing a fresh
+    /// allocation per row next frame. Resize-in-place is what preserves the inner
+    /// buffers.
+    ///
+    /// The snapshot is stamped with [`damage_epoch`](Self::damage_epoch) as its
+    /// [`snapshot_seq`](crate::render::RenderInput::snapshot_seq): the monotone
+    /// version of the engine state this frame reflects. Because the whole snapshot
+    /// is filled under the one lock the caller holds, that seq is internally
+    /// consistent (no torn read) and a later `damage_epoch()` lets the caller detect
+    /// staleness. This builds on the EXISTING epoch (O(1); already read for the
+    /// frontend's coarse present early-out) — no new counter and no extra damage
+    /// scan.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "display_offset is a scrollback row count that fits i32 in practice; \
+                  the snapshot field is i32 (viewport row = r - display_offset)"
+    )]
+    pub fn cell_frame_into(
+        &mut self,
+        scratch: &mut crate::render::RenderInput,
+        rows: usize,
+        cols: usize,
+    ) {
+        scratch.rows = rows;
+        scratch.cols = cols;
+
+        // Resize the outer Vec-of-Vecs to `rows`, KEEPING the existing inner
+        // per-row Vecs (their grown capacity), then refill each in place via the
+        // `*_row_into` accessor (which clears + repushes). `resize_with` truncates
+        // when `rows` shrank (dropping the surplus inner Vecs) and appends fresh
+        // empty Vecs when `rows` grew; the `0..len` already-present rows keep their
+        // buffers untouched until the per-row `*_into` clear+refill below.
+        // One combined pass fills cells + emoji-clusters + combining marks per
+        // row, so the extras map is probed once per cell (inside
+        // `render_row_into_impl`) instead of in three independent full-grid
+        // scans. `cells[r]` / `clusters[r]` / `combining[r]` are disjoint fields,
+        // so the three per-row borrows coexist.
+        scratch.cells.resize_with(rows, Vec::new);
+        scratch.clusters.resize_with(rows, Vec::new);
+        scratch.combining.resize_with(rows, Vec::new);
+        for r in 0..rows {
+            self.render_row_into_impl(
+                r,
+                &mut scratch.cells[r],
+                Some((&mut scratch.clusters[r], &mut scratch.combining[r])),
+                false,
+            );
+        }
+
+        // Images stay a SEPARATE pass: an image/placeholder cell carries only an
+        // extra (no glyph), so the row may be unmaterialized and `render_row_into`
+        // (which iterates `grid_row.len()`) would miss it. The batch fill walks
+        // the extras map ONCE for the whole frame (instead of rows x cols probes
+        // whenever ANY extra exists) and is byte-identical to the per-row
+        // `images_row_into` — do NOT fold it into the cell pass.
+        self.images_frame_into(&mut scratch.images, rows);
+
+        scratch.line_sizes.clear();
+        scratch.line_sizes.extend((0..rows).map(|r| {
+            u16::try_from(r)
+                .ok()
+                .and_then(|vr| self.grid().row(vr))
+                .map_or(
+                    crate::grid::LineSize::SingleWidth,
+                    crate::grid::Row::line_size,
+                )
+        }));
+
+        let cur = self.cursor();
+        scratch.cursor_row = cur.row as usize;
+        scratch.cursor_col = cur.col as usize;
+        scratch.cursor_visible = self.cursor_visible();
+        scratch.cursor_style = self.cursor_style();
+        scratch.display_offset = self.grid().display_offset() as i32;
+        // Capture base_y (absolute row of the top visible line) under the SAME lock as
+        // the cells, so a host that re-anchors absolute rows into this frame (⌘F find
+        // highlight) uses a value consistent with the exact grid just extracted.
+        scratch.base_y = i64::try_from(self.grid().base_y()).unwrap_or(i64::MAX);
+        // Capture the protected-footer insertion revision at the same extraction
+        // boundary. A host can therefore fail closed when retained absolute-row
+        // geometry no longer describes this exact frame.
+        scratch.absolute_row_revision = self.absolute_row_revision();
+        // `clone_from` reuses the destination's existing allocation where the
+        // selection's owned data permits, instead of dropping + reallocating.
+        scratch.selection.clone_from(self.text_selection());
+
+        // Stamp the snapshot with the engine's monotone damage epoch (A-3 seq).
+        // O(1), and idempotent within a damage session, so reading it here is free
+        // even when the frontend also reads it for its present early-out.
+        scratch.snapshot_seq = self.damage_epoch();
+
+        // BiDi visual reordering (feature `bidi`): permute each row into visual
+        // order so RTL runs display correctly on BOTH renderers and in the
+        // `image` capture. No-op for pure-LTR frames and when the feature is off
+        // (byte-identical). See terminal/bidi_reorder.rs::apply_bidi_reorder.
+        #[cfg(feature = "bidi")]
+        self.apply_bidi_reorder(scratch);
+    }
+}
+
+/// A combining char that marks its cell as a multi-codepoint EMOJI sequence:
+/// ZWJ (U+200D, family/role sequences), an emoji skin-tone modifier
+/// (U+1F3FB–U+1F3FF), COMBINING ENCLOSING KEYCAP (U+20E3), or a regional
+/// indicator (U+1F1E6–U+1F1FF, the second half of a flag pair the writer folds
+/// into one cell). VS15/VS16 are presentation selectors, not sequence markers,
+/// and are excluded on purpose.
+#[inline]
+fn is_emoji_sequence_marker(c: char) -> bool {
+    matches!(c as u32, 0x200D | 0x20E3 | 0x1F3FB..=0x1F3FF | 0x1F1E6..=0x1F1FF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_row_out_of_range_is_empty() {
+        let term = Terminal::new(2, 4);
+        assert!(term.render_row(99).is_empty());
+    }
+
+    #[test]
+    fn cell_frame_stamps_absolute_row_revision() {
+        let mut term = Terminal::new(5, 10);
+        let before = term.cell_frame(5, 10);
+        assert_eq!(before.absolute_row_revision, 0);
+
+        // Insert one history row before two protected footer rows. This is the
+        // non-uniform coordinate change the frame stamp exists to fence. The
+        // displaced top row must be WRITTEN — never-written rows scroll
+        // history-free (no archival, no splice, no revision bump).
+        term.process(b"\x1b[1;1HA");
+        term.process(b"\x1b[1;3r\x1b[3;1H\r\nX\x1b[r");
+        assert_eq!(term.absolute_row_revision(), 1);
+
+        let after = term.cell_frame(5, 10);
+        assert_eq!(
+            after.absolute_row_revision,
+            term.absolute_row_revision(),
+            "snapshot carries the terminal revision from its extraction boundary"
+        );
+    }
+
+    /// The batch `images_frame_into` fill must be byte-identical to the per-row
+    /// `images_row` reference for every row — covering a direct iTerm2
+    /// placement, a Kitty Unicode placeholder, non-image extras (hyperlink /
+    /// colored underline) that must NOT emit entries, scrolled state (extras
+    /// `row_offset` > 0 with stale scrolled-off entries in the map), and a
+    /// `rows` request larger than the grid.
+    #[test]
+    fn images_frame_into_matches_per_row() {
+        let mut term = Terminal::new(10, 30);
+        term.set_cell_pixel_size(10, 20);
+
+        // Non-image extras: a hyperlink cell and a colored-underline cell make
+        // the extras map non-empty (the per-row scan's worst case).
+        term.process(b"\x1b]8;;http://example.com\x1b\\L\x1b]8;;\x1b\\");
+        term.process(b"\x1b[4m\x1b[58;2;10;20;30mU\x1b[0m\r\n");
+
+        // Direct OSC 1337 placement: 3 cols x 2 rows at rows 1..=2.
+        let b64 = aterm_codec::base64::encode(b"not-a-real-png").expect("encode");
+        let mut seq = b"\x1b]1337;File=inline=1;width=3;height=2:".to_vec();
+        seq.extend_from_slice(b64.as_bytes());
+        seq.extend_from_slice(b"\x1b\\");
+        term.process(&seq);
+
+        // A stored Kitty image (a=t, id 5) shown via a Unicode placeholder cell.
+        let raw = vec![0u8; 10 * 20 * 4];
+        let mut apc = b"\x1b_Ga=t,f=32,s=10,v=20,i=5;".to_vec();
+        apc.extend_from_slice(
+            aterm_codec::base64::encode(&raw)
+                .expect("encode")
+                .as_bytes(),
+        );
+        apc.extend_from_slice(b"\x1b\\");
+        term.process(&apc);
+        let mut ph = b"\x1b[38;5;5m".to_vec();
+        let mut buf = [0u8; 4];
+        for c in ['\u{10EEEE}', '\u{0305}', '\u{0305}'] {
+            ph.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+        ph.extend_from_slice(b"\x1b[0m");
+        term.process(&ph);
+
+        // Scroll twice from the bottom row: the extras map now carries a
+        // nonzero row_offset AND stale scrolled-off entries the batch path
+        // must filter exactly like the per-row probes do.
+        term.process(b"\x1b[10;1H\r\n\r\n");
+
+        let rows = usize::from(term.grid().rows()) + 5; // beyond the grid too
+        let mut batch: Vec<Vec<(usize, aterm_grid::ImageRef)>> = Vec::new();
+        term.images_frame_into(&mut batch, rows);
+        assert_eq!(batch.len(), rows);
+        let mut total = 0usize;
+        for (r, got) in batch.iter().enumerate() {
+            let want = term.images_row(r);
+            assert_eq!(got.len(), want.len(), "row {r} entry count");
+            for ((gc, gi), (wc, wi)) in got.iter().zip(&want) {
+                assert_eq!(gc, wc, "row {r} column order");
+                assert!(
+                    std::sync::Arc::ptr_eq(&gi.image, &wi.image),
+                    "row {r} image identity"
+                );
+                assert_eq!(
+                    (gi.cell_row, gi.cell_col),
+                    (wi.cell_row, wi.cell_col),
+                    "row {r} tile coordinates"
+                );
+            }
+            total += got.len();
+        }
+        assert!(total > 0, "the frame must actually contain image cells");
+    }
+
+    #[test]
+    fn render_row_default_colors() {
+        let mut term = Terminal::new(2, 8);
+        term.process(b"Hi");
+        let cells = term.render_row(0);
+        assert!(cells.len() >= 2);
+        assert_eq!(cells[0].ch, 'H');
+        assert_eq!(cells[1].ch, 'i');
+        // Default fg/bg come straight from the terminal defaults.
+        let fg = term.default_foreground();
+        let bg = term.default_background();
+        assert_eq!(cells[0].fg, [fg.r, fg.g, fg.b]);
+        assert_eq!(cells[0].bg, [bg.r, bg.g, bg.b]);
+    }
+
+    /// A bare `Terminal::new()` defaults to the SINGLE-SOURCE constants in aterm-types
+    /// (pins the constructor boundary; transient_state used 229 while
+    /// `TerminalConfig::default` used 255 before they were unified — see the color
+    /// audit) (N2).
+    #[test]
+    fn terminal_new_defaults_are_single_source() {
+        let term = Terminal::new(2, 4);
+        assert_eq!(term.default_foreground(), aterm_types::DEFAULT_FOREGROUND);
+        assert_eq!(term.default_background(), aterm_types::DEFAULT_BACKGROUND);
+    }
+
+    /// OSC 110 (reset default fg) restores the CONFIGURED (themed) default — never a
+    /// transient OSC-10 value nor the spec default. This is the reset-to-configured
+    /// semantics behind the single-source fix (S10).
+    #[test]
+    fn osc_110_resets_to_configured_default_foreground() {
+        use crate::config::TerminalConfig;
+        let mut term = Terminal::new(2, 8);
+        // A themed configured default fg (#112233); allow runtime colour ops.
+        let mut tc = TerminalConfig::default();
+        tc.default_foreground = aterm_types::Rgb::new(0x11, 0x22, 0x33);
+        tc.allow_palette_reconfigure = true;
+        term.apply_config(&tc);
+        // OSC 10 sets the dynamic default fg → magenta.
+        term.process(b"\x1b]10;rgb:ff/00/ff\x07");
+        assert_eq!(
+            term.default_foreground(),
+            aterm_types::Rgb::new(0xff, 0x00, 0xff),
+            "OSC 10 set took effect"
+        );
+        // OSC 110 resets → back to the CONFIGURED themed value, not magenta/spec.
+        term.process(b"\x1b]110\x07");
+        assert_eq!(
+            term.default_foreground(),
+            aterm_types::Rgb::new(0x11, 0x22, 0x33),
+            "OSC 110 resets to the configured (themed) default"
+        );
+        assert_ne!(
+            term.default_foreground(),
+            aterm_types::Rgb::new(0xff, 0x00, 0xff)
+        );
+    }
+
+    #[test]
+    fn vs16_widened_emoji_sets_emoji_presentation() {
+        // ❤️ = U+2764 (HEAVY BLACK HEART, text default) + U+FE0F (VS16). VS16
+        // widens it to 2 cells AND requests colour presentation.
+        let mut term = Terminal::new(2, 8);
+        term.process("\u{2764}\u{FE0F}".as_bytes());
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, '\u{2764}');
+        assert!(!cells[0].wide, "lead cell is not a continuation");
+        assert!(
+            cells[0].emoji_presentation,
+            "VS16-widened ❤️ lead must request emoji presentation"
+        );
+        // The right half is a wide continuation carrying no glyph / no flag.
+        assert!(cells[1].wide, "second column is the wide continuation");
+        assert!(
+            !cells[1].emoji_presentation,
+            "continuation cell carries no presentation flag"
+        );
+    }
+
+    #[test]
+    fn bare_emoji_base_without_vs16_is_text_presentation() {
+        // Bare ❤ (no VS16) stays narrow and text — NO emoji presentation, so
+        // the renderer keeps drawing the mono black-heart glyph.
+        let mut term = Terminal::new(2, 8);
+        term.process("\u{2764}".as_bytes());
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, '\u{2764}');
+        assert!(!cells[0].wide);
+        assert!(
+            !cells[0].emoji_presentation,
+            "bare ❤ must not request emoji presentation"
+        );
+    }
+
+    #[test]
+    fn cluster_row_emits_zwj_skin_keycap_not_vs16_or_plain() {
+        let mut term = Terminal::new(2, 20);
+        // family ZWJ (col 0) sp(2) skin (3) sp(5) keycap (6) sp(?) ❤️ VS16 plain 'a'
+        term.process(
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{1F44D}\u{1F3FD} \u{31}\u{FE0F}\u{20E3} \u{2764}\u{FE0F}a".as_bytes(),
+        );
+        let clusters = term.cluster_row(0);
+        // family at lead col 0
+        let family = clusters
+            .iter()
+            .find(|(c, _)| *c == 0)
+            .map(|(_, s)| s.as_ref());
+        assert_eq!(
+            family,
+            Some("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"),
+            "family ZWJ cluster"
+        );
+        // skin-tone thumbs-up at col 3
+        let skin = clusters
+            .iter()
+            .find(|(c, _)| *c == 3)
+            .map(|(_, s)| s.as_ref());
+        assert_eq!(skin, Some("\u{1F44D}\u{1F3FD}"), "skin-tone cluster");
+        // keycap at col 6
+        let keycap = clusters
+            .iter()
+            .find(|(c, _)| *c == 6)
+            .map(|(_, s)| s.as_ref());
+        assert_eq!(keycap, Some("\u{31}\u{FE0F}\u{20E3}"), "keycap cluster");
+        // VS16 ❤️ must NOT be emitted (it keeps the emoji_presentation path).
+        assert!(
+            clusters.iter().all(|(_, s)| !s.starts_with('\u{2764}')),
+            "VS16 ❤️ must not be a shaping cluster, got {clusters:?}"
+        );
+    }
+
+    #[test]
+    fn regional_indicator_pair_folds_into_one_flag_cluster() {
+        // 🇺🇸 = regional indicator U + S. The pair must fold into ONE 2-cell
+        // grapheme (lead col 0 wide, col 1 continuation), with S as a combining
+        // mark, and surface as a flag cluster for shaping.
+        let mut term = Terminal::new(2, 12);
+        term.process("\u{1F1FA}\u{1F1F8}".as_bytes());
+        let cells = term.render_row(0);
+        assert_eq!(
+            cells[0].ch, '\u{1F1FA}',
+            "lead cell is regional indicator U"
+        );
+        assert!(!cells[0].wide, "lead is not a continuation");
+        assert!(cells[1].wide, "col 1 is the wide continuation of the flag");
+        // The pair occupies exactly 2 cells, not 4 (render_row trims to the
+        // occupied width, so a folded pair is a length-2 row).
+        assert_eq!(
+            cells.len(),
+            2,
+            "RI pair folds into one 2-cell flag, not two glyphs"
+        );
+
+        let clusters = term.cluster_row(0);
+        let flag = clusters
+            .iter()
+            .find(|(c, _)| *c == 0)
+            .map(|(_, s)| s.as_ref());
+        assert_eq!(
+            flag,
+            Some("\u{1F1FA}\u{1F1F8}"),
+            "flag cluster surfaced for shaping"
+        );
+    }
+
+    #[test]
+    fn three_regional_indicators_pair_then_single() {
+        // 🇺🇸🇫: GB12/GB13 — the first two pair into a flag; the third stands
+        // alone in its own cell (it is NOT folded into the completed pair).
+        let mut term = Terminal::new(2, 12);
+        term.process("\u{1F1FA}\u{1F1F8}\u{1F1EB}".as_bytes());
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, '\u{1F1FA}', "pair lead U");
+        assert!(cells[1].wide, "pair continuation");
+        // The third RI starts a fresh cell at col 2 (wide), not folded in.
+        assert_eq!(cells[2].ch, '\u{1F1EB}', "third RI stands alone");
+        let clusters = term.cluster_row(0);
+        assert_eq!(
+            clusters.len(),
+            1,
+            "only the completed pair is a cluster, got {clusters:?}"
+        );
+        assert_eq!(clusters[0].0, 0, "the flag cluster is at the pair lead");
+    }
+
+    #[test]
+    fn sgr_decorations_surface_on_render_cells() {
+        let mut term = Terminal::new(2, 16);
+        // SGR 4 underline, 21 double, 4:3 curly, 9 strike, 53 overline.
+        term.process(
+            b"\x1b[4mA\x1b[0m\x1b[21mB\x1b[0m\x1b[4:3mC\x1b[0m\x1b[9mD\x1b[0m\x1b[53mE\x1b[0m",
+        );
+        let cells = term.render_row(0);
+        assert_eq!(
+            cells[0].underline,
+            UnderlineStyle::Single,
+            "SGR 4 -> single"
+        );
+        assert_eq!(
+            cells[1].underline,
+            UnderlineStyle::Double,
+            "SGR 21 -> double"
+        );
+        assert_eq!(
+            cells[2].underline,
+            UnderlineStyle::Curly,
+            "SGR 4:3 -> curly"
+        );
+        assert_eq!(cells[3].underline, UnderlineStyle::None);
+        assert!(cells[3].strikethrough, "SGR 9 -> strikethrough");
+        assert!(cells[4].overline, "SGR 53 -> overline");
+        // Plain cells carry no decoration.
+        let mut plain = Terminal::new(2, 8);
+        plain.process(b"x");
+        let pc = plain.render_row(0);
+        assert_eq!(pc[0].underline, UnderlineStyle::None);
+        assert!(!pc[0].strikethrough && !pc[0].overline);
+    }
+
+    #[test]
+    fn underline_color_surfaces_from_sgr58() {
+        let mut term = Terminal::new(2, 8);
+        // SGR 4 underline + 58;2;255;0;0 sets a red underline colour.
+        term.process(b"\x1b[4;58:2::255:0:0mU\x1b[0m");
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].underline, UnderlineStyle::Single);
+        assert_eq!(
+            cells[0].underline_color,
+            Some([255, 0, 0]),
+            "SGR 58 red underline colour"
+        );
+    }
+
+    /// W5(g): SGR 58:5:n (INDEXED underline colour) resolves against the LIVE
+    /// palette at extraction time — it was previously parsed + stored (with a
+    /// comment promising draw-time resolution) but never read, so an indexed
+    /// underline silently fell back to the glyph fg on both backends.
+    #[test]
+    fn indexed_underline_color_resolves_against_live_palette() {
+        let mut term = Terminal::new(2, 8);
+        term.process(b"\x1b[4;58:5:1mU\x1b[0m");
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].underline, UnderlineStyle::Single);
+        let red = term.color_palette().get(1);
+        assert_eq!(
+            cells[0].underline_color,
+            Some([red.r, red.g, red.b]),
+            "SGR 58:5:1 resolves to palette entry 1"
+        );
+        // LIVE resolution: an OSC 4 palette redefinition re-colors the SAME
+        // cell on the next extraction (the whole point of storing the index).
+        let mut tc = crate::config::TerminalConfig::default();
+        tc.allow_palette_reconfigure = true;
+        term.apply_config(&tc);
+        term.process(b"\x1b]4;1;rgb:12/34/56\x07");
+        let cells = term.render_row(0);
+        assert_eq!(
+            cells[0].underline_color,
+            Some([0x12, 0x34, 0x56]),
+            "OSC 4 palette change must re-color the indexed underline"
+        );
+    }
+
+    /// W5(f)+(e) end-to-end: `bold_is_bright = false` stops the 0–7 → 8–15
+    /// promotion, and `faint_opacity` drives the SGR 2 blend — both applied
+    /// through `apply_config` and visible in `render_row` output.
+    #[test]
+    fn style_policy_flows_through_apply_config() {
+        use crate::config::TerminalConfig;
+        let mut term = Terminal::new(2, 8);
+        term.process(b"\x1b[1;33mB\x1b[0m \x1b[2mD\x1b[0m");
+        let bright = term.color_palette().get(11);
+        let base = term.color_palette().get(3);
+        let cells = term.render_row(0);
+        assert_eq!(
+            cells[0].fg,
+            [bright.r, bright.g, bright.b],
+            "default promotes"
+        );
+        let dim_default = cells[2].fg;
+
+        let mut tc = TerminalConfig::default();
+        tc.bold_is_bright = false;
+        tc.faint_opacity = 1.0; // dim retains the full fg → no visual change
+        term.apply_config(&tc);
+        let cells = term.render_row(0);
+        assert_eq!(
+            cells[0].fg,
+            [base.r, base.g, base.b],
+            "bold_is_bright=false keeps the base indexed colour"
+        );
+        let fg = term.default_foreground();
+        assert_eq!(
+            cells[2].fg,
+            [fg.r, fg.g, fg.b],
+            "faint_opacity=1.0 leaves dim text at the full fg"
+        );
+        assert_ne!(dim_default, cells[2].fg, "the default opacity did dim");
+    }
+
+    #[test]
+    fn combining_marks_surface_for_diacritics_not_emoji() {
+        let mut term = Terminal::new(2, 12);
+        // é = e + U+0301, then a ZWJ family (emoji sequence), then plain 'x'.
+        term.process("e\u{0301} \u{1F468}\u{200D}\u{1F469} x".as_bytes());
+        let comb = term.combining_row(0);
+        // The 'e' at col 0 surfaces its acute mark.
+        let m0 = comb.iter().find(|(c, _)| *c == 0).map(|(_, m)| m.as_ref());
+        assert_eq!(
+            m0,
+            Some(['\u{0301}'].as_slice()),
+            "acute mark overlaid on e"
+        );
+        // The emoji family is NOT a combining-overlay cell (cluster_row owns it).
+        let family_col = 2; // after "e\u{0301} " (cols 0,1)
+        assert!(
+            comb.iter().all(|(c, _)| *c != family_col),
+            "emoji cluster must not be a combining-overlay cell, got {comb:?}"
+        );
+    }
+
+    #[test]
+    fn combining_row_empty_for_plain_and_vs16() {
+        let mut term = Terminal::new(2, 8);
+        // VS16 ❤️ has a combining selector but NO overlay mark.
+        term.process("hi \u{2764}\u{FE0F}".as_bytes());
+        assert!(
+            term.combining_row(0).is_empty(),
+            "plain text + VS16 has no overlay marks"
+        );
+    }
+
+    #[test]
+    fn cluster_row_empty_for_plain_text() {
+        let mut term = Terminal::new(2, 8);
+        term.process(b"hello");
+        assert!(
+            term.cluster_row(0).is_empty(),
+            "plain ASCII has no emoji clusters"
+        );
+    }
+
+    #[test]
+    fn wide_cjk_is_not_emoji_presentation() {
+        // A naturally-wide CJK char is wide but NOT emoji-capable, so it must
+        // not be mistaken for a VS16 emoji.
+        let mut term = Terminal::new(2, 8);
+        term.process("\u{65E5}".as_bytes()); // 日
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, '\u{65E5}');
+        assert!(
+            !cells[0].wide,
+            "lead cell of a wide glyph is not the continuation"
+        );
+        assert!(
+            !cells[0].emoji_presentation,
+            "wide CJK must not request emoji presentation"
+        );
+    }
+
+    #[test]
+    fn render_row_indexed_fg_red() {
+        let mut term = Terminal::new(2, 8);
+        // SGR 31 = red foreground.
+        term.process(b"\x1b[31mR\x1b[0m");
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, 'R');
+        let [r, g, b] = cells[0].fg;
+        assert!(
+            r > g && r > b,
+            "expected red-dominant fg, got {:?}",
+            cells[0].fg
+        );
+    }
+
+    #[test]
+    fn render_row_indexed_bg_green() {
+        let mut term = Terminal::new(2, 8);
+        // SGR 42 = green background.
+        term.process(b"\x1b[42mG\x1b[0m");
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, 'G');
+        let [r, g, b] = cells[0].bg;
+        assert!(
+            g > r && g > b,
+            "expected green-dominant bg, got {:?}",
+            cells[0].bg
+        );
+    }
+
+    #[test]
+    fn render_row_truecolor_fg() {
+        let mut term = Terminal::new(2, 8);
+        // SGR 38;2;10;20;200 = a blue-ish truecolor fg.
+        term.process(b"\x1b[38;2;10;20;200mX\x1b[0m");
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, 'X');
+        assert_eq!(cells[0].fg, [10, 20, 200]);
+    }
+
+    #[test]
+    fn render_row_protected_text_is_visible() {
+        // DECSCA (ESC [ 1 " q) sets the PROTECTED flag, which shares bit 10 with
+        // WIDE_CONTINUATION. Protected characters must still render their glyph
+        // — they are NOT wide-continuation spacers. Regression for the bit-10
+        // collision that blanked every DECSCA-protected cell.
+        let mut term = Terminal::new(2, 8);
+        term.process(b"\x1b[1\"qSECRET\x1b[0\"q");
+        let cells = term.render_row(0);
+        let text: String = cells.iter().take(6).map(|c| c.ch).collect();
+        assert_eq!(text, "SECRET", "protected text must render, not blank");
+        assert!(
+            !cells[0].wide,
+            "a protected cell is not a wide continuation"
+        );
+    }
+
+    #[test]
+    fn render_row_wide_continuation_is_blanked() {
+        // A real wide char (中, U+4E2D) occupies a WIDE lead cell + a
+        // WIDE_CONTINUATION spacer. The lead keeps the glyph; the spacer renders
+        // blank and is flagged `wide`. (Counterpart to the protected-cell case.)
+        let mut term = Terminal::new(2, 8);
+        term.process("中X".as_bytes());
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, '中');
+        assert!(!cells[0].wide, "the wide LEAD is not a continuation");
+        assert_eq!(cells[1].ch, ' ', "the continuation spacer renders blank");
+        assert!(cells[1].wide, "the continuation spacer is flagged wide");
+        assert_eq!(
+            cells[2].ch, 'X',
+            "the next glyph follows the 2-cell wide char"
+        );
+    }
+
+    /// `render_row_at_screen` is the LIVE-frame twin of `render_row`: identical at
+    /// `display_offset == 0`, but IGNORES a GUI scroll-back — so a socket `cell`/
+    /// `screen`/`cells` read never pairs a scrolled-back row's colours/attrs with the
+    /// live glyph (the round-4 scroll-frame defect).
+    #[test]
+    fn render_row_at_screen_ignores_display_offset() {
+        let text = |cells: &[RenderCell]| cells.iter().map(|c| c.ch).collect::<String>();
+        // 2 visible rows; write 4 lines so 2 scroll into history.
+        let mut term = Terminal::new(2, 8);
+        term.process(b"L0aaa\r\nL1bbb\r\nL2ccc\r\nL3ddd");
+
+        // At offset 0 the two paths are identical.
+        assert_eq!(
+            text(&term.render_row(0)),
+            text(&term.render_row_at_screen(0))
+        );
+        let live0 = text(&term.render_row_at_screen(0));
+        let live1 = text(&term.render_row_at_screen(1));
+
+        // Scroll the GUI back one line.
+        term.scroll_display(1);
+
+        // The LIVE-frame read is unchanged by the scroll...
+        assert_eq!(
+            text(&term.render_row_at_screen(0)),
+            live0,
+            "screen frame is offset-independent"
+        );
+        assert_eq!(
+            text(&term.render_row_at_screen(1)),
+            live1,
+            "screen frame is offset-independent"
+        );
+        // ...while the offset-AWARE render_row followed the scroll (proving the two
+        // frames genuinely diverge, so the socket reads picking the live one matters).
+        assert_ne!(
+            text(&term.render_row(0)),
+            live0,
+            "offset-aware render_row moved with the scroll"
+        );
+    }
+
+    /// The per-frame snapshot folds emoji-cluster + combining-mark extraction
+    /// into `render_row_into_impl` (one extras probe per cell) instead of the
+    /// old `cluster_row_into` / `combining_row_into` full-grid passes. Pin that
+    /// the folded output is byte-identical to the standalone row accessors.
+    #[test]
+    fn cell_frame_clusters_combining_match_row_accessors() {
+        let mut term = Terminal::new(3, 24);
+        // ZWJ family + skin-tone + keycap (clusters), VS16 heart (presentation,
+        // neither list), é diacritic (combining), and plain text.
+        term.process(
+            "\u{1F468}\u{200D}\u{1F469} \u{1F44D}\u{1F3FD} \u{31}\u{FE0F}\u{20E3} \u{2764}\u{FE0F} e\u{0301} hi"
+                .as_bytes(),
+        );
+        let frame = term.cell_frame(3, 24);
+        for r in 0..3 {
+            assert_eq!(
+                frame.clusters[r],
+                term.cluster_row(r),
+                "folded clusters must equal cluster_row for row {r}"
+            );
+            assert_eq!(
+                frame.combining[r],
+                term.combining_row(r),
+                "folded combining must equal combining_row for row {r}"
+            );
+        }
+        // Sanity: the row actually carries clusters AND a combining mark, so the
+        // parity assertions above are non-trivial.
+        assert!(
+            !frame.clusters[0].is_empty(),
+            "test content must produce at least one emoji cluster"
+        );
+        assert!(
+            !frame.combining[0].is_empty(),
+            "test content must produce at least one combining-mark overlay"
+        );
+    }
+}

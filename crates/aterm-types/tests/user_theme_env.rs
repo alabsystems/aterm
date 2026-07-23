@@ -1,0 +1,63 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! `scheme::load` reads a user theme file from the `XDG_CONFIG_HOME`-resolved
+//! theme dir, and reports `NotFound` for an absent name.
+//!
+//! This is the ONE test that must override `XDG_CONFIG_HOME`, so it runs alone
+//! in its own test binary: libtest runs `#[test]`s in a binary in parallel, and
+//! `user_theme_dir()` reads the environment on every `load()` call, so an env
+//! override inside the 500+-test unit binary races every sibling that calls
+//! `load()`. A single `#[test]` per binary makes `std::env::set_var` genuinely
+//! safe — no other thread exists to read the environment concurrently (the same
+//! convention as the aterm-containment `init_from_env_*` tests and
+//! aterm-render's `no_procedural_glyphs_env`).
+
+use aterm_types::Rgb;
+use aterm_types::scheme::{ThemeError, load};
+
+#[test]
+fn load_reads_user_theme_file_then_not_found() {
+    // Isolate to a temp config home so the test never touches the real one.
+    let tmp = std::env::temp_dir().join(format!(
+        "aterm-theme-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let theme_dir = tmp.join("aterm").join("themes");
+    std::fs::create_dir_all(&theme_dir).expect("mk theme dir");
+    std::fs::write(
+        theme_dir.join("Custom.conf"),
+        "name = Custom\nforeground = #ddeeff\nbackground = #102030\ncolor1 = #ff0000\n",
+    )
+    .expect("write theme");
+
+    // SAFETY: single `#[test]` in its own integration-test binary — no other
+    // thread exists in this process to read the environment concurrently. We
+    // still save and restore the var so the process exits with a clean env.
+    let prev = std::env::var_os("XDG_CONFIG_HOME");
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+    }
+    let loaded = load("Custom");
+    let missing = load("DoesNotExist_xyz");
+    // Restore before asserting so a failure can't leak the override.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    let s = loaded.expect("user theme loads");
+    assert_eq!(s.name, "Custom");
+    assert_eq!(s.foreground, Rgb::new(0xdd, 0xee, 0xff));
+    assert_eq!(s.background, Rgb::new(0x10, 0x20, 0x30));
+    assert_eq!(s.ansi[1], Rgb::new(0xff, 0x00, 0x00));
+    assert!(matches!(missing, Err(ThemeError::NotFound(_))));
+}

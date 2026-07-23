@@ -1,0 +1,72 @@
+id = "s1_19"
+kind = "head"
+viewbox = [160, 136]
+anchor = { eye_y = 0.51, center_x = 0.5, word_top = 1.0 }
+
+# Quizzical folded-ear cat: asymmetry is now intentional and readable instead
+# of collapsing into mismatched pinpricks.
+[[layer]]
+role = "outline"
+ref_fill = "#332735"
+recolor = "fixed"
+paths = ["M 16 84 C 14 69 18 56 27 46 L 23 14 C 23 10 27 8 31 11 L 55 29 C 70 24 89 24 104 29 L 129 22 L 142 15 C 145 13 147 16 145 20 L 136 48 C 144 58 148 72 145 86 C 142 109 126 125 103 130 C 88 133 71 133 56 130 C 33 126 18 110 16 84 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#B99D82"
+recolor = "coat"
+paths = ["M 20 83 C 18 69 22 58 31 49 L 27 20 L 55 35 C 70 30 89 30 105 35 L 131 27 L 139 22 L 132 49 C 141 59 144 72 141 85 C 139 105 124 121 102 126 C 88 129 72 129 57 126 C 37 122 22 107 20 83 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#80615C"
+recolor = "fixed"
+paths = ["M 93 34 C 108 29 124 35 132 48 C 125 52 116 54 106 52 C 100 47 96 41 93 34 Z", "M 36 54 C 44 48 53 47 62 50 L 57 58 C 49 56 42 58 36 63 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#E994A6"
+recolor = "fixed"
+paths = ["M 29 18 L 50 32 L 32 38 Z", "M 132 28 L 138 22 L 132 42 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F7DFD0"
+recolor = "fixed"
+paths = ["M 62 85 C 62 78 69 75 78 79 C 79 80 80 81 80 82 C 80 81 81 80 82 79 C 91 75 98 78 98 85 C 98 94 91 99 80 99 C 69 99 62 94 62 85 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#29202C"
+recolor = "fixed"
+paths = ["M 39 67 C 39 56 46 50 56 50 C 66 50 73 57 73 68 C 73 79 66 85 56 85 C 46 85 39 78 39 67 Z", "M 93 67 C 93 60 98 56 105 56 C 112 56 117 60 117 67 C 117 74 112 78 105 78 C 98 78 93 74 93 67 Z"]
+
+[[layer]]
+role = "iris"
+ref_fill = "#78B8D8"
+recolor = "iris"
+paths = ["M 47 67 C 47 60 50 56 56 56 C 62 56 65 60 65 67 C 65 74 62 79 56 79 C 50 79 47 74 47 67 Z", "M 99 67 C 99 63 101 61 105 61 C 109 61 111 63 111 67 C 111 71 109 73 105 73 C 101 73 99 71 99 67 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 49 60 C 49 57 51 55 54 55 C 57 55 59 57 59 60 C 59 63 57 65 54 65 C 51 65 49 63 49 60 Z", "M 100 64 C 100 62 102 60 104 60 C 106 60 108 62 108 64 C 108 66 106 68 104 68 C 102 68 100 66 100 64 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#AD5A6B"
+recolor = "fixed"
+paths = ["M 75 83 C 75 79 79 78 80 81 C 82 78 86 79 86 83 C 86 86 83 88 80 90 C 78 88 75 86 75 83 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#302433"
+recolor = "fixed"
+paths = ["M 78 88 L 83 88 C 83 92 88 94 94 90 C 92 98 85 101 80 96 C 77 100 71 99 69 94 C 74 96 78 93 78 88 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#332735"
+recolor = "fixed"
+paths = ["M 53 87 L 12 83 L 12 86 L 53 90 Z", "M 53 94 L 8 97 L 8 100 L 54 97 Z", "M 107 87 L 148 83 L 148 86 L 107 90 Z", "M 107 94 L 152 97 L 152 100 L 106 97 Z"]

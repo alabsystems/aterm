@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm buffer-primitives kernel (ATERM_DESIGN §4): the 11-verb BufferApi over the single event-log spine. RING-3, FROZEN at M1."
+
+[dependencies]
+aterm-error = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# Tier-1 conformance (conformance_eventlog.rs) validates the real EventLog
+# against the DERIVED ring spec generated from aterm_spec::derive::ring_model().
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true

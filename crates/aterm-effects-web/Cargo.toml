@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-effects-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Effects-only wasm-bindgen adapter for aterm PHOSPHOR rain over an external authoritative terminal grid."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Host-neutral MatrixRain overlay adapter. This crate deliberately does not
+# depend on aterm-wasm/AtermTerminal: the embedding terminal remains the one
+# authoritative parser, input, selection, and scrollback owner.
+aterm-effects = { path = "../aterm-effects" }
+# Names the existing render-boundary SceneAtlas in the zero-copy accessor; this
+# is already in aterm-effects' closure and adds no renderer/backend of its own.
+aterm-render = { path = "../aterm-render", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Keep generated glue compatible with the other web artifacts in this workspace.
+wasm-bindgen = "=0.2.108"
+console_error_panic_hook = "0.1"
+# Some transitive dependencies select getrandom; wasm32-unknown-unknown needs
+# its JS entropy backend even though MatrixRain itself is deterministically seeded.
+getrandom = { version = "0.2", features = ["js"] }
+
+[lints]
+workspace = true

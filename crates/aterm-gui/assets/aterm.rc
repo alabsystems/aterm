@@ -1,0 +1,5 @@
+// Windows resource script — embeds the aterm application icon into the exe.
+// The lowest-numbered ICON resource becomes the icon the shell shows for the
+// process (taskbar button, Alt-Tab, titlebar, Explorer). Compiled + linked by
+// build.rs via embed-resource on Windows targets only.
+1 ICON "aterm.ico"

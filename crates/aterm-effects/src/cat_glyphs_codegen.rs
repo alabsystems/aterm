@@ -1,0 +1,630 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Cat-art v4 codegen (docs/cat-art-v4-design.md §1): turn the semantic glyph asset
+//! TOMLs under `crates/aterm-effects/art/glyphs/` into the checked-in const drawlist
+//! module [`crate::cat_glyphs_gen`].
+//!
+//! This is the checked-in-codegen half of the repo's xtask/gate culture: the
+//! generator is a pure function [`generate_from_dir`] (asset dir → Rust source
+//! string), driven by the `gen_cat_glyphs` example to (re)write the file, and pinned
+//! by the [`cat_glyphs_gen_matches_assets`](tests) drift test that regenerates into a
+//! string and asserts byte-equality with the checked-in file.
+//!
+//! ## What crosses the boundary
+//!
+//! Only glyphs whose `kind` is a roster kind (`head`, `special`, `accessory`) and that
+//! are not `excluded = true` are emitted. The paw-print / decoration **props** (paws
+//! are removed, §0/§4) and the not-yet-promoted legacy sheet-2 imports are held
+//! out. Each path coordinate `(x, y)` in the glyph's `viewbox` pixel frame is
+//! normalized and quantized to the integer `0..=FIXED_ONE` frame
+//! (`round(x / vw * FIXED_ONE)`, clamped) so the whole drawlist is integer — `Eq`-safe,
+//! byte-deterministic. Floats live only here at bake/codegen time, never in the const
+//! data or any hashed key.
+
+use std::path::Path;
+
+use aterm_scene::vector::{FIXED_ONE, PathCmd};
+
+/// The kinds that make it into the roster (in emit order: heads, then specials, then
+/// accessories). `prop` / `unknown` assets are held out (§0/§4/§8).
+const INCLUDED_KINDS: &[&str] = &["head", "special", "accessory"];
+
+/// Canonical `role` vocabulary → Rust variant, in a FIXED order (painter-role order of
+/// docs/cat-art-v4-design.md §0). The emitted `GlyphRole` enum is this list filtered to
+/// the roles the roster actually uses; an asset role outside this table is a hard error
+/// (register it here — the repo's fail-closed idiom).
+const ROLE_VOCAB: &[(&str, &str)] = &[
+    ("outline", "Outline"),
+    ("coat", "Coat"),
+    ("coat_shade", "CoatShade"),
+    ("muzzle", "Muzzle"),
+    ("inner_ear", "InnerEar"),
+    ("eye", "Eye"),
+    ("iris", "Iris"),
+    ("catch_light", "CatchLight"),
+    ("nose", "Nose"),
+    ("mouth", "Mouth"),
+    ("whisker", "Whisker"),
+    ("blush", "Blush"),
+    ("pattern", "Pattern"),
+    ("pink", "Pink"),
+    ("accessory", "Accessory"),
+    ("detail", "Detail"),
+];
+
+/// Canonical `recolor` vocabulary → variant (§2.1). Filtered to what the roster uses.
+const RECOLOR_VOCAB: &[(&str, &str)] = &[
+    ("coat", "Coat"),
+    ("coat_shade", "CoatShade"),
+    ("iris", "Iris"),
+    ("fixed", "Fixed"),
+];
+
+/// Canonical `kind` vocabulary → variant. Only [`INCLUDED_KINDS`] are ever emitted, but
+/// the table also validates that an included asset's kind is a known one.
+const KIND_VOCAB: &[(&str, &str)] = &[
+    ("head", "Head"),
+    ("special", "Special"),
+    ("accessory", "Accessory"),
+    ("prop", "Prop"),
+];
+
+/// The authored-asset boundary is deliberately path-only. Unknown keys fail
+/// closed for roster glyphs so a future `text`, `label`, or `font` field cannot
+/// be mistaken for shipping artwork or silently ignored by codegen.
+const GLYPH_KEYS: &[&str] = &["id", "kind", "viewbox", "anchor", "layer", "excluded"];
+const ANCHOR_KEYS: &[&str] = &["eye_y", "center_x", "word_top", "attach"];
+const LAYER_KEYS: &[&str] = &["role", "ref_fill", "recolor", "paths"];
+
+/// One emitted layer: role + recolor variant names, its source `ref_fill` (packed
+/// `0x00RR_GGBB`), and its quantized paths.
+struct Layer {
+    role: &'static str,
+    recolor: &'static str,
+    /// The colour this layer had in the reference. `Recolor::Fixed` layers bake it
+    /// verbatim; `Coat`/`Iris` layers swap it for a ramp colour but keep it as the
+    /// fallback and for the shade derivation.
+    fill: u32,
+    /// Each path is a sequence of `PathSeg` literal strings (e.g. `PathSeg::Move(1,2)`).
+    paths: Vec<Vec<String>>,
+}
+
+/// One emitted glyph: its id, kind, quantized anchors, and layers.
+struct Glyph {
+    id: String,
+    /// Emit-order rank of the kind: 0 head, 1 special, 2 accessory.
+    kind_rank: usize,
+    kind: &'static str,
+    variant: String,
+    /// Viewbox width/height, quantized to a fixed thousandth. Runtime layout
+    /// preserves the authored art's proportions without parsing asset TOML.
+    aspect_x1000: u16,
+    eye_y: u16,
+    center_x: u16,
+    word_top: u16,
+    layers: Vec<Layer>,
+}
+
+/// Generate the full `cat_glyphs_gen.rs` source from the asset TOMLs in `glyph_dir`.
+/// Deterministic: assets are ordered (heads, specials, accessories; each by `id`) and
+/// every coordinate quantized by a pure integer rule. Returns `Err(msg)` on any
+/// malformed asset (fail-closed) so the drift test / generator never emits junk.
+///
+/// # Errors
+/// Any unreadable dir, malformed TOML, unknown role/recolor/kind, missing
+/// viewbox/anchor, unknown roster-schema key, unparseable path `d`-string, or
+/// colliding variant name.
+pub fn generate_from_dir(glyph_dir: &Path) -> Result<String, String> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(glyph_dir)
+        .map_err(|e| format!("read_dir {}: {e}", glyph_dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+        .collect();
+    files.sort();
+
+    let mut glyphs: Vec<Glyph> = Vec::new();
+    for path in &files {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let text = std::fs::read_to_string(path).map_err(|e| format!("read {name}: {e}"))?;
+        let doc: toml::Value = text.parse().map_err(|e| format!("parse {name}: {e}"))?;
+        if let Some(g) = glyph_from_doc(&doc, name)? {
+            glyphs.push(g);
+        }
+    }
+
+    // Emit order: kind rank (head < special < accessory), then id.
+    glyphs.sort_by(|a, b| a.kind_rank.cmp(&b.kind_rank).then_with(|| a.id.cmp(&b.id)));
+
+    // Variant-name collision guard (the ids are unique; assert the derived variants are
+    // too, so the roster enum is always well-formed).
+    let mut seen = std::collections::BTreeSet::new();
+    for g in &glyphs {
+        if !seen.insert(g.variant.clone()) {
+            return Err(format!(
+                "variant-name collision: `{}` derived from id `{}` twice",
+                g.variant, g.id
+            ));
+        }
+    }
+
+    Ok(emit(&glyphs))
+}
+
+/// Parse one asset doc into a [`Glyph`], or `Ok(None)` if it is not a roster glyph
+/// (wrong kind, or `excluded = true`).
+fn glyph_from_doc(doc: &toml::Value, name: &str) -> Result<Option<Glyph>, String> {
+    if doc.get("excluded").and_then(toml::Value::as_bool) == Some(true) {
+        return Ok(None);
+    }
+    let id = doc
+        .get("id")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| format!("{name}: missing `id`"))?
+        .to_string();
+    let kind_str = doc
+        .get("kind")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| format!("{name}: missing `kind`"))?;
+    let Some(kind_rank) = INCLUDED_KINDS.iter().position(|k| *k == kind_str) else {
+        // Not a roster kind (prop / unknown / …): held out, not an error.
+        return Ok(None);
+    };
+    reject_unknown_keys(doc, GLYPH_KEYS, name, "glyph")?;
+    let kind = lookup(KIND_VOCAB, kind_str)
+        .ok_or_else(|| format!("{name}: kind `{kind_str}` not in KIND_VOCAB"))?;
+
+    let vb = doc
+        .get("viewbox")
+        .and_then(toml::Value::as_array)
+        .filter(|a| a.len() == 2)
+        .ok_or_else(|| format!("{name}: missing `viewbox = [w, h]`"))?;
+    let (vw, vh) = (num(&vb[0]), num(&vb[1]));
+    if !vw.is_finite() || !vh.is_finite() || vw <= 0.0 || vh <= 0.0 {
+        return Err(format!("{name}: degenerate viewbox [{vw}, {vh}]"));
+    }
+
+    let anchor = doc
+        .get("anchor")
+        .ok_or_else(|| format!("{name}: missing `anchor`"))?;
+    reject_unknown_keys(anchor, ANCHOR_KEYS, name, "anchor")?;
+    let anchor_frac = |key: &str| -> Result<u16, String> {
+        let f = anchor
+            .get(key)
+            .map(num)
+            .ok_or_else(|| format!("{name}: anchor missing `{key}`"))?;
+        Ok(quant_frac(f))
+    };
+    let eye_y = anchor_frac("eye_y")?;
+    let center_x = anchor_frac("center_x")?;
+    let word_top = anchor_frac("word_top")?;
+
+    let mut layers = Vec::new();
+    for (li, layer) in doc
+        .get("layer")
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        reject_unknown_keys(layer, LAYER_KEYS, name, &format!("layer {li}"))?;
+        let role_str = layer
+            .get("role")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("{name}: layer {li} missing `role`"))?;
+        let role = lookup(ROLE_VOCAB, role_str)
+            .ok_or_else(|| format!("{name}: layer {li} role `{role_str}` not in ROLE_VOCAB"))?;
+        let recolor_str = layer
+            .get("recolor")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("{name}: layer {li} missing `recolor`"))?;
+        let recolor = lookup(RECOLOR_VOCAB, recolor_str).ok_or_else(|| {
+            format!("{name}: layer {li} recolor `{recolor_str}` not in RECOLOR_VOCAB")
+        })?;
+        let fill = layer
+            .get("ref_fill")
+            .and_then(toml::Value::as_str)
+            .and_then(parse_hex_rgb)
+            .ok_or_else(|| format!("{name}: layer {li} missing/invalid `ref_fill`"))?;
+
+        let mut paths = Vec::new();
+        for (pi, p) in layer
+            .get("paths")
+            .and_then(toml::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+        {
+            let d = p
+                .as_str()
+                .ok_or_else(|| format!("{name}: layer {li} path {pi} is not a string"))?;
+            let cmds = aterm_scene::vector::parse_path(d)
+                .ok_or_else(|| format!("{name}: layer {li} path {pi} unparseable `d`-string"))?;
+            let segs = quantize_path(&cmds, vw, vh);
+            if !segs.is_empty() {
+                paths.push(segs);
+            }
+        }
+        if !paths.is_empty() {
+            layers.push(Layer {
+                role,
+                recolor,
+                fill,
+                paths,
+            });
+        }
+    }
+
+    Ok(Some(Glyph {
+        variant: variant_name(&id),
+        id,
+        kind_rank,
+        kind,
+        aspect_x1000: ((vw / vh) * 1000.0).round().clamp(1.0, f32::from(u16::MAX)) as u16,
+        eye_y,
+        center_x,
+        word_top,
+        layers,
+    }))
+}
+
+fn reject_unknown_keys(
+    value: &toml::Value,
+    allowed: &[&str],
+    name: &str,
+    scope: &str,
+) -> Result<(), String> {
+    let table = value
+        .as_table()
+        .ok_or_else(|| format!("{name}: {scope} must be a table"))?;
+    if let Some(key) = table.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!(
+            "{name}: unsupported {scope} key `{key}`; cat glyphs are path-only"
+        ));
+    }
+    Ok(())
+}
+
+/// Quantize one parsed path into `PathSeg` literal strings in the `0..=FIXED_ONE` frame.
+fn quantize_path(cmds: &[PathCmd], vw: f32, vh: f32) -> Vec<String> {
+    let qx = |v: f32| quant(v, vw);
+    let qy = |v: f32| quant(v, vh);
+    cmds.iter()
+        .map(|c| match *c {
+            PathCmd::Move(x, y) => format!("PathSeg::Move({},{})", qx(x), qy(y)),
+            PathCmd::Line(x, y) => format!("PathSeg::Line({},{})", qx(x), qy(y)),
+            PathCmd::Cubic(x1, y1, x2, y2, x, y) => format!(
+                "PathSeg::Cubic({},{},{},{},{},{})",
+                qx(x1),
+                qy(y1),
+                qx(x2),
+                qy(y2),
+                qx(x),
+                qy(y)
+            ),
+            PathCmd::Close => "PathSeg::Close".to_string(),
+        })
+        .collect()
+}
+
+/// `round(v / extent * FIXED_ONE)`, clamped to `0..=FIXED_ONE`. The integer rule is the
+/// same on every host (no platform float variance in the const data).
+fn quant(v: f32, extent: f32) -> u16 {
+    let q = (v / extent * f32::from(FIXED_ONE)).round();
+    q.clamp(0.0, f32::from(FIXED_ONE)) as u16
+}
+
+/// Quantize an already-normalized `0..1` anchor fraction to the fixed frame.
+fn quant_frac(f: f32) -> u16 {
+    (f * f32::from(FIXED_ONE))
+        .round()
+        .clamp(0.0, f32::from(FIXED_ONE)) as u16
+}
+
+/// Snake-case asset id → UpperCamel Rust variant (`s1_00` → `S100`, `spec_maneki` →
+/// `SpecManeki`, `acc_bow` → `AccBow`). Injective over the asset ids (guarded).
+fn variant_name(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    let mut cap = true;
+    for ch in id.chars() {
+        if ch == '_' {
+            cap = true;
+            continue;
+        }
+        if cap {
+            out.extend(ch.to_uppercase());
+            cap = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn lookup(vocab: &[(&str, &'static str)], key: &str) -> Option<&'static str> {
+    vocab.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+/// Parse a `#RRGGBB` asset colour into packed `0x00RR_GGBB`.
+fn parse_hex_rgb(s: &str) -> Option<u32> {
+    let h = s.strip_prefix('#')?;
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(h, 16).ok()
+}
+
+fn num(v: &toml::Value) -> f32 {
+    v.as_float()
+        .map(|f| f as f32)
+        .or_else(|| v.as_integer().map(|i| i as f32))
+        .unwrap_or(0.0)
+}
+
+/// Render the final Rust source. Deterministic given ordered `glyphs`.
+fn emit(glyphs: &[Glyph]) -> String {
+    let mut s = String::new();
+    s.push_str(HEADER);
+
+    // Enum variant sets that the roster actually uses (canonical order, filtered).
+    let used_roles = present(
+        ROLE_VOCAB,
+        glyphs.iter().flat_map(|g| g.layers.iter().map(|l| l.role)),
+    );
+    let used_recolors = present(
+        RECOLOR_VOCAB,
+        glyphs
+            .iter()
+            .flat_map(|g| g.layers.iter().map(|l| l.recolor)),
+    );
+    let used_kinds = present(KIND_VOCAB, glyphs.iter().map(|g| g.kind));
+
+    emit_enum(
+        &mut s,
+        "GlyphRole",
+        "Painter role of a glyph layer (§0).",
+        &used_roles,
+    );
+    emit_enum(
+        &mut s,
+        "Recolor",
+        "Which genome channel recolors a layer at bake time (§2.1).",
+        &used_recolors,
+    );
+    emit_enum(
+        &mut s,
+        "GlyphKind",
+        "The roster class of a glyph.",
+        &used_kinds,
+    );
+
+    s.push_str(STRUCTS);
+
+    // CatGlyphId roster enum.
+    s.push_str(
+        "/// The glyph roster: heads first, then specials, then accessories. Indexes [`GLYPHS`].\n",
+    );
+    s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
+    s.push_str("pub enum CatGlyphId {\n");
+    for g in glyphs {
+        s.push_str("    ");
+        s.push_str(&g.variant);
+        s.push_str(",\n");
+    }
+    s.push_str("}\n\n");
+
+    // Stable enum-value roster. Persistence stores the semantic `GlyphDef::id`
+    // string, then resolves it through this table; it never serializes a Rust
+    // discriminant whose ordinal could change when contributors add art.
+    s.push_str("/// Every glyph id in [`GLYPHS`] order. Pair with `GLYPHS[i].id` for stable string lookup.\n");
+    s.push_str("pub const GLYPH_IDS: &[CatGlyphId] = &[\n");
+    for g in glyphs {
+        s.push_str(&format!("    CatGlyphId::{},\n", g.variant));
+    }
+    s.push_str("];\n\n");
+
+    // GLYPHS table.
+    s.push_str("/// Every roster glyph's const drawlist, indexed by [`CatGlyphId`] order.\n");
+    s.push_str("pub const GLYPHS: &[GlyphDef] = &[\n");
+    for g in glyphs {
+        s.push_str(&format!("    // {} ({})\n", g.variant, g.id));
+        s.push_str(&format!(
+            "    GlyphDef {{ id: {:?}, kind: GlyphKind::{}, aspect_x1000: {}, eye_y: {}, center_x: {}, word_top: {}, layers: &[\n",
+            g.id, g.kind, g.aspect_x1000, g.eye_y, g.center_x, g.word_top
+        ));
+        for l in &g.layers {
+            s.push_str(&format!(
+                "        Layer {{ role: GlyphRole::{}, recolor: Recolor::{}, fill: {:#08X}, paths: &[\n",
+                l.role, l.recolor, l.fill
+            ));
+            for path in &l.paths {
+                s.push_str("            &[");
+                s.push_str(&path.join(","));
+                s.push_str("],\n");
+            }
+            s.push_str("        ] },\n");
+        }
+        s.push_str("    ] },\n");
+    }
+    s.push_str("];\n\n");
+
+    // HEADS roster.
+    s.push_str("/// The head variants (the roster the genome's `variant` field indexes, §3).\n");
+    s.push_str("pub const HEADS: &[CatGlyphId] = &[\n");
+    for g in glyphs.iter().filter(|g| g.kind == "Head") {
+        s.push_str(&format!("    CatGlyphId::{},\n", g.variant));
+    }
+    s.push_str("];\n");
+
+    s
+}
+
+/// The canonical-ordered subset of `vocab` variants that appear in `used`.
+fn present<'a>(
+    vocab: &[(&str, &'static str)],
+    used: impl Iterator<Item = &'a str>,
+) -> Vec<&'static str> {
+    let set: std::collections::BTreeSet<&str> = used.collect();
+    vocab
+        .iter()
+        .filter(|(_, v)| set.contains(v))
+        .map(|(_, v)| *v)
+        .collect()
+}
+
+fn emit_enum(s: &mut String, name: &str, doc: &str, variants: &[&str]) {
+    s.push_str(&format!("/// {doc}\n"));
+    s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
+    s.push_str(&format!("pub enum {name} {{\n"));
+    for v in variants {
+        s.push_str(&format!("    {v},\n"));
+    }
+    s.push_str("}\n\n");
+}
+
+const HEADER: &str = "\
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+//
+// @generated by: cargo run -p aterm-effects --example gen_cat_glyphs
+//
+// DO NOT EDIT BY HAND. Regenerated from the semantic glyph asset TOMLs under
+// crates/aterm-effects/art/glyphs/. The drift test `cat_glyphs_gen_matches_assets`
+// fails if this file is stale relative to those assets. See docs/cat-art-v4-design.md §1.
+
+use aterm_scene::vector::PathSeg;
+
+";
+
+const STRUCTS: &str = "\
+/// One glyph layer: a painter-order fill of `paths` in the glyph's fixed-point frame.
+pub struct Layer {
+    pub role: GlyphRole,
+    pub recolor: Recolor,
+    /// The source reference colour, packed `0x00RR_GGBB`. Baked verbatim for
+    /// `Recolor::Fixed`; the ramp fallback / shade base otherwise.
+    pub fill: u32,
+    pub paths: &'static [&'static [PathSeg]],
+}
+
+/// One roster glyph: id, kind, fixed-point anchors, and its painter-ordered layers.
+pub struct GlyphDef {
+    pub id: &'static str,
+    pub kind: GlyphKind,
+    /// Authored asset viewbox width/height, fixed-point ×1000.
+    pub aspect_x1000: u16,
+    pub eye_y: u16,
+    pub center_x: u16,
+    pub word_top: u16,
+    pub layers: &'static [Layer],
+}
+
+";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The asset dir shipped with the crate.
+    fn glyph_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("art/glyphs")
+    }
+
+    /// The drift gate (§1): regenerate the source from the assets and assert it equals
+    /// the checked-in `cat_glyphs_gen.rs`. Regenerate with
+    /// `cargo run -p aterm-effects --example gen_cat_glyphs` after touching any asset.
+    #[test]
+    fn cat_glyphs_gen_matches_assets() {
+        let generated = generate_from_dir(&glyph_dir()).expect("generate cat glyph drawlists");
+        let checked_in = include_str!("cat_glyphs_gen.rs");
+        assert_eq!(
+            generated, checked_in,
+            "cat_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_cat_glyphs`"
+        );
+    }
+
+    /// The generator is a pure function of the assets: two runs are byte-identical.
+    #[test]
+    fn cat_glyphs_codegen_is_deterministic() {
+        let a = generate_from_dir(&glyph_dir()).expect("gen a");
+        let b = generate_from_dir(&glyph_dir()).expect("gen b");
+        assert_eq!(a, b, "codegen must be deterministic");
+    }
+
+    #[test]
+    fn variant_names_are_camel_case() {
+        assert_eq!(variant_name("s1_00"), "S100");
+        assert_eq!(variant_name("s2_06b"), "S206b");
+        assert_eq!(variant_name("spec_maneki"), "SpecManeki");
+        assert_eq!(variant_name("acc_bow"), "AccBow");
+    }
+
+    fn roster_doc(extra: &str) -> toml::Value {
+        format!(
+            r##"
+id = "head_schema_test"
+kind = "head"
+viewbox = [16, 16]
+anchor = {{ eye_y = 0.5, center_x = 0.5, word_top = 1.0 }}
+{extra}
+
+[[layer]]
+role = "outline"
+ref_fill = "#202020"
+recolor = "fixed"
+paths = ["M 1 1 L 15 1 L 8 15 Z"]
+"##
+        )
+        .parse()
+        .expect("schema fixture")
+    }
+
+    #[test]
+    fn roster_schema_rejects_text_primitives_and_unknown_keys() {
+        for (scope, source) in [
+            ("glyph", roster_doc("text = \"not artwork\"")),
+            (
+                "anchor",
+                r##"
+id = "head_schema_test"
+kind = "head"
+viewbox = [16, 16]
+anchor = { eye_y = 0.5, center_x = 0.5, word_top = 1.0, label = "cat" }
+[[layer]]
+role = "outline"
+ref_fill = "#202020"
+recolor = "fixed"
+paths = ["M 1 1 L 15 1 L 8 15 Z"]
+"##
+                .parse()
+                .expect("anchor fixture"),
+            ),
+            (
+                "layer 0",
+                r##"
+id = "head_schema_test"
+kind = "head"
+viewbox = [16, 16]
+anchor = { eye_y = 0.5, center_x = 0.5, word_top = 1.0 }
+[[layer]]
+role = "outline"
+ref_fill = "#202020"
+recolor = "fixed"
+font = "terminal"
+paths = ["M 1 1 L 15 1 L 8 15 Z"]
+"##
+                .parse()
+                .expect("layer fixture"),
+            ),
+        ] {
+            let error = match glyph_from_doc(&source, "schema.toml") {
+                Ok(_) => panic!("{scope} text primitive must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.contains(scope), "unexpected error: {error}");
+            assert!(error.contains("path-only"), "unexpected error: {error}");
+        }
+    }
+}

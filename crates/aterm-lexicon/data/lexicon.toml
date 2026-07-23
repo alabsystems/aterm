@@ -1,0 +1,988 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sparkle-words lexicon. Each [[entry]] declares surface forms for one
+# (class, language). class = "profanity" | "feline" | "orca" | "emphasis".
+# Cross-class homographs resolve by total order: profanity > feline > orca > emphasis.
+# mode="suffix": surfaces = stems x suffixes (+ forms[]). mode="forms": forms[] only.
+# cjk=true: no-space script; forms[] are whole compounds matched by maximal run.
+# ambiguous=true: only loaded when the entry's lang is in the configured `languages`.
+# Seed authored with machine assistance; best-effort, extend via PR. See docs/sparkle-words-design.md
+
+# ===================== group: en =====================
+[[entry]]
+class    = "profanity"
+lang     = "en"
+mode     = "suffix"
+stems    = ["fuck"]
+suffixes = ["", "ing", "ed", "s", "er", "ers", "in"]
+forms    = ["motherfucker", "motherfucking", "clusterfuck", "fuckwit", "fuckup", "fuckhead", "unfuck", "fuckface", "fuckboy"]
+cjk      = false
+ambiguous= false
+notes    = "Strong general-purpose English expletive. Concatenative suffixing is clean. 'fuckin' is the common dropped-g colloquial spelling. Irregular compounds enumerated in forms[]."
+
+[[entry]]
+class    = "orca"
+lang     = "en"
+mode     = "forms"
+forms    = ["orca", "orcas"]
+cjk      = false
+ambiguous= false
+notes    = "Orca / killer whale family — drawn as the randomized water-droplet 'splash'. Low-ambiguity whole word (also a name/brand; word-boundary matching handles those)."
+
+[[entry]]
+class    = "feline"
+lang     = "en"
+mode     = "forms"
+forms    = ["cat", "cats", "kitty", "kitties", "kitten", "kittens", "kittycat", "pussycat", "meow", "meows", "mew", "mews"]
+cjk      = false
+ambiguous= false
+notes    = "Bare 'cat' is highly ambiguous (substring of many words: category, catch, scatter, etc.; also acronym CAT, name; collides across languages) and 'kit' is a common English word; ambiguous=false here because external guards/word-boundary matching handle those collisions. 'kitty' can also be a name/poker pool but listed as common feline term. meow/mew (+ plurals) are the onomatopoeic cat-calls; 'meow' is also listed under ms, so its language set unions to en+ms. Bare 'mew' is 3 folded chars and rides the bare-cat opt-in."
+
+# ===================== group: romance =====================
+[[entry]]
+class    = "profanity"
+lang     = "es"
+mode     = "forms"
+forms    = ["joder", "jodido", "jodida", "jode", "jodete", "mierda", "coño"]
+cjk      = false
+ambiguous= false
+notes    = "joder = strong general-purpose expletive (jod- root); mierda = shit. jodido/-a also adjectival 'fucked/damned'."
+
+[[entry]]
+class    = "feline"
+lang     = "es"
+mode     = "suffix"
+stems    = ["gat"]
+suffixes = ["o", "os", "a", "as", "ito", "ita", "itos", "itas"]
+forms    = ["minino", "minina", "mininos", "mininas"]
+cjk      = false
+ambiguous= false
+notes    = "gato/gata + plurals + diminutives -ito/-ita (kitten). minino/minina = colloquial 'kitty'."
+
+[[entry]]
+class    = "profanity"
+lang     = "fr"
+mode     = "forms"
+forms    = ["merde", "merdique", "putain", "foutre", "foutu", "foutue", "enculé"]
+cjk      = false
+ambiguous= false
+notes    = "merde = shit/damn; putain = main intensifier; foutre/foutu = 'fuck/fucked' family; merdique = crappy."
+
+[[entry]]
+class    = "feline"
+lang     = "fr"
+mode     = "forms"
+forms    = ["chat", "chats", "chaton", "chatons", "minou", "minet"]
+cjk      = false
+ambiguous= true
+notes    = "Listed as forms because 'chat' collides with English 'chat' (ambiguous). chaton/chatons = kitten(s); minou/minet = kitty."
+
+[[entry]]
+class    = "profanity"
+lang     = "it"
+mode     = "forms"
+forms    = ["cazzo", "cazzi", "merda", "vaffanculo", "stronzo", "minchia"]
+cjk      = false
+ambiguous= false
+notes    = "cazzo = primary expletive ('dick/fuck'); vaffanculo = 'fuck off'; merda = shit; minchia regional (Sicilian) intensifier."
+
+[[entry]]
+class    = "feline"
+lang     = "it"
+mode     = "suffix"
+stems    = ["gatt"]
+suffixes = ["o", "i", "a", "e", "ino", "ina"]
+forms    = ["micio", "micia", "mici", "micini"]
+cjk      = false
+ambiguous= false
+notes    = "gatto/gatti/gatta/gatte + diminutives gattino/gattina (kitten). micio/micia = 'kitty'."
+
+[[entry]]
+class    = "profanity"
+lang     = "pt"
+mode     = "forms"
+forms    = ["foder", "fodido", "fodida", "fode", "foda", "merda", "caralho"]
+cjk      = false
+ambiguous= false
+notes    = "foder = 'to fuck' (fod- root); fodido/-a = 'fucked'; merda = shit; caralho = strong intensifier ('dick')."
+
+[[entry]]
+class    = "feline"
+lang     = "pt"
+mode     = "suffix"
+stems    = ["gat"]
+suffixes = ["o", "os", "a", "as", "inho", "inha"]
+forms    = ["bichano", "bichana"]
+cjk      = false
+ambiguous= false
+notes    = "gato/gata + plurals + diminutives gatinho/gatinha (kitten). bichano/bichana = colloquial 'kitty/tomcat'."
+
+[[entry]]
+class    = "profanity"
+lang     = "ca"
+mode     = "forms"
+forms    = ["merda", "collons", "hòstia", "cony", "carall"]
+cjk      = false
+ambiguous= false
+notes    = "merda = shit; collons = 'balls/damn' (main expletive); cony = strong vulgarism; hòstia/carall intensifiers."
+
+[[entry]]
+class    = "feline"
+lang     = "ca"
+mode     = "suffix"
+stems    = ["gat"]
+suffixes = ["", "s", "et", "ets", "eta", "etes"]
+forms    = ["mix", "mixeta"]
+cjk      = false
+ambiguous= true
+notes    = "Empty suffix yields bare 'gat'. gatet/gateta = kitten. 'mix' (kitty) collides with English 'mix' -> ambiguous."
+
+[[entry]]
+class    = "profanity"
+lang     = "ro"
+mode     = "forms"
+forms    = ["pula", "pizda", "rahat", "muie"]
+cjk      = false
+ambiguous= false
+notes    = "Fusional -> explicit forms. pula = 'dick'; pizda vulgar; rahat = shit; muie strong insult."
+
+[[entry]]
+class    = "profanity"
+lang     = "ro"
+mode     = "forms"
+forms    = ["futu", "fut"]
+cjk      = false
+ambiguous= true
+notes    = "Romanian 'fuck' verb forms. Language-gated because live exact-token scanning otherwise decorates the ordinary English word 'future' while its fut/futu prefixes are being typed."
+
+[[entry]]
+class    = "feline"
+lang     = "ro"
+mode     = "suffix"
+stems    = ["pisic"]
+suffixes = ["ă", "a", "i", "uță"]
+forms    = ["motan", "motani", "pisoi"]
+cjk      = false
+ambiguous= false
+notes    = "pisică/pisica (cat, indef/def), pisici (plural), pisicuță (kitten). motan = tomcat; pisoi = kitten."
+
+# ===================== group: germanic =====================
+# ===== German (de) =====
+[[entry]]
+class    = "profanity"
+lang     = "de"
+mode     = "forms"
+forms    = ["scheiße", "scheisse", "scheiß", "scheiss", "scheißen", "scheissen", "ficken", "fick", "verdammt", "verfickt"]
+cjk      = false
+ambiguous= false
+notes    = "Both ß and ss surfaces enumerated (Swiss/keyboard-less typing uses ss). scheiße/scheisse = shit; scheiß(en) verbal/intensifier prefix; ficken/fick = fuck; verdammt = damn; verfickt = fucking (adj)."
+
+[[entry]]
+class    = "feline"
+lang     = "de"
+mode     = "forms"
+forms    = ["katze", "katzen", "kätzchen", "kater", "kätzin", "mieze", "miezekatze"]
+cjk      = false
+ambiguous= true
+notes    = "katze/katzen = cat/cats; kätzchen = kitten (umlaut diminutive); kater = tomcat BUT also means 'hangover' (and is an EN/NL surname) -> ambiguous; mieze/miezekatze = colloquial kitty. Plural/diminutive are non-concatenative (umlaut) so forms mode."
+
+# ===== Dutch (nl) =====
+[[entry]]
+class    = "profanity"
+lang     = "nl"
+mode     = "forms"
+forms    = ["kut", "schijt", "godver", "godverdomme", "neuken", "neukt", "geneukt", "klote"]
+cjk      = false
+ambiguous= false
+notes    = "kut = cunt (general expletive); schijt = shit; godver(domme) = goddamn; neuken/neukt/geneukt = fuck (inf/pres/past part); klote = crap/bollocks intensifier."
+
+[[entry]]
+class    = "feline"
+lang     = "nl"
+mode     = "suffix"
+stems    = ["kat"]
+suffixes = ["", "ten", "je", "jes"]
+forms    = ["poes", "poesje", "kitten"]
+cjk      = false
+ambiguous= true
+notes    = "kat/katten = cat/cats (consonant doubling handled by suffix 'ten'); katje/katjes = kitten(s); poes/poesje = pussycat (also vulgar slang); kitten collides with EN 'kitten' -> ambiguous."
+
+# ===== Swedish (sv) =====
+[[entry]]
+class    = "profanity"
+lang     = "sv"
+mode     = "forms"
+forms    = ["fan", "skit", "jävla", "jävlar", "knulla", "knullar", "helvete"]
+cjk      = false
+ambiguous= true
+notes    = "fan = damn/devil (collides with EN 'fan' and the proper name -> ambiguous); skit = shit; jävla/jävlar = fucking/bloody; knulla/knullar = fuck (inf/pres); helvete = hell."
+
+[[entry]]
+class    = "feline"
+lang     = "sv"
+mode     = "suffix"
+stems    = ["katt"]
+suffixes = ["", "er", "unge", "ungar", "en"]
+forms    = ["kisse", "kissen"]
+cjk      = false
+ambiguous= false
+notes    = "katt/katter = cat/cats; kattunge/kattungar = kitten(s); katten = the cat (def); kisse/kissen = colloquial kitty (clean enough but irregular -> forms)."
+
+# ===== Norwegian (no) =====
+[[entry]]
+class    = "profanity"
+lang     = "no"
+mode     = "forms"
+forms    = ["faen", "dritt", "jævla", "knulle", "knuller", "helvete"]
+cjk      = false
+ambiguous= false
+notes    = "faen = damn/devil (Bokmål); dritt = shit/crap; jævla = fucking/bloody; knulle/knuller = fuck (inf/pres); helvete = hell."
+
+[[entry]]
+class    = "feline"
+lang     = "no"
+mode     = "suffix"
+stems    = ["katt"]
+suffixes = ["", "er", "unge", "unger", "en"]
+forms    = ["pus", "pusekatt", "pusen"]
+cjk      = false
+ambiguous= true
+notes    = "katt/katter = cat/cats; kattunge/kattunger = kitten(s); katten = the cat; pus/pusekatt = kitty -> 'pus' collides with EN 'pus' -> ambiguous."
+
+# ===== Danish (da) =====
+[[entry]]
+class    = "profanity"
+lang     = "da"
+mode     = "forms"
+forms    = ["fanden", "lort", "kneppe", "knepper", "satan", "pis", "helvede"]
+cjk      = false
+ambiguous= false
+notes    = "fanden = the devil/damn; lort = shit/turd; kneppe/knepper = fuck (inf/pres); satan = intensifier; pis = piss/crap; helvede = hell."
+
+[[entry]]
+class    = "feline"
+lang     = "da"
+mode     = "suffix"
+stems    = ["kat"]
+suffixes = ["", "te", "ten"]
+forms    = ["killing", "killinger", "missekat", "mis", "misser"]
+cjk      = false
+ambiguous= true
+notes    = "kat/katte/katten = cat/cats/the cat; killing/killinger = kitten(s) -> collides with EN 'killing' -> ambiguous; missekat/mis/misser = kitty (mis collides with EN prefix/words)."
+
+# ===== Icelandic (is) =====
+[[entry]]
+class    = "profanity"
+lang     = "is"
+mode     = "forms"
+forms    = ["fokk", "fokka", "helvíti", "helvítis", "andskotinn", "djöfull", "fjandinn"]
+cjk      = false
+ambiguous= false
+notes    = "Fusional language -> forms mode. fokk/fokka = fuck (loan, noun/verb); helvíti/helvítis = hell (nom/gen, common intensifier); andskotinn = the devil/damn; djöfull = devil; fjandinn = the fiend/devil."
+
+[[entry]]
+class    = "feline"
+lang     = "is"
+mode     = "forms"
+forms    = ["köttur", "kettir", "kötturinn", "kettlingur", "kettlingar", "kisa"]
+cjk      = false
+ambiguous= false
+notes    = "Non-concatenative declension -> forms mode. köttur = cat (nom sg), kettir = cats (nom pl), kötturinn = the cat (def); kettlingur/kettlingar = kitten(s); kisa = kitty (colloquial)."
+
+# ===================== group: slavic-baltic =====================
+[[entry]]
+class    = "profanity"
+lang     = "ru"
+mode     = "forms"
+forms    = ["блядь","бля","хуй","хуйня","нахуй","ёбаный","ебать","пизда","сука"]
+cjk      = false
+ambiguous= false
+notes    = "Russian mat. сука also literally 'female dog' (neutral) and a borderline name-collision risk; блядь/бля are the strong general expletive; ёбаный/ебать/нахуй from the е-б- root."
+
+[[entry]]
+class    = "feline"
+lang     = "ru"
+mode     = "forms"
+forms    = ["кот","коты","кошка","кошки","котёнок","котята","котик","киса"]
+cjk      = false
+ambiguous= false
+notes    = "кот=tomcat, кошка=she-cat; котёнок/котята=kitten(s); котик/киса affectionate. киса can also be the female name Кися/Киса (minor collision)."
+
+[[entry]]
+class    = "profanity"
+lang     = "uk"
+mode     = "forms"
+forms    = ["курва","лайно","бляха","хуй","пизда","йобаний","сука"]
+cjk      = false
+ambiguous= true
+notes    = "курва is shared across many Slavic langs (pl kurwa, cs/sk kurva) so cross-language collision; лайно=shit, бляха(-муха) euphemistic. Cyrillic script."
+
+[[entry]]
+class    = "feline"
+lang     = "uk"
+mode     = "forms"
+forms    = ["кіт","коти","кішка","кішки","кошеня","кошенята","котик","киця"]
+cjk      = false
+ambiguous= false
+notes    = "кіт=tomcat, кішка=she-cat; кошеня/кошенята=kitten(s); котик/киця affectionate."
+
+[[entry]]
+class    = "profanity"
+lang     = "pl"
+mode     = "forms"
+forms    = ["kurwa","chuj","jebany","jebać","pierdolić","gówno","pizda","skurwysyn"]
+cjk      = false
+ambiguous= true
+notes    = "kurwa is the flagship Polish expletive but the form is shared with cs/sk (kurva) — cross-language collision. chuj=dick, jebany/jebać/pierdolić verbal, gówno=shit."
+
+[[entry]]
+class    = "feline"
+lang     = "pl"
+mode     = "forms"
+forms    = ["kot","koty","kotka","kotek","kotki","kociak","kotka","kicia"]
+cjk      = false
+ambiguous= false
+notes    = "kot=cat (masc), kotka=she-cat; kotek/kociak/kicia diminutives ('kitty'). kot is also a Polish surname (minor)."
+
+[[entry]]
+class    = "profanity"
+lang     = "cs"
+mode     = "forms"
+forms    = ["kurva","hovno","prdel","do prdele","kunda","jebat","zkurvený","sráč"]
+cjk      = false
+ambiguous= true
+notes    = "kurva shared with sk/pl(kurwa). hovno=shit, do prdele='to the arse' (very common interjection), kunda vulgar, jebat verbal."
+
+[[entry]]
+class    = "feline"
+lang     = "cs"
+mode     = "forms"
+forms    = ["kočka","kočky","kotě","koťata","kocour","kočička","kočičky","číča"]
+cjk      = false
+ambiguous= false
+notes    = "kočka=cat (default fem), kocour=tomcat; kotě/koťata=kitten(s); kočička/číča affectionate 'kitty'. kočka is also slang for an attractive woman."
+
+[[entry]]
+class    = "profanity"
+lang     = "sk"
+mode     = "forms"
+forms    = ["kurva","jebať","piča","do piče","hovno","skurvený","sráč"]
+cjk      = false
+ambiguous= true
+notes    = "kurva shared with cs/pl. jebať verbal, piča/do piče vulgar, hovno=shit."
+
+[[entry]]
+class    = "feline"
+lang     = "sk"
+mode     = "forms"
+forms    = ["mačka","mačky","mačiatko","mačiatka","kocúr","mačička","mačičky"]
+cjk      = false
+ambiguous= false
+notes    = "mačka=cat (default fem), kocúr=tomcat; mačiatko/mačiatka=kitten(s); mačička 'kitty'."
+
+[[entry]]
+class    = "profanity"
+lang     = "bg"
+mode     = "forms"
+forms    = ["мамка му","мамка","лайно","путка","кур","ебати","копеле"]
+cjk      = false
+ambiguous= false
+notes    = "Bulgarian: 'мамка му' (lit. his/its mother) is the everyday strong interjection; лайно=shit, путка/кур vulgar, ебати verbal, копеле=bastard. Cyrillic."
+
+[[entry]]
+class    = "feline"
+lang     = "bg"
+mode     = "forms"
+forms    = ["котка","котки","коте","котета","котенце","котенца"]
+cjk      = false
+ambiguous= false
+notes    = "котка=cat, котки=cats; коте/котета and котенце/котенца=kitten(s)/'kitty'. Cyrillic."
+
+[[entry]]
+class    = "profanity"
+lang     = "sr"
+mode     = "forms"
+forms    = ["јебем","јебати","курац","пичка","говно","срање","кучка"]
+cjk      = false
+ambiguous= false
+notes    = "Serbian rendered in Cyrillic to distinguish from hr Latin. јебем/јебати verbal, курац=dick, пичка/говно/срање vulgar. Same lexemes as Croatian."
+
+[[entry]]
+class    = "feline"
+lang     = "sr"
+mode     = "forms"
+forms    = ["мачка","мачке","маче","мачић","маца","мачкица"]
+cjk      = false
+ambiguous= false
+notes    = "мачка=cat, мачке=cats; маче=kitten, мачић/мачкица/маца diminutives 'kitty'. Cyrillic."
+
+[[entry]]
+class    = "profanity"
+lang     = "hr"
+mode     = "forms"
+forms    = ["jebem","jebati","kurac","pička","govno","sranje","kučka"]
+cjk      = false
+ambiguous= false
+notes    = "Croatian Latin script (same lexemes as Serbian). jebem/jebati verbal, kurac=dick, pička/govno/sranje vulgar."
+
+[[entry]]
+class    = "feline"
+lang     = "hr"
+mode     = "forms"
+forms    = ["mačka","mačke","mače","mačić","maca","mačkica"]
+cjk      = false
+ambiguous= true
+notes    = "mačka=cat; mače=kitten; maca/mačić/mačkica 'kitty'. maca collides with other-language words (e.g. the plant/Sp.) and is also a nickname (minor)."
+
+[[entry]]
+class    = "profanity"
+lang     = "lt"
+mode     = "forms"
+forms    = ["šūdas","šūdai","velnias","po velnių","rupūžė","kurva"]
+cjk      = false
+ambiguous= true
+notes    = "Lithuanian has weak native swearing; šūdas=shit is the main one. velnias=devil and rupūžė=toad are everyday words used as mild curses (ambiguous, not exclusively profane); kurva is a Slavic loan."
+
+[[entry]]
+class    = "feline"
+lang     = "lt"
+mode     = "forms"
+forms    = ["katė","katės","katinas","kačiukas","kačiukai","katytė"]
+cjk      = false
+ambiguous= false
+notes    = "katė=cat (fem), katinas=tomcat; kačiukas/kačiukai=kitten(s); katytė 'kitty'."
+
+[[entry]]
+class    = "profanity"
+lang     = "lv"
+mode     = "forms"
+forms    = ["mēsls","mēsli","sūds","velns","dirsa","pakaļa"]
+cjk      = false
+ambiguous= true
+notes    = "Latvian mild swearing: mēsls/mēsli (dung/trash) and sūds=shit are the common expletives; velns=devil and pakaļa=behind are ordinary words used as curses (ambiguous, not exclusively profane); dirsa vulgar."
+
+[[entry]]
+class    = "feline"
+lang     = "lv"
+mode     = "forms"
+forms    = ["kaķis","kaķi","kaķēns","kaķēni","kaķene","kaķītis"]
+cjk      = false
+ambiguous= false
+notes    = "kaķis=cat (masc default), kaķene=she-cat; kaķēns/kaķēni=kitten(s); kaķītis 'kitty'."
+
+# ===================== group: other-euro =====================
+# ===== Greek (el) =====
+[[entry]]
+class    = "profanity"
+lang     = "el"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["γαμώ","γαμώτο","γαμήσου","γαμιέται","σκατά","μαλάκας","μαλάκα","μαλάκες"]
+notes    = "γαμώ = strong 'fuck' verb; γαμώτο = 'goddammit'. σκατά = shit. μαλάκας (wanker/asshole) is the most ubiquitous Greek insult, declined μαλάκα (voc/acc), μαλάκες (pl)."
+
+[[entry]]
+class    = "feline"
+lang     = "el"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["γάτα","γάτες","γάτος","γατάκι","γατάκια","γατούλα"]
+notes    = "γάτα cat (f), γάτος tomcat (m), γάτες plural; γατάκι kitten, γατάκια kittens, γατούλα affectionate 'kitty'."
+
+# ===== Finnish (fi) =====
+[[entry]]
+class    = "profanity"
+lang     = "fi"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["vittu","vitun","vittua","perkele","saatana","saatanan","paska","helvetti"]
+notes    = "vittu is the core 'fuck'-strength expletive (gen vitun, part vittua). perkele/saatana = devil-class curses, paska = shit, helvetti = hell. Finnish swears inflect in cases; common typed forms listed."
+
+[[entry]]
+class    = "feline"
+lang     = "fi"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["kissa","kissat","kissan","kissanpentu","kisu","mirri"]
+notes    = "kissa cat, kissat cats, kissan gen, kissanpentu kitten (lit. cat-cub), kisu/mirri affectionate 'kitty'. kisu and mirri can also appear as nicknames; flagged ambiguous."
+
+# ===== Hungarian (hu) =====
+[[entry]]
+class    = "profanity"
+lang     = "hu"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["bassza","baszd","baszmeg","kurva","fasz","faszom","szar","szart"]
+notes    = "basz- = 'fuck' verb root: bassza (he/she fucks it), baszd (imp.), baszmeg ('fuck it'). kurva = whore (also intensifier), fasz/faszom = dick/'my dick', szar = shit (acc szart)."
+
+[[entry]]
+class    = "feline"
+lang     = "hu"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["macska","macskák","macskát","cica","cicus","cicák"]
+notes    = "macska cat, macskák cats, macskát acc; cica/cicus 'kitty/kitten', cicák kitties. cica is also used as a female nickname/term of endearment; flagged ambiguous."
+
+# ===== Turkish (tr) =====
+[[entry]]
+class    = "profanity"
+lang     = "tr"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["siktir","sikerim","sikeyim","amına","amına koyayım","bok","orospu","piç"]
+notes    = "sik- = 'fuck' verb: siktir ('fuck off'), sikerim/sikeyim (1sg). amına koyayım is the heavy 'amına' family. bok = shit, orospu = whore, piç = bastard. CASING CAVEAT: Turkish has dotted/dotless i: lowercase of 'I' is 'ı' (dotless) and of 'İ' is 'i'; forms with ı (amına, sıçtır variants) must NOT be matched via a non-Turkish lowercase that maps İ→i / I→i. Use Turkish-locale case folding."
+
+[[entry]]
+class    = "feline"
+lang     = "tr"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["kedi","kediler","kedicik","kedim","pisi","pisi pisi"]
+notes    = "kedi cat, kediler cats, kedicik kitten (-cik dim.), kedim 'my cat'; pisi / pisi pisi = 'kitty' (the call used for cats). Same İ/I casing caveat applies to any matcher."
+
+# ===== Estonian (et) =====
+[[entry]]
+class    = "profanity"
+lang     = "et"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["kurat","kuradi","sitt","sita","perse","raisk","persse"]
+notes    = "kurat = devil, the prime Estonian curse (gen kuradi). sitt = shit (gen sita). perse = arse, persse 'up the arse' (common interjection). raisk = 'damn/carrion'. Estonian lacks a direct high-frequency 'fuck' verb; these are the real strong expletives."
+
+[[entry]]
+class    = "feline"
+lang     = "et"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["kass","kassid","kassi","kassipoeg","kiisu","kiisupoeg"]
+notes    = "kass cat, kassid cats, kassi gen/part, kassipoeg kitten (lit. cat-cub), kiisu affectionate 'kitty', kiisupoeg little kitty."
+
+# ===== Basque (eu) =====
+[[entry]]
+class    = "profanity"
+lang     = "eu"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["kaka","kakazaharra","puta","puta","ostia","alua","zakil"]
+notes    = "Basque has no native single 'fuck' verb; strongest native expletive is kaka (shit) / kaka zaharra ('old shit'). puta (whore), ostia (< Sp. hostia), alu(a) (cunt), zakil (dick) are heavily used, mostly Spanish-influenced. AMBIGUOUS: puta/puta and ostia collide with Spanish profanity; kaka collides with et/eu seed and child-speak 'poop' in several languages."
+
+[[entry]]
+class    = "feline"
+lang     = "eu"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["katu","katua","katuak","katakume","katutxo","katuak"]
+notes    = "katu cat (bare stem), katua 'the cat' (sing. abs.), katuak cats / 'the cat' (erg.), katakume kitten (lit. cat-offspring), katutxo little cat (dim. -txo)."
+
+# ===================== group: mideast-southasia =====================
+# ===== Arabic (ar) =====
+[[entry]]
+class    = "profanity"
+lang     = "ar"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["نيك","ينيك","لعنة","خرا","خراء","كس","كسمك","طيز"]
+notes    = "Real Arabic expletives: نيك (fuck) + inflection ينيك; كس/كسمك and طيز are crude colloquial. لعنة=curse/damn, خرا(ء)=shit. ambiguous: نيك resembles transliterated name 'Nick'; طيز/كس spellings overlap with benign roots in some dialects. Listed without ال/و/ب clitics."
+
+[[entry]]
+class    = "feline"
+lang     = "ar"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["قطة","قطه","قطط","قط","هريرة","هريرات","بسة","بس"]
+notes    = "قطة/قطه=cat(f), قطط=cats, قط=cat(m) — also قَطّ='ever/never', collision. هريرة/هريرات=kitten(s). بسة/بس=colloquial cat — بس also = 'but/enough', collision. Without ال/و/ب clitics."
+
+# ===== Hebrew (he) =====
+[[entry]]
+class    = "profanity"
+lang     = "he"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["זין","חרא","כוס","זיון","לזיין","בן זונה"]
+notes    = "זין=dick (also = letter zayin / 'weapon', collision); חרא=shit; כוס=cunt — identical spelling to כּוֹס 'cup/glass', strong collision; זיון/לזיין=fuck (noun/inf); בן זונה=son of a whore. Without ה/ו clitics."
+
+[[entry]]
+class    = "feline"
+lang     = "he"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["חתול","חתולה","חתולים","חתולות","חתלתול","חתלתולה"]
+notes    = "חתול/חתולה=cat m/f, חתולים/חתולות=cats m/f, חתלתול(ה)=kitten. Without ה/ו clitics. No notable cross-language collision."
+
+# ===== Persian (fa) =====
+[[entry]]
+class    = "profanity"
+lang     = "fa"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["کیر","کس","تخمی","ریدم","کونی","جنده","کسکش"]
+notes    = "کیر=dick; کس=cunt — also کَس='person/somebody', strong collision; تخمی=crappy; ریدم=I shat; کونی=faggot(slur); جنده=whore; کسکش=pimp. Persian script (shared with ur but distinct vocab)."
+
+[[entry]]
+class    = "feline"
+lang     = "fa"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["گربه","گربه‌ها","بچه‌گربه","پیشی","پیشو"]
+notes    = "گربه=cat, گربه‌ها=cats, بچه‌گربه=kitten, پیشی/پیشو=kitty(colloquial). ambiguous: پیشی also relates to پیشی='precedence/lead'. Uses ZWNJ in plural/compound."
+
+# ===== Hindi (hi) =====
+[[entry]]
+class    = "profanity"
+lang     = "hi"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["bhenchod","madarchod","gandu","chutiya","bhosdike","lund","भेनचोद","गांडू","चूतिया"]
+notes    = "Romanized forms are how these are overwhelmingly typed; Devanagari variants भेनचोद/गांडू/चूतिया added. bhenchod=sisterfucker, madarchod=motherfucker, gandu=asshole, chutiya=idiot/cunt, bhosdike, lund=dick."
+
+[[entry]]
+class    = "feline"
+lang     = "hi"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["बिल्ली","बिल्लियाँ","बिल्लियां","बिल्ला","बिलौटा","किटी"]
+notes    = "बिल्ली=cat(f), बिल्लियाँ/बिल्लियां=cats, बिल्ला=tomcat, बिलौटा=kitten, किटी=kitty (English loan, collides with EN 'kitty')."
+
+# ===== Urdu (ur) =====
+[[entry]]
+class    = "profanity"
+lang     = "ur"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["گاندو","چوتیا","بھینچود","مادرچود","لن","بھوسدی"]
+notes    = "Urdu (Nastaliq/Arabic script): گاندو=asshole, چوتیا=idiot/cunt, بھینچود=sisterfucker, مادرچود=motherfucker, لن=dick, بھوسدی. Same spoken family as hi but written in Urdu script."
+
+[[entry]]
+class    = "feline"
+lang     = "ur"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["بلی","بلیاں","بلا","بلونگڑا"]
+notes    = "بلی=cat, بلیاں=cats, بلا=tomcat — collides with بَلا='calamity/misfortune', بلونگڑا=kitten."
+
+# ===== Bengali (bn) =====
+[[entry]]
+class    = "profanity"
+lang     = "bn"
+mode     = "forms"
+cjk      = false
+ambiguous= true
+forms    = ["বাল","মাগি","চোদা","খানকি","বাঞ্চোত","শালা"]
+notes    = "বাল=pubic hair (mild expletive), মাগি=slut, চোদা=fuck, খানকি=whore, বাঞ্চোত=sisterfucker, শালা=mild abuse — literally 'brother-in-law', so collides with the kinship term."
+
+[[entry]]
+class    = "feline"
+lang     = "bn"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["বিড়াল","বিড়ালছানা","বিলাই","মেকুর","বিড়ালটি"]
+notes    = "বিড়াল=cat, বিড়ালছানা=kitten, বিলাই=colloquial cat, মেকুর=dialectal cat, বিড়ালটি=the cat."
+
+# ===== Tamil (ta) =====
+[[entry]]
+class    = "profanity"
+lang     = "ta"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["ஓத்தா","புண்ட","தேவடியா","பூல்","சுன்னி"]
+notes    = "Tamil expletives: ஓத்தா=fuck(off), புண்ட=cunt, தேவடியா=son of a whore, பூல்/சுன்னி=dick. Strong colloquial vulgarities."
+
+[[entry]]
+class    = "feline"
+lang     = "ta"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["பூனை","பூனைகள்","பூனைக்குட்டி","பூனைக்குட்டிகள்"]
+notes    = "பூனை=cat, பூனைகள்=cats, பூனைக்குட்டி=kitten, பூனைக்குட்டிகள்=kittens."
+
+# ===================== group: cjk-sea =====================
+[[entry]]
+class    = "profanity"
+lang     = "ja"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["くそ","クソ","くそっ","くそったれ","ちくしょう","ちきしょう","畜生"]
+notes    = "Japanese has no true 'fuck' expletive; くそ/クソ (kuso, 'shit/damn') and ちくしょう (chikushou, 'dammit') are the strongest general-purpose curses. くそ also written in kanji 糞 but kana is far more commonly typed."
+
+[[entry]]
+class    = "feline"
+lang     = "ja"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["猫","ねこ","ネコ","子猫","仔猫","こねこ","猫ちゃん","にゃんこ"]
+notes    = "猫=neko (cat). 子猫/仔猫/こねこ=kitten. 猫ちゃん, にゃんこ=affectionate 'kitty'. Whole compounds enumerated."
+
+[[entry]]
+class    = "profanity"
+lang     = "zh"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["妈的","他妈的","肏","卧槽","我操","握草"]
+notes    = "他妈的/妈的 (TMD, 'your mother's') is the canonical general expletive. 肏 (cào) is the literal 'fuck' character. 卧槽/我操 are euphemistic spellings. See separate entries for single chars 操/草/干 which are ambiguous everyday words."
+
+[[entry]]
+class    = "profanity"
+lang     = "zh"
+mode     = "forms"
+cjk      = true
+ambiguous= true
+forms    = ["操","草","干"]
+notes    = "Common euphemistic homophone spellings of 肏 (fuck): 操='drill/exercise/handle', 草='grass', 干='dry/to do'. All three are extremely common ordinary words, so flagged ambiguous."
+
+[[entry]]
+class    = "feline"
+lang     = "zh"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["猫","貓","小猫","小貓","猫咪","貓咪","小猫咪"]
+notes    = "猫 (simplified) / 貓 (traditional) = cat. 小猫/小貓 = kitten/little cat. 猫咪/貓咪 = kitty. Both script variants provided."
+
+[[entry]]
+class    = "profanity"
+lang     = "ko"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["씨발","시발","씨발놈","좆","존나","개새끼","씨팔"]
+notes    = "씨발/시발/씨팔 (ssibal) is the canonical Korean 'fuck'. 좆 (jot) = 'dick/fuck'. 존나 (jonna) = 'fucking' intensifier. 개새끼 (gae-saekki) = 'son of a bitch'. 시발 also coincides homophonically with 始發 'first departure' but the curse spelling dominates."
+
+[[entry]]
+class    = "feline"
+lang     = "ko"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["고양이","새끼고양이","아기고양이","야옹이","고양이새끼","냥이"]
+notes    = "고양이 = cat. 새끼고양이/아기고양이 = kitten. 야옹이/냥이 = kitty (cute). Note 고양이새끼 can also be an insult ('cat's offspring') but is kept in feline set as a literal compound."
+
+[[entry]]
+class    = "profanity"
+lang     = "th"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["เหี้ย","สัส","ควย","เย็ด","ไอ้สัส","ห่า"]
+notes    = "เย็ด = literal 'fuck'. เหี้ย (hia, a monitor lizard) is the most common all-purpose curse. สัส/ไอ้สัส = vulgar intensifier (from สัตว์ 'beast'). ควย (khuay) = 'dick'. ห่า = 'damn/plague'. Thai is written without spaces, cjk=true."
+
+[[entry]]
+class    = "feline"
+lang     = "th"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["แมว","ลูกแมว","เหมียว","น้องแมว","เจ้าเหมียว"]
+notes    = "แมว (maeo) = cat. ลูกแมว = kitten. เหมียว/เจ้าเหมียว = kitty/meow. น้องแมว = affectionate 'kitty'."
+
+[[entry]]
+class    = "profanity"
+lang     = "vi"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["đụ","địt","lồn","cặc","đm","đ.m","đụ má"]
+notes    = "Vietnamese uses spaces, cjk=false. đụ/địt = 'fuck'. lồn = 'cunt', cặc = 'dick'. đm/đ.m = abbreviation of đụ má / địt mẹ ('fuck your mother'). Tone marks essential."
+
+[[entry]]
+class    = "feline"
+lang     = "vi"
+mode     = "forms"
+cjk      = false
+ambiguous= false
+forms    = ["mèo","con mèo","mèo con","mèo cái","mèo nhỏ","mèo mun"]
+notes    = "mèo = cat. con mèo = 'the cat'. mèo con = kitten. mèo cái = female cat. Tone mark on è is required; 'meo' without it is a different/meaningless string."
+
+[[entry]]
+class    = "profanity"
+lang     = "km"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["ចុយ","ក្ដ","ខ្ទើយ","ចង្រៃ"]
+notes    = "Best-effort Khmer. ចុយ (chuy) = literal 'fuck'. ក្ដ (kandor) = 'penis'. ខ្ទើយ is a slur. ចង្រៃ = 'damned/wretched'. Khmer script has no inter-word spaces, cjk=true. Recommend native-speaker review."
+
+[[entry]]
+class    = "feline"
+lang     = "km"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["ឆ្មា","កូនឆ្មា"]
+notes    = "ឆ្មា (chhmaa) = cat. កូនឆ្មា = kitten ('child cat'). Khmer, cjk=true."
+
+[[entry]]
+class    = "profanity"
+lang     = "lo"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["ໂຄຍ","ຫີ","ຫำ","ບ້າ"]
+notes    = "Best-effort Lao. ໂຄຍ (khoy) = 'dick' (strong general vulgar), ຫີ = 'cunt', ຫำ = 'testicle/penis', ບ້າ = 'crazy/damn'. Lao lacks inter-word spaces, cjk=true. Recommend native-speaker review."
+
+[[entry]]
+class    = "feline"
+lang     = "lo"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["ແມວ","ລູກແມວ"]
+notes    = "ແມວ (maew) = cat. ລູກແມວ = kitten ('child cat'). Lao, cjk=true."
+
+# ===================== group: misc-global =====================
+# ============ INDONESIAN (id) ============
+
+[[entry]]
+class    = "profanity"
+lang     = "id"
+mode     = "forms"
+forms    = ["anjing", "anjir", "ngentot", "kontol", "memek", "bangsat", "tai", "taik"]
+cjk      = false
+ambiguous= false
+notes    = "anjing (lit. 'dog') and tai/taik (lit. 'shit') double as ordinary nouns in-language; anjir is the softened euphemism. ngentot/entot is the literal 'fuck' verb. kontol=dick, memek=cunt, bangsat=bastard/vermin."
+
+[[entry]]
+class    = "feline"
+lang     = "id"
+mode     = "forms"
+forms    = ["kucing", "kucing-kucing", "anak kucing", "meong", "pus"]
+cjk      = false
+ambiguous= true
+notes    = "Plural by reduplication (kucing-kucing); kitten is multiword 'anak kucing'. meong=meow/kitty. 'pus' is the cat-calling word but collides with English 'pus' -> ambiguous."
+
+# ============ MALAY (ms) ============
+
+[[entry]]
+class    = "profanity"
+lang     = "ms"
+mode     = "forms"
+forms    = ["pukimak", "pundek", "babi", "sial", "bangsat", "anjing", "lancau"]
+cjk      = false
+ambiguous= true
+notes    = "pukimak (~'your mother's cunt') and pundek/lancau are the strong Malay expletives. babi (lit. 'pig'), sial (lit. 'unlucky/damn') and anjing (lit. 'dog') are also ordinary words -> ambiguous within-language. Shares anjing/bangsat with Indonesian."
+
+[[entry]]
+class    = "feline"
+lang     = "ms"
+mode     = "forms"
+forms    = ["kucing", "kucing-kucing", "anak kucing", "meow"]
+cjk      = false
+ambiguous= false
+notes    = "Plural via reduplication; kitten = multiword 'anak kucing'. Essentially identical to Indonesian feline vocabulary."
+
+# ============ SWAHILI (sw) ============
+
+[[entry]]
+class    = "profanity"
+lang     = "sw"
+mode     = "forms"
+forms    = ["tomba", "kutomba", "mavi", "shenzi", "kuma", "kumamako", "mkundu"]
+cjk      = false
+ambiguous= true
+notes    = "tomba/kutomba is the literal 'fuck' verb. mavi=shit, shenzi=savage/barbaric (insult), kuma=vulgar vagina, kumamako='your mother's...', mkundu=anus. 'kuma' collides with name/word in other langs (e.g. Japanese kuma=bear) -> ambiguous."
+
+[[entry]]
+class    = "feline"
+lang     = "sw"
+mode     = "forms"
+forms    = ["paka", "paka mdogo", "paka wadogo", "mtoto wa paka"]
+cjk      = false
+ambiguous= false
+notes    = "N-class noun: singular and plural both 'paka'. Kitten = 'paka mdogo' (small cat) or 'mtoto wa paka' (offspring of cat); plural small = 'paka wadogo'. All multiword -> forms mode."
+
+# ============ TAGALOG / FILIPINO (tl) ============
+
+[[entry]]
+class    = "profanity"
+lang     = "tl"
+mode     = "forms"
+forms    = ["putangina", "tangina", "putang ina", "gago", "gaga", "puta", "tarantado"]
+cjk      = false
+ambiguous= true
+notes    = "putangina (~'your mother is a whore') is the strongest general-purpose expletive; tangina/putang ina are its contraction/full form. gago/gaga=fool (m/f). 'puta' and 'gago' collide with Spanish/Portuguese -> ambiguous."
+
+[[entry]]
+class    = "feline"
+lang     = "tl"
+mode     = "forms"
+forms    = ["pusa", "pusang", "mga pusa", "kuting", "pusakal"]
+cjk      = false
+ambiguous= false
+notes    = "pusa=cat; 'pusang' is pusa + ligature -ng; plural is analytic 'mga pusa'; kuting=kitten; pusakal=stray/alley cat (pusa+askal). Multiword/ligature -> forms mode."
+
+# ============ AFRIKAANS (af) ============
+
+[[entry]]
+class    = "profanity"
+lang     = "af"
+mode     = "forms"
+forms    = ["fok", "fokken", "fokof", "fokop", "gefok", "kak", "poes", "naai", "doos"]
+cjk      = false
+ambiguous= true
+notes    = "fok is the real 'fuck' (fokken=fucking, fokof=fuck off, fokop=fuck up, gefok=fucked); kak=shit, poes=cunt, naai=screw, doos=cunt/idiot. poes/naai/doos are ordinary Dutch words (cat/pussy, sew, box) and 'kak' too -> ambiguous via Dutch collision."
+
+[[entry]]
+class    = "feline"
+lang     = "af"
+mode     = "suffix"
+stems    = ["kat"]
+suffixes = ["", "te", "jie", "jies"]
+forms    = []
+cjk      = false
+ambiguous= true
+notes    = "Clean concatenation: kat (cat), katte (cats), katjie (kitten, diminutive -jie), katjies (kittens). 'kat' collides with English/Dutch 'kat' and proper name Kat -> ambiguous."
+
+# ============ JAVANESE (jv) ============
+
+[[entry]]
+class    = "profanity"
+lang     = "jv"
+mode     = "forms"
+forms    = ["jancok", "jancuk", "cok", "diancuk", "asu", "bajingan", "kontol", "matamu"]
+cjk      = false
+ambiguous= false
+notes    = "jancok/jancuk (Surabaya iconic ~'fuck'), cok (clipped), diancuk (passive/intensified); asu=dog (strong insult), bajingan=scoundrel, kontol=dick (shared w/ id), matamu (lit. 'your eye', dismissive curse)."
+
+[[entry]]
+class    = "feline"
+lang     = "jv"
+mode     = "forms"
+forms    = ["kucing", "kucing cilik", "anak kucing", "meong"]
+cjk      = false
+ambiguous= false
+notes    = "kucing=cat (shared with id/ms); kitten = 'kucing cilik' (small cat) or 'anak kucing'; meong=meow/kitty. Multiword -> forms mode."
+
+
+# ===================== group: emphasis =====================
+# Hype / emphasis words — the animated-ink-only class (no sprite overlay).
+# INTENTIONALLY EMPTY: the builtin ships no emphasis forms (the 2026-07-02
+# product decision — earlier hype-oriented seeds were removed). The
+# class exists so user words flow in via [sparkle_words.emphasis].extra_words
+# (or a lexicon override file) with zero lexicon changes.

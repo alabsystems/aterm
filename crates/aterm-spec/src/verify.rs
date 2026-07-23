@@ -1,0 +1,977 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+// Author: Andrew Yates
+
+//! The single shared **verification gate** for aterm's conformance and spec-link
+//! tests — the honesty ratchet, TWO-TIER since 2026-07-06 (VERIFY-1, owner
+//! decision).
+//!
+//! ## The two tiers
+//!
+//! **Tier default — the in-process interpreter** ([`crate::interp`]): every
+//! DERIVED-model obligation (Tier-0 invariant checks, prove-and-catch
+//! non-vacuity, per-transition conformance) is discharged by an exhaustive BFS
+//! of the same bounded model through the embedded executable interpreter — a
+//! REAL check that fails loudly on a violation, never a skip. A fresh clone
+//! with no toolchain verifies for real, out of the box.
+//!
+//! **Tier escalation — the external Trust binaries**: wherever `ty` /
+//! `trust-ir` / `ay` are installed, the SAME obligations are ADDITIONALLY
+//! checked by the external tool (and the tool-only obligations — hand-written
+//! `.tla`, `--strict-vacuity` verdicts, `spec-link` closure, SMT certificates —
+//! run in full). The two tiers checking one derived model must agree; a
+//! disagreement PANICS (a checker bug is never silently swallowed). Obligations
+//! that exist ONLY to assert the external tool's independent agreement report a
+//! prominent one-line notice and return early where the tool is absent (the
+//! [`ty_escalation`]-family idiom) — the in-process tier still covered the
+//! model itself.
+//!
+//! ## The checker is part of Trust
+//!
+//! `ty`/`trust-ir` live in the Trust toolchain (`$HOME/trust/first-party/{ty,trust-ir}`),
+//! NOT a standalone checkout. Build them once:
+//!
+//! ```sh
+//! cargo build --release -p tla-cli   # in $HOME/trust/first-party/ty       -> ty
+//! cargo build --release              # in $HOME/trust/first-party/trust-ir -> trust-ir
+//! ```
+//!
+//! [`find_ty`]/[`find_trust_ir`] then discover them automatically at their canonical
+//! release paths — or anywhere the full-toolchain bootstrap (`build/<triple>/…`)
+//! dropped them, or on `PATH`. The home directory (`$HOME`, or `%USERPROFILE%` on
+//! Windows) and `PATH` are the only environment access; there is no path override
+//! and nothing to remember to set.
+//!
+//! ## Caller idioms
+//!
+//! ```ignore
+//! // Derived-model obligation (interpreter always; ty additionally when installed):
+//! aterm_spec::verify::check_model_tiered(&m, "Thing Tier-0");
+//! aterm_spec::verify::prove_and_catch_tiered(&m, "Thing non-vacuity");
+//! let (ok, why) = aterm_spec::verify::validate_transition_tiered(&m, &overrides, &prev, &next, Some("Push"), "Thing conformance");
+//!
+//! // External-tool-agreement obligation (runs only where the tool exists):
+//! let Some(ty) = aterm_spec::verify::ty_escalation("Thing .tla check") else { return };
+//! ```
+//!
+//! The LEGACY hard-require forms ([`ty`], [`trust_ir`], [`ay`]) still exist for
+//! gates that must never run tool-less (none in-tree today outside migration).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+
+use crate::derive::Model;
+use crate::interp;
+
+/// Discover the Trust `ty` model-checker. Searches, in order: the canonical
+/// first-party cargo build, any full-toolchain bootstrap stage build, then `ty` on
+/// `PATH`. The home directory and `PATH` are the only environment access.
+#[must_use]
+pub fn find_ty() -> Option<PathBuf> {
+    find_trust_bin("ty", "ty/target/release")
+}
+
+/// Discover the Trust `trust-ir` `spec-link` cross-referencer. Mirrors [`find_ty`].
+#[must_use]
+pub fn find_trust_ir() -> Option<PathBuf> {
+    find_trust_bin("trust-ir", "trust-ir/target/release")
+}
+
+/// Discover the Trust `ay` SAT/SMT/CHC solver. Mirrors [`find_ty`] exactly
+/// (canonical first-party build → full-toolchain bootstrap stage scan → PATH),
+/// plus the standalone `~/ay` release checkout some proof bundles' `verify.sh`
+/// scripts also probe. Used by the always-on `sparkle_v2_ay_certificates`
+/// gate: hand-encoded SMT-LIB2 certificates are re-checked fail-closed, the
+/// same honesty ratchet as the `ty` Tier-0 gates.
+#[must_use]
+pub fn find_ay() -> Option<PathBuf> {
+    if let Some(p) = find_trust_bin("ay", "ay/target/release") {
+        return Some(p);
+    }
+    // Standalone `~/ay` checkout, probed the same Windows-aware way as `find_trust_bin`
+    // (all candidate homes + the platform exe name) rather than `$HOME` only.
+    let exe = exe_name("ay");
+    for home in home_dirs() {
+        let standalone = home.join("ay/target/release").join(&exe);
+        if standalone.exists() {
+            return Some(standalone);
+        }
+    }
+    None
+}
+
+/// Shared discovery: the canonical `$HOME/trust/first-party/<rel_dir>/<bin>` cargo
+/// build, then any matching tool the full-toolchain bootstrap left under
+/// `$HOME/trust/build/<triple>/…`, then `<bin>` on `PATH`. All filesystem probes use
+/// the platform executable name (`ty` vs `ty.exe`).
+// Skip: drop glue for the `Vec<PathBuf>` search-path IntoIter (std/alloc
+// internals — the drop-glue lane). Build-tooling discovery; every miss
+// returns None (fail-closed).
+#[cfg_attr(trust_verify, trust::skip)]
+fn find_trust_bin(bin: &str, first_party_rel_dir: &str) -> Option<PathBuf> {
+    let exe = exe_name(bin);
+    for home in home_dirs() {
+        let canonical = home
+            .join("trust/first-party")
+            .join(first_party_rel_dir)
+            .join(&exe);
+        if canonical.exists() {
+            return Some(canonical);
+        }
+        if let Some(p) = scan_trust_bootstrap(&home.join("trust/build"), &exe) {
+            return Some(p);
+        }
+    }
+    path_search(&exe)
+}
+
+/// `<bin>` with the platform executable suffix (`.exe` on Windows, none on Unix).
+fn exe_name(bin: &str) -> String {
+    format!("{bin}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Candidate home directories: `$HOME`, then (Windows) `%USERPROFILE%`. Native
+/// Windows shells set only `USERPROFILE`; Git Bash sets `HOME`, sometimes as a
+/// POSIX-style `/c/…` path that Win32 file APIs cannot resolve — normalize it.
+fn home_dirs() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(dir) = std::env::var(var)
+            && !dir.is_empty()
+        {
+            homes.push(PathBuf::from(normalize_home(dir)));
+        }
+    }
+    homes
+}
+
+/// On Windows, rewrite a POSIX-style `/c/Users//…` home to `C:/Users//…`; otherwise
+/// pass through unchanged.
+fn normalize_home(dir: String) -> String {
+    if cfg!(windows) {
+        let b = dir.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b'/' {
+            return format!("{}:{}", b[1] as char, &dir[2..]);
+        }
+    }
+    dir
+}
+
+/// Best-effort scan of the full-toolchain bootstrap output
+/// (`$HOME/trust/build/<triple>/{stage2-tools-bin/<triple>,stage1/bin}/<exe>`) — the
+/// layout `x.py`/bootstrap produces when the whole Trust compiler is built.
+// Skip: the `read_dir` iterator's `next` is an absent std body under the
+// generic trait path (fs iteration); every I/O miss returns None
+// (fail-closed). Build-tooling discovery, not runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+fn scan_trust_bootstrap(build: &Path, exe: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(build).ok()?.flatten() {
+        let triple_dir = entry.path();
+        let triple = entry.file_name();
+        for cand in [
+            triple_dir.join("stage2-tools-bin").join(&triple).join(exe),
+            triple_dir.join("stage1").join("bin").join(exe),
+        ] {
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// `PATH` lookup via `std::env::split_paths` — portable, no shell dependency.
+// Skip: `Path::is_file` is an fs syscall wrapper (absent body); every
+// miss returns None (fail-closed). Build-tooling discovery.
+#[cfg_attr(trust_verify, trust::skip)]
+fn path_search(exe: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(exe))
+        .find(|cand| cand.is_file())
+}
+
+/// Locate the Trust `ty` model-checker for `label`, or PANIC with a build hint.
+/// Verification is ALWAYS required — no env var, no skip. A conformance test that
+/// cannot reach `ty` FAILS rather than reporting a false `ok`.
+#[must_use]
+pub fn ty(label: &str) -> PathBuf {
+    require(
+        "ty",
+        "cargo build --release -p tla-cli   (in $HOME/trust/first-party/ty)",
+        find_ty(),
+        label,
+    )
+}
+
+/// Locate the Trust `trust-ir` `spec-link` tool for `label`, or PANIC with a build
+/// hint. Always required — see [`ty`].
+#[must_use]
+pub fn trust_ir(label: &str) -> PathBuf {
+    require(
+        "trust-ir",
+        "cargo build --release   (in $HOME/trust/first-party/trust-ir)",
+        find_trust_ir(),
+        label,
+    )
+}
+
+/// Locate the Trust `ay` solver for `label`, or PANIC with a build hint.
+/// Always required — see [`ty`] (the same fail-closed gate, no skip path).
+#[must_use]
+pub fn ay(label: &str) -> PathBuf {
+    require(
+        "ay",
+        "cargo build --release   (in $HOME/trust/first-party/ay)",
+        find_ay(),
+        label,
+    )
+}
+
+/// The gate: return the discovered path, or PANIC. There is no skip and no opt-out —
+/// the honesty ratchet, batteries-on.
+// AUDITED CONTRACT PANIC (T9 surface): this panic IS the product — the
+// honesty ratchet's fail-closed gate. The declaration reclassifies its
+// refuted panic-freedom obligation into the always-visible `contract-panic`
+// gate column; it can never mask any other panic in this fn.
+#[cfg_attr(
+    trust_verify,
+    trust::contract_panic(message_contains = "VERIFICATION GATE")
+)]
+// Skip: a build-tooling PRECONDITION — its panic is the deliberate
+// "verifier binary missing, build it first" abort (the documented contract:
+// verification is always required and a missing checker must FAIL loudly,
+// never silently skip). Not shipping runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+fn require(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> PathBuf {
+    found.unwrap_or_else(|| {
+        panic!(
+            "VERIFICATION GATE: Trust `{bin}` not found — `{label}` could NOT be \
+             model-checked / spec-linked. Build the Trust toolchain once: {build_hint}. \
+             Verification is always required; this test FAILS rather than reporting a \
+             false ok."
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The ESCALATION tier (VERIFY-1, owner decision 2026-07-06): obligations that
+// assert the EXTERNAL tool's independent agreement run only where the tool is
+// installed. The notice is one prominent line naming exactly what did not run
+// and how to enable it — never silent, and never claimed as a discharged check.
+// ---------------------------------------------------------------------------
+
+/// Shared escalation report + early-return decision.
+fn escalation(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> Option<PathBuf> {
+    if found.is_none() {
+        eprintln!(
+            "VERIFY ESCALATION TIER NOT RUN: Trust `{bin}` is not installed, so `{label}` \
+             (an external-tool-agreement obligation) did not run on this machine. The \
+             in-process interpreter tier still verified every derived model. Enable the \
+             escalation tier once: {build_hint}."
+        );
+    }
+    found
+}
+
+/// The `ty` ESCALATION tier: `Some(path)` when installed; `None` (with a
+/// prominent notice) otherwise — the caller returns early. Use for obligations
+/// the in-process tier cannot express: hand-written `.tla` specs,
+/// `--strict-vacuity` verdicts, `ty trace` overclaim controls.
+#[must_use]
+pub fn ty_escalation(label: &str) -> Option<PathBuf> {
+    escalation(
+        "ty",
+        "cargo build --release -p tla-cli   (in $HOME/trust/first-party/ty)",
+        find_ty(),
+        label,
+    )
+}
+
+/// The `trust-ir` (`spec-link`) escalation tier. See [`ty_escalation`].
+#[must_use]
+pub fn trust_ir_escalation(label: &str) -> Option<PathBuf> {
+    escalation(
+        "trust-ir",
+        "cargo build --release   (in $HOME/trust/first-party/trust-ir)",
+        find_trust_ir(),
+        label,
+    )
+}
+
+/// The `ay` (SMT/CHC certificate) escalation tier. See [`ty_escalation`].
+#[must_use]
+pub fn ay_escalation(label: &str) -> Option<PathBuf> {
+    escalation(
+        "ay",
+        "cargo build --release   (in $HOME/trust/first-party/ay)",
+        find_ay(),
+        label,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The TIERED derived-model discharges (VERIFY-1): interpreter ALWAYS (a real,
+// loud-failing check), external `ty` ADDITIONALLY wherever installed. The two
+// tiers check the SAME derived model; disagreement panics.
+// ---------------------------------------------------------------------------
+
+/// How a tiered obligation was discharged (for the caller's log line).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Discharge {
+    /// Interpreter BMC only (no `ty` installed) — still a real exhaustive check.
+    Interpreter,
+    /// Interpreter BMC AND the external `ty` binary agreed.
+    InterpreterAndTy,
+    /// Function-valued model: interpreter inapplicable, `ty` checked it.
+    TyOnly,
+    /// Function-valued model AND no `ty`: the obligation did NOT run (reported
+    /// loudly; the only combination with no coverage, and it names itself).
+    NotRun,
+}
+
+/// Run `ty check` on a derived model's generated spec + cfg; panics on failure
+/// (with the generated TLA for diagnosis). `cfg` overrides come pre-rendered.
+// Skip: shells out to `ty` and renders its output (absent std format/io
+// bodies + the closure it drives). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+/// Returns (verdict, evidence): whether `ty check` exited 0, plus a rendered
+/// transcript naming the exact binary and its full output — so a TIER
+/// DISAGREEMENT panic identifies WHICH `ty` build said what (the 2026-07-20
+/// `derived_native_tab_identity` disagreement was undiagnosable precisely
+/// because the panic carried neither the binary path nor its output; the
+/// culprit turned out to be transient toolchain drift, not the model).
+fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, String) {
+    let dir = std::env::temp_dir().join(format!("aterm-tier-{}-{}", m.name, std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mk tempdir");
+    let spec = dir.join(format!("{}.tla", m.name));
+    let cfgp = dir.join(format!("{}.cfg", m.name));
+    std::fs::write(&spec, m.to_tla()).expect("write derived spec");
+    std::fs::write(&cfgp, cfg).expect("write derived cfg");
+    let out = Command::new(ty)
+        .arg("check")
+        .arg(&spec)
+        .arg("--config")
+        .arg(&cfgp)
+        .output()
+        .unwrap_or_else(|e| panic!("run ty check for {label}: {e}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let evidence = format!(
+        "ty binary: {} ({:?})\n--- ty stdout ---\n{}\n--- ty stderr ---\n{}",
+        ty.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    (out.status.success(), evidence)
+}
+
+/// TIERED Tier-0 check of a derived model: the interpreter proves every
+/// invariant over the whole bounded reachable space (panics on a violation),
+/// and `ty check` additionally proves the generated TLA+ wherever installed
+/// (panics on failure or on tier disagreement). Function-valued models skip
+/// the interpreter (inapplicable by construction) and REQUIRE the `ty` tier;
+/// with no `ty` they report [`Discharge::NotRun`] loudly.
+// Skip: a tiered verification DRIVER — shells out to `ty`, renders output,
+// and its asserts are deliberate harness aborts. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn check_model_tiered(m: &Model, label: &str) -> Discharge {
+    let interp_ran = if m.fn_vars.is_empty() {
+        match interp::bmc(m) {
+            Ok(n) => eprintln!("{label}: {} proven over {n} states (interpreter).", m.name),
+            Err((st, inv)) => panic!(
+                "{label}: {} invariant `{inv}` VIOLATED at {st:?} (interpreter tier)",
+                m.name
+            ),
+        }
+        true
+    } else {
+        false
+    };
+    match find_ty() {
+        Some(ty) => {
+            let (ok, evidence) = ty_check_derived(&ty, m, &m.to_cfg(), label);
+            assert!(
+                ok,
+                "{label}: ty check FAILED on derived {} spec{}\n{evidence}\n--- generated ---\n{}",
+                m.name,
+                if interp_ran {
+                    " — TIER DISAGREEMENT (interpreter proved it; checker bug?)"
+                } else {
+                    ""
+                },
+                m.to_tla()
+            );
+            eprintln!(
+                "{label}: {} additionally model-checked clean by ty.",
+                m.name
+            );
+            if interp_ran {
+                Discharge::InterpreterAndTy
+            } else {
+                Discharge::TyOnly
+            }
+        }
+        None if interp_ran => Discharge::Interpreter,
+        None => {
+            eprintln!(
+                "VERIFY ESCALATION TIER NOT RUN: `{label}` ({}) is a FUNCTION-VALUED model \
+                 the interpreter cannot evaluate and Trust `ty` is not installed — this \
+                 obligation did not run. Build ty once: cargo build --release -p tla-cli \
+                 (in $HOME/trust/first-party/ty).",
+                m.name
+            );
+            Discharge::NotRun
+        }
+    }
+}
+
+/// TIERED prove-and-catch (the `Buggy` convention): the interpreter proves the
+/// invariant at `Buggy=0` and finds a counterexample at `Buggy=1` (panics
+/// otherwise), and `ty` additionally does the same wherever installed (panics
+/// on failure or tier disagreement). Function-valued models (`fn_vars`
+/// non-empty: Coalesce, Recording, TierResidency, …) skip the interpreter
+/// (inapplicable by construction) and REQUIRE the `ty` tier; with no `ty` they
+/// report [`Discharge::NotRun`] loudly.
+// Skip: same tiered-driver class as `check_model_tiered`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Discharge {
+    let interp_ran = if m.fn_vars.is_empty() {
+        interp::prove_and_catch(m);
+        true
+    } else {
+        false
+    };
+    match find_ty() {
+        Some(ty) => {
+            let (ok, evidence) = ty_check_derived(&ty, m, &m.to_cfg(), label);
+            assert!(
+                ok,
+                "{label}: ty check FAILED at Buggy=0 on {}{}\n{evidence}\n--- generated ---\n{}",
+                m.name,
+                if interp_ran {
+                    " — TIER DISAGREEMENT (interpreter proved it; checker bug?)"
+                } else {
+                    ""
+                },
+                m.to_tla()
+            );
+            let (caught_ok, evidence) =
+                ty_check_derived(&ty, m, &m.to_cfg_with(&[("Buggy", 1)]), label);
+            assert!(
+                !caught_ok,
+                "{label}: ty found NO counterexample at Buggy=1 on {}{}\n{evidence}",
+                m.name,
+                if interp_ran {
+                    " — TIER DISAGREEMENT (interpreter caught it; checker bug?)"
+                } else {
+                    " — the property is trivial / does not catch the defect"
+                }
+            );
+            eprintln!(
+                "{label}: {} {}proven (Buggy=0) and caught (Buggy=1) by ty.",
+                m.name,
+                if interp_ran { "additionally " } else { "" }
+            );
+            if interp_ran {
+                Discharge::InterpreterAndTy
+            } else {
+                Discharge::TyOnly
+            }
+        }
+        None if interp_ran => Discharge::Interpreter,
+        None => {
+            eprintln!(
+                "VERIFY ESCALATION TIER NOT RUN: `{label}` ({}) is a FUNCTION-VALUED model \
+                 the interpreter cannot evaluate and Trust `ty` is not installed — this \
+                 obligation did not run. Build ty once: cargo build --release -p tla-cli \
+                 (in $HOME/trust/first-party/ty).",
+                m.name
+            );
+            Discharge::NotRun
+        }
+    }
+}
+
+/// The machine-verified NEGATIVE-CONTROL criterion for `--strict-vacuity`'s
+/// dead-action class (the audited-exception mechanism of the `spec_xref_closure`
+/// gate, upgraded from a hand-maintained model-name list to a proof):
+///
+/// A derived model may carry actions that are DEAD at its committed config ONLY
+/// when every one of them is a genuine prove-and-catch mutant, which this fn
+/// verifies with the in-process interpreter:
+///
+/// 1. the model is scalar (the interpreter can actually verify it — a
+///    function-valued model gets NO dead-action relaxation, fail-closed);
+/// 2. the model declares the `Buggy` dial, committed to 0 (a dead action in a
+///    dial-less model has no catch config — it is a REAL vacuity);
+/// 3. `ty_reported_dead` agrees EXACTLY with the interpreter's own dead set at
+///    the committed config (tier agreement in BOTH directions: a `ty` verdict
+///    the interpreter contradicts fails, and — because the caller derives
+///    nothing from `ty`'s output alone — a parse/format drift that under-reports
+///    `ty`'s dead set also fails rather than silently passing);
+/// 4. the `Buggy = 1` baseline with ALL committed-dead actions removed still
+///    satisfies every invariant (otherwise an unrelated Buggy branch could
+///    supply the counterexample and make harmless dead actions look caught);
+/// 5. each dead action, added back ALONE to that safe baseline, FIRES somewhere
+///    in its reachable space (the mutant is independently exercisable — an
+///    action dead at BOTH configs is a REAL vacuity, e.g. a typo'd guard);
+/// 6. each isolated dead action makes that baseline violate an invariant (every
+///    negative control is independently caught, rather than sharing one global
+///    counterexample supplied by a different mutant).
+///
+/// Returns `Ok(n)` — the number of machine-verified negative controls (0 for a
+/// strictly non-vacuous model) — or `Err(reason)`; the caller's gate must stay
+/// RED on `Err`. Anything this fn cannot verify is a failure, never a waiver.
+// Skip: verification-harness driver over the interpreter tier (BTreeSet ops +
+// deliberate audit-failure strings). Not shipping runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn audit_dead_negative_controls(m: &Model, ty_reported_dead: &[&str]) -> Result<usize, String> {
+    if !m.fn_vars.is_empty() {
+        return Err(format!(
+            "{}: function-valued model — the interpreter cannot verify negative controls, so \
+             no dead-action relaxation is available; keep the model strictly non-vacuous",
+            m.name
+        ));
+    }
+    let all: BTreeSet<&str> = m.actions.iter().map(|a| a.name as &str).collect();
+    for d in ty_reported_dead {
+        if !all.contains(d) {
+            return Err(format!(
+                "{}: ty reported dead action `{d}` that the model does not declare — \
+                 spec/emission drift",
+                m.name
+            ));
+        }
+    }
+    let fired0 = interp::fired_actions(&interp::with_buggy(m, 0));
+    let interp_dead: BTreeSet<&str> = all
+        .iter()
+        .copied()
+        .filter(|a| !fired0.contains(a))
+        .collect();
+    let ty_dead: BTreeSet<&str> = ty_reported_dead.iter().copied().collect();
+    if ty_dead != interp_dead {
+        return Err(format!(
+            "{}: TIER DISAGREEMENT on the committed-config dead set — ty reports {:?} but the \
+             interpreter finds {:?}",
+            m.name, ty_dead, interp_dead
+        ));
+    }
+    if interp_dead.is_empty() {
+        return Ok(0); // strictly non-vacuous — nothing to audit
+    }
+    if !m.consts.iter().any(|(n, v)| *n == "Buggy" && *v == 0) {
+        return Err(format!(
+            "{}: dead action(s) {:?} in a model with no committed `Buggy = 0` dial — there is \
+             no catch config under which they could be negative controls; REAL vacuity",
+            m.name, interp_dead
+        ));
+    }
+    let buggy = interp::with_buggy(m, 1);
+    let mut baseline = buggy.clone();
+    baseline
+        .actions
+        .retain(|action| !interp_dead.contains(action.name));
+    if let Err((state, invariant)) = interp::bmc(&baseline) {
+        return Err(format!(
+            "{}: Buggy=1 baseline with all committed-dead actions removed still violates \
+             invariant `{invariant}` at {state:?} — an unrelated Buggy branch supplies the \
+             counterexample, so no dead action can be credited as an independently caught \
+             negative control",
+            m.name
+        ));
+    }
+
+    for d in &interp_dead {
+        let mut isolated = buggy.clone();
+        isolated
+            .actions
+            .retain(|action| !interp_dead.contains(action.name) || action.name == *d);
+        if !interp::fired_actions(&isolated).contains(d) {
+            return Err(format!(
+                "{}: action `{d}` is dead at the committed config AND never fires at Buggy=1 \
+                 when added alone to the safe baseline — not an independently exercisable \
+                 negative control; REAL vacuity (typo'd guard or mutant dependency?)",
+                m.name
+            ));
+        }
+        if interp::bmc(&isolated).is_ok() {
+            return Err(format!(
+                "{}: action `{d}` fires when added alone to the Buggy=1 baseline, but NO \
+                 invariant is violated — this mutant is independently caught by nothing, so \
+                 it proves nothing",
+                m.name
+            ));
+        }
+    }
+    Ok(interp_dead.len())
+}
+
+/// TIERED liveness / deadlock-freedom (the `CHECK_DEADLOCK` protocol): the
+/// interpreter proves no non-final wedge is reachable at `Buggy=0` and finds
+/// the wedge at `Buggy=1` ([`interp::find_deadlock`], panics otherwise), and
+/// `ty` additionally does the same via `to_cfg_deadlock_with` wherever
+/// installed (asserting the `Buggy=1` failure is a DEADLOCK, not an invariant
+/// violation — panics on failure or tier disagreement). `is_final` names the
+/// legitimate work-complete terminal states (the interpreter twin of the
+/// model's `Done` stutter self-loop).
+// Skip: a VERIFICATION-HARNESS driver — it shells out to `ty`, writes
+// temp spec/cfg files, and every `expect(..)` is a deliberate test-time
+// abort (a missing model checker MUST fail the run loudly). The lossy
+// stdout/stderr rendering is display-only. Not shipping runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn deadlock_free_and_catches_tiered(
+    m: &Model,
+    is_final: impl Fn(&interp::State) -> bool,
+    label: &str,
+) -> Discharge {
+    assert!(
+        m.fn_vars.is_empty(),
+        "{label}: deadlock_free_and_catches_tiered requires a scalar model"
+    );
+    assert!(
+        interp::find_deadlock(&interp::with_buggy(m, 0), &is_final).is_none(),
+        "{label}: {} (Buggy=0) must be DEADLOCK-FREE (interpreter tier)",
+        m.name
+    );
+    let wedge = interp::find_deadlock(&interp::with_buggy(m, 1), &is_final);
+    assert!(
+        wedge.is_some(),
+        "{label}: {} (Buggy=1) MUST reach a wedge (interpreter tier)",
+        m.name
+    );
+    eprintln!(
+        "{label}: {} deadlock-free (Buggy=0) and wedge caught at {:?} (interpreter, Buggy=1).",
+        m.name,
+        wedge.unwrap()
+    );
+    match find_ty() {
+        Some(ty) => {
+            let dir =
+                std::env::temp_dir().join(format!("aterm-dl-{}-{}", m.name, std::process::id()));
+            std::fs::create_dir_all(&dir).expect("mk tempdir");
+            let spec = dir.join(format!("{}.tla", m.name));
+            std::fs::write(&spec, m.to_tla()).expect("write spec");
+            let run = |cfg_name: &str, cfg: String| -> (bool, String) {
+                let cfgp = dir.join(cfg_name);
+                std::fs::write(&cfgp, cfg).expect("write cfg");
+                let out = Command::new(&ty)
+                    .arg("check")
+                    .arg(&spec)
+                    .arg("--config")
+                    .arg(&cfgp)
+                    .output()
+                    .expect("run ty check");
+                (
+                    out.status.success(),
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    ),
+                )
+            };
+            let (ok, out) = run("ok.cfg", m.to_cfg_deadlock_with(&[]));
+            assert!(
+                ok,
+                "{label}: ty says {} (Buggy=0) deadlocks — TIER DISAGREEMENT\n{out}",
+                m.name
+            );
+            let (bug_ok, bug_out) = run("bug.cfg", m.to_cfg_deadlock_with(&[("Buggy", 1)]));
+            assert!(
+                !bug_ok,
+                "{label}: ty found NO wedge at Buggy=1 on {} — TIER DISAGREEMENT\n{bug_out}",
+                m.name
+            );
+            assert!(
+                bug_out.contains("Deadlock"),
+                "{label}: {} (Buggy=1) failure must be a DEADLOCK, not an invariant \
+                 violation\n{bug_out}",
+                m.name
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!(
+                "{label}: {} additionally deadlock-checked by ty (free at Buggy=0, wedge at Buggy=1).",
+                m.name
+            );
+            Discharge::InterpreterAndTy
+        }
+        None => Discharge::Interpreter,
+    }
+}
+
+/// TIERED per-transition conformance (the Tier-1 `ty trace validate` twin):
+/// does the model's `Next` admit the real `prev -> next` step?
+///
+/// The interpreter tier ALWAYS answers ([`interp::admits`]); the `ty` tier
+/// additionally validates a two-step JSON trace against `transition_spec()`
+/// wherever installed, and the verdicts MUST agree (disagreement panics).
+/// Returns `(conforms, diagnostics)` so callers keep their positive AND
+/// negative-control assertions unchanged. `overrides` are the cfg constant
+/// overrides the real-code regime needs (e.g. a production `Cap`); `action`
+/// optionally names the expected action in the trace (`None` lets any action
+/// admit).
+// Skip: the tiered validation driver shells out to `ty` and renders JSON
+// traces (absent std format/iterator bodies + deliberate harness aborts).
+// Verification tooling, not shipping runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn validate_transition_tiered(
+    m: &Model,
+    overrides: &[(&'static str, i64)],
+    prev: &BTreeMap<&'static str, i64>,
+    next: &BTreeMap<&'static str, i64>,
+    action: Option<&str>,
+    label: &str,
+) -> (bool, String) {
+    // Interpreter verdict: THE named action (when given) — or some action —
+    // admits the step. The overrides are applied to the interpreter's constants
+    // exactly as the cfg applies them to the `ty` tier, so both tiers evaluate
+    // the SAME model instance. The named form asks the action directly rather
+    // than trusting `admits`'s first-match order.
+    let m_eff = interp::with_consts(m, overrides);
+    let admitted = interp::admits(&m_eff, prev, next);
+    let interp_ok = match action {
+        Some(a) => m_eff.successors(a, prev).contains(next),
+        None => admitted.is_some(),
+    };
+    let interp_why = match admitted {
+        Some(a) => format!("interpreter: admitted by action `{a}`"),
+        None => "interpreter: NO action admits this transition".to_string(),
+    };
+
+    let Some(ty) = find_ty() else {
+        return (interp_ok, interp_why);
+    };
+
+    // ty tier: two-step trace against the parameterized-Init transition spec.
+    // The dir is unique PER CALL (atomic counter), not per (model, pid): two
+    // tests in one process validating the same model run concurrently, and a
+    // shared dir gets torn spec/cfg writes (a real corrupted-cfg incident).
+    static CONF_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-conf-{}-{}-{}",
+        m.name,
+        std::process::id(),
+        CONF_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("mk tempdir");
+    let spec = dir.join(format!("{}.tla", m.name));
+    let cfg = dir.join(format!("{}.cfg", m.name));
+    let trace = dir.join("t.json");
+    std::fs::write(&spec, m.transition_spec()).expect("write spec");
+    std::fs::write(&cfg, m.transition_cfg(prev, overrides)).expect("write cfg");
+    std::fs::write(
+        &trace,
+        transition_trace_json(m, prev, next, action.or(admitted)),
+    )
+    .expect("write trace");
+    let out = Command::new(&ty)
+        .arg("trace")
+        .arg("validate")
+        .arg(&trace)
+        .arg("--spec")
+        .arg(&spec)
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap_or_else(|e| panic!("run ty trace validate for {label}: {e}"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let ty_ok = out.status.success();
+    assert!(
+        ty_ok == interp_ok,
+        "{label}: TIER DISAGREEMENT on {} transition {prev:?} -> {next:?}: \
+         interpreter={interp_ok} ty={ty_ok} (checker bug — never swallow this)\n\
+         {interp_why}\n--- ty ---\n{combined}",
+        m.name
+    );
+    (ty_ok, combined)
+}
+
+/// The two-step `ty trace validate` JSON for a derived model: `prev` at index 0,
+/// `next` (+ the admitting action, when known) at index 1. Variables serialize
+/// in the model's declared order.
+// Skip: the field-render chain drives closure bodies + `Extend`/format
+// (absent std bodies). Spec-harness trace emission, not runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+fn transition_trace_json(
+    m: &Model,
+    prev: &BTreeMap<&'static str, i64>,
+    next: &BTreeMap<&'static str, i64>,
+    action: Option<&str>,
+) -> String {
+    let vars: Vec<&str> = m.vars.iter().map(|v| v.name).collect();
+    let state_json = |s: &BTreeMap<&'static str, i64>| -> String {
+        let fields: Vec<String> = vars
+            .iter()
+            .map(|v| {
+                format!(
+                    "\"{v}\":{{\"type\":\"int\",\"value\":{}}}",
+                    s.get(v).copied().unwrap_or(0)
+                )
+            })
+            .collect();
+        format!("{{{}}}", fields.join(","))
+    };
+    let var_list: Vec<String> = vars.iter().map(|v| format!("\"{v}\"")).collect();
+    let action_field = action
+        .map(|a| format!(",\"action\":{{\"name\":\"{a}\"}}"))
+        .unwrap_or_default();
+    format!(
+        "{{\"version\":\"1\",\"module\":\"{}\",\"variables\":[{}],\"steps\":[\
+         {{\"index\":0,\"state\":{}}},\
+         {{\"index\":1,\"state\":{}{action_field}}}\
+         ]}}",
+        m.name,
+        var_list.join(","),
+        state_json(prev),
+        state_json(next),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
+    use crate::ty_model;
+
+    /// The two committed-dead `ConfigCatalogSnapshot` mutants are verified
+    /// negative controls: dial present, fire at Buggy=1, caught at Buggy=1.
+    #[test]
+    fn audit_accepts_config_catalog_snapshot_mutants() {
+        let m = config_catalog_snapshot_model();
+        assert_eq!(
+            audit_dead_negative_controls(&m, &["AdmitStaleTrail", "AdmitStaleNyan"]),
+            Ok(2)
+        );
+    }
+
+    /// Transact's `BuggyCommit` — the original hand-audited exception — now
+    /// passes the machine-verified criterion instead.
+    #[test]
+    fn audit_accepts_transact_buggy_commit() {
+        assert_eq!(
+            audit_dead_negative_controls(&transact_model(), &["BuggyCommit"]),
+            Ok(1)
+        );
+    }
+
+    /// A strictly non-vacuous model audits clean with an empty reported set.
+    #[test]
+    fn audit_accepts_strictly_nonvacuous_model() {
+        assert_eq!(audit_dead_negative_controls(&ring_model(), &[]), Ok(0));
+    }
+
+    /// Tier agreement is required in BOTH directions: an empty ty report while
+    /// the interpreter finds dead actions fails (this is the fail-open guard —
+    /// a ty output-format drift cannot silently grant the relaxation), and an
+    /// action ty names that the model does not declare fails.
+    #[test]
+    fn audit_rejects_tier_disagreement_and_unknown_actions() {
+        let m = config_catalog_snapshot_model();
+        let under_reported = audit_dead_negative_controls(&m, &[]);
+        assert!(
+            under_reported
+                .as_ref()
+                .is_err_and(|e| e.contains("TIER DISAGREEMENT")),
+            "{under_reported:?}"
+        );
+        let unknown = audit_dead_negative_controls(&m, &["NoSuchAction"]);
+        assert!(
+            unknown
+                .as_ref()
+                .is_err_and(|e| e.contains("does not declare")),
+            "{unknown:?}"
+        );
+    }
+
+    /// A dead action in a model whose `Buggy` is not committed to 0 has no
+    /// catch config — REAL vacuity, rejected.
+    #[test]
+    fn audit_rejects_dead_actions_without_committed_buggy_dial() {
+        let m = interp::with_consts(&config_catalog_snapshot_model(), &[("Buggy", 2)]);
+        let r = audit_dead_negative_controls(&m, &["AdmitStaleTrail", "AdmitStaleNyan"]);
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.contains("no committed `Buggy = 0` dial")),
+            "{r:?}"
+        );
+    }
+
+    /// An action dead at BOTH configs (a typo'd guard, not a mutant) is a REAL
+    /// vacuity, and a Buggy=1 space no invariant catches proves nothing — both
+    /// rejected.
+    #[test]
+    fn audit_rejects_never_firing_and_uncaught_mutants() {
+        // `Stuck` cannot fire at any config: its guard needs count > Cap while
+        // count never exceeds Cap.
+        let never = ty_model! {
+            NeverFires {
+                const Buggy = 0;
+                const Cap = 2;
+                var count = 0;
+                action Step when (count <= Cap - 1) { count = count + 1; }
+                action Stuck when (Buggy == 1 && count == Cap + 1) { count = 0; }
+                invariant Bounded: count <= Cap;
+            }
+        };
+        let r = audit_dead_negative_controls(&never, &["Stuck"]);
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.contains("never fires at Buggy=1")),
+            "{r:?}"
+        );
+
+        // `Harmless` fires at Buggy=1 but violates nothing there — the "mutant"
+        // is caught by no invariant, so it proves nothing.
+        let uncaught = ty_model! {
+            UncaughtMutant {
+                const Buggy = 0;
+                const Cap = 2;
+                var count = 0;
+                action Step when (count <= Cap - 1) { count = count + 1; }
+                action Harmless when (Buggy == 1 && count == 0) { count = 1; }
+                invariant Bounded: count <= Cap;
+            }
+        };
+        let r = audit_dead_negative_controls(&uncaught, &["Harmless"]);
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("caught by nothing")),
+            "{r:?}"
+        );
+    }
+
+    /// One caught mutant must not launder a second harmless mutant through a
+    /// shared Buggy=1 counterexample. Each committed-dead action earns the
+    /// strict-vacuity relaxation only when it independently turns the safe
+    /// all-live baseline into an invariant violation.
+    #[test]
+    fn audit_rejects_two_mutants_when_only_one_is_independently_caught() {
+        let partly_vacuous = ty_model! {
+            PartlyVacuousMutants {
+                const Buggy = 0;
+                const Cap = 1;
+                var count = 0;
+                action Step when (count <= Cap - 1) { count = count + 1; }
+                action Reset when (count == Cap) { count = 0; }
+                action Caught when (Buggy == 1 && count == 0) { count = Cap + 1; }
+                action Harmless when (Buggy == 1 && count == 0) { count = Cap; }
+                invariant Bounded: count <= Cap;
+            }
+        };
+        let r = audit_dead_negative_controls(&partly_vacuous, &["Caught", "Harmless"]);
+        assert!(
+            r.as_ref().is_err_and(|e| {
+                e.contains("Harmless") && e.contains("independently caught by nothing")
+            }),
+            "{r:?}"
+        );
+    }
+}

@@ -1,0 +1,72 @@
+id = "s1_15"
+kind = "head"
+viewbox = [160, 136]
+anchor = { eye_y = 0.52, center_x = 0.5, word_top = 1.0 }
+
+# Hero meow face: the open mouth, tongue, eyes, and cheek marks are sized for
+# terminal-scale recognition instead of retaining subpixel trace noise.
+[[layer]]
+role = "outline"
+ref_fill = "#2B2530"
+recolor = "fixed"
+paths = ["M 15 83 C 13 68 17 54 26 44 L 23 15 C 23 10 27 8 31 11 L 54 28 C 70 23 90 23 106 28 L 130 11 C 134 8 138 11 137 16 L 134 45 C 143 55 147 69 145 85 C 143 108 126 125 103 130 C 88 133 71 133 56 130 C 32 126 17 110 15 83 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#E2B184"
+recolor = "coat"
+paths = ["M 19 82 C 17 68 21 55 30 46 L 27 19 L 55 33 C 70 28 90 28 105 33 L 133 19 L 130 46 C 139 55 143 69 141 84 C 139 105 124 121 102 126 C 88 129 72 129 57 126 C 35 122 21 106 19 82 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#F39AAF"
+recolor = "fixed"
+paths = ["M 30 18 L 49 31 L 33 36 Z", "M 130 18 L 111 31 L 127 36 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#FFE9DD"
+recolor = "fixed"
+paths = ["M 56 82 C 56 74 65 70 77 76 C 79 77 80 78 80 80 C 80 78 81 77 83 76 C 95 70 104 74 104 82 C 104 91 97 96 92 97 C 90 106 85 111 80 111 C 75 111 70 106 68 97 C 63 96 56 91 56 82 Z"]
+
+[[layer]]
+role = "blush"
+ref_fill = "#F4879F"
+recolor = "fixed"
+paths = ["M 35 82 C 35 78 39 75 44 75 C 49 75 53 78 53 82 C 53 86 49 89 44 89 C 39 89 35 86 35 82 Z", "M 107 82 C 107 78 111 75 116 75 C 121 75 125 78 125 82 C 125 86 121 89 116 89 C 111 89 107 86 107 82 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2029"
+recolor = "fixed"
+paths = ["M 43 69 C 49 60 62 60 68 69 L 63 73 C 58 67 52 67 48 73 Z", "M 92 69 C 98 60 111 60 117 69 L 112 73 C 108 67 102 67 97 73 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#2A2029"
+recolor = "fixed"
+paths = ["M 67 87 C 67 81 73 79 80 83 C 87 79 93 81 93 87 C 93 99 87 108 80 108 C 73 108 67 99 67 87 Z"]
+
+[[layer]]
+role = "pink"
+ref_fill = "#F0718A"
+recolor = "fixed"
+paths = ["M 71 98 C 75 94 85 94 89 98 C 87 104 84 106 80 106 C 76 106 73 104 71 98 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#A84E69"
+recolor = "fixed"
+paths = ["M 73 80 C 73 75 78 74 80 78 C 82 74 87 75 87 80 C 87 84 83 87 80 89 C 77 87 73 84 73 80 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#FFF7EE"
+recolor = "fixed"
+paths = ["M 68 86 L 75 88 L 71 93 Z", "M 92 86 L 85 88 L 89 93 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#2B2530"
+recolor = "fixed"
+paths = ["M 54 86 L 7 80 L 7 83 L 55 89 Z", "M 54 94 L 4 97 L 4 100 L 55 97 Z", "M 56 101 L 14 114 L 13 111 L 55 98 Z", "M 106 86 L 153 80 L 153 83 L 105 89 Z", "M 106 94 L 156 97 L 156 100 L 105 97 Z", "M 104 101 L 146 114 L 147 111 L 105 98 Z"]

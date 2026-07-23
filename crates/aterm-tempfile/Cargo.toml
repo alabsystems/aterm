@@ -1,0 +1,15 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-tempfile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Zero-dependency temporary files and directories with RAII cleanup"
+
+[dependencies]
+
+[lints]
+workspace = true

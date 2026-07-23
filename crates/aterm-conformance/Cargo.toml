@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm VT conformance + integration tests, founded on the engine read API (feed -> read screen -> assert). The screen-reading oracle IS the introspection API."
+
+[dependencies]
+# Enable the `sixel` feature so the conformance binary compiles the decode +
+# inline-image placement path AND advertises DA1 code 4. This flips the whole
+# crate to the rendering path: the sixel locks below assert ACTUAL rendering
+# (cursor moves in scrolling mode, image is observable), not consume-only.
+aterm-core = { workspace = true, features = ["sixel"] }
+
+[dev-dependencies]
+aterm-types = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

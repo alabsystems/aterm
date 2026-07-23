@@ -1,0 +1,30 @@
+id = "acc_bow"
+kind = "accessory"
+viewbox = [64, 42]
+anchor = { eye_y = 0.50, center_x = 0.5, word_top = 1.0, attach = "left_ear" }
+
+# Compact hero bow. Every path belongs to the bow itself; the old pale backdrop
+# was intentionally discarded so overlays never stamp a rectangle.
+[[layer]]
+role = "outline"
+ref_fill = "#351D2C"
+recolor = "fixed"
+paths = ["M 28 13 C 21 8 11 3 6 6 C 1 10 1 31 6 36 C 12 40 22 34 29 29 C 31 32 35 32 37 29 C 44 34 54 40 59 36 C 64 31 64 10 59 6 C 54 3 44 8 37 13 C 35 10 31 10 28 13 Z"]
+
+[[layer]]
+role = "accessory"
+ref_fill = "#D83A4A"
+recolor = "fixed"
+paths = ["M 27 16 C 20 11 12 7 8 9 C 5 12 5 29 8 33 C 12 35 21 30 27 26 Z", "M 38 16 C 44 11 52 7 56 9 C 59 12 59 29 56 33 C 52 35 44 30 38 26 Z", "M 27 14 C 30 12 35 12 38 14 L 38 28 C 35 31 30 31 27 28 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#F16A72"
+recolor = "fixed"
+paths = ["M 9 11 C 13 9 20 12 25 16 L 25 19 C 19 16 14 14 9 15 Z", "M 55 11 C 51 9 44 12 39 16 L 39 19 C 45 16 50 14 55 15 Z", "M 29 15 C 31 14 34 14 36 15 L 36 18 L 29 18 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#8F2639"
+recolor = "fixed"
+paths = ["M 26 20 L 15 17 L 24 24 L 16 30 L 27 25 Z", "M 38 20 L 49 17 L 40 24 L 48 30 L 37 25 Z", "M 30 19 L 35 19 L 35 27 L 30 27 Z"]

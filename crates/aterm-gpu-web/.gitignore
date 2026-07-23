@@ -1,0 +1,6 @@
+/target
+/pkg
+/pkg-web
+# Locally-installed wasm-bindgen CLI pinned to the lockfile's wasm-bindgen version
+# (wgpu 29 requires >= 0.2.108; the system CLI is 0.2.100). Build artifact, not source.
+/.wbtool

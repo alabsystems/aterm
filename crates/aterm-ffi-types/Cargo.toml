@@ -1,0 +1,26 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-ffi-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FFI boundary types, error enums, safety helpers, and pointer lifecycle tracking for aterm"
+
+[features]
+default = []
+# Retained for downstream opt-in to per-call-site FFI trace logging. Panic
+# logging (F11-2, #7941) is always on and does not depend on this feature.
+ffi-logging = []
+
+[dependencies]
+aterm-types = { workspace = true }
+# Required unconditionally so `aterm_ffi_catch_unwind!` can log panics
+# even when the `ffi-logging` feature is off (silent panic masking —
+# F11-2, #7941).
+aterm-log = { workspace = true }
+
+[lints]
+workspace = true

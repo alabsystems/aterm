@@ -1,0 +1,14 @@
+/target
+/pkg
+/pkg-web
+# Locally-installed wasm-bindgen CLI pinned to the lockfile's wasm-bindgen version.
+# Build artifact, not source.
+/.wbtool
+*.node
+/iso.mjs
+/*.png
+# browser-proof: keep index.html + the runner; ignore generated wasm/js/font
+/browser-proof/*.wasm
+/browser-proof/*.js
+/browser-proof/*.d.ts
+/browser-proof/font.ttf

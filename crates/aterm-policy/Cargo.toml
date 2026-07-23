@@ -1,0 +1,32 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OSC / escape-sequence policy engine data model and built-in profiles (Phase 2 of #7874)"
+
+[features]
+default = []
+
+[dependencies]
+aterm-error = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+# web_time::Instant is a byte-identical re-export of std on native, but uses the
+# JS clock on wasm32 (where std::time::Instant::now() panics) — keeps the
+# TokenBucket rate-limiter on the engine-wide web_time discipline.
+web-time = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "policy_engine_hotpath"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,80 @@
+# Tone-of-typing HELD-OUT sanity set — the conformance tests' committed
+# expectations file (label <TAB> lang <TAB> text). NEVER fed to SGD: the
+# trainer refuses to write weights that do not clear the documented floors
+# here (overall >= 0.70; zh/ja/ko/en/es each >= 0.60), and
+# `holdout_sanity_set_clears_documented_floors` re-audits the committed
+# asset on every test run. Lines recombine the training distribution's
+# surface markers in fresh sentences — this audits asset integrity and
+# marker coverage, not scientific generalization (see tone_corpus.tsv's
+# methodology header).
+calm	en	okay that plan works, see you tomorrow
+calm	en	no worries, we have plenty of time
+calm	en	all quiet here, nothing to report
+calm	zh	好的，那就慢慢来吧
+calm	zh	没问题，一切都好
+calm	ja	わかりました、それで大丈夫です
+calm	ja	急がずゆっくりやりましょう
+calm	ko	네 알겠어요, 천천히 할게요
+calm	ko	괜찮아요, 문제 없습니다
+calm	es	tranquilo, lo hacemos con calma
+calm	es	todo bien por aquí, sin prisa
+calm	de	alles in ordnung, lass dir zeit
+calm	fr	pas de souci, on a le temps
+calm	ru	всё в порядке, не спеши
+excited	en	yes!! the release finally shipped!!
+excited	en	this demo is amazing, let's go!!
+excited	en	wow it passed every test, awesome!
+excited	zh	太好了！终于上线了！
+excited	zh	哇，这也太酷了吧！
+excited	ja	やった！テストが全部通った！
+excited	ja	すごい！本当に楽しみ！
+excited	ko	와!! 드디어 배포했어!
+excited	ko	대박이야, 정말 신나!
+excited	es	increíble, funcionó a la primera!!
+excited	es	qué emoción, salió genial!!
+excited	de	juhu, es funktioniert endlich!
+excited	fr	génial, on a réussi le lancement!!
+excited	ru	ура, наконец получилось!!
+frustrated	en	ugh the build is broken again
+frustrated	en	why does this test fail every time
+frustrated	en	i am so done with this bug
+frustrated	zh	又报错了，真受不了
+frustrated	zh	为什么还是不行，烦死了
+frustrated	ja	またエラーだ、もううんざり
+frustrated	ja	何度やっても失敗する、最悪
+frustrated	ko	또 에러야, 진짜 짜증나
+frustrated	ko	왜 계속 실패하는 거야
+frustrated	es	otra vez se rompió, qué rabia
+frustrated	es	estoy harto de que falle todo
+frustrated	de	schon wieder ein fehler, das nervt
+frustrated	fr	encore cassé, ras le bol
+frustrated	ru	опять сломалось, как же надоело
+playful	en	haha the cat sat on my keyboard again :3
+playful	en	hehe sneaky little easter egg
+playful	en	lol that gif is ridiculous
+playful	zh	哈哈哈笑死我了
+playful	zh	嘿嘿，小猫咪真调皮
+playful	ja	www 猫がキーボードで寝てる
+playful	ja	ふふ、面白すぎるよ
+playful	ko	ㅋㅋㅋㅋ 고양이 너무 귀여워
+playful	ko	ㅎㅎ 장난 좀 쳤어
+playful	es	jajaja el gatito es muy travieso
+playful	es	jeje qué broma tan boba
+playful	de	haha die katze schon wieder, zu süß
+playful	fr	mdr le chat dort sur le clavier
+playful	ru	ахаха котик опять смешит меня
+technical	code	git log --oneline -20
+technical	code	cargo test -p aterm-effects --lib
+technical	code	docker ps -a | grep exited
+technical	code	SELECT count(*) FROM sessions WHERE open;
+technical	code	tail -n 100 /var/log/syslog
+technical	en	the parser caches tokens per line
+technical	zh	重启之前先备份配置文件
+technical	zh	这个查询需要加索引
+technical	ja	再現手順をログに残してください
+technical	ja	この処理は非同期で実行されます
+technical	ko	배포 전에 로그를 백업하세요
+technical	ko	이 쿼리에는 인덱스가 필요합니다
+technical	es	añade un índice a esa consulta
+technical	es	el proceso corre en segundo plano
+technical	ru	добавь индекс для этого запроса

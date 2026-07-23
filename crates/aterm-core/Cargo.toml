@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — lean, headless VT terminal engine core"
+
+[features]
+default = ["disk-tier"]
+# Disk-backed scrollback cold tier, forwarded to aterm-grid AND aterm-scrollback
+# (aterm-core conditionally re-exports the latter's disk-tier types). DEFAULT-ON so
+# native builds are byte-identical; a wasm consumer disables it
+# (--no-default-features) to drop libc/zstd-sys.
+disk-tier = ["aterm-grid/disk-tier", "aterm-scrollback/disk-tier"]
+# Serde on the CheckpointMeta seam (seamless-update screen carry): derives on the
+# checkpoint's scalar projections only — grid bodies stay on the binary Line codec.
+serde = ["dep:serde", "aterm-types/serde"]
+# Opt-in heavyweight stress/stability integration tests (tests/stress_stability.rs).
+# Off by default to keep CI fast: `cargo test -p aterm-core --features long-tests`.
+long-tests = []
+# Opt-in deterministic fault injection (src/fault.rs): a thread-local registry so a
+# downstream/release test can force fail-closed branches (alloc/IO failure). OFF by
+# default — production `triggered()` is a const-false the optimizer folds away
+# (unit tests reach the registry via cfg(test) without this feature).
+fault-injection = []
+# Opt-in UAX #9 BiDi visual reordering bridge (terminal/bidi_reorder.rs). OFF by
+# default: with the feature off, `aterm-bidi` is not compiled into the engine and
+# the build is byte-identical. Consumers that render mixed LTR/RTL text enable it
+# to reach `Terminal::bidi_visual_order`. The render-time application of the
+# returned permutation is the renderer's job (the remaining integration step).
+bidi = ["dep:aterm-bidi"]
+# TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]`/`#[spec_unmodeled]`
+# anchors as part of the LIBRARY (not just the unit-test build) so a DOWNSTREAM test
+# binary — the relocated `spec_xref_closure` gate in aterm-gui's test build — can
+# COLLECT them via `inventory`. OFF by default: the production `cargo build` is
+# byte-identical (no `aterm-spec` in the closure, no `inventory` submissions). The
+# anchors stay `#[cfg_attr(any(test, feature = "spec-anchors"), …)]`, so aterm-core's
+# OWN unit-test build still expands them (Phase 0 unchanged) AND aterm-gui's gate
+# enables this feature to see them cross-crate.
+spec-anchors = ["dep:aterm-spec"]
+# Sixel graphics: compile the `aterm-sixel` decoder into the engine and route a
+# decoded raster into the existing inline-image placement/blit path (the OSC 1337
+# `File=` path). OFF by default: production `cargo build` is byte-identical — no
+# `aterm-sixel`, sixel DCS stays consume-only, and DA1 does NOT advertise code 4.
+# Enabled by the GUI/app crate (and aterm-conformance) where rendering is wanted.
+sixel = ["dep:aterm-sixel"]
+
+[dependencies]
+aterm-error = { workspace = true }
+# Optional: pulled into the LIBRARY only by the off-by-default `spec-anchors`
+# feature (the anchor macros emit `::aterm_spec::inventory::submit!`). Still a
+# dev-dependency below for aterm-core's own test build (Phase 0 gate + conformance).
+aterm-spec = { workspace = true, optional = true }
+aterm-log = { workspace = true }
+aterm-alloc = { workspace = true }
+aterm-bits = { workspace = true }
+aterm-hash = { workspace = true }
+aterm-codec = { workspace = true }
+aterm-rle = { workspace = true }
+aterm-tempfile = { workspace = true }
+aterm-types = { workspace = true }
+serde = { workspace = true, optional = true }
+aterm-provenance = { workspace = true, features = ["internal-mint"] }
+aterm-grapheme = { workspace = true }
+# Path (not `workspace = true`) so we can set default-features = false here without
+# forcing it on every workspace consumer; disk-tier is re-enabled by default via this
+# crate's own default = ["disk-tier"], so the native closure is unchanged.
+aterm-grid = { path = "../aterm-grid", default-features = false, features = ["alacritty-compat"] }
+aterm-parser = { workspace = true }
+aterm-scrollback = { workspace = true }
+aterm-ffi-types = { workspace = true }
+aterm-policy = { workspace = true }
+aterm-vi = { workspace = true }
+aterm-selection = { workspace = true }
+# `regex` enables regex-mode scrollback search (TerminalSearch::search_results_opts
+# with is_regex = true), surfaced by the GUI introspection `search` verb (SEARCH-1).
+aterm-search = { workspace = true, features = ["regex"] }
+aterm-shell-integration = { workspace = true }
+aterm-containment = { workspace = true }
+# Internal clock seam: std::time on native (byte-identical), JS clock on wasm32 so
+# the engine's Instant/SystemTime reads don't panic "time not implemented".
+web-time = { workspace = true }
+# Optional: UAX #9 BiDi reordering, pulled in only by the off-by-default `bidi`
+# feature. Not in the default production closure.
+aterm-bidi = { workspace = true, optional = true }
+# Optional: the sixel raster decoder, pulled into the LIBRARY only by the
+# off-by-default `sixel` feature (re-exported as `crate::sixel`). Also a
+# dev-dependency below so aterm-core's own `sixel`-gated proptests can build.
+aterm-sixel = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Test-only: trigger evaluation (`#[cfg(test)] mod triggers`, test_support/triggers/*)
+# is the sole `regex` consumer. Kept out of the production closure (§2.7 / A-4).
+regex = { workspace = true }
+proptest = { workspace = true }
+aterm-spec = { workspace = true }
+# Test-only: the `spec_xref_closure` gate (terminal/spec_xref_gate.rs) resolves
+# external `.tla` machine names against the ISOLATION-family specs in this crate
+# (TRUST_NATIVE_TLA §2.2 obligation 4). Test-only, so it stays out of the
+# production closure.
+aterm-spec-models = { workspace = true }
+# Test-only: expose aterm-grid's testing-gated facade items (ExtendedStyleInfo,
+# DamageRect, with_style_id, is_combining_mark, …) re-exported under
+# `#[cfg(any(test, feature = "testing"))]` in `grid/mod.rs`. Resolver 2
+# keeps this out of the production `cargo build`.
+aterm-grid = { path = "../aterm-grid", default-features = false, features = ["alacritty-compat", "testing"] }
+
+[lints]
+workspace = true

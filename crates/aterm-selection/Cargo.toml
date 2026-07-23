@@ -1,0 +1,19 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-selection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Smart semantic selection and text selection state machines for terminal text"
+
+[dependencies]
+aterm-ffi-types = { workspace = true }
+aterm-grapheme = { workspace = true }
+aterm-types = { workspace = true }
+regex = { workspace = true }
+
+[lints]
+workspace = true

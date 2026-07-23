@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — a transparent, introspecting terminal: runs your shell unchanged while the engine builds a live model the AI can read (U1)."
+
+[dependencies]
+aterm-core = { workspace = true }
+# P0: the daily-driver CLI runs the shell through the PROTECTED spawn seam
+# (cap-gated + setrlimit-bounded + fail-closed fork/exec + OS-sandbox-wrapped when
+# the mode demands it), exactly like aterm-gui — not raw forkpty/execvp.
+aterm-pty = { workspace = true }
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
+aterm-sandbox = { workspace = true }
+aterm-containment = { workspace = true }
+# Read-only introspection sources for the `aterm` diagnostic subcommands
+# (CLI-DIAG): font enumeration / face metrics for `list-fonts` / `show-face`
+# (aterm-render), and the built-in colour-scheme registry for `list-themes`
+# (aterm-types). Neither is on the shell hot path — they are only reached by a
+# diagnostic subcommand that prints and exits before any PTY spawn.
+aterm-render = { workspace = true }
+aterm-types = { workspace = true }
+
+# The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
+# the Windows driver is kernel32 console FFI with no libc.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

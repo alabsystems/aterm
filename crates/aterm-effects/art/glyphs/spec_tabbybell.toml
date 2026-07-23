@@ -1,0 +1,71 @@
+id = "spec_tabbybell"
+kind = "special"
+viewbox = [150, 160]
+anchor = { eye_y = 0.38, center_x = 0.5, word_top = 1.0 }
+
+# Biscuit: a seated tabby with a quiet smile and one small brass bell.
+[[layer]]
+role = "outline"
+ref_fill = "#342B35"
+recolor = "fixed"
+paths = ["M 22 63 C 20 49 24 38 34 30 L 31 10 C 31 5 35 3 39 7 L 55 20 C 68 16 83 16 96 21 L 113 8 C 117 5 121 8 120 13 L 117 34 C 126 43 129 55 126 67 C 123 86 108 98 90 102 C 72 106 53 102 40 94 C 29 87 23 77 22 63 Z", "M 39 94 C 25 108 27 139 42 153 C 56 164 98 164 111 151 C 123 136 119 108 101 96 Z", "M 105 130 C 123 123 139 130 139 141 C 139 153 121 158 106 151 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#C99B70"
+recolor = "coat"
+paths = ["M 27 62 C 25 50 29 41 39 33 L 36 14 L 55 26 C 68 22 83 22 96 27 L 115 14 L 112 36 C 120 44 124 54 121 66 C 119 82 106 93 89 97 C 73 101 56 97 44 90 C 34 84 28 75 27 62 Z", "M 44 98 C 33 111 34 135 46 147 C 59 157 94 157 106 146 C 116 133 112 111 98 101 Z", "M 108 133 C 123 128 134 133 134 141 C 134 149 121 153 109 148 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#ECA0AA"
+recolor = "fixed"
+paths = ["M 37 13 L 52 25 L 39 30 Z", "M 115 14 L 100 26 L 112 31 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#71554E"
+recolor = "fixed"
+paths = ["M 61 20 L 68 40 L 61 46 L 54 28 Z", "M 76 18 L 81 42 L 74 47 L 69 23 Z", "M 91 21 L 96 40 L 89 46 L 84 26 Z", "M 32 68 L 52 63 L 54 69 L 34 75 Z", "M 118 68 L 98 63 L 96 69 L 116 75 Z", "M 51 112 L 66 108 L 68 116 L 53 120 Z", "M 97 112 L 84 108 L 82 116 L 95 120 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F4DDCD"
+recolor = "fixed"
+paths = ["M 52 63 C 52 56 59 53 69 58 C 70 59 70 60 71 61 C 72 60 72 59 73 58 C 83 53 90 56 90 63 C 90 74 82 80 71 80 C 60 80 52 74 52 63 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 42 51 C 49 43 59 43 66 51 L 62 55 C 57 49 51 49 46 55 Z", "M 78 51 C 85 43 95 43 102 51 L 98 55 C 93 49 87 49 82 55 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#A95B70"
+recolor = "fixed"
+paths = ["M 66 60 C 66 57 69 56 71 59 C 73 56 76 57 76 60 C 76 64 74 66 71 68 C 68 66 66 64 66 60 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 69 67 L 73 67 L 73 71 C 77 74 81 72 83 69 C 82 77 76 80 71 75 C 66 80 60 77 59 69 C 61 72 65 74 69 71 Z"]
+
+[[layer]]
+role = "accessory"
+ref_fill = "#B94F5A"
+recolor = "fixed"
+paths = ["M 40 88 C 58 95 84 95 103 88 L 104 99 C 85 106 58 106 39 99 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#B98C50"
+recolor = "fixed"
+paths = ["M 63 100 C 63 94 68 90 74 90 C 80 90 85 94 85 100 C 85 107 80 112 74 112 C 68 112 63 107 63 100 Z", "M 71 95 L 77 95 L 77 106 L 71 106 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#342B35"
+recolor = "fixed"
+paths = ["M 47 68 L 12 65 L 12 67 L 47 71 Z", "M 47 73 L 9 77 L 9 80 L 48 76 Z", "M 95 68 L 130 65 L 130 67 L 95 71 Z", "M 95 73 L 133 77 L 133 80 L 94 76 Z"]

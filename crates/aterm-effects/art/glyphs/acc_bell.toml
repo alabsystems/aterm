@@ -1,0 +1,35 @@
+id = "acc_bell"
+kind = "accessory"
+viewbox = [48, 56]
+anchor = { eye_y = 0.50, center_x = 0.5, word_top = 1.0, attach = "collar" }
+
+# A compact collar bell with no backdrop or sampled shadow.
+[[layer]]
+role = "outline"
+ref_fill = "#352A24"
+recolor = "fixed"
+paths = ["M 17 14 L 17 9 C 17 3 31 3 31 9 L 31 14 C 39 18 43 28 43 39 C 43 43 40 46 36 46 L 30 46 C 30 52 27 55 24 55 C 21 55 18 52 18 46 L 12 46 C 8 46 5 43 5 39 C 5 28 9 18 17 14 Z"]
+
+[[layer]]
+role = "accessory"
+ref_fill = "#F0B431"
+recolor = "fixed"
+paths = ["M 20 15 L 20 9 C 20 7 28 7 28 9 L 28 15 C 35 18 39 28 39 38 C 39 41 37 42 34 42 L 14 42 C 11 42 9 41 9 38 C 9 28 13 18 20 15 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#FFD867"
+recolor = "fixed"
+paths = ["M 14 24 C 18 18 24 16 29 18 C 22 20 17 25 15 33 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#9B6A22"
+recolor = "fixed"
+paths = ["M 9 36 C 18 33 30 33 39 36 L 39 41 C 30 39 18 39 9 41 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#6A4631"
+recolor = "fixed"
+paths = ["M 21 44 C 21 41 23 40 24 40 C 26 40 28 42 28 45 C 28 50 26 52 24 52 C 22 52 21 49 21 44 Z"]

@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Tier-1 conformance + on-GPU clamp laws for the M3 phase-B EDR ("HDR glow")
+//! present gate.
+//!
+//! ## Two-tier proof (the boolean policy)
+//!
+//! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
+//!   `HdrPresentGate` derived model (`aterm_spec::derive::hdr_present_gate_model`)
+//!   carries `SdrInvariance` / `BoostNeedsLinearF16` / `F16NeedsSupport`.
+//!   `cargo test -p aterm-spec`
+//!   (`derived_hdr_present_gate_proves_and_catches_hdr_without_optin`) runs the
+//!   REAL `ty` binary over the whole bounded state space: it PROVES the
+//!   invariants at `Buggy=0` and CATCHES the config-ignoring attach at `Buggy=1`.
+//! * **Tier-1 (concrete, this file)** — the SHIPPING policy functions
+//!   [`aterm_gpu::hdr_swapchain_wants_f16`] (Attach) and
+//!   [`aterm_gpu::hdr_present_plan`] (Present) have a finite boolean domain, so
+//!   we don't sample: every 2^3 Attach→Present chain AND every 2^3 raw plan
+//!   input (covering the live config-flip states where the surface format no
+//!   longer matches the config) is enumerated — a complete proof for the real
+//!   code, with non-vacuity controls.
+//!
+//! ## On-GPU clamp laws (the float pipeline)
+//!
+//! The `gpu_*` tests drive the REAL `fs_blit` `hdr` arm and the REAL EDR aurora
+//! pass through `present_hdr_for_test` (an `Rgba16Float` swapchain stand-in,
+//! half-float readback) and assert the two laws `aterm_render::hdr` proves in
+//! the abstract (exhaustive sweeps + trust-mc):
+//! (1) GRID CLAMP — the non-additive stream never exceeds 1.0, and equals the
+//! linear decode of the SDR readback byte-for-byte (within f16 quantization);
+//! (2) ADDITIVE CLAMP — with the aurora pass on, no channel exceeds the
+//! sanitized EDR max, and (non-vacuity) some channel genuinely exceeds 1.0.
+//! Gated: no GPU / no system font -> the test no-ops (returns), like the other
+//! differential suites.
+
+use aterm_core::terminal::Terminal;
+use aterm_gpu::{GpuRenderer, WindowGpu, hdr_present_plan, hdr_swapchain_wants_f16};
+use aterm_render::{GlowQuad, RenderInput, hdr, premul_rgb};
+
+/// Iterate every (hdr_glow, supports_f16, glow_nonempty) tuple over {false,true}^3.
+fn all_inputs() -> impl Iterator<Item = (bool, bool, bool)> {
+    (0u32..8).map(|bits| {
+        let b = |i: u32| (bits >> i) & 1u32 == 1;
+        (b(0), b(1), b(2))
+    })
+}
+
+/// Tier-1, complete: chain the SHIPPING Attach decision into the SHIPPING
+/// Present plan for every input combination and check the three model
+/// invariants on the outcome — plus the raw plan over ALL surface states
+/// (including the live-flip mismatches an Attach chain cannot reach).
+#[test]
+fn hdr_gate_exhaustive_attach_present_chain() {
+    let mut boosted = 0usize;
+    let mut f16_chosen = 0usize;
+    for (hdr_glow, supports_f16, glow) in all_inputs() {
+        // Attach: the swapchain format decision (create_window_surface's seam).
+        let is_f16 = hdr_swapchain_wants_f16(hdr_glow, supports_f16);
+        // Present: the per-frame plan (present_input's seam).
+        let plan = hdr_present_plan(hdr_glow, is_f16, glow);
+
+        // F16NeedsSupport: the EDR format is never picked without support.
+        assert!(
+            !is_f16 || supports_f16,
+            "({hdr_glow},{supports_f16},{glow}): f16 without surface support"
+        );
+        // SdrInvariance: hdr off => nothing HDR anywhere in the chain.
+        if !hdr_glow {
+            assert!(
+                !is_f16 && !plan.blit_linear_encode && !plan.glow_boost_pass,
+                "({hdr_glow},{supports_f16},{glow}): SDR invariance violated"
+            );
+        }
+        // BoostNeedsLinearF16: a >1.0 emission only on a linear-decoded f16 target.
+        assert!(
+            !plan.glow_boost_pass || (plan.blit_linear_encode && is_f16),
+            "({hdr_glow},{supports_f16},{glow}): boost without a linear f16 blit"
+        );
+        // The encode follows the SURFACE, exactly.
+        assert_eq!(
+            plan.blit_linear_encode, is_f16,
+            "({hdr_glow},{supports_f16},{glow}): encode must track the actual format"
+        );
+        boosted += usize::from(plan.glow_boost_pass);
+        f16_chosen += usize::from(is_f16);
+    }
+    // NON-VACUITY: the invariants above must not hold because the gate is dead.
+    assert_eq!(f16_chosen, 2, "f16 is chosen iff hdr_glow AND supports_f16");
+    assert_eq!(
+        boosted, 1,
+        "the aurora pass fires exactly for (on, f16, glow)"
+    );
+
+    // The RAW plan over every surface state — covers a swapchain whose format no
+    // longer matches what the current config would pick (live flips): an 8-bit
+    // surface NEVER decodes/boosts, an f16 surface ALWAYS decodes, and switching
+    // hdr_glow off kills the boost even on a still-f16 surface.
+    for (hdr_glow, is_f16, glow) in all_inputs() {
+        let plan = hdr_present_plan(hdr_glow, is_f16, glow);
+        assert_eq!(plan.blit_linear_encode, is_f16);
+        assert_eq!(plan.glow_boost_pass, hdr_glow && is_f16 && glow);
+    }
+}
+
+/// A tiny glow-bearing frame: an all-background grid with a row of
+/// premultiplied LUMEN quads (the glow_parity construction), cursor hidden so
+/// the pixels are exactly bg + aurora.
+fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput {
+    let (cw, ch) = cpu_cell;
+    let mut t = Terminal::new(rows as u16, cols as u16);
+    let mut input = t.cell_frame(rows, cols);
+    input.cursor_visible = false;
+    let base = 0x0050_FA7B; // Dracula green
+    for (i, a) in [40u8, 90, 160, 220, 255].iter().enumerate() {
+        let col = i + 1;
+        input.cursor_glow_add.push(GlowQuad {
+            row: 1,
+            x: (col * cw) as u16,
+            y: ch as u16,
+            w: cw as u16,
+            h: ch as u16,
+            color: premul_rgb(base, *a),
+        });
+    }
+    input
+}
+
+fn gpu(px: f32) -> Option<GpuRenderer> {
+    match GpuRenderer::new(px, aterm_render::Theme::default()) {
+        Ok(mut g) => {
+            // Deterministic expectations: the bloom halo is a separate additive
+            // layer over the offscreen, orthogonal to the laws under test.
+            g.set_bloom(false);
+            g.set_shimmer(false);
+            Some(g)
+        }
+        Err(e) => {
+            eprintln!("SKIP: no GPU/font available: {e}");
+            None
+        }
+    }
+}
+
+/// GRID CLAMP LAW on the REAL pipeline: with `hdr_glow` on and real headroom,
+/// the blit stream (no aurora pass) never leaves [0, 1] — and every channel
+/// equals `aterm_render::hdr::hdr_grid_encode` of the SDR readback byte within
+/// f16 quantization, so the EDR grid is exactly the linear reading of the SDR
+/// frame (identical on glass at reference white).
+#[test]
+fn gpu_hdr_blit_grid_clamped_and_linear() {
+    let Some(mut gpu) = gpu(18.0) else { return };
+    gpu.set_hdr_glow(true);
+    let mut win = WindowGpu::new();
+    win.set_edr_max(2.0);
+    let (cw, ch) = gpu.cell_size();
+    let input = glow_input((cw, ch), 4, 16);
+
+    // The SDR source of truth (this also proves the readback path is UNTOUCHED
+    // by the HDR config: same bytes as every parity suite pins).
+    let sdr = gpu.render_input(&mut win, &input, None);
+    // The EDR present WITHOUT the aurora pass: pure grid stream.
+    let (hdrpix, w, h) = gpu.present_hdr_for_test(&mut win, &input, false);
+    assert_eq!((w as usize, h as usize), (sdr.width, sdr.height));
+
+    let mut max_dev = 0.0f32;
+    for (i, &px) in sdr.pixels.iter().enumerate() {
+        for (ch_i, shift) in [(0usize, 16u32), (1, 8), (2, 0)] {
+            let byte = ((px >> shift) & 0xff) as u8;
+            let got = hdrpix[i * 4 + ch_i];
+            assert!(
+                (0.0..=1.0).contains(&got),
+                "pixel {i} ch {ch_i}: grid stream escaped [0,1]: {got}"
+            );
+            let want = hdr::hdr_grid_encode(byte);
+            max_dev = max_dev.max((got - want).abs());
+        }
+    }
+    // f16 quantization near 1.0 is ~4.9e-4; GPU pow adds noise well below 5e-3.
+    assert!(
+        max_dev <= 5e-3,
+        "EDR grid must be the linear decode of the SDR bytes (max dev {max_dev})"
+    );
+}
+
+/// ADDITIVE CLAMP LAW on the REAL pipeline: with the aurora pass on and a
+/// 2.0x panel, no channel exceeds the sanitized EDR max — and (non-vacuity)
+/// the aurora genuinely emits ABOVE reference white, the whole point of M3.
+/// On an SDR panel (edr_max = 1.0, headroom 0) the pass provably adds nothing:
+/// output equals the pass-less present exactly.
+#[test]
+fn gpu_hdr_aurora_bounded_by_edr_and_nonvacuous() {
+    let Some(mut gpu) = gpu(18.0) else { return };
+    gpu.set_hdr_glow(true);
+    let mut win = WindowGpu::new();
+    let (cw, ch) = gpu.cell_size();
+    let input = glow_input((cw, ch), 4, 16);
+
+    // 2.0x EDR panel: bounded by 2.0, and some pixel must exceed 1.0.
+    win.set_edr_max(2.0);
+    let edr_bound = hdr::sanitize_edr_max(2.0);
+    let (lit, _, _) = gpu.present_hdr_for_test(&mut win, &input, true);
+    let mut over_white = 0usize;
+    for (i, &v) in lit.iter().enumerate() {
+        if i % 4 == 3 {
+            continue; // alpha: COLOR write-mask leaves the blit's 1.0
+        }
+        assert!(
+            v >= 0.0 && v <= edr_bound + 1e-3,
+            "channel {i} exceeded the panel EDR max: {v} > {edr_bound}"
+        );
+        if v > 1.0 {
+            over_white += 1;
+        }
+    }
+    assert!(
+        over_white > 0,
+        "NON-VACUITY: the EDR aurora must emit above reference white somewhere"
+    );
+
+    // SDR panel: headroom 0 -> the pass adds nothing (bit-identical output).
+    win.set_edr_max(1.0);
+    let (flat_boost, _, _) = gpu.present_hdr_for_test(&mut win, &input, true);
+    let (flat_plain, _, _) = gpu.present_hdr_for_test(&mut win, &input, false);
+    assert_eq!(
+        flat_boost, flat_plain,
+        "zero headroom must make the aurora pass a provable no-op"
+    );
+    for &v in &flat_boost {
+        assert!(v <= 1.0, "SDR-panel present must stay at reference white");
+    }
+}
+
+/// SDR INVARIANCE at the present seam, on the REAL pipeline: with `hdr_glow`
+/// OFF the plan keeps the aurora pass off even when the caller asks for it and
+/// glow quads exist — no channel ever exceeds 1.0. (The attach seam's half —
+/// an SDR window never gets an f16 swapchain at all — is the exhaustive test
+/// above plus the readback byte-identity every parity suite pins.)
+#[test]
+fn gpu_hdr_off_never_boosts() {
+    let Some(mut gpu) = gpu(18.0) else { return };
+    gpu.set_hdr_glow(false);
+    let mut win = WindowGpu::new();
+    win.set_edr_max(16.0); // maximum temptation
+    let (cw, ch) = gpu.cell_size();
+    let input = glow_input((cw, ch), 4, 16);
+    let (pix, _, _) = gpu.present_hdr_for_test(&mut win, &input, true);
+    for (i, &v) in pix.iter().enumerate() {
+        assert!(
+            v <= 1.0,
+            "channel {i}: hdr_glow off must never emit above reference white ({v})"
+        );
+    }
+}

@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# cargo-deny configuration for the aterm workspace.
+# ---------------------------------------------------------------------------
+# aterm is built and shipped OFFLINE from a pinned, locally-cached/vendored
+# dependency set (see Cargo.lock + the "present in local cargo cache for offline
+# builds" note in the workspace Cargo.toml). This file is the offline
+# supply-chain audit policy for that set: it lets a maintainer run
+#
+#     cargo deny check
+#
+# to gate on security advisories, dependency bans, license policy, and source
+# provenance. With a vendored advisory DB it runs without network access:
+#
+#     cargo deny --offline check
+#
+# cargo-deny is OPTIONAL tooling. It is NOT required to build or test aterm and
+# is NOT promised in CI. The script that wraps it (scripts/audit-supply-chain.sh)
+# skips gracefully when the binary is absent — mirroring how the Kani lane skips
+# when trust-mc is missing.
+#
+# Schema: cargo-deny v2 (the current `[graph]`/`[advisories]`/`[licenses]`/
+# `[bans]`/`[sources]` layout; no `version` keys, no removed fields such as
+# `[licenses].deny`/`copyleft` or `[advisories].vulnerability`/`notice`). Keep
+# it conservative: warn — don't hard-fail — on things inherent to a large
+# GPU/GUI dependency tree (e.g. duplicate transitive versions) so a routine
+# audit stays signal, not noise.
+# ---------------------------------------------------------------------------
+
+# Evaluate the dependency graph for all targets aterm actually supports, so the
+# audit covers the macOS (objc2/metal), Linux (wayland/x11/drm), and Windows
+# (windows-sys) backends of the GPU renderer rather than just the host triple.
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Audit the default feature set. dev-dependencies (proptest/criterion) stay in
+# the graph and are therefore in scope for advisories and licensing.
+all-features = false
+no-default-features = false
+
+# ---------------------------------------------------------------------------
+# Security advisories (RustSec). Run with a locally-cloned advisory DB for a
+# fully offline audit: `cargo deny --offline check advisories`.
+# ---------------------------------------------------------------------------
+[advisories]
+# RustSec advisory DB source. Cloned/refreshed out-of-band; `--offline` reuses
+# the local checkout without fetching. (Crates with a known vulnerability are
+# ALWAYS an error in cargo-deny v2 — there is no knob to downgrade that, which
+# is exactly the conservative behaviour we want.)
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Fail the audit if any resolved crate version has been yanked from the registry
+# (a strong supply-chain signal for an offline/pinned tree).
+yanked = "deny"
+# Surface unmaintained / unsound advisories across the whole graph so nothing
+# hides in a transitive dep, but treat them as informational (they do not, on
+# their own, fail the audit the way a vulnerability or yank does).
+unmaintained = "all"
+unsound = "all"
+# No advisories are ignored. If a future advisory needs a vetted, time-boxed
+# exception, add its RUSTSEC id here with a comment explaining why and the plan
+# to remove it — never blanket-ignore.
+ignore = []
+
+# ---------------------------------------------------------------------------
+# License policy. The allowlist below was derived from the ACTUAL resolved tree
+# (412 packages in Cargo.lock as audited 2026-06): every crate's SPDX expression
+# is satisfied by this set, with zero crates left unsatisfied. It is an
+# Apache-2.0-compatible permissive allowlist — the workspace itself is
+# Apache-2.0 (see Cargo.toml [workspace.package]).
+#
+# Notable deliberate EXCLUSIONS (kept off the allowlist on purpose, and still
+# safe because each such crate dual-licenses under a permissive alternative that
+# IS allowed, so its `OR` expression is satisfied without them):
+#   * LGPL-2.1-or-later  — r-efi is "MIT OR Apache-2.0 OR LGPL-2.1-or-later";
+#                          the MIT/Apache arm satisfies it. We do not want to
+#                          broadly bless copyleft.
+#   * Unlicense          — aho-corasick/memchr/walkdir/same-file/termcolor/
+#                          winapi-util are all "Unlicense OR MIT"; the MIT arm
+#                          satisfies them. Public-domain dedications are left
+#                          off the explicit allowlist.
+# If a future dependency forces one of these as its ONLY license, that is a
+# conscious policy decision to make here — not something to allow silently.
+# ---------------------------------------------------------------------------
+[licenses]
+# Permissive licenses present in (and required by) the resolved tree. Each line
+# notes a representative crate that pulls the license in without a permissive
+# OR-alternative, i.e. the reason it MUST be on the list.
+allow = [
+    "Apache-2.0",   # workspace license + many deps
+    "MIT",          # the dominant permissive license in the tree
+    "BSD-2-Clause", # arrayref
+    "BSD-3-Clause", # tiny-skia, tiny-skia-path
+    "CC0-1.0",      # hexf-parse
+    "ISC",          # libloading
+    "Unicode-3.0",  # unicode-ident: "(MIT OR Apache-2.0) AND Unicode-3.0"
+    "Zlib",         # foldhash, slotmap
+]
+# Per-crate license exceptions (allow a license only for the named crate). None
+# are needed today: the rustix / wasi / wit-* / linux-raw-sys family is
+# "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT", whose plain-Apache-2.0
+# (and MIT) arms are already allowed, so the WITH-exception arm never has to be
+# reached. Add narrowly-scoped entries here, e.g.
+#   { allow = ["OpenSSL"], name = "ring" }
+# rather than widening the global allow list above.
+exceptions = []
+# Confidence required for the license-text matcher to accept a crate's declared
+# license. 0.8 is cargo-deny's default; keep it strict.
+confidence-threshold = 0.8
+# Every crate in the current tree declares a parseable SPDX expression, so no
+# `[[licenses.clarify]]` entries are needed. If a future dependency ships a
+# license file without a parseable SPDX header, add a narrowly-scoped,
+# hash-pinned clarify entry here rather than lowering the confidence above.
+
+# ---------------------------------------------------------------------------
+# Bans: dependency hygiene. The tree is large (a GPU/GUI terminal pulls in the
+# wgpu/winit/wayland/objc2 stacks), so duplicate transitive versions are a fact
+# of life — we WARN on them (so they stay visible and can be deduplicated as the
+# ecosystem converges) rather than hard-failing an otherwise-clean audit.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+# A wildcard ("*") version requirement is a supply-chain hazard (it floats to
+# whatever happens to resolve) — forbid it.
+wildcards = "deny"
+# ...but allow wildcard requirements between the workspace's own path crates
+# (the internal aterm-* members reference each other by path, not by a pinned
+# registry version), which are not a registry-floating risk.
+allow-wildcard-paths = true
+# `atpkg` promotes `ring` to a DELIBERATE, load-bearing DIRECT dependency: it is the
+# Ed25519 verify root of the toolchain package manager's two-tier signature anchor
+# (docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13 — the offline root key signs index.toml, a
+# delegated release key signs each pkg.toml, both verified over the EXACT raw manifest
+# bytes). ring was previously only a TRANSITIVE dep (via rustls); making it a direct
+# edge is a conscious supply-chain decision, recorded here rather than left implicit.
+#
+# cargo-deny has NO "require-crate-present" knob, so this file CANNOT assert that ring
+# exists on the verify path. Presence is instead guaranteed structurally: ring is a
+# hard direct dependency of crates/atpkg (the workspace will not compile without it).
+# What the entry below DOES enforce is the other half — that ring never drifts BELOW
+# the audited floor (0.17.14). A future rustls bump that switched its backend to
+# aws-lc-rs would drop ring from rustls's subtree, but atpkg's own direct edge keeps it
+# present and at/above the floor regardless.
+#
+# To outright ban a crate, add e.g.
+#   { name = "openssl", reason = "atpkg's crypto root is ring (pure-Rust); do not add a second C TLS/crypto stack" }
+# with a reason string.
+deny = [
+    { name = "ring", version = "<0.17.14", reason = "atpkg's load-bearing Ed25519 verify root (TOOLCHAIN-PACKAGE-MANAGER.md S8/S13): never allow it to drift below the audited, vendored floor on the verify path" },
+    { name = "tar", version = "<0.4.44", reason = "atpkg's bundle extractor (TOOLCHAIN-PACKAGE-MANAGER.md S13/S15): pin the tar reader at/above the audited floor — extraction is attacker-influenced input, so a known-bad tar version must never slip in. NOTE: cargo-deny is not installed in the current dev env, so this floor is inspection-only until it can run (same caveat as the ring ban)" },
+]
+# Crates explicitly allowed to appear more than once (none pinned yet — the
+# warn-level policy above already keeps duplicates non-fatal).
+skip = []
+# Subtrees whose internal duplicates are ignored wholesale (none needed yet).
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources: provenance. aterm pins all crates from crates.io and uses no git
+# dependencies; the offline cache/vendor dir is populated from exactly these.
+# Any crate from an unknown registry or a git source is a hard failure — that is
+# the supply-chain boundary this section enforces.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The only registry aterm draws from.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git sources are permitted (the workspace's only path deps are the internal
+# aterm-* crates, which are not "sources" in cargo-deny's sense).
+allow-git = []

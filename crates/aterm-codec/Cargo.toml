@@ -1,0 +1,19 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Base64 and hex encoding/decoding for aterm: zero external dependencies"
+
+[dependencies]
+# None — pure std
+
+[dev-dependencies]
+# None — tests use only std
+
+[lints]
+workspace = true

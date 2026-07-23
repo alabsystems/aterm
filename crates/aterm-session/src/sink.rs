@@ -1,0 +1,1070 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The single serialization point for all bytes entering one session's PTY master
+//! (design §6.3).
+
+use std::collections::VecDeque;
+use std::io;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::{Arc, Condvar, Mutex};
+
+/// The ONE place bytes enter a session's PTY master fd. Every writer — the GUI
+/// keyboard, every control verb, the future `keys` forwarder, and the reader
+/// thread's query replies — funnels through [`SinkWriter::write_frame`], so two
+/// writers can never interleave bytes INSIDE one frame (whole-frame atomicity).
+/// Without this, two edges writing prompts larger than `PIPE_BUF` (512 on Darwin)
+/// would shred each other — the multi-writer-corruption hazard the design calls out.
+///
+/// Ordering guarantee: **total order per sink, arbitrary fairness across writers,
+/// whole-frame atomicity**.
+///
+/// ## Backpressure scope (honest)
+///
+/// The master stays in BLOCKING mode. [`SinkWriter::write_frame`] keeps the Phase 0
+/// semantics: the whole frame is written under the lock, blocking the caller while
+/// a wedged foreground drains. The first §6.2 milestone layers on top as
+/// [`SinkWriter::write_frame_nonparking`] (the UI keystroke egress): each byte is
+/// written only after a `poll(2)` `POLLOUT` check (writable guarantees only SOME
+/// room, and a blocking pty write larger than the free room parks until it ALL
+/// fits — so one byte per check is the only parking-free unit), spilling the
+/// remainder to an in-order buffer a detached drainer thread feeds out when the
+/// kernel has no room — so one keypress into a wedged program can no longer park
+/// the event loop. Frames larger than `NONPARK_MAX` take the blocking path so bulk
+/// producers (paste, control verbs — expendable threads) feel the `SPILL_CAP`
+/// backpressure instead of growing the spill without bound. While ANY spilled
+/// bytes are undelivered, every writer (blocking ones included) queues behind
+/// them, so the total order per sink and whole-frame atomicity survive the spill.
+/// A spilled frame's `Ok(len)` means ACCEPTED-FOR-DELIVERY (in order, unless the
+/// peer closes first), no longer delivered-to-the-kernel. The per-edge token
+/// bucket remains future work; [`aterm_pty::write_some`] already returns the true
+/// accepted count, so that layer still won't change this interface.
+///
+/// ## fd ownership (the close-vs-use race fix)
+///
+/// A sink built with [`SinkWriter::new_owned`] OWNS the master fd: it is closed
+/// exactly when the LAST `Arc<SinkWriter>` clone drops (via the held [`OwnedFd`]) —
+/// never by an out-of-band `close()`. Every party that uses the master holds an
+/// `Arc<SinkWriter>` clone (the session reader thread, each window's mirror, each
+/// in-flight control verb), so the fd number cannot be freed — and therefore cannot
+/// be recycled by a subsequent `forkpty` — while any reader is parked in
+/// `read(master)` or any writer is inside `write_frame`. The GUI/reader still use
+/// the RAW fd (via [`SinkWriter::master`]) for read/resize, valid for exactly as
+/// long as they hold their clone. (Previously `Session::drop` `close()`d a bare
+/// `i32` on a detached thread, racing the still-parked reader and the live sink
+/// mirrors — a recycled fd could then route a read or a keystroke to the WRONG
+/// session.) [`SinkWriter::new`] keeps the old BORROWED semantics (no close) for
+/// test stubs and sentinel (`-1`) fds.
+pub struct SinkWriter {
+    /// The raw master fd, used directly for write/read/resize. Equals the owned fd's
+    /// number when `_owned` is `Some`; a borrowed/sentinel number otherwise.
+    master: i32,
+    /// Ownership token: `Some` iff this sink OWNS the fd (built via `new_owned`), in
+    /// which case dropping the last `Arc<SinkWriter>` closes it. `None` for borrowed
+    /// fds / `-1` stubs (no close — unchanged legacy behavior). Held only for its
+    /// `Drop`; never read.
+    #[cfg(unix)]
+    _owned: Option<OwnedFd>,
+    /// Windows twin of the ownership token: the RAII [`aterm_pty::OwnedMaster`]
+    /// around the opaque ConPTY registry key — its `Drop` (on the last
+    /// `Arc<SinkWriter>` clone) closes the session, the same
+    /// close-on-last-drop discipline the `OwnedFd` provides on Unix.
+    #[cfg(windows)]
+    _owned: Option<aterm_pty::OwnedMaster>,
+    /// The write-serialization + wedged-tty spill state, behind its own `Arc` so the
+    /// detached spill DRAINER thread can hold it without holding the sink itself
+    /// (the drainer pins the PTY via its own `dup(2)`'d fd — see [`Shared`]).
+    shared: Arc<Shared>,
+}
+
+/// The serialization + spill state one [`SinkWriter`] and its (at most one) spill
+/// drainer thread share. Lock ORDER: `lock` may be taken and then `spill` (the
+/// direct-write paths), or either alone — never `spill` then `lock` while holding
+/// `spill` (the drainer peeks `spill`, RELEASES it, then takes `lock` to write), so
+/// the pair cannot invert.
+// trust::paired — opts Shared into the toolchain's PAIRED-CONDVAR certificate:
+// a whole-crate, fail-closed proof that the private `drained` Condvar is only
+// ever waited with a guard obtained from its fixed sibling `spill` Mutex of the
+// SAME instance (and never escapes), which discharges std Condvar::wait's
+// multi-mutex re-entrancy panic at the wait site below. Any future second wait
+// site, field escape, or cross-instance guard threading DECERTIFIES the pair
+// and the wait returns as a fatal absent-callee row (never a silent pass).
+#[cfg_attr(trust_verify, trust::paired)]
+struct Shared {
+    /// Serializes whole frames. Held for the duration of one fd write so no other
+    /// writer's bytes interleave. A poisoned lock is recovered (we never panic a
+    /// writer thread for the fd's sake); the invariant it guards is "one frame at a
+    /// time", which a recovered guard still upholds.
+    lock: Mutex<()>,
+    /// The wedged-tty SPILL buffer (design §6.2's backpressure layer, first
+    /// milestone): bytes a non-parking writer could not hand to the kernel without
+    /// blocking. While non-empty, EVERY writer appends behind it (global FIFO is
+    /// preserved) and a single drainer thread feeds it to the fd at whatever pace
+    /// the foreground program drains its input buffer.
+    spill: Mutex<Spill>,
+    /// Signalled by the drainer as spill bytes are accepted, so a BLOCKING writer
+    /// waiting for room (`SPILL_CAP` backpressure) can proceed.
+    // Live only on the unix spill/drain path; the Windows twin writes blocking.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    drained: Condvar,
+}
+
+/// See [`Shared::spill`].
+struct Spill {
+    /// Spilled bytes, oldest first. A frame is appended contiguously under the
+    /// mutex, and the drainer removes bytes only AFTER the kernel accepted them —
+    /// so "non-empty" is exactly "undelivered bytes exist", the predicate every
+    /// writer consults to keep FIFO order.
+    buf: VecDeque<u8>,
+    /// A drainer thread is live. Spawned on first spill, exits when `buf` empties
+    /// (or the peer closes), so an unwedged session carries no extra thread.
+    // Live only on the unix spill/drain path; the Windows twin writes blocking.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    draining: bool,
+}
+
+impl SinkWriter {
+    /// Wrap a BORROWED PTY master fd: this sink does NOT close it (the caller — or a
+    /// `-1` sentinel — retains ownership). The legacy constructor, used by tests and
+    /// by sink stubs that don't drive a real PTY.
+    #[must_use]
+    pub fn new(master: i32) -> Self {
+        Self {
+            master,
+            _owned: None,
+            shared: Arc::new(Shared::new()),
+        }
+    }
+
+    /// Take OWNERSHIP of a PTY master fd (passed as an [`OwnedFd`], so this crate
+    /// stays `forbid(unsafe_code)` — the caller does the one `from_raw_fd`): the fd
+    /// is closed exactly when the last `Arc<SinkWriter>` clone drops (see the type
+    /// docs). Use this for a fd the caller owns and must NOT `close()` elsewhere
+    /// (e.g. a `forkpty` master).
+    ///
+    /// SPEC (initiative A7, WS-G): this constructor establishes the OwnedFd-RAII
+    /// ownership discipline modeled by `fd_lifecycle_model()` (machine
+    /// `fd_lifecycle` / `FdLifecycle`). Its two RAII actions have NO aterm method to
+    /// bind — they ARE the std `Arc::clone` and `OwnedFd::drop` the discipline rides
+    /// on — so they are waived here (the `master()`/`write_frame` fd-USE action is
+    /// the real `#[refines]` anchor, on those methods). This covers the model's
+    /// Clone/DropClone actions for the closure gate's coverage obligation (Ob.3).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::spec_unmodeled(
+            machine = "fd_lifecycle",
+            action = "Clone",
+            reason = "RAII, no aterm method to anchor: the Clone action is std `Arc::clone(&sink)` \
+                      taken by each holder (the reader thread, each window mirror, each in-flight \
+                      control verb). It only increments the live strong count — there is no \
+                      SinkWriter method to bind a #[refines] to. The fd-USE this clone authorizes \
+                      IS modeled+anchored (UseFd -> master()/write_frame). Waived so the model's \
+                      Clone action is covered (Ob.3) without inventing a no-op wrapper."
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::spec_unmodeled(
+            machine = "fd_lifecycle",
+            action = "DropClone",
+            reason = "RAII, no aterm method to anchor: the DropClone action is the std `Drop` of an \
+                      `Arc<SinkWriter>` clone; THE FIX is that the held `OwnedFd` (this field) closes \
+                      the fd EXACTLY when the LAST clone drops (sink.rs:32-39, exercised by the \
+                      `owned_fd_stays_open_until_last_clone_drops` regression). The close is \
+                      `OwnedFd::drop`, not an aterm method, so there is nothing to #[refines]. Waived \
+                      so the model's DropClone action is covered (Ob.3)."
+        )
+    )]
+    #[must_use]
+    #[cfg(unix)]
+    pub fn new_owned(master: OwnedFd) -> Self {
+        Self {
+            master: master.as_raw_fd(),
+            _owned: Some(master),
+            shared: Arc::new(Shared::new()),
+        }
+    }
+
+    /// Take OWNERSHIP of a PTY master (Windows twin, same name so call sites
+    /// read identically): the argument is the RAII [`aterm_pty::OwnedMaster`]
+    /// around the opaque ConPTY registry key. The session is closed exactly
+    /// when the last `Arc<SinkWriter>` clone drops — the same
+    /// close-on-last-drop discipline as the Unix `OwnedFd` constructor above.
+    /// Carries the same two Ob.3 waivers as that constructor (the closure gate
+    /// collects per-target: on Windows the unix twin is compiled out, so the
+    /// model's Clone/DropClone coverage must come from HERE).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::spec_unmodeled(
+            machine = "fd_lifecycle",
+            action = "Clone",
+            reason = "RAII, no aterm method to anchor (Windows twin of the unix waiver): the Clone \
+                      action is std `Arc::clone(&sink)` taken by each holder (the reader thread, \
+                      each window mirror, each in-flight control verb). It only increments the \
+                      live strong count — there is no SinkWriter method to bind a #[refines] to. \
+                      The fd-USE this clone authorizes IS modeled+anchored (UseFd -> \
+                      master()/write_frame). Waived so the model's Clone action is covered (Ob.3) \
+                      without inventing a no-op wrapper."
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::spec_unmodeled(
+            machine = "fd_lifecycle",
+            action = "DropClone",
+            reason = "RAII, no aterm method to anchor (Windows twin of the unix waiver): the \
+                      DropClone action is the std `Drop` of an `Arc<SinkWriter>` clone; the held \
+                      `OwnedMaster` (this field) closes the ConPTY session EXACTLY when the LAST \
+                      clone drops — the same close-on-last-drop discipline as the unix `OwnedFd`. \
+                      The close is `OwnedMaster::drop`, not an aterm method, so there is nothing \
+                      to #[refines]. Waived so the model's DropClone action is covered (Ob.3)."
+        )
+    )]
+    #[must_use]
+    #[cfg(windows)]
+    pub fn new_owned(master: aterm_pty::OwnedMaster) -> Self {
+        Self {
+            master: master.as_raw(),
+            _owned: Some(master),
+            shared: Arc::new(Shared::new()),
+        }
+    }
+
+    /// PROJECTION (TRUST_VACUITY_GATE §2.2 / L2): the `&SinkWriter` → derived
+    /// `fd_lifecycle_model` abstract-state witness for the `UseFd` `#[refines]`
+    /// anchors below (`master()` / `write_frame`). It maps the live sink onto the
+    /// model's `<<fdOpen, hasOwner>>` observables:
+    ///
+    ///   * `fd_open` — whether this sink still names a usable master fd (`master != -1`):
+    ///     the model's `fdOpen` from the holder's vantage. A `UseFd` is sound exactly
+    ///     when this is `true`, which the OwnedFd-last-drop discipline guarantees while
+    ///     any clone is alive (so `usedAfterClose` never latches — `NoUseAfterClose`).
+    ///   * `owns_fd` — whether this sink OWNS the fd (built via `new_owned`): the
+    ///     `_owned` token whose `Drop` on the last clone is the model's `DropClone`
+    ///     close-on-last-drop.
+    ///
+    /// The live Arc strong count (the model's `clones`) is NOT observable from
+    /// `&self` (it lives in the `Arc` the caller holds), so it is intentionally out of
+    /// the structural projection — exactly the partial-projection shape the fork_exec
+    /// witness uses for its child program-counter (L2 requires a real projection
+    /// NAME, not its execution; the BEHAVIORAL guarantee is the Tier-0 `ty` proof +
+    /// the `owned_fd_stays_open_until_last_clone_drops` regression).
+    #[must_use]
+    pub fn project_fd_state(&self) -> (bool, bool) {
+        (self.master != -1, self._owned.is_some())
+    }
+
+    /// The wrapped master fd (for callers that read/resize it directly). For an
+    /// owned sink it is valid for as long as the caller holds its `Arc<SinkWriter>`
+    /// clone — the fd cannot close out from under it while a clone is alive.
+    ///
+    /// SPEC (A7): handing out the RAW master fd for read/resize is the model's
+    /// `UseFd` action — a holder using the raw fd. The OwnedFd-last-drop discipline
+    /// (modeled by `fd_lifecycle_model`) is what makes this sound: while any clone is
+    /// alive the fd is open, so `usedAfterClose` can never latch (NoUseAfterClose).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "fd_lifecycle",
+            action = "UseFd",
+            project = "aterm_session::sink::SinkWriter::project_fd_state"
+        )
+    )]
+    #[must_use]
+    pub fn master(&self) -> i32 {
+        self.master
+    }
+
+    /// Whether this sink's PROCESS-LOCAL egress buffer is fully drained to the
+    /// kernel — i.e. no wedged-tty spill bytes are still waiting in this
+    /// process's memory for the detached drainer to hand out. True on the fast
+    /// path (nothing ever spilled) and once a drainer has emptied the buffer.
+    ///
+    /// The seamless overlap handoff consults this before it `_exit`s at Commit:
+    /// bytes tolerated into the overlap that landed in the spill (not yet the
+    /// PTY master) would die with the process, so Commit must wait until every
+    /// live sink reports drained. Kernel-queued bytes, by contrast, are the
+    /// child's to replay and need no such wait.
+    #[must_use]
+    pub fn egress_drained_to_kernel(&self) -> bool {
+        self.shared.spill_is_empty()
+    }
+
+    /// Write a WHOLE frame atomically with respect to other writers, returning the
+    /// number of bytes accepted (`== bytes.len()` on success). Holds the
+    /// serialization lock for the duration, so no other writer's bytes can appear
+    /// inside this frame. Propagates the first hard error rather than silently
+    /// dropping the tail (the bug the legacy `write_all` had before `write_some`).
+    ///
+    /// Returns early only on a hard error or a `0` write (peer closed). The
+    /// direct-read gather keeps the master `O_NONBLOCK`, so blocking semantics
+    /// (park until the foreground reads) come from `write_some_blocking`'s
+    /// pollout-retry rather than the kernel — a `WouldBlock` never surfaces here.
+    ///
+    /// SPEC (A7): writing through the raw master fd is the model's `UseFd` action.
+    /// The OwnedFd-last-drop discipline guarantees the fd is open for the whole
+    /// duration any clone (including this writer's) is alive, so the use can never
+    /// land on a closed/recycled fd — the `NoUseAfterClose` invariant of
+    /// `fd_lifecycle_model`.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "fd_lifecycle",
+            action = "UseFd",
+            project = "aterm_session::sink::SinkWriter::project_fd_state"
+        )
+    )]
+    pub fn write_frame(&self, bytes: &[u8]) -> io::Result<usize> {
+        // FIFO with any SPILLED bytes: while the wedged-tty spill buffer is
+        // non-empty this frame must queue BEHIND it (a direct write would overtake
+        // spilled keystrokes), under the SPILL_CAP wait so a paste into a wedged
+        // foreground applies real backpressure to its (expendable) thread. Checked
+        // BEFORE the fd lock: while draining, the drainer may sit parked in a
+        // blocking write HOLDING the fd lock, and waiting on it here would park
+        // this caller behind the wedge instead of behind the cap.
+        if !self.shared.spill_is_empty() && self.shared.spill_append(self.master, bytes, true) {
+            return Ok(bytes.len());
+        }
+        let guard = self
+            .shared
+            .lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Re-check under the guard: a mid-frame spill by the previous lock holder
+        // (or a racing writer's append) may have landed since the entry check.
+        if !self.shared.spill_is_empty() {
+            drop(guard);
+            if self.shared.spill_append(self.master, bytes, true) {
+                return Ok(bytes.len());
+            }
+            // Spill unavailable (drainer could not be arranged): fall through to
+            // the plain blocking write — degraded exactly to the legacy behavior.
+            return self.write_frame_locked(bytes);
+        }
+        let mut off = 0;
+        while off < bytes.len() {
+            // `get` + saturating_add (the drain_loop idiom): `off < len` makes
+            // the `get` always Some, and `n <= rest.len()` (POSIX) means the
+            // sum never saturates — both spellings byte-identical on every
+            // real path; write_some_blocking's body is outside this crate's
+            // bundle so `n` is unbounded to the verifier.
+            let Some(rest) = bytes.get(off..) else { break };
+            match aterm_pty::write_some_blocking(self.master, rest) {
+                Ok(0) => break, // peer closed mid-frame
+                Ok(n) => off = off.saturating_add(n),
+                Err(e) => return Err(e),
+            }
+        }
+        drop(guard);
+        Ok(off)
+    }
+
+    /// The legacy blocking write, taking the fd lock itself (the degraded path
+    /// when spilling is impossible — e.g. `dup(2)` refused a drainer fd).
+    fn write_frame_locked(&self, bytes: &[u8]) -> io::Result<usize> {
+        let _guard = self
+            .shared
+            .lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut off = 0;
+        while off < bytes.len() {
+            // `get` + saturating_add (the drain_loop idiom): `off < len` makes
+            // the `get` always Some, and `n <= rest.len()` (POSIX) means the
+            // sum never saturates. write_some_blocking is cross-crate, so `n` is
+            // unbounded to the verifier — byte-identical on every real path.
+            let Some(rest) = bytes.get(off..) else { break };
+            match aterm_pty::write_some_blocking(self.master, rest) {
+                Ok(0) => break, // peer closed mid-frame
+                Ok(n) => off = off.saturating_add(n),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(off)
+    }
+
+    /// Frames larger than this bypass the non-parking path and take the plain
+    /// BLOCKING [`Self::write_frame`]: the UI thread never produces one (its
+    /// frames are keystrokes / mouse reports / IME commits — tens of bytes), and
+    /// the bulk producers that do (paste, control verbs) run on expendable
+    /// threads that must feel the [`Shared::SPILL_CAP`] backpressure.
+    // Live only on the unix spill/drain path; the Windows twin writes blocking.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    const NONPARK_MAX: usize = 4096;
+
+    /// [`Self::write_frame`] that NEVER parks the calling thread — the UI-thread
+    /// keystroke egress (design §6.2's first backpressure milestone). The common
+    /// case is byte-identical to `write_frame`: one uncontended lock, a handful
+    /// of poll-guarded `write(2)`s. Only when the tty input buffer is FULL (a
+    /// wedged foreground program that stopped reading — previously this parked
+    /// the WHOLE event loop on one keypress) or another writer holds the fd lock
+    /// does the frame spill to the buffer a detached drainer feeds out in order.
+    ///
+    /// Same whole-frame atomicity and per-producer FIFO as `write_frame`: while
+    /// anything is spilled, EVERY writer (this one and the blocking ones) appends
+    /// behind it. Returns `Ok(len)` for a spilled frame — the bytes are accepted
+    /// and WILL be delivered in order unless the peer closes first (then they are
+    /// dropped with the dead session, exactly like a blocking write's `Ok(0)`).
+    ///
+    /// SPEC (A7): writing through the raw master fd is the model's `UseFd` action;
+    /// the OwnedFd-last-drop discipline (plus the drainer's own `dup(2)` — see
+    /// [`Shared`]) keeps every use on a live fd (`NoUseAfterClose`).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "fd_lifecycle",
+            action = "UseFd",
+            project = "aterm_session::sink::SinkWriter::project_fd_state"
+        )
+    )]
+    #[cfg(unix)]
+    pub fn write_frame_nonparking(&self, bytes: &[u8]) -> io::Result<usize> {
+        // Only SMALL frames get the non-parking treatment. The UI thread only
+        // ever produces small frames (keystrokes / mouse reports / IME commits —
+        // tens of bytes); anything larger is paste/bulk from an expendable
+        // thread (the GUI paste runs detached, control verbs on the control
+        // thread), which must take the BLOCKING path so the SPILL_CAP applies —
+        // otherwise repeated pastes into a wedged foreground would accumulate
+        // unbounded memory in the spill.
+        if bytes.len() > Self::NONPARK_MAX {
+            return self.write_frame(bytes);
+        }
+        // Bound the spill on the non-parking path too. This path normally SKIPS the
+        // `SPILL_CAP` backpressure to keep the UI event loop unparked, but a spill
+        // already AT capacity means a wedged foreground has stopped draining, and
+        // appending uncapped here lets a machine-rate small-frame producer (the
+        // cross-session `input`/`mouse` control verbs funnel through this same egress)
+        // grow `buf` without bound. The sink must not DROP bytes (the `NoSilentLoss`
+        // invariant), so at the cap the only choices are park or grow — grow is the
+        // unbounded-memory bug — and the sole cap-respecting option is to route the
+        // frame to the BLOCKING, `SPILL_CAP`-enforcing `write_frame`: no bytes dropped,
+        // order preserved (`write_frame` queues behind the spill). This bounds memory
+        // (a recoverable park instead of an eventual OOM) and is a strict improvement.
+        //
+        // Caveat, by design: `write_frame` parks the CALLING thread until the wedged
+        // foreground reads. For the human keyboard (never reaches `SPILL_CAP` at typing
+        // rate) and for control verbs egressed on the expendable control thread, that
+        // is the right thread to park. It does NOT keep the loop responsive when
+        // automated `WriteInput` verbs are dispatched ONTO the UI event loop AND a
+        // flood has already filled the spill into a wedged child — the next UI-thread
+        // frame then parks the loop. Keeping the loop responsive there is a caller-side
+        // fix: route automated/cross-session input egress through `write_frame` on the
+        // expendable control thread so this guard never fires on the UI thread.
+        if self.shared.spill_len() >= Shared::SPILL_CAP {
+            return self.write_frame(bytes);
+        }
+        // Undelivered spill exists → queue behind it (order), never touch the fd.
+        if !self.shared.spill_is_empty() && self.shared.spill_append(self.master, bytes, false) {
+            return Ok(bytes.len());
+        }
+        let Ok(guard) = self.shared.lock.try_lock() else {
+            // Another writer is mid-frame (or the drainer is writing): queueing
+            // behind the current holder preserves order without waiting on it.
+            if self.shared.spill_append(self.master, bytes, false) {
+                return Ok(bytes.len());
+            }
+            // No drainer possible: degrade to the legacy blocking write.
+            return self.write_frame_locked(bytes);
+        };
+        // Re-check under the guard: the previous holder may have spilled a frame
+        // tail between the entry check and our try_lock — writing directly now
+        // would overtake it (and could split its frame).
+        if !self.shared.spill_is_empty() {
+            drop(guard);
+            if self.shared.spill_append(self.master, bytes, false) {
+                return Ok(bytes.len());
+            }
+            return self.write_frame_locked(bytes);
+        }
+        let mut off = 0;
+        while off < bytes.len() {
+            match aterm_pty::poll_writable(self.master, 0) {
+                Ok(true) => {}
+                Ok(false) => return self.spill_tail_locked(guard, bytes, off),
+                Err(e) => return Err(e),
+            }
+            // ONE byte per POLLOUT check: writable guarantees only that SOME room
+            // exists (on a pty master, as little as one byte below the watermark),
+            // and a blocking write(2) larger than the free room does NOT short-
+            // write — it parks until EVERY byte is accepted. Since the wedged-
+            // foreground scenario fills the queue with these very keystrokes, the
+            // boundary frame would otherwise straddle the last bytes of room and
+            // park exactly where this function promises not to. Frames here are
+            // ≤ NONPARK_MAX and almost always ≤ ~20 bytes, so the extra syscalls
+            // are noise.
+            // `off < bytes.len()` (the loop condition) makes this `get` always
+            // `Some`; the `else` arm never fires, and exiting the loop there is
+            // the same observable outcome as the peer-closed break — so this is
+            // behavior-identical while discharging the bounds obligation.
+            let Some(one) = bytes.get(off..=off) else {
+                break;
+            };
+            match aterm_pty::write_some_nonparking(self.master, one) {
+                aterm_pty::NonParkWrite::Closed => break, // peer closed mid-frame
+                // The slice is exactly ONE byte, so a successful non-zero write
+                // wrote exactly one: `+= 1` is the same increment as `+= n`, and
+                // under the loop condition (`off < bytes.len()`) it provably
+                // cannot overflow.
+                aterm_pty::NonParkWrite::Wrote(_) => off = off.saturating_add(1),
+                // The gather keeps the master O_NONBLOCK; a race with the
+                // poll_writable(0) above lands here — treat as "no room".
+                aterm_pty::NonParkWrite::WouldBlock => {
+                    return self.spill_tail_locked(guard, bytes, off);
+                }
+                aterm_pty::NonParkWrite::Fatal(e) => return Err(e),
+            }
+        }
+        drop(guard);
+        Ok(off)
+    }
+
+    /// Windows: the unix spill/`poll(2)` machinery does not apply to a ConPTY handle
+    /// (`master` is an opaque registry key, not a pollable fd), so the UI-thread egress
+    /// falls back to the ordered blocking [`Self::write_frame`]. Same whole-frame
+    /// atomicity via the shared lock; ConPTY input writes do not wedge the way a full
+    /// unix tty input buffer does.
+    #[cfg(windows)]
+    pub fn write_frame_nonparking(&self, bytes: &[u8]) -> io::Result<usize> {
+        self.write_frame(bytes)
+    }
+
+    /// Spill `bytes[off..]` while HOLDING the fd lock — the only state in which a
+    /// frame can be SPLIT (head already on the wire, tail spilled). The tail
+    /// PREPENDS to the spill: a frame another writer appended while we held the
+    /// lock arrived after ours started, so it must drain AFTER our tail — an
+    /// append would let the drainer deliver it INSIDE our frame. The drainer
+    /// cannot hold a stale peek across this (it peeks under this same fd lock).
+    /// If no drainer can be arranged, degrade to finishing the frame inline (the
+    /// legacy parking behavior) rather than stranding the tail.
+    #[cfg(unix)]
+    fn spill_tail_locked(
+        &self,
+        guard: std::sync::MutexGuard<'_, ()>,
+        bytes: &[u8],
+        off: usize,
+    ) -> io::Result<usize> {
+        // Both callers pass `off` from inside a `while off < bytes.len()` write
+        // loop, so `off <= bytes.len()` always holds and this `get` is always
+        // `Some`; the unreachable `else` arm reports the frame accepted exactly
+        // like the successful-prepend path, so it is behavior-identical.
+        let Some(tail) = bytes.get(off..) else {
+            drop(guard);
+            return Ok(bytes.len());
+        };
+        if self.shared.spill_prepend(self.master, tail) {
+            drop(guard);
+            return Ok(bytes.len());
+        }
+        let mut off = off;
+        while off < bytes.len() {
+            // `off < bytes.len()` (the loop condition) makes this `get` always
+            // `Some`; the unreachable `else` arm exits the loop like a completed
+            // frame, so the observable result is unchanged.
+            let Some(rest) = bytes.get(off..) else { break };
+            match aterm_pty::write_some_blocking(self.master, rest) {
+                Ok(0) => return Ok(off), // peer closed mid-frame
+                // `write_some_blocking` never writes more than the slice it was
+                // given (`write(2)` returns at most its count), so `n <= bytes.len() -
+                // off` and this clamp is a no-op — it equals the previous
+                // `n.min(bytes.len() - off)`, spelled as a visible branch so
+                // `off + n <= bytes.len()` (no overflow) is derivable without
+                // seeing through `min`.
+                Ok(n) => {
+                    // Both operands saturate: `off <= bytes.len()` (loop guard)
+                    // and the clamped `n` is <= room, so neither ever actually
+                    // saturates — it only discharges the obligations the
+                    // verifier cannot chain through the cross-crate `n`.
+                    let room = bytes.len().saturating_sub(off);
+                    off = off.saturating_add(if n <= room { n } else { room });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        drop(guard);
+        Ok(off)
+    }
+}
+
+impl Shared {
+    /// Spill capacity a BLOCKING writer waits under (backpressure for a paste into
+    /// a wedged foreground); non-parking writers (tiny keystroke frames) may exceed
+    /// it briefly rather than stall the UI.
+    // Live only on the unix spill/drain path; the Windows twin writes blocking.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    const SPILL_CAP: usize = 2 * 1024 * 1024;
+    /// Bytes the drainer hands to the kernel per fd-lock acquisition.
+    // Live only on the unix spill/drain path; the Windows twin writes blocking.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    const DRAIN_CHUNK: usize = 8 * 1024;
+
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            spill: Mutex::new(Spill {
+                buf: VecDeque::new(),
+                draining: false,
+            }),
+            drained: Condvar::new(),
+        }
+    }
+
+    /// Undelivered spilled bytes exist (the FIFO predicate every writer consults).
+    fn spill_is_empty(&self) -> bool {
+        self.spill
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .buf
+            .is_empty()
+    }
+
+    /// Current undelivered spill length in bytes — the `SPILL_CAP` predicate the
+    /// non-parking egress consults so it can bound the buffer without parking on
+    /// the common (empty/small) path. Only the unix spill/drain path spills.
+    #[cfg(unix)]
+    fn spill_len(&self) -> usize {
+        self.spill
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .buf
+            .len()
+    }
+
+    /// PREPEND a split frame's tail to the spill front — callable ONLY while
+    /// holding the fd lock (see `spill_tail_locked`): the holder's frame head is
+    /// already on the wire, so its tail must drain before anything a concurrent
+    /// writer appended meanwhile, and holding the fd lock is what guarantees the
+    /// drainer has no stale peek to reorder around (it peeks under that lock).
+    /// Same drainer-arrangement contract as [`Self::spill_append`].
+    #[cfg(unix)]
+    fn spill_prepend(self: &Arc<Self>, master: i32, tail: &[u8]) -> bool {
+        let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
+        if !s.draining && !self.arrange_drainer(master, &mut s) {
+            return false;
+        }
+        for b in tail.iter().rev() {
+            s.buf.push_front(*b);
+        }
+        true
+    }
+
+    /// Append one frame to the spill, arranging the drainer, returning whether the
+    /// frame was accepted. `wait_for_room` applies the `SPILL_CAP` backpressure
+    /// (blocking callers only — their thread is expendable; the UI's is not).
+    /// Returns `false` only when a drainer could not be arranged (no `dup`/spawn),
+    /// in which case NOTHING was appended and the caller must fall back to a
+    /// blocking write — spilling without a drainer would strand the bytes.
+    #[cfg(unix)]
+    fn spill_append(self: &Arc<Self>, master: i32, bytes: &[u8], wait_for_room: bool) -> bool {
+        let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
+        if wait_for_room {
+            while s.draining && s.buf.len() > Self::SPILL_CAP {
+                s = self.drained.wait(s).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+        if !s.draining && !self.arrange_drainer(master, &mut s) {
+            return false;
+        }
+        s.buf.extend(bytes.iter().copied());
+        true
+    }
+
+    /// Windows stub: the fd-`dup(2)` spill drainer does not exist for a ConPTY handle,
+    /// so spilling is never available — return `false` so the caller
+    /// ([`SinkWriter::write_frame`]) falls through to the ordered blocking write. Kept
+    /// as a compiled no-op (never reached at runtime — `spill_is_empty()` is always
+    /// true on Windows, so the caller short-circuits before this).
+    #[cfg(windows)]
+    fn spill_append(self: &Arc<Self>, _master: i32, _bytes: &[u8], _wait_for_room: bool) -> bool {
+        false
+    }
+
+    /// Spawn the drainer thread (caller holds the spill mutex and has checked
+    /// `!s.draining`): arrange it BEFORE committing bytes, so a `dup`/spawn
+    /// failure never strands anything. The drainer's own dup'd fd keeps the
+    /// write target alive independent of the sink's lifetime.
+    #[cfg(unix)]
+    // Verified panic-free — skip DROPPED (2026-07-16). The last residual was
+    // `Builder::spawn`'s name-dependent `CString::new(name).expect(interior-nul)`
+    // panic, unreachable here because the thread name is the fixed nul-free literal
+    // `"aterm-sink-drain"`. The toolchain's SPAWN-NAMESAFE V2 value-provenance trace
+    // (trust-mir-extract `mark_spawn_namesafe_calls`) now proves that on the real
+    // release MIR — the inlined `Builder { name: .. }` aggregate feeding
+    // `spawn_unchecked` — and the bridge discharges the tagged call. Any future
+    // non-literal / mutated / ambiguous name makes the trace fail CLOSED and the
+    // spawn obligation returns as a fatal absent-callee row (never a silent pass).
+    // `Builder::new`/`.name` are classified total; `dup_fd`/`Arc::clone`/`is_err()`/
+    // the bool store are total; the closure verifies separately (a panic on the
+    // DETACHED drain thread unwinds to its own boundary, never the sink).
+    fn arrange_drainer(self: &Arc<Self>, master: i32, s: &mut Spill) -> bool {
+        let Ok(fd) = aterm_pty::dup_fd(master) else {
+            return false;
+        };
+        let shared = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("aterm-sink-drain".into())
+            .spawn(move || shared.drain_loop(fd));
+        if spawned.is_err() {
+            return false;
+        }
+        s.draining = true;
+        true
+    }
+
+    /// The drainer: feed spilled bytes to the fd (blocking writes are FINE here —
+    /// this thread exists to absorb the wedge) in `DRAIN_CHUNK`s, removing bytes
+    /// only after the kernel accepted them, until the spill empties (exit;
+    /// respawned on the next spill) or the peer closes (drop the remainder with
+    /// the dead session). The PEEK happens under the fd lock (taken FIRST, then
+    /// the spill mutex — the same order every writer uses, so no inversion): a
+    /// writer that split a frame holds the fd lock while it prepends the tail,
+    /// and peeking under that lock means the drainer can never carry a stale
+    /// pre-prepend chunk that would deliver a foreign frame inside the split one.
+    #[cfg(unix)]
+    fn drain_loop(self: Arc<Self>, fd: OwnedFd) {
+        loop {
+            let guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+            // Peek without removing, so writers keep seeing "undelivered bytes
+            // exist" and append behind them (FIFO).
+            let chunk: Vec<u8> = {
+                let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
+                if s.buf.is_empty() {
+                    s.draining = false;
+                    drop(s);
+                    drop(guard);
+                    self.drained.notify_all();
+                    return;
+                }
+                s.buf.iter().take(Self::DRAIN_CHUNK).copied().collect()
+            };
+            let mut off = 0;
+            let mut dead = false;
+            while off < chunk.len() {
+                // `off < chunk.len()` (the loop condition) makes this `get`
+                // always `Some`; the unreachable `else` arm exits the loop like
+                // a completed chunk, so the observable result is unchanged.
+                let Some(rest) = chunk.get(off..) else { break };
+                // `write_some_count_blocking` keeps the `io::Error` OUT of this
+                // loop: it returns the accepted byte count as a plain `usize` (0
+                // on any hard error, retrying `EINTR` internally). The _blocking
+                // variant matters: the gather keeps the master `O_NONBLOCK` (per-
+                // description, shared by this dup'd fd), and a bare EAGAIN-
+                // collapses-to-0 here would misread the full-but-alive input
+                // queue of the wedged foreground — the very state this drainer
+                // absorbs — as session-dead and DROP the spill. It parks in
+                // poll(POLLOUT) and retries instead, the legacy kernel behavior.
+                match aterm_pty::write_some_count_blocking(fd.as_raw_fd(), rest) {
+                    // saturating_add: `n <= rest.len() <= chunk.len() - off`
+                    // (the POSIX write contract), so the sum never actually
+                    // saturates — but `write_some_count`'s return is opaque to
+                    // the verifier here, so `n` is unbounded and the plain `+=`
+                    // would carry an undischargeable overflow obligation.
+                    // Behavior-identical on every real return.
+                    n if n > 0 => off = off.saturating_add(n),
+                    // Peer closed / hard error: the session is dead — drop the
+                    // spill (a blocking write would have reported Ok(0)/Err once;
+                    // these bytes were already accepted-for-delivery).
+                    _ => {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            drop(guard);
+            {
+                let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
+                if dead {
+                    s.buf.clear();
+                    s.draining = false;
+                    drop(s);
+                    self.drained.notify_all();
+                    return;
+                }
+                // Safe even though the fd lock was released above: a writer that
+                // grabs it re-checks the (still non-empty) spill and APPENDS —
+                // prepends happen only on a frame split, which requires having
+                // found the spill EMPTY under the lock — so the front `off` bytes
+                // are exactly the chunk just written.
+                // pop_front loop (not `drain(..take)`): the default-mode
+                // verifier mints a blanket unmodeled row for ANY `drain`
+                // argument, while `pop_front` is a modeled total accessor.
+                // Identical removal semantics for a `u8` ring (no drop glue,
+                // same front-first order); the cap keeps the old `min`
+                // fail-closed bound. This is the backpressure fallback path,
+                // where <= 8 KiB O(1) pops vanish against the write(2) they
+                // follow.
+                let len = s.buf.len();
+                let take = if off <= len { off } else { len };
+                for _ in 0..take {
+                    let _ = s.buf.pop_front();
+                }
+            }
+            self.drained.notify_all();
+        }
+    }
+}
+
+// Unix-gated as a module: every test here drives a real `UnixStream::pair()`
+// fixture (borrowed-fd + OwnedFd ownership semantics). The Windows ownership
+// twin (OwnedMaster close-on-last-drop) is exercised end-to-end by aterm-pty's
+// tests/windows_smoke.rs.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
+    use std::thread;
+
+    // Whole-frame atomicity: N threads each write a distinct frame LARGER than the
+    // socket send buffer (so a single `write` short-writes and the loop iterates,
+    // giving the kernel real opportunities to interleave two writers). Through one
+    // SinkWriter the bytes must arrive as exactly N CONTIGUOUS single-byte runs;
+    // without the serialization lock the runs would fragment. Driven on a stream
+    // socketpair (no shell, no unsafe — fds are borrowed from owned `UnixStream`s),
+    // with a concurrent reader so the oversized writes never deadlock on a full buffer.
+    #[test]
+    fn write_frame_is_whole_frame_atomic_across_threads() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        // Borrowed fd (the owned `writer` is dropped below) — `new` doesn't close it.
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+
+        const N: u8 = 4;
+        const LEN: usize = 128 * 1024; // > any default socket buffer -> forces short writes
+
+        // Drain concurrently so the oversized frames don't block on a full buffer.
+        let reader_handle = thread::spawn(move || {
+            let mut buf = vec![0u8; (N as usize) * LEN];
+            reader.read_exact(&mut buf).expect("read_exact");
+            buf
+        });
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let s = Arc::clone(&sink);
+            handles.push(thread::spawn(move || {
+                let frame = vec![b'A' + i; LEN];
+                assert_eq!(
+                    s.write_frame(&frame).expect("write_frame"),
+                    LEN,
+                    "whole frame accepted"
+                );
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread");
+        }
+        let buf = reader_handle.join().expect("reader thread");
+        drop(writer); // keep the borrowed fd alive until here
+
+        let runs = runs_of(&buf);
+        assert_eq!(
+            runs.len(),
+            N as usize,
+            "expected {N} contiguous frames; interleaving fragmented them into {} runs",
+            runs.len()
+        );
+        for (byte, len) in &runs {
+            assert_eq!(
+                *len, LEN,
+                "frame for byte {byte} was split — writers interleaved"
+            );
+        }
+        let mut distinct: Vec<u8> = runs.iter().map(|(b, _)| *b).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            N as usize,
+            "every frame's byte must appear exactly once"
+        );
+    }
+
+    // Run-length summary [(byte, count), ...] of consecutive equal bytes.
+    fn runs_of(buf: &[u8]) -> Vec<(u8, usize)> {
+        let mut runs: Vec<(u8, usize)> = Vec::new();
+        for &b in buf {
+            match runs.last_mut() {
+                Some((rb, n)) if *rb == b => *n += 1,
+                _ => runs.push((b, 1)),
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn write_frame_reports_full_count() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        assert_eq!(sink.write_frame(b"hello-sink").expect("write_frame"), 10);
+        let mut buf = [0u8; 10];
+        reader.read_exact(&mut buf).expect("read_exact");
+        assert_eq!(&buf, b"hello-sink");
+        drop(writer);
+    }
+
+    // REGRESSION (integration audit): a `new_owned` SinkWriter OWNS the fd and closes
+    // it only when the LAST Arc clone drops — never out-of-band. So while ANY clone is
+    // alive (a parked reader, a window mirror, an in-flight control verb), the fd
+    // number stays valid and cannot be recycled by a later forkpty. This is what
+    // prevents a close-vs-read/write race from routing a read or keystroke to the
+    // WRONG session.
+    #[test]
+    fn owned_fd_stays_open_until_last_clone_drops() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        // Safe owning conversion (no unsafe — this crate is forbid(unsafe_code)):
+        // the SinkWriter takes the writer end's OwnedFd and is its sole owner.
+        let owned: OwnedFd = writer.into();
+        let sink = Arc::new(SinkWriter::new_owned(owned));
+        let clone = Arc::clone(&sink);
+
+        // Drop the original Arc: a clone remains, so the fd MUST still be open+writable.
+        drop(sink);
+        assert_eq!(
+            clone
+                .write_frame(b"alive")
+                .expect("write while a clone holds the fd"),
+            5
+        );
+
+        // Drop the LAST clone: the OwnedFd closes the fd exactly once. The peer then
+        // reads the 5 bytes and EOF (read_to_end returns) — which only happens because
+        // the write end was closed on the last clone drop. (A leak would hang here.)
+        drop(clone);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).expect("read_to_end");
+        assert_eq!(
+            &buf, b"alive",
+            "peer got the bytes then EOF — fd closed on last clone drop"
+        );
+    }
+
+    /// Fill a socketpair's send buffer solid (the "wedged foreground"), then
+    /// prove `write_frame_nonparking` returns promptly instead of parking, and
+    /// that every spilled byte is delivered IN ORDER once the peer drains.
+    #[test]
+    fn nonparking_write_never_parks_and_preserves_order() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+
+        // Wedge: stuff the pipe until the kernel reports no room.
+        writer.set_nonblocking(true).expect("nonblocking for fill");
+        let mut wedged = 0usize;
+        loop {
+            match aterm_pty::write_some(writer.as_raw_fd(), &[b'.'; 4096]) {
+                Ok(n) if n > 0 => wedged += n,
+                _ => break,
+            }
+        }
+        writer.set_nonblocking(false).expect("back to blocking");
+        assert!(wedged > 0, "buffer filled");
+
+        // The keystroke that used to park the event loop: must return promptly.
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            sink.write_frame_nonparking(b"AAAA")
+                .expect("spill accepted"),
+            4
+        );
+        // Follow-ups while STILL wedged queue behind it (order), from both APIs.
+        assert_eq!(
+            sink.write_frame_nonparking(b"BBBB")
+                .expect("spill accepted"),
+            4
+        );
+        assert_eq!(sink.write_frame(b"CCCC").expect("spill accepted"), 4);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "non-parking writes must not wait for the wedge to clear"
+        );
+
+        // Unwedge: drain everything; the spill drainer must deliver A,B,C after
+        // the fill bytes, contiguous and in submission order.
+        let mut got = Vec::new();
+        let expect = wedged + 12;
+        let mut chunk = [0u8; 65536];
+        while got.len() < expect {
+            let n = reader.read(&mut chunk).expect("drain");
+            assert!(n > 0, "peer closed early");
+            got.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(&got[wedged..], b"AAAABBBBCCCC", "spill delivered in order");
+
+        // The drainer settled: a fresh direct write goes straight through.
+        assert_eq!(sink.write_frame_nonparking(b"D").expect("direct"), 1);
+        let mut one = [0u8; 8];
+        let n = reader.read(&mut one).expect("read D");
+        assert_eq!(&one[..n], b"D");
+    }
+
+    /// `egress_drained_to_kernel` tracks the PROCESS-LOCAL spill: true on the
+    /// fast path (nothing spilled), false while a wedged-tty spill holds bytes
+    /// this process has not yet handed to the kernel, and true again once the
+    /// drainer empties it. This is the predicate the seamless overlap handoff
+    /// consults so it never `_exit`s over tolerated input still trapped in the
+    /// spill (bytes that would be lost, unlike kernel-queued output the child
+    /// replays).
+    #[test]
+    fn egress_drained_predicate_follows_the_spill() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+        assert!(
+            sink.egress_drained_to_kernel(),
+            "a fresh sink has nothing in its process-local egress"
+        );
+
+        // Wedge the tty so the next write must spill into this process's buffer.
+        writer.set_nonblocking(true).expect("nonblocking for fill");
+        let mut wedged = 0usize;
+        loop {
+            match aterm_pty::write_some(writer.as_raw_fd(), &[b'.'; 4096]) {
+                Ok(n) if n > 0 => wedged += n,
+                _ => break,
+            }
+        }
+        writer.set_nonblocking(false).expect("back to blocking");
+        assert!(wedged > 0, "buffer filled");
+
+        assert_eq!(sink.write_frame_nonparking(b"held").expect("spill"), 4);
+        assert!(
+            !sink.egress_drained_to_kernel(),
+            "tolerated bytes trapped in the spill must read as NOT drained"
+        );
+
+        // Unwedge: drain the kernel buffer so the spill drainer can flush.
+        let mut sink_bytes = Vec::new();
+        let mut chunk = [0u8; 65536];
+        while sink_bytes.len() < wedged + 4 {
+            let n = reader.read(&mut chunk).expect("drain");
+            assert!(n > 0, "peer closed early");
+            sink_bytes.extend_from_slice(&chunk[..n]);
+        }
+        // The drainer runs on its own thread; poll the predicate until it settles.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !sink.egress_drained_to_kernel() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the spill never drained to the kernel"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            &sink_bytes[wedged..],
+            b"held",
+            "the held bytes reached the kernel"
+        );
+    }
+
+    /// An unwedged fd takes the fast path: bytes land without any drainer thread
+    /// (spill stays empty), byte-identical to the legacy write.
+    #[test]
+    fn nonparking_fast_path_writes_inline() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        assert_eq!(sink.write_frame_nonparking(b"hello").expect("write"), 5);
+        assert!(sink.shared.spill_is_empty(), "no spill on the fast path");
+        let mut buf = [0u8; 8];
+        let n = reader.read(&mut buf).expect("read");
+        assert_eq!(&buf[..n], b"hello");
+    }
+}

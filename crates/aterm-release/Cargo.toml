@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-release"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm — the one-command release cutter behind the `cargo ship` alias: ledger claim, universal build, bundle/sign/DMG, draft-first GitHub publish, post-publish verify."
+
+[[bin]]
+name = "aterm-release"
+path = "src/main.rs"
+
+[dependencies]
+# The shared serde `Manifest` type (release spec §4) lives in aterm-update-core
+# so publisher and updater client agree by compilation, not by convention — the
+# publish-time byte round-trip through the CLIENT's parser is the bridge proof.
+aterm-update-core = { workspace = true }
+# Manifest emission, the dist/cut-state.toml resume journal, and the release.conf
+# key=value surface are all serde-derived TOML (derive comes with the workspace dep).
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+# DMG sha256 is computed in-process (dmg.rs) — never shelled out to `shasum`,
+# so the digest that lands in the manifest is the digest of the bytes we hashed.
+sha2 = { workspace = true }
+# Release-channel signatures are verified in the cutter itself.  The signer is
+# deliberately external/owner-only, but trusting its exit status would not bind
+# the bytes uploaded to the public key compiled into clients.
+ring = { version = "0.17.14", default-features = false }
+base64 = "0.22.1"
+
+[dev-dependencies]
+# Tier-1 binds the real release-floor resolver and late guard to their derived
+# lifecycle model; production release binaries retain no spec dependency.
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true

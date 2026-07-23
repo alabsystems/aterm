@@ -1,0 +1,23 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TLA+ specification coverage tracking for aterm verification"
+
+[dependencies]
+aterm-spec-macros.workspace = true
+aterm-error.workspace = true
+# Distributed-slice collection: #[refines]/#[spec_unmodeled] anchor records are
+# submitted into an inventory slice (crate `xref` module) that the cross-crate
+# spec_xref_closure gate collects (TRUST_NATIVE_TLA, Phase 0). Re-exported so the
+# proc-macro-generated `::aterm_spec::inventory::submit!` resolves in any
+# downstream crate without that crate needing its own inventory dependency.
+inventory.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,67 @@
+# Trail Pack — "emberfall"
+# A warm two-stop beam (deep red tail brightening to gold at the head) that
+# sheds slow falling embers. Select it with:
+#
+#     cursor_trail_style = "pack:emberfall"
+
+pack = 1
+id = "emberfall"
+name = "Emberfall"
+authors = ["aterm"]
+license = "Apache-2.0"
+description = "Warm red→gold beam shedding slow falling embers."
+
+[beam]
+enabled = true
+cell_frac = 0.13
+cov_base = 0.16
+cov_slope = 0.69
+envelope = { kind = "linear" }
+
+[[beam.layers]]
+thickness_mul = 3.0
+coverage_mul = 0.30
+stride = 2
+
+[[beam.layers]]
+thickness_mul = 1.8
+coverage_mul = 0.55
+white_base = 0.10
+stride = 2
+
+[[beam.layers]]
+thickness_mul = 1.0
+coverage_mul = 1.0
+white_base = 0.22
+white_pos_mul = 0.40
+stride = 1
+
+[ramp]
+kind = "stops"
+stops = [
+  { t = 0.0, color = "#3a0a02" },
+  { t = 0.6, color = "#c8320a" },
+  { t = 1.0, color = "#ffcf5a" },
+]
+
+[crown]
+enabled = true
+radius_cells = 1.0
+peak_cov = 0.20
+typing_window_ms = 350
+jump_window_ms = 220
+
+[channels]
+glow_add = true
+halo = "add"
+
+# Falling embers: shed slowly, drift down under gravity.
+[[particles]]
+spawn_weight = 1.0
+vx = [-0.3, 0.3]
+vy = [-0.4, 0.2]
+gravity = 1.6
+life = [0.5, 1.2]
+size = 0.18
+typing_burst_max = 3
+jump_burst_max = 8

@@ -1,0 +1,72 @@
+id = "s1_00"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.54, center_x = 0.5, word_top = 1.0 }
+
+# Bean: the neutral roster anchor and accessory mannequin. Explicit irises and
+# pupils keep dark-coat contrast adaptation expressive instead of blank-eyed.
+[[layer]]
+role = "outline"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 18 81 C 16 68 21 57 31 48 L 28 22 C 28 17 32 16 36 20 L 57 36 C 72 30 90 30 105 36 L 128 20 C 132 17 135 20 134 25 L 131 49 C 140 58 144 71 141 85 C 137 106 118 121 92 126 C 66 129 41 123 28 108 C 21 101 18 91 18 81 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#B79A80"
+recolor = "coat"
+paths = ["M 23 80 C 21 68 26 59 35 51 L 33 28 L 56 43 C 70 37 90 37 106 43 L 129 27 L 126 51 C 134 59 138 71 136 83 C 133 101 115 115 92 120 C 68 123 46 117 34 105 C 27 98 23 89 23 80 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#E99BA2"
+recolor = "fixed"
+paths = ["M 35 29 L 53 42 L 36 47 Z", "M 128 28 L 109 43 L 126 48 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F5E8DF"
+recolor = "fixed"
+paths = ["M 48 85 C 48 76 56 72 66 77 C 69 78 71 81 72 84 C 73 81 76 78 79 77 C 89 72 98 76 98 85 C 98 97 88 104 73 104 C 58 104 48 97 48 85 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#28232D"
+recolor = "fixed"
+paths = ["M 43 69 C 43 62 48 58 54 58 C 60 58 65 63 65 70 C 65 77 60 81 54 81 C 48 81 43 76 43 69 Z", "M 82 70 C 82 63 87 58 93 58 C 99 58 104 62 104 69 C 104 76 99 81 93 81 C 87 81 82 77 82 70 Z"]
+
+[[layer]]
+role = "iris"
+ref_fill = "#778A7E"
+recolor = "iris"
+paths = ["M 48 70 C 48 65 50 62 54 62 C 58 62 60 65 60 70 C 60 75 58 78 54 78 C 50 78 48 75 48 70 Z", "M 87 70 C 87 65 89 62 93 62 C 97 62 99 65 99 70 C 99 75 97 78 93 78 C 89 78 87 75 87 70 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#211C24"
+recolor = "fixed"
+paths = ["M 52 65 C 54 64 56 65 56 70 C 56 75 54 76 52 75 C 51 72 51 68 52 65 Z", "M 91 65 C 93 64 95 65 95 70 C 95 75 93 76 91 75 C 90 72 90 68 91 65 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 49 64 C 49 62 51 61 53 61 C 55 61 56 63 56 65 C 56 67 54 68 52 68 C 50 68 49 66 49 64 Z", "M 88 64 C 88 62 90 61 92 61 C 94 61 95 63 95 65 C 95 67 93 68 91 68 C 89 68 88 66 88 64 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#95586B"
+recolor = "fixed"
+paths = ["M 68 85 C 68 82 71 80 73 80 C 76 80 79 82 79 85 C 79 89 76 91 73 93 C 70 91 68 89 68 85 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 72 91 L 75 91 C 75 96 80 98 84 94 C 84 101 78 104 73 99 C 68 104 62 101 62 94 C 66 98 71 96 72 91 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 48 88 L 7 83 L 7 87 L 48 91 Z", "M 48 94 L 3 99 L 3 103 L 49 97 Z", "M 98 88 L 145 82 L 145 86 L 98 91 Z", "M 98 94 L 152 99 L 152 103 L 98 97 Z"]

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Resource sandbox for spawned children (ATERM_DESIGN WS-G): POSIX rlimits applied before exec, gated on an aterm-cap capability."
+
+[features]
+default = []
+# TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]`/`#[spec_unmodeled]`
+# anchors that bind this crate's sandbox-apply code to the external `Sandbox.tla`
+# spec. OFF by default so the production build is byte-identical (no `aterm-spec`
+# dependency, no `inventory` submission); the workspace `spec_xref_closure` gate
+# (aterm-gui's test build) enables it to COLLECT the anchors cross-crate.
+spec-anchors = ["dep:aterm-spec"]
+
+[dependencies]
+aterm-cap = { workspace = true }
+# Optional: only pulled in by the off-by-default `spec-anchors` feature (the macro
+# emits `::aterm_spec::inventory::submit!` anchor records; nothing else uses it).
+aterm-spec = { workspace = true, optional = true }
+
+# POSIX-only: the setrlimit actuator (src/unix.rs). The Windows actuator is a
+# documented, capability-gated no-op (src/windows.rs) with zero FFI.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+# The Tier-1 conformance test (`tests/conformance_sandbox.rs`) needs the derived/
+# external spec machinery and `ty`; the anchors it relies on are compiled via the
+# crate's own test build (`cfg(test)`), so no feature is needed for the test itself.
+aterm-spec = { workspace = true }
+aterm-spec-models = { workspace = true }
+# Test-only: sandbox tests mint a root `Authority`; `launcher-mint` makes the sealed
+# mint nameable for this crate's own test build. The production `apply`/`restore`
+# seam receives a `Cap<Sandbox>` by argument and never mints. See aterm-cap's
+# `mint_sites_are_launcher_only` gate.
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
+
+[lints]
+workspace = true

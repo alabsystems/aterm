@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-shell-integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shell integration (OSC 7/133/633) — extracted from aterm-core for independent verification"
+
+[features]
+default = []
+local-pty = ["dep:aterm-containment"]
+
+[dependencies]
+aterm-containment = { workspace = true, optional = true }
+rand_core = { workspace = true }
+
+# wasm32-unknown-unknown has no OS entropy source: getrandom (pulled in transitively
+# via rand_core's `getrandom` feature for OsRng) needs its `js` backend to compile.
+# Target-gated, so native builds are unaffected.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

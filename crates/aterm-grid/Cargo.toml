@@ -1,0 +1,72 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-grid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal grid model: cells, rows, styles, damage tracking, page storage, cursor and region state"
+
+[features]
+default = ["disk-tier"]
+# Disk-backed scrollback cold tier (mmap + zstd via aterm-scrollback). DEFAULT-ON
+# so native builds are byte-identical; OFF for wasm32 (no libc/zstd-sys) — the grid
+# then runs hot/warm RAM tiers only with no disk spill (scrollback_budget.rs dropped).
+disk-tier = ["aterm-scrollback/disk-tier"]
+alacritty-compat = []  # Expose legacy Alacritty-facing CellFlags aliases
+fuzz = ["aterm-scrollback/fuzz"]  # Expose fuzz-only APIs (#4258)
+testing = []  # Expose test-only helpers for downstream crate tests
+# TRUST_NATIVE_TLA §4 (Phase 4): register this crate's ring-buffer kani harnesses as
+# `proof_anchor!`s in the unified verifier ledger. Pulls in aterm-spec ONLY to submit
+# the (machine, action, proof) records; OFF by default so production builds stay free
+# of aterm-spec. The anchors are decoupled from the `#[cfg(kani)]` harnesses.
+spec-anchors = ["dep:aterm-spec"]
+
+[dependencies]
+aterm-rle = { workspace = true }
+# The grid's `disk-tier` feature forwards to `aterm-scrollback/disk-tier`, which
+# provides the `aterm_scrollback::mmap` wrapper the disk-spill (scrollback_budget.rs)
+# maps over. Not forced here so a wasm consumer can drop libc/zstd-sys; default-on
+# via this crate's own `disk-tier` so native closures are unchanged (§2.7).
+aterm-scrollback = { workspace = true }
+aterm-types = { workspace = true }
+aterm-log = { workspace = true }
+aterm-hash = { workspace = true }
+aterm-alloc = { workspace = true }
+aterm-tempfile = { workspace = true }
+aterm-error = { workspace = true }
+aterm-grapheme = { workspace = true }
+# Phase-4 verifier-ledger anchors only (see `spec-anchors` feature). Optional and OFF
+# by default so the default dependency closure is unchanged.
+aterm-spec = { workspace = true, optional = true }
+
+[dev-dependencies]
+ntest = "0.9"
+proptest = { workspace = true }
+criterion = "0.5"
+aterm-tempfile = { workspace = true }
+aterm-selection = { workspace = true }
+# Phase-4: make aterm-spec available under plain `cargo test -p aterm-grid` so the
+# `#[cfg(test)]`-visible `spec_proof_anchors` module compiles its `proof_anchor!`s.
+aterm-spec = { workspace = true }
+
+[build-dependencies]
+# COMPILE-TIME temporal gate (build.rs): the scrollback-offload detach-window
+# protocol (`offload_window_spec.rs`, shared with tests/conformance_offload.rs) is
+# model-checked in Trust `ty` while BUILDING this crate — a violated invariant fails
+# `cargo build`, not merely `cargo test`. No cycle: aterm-spec depends only on
+# aterm-spec-macros + aterm-error.
+aterm-spec = { workspace = true }
+
+[[bench]]
+name = "extras_shift"
+harness = false
+
+[[bench]]
+name = "scroll_damage"
+harness = false
+
+[lints]
+workspace = true

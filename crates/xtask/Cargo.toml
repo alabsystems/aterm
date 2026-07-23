@@ -1,0 +1,41 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "aterm build-graph tasks (TRUST_VACUITY_GATE §2.1/§2.5): harness-manifest + always-run spec-link"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+# The anchor graph: aterm-spec (the IR lowering + model registry + proof anchors)
+# and aterm-spec-models (the external ISOLATION .tla). The proof-anchor-bearing
+# crates are linked WITH `spec-anchors` ON so `inventory` collects every
+# `proof_anchor!` (the kani half) into THIS binary — making the L1 proof-name
+# resolution + the lowered `proof` lines an ALWAYS-RUN node independent of
+# aterm-gui's test binary (finding 5). (The in-source path_confine/window_routing
+# `#[cfg(test)]` anchors collect only in aterm-gui's test binary; those remain
+# covered by the gate. This node covers the embedded models, the external ISOLATION
+# specs, and the cross-crate proof anchors — the L1 teeth.)
+aterm-spec = { workspace = true }
+aterm-spec-models = { workspace = true }
+aterm-scrollback = { workspace = true, features = ["spec-anchors"] }
+aterm-grid = { workspace = true, features = ["spec-anchors"] }
+# aterm-search: the streaming-search `#[refines]` anchors (temporal half of the
+# derived StreamingSearch machine) + its kani `proof_anchor!`s, collected into
+# THIS always-run node exactly like the scrollback/grid proof anchors.
+aterm-search = { workspace = true, features = ["spec-anchors"] }
+# The main-loop completeness census (`gate mainloop`) — ONE implementation shared
+# with tools/freeze-safety-gate/build.rs (where it is a build-blocking obligation),
+# so the manual verb and the compile gate cannot diverge. Also provides the shared
+# source-walk helpers (collect_rs_files / is_test_file) every scan gate uses.
+aterm-census = { workspace = true }
+
+[lints]
+workspace = true

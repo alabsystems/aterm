@@ -1,0 +1,44 @@
+aterm
+Copyright 2026 Andrew Yates
+
+Unless a file or component says otherwise, aterm source is licensed under the
+Apache License, Version 2.0. See LICENSE.
+
+The aterm-gpu-web and aterm-wasm crates, and individual files marked with
+`SPDX-License-Identifier: MIT`, are licensed under the MIT License. See
+LICENSE-MIT. The aterm-wasm crate was normalized to MIT for this distribution.
+
+This source distribution includes modified copies of these upstream crates:
+
+- indexmap 2.14.0, Apache-2.0 OR MIT (`vendor/indexmap/`)
+- libm 0.2.16, MIT (`vendor/libm/`)
+- pkg-config 0.3.33, MIT OR Apache-2.0 (`vendor/pkg-config/`)
+- smol_str 0.2.2, MIT OR Apache-2.0 (`vendor/smol_str/`)
+- winit 0.30.13, Apache-2.0 (`vendor/winit/`)
+- winnow 0.7.15, MIT (`vendor/winnow/`)
+
+Each vendored crate retains its upstream license text. The winit copy contains
+aterm modifications to macOS application behavior and Wayland seat/data-device
+handling; modified and added files carry prominent notices.
+
+`crates/aterm-lz4/` is a modified, block-mode-only subset derived from
+lz4_flex 0.11.5 by Pascal Seitz and contributors. Its upstream-derived files
+are MIT-licensed and carry local compatibility, lint, and verification changes.
+See `crates/aterm-lz4/LICENSE-MIT`.
+
+Bundled fonts and font fixtures retain their own terms:
+
+- DejaVu Sans Mono: Bitstream Vera and DejaVu terms in
+  `crates/aterm-render/assets/DejaVuSansMono.LICENSE.txt`.
+- Symbols Nerd Font Mono 3.4.0: MIT terms in
+  `crates/aterm-render/assets/SymbolsNerdFont-LICENSE.txt`.
+- JetBrains Mono test fixture: SIL Open Font License 1.1 in
+  `crates/aterm-render/tests/fixtures/OFL.txt`.
+
+Generated Unicode segmentation, width, emoji-presentation, and compatibility
+tables derive from Unicode data. Unicode copyright and permission terms are in
+UNICODE-LICENSE.txt.
+
+The public source snapshot deliberately excludes private operational notes,
+release credentials, internal proof packets, and unused traced art inputs. It
+includes no executable binary, installer, or managed ALab tool package.

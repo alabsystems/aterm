@@ -1,0 +1,19 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-bits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal Pod/Zeroable traits and byte casting helpers for aterm — zero external deps (replaces bytemuck, #7894)"
+
+[dependencies]
+# None — pure std
+
+[dev-dependencies]
+# None — tests use only std
+
+[lints]
+workspace = true

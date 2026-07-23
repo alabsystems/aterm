@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm L3 — network transport for the control protocol: a transport abstraction generalizing the local proxy dial, plus a channel-bound capability so a captured edge token cannot replay across connections. Predicates run on the AUTHORITATIVE surface, so no astream fold is needed to drive a remote aterm."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The capability the network hop carries (the same EdgeToken the local one-hop
+# proxy mints), and the session/op identity it binds to.
+aterm-session = { workspace = true }
+# The portable local-socket type the relay bridges to (Unix: a pure std
+# UnixStream alias — zero behavioral change; Windows: AF_UNIX over winsock).
+aterm-uds = { workspace = true }
+# Real capability crypto: HMAC-SHA256 binds the edge token to the channel
+# exporter; constant-time verify via `Mac::verify_slice`.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rustls = { workspace = true }

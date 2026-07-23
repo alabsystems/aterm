@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-sixel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — Sixel (DEC graphics) DCS decoder: raster + palette → packed RGBA"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,84 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "atpkg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm toolchain package manager — the signature anchor: detached Ed25519 verification of manifests over their exact raw bytes, with a compile-time-pinned offline root key delegating a rotatable release key."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "atpkg"
+path = "src/main.rs"
+
+[dependencies]
+# THE load-bearing crypto root. atpkg's two-tier signature anchor
+# (docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13) verifies every manifest with
+# `ring::signature::UnparsedPublicKey::new(&ED25519, pk).verify(msg, sig)`. ring is
+# already in the compiled tree TRANSITIVELY (via rustls), but promoting it to a HARD
+# DIRECT dependency is a deliberate supply-chain decision: it pins the verify
+# primitive to an explicit floor so a future rustls bump that switches its backend to
+# aws-lc-rs (dropping ring) cannot silently break the only crypto we depend on. The
+# matching `deny.toml` [bans] floor blocks drift BELOW this version; presence is
+# guaranteed structurally by this direct edge. `default-features = false` drops
+# alloc/std/RNG from atpkg's own edge — Ed25519 VERIFICATION needs none of them — so
+# atpkg does not rely on rustls keeping those features enabled.
+ring = { version = "0.17.14", default-features = false }
+# Decode the base64 root + release Ed25519 public keys (32 raw bytes each).
+base64 = "0.22.1"
+# getuid() for the 0600, owned-by-uid durable high-water floor file (mirrors
+# aterm-update-core's privatedir hardening). Already a workspace dependency.
+libc = { workspace = true }
+# The shared, platform-free ownership predicate (dir_safe_for_private_write) reused
+# for the floor file's directory, so atpkg and the updater cannot drift on what
+# "private" means.
+aterm-types = { workspace = true }
+# The shared advisory file lock (flock LOCK_EX) — the SAME primitive aterm-update uses
+# for its apply/stage critical sections — serializes the high-water floor's
+# read->compare->write so a racing advance across concurrent atpkg processes cannot be
+# clobbered down (anti-rollback monotonicity, CWE-362). Brings the artifact-agnostic
+# core in as the design's shared substrate (§13). Also supplies pick_slug/is_valid_slug
+# for resolve_account() (the configurable index account, R3/§5).
+aterm-update-core = { workspace = true }
+# Parse index.toml / pkg-*.toml — but ONLY after signature verification. The parsers
+# take `&sig::VerifiedBytes` (no public constructor), so an unverified-bytes parse does
+# not type-check; serde derives the schema structs and the real `toml` parser replaces
+# Phase 1's [keys] line-scanner, getting table-scoping + duplicate-key rejection for
+# free (docs/TOOLCHAIN-PACKAGE-MANAGER.md §4/§5). reject-newer via SUPPORTED_SCHEMA.
+serde = { workspace = true }
+toml = { workspace = true }
+# Parse the GitHub Releases API JSON when wiring the production network Fetcher (the
+# release listing + per-asset url/name). Scoped to the net adapter; the verify/parse
+# core never touches JSON. Already a workspace dependency (aterm-update uses it too).
+serde_json = { workspace = true }
+# In-process SHA-256 for the apply-time `tree_root` re-verify (§4.2/§8): hash every
+# extracted file's content + the sorted (relpath, mode, sha) list. Streamed, so a
+# multi-GB sysroot is never buffered whole. Already a workspace dependency (in the lock
+# via rustls); using it directly avoids spawning `shasum` per file across thousands of
+# files. NOT the signature root — that stays `ring` (§8); this is content-integrity only.
+sha2 = { workspace = true }
+# The bundle extractor: read a `.tar.zst` and lay it down through the tar-slip-safe
+# `vet_entry` gate (§9/§15). `zstd` is already a workspace dependency (aterm-scrollback);
+# `tar` is the one genuinely-new external dep the design flags for supply-chain audit
+# (§13/§15) — pinned, with a matching `deny.toml` floor-ban. We drive per-entry
+# extraction manually (NOT tar's own `unpack`) so EVERY entry is vetted before a byte is
+# written, modes are sanitized, and a single escape aborts the whole stage.
+tar = "0.4.44"
+zstd = { workspace = true }
+
+[dev-dependencies]
+# Test fixtures must SIGN deterministic manifests
+# (Ed25519KeyPair::from_seed_unchecked + .sign), which needs ring's `alloc` feature.
+# Re-declaring ring here with DEFAULT features pulls alloc into the TEST build only
+# (feature unification across normal+dev within this leaf package). The normal build
+# (`cargo build -p atpkg`) still uses the default-features=false edge above and so
+# proves the no-alloc verify path compiles on its own.
+ring = { version = "0.17.14" }
+
+[lints]
+workspace = true

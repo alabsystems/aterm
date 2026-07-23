@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-render-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Renderer-agnostic surface for aterm: the injected Rasterizer trait + the per-frame Frame/RenderInput types (ATERM_DESIGN WS-F)."
+
+[features]
+default = ["disk-tier"]
+# Disk-backed scrollback cold tier, forwarded through aterm-core. DEFAULT-ON so
+# native builds are byte-identical; a wasm consumer disables it
+# (--no-default-features) to drop libc/zstd-sys.
+disk-tier = ["aterm-core/disk-tier"]
+
+[dependencies]
+# Path (not `workspace = true`) so we can set default-features = false here without
+# forcing it on every workspace consumer; disk-tier is re-enabled by default via this
+# crate's own default = ["disk-tier"], so the native closure is unchanged.
+aterm-core = { path = "../aterm-core", default-features = false }
+png = "0.17"
+
+[lints]
+workspace = true

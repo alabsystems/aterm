@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm L2 — agent interface: turn-completion (idle ∧ prompt-ready) and the self-reflection feedback governor, composed over the L0/L0.5 observation predicates"
+
+[lints]
+workspace = true
+
+# The AI-friendly drive CLI (the "sugar" interface over the core `await`/`send`
+# primitives). The library is the reusable Turn/SelfGovernor API.
+[[bin]]
+name = "aterm-drive"
+path = "src/bin/aterm-drive.rs"
+
+# The fleet-federation bridge: merge every live session's `subscribe events` into
+# one astream-subject-addressed stream, and dispatch commands back to the fleet.
+[[bin]]
+name = "aterm-fleet"
+path = "src/bin/aterm-fleet.rs"
+
+[dependencies]
+# Predicate constructors (idle/seq/block/row-match). Agent knowledge lives HERE;
+# the engine core knows nothing of "a turn" or "a Claude prompt".
+aterm-observe = { workspace = true }
+# The portable control-socket stream (std-only): `RelayClient`'s local-connect /
+# `dial` constructors talk raw control protocol over a `CtlStream`. No external deps.
+aterm-uds = { workspace = true }
+
+[dev-dependencies]
+web-time = { workspace = true }
+# The E2E loopback-TLS remote-Turn test drives a real `dial_and_relay` bridge and a
+# channel-bound capability. Transport-only test deps; no cycle (aterm-net ⊄ aterm-agent).
+aterm-net = { workspace = true }
+aterm-session = { workspace = true }

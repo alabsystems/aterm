@@ -1,0 +1,86 @@
+# Trail Pack — "synthwave"
+# A neon HSV-sweep beam that trails a spatial spectrum behind the cursor, with a
+# spray of magenta motes rising off the wake. Select it with:
+#
+#     cursor_trail_style = "pack:synthwave"
+#
+# Copy this file to ~/.config/aterm/trail-packs/ and add its path to
+# [cursor_trail] packs = ["…/synthwave.toml"] (see docs/trail-packs.md).
+
+pack = 1                       # schema/format version — fail-closed on unknown
+id = "synthwave"               # picker key: cursor_trail_style = "pack:synthwave"
+name = "Synthwave"
+authors = ["aterm"]
+license = "Apache-2.0"
+description = "Neon spectrum sweep with rising magenta motes."
+
+[beam]
+enabled = true
+cell_frac = 0.16               # core thickness base (× cell height)
+heat_gain = 0.10               # core swells slightly with typing heat
+cov_base = 0.34                # birth-coverage ramp base
+cov_slope = 0.52               # birth-coverage ramp slope (× path position)
+envelope = { kind = "hold_cosine", hold_frac = 0.45 }
+
+# A fat spectrum band under a soft edge glow (each layer maps 1:1 to a bloom
+# tuple; the mix target is fixed to white).
+[[beam.layers]]
+thickness_mul = 1.0
+coverage_mul = 0.95
+white_base = 0.06
+white_pos_mul = 0.0
+stride = 1
+
+[[beam.layers]]
+thickness_mul = 1.45
+coverage_mul = 0.36
+stride = 2
+
+[[beam.layers]]
+thickness_mul = 2.0
+coverage_mul = 0.14
+stride = 3
+
+[ramp]
+kind = "hsv_sweep"
+span_deg = 300.0
+sat = 0.92
+val = 1.0
+hue_step_per_move = 0.04       # spatially-keyed hue roll (no per-key hue pops)
+
+[heat]
+bright_floor = 0.35
+bright_slope = 0.85
+life_base_mul = 0.4
+life_a = 1.2
+life_b = 0.0
+chain_keys = 3.0
+chain_gap_max = 0.18
+chain_life_max = 0.7
+
+[crown]
+enabled = true
+radius_cells = 0.9
+peak_cov = 0.22
+typing_window_ms = 350
+jump_window_ms = 200
+
+[ring]
+enabled = true
+life_ms = 320
+
+[channels]
+glow_add = true
+halo = "add"
+bed = false
+
+# One rising-mote population: magenta specks that drift up off the wake.
+[[particles]]
+spawn_weight = 1.0
+vx = [-0.4, 0.4]
+vy = [-1.8, -0.6]
+gravity = -0.4
+life = [0.4, 0.9]
+size = 0.16
+typing_burst_max = 4
+jump_burst_max = 12

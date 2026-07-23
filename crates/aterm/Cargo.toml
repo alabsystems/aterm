@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — THE one binary: the transparent terminal session, the GPU window, and every verb (ctl/pkg/fleet/drive/help), behind a single name."
+
+[[bin]]
+name = "aterm"
+path = "src/main.rs"
+
+[dependencies]
+# The four faces of the one command, all libraries:
+aterm-cli = { path = "../aterm-cli" }     # the SESSION (PTY passthrough) + parser/diag/manual
+aterm-gui = { path = "../aterm-gui" }     # the WINDOW (winit/wgpu) + headless engine
+aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket client
+atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
+aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
+
+[lints]
+workspace = true

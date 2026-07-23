@@ -1,0 +1,35 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-containment"
+description = "4-mode containment architecture for AI agent isolation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# TOML-based allowlist parsing (`AllowlistConfig::from_toml_str` /
+# `AllowlistConfig::from_toml_file`). Off by default so `aterm-core`'s build
+# tree does not pull `toml` + `serde` through this crate when consumers only
+# use `AllowlistConfig` via struct literals (#7729). Binary consumers that
+# load TOML allowlist files (aterm-daemon) opt in explicitly.
+allowlist-toml = ["dep:toml"]
+
+[dependencies]
+aterm-log.workspace = true
+aterm-error.workspace = true
+toml = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+aterm-log = { workspace = true }
+aterm-tempfile.workspace = true
+
+[lints]
+workspace = true

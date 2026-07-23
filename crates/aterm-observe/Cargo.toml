@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-observe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm L0.5 — semantic surface predicates (regex row-match) over the core Observation Kernel; keeps `regex` out of aterm-core's production closure"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The Observation Kernel (L0) primitive this layer builds semantic predicates on.
+aterm-core = { workspace = true }
+# The semantic vocabulary. This crate is the ONLY place `regex` enters the
+# watcher stack — the core stores an opaque `dyn RowMatch` (RFC R2 purity).
+regex = { workspace = true }
+
+[dev-dependencies]
+web-time = { workspace = true }

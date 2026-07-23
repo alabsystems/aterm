@@ -1,0 +1,19 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal logging facade for aterm: zero external dependencies"
+
+[dependencies]
+# None — pure std
+
+[dev-dependencies]
+# None — tests use only std
+
+[lints]
+workspace = true

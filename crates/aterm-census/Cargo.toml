@@ -1,0 +1,37 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# aterm-census — the MAIN-LOOP COMPLETENESS CENSUS (L0 whole-Mac-freeze class,
+# OB-1..OB-6) and the LOCK-ORDER CENSUS (L0-DEADLOCK lock-graph sense, OB-7)
+# as ONE shared library with TWO consumers each, so the manual verbs and the
+# build-blocking gate can never diverge:
+#
+#   * `cargo xtask gate mainloop` / `gate lockorder`  (crates/xtask/src/gate.rs)
+#   * tools/freeze-safety-gate/build.rs   (the SAME `cargo build` as the temporal
+#                                          proof gate — the AUTOMATIC obligations)
+#
+# The `aterm-census` BIN points the CURRENT walkers at ANY checkout root
+# (`cargo run -p aterm-census -- <root> [--mainloop|--locks]`) — the
+# counterfactual instrument used to demonstrate the censuses catch the original
+# pre-a69a6bb3 freeze shape and an injected ABBA lock cycle.
+
+[package]
+name = "aterm-census"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Main-loop completeness census (L0 freeze class) + lock-order census (L0-DEADLOCK): shared by the xtask gate verbs and the freeze-safety-gate build"
+
+[[bin]]
+name = "aterm-census"
+path = "src/main.rs"
+
+[dependencies]
+# None — pure std, so the census stays offline-capable inside a build script.
+
+[dev-dependencies]
+# None — tests use only std (synthetic trees under a temp dir).
+
+[lints]
+workspace = true

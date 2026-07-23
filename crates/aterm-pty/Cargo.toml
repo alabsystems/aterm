@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's single PTY spawn + IO seam (ATERM_DESIGN WS-G): all raw libc forkpty/read/write/ioctl contained in one auditable place."
+
+[features]
+default = []
+# TRUST_NATIVE_TLA Phase 2: compile the source↔spec `#[refines]`/`#[spec_unmodeled]`
+# anchors binding `write_all` (→ external `WriteAll.tla`) and the fork→exec child
+# seam (→ `ForkExec.tla`) to those specs. OFF by default (byte-identical production
+# seam, no `aterm-spec`/`inventory`); the workspace `spec_xref_closure` gate
+# (aterm-gui's test build) enables it to COLLECT the anchors cross-crate.
+spec-anchors = ["dep:aterm-spec"]
+
+[dependencies]
+aterm-cap = { workspace = true }
+aterm-sandbox = { workspace = true }
+# Canonical PTY env-sanitization deny-list (`aterm_types::domain::is_ai_env_var`),
+# applied in `spawn_shell_with_pid` so AI-tool / containment env vars don't leak
+# into child shells. Used PARENT-side (before forkpty), so it adds no child-side
+# allocation. Default-feature only (no serde/winit) — stays a lean leaf dep.
+aterm-types = { workspace = true }
+# Optional: only pulled in by the off-by-default `spec-anchors` feature.
+aterm-spec = { workspace = true, optional = true }
+
+# POSIX-only: the forkpty/execve seam (src/unix.rs). The Windows backend
+# (src/windows/) is direct kernel32 `extern "system"` FFI — no libc.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+# Test-only: the pty tests mint a root `Authority` (unix.rs, windows/mod.rs,
+# tests/windows_smoke.rs). `launcher-mint` makes the sealed
+# `aterm_cap::Authority::root_authority()` nameable for this crate's OWN test build
+# only — the production spawn seam never mints, it receives `Cap`s by argument. See
+# aterm-cap's `mint_sites_are_launcher_only` gate.
+[dev-dependencies]
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
+
+# These back Unix-only tests (Seatbelt wrap, forkpty conformance); the Windows
+# test lane is tests/windows_smoke.rs + the pure cmdline/shell unit tests.
+[target.'cfg(unix)'.dev-dependencies]
+# Test-only: lock this seam's inlined SANDBOX_EXEC_PATH against the canonical one
+# in the policy crate, and reuse the network-deny profile in the OS-sandbox-wrap
+# enforcement test. NOT a build dependency of the lean seam.
+aterm-containment = { workspace = true }
+# Test-only: Tier-1 `WriteAll.tla` conformance (`tests/conformance_writeall.rs`)
+# drives the real `write_all` drain loop and validates the offset trajectory.
+aterm-spec = { workspace = true }
+aterm-spec-models = { workspace = true }
+
+[lints]
+workspace = true

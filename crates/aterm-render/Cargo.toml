@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm CPU rasterizer: the terminal grid -> an RGBA framebuffer. The renderer core AND the read_image pixel-introspection oracle (headless, testable)."
+
+[features]
+default = ["disk-tier", "embedded-font", "embedded-symbols"]
+# Compile source↔spec anchors into the library for the downstream aterm-gui
+# closure gate. Off by default, so production rendering carries no verifier dep.
+spec-anchors = ["dep:aterm-spec"]
+# Disk-backed scrollback cold tier, forwarded through aterm-core. DEFAULT-ON so
+# native builds are byte-identical; a wasm consumer disables it
+# (--no-default-features) to drop libc/zstd-sys.
+disk-tier = ["aterm-core/disk-tier", "aterm-render-api/disk-tier"]
+# FONT-EMBED: compile in a bundled last-resort monospace font (DejaVu Sans Mono,
+# ~340KB, Bitstream Vera license — see assets/DejaVuSansMono.LICENSE.txt) so text
+# renders even on a host with NO usable system font (e.g. a stripped Linux box).
+# DEFAULT-ON; disable with --no-default-features to drop the ~340KB from the binary.
+embedded-font = []
+# FONT-2b: compile in the Symbols Nerd Font (Mono, ~2.5MB, MIT — see
+# assets/SymbolsNerdFont-LICENSE.txt) as a GUARANTEED last-resort icon face, so the
+# Nerd Font PUA icons (Devicons / Font Awesome / Material / Powerline-extra / …) render
+# out of the box with NO installed Nerd Font. Tried last in the runtime fallback, so any
+# installed/configured face still wins. DEFAULT-ON; --no-default-features drops the ~2.5MB.
+embedded-symbols = []
+
+[dependencies]
+# Path (not `workspace = true`) so we can set default-features = false here without
+# forcing it on every workspace consumer; disk-tier is re-enabled by default via this
+# crate's own default = ["disk-tier"], so the native closure is unchanged.
+aterm-core = { path = "../aterm-core", default-features = false }
+aterm-render-api = { path = "../aterm-render-api", default-features = false }
+# The Unicode `Emoji_Presentation` gate: a default-text code point (⏺ U+23FA) is
+# never resolved to the colour-emoji face merely because that face covers it.
+aterm-grapheme = { workspace = true }
+# Ligature config (LigatureMode / TextShapingConfig / FontFeature): the shaping
+# settings that gate liga/calt. Plain data types, no default features.
+aterm-types = { workspace = true }
+# Fast non-DoS hasher (FxHash) for the per-cell glyph caches — the render profile
+# showed ~10% of rasterize time in SipHash. Glyph-cache keys are local render state
+# (font glyphs), not an untrusted hashmap-flood vector, so FxHash is the standard,
+# safe choice (matches the engine's grid/core caches, which already use it).
+aterm-hash = { workspace = true }
+fontdue = "0.9"
+png = "0.17"
+rustybuzz = "0.20.1"
+# FONT-2: fill a ttf-parser (VARIATION-applied) glyph outline into a coverage mask
+# for the portable raster path — fontdue has no variation API, so a variable primary
+# would otherwise draw only its fvar DEFAULT instance off macOS / under
+# ATERM_RASTERIZER=fontdue. Tiny, no-font-parsing coverage rasterizer (nonzero winding
+# + AA); already in the tree via a transitive dep.
+ab_glyph_rasterizer = "0.1.10"
+# Color-emoji (Apple Color Emoji `sbix` table) glyph extraction. fontdue is a
+# monochrome rasterizer; ttf-parser reads the embedded per-glyph PNG bitmaps.
+ttf-parser = "0.25"
+# Optional verifier registry used only when `spec-anchors` is enabled. The same
+# crate remains a dev-dependency below for this crate's Tier-1 tests.
+aterm-spec = { workspace = true, optional = true }
+
+[dev-dependencies]
+libc = { workspace = true }
+# Base64 encoder for the inline-image (OSC 1337) integration tests.
+aterm-codec = { workspace = true }
+# Sparkle-words v2 visual demo (examples/sparkle_v2_demo.rs, design §13): the
+# genome + CatBaker + nova engines now live in the shared aterm-effects
+# library (extracted from aterm-gui). The dev-dep cycle (effects depends on
+# this crate) is fine — cargo permits dev-dependency cycles. Dev-only: the
+# shipped renderer lib gains no effects/lexicon dep.
+aterm-effects = { workspace = true }
+# `aterm_scene::mix_rgb` (the shared linear-RGB colour mix) for the sparkle demo only —
+# dev-only, so the shipped renderer lib carries no aterm-scene dep.
+aterm-scene = { workspace = true }
+# The genome's context SimHash folds tokens through the lexicon's shared
+# case-folding (demo helpers).
+aterm-lexicon = { workspace = true }
+# Trust/ty derived-model proof of the colour-presentation gate invariant
+# (tests/presentation_gate.rs): a default-text code point never resolves to the
+# colour-emoji face. Same in-process model interpreter the scrollback/session
+# proofs use.
+aterm-spec = { workspace = true }
+# Direct shaping access for the ligature gate (pre-check that "=>" ligates).
+rustybuzz = "0.20.1"
+# Coverage probing for the W6 styled-face/fallback-chain gates
+# (tests/styled_faces.rs): scan for a code point one fixture covers and the
+# other lacks, so the fallback routing test can never go vacuous.
+fontdue = "0.9"
+# Property test (tests/set_px_rerasterizes.rs): the renderer's DPR re-rasterization
+# guarantee — set_px(newPx) scales cell metrics proportionally AND clears the glyph
+# atlas/caches so a subsequent render re-rasterizes at the new px. The host-side DPR
+# fix in the renderer depends on this engine invariant holding.
+proptest = { workspace = true }
+
+[lints]
+workspace = true

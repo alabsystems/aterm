@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-nest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — a std-only CLI that builds an N-deep stack of nested aterms and runs a command in the deepest, driving each level over its own control socket."
+
+[[bin]]
+name = "aterm-nest"
+path = "src/main.rs"
+
+[dependencies]
+# The portable control-socket stream + CSPRNG helper (std Unix sockets on
+# Unix; AF_UNIX-over-winsock + BCryptGenRandom on Windows). Workspace crate,
+# std-only — this binary stays free of third-party dependencies.
+aterm-uds = { workspace = true }
+
+[lints]
+workspace = true

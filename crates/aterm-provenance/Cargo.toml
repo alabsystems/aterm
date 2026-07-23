@@ -1,0 +1,32 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-provenance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trusted data-flow provenance framework for aterm: Origin lattice + Provenance<T, O> wrapper (Phase 0, issue #8000)"
+
+[features]
+# Gate the raw `HostAuthorizationToken::__new_for_capability_only` and
+# `NetworkAuthorizationToken::__new_for_capability_only` constructors behind a
+# non-default feature so that workspace crates cannot forge capability-seal
+# tokens by accident. Only an explicit allow-list of crates (aterm-core,
+# aterm-ssh-conductor, aterm-tmux) enables this feature transitively through
+# aterm-core-ffi. See #8013 for the security analysis and
+# `aterm audit policy --seals` for the CI gate.
+internal-mint = []
+
+[build-dependencies]
+# None — build.rs uses only std
+
+[dependencies]
+aterm-error = { workspace = true }
+
+[dev-dependencies]
+# None — tests use only std
+
+[lints]
+workspace = true

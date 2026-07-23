@@ -1,0 +1,35 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "atpkg-keys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — OWNER-side Ed25519 signing for atpkg manifests (keygen + detached sign over exact raw bytes). Produces signatures the verify-only atpkg client accepts; never shipped to clients."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "atpkg-keys"
+path = "src/main.rs"
+
+[dependencies]
+# Producer-side: the FULL ring crate (RNG for keygen + the signing op). The CLIENT
+# (atpkg) deliberately uses `default-features = false` (verify-only, no RNG/alloc); this
+# tool is owner-only and never shipped, so it carries the full crate. At/above the
+# deny.toml ring floor, so no ban is tripped.
+ring = "0.17.14"
+# Encode the 32-byte raw public key (for PINNED_PKG_ROOTKEY / the index release_key_pubkey).
+base64 = "0.22.1"
+
+[dev-dependencies]
+# Prove the producer↔client contract: sign here, verify + INSTALL with the ACTUAL client.
+atpkg = { path = "../atpkg" }
+# The owner→client integration test builds a real `.tar.zst` to drive the client install.
+zstd = { workspace = true }
+
+[lints]
+workspace = true

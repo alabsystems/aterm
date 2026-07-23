@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — a std-only command-line client for the aterm introspection control socket (v1)."
+
+[[bin]]
+name = "aterm-ctl"
+path = "src/main.rs"
+
+[dependencies]
+# Engine-side socket naming/discovery decisions, shared with the server so
+# the two can never drift. Platform-free; no external dependencies.
+aterm-types = { workspace = true }
+# The portable control-socket stream + `latest`-alias resolution (std Unix
+# sockets on Unix; AF_UNIX-over-winsock on Windows). Workspace crate, std-only
+# — this binary stays free of third-party dependencies.
+aterm-uds = { workspace = true }
+
+[lints]
+workspace = true

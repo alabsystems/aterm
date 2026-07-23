@@ -1,0 +1,1575 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The engine-owned render SNAPSHOT (`read_image` boundary, REARCH A-3).
+//!
+//! [`RenderInput`] is the plain-owned, `Terminal`-free value a renderer reads to
+//! paint one frame. Historically the CPU renderer reached into `&Terminal`
+//! internals to build it (`Renderer::extract_into`); A-3 inverts that boundary so
+//! the ENGINE produces the snapshot ([`Terminal::cell_frame_into`]) and the
+//! renderer becomes a PURE consumer of this value — no `&Terminal`, no reach into
+//! core. Hosting the type HERE (rather than in `aterm-render-api`) lets
+//! `aterm-core` build the snapshot without a dependency cycle: `aterm-render-api`
+//! re-exports `RenderInput` from here, so every existing
+//! `aterm_render::RenderInput` / `aterm_render_api::RenderInput` call site is
+//! unchanged.
+
+use crate::grid::LineSize;
+use crate::selection::TextSelection;
+use crate::terminal::{CursorStyle, RenderCell};
+
+/// One faded cell of the cursor MOTION TRAIL (the "streaming trailer" effect): a
+/// cell the cursor recently swept through, painted in the trail colour at `alpha`
+/// coverage over the cell's own background. The whole trail fades out within a
+/// few hundred milliseconds of the move, so it reads as a comet behind the cursor
+/// and makes cursor motion (e.g. a Ctrl-A/Ctrl-E jump) unmistakable.
+///
+/// Position is in the SAME viewport coordinate space as
+/// [`RenderInput::cursor_row`]/[`RenderInput::cursor_col`] (i.e. after the
+/// tab-strip splice and any split-pane offset), so the renderer draws each trail
+/// cell with the IDENTICAL `pad + col*cell_w` / `pad + row*cell_h` geometry it
+/// uses for the cursor. The renderer is a pure consumer: the host (the windowed
+/// frontend) owns the animation clock and hands the renderer the already-resolved
+/// `alpha` per cell each frame, so the renderer stays deterministic (CPU/GPU
+/// byte-parity is preserved — an empty trail is byte-identical to the pre-trail
+/// path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrailCell {
+    /// Viewport row (0-indexed from the top of the visible area).
+    pub row: usize,
+    /// Viewport column (0-indexed).
+    pub col: usize,
+    /// Blend coverage `0..=255` of the trail colour over this cell's background
+    /// (`0` = invisible, `255` = the solid trail colour). Drawn OPAQUELY as the
+    /// pre-blended result, so the CPU fill and the GPU `REPLACE` quad land the
+    /// identical pixel.
+    pub alpha: u8,
+}
+
+/// One additive LIGHT quad of the "LUMEN WAKE" cursor aurora — a fragment of
+/// emitted light (comet body, bloom-crown slab, landing-ring strip, or a spark
+/// particle) composited with PREMULTIPLIED ADDITIVE blend (`dst + src`, saturating).
+///
+/// The host pre-multiplies the colour by its coverage (so `color` is already the
+/// light to add) and the renderer simply does a per-channel saturating add — which
+/// is order-independent and BYTE-EXACT between the GPU (`One`/`One` blend over the
+/// linear `Rgba8Unorm` target) and the CPU (`add_sat`). Additive light only ever
+/// BRIGHTENS, so the text underneath stays legible (no smear, no darkening), and an
+/// empty `cursor_glow_add` is byte-identical to the pre-aurora render path.
+///
+/// INVARIANTS the host upholds so the renderer is a dumb, parity-safe consumer:
+/// (1) the coordinate convention is PER STREAM — the cursor-effect streams
+/// (`cursor_glow_add`, `glow_under`) are WINDOW-ABSOLUTE pixels (the
+/// window-space effects layer: the producer folds in the grid origin and clamps
+/// to the EFFECTS BOX — the grid plus the chrome head band above it — so the
+/// renderer adds NO offset), while the grid-anchored `nova_add` stream stays
+/// GRID-INTERIOR (its word_decorations producer knows no window origin; the
+/// renderer offsets it like every other grid stream); (2)
+/// every quad lies within EXACTLY ONE grid-anchored cell-row band — a halo/ring
+/// spilling into a neighbour row is emitted as a SEPARATE quad tagged with that
+/// row — so the row-scoped dirty gate + GPU scissor cover it exactly. `row` is
+/// a grid-row DAMAGE HINT: an above-grid quad tags row 0, which opens the top
+/// band on both presenters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GlowQuad {
+    /// The viewport row band this quad lives in — a grid-row DAMAGE HINT for
+    /// the dirty gate (above-grid quads tag row 0).
+    pub row: u16,
+    /// Pixel X in this stream's coordinate space. Cursor-effect streams are
+    /// window-absolute; grid-anchored streams such as `nova_add` are
+    /// grid-interior, as documented on [`GlowQuad`].
+    pub x: u16,
+    /// Pixel Y in this stream's coordinate space (window-absolute or
+    /// grid-interior according to the owning stream).
+    pub y: u16,
+    /// Quad width in pixels.
+    pub w: u16,
+    /// Quad height in pixels (kept within the single `row` cell band).
+    pub h: u16,
+    /// PREMULTIPLIED light colour `0x00RRGGBB` — added (saturating) onto the dest.
+    pub color: u32,
+}
+
+/// How a [`RainHalo`]'s radially-weighted colour composites onto the frame.
+///
+/// Every legacy stream is [`Add`](HaloMode::Add) — pure premultiplied light,
+/// invisible over a white background (you cannot brighten white into smoke).
+/// [`Over`](HaloMode::Over) is the light-theme answer: the quad becomes a
+/// source-over VEIL whose per-pixel opacity is the radial falloff weight, so
+/// grey smoke / pale steam / any darkening effect reads on ANY background.
+/// Within one stream, every `Add` quad composites BEFORE every `Over` quad
+/// (veils dim light — the GPU's per-mode split draw order; the CPU rasterizer
+/// mirrors it), so overlapping mixed-mode halos stay parity-exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HaloMode {
+    /// PREMULTIPLIED saturating-add light (CPU `add_sat` == GPU One/One on the
+    /// Unorm view) — the historical mode; byte-identical to the pre-mode path.
+    #[default]
+    Add,
+    /// SOURCE-OVER veil: `color` is a STRAIGHT (unpremultiplied) RGB and the
+    /// radial falloff weight is the per-pixel ALPHA of a source-over composite
+    /// (centre most opaque, fading to 0 at the radii) — light or dark veils
+    /// that read on any background (the light-theme smoke/steam law).
+    Over,
+}
+
+/// A PHOSPHOR rain bright-head halo: like [`GlowQuad`] (a single-row-band
+/// premultiplied additive quad) but its light falls off
+/// RADIALLY from the head centre instead of filling the rect flat. `color` is
+/// the PEAK (centre) light; each covered pixel scales it by an integer
+/// elliptical falloff — `weight = ((256 − nsq)² >> 8)` clamped, where
+/// `nsq = (dx²·256)/rx² + (dy²·256)/ry²` with `(dx, dy)` the pixel's offset
+/// from `(cx, cy)` — then `add_sat`s it (or, in [`HaloMode::Over`], uses the
+/// weight as the per-pixel source-over ALPHA of the straight `color`). The
+/// falloff is pure integer math so the CPU rasterizer and the GPU
+/// `fs_rain_glow`/`fs_rain_glow_over` shaders compute it byte-for-byte
+/// identically (the halo-parity contract). Coordinates follow the [`GlowQuad`]
+/// convention PER STREAM: cursor-effect streams (`glow_halo`) are
+/// WINDOW-ABSOLUTE px (the producer folds in the grid origin); the grid-anchored
+/// `rain_add` stream stays grid-interior (the renderer offsets it). `row` is a
+/// grid-row DAMAGE HINT (above-grid quads tag row 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RainHalo {
+    /// The viewport row band this quad lives in — a grid-row DAMAGE HINT for
+    /// the dirty gate (above-grid quads tag row 0).
+    pub row: u16,
+    /// Pixel X of the quad (window-absolute for cursor-effect streams;
+    /// grid-interior for `rain_add` — see the struct doc).
+    pub x: u16,
+    /// Pixel Y of the quad (same convention as `x`).
+    pub y: u16,
+    /// Quad width in pixels.
+    pub w: u16,
+    /// Quad height in pixels (kept within the single `row` cell band).
+    pub h: u16,
+    /// The halo-centre colour `0x00RRGGBB`. In [`HaloMode::Add`] this is the
+    /// PREMULTIPLIED PEAK light (scaled down per pixel by the radial falloff
+    /// before the saturating add); in [`HaloMode::Over`] it is a STRAIGHT
+    /// (unpremultiplied) veil colour (the falloff scales its OPACITY instead).
+    pub color: u32,
+    /// Pixel X of the halo CENTRE (the bright core / falloff origin; same
+    /// coordinate convention as `x`). May lie outside this quad's row band
+    /// (a halo spans up to 3).
+    pub cx: u16,
+    /// Pixel Y of the halo CENTRE (same convention as `y`).
+    pub cy: u16,
+    /// Horizontal elliptical falloff half-extent in pixels — light reaches 0 at
+    /// this radius. `>= 1` (the emitter guarantees it; 0 would divide by zero).
+    pub rx: u16,
+    /// Vertical elliptical falloff half-extent in pixels — light reaches 0 at
+    /// this radius. `>= 1` (the emitter guarantees it; 0 would divide by zero).
+    pub ry: u16,
+    /// How the radially-weighted colour composites (defaults to the historical
+    /// [`HaloMode::Add`]; [`HaloMode::Over`] is the light-theme veil).
+    pub mode: HaloMode,
+}
+
+/// How a [`FirePatch`]'s per-pixel field output composites onto the frame.
+///
+/// [`Add`](FireMode::Add) is the dark-theme flame: the field emits
+/// PREMULTIPLIED light (`palette·coverage`) saturating-added onto the dest
+/// (CPU `add_sat` == GPU One/One on the Unorm view) — pure emission,
+/// byte-invisible over white. [`Over`](FireMode::Over) is the light-theme
+/// flame: the SAME field shapes a straight ink palette + per-pixel alpha
+/// composited source-over (CPU `over_rgb` == GPU SrcAlpha/OneMinusSrcAlpha on
+/// the same Unorm view, the [`HaloMode::Over`] contract) — fire as PAINT that
+/// reads on any background. Within one stream every `Add` patch composites
+/// BEFORE every `Over` patch (the GPU's per-mode split draw order; the CPU
+/// rasterizer mirrors it), so overlapping mixed-mode patches stay parity-exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FireMode {
+    /// PREMULTIPLIED saturating-add flame light — the dark-theme mode.
+    #[default]
+    Add,
+    /// SOURCE-OVER ink-fire: straight RGB + field-shaped alpha — the
+    /// light-theme mode (readable on white).
+    Over,
+}
+
+/// One EMBERFORGE **FirePatch**: a per-pixel, pure-integer procedural FIRE
+/// FIELD evaluated at every device pixel of the patch quad by BOTH backends —
+/// the full-art-scale generalization of the [`RainHalo`] parity trick. The
+/// shared field function (`aterm_render::fire_field`, mirrored op-for-op by
+/// the GPU `fs_fire_add`/`fs_fire_over` WGSL) maps `(window_px, window_py,
+/// patch params)` to a palette colour + coverage with NO state and NO floats,
+/// so the CPU rasterizer and the GPU fragment shader land the IDENTICAL byte
+/// (the fire-parity contract).
+///
+/// Quads obey the [`RainHalo`] cursor-stream invariants: WINDOW-ABSOLUTE
+/// pixels (the window-space effects layer — the producer folds in the grid
+/// origin, the renderer adds NO offset; flames may light the head band above
+/// the grid), each within EXACTLY ONE grid-anchored cell-row band (`row` is a
+/// grid-row DAMAGE HINT; above-grid patches tag row 0) — a flame spanning rows
+/// is emitted as per-row patches. The field itself is a function of ABSOLUTE
+/// pixel coordinates plus the patch parameters, so patches sharing a burn
+/// (same `base_y`/`peak_h`/`phase`/`temp`/`lean`/`cell_h`) are CONTINUOUS
+/// across patch boundaries — zero seams; splitting a wide patch in two is
+/// byte-identical. `base_y`, like a halo's `cx`/`cy`, may lie outside the
+/// patch's own row band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FirePatch {
+    /// The viewport row band this quad lives in — a grid-row DAMAGE HINT for
+    /// the dirty gate (above-grid patches tag row 0).
+    pub row: u16,
+    /// Window-absolute pixel X of the quad (the producer already folded in the
+    /// grid origin).
+    pub x: u16,
+    /// Window-absolute pixel Y of the quad.
+    pub y: u16,
+    /// Quad width in pixels.
+    pub w: u16,
+    /// Quad height in pixels (kept within the single `row` cell band).
+    pub h: u16,
+    /// Window-absolute pixel Y of the flame ROOT (field `v = 0`; flames rise
+    /// UPWARD, so live pixels have `y < base_y`). Shared across a burn's
+    /// patches so the field is continuous vertically.
+    pub base_y: u16,
+    /// Maximum flame height in pixels — the tongue-height envelope at this
+    /// patch. `0` is treated as `1` by the field (total function).
+    pub peak_h: u16,
+    /// Churn phase in units of 1/1024 s, QUANTIZED by the producer so both
+    /// backends see the identical time. All patches of one burn share it.
+    pub phase: u32,
+    /// Display temperature `0..=255`: palette reach (white confined to the
+    /// root at high temp), coverage density, and churn/rise speed.
+    pub temp: u8,
+    /// Per-cell envelope `0..=255` (head→tail falloff arrives through this);
+    /// scales the tongue height.
+    pub strength: u8,
+    /// Horizontal shear: the field's sample column drifts `lean/4` px per full
+    /// rise (tongues drag against the typing direction). Signed.
+    pub lean: i8,
+    /// Readability ceiling on emitted coverage/alpha `0..=255` — text under
+    /// the fire stays legible.
+    pub cov_cap: u8,
+    /// The cell height in pixels: the field's spatial unit (DPI-independent
+    /// flame anatomy). `< 2` is clamped to 2 by the field (total function).
+    pub cell_h: u16,
+    /// How the field output composites (defaults to the dark-theme
+    /// [`FireMode::Add`]; [`FireMode::Over`] is the light-theme ink-fire).
+    pub mode: FireMode,
+}
+
+/// One textured sprite quad of a **Scene** — aterm's data-driven "Living Panels"
+/// habitat that can replace the text performance HUD with an animated, GPU-rendered
+/// world (a cat meadow, a cosmos, a numbers pulse, …). A `SpriteQuad` is a rectangle
+/// sampled from an RGBA8 *scene atlas* (procedurally baked, or supplied by a sprite
+/// sheet) and composited SOURCE-OVER (straight alpha) onto the frame — the SAME blend
+/// the inline-image / colour-emoji / settings-tray paths already use, so the CPU fill
+/// and the GPU sampled quad land the IDENTICAL pixel (parity by construction).
+///
+/// The host (`aterm-scene` + the windowed frontend) owns ALL art and animation and
+/// hands the renderer a fully-resolved list each frame; the renderer is a dumb,
+/// parity-safe consumer. The host upholds the same dirty-gate invariants as
+/// [`GlowQuad`]: (1) the dest rect is in GRID-INTERIOR pixels (pad-relative; the
+/// renderer offsets by `pad`), clamped to the grid; (2) every quad lies within EXACTLY
+/// ONE cell-row band (`row`) — a sprite spanning rows is emitted as per-row slices —
+/// so the row-scoped dirty gate + GPU scissor cover it exactly. Atlas coordinates are
+/// integer TEXELS (not normalized UV) so the type stays `Copy + Eq` and the damage
+/// cache compares it byte-exactly (no float reflexivity hazard). An empty `scene_over`
+/// is byte-identical to the pre-scene render path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpriteQuad {
+    /// The viewport row band this quad lives in (its sole row, for the dirty gate).
+    pub row: u16,
+    /// Grid-interior pixel X of the dest rect (pad-relative).
+    pub x: u16,
+    /// Grid-interior pixel Y of the dest rect (pad-relative; within the `row` band).
+    pub y: u16,
+    /// Dest width in pixels.
+    pub w: u16,
+    /// Dest height in pixels (kept within the single `row` cell band).
+    pub h: u16,
+    /// Source rect X in the scene atlas, in texels.
+    pub ax: u16,
+    /// Source rect Y in the scene atlas, in texels.
+    pub ay: u16,
+    /// Source rect width in the scene atlas, in texels.
+    pub aw: u16,
+    /// Source rect height in the scene atlas, in texels.
+    pub ah: u16,
+    /// Multiply tint `0x00RRGGBB` applied to the sampled texel (`0x00FF_FFFF` = none).
+    pub tint: u32,
+    /// Extra opacity `0..=255` multiplied onto the sampled alpha (`255` = as-authored).
+    pub alpha: u8,
+    /// Mirror the sampled sprite horizontally (a creature facing left vs right from one
+    /// baked pose). The renderer samples `u → 1-u`; CPU and GPU honor it identically.
+    pub flip_x: bool,
+}
+
+/// One FREE-FLOATING decorative sprite: an arbitrary pixel rectangle at an
+/// arbitrary — even off-grid — position, with NO row tag. It is [`SpriteQuad`]
+/// with the single-row-band invariant removed: the full `[y, y+h)` pixel extent
+/// is authoritative for dirty tracking (the shared dirty computation row-unions
+/// every cell-row band the extent overlaps, prev∪cur), so a sprite may span any
+/// number of row bands and needs no host-side per-row slicing.
+///
+/// The dest origin is in GRID-INTERIOR pixels (pad-relative; the renderer
+/// offsets by `pad`) and SIGNED: a cat peeking in from outside the grid (its
+/// top edge up in the top pad strip, or rising from below the bottom edge) has
+/// a negative / past-the-edge origin that `u16` cannot express. Extents and
+/// atlas coordinates stay non-negative integer texels (not normalized UV), so
+/// the type stays `Copy + Eq` and the damage cache compares it byte-exactly
+/// (no float reflexivity hazard) — exactly the [`SpriteQuad`] contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FreeSprite {
+    /// Grid-interior pixel X of the dest rect (pad-relative; may be negative
+    /// for an off-grid peek).
+    pub x: i32,
+    /// Grid-interior pixel Y of the dest rect (pad-relative; may be negative —
+    /// a sprite hanging in from above row 0 — or extend past the bottom edge).
+    pub y: i32,
+    /// Dest width in pixels (zero is a no-op, rejected in the stamp).
+    pub w: u16,
+    /// Dest height in pixels (zero is a no-op, rejected in the stamp).
+    pub h: u16,
+    /// Source rect X in the free atlas, in texels.
+    pub ax: u16,
+    /// Source rect Y in the free atlas, in texels.
+    pub ay: u16,
+    /// Source rect width in the free atlas, in texels.
+    pub aw: u16,
+    /// Source rect height in the free atlas, in texels.
+    pub ah: u16,
+    /// Multiply tint `0x00RRGGBB` applied to the sampled texel (`0x00FF_FFFF` = none).
+    pub tint: u32,
+    /// Extra opacity `0..=255` multiplied onto the sampled alpha (`255` = as-authored).
+    pub alpha: u8,
+    /// Mirror the sampled sprite horizontally, exactly like [`SpriteQuad::flip_x`].
+    pub flip_x: bool,
+    /// Painter's-order slot: under or over the terminal text.
+    pub z: FreeZ,
+    /// Sampling regime (v1 renderers consume `Nearest` only; `Linear` is deferred).
+    pub sampler: FreeSampler,
+}
+
+/// Where a [`FreeSprite`] sits relative to the terminal text (painter's-order
+/// slot, not a depth test). Participates in the byte-exact damage compare, so a
+/// same-rect z flip is a real content change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FreeZ {
+    /// Drawn after the cell backgrounds / legacy scene+cat sprites, before glyphs.
+    #[default]
+    UnderText,
+    /// Drawn after glyphs and word decorations, before the cursor.
+    OverText,
+}
+
+/// How a [`FreeSprite`] samples its atlas. v1 renderers consume `Nearest` only
+/// (the cat regime: host bakes at exact 1:1 dest size); `Linear` is carried in
+/// the type and the damage compare from day one but deferred in the renderers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FreeSampler {
+    /// NEAREST 1:1 (cats).
+    #[default]
+    Nearest,
+    /// Bilinear (deferred — scene-style scaled art).
+    Linear,
+}
+
+/// The RGBA8 **scene atlas** carried alongside a frame's [`SpriteQuad`]s: the texture
+/// every scene sprite samples (procedurally baked by `aterm-scene`, or a sprite sheet).
+/// Shared by `Arc` so cloning a [`RenderInput`] is cheap, and identified by a monotonic
+/// `version` so the GPU re-uploads the texture only when the atlas actually changes (a
+/// skin/theme switch). Straight-alpha, row-major, length `width*height*4`.
+#[derive(Debug)]
+pub struct SceneAtlas {
+    /// Atlas width in texels.
+    pub width: u32,
+    /// Atlas height in texels.
+    pub height: u32,
+    /// Straight-alpha RGBA8 pixels.
+    pub rgba: Vec<u8>,
+    /// Monotonic version; the GPU caches its uploaded texture against this.
+    pub version: u64,
+}
+
+/// Which small procedural sprite a [`WordDecoration`] paints. These are
+/// rasterized by the renderer (not the text font) into a 0/255 coverage mask so
+/// the CPU fill and the GPU atlas land identical pixels — the same parity
+/// contract as the cursor glow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecoGlyph {
+    /// A 4-pointed sparkle star (the default profanity spark).
+    #[default]
+    Star4,
+    /// A 5-pointed star variant.
+    Star5,
+    /// A small round twinkle dot.
+    Dot,
+    /// A plus / cross-shaped sparkle.
+    Plus,
+    /// A cat's paw print (the feline mark).
+    Paw,
+    /// A water droplet / teardrop (the orca "splash" mark): a round bulb low in the
+    /// cell tapering to a point at the top.
+    Droplet,
+    /// An annulus-arc ring segment filling the cell (Sparkle Words v2, the
+    /// SINGULARITY nova's darkening ring): the supernova's additive streams can
+    /// only brighten (`nova_add` is One/One), so the magic Singularity variant's
+    /// collapse ring is stamped as one `DecoBlend::Over` decoration per covered
+    /// cell, each carrying this soft annulus coverage mask tinted dark. Rasterized
+    /// by `deco_coverage` like every other sparkle sprite (cell-sized,
+    /// parameterized only by the cell geometry), so CPU and GPU sample the one
+    /// shared mask.
+    RingArc,
+    /// A full-cell soft-edged square (Sparkle Words v3 §3.3, the SUPER NOVA's
+    /// light-background "eclipse"): additive detonation light is invisible on
+    /// light themes, so the escalated nova's dark veil is stamped as one
+    /// `DecoBlend::Over` decoration per covered cell, each carrying this
+    /// near-solid coverage mask tinted dark — interior at full coverage with a
+    /// ~1 px anti-aliased ramp at all four cell borders. Rasterized by
+    /// `deco_coverage` like every other sparkle sprite (cell-sized,
+    /// parameterized only by the cell geometry), so CPU and GPU sample the one
+    /// shared mask.
+    Shade,
+}
+
+/// How a [`WordDecoration`] composites onto the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecoBlend {
+    /// Premultiplied saturating ADD (`dst + src`) — the profanity sparkle, which
+    /// only ever brightens, exactly like [`GlowQuad`].
+    #[default]
+    Add,
+    /// Source-OVER alpha blend (`dst*(1-a) + src*a`) — the feline cat-paw, a
+    /// solid stamp tinted by `color` at `alpha`.
+    Over,
+}
+
+/// One "sparkle word" decoration: a small sprite stamped over (or near) a cell
+/// of a matched word. The HOST owns the matching + animation and hands the
+/// renderer a fully-resolved list each frame; the renderer is a pure consumer
+/// (an empty list is byte-identical to the pre-feature path, like the cursor
+/// glow). Decorations are render-only — they never touch grid cells,
+/// copied text, or recordings.
+///
+/// Position is in the SAME viewport coordinate space as
+/// [`RenderInput::cursor_row`]/[`cursor_col`](RenderInput::cursor_col); the
+/// renderer derives the cell origin exactly as it does for the cursor, then
+/// offsets by the sub-cell `(dx, dy)` jitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordDecoration {
+    /// Viewport row (0-indexed from the top of the visible area).
+    pub row: u16,
+    /// Viewport column (0-indexed) of the cell this sprite sits on.
+    pub col: u16,
+    /// Sub-cell horizontal jitter in pixels (sparkle liveliness; `0` for paw).
+    pub dx: i8,
+    /// Sub-cell vertical jitter in pixels (`0` for paw).
+    pub dy: i8,
+    /// Which sprite to stamp.
+    pub glyph: DecoGlyph,
+    /// How to composite it.
+    pub blend: DecoBlend,
+    /// Tint colour `0x00RRGGBB` (host-resolved; for `Add` this is the light to
+    /// add, for `Over` the stamp colour).
+    pub color: u32,
+    /// Coverage / opacity `0..=255` of the sprite (the host's animation envelope
+    /// already folded in; the renderer multiplies the sprite mask by this).
+    pub alpha: u8,
+}
+
+/// One animated-ink foreground OVERRIDE for a single cell (Sparkle Words v2
+/// "animated ink"). `color` is the HOST-resolved FINAL colour — the gradient,
+/// specular sweep and legibility guard are pre-folded by the host — so both
+/// renderers do ZERO new colour math: they substitute it wherever
+/// [`RenderCell::fg`] would tint ink (the glyph blit, combining-mark overlays,
+/// underline / strikethrough / overline). An explicit SGR 58 `underline_color`
+/// still wins over ink. `GlyphImage::Rgba` (colour emoji) blits ignore `fg` on
+/// both backends, so emoji cells are untouched by construction.
+///
+/// Invariants the host upholds: [`RenderInput::ink`] is sorted by `(row, col)`
+/// with unique cells (the renderers walk it in lockstep with their column
+/// loops); a wide glyph is governed by its LEAD cell's entry (a continuation
+/// column carries no glyph, so an entry there is inert). An EMPTY list is
+/// byte-identical to the pre-ink render path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InkCell {
+    /// Viewport row (0-indexed from the top of the visible area).
+    pub row: u16,
+    /// Viewport column (0-indexed); the LEAD cell of a wide glyph.
+    pub col: u16,
+    /// Final `[r, g, b]` to substitute for the cell's resolved `fg`.
+    pub color: [u8; 3],
+}
+
+/// One EFFECT-owned per-cell glyph-ink foreground OVERRIDE (EMBERFORGE
+/// "dark glyph cores": engulfed cells recoloured toward charred ember-black so
+/// the letterform reads as a silhouette inside the flame). `fg` is the
+/// HOST-resolved FINAL colour — the renderers do ZERO new colour math and
+/// substitute it exactly where an [`InkCell`] would substitute (the glyph
+/// blit, combining-mark overlays, line decorations — SGR 58 still wins),
+/// BEFORE the minimum-contrast / selection fg floors. When a cell carries BOTH
+/// an ink entry and a `char_fg` entry, INK WINS (animated ink is a
+/// user-visible feature; the effect recolour yields).
+///
+/// Invariants the host upholds (the [`InkCell`] contract, verbatim):
+/// [`RenderInput::char_fg`] is sorted by `(row, col)` with unique cells (the
+/// renderers merge-walk it in lockstep with their column loops); a wide glyph
+/// is governed by its LEAD cell's entry (a continuation column carries no
+/// glyph, so an entry there is inert); `GlyphImage::Rgba` (colour emoji) blits
+/// ignore `fg` on both backends, so emoji cells are untouched by construction.
+/// An EMPTY list is byte-identical to the pre-char_fg render path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharFg {
+    /// Viewport row (0-indexed from the top of the visible area).
+    pub row: u16,
+    /// Viewport column (0-indexed); the LEAD cell of a wide glyph.
+    pub col: u16,
+    /// Final `0x00RRGGBB` to substitute for the cell's resolved `fg`.
+    pub fg: u32,
+}
+
+/// One EFFECT-owned CONTRAST-HALO cell (EMBERFORGE text legibility): the fire
+/// ENGULFMENT WEIGHT for a glyph cell, driving the alpha of the dark warm
+/// dilation ring the renderers stamp under the glyph's ink (over the flame) so
+/// the letterform separates from the fire at any brightness. Carries NO colour
+/// on purpose — the ink itself is NEVER recoloured (the no-recolor law: the
+/// owner vetoed ink recolouring twice, v0.41/v0.42; the halo lives around the
+/// strokes, never in them). A COLOR-FREE strength stream: `strength` scales
+/// only the halo ring's opacity (`0` a bare rim, `255` the full separator).
+///
+/// Invariants the host upholds (the [`CharFg`]/[`InkCell`] contract, verbatim):
+/// [`RenderInput::fire_halo`] is sorted by `(row, col)` with unique cells (the
+/// renderers merge-walk it in lockstep with their column loops); a wide glyph
+/// is governed by its LEAD cell's entry; `GlyphImage::Rgba` (colour emoji)
+/// cells draw no mono coverage, so they are never haloed by construction. This
+/// is a GRID stream (cell-anchored): the tab-strip splice shifts `row` down
+/// with the terminal content, exactly like `char_fg`. An EMPTY list is
+/// byte-identical to the pre-fire_halo render path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FireHaloCell {
+    /// Viewport row (0-indexed from the top of the visible area).
+    pub row: u16,
+    /// Viewport column (0-indexed); the LEAD cell of a wide glyph.
+    pub col: u16,
+    /// Fire engulfment weight for this cell (`0..=255`): scales the contrast
+    /// halo's stamp alpha — a lick barely rims the glyph, the wall rims firmly.
+    pub strength: u8,
+}
+
+/// Sentinel for [`RenderInput::default_bg`] / [`RenderInput::cursor_color`] meaning
+/// "the host did not resolve a live colour for this frame — fall back to the
+/// renderer's configured theme." Real frame colours are `0x00RRGGBB` (high byte
+/// always 0), so a set high byte is unambiguously "unset". Lets every render path that
+/// doesn't fill these fields (headless, the composed-pane scratch, tests) stay
+/// byte-identical to the pre-OSC-11/12 behaviour while the windowed redraw fills them
+/// with live values.
+pub const COLOR_UNSET: u32 = 0xFF00_0000;
+
+/// Everything a renderer reads from a `&Terminal` for one frame, snapshotted into
+/// plain owned data — the engine emits it via [`crate::terminal::Terminal::cell_frame_into`].
+///
+/// The windowed frontend holds the `Terminal` mutex only long enough to extract
+/// this struct, then renders WITHOUT the lock — so the PTY reader thread is no
+/// longer starved for the multi-millisecond duration of a frame (CPU
+/// rasterization or GPU encode + readback).
+///
+/// `PartialEq`/`Eq` are hand-written and compare only the rendered CONTENT (every
+/// field EXCEPT pure frame metadata such as
+/// [`snapshot_seq`](RenderInput::snapshot_seq) and
+/// [`absolute_row_revision`](RenderInput::absolute_row_revision)): the CPU renderer's
+/// damage-tracking fast path compares a fresh `RenderInput` against the one it
+/// cached last frame — overall and per row — to decide which rows changed (and
+/// whether anything changed at all). `snapshot_seq` is pure metadata that
+/// advances on every damaged frame, so including it in the comparison would make
+/// equality ALWAYS differ and defeat the row-level reuse / dirty-gate; it is
+/// therefore excluded. Content equality stays exact (byte-for-byte intent), which
+/// is what the no-visual-regression contract requires.
+#[derive(Debug)]
+pub struct RenderInput {
+    /// Number of visible rows this frame was extracted for.
+    pub rows: usize,
+    /// Number of columns this frame was extracted for.
+    pub cols: usize,
+    /// One resolved `RenderCell` row per visible row, in viewport order.
+    pub cells: Vec<Vec<RenderCell>>,
+    /// Cursor cell row.
+    pub cursor_row: usize,
+    /// Cursor cell column.
+    pub cursor_col: usize,
+    /// DECTCEM cursor visibility.
+    pub cursor_visible: bool,
+    /// The terminal's own DECSCUSR style. The frontend's unfocused override is
+    /// NOT baked in here — it lives on the renderer and is applied in
+    /// `render_input`.
+    pub cursor_style: CursorStyle,
+    /// The cursor MOTION TRAIL for this frame (the "streaming trailer" effect):
+    /// recently-swept cells fading out behind the cursor. Owned by the host's
+    /// animation clock (the windowed frontend fills it each frame and decays it),
+    /// not by the engine — `cell_frame_into` leaves it untouched. EMPTY in the
+    /// common case (no recent move / the effect disabled), which is byte-identical
+    /// to the pre-trail render path. See [`TrailCell`].
+    pub cursor_trail: Vec<TrailCell>,
+    /// The fully-resolved trail colour (`0x00RRGGBB`) to blend over each trail
+    /// cell's background. The host resolves it (config `cursor_trail_color`, else
+    /// the theme cursor colour) so the renderer needs no theme knowledge for the
+    /// trail. Only consulted when `cursor_trail` is non-empty.
+    pub cursor_trail_color: u32,
+    /// Additive LIGHT quads for the "LUMEN WAKE" cursor aurora (comet of emitted
+    /// light, bloom crown, landing ring, sparks). Premultiplied + saturating-added
+    /// over the frame, UNDER the crisp cursor. WINDOW-ABSOLUTE pixels (the
+    /// [`GlowQuad`] invariants; above-grid quads tag row 0). Host-owned
+    /// animation; the engine leaves it untouched. EMPTY in the common case →
+    /// byte-identical to the pre-aurora path. See [`GlowQuad`].
+    pub cursor_glow_add: Vec<GlowQuad>,
+    /// GLOW-HALO cursor-effect RADIAL light (EMBERFORGE round embers / crown):
+    /// soft elliptical-falloff halos drawn with
+    /// [`cursor_glow_add`](RenderInput::cursor_glow_add) — the same premultiplied
+    /// saturating-add contract (CPU `add_sat` == GPU One/One on the Unorm view),
+    /// but each quad's light falls off RADIALLY from its centre like
+    /// [`rain_add`](RenderInput::rain_add) (the [`RainHalo`] integer falloff, so
+    /// CPU and GPU stay byte-exact). Drawn immediately AFTER the LUMEN aurora
+    /// and BEFORE the nova / rain additive streams. Quads obey the [`RainHalo`]
+    /// cursor-stream invariants: WINDOW-ABSOLUTE pixels, each within EXACTLY
+    /// ONE grid-anchored row band (a halo spanning rows is emitted as per-row
+    /// quads sharing one centre; above-grid quads tag row 0).
+    /// Host-owned animation; the engine leaves it untouched. EMPTY in the
+    /// common case → byte-identical to the pre-halo render path.
+    pub glow_halo: Vec<RainHalo>,
+    /// UNDER-GLYPH additive light (EMBERFORGE flame BODY: the fire volume the
+    /// glyphs sit inside as dark silhouettes): [`GlowQuad`]s with the SAME
+    /// premultiplied saturating-add contract as
+    /// [`cursor_glow_add`](RenderInput::cursor_glow_add) (CPU `add_sat` == GPU
+    /// One/One on the Unorm view, byte-exact) but drawn at a DIFFERENT z-slot —
+    /// after the cell background fill and the under-text sprites, BEFORE the
+    /// glyph ink — so the light lands UNDER the letterforms while
+    /// tips/embers/beam (`cursor_glow_add`/`glow_halo`/`nova_add`) stay above.
+    /// Pairs with [`char_fg`](RenderInput::char_fg), which chars the engulfed
+    /// glyphs toward ember-black. Quads obey the [`GlowQuad`] invariants:
+    /// WINDOW-ABSOLUTE pixels, each within EXACTLY ONE grid-anchored row band
+    /// (above-grid quads tag row 0). Host-owned animation; the engine leaves
+    /// it untouched. EMPTY in the common case → byte-identical to the
+    /// pre-glow_under render path.
+    pub glow_under: Vec<GlowQuad>,
+    /// EMBERFORGE per-pixel procedural FIRE FIELD patches (the flame BODY at
+    /// full art scale): each [`FirePatch`] quad is evaluated at EVERY device
+    /// pixel by the shared pure-integer field function — CPU rasterizer and
+    /// GPU fragment shader byte-exact (the fire-parity contract). Drawn at the
+    /// [`glow_under`](RenderInput::glow_under) z-slot (after the cell bg +
+    /// under-text sprites, BEFORE the glyph ink) so engulfed glyphs read as
+    /// charred silhouettes inside the flame volume, [`FireMode::Add`] patches
+    /// then [`FireMode::Over`] patches within the stream. Quads obey the
+    /// [`FirePatch`] invariants: WINDOW-ABSOLUTE pixels, each within EXACTLY
+    /// ONE grid-anchored row band (above-grid patches tag row 0). Host-owned
+    /// animation; the engine leaves it untouched. EMPTY in the common case →
+    /// byte-identical to the pre-fire render path.
+    pub fire_patch: Vec<FirePatch>,
+    /// The rainbow-cursor BLOCK FILL override (`0x00RRGGBB`), or `None` for the ordinary
+    /// themed cursor. When `Some` AND the cursor is a BLOCK, the renderer fills the block
+    /// with this colour (still run through `floor_cursor_fill` so the cut-out glyph keeps
+    /// its contrast) instead of the theme/OSC-12 cursor colour — the typing-reactive
+    /// rainbow cursor. Host-owned animation (see `cursor_rainbow`); `None` is
+    /// byte-identical to the ordinary cursor path. Ignored for bar/underline cursors.
+    pub cursor_fill_override: Option<u32>,
+    /// SCENE source-over sprite quads for this frame — the animated "Living Panels"
+    /// habitat painted into the HUD band, UNDER the terminal text (z-order: after the
+    /// cell backgrounds, before glyphs). Sampled from the host's RGBA8 scene atlas and
+    /// composited straight-alpha src-over, exactly like inline images. Host-owned
+    /// animation; the engine leaves it untouched. EMPTY in the common case (feature off)
+    /// → byte-identical to the pre-scene render path. See [`SpriteQuad`].
+    pub scene_over: Vec<SpriteQuad>,
+    /// SCENE additive LIGHT sprites (sun, fireflies, comet trails, nebula, sparkles) —
+    /// textured quads sampled from the same scene atlas but composited with PREMULTIPLIED
+    /// ADDITIVE blend (the sampled coverage × `tint` × `alpha` is saturating-added, the
+    /// same math as a `DecoBlend::Add` decoration / the LUMEN glow). Drawn at the SCENE
+    /// z-order: over [`scene_over`](RenderInput::scene_over), still UNDER the terminal
+    /// text. EMPTY in the common case → byte-identical to the pre-scene path.
+    pub scene_add: Vec<SpriteQuad>,
+    /// The RGBA8 atlas the scene quads sample (shared `Arc`; `None` when no scene is
+    /// active). Carried with the snapshot so both renderers sample identical texels and
+    /// the GPU can cache its upload by [`SceneAtlas::version`].
+    pub scene_atlas: Option<std::sync::Arc<SceneAtlas>>,
+    /// The "sparkle word" decorations for this frame: small sprites stamped over
+    /// cells of matched profanity / feline words. Host-owned (the windowed
+    /// frontend matches text + drives the animation; `cell_frame_into` leaves it
+    /// untouched). EMPTY in the common case (feature off / no match), which is
+    /// byte-identical to the pre-feature render path. See [`WordDecoration`].
+    pub word_decorations: Vec<WordDecoration>,
+    /// Animated-ink per-cell fg OVERRIDES (Sparkle Words v2): host-resolved
+    /// final colours, sorted by `(row, col)` with unique cells. Renderers
+    /// substitute each entry for its cell's `fg` at every fg consult site
+    /// (glyph, combining marks, line decorations — SGR 58 still wins), BEFORE
+    /// the minimum-contrast / selection fg floors. Host-owned animation; the
+    /// engine leaves it untouched. EMPTY in the common case (feature off / no
+    /// match / settled+unchanged) → byte-identical to the pre-ink path. See
+    /// [`InkCell`].
+    pub ink: Vec<InkCell>,
+    /// EFFECT-owned per-cell FINAL glyph-ink fg overrides (EMBERFORGE dark
+    /// glyph cores: engulfed letterforms charred toward ember-black inside the
+    /// [`glow_under`](RenderInput::glow_under) flame body). Host-resolved
+    /// `0x00RRGGBB`, sorted by `(row, col)` with unique cells. Renderers
+    /// substitute each entry at the SAME fg-resolution seam as
+    /// [`ink`](RenderInput::ink) (glyph, combining marks, line decorations —
+    /// SGR 58 still wins), BEFORE the minimum-contrast / selection fg floors;
+    /// when a cell carries both, INK WINS (the user-visible feature over the
+    /// effect recolour). Host-owned animation; the engine leaves it untouched.
+    /// EMPTY in the common case → byte-identical to the pre-char_fg path. See
+    /// [`CharFg`].
+    pub char_fg: Vec<CharFg>,
+    /// EFFECT-owned per-cell CONTRAST-HALO strengths (EMBERFORGE fire
+    /// legibility): the fire engulfment weight for each glyph cell the flame
+    /// covers, driving the alpha of the dark warm dilation ring stamped under
+    /// the glyph ink (over the flame) so the letterform reads against the
+    /// blaze. A COLOR-FREE stream — the ink is never recoloured (the
+    /// no-recolor law) — sorted by `(row, col)` with unique cells (the
+    /// [`CharFg`] walk contract). A GRID stream: the tab-strip splice shifts
+    /// rows down with the terminal content, exactly like
+    /// [`char_fg`](RenderInput::char_fg). Host-owned animation; the engine
+    /// leaves it untouched. EMPTY in the common case → byte-identical to the
+    /// pre-fire_halo path. See [`FireHaloCell`].
+    pub fire_halo: Vec<FireHaloCell>,
+    /// Peeking-cat sprites (Sparkle Words v2), drawn UNDER text — CPU pass 1c
+    /// inside `render_row` (between the cell-bg fill and inline images) / GPU
+    /// `emit_base_pre` right after `scene_over` — so the cat sits under the
+    /// row-above's glyphs, under the word's own glyphs, and under inline images
+    /// on BOTH backends. Each quad lies in exactly one row band (the documented
+    /// [`SpriteQuad`] invariant; a cat spanning two rows is emitted as a head
+    /// quad in row `r-1` plus a chin-slice quad in row `r`). Sampled from
+    /// [`cat_atlas`](RenderInput::cat_atlas) with NEAREST 1:1 (host bakes at
+    /// exact destination size), unlike the bilinear `scene_over` regime.
+    /// Host-owned animation; the engine leaves it untouched. EMPTY in the
+    /// common case (feature off / no match) → byte-identical to the pre-cat
+    /// render path.
+    pub cat_quads: Vec<SpriteQuad>,
+    /// RGBA8 atlas for [`cat_quads`](RenderInput::cat_quads) (host-baked by the
+    /// `CatBaker`, versioned like [`scene_atlas`](RenderInput::scene_atlas)):
+    /// shared `Arc` so cloning is cheap; the GPU re-uploads only when
+    /// [`SceneAtlas::version`] changes (a rebake must repaint). `None` when no
+    /// cat is live.
+    pub cat_atlas: Option<std::sync::Arc<SceneAtlas>>,
+    /// FREE-FLOATING decorative sprites: arbitrary pixel rects at arbitrary
+    /// (even off-grid) positions with NO row tag — the [`FreeSprite`] layer.
+    /// Dirty tracking row-unions each sprite's true `[y, y+h)` pixel extent
+    /// (prev∪cur), so a sprite may span any number of cell-row bands without
+    /// host-side per-row slicing. Sampled from
+    /// [`free_atlas`](RenderInput::free_atlas) (v1: NEAREST 1:1, the cat
+    /// regime). Host-owned animation; the engine leaves it untouched. EMPTY in
+    /// the common case (feature off) → byte-identical to the pre-free-layer
+    /// render path.
+    pub free_sprites: Vec<FreeSprite>,
+    /// RGBA8 atlas for [`free_sprites`](RenderInput::free_sprites), versioned
+    /// like [`cat_atlas`](RenderInput::cat_atlas): shared `Arc` so cloning is
+    /// cheap; the GPU re-uploads only when [`SceneAtlas::version`] changes.
+    /// `None` when no free sprite is live.
+    pub free_atlas: Option<std::sync::Arc<SceneAtlas>>,
+    /// SUPERNOVA additive light quads (Sparkle Words v2): the profanity nova's
+    /// crown / shockwave ring / rays as PREMULTIPLIED `0x00RRGGBB` light,
+    /// saturating-added over the frame exactly like
+    /// [`cursor_glow_add`](RenderInput::cursor_glow_add) (CPU `add_sat` == GPU
+    /// One/One on the Unorm view — byte-exact over background). Quads obey the
+    /// [`GlowQuad`] invariants: GRID-INTERIOR pixels, each within EXACTLY ONE
+    /// grid-anchored row band (the host splits ring chords / ray slabs at row
+    /// boundaries), so the row-scoped dirty gate + GPU scissor cover them
+    /// exactly. Drawn AFTER
+    /// the LUMEN aurora, UNDER the word decorations and the cursor. Host-owned
+    /// animation (self-terminating; a settled nova emits nothing); the engine
+    /// leaves it untouched. EMPTY in the common case → byte-identical to the
+    /// pre-nova render path.
+    pub nova_add: Vec<GlowQuad>,
+    /// PHOSPHOR rain glyph sprites (Matrix digital rain), drawn UNDER text —
+    /// CPU pass 1c between [`scene_over`](RenderInput::scene_over) and
+    /// [`cat_quads`](RenderInput::cat_quads) / GPU `RainUnder` in the same slot
+    /// — so cats walk on rain and every glyph stays legible over it. Each quad
+    /// lies in EXACTLY ONE row band (the documented [`SpriteQuad`] invariant;
+    /// rows-only dirty marking ghosts a band violator). Sampled from
+    /// [`rain_atlas`](RenderInput::rain_atlas) with NEAREST 1:1 (the cat
+    /// regime: host bakes at exact destination size). Host-owned animation;
+    /// the engine leaves it untouched. EMPTY in the common case (feature off)
+    /// → byte-identical to the pre-rain render path.
+    pub rain_quads: Vec<SpriteQuad>,
+    /// RGBA8 white-coverage rain-glyph atlas for
+    /// [`rain_quads`](RenderInput::rain_quads) (host-baked by the `RainBaker`,
+    /// versioned like [`cat_atlas`](RenderInput::cat_atlas)): shared `Arc` so
+    /// cloning is cheap; the GPU re-uploads only when [`SceneAtlas::version`]
+    /// changes, so every rebake must bump it (a same-version rebake is
+    /// invisible to damage). `None` when no rain is live. The engine leaves it
+    /// untouched.
+    pub rain_atlas: Option<std::sync::Arc<SceneAtlas>>,
+    /// PHOSPHOR bright-head additive halos: PREMULTIPLIED `0x00RRGGBB` light,
+    /// saturating-added exactly like [`nova_add`](RenderInput::nova_add) (CPU
+    /// `add_sat` == GPU One/One on the Unorm view). Quads are GRID-INTERIOR
+    /// pixels (this stream stays grid-anchored: the renderer offsets it by
+    /// `(pad, grid_top)`), each within EXACTLY ONE row band. Host-owned
+    /// animation; the engine leaves it untouched. EMPTY in the common case →
+    /// byte-identical to the pre-rain render path.
+    pub rain_add: Vec<RainHalo>,
+    /// Scrollback offset: viewport row `r` shows live row `r - display_offset`.
+    pub display_offset: i32,
+    /// Absolute row of the top visible line at extraction (`Grid::base_y()` =
+    /// `oldest_absolute_row + scrollback_lines`), captured under the SAME lock as the
+    /// cells so it is consistent with this exact frame. Display-offset-independent
+    /// metadata a host uses to map an ABSOLUTE row into this frame's grid
+    /// (`viewport_row = absolute - base_y + display_offset`) — e.g. the ⌘F find bar
+    /// re-anchors its match highlights to the presented content, so a highlight can't
+    /// drift off its line when a program streams output between frames. Pure metadata:
+    /// like `snapshot_seq` it does NOT affect the rendered pixels and is EXCLUDED from
+    /// `PartialEq` (a base_y-only change from a passive scroll must not force a repaint).
+    pub base_y: i64,
+    /// Revision of top-anchored protected-footer row insertions at extraction,
+    /// captured under the SAME lock as [`base_y`](Self::base_y) and the cells.
+    /// Such an insertion cannot be re-anchored with one uniform `base_y` delta.
+    /// Hosts retaining absolute-row overlays use this stamp to reject stale
+    /// geometry for this exact frame.
+    /// Pure metadata: it does not affect rendered pixels and is excluded from
+    /// `PartialEq`, like [`snapshot_seq`](Self::snapshot_seq).
+    pub absolute_row_revision: u64,
+    /// M1b SUB-ROW SCROLL TRANSLATE (display-only): the SIGNED fractional-pixel
+    /// residual the smooth-scroll kinematics bank below one whole row
+    /// (`scroll_frac_px ∈ (-cell_h, cell_h)`). A POSITIVE value is the `frac` half
+    /// of [`scroll_motion::decompose`]'s Euclidean split for a whole-row glide; a
+    /// NEGATIVE value is the elastic-overscroll spring displacement at a history
+    /// end. The renderer shifts the TERMINAL-CONTENT pixel band by this many device
+    /// px at PRESENT time — UP for a positive frac (the incoming row appears at the
+    /// bottom), DOWN for a negative frac (the rubber-band bounce sags the content,
+    /// exposing a strip at the top) — glyph rasters and shaping are untouched (text
+    /// stays raster-exact while it moves). `0` (the default) is the whole-row path:
+    /// the translate is a literal identity, byte-for-byte the pre-M1b frame. It is
+    /// consumed at present time (not in the content damage diff), so it is
+    /// deliberately EXCLUDED from `PartialEq`/`Eq` (like `snapshot_seq`) — a
+    /// frac-only change re-translates from the pristine damage cache without
+    /// dirtying a cell.
+    pub scroll_frac_px: i32,
+    /// M1b GRID/CHROME PARTITION: the terminal-content row band `[grid_top_row,
+    /// grid_bot_row)` within this frame's rows. Chrome (the prepended tab-strip, the
+    /// appended HUD, split-pane dividers) lives OUTSIDE this band and is PINNED —
+    /// the [`scroll_frac_px`](Self::scroll_frac_px) translate touches only the grid
+    /// band's pixels, so every chrome pixel is invariant under the shift. The
+    /// default `grid_bot_row == 0` means "no grid band" ⇒ no translate (the
+    /// byte-identical pre-M1b path); the windowed compose path fills these from the
+    /// strip/HUD splice counts. Excluded from `PartialEq`/`Eq` for the same reason
+    /// as `scroll_frac_px`.
+    pub grid_top_row: usize,
+    /// One past the last terminal-content row — see [`grid_top_row`](Self::grid_top_row).
+    pub grid_bot_row: usize,
+    /// A clone of the active text selection, for per-cell highlighting.
+    pub selection: TextSelection,
+    /// Per-row, sparse emoji grapheme-cluster strings (`term.cluster_row(r)`):
+    /// `(col, cluster)` for cells whose combining marks form a ZWJ / skin-tone /
+    /// keycap sequence. The renderer shapes each to a single colour glyph; cells
+    /// absent here take the ordinary single-codepoint dispatch.
+    pub clusters: Vec<Vec<(usize, Box<str>)>>,
+    /// Per-row, sparse combining MARKS (`term.combining_row(r)`): `(col, marks)`
+    /// for cells with diacritics (é, ñ, …). The renderer overlays each mark's
+    /// glyph on the base so accents render.
+    pub combining: Vec<Vec<(usize, Box<[char]>)>>,
+    /// Per-row DEC line size (DECDWL/DECDHL via `ESC # 3..6`): the renderer draws
+    /// double-width / double-height rows scaled. `SingleWidth` (the default) is
+    /// the ordinary path.
+    pub line_sizes: Vec<LineSize>,
+    /// Per-row, sparse inline-image placements (`term.images_row(r)`):
+    /// `(col, ImageRef)` for every cell covered by an iTerm2 OSC 1337 `File=`
+    /// image. The renderer decodes each image once (keyed by the `Arc` inside the
+    /// ref) and blits the cell's tile; a covered cell SKIPS its glyph (the bg
+    /// still fills). Cells absent here take the ordinary glyph dispatch, so a
+    /// frame with no images is byte-identical to the pre-image path.
+    pub images: Vec<Vec<(usize, aterm_grid::ImageRef)>>,
+    /// The LIVE default background colour (`0x00RRGGBB`) for this frame: the engine's
+    /// dynamic default-bg already folded with DECSCNM reverse-video, resolved by the
+    /// host. The renderer paints the window PADDING band and the base clear from this
+    /// (not the static config theme), so OSC 11 (set default bg) / OSC 111 (reset) and
+    /// DECSCNM (DECSET ?5) reach the frame border too, matching the grid interior
+    /// (which resolves per-cell from the same live value). Equals the configured bg
+    /// until a program changes it, so the default path is byte-identical.
+    pub default_bg: u32,
+    /// The LIVE cursor colour (`0x00RRGGBB`) for this frame: the engine's OSC 12 cursor
+    /// colour if a program set one, else the host's configured theme cursor colour (the
+    /// host resolves the fallback so the renderer needs no theme
+    /// knowledge). The renderer fills the block/bar/underline cursor
+    /// from this, so OSC 12 / OSC 112 (reset) actually reach the screen. The damage
+    /// gate that un-gates a cursor-colour-only change (which dirties no cell) lives in
+    /// `aterm_render::compute_dirty_rows` (folded into `cursor_changed`); it is also
+    /// compared in this type's `PartialEq` for whole-snapshot equality / test parity.
+    pub cursor_color: u32,
+    /// The engine's monotone damage epoch at snapshot time (A-3 read_image seq):
+    /// the value of [`Terminal::damage_epoch`](crate::terminal::Terminal::damage_epoch)
+    /// captured under the SAME lock that filled the rest of this snapshot. It is a
+    /// version stamp, not rendered content — a consumer that records it can detect
+    /// staleness (compare against a later `damage_epoch()`), and because the whole
+    /// snapshot is filled under one lock, the value is internally consistent (no
+    /// torn read). Deliberately EXCLUDED from `PartialEq`/`Eq` (see the type doc):
+    /// it advances every damaged frame, so counting it would defeat the renderer's
+    /// content-based damage cache.
+    pub snapshot_seq: u64,
+    /// PRESENT-TIME latency hint: this frame is an immediate keystroke-echo that
+    /// bypasses present coalescing (`input_hot`). The GPU present path uses it to
+    /// DEFER the throwaway-copy present-time bloom halo — a whole-framebuffer copy +
+    /// a second `queue.submit` that would otherwise run on EVERY keystroke — to
+    /// the next settle frame. A haloed comet mid-keystroke is imperceptible, and
+    /// the comet is still animating on the settle frame (its `cursor_glow_add`
+    /// differs frame-to-frame), so the halo lands ~1 frame (~16 ms) later while the
+    /// keystroke itself presents at minimum latency. Like `scroll_frac_px` this is
+    /// consumed at PRESENT time only, so it is EXCLUDED from `PartialEq`/`Eq`: it
+    /// must never dirty a cell or force a repaint. The CPU backend ignores it.
+    pub input_hot: bool,
+}
+
+impl Clone for RenderInput {
+    /// A fresh deep copy of every field (`snapshot_seq` included). Equivalent to a
+    /// derived `clone`; used by the snapshot seed paths.
+    fn clone(&self) -> Self {
+        RenderInput {
+            rows: self.rows,
+            cols: self.cols,
+            cells: self.cells.clone(),
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+            cursor_visible: self.cursor_visible,
+            cursor_style: self.cursor_style,
+            cursor_trail: self.cursor_trail.clone(),
+            cursor_trail_color: self.cursor_trail_color,
+            cursor_glow_add: self.cursor_glow_add.clone(),
+            glow_halo: self.glow_halo.clone(),
+            glow_under: self.glow_under.clone(),
+            fire_patch: self.fire_patch.clone(),
+            cursor_fill_override: self.cursor_fill_override,
+            scene_over: self.scene_over.clone(),
+            scene_add: self.scene_add.clone(),
+            scene_atlas: self.scene_atlas.clone(),
+            word_decorations: self.word_decorations.clone(),
+            ink: self.ink.clone(),
+            char_fg: self.char_fg.clone(),
+            fire_halo: self.fire_halo.clone(),
+            cat_quads: self.cat_quads.clone(),
+            cat_atlas: self.cat_atlas.clone(),
+            free_sprites: self.free_sprites.clone(),
+            free_atlas: self.free_atlas.clone(),
+            nova_add: self.nova_add.clone(),
+            rain_quads: self.rain_quads.clone(),
+            rain_atlas: self.rain_atlas.clone(),
+            rain_add: self.rain_add.clone(),
+            display_offset: self.display_offset,
+            base_y: self.base_y,
+            absolute_row_revision: self.absolute_row_revision,
+            scroll_frac_px: self.scroll_frac_px,
+            grid_top_row: self.grid_top_row,
+            grid_bot_row: self.grid_bot_row,
+            selection: self.selection.clone(),
+            clusters: self.clusters.clone(),
+            combining: self.combining.clone(),
+            line_sizes: self.line_sizes.clone(),
+            images: self.images.clone(),
+            default_bg: self.default_bg,
+            cursor_color: self.cursor_color,
+            snapshot_seq: self.snapshot_seq,
+            input_hot: self.input_hot,
+        }
+    }
+
+    /// CAPACITY-REUSING in-place update — the persistent-snapshot path the GPU
+    /// present + CPU damage caches use to store the prior frame each changed frame.
+    /// The derived `clone_from` falls back to `*self = source.clone()`, which
+    /// deep-clones a fresh grid and drops the old one every call; this override
+    /// delegates to each field's `clone_from` so `Vec::clone_from` reuses the
+    /// destination's existing allocation for the common prefix (inner per-row Vecs
+    /// recurse), so a stable-dimension frame reallocates NOTHING for the grid. The
+    /// result is byte-for-byte identical to `*self = source.clone()`; only the
+    /// allocation lifetime changes, so the same dirty sets follow from the same
+    /// stored snapshot. (Ported from the prior render-api location under A-3.)
+    fn clone_from(&mut self, source: &Self) {
+        self.rows = source.rows;
+        self.cols = source.cols;
+        self.cells.clone_from(&source.cells);
+        self.cursor_row = source.cursor_row;
+        self.cursor_col = source.cursor_col;
+        self.cursor_visible = source.cursor_visible;
+        self.cursor_style = source.cursor_style;
+        self.cursor_trail.clone_from(&source.cursor_trail);
+        self.cursor_trail_color = source.cursor_trail_color;
+        self.cursor_glow_add.clone_from(&source.cursor_glow_add);
+        self.glow_halo.clone_from(&source.glow_halo);
+        self.glow_under.clone_from(&source.glow_under);
+        self.fire_patch.clone_from(&source.fire_patch);
+        self.scene_over.clone_from(&source.scene_over);
+        self.scene_add.clone_from(&source.scene_add);
+        self.scene_atlas.clone_from(&source.scene_atlas);
+        self.word_decorations.clone_from(&source.word_decorations);
+        self.ink.clone_from(&source.ink);
+        self.char_fg.clone_from(&source.char_fg);
+        self.fire_halo.clone_from(&source.fire_halo);
+        self.cat_quads.clone_from(&source.cat_quads);
+        self.cat_atlas.clone_from(&source.cat_atlas);
+        self.free_sprites.clone_from(&source.free_sprites);
+        self.free_atlas.clone_from(&source.free_atlas);
+        self.nova_add.clone_from(&source.nova_add);
+        self.rain_quads.clone_from(&source.rain_quads);
+        self.rain_atlas.clone_from(&source.rain_atlas);
+        self.rain_add.clone_from(&source.rain_add);
+        self.display_offset = source.display_offset;
+        self.base_y = source.base_y;
+        self.absolute_row_revision = source.absolute_row_revision;
+        self.scroll_frac_px = source.scroll_frac_px;
+        self.grid_top_row = source.grid_top_row;
+        self.grid_bot_row = source.grid_bot_row;
+        self.selection.clone_from(&source.selection);
+        self.clusters.clone_from(&source.clusters);
+        self.combining.clone_from(&source.combining);
+        self.line_sizes.clone_from(&source.line_sizes);
+        self.images.clone_from(&source.images);
+        self.default_bg = source.default_bg;
+        self.cursor_color = source.cursor_color;
+        self.snapshot_seq = source.snapshot_seq;
+        self.input_hot = source.input_hot;
+    }
+}
+
+// Hand-written equality: compare rendered CONTENT only, NOT `snapshot_seq`.
+// The CPU damage cache (`aterm-render`) compares the incoming snapshot against the
+// previous frame's to decide which rows are dirty; `snapshot_seq` is metadata that
+// changes every damaged frame, so including it would make every frame compare
+// unequal and defeat row-level reuse. Every content field is itself `Eq`.
+impl PartialEq for RenderInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+            && self.cols == other.cols
+            && self.cells == other.cells
+            && self.cursor_row == other.cursor_row
+            && self.cursor_col == other.cursor_col
+            && self.cursor_visible == other.cursor_visible
+            && self.cursor_style == other.cursor_style
+            && self.cursor_trail == other.cursor_trail
+            && self.cursor_trail_color == other.cursor_trail_color
+            && self.cursor_glow_add == other.cursor_glow_add
+            && self.glow_halo == other.glow_halo
+            && self.glow_under == other.glow_under
+            && self.fire_patch == other.fire_patch
+            && self.scene_over == other.scene_over
+            && self.scene_add == other.scene_add
+            && self.scene_atlas.as_ref().map(|a| a.version)
+                == other.scene_atlas.as_ref().map(|a| a.version)
+            && self.word_decorations == other.word_decorations
+            && self.ink == other.ink
+            && self.char_fg == other.char_fg
+            && self.fire_halo == other.fire_halo
+            && self.cat_quads == other.cat_quads
+            && self.cat_atlas.as_ref().map(|a| a.version)
+                == other.cat_atlas.as_ref().map(|a| a.version)
+            && self.free_sprites == other.free_sprites
+            && self.free_atlas.as_ref().map(|a| a.version)
+                == other.free_atlas.as_ref().map(|a| a.version)
+            && self.nova_add == other.nova_add
+            && self.rain_quads == other.rain_quads
+            && self.rain_atlas.as_ref().map(|a| a.version)
+                == other.rain_atlas.as_ref().map(|a| a.version)
+            && self.rain_add == other.rain_add
+            && self.display_offset == other.display_offset
+            && self.selection == other.selection
+            && self.clusters == other.clusters
+            && self.combining == other.combining
+            && self.line_sizes == other.line_sizes
+            && self.images == other.images
+            && self.default_bg == other.default_bg
+            && self.cursor_color == other.cursor_color
+        // `snapshot_seq` intentionally NOT compared — see the impl comment.
+        // `scroll_frac_px` / `grid_top_row` / `grid_bot_row` are also NOT compared:
+        // they are consumed at PRESENT time (the sub-row translate re-derives the
+        // presented pixels from the pristine damage cache each frame), not in the
+        // content damage diff. Comparing them would force a full repaint on a
+        // frac-only change (a drag frame) that dirties no cell — the translate needs
+        // only a re-present, not a re-raster. See `RenderInput::scroll_frac_px`.
+        // `input_hot` is likewise NOT compared: it is a present-time bloom-defer hint
+        // (see its doc), so a hot→settle transition must not by itself force a repaint
+        // — the animating comet already differs frame-to-frame while a halo is pending.
+        // `base_y` and `absolute_row_revision` are NOT compared either: they are
+        // host-consumed re-anchor metadata (like `snapshot_seq`) that do not affect
+        // rendered pixels, so metadata-only changes must not force a raster repaint.
+    }
+}
+
+impl Eq for RenderInput {}
+
+impl Default for RenderInput {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl RenderInput {
+    /// An empty 0×0 snapshot with no allocations — the seed for a persistent
+    /// scratch buffer that [`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into)
+    /// refills in place each frame (C-1). Cursor scalars default to off/origin and
+    /// `snapshot_seq` to 0; the first `cell_frame_into` overwrites every field.
+    #[must_use]
+    pub fn empty() -> Self {
+        RenderInput {
+            rows: 0,
+            cols: 0,
+            cells: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            cursor_style: CursorStyle::default(),
+            cursor_trail: Vec::new(),
+            cursor_trail_color: 0,
+            cursor_glow_add: Vec::new(),
+            glow_halo: Vec::new(),
+            glow_under: Vec::new(),
+            fire_patch: Vec::new(),
+            cursor_fill_override: None,
+            scene_over: Vec::new(),
+            scene_add: Vec::new(),
+            scene_atlas: None,
+            word_decorations: Vec::new(),
+            ink: Vec::new(),
+            char_fg: Vec::new(),
+            fire_halo: Vec::new(),
+            cat_quads: Vec::new(),
+            cat_atlas: None,
+            free_sprites: Vec::new(),
+            free_atlas: None,
+            nova_add: Vec::new(),
+            rain_quads: Vec::new(),
+            rain_atlas: None,
+            rain_add: Vec::new(),
+            display_offset: 0,
+            base_y: 0,
+            absolute_row_revision: 0,
+            scroll_frac_px: 0,
+            grid_top_row: 0,
+            grid_bot_row: 0,
+            selection: TextSelection::new(),
+            clusters: Vec::new(),
+            combining: Vec::new(),
+            line_sizes: Vec::new(),
+            images: Vec::new(),
+            default_bg: COLOR_UNSET,
+            cursor_color: COLOR_UNSET,
+            snapshot_seq: 0,
+            input_hot: false,
+        }
+    }
+
+    /// Drop every host-owned VISUAL BLING layer, leaving only the terminal cell content
+    /// (grid + cursor position/colour + selection + images). Empties the cursor motion
+    /// trail, the LUMEN cursor glow, the GLOW-HALO radial cursor-effect light,
+    /// the EMBERFORGE under-glyph flame-body light, the per-pixel FIRE-FIELD
+    /// patches (`fire_patch`) and the charred glyph-ink fg
+    /// overrides, the fire contrast-halo strengths (`fire_halo`),
+    /// the sparkle-word decorations, the animated ink fg
+    /// overrides, the peeking-cat sprites (quads + atlas Arc nulled), the supernova
+    /// additive light, the PHOSPHOR rain (quads + additive halos + atlas Arc
+    /// nulled), and the animated Scene (sprites + additive light + atlas). Used
+    /// by the `image plain` introspection capture so an AI reads the bare screen — the
+    /// bling is architecturally a set of separate layers, so suppressing it is exactly
+    /// this. The cell grid is untouched.
+    pub fn clear_overlays(&mut self) {
+        self.cursor_trail.clear();
+        self.cursor_glow_add.clear();
+        self.glow_halo.clear();
+        self.glow_under.clear();
+        self.fire_patch.clear();
+        self.scene_over.clear();
+        self.scene_add.clear();
+        self.scene_atlas = None;
+        self.word_decorations.clear();
+        self.ink.clear();
+        self.char_fg.clear();
+        self.fire_halo.clear();
+        self.cat_quads.clear();
+        self.cat_atlas = None;
+        self.free_sprites.clear();
+        self.free_atlas = None;
+        self.nova_add.clear();
+        self.rain_quads.clear();
+        self.rain_atlas = None;
+        self.rain_add.clear();
+    }
+
+    /// The emoji grapheme-cluster string at viewport cell `(row, col)`, if this
+    /// frame captured one there (a ZWJ / skin-tone / keycap sequence). Used by
+    /// the GPU atlas builder to resolve keys exactly as the CPU blit does.
+    ///
+    /// The per-row list is sorted by column with one entry per column (built
+    /// ascending; re-sorted after any BiDi reorder / pane compose), so this binary
+    /// searches — a fully-dense row (a cluster on every cell) resolves in
+    /// O(cols·log cols) across the GPU atlas loops instead of the O(cols²) a
+    /// per-column linear scan gives.
+    #[must_use]
+    pub fn cluster_at(&self, row: usize, col: usize) -> Option<&str> {
+        let row = self.clusters.get(row)?;
+        row.binary_search_by_key(&col, |(c, _)| *c)
+            .ok()
+            .map(|i| row[i].1.as_ref())
+    }
+
+    /// The combining marks to overlay at viewport cell `(row, col)`, if any.
+    /// (The list is sorted by column — see [`cluster_at`](Self::cluster_at) — so
+    /// this binary-searches.)
+    #[must_use]
+    pub fn combining_at(&self, row: usize, col: usize) -> Option<&[char]> {
+        let row = self.combining.get(row)?;
+        row.binary_search_by_key(&col, |(c, _)| *c)
+            .ok()
+            .map(|i| row[i].1.as_ref())
+    }
+
+    /// The inline-image reference covering viewport cell `(row, col)`, if any.
+    /// A cell with an image SKIPS its glyph on both the CPU and GPU paths; the
+    /// renderer blits the image tile instead. Used by both renderers to stay in
+    /// lockstep on the image-vs-glyph precedence rule. (Sorted by column — see
+    /// [`cluster_at`](Self::cluster_at) — so this binary-searches.)
+    #[must_use]
+    pub fn image_at(&self, row: usize, col: usize) -> Option<&aterm_grid::ImageRef> {
+        let row = self.images.get(row)?;
+        row.binary_search_by_key(&col, |(c, _)| *c)
+            .ok()
+            .map(|i| &row[i].1)
+    }
+
+    /// Whether the image at (`row`,`col`), if any, HIDES the cell's glyph — i.e. it
+    /// is drawn OVER the text (`z_index >= 0`, the default). A Kitty `z < 0` image is
+    /// drawn BEHIND the text, so it does NOT hide the glyph and this returns `false`.
+    /// Both renderers gate glyph drawing on this, so the image/text z-order matches.
+    #[must_use]
+    pub fn image_hides_glyph_at(&self, row: usize, col: usize) -> bool {
+        self.image_at(row, col)
+            .is_some_and(|r| r.image.z_index >= 0)
+    }
+}
+
+#[cfg(test)]
+mod z_index_tests {
+    use super::RenderInput;
+    use aterm_grid::{ImageData, ImageFormat, ImageRef};
+    use std::sync::Arc;
+
+    fn image_ref(z: i32) -> ImageRef {
+        ImageRef {
+            image: Arc::new(ImageData {
+                bytes: Vec::new(),
+                format: ImageFormat::Png,
+                cols: 1,
+                rows: 1,
+                z_index: z,
+            }),
+            cell_row: 0,
+            cell_col: 0,
+        }
+    }
+
+    #[test]
+    fn image_hides_glyph_only_when_z_is_nonnegative() {
+        let mut input = RenderInput::empty();
+        // col 0: z=0 (over text, default) — hides; col 1: z=-1 (behind) — does NOT;
+        // col 2: z=5 (over) — hides; col 3: no image.
+        input.images = vec![vec![
+            (0, image_ref(0)),
+            (1, image_ref(-1)),
+            (2, image_ref(5)),
+        ]];
+        assert!(
+            input.image_hides_glyph_at(0, 0),
+            "z=0 image hides the glyph"
+        );
+        assert!(
+            !input.image_hides_glyph_at(0, 1),
+            "z<0 image draws BEHIND text — glyph still paints"
+        );
+        assert!(
+            input.image_hides_glyph_at(0, 2),
+            "z>0 image hides the glyph"
+        );
+        assert!(
+            !input.image_hides_glyph_at(0, 3),
+            "no image at the column — nothing hides the glyph"
+        );
+    }
+
+    #[test]
+    fn per_column_accessors_binary_search_sparse_sorted_lists() {
+        // The per-row (col, _) lists are sorted by column with one entry per column
+        // (built ascending; re-sorted after BiDi reorder / pane compose). The
+        // accessors binary-search that order, so verify they resolve the RIGHT entry
+        // at each populated column — including GAPS between columns — and return None
+        // for absent columns. A regression to a linear scan would still pass this;
+        // a BROKEN binary search (e.g. an unsorted list) would miss the gapped entries.
+        let mut input = RenderInput::empty();
+        // Sparse, ascending columns with gaps (0, 5, 100) as a reordered/dense row
+        // would produce after the re-sort.
+        input.clusters = vec![vec![
+            (0, "a".into()),
+            (5, "flag".into()),
+            (100, "zwj".into()),
+        ]];
+        input.combining = vec![vec![
+            (0, vec!['\u{0301}'].into()),
+            (5, vec!['\u{0308}'].into()),
+            (100, vec!['\u{0327}'].into()),
+        ]];
+        input.images = vec![vec![(5, image_ref(0)), (100, image_ref(2))]];
+
+        assert_eq!(input.cluster_at(0, 0), Some("a"));
+        assert_eq!(input.cluster_at(0, 5), Some("flag"));
+        assert_eq!(input.cluster_at(0, 100), Some("zwj"));
+        assert_eq!(input.cluster_at(0, 4), None, "gap column has no cluster");
+        assert_eq!(input.cluster_at(0, 101), None, "past-the-end column");
+
+        assert_eq!(input.combining_at(0, 5), Some(['\u{0308}'].as_slice()));
+        assert_eq!(input.combining_at(0, 100), Some(['\u{0327}'].as_slice()));
+        assert_eq!(input.combining_at(0, 50), None, "gap column has no marks");
+
+        assert_eq!(input.image_at(0, 5).map(|r| r.image.z_index), Some(0));
+        assert_eq!(input.image_at(0, 100).map(|r| r.image.z_index), Some(2));
+        assert!(input.image_at(0, 0).is_none(), "col 0 has no image");
+        assert!(input.image_hides_glyph_at(0, 100), "z=2 image hides glyph");
+    }
+}
+
+#[cfg(test)]
+mod rain_channel_tests {
+    use super::{
+        CharFg, FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, RenderInput,
+        SceneAtlas, SpriteQuad,
+    };
+    use std::sync::Arc;
+
+    fn rain_atlas(version: u64, fill: u8) -> Arc<SceneAtlas> {
+        Arc::new(SceneAtlas {
+            width: 2,
+            height: 2,
+            rgba: vec![fill; 2 * 2 * 4],
+            version,
+        })
+    }
+
+    fn rain_quad(row: u16) -> SpriteQuad {
+        SpriteQuad {
+            row,
+            x: 4,
+            y: row * 16,
+            w: 8,
+            h: 16,
+            ax: 0,
+            ay: 0,
+            aw: 8,
+            ah: 16,
+            tint: 0x0000_FF44,
+            alpha: 96,
+            flip_x: true,
+        }
+    }
+
+    fn rain_halo(row: u16) -> RainHalo {
+        RainHalo {
+            row,
+            x: 4,
+            y: row * 16,
+            w: 8,
+            h: 16,
+            color: 0x0020_6030,
+            cx: 8,
+            cy: row * 16 + 8,
+            rx: 8,
+            ry: 8,
+            mode: HaloMode::Add,
+        }
+    }
+
+    fn under_quad(row: u16) -> GlowQuad {
+        GlowQuad {
+            row,
+            x: 2,
+            y: row * 16 + 3,
+            w: 12,
+            h: 10,
+            color: 0x0060_2008,
+        }
+    }
+
+    fn char_fg(row: u16, col: u16) -> CharFg {
+        CharFg {
+            row,
+            col,
+            fg: 0x0018_0C04,
+        }
+    }
+
+    fn fire_halo(row: u16, col: u16) -> FireHaloCell {
+        FireHaloCell {
+            row,
+            col,
+            strength: 160,
+        }
+    }
+
+    fn fire_patch(row: u16) -> FirePatch {
+        FirePatch {
+            row,
+            x: 4,
+            y: row * 16,
+            w: 24,
+            h: 16,
+            base_y: (row + 1) * 16,
+            peak_h: 40,
+            phase: 2048,
+            temp: 128,
+            strength: 200,
+            lean: -24,
+            cov_cap: 90,
+            cell_h: 16,
+            mode: FireMode::Add,
+        }
+    }
+
+    fn populated() -> RenderInput {
+        let mut input = RenderInput::empty();
+        input.rain_quads = vec![rain_quad(1), rain_quad(2)];
+        input.rain_atlas = Some(rain_atlas(7, 0xFF));
+        input.rain_add = vec![rain_halo(1)];
+        input.glow_halo = vec![rain_halo(2)];
+        input.glow_under = vec![under_quad(1), under_quad(2)];
+        input.fire_patch = vec![fire_patch(1), fire_patch(2)];
+        input.char_fg = vec![char_fg(1, 3), char_fg(1, 4)];
+        input.fire_halo = vec![fire_halo(1, 3), fire_halo(1, 4)];
+        input
+    }
+
+    #[test]
+    fn absolute_row_revision_is_cloned_but_not_render_content() {
+        let base = RenderInput::empty();
+        let mut stamped = base.clone();
+        stamped.absolute_row_revision = 7;
+
+        assert_eq!(
+            base, stamped,
+            "absolute-row revision is host metadata, not raster content"
+        );
+        assert_eq!(stamped.clone().absolute_row_revision, 7);
+
+        let mut reused = RenderInput::empty();
+        reused.clone_from(&stamped);
+        assert_eq!(
+            reused.absolute_row_revision, 7,
+            "capacity-reusing snapshots preserve the frame stamp"
+        );
+    }
+
+    /// The `image plain` introspection contract: `clear_overlays` strips the
+    /// rain like every other bling layer — both quad Vecs cleared AND the
+    /// atlas Arc nulled (a dangling atlas would keep the GPU upload alive).
+    /// The GLOW-HALO cursor-effect stream IS bling too, so it is stripped
+    /// alongside — as are the EMBERFORGE under-glyph light (`glow_under`) and
+    /// the charred glyph-ink overrides (`char_fg`).
+    #[test]
+    fn clear_overlays_strips_all_three_rain_channels() {
+        let mut input = populated();
+        input.clear_overlays();
+        assert!(input.rain_quads.is_empty(), "rain quads must be cleared");
+        assert!(input.rain_atlas.is_none(), "rain atlas Arc must be nulled");
+        assert!(input.rain_add.is_empty(), "rain halos must be cleared");
+        assert!(input.glow_halo.is_empty(), "glow halos must be cleared");
+        assert!(input.glow_under.is_empty(), "glow_under must be cleared");
+        assert!(input.fire_patch.is_empty(), "fire_patch must be cleared");
+        assert!(input.char_fg.is_empty(), "char_fg must be cleared");
+        assert!(input.fire_halo.is_empty(), "fire_halo must be cleared");
+        assert_eq!(input, RenderInput::empty(), "stripped == bare empty frame");
+    }
+
+    /// The damage cache compares snapshots with `PartialEq`; rain IS content,
+    /// so a change in any channel must compare unequal — but the atlas is
+    /// compared by VERSION only (a same-version rebake must stay equal, or a
+    /// progressive bake would defeat row-level reuse; RainBaker bumps the
+    /// version whenever texels must repaint).
+    #[test]
+    fn partial_eq_sees_rain_content_and_atlas_version_only() {
+        let base = populated();
+
+        let mut quads_changed = base.clone();
+        quads_changed.rain_quads[1].y += 16;
+        assert_ne!(
+            base, quads_changed,
+            "rain_quads content change must be seen"
+        );
+
+        let mut add_changed = base.clone();
+        add_changed.rain_add[0].color = 0x0001_0101;
+        assert_ne!(base, add_changed, "rain_add change must be seen");
+
+        let mut halo_changed = base.clone();
+        halo_changed.glow_halo[0].rx += 1;
+        assert_ne!(base, halo_changed, "glow_halo change must be seen");
+
+        // The blend mode IS content: an Add ember becoming an Over veil must
+        // miss the damage gate (defaults pinned so legacy streams stay Add).
+        assert_eq!(HaloMode::default(), HaloMode::Add, "legacy halos stay Add");
+        let mut mode_changed = base.clone();
+        mode_changed.glow_halo[0].mode = HaloMode::Over;
+        assert_ne!(base, mode_changed, "glow_halo mode change must be seen");
+
+        let mut under_changed = base.clone();
+        under_changed.glow_under[0].color = 0x0001_0101;
+        assert_ne!(base, under_changed, "glow_under change must be seen");
+
+        // The fire field's phase IS content (the animation clock both backends
+        // key the field on), as is its blend mode (defaults pinned so legacy
+        // streams stay Add — the dark-theme emission).
+        assert_eq!(FireMode::default(), FireMode::Add, "legacy fire stays Add");
+        let mut fire_changed = base.clone();
+        fire_changed.fire_patch[0].phase += 16;
+        assert_ne!(base, fire_changed, "fire_patch phase change must be seen");
+        let mut fire_mode_changed = base.clone();
+        fire_mode_changed.fire_patch[1].mode = FireMode::Over;
+        assert_ne!(
+            base, fire_mode_changed,
+            "fire_patch mode change must be seen"
+        );
+
+        let mut char_fg_changed = base.clone();
+        char_fg_changed.char_fg[1].fg = 0x0000_0000;
+        assert_ne!(base, char_fg_changed, "char_fg change must be seen");
+
+        // The contrast-halo STRENGTH is content too (it scales the stamp
+        // alpha): a swelling/decaying engulfment must miss the damage gate.
+        let mut fire_halo_changed = base.clone();
+        fire_halo_changed.fire_halo[1].strength = 40;
+        assert_ne!(
+            base, fire_halo_changed,
+            "fire_halo strength change must be seen"
+        );
+
+        let mut version_bumped = base.clone();
+        version_bumped.rain_atlas = Some(rain_atlas(8, 0xFF));
+        assert_ne!(base, version_bumped, "atlas version bump must be seen");
+
+        let mut same_version_rebake = base.clone();
+        same_version_rebake.rain_atlas = Some(rain_atlas(7, 0x00));
+        assert_eq!(
+            base, same_version_rebake,
+            "a same-version rebake (different texels, equal version) compares EQUAL"
+        );
+    }
+
+    /// The capacity-reusing damage-cache path: `clone_from` omissions compile
+    /// fine (unlike `clone`'s struct literal), so pin that all three channels
+    /// actually arrive — a miss stores a stale channel and silently corrupts
+    /// the dirty diff.
+    #[test]
+    fn clone_from_copies_all_three_rain_channels() {
+        let source = populated();
+
+        // Non-empty destination: clone_from must OVERWRITE stale rain, not merge.
+        let mut dst = RenderInput::empty();
+        dst.rain_quads = vec![rain_quad(9); 8];
+        dst.rain_atlas = Some(rain_atlas(99, 0xAA));
+        dst.rain_add = vec![rain_halo(9); 8];
+        dst.glow_halo = vec![rain_halo(9); 8];
+        dst.glow_under = vec![under_quad(9); 8];
+        dst.fire_patch = vec![fire_patch(9); 8];
+        dst.char_fg = vec![char_fg(9, 9); 8];
+        dst.fire_halo = vec![fire_halo(9, 9); 8];
+        dst.clone_from(&source);
+        assert_eq!(dst.rain_quads, source.rain_quads);
+        assert_eq!(
+            dst.rain_atlas.as_ref().map(|a| a.version),
+            source.rain_atlas.as_ref().map(|a| a.version)
+        );
+        assert_eq!(dst.rain_add, source.rain_add);
+        assert_eq!(dst.glow_halo, source.glow_halo);
+        assert_eq!(dst.glow_under, source.glow_under);
+        assert_eq!(dst.fire_patch, source.fire_patch);
+        assert_eq!(dst.char_fg, source.char_fg);
+        assert_eq!(dst.fire_halo, source.fire_halo);
+        assert_eq!(dst, source, "clone_from == clone, byte-for-byte");
+    }
+}

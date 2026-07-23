@@ -1,0 +1,65 @@
+id = "s1_18"
+kind = "head"
+viewbox = [160, 136]
+anchor = { eye_y = 0.52, center_x = 0.5, word_top = 1.0 }
+
+# Pip: a shy crescent-eyed face with a tiny round button nose.
+[[layer]]
+role = "outline"
+ref_fill = "#352F34"
+recolor = "fixed"
+paths = ["M 26 82 C 23 70 26 59 34 51 L 33 27 C 32 21 37 19 42 23 L 58 36 C 72 32 88 32 102 36 L 118 23 C 123 19 128 21 127 27 L 126 51 C 134 59 137 70 134 83 C 131 102 118 116 99 121 C 87 125 73 125 61 121 C 42 117 29 102 26 82 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#B99A79"
+recolor = "coat"
+paths = ["M 30 81 C 27 70 30 61 38 54 L 37 31 L 58 42 C 72 38 88 38 102 42 L 123 31 L 122 54 C 130 61 133 70 130 82 C 127 98 115 112 98 117 C 86 121 74 121 62 117 C 46 113 33 99 30 81 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#D18B96"
+recolor = "fixed"
+paths = ["M 38 29 L 54 41 L 40 45 Z", "M 122 29 L 106 41 L 120 45 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#8A6A58"
+recolor = "fixed"
+paths = ["M 72 38 L 76 34 L 80 39 L 84 34 L 88 38 L 84 45 L 80 42 L 76 45 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F2DFD0"
+recolor = "fixed"
+paths = ["M 57 79 C 57 70 66 67 78 73 C 79 74 80 75 80 77 C 81 75 82 74 83 73 C 94 67 103 70 103 79 C 103 92 93 100 80 100 C 67 100 57 92 57 79 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#373138"
+recolor = "fixed"
+paths = ["M 47 66 C 51 58 62 58 66 66 L 62 71 C 58 66 53 66 49 71 Z", "M 94 66 C 98 58 109 58 113 66 L 111 71 C 106 66 101 66 97 71 Z"]
+
+[[layer]]
+role = "blush"
+ref_fill = "#C87580"
+recolor = "fixed"
+paths = ["M 36 80 C 40 77 47 77 50 81 C 47 85 39 85 36 83 Z", "M 124 80 C 120 77 113 77 110 81 C 113 85 121 85 124 83 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#965668"
+recolor = "fixed"
+paths = ["M 76 79 C 76 76 78 74 80 74 C 83 74 85 76 85 79 C 85 83 83 85 80 85 C 77 85 76 83 76 79 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#352F34"
+recolor = "fixed"
+paths = ["M 77 86 L 83 86 L 83 90 C 87 94 91 92 94 89 C 93 97 86 100 80 95 C 74 100 67 97 66 89 C 69 92 74 94 77 90 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#352F34"
+recolor = "fixed"
+paths = ["M 54 87 L 20 84 L 20 87 L 54 90 Z", "M 54 93 L 17 97 L 17 100 L 55 96 Z", "M 106 87 L 140 84 L 140 87 L 106 90 Z", "M 106 93 L 143 97 L 143 100 L 105 96 Z"]

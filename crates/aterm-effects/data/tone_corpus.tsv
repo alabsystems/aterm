@@ -1,0 +1,315 @@
+# Tone-of-typing TRAINING corpus — label <TAB> lang <TAB> text.
+#
+# Methodology (and honest limits): a hand-authored seed set for a COARSE mood
+# hint, written for this feature (2026-07) in the style of short terminal /
+# chat lines. Five classes (calm / excited / frustrated / playful /
+# technical), ~60 lines per class, spanning en zh ja ko es de fr ru ar hi
+# plus code-flavoured technical lines. Lines were written to carry each
+# mood's LOUD SURFACE MARKERS (laughter tokens, exclamation shapes,
+# complaint vocabulary, shell/code syntax) because that is exactly what a
+# hashed char-n-gram model can learn from a set this small. This is NOT a
+# sentiment-science dataset: no sarcasm, no dialect breadth, no annotation
+# process beyond the author's judgement; machine assistance was used to
+# draft and review the non-English lines (same curation stance as the
+# lexicon's seed data: best-effort, extend via PR). The committed holdout
+# file is the conformance expectations set, held out from SGD.
+calm	en	ok sounds good to me
+calm	en	no rush, take your time
+calm	en	that seems fine, let's continue tomorrow
+calm	en	sure, whenever you are ready
+calm	en	all good on my end
+calm	en	thanks, that looks fine
+calm	en	we can pick this up later, no problem
+calm	en	everything is quiet today
+calm	en	sounds reasonable, i agree
+calm	en	take it easy, we have plenty of time
+calm	en	that works for me, thanks
+calm	en	nothing urgent here, all steady
+calm	zh	好的，没问题
+calm	zh	不着急，慢慢来
+calm	zh	一切都很顺利
+calm	zh	可以，我们明天再说
+calm	zh	没关系，慢慢处理就好
+calm	zh	今天很平静，一切正常
+calm	ja	はい、大丈夫です
+calm	ja	急がなくていいですよ
+calm	ja	ゆっくりで大丈夫です
+calm	ja	了解です、問題ありません
+calm	ja	今日は穏やかな一日でした
+calm	ja	そのままで大丈夫だと思います
+calm	ko	네, 괜찮아요
+calm	ko	천천히 하셔도 돼요
+calm	ko	문제 없어요, 편하게 하세요
+calm	ko	알겠습니다, 괜찮습니다
+calm	ko	오늘은 조용하고 평화롭네요
+calm	ko	서두르지 않아도 됩니다
+calm	es	vale, no hay prisa
+calm	es	todo tranquilo por aquí
+calm	es	está bien, lo vemos mañana
+calm	es	de acuerdo, con calma
+calm	es	no pasa nada, tómate tu tiempo
+calm	es	todo en orden, gracias
+calm	de	alles gut, kein stress
+calm	de	passt schon, lass dir zeit
+calm	de	in ordnung, wir machen morgen weiter
+calm	de	kein problem, ganz in ruhe
+calm	de	alles ruhig heute
+calm	fr	d'accord, pas de souci
+calm	fr	tout va bien, prends ton temps
+calm	fr	c'est bon pour moi, merci
+calm	fr	on verra ça demain tranquillement
+calm	fr	tout est calme aujourd'hui
+calm	ru	хорошо, не торопись
+calm	ru	всё спокойно, всё в порядке
+calm	ru	ладно, сделаем завтра
+calm	ru	не переживай, время есть
+calm	ru	всё идёт своим чередом
+calm	ar	حسنا، لا داعي للعجلة
+calm	ar	كل شيء على ما يرام
+calm	ar	لا بأس، خذ وقتك
+calm	ar	الأمور هادئة اليوم
+calm	ar	تمام، سنكمل غدا
+calm	hi	ठीक है, कोई जल्दी नहीं
+calm	hi	सब ठीक है, आराम से करो
+calm	hi	कोई बात नहीं, समय ले लो
+calm	hi	आज सब शांत है
+calm	hi	हाँ ठीक है, कल देखते हैं
+excited	en	yes!! it finally works!!
+excited	en	we shipped it, let's go!!
+excited	en	this is amazing, i can't wait
+excited	en	woohoo the demo went perfectly
+excited	en	incredible news, so hyped
+excited	en	it passed all the tests, awesome!!
+excited	en	let's gooo we got the green light
+excited	en	wow this is so cool!!
+excited	en	i can't believe it worked, yes!
+excited	en	huge win today, absolutely thrilled
+excited	en	the release is live, so exciting!!
+excited	zh	太棒了！我们成功了！
+excited	zh	真是太厉害了！
+excited	zh	哇！这个效果太酷了！
+excited	zh	终于成功了！好开心！
+excited	zh	太激动了，等不及了！
+excited	zh	我们赢了！太好了！
+excited	ja	やった！ついに動いた！
+excited	ja	すごい！最高です！
+excited	ja	わあ、これは素晴らしい！
+excited	ja	楽しみすぎる！
+excited	ja	ついに完成した！うれしい！
+excited	ja	最高！本当にすごいよ！
+excited	ko	됐다!! 드디어 성공했어!
+excited	ko	대박! 진짜 대단해!
+excited	ko	와 이거 정말 멋지다!
+excited	ko	너무 기대돼요!
+excited	ko	우리가 해냈어! 최고야!
+excited	ko	정말 신난다!!
+excited	es	increíble!! por fin funciona!!
+excited	es	qué emoción, lo logramos!!
+excited	es	esto es genial, no puedo esperar
+excited	es	guau, salió perfecto!!
+excited	es	vamos!! qué gran noticia
+excited	es	estoy feliz, funcionó todo!!
+excited	de	endlich klappt es, super!!
+excited	de	wahnsinn, das ist großartig!
+excited	de	wir haben es geschafft, juhu!
+excited	de	ich freue mich riesig darauf!
+excited	de	das ist ja fantastisch!!
+excited	fr	génial, ça marche enfin!!
+excited	fr	incroyable, on a réussi!!
+excited	fr	j'ai trop hâte, c'est super!
+excited	fr	bravo, c'est magnifique!!
+excited	fr	on l'a fait, quelle victoire!
+excited	ru	ура!! наконец-то работает!!
+excited	ru	это потрясающе!
+excited	ru	мы сделали это, супер!
+excited	ru	невероятно, всё получилось!!
+excited	ru	жду не дождусь, так здорово!
+excited	ar	رائع! نجحنا أخيرا!
+excited	ar	هذا مذهل حقا!
+excited	ar	يا له من خبر رائع!
+excited	ar	لقد نجح الأمر! مدهش!
+excited	ar	متحمس جدا لهذا!
+excited	hi	वाह! आखिरकार काम कर गया!
+excited	hi	यह तो कमाल है!
+excited	hi	हम जीत गए! बहुत बढ़िया!
+excited	hi	बहुत ही शानदार खबर!
+excited	hi	मुझे इंतज़ार नहीं हो रहा, मज़ा आ गया!
+frustrated	en	why is this broken again
+frustrated	en	ugh this makes no sense at all
+frustrated	en	i hate this flaky test so much
+frustrated	en	nothing works today, great
+frustrated	en	this stupid bug keeps coming back
+frustrated	en	seriously? it failed again??
+frustrated	en	i give up, this is hopeless
+frustrated	en	why does it crash every single time
+frustrated	en	this is so annoying, third time now
+frustrated	en	the build broke again, of course it did
+frustrated	en	damn it, the deploy failed once more
+frustrated	zh	又坏了，烦死了
+frustrated	zh	为什么总是出错
+frustrated	zh	这个bug怎么又来了
+frustrated	zh	气死我了，还是不行
+frustrated	zh	受不了了，一直报错
+frustrated	zh	怎么又崩溃了，真烦
+frustrated	ja	なんでまた壊れたの
+frustrated	ja	もう嫌だ、動かない
+frustrated	ja	またエラーかよ、いい加減にして
+frustrated	ja	何回やってもだめだ
+frustrated	ja	本当にイライラする
+frustrated	ja	またビルドが失敗した、最悪
+frustrated	ko	짜증나 또 안 되잖아
+frustrated	ko	왜 자꾸 에러가 나는 거야
+frustrated	ko	진짜 미치겠네, 또 실패야
+frustrated	ko	하 진짜 답답하다
+frustrated	ko	왜 안 되는지 모르겠어, 화난다
+frustrated	ko	또 터졌어, 최악이야
+frustrated	es	no funciona otra vez, qué rabia
+frustrated	es	por qué siempre se rompe esto
+frustrated	es	estoy harto de este error
+frustrated	es	otra vez falló, no puede ser
+frustrated	es	qué fastidio, nada funciona hoy
+frustrated	es	maldita sea, se cayó el servidor otra vez
+frustrated	de	warum geht das schon wieder nicht
+frustrated	de	ich habe die nase voll von diesem fehler
+frustrated	de	schon wieder kaputt, na toll
+frustrated	de	das nervt total, nichts funktioniert
+frustrated	de	mist, der build ist wieder rot
+frustrated	fr	pourquoi ça casse encore
+frustrated	fr	ras le bol de ce bug
+frustrated	fr	ça ne marche toujours pas, c'est pénible
+frustrated	fr	encore une erreur, franchement
+frustrated	fr	c'est agaçant, rien ne fonctionne aujourd'hui
+frustrated	ru	опять не работает, ну сколько можно
+frustrated	ru	почему всё снова сломалось
+frustrated	ru	надоело, вечно одна и та же ошибка
+frustrated	ru	снова упало, кошмар
+frustrated	ru	меня это бесит, ничего не выходит
+frustrated	ar	لماذا تعطل مرة أخرى
+frustrated	ar	لقد سئمت من هذا الخطأ
+frustrated	ar	مرة أخرى فشل، هذا محبط
+frustrated	ar	لا شيء يعمل اليوم، يا للإزعاج
+frustrated	ar	هذا مزعج جدا حقا
+frustrated	hi	फिर से टूट गया, बहुत बुरा
+frustrated	hi	यह फिर काम क्यों नहीं कर रहा
+frustrated	hi	इस बग से तंग आ गया हूँ
+frustrated	hi	फिर वही एरर, गुस्सा आता है
+frustrated	hi	आज कुछ भी काम नहीं कर रहा, झुंझलाहट होती है
+playful	en	lol that cat video is so silly
+playful	en	hehe you totally walked into that one
+playful	en	meow meow says the keyboard cat :3
+playful	en	haha nice pun, very punny
+playful	en	teehee let's sneak in a tiny easter egg
+playful	en	lmao did you see that goofy gif
+playful	en	silly kitty knocked my coffee over again haha
+playful	en	hehe plot twist: it was a feature all along
+playful	en	:3 uwu the duck says quack
+playful	en	haha okay that joke was terrible and i love it
+playful	zh	哈哈哈这个太好笑了
+playful	zh	嘿嘿，被我发现了吧
+playful	zh	喵喵喵，小猫咪真可爱
+playful	zh	哈哈你也太逗了
+playful	zh	嘻嘻，我们来玩个小彩蛋
+playful	zh	笑死我了哈哈哈
+playful	ja	www それはウケる
+playful	ja	にゃんにゃん、猫かわいいね
+playful	ja	ふふふ、冗談だよ
+playful	ja	あはは、それ面白すぎる
+playful	ja	えへへ、内緒だよ
+playful	ja	笑った、まじウケるwww
+playful	ko	ㅋㅋㅋㅋ 너무 웃겨
+playful	ko	히히 장난이야
+playful	ko	야옹야옹 고양이 귀엽다 ㅎㅎ
+playful	ko	ㅎㅎㅎ 웃음이 멈추지 않아
+playful	ko	농담이야 ㅋㅋ 놀랐지
+playful	ko	고양이가 키보드 위에서 잔다 ㅋㅋㅋ
+playful	es	jajaja qué gracioso
+playful	es	jeje te pillé
+playful	es	miau miau dice el gatito
+playful	es	jaja qué broma tan tonta, me encanta
+playful	es	jiji vamos a esconder un huevo de pascua
+playful	es	jajaja no puedo parar de reír
+playful	de	haha das ist zu witzig
+playful	de	hihi kleiner scherz
+playful	de	miau macht die katze, so süß
+playful	de	haha der witz war herrlich schlecht
+playful	de	hehe streich gelungen
+playful	fr	haha trop drôle
+playful	fr	hihi je t'ai eu
+playful	fr	miaou miaou fait le petit chat
+playful	fr	mdr cette blague est nulle et j'adore
+playful	fr	héhé petite surprise cachée
+playful	ru	ахаха это очень смешно
+playful	ru	хи-хи, шутка удалась
+playful	ru	мяу мяу, какой милый котик
+playful	ru	ору, не могу перестать смеяться)))
+playful	ru	хех, вот это прикол
+playful	ar	ههههه هذا مضحك جدا
+playful	ar	هههه أمزح معك فقط
+playful	ar	مياو مياو قطة لطيفة
+playful	ar	ههههه لا أستطيع التوقف عن الضحك
+playful	ar	هيهي مزحة صغيرة
+playful	hi	हाहाहा यह बहुत मज़ेदार है
+playful	hi	हीही मज़ाक कर रहा हूँ
+playful	hi	म्याऊँ म्याऊँ प्यारी बिल्ली
+playful	hi	हाहा क्या मस्त जोक था
+playful	hi	हेहे छोटा सा सरप्राइज़
+technical	code	git rebase -i HEAD~3
+technical	code	cargo build --release --workspace
+technical	code	sudo systemctl restart nginx
+technical	code	kubectl get pods -n production
+technical	code	SELECT id, name FROM users WHERE active = 1;
+technical	code	fn main() { println!("hello"); }
+technical	code	docker compose up -d --build
+technical	code	rsync -avz ./dist/ server:/var/www/
+technical	code	chmod +x scripts/deploy.sh && ./scripts/deploy.sh
+technical	code	curl -s https://api.example.com/v1/status | jq .ok
+technical	code	ERROR: connection refused at 127.0.0.1:5432
+technical	code	panicked at 'index out of bounds: the len is 4'
+technical	code	warning: unused variable `buf` at src/main.rs:42
+technical	code	make -j8 && make install
+technical	code	ssh deploy@10.0.0.7 'tail -f /var/log/app.log'
+technical	code	let mut acc: Vec<u32> = Vec::with_capacity(64);
+technical	code	printf '%s\n' "$PATH" | tr ':' '\n'
+technical	code	git bisect start HEAD v0.55
+technical	code	grep -rn TODO src/ | wc -l
+technical	code	python -m venv .venv && source .venv/bin/activate
+technical	en	the allocator falls back to mmap for large slabs
+technical	en	we cache the parsed config per generation
+technical	en	the mutex guards only the queue head
+technical	en	checksum verification runs before the header parse
+technical	zh	先检查配置文件再重启服务
+technical	zh	这个函数的时间复杂度是线性的
+technical	zh	内存占用需要进一步分析
+technical	zh	把日志级别改成 debug 再复现一次
+technical	ja	メモリリークをプロファイラで調査中です
+technical	ja	この関数は毎フレーム呼ばれます
+technical	ja	設定ファイルを再読み込みしてから再起動します
+technical	ja	ログレベルをdebugにして再現してください
+technical	ko	서버 로그를 먼저 확인해 주세요
+technical	ko	이 함수는 매 프레임 호출됩니다
+technical	ko	메모리 사용량을 프로파일링 중입니다
+technical	ko	설정 파일을 다시 불러온 뒤 재시작하세요
+technical	es	revisa los logs del servidor antes de reiniciar
+technical	es	la función se ejecuta en tiempo lineal
+technical	es	hay que perfilar el uso de memoria
+technical	es	compila con optimizaciones y vuelve a medir
+technical	de	bitte zuerst die serverlogs prüfen
+technical	de	die funktion läuft in linearer zeit
+technical	de	der cache wird pro generation invalidiert
+technical	de	kompiliere mit optimierungen und miss erneut
+technical	fr	vérifie les logs du serveur avant de redémarrer
+technical	fr	la fonction s'exécute en temps linéaire
+technical	fr	il faut profiler l'utilisation mémoire
+technical	fr	recompile avec les optimisations et remesure
+technical	ru	сначала проверь логи сервера
+technical	ru	функция выполняется за линейное время
+technical	ru	нужно профилировать использование памяти
+technical	ru	пересобери с оптимизациями и измерь снова
+technical	ar	تحقق من سجلات الخادم أولا
+technical	ar	تعمل الدالة في زمن خطي
+technical	ar	نحتاج إلى تحليل استهلاك الذاكرة
+technical	ar	أعد التجميع مع التحسينات ثم قس مجددا
+technical	hi	पहले सर्वर लॉग जाँच लो
+technical	hi	यह फ़ंक्शन रैखिक समय में चलता है
+technical	hi	मेमोरी उपयोग की प्रोफाइलिंग करनी होगी
+technical	hi	ऑप्टिमाइज़ेशन के साथ दोबारा कंपाइल करो

@@ -1,0 +1,32 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-update-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — artifact-agnostic, portable POSIX update primitives (source resolution, advisory file lock, curl/token plumbing, private-dir hardening, sha256) shared by aterm-update and atpkg."
+
+[dependencies]
+# Reuse the single source-of-truth private-dir ownership predicate (no drift with
+# the control socket's Application Support hardening).
+aterm-types = { workspace = true }
+# Route diagnostics through the global logger aterm-gui installs, so they land in
+# the app log file (visible for a Finder-launched .app, unlike stderr).
+aterm-log = { workspace = true }
+# The shared release-manifest wire type (src/manifest.rs): ONE serde struct the
+# publisher (crates/aterm-release) and the updater client both compile against,
+# so field agreement is compiler-enforced rather than hand-synced.
+serde = { workspace = true }
+toml = { workspace = true }
+
+# flock(2) for the apply/stage critical sections + getuid(2) for the private-dir
+# ownership check. The two narrow syscalls with no safe std wrapper (POSIX-only;
+# Windows uses std-only approximations).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,64 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# CJK compounds that CONTAIN a cat character (猫 / 貓) but do NOT denote a
+# domestic cat. The feline matcher suppresses these so the cat ideograph inside
+# e.g. "panda" never sparkles.
+#
+# Excluded by design: 子猫 / 小猫 (genuine kittens) ARE real cats and are
+# intentionally NOT listed here.
+
+[[exception]]
+word = "熊猫"
+lang = "ja"
+meaning = "panda"
+
+[[exception]]
+word = "熊猫"
+lang = "zh"
+meaning = "panda"
+
+[[exception]]
+word = "貓熊"
+lang = "zh"
+meaning = "panda"
+
+[[exception]]
+word = "山猫"
+lang = "ja"
+meaning = "lynx / wildcat"
+
+[[exception]]
+word = "山猫"
+lang = "zh"
+meaning = "lynx / wildcat"
+
+[[exception]]
+word = "猫車"
+lang = "ja"
+meaning = "wheelbarrow"
+
+[[exception]]
+word = "猫背"
+lang = "ja"
+meaning = "stoop; round-shouldered posture"
+
+[[exception]]
+word = "招き猫"
+lang = "ja"
+meaning = "beckoning-cat figurine (lucky charm)"
+
+[[exception]]
+word = "猫舌"
+lang = "ja"
+meaning = "sensitivity to hot food/drink"
+
+[[exception]]
+word = "猫目"
+lang = "ja"
+meaning = "cat's-eye (gemstone / road reflector)"
+
+[[exception]]
+word = "海猫"
+lang = "ja"
+meaning = "black-tailed gull"

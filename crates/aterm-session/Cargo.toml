@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hierarchical-session routing fabric: stable session ids, the per-edge op-scoped fail-closed authority table (EdgeToken/decide_edge), and the single whole-frame-atomic byte sink to a PTY master."
+
+[features]
+default = []
+# TRUST_NATIVE_TLA (initiative A7, WS-G): compile the source↔spec
+# `#[refines]`/`#[spec_unmodeled]` anchors binding the `SinkWriter` PTY-master
+# fd-lifecycle (sink.rs) to the derived `fd_lifecycle_model()` (machine
+# `FdLifecycle`). OFF by default (byte-identical production sink, no
+# `aterm-spec`/`inventory`); the workspace `spec_xref_closure` gate (aterm-gui's
+# test build) enables it to COLLECT the anchors cross-crate, exactly like aterm-pty.
+spec-anchors = ["dep:aterm-spec"]
+
+[dependencies]
+aterm-pty = { workspace = true }
+rand_core = { workspace = true }
+# Optional: only pulled in by the off-by-default `spec-anchors` feature, which arms
+# the fd-lifecycle source↔spec anchors on `SinkWriter` (sink.rs).
+aterm-spec = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Derived-spec models (ty_model!) + the in-process interpreter for the fabric's
+# bounded state machines (the edge gate, the sink no-loss loop). The exhaustive
+# TLA+ `ty` model-check is gated on the external `ty` binary; the interpreter-driven
+# proves/catches run unconditionally. Also makes the fd-lifecycle anchors expand
+# under plain `cargo test -p aterm-session` (the `test` cfg in the cfg_attr gate).
+aterm-spec = { workspace = true }
+# spill_bound.rs regression test only: `pipe(2)` to build a blocking fd whose read
+# end is never drained (a wedged foreground), so the non-parking spill path is
+# exercised end-to-end against a full kernel buffer.
+libc = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,71 @@
+id = "s1_01"
+kind = "head"
+viewbox = [160, 136]
+anchor = { eye_y = 0.51, center_x = 0.5, word_top = 1.0 }
+
+# Pebble: low round ears, a calm gaze, and one smooth forehead marking.
+[[layer]]
+role = "outline"
+ref_fill = "#343139"
+recolor = "fixed"
+paths = ["M 20 80 C 18 68 21 57 30 48 L 29 24 C 29 18 34 16 39 20 L 56 33 C 71 29 89 29 104 33 L 122 20 C 127 16 132 19 131 25 L 130 49 C 138 58 142 70 140 83 C 137 104 123 119 102 125 C 88 129 72 129 58 125 C 37 120 23 104 20 80 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#8D898D"
+recolor = "coat"
+paths = ["M 24 79 C 22 68 25 59 34 51 L 33 27 L 56 39 C 71 35 89 35 104 39 L 127 25 L 126 51 C 134 59 138 70 136 82 C 133 100 120 115 101 121 C 87 125 73 125 59 121 C 41 116 27 101 24 79 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#C08A98"
+recolor = "fixed"
+paths = ["M 34 25 L 52 37 L 36 42 Z", "M 126 25 L 108 38 L 124 42 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#747177"
+recolor = "fixed"
+paths = ["M 70 34 C 75 30 85 30 90 34 C 94 39 91 45 80 51 C 69 45 66 39 70 34 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#C1B8B5"
+recolor = "fixed"
+paths = ["M 60 82 C 60 75 68 72 79 77 C 80 78 80 79 80 80 C 81 79 81 78 82 77 C 93 72 101 75 101 82 C 101 94 92 100 80 100 C 68 100 60 94 60 82 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#35323A"
+recolor = "fixed"
+paths = ["M 45 65 C 50 61 60 61 65 65 C 60 69 50 69 45 65 Z", "M 95 65 C 100 61 110 61 115 65 C 110 69 100 69 95 65 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#F5F1EC"
+recolor = "fixed"
+paths = ["M 51 63 L 54 63 L 54 65 L 51 65 Z", "M 101 63 L 104 63 L 104 65 L 101 65 Z"]
+
+[[layer]]
+role = "blush"
+ref_fill = "#BC7F8A"
+recolor = "fixed"
+paths = ["M 34 80 C 38 77 45 77 49 80 C 46 84 38 85 34 83 Z", "M 126 80 C 122 77 115 77 111 80 C 114 84 122 85 126 83 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#9E596B"
+recolor = "fixed"
+paths = ["M 75 79 C 75 76 78 75 80 78 C 82 75 85 76 85 79 C 85 83 83 85 80 87 C 77 85 75 83 75 79 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#343139"
+recolor = "fixed"
+paths = ["M 78 86 L 82 86 L 82 90 C 85 92 88 91 90 89 C 89 95 84 97 80 93 C 76 97 71 95 70 89 C 72 91 75 92 78 90 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#343139"
+recolor = "fixed"
+paths = ["M 52 87 L 13 84 L 13 87 L 52 90 Z", "M 52 93 L 10 97 L 10 100 L 53 96 Z", "M 108 87 L 147 84 L 147 87 L 108 90 Z", "M 108 93 L 150 97 L 150 100 L 107 96 Z"]

@@ -1,0 +1,52 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Search primitives for aterm terminal content"
+
+[features]
+default = []
+# Enables regex-mode scrollback search (SearchIndex::search_*_opts with
+# is_regex = true). Left opt-in here; a later slice flips it on for the GUI.
+regex = ["dep:regex"]
+# TRUST_NATIVE_TLA: compile the streaming-search `#[refines]` anchors and the
+# kani `proof_anchor!`s as part of the LIBRARY so a downstream test binary (the
+# `spec_xref_closure` gate in aterm-gui) can collect them via `inventory`. OFF by
+# default: the production build is byte-identical (no aterm-spec in the closure).
+spec-anchors = ["dep:aterm-spec"]
+
+[dependencies]
+aterm-types = { workspace = true }
+aterm-error = { workspace = true }
+aterm-hash = { workspace = true }
+# Required (not optional): the index emits a one-time eviction warning so
+# truncated search results are observable rather than silent (DL-2).
+aterm-log = { workspace = true }
+aterm-grapheme = { workspace = true }
+regex = { workspace = true, optional = true }
+memchr = { workspace = true }
+# Optional: pulled into the LIBRARY only by the off-by-default `spec-anchors`
+# feature (the anchor macros emit `::aterm_spec::inventory::submit!`). Still a
+# dev-dependency below for aterm-search's own test build.
+aterm-spec = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The `#[cfg_attr(any(test, feature = "spec-anchors"), …)]` anchors expand in the
+# unit-test build, and the Tier-1 lockstep (tests/conformance_streaming.rs)
+# drives the derived StreamingSearch model + tiered transition validation.
+aterm-spec = { workspace = true }
+
+[build-dependencies]
+# COMPILE-TIME temporal gate (build.rs): the derived StreamingSearch model is
+# model-checked in Trust `ty` while BUILDING this crate — a violated invariant
+# (or a vacuous Buggy=1) fails `cargo build`, not merely `cargo test`. No cycle:
+# aterm-spec depends only on aterm-spec-macros + aterm-error.
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true

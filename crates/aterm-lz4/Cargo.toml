@@ -1,0 +1,54 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+#
+# This crate is a modified block-mode subset of the upstream `lz4_flex` crate
+# (https://github.com/pseitz/lz4_flex, MIT-licensed, by Pascal Seitz et al).
+# See `LICENSE-MIT` in this directory for the upstream license. The derived
+# files preserve the original layout (`src/block/*.rs`, `src/sink.rs`,
+# `src/fastcpy.rs`) and carry local compatibility, lint, and verification
+# changes.
+
+[package]
+name = "aterm-lz4"
+description = "Vendored block-mode subset of lz4_flex for aterm. MIT/Apache-2.0."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT AND Apache-2.0"
+
+[lib]
+name = "aterm_lz4"
+path = "src/lib.rs"
+
+[features]
+# Mirrors upstream lz4_flex feature flags for the block-mode subset.
+# Defaults enable the safe-only code paths (zero unsafe) and `std`.
+default = ["std", "safe-encode", "safe-decode", "checked-decode"]
+std = []
+safe-encode = []
+safe-decode = []
+# Extra runtime sanity checks on decode (bounds, etc). Matches upstream.
+checked-decode = []
+# `frame` and `nightly` are declared but intentionally left disabled and
+# unimplemented here: they exist only to silence `unexpected_cfgs` warnings
+# on the vendored source, which still carries its upstream `#[cfg(feature =
+# "frame")]` / `#[cfg(feature = "nightly")]` gates. Enabling them is not
+# supported in-tree — the `frame/` module was deliberately omitted and
+# `nightly` relies on unstable rustc features we do not use.
+frame = []
+nightly = []
+
+[dependencies]
+
+[dev-dependencies]
+# Upstream lz4_flex uses proptest for fastcpy property tests; keeping it as
+# a dev-dep lets vendor refreshes land without edits to the inline tests.
+#
+# Upstream also used the `more-asserts` crate for `assert_le!` / `assert_gt!`
+# macros in compress.rs tests; we instead provide local equivalents in
+# `lib.rs` (under `#[cfg(test)]`) to avoid another dependency.
+proptest = { workspace = true }
+
+[lints]
+workspace = true

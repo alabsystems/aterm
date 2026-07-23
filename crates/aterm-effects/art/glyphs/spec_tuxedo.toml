@@ -1,0 +1,77 @@
+id = "spec_tuxedo"
+kind = "special"
+viewbox = [160, 146]
+anchor = { eye_y = 0.45, center_x = 0.5, word_top = 1.0 }
+
+# Sir Socks: a composed tuxedo bust with a soft storm-blue gaze and bow tie.
+[[layer]]
+role = "outline"
+ref_fill = "#342B35"
+recolor = "fixed"
+paths = ["M 17 82 C 14 68 18 55 28 45 L 25 16 C 25 11 29 9 33 12 L 55 29 C 70 24 89 24 105 30 L 131 14 C 135 11 139 14 138 19 L 135 47 C 143 57 147 71 145 85 C 142 108 126 124 103 129 C 88 132 72 132 57 129 C 34 125 19 109 17 82 Z", "M 51 120 C 59 112 70 108 80 108 C 91 108 102 112 110 120 L 117 143 L 43 143 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#292936"
+recolor = "fixed"
+paths = ["M 21 81 C 18 68 22 57 32 48 L 29 21 L 55 35 C 70 30 89 30 105 36 L 133 20 L 131 48 C 139 57 143 70 141 84 C 139 104 124 120 102 125 C 88 128 72 128 58 125 C 38 121 23 106 21 81 Z", "M 55 122 C 62 116 71 113 80 113 C 90 113 99 116 106 122 L 111 139 L 49 139 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#F5EEE8"
+recolor = "fixed"
+paths = ["M 68 34 C 72 31 76 29 80 29 C 85 29 89 31 93 35 L 91 60 C 91 73 98 82 108 91 C 101 110 91 122 80 124 C 68 121 58 110 52 91 C 62 82 69 73 69 60 Z", "M 58 122 C 65 117 73 115 80 115 C 88 115 96 117 103 122 L 107 139 L 53 139 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#D88C9C"
+recolor = "fixed"
+paths = ["M 30 20 L 50 34 L 33 39 Z", "M 132 20 L 112 34 L 129 39 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#FFF8F0"
+recolor = "fixed"
+paths = ["M 61 82 C 61 75 69 72 79 77 C 80 78 80 79 80 80 C 81 79 81 78 82 77 C 92 72 100 75 100 82 C 100 94 91 100 80 100 C 69 100 61 94 61 82 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 42 65 C 42 58 47 53 54 53 C 61 53 66 58 66 65 C 66 73 61 78 54 78 C 47 78 42 73 42 65 Z", "M 94 65 C 94 58 99 53 106 53 C 113 53 118 58 118 65 C 118 73 113 78 106 78 C 99 78 94 73 94 65 Z"]
+
+[[layer]]
+role = "iris"
+ref_fill = "#738A9A"
+recolor = "fixed"
+paths = ["M 49 65 C 49 60 51 57 54 57 C 58 57 60 60 60 65 C 60 70 58 74 54 74 C 51 74 49 70 49 65 Z", "M 101 65 C 101 60 103 57 106 57 C 110 57 112 60 112 65 C 112 70 110 74 106 74 C 103 74 101 70 101 65 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 50 60 C 50 58 52 57 54 57 C 56 57 57 59 57 61 C 57 63 55 64 53 64 C 51 64 50 62 50 60 Z", "M 102 60 C 102 58 104 57 106 57 C 108 57 109 59 109 61 C 109 63 107 64 105 64 C 103 64 102 62 102 60 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#A75A70"
+recolor = "fixed"
+paths = ["M 75 79 C 75 76 78 75 80 78 C 82 75 85 76 85 79 C 85 83 83 85 80 87 C 77 85 75 83 75 79 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 78 86 L 82 86 L 82 90 C 86 93 90 91 92 88 C 91 96 85 99 80 94 C 75 99 69 96 68 88 C 70 91 74 93 78 90 Z"]
+
+[[layer]]
+role = "accessory"
+ref_fill = "#B95666"
+recolor = "fixed"
+paths = ["M 78 119 C 67 111 55 111 50 119 C 46 127 53 135 65 133 L 79 126 Z", "M 82 119 C 93 111 105 111 110 119 C 114 127 107 135 95 133 L 81 126 Z", "M 74 116 L 86 116 L 87 130 L 73 130 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#342B35"
+recolor = "fixed"
+paths = ["M 53 86 L 12 82 L 12 84 L 53 89 Z", "M 53 92 L 8 95 L 8 98 L 54 95 Z", "M 107 86 L 148 82 L 148 84 L 107 89 Z", "M 107 92 L 152 95 L 152 98 L 106 95 Z"]

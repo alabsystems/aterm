@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-uds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — the portable control-socket stream: pure type aliases to std Unix-domain sockets on Unix, AF_UNIX over winsock (afunix.sys) on Windows, plus the latest-alias, CSPRNG, and pid-liveness helpers the control channel needs. Std-only; the Windows side is direct ws2_32/kernel32/bcrypt FFI."
+
+# Deliberately dependency-free on EVERY platform (the Windows side is raw
+# `unsafe extern "system"` FFI, the house pattern) so the whole transport
+# stays auditable in one small crate.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-lexicon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multilingual whole-word lexical matching for the sparkle-words text decorations (profanity + feline families)"
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+aterm-hash = { workspace = true }
+
+[dev-dependencies]
+# Tests use only std + the crate itself.
+
+[lints]
+workspace = true

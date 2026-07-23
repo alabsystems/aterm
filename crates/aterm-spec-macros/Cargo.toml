@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-spec-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Proc macros for aterm TLA+ refinement mapping"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+
+[dev-dependencies]
+# Test-only: the `#[refines]`/`#[spec_unmodeled]`/`#[spec_invariant]` anchor
+# emitters now generate `::aterm_spec::{inventory,xref}::…` paths (TRUST_NATIVE_TLA
+# Phase 0), so the attribute-macro integration tests need `aterm-spec` linked to
+# resolve them. This is a DEV-dependency cycle (aterm-spec depends on this crate as
+# a normal dep; this crate depends on aterm-spec only for tests), which Cargo
+# permits because dev-deps never enter the normal build graph.
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true

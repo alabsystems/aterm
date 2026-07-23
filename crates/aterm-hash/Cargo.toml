@@ -1,0 +1,19 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-hash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fast non-cryptographic FxHash implementation for aterm (replaces rustc-hash)"
+
+[dependencies]
+# None - zero external dependencies
+
+[dev-dependencies]
+# None - tests use only std
+
+[lints]
+workspace = true

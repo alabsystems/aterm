@@ -1,0 +1,63 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — silent, signature-pinned in-app updater that pulls notarized releases from GitHub and swaps the .app on next launch."
+
+[features]
+default = []
+# Compile the shipping source↔spec anchors for cross-crate inventory collection.
+# Tests always compile the same anchors through `cfg(test)`; the default updater
+# build keeps the specification machinery out of the shipped dependency graph.
+spec-anchors = ["dep:aterm-spec"]
+
+[dependencies]
+# Manifest (aterm-appcast.toml) + the on-disk `ready.toml` staging marker.
+toml = { workspace = true }
+serde = { workspace = true }
+# GitHub Releases API response is JSON; parse it (scoped to this crate only — the
+# core engine crates stay JSON-free).
+serde_json = { workspace = true }
+# renamex_np(RENAME_SWAP) for the atomic bundle swap (the .app-only syscall that
+# stays here). Already a workspace dependency (used by the control socket).
+libc = { workspace = true }
+# The artifact-agnostic, portable update primitives (Source resolution, FileLock +
+# same_volume, curl/token plumbing, ensure_private_dir, sha256_file, the pin idiom).
+aterm-update-core = { workspace = true }
+# Route updater diagnostics through the global logger aterm-gui installs, so they
+# land in the app log file (visible for a Finder-launched .app, unlike stderr).
+aterm-log = { workspace = true }
+# Ed25519 verification of the OPTIONAL signed update manifest (the Apple-free "signed
+# channel" tier — a repo-write attacker can't forge a manifest without the offline
+# private key). Verify-only, so no `alloc`; the SAME primitive atpkg pins (§8). The
+# default (no pinned pubkey) tier needs no crypto — it stays sha256 + repo-trust.
+ring = { version = "0.17.14", default-features = false }
+# Decode the base64-pinned Ed25519 public key (32 raw bytes), same as atpkg.
+base64 = "0.22.1"
+# Shipping introspection fingerprints the decoded compile-time update key. This
+# reports the key the verifier actually consumes, independent of optimizer/lipo
+# treatment of the source base64 literal.
+sha2 = { workspace = true }
+# The ONE audited entropy surface (`aterm_uds::rand`) for the re-exec nonce —
+# no hand-rolled `/dev/urandom` reads here (that pattern caused the 2026-07-04/05
+# kernel panics). aterm-uds has an empty deps section, so no cycle.
+aterm-uds = { workspace = true }
+# Optional source↔spec anchor support. The real Tier-1 conformance test gets the
+# same crate through `[dev-dependencies]` below.
+aterm-spec = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Signing side (Ed25519KeyPair::from_seed_unchecked + .sign) for the sig unit tests;
+# default features pull in ring's `alloc` (test build only). Mirrors atpkg's sig tests.
+ring = { version = "0.17.14" }
+# Tier-1 binds the real updater reducers to their single-source derived models;
+# production builds retain no spec dependency.
+aterm-spec = { workspace = true }
+
+[lints]
+workspace = true

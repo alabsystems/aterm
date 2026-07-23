@@ -1,0 +1,85 @@
+id = "spec_stretch"
+kind = "special"
+viewbox = [200, 128]
+anchor = { eye_y = 0.55, center_x = 0.50, word_top = 1.0 }
+
+# Toastbyte: aterm's flying cursor companion. A berry-frosted keycap pastry,
+# prompt-shaped sprinkles, and a soft original cat silhouette pair with the
+# renderer's rainbow trail without copying any source pixel geometry.
+[[layer]]
+role = "outline"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 30 31 C 27 31 24 34 24 38 L 24 94 C 24 99 27 102 32 102 L 137 102 C 142 102 145 99 145 94 L 145 38 C 145 34 142 31 137 31 Z", "M 119 68 C 117 56 120 47 128 41 L 126 24 C 126 19 130 17 134 20 L 147 30 C 157 27 168 29 176 35 L 184 29 C 188 26 191 29 190 34 L 187 51 C 193 60 194 72 190 82 C 184 98 168 106 150 104 C 132 102 121 89 119 68 Z", "M 31 55 C 21 47 11 49 8 58 C 5 67 11 75 21 74 C 14 80 14 89 21 94 C 29 99 39 94 42 84 L 42 62 Z", "M 43 96 C 38 96 35 100 36 105 L 38 115 C 39 120 44 122 49 120 L 61 116 C 65 114 66 109 63 105 L 56 97 Z", "M 86 96 C 81 97 79 101 80 106 L 82 117 C 83 122 89 124 93 121 L 104 115 C 108 112 107 106 103 103 L 96 97 Z", "M 139 94 C 134 95 132 100 134 105 L 139 117 C 141 122 147 123 151 119 L 160 111 C 164 107 161 101 157 99 L 149 95 Z"]
+
+[[layer]]
+role = "accessory"
+ref_fill = "#E8C77C"
+recolor = "fixed"
+paths = ["M 31 37 C 29 37 29 39 29 42 L 29 91 C 29 95 31 97 35 97 L 134 97 C 138 97 140 95 140 91 L 140 42 C 140 39 138 37 134 37 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#F0ADC9"
+recolor = "fixed"
+paths = ["M 39 44 C 39 41 42 40 45 40 L 124 40 C 129 40 132 43 132 48 L 132 82 C 132 88 129 91 123 91 L 46 91 C 41 91 38 88 38 83 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#8B5F8F"
+recolor = "fixed"
+paths = ["M 49 55 L 57 59 L 49 63 L 49 59 L 53 57 L 49 55 Z", "M 59 64 L 68 64 L 68 67 L 59 67 Z", "M 84 48 L 89 48 L 89 54 L 84 54 Z", "M 105 72 L 111 72 L 111 78 L 105 78 Z", "M 74 81 L 80 81 L 80 85 L 74 85 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#5A9AA0"
+recolor = "fixed"
+paths = ["M 67 48 L 73 48 L 73 54 L 67 54 Z", "M 95 58 L 101 58 L 101 64 L 95 64 Z", "M 115 50 L 121 50 L 121 56 L 115 56 Z", "M 52 76 L 58 76 L 58 82 L 52 82 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#A89591"
+recolor = "coat"
+paths = ["M 124 68 C 122 58 125 50 133 44 L 131 27 L 147 37 C 157 33 168 35 176 42 L 185 34 L 182 53 C 188 61 189 71 185 80 C 180 93 167 100 151 98 C 136 96 126 86 124 68 Z", "M 33 59 C 25 52 16 54 14 61 C 13 68 21 71 29 68 C 21 75 20 84 26 89 C 32 93 39 87 38 80 L 38 62 Z", "M 43 101 L 55 101 L 60 109 C 61 111 59 113 57 113 L 46 117 C 44 118 42 116 42 113 L 40 106 C 39 103 40 102 43 101 Z", "M 87 101 L 96 101 L 101 108 C 103 110 101 112 99 113 L 90 118 C 88 119 86 117 86 114 L 84 107 C 83 104 84 102 87 101 Z", "M 141 99 L 149 99 L 156 105 C 158 107 157 109 155 111 L 148 117 C 146 119 144 117 143 115 L 138 106 C 136 103 138 100 141 99 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#E99AA4"
+recolor = "fixed"
+paths = ["M 132 27 L 145 37 L 133 41 Z", "M 185 35 L 177 43 L 182 49 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F5E8DF"
+recolor = "fixed"
+paths = ["M 135 74 C 135 67 142 64 150 68 C 152 69 154 71 154 74 C 155 71 157 69 160 68 C 168 64 176 67 176 74 C 176 84 168 90 155 90 C 143 90 135 84 135 74 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2D2731"
+recolor = "fixed"
+paths = ["M 134 62 C 139 55 148 55 153 62 L 150 66 C 146 61 140 61 137 66 Z", "M 158 62 C 163 55 172 55 177 62 L 174 66 C 170 61 164 61 161 66 Z"]
+
+[[layer]]
+role = "blush"
+ref_fill = "#D98291"
+recolor = "fixed"
+paths = ["M 127 74 C 127 70 131 68 135 68 C 139 68 142 71 142 75 C 142 79 139 81 134 81 C 130 81 127 78 127 74 Z", "M 174 74 C 174 70 178 68 182 68 C 186 68 189 71 189 75 C 189 79 186 81 181 81 C 177 81 174 78 174 74 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#A8566B"
+recolor = "fixed"
+paths = ["M 150 74 C 150 71 153 70 155 72 C 157 70 160 71 160 74 C 160 77 158 79 155 81 C 152 79 150 77 150 74 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 153 80 L 157 80 L 157 84 C 161 87 165 85 167 82 C 167 89 160 93 155 88 C 150 93 143 89 143 82 C 146 85 151 87 153 84 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#302936"
+recolor = "fixed"
+paths = ["M 137 77 L 113 73 L 113 76 L 137 80 Z", "M 137 83 L 111 86 L 111 89 L 138 86 Z", "M 175 77 L 191 73 L 191 76 L 175 80 Z", "M 175 83 L 192 86 L 192 89 L 174 86 Z"]

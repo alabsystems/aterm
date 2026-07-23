@@ -1,0 +1,275 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm — a native windowed terminal: winit + softbuffer presenting the aterm-render framebuffer over a real PTY shell."
+
+[[bin]]
+name = "aterm-gui"
+path = "src/main.rs"
+
+[features]
+# `sixel` is ON by default so the SHIPPED GUI binary decodes + renders sixel
+# graphics and DA1 advertises code 4. It forwards to aterm-core's `sixel`
+# feature (which pulls in the `aterm-sixel` decoder and routes a decoded raster
+# into the inline-image placement/blit path). The production `cargo build
+# -p aterm-gui` therefore renders sixel; a consumer that wants the byte-identical
+# no-sixel engine can still build with `--no-default-features`.
+# `a11y-accesskit` is ON by default too: every overlay surface (Settings / About /
+# Palette / Update) fans its ONE model out to a cross-platform accessibility tree
+# (see `src/overlay.rs::OverlayModel::a11y`), so a screen reader reads the same
+# state the pixels + `controls` verb do. The EXACT-pinned `accesskit_winit =0.33.1`
+# resolves against the vendored winit 0.30.13 through the workspace
+# `[patch.crates-io]` redirect (a SINGLE winit instance links), so shipping it on is
+# clean today. On macOS it is mutually exclusive with `a11y-appkit` (both claim the
+# content view's a11y tree) — build the AppKit publisher path with
+# `--no-default-features --features sixel,a11y-appkit`.
+default = ["sixel", "a11y-accesskit"]
+# Sixel graphics rendering in the shipped app (see `default` above). A thin
+# forward to aterm-core/sixel: aterm-gui carries no sixel code of its own, so
+# this only flips the engine feature on for this binary.
+sixel = ["aterm-core/sixel"]
+# Opt-in macOS NSAccessibility publishing (accessibility.rs): publishes the
+# visible grid text / role / label to the content NSView so VoiceOver can read
+# the terminal. OFF by default — the pure accessibility snapshot builder always
+# compiles (and is unit-tested), but the AppKit imperative wiring + its extra
+# objc2 bindings are only built when this is enabled, so the default GUI build is
+# byte-identical and carries no per-frame a11y publish cost. (objc2 +
+# objc2-foundation themselves are now always-on macOS deps for the menu bar, so
+# this feature only adds the extra NSAccessibility binding set.)
+a11y-appkit = [
+    "objc2-app-kit/NSAccessibility",
+    "objc2-app-kit/NSAccessibilityProtocols",
+    "objc2-app-kit/NSAccessibilityConstants",
+    # NSRange for the caret's AXSelectedTextRange; NSRange is feature-gated in
+    # objc2-foundation and NOT in the always-on feature list above, so it enters
+    # the build only with the publisher — the default build stays byte-identical.
+    "objc2-foundation/NSRange",
+]
+# CROSS-PLATFORM accessibility via AccessKit: every overlay surface (Settings / About /
+# Palette / Update) maps its ONE model to a native a11y tree (UIA on Windows, AT-SPI on
+# Linux, NSAccessibility on macOS) from the SAME model the pixels + `controls` verb use.
+# ON by default (see `default` above) now that it links cleanly against the vendored winit
+# 0.30.13 (single winit instance via the workspace patch). Mutually exclusive with
+# `a11y-appkit` on macOS (both would claim the content view's accessibility tree), enforced
+# by a `compile_error!` in `accesskit_tree.rs`.
+a11y-accesskit = ["dep:accesskit", "dep:accesskit_winit"]
+
+[dependencies]
+# `bidi`: compile in the UAX #9 visual-reordering bridge so RTL (Hebrew/Arabic)
+# displays in correct visual order. The render-time application lives in
+# aterm-core (cell_frame_into -> apply_bidi_reorder); pure-LTR frames are
+# untouched. Runtime-gated by BiDiMode (default Implicit).
+aterm-core = { workspace = true, features = ["bidi", "serde"] }
+# L0.5 semantic predicates: the `await match <re>` verb compiles its regex here,
+# so the engine core stays regex-free (RFC R2 purity).
+aterm-observe = { workspace = true }
+# Multilingual whole-word matching for the sparkle-words text decorations.
+aterm-lexicon = { workspace = true }
+# The cursor aurora/comet-trail + sparkle-words state machines (extracted so the
+# web embedders share them); re-exported at the crate root as `crate::<module>`.
+aterm-effects = { workspace = true }
+# The mosh-style predictive-echo state machine (extracted so the web embedders
+# share it); aliased at the crate root so `crate::predict::*` reads unchanged.
+aterm-predict = { workspace = true }
+aterm-buffer = { path = "../aterm-buffer" }
+aterm-grapheme = { workspace = true }
+aterm-codec = { workspace = true }
+aterm-pty = { workspace = true }
+aterm-session = { workspace = true }
+# L3 network drive: the opt-in (secure-default-OFF) TLS front-end that relays a
+# channel-bound remote driver into the local control socket (see net_listen.rs).
+aterm-net = { workspace = true }
+# Portable control-socket stream (std Unix sockets on Unix, AF_UNIX-over-winsock
+# on Windows) + the latest-alias/CSPRNG/pid-liveness helpers control_auth uses.
+aterm-uds = { workspace = true }
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
+aterm-sandbox = { workspace = true }
+aterm-containment = { workspace = true }
+aterm-log = { workspace = true }
+aterm-render = { workspace = true }
+aterm-gpu = { workspace = true }
+# Cmd-F find bar: back the find over the live screen + scrollback with the shared
+# trigram/Bloom search engine instead of a hand-rolled scan (app_search.rs).
+aterm-search = { workspace = true }
+# build_info: FxHash the running binary into a content signature (no crypto dep).
+aterm-hash = { workspace = true }
+# K-2: enable the winit→engine key map so the GUI and the future native shell
+# share one table instead of an inline match. POL-1: install a default OSC policy.
+aterm-types = { workspace = true, features = ["winit-keymap"] }
+aterm-policy = { workspace = true }
+# Silent in-app self-update: checks the private GitHub Release, verifies the
+# notarized + Team-ID-pinned DMG, and swaps aterm.app on next launch. Inert in a
+# plain `cargo build` (no pinned Team ID) and a no-op outside an installed .app.
+aterm-update = { workspace = true }
+# Settings ▸ Packages: read the co-located toolchain manager's OWN durable state
+# (status.toml, dev-link markers, inert/enabled posture) in-process — same source
+# of truth as the `atpkg` verbs, no parallel parser to drift. Network/install
+# verbs still run ONLY via the co-located `atpkg` binary, never in this process.
+atpkg = { workspace = true }
+libc = { workspace = true }
+winit = { workspace = true }
+softbuffer = "0.4"
+# Cross-platform accessibility tree (behind the default-on `a11y-accesskit` feature).
+# accesskit_winit =0.33.1 targets winit ^0.30.5, satisfied by the vendored winit 0.30.13
+# through the workspace `[patch.crates-io]` redirect (so a SINGLE winit instance links).
+# EXACT-pinned: a bump to winit 0.31 would split the winit graph and break the patch (see
+# the vendored-winit note in the root Cargo.toml). `dep:` so the feature, not the dep
+# presence, gates compilation.
+accesskit = { version = "0.24", optional = true }
+accesskit_winit = { version = "=0.33.1", optional = true }
+# Config file parsing. Both crates are ALREADY in this binary's tree (via the
+# engine's config + policy crates), so this adds bindings, not weight.
+serde = { workspace = true }
+# Seamless-update screen carry: the checkpoint meta rides the TOML manifest as a
+# JSON string (TOML cannot represent its `None` fields). Same workspace version
+# aterm-update already uses.
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+# Smart-title inference runs on one bounded worker, never the UI thread. ureq gives
+# both the local Ollama and opt-in OpenAI-compatible providers a native, portable
+# HTTP client; TLS stays enabled for remote endpoints and JSON bodies are bounded.
+ureq = { version = "=3.3.0", default-features = false, features = ["json", "rustls", "platform-verifier"] }
+# NON-DESTRUCTIVE config writes from the Preferences window's Save button
+# (prefs::apply_prefs_edits): edit only the touched keys in `aterm.toml` while
+# preserving every other key, comment, and the file's formatting. `toml_edit` 0.22 is
+# ALREADY in this binary's tree (the `toml` 0.8 dep re-exports it), so this adds the
+# format-preserving DOM API surface, not a new dep to the lockfile.
+toml_edit = "0.22"
+# PNG encode for the control-socket `window` verb (the macOS full-window capture):
+# it draws the front NSWindow's on-screen pixels into a tightly-packed RGBA8 buffer
+# and encodes them here. Same crate (and version) aterm-render already uses for the
+# `image` verb's framebuffer PNG, so this adds bindings, not a new dep to the tree.
+png = "0.17"
+
+# Glyph rasterization for the widget-tray text labels (free-positioned, multi-size).
+# The SAME crate + version aterm-render uses, so it adds no new dep to the tree.
+fontdue = "0.9"
+
+[build-dependencies]
+# The build script derives the exact 64-byte lowercase updater-key fingerprint
+# record embedded in a dedicated Mach-O section.  It deliberately hashes the
+# same raw Ed25519 key bytes that `aterm-update` verifies at runtime.
+base64 = "0.22.1"
+sha2 = { workspace = true }
+# Windows only: compile + link the application .ico (assets/aterm.rc → assets/
+# aterm.ico) into the exe so the shell shows the aterm icon (taskbar button,
+# Alt-Tab, titlebar, Explorer) instead of the generic exe glyph. build.rs gates
+# the call on CARGO_CFG_TARGET_OS = "windows" and uses `manifest_optional()`, so
+# non-Windows targets and toolchain-less builds are entirely unaffected.
+embed-resource = "3"
+
+[dev-dependencies]
+# The GUI's physical-key Tier-1 test drives `App::on_key` itself. Winit's native
+# platform payload is intentionally private, so its narrowly gated synthetic
+# constructor is enabled only for test/bench targets, never the shipped binary.
+winit = { workspace = true, features = ["aterm-test-key-event"] }
+# Tier-1 conformance: bind the real `App` window lifecycle to the ty-proven
+# `window_routing_model()`. Same model that is Tier-0 `ty check`ed in
+# aterm-spec, so the spec the conformance test writes cannot drift from it.
+aterm-spec = { workspace = true }
+# Property tests for the typography config mapping (`Config::text_shaping`).
+proptest = { workspace = true }
+# TRUST_NATIVE_TLA Phase 2: the relocated `spec_xref_closure` gate lives in this
+# binary's TEST build (`#[cfg(test)] mod spec_xref_gate` in main.rs). It collects
+# the ISOLATION-family `#[refines]`/`#[spec_unmodeled]` anchors via `inventory`, so
+# every anchor-bearing crate must be LINKED WITH ITS `spec-anchors` FEATURE ON in
+# this test build. Re-declaring these (already normal `[dependencies]`) here with
+# `features = ["spec-anchors"]` turns the anchors on ONLY for aterm-gui's test/bench
+# build (Cargo unifies dev-dep features into the test build) — the production
+# `cargo build -p aterm-gui` stays byte-identical (feature OFF). aterm-core supplies
+# the `terminal_modes` + `alt_screen` anchors, aterm-sandbox the `sandbox`, aterm-pty
+# the `write_all` + `fork_exec`, aterm-gpu the `gpu_encode`; aterm-gui's own
+# `path_confine` anchor expands via this crate's `cfg(test)` directly.
+aterm-core = { workspace = true, features = ["spec-anchors"] }
+aterm-sandbox = { workspace = true, features = ["spec-anchors"] }
+aterm-pty = { workspace = true, features = ["spec-anchors"] }
+aterm-gpu = { workspace = true, features = ["spec-anchors"] }
+# aterm-session supplies the `fd_lifecycle` anchors (the SinkWriter PTY-master
+# fd-lifecycle: UseFd #[refines] on master()/write_frame + Clone/DropClone RAII
+# waivers). Re-declared here with `spec-anchors` ON so `inventory` collects them
+# into this gate's test binary (initiative A7, WS-G).
+aterm-session = { workspace = true, features = ["spec-anchors"] }
+# TRUST_NATIVE_TLA §4 (Phase 4): the PROOF-anchor (kani-half) crates. Linked into this
+# test build with `spec-anchors` ON so `inventory` collects their `proof_anchor!`
+# records (Ring/EvictFull/TierResidency) for the unified verifier ledger. These are NOT
+# normal `[dependencies]` of aterm-gui, so the production binary never links them — the
+# ledger is a test-build artifact, exactly like the ISOLATION anchors above.
+aterm-scrollback = { workspace = true, features = ["spec-anchors"] }
+aterm-grid = { workspace = true, features = ["spec-anchors"] }
+# aterm-search supplies the `streaming_search` #[refines] anchors (the derived
+# StreamingSearch machine's temporal half) AND its kani `proof_anchor!` records;
+# re-declared with `spec-anchors` ON so this gate's test binary collects both.
+aterm-search = { workspace = true, features = ["spec-anchors"] }
+# Resolve external ISOLATION `.tla` machine names (obligation 4) against the
+# committed specs in this crate; test-only, out of the production closure.
+aterm-spec-models = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# HDR-on-Windows (M3 phase B): query the display's panel MaxLuminance via DXGI
+# `IDXGIOutput6::GetDesc1` for the cursor-aurora EDR headroom. DXGI is genuinely
+# COM (vtable dispatch), so the `windows` crate is the right tool (the house-rule
+# carve-out); already in the tree via wgpu-hal 0.62.2, so this is a direct dep, not
+# a new crate. The DisplayConfig SDR-white/HDR-state query is FLAT C (not COM) and
+# is hand-rolled in hdr_win.rs (house style), so those features are not pulled here.
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Native X11 clipboard (clipboard_x11.rs) over the pure-Rust x11rb RustConnection,
+# so copy / paste / OSC-52 yank work on Linux WITHOUT an external helper binary
+# (xclip / xsel / wl-copy — none of which are guaranteed installed) and WITHOUT a
+# heavy new dependency. x11rb is ALREADY in this binary's tree (winit's X11 backend
+# pulls it), so this adds bindings, not weight. `default-features = false` selects
+# only the pure-Rust connection (no libxcb FFI).
+x11rb = { version = "0.13", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# NSBeep for the audible bell + NSWindow.setColorSpace to drop the per-frame
+# CoreAnimation colour-space conversion (see main.rs), plus the always-on native
+# menu bar (menu.rs): NSApplication/NSMenu/NSMenuItem build + install the Apple
+# main menu, NSEvent supplies the key-equivalent modifier flags. NSToolbar/
+# NSToolbarItem back the per-window native COMPACT chrome (toolbar.rs): a single
+# UnifiedCompact-style toolbar row (NSWindowToolbarStyle::UnifiedCompact +
+# setTitleVisibility hidden) whose ONE custom-view item is the Ghostty-style
+# full-width tab strip. That strip is an NSView container holding one custom
+# NSView (ATermTabView) PER tab — each with an NSTextField title label
+# (NSText/NSTextField), an NSFont, an NSColor accent/dim treatment, a close ×
+# NSButton, and an NSTrackingArea for hover-reveal — plus a trailing "+" New Tab
+# NSButton (NSImage = the add template). NSGraphics also gives the NSRectFill the
+# per-tab drawRect: uses to paint the active accent. (NSSegmentedControl /
+# NSSegmentedCell / NSAnimation are now vestigial — the strip was an
+# NSSegmentedControl before the view-based rewrite — but are kept to avoid
+# churning the build surface.) NSPasteboard backs the in-process clipboard
+# read/write (control_selection.rs `pbcopy`/`pbpaste`), so a copy/paste never
+# forks a `/usr/bin/pbcopy`/`pbpaste` subprocess on the winit event-loop thread.
+# NSOpenPanel/NSSavePanel/NSPanel expose the system local-file picker used by the
+# Markdown and editor tab actions; these are binding features in the same crate.
+# AppKit (objc2-app-kit 0.2) is already linked
+# in-process via softbuffer/winit; these add bindings, not a dep.
+objc2-app-kit = { version = "0.2", features = ["NSGraphics", "NSColorSpace", "NSColor", "NSWindow", "NSView", "NSResponder", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSRunningApplication", "NSPasteboard", "NSToolbar", "NSToolbarItem", "NSImage", "NSControl", "NSCell", "NSButton", "NSBezierPath", "NSText", "NSTextField", "NSFont", "NSTrackingArea", "NSSegmentedControl", "NSSegmentedCell", "NSAnimation", "NSAppearance", "NSAlert", "NSPanel", "NSSavePanel", "NSOpenPanel"] }
+# objc2 + objc2-foundation are now ALWAYS built on macOS (not just the optional
+# `a11y-appkit` feature): menu.rs declares an NSObject action target (objc2's
+# declare_class!) and uses NSString/MainThreadMarker for the menu. Both are
+# already in the tree transitively via objc2-app-kit, so this adds bindings only.
+# (The `a11y-appkit` feature below just enables the extra NSAccessibility
+# bindings; the base crates are no longer gated behind it.)
+objc2-foundation = { version = "0.2", features = ["NSString", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop"] }
+objc2 = { version = "0.5" }
+# macOS Keychain storage for network-drive tokens (net_connections.rs): a saved
+# connection's drive secret lives in the Keychain (generic password), never in
+# aterm.toml. Only the small `passwords` API is used (Security.framework is an
+# OS dylib — no C build).
+security-framework = "3"
+
+[lints]
+workspace = true

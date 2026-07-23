@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+# The AUTHORITATIVE atpkg surface for the `aterm` program (tools/atpkg-pack.sh reads both;
+# EXPOSE(env) > this declaration > name-token heuristic). `expose` = bins atpkg SHIMS onto the
+# user's PATH; `bundle` = bins SHIPPED in the tarball but NOT shimmed. ONE command lands on PATH
+# — `aterm` — the single front door an AI learns; `aterm help` reveals the rest. The siblings are
+# BUNDLED (not exposed) so `aterm <verb>` dispatch (aterm ctl/pkg/fleet/drive) resolves them via
+# current_exe from the same store bin/ — they ride along, attested by the same signature, without
+# adding names to PATH. The producer/dev/signing bins (atpkg-keys — "never shipped to clients",
+# aterm-release, aterm-dev, aterm-nest, xtask) are in NEITHER list. Every name must be a bin the
+# release build produces, or the pack fails closed.
+[workspace.metadata.atpkg]
+expose = ["aterm"] # THE one command — window + session + every verb IN ONE BINARY
+# One binary since the one-binary collapse: ctl/pkg/fleet/drive/help are
+# in-process subcommands of `aterm`, and the window is its no-TTY/--window
+# mode. Distribution ships argv0 compat SYMLINKS (aterm-ctl, atpkg,
+# aterm-fleet, aterm-drive, aterm-gui, aterm-cli) beside it — dispatched by
+# argv[0] — so nothing else lands in `bundle` as a separate binary.
+bundle = []
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/alabsystems/aterm"
+authors = ["Andrew Yates"]
+description = "aterm — a fast, hardened terminal engine"
+
+[workspace.dependencies]
+# --- external (pinned; present in local cargo cache for offline builds) ---
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "2", features = ["full", "extra-traits"] }
+proptest = "1"   # dev-dep: property tests in foundation crates
+serde = { version = "1", features = ["derive"] }   # optional feature in aterm-types
+serde_json = "1"   # aterm-update only: parse the GitHub Releases API response
+zstd = "0.13"    # aterm-scrollback warm-tier compression
+libc = "0.2"     # aterm-scrollback mmap/disk tier
+toml = "0.8"
+regex = "1"
+memchr = "2"
+# aterm-net (L3 network drive): real capability crypto — HMAC-SHA256 channel
+# binding + HKDF, and TLS 1.3 (rustls, ring provider) with the RFC 5705
+# keying-material exporter. rustls uses the `ring` backend (no aws-lc C build).
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Distributed-slice collection across crates: the #[refines]/#[spec_unmodeled]
+# anchor emitters submit RefinementEntry/Waiver records into an inventory slice
+# that the spec_xref_closure gate collects at test time (TRUST_NATIVE_TLA, Phase 0).
+inventory = "0.3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+winit = "0.30"   # aterm-gui windowing; aterm-types winit-keymap feature reuses its key enums
+# Drop-in std::time replacement: EXACTLY `std::time` on native (zero-cost, byte-identical),
+# JS clock on wasm32 — lets the engine's internal Instant/SystemTime reads run under wasm
+# instead of panicking "time not implemented".
+web-time = "1"
+# Public-domain 8x8 Unicode bitmap faces for PHOSPHOR's bounded dynamic
+# material ROM: real sampled terminal characters, rendered identically in the
+# native and wasm/embedded pipelines without consulting a host font API.
+font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
+
+# --- internal aterm crates (added by tools/port_crate.sh as each is ported) ---
+aterm-render-api = { path = "crates/aterm-render-api" }
+# L0.5 semantic surface predicates (regex row-match) over the Observation Kernel.
+aterm-observe = { path = "crates/aterm-observe" }
+# L2 agent interface: turn-completion + self-reflection governor over L0/L0.5/L1.
+aterm-agent = { path = "crates/aterm-agent" }
+# L3 network transport: relay the control protocol over a network boundary with a
+# channel-bound capability (drive a remote aterm; predicates run on its surface).
+aterm-net = { path = "crates/aterm-net" }
+# Portable control-socket stream: std Unix-domain sockets on Unix, AF_UNIX
+# over winsock (afunix.sys) on Windows. Std-only; no external deps.
+aterm-uds = { path = "crates/aterm-uds" }
+aterm-pty = { path = "crates/aterm-pty" }
+aterm-session = { path = "crates/aterm-session" }
+aterm-cap = { path = "crates/aterm-cap" }
+aterm-ffi = { path = "crates/aterm-ffi" }
+aterm-sandbox = { path = "crates/aterm-sandbox" }
+aterm-render = { path = "crates/aterm-render" }
+aterm-gpu = { path = "crates/aterm-gpu" }
+# The shared deterministic RGB/atlas/rasterizer kit (mix_rgb, smoothstep, Tile/Atlas)
+# used by aterm-effects. (Also carries an unused "Living Panels" scene framework — no
+# live consumer; the GUI Scene feature was removed.)
+aterm-scene = { path = "crates/aterm-scene" }
+# The shared cursor-aurora + sparkle-words effect engines (extracted from aterm-gui
+# so the web embedders drive the same art).
+aterm-effects = { path = "crates/aterm-effects" }
+# The mosh-style predictive-echo state machine (extracted from aterm-gui so the
+# web embedders drive the same speculative typing).
+aterm-predict = { path = "crates/aterm-predict" }
+aterm-core = { path = "crates/aterm-core" }
+aterm-shell-integration = { path = "crates/aterm-shell-integration" }
+aterm-search = { path = "crates/aterm-search" }
+aterm-selection = { path = "crates/aterm-selection" }
+aterm-policy = { path = "crates/aterm-policy" }
+aterm-vi = { path = "crates/aterm-vi" }
+aterm-containment = { path = "crates/aterm-containment" }
+aterm-ffi-types = { path = "crates/aterm-ffi-types" }
+aterm-grid = { path = "crates/aterm-grid" }
+aterm-scrollback = { path = "crates/aterm-scrollback" }
+aterm-parser = { path = "crates/aterm-parser" }
+aterm-grapheme = { path = "crates/aterm-grapheme" }
+# Multilingual whole-word matching for the sparkle-words text decorations.
+aterm-lexicon = { path = "crates/aterm-lexicon" }
+aterm-types = { path = "crates/aterm-types" }
+aterm-spec = { path = "crates/aterm-spec" }
+aterm-spec-macros = { path = "crates/aterm-spec-macros" }
+aterm-spec-models = { path = "crates/aterm-spec-models" }
+aterm-provenance = { path = "crates/aterm-provenance" }
+aterm-error = { path = "crates/aterm-error" }
+aterm-error-derive = { path = "crates/aterm-error-derive" }
+aterm-tempfile = { path = "crates/aterm-tempfile" }
+aterm-bidi = { path = "crates/aterm-bidi" }
+aterm-lz4 = { path = "crates/aterm-lz4" }
+aterm-rle = { path = "crates/aterm-rle" }
+aterm-codec = { path = "crates/aterm-codec" }
+aterm-bits = { path = "crates/aterm-bits" }
+aterm-hash = { path = "crates/aterm-hash" }
+aterm-log = { path = "crates/aterm-log" }
+aterm-alloc = { path = "crates/aterm-alloc" }
+aterm-update = { path = "crates/aterm-update" }
+# Artifact-agnostic, portable POSIX update primitives (source resolution, file
+# lock, curl/token plumbing, private-dir hardening, sha256). aterm-update layers
+# the macOS/.app-only logic on top; atpkg will reuse these too.
+aterm-update-core = { path = "crates/aterm-update-core" }
+# The toolchain package manager (Settings ▸ Packages reads its status/link state
+# in-process; the network verbs still run only via the co-located `atpkg` binary).
+atpkg = { path = "crates/atpkg" }
+aterm-sixel = { path = "crates/aterm-sixel" }
+# The main-loop completeness census (L0 whole-Mac-freeze class): ONE shared
+# implementation consumed by `xtask gate mainloop` (manual verb) AND
+# tools/freeze-safety-gate/build.rs (the automatic, build-blocking obligation).
+aterm-census = { path = "crates/aterm-census" }
+# (none yet — populated bottom-up)
+
+# --- workspace-wide lint policy (inherited via `[lints] workspace = true`) ---
+# One central ratchet for every crate. The whole tree is kept clean under
+# `cargo clippy --workspace --all-targets -- -D warnings` (tools/verify.sh runs it);
+# there is no CI, so this local gate IS the contract.
+[workspace.lints.rust]
+# Edition 2024 already warns here; deny it workspace-wide so an unsafe op outside an
+# explicit `unsafe {}` inside an `unsafe fn` can never sneak in.
+unsafe_op_in_unsafe_fn = "deny"
+# Centralized known-cfg superset (was declared per-crate). Verification/fuzzing
+# tools gate code behind these cfgs (kani proofs, loom interleavings, miri, fuzz
+# harnesses; `aterm_ffi_catch_unwind!` also expands a `#[cfg(kani)]` arm). Declaring
+# the union here keeps `unexpected_cfgs` honest in every crate from one place — an
+# undeclared cfg name still warns; an unused-but-declared one is harmless.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)'] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+# Aggressive size+speed, functionality-preserving: fat LTO (whole-program
+# optimization across crates → smaller + often faster) + strip symbols. NOT
+# panic="abort" — aterm relies on catch_unwind for FFI-boundary panic isolation
+# (aterm_ffi_catch_unwind!), which abort would break.
+#
+# opt-level is left at the default 3 BY DELIBERATE OWNER DECISION (2026-06-14):
+# opt-level="s" was measured to shrink aterm-gui 6.74 → 5.48 MB (-18.7%) but cost
+# -12.5% flood throughput (166 → 146 MiB/s). aterm stays #1 of 5 on BOTH axes either
+# way (next-smallest competitor 13.3 MB; next-fastest 102 MiB/s), so the owner kept
+# the throughput crown — the binary already crushes every competitor on size. Do
+# not switch to "s"/"z" without re-confirming this tradeoff is wanted.
+lto = true
+codegen-units = 1
+strip = true
+
+# The web-render frontends ship as browser download assets, so size beats
+# throughput for them: build ONLY these two for size (opt-level="z"). The engine
+# profile above (opt-level 3, owner's throughput decision) is untouched. orc's
+# build-aterm-wasm.mjs compiles these to wasm32 and wasm-opt's the result.
+[profile.release.package.aterm-wasm]
+opt-level = "z"
+
+[profile.release.package.aterm-gpu-web]
+opt-level = "z"
+
+# Same codegen as release but keeps symbols, for sampling profilers (sample/samply):
+#   cargo build --profile profiling -p aterm-gui
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
+
+# --- Vendored, patched winit -------------------------------------------------
+# winit 0.30 ships file drag-and-drop ONLY on macOS (NSDraggingDestination) and
+# X11 (XDND); its Wayland backend has NO data-device support, so a native-Wayland
+# session never delivers `WindowEvent::DroppedFile`/`HoveredFile`/`HoveredFileCancelled`
+# and aterm's drop-to-paste (the iTerm-style file drop) silently does nothing there.
+# We vendor winit 0.30.13 verbatim under `vendor/winit` and add the missing Wayland
+# DnD (sctk `data_device_manager`, `text/uri-list`), so the SAME three events fire on
+# Wayland as on X11/macOS. `[patch.crates-io]` redirects every `winit = "0.30"` in the
+# workspace to the local copy without touching any crate's own dependency line; the
+# vendored manifest keeps version 0.30.13, so the `^0.30` requirement still resolves.
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+
+# --- aterm-owned forks of upstream crates (vendored for Trust verification) ---
+# These crates carried genuine latent panics/overflows that Trust (verification
+# by default) correctly refuses to compile (e.g. libm `i64::abs` overflow at MIN,
+# indexmap `RangeInclusive` index, winnow `offset_from`, pkg-config). We vendor +
+# fix them at the root (see vendor/<crate>, marked "// aterm-trust:") so a fully
+# verified build needs NO verification-bypass flags. Each fork keeps its upstream
+# version so the existing `^` requirements still resolve.
+libm = { path = "vendor/libm" }
+indexmap = { path = "vendor/indexmap" }
+winnow = { path = "vendor/winnow" }
+pkg-config = { path = "vendor/pkg-config" }
+smol_str = { path = "vendor/smol_str" }

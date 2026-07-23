@@ -1,0 +1,72 @@
+id = "s1_04"
+kind = "head"
+viewbox = [160, 136]
+anchor = { eye_y = 0.52, center_x = 0.5, word_top = 1.0 }
+
+# Curious calico: the old ghost eyes are replaced by two bright, asymmetric
+# irises inside a clean split-color silhouette.
+[[layer]]
+role = "outline"
+ref_fill = "#352936"
+recolor = "fixed"
+paths = ["M 16 83 C 14 68 18 55 27 45 L 24 16 C 24 11 28 9 32 12 L 55 29 C 70 24 89 24 105 30 L 131 14 C 135 11 139 14 138 19 L 135 47 C 143 57 147 71 145 85 C 142 108 126 124 103 129 C 88 132 71 132 56 129 C 33 125 18 109 16 83 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#D9B185"
+recolor = "coat"
+paths = ["M 20 82 C 18 68 22 57 31 48 L 28 21 L 55 35 C 70 30 89 30 105 36 L 133 20 L 131 48 C 139 57 143 70 141 84 C 139 104 124 120 102 125 C 88 128 72 128 57 125 C 37 121 22 106 20 82 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#684C53"
+recolor = "fixed"
+paths = ["M 100 34 C 116 29 130 36 135 50 C 141 65 136 83 125 93 C 116 101 105 101 96 95 C 102 87 104 78 101 69 C 98 58 94 47 100 34 Z", "M 21 82 C 27 76 34 73 43 75 C 49 81 50 91 45 101 C 34 98 25 91 21 82 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#F39CAA"
+recolor = "fixed"
+paths = ["M 29 19 L 49 33 L 32 38 Z", "M 132 19 L 112 33 L 129 38 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#FBE7D6"
+recolor = "fixed"
+paths = ["M 63 84 C 63 77 70 74 79 78 C 80 79 80 80 80 81 C 81 80 81 79 82 78 C 91 74 98 77 98 84 C 98 93 91 98 80 98 C 70 98 63 93 63 84 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#29202C"
+recolor = "fixed"
+paths = ["M 40 66 C 40 56 47 50 56 50 C 65 50 72 57 72 67 C 72 77 65 83 56 83 C 47 83 40 76 40 66 Z", "M 91 65 C 91 55 98 49 107 49 C 116 49 123 56 123 66 C 123 76 116 82 107 82 C 98 82 91 75 91 65 Z"]
+
+[[layer]]
+role = "iris"
+ref_fill = "#72C8B8"
+recolor = "iris"
+paths = ["M 47 66 C 47 60 50 56 56 56 C 62 56 65 60 65 66 C 65 72 62 77 56 77 C 50 77 47 72 47 66 Z", "M 98 65 C 98 59 101 55 107 55 C 113 55 116 59 116 65 C 116 71 113 76 107 76 C 101 76 98 71 98 65 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 49 60 C 49 57 51 55 54 55 C 57 55 59 57 59 60 C 59 63 57 65 54 65 C 51 65 49 63 49 60 Z", "M 100 59 C 100 56 102 54 105 54 C 108 54 110 56 110 59 C 110 62 108 64 105 64 C 102 64 100 62 100 59 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#B45C72"
+recolor = "fixed"
+paths = ["M 75 82 C 75 78 79 77 80 80 C 82 77 86 78 86 82 C 86 85 83 87 80 89 C 78 87 75 85 75 82 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#302433"
+recolor = "fixed"
+paths = ["M 78 87 L 83 87 C 82 92 86 94 91 91 C 89 98 83 100 80 95 C 77 100 71 98 69 91 C 74 94 78 92 78 87 Z"]
+
+[[layer]]
+role = "whisker"
+ref_fill = "#352936"
+recolor = "fixed"
+paths = ["M 53 86 L 12 82 L 12 84 L 53 89 Z", "M 53 92 L 8 95 L 8 98 L 54 95 Z", "M 107 86 L 148 82 L 148 84 L 107 89 Z", "M 107 92 L 152 95 L 152 98 L 106 95 Z"]
