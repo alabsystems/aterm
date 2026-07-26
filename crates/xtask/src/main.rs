@@ -359,10 +359,8 @@ fn spec_link() -> ExitCode {
         String::from_utf8_lossy(&out.stderr)
     );
     eprintln!("--- trust-ir spec-link (xtask always-run node) ---\n{report}");
-    let structurally_clean = aterm_spec::ir::spec_link_report_is_clean(
-        out.status.success(),
-        &report,
-    );
+    let structurally_clean =
+        aterm_spec::ir::spec_link_report_is_clean(out.status.success(), &report);
     let proof_evidence = report.contains("harness manifest")
         && report.contains(&format!("checked {} proof binding", proofs.len()));
     if structurally_clean && proof_evidence {

@@ -87,12 +87,20 @@ pub(super) struct LineCache {
     /// `chars().nth(col)` per read, re-introducing the quadratic this
     /// cache exists to remove.
     row: Option<(i32, Vec<char>)>,
+    /// Wide-CONTINUATION flags for the same cached line, from ONE
+    /// [`BufferAccess::line_wide_continuations`] call. Kept beside the chars
+    /// (not derived per read) for exactly the reason the chars are: a per-cell
+    /// probe would re-materialize the scrollback row once per column.
+    conts: Option<(i32, Vec<bool>)>,
 }
 
 impl LineCache {
     /// Create an empty cache.
     pub(super) fn new() -> Self {
-        Self { row: None }
+        Self {
+            row: None,
+            conts: None,
+        }
     }
 
     /// Read the character at `point`, reusing a materialized scrollback
@@ -102,6 +110,47 @@ impl LineCache {
     /// space. `line_text` resolves each scrollback cell with the same
     /// complex-char first-char mapping as `char_at`, so the cached chars
     /// match `char_at` column-for-column.
+    /// [`Self::char_at`] for WORD MOTIONS: a double-width character's
+    /// continuation cell resolves to the character itself, not to the literal
+    /// `' '` the grid stores there.
+    ///
+    /// Without this, `日本語` reads as `日 · 本 · 語` — the classifier sees a
+    /// space between every glyph (`' '` is in [`DEFAULT_SEPARATORS`] and is
+    /// whitespace for WORD motions), so `w`/`b`/`e`/`W`/`B`/`E` step ONE glyph
+    /// at a time through CJK instead of crossing the run. Alacritty, which
+    /// these motions are ported from, skips the spacer explicitly.
+    ///
+    /// Deliberately SEPARATE from [`Self::char_at`]: that function's documented
+    /// contract is to be behaviour-identical to `cell_char` and to agree with
+    /// `line_text` column-for-column, which bracket matching and the paragraph
+    /// motions rely on. Only the word classifier wants the merged reading.
+    pub(super) fn word_char_at(&mut self, grid: &dyn BufferAccess, point: ViPoint) -> char {
+        let ch = self.char_at(grid, point);
+        if point.col == 0 || !self.is_wide_continuation(grid, point) {
+            return ch;
+        }
+        // Resolve to the lead cell. A continuation is always exactly one cell
+        // past its lead, so this is a single step, not a walk.
+        self.char_at(grid, ViPoint::new(point.line, point.col - 1))
+    }
+
+    /// Whether `point` is the SECOND half of a double-width character, from the
+    /// batched per-line flags (one grid call per line, cached beside the text).
+    fn is_wide_continuation(&mut self, grid: &dyn BufferAccess, point: ViPoint) -> bool {
+        let needs_refresh = match &self.conts {
+            Some((line, _)) => *line != point.line,
+            None => true,
+        };
+        if needs_refresh {
+            let flags = grid.line_wide_continuations(point.line).unwrap_or_default();
+            self.conts = Some((point.line, flags));
+        }
+        self.conts
+            .as_ref()
+            .and_then(|(_, f)| f.get(point.col as usize).copied())
+            .unwrap_or(false)
+    }
+
     pub(super) fn char_at(&mut self, grid: &dyn BufferAccess, point: ViPoint) -> char {
         if point.line >= 0 {
             // Visible rows: a direct lookup is already cheap and avoids

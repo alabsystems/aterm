@@ -296,14 +296,14 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         App,
-        "window [<target>] [path] : screenshot a GUI window -> PNG, reply OK <w> <h> <path> (target: front|prefs|perf|about|menu|update, default front; bare filename confined to images/)",
+        "window [<target>] [path] : screenshot a GUI window -> PNG, reply OK <w> <h> <path> (target: front|prefs|about|menu|update, default front; bare filename confined to images/)",
     ),
     v(
         "video",
         Read,
         Status,
         App,
-        "record N seconds (0.5..=60) of the front window's PRESENTED frames -> frame_NNNN.png + index.json (same-clock timestamps). Flags: full | keys (owner-only keystroke log — covers BOTH hardware and socket-injected input, so key->frame latency works for an AI driving over the socket) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; the server keeps the newest 8 recordings. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized=); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms. key->frame latency = first frame showing the glyph minus inputs[].t_us; cadence gaps = frames[].t_us deltas vs ~16667",
+        "record N seconds (0.5..=60) of the front window's PRESENTED frames -> frame_NNNN.png + index.json (same-clock timestamps). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input driven through the ACTIVE-TAB verbs — a CROSS-SESSION `@<sid>` verb, which is what the `@self` selector expands to, egresses on the control thread and is NOT logged, so drive FLAGLESS when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; the server keeps the newest 8 recordings. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized=); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms. key->frame latency = first frame showing the glyph minus inputs[].t_us; cadence gaps = frames[].t_us deltas vs ~16667",
     ),
     v(
         "chrome",
@@ -317,7 +317,14 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         App,
-        "GUI controls as text (front|prefs|perf|about|menu|update)",
+        "GUI controls as text (front|prefs|about|menu|update)",
+    ),
+    v(
+        "panes",
+        Read,
+        Lines,
+        App,
+        "the front window's ACTIVE-tab split-pane layout: `layout tab=<i> panes=<n> zoomed=<bool>` header, then one `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> focused=<bool>` row per visible pane (cell coords; 1-cell divider gaps between rects)",
     ),
     v(
         "inspect",
@@ -366,7 +373,6 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "timeline [<n>] [since=<id>]: the session EVENT TIMELINE - one `event <id> t=<ms> kind=<k> ...` line per lifecycle event (spawned/state-change/title-change/cwd-change/meta-change), monotonic ids, drop-oldest ring",
     ),
-    v("widgets", Read, Status, App, "live HUD widget values"),
     v(
         "metrics",
         Read,
@@ -504,7 +510,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "rain [status|on|off|toggle]: matrix rain for the focused window's front session \
-         (status prints config_enabled= session_override= effective=)",
+         (status prints config_enabled= session_override= effective= engine= active= \
+         scope=window|focused-pane focused= animating=, plus a live engine's \
+         weather= density= tick= scanned= material= emitting= vis= drain= seq= streak= diag)",
     ),
     v(
         "hover",
@@ -512,13 +520,6 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "toggle the drop-target highlight",
-    ),
-    v(
-        "metric",
-        Write,
-        Status,
-        App,
-        "metric <name> <value>: feed an app metric to the Engine HUD",
     ),
     // session lifecycle
     v(

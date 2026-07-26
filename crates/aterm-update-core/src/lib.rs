@@ -7,8 +7,9 @@
 //! This crate holds the parts of the updater that are NOT tied to the macOS `.app`
 //! shape: resolving the GitHub release source (owner/repo) under
 //! env > config > default precedence with a URL-safety allowlist; an advisory
-//! [`FileLock`] and a [`same_volume`] check; authenticated `curl` plumbing to the
-//! private GitHub Releases API ([`api_get`], [`download_bytes`], [`download_to`]); the
+//! [`FileLock`] and a [`same_volume`] check; token-optional `curl` plumbing to the
+//! GitHub Releases API ([`api_get`], [`download_bytes`], [`download_to`] — anonymous
+//! when no token is provisioned, so a PUBLIC channel needs no credential); the
 //! per-machine [`token`] resolution chain; private-dir hardening
 //! ([`ensure_private_dir`]); a `shasum`-backed [`sha256_file`]; and a generic
 //! compile-time-pin idiom ([`compile_time_pin!`] + [`pin_active`]).
@@ -35,11 +36,13 @@ mod source;
 mod sys;
 
 pub use hash::sha256_file;
-pub use http::{api_get, download_bytes, download_to};
+pub use http::{HttpError, api_get, api_get_classified, download_bytes, download_to};
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;
 pub use sentinel::Sentinel;
-pub use source::{DEFAULT_OWNER, DEFAULT_REPO, Source, is_valid_slug, pick_slug};
+pub use source::{
+    DEFAULT_OWNER, DEFAULT_REPO, PUBLISH_OWNER, PUBLISH_REPO, Source, is_valid_slug, pick_slug,
+};
 pub use sys::{FileLock, same_volume};
 
 /// Read a compile-time pin from the named build environment variable, or `""` if it

@@ -118,7 +118,14 @@ pub struct ColParams {
 /// stays under 1 Hz structurally (WCAG 2.3.1).
 #[must_use]
 pub fn col_params(fp: &FieldParams, col: u32) -> ColParams {
-    let rows = fp.rows.max(1);
+    // Floor at 3, not 1: the trail clamps below are `.clamp(3, rows)` and
+    // `Ord::clamp` panics when `min > max`, so a 1–2-row viewport (a tiny
+    // window, or a heavily-subdivided split pane) must derive its cycle from
+    // a 3-row VIRTUAL field. Drawing is bounded by the live geometry
+    // elsewhere (`head_row < rows` on-screen test against the REAL rows), so
+    // the only effect is a slightly longer off-screen cycle — never an
+    // out-of-range row and never a panic.
+    let rows = fp.rows.max(3);
     let h = rain_hash32(fp.seed32 ^ ((col << 1) | 1));
     // Step period 2..=5 from the hash, then the speed-knob shift (5 =
     // neutral; faster knobs shorten the period), clamped >= 2.
@@ -378,6 +385,33 @@ mod tests {
                                 fp.tick_ms
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// TINY VIEWPORTS (split-pane audit): a 1- or 2-row field must never
+    /// panic — `.clamp(3, rows)` requires the derivation `rows >= 3`, and a
+    /// heavily-subdivided split pane (or a 1-row window) legitimately emits
+    /// at `fp.rows < 3`. The virtual 3-row cycle keeps every invariant: the
+    /// trail pins to its 3-row floor, `p >= 2`, and the flash floor holds.
+    #[test]
+    fn tiny_viewports_never_panic_and_keep_invariants() {
+        for rows in [1u32, 2, 3] {
+            for speed in [1u32, 5, 10] {
+                for trail in [1u32, 5, 10] {
+                    let fp = params(rows, 83, speed, trail);
+                    for col in 0..100 {
+                        let cp = col_params(&fp, col);
+                        // rows <= 3 ⇒ the virtual field is exactly 3 rows,
+                        // so the trail clamp pins l to its 3-row floor.
+                        assert_eq!(cp.l, 3);
+                        assert!(cp.p >= 2);
+                        assert!(
+                            cp.c * cp.p * fp.tick_ms >= 1000,
+                            "flash floor broken at rows={rows}"
+                        );
                     }
                 }
             }

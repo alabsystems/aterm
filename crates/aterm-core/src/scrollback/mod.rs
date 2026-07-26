@@ -12,9 +12,13 @@
 // Keep this list explicit (no wildcard) so new public symbols in aterm-scrollback
 // do not become part of aterm_core::scrollback::* without review.
 pub use aterm_scrollback::{
-    CellAttrs, HyperlinkSpan, Line, Rle, Scrollback, ScrollbackIter, ScrollbackRevIter,
-    ScrollbackStorage, WatermarkLevel,
+    CellAttrs, ColdTierCodec, HyperlinkSpan, Line, Rle, Scrollback, ScrollbackIter,
+    ScrollbackRevIter, ScrollbackStorage, TierCapabilities, WatermarkLevel,
 };
+// The construction-default TOTAL retention cap (audit E1): embedders that brand
+// budgets/limits (wasm exports, the daemon builder) need the same number the
+// tiered defaults were built from.
+pub use aterm_scrollback::DEFAULT_LINE_LIMIT;
 // Disk cold-tier types are disk-tier-gated in aterm-scrollback (mmap + zstd-sys);
 // dropped on wasm.
 #[cfg(feature = "disk-tier")]

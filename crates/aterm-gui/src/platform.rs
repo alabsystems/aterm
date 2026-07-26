@@ -218,12 +218,11 @@ pub(crate) trait AppRt {
     /// Called once, when the menu is installed.
     fn install_quit_confirm(&self);
 
-    /// Query the OS "Reduce Motion" accessibility preference (macOS:
-    /// `NSWorkspace.accessibilityDisplayShouldReduceMotion`). `false` off macOS —
-    /// winit exposes no portable equivalent yet (a GNOME
-    /// `org.gnome.desktop.interface enable-animations` D-Bus read is the
-    /// documented follow-up); the explicit config `motion = "reduced"` override
-    /// still works everywhere. Feeds [`crate::motion::MotionPolicy`] (W11).
+    /// Query the OS motion preference. macOS reads
+    /// `NSWorkspace.accessibilityDisplayShouldReduceMotion`; Windows reads
+    /// `SPI_GETCLIENTAREAANIMATION`; platforms without an implemented query
+    /// return `false`. The explicit `motion = "reduced"` override works
+    /// everywhere. Feeds [`crate::motion::MotionPolicy`] (W11).
     fn reduce_motion(&self) -> bool;
 
     /// Snapshot the OS-native display accessibility preferences consumed by the
@@ -238,7 +237,8 @@ pub(crate) trait AppRt {
     /// workspace notification center), posting [`Wake::ReduceMotionChanged`] so
     /// the main thread re-queries [`Self::reduce_motion`] and repaints. Returns
     /// the retained observer target the caller must keep alive for the process
-    /// life (AppKit references it weakly); `None` off macOS / off the main thread.
+    /// life (AppKit references it weakly). Windows currently samples only at
+    /// window attach; other platforms have no query, so both return `None`.
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver>;
 }
 
@@ -697,49 +697,86 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     Some((age_s.max(0.0) * 1e9) as u64)
 }
 
-/// Non-consuming main-thread peek for hardware input already queued in AppKit
-/// but not yet dispatched through winit. Final update Commit must reject while
-/// this is true; otherwise `_exit` could overtake a queued keyDown and lose it.
+/// Whether a hardware-input event occurred inside `within`, including an event
+/// that CoreGraphics has accepted but AppKit/winit has not dispatched yet.
+///
+/// This deliberately queries the CoreGraphics event-source clocks instead of
+/// calling `NSApplication::nextEventMatchingMask`. The latter is not a passive
+/// peek: AppKit may service a queued run-loop closure while answering it, which
+/// recursively enters winit when this function is called from `about_to_wait`.
+/// `CGEventSourceSecondsSinceLastEventType` is a flat, non-dispatching C getter,
+/// so it is safe from every winit callback. The combined-session source is
+/// conservative (activity in another application can postpone an automatic
+/// update), which is appropriate for the "install when quiet" policy.
 #[cfg(target_os = "macos")]
-pub(crate) fn pending_user_input_event() -> bool {
-    use objc2_app_kit::{NSApplication, NSEventMask};
-    use objc2_foundation::{MainThreadMarker, NSDate, NSDefaultRunLoopMode};
+pub(crate) fn recent_user_input_event(within: std::time::Duration) -> bool {
+    // Stable CGEventType ABI values matching the former AppKit NSEventMask:
+    // mouse buttons/motion/drags, keyboard/flags, and scroll-wheel input.
+    const USER_INPUT_EVENT_TYPES: [u32; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 25, 26, 27];
+    const COMBINED_SESSION_STATE: i32 = 0;
 
-    let Some(mtm) = MainThreadMarker::new() else {
-        return true;
-    };
-    let mask = NSEventMask::KeyDown
-        | NSEventMask::KeyUp
-        | NSEventMask::FlagsChanged
-        | NSEventMask::LeftMouseDown
-        | NSEventMask::LeftMouseUp
-        | NSEventMask::RightMouseDown
-        | NSEventMask::RightMouseUp
-        | NSEventMask::OtherMouseDown
-        | NSEventMask::OtherMouseUp
-        | NSEventMask::MouseMoved
-        | NSEventMask::LeftMouseDragged
-        | NSEventMask::RightMouseDragged
-        | NSEventMask::OtherMouseDragged
-        | NSEventMask::ScrollWheel;
-    // SAFETY: main-thread AppKit queue query; `dequeue=false` is the
-    // load-bearing non-consuming peek and distantPast makes it non-blocking.
-    unsafe {
-        let expiration = NSDate::distantPast();
-        NSApplication::sharedApplication(mtm)
-            .nextEventMatchingMask_untilDate_inMode_dequeue(
-                mask,
-                Some(&expiration),
-                NSDefaultRunLoopMode,
-                false,
-            )
-            .is_some()
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
     }
+
+    let within_seconds = within.as_secs_f64();
+    USER_INPUT_EVENT_TYPES.into_iter().any(|event_type| {
+        // SAFETY: this CoreGraphics getter accepts the published enum values
+        // above, returns a scalar, and neither pumps nor mutates the event queue.
+        let age_seconds =
+            unsafe { CGEventSourceSecondsSinceLastEventType(COMBINED_SESSION_STATE, event_type) };
+        user_input_age_is_recent(age_seconds, within_seconds)
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn pending_user_input_event() -> bool {
+pub(crate) fn recent_user_input_event(_within: std::time::Duration) -> bool {
     false
+}
+
+/// Reduce one CoreGraphics age sample without platform state. Invalid negative
+/// or NaN samples fail closed; positive infinity is the useful "never observed"
+/// shape and therefore is not recent.
+#[cfg(any(target_os = "macos", test))]
+fn user_input_age_is_recent(age_seconds: f64, within_seconds: f64) -> bool {
+    age_seconds.is_nan() || age_seconds < 0.0 || age_seconds <= within_seconds
+}
+
+#[cfg(test)]
+mod user_input_probe_tests {
+    use super::user_input_age_is_recent;
+
+    #[test]
+    fn input_age_reducer_is_boundary_exact_and_fail_closed() {
+        assert!(user_input_age_is_recent(0.0, 0.5));
+        assert!(user_input_age_is_recent(0.5, 0.5));
+        assert!(!user_input_age_is_recent(0.500_001, 0.5));
+        assert!(user_input_age_is_recent(f64::NAN, 0.5));
+        assert!(user_input_age_is_recent(-0.001, 0.5));
+        assert!(!user_input_age_is_recent(f64::INFINITY, 0.5));
+    }
+
+    /// Regression for crash-45791: even a non-dequeuing AppKit event query can
+    /// run winit's queued observer closure and recursively enter its handler.
+    /// Keep the event-pumping selector out of the platform layer completely.
+    #[test]
+    fn automatic_update_input_probe_never_polls_the_appkit_event_queue() {
+        let forbidden_selector = ["nextEventMatchingMask_", "untilDate_inMode_dequeue("].concat();
+        assert!(
+            !include_str!("platform.rs").contains(&forbidden_selector),
+            "winit callbacks must not query AppKit through its event-pumping selector"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_graphics_input_probe_is_callable_off_the_appkit_main_thread() {
+        // Rust's test harness runs this on a worker. The old MainThreadMarker +
+        // AppKit queue path failed closed here and could not exercise its query;
+        // CoreGraphics' scalar source-clock getter is thread-safe.
+        let _ = super::recent_user_input_event(std::time::Duration::from_millis(500));
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

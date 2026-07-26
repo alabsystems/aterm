@@ -6,7 +6,7 @@
 //! blanks) over the hand-written Keep-a-Changelog `CHANGELOG.md`. Gates run
 //! before the claim (`[Unreleased]` body non-empty; `'''` anywhere in the body
 //! is a hard abort with the offending line number — never a silent collapse);
-//! the roll (`[Unreleased]` → `[0.26] - <local date>` + fresh scaffold) lands
+//! the roll (`[Unreleased]` → `[0.2.0] - <local date>` + fresh scaffold) lands
 //! inside the claim commit; the extracted section body is used verbatim, once,
 //! for manifest + GitHub notes + in-app notes.
 //!
@@ -110,7 +110,7 @@ pub fn gate_unreleased(text: &str) -> Result<GateSummary> {
 }
 
 /// The same gate over an arbitrary section — the RECUT path (spec §5) re-cuts
-/// a version whose body was already rolled into `## [X.Y]` by the earlier
+/// a version whose body was already rolled into `## [X.Y.Z]` by the earlier
 /// wedged cut, so the gate must judge THAT section (the fresh `[Unreleased]`
 /// scaffold above it is legitimately empty then).
 pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
@@ -184,7 +184,7 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
 /// `date` is `YYYY-MM-DD` — pass [`today_la`] for a real cut; injected so
 /// tests are deterministic.
 pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
-    // Double-roll guard: a second `## [X.Y]` section would split the release
+    // Double-roll guard: a second `## [X.Y.Z]` section would split the release
     // notes across two headings and desync the recut detection (spec §5
     // derives "recut" from this section's presence).
     if has_section(text, version) {

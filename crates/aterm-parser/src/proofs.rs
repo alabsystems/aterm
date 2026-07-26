@@ -537,8 +537,14 @@ fn bulk_decode_first_sequence_matches_scalar() {
         None => {
             // No valid first sequence ⇒ bulk consumes and emits nothing, leaving
             // the byte for the scalar boundary step.
-            kani::assert(consumed == 0, "bulk consumes nothing on an invalid first sequence");
-            kani::assert(out.is_empty(), "bulk emits nothing on an invalid first sequence");
+            kani::assert(
+                consumed == 0,
+                "bulk consumes nothing on an invalid first sequence",
+            );
+            kani::assert(
+                out.is_empty(),
+                "bulk emits nothing on an invalid first sequence",
+            );
         }
     }
 }

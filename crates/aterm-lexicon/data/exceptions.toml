@@ -1,12 +1,24 @@
 # Copyright 2026 Andrew Yates
 # SPDX-License-Identifier: Apache-2.0
 #
-# CJK compounds that CONTAIN a cat character (猫 / 貓) but do NOT denote a
-# domestic cat. The feline matcher suppresses these so the cat ideograph inside
-# e.g. "panda" never sparkles.
+# CJK compounds whose MAXIMAL-MUNCH match would be a false positive.
 #
-# Excluded by design: 子猫 / 小猫 (genuine kittens) ARE real cats and are
-# intentionally NOT listed here.
+# The scanner is maximal-munch from the run start, so a listed surface that is
+# a PREFIX of an ordinary compound fires on that compound. This file suppresses
+# those. The mechanism is CLASS-AGNOSTIC (consulted before forms at each
+# length) even though it began life as a feline-only list.
+#
+# 1. FELINE: compounds that CONTAIN a cat character (猫 / 貓) but do NOT denote
+#    a domestic cat, so the cat ideograph inside e.g. "panda" never sparkles.
+#    Excluded by design: 子猫 / 小猫 (genuine kittens) ARE real cats and are
+#    intentionally NOT listed.
+#
+# 2. PROFANITY: 我操 ("I fuck") is a listed non-ambiguous zh expletive, and it
+#    is a prefix of the extremely common 我操作… ("I operate…"). Maximal munch
+#    tries 我操作电脑 -> 我操作 -> 我操 and stops at the expletive before 操作
+#    ("operate") is ever considered, so "我操作电脑" — "I operate the computer"
+#    — detonated an f-bomb. Suppressing the benign compounds fixes it while
+#    "我操这也太慢了" still fires.
 
 [[exception]]
 word = "熊猫"
@@ -62,3 +74,21 @@ meaning = "cat's-eye (gemstone / road reflector)"
 word = "海猫"
 lang = "ja"
 meaning = "black-tailed gull"
+
+# --- profanity false positives (2026-07-24) ------------------------------
+# 我操 is a real expletive, but it prefixes these ordinary verbs.
+
+[[exception]]
+word = "我操作"
+lang = "zh"
+meaning = "I operate / I use (操作 = to operate)"
+
+[[exception]]
+word = "我操控"
+lang = "zh"
+meaning = "I control (操控 = to control)"
+
+[[exception]]
+word = "我操心"
+lang = "zh"
+meaning = "I worry about (操心 = to be concerned)"

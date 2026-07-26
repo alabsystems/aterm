@@ -290,7 +290,11 @@ fn bolt_cursor_paints_the_lightning_silhouette() {
         .filter(|p| p[1][0] > p[0][0])
         .map(|p| p[1][0] - p[0][0])
         .collect();
-    assert_eq!(jumps.len(), 1, "bolt: exactly one waist step, got {jumps:?}");
+    assert_eq!(
+        jumps.len(),
+        1,
+        "bolt: exactly one waist step, got {jumps:?}"
+    );
     assert!(
         jumps[0] >= (cw / 8).max(1),
         "bolt: the waist step must jut visibly right"
@@ -335,7 +339,10 @@ fn bolt_cursor_honours_the_fill_override_and_keeps_the_glyph() {
     let rects = cursor_rects(CursorStyle::Bolt, 0, 0, cw, ch);
     let area: usize = rects.iter().map(|&[_, _, w, h]| w * h).sum();
     let laser_px = f.pixels.iter().filter(|&&p| p == LASER).count();
-    assert_eq!(laser_px, area, "bolt: every strip pixel takes the laser hue");
+    assert_eq!(
+        laser_px, area,
+        "bolt: every strip pixel takes the laser hue"
+    );
     assert!(
         cursor_positions(&f).is_empty(),
         "bolt: nothing left in the theme cursor colour"

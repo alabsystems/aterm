@@ -15,6 +15,7 @@ use aterm_hash::FxHashMap;
 use aterm_scrollback::{CellAttrs, Line};
 
 use crate::CellExtra;
+use crate::CellFlags;
 use crate::PackedColor;
 
 /// A scrollback row materialized for rendering with full fidelity.
@@ -124,6 +125,11 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
         return row;
     };
 
+    // E6a: `unit_char_start` is monotone across this walk, so a run-cursor
+    // reads the RLE attrs in O(runs) TOTAL instead of `get_attr`'s
+    // rescan-from-start per cell (which made the walk O(cols × runs) — the
+    // accidental attr term in the scrolled-frame cost).
+    let mut attr_cursor = line.attr_cursor();
     let mut byte_idx: usize = 0;
     let mut char_idx: usize = 0;
     let mut col: u16 = 0;
@@ -150,13 +156,13 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
         char_idx += chars_consumed;
         let unit_str = &text[unit_byte_start..byte_idx];
 
-        let attrs = line.get_attr(unit_char_start);
+        let attrs = attr_cursor.attr_at(unit_char_start);
         let flags = CellFlags::from_bits(attrs.flags);
         // Effective width, with the live writer's row-edge exception: a VS16
         // widening FAILS at the last column (no room for the continuation
         // spacer), so the live cell stayed narrow there — demote to match
         // instead of dropping it as an unfittable wide glyph.
-        let is_wide = unit.wide && !(unit.vs16_widened && col + 1 >= cols);
+        let is_wide = stored_unit_is_wide(unit, attrs) && !(unit.vs16_widened && col + 1 >= cols);
         let is_complex = chars_consumed > 1 || c as u32 > super::Cell::MAX_DIRECT_CODEPOINT;
 
         let fg = PackedColor(attrs.fg);
@@ -254,6 +260,23 @@ pub(crate) struct GraphemeUnit {
     /// restore paths demote such a unit back to narrow at the row edge —
     /// matching the live cell instead of dropping it as an unfittable wide.
     pub(crate) vs16_widened: bool,
+    /// The unit's final width was explicitly narrowed by VS15. This overrides a
+    /// stale/authored `WIDE` attribute: presentation selectors are part of the
+    /// stored text and must keep their live write-path semantics.
+    force_narrow: bool,
+}
+
+/// Resolve a Line-backed unit's write-time cell geometry.
+///
+/// A live grid stores a wide main cell with [`CellFlags::WIDE`], including an
+/// East-Asian-Ambiguous scalar printed while the terminal's CJK-width policy was
+/// active. Row-to-Line conversion preserves that bit while omitting the spacer.
+/// Recomputing solely from Unicode's default (narrow-ambiguous) table therefore
+/// collapses the cell after it enters scrollback. Prefer either source of wide
+/// geometry, except that an explicit VS15 in the text remains authoritative.
+#[inline]
+pub(crate) fn stored_unit_is_wide(unit: GraphemeUnit, attrs: CellAttrs) -> bool {
+    !unit.force_narrow && (unit.wide || CellFlags::from_bits(attrs.flags).contains(CellFlags::WIDE))
 }
 
 /// [`advance_grapheme_unit`] plus the unit's EFFECTIVE cell width: returns a
@@ -280,6 +303,7 @@ pub(crate) fn advance_grapheme_unit_wide(text: &str, byte_idx: &mut usize) -> Gr
             chars: 0,
             wide: false,
             vs16_widened: false,
+            force_narrow: false,
         };
     };
 
@@ -292,6 +316,9 @@ pub(crate) fn advance_grapheme_unit_wide(text: &str, byte_idx: &mut usize) -> Gr
     // Whether the CURRENT wide state came from VS16 widening a narrow base
     // (the live widen can fail at the row edge — see [`GraphemeUnit`]).
     let mut vs16_widened = false;
+    // True only while the latest width-selecting presentation selector is VS15.
+    // A later effective VS16 clears it again, matching the live writer.
+    let mut force_narrow = false;
     // The most-recently-absorbed scalar, for the flag-pair join test below (a
     // second regional indicator folds onto the immediately-preceding one). The
     // skin-tone test instead uses the unit BASE `c`, so an intervening zero-width
@@ -324,6 +351,7 @@ pub(crate) fn advance_grapheme_unit_wide(text: &str, byte_idx: &mut usize) -> Gr
             if !wide && aterm_grapheme::is_vs16_emoji_capable(c) {
                 wide = true;
                 vs16_widened = true;
+                force_narrow = false;
             }
             last_was_zwj = false;
         } else if next_c == '\u{FE0E}' {
@@ -331,6 +359,7 @@ pub(crate) fn advance_grapheme_unit_wide(text: &str, byte_idx: &mut usize) -> Gr
             // like the live `narrow_previous_cell_for_vs15`.
             wide = false;
             vs16_widened = false;
+            force_narrow = true;
             last_was_zwj = false;
         } else if next_width == 0 || last_was_zwj {
             // Zero-width chars (combining marks, other selectors)
@@ -366,6 +395,7 @@ pub(crate) fn advance_grapheme_unit_wide(text: &str, byte_idx: &mut usize) -> Gr
         chars: char_count,
         wide,
         vs16_widened,
+        force_narrow,
     }
 }
 
@@ -394,7 +424,7 @@ fn place_cell(
     let cell_flags = if is_wide {
         flags.union(CellFlags::WIDE)
     } else {
-        flags
+        flags.difference(CellFlags::WIDE)
     };
 
     if is_complex {

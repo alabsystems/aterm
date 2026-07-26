@@ -178,43 +178,171 @@ pub(crate) fn collect() -> DiagInfo {
     }
 }
 
-/// Parse `text` as the `aterm.toml` config, returning the (possibly empty) list of
-/// soft WARNINGS for a structurally-valid file, or a hard `Err` (with the toml error's
-/// line/column) for a TOML syntax error. Pure — the file I/O lives in [`validate_config`].
-///
-/// A clean TOML parse is not the whole story: the loader warn-skips bad chords /
-/// escapes / actions in `[key_sequences]` and `[keybindings]` at runtime, so an entry
-/// that parses as a string can still silently never work. Those are returned as
-/// warnings so the diagnostic doesn't print a false green.
-pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
-    let config = toml::from_str::<crate::app_config::Config>(text).map_err(|e| e.to_string())?;
-    let trail_packs = config.resolve_trail_pack_catalog();
+/// One deterministic, source-addressable warning shared by `--validate-config`
+/// and the native Manual language service. `key` names the owning TOML item so
+/// the editor can underline the same value whose runtime consumer would skip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfigSemanticWarning {
+    pub(crate) key: &'static str,
+    pub(crate) message: String,
+}
+
+/// Semantic checks that require no filesystem, platform service, or ambient
+/// capability. Keeping this subset separate lets the config editor stay pure
+/// and responsive while sharing the exact keybinding/sequence and palette
+/// acceptance rules with `--validate-config`.
+pub(crate) fn config_semantic_warnings(
+    config: &crate::app_config::Config,
+) -> Vec<ConfigSemanticWarning> {
     let mut warnings = Vec::new();
+
+    if let Some(font_px) = config.font_px
+        && (!font_px.is_finite() || !(crate::FONT_PX_MIN..=crate::FONT_PX_MAX).contains(&font_px))
+    {
+        warnings.push(ConfigSemanticWarning {
+            key: "font_px",
+            message: format!(
+                "font_px is {font_px:?}, outside the supported {}–{} range; the resolver ignores it rather than clamping it and uses the next valid precedence fallback",
+                crate::FONT_PX_MIN,
+                crate::FONT_PX_MAX,
+            ),
+        });
+    }
+
+    if let Some(variations) = config.font_variation.as_ref() {
+        for (index, spec) in variations.0.iter().enumerate() {
+            if aterm_render::variation::parse_variation_spec(spec).is_none() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "font_variation",
+                    message: format!(
+                        "font_variation[{index}]: malformed entry {spec:?} is ignored; use \"tag=value\", for example \"wght=450\""
+                    ),
+                });
+            }
+        }
+    }
+
+    if let Some(feature_entries) = config.font_features.as_ref() {
+        use aterm_types::text_shaping::FontFeature;
+        for (index, entry) in feature_entries.iter().enumerate() {
+            let tokens = entry.split_whitespace().collect::<Vec<_>>();
+            let rejected = tokens
+                .iter()
+                .copied()
+                .filter(|token| FontFeature::parse_token(token).is_none())
+                .collect::<Vec<_>>();
+            if tokens.is_empty() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "font_features",
+                    message: format!(
+                        "font_features[{index}]: blank entry contains no OpenType feature token and has no effect"
+                    ),
+                });
+            } else if !rejected.is_empty() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "font_features",
+                    message: format!(
+                        "font_features[{index}]: malformed token(s) {rejected:?} are ignored; use tag, +tag, -tag, or tag=unsigned-value with a 1–4 byte ASCII tag"
+                    ),
+                });
+            }
+            let accepted = tokens
+                .iter()
+                .filter(|token| FontFeature::parse_token(token).is_some())
+                .count();
+            if accepted > 256 {
+                warnings.push(ConfigSemanticWarning {
+                    key: "font_features",
+                    message: format!(
+                        "font_features[{index}]: only the first 256 valid tokens are applied; {} later token(s) are ignored",
+                        accepted - 256
+                    ),
+                });
+            }
+        }
+    }
+
+    if let Some(update) = config.update.as_ref() {
+        for (key, value) in [
+            ("update.owner", update.owner.as_deref()),
+            ("update.repo", update.repo.as_deref()),
+        ] {
+            if let Some(value) = value
+                && !aterm_update_core::is_valid_slug(value.trim())
+            {
+                warnings.push(ConfigSemanticWarning {
+                    key,
+                    message: format!(
+                        "{key} value {value:?} is not a safe GitHub slug and is ignored; a valid environment value or the compiled default is used"
+                    ),
+                });
+            }
+        }
+    }
+
+    if let Some(packages) = config.packages.as_ref() {
+        if let Some(account) = packages.account.as_deref()
+            && !aterm_update_core::is_valid_slug(account.trim())
+        {
+            warnings.push(ConfigSemanticWarning {
+                key: "packages.account",
+                message: format!(
+                    "packages.account value {account:?} is not a safe GitHub owner slug and is ignored; atpkg uses its next valid precedence fallback"
+                ),
+            });
+        }
+        if packages
+            .channel
+            .as_deref()
+            .is_some_and(|channel| channel.trim().is_empty())
+        {
+            warnings.push(ConfigSemanticWarning {
+                key: "packages.channel",
+                message: "packages.channel is blank and is treated as unset; atpkg uses the stable channel"
+                    .to_string(),
+            });
+        }
+    }
     if let Some(table) = config.key_sequences.as_ref() {
         for (chord, bytes) in table {
             if let Err(e) = crate::keybinding::Chord::parse(chord) {
-                warnings.push(format!("key_sequences: chord {chord:?} invalid ({e})"));
+                warnings.push(ConfigSemanticWarning {
+                    key: "key_sequences",
+                    message: format!("key_sequences: chord {chord:?} invalid ({e})"),
+                });
             } else if let Err(e) = crate::keybinding::parse_byte_sequence(bytes) {
-                warnings.push(format!("key_sequences[{chord:?}]: value invalid ({e})"));
+                warnings.push(ConfigSemanticWarning {
+                    key: "key_sequences",
+                    message: format!("key_sequences[{chord:?}]: value invalid ({e})"),
+                });
             } else if bytes.is_empty() {
                 // An empty value parses Ok([]) but the loader warn-skips it (it would
                 // silently dead-key the chord), so flag it rather than false-greening.
-                warnings.push(format!(
-                    "key_sequences[{chord:?}]: empty value would silently disable the key"
-                ));
+                warnings.push(ConfigSemanticWarning {
+                    key: "key_sequences",
+                    message: format!(
+                        "key_sequences[{chord:?}]: empty value would silently disable the key"
+                    ),
+                });
             } else {
                 if let Some(label) = crate::keybinding::builtin_shadow_label(chord) {
-                    warnings.push(format!(
-                        "key_sequences: chord {chord:?} conflicts with built-in {label}"
-                    ));
+                    warnings.push(ConfigSemanticWarning {
+                        key: "key_sequences",
+                        message: format!(
+                            "key_sequences: chord {chord:?} conflicts with built-in {label}"
+                        ),
+                    });
                 }
                 if let Some(kb) = config.keybindings.as_ref()
                     && crate::keybinding::chord_in_keybindings(chord, kb)
                 {
-                    warnings.push(format!(
-                        "key_sequences: chord {chord:?} is also bound in [keybindings] \
-                         (the keybinding wins; this sequence never fires)"
-                    ));
+                    warnings.push(ConfigSemanticWarning {
+                        key: "key_sequences",
+                        message: format!(
+                            "key_sequences: chord {chord:?} is also bound in [keybindings] \
+                             (the keybinding wins; this sequence never fires)"
+                        ),
+                    });
                 }
             }
         }
@@ -222,60 +350,999 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
     if let Some(table) = config.keybindings.as_ref() {
         for (chord, action) in table {
             if let Err(e) = crate::keybinding::Chord::parse(chord) {
-                warnings.push(format!("keybindings: chord {chord:?} invalid ({e})"));
+                warnings.push(ConfigSemanticWarning {
+                    key: "keybindings",
+                    message: format!("keybindings: chord {chord:?} invalid ({e})"),
+                });
             } else if crate::keybinding::Action::parse(action).is_none() {
-                warnings.push(format!("keybindings[{chord:?}]: unknown action {action:?}"));
+                warnings.push(ConfigSemanticWarning {
+                    key: "keybindings",
+                    message: format!("keybindings[{chord:?}]: unknown action {action:?}"),
+                });
             } else if let Some(label) = crate::keybinding::builtin_shadow_label(chord) {
-                warnings.push(format!(
-                    "keybindings: chord {chord:?} conflicts with built-in {label}"
-                ));
+                warnings.push(ConfigSemanticWarning {
+                    key: "keybindings",
+                    message: format!(
+                        "keybindings: chord {chord:?} conflicts with built-in {label}"
+                    ),
+                });
             }
         }
     }
-    // W5h: keys the loaders warn-skip (falling back to a default) also flagged
-    // here, so `--validate-config` can't false-green a config whose font/theme/
-    // cursor/colours silently do nothing at load.
-    //
-    // Font resolvability: the loader falls back to $ATERM_FONT then the built-in
-    // candidates with zero output — the classic "my font_family did nothing".
-    if let Some(fam) = config.font_family.as_deref()
-        && let Some(w) = crate::app_config::Config::font_family_warning(Some(fam))
-    {
-        warnings.push(w);
+    if let Some(palette) = config.palette.as_ref() {
+        for (i, hex) in palette.iter().enumerate() {
+            if crate::app_config::parse_hex_color(hex).is_none() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "palette",
+                    message: format!(
+                        "palette[{i}]: expected #RRGGBB, got {hex:?} (ignored at load)"
+                    ),
+                });
+            }
+        }
     }
-    // Theme names: both sides of a `dark:…,light:…` split resolve (or warn).
+    if let Some(palette) = config
+        .sparkle_words
+        .as_ref()
+        .and_then(|sparkle| sparkle.profanity.as_ref())
+        .and_then(|profanity| profanity.palette.as_ref())
+    {
+        for (index, color) in palette.iter().enumerate() {
+            if crate::app_config::parse_hex_color(color).is_none() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "sparkle_words.profanity.palette",
+                    message: format!(
+                        "sparkle_words.profanity.palette[{index}]: expected RRGGBB or #RRGGBB, got {color:?}; this color is ignored"
+                    ),
+                });
+            }
+        }
+    }
+    if let Some(hue) = config
+        .matrix_rain
+        .as_ref()
+        .and_then(|rain| rain.hue.as_deref())
+    {
+        let hue = hue.trim();
+        let valid = hue.eq_ignore_ascii_case("matrix")
+            || hue.eq_ignore_ascii_case("theme")
+            || (hue.starts_with('#') && crate::app_config::parse_hex_color(hue).is_some());
+        if !valid {
+            warnings.push(ConfigSemanticWarning {
+                key: "matrix_rain.hue",
+                message: format!(
+                    "matrix_rain.hue value {hue:?} is not matrix, theme, or #RRGGBB; stock matrix green is used"
+                ),
+            });
+        }
+    }
+
+    if let Some(custom) = config
+        .sparkle_words
+        .as_ref()
+        .and_then(|sparkle| sparkle.custom.as_ref())
+    {
+        for (index, record) in custom.iter().enumerate() {
+            let record_number = index + 1;
+            if !record.words.iter().any(|word| !word.trim().is_empty()) {
+                warnings.push(ConfigSemanticWarning {
+                    key: if record.words.is_empty() {
+                        "sparkle_words.custom"
+                    } else {
+                        "sparkle_words.custom.words"
+                    },
+                    message: format!(
+                        "sparkle_words.custom.words in [[sparkle_words.custom]] record {record_number} has no nonblank word; the record cannot match and is ignored"
+                    ),
+                });
+            }
+            let live_burst = record
+                .burst
+                .as_ref()
+                .is_some_and(|burst| burst.chance.unwrap_or(100) != 0);
+            if record.ink.is_none() && record.graphic.is_none() && !live_burst {
+                let (key, detail) = if record.burst.is_some() {
+                    (
+                        "sparkle_words.custom.burst.chance",
+                        "its only configured burst has chance = 0",
+                    )
+                } else {
+                    (
+                        "sparkle_words.custom",
+                        "it configures no ink, graphic, or live burst axis",
+                    )
+                };
+                warnings.push(ConfigSemanticWarning {
+                    key,
+                    message: format!(
+                        "sparkle_words.custom in [[sparkle_words.custom]] record {record_number} is inert because {detail}; the record is ignored"
+                    ),
+                });
+            }
+        }
+    }
+
+    if let Some(net) = config.net.as_ref() {
+        let mut names = std::collections::HashSet::new();
+        for (index, connection) in net.connections.iter().enumerate() {
+            let record = index + 1;
+            if !crate::net_connections::valid_connection_name(&connection.name) {
+                warnings.push(ConfigSemanticWarning {
+                    key: "net.connections.name",
+                    message: format!(
+                        "net.connections.name in [[net.connections]] record {record} must be a nonempty [A-Za-z0-9_-] name; this connection cannot be dialed"
+                    ),
+                });
+            } else if !names.insert(connection.name.as_str()) {
+                warnings.push(ConfigSemanticWarning {
+                    key: "net.connections.name",
+                    message: format!(
+                        "net.connections.name in [[net.connections]] record {record} duplicates {:?}; only the first matching record can be resolved",
+                        connection.name
+                    ),
+                });
+            }
+            if connection.host.trim().is_empty() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "net.connections.host",
+                    message: format!(
+                        "net.connections.host in [[net.connections]] record {record} is blank; dialing this connection always fails before TLS"
+                    ),
+                });
+            } else if !crate::net_connections::valid_dial_endpoint(&connection.host) {
+                warnings.push(ConfigSemanticWarning {
+                    key: "net.connections.host",
+                    message: format!(
+                        "net.connections.host in [[net.connections]] record {record} must be host:port, a numeric IP:port, or bracketed IPv6:port with a nonzero port; dialing this value always fails before TLS"
+                    ),
+                });
+            }
+            if crate::net_connections::parse_fingerprint(&connection.fingerprint).is_none() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "net.connections.fingerprint",
+                    message: format!(
+                        "net.connections.fingerprint in [[net.connections]] record {record} must be 64 hexadecimal SHA-256 digits, optionally prefixed by sha256:; dialing refuses this record"
+                    ),
+                });
+            }
+            if connection.sid.is_some() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "net.connections.sid",
+                    message: format!(
+                        "net.connections.sid in [[net.connections]] record {record} is stored but currently inert because the shipping rebind check is nonce-only"
+                    ),
+                });
+            }
+            if connection.expect_nonce.is_some() {
+                warnings.push(ConfigSemanticWarning {
+                    key: "net.connections.expect_nonce",
+                    message: format!(
+                        "net.connections.expect_nonce in [[net.connections]] record {record} currently makes dialing fail closed because the shipping wire protocol cannot verify the remote launch nonce"
+                    ),
+                });
+            }
+        }
+    }
+    if let Some(ink) = config
+        .sparkle_words
+        .as_ref()
+        .and_then(|sparkle| sparkle.ink.as_ref())
+        && ink.loop_.unwrap_or(false)
+        && let Some(sweep_ms) = ink.sweep_ms
+        && sweep_ms < 600
+    {
+        warnings.push(ConfigSemanticWarning {
+            key: "sparkle_words.ink.sweep_ms",
+            message: format!(
+                "sparkle_words.ink.sweep_ms is configured as {sweep_ms} ms but is effectively 600 ms because loop = true raises the flash-safety minimum"
+            ),
+        });
+    }
+    if let Some(rain) = config.matrix_rain.as_ref()
+        && let Some(head_alpha) = rain.head_alpha
+    {
+        use crate::matrix_rain::{RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR};
+        if let Some(alpha) = rain.alpha {
+            let resolved_alpha =
+                alpha.clamp(u32::from(RAIN_ALPHA_FLOOR), u32::from(RAIN_ALPHA_CAP));
+            if head_alpha < resolved_alpha {
+                warnings.push(ConfigSemanticWarning {
+                    key: "matrix_rain.head_alpha",
+                    message: format!(
+                        "matrix_rain.head_alpha is configured as {head_alpha} but is effectively {resolved_alpha} because rain heads cannot be dimmer than the resolved matrix_rain.alpha"
+                    ),
+                });
+            }
+        } else if head_alpha < u32::from(RAIN_ALPHA_CAP) {
+            let floor_note = if head_alpha < u32::from(RAIN_ALPHA_FLOOR) {
+                format!(" is first clamped to {RAIN_ALPHA_FLOOR} and")
+            } else {
+                String::new()
+            };
+            warnings.push(ConfigSemanticWarning {
+                key: "matrix_rain.head_alpha",
+                message: format!(
+                    "matrix_rain.head_alpha is configured without matrix_rain.alpha; it{floor_note} may be raised further to the theme-derived body alpha because rain heads cannot be dimmer than the body"
+                ),
+            });
+        }
+    }
+    if let Some(configured_top) = config.window_padding_top
+        && configured_top.is_finite()
+    {
+        let base = config.window_padding_or_default();
+        if configured_top > base {
+            warnings.push(ConfigSemanticWarning {
+                key: "window_padding_top",
+                message: format!(
+                    "window_padding_top is configured as {configured_top}px but is effectively {base}px because it cannot exceed window_padding"
+                ),
+            });
+        }
+    }
+    if config.allow_osc52_query == Some(true) {
+        warnings.push(ConfigSemanticWarning {
+            key: "allow_osc52_query",
+            message: "allow_osc52_query is enabled, but the GUI clipboard callback drops every OSC 52 Query and returns no contents; clipboard reads remain unavailable"
+                .to_string(),
+        });
+    }
+    if config.allow_window_ops == Some(true) {
+        warnings.push(ConfigSemanticWarning {
+            key: "allow_window_ops",
+            message: "allow_window_ops enables only the GUI's XTWINOPS window-title and text-grid-size fallback reports; no window callback is installed, so host manipulation and most state/geometry requests are ignored"
+                .to_string(),
+        });
+    }
+    warnings
+}
+
+/// Runtime validation that deliberately owns ambient filesystem access.
+///
+/// Manual runs this set off the event-loop and merges the result only when the
+/// exact document revision is still current. `--validate-config` calls the same
+/// function synchronously. Keeping the checks source-addressable prevents the
+/// editor and the loader from disagreeing about a font, theme, Trail Pack, or
+/// keyword-toy pack that would otherwise be silently replaced/skipped.
+pub(crate) fn config_host_semantic_warnings(
+    config: &crate::app_config::Config,
+) -> Vec<ConfigSemanticWarning> {
+    config_host_semantic_warnings_with_backend(config, crate::app_config::resolve_want_gpu(config))
+}
+
+/// Host validation with the renderer backend supplied by the caller. Manual
+/// passes the backend that is actually presenting its window; command-line
+/// validation uses [`crate::app_config::resolve_want_gpu`] through the wrapper
+/// above because no renderer has been constructed there yet.
+pub(crate) fn config_host_semantic_warnings_with_backend(
+    config: &crate::app_config::Config,
+    backend_gpu: bool,
+) -> Vec<ConfigSemanticWarning> {
+    let assets =
+        config.resolve_asset_catalog_with_themes(crate::app_config::ThemeCatalog::discover());
+    config_host_semantic_warnings_with_backend_and_assets(
+        config,
+        backend_gpu,
+        &assets,
+        crate::net_listen::launched_inside_aterm(),
+    )
+}
+
+/// Host validation against the exact immutable non-text asset generation
+/// admitted with `config`. Manual passes its [`ConfigSnapshot`](crate::native_config_service::ConfigSnapshot)
+/// catalog here so theme, Trail Pack, and Nyan diagnostics cannot race a live
+/// directory/file change or disagree with what the renderer actually applies.
+///
+/// `nested` — whether this process was launched inside another aterm
+/// ([`crate::net_listen::launched_inside_aterm`]) — is supplied by the CALLER.
+/// It is process-global environment state, and the listener arms below branch on
+/// it, so reading it here would make this projection depend on how the host
+/// process happened to be started: the suite's own listener tests then see the
+/// no-bind arm whenever they are run from inside aterm. Same law the pure
+/// `listener_capability_warnings` already states, one frame up.
+pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
+    config: &crate::app_config::Config,
+    backend_gpu: bool,
+    assets: &crate::app_config::ConfigAssetCatalog,
+    nested: bool,
+) -> Vec<ConfigSemanticWarning> {
+    let mut warnings = Vec::new();
+
+    // Environment/CLI precedence is a host fact, so Manual resolves it in this
+    // off-thread lane. Only authored keys receive diagnostics: an absent key
+    // has no misleading TOML token to underline, while Settings still exposes
+    // the active value in its ordinary row projection.
+    for key in [
+        "columns",
+        "lines",
+        "font_px",
+        "font_family",
+        "gpu",
+        "tab_strip_rows",
+        "stem_gamma",
+        "window_theme",
+        "shell",
+        "net.listen",
+        "net.cert",
+        "net.key",
+        "update.owner",
+        "update.repo",
+        "update.auto_apply",
+        "packages.account",
+    ] {
+        if config_key_is_authored(config, key)
+            && let Some(active) = crate::app_config::active_environment_override(key)
+        {
+            warnings.push(ConfigSemanticWarning {
+                key,
+                message: format!(
+                    "{key}: ${} overrides the saved value; effective value is {}",
+                    active.variable, active.effective
+                ),
+            });
+        }
+    }
+
+    if config.font_family.is_some()
+        && let Some(message) = crate::app_config::Config::font_family_warning(
+            crate::effective_font_family(config.font_family_request().as_deref()).as_deref(),
+        )
+    {
+        warnings.push(ConfigSemanticWarning {
+            key: "font_family",
+            message,
+        });
+    }
+
     for appearance in [
         aterm_types::Appearance::Dark,
         aterm_types::Appearance::Light,
     ] {
         if let Some(name) = config.resolve_theme_name(appearance)
             && !name.eq_ignore_ascii_case("default")
-            && let Err(e) = aterm_types::scheme::load(&name)
+            && let Err(error) = assets.themes.resolve(&name)
         {
-            let w = format!("theme: {name:?} does not resolve ({e}); Default used at load");
-            if !warnings.contains(&w) {
-                warnings.push(w);
+            let message =
+                format!("theme: {name:?} does not resolve ({error}); Default used at load");
+            if !warnings
+                .iter()
+                .any(|warning: &ConfigSemanticWarning| warning.message == message)
+            {
+                warnings.push(ConfigSemanticWarning {
+                    key: "theme",
+                    message,
+                });
             }
         }
     }
-    // Cursor-style spellings (the loader falls back to a blinking block).
-    if let Some(style) = config.cursor_style.as_deref()
-        && !matches!(
-            style.trim().to_ascii_lowercase().as_str(),
-            "block" | "underline" | "bar" | "beam"
-        )
+
+    warnings.extend(
+        assets
+            .trail_packs
+            .diagnostics
+            .iter()
+            .cloned()
+            .map(|message| ConfigSemanticWarning {
+                key: "cursor_trail_packs",
+                message,
+            }),
+    );
+    if let Some(message) = config.cursor_trail_style_warning(&assets.trail_packs) {
+        warnings.push(ConfigSemanticWarning {
+            key: "cursor_trail_style",
+            message,
+        });
+    }
+    if let Some(reason) = assets.nyan_sprite.diagnostic() {
+        let source = assets
+            .nyan_sprite
+            .source_id()
+            .unwrap_or("configured source");
+        warnings.push(ConfigSemanticWarning {
+            key: "cursor_nyan_sprite",
+            message: format!("cursor_nyan_sprite {source:?} is invalid ({reason}); disabled"),
+        });
+    }
+
+    let (_, font_warnings) = crate::app_config::FontConfig::from_config(config);
+    for message in font_warnings {
+        let key = [
+            "font_family_bold_italic",
+            "font_family_bold",
+            "font_family_italic",
+            "fallback_fonts",
+            "symbol_font",
+            "emoji_font",
+        ]
+        .into_iter()
+        .find(|key| message.starts_with(&format!("config {key}:")))
+        .unwrap_or("font_family");
+        warnings.push(ConfigSemanticWarning { key, message });
+    }
+
+    if let Some(path) = config
+        .sparkle_words
+        .as_ref()
+        .and_then(|sparkle| sparkle.lexicon.as_deref())
     {
-        warnings.push(format!(
-            "cursor_style: expected block|underline|bar, got {style:?} (block used at load)"
+        let expanded = crate::app_config::sparkle_expand_tilde(path);
+        match aterm_effects::file_feed::read_bounded_regular_utf8(
+            &expanded,
+            aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES,
+        ) {
+            Ok(contents) => {
+                let languages = config.sparkle_languages();
+                let languages = languages.iter().map(String::as_str).collect::<Vec<_>>();
+                if let Err(error) =
+                    aterm_lexicon::Lexicon::with_languages_and_override(&languages, Some(&contents))
+                {
+                    warnings.push(ConfigSemanticWarning {
+                        key: "sparkle_words.lexicon",
+                        message: format!(
+                            "sparkle_words.lexicon {expanded:?} is rejected ({error}); that lexicon layer is skipped"
+                        ),
+                    });
+                }
+            }
+            Err(error) => warnings.push(ConfigSemanticWarning {
+                key: "sparkle_words.lexicon",
+                message: format!(
+                    "sparkle_words.lexicon {expanded:?} is unreadable ({error}); that lexicon layer is skipped"
+                ),
+            }),
+        }
+    }
+
+    warnings.extend(
+        config
+            .sparkle_toy_pack_warnings()
+            .into_iter()
+            .map(|message| ConfigSemanticWarning {
+                key: "sparkle_words.toy_packs",
+                message,
+            }),
+    );
+    if let Some((deco, override_toml)) = config.sparkle_runtime_parts() {
+        let languages = config.sparkle_languages();
+        let languages = languages.iter().map(String::as_str).collect::<Vec<_>>();
+        match aterm_lexicon::Lexicon::with_languages_and_override(
+            &languages,
+            override_toml.as_deref(),
+        ) {
+            Ok(lexicon) => {
+                warnings.extend(
+                    lexicon
+                        .conflicts()
+                        .iter()
+                        .filter(|warning| {
+                            aterm_effects::pipeline::lexicon_warning_applies(
+                                warning,
+                                deco.cjk_single_char,
+                            )
+                        })
+                        .map(|warning| sparkle_lexicon_conflict_warning(config, warning)),
+                );
+            }
+            Err(error) => warnings.push(ConfigSemanticWarning {
+                key: "sparkle_words",
+                message: format!(
+                    "the merged sparkle_words lexicon is rejected ({error}); runtime falls back to the built-in lexicon"
+                ),
+            }),
+        }
+    }
+    let listener_inputs = crate::net_listen::listener_inputs(config);
+    let effective_listener_fields = listener_inputs.presence();
+    warnings.extend(listener_capability_warnings(
+        config,
+        effective_listener_fields,
+        nested,
+    ));
+    if !nested && effective_listener_fields.into_iter().all(|present| present) {
+        match crate::net_listen::preflight_listener(&listener_inputs) {
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                warnings.extend(
+                    error
+                        .config_keys()
+                        .iter()
+                        .map(|&key| ConfigSemanticWarning {
+                            key,
+                            message: error.to_string(),
+                        }),
+                )
+            }
+        }
+    }
+
+    let package_disabled = std::env::var_os("ATPKG_DISABLE").is_some();
+    let package_root_available = std::env::var("ATPKG_ROOTKEY_OVERRIDE")
+        .ok()
+        .is_some_and(|key| !key.is_empty())
+        || !atpkg::PINNED_PKG_ROOTKEY.is_empty();
+    warnings.extend(package_capability_warnings(
+        config,
+        package_disabled,
+        package_root_available,
+    ));
+    warnings.extend(config_backend_capability_warnings(
+        config,
+        backend_gpu,
+        ConfigCapabilityPlatform::CURRENT,
+    ));
+    warnings
+}
+
+fn first_authored_listener_key(config: &crate::app_config::Config) -> Option<&'static str> {
+    let net = config.net.as_ref()?;
+    if net.listen.is_some() {
+        Some("net.listen")
+    } else if net.cert.is_some() {
+        Some("net.cert")
+    } else if net.key.is_some() {
+        Some("net.key")
+    } else {
+        None
+    }
+}
+
+/// Pure listener admission projection. The caller supplies effective env/config
+/// presence and nesting so the no-bind arms can be exhaustively tested without
+/// mutating process-global environment state.
+fn listener_capability_warnings(
+    config: &crate::app_config::Config,
+    effective_fields: [bool; 3],
+    nested: bool,
+) -> Vec<ConfigSemanticWarning> {
+    let Some(key) = first_authored_listener_key(config) else {
+        return Vec::new();
+    };
+    if nested {
+        return vec![ConfigSemanticWarning {
+            key,
+            message: format!(
+                "{key}: the network listener never binds in an aterm child/nested session, even when net.listen, net.cert, and net.key are complete"
+            ),
+        }];
+    }
+    let count = effective_fields
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if count == 1 || count == 2 {
+        vec![ConfigSemanticWarning {
+            key,
+            message: format!(
+                "{key}: the effective network-listener configuration is incomplete ({count}/3 of listen, cert, and key); no port is bound until all three resolve"
+            ),
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+fn first_authored_package_key(config: &crate::app_config::Config) -> Option<&'static str> {
+    let packages = config.packages.as_ref()?;
+    if packages.enabled.is_some() {
+        Some("packages.enabled")
+    } else if packages.auto_update.is_some() {
+        Some("packages.auto_update")
+    } else if packages.auto_install.is_some() {
+        Some("packages.auto_install")
+    } else if packages.account.is_some() {
+        Some("packages.account")
+    } else if packages.channel.is_some() {
+        Some("packages.channel")
+    } else if packages.include.is_some() {
+        Some("packages.include")
+    } else if packages.exclude.is_some() {
+        Some("packages.exclude")
+    } else {
+        Some("packages")
+    }
+}
+
+/// Pure atpkg admission projection. The package preferences remain parseable
+/// while disabled, but no package operation may act without both operator
+/// opt-in and a verification root.
+fn package_capability_warnings(
+    config: &crate::app_config::Config,
+    disabled: bool,
+    root_available: bool,
+) -> Vec<ConfigSemanticWarning> {
+    let Some(key) = first_authored_package_key(config) else {
+        return Vec::new();
+    };
+    let reason = if disabled {
+        Some("$ATPKG_DISABLE is set")
+    } else if !root_available {
+        Some("no package verification root is pinned or supplied by $ATPKG_ROOTKEY_OVERRIDE")
+    } else {
+        None
+    };
+    reason.map_or_else(Vec::new, |reason| {
+        vec![ConfigSemanticWarning {
+            key,
+            message: format!(
+                "{key}: package install/update operations are currently inert because {reason}; atpkg fails closed and performs no install or update"
+            ),
+        }]
+    })
+}
+
+/// Native compositor families relevant to config capability validation.
+/// Keeping this explicit (instead of a `target_macos` boolean) matters because
+/// Windows consumes `background_material` as Mica/Mica Alt/Acrylic without the
+/// macOS translucency precondition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // non-host variants drive the cross-platform test matrix
+pub(crate) enum ConfigCapabilityPlatform {
+    MacOs,
+    Windows,
+    Unsupported,
+}
+
+impl ConfigCapabilityPlatform {
+    #[cfg(target_os = "macos")]
+    const CURRENT: Self = Self::MacOs;
+    #[cfg(windows)]
+    const CURRENT: Self = Self::Windows;
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    const CURRENT: Self = Self::Unsupported;
+}
+
+/// Deterministic capability half of host validation. `platform` is an explicit
+/// input so every platform/backend arm can be exhaustively tested on one build
+/// host rather than hidden behind conditional compilation.
+pub(crate) fn config_backend_capability_warnings(
+    config: &crate::app_config::Config,
+    backend_gpu: bool,
+    platform: ConfigCapabilityPlatform,
+) -> Vec<ConfigSemanticWarning> {
+    use crate::app_config::BackgroundMaterial;
+
+    let mut warnings = Vec::new();
+    let opacity = config.background_opacity_or_default();
+    if config.background_opacity.is_some() && opacity < 1.0 {
+        let issue = if !backend_gpu {
+            Some(
+                "the current CPU renderer has no translucent present path; the window stays solid (the saved value applies with the macOS GPU renderer)",
+            )
+        } else if platform != ConfigCapabilityPlatform::MacOs {
+            Some(
+                "this platform has no implemented per-pixel translucent window consumer; the GPU still presents a solid grid (Windows background_material can style DWM chrome independently)",
+            )
+        } else {
+            None
+        };
+        if let Some(issue) = issue {
+            warnings.push(ConfigSemanticWarning {
+                key: "background_opacity",
+                message: format!("background_opacity requests translucency, but {issue}"),
+            });
+        }
+    }
+
+    let material = config
+        .background_material
+        .as_deref()
+        .and_then(BackgroundMaterial::parse)
+        .unwrap_or(BackgroundMaterial::None);
+    if material != BackgroundMaterial::None {
+        let issue = match platform {
+            ConfigCapabilityPlatform::Unsupported => Some((
+                "this platform has no native window-material consumer",
+                "it is supported only by the macOS and Windows GPU renderers",
+            )),
+            ConfigCapabilityPlatform::MacOs if !backend_gpu => Some((
+                "the current CPU renderer cannot composite a window material",
+                "it requires the macOS GPU renderer and background_opacity < 1",
+            )),
+            ConfigCapabilityPlatform::MacOs if opacity >= 1.0 => Some((
+                "background_opacity resolves to 1 (solid)",
+                "it requires the macOS GPU renderer and background_opacity < 1",
+            )),
+            ConfigCapabilityPlatform::Windows if !backend_gpu => Some((
+                "the current CPU renderer does not install a DWM system backdrop",
+                "Mica, Mica Alt, and Acrylic require the Windows GPU renderer",
+            )),
+            ConfigCapabilityPlatform::MacOs | ConfigCapabilityPlatform::Windows => None,
+        };
+        if let Some((reason, requirement)) = issue {
+            warnings.push(ConfigSemanticWarning {
+                key: "background_material",
+                message: format!(
+                    "background_material has no effect because {reason}; {requirement}"
+                ),
+            });
+        }
+    }
+
+    if config.window_colorspace.is_some()
+        && (platform != ConfigCapabilityPlatform::MacOs || !backend_gpu)
+    {
+        let reason = if platform != ConfigCapabilityPlatform::MacOs {
+            "this platform has no macOS CAMetalLayer to tag"
+        } else {
+            "the current CPU renderer has no GPU CAMetalLayer"
+        };
+        warnings.push(ConfigSemanticWarning {
+            key: "window_colorspace",
+            message: format!(
+                "window_colorspace has no effect because {reason}; it applies only to the macOS GPU window layer"
+            ),
+        });
+    }
+    if !backend_gpu {
+        for (key, authored) in [
+            (
+                crate::prefs::EDIT_CURSOR_TRAIL_BLOOM,
+                config.cursor_trail_bloom.is_some(),
+            ),
+            (
+                crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH,
+                config.cursor_trail_bloom_strength.is_some(),
+            ),
+            (
+                crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
+                config.cursor_trail_bloom_radius.is_some(),
+            ),
+            (
+                crate::prefs::EDIT_CURSOR_FIRE_SHIMMER,
+                config.cursor_fire_shimmer.is_some(),
+            ),
+            (crate::prefs::EDIT_HDR_GLOW, config.hdr_glow.is_some()),
+            (
+                crate::prefs::EDIT_CURSOR_GLOW_SDR_BOOST,
+                config.cursor_glow_sdr_boost.is_some(),
+            ),
+        ] {
+            if authored {
+                warnings.push(ConfigSemanticWarning {
+                    key,
+                    message: format!(
+                        "{key} is parsed and preserved but has no effect while the CPU renderer is active; it requires the GPU renderer"
+                    ),
+                });
+            }
+        }
+    }
+    if config.font_thicken.is_some() && platform != ConfigCapabilityPlatform::MacOs {
+        warnings.push(ConfigSemanticWarning {
+            key: "font_thicken",
+            message: "font_thicken is parsed and preserved but has no effect on this platform; it requires macOS CoreText smoothing"
+                .to_string(),
+        });
+    }
+    if platform != ConfigCapabilityPlatform::MacOs {
+        for (key, authored) in [
+            (
+                crate::prefs::EDIT_TRAIL_SOUNDS,
+                config.trail_sounds.is_some(),
+            ),
+            (
+                crate::prefs::EDIT_TRAIL_SOUND_VOLUME,
+                config.trail_sound_volume.is_some(),
+            ),
+        ] {
+            if authored {
+                warnings.push(ConfigSemanticWarning {
+                    key,
+                    message: format!(
+                        "{key} is parsed and preserved but has no effect on this platform; cursor-trail audio is currently implemented only on macOS"
+                    ),
+                });
+            }
+        }
+    }
+    if platform == ConfigCapabilityPlatform::Unsupported {
+        if config.confirm_multiline_paste.is_some() {
+            warnings.push(ConfigSemanticWarning {
+                key: "confirm_multiline_paste",
+                message: "confirm_multiline_paste is parsed and preserved but has no protective effect on this platform because the dialog fallback accepts the paste without prompting; native confirmation is implemented on macOS and Windows"
+                    .to_string(),
+            });
+        }
+        if config.allow_notifications.is_some() {
+            warnings.push(ConfigSemanticWarning {
+                key: "allow_notifications",
+                message: "allow_notifications is parsed and preserved but has no effect on this platform because desktop-notification delivery is currently implemented only on macOS and Windows"
+                    .to_string(),
+            });
+        }
+    }
+    if platform != ConfigCapabilityPlatform::MacOs
+        && let Some(update) = config.update.as_ref()
+    {
+        for (key, authored) in [
+            ("update.owner", update.owner.is_some()),
+            ("update.repo", update.repo.is_some()),
+            ("update.auto_apply", update.auto_apply.is_some()),
+        ] {
+            if authored {
+                warnings.push(ConfigSemanticWarning {
+                    key,
+                    message: format!(
+                        "{key} is parsed and preserved but has no effect on this platform because the in-app updater is macOS-only"
+                    ),
+                });
+            }
+        }
+    }
+    warnings
+}
+
+fn sparkle_lexicon_conflict_warning(
+    config: &crate::app_config::Config,
+    conflict: &str,
+) -> ConfigSemanticWarning {
+    let Some(sparkle) = config.sparkle_words.as_ref() else {
+        return ConfigSemanticWarning {
+            key: "sparkle_words",
+            message: format!("sparkle_words lexicon conflict: {conflict}"),
+        };
+    };
+
+    if let Some(custom) = sparkle.custom.as_deref() {
+        for (record_index, record) in custom.iter().enumerate() {
+            for (word_index, word) in record.words.iter().enumerate() {
+                if lexicon_conflict_mentions_word(conflict, word) {
+                    return ConfigSemanticWarning {
+                        key: "sparkle_words.custom.words",
+                        message: format!(
+                            "sparkle_words.custom.words in [[sparkle_words.custom]] record {} word {} has a merged lexicon conflict: {conflict}",
+                            record_index + 1,
+                            word_index + 1,
+                        ),
+                    };
+                }
+            }
+        }
+    }
+
+    for (key, words) in [
+        (
+            "sparkle_words.profanity.extra_words",
+            sparkle
+                .profanity
+                .as_ref()
+                .and_then(|category| category.extra_words.as_deref()),
+        ),
+        (
+            "sparkle_words.feline.extra_words",
+            sparkle
+                .feline
+                .as_ref()
+                .and_then(|category| category.extra_words.as_deref()),
+        ),
+        (
+            "sparkle_words.orca.extra_words",
+            sparkle
+                .orca
+                .as_ref()
+                .and_then(|category| category.extra_words.as_deref()),
+        ),
+        (
+            "sparkle_words.emphasis.extra_words",
+            sparkle
+                .emphasis
+                .as_ref()
+                .and_then(|category| category.extra_words.as_deref()),
+        ),
+    ] {
+        if let Some((index, _)) = words.and_then(|words| {
+            words
+                .iter()
+                .enumerate()
+                .find(|(_, word)| lexicon_conflict_mentions_word(conflict, word))
+        }) {
+            return ConfigSemanticWarning {
+                key,
+                message: format!("{key}[{index}]: merged lexicon conflict: {conflict}"),
+            };
+        }
+    }
+
+    if sparkle.lexicon.is_some() {
+        ConfigSemanticWarning {
+            key: "sparkle_words.lexicon",
+            message: format!("sparkle_words.lexicon merged-layer conflict: {conflict}"),
+        }
+    } else if sparkle
+        .toy_packs
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty())
+    {
+        ConfigSemanticWarning {
+            key: "sparkle_words.toy_packs",
+            message: format!("sparkle_words.toy_packs merged-layer conflict: {conflict}"),
+        }
+    } else {
+        ConfigSemanticWarning {
+            key: "sparkle_words",
+            message: format!("sparkle_words merged lexicon conflict: {conflict}"),
+        }
+    }
+}
+
+fn lexicon_conflict_mentions_word(conflict: &str, word: &str) -> bool {
+    let word = word.trim();
+    !word.is_empty() && conflict.contains(&format!("{word:?}"))
+}
+
+fn config_key_is_authored(config: &crate::app_config::Config, key: &str) -> bool {
+    match key {
+        "columns" => config.columns.is_some(),
+        "lines" => config.lines.is_some(),
+        "font_px" => config.font_px.is_some(),
+        "font_family" => config.font_family.is_some(),
+        "gpu" => config.gpu.is_some(),
+        "tab_strip_rows" => config.tab_strip_rows.is_some(),
+        "stem_gamma" => config.stem_gamma.is_some(),
+        "window_theme" => config.window_theme.is_some(),
+        "shell" => config.shell.is_some(),
+        "net.listen" => config.net.as_ref().is_some_and(|net| net.listen.is_some()),
+        "net.cert" => config.net.as_ref().is_some_and(|net| net.cert.is_some()),
+        "net.key" => config.net.as_ref().is_some_and(|net| net.key.is_some()),
+        "update.owner" => config
+            .update
+            .as_ref()
+            .is_some_and(|update| update.owner.is_some()),
+        "update.repo" => config
+            .update
+            .as_ref()
+            .is_some_and(|update| update.repo.is_some()),
+        "update.auto_apply" => config
+            .update
+            .as_ref()
+            .is_some_and(|update| update.auto_apply.is_some()),
+        "packages.account" => config
+            .packages
+            .as_ref()
+            .is_some_and(|packages| packages.account.is_some()),
+        _ => false,
+    }
+}
+
+/// Parse `text` as the `aterm.toml` config, returning the (possibly empty) list of
+/// soft WARNINGS for a structurally-valid file, or a hard `Err` (with the toml error's
+/// line/column) for a TOML syntax error. The explicit CLI validation path may
+/// resolve referenced assets; the shared semantic subset above remains pure.
+///
+/// A clean TOML parse is not the whole story: the loader warn-skips bad chords /
+/// escapes / actions in `[key_sequences]` and `[keybindings]` at runtime, so an entry
+/// that parses as a string can still silently never work. Those are returned as
+/// warnings so the diagnostic doesn't print a false green.
+pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
+    if text.len() > crate::native_config_service::MAX_CONFIG_FILE_BYTES {
+        return Err(format!(
+            "config exceeds the {}-byte admission limit",
+            crate::native_config_service::MAX_CONFIG_FILE_BYTES
         ));
     }
-    // Cursor-trail-style spellings: an unknown value fails the `glow_config`
-    // enablement gate, so the whole cursor effect silently vanishes at load —
-    // the classic "my typo'd style did nothing". Validated against the SAME
-    // canonical + alias set the Settings picker resolves through.
-    warnings.extend(trail_packs.diagnostics.iter().cloned());
-    if let Some(w) = config.cursor_trail_style_warning(&trail_packs) {
-        warnings.push(w);
+    let config = toml::from_str::<crate::app_config::Config>(text).map_err(|e| e.to_string())?;
+    let mut warnings = config_semantic_warnings(&config)
+        .into_iter()
+        .map(|warning| warning.message)
+        .collect::<Vec<_>>();
+    // W5h: keys the loaders warn-skip (falling back to a default) also flagged
+    // here, so `--validate-config` can't false-green a config whose font/theme/
+    // cursor/colours silently do nothing at load.
+    //
+    // Cursor-style spellings (unknown values fall back to a blinking block;
+    // the retired underline spelling is preserved but resolves to a bar).
+    if let Some(style) = config.cursor_style.as_deref() {
+        let normalized = style.trim().to_ascii_lowercase();
+        if normalized == "underline" {
+            warnings.push(
+                "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
+                    .to_string(),
+            );
+        } else if !matches!(normalized.as_str(), "block" | "bar" | "beam") {
+            warnings.push(format!(
+                "cursor_style: expected block|bar, got {style:?} (block used at load)"
+            ));
+        }
     }
     // Hex colours: every colour-typed key the loaders parse-or-skip.
     for (key, value) in [
@@ -298,16 +1365,11 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
             ));
         }
     }
-    if let Some(palette) = config.palette.as_ref() {
-        for (i, hex) in palette.iter().enumerate() {
-            if crate::app_config::parse_hex_color(hex).is_none() {
-                warnings.push(format!(
-                    "palette[{i}]: expected #RRGGBB, got {hex:?} (ignored at load)"
-                ));
-            }
-        }
-    }
-    warnings.extend(config.sparkle_toy_pack_warnings());
+    warnings.extend(
+        config_host_semantic_warnings(&config)
+            .into_iter()
+            .map(|warning| warning.message),
+    );
     Ok(warnings)
 }
 
@@ -319,29 +1381,36 @@ pub(crate) fn validate_config() -> (String, bool) {
             "no config path (HOME / XDG_CONFIG_HOME unset); built-in defaults in use".to_string(),
             true,
         ),
-        Some(p) if !p.exists() => (
+        Some(p) => validate_config_path(&p),
+    }
+}
+
+fn validate_config_path(path: &std::path::Path) -> (String, bool) {
+    match crate::native_config_service::VersionedConfigService::observe_path(path, true) {
+        Err(error) => (
+            format!("config {} is unreadable: {error}", path.display()),
+            false,
+        ),
+        Ok(observation) if !observation.baseline.observed.exists => (
             format!(
                 "no config file at {} — built-in defaults in use (OK)",
-                p.display()
+                path.display()
             ),
             true,
         ),
-        Some(p) => match std::fs::read_to_string(&p) {
-            Err(e) => (format!("config {} is unreadable: {e}", p.display()), false),
-            Ok(text) => match validate_config_text(&text) {
-                Ok(w) if w.is_empty() => (format!("config {} is valid", p.display()), true),
-                Ok(w) => (
-                    format!(
-                        "config {} is valid, but {} entr{} will be skipped at load:\n  {}",
-                        p.display(),
-                        w.len(),
-                        if w.len() == 1 { "y" } else { "ies" },
-                        w.join("\n  ")
-                    ),
-                    true,
+        Ok(observation) => match validate_config_text(&observation.text) {
+            Ok(w) if w.is_empty() => (format!("config {} is valid", path.display()), true),
+            Ok(w) => (
+                format!(
+                    "config {} is structurally valid, with {} runtime warning{}:\n  {}",
+                    path.display(),
+                    w.len(),
+                    if w.len() == 1 { "" } else { "s" },
+                    w.join("\n  ")
                 ),
-                Err(e) => (format!("config {} is INVALID:\n{e}", p.display()), false),
-            },
+                true,
+            ),
+            Err(e) => (format!("config {} is INVALID:\n{e}", path.display()), false),
         },
     }
 }
@@ -450,12 +1519,20 @@ pub(crate) fn list_keybinds() -> String {
     s
 }
 
-/// `--show-config`: the EFFECTIVE resolved config — the values aterm would launch
-/// with right now, after applying the env > config > default precedence. Reuses
-/// the same resolvers the startup path uses (`resolve_font_px`,
-/// `resolve_tab_strip_rows`, `Config::theme`/`applied_terminal_config`) so what is
-/// printed is what would be applied. The config FILE path + presence is shown so
-/// the reader knows whether any of this came from disk.
+fn show_config_font_px(value: f32, explicit: bool) -> String {
+    if explicit {
+        format!("{value} (explicit physical px)")
+    } else {
+        format!("{value} (auto base; final physical px depends on display scale)")
+    }
+}
+
+/// `--show-config`: the resolved launch config after applying the
+/// env > config > default precedence. Most values are final before a window
+/// exists. An unset font size is necessarily reported as its auto-scale base:
+/// the final physical size is selected only when the real window/display scale
+/// is known. The config FILE path + presence is shown so the reader knows
+/// whether any of this came from disk.
 pub(crate) fn show_config() -> String {
     let config = crate::app_config::load_config();
     let (config_path, config_exists) = match crate::app_config::config_path() {
@@ -463,28 +1540,28 @@ pub(crate) fn show_config() -> String {
         None => ("(no HOME / XDG_CONFIG_HOME)".to_string(), false),
     };
     let gpu = crate::app_config::resolve_want_gpu(&config);
-    let font_px = crate::app_config::resolve_font_px(&config);
+    let font_px = show_config_font_px(
+        crate::app_config::resolve_font_px(&config),
+        crate::app_config::font_px_is_explicit(&config),
+    );
     let tab_strip_rows = crate::app_config::resolve_tab_strip_rows(&config);
     let theme_name = config
         .theme
         .clone()
         .unwrap_or_else(|| "Default".to_string());
-    let tc = config.applied_terminal_config();
+    let themes = crate::app_config::ThemeCatalog::discover();
+    let tc = config.applied_terminal_config_for_with_assets(aterm_types::Appearance::Dark, &themes);
     // The same effective resolution the renderer uses (env > config > platform
     // default), so `--show-config` reports the face that actually loads — on a
     // pristine config that is "(built-in candidates)", the library's
     // FONT_CANDIDATES lead (SF Mono on macOS); `--show-face` names the file.
-    let font_family = crate::effective_font_family(config.font_family.as_deref())
+    let font_family = crate::effective_font_family(config.font_family_request().as_deref())
         .unwrap_or_else(|| "(built-in candidates)".to_string());
-    let columns = crate::app_config::env_u16("ATERM_COLUMNS")
-        .or(config.columns)
-        .unwrap_or(80);
-    let lines = crate::app_config::env_u16("ATERM_LINES")
-        .or(config.lines)
-        .unwrap_or(24);
+    let columns = crate::app_config::resolve_initial_columns(&config);
+    let lines = crate::app_config::resolve_initial_lines(&config);
 
     let mut s = String::new();
-    let _ = writeln!(s, "effective config (env > config > default)");
+    let _ = writeln!(s, "resolved launch config (env > config > default)");
     let _ = writeln!(s, "=========================================");
     let _ = writeln!(
         s,
@@ -559,7 +1636,7 @@ pub(crate) fn show_face(family: &str) -> (String, bool) {
     let family = family.trim();
     let resolved_family = if family.is_empty() {
         let config = crate::app_config::load_config();
-        crate::effective_font_family(config.font_family.as_deref()).unwrap_or_default()
+        crate::effective_font_family(config.font_family_request().as_deref()).unwrap_or_default()
     } else {
         family.to_string()
     };
@@ -596,6 +1673,491 @@ pub(crate) fn show_face(family: &str) -> (String, bool) {
 mod tests {
     use super::*;
 
+    fn parsed(source: &str) -> crate::app_config::Config {
+        toml::from_str(source).expect("test config")
+    }
+
+    #[test]
+    fn semantic_warnings_match_dependent_runtime_clamps() {
+        let config = parsed(
+            "[sparkle_words.ink]\nloop = true\nsweep_ms = 400\n\
+             [matrix_rain]\nalpha = 120\nhead_alpha = 20\n",
+        );
+        let warnings = config_semantic_warnings(&config);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|warning| {
+            warning.key == "sparkle_words.ink.sweep_ms"
+                && warning.message.contains("effectively 600 ms")
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.key == "matrix_rain.head_alpha" && warning.message.contains("effectively 120")
+        }));
+
+        let clean = parsed(
+            "[sparkle_words.ink]\nloop = true\nsweep_ms = 600\n\
+             [matrix_rain]\nalpha = 120\nhead_alpha = 120\n",
+        );
+        assert!(config_semantic_warnings(&clean).is_empty());
+    }
+
+    #[test]
+    fn capability_warning_matrix_distinguishes_macos_windows_and_unsupported() {
+        let translucent = parsed(
+            "background_opacity = 0.7\nbackground_material = \"hud\"\n\
+             window_colorspace = \"display-p3\"\n",
+        );
+        let keys = |gpu, platform| {
+            config_backend_capability_warnings(&translucent, gpu, platform)
+                .into_iter()
+                .map(|warning| warning.key)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert!(keys(true, ConfigCapabilityPlatform::MacOs).is_empty());
+        assert_eq!(
+            keys(false, ConfigCapabilityPlatform::MacOs),
+            std::collections::BTreeSet::from([
+                "background_material",
+                "background_opacity",
+                "window_colorspace",
+            ])
+        );
+        assert_eq!(
+            keys(true, ConfigCapabilityPlatform::Windows),
+            std::collections::BTreeSet::from(["background_opacity", "window_colorspace"]),
+            "Windows GPU consumes DWM material, but not per-pixel grid opacity"
+        );
+        assert_eq!(
+            keys(false, ConfigCapabilityPlatform::Windows),
+            std::collections::BTreeSet::from([
+                "background_material",
+                "background_opacity",
+                "window_colorspace",
+            ])
+        );
+        assert_eq!(
+            keys(true, ConfigCapabilityPlatform::Unsupported),
+            std::collections::BTreeSet::from([
+                "background_material",
+                "background_opacity",
+                "window_colorspace",
+            ])
+        );
+
+        let opaque = parsed("background_material = \"sidebar\"\n");
+        assert_eq!(
+            config_backend_capability_warnings(&opaque, true, ConfigCapabilityPlatform::MacOs)
+                .len(),
+            1
+        );
+        assert!(
+            config_backend_capability_warnings(&opaque, true, ConfigCapabilityPlatform::Windows)
+                .is_empty()
+        );
+
+        let platform_only = parsed(
+            "font_thicken = true\n[update]\nowner = \"safe-owner\"\nrepo = \"aterm\"\nauto_apply = true\n",
+        );
+        let non_macos = config_backend_capability_warnings(
+            &platform_only,
+            true,
+            ConfigCapabilityPlatform::Unsupported,
+        );
+        assert_eq!(
+            non_macos
+                .iter()
+                .map(|warning| warning.key)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "font_thicken",
+                "update.auto_apply",
+                "update.owner",
+                "update.repo",
+            ])
+        );
+        assert!(
+            config_backend_capability_warnings(
+                &platform_only,
+                true,
+                ConfigCapabilityPlatform::MacOs,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn platform_warning_matrix_discloses_audio_dialog_and_notification_stubs() {
+        let config = parsed(
+            "trail_sounds = true\ntrail_sound_volume = 0.4\nconfirm_multiline_paste = true\nallow_notifications = true\n",
+        );
+        let keys = |platform| {
+            config_backend_capability_warnings(&config, true, platform)
+                .into_iter()
+                .map(|warning| warning.key)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert!(keys(ConfigCapabilityPlatform::MacOs).is_empty());
+        assert_eq!(
+            keys(ConfigCapabilityPlatform::Windows),
+            std::collections::BTreeSet::from(["trail_sound_volume", "trail_sounds"]),
+            "Windows has dialogs/notifications but no trail-audio consumer"
+        );
+        assert_eq!(
+            keys(ConfigCapabilityPlatform::Unsupported),
+            std::collections::BTreeSet::from([
+                "allow_notifications",
+                "confirm_multiline_paste",
+                "trail_sound_volume",
+                "trail_sounds",
+            ])
+        );
+    }
+
+    #[test]
+    fn pure_semantics_report_runtime_fallbacks_instead_of_false_green() {
+        let source = r##"
+font_px = 201
+font_variation = ["wght=450", "not-an-axis"]
+font_features = ["+ss01 toolong", "cv01=2"]
+
+[update]
+owner = ""
+repo = "bad/repo"
+
+[packages]
+account = "bad/account"
+channel = "   "
+
+[matrix_rain]
+hue = "blue"
+
+[sparkle_words.profanity]
+palette = ["#112233", "not-a-color"]
+"##;
+        let warnings = config_semantic_warnings(&parsed(source));
+        let joined = warnings
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "font_px",
+            "ignores it rather than clamping",
+            "font_variation[1]",
+            "font_features[0]",
+            "update.owner",
+            "update.repo",
+            "packages.account",
+            "packages.channel is blank",
+            "matrix_rain.hue",
+            "sparkle_words.profanity.palette[1]",
+        ] {
+            assert!(joined.contains(expected), "missing {expected:?}: {joined}");
+        }
+
+        let clean = parsed(
+            r##"font_px = 200
+font_variation = ["wght=450"]
+font_features = ["+ss01 -calt cv01=2"]
+[update]
+owner = "safe-owner"
+repo = "safe.repo"
+[packages]
+account = "safe_owner"
+channel = "stable"
+[matrix_rain]
+hue = "#12ABef"
+[sparkle_words.profanity]
+palette = ["#112233"]
+"##,
+        );
+        assert!(
+            config_semantic_warnings(&clean).is_empty(),
+            "valid boundary/domain values stay clean"
+        );
+    }
+
+    #[test]
+    fn security_capability_warnings_name_the_gui_hosts_that_are_actually_missing() {
+        let enabled = config_semantic_warnings(&parsed(
+            "allow_osc52_query = true\nallow_window_ops = true\n",
+        ));
+        assert_eq!(enabled.len(), 2, "{enabled:?}");
+        assert!(enabled.iter().any(|warning| {
+            warning.key == "allow_osc52_query"
+                && warning.message.contains("drops every OSC 52 Query")
+                && warning.message.contains("remain unavailable")
+        }));
+        assert!(enabled.iter().any(|warning| {
+            warning.key == "allow_window_ops"
+                && warning.message.contains("window-title and text-grid-size")
+                && warning.message.contains("host manipulation")
+                && warning.message.contains("most state/geometry")
+        }));
+
+        assert!(
+            config_semantic_warnings(&parsed(
+                "allow_osc52_query = false\nallow_window_ops = false\n"
+            ))
+            .is_empty(),
+            "disabled capabilities are the honest fail-closed default"
+        );
+    }
+
+    #[test]
+    fn custom_and_connection_records_disclose_every_inert_or_refused_arm() {
+        let fingerprint = "00".repeat(32);
+        let source = format!(
+            r#"
+[[sparkle_words.custom]]
+words = [" "]
+
+[[sparkle_words.custom]]
+words = ["quiet"]
+burst = {{ kind = "glow", chance = 0 }}
+
+[[sparkle_words.custom]]
+words = ["live"]
+ink = "rainbow"
+
+[[net.connections]]
+name = "bad/name"
+host = "bad.example:7100"
+fingerprint = "nope"
+
+[[net.connections]]
+name = "work"
+host = "one.example:7100"
+fingerprint = "{fingerprint}"
+
+[[net.connections]]
+name = "work"
+host = "two.example:7100"
+fingerprint = "{fingerprint}"
+expect_nonce = "launch-pin"
+"#
+        );
+        let warnings = config_semantic_warnings(&parsed(&source));
+        let joined = warnings
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "record 1 has no nonblank word",
+            "record 1 is inert",
+            "record 2 is inert",
+            "record 1 must be a nonempty",
+            "record 1 must be 64 hexadecimal",
+            "record 3 duplicates",
+            "record 3 currently makes dialing fail closed",
+        ] {
+            assert!(joined.contains(expected), "missing {expected:?}: {joined}");
+        }
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.message.contains("record 3 is inert")),
+            "live custom record must not be called inert"
+        );
+    }
+
+    #[test]
+    fn saved_connection_rejects_nonblank_endpoint_syntax_before_dial() {
+        let fingerprint = "00".repeat(32);
+        let config = parsed(&format!(
+            "[[net.connections]]\nname = \"work\"\nhost = \"missing-port\"\nfingerprint = \"{fingerprint}\"\n"
+        ));
+        let warnings = config_semantic_warnings(&config);
+        let endpoint = warnings
+            .iter()
+            .find(|warning| warning.key == "net.connections.host")
+            .expect("invalid endpoint warning");
+        assert!(endpoint.message.contains("must be host:port"));
+        assert!(endpoint.message.contains("record 1"));
+    }
+
+    #[test]
+    fn theme_derived_matrix_body_discloses_conditional_head_floor() {
+        let warnings = config_semantic_warnings(&parsed("[matrix_rain]\nhead_alpha = 80\n"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains("theme-derived body alpha"));
+
+        let max = config_semantic_warnings(&parsed("[matrix_rain]\nhead_alpha = 135\n"));
+        assert!(max.is_empty(), "the body cannot exceed the cap: {max:?}");
+    }
+
+    #[test]
+    fn listener_and_package_admission_warnings_are_pure_and_specific() {
+        let listener = parsed("[net]\nlisten = \"127.0.0.1:7100\"\n");
+        let partial = listener_capability_warnings(&listener, [true, false, false], false);
+        assert_eq!(partial.len(), 1);
+        assert!(partial[0].message.contains("incomplete (1/3"));
+        assert!(listener_capability_warnings(&listener, [true, true, true], false).is_empty());
+        let nested = listener_capability_warnings(&listener, [true, true, true], true);
+        assert_eq!(nested.len(), 1);
+        assert!(nested[0].message.contains("never binds in an aterm child"));
+
+        let packages = parsed("[packages]\nauto_update = true\n");
+        let disabled = package_capability_warnings(&packages, true, true);
+        assert_eq!(disabled.len(), 1);
+        assert!(disabled[0].message.contains("$ATPKG_DISABLE"));
+        let rootless = package_capability_warnings(&packages, false, false);
+        assert_eq!(rootless.len(), 1);
+        assert!(rootless[0].message.contains("verification root"));
+        assert!(package_capability_warnings(&packages, false, true).is_empty());
+    }
+
+    #[test]
+    fn host_semantics_accept_valid_lexicon_and_report_missing_or_rejected_layers() {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-config-lexicon-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let valid = root.join("valid.toml");
+        let invalid = root.join("invalid.toml");
+        let conflict = root.join("conflict.toml");
+        let oversized = root.join("oversized.toml");
+        std::fs::write(
+            &valid,
+            "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"ultrathink\"]\n",
+        )
+        .unwrap();
+        std::fs::write(&invalid, "[[entry]\nclass = \"emphasis\"\n").unwrap();
+        std::fs::write(
+            &conflict,
+            "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"abc猫\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &oversized,
+            vec![b'x'; aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES + 1],
+        )
+        .unwrap();
+
+        let config_for = |path: &std::path::Path| {
+            parsed(&format!(
+                "[sparkle_words]\nlexicon = {:?}\n",
+                path.to_string_lossy()
+            ))
+        };
+        assert!(
+            config_host_semantic_warnings(&config_for(&valid))
+                .iter()
+                .all(|warning| warning.key != "sparkle_words.lexicon")
+        );
+        let rejected = config_host_semantic_warnings(&config_for(&invalid));
+        assert!(rejected.iter().any(|warning| {
+            warning.key == "sparkle_words.lexicon" && warning.message.contains("rejected")
+        }));
+        let missing = config_host_semantic_warnings(&config_for(&root.join("missing.toml")));
+        assert!(missing.iter().any(|warning| {
+            warning.key == "sparkle_words.lexicon" && warning.message.contains("unreadable")
+        }));
+        let oversized_warnings = config_host_semantic_warnings(&config_for(&oversized));
+        assert!(oversized_warnings.iter().any(|warning| {
+            warning.key == "sparkle_words.lexicon"
+                && warning.message.contains("unreadable")
+                && warning
+                    .message
+                    .contains(&aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES.to_string())
+        }));
+        let conflict = config_host_semantic_warnings(&config_for(&conflict));
+        assert!(conflict.iter().any(|warning| {
+            warning.key == "sparkle_words.lexicon"
+                && warning.message.contains("merged-layer conflict")
+                && warning.message.contains("abc猫")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn host_semantics_mirrors_runtime_merged_lexicon_conflicts_and_cjk_filter() {
+        let inline = parsed(
+            r#"[sparkle_words.feline]
+cjk_single_char = false
+
+[[sparkle_words.custom]]
+words = ["犬", "abc猫"]
+ink = "rainbow"
+"#,
+        );
+        let warnings = config_host_semantic_warnings(&inline);
+        assert!(warnings.iter().any(|warning| {
+            warning.key == "sparkle_words.custom.words"
+                && warning.message.contains("record 1 word 1")
+                && warning.message.contains("requires cjk_single_char = true")
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning.key == "sparkle_words.custom.words"
+                && warning.message.contains("record 1 word 2")
+                && warning.message.contains("dropped")
+        }));
+
+        let opted_in = parsed(
+            r#"[sparkle_words.feline]
+cjk_single_char = true
+
+[[sparkle_words.custom]]
+words = ["犬", "abc猫"]
+ink = "rainbow"
+"#,
+        );
+        let opted_in = config_host_semantic_warnings(&opted_in);
+        assert!(
+            opted_in
+                .iter()
+                .all(|warning| !warning.message.contains("requires cjk_single_char = true")),
+            "resolved opt-in must filter the same warning as recompute_sparkle: {opted_in:?}"
+        );
+        assert!(opted_in.iter().any(|warning| {
+            warning.key == "sparkle_words.custom.words"
+                && warning.message.contains("record 1 word 2")
+        }));
+
+        let extra = parsed("[sparkle_words.emphasis]\nextra_words = [\"abc猫\"]\n");
+        assert!(config_host_semantic_warnings(&extra).iter().any(|warning| {
+            warning.key == "sparkle_words.emphasis.extra_words"
+                && warning
+                    .message
+                    .starts_with("sparkle_words.emphasis.extra_words[0]")
+        }));
+    }
+
+    #[test]
+    fn host_validation_reports_only_authored_environment_masking() {
+        const CHILD: &str = "ATERM_HOST_OVERRIDE_WARNING_CHILD";
+        const EXACT: &str =
+            "diagnostics::tests::host_validation_reports_only_authored_environment_masking";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", EXACT, "--nocapture"])
+                .env(CHILD, "1")
+                .env("ATERM_COLUMNS", "120")
+                .env("RUST_TEST_THREADS", "1")
+                .status()
+                .expect("launch isolated environment-precedence validation");
+            assert!(status.success());
+            return;
+        }
+
+        let authored: crate::app_config::Config = toml::from_str("columns = 80\n").unwrap();
+        let warnings = config_host_semantic_warnings(&authored);
+        assert!(warnings.iter().any(|warning| {
+            warning.key == "columns"
+                && warning.message.contains("$ATERM_COLUMNS overrides")
+                && warning.message.contains("effective value is 120")
+        }));
+
+        let absent = config_host_semantic_warnings(&crate::app_config::Config::default());
+        assert!(
+            absent.iter().all(|warning| warning.key != "columns"),
+            "an absent TOML token must not receive a source diagnostic"
+        );
+    }
+
     #[test]
     fn validate_accepts_good_config_and_rejects_bad() {
         // A well-formed config of known keys parses.
@@ -610,6 +2172,34 @@ mod tests {
         );
         // Malformed TOML syntax is reported.
         assert!(validate_config_text("font_px = = 1").is_err());
+    }
+
+    #[test]
+    fn cli_validation_rejects_the_same_oversized_generation_as_runtime_and_manual() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-config-validation-limit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::native_config_service::MAX_CONFIG_FILE_BYTES as u64 + 1)
+            .unwrap();
+
+        let (message, valid) = validate_config_path(&path);
+        assert!(!valid);
+        assert!(message.contains("exceeds"), "{message}");
+        assert!(
+            message.contains(&crate::native_config_service::MAX_CONFIG_FILE_BYTES.to_string()),
+            "{message}"
+        );
+        let direct = validate_config_text(
+            &" ".repeat(crate::native_config_service::MAX_CONFIG_FILE_BYTES + 1),
+        )
+        .unwrap_err();
+        assert!(direct.contains("admission limit"), "{direct}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -734,6 +2324,15 @@ mod tests {
         )
         .expect("valid");
         assert!(clean.is_empty(), "clean config must not warn: {clean:?}");
+
+        let retired = validate_config_text("cursor_style = \"underline\"\n")
+            .expect("retired compatibility spelling remains structurally loadable");
+        assert_eq!(
+            retired,
+            [
+                "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
+            ]
+        );
     }
 
     /// An unknown `cursor_trail_style` silently disables the WHOLE cursor
@@ -860,9 +2459,9 @@ mod tests {
     }
 
     #[test]
-    fn show_config_reports_effective_resolved_values() {
+    fn show_config_reports_resolved_launch_values() {
         let out = show_config();
-        assert!(out.contains("effective config"), "header present");
+        assert!(out.contains("resolved launch config"), "header present");
         // The key resolved knobs are each surfaced with a label.
         for label in [
             "config file:",
@@ -882,6 +2481,15 @@ mod tests {
         ] {
             assert!(out.contains(label), "{label} must appear in show-config");
         }
+    }
+
+    #[test]
+    fn show_config_font_size_distinguishes_auto_base_from_explicit_pixels() {
+        assert_eq!(
+            show_config_font_px(12.0, false),
+            "12 (auto base; final physical px depends on display scale)"
+        );
+        assert_eq!(show_config_font_px(24.0, true), "24 (explicit physical px)");
     }
 
     /// The renderer label the reports print is derived from the SHARED backend

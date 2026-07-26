@@ -203,6 +203,45 @@ fn codex_scroll_repins_viewport_and_piecewise_reanchors_active_selection() {
     );
 }
 
+/// PARAGRAPH-BREAK regression: Codex streams "A", a blank separator line
+/// (displayed by printing nothing), then "B" through its insert-history
+/// protocol, one scroll per committed line. Once "A" has been archived, the
+/// blank separator is displaced ALONE — it must follow "A" into history as
+/// an empty line. (Pre-fix, the never-written gate keyed on `Row::len == 0`
+/// for the whole displaced set, which also holds for a blank separator, so
+/// the paragraph break silently vanished from the transcript.)
+#[test]
+fn codex_streamed_blank_separator_line_is_archived() {
+    let mut term = Terminal::new(5, 10);
+    for text in ["A", "", "B", "C", "D", "E"] {
+        let seq = format!("\x1b[1;3r\x1b[3;1H\r\n{text}\x1b[r");
+        term.process(seq.as_bytes());
+    }
+
+    // The first three scrolls displace the fresh-session blank band (rows
+    // never written on a brand-new screen) — dropped. The next three
+    // displace A, the separator, and B in order.
+    assert_eq!(
+        term.grid().scrollback_lines(),
+        3,
+        "the paragraph break must be retained in history"
+    );
+    for (index, expected) in ["A", "", "B"].into_iter().enumerate() {
+        assert_eq!(
+            term.grid()
+                .get_history_line(index)
+                .expect("every displaced transcript row is retained")
+                .to_string()
+                .trim_end(),
+            expected,
+            "history line {index}"
+        );
+    }
+    for (row, expected) in ['C', 'D', 'E'].into_iter().enumerate() {
+        assert_eq!(term.grid().cell(row as u16, 0).unwrap().char(), expected);
+    }
+}
+
 /// FULLSCREEN-GROW regression (owner report, 2026-07-22), two halves.
 ///
 /// Half 1 — a FRESH Codex session scrolls its top-anchored region while the

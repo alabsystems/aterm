@@ -6,12 +6,9 @@
 //! the former overlay-input adapter as test scaffolding around [`crate::settings`];
 //! production cannot construct its `Overlay::Settings` variant.
 
-#![allow(
-    dead_code,
-    reason = "legacy Settings overlay input remains test scaffolding; production routes through the native tab methods in this module"
-)]
-
-use crate::{App, Wake, WindowState};
+#[cfg(test)]
+use crate::Wake;
+use crate::{App, WindowState};
 
 /// The §L.3 anonymous suggestion form (Google Forms): the landing page's Send
 /// opens it PREFILLED in the default browser — the overlay itself never talks
@@ -49,6 +46,42 @@ fn percent_encode(s: &str) -> String {
 }
 
 impl App {
+    /// Enumerate every live Settings presentation in `wid`, including leaves
+    /// that are not currently focused. Generic split/restore operations may
+    /// place Settings beside a terminal or another native app, so focus is a
+    /// presentation detail rather than an identity test.
+    fn settings_tabs_in_window(
+        &self,
+        wid: crate::WindowId,
+    ) -> Vec<(
+        usize,
+        crate::tab_model::TabId,
+        crate::native_app::AppInstanceId,
+        crate::tab_model::ViewId,
+    )> {
+        let Some(window) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        window
+            .tab_set
+            .tabs()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, tab)| {
+                tab.root.leaves().into_iter().filter_map(move |view| {
+                    let crate::tab_model::View::Native(native) =
+                        self.view_store.get(view).copied()?
+                    else {
+                        return None;
+                    };
+                    (self.native_runtime.app(native.instance)?.kind()
+                        == crate::native_app::AppKind::Settings)
+                        .then_some((index, tab.id, native.instance, view))
+                })
+            })
+            .collect()
+    }
+
     /// Find the Settings presentation in `wid` by stable native-app identity.
     ///
     /// Settings is a process-singleton controller with zero or more tab views. It is
@@ -62,22 +95,111 @@ impl App {
         crate::native_app::AppInstanceId,
         crate::tab_model::ViewId,
     )> {
-        self.windows
-            .get(&wid)?
-            .tab_set
-            .tabs()
-            .iter()
-            .enumerate()
-            .find_map(|(index, tab)| {
-                let view = tab.focus;
-                let crate::tab_model::View::Native(native) = self.view_store.get(view).copied()?
-                else {
-                    return None;
-                };
-                (self.native_runtime.app(native.instance)?.kind()
-                    == crate::native_app::AppKind::Settings)
-                    .then_some((index, tab.id, native.instance, view))
+        let window = self.windows.get(&wid)?;
+        let active = window.tab_set.active_id();
+        let focused = window.tab_set.active().map(|tab| tab.focus);
+        self.settings_tabs_in_window(wid)
+            .into_iter()
+            .min_by_key(|(index, tab, _, view)| {
+                (
+                    usize::from(Some(*tab) != active),
+                    usize::from(Some(*view) != focused),
+                    *index,
+                    view.get(),
+                )
             })
+    }
+
+    /// Resolve one Settings view in `wid`. The ordering mirrors
+    /// [`Self::settings_tab_in_window`]: an active/focused presentation wins, then
+    /// stable tab/view order.
+    fn native_settings_view_target_in_window(
+        &self,
+        wid: crate::WindowId,
+    ) -> Option<(
+        crate::native_app::AppInstanceId,
+        crate::tab_model::ViewId,
+        &crate::native_settings::SettingsViewState,
+    )> {
+        let window = self.windows.get(&wid)?;
+        let active = window.tab_set.active_id();
+        let focused = window.tab_set.active().map(|tab| tab.focus);
+        let mut targets = self.settings_tabs_in_window(wid);
+        targets.sort_by_key(|(index, tab, _, view)| {
+            (
+                usize::from(Some(*tab) != active),
+                usize::from(Some(*view) != focused),
+                *index,
+                view.get(),
+            )
+        });
+        targets.into_iter().find_map(|(_, _, instance, view)| {
+            let crate::native_app::AppViewState::Settings(state) =
+                self.native_runtime.view_state(view)?
+            else {
+                return None;
+            };
+            Some((instance, view, state.as_ref()))
+        })
+    }
+
+    fn native_settings_view_target_matching(
+        &self,
+    ) -> Option<(
+        crate::WindowId,
+        crate::native_app::AppInstanceId,
+        crate::tab_model::ViewId,
+        &crate::native_settings::SettingsViewState,
+    )> {
+        let front = self.frontmost_window.and_then(|wid| {
+            self.native_settings_view_target_in_window(wid)
+                .map(|(instance, view, state)| (wid, instance, view, state))
+        });
+        if front.is_some() {
+            return front;
+        }
+        let mut windows = self.windows.keys().copied().collect::<Vec<_>>();
+        windows.sort_unstable_by_key(|wid| wid.0);
+        windows.into_iter().find_map(|wid| {
+            self.native_settings_view_target_in_window(wid)
+                .map(|(instance, view, state)| (wid, instance, view, state))
+        })
+    }
+
+    /// Resolve a Settings presentation from the front window's active tab only.
+    /// Compatibility `window about|update` captures that exact window/tab, so its
+    /// semantic twin must never fall back to an inactive tab or another window.
+    fn native_settings_front_view_target_matching(
+        &self,
+        route: Option<crate::native_settings::SettingsRoute>,
+    ) -> Option<(
+        crate::WindowId,
+        crate::native_app::AppInstanceId,
+        crate::tab_model::ViewId,
+        &crate::native_settings::SettingsViewState,
+    )> {
+        let wid = self.frontmost_window?;
+        let tab = self.windows.get(&wid)?.tab_set.active()?;
+        let mut views = tab.root.leaves();
+        views.sort_unstable_by_key(|view| (usize::from(*view != tab.focus), view.get()));
+        views.into_iter().find_map(|view| {
+            let crate::tab_model::View::Native(native) = self.view_store.get(view).copied()? else {
+                return None;
+            };
+            if self.native_runtime.app(native.instance)?.kind()
+                != crate::native_app::AppKind::Settings
+            {
+                return None;
+            }
+            let crate::native_app::AppViewState::Settings(state) =
+                self.native_runtime.view_state(view)?
+            else {
+                return None;
+            };
+            route
+                .is_none_or(|expected| state.route == expected)
+                .then_some((wid, native.instance, view, state.as_ref()))
+        })
     }
 
     /// Whether any window presents the process-singleton native Settings app.
@@ -124,25 +246,60 @@ impl App {
         }
     }
 
-    /// Legacy SettingsState projection for compatibility control verbs. The
-    /// authoritative surface is still the native tab; this returns the exact data
-    /// model embedded in one of its live per-view controllers.
+    /// Locate the native Settings presentation targeted by compatibility control
+    /// verbs. Prefer the front window, then any other live presentation of the
+    /// process-singleton controller. Returning the real view state and stable IDs
+    /// lets inspection compile the same semantic tree as paint instead of reviving
+    /// the retired overlay's parallel projection.
+    pub(crate) fn native_settings_view_target(
+        &self,
+    ) -> Option<(
+        crate::WindowId,
+        crate::native_app::AppInstanceId,
+        crate::tab_model::ViewId,
+        &crate::native_settings::SettingsViewState,
+    )> {
+        self.native_settings_view_target_matching()
+    }
+
+    /// Locate whichever Settings view is actually visible in the front window's active
+    /// tab. Route-specific compatibility aliases use this for honest mismatch reports;
+    /// unlike [`Self::native_settings_view_target`], it never falls back process-wide.
+    pub(crate) fn native_settings_front_view_target(
+        &self,
+    ) -> Option<(
+        crate::WindowId,
+        crate::native_app::AppInstanceId,
+        crate::tab_model::ViewId,
+        &crate::native_settings::SettingsViewState,
+    )> {
+        self.native_settings_front_view_target_matching(None)
+    }
+
+    /// Locate a live presentation of one exact Settings route for a compatibility
+    /// alias in the front window's active tab. This is deliberately distinct from the
+    /// generic `controls prefs` target: `controls about` and `controls update` must either
+    /// inspect the page photographed by `window about|update` or report that it is not
+    /// frontmost, never serialize a background or parallel retired model.
+    pub(crate) fn native_settings_route_view_target(
+        &self,
+        route: crate::native_settings::SettingsRoute,
+    ) -> Option<(
+        crate::WindowId,
+        crate::native_app::AppInstanceId,
+        crate::tab_model::ViewId,
+        &crate::native_settings::SettingsViewState,
+    )> {
+        self.native_settings_front_view_target_matching(Some(route))
+    }
+
+    /// Legacy overlay-model access retained only for the old model-level tests.
+    /// Production control inspection uses [`Self::native_settings_view_target`]
+    /// and the native compiled semantic tree.
+    #[cfg(test)]
     pub(crate) fn native_settings_legacy_state(&self) -> Option<&crate::settings::SettingsState> {
-        let front = self
-            .frontmost_window
-            .and_then(|wid| self.settings_tab_in_window(wid).map(|(_, _, _, view)| view));
-        let view = front.or_else(|| {
-            self.windows
-                .keys()
-                .copied()
-                .find_map(|wid| self.settings_tab_in_window(wid).map(|(_, _, _, view)| view))
-        })?;
-        match self.native_runtime.view_state(view)? {
-            crate::native_app::AppViewState::Settings(state) => Some(&state.legacy),
-            crate::native_app::AppViewState::Markdown(_)
-            | crate::native_app::AppViewState::Editor(_)
-            | crate::native_app::AppViewState::Recovery(_) => None,
-        }
+        self.native_settings_view_target()
+            .map(|(_, _, _, state)| &state.legacy)
     }
 
     /// Host for the retired Settings overlay used by legacy model tests. Production
@@ -162,9 +319,10 @@ impl App {
     /// `settings_tray` a pure painter. Called on overlay open, on category
     /// switches, at the start of every redraw (the drain-while-open path: a
     /// sighting bumps the host revision, the next frame syncs + repaints),
-    /// and before `controls prefs` serializes. Cheap at rest: one revision
+    /// and before legacy overlay model tests serialize. Cheap at rest: one revision
     /// compare, no clone. The repaint rides `RepaintKey::settings_fp`, which
     /// folds the revision only while the Kitty Log category is active.
+    #[cfg(test)]
     pub(crate) fn sync_settings_kitty_log(&mut self) {
         let rev = self.kitty_log.revision();
         let stale = self
@@ -270,8 +428,29 @@ impl App {
 
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.tab_set.switch_to(tab_id);
+            // A Settings leaf may share its tab with a focused terminal. An
+            // explicit Settings action must reveal and target the exact native
+            // presentation instead of merely activating its containing tab.
+            let focused = ws
+                .tab_set
+                .active_mut()
+                .is_some_and(|tab| tab.set_focus(view));
+            if !focused {
+                return false;
+            }
+            // A last-tab close parks the logical window behind `pending_close`
+            // until its main-loop caller can escalate with an ActiveEventLoop.
+            // An explicit reopen can race that escalation (or recover a window
+            // left behind by an older caller), so installing/focusing a real tab
+            // must cancel the stale empty-window teardown before another wake
+            // observes it.
+            ws.pending_close = false;
             ws.last_present = None;
         }
+        // Returning from Manual's separate config Editor (or another native
+        // tab) to an existing Settings tab must publish the canonical front
+        // content before the exact-view stale-target guard resolves the action.
+        self.resync_active_or_window(wid);
         self.sync_settings_title_summary_health();
         if route == crate::native_settings::SettingsRoute::SoftwareUpdate {
             self.acknowledge_native_update_attention();
@@ -282,8 +461,13 @@ impl App {
         // never a status.toml parse on the event loop.
         self.publish_native_packages_state();
         self.start_native_packages_refresh();
+        let action_id = if route == crate::native_settings::SettingsRoute::Manual {
+            crate::native_ui::ActionId::new("settings/manual/open")
+        } else {
+            crate::native_ui::ActionId::new(format!("settings/route{}", route.path()))
+        };
         let action = crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-            id: crate::native_ui::ActionId::new(format!("settings/route{}", route.path())),
+            id: action_id,
             value: None,
         });
         // Reuse the exact human/semantic-action host path.  The old direct
@@ -305,34 +489,80 @@ impl App {
     /// at least one tab was removed. The compatibility `settings false` control verb
     /// uses this exact path; no OS window or fake PTY is involved.
     pub(crate) fn close_settings_tabs(&mut self) -> bool {
-        let targets: Vec<crate::WindowId> = self
+        // Snapshot stable identities once. A blocked draft is attempted once
+        // and remains focused with its recovery UI; successful removals cannot
+        // make this loop rediscover and spin on that same blocked view.
+        let targets: Vec<(
+            crate::WindowId,
+            crate::tab_model::TabId,
+            crate::tab_model::ViewId,
+        )> = self
             .windows
             .keys()
             .copied()
-            .filter(|wid| self.settings_tab_in_window(*wid).is_some())
+            .flat_map(|wid| {
+                self.settings_tabs_in_window(wid)
+                    .into_iter()
+                    .map(move |(_, tab, _, view)| (wid, tab, view))
+            })
             .collect();
         let mut removed = false;
-        for wid in targets {
-            let Some((_, tab, _, _)) = self.settings_tab_in_window(wid) else {
+        for (wid, tab, view) in targets {
+            let focused = self.windows.get_mut(&wid).is_some_and(|ws| {
+                if !ws.tab_set.switch_to(tab) {
+                    return false;
+                }
+                ws.tab_set
+                    .active_mut()
+                    .is_some_and(|active| active.set_focus(view))
+            });
+            if !focused {
                 continue;
-            };
-            let previous = self.windows.get(&wid).and_then(|ws| ws.tab_set.active_id());
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.tab_set.switch_to(tab);
             }
-            match self.close_active_native_tab(wid) {
+            self.resync_active_or_window(wid);
+            let split = self
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.tab_set.active())
+                .is_some_and(|active| active.root.len() > 1);
+            let result = if split {
+                self.close_focused_mixed_leaf(wid)
+            } else {
+                self.close_active_native_tab(wid)
+            };
+            match result {
                 Ok(()) => removed = true,
                 Err(_) => {
-                    if let Some(previous) = previous
-                        && let Some(ws) = self.windows.get_mut(&wid)
-                    {
-                        ws.tab_set.switch_to(previous);
-                    }
+                    // Keep the refusing Settings view selected so its retained
+                    // draft banner and exact close-recovery palette remain
+                    // visible to the control caller.
                     self.sync_window(wid);
                 }
             }
         }
         removed
+    }
+
+    /// Apply the compatibility `settings [open|close]` request while keeping
+    /// process singleton identity separate from per-window presentation. An
+    /// explicit open always addresses the current front window; toggle and
+    /// close retain their historical process-wide meaning.
+    pub(crate) fn apply_settings_open_request(&mut self, open: Option<bool>) -> bool {
+        match open {
+            Some(true) => {
+                let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::Home);
+            }
+            Some(false) => {
+                self.close_settings_tabs();
+            }
+            None if self.settings_tab_open() => {
+                self.close_settings_tabs();
+            }
+            None => {
+                let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::Home);
+            }
+        }
+        self.settings_tab_open()
     }
 
     /// Open the Settings overlay on the front window (no-op if already open). Snapshots
@@ -367,6 +597,7 @@ impl App {
     /// Close the Settings overlay on the front window (no-op if already closed). The
     /// `settings_fp` key term drops to `0`, so the next frame repaints the clean terminal.
     ///
+    #[cfg(test)]
     pub(crate) fn settings_exit(&mut self) {
         if let Some(ws) = self.settings_host_mut()
             && ws.settings().is_some()
@@ -398,6 +629,7 @@ impl App {
     /// ↑/↓: move the sidebar CATEGORY while the sidebar pane is focused, the flat
     /// filtered selection while searching, else the grouped content selection —
     /// keeping the target on-screen (design §6).
+    #[cfg(test)]
     pub(crate) fn settings_move(&mut self, delta: isize) {
         if let Some(ws) = self.settings_host_mut() {
             let band = Self::settings_band(ws);
@@ -452,11 +684,13 @@ impl App {
             s.pane = crate::settings::SettingsPane::Sidebar;
         }
         // Category-switch Kitty Log snapshot (§F4.6).
+        #[cfg(test)]
         self.sync_settings_kitty_log();
         self.settings_repaint_front();
     }
 
     /// →/Tab/↵ from the sidebar: give the content pane keyboard focus.
+    #[cfg(test)]
     pub(crate) fn settings_focus_content(&mut self) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.focus_content();
@@ -465,6 +699,7 @@ impl App {
     }
 
     /// Esc/Tab from the content pane: give the sidebar keyboard focus.
+    #[cfg(test)]
     pub(crate) fn settings_focus_sidebar(&mut self) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.focus_sidebar();
@@ -473,6 +708,7 @@ impl App {
     }
 
     /// Tab/⇧Tab: toggle keyboard focus between the two panes (design §6).
+    #[cfg(test)]
     pub(crate) fn settings_toggle_pane(&mut self) {
         let sidebar = self
             .settings_host()
@@ -496,6 +732,7 @@ impl App {
     /// Append a character to the search query (keeping the selection visible + scrolled in).
     /// A fresh "kitty" completion in the query summons the §L.4 cameo over the
     /// sidebar — GUI only (a headless driver must not park a never-ticking cameo).
+    #[cfg(test)]
     pub(crate) fn settings_search_push(&mut self, c: char) {
         let headless = self.headless;
         if let Some(ws) = self.settings_host_mut() {
@@ -512,6 +749,7 @@ impl App {
     }
 
     /// Delete the last search-query character.
+    #[cfg(test)]
     pub(crate) fn settings_search_backspace(&mut self) {
         if let Some(ws) = self.settings_host_mut() {
             let band = Self::settings_band(ws);
@@ -528,6 +766,7 @@ impl App {
     /// An EMPTIED query confirms back into GROUPED mode (`search_confirm` re-anchors
     /// the category + re-zeroes the scroll unit); the grouped clamp then brings the
     /// selected row's box into view — mirrors `settings_search_clear`.
+    #[cfg(test)]
     pub(crate) fn settings_search_confirm(&mut self) {
         if let Some(ws) = self.settings_host_mut() {
             let band = Self::settings_band(ws);
@@ -545,6 +784,7 @@ impl App {
     /// Clear the filter and leave search (the single Esc level out of a filtered list).
     /// `search_clear` re-anchors the category on the selection; the grouped clamp then
     /// scrolls the selected row's box into view.
+    #[cfg(test)]
     pub(crate) fn settings_search_clear(&mut self) {
         if let Some(ws) = self.settings_host_mut() {
             let band = Self::settings_band(ws);
@@ -568,29 +808,17 @@ impl App {
         self.settings_repaint_front();
     }
 
-    /// `settings section <name>` (socket): navigate the OPEN native Settings tab
-    /// to the corresponding stable route. ERR when no Settings view is up.
-    pub(crate) fn settings_show_section(
+    /// `settings section <name>` (socket): navigate the OPEN native Settings tab to the
+    /// parsed stable route. The control parser accepts visible labels and compatibility
+    /// aliases before this main-thread boundary; no retired category is representable
+    /// here. ERR when no Settings view is up.
+    pub(crate) fn settings_show_route(
         &mut self,
-        section: crate::prefs::Section,
+        route: crate::native_settings::SettingsRoute,
     ) -> Result<(), String> {
         if !self.settings_tab_open() {
             return Err("settings not open (use: settings open)".to_string());
         }
-        let route = match section {
-            crate::prefs::Section::Appearance => crate::native_settings::SettingsRoute::Appearance,
-            crate::prefs::Section::Cursor => crate::native_settings::SettingsRoute::CursorMotion,
-            crate::prefs::Section::Typography => crate::native_settings::SettingsRoute::TextFonts,
-            crate::prefs::Section::Window => crate::native_settings::SettingsRoute::WindowTabs,
-            crate::prefs::Section::Input => crate::native_settings::SettingsRoute::KeyboardInput,
-            crate::prefs::Section::Performance => {
-                crate::native_settings::SettingsRoute::Performance
-            }
-            crate::prefs::Section::Terminal => crate::native_settings::SettingsRoute::Terminal,
-            crate::prefs::Section::Security => crate::native_settings::SettingsRoute::Security,
-            crate::prefs::Section::Packages => crate::native_settings::SettingsRoute::Packages,
-            crate::prefs::Section::KittyLog => crate::native_settings::SettingsRoute::Diagnostics,
-        };
         self.open_settings_tab(route)
             .then_some(())
             .ok_or_else(|| "could not focus the native Settings tab".to_string())
@@ -598,6 +826,7 @@ impl App {
 
     /// Landing ↵: a non-empty suggestion box SENDS; an empty one is Get started
     /// (the hero's one Enter affordance stays useful either way).
+    #[cfg(test)]
     pub(crate) fn settings_landing_confirm(&mut self) {
         let has_text = self
             .settings_host()
@@ -613,6 +842,7 @@ impl App {
     /// Append to the landing suggestion box (§L.3). A fresh "kitty" completion
     /// summons the cameo (§L.4) — GUI only: a headless driver typing into the
     /// box must not park a never-ticking cameo in the fingerprint.
+    #[cfg(test)]
     pub(crate) fn settings_comment_push(&mut self, c: char) {
         let headless = self.headless;
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
@@ -630,6 +860,7 @@ impl App {
 
     /// Delete the last suggestion-box character (the kitty high-water count
     /// follows DOWN so deleting + retyping summons again).
+    #[cfg(test)]
     pub(crate) fn settings_comment_backspace(&mut self) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.comment.pop();
@@ -669,9 +900,10 @@ impl App {
     }
 
     /// Reset the SELECTED control to its built-in default (Del / Cmd-Backspace): persist
-    /// the key as REMOVED (`None`) through the same atomic writer + `Wake::ConfigReload`
-    /// live-apply the edits use, then optimistically clear the row's seed so it shows the
+    /// the key as REMOVED (`None`) through the retired overlay's test-only persistence
+    /// seam, then optimistically clear the row's seed so it shows the
     /// default this frame.
+    #[cfg(test)]
     pub(crate) fn settings_reset_selected(&mut self) {
         let key = self
             .settings_host()
@@ -684,12 +916,19 @@ impl App {
         let persisted = matches!(outcome, crate::prefs::SaveOutcome::Saved);
         let status = match &outcome {
             crate::prefs::SaveOutcome::Saved => {
+                #[cfg(test)]
                 if let Some(proxy) = self.proxy.as_ref() {
                     let _ = proxy.send_event(Wake::ConfigReload);
                 }
                 format!("reset: {key} = (default)")
             }
             crate::prefs::SaveOutcome::Unchanged => format!("{key}: already default"),
+            crate::prefs::SaveOutcome::Conflict { message, .. } => {
+                format!("reset conflict: {message}; reload aterm.toml before retrying")
+            }
+            crate::prefs::SaveOutcome::PublishedUnverified { message, .. } => format!(
+                "reset publication unverified: {message}; reload aterm.toml before retrying"
+            ),
             crate::prefs::SaveOutcome::Error(e) => format!("reset failed: {e}"),
         };
         if let Some(ws) = self.settings_host_mut() {
@@ -762,7 +1001,7 @@ impl App {
     /// Persist ONE control value through the shared seam — the single commit path the
     /// activate (toggle/cycle), popup-menu, and ←/→ step gestures all funnel into:
     /// [`crate::prefs::save_prefs_edits`] (pure, atomic, format-preserving), then
-    /// `Wake::ConfigReload` to apply live (the re-theme IS the preview), a footer status,
+    /// a footer status,
     /// and an optimistic seed update so the row reflects the value THIS frame (the
     /// authoritative rebuild follows when the reload lands; both produce the same seed).
     pub(crate) fn settings_commit_value(
@@ -792,34 +1031,26 @@ impl App {
             return format!("{key}: unchanged");
         }
 
-        // A HUD panel switched ON while the master `show_hud` is off would edit the
-        // file yet visibly do nothing (the reload applies `master && per-panel`), so
-        // the gesture revives the master in the SAME atomic write — the overlay row
-        // thereby shares the View-menu / Performance-panel `user_set_panel` semantics.
-        let mut edits: Vec<(&str, Option<String>)> = vec![(key, val.clone())];
-        let revive_master = val.as_deref() == Some("true")
-            && crate::hud_bar::PanelId::ALL
-                .iter()
-                .any(|p| p.config_key() == key)
-            && !self.config.show_hud_or_default();
-        if revive_master {
-            self.config.show_hud = Some(true);
-            edits.push((crate::prefs::EDIT_SHOW_HUD, Some("true".to_string())));
-        }
-
         // Persist through the shared pure, atomic, format-preserving writer. A clone
         // keeps `val` for the optimistic snapshot below.
-        let outcome = crate::prefs::save_prefs_edits(&edits);
+        let outcome = crate::prefs::save_prefs_edits(&[(key, val.clone())]);
         let persisted = matches!(outcome, crate::prefs::SaveOutcome::Saved);
         let status = match &outcome {
             crate::prefs::SaveOutcome::Saved => {
-                // Apply live exactly like the config-watcher — the identical wake.
+                // Retired overlay test seam: request its explicit local resample.
+                #[cfg(test)]
                 if let Some(proxy) = self.proxy.as_ref() {
                     let _ = proxy.send_event(Wake::ConfigReload);
                 }
                 format!("saved: {key} = {}", val.as_deref().unwrap_or(""))
             }
             crate::prefs::SaveOutcome::Unchanged => format!("{key}: unchanged"),
+            crate::prefs::SaveOutcome::Conflict { message, .. } => {
+                format!("save conflict: {message}; reload aterm.toml before retrying")
+            }
+            crate::prefs::SaveOutcome::PublishedUnverified { message, .. } => {
+                format!("publication unverified: {message}; reload aterm.toml before retrying")
+            }
             crate::prefs::SaveOutcome::Error(e) => format!("save failed: {e}"),
         };
 
@@ -836,15 +1067,6 @@ impl App {
                         f.seed = val.clone();
                     }
                 }
-                if revive_master
-                    && persisted
-                    && let Some(f) = s
-                        .fields
-                        .iter_mut()
-                        .find(|f| f.key == crate::prefs::EDIT_SHOW_HUD)
-                {
-                    f.seed = Some("true".to_string());
-                }
                 s.status = Some(status.clone());
             }
             if let Some(w) = &ws.os_window {
@@ -853,33 +1075,6 @@ impl App {
         }
         self.overlay_a11y_update();
         status
-    }
-
-    /// `settings set|unset <key> …` (control socket): commit ONE settings field BY
-    /// KEY through the exact validated seam every overlay gesture funnels into —
-    /// [`Self::settings_commit_value`] → `save_prefs_edits` (pure, atomic, domain-
-    /// checked, format-preserving) → `Wake::ConfigReload` live-apply. Works with
-    /// the overlay closed and headless; keys are what `controls prefs` prints. A
-    /// domain-rejected write comes back as the writer's own `save failed: …`.
-    pub(crate) fn set_settings_field(
-        &mut self,
-        key: &str,
-        val: Option<String>,
-    ) -> Result<String, String> {
-        let Some(field) = crate::prefs::editable_fields(&self.config)
-            .into_iter()
-            .find(|f| f.key == key)
-        else {
-            return Err(format!(
-                "unknown key {key:?} (list keys with `controls prefs`)"
-            ));
-        };
-        let status = self.settings_commit_value(field.key, val);
-        if status.starts_with("save failed") {
-            Err(status)
-        } else {
-            Ok(status)
-        }
     }
 
     /// The live [`crate::settings::SettingsGeom`] of the front window's settings card —
@@ -935,6 +1130,7 @@ impl App {
     }
 
     /// Move the popup menu highlight by `delta` (clamped, no wrap).
+    #[cfg(test)]
     pub(crate) fn settings_menu_move(&mut self, delta: isize) {
         let visible = self.settings_menu_visible();
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
@@ -944,6 +1140,7 @@ impl App {
     }
 
     /// Jump the popup menu highlight to the next option starting with `c`.
+    #[cfg(test)]
     pub(crate) fn settings_menu_jump(&mut self, c: char) {
         let visible = self.settings_menu_visible();
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
@@ -953,6 +1150,7 @@ impl App {
     }
 
     /// Wheel-scroll the popup menu's option window by `delta` rows.
+    #[cfg(test)]
     pub(crate) fn settings_menu_scroll(&mut self, delta: isize) {
         let visible = self.settings_menu_visible();
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
@@ -1014,6 +1212,7 @@ impl App {
     /// canonical `#RRGGBB` (or `None` for an emptied hex — reset to the theme
     /// default) ONCE through the UNCHANGED [`Self::settings_commit_value`] seam —
     /// the same path every widget uses.
+    #[cfg(test)]
     pub(crate) fn settings_wheel_commit(&mut self) {
         let pending = self
             .settings_host()
@@ -1031,6 +1230,7 @@ impl App {
     }
 
     /// Tab inside the wheel popover: cycle keyboard focus Wheel → Value → Hex.
+    #[cfg(test)]
     pub(crate) fn settings_wheel_focus_next(&mut self) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.wheel_focus_next();
@@ -1040,6 +1240,7 @@ impl App {
 
     /// Arrow-key adjust of the wheel's focused sub-control (`big` = Shift): hue/
     /// saturation on the disk, brightness on the value slider (design §7).
+    #[cfg(test)]
     pub(crate) fn settings_wheel_arrow(&mut self, dx: f32, dy: f32, big: bool) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.wheel_arrow(dx, dy, big);
@@ -1048,6 +1249,7 @@ impl App {
     }
 
     /// Type into the wheel's hex readout (no-op unless the hex field has focus).
+    #[cfg(test)]
     pub(crate) fn settings_wheel_hex_push(&mut self, c: char) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.wheel_hex_push(c);
@@ -1056,6 +1258,7 @@ impl App {
     }
 
     /// Delete the last hex character (no-op unless the hex field has focus).
+    #[cfg(test)]
     pub(crate) fn settings_wheel_hex_backspace(&mut self) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.wheel_hex_backspace();
@@ -1118,6 +1321,7 @@ impl App {
     /// rather than clobbered), nudge a bounded numeric one step (`big` = Shift = ×10)
     /// clamped to its range — each press committing via the shared seam. Free-form rows
     /// no-op ([`crate::settings::step_edit`]).
+    #[cfg(test)]
     pub(crate) fn settings_step(&mut self, delta: isize, big: bool) {
         // Same rescue as `settings_activate`: ←/→ act on the selection, which a wheel
         // scroll may have moved out of the band.
@@ -1141,6 +1345,7 @@ impl App {
 
     /// Wheel-scroll the content band by `delta` rows — moves the scroll window WITHOUT
     /// touching the selection (the wash may leave the band). Grouped or flat per mode.
+    #[cfg(test)]
     pub(crate) fn settings_scroll_body(&mut self, delta: isize) {
         if let Some(ws) = self.settings_host_mut() {
             let band = Self::settings_band(ws);
@@ -1189,6 +1394,7 @@ impl App {
     }
 
     /// Append a typed character to the in-panel edit buffer.
+    #[cfg(test)]
     pub(crate) fn settings_edit_push(&mut self, c: char) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.edit_push(c);
@@ -1197,6 +1403,7 @@ impl App {
     }
 
     /// Delete the last character of the in-panel edit buffer.
+    #[cfg(test)]
     pub(crate) fn settings_edit_backspace(&mut self) {
         if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
             s.edit_backspace();
@@ -1213,8 +1420,9 @@ impl App {
     }
 
     /// Commit the in-panel edit (Enter): persist the typed value through the SAME prefs
-    /// seam + `Wake::ConfigReload`. A rejected value (bad number) sets a status message
+    /// seam. A rejected value (bad number) sets a status message
     /// and STAYS in edit mode so the user can fix it; a clean commit leaves edit mode.
+    #[cfg(test)]
     pub(crate) fn settings_edit_commit(&mut self) {
         let pending = self
             .settings_host()
@@ -1228,10 +1436,13 @@ impl App {
         let (update_seed, leave_edit) = match &outcome {
             crate::prefs::SaveOutcome::Saved => (true, true),
             crate::prefs::SaveOutcome::Unchanged => (false, true),
-            crate::prefs::SaveOutcome::Error(_) => (false, false),
+            crate::prefs::SaveOutcome::Conflict { .. }
+            | crate::prefs::SaveOutcome::PublishedUnverified { .. }
+            | crate::prefs::SaveOutcome::Error(_) => (false, false),
         };
         let status = match &outcome {
             crate::prefs::SaveOutcome::Saved => {
+                #[cfg(test)]
                 if let Some(proxy) = self.proxy.as_ref() {
                     let _ = proxy.send_event(Wake::ConfigReload);
                 }
@@ -1241,6 +1452,12 @@ impl App {
                 }
             }
             crate::prefs::SaveOutcome::Unchanged => format!("{key}: unchanged"),
+            crate::prefs::SaveOutcome::Conflict { message, .. } => {
+                format!("conflict for {key}: {message}; reload aterm.toml before retrying")
+            }
+            crate::prefs::SaveOutcome::PublishedUnverified { message, .. } => format!(
+                "publication for {key} is unverified: {message}; reload aterm.toml before retrying"
+            ),
             crate::prefs::SaveOutcome::Error(e) => format!("invalid {key}: {e}"),
         };
 
@@ -1835,7 +2052,8 @@ mod tests {
         // Advance the service while there is no Settings view/controller to
         // receive ConfigChanged. The reopened view observes this exact value,
         // so its first edit must not pretend to have been authored at revision 1.
-        app.sync_native_config_external("copy_on_select = true\n".to_string())
+        app.native_config_service
+            .replace_external("copy_on_select = true\n".to_string())
             .expect("valid external config");
         let revision = app.native_config_service.snapshot().revision;
         assert!(revision > 1);
@@ -1846,6 +2064,33 @@ mod tests {
 
     #[test]
     fn native_settings_tab_reuses_identity_and_never_fabricates_a_terminal() {
+        const CHILD: &str = "ATERM_NATIVE_SETTINGS_TAB_IDENTITY_CHILD";
+        const ROOT: &str = "ATERM_NATIVE_SETTINGS_TAB_IDENTITY_ROOT";
+        const EXACT: &str = concat!(
+            "app_settings::tests::",
+            "native_settings_tab_reuses_identity_and_never_fabricates_a_terminal"
+        );
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "aterm-native-settings-tab-identity-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", EXACT, "--nocapture"])
+                .env(CHILD, "1")
+                .env(ROOT, &root)
+                .env("XDG_CONFIG_HOME", &root)
+                .env("RUST_TEST_THREADS", "1")
+                .status()
+                .expect("launch isolated native Settings-tab identity test");
+            let _ = std::fs::remove_dir_all(root);
+            assert!(status.success());
+            return;
+        }
+
+        let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
         let (terminal_tabs, terminal_layouts, sessions) = {
@@ -1853,30 +2098,65 @@ mod tests {
             (ws.tabs.count, ws.layouts.len(), app.pool.sessions.len())
         };
 
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
-        let first_tab = app
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.tab_set.active_id())
-            .expect("Settings tab");
-        assert!(app.settings_tab_open());
-        assert_eq!(app.windows.get(&wid).unwrap().tabs.count, terminal_tabs);
-        assert_eq!(
-            app.windows.get(&wid).unwrap().layouts.len(),
-            terminal_layouts
-        );
-        assert_eq!(
-            app.pool.sessions.len(),
-            sessions,
-            "native Settings creates no Session"
-        );
+        let mut first_tab = None;
+        for route in crate::native_settings::SettingsRoute::ALL
+            .into_iter()
+            .filter(|route| *route != crate::native_settings::SettingsRoute::Manual)
+        {
+            assert!(app.open_settings_tab(route), "open native route {route:?}");
+            let active_tab = app
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.tab_set.active_id())
+                .expect("Settings tab");
+            let canonical_tab = *first_tab.get_or_insert(active_tab);
+            assert_eq!(
+                active_tab, canonical_tab,
+                "every pane reuses the same Settings presentation"
+            );
+            let (instance, _) = app
+                .active_native_view(wid)
+                .expect("active native Settings view");
+            assert_eq!(
+                app.native_runtime.app(instance).map(|native| native.kind()),
+                Some(crate::native_app::AppKind::Settings),
+                "{route:?} stays inside the native Settings app"
+            );
+            assert!(app.prepare_native_input_scratch(wid), "render {route:?}");
+            let ws = app.windows.get(&wid).unwrap();
+            assert!(ws.front_terminal().is_none(), "{route:?} owns no PTY");
+            assert!(ws.settings_card.is_some(), "{route:?} compiled native UI");
+            assert_eq!(ws.tabs.count, terminal_tabs);
+            assert_eq!(ws.layouts.len(), terminal_layouts);
+            assert_eq!(
+                app.pool.sessions.len(),
+                sessions,
+                "native Settings creates no Session"
+            );
+        }
 
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
-        assert_eq!(
-            app.windows.get(&wid).unwrap().tab_set.active_id(),
-            Some(first_tab),
-            "route changes reuse the same Settings presentation"
+        // Manual deliberately opens the canonical config Editor instead of
+        // pretending to be another settings pane. Returning from it must still
+        // recover the original Settings presentation.
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Manual));
+        assert!(
+            root.join("aterm/aterm.toml").is_file(),
+            "Manual must resolve only the isolated config file"
         );
+        let (manual_instance, _) = app.active_native_view(wid).expect("Manual editor tab");
+        assert_eq!(
+            app.native_runtime
+                .app(manual_instance)
+                .map(|native| native.kind()),
+            Some(crate::native_app::AppKind::Editor)
+        );
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert_eq!(
+            app.windows.get(&wid).and_then(|ws| ws.tab_set.active_id()),
+            first_tab,
+            "returning from Manual reuses the canonical Settings tab"
+        );
+        assert!(app.settings_tab_open());
 
         assert!(app.close_settings_tabs());
         assert!(!app.settings_tab_open());
@@ -1886,6 +2166,168 @@ mod tests {
             terminal_layouts
         );
         assert_eq!(app.pool.sessions.len(), sessions);
+    }
+
+    #[test]
+    fn settings_presentation_split_discovery_focus_and_close_preserve_terminal_siblings() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (instance, first_settings) = app.active_native_view(wid).expect("Settings view");
+        let second_settings = app
+            .split_active_with_native(
+                wid,
+                crate::tab_model::SplitAxis::Horizontal,
+                instance,
+                crate::native_app::AppViewState::Settings(Box::new(
+                    crate::native_settings::SettingsViewState::new(&app.config),
+                )),
+            )
+            .expect("second Settings presentation");
+        let (terminal_session, terminal_view) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
+        assert_eq!(app.focused_session_id(wid), Some(terminal_session));
+        assert_eq!(app.settings_tabs_in_window(wid).len(), 2);
+        assert!(
+            app.settings_tab_open(),
+            "nonfocused Settings leaves remain open"
+        );
+
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (_, focused_settings) = app.active_native_view(wid).expect("Settings focused");
+        assert!(
+            [first_settings, second_settings].contains(&focused_settings),
+            "open focuses an existing Settings leaf"
+        );
+        assert_eq!(
+            app.settings_tabs_in_window(wid).len(),
+            2,
+            "open never duplicates a visible nonfocused presentation"
+        );
+
+        assert!(app.close_settings_tabs());
+        assert!(!app.settings_tab_open());
+        assert!(matches!(
+            app.view_store.get(terminal_view),
+            Some(crate::tab_model::View::Terminal(terminal))
+                if terminal.session == terminal_session
+        ));
+        assert!(app.pool.get(terminal_session).is_some());
+        assert!(
+            app.windows[&wid]
+                .tab_set
+                .tabs()
+                .iter()
+                .any(|tab| tab.root.contains(terminal_view))
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn settings_presentation_introspection_uses_nonfocused_split_leaf_viewport() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (instance, settings) = app.active_native_view(wid).expect("Settings view");
+        let (_, terminal) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        assert!(app.active_native_view(wid).is_none());
+        assert_eq!(
+            app.windows[&wid].tab_set.active().map(|tab| tab.focus),
+            Some(terminal)
+        );
+
+        let full = app.native_ui_viewport(wid).expect("window viewport");
+        let exact = app
+            .native_ui_viewport_for(wid, settings)
+            .expect("Settings leaf viewport");
+        assert!(
+            exact.width < full.width,
+            "split leaf is narrower than its window"
+        );
+        let expected = app
+            .compiled_native_ui_for(wid, instance, settings, exact)
+            .expect("compile exact Settings leaf")
+            .controls_lines();
+        let emitted = app
+            .read_aux_controls(crate::app_introspect::AuxTarget::Prefs)
+            .into_iter()
+            .filter(|line| line.starts_with("ui "))
+            .collect::<Vec<_>>();
+        assert_eq!(emitted, expected);
+    }
+
+    #[test]
+    fn settings_presentation_explicit_open_is_idempotent_per_front_window() {
+        let mut app = App::headless_for_test();
+        let first = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let first_instance = app.settings_tabs_in_window(first)[0].2;
+
+        let session = app.next_session_id;
+        let second = app.insert_logical_window(crate::stub_session(session), 24, 80);
+        assert_eq!(app.frontmost_window, Some(second));
+        assert!(app.settings_tabs_in_window(second).is_empty());
+        assert!(
+            app.settings_tab_open(),
+            "the first window still presents Settings"
+        );
+
+        assert!(app.apply_settings_open_request(Some(true)));
+        let second_presentations = app.settings_tabs_in_window(second);
+        assert_eq!(second_presentations.len(), 1);
+        assert_eq!(second_presentations[0].2, first_instance);
+        assert_eq!(
+            app.windows
+                .keys()
+                .copied()
+                .flat_map(|wid| app.settings_tabs_in_window(wid))
+                .filter(|(_, _, instance, _)| *instance == first_instance)
+                .count(),
+            2,
+            "both windows share one Settings controller"
+        );
+
+        assert!(app.apply_settings_open_request(Some(true)));
+        assert_eq!(
+            app.settings_tabs_in_window(second).len(),
+            1,
+            "a repeated explicit open reuses the requesting window's view"
+        );
+    }
+
+    #[test]
+    fn settings_last_tab_close_arms_teardown_and_reopen_cancels_the_stale_flag() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert_eq!(app.windows[&wid].tab_set.len(), 2);
+
+        // Retire the original terminal tab so this becomes the supported
+        // native-only shape produced by recursive restore/detach. `false` means
+        // the closed terminal was not the window's final canonical tab.
+        assert!(!app.close_tab_at(wid, 0));
+        assert_eq!(app.windows[&wid].tab_set.len(), 1);
+        assert!(app.settings_tab_open());
+
+        assert!(app.close_settings_tabs());
+        assert!(!app.settings_tab_open());
+        assert!(app.windows[&wid].tab_set.is_empty());
+        assert!(
+            app.windows[&wid].pending_close,
+            "the main-loop Settings wake must escalate this empty window"
+        );
+
+        // If an explicit open wins the race before escalation, the new tab is
+        // authoritative and the old pending-close edge must not later destroy it.
+        assert!(app.apply_settings_open_request(Some(true)));
+        assert_eq!(app.windows[&wid].tab_set.len(), 1);
+        assert!(app.settings_tab_open());
+        assert!(
+            !app.windows[&wid].pending_close,
+            "reopening a real Settings tab cancels stale empty-window teardown"
+        );
+        assert!(app.structural_invariants_ok());
     }
 
     #[test]
@@ -1921,10 +2363,9 @@ mod tests {
         let compiled = app.compiled_native_ui(wid).unwrap();
         assert!(
             compiled
-                .semantic(&crate::native_ui::UiKey::new(
-                    "settings/page-heading/appearance"
-                ))
-                .is_some()
+                .semantic(&crate::native_ui::UiKey::new("settings/preview/appearance"))
+                .is_some(),
+            "the compact frame presents Appearance's exact live preview even when its redundant heading is shed"
         );
         assert!(
             compiled
@@ -1935,20 +2376,26 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_section_control_navigates_the_native_view() {
+    fn section_control_navigates_the_typed_native_route() {
         let mut app = App::headless_for_test();
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-        app.settings_show_section(crate::prefs::Section::Security)
-            .expect("open native Settings route");
-        let (_, view) = app
-            .active_native_view(crate::WindowId(0))
-            .expect("active Settings view");
-        let crate::native_app::AppViewState::Settings(state) =
-            app.native_runtime.view_state(view).expect("view state")
-        else {
-            panic!("Settings view kind");
-        };
-        assert_eq!(state.route, crate::native_settings::SettingsRoute::Security);
+        for route in [
+            crate::native_settings::SettingsRoute::CursorMotion,
+            crate::native_settings::SettingsRoute::TextFonts,
+            crate::native_settings::SettingsRoute::Security,
+        ] {
+            app.settings_show_route(route)
+                .expect("open native Settings route");
+            let (_, view) = app
+                .active_native_view(crate::WindowId(0))
+                .expect("active Settings view");
+            let crate::native_app::AppViewState::Settings(state) =
+                app.native_runtime.view_state(view).expect("view state")
+            else {
+                panic!("Settings view kind");
+            };
+            assert_eq!(state.route, route);
+        }
         assert!(app.native_settings_legacy_state().is_some());
     }
 

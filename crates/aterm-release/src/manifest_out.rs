@@ -38,14 +38,19 @@ pub fn archived_manifest_signature_asset(tag: &str) -> String {
 /// Everything the §4 field set derives from — all resolved by the caller
 /// (publish.rs), so this module stays pure and fixture-testable.
 pub struct ManifestInputs<'a> {
-    /// Display version, e.g. "0.26" (non-load-bearing; build_number gates).
+    /// The release version, canonical `MAJOR.MINOR.PATCH`, e.g. "0.2.0" —
+    /// load-bearing. It must equal the canonical `vMAJOR.MINOR.PATCH` release tag and
+    /// must be the `<version>` in the `aterm-<version>.dmg` asset name, because
+    /// the deployed client binds all three (see the doc on
+    /// `aterm_update_core::Manifest::version`). Not the ordering key:
+    /// `build_number` is the apply gate.
     pub version: &'a str,
     /// The verified ledger claim `n` — must equal the binary's
     /// ATERM_BUILD_NUMBER and the plist's CFBundleVersion (self-checked).
     pub build_number: u64,
     /// Full 40-hex release commit (the claim commit for a real cut).
     pub commit: &'a str,
-    /// Exact DMG asset name in the same release, e.g. "aterm-0.26.dmg".
+    /// Exact DMG asset name in the same release, e.g. "aterm-0.2.0.dmg".
     pub dmg_name: &'a str,
     /// Lowercase-hex SHA-256 of the DMG bytes (computed in-process, dmg.rs).
     pub dmg_sha256: &'a str,

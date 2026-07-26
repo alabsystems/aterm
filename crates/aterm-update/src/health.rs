@@ -27,6 +27,20 @@
 //! interleaved network blip cannot reset a pipeline streak and suppress the
 //! escalation. (An on-disk ledger from a pre-v0.26 build may carry the retired
 //! rescue-path counters; unknown keys parse fine and are dropped on the next write.)
+//!
+//! # SCOPE — this ledger covers the CHECK/DOWNLOAD/STAGE lane ONLY
+//!
+//! Every class above is a failure to *acquire and stage* an update. **Nothing here
+//! observes whether a staged update is ever successfully APPLIED.** That gap is not
+//! hypothetical: through 2026-07 the owner's machine carried an all-zero
+//! `health.toml` — a perfect score — while the seamless apply/handoff lane failed
+//! 100% of the time across three releases and every update had to wait for a cold
+//! launch. Downloading and staging really were healthy; the ledger was telling the
+//! truth about the only thing it measures, and the dashboard still read green on a
+//! half-broken updater.
+//!
+//! So do NOT read "health is clean" as "the updater works". If you extend this
+//! ledger, an apply/handoff failure class is the missing one.
 
 use aterm_update_core::FileLock;
 use serde::{Deserialize, Serialize};
@@ -34,9 +48,16 @@ use std::path::Path;
 
 /// Consecutive `pipeline` failures at which the state is called PERSISTENT: the
 /// status wording stops saying "deferred" and the GUI raises a notification.
-/// 3 checks ≈ 18h at the default 6h interval — long enough to skip a flaky day,
-/// short enough that a stranded client is noticed within a day. (Re-exported from
-/// the crate root so cross-platform status consumers share the one threshold.)
+/// (Re-exported from the crate root so cross-platform status consumers share the
+/// one threshold.)
+///
+/// This 3 was chosen against a 6h check interval, where it meant "≈18h — long
+/// enough to skip a flaky day". **That interval is retired.** The cadence is now
+/// 75s (`ATERM_UPDATE_INTERVAL_SECS`, `spawn_background_check`), so 3 consecutive
+/// failures is ≈4 minutes: the threshold now means "three checks in a row", and it
+/// escalates far sooner than the original rationale intended. It has not been
+/// re-tuned for the new cadence — revisit it against 75s rather than trusting the
+/// old "skip a flaky day" reading.
 pub use crate::PERSISTENT_AFTER;
 
 /// The durable health record. All fields default so an absent/corrupt file reads as

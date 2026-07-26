@@ -38,7 +38,7 @@ pub const TRUST_RUSTUP_TOOLCHAIN_BIN: &str = ".rustup/toolchains/trust/bin";
 
 /// The gate knobs that come off the `cut` command line.
 pub struct GateOpts {
-    /// Display version being cut, e.g. "0.26" — drives the tag gates.
+    /// Release version being cut, e.g. "0.2.0" — drives the tag gates.
     pub version: String,
     /// `--arm64-only`: single-arch build; skips the x86_64 target probe.
     pub arm64_only: bool,
@@ -86,6 +86,7 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
         },
     )?;
     let gh_account = gh_auth()?;
+    locked_metadata_gate(repo)?;
     let trust_rustc = trust_rustc_probe()?;
     let universal = if opts.arm64_only {
         false
@@ -104,6 +105,60 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
     })
 }
 
+/// Prove the committed Cargo.lock already resolves the workspace without any
+/// rewrite or network access. App cuts deliberately preserve the independent
+/// source version and lockfile, so a stale lock must fail before the ledger
+/// claim rather than dirtying the tree during the expensive build.
+pub fn locked_metadata_gate(repo: &Path) -> Result<()> {
+    let lock_path = repo.join("Cargo.lock");
+    let lock_before = fs::read(&lock_path).map_err(|error| {
+        Error::new(format!(
+            "read committed Cargo.lock before release metadata check: {error}"
+        ))
+    })?;
+    let out = Command::new("cargo")
+        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .current_dir(repo)
+        .output()
+        .map_err(|error| Error::new(format!("failed to run locked Cargo metadata: {error}")))?;
+    let lock_after = match fs::read(&lock_path) {
+        Ok(bytes) => bytes,
+        Err(read_error) => {
+            fs::write(&lock_path, &lock_before).map_err(|restore_error| {
+                Error::new(format!(
+                    "Cargo.lock disappeared during locked metadata ({read_error}) and restoring \
+                     its exact prior bytes failed: {restore_error}"
+                ))
+            })?;
+            return Err(Error::new(format!(
+                "Cargo.lock disappeared during locked metadata ({read_error}); exact prior bytes \
+                 were restored"
+            )));
+        }
+    };
+    if lock_after != lock_before {
+        fs::write(&lock_path, &lock_before).map_err(|error| {
+            Error::new(format!(
+                "locked Cargo metadata changed Cargo.lock and restoring its exact prior bytes \
+                 failed: {error}"
+            ))
+        })?;
+        return Err(Error::new(
+            "locked Cargo metadata attempted to rewrite Cargo.lock; exact prior bytes were \
+             restored — refresh and commit the lock before cutting"
+                .to_string(),
+        ));
+    }
+    if !out.status.success() {
+        return Err(Error::new(format!(
+            "Cargo.lock is not an exact offline resolution of Cargo.toml — refresh and commit \
+             it before cutting: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Releases are cut ONLY on the owner's arm64 Mac (spec §6). Compile-time cfg
 /// IS the host check here: the ship binary is always built on the cutting
 /// machine via the `cargo ship` run alias — never cross-compiled, never
@@ -120,7 +175,7 @@ pub fn host_gate() -> Result<()> {
     }
 }
 
-/// Clean tree: the release commit must be EXACTLY the bump+roll+ledger
+/// Clean tree: the release commit must be EXACTLY the changelog-roll + ledger
 /// changes, and a rejected-push retry does `reset --hard` — stray local edits
 /// would be destroyed, so refuse them up front.
 pub fn clean_tree(git: &dyn GitRunner) -> Result<()> {
@@ -169,7 +224,7 @@ pub fn head_matches_origin(git: &dyn GitRunner) -> Result<String> {
     Ok(head)
 }
 
-/// Tag vX.Y must be absent BOTH locally and on origin: the publish step mints
+/// Tag vX.Y.Z must be absent BOTH locally and on origin: the publish step mints
 /// it late (spec decision 5), so any pre-existing tag means this version was
 /// already cut (or half-cut) — colliding with it would re-point a published
 /// artifact. Local and remote are checked separately because either alone can
@@ -182,8 +237,9 @@ pub fn tag_free(git: &dyn GitRunner, version: &str) -> Result<()> {
     let local = git.git(&["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")])?;
     if local.success() {
         return Err(Error::new(format!(
-            "tag {tag} already exists locally — this version was already cut (pick the \
-             next version, or delete the stale tag if that cut was abandoned)"
+            "tag {tag} already exists locally — this version was already cut (bump \
+             [workspace.package] version's MINOR in Cargo.toml, or delete the stale \
+             tag if that cut was abandoned)"
         )));
     }
     let remote = git_ok(
@@ -193,7 +249,7 @@ pub fn tag_free(git: &dyn GitRunner, version: &str) -> Result<()> {
     if !remote.stdout_utf8().trim().is_empty() {
         return Err(Error::new(format!(
             "tag {tag} already exists on origin — v{version} was already cut/published \
-             elsewhere"
+             elsewhere; bump [workspace.package] version's MINOR in Cargo.toml"
         )));
     }
     Ok(())

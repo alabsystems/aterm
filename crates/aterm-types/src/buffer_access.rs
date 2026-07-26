@@ -50,6 +50,34 @@ pub trait BufferAccess {
         false
     }
 
+    /// WIDE-CONTINUATION flags for one whole line, one entry per column:
+    /// `true` where the cell is the SECOND half of a double-width character.
+    ///
+    /// Batched on purpose. A double-width char stores a literal `' '` in its
+    /// continuation cell, so any consumer that classifies characters — vi's
+    /// word motions, most obviously — reads a CJK run as alternating glyph and
+    /// space and chops it into single-glyph "words". Probing that per column
+    /// through [`Self::is_wide`] would re-materialize a scrollback row once per
+    /// cell, which is exactly the quadratic the callers' line caches exist to
+    /// avoid; returning the whole line lets them pay ONE materialization and
+    /// cache the answer beside the text.
+    ///
+    /// The default derives the flags from [`Self::is_wide`], which is correct
+    /// for any implementation but pays that per-cell cost — implementations
+    /// with row-level flags should override it. `None` means "no information",
+    /// and callers must treat every cell as a non-continuation.
+    fn line_wide_continuations(&self, line: i32) -> Option<Vec<bool>> {
+        let cols = self.cols();
+        if cols == 0 {
+            return None;
+        }
+        Some(
+            (0..cols)
+                .map(|c| c > 0 && self.is_wide(line, c - 1))
+                .collect(),
+        )
+    }
+
     /// Current display offset (0 = live view, >0 = scrolled back).
     ///
     /// Default implementation returns 0 (no scrollback offset). Override

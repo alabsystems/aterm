@@ -31,6 +31,9 @@ mod ledger;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
+#[path = "../src/mirror.rs"]
+#[allow(dead_code)]
+mod mirror;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
@@ -43,13 +46,11 @@ mod verify;
 
 use aterm_spec::derive::{
     Model, release_channel_floor_model, release_channel_single_head_model,
-    release_historical_recovery_model, release_key_epoch_transition_model,
     release_published_identity_model, release_yank_successor_first_model,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use ledger::{GitRunner, RunOut};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Mutex;
 
@@ -378,7 +379,7 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
     let _ = std::fs::remove_file(&path);
     let journal = publish::Journal {
         format: publish::JOURNAL_FORMAT,
-        version: "0.55".into(),
+        version: "0.55.0".into(),
         build_number: 3,
         commit: "0123456789abcdef0123456789abcdef01234567".into(),
         min_build: Some(2),
@@ -389,6 +390,9 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         release_id: Some(55),
         draft_create_issued: true,
         upload_intents: Vec::new(),
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         done: publish::STEPS
             .iter()
             .take_while(|step| **step != "archive")
@@ -638,11 +642,11 @@ fn live_release_identity_conforms_to_single_head_archive_guard() {
     let model = release_channel_single_head_model();
     let commit = "a".repeat(40);
     let expected = publish::ExpectedReleaseIdentity {
-        version: "0.2",
+        version: "0.2.0",
         build: 2,
         commit: &commit,
     };
-    let manifest = release_manifest("0.2", 2, &commit, "aterm-0.2.dmg");
+    let manifest = release_manifest("0.2.0", 2, &commit, "aterm-0.2.0.dmg");
 
     let real = publish::validate_live_release_identity(
         expected,
@@ -670,19 +674,19 @@ fn live_release_identity_conforms_to_single_head_archive_guard() {
     for (label, bad) in [
         (
             "archive rejects wrong version",
-            release_manifest("0.3", 2, &commit, "aterm-0.2.dmg"),
+            release_manifest("0.3.0", 2, &commit, "aterm-0.2.0.dmg"),
         ),
         (
             "archive rejects wrong build",
-            release_manifest("0.2", 3, &commit, "aterm-0.2.dmg"),
+            release_manifest("0.2.0", 3, &commit, "aterm-0.2.0.dmg"),
         ),
         (
             "archive rejects wrong commit",
-            release_manifest("0.2", 2, &"b".repeat(40), "aterm-0.2.dmg"),
+            release_manifest("0.2.0", 2, &"b".repeat(40), "aterm-0.2.0.dmg"),
         ),
         (
             "archive rejects wrong DMG",
-            release_manifest("0.2", 2, &commit, "other.dmg"),
+            release_manifest("0.2.0", 2, &commit, "other.dmg"),
         ),
     ] {
         assert_live_identity_refusal(
@@ -817,449 +821,6 @@ fn live_release_identity_conforms_to_single_head_archive_guard() {
     assert!(!buggy.check_invariant("LiveIdentityGuardCannotBeBypassed", &bypassed));
 }
 
-/// Tier-1 binds the committed one-shot authority, updater binary pin, exact
-/// current-key signature, archived epoch-2 history, and activation boundary to
-/// `ReleaseKeyEpochTransition`. Negative controls prove malformed authority,
-/// substituted keys, unsigned activation, and generic rotation remain rejected.
-#[test]
-fn key_epoch_authority_refines_one_shot_transition_model() {
-    fn fingerprint(bytes: &[u8]) -> String {
-        Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    }
-
-    let current = Ed25519KeyPair::from_seed_unchecked(&[42_u8; 32]).unwrap();
-    let retired = Ed25519KeyPair::from_seed_unchecked(&[43_u8; 32]).unwrap();
-    let current_key = B64.encode(current.public_key().as_ref());
-    let retired_key = B64.encode(retired.public_key().as_ref());
-    let retired_manifest = b"exact retired-epoch evidence bytes";
-    let retired_signature = retired.sign(retired_manifest).as_ref().to_vec();
-    let authority_text = format!(
-        "schema = 1\nepoch = 2\nactivation_version = \"0.55\"\n\
-         current_pubkey = \"{current_key}\"\ncurrent_fingerprint_sha256 = \"{}\"\n\
-         retired_epoch = 1\nretired_pubkey = \"{retired_key}\"\n\
-         retired_fingerprint_sha256 = \"{}\"\n\
-         retired_evidence_tag = \"v0.26\"\n\
-         retired_manifest_asset_id = 7\n\
-         retired_manifest_size = {}\n\
-         retired_manifest_sha256 = \"{}\"\n\
-         retired_signature_asset_id = 8\n\
-         retired_signature_size = {}\n\
-         retired_signature_sha256 = \"{}\"\n\
-         transition_reason = \"lost-private-key\"\n\
-         old_pinned_clients_require_manual_bootstrap = true\n",
-        fingerprint(current.public_key().as_ref()),
-        fingerprint(retired.public_key().as_ref()),
-        retired_manifest.len(),
-        fingerprint(retired_manifest),
-        retired_signature.len(),
-        fingerprint(&retired_signature),
-    );
-    let fixture_authority = publish::parse_channel_signing_authority(&authority_text)
-        .expect("independent cryptographic fixture authority must validate");
-
-    // The model's identity constants project from the exact committed production
-    // authority. Fixture keys exercise signing without ever embedding production
-    // private material; production and every deterministic fixture must differ.
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let committed_text =
-        std::fs::read_to_string(repo.join(publish::CHANNEL_SIGNING_AUTHORITY_FILE))
-            .expect("committed channel signing authority");
-    let authority = publish::parse_channel_signing_authority(&committed_text)
-        .expect("committed epoch authority must parse and fingerprint exactly");
-    assert_eq!(
-        authority.current_pubkey,
-        "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8="
-    );
-    assert_eq!(
-        authority.current_fingerprint_sha256,
-        "529d8b60583fdc58b13afdba7050de6b21c0740b86dd87e5af769a2afb6c30f4"
-    );
-    assert_eq!(
-        authority.retired_pubkey,
-        "D4Wh30llPpreRKNfFXs7pjXl0jUXMIZxgf6F9+U/24U="
-    );
-    assert_eq!(
-        authority.retired_fingerprint_sha256,
-        "b8d47d9179feb56b1cbbe61c000b81f18d1ac152507d8abd320e2a2297890f1f"
-    );
-    for fixture_key in [&current_key, &retired_key] {
-        assert_ne!(
-            authority.current_pubkey, *fixture_key,
-            "production update authority must never reuse a deterministic test key"
-        );
-    }
-
-    let model = release_key_epoch_transition_model();
-    let mut state = model.init_state();
-    state = tier1_step(
-        &model,
-        &state,
-        "AuthorizeLostKeyEpoch",
-        "key epoch: strict one-shot authorization",
-    );
-    publish::validate_channel_signing_authority(&authority).unwrap();
-    assert_eq!(authority.activation_version, "0.55");
-    state = tier1_step(
-        &model,
-        &state,
-        "PersistOneShotEpochRecord",
-        "key epoch: fingerprinted authority record persisted",
-    );
-
-    let retired_release = archive_release("v0.26", 7, 8);
-    publish::verify_retired_epoch_evidence_with(
-        &fixture_authority,
-        std::slice::from_ref(&retired_release),
-        |_, _, tag, name| match (tag, name) {
-            ("v0.26", manifest_out::MANIFEST_ASSET) => Ok(retired_manifest.to_vec()),
-            ("v0.26", manifest_out::MANIFEST_SIG_ASSET) => Ok(retired_signature.clone()),
-            other => panic!("unexpected retired-evidence fetch {other:?}"),
-        },
-    )
-    .expect("structured retired evidence must replay hashes and Ed25519");
-
-    let arm_report = format!(
-        "aterm diagnostics\nupdate-pin-sha256: {}\n",
-        authority.current_fingerprint_sha256
-    );
-    let x86_report = arm_report.clone();
-    buildplan::validate_slice_update_pin_reports(
-        &authority.current_fingerprint_sha256,
-        &[("arm64", &arm_report), ("x86_64", &x86_report)],
-    )
-    .expect("every shipping slice must report the exact current pin");
-    state = tier1_step(
-        &model,
-        &state,
-        "BuildV055WithPersistedPin",
-        "key epoch: binary embeds exact current authority",
-    );
-
-    let manifest55 = b"exact v0.55 manifest bytes";
-    let signature55 = current.sign(manifest55).as_ref().to_vec();
-    let activation = archive_release("v0.55", 1, 2);
-    assert!(
-        publish::verify_epoch_channel_head_signature_with(
-            &fixture_authority,
-            std::slice::from_ref(&activation),
-            "v0.55",
-            manifest55,
-            Some(&signature55),
-            |_, _, tag, name| match (tag, name) {
-                ("v0.55", manifest_out::MANIFEST_SIG_ASSET) => Ok(signature55.clone()),
-                other => panic!("unexpected activation fetch {other:?}"),
-            },
-        )
-        .unwrap()
-    );
-    state = tier1_step(
-        &model,
-        &state,
-        "SignV055Manifest",
-        "key epoch: exact v0.55 manifest signed by current key",
-    );
-
-    assert_eq!(
-        publish::validate_channel_epoch_target(&authority, &[], "0.55").unwrap(),
-        publish::ChannelSigningEpoch::Current
-    );
-    state = tier1_step(
-        &model,
-        &state,
-        "PublishV055Epoch",
-        "key epoch: exact activation target becomes publishable",
-    );
-    assert!(
-        publish::validate_channel_epoch_target(
-            &authority,
-            std::slice::from_ref(&activation),
-            "0.56"
-        )
-        .is_ok()
-    );
-    state = tier1_step(
-        &model,
-        &state,
-        "CloseOneShotEpoch",
-        "key epoch: activation consumed before later publications",
-    );
-    assert_eq!(state["epoch_consumed"], 1);
-
-    // Archived epoch-2 history continues to verify under the same current key.
-    let manifest56 = b"exact v0.56 manifest bytes";
-    let signature56 = current.sign(manifest56).as_ref().to_vec();
-    let archived55 = publish::AppcastRelease {
-        release_id: 3,
-        tag: "v0.55".into(),
-        draft: false,
-        target_commitish: "a".repeat(40),
-        assets: vec![
-            publish::AppcastAsset {
-                id: 3,
-                name: manifest_out::archived_manifest_asset("v0.55"),
-            },
-            publish::AppcastAsset {
-                id: 4,
-                name: manifest_out::archived_manifest_signature_asset("v0.55"),
-            },
-        ],
-    };
-    let head56 = archive_release("v0.56", 5, 6);
-    assert!(
-        publish::verify_epoch_channel_head_signature_with(
-            &fixture_authority,
-            &[archived55.clone(), head56.clone()],
-            "v0.56",
-            manifest56,
-            Some(&signature56),
-            |_, _, tag, name| match (tag, name) {
-                ("v0.56", manifest_out::MANIFEST_SIG_ASSET) => Ok(signature56.clone()),
-                ("v0.55", name) if name == manifest_out::archived_manifest_asset("v0.55") => {
-                    Ok(manifest55.to_vec())
-                }
-                ("v0.55", name)
-                    if name == manifest_out::archived_manifest_signature_asset("v0.55") =>
-                {
-                    Ok(signature55.clone())
-                }
-                other => panic!("unexpected archived epoch fetch {other:?}"),
-            },
-        )
-        .unwrap()
-    );
-
-    // NEGATIVE CONTROLS: the production seams reject each modeled mutant.
-    let bad_fingerprint =
-        committed_text.replace(&authority.current_fingerprint_sha256, &"0".repeat(64));
-    assert!(publish::parse_channel_signing_authority(&bad_fingerprint).is_err());
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let retired_without_replacement =
-        buggy.successors("RetireOldWithoutReplacement", &model.init_state())[0].clone();
-    assert!(!model.check_invariant(
-        "RetirementIsAtomicWithReplacement",
-        &retired_without_replacement
-    ));
-
-    assert!(
-        buildplan::validate_slice_update_pin_reports(
-            &authority.current_fingerprint_sha256,
-            &[("arm64", "aterm diagnostics\n")],
-        )
-        .is_err()
-    );
-    let wrong_slice = format!(
-        "update-pin-sha256: {}\n",
-        authority.retired_fingerprint_sha256
-    );
-    assert!(
-        buildplan::validate_slice_update_pin_reports(
-            &authority.current_fingerprint_sha256,
-            &[("arm64", &arm_report), ("x86_64", &wrong_slice)],
-        )
-        .is_err()
-    );
-    assert!(
-        publish::verify_retired_epoch_evidence_with(
-            &fixture_authority,
-            std::slice::from_ref(&retired_release),
-            |_, _, _, name| {
-                if name.ends_with(".sig") {
-                    Ok(retired_signature.clone())
-                } else {
-                    Ok(b"substituted retired manifest".to_vec())
-                }
-            },
-        )
-        .is_err()
-    );
-    let replaced_retired_asset = archive_release("v0.26", 70, 8);
-    assert!(
-        publish::verify_retired_epoch_evidence_with(
-            &fixture_authority,
-            std::slice::from_ref(&replaced_retired_asset),
-            |_, _, _, _| unreachable!("asset-ID replacement must fail before byte fetch"),
-        )
-        .is_err()
-    );
-    let phase2 = model.successors(
-        "PersistOneShotEpochRecord",
-        &model.successors("AuthorizeLostKeyEpoch", &model.init_state())[0],
-    )[0]
-    .clone();
-    let wrong_pin = buggy.successors("BuildV055WithWrongPin", &phase2)[0].clone();
-    let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &phase2,
-        &wrong_pin,
-        Some("BuildV055WithWrongPin"),
-        "key epoch: reject wrong embedded pin",
-    );
-    assert!(!admitted);
-
-    let wrong_signature = retired.sign(manifest55).as_ref().to_vec();
-    assert!(
-        publish::verify_epoch_channel_head_signature_with(
-            &fixture_authority,
-            std::slice::from_ref(&activation),
-            "v0.55",
-            manifest55,
-            Some(&wrong_signature),
-            |_, _, _, _| Ok(wrong_signature.clone()),
-        )
-        .is_err()
-    );
-    let phase3 = model.successors("BuildV055WithPersistedPin", &phase2)[0].clone();
-    let substituted = buggy.successors("SignWithSubstitutedKey", &phase3)[0].clone();
-    assert!(!model.check_invariant("KeyIdentityCannotChangeSilently", &substituted));
-
-    let unsigned_activation = publish::AppcastRelease {
-        release_id: 7,
-        tag: "v0.55".into(),
-        draft: false,
-        target_commitish: "a".repeat(40),
-        assets: vec![publish::AppcastAsset {
-            id: 7,
-            name: manifest_out::MANIFEST_ASSET.into(),
-        }],
-    };
-    assert!(
-        publish::verify_epoch_channel_head_signature_with(
-            &fixture_authority,
-            &[unsigned_activation],
-            "v0.55",
-            manifest55,
-            None,
-            |_, _, _, _| unreachable!(),
-        )
-        .is_err()
-    );
-    let unsigned = buggy.successors("PublishUnsignedV055", &phase3)[0].clone();
-    assert!(!model.check_invariant("UnsignedEpochCannotPublish", &unsigned));
-
-    // Out-of-band v0.56 metadata cannot stand in for the exact v0.55 activation.
-    assert!(publish::validate_channel_epoch_target(&authority, &[head56], "0.57").is_err());
-    assert!(publish::validate_channel_epoch_target(&authority, &[], "0.54").is_err());
-    let generic_authority = committed_text.replace("epoch = 2", "epoch = 3");
-    assert!(publish::parse_channel_signing_authority(&generic_authority).is_err());
-    let generic = buggy.successors("GenericRotateAfterClose", &state)[0].clone();
-    assert!(!model.check_invariant("EpochIsOneShot", &generic));
-}
-
-/// Tier-1 binds the real epoch selector to the recovery-only state machine.
-/// The same v0.54 target rejected by publication remains safely convergent as
-/// either cleanup-only state or exact already-published retired-key state.
-#[test]
-fn historical_recovery_policy_refines_nonpublishing_model() {
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let authority = publish::load_channel_signing_authority(&repo).unwrap();
-    assert!(publish::validate_channel_epoch_target(&authority, &[], "0.54").is_err());
-
-    let model = release_historical_recovery_model();
-    let unpublished = publish::select_recovery_signature_policy(
-        &authority,
-        &[],
-        "0.54",
-        verify::ReleaseState::Absent,
-    )
-    .unwrap();
-    assert_eq!(
-        unpublished,
-        (
-            publish::RecoveryEpochMode::RetiredNonPublishingOnly,
-            false,
-            None,
-        )
-    );
-    assert_eq!(
-        publish::absent_draft_decision(Some(false)),
-        publish::AbsentDraftDecision::AbandonProvenNoPost
-    );
-    for ambiguous in [Some(true), None] {
-        assert_eq!(
-            publish::absent_draft_decision(ambiguous),
-            publish::AbsentDraftDecision::RetainOwnerAwaitVisibility
-        );
-    }
-    let no_post = tier1_step(
-        &model,
-        &model.init_state(),
-        "LearnNoPostFromCurrentJournal",
-        "historical recovery: current v5 journal proves no create POST",
-    );
-    let abandoned = tier1_step(
-        &model,
-        &no_post,
-        "AbandonProvenNoPost",
-        "historical recovery: proven-no-POST absence is safely abandoned",
-    );
-    assert_eq!(abandoned["owner_held"], 0);
-
-    let signed_release = archive_release("v0.54", 54, 55);
-    let signed = publish::select_recovery_signature_policy(
-        &authority,
-        std::slice::from_ref(&signed_release),
-        "0.54",
-        verify::ReleaseState::Published,
-    )
-    .unwrap();
-    assert_eq!(
-        signed.0,
-        publish::RecoveryEpochMode::RetiredNonPublishingOnly
-    );
-    assert!(signed.1);
-    assert_eq!(signed.2.as_deref(), Some(authority.retired_pubkey.as_str()));
-    let observed = tier1_step(
-        &model,
-        &model.init_state(),
-        "ObserveSignedPublishedLegacy",
-        "historical recovery: published signature selects exact retired public key",
-    );
-    let finished = tier1_step(
-        &model,
-        &observed,
-        "FinishSignedPublishedLegacy",
-        "historical recovery: only post-publication bookkeeping converges",
-    );
-    assert_eq!(finished["owner_held"], 0);
-
-    let unsigned_release = publish::AppcastRelease {
-        release_id: 54,
-        tag: "v0.54".into(),
-        draft: false,
-        target_commitish: "a".repeat(40),
-        assets: vec![publish::AppcastAsset {
-            id: 54,
-            name: manifest_out::MANIFEST_ASSET.into(),
-        }],
-    };
-    let unsigned = publish::select_recovery_signature_policy(
-        &authority,
-        &[unsigned_release],
-        "0.54",
-        verify::ReleaseState::Published,
-    )
-    .unwrap();
-    assert!(!unsigned.1);
-    assert!(unsigned.2.is_none());
-
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let republished =
-        buggy.successors("RepublishLegacyDuringRecovery", &model.init_state())[0].clone();
-    assert!(!model.check_invariant("RecoveryNeverPublishesRetiredEpoch", &republished));
-    let signed_observed =
-        buggy.successors("ObserveSignedPublishedLegacy", &model.init_state())[0].clone();
-    let wrong_key =
-        buggy.successors("FinishSignedLegacyWithCurrentKey", &signed_observed)[0].clone();
-    assert!(!model.check_invariant("SignedLegacyUsesOnlyRetiredKey", &wrong_key));
-    let unsafe_absent = buggy.successors("AbandonUnknownAbsent", &model.init_state())[0].clone();
-    assert!(!buggy.check_invariant("AmbiguousAbsenceRetainsOwner", &unsafe_absent));
-    assert!(!buggy.check_invariant("NoDelayedDraftAfterUnlock", &unsafe_absent));
-}
-
 /// Tier-1 binds the model's symbolic-target distinction to the real immutable
 /// release snapshot and exact historical tag resolver. The old
 /// target-equals-manifest mutant is retained as an explicit negative control.
@@ -1368,8 +929,8 @@ fn yank_published(tag: &str, build: u64, min_build: Option<u64>) -> verify::Publ
 #[test]
 fn yank_successor_decision_refines_successor_first_model() {
     let model = release_yank_successor_first_model();
-    let bad = yank_published("v0.54", 54, None);
-    let successor = yank_published("v0.55", 55, Some(55));
+    let bad = yank_published("v0.54.0", 54, None);
+    let successor = yank_published("v0.55.0", 55, Some(55));
     assert!(verify::yank_successor_covers(&bad, &successor).unwrap());
     let before = model.init_state();
     let published = tier1_step(
@@ -1400,12 +961,26 @@ fn yank_successor_decision_refines_successor_first_model() {
     );
     assert!(model.action_enabled("DeleteExactTagAfterSuccessor", &reproved));
 
-    let weak_floor = yank_published("v0.55", 55, Some(54));
+    let weak_floor = yank_published("v0.55.0", 55, Some(54));
     assert!(!verify::yank_successor_covers(&bad, &weak_floor).unwrap());
-    let stale_order = yank_published("v0.53", 56, Some(55));
+    let stale_order = yank_published("v0.53.0", 56, Some(55));
     assert!(!verify::yank_successor_covers(&bad, &stale_order).unwrap());
-    let stale_build = yank_published("v0.55", 54, Some(55));
+    let stale_build = yank_published("v0.55.0", 54, Some(55));
     assert!(verify::yank_successor_covers(&bad, &stale_build).is_err());
+
+    // A retired two-component release is inert archive history no client
+    // selects: it is refused as target AND as successor, so a non-orderable
+    // identity can never license a deletion.
+    let retired = yank_published("v0.61", 61, Some(61));
+    for (bad_end, successor_end) in [(&bad, &retired), (&retired, &successor)] {
+        let error = verify::yank_successor_covers(bad_end, successor_end)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("retired two-component release"),
+            "retired release was ordered instead of refused: {error}"
+        );
+    }
 
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let weak = buggy.successors("DeleteTagWithWeakFloor", &before)[0].clone();
@@ -1428,10 +1003,10 @@ fn yank_successor_decision_refines_successor_first_model() {
     );
     assert!(buggy_admitted, "mutant did not admit weak floor: {why}");
 
-    let overflow = yank_published("v0.54", u64::MAX, None);
+    let overflow = yank_published("v0.54.0", u64::MAX, None);
     assert!(verify::yank_successor_covers(&overflow, &successor).is_err());
     let mut mismatched = successor;
-    mismatched.version = "0.56".into();
+    mismatched.version = "0.56.0".into();
     assert!(verify::yank_successor_covers(&bad, &mismatched).is_err());
 }
 
@@ -1442,14 +1017,14 @@ fn yank_successor_decision_refines_successor_first_model() {
 fn archive_executor_refines_identity_preserving_single_head_transitions() {
     let model = release_channel_single_head_model();
     let releases = vec![
-        archive_release("v0.2", 1, 2),
-        archive_release("v0.1", 11, 12),
-        archive_release("v0.0", 21, 22),
+        archive_release("v0.2.0", 1, 2),
+        archive_release("v0.1.0", 11, 12),
+        archive_release("v0.0.0", 21, 22),
     ];
     let mut remote = IdentityArchiveRemote::new(releases.clone());
     let ids_before = remote.ids();
     assert_eq!(
-        publish::converge_appcast_archive(&mut remote, "v0.2").unwrap(),
+        publish::converge_appcast_archive(&mut remote, "v0.2.0").unwrap(),
         4
     );
     assert_eq!(remote.ids(), ids_before, "metadata PATCH must preserve IDs");
@@ -1486,7 +1061,7 @@ fn archive_executor_refines_identity_preserving_single_head_transitions() {
 
     let mut replacement = IdentityArchiveRemote::new(releases);
     replacement.replace_object_mutant = true;
-    let error = publish::converge_appcast_archive(&mut replacement, "v0.2")
+    let error = publish::converge_appcast_archive(&mut replacement, "v0.2.0")
         .unwrap_err()
         .to_string();
     assert!(

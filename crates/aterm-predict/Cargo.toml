@@ -9,6 +9,13 @@ repository.workspace = true
 description = "aterm predictive local echo — the mosh-modeled, pure, clock-injected speculative-typing state machine, extracted from aterm-gui so the native GUI and the web embedders (aterm-wasm / aterm-gpu-web) drive ONE implementation."
 
 [dependencies]
+# The ONE width authority in the workspace. Which characters are predictable is a
+# WIDTH question (one cell, self-echoing) — accented Latin letters echo exactly like
+# ASCII, combining marks alter the cell to their left, CJK/emoji take two — and a
+# second hand-rolled range table here would be a second source of truth that drifts
+# from the grid's. Already inside the pinned wasm process closure, so this edge adds
+# no crate to the web builds.
+aterm-grapheme = { workspace = true }
 # The engine-wide injected-clock idiom: EXACTLY std::time::Instant on native
 # (byte-identical to the pre-extraction aterm-gui build), a JS clock on wasm32 —
 # the state machine stays clockless (the host injects `now`), but wasm hosts

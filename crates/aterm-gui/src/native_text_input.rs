@@ -157,6 +157,29 @@ impl TextInputState {
         self.preedit = None;
     }
 
+    /// Caret one WORD left (⌥← / ⌥B). Mirrors [`Self::move_left`]'s
+    /// selection discipline exactly — only the step differs.
+    pub(crate) fn move_word_left(&mut self, extend: bool) {
+        let head = previous_word_boundary(&self.value, self.selection.head);
+        if extend {
+            self.selection.head = head;
+        } else {
+            self.selection = TextSelection::caret(head);
+        }
+        self.preedit = None;
+    }
+
+    /// Caret one WORD right (⌥→ / ⌥F), landing at the END of the next word.
+    pub(crate) fn move_word_right(&mut self, extend: bool) {
+        let head = next_word_boundary(&self.value, self.selection.head);
+        if extend {
+            self.selection.head = head;
+        } else {
+            self.selection = TextSelection::caret(head);
+        }
+        self.preedit = None;
+    }
+
     /// Caret to the start of the value (readline/macOS Ctrl-A); `extend` keeps
     /// the anchor so Shift-variants grow the selection instead.
     pub(crate) fn move_to_start(&mut self, extend: bool) {
@@ -393,6 +416,27 @@ fn previous_word_boundary(text: &str, position: usize) -> usize {
     nearest_boundary(text, start)
 }
 
+/// The forward twin of [`previous_word_boundary`]: skip any whitespace at the
+/// caret, then the run of non-whitespace after it — i.e. land at the END of the
+/// next word.
+///
+/// END, not start: that is what readline's `forward-word`, emacs, Terminal.app
+/// and iTerm2 all do, and it is the half of the pair that makes ⌥→ then ⌥←
+/// return you to where you began. (zsh's own `forward-word` lands on the START
+/// of the next word instead, which is the asymmetry the 2026-07-24 audit was
+/// asked about — but that is the shell's rule for the terminal, not this
+/// field's.) Clamped to a grapheme boundary so a cluster is never split.
+fn next_word_boundary(text: &str, position: usize) -> usize {
+    let start = nearest_boundary(text, position);
+    let after = &text[start..];
+    let ws = after.len() - after.trim_start().len();
+    let rest = &after[ws..];
+    let word = rest
+        .find(char::is_whitespace)
+        .unwrap_or(rest.len());
+    nearest_boundary(text, start + ws + word)
+}
+
 fn next_grapheme(text: &str, position: usize) -> usize {
     let position = nearest_boundary(text, position);
     if position >= text.len() {
@@ -549,5 +593,61 @@ mod tests {
         assert!(input.value().len() <= MAX_TEXT_INPUT_BYTES);
         assert!(input.value().is_char_boundary(input.value().len()));
         assert!(!input.value().ends_with('e'));
+    }
+
+    /// WORD MOTION in Settings fields (2026-07-24 audit: there was none). ⌥→
+    /// lands at the END of the next word — readline / emacs / Terminal.app /
+    /// iTerm2 semantics — which is precisely what makes ⌥→ then ⌥← a
+    /// round-trip. (zsh's own `forward-word` goes to the START of the next
+    /// word; that asymmetry is the shell's rule for the TERMINAL, and is not
+    /// what a Cocoa text field should do.)
+    #[test]
+    fn alt_word_motion_walks_whole_words_and_round_trips() {
+        let mut input = TextInputState::new("hello brave world".into());
+        input.set_selection(0, 0);
+
+        input.move_word_right(false);
+        assert_eq!(input.selection().head, 5, "⌥→ must land at the END of 'hello'");
+        input.move_word_right(false);
+        assert_eq!(input.selection().head, 11, "⌥→ must cross to the end of 'brave'");
+
+        // ROUND TRIP: back over the word we just crossed.
+        input.move_word_left(false);
+        assert_eq!(input.selection().head, 6, "⌥← must land at the START of 'brave'");
+
+        // Clamped at both ends — no panic, no runaway.
+        input.set_selection(0, 0);
+        input.move_word_left(false);
+        assert_eq!(input.selection().head, 0, "⌥← at the start is inert");
+        let end = input.value().len();
+        input.set_selection(end, end);
+        input.move_word_right(false);
+        assert_eq!(input.selection().head, end, "⌥→ at the end is inert");
+
+        // `extend` grows the selection instead of collapsing it.
+        input.set_selection(0, 0);
+        input.move_word_right(true);
+        assert!(!input.selection().is_caret(), "shift-⌥→ must select, not just move");
+        assert_eq!(input.selection().head, 5);
+    }
+
+    /// The motions must never split a grapheme cluster — the same law
+    /// `delete_word_backward` obeys.
+    #[test]
+    fn alt_word_motion_respects_grapheme_clusters() {
+        let mut input = TextInputState::new("héllo wörld".into());
+        input.set_selection(0, 0);
+        input.move_word_right(false);
+        let head = input.selection().head;
+        assert!(
+            input.value().is_char_boundary(head),
+            "⌥→ landed inside a multi-byte character at {head}"
+        );
+        input.move_word_left(false);
+        let back = input.selection().head;
+        assert!(
+            input.value().is_char_boundary(back),
+            "⌥← landed inside a multi-byte character at {back}"
+        );
     }
 }

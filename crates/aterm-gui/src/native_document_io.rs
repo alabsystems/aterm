@@ -134,6 +134,11 @@ pub(crate) fn detect_version_conflict(
     None
 }
 
+fn content_is_equivalent(expected: ObservedFileVersion, actual: ObservedFileVersion) -> bool {
+    expected.exists == actual.exists
+        && (!expected.exists || (expected.len == actual.len && expected.content == actual.content))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FileWatchInput {
     pub(crate) baseline: ObservedFileVersion,
@@ -145,6 +150,13 @@ pub(crate) struct FileWatchInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileWatchReduction {
     Unchanged,
+    /// The host observed the exact same content through the still-valid file
+    /// capability, but the target's identity or metadata token advanced (for
+    /// example, an atomic replace with byte-identical contents). Rebind only
+    /// the save baseline; a dirty in-memory draft must remain untouched.
+    RebindEquivalent {
+        change: VersionConflict,
+    },
     /// The canonical document is clean, so the observed bytes may atomically
     /// replace it and become the new save baseline.
     ReloadClean {
@@ -169,6 +181,12 @@ pub(crate) fn reduce_file_watch(input: FileWatchInput) -> FileWatchReduction {
     };
     if input.save_in_flight {
         FileWatchReduction::DeferredSaving { change }
+    } else if content_is_equivalent(input.baseline, input.observed) {
+        // `detect_version_conflict` still makes identity/metadata decisive for
+        // a save CAS. This narrower watch verdict is safe only after the host
+        // has revalidated the existing path/symlink capability, and it never
+        // authorizes a write by itself.
+        FileWatchReduction::RebindEquivalent { change }
     } else if input.document_dirty {
         FileWatchReduction::ConflictDirty { change }
     } else {
@@ -224,9 +242,21 @@ pub(crate) enum AtomicSaveResult {
     Committed(AtomicSaveProof),
     Conflict {
         observed: ObservedFileVersion,
+        /// The host revalidated the original logical path/symlink capability
+        /// after observing this conflict. Only such a conflict may use the
+        /// byte-equivalent baseline-rebind path.
+        equivalent_rebind_allowed: bool,
     },
     Failed {
         stage: AtomicSaveStage,
+        message: String,
+    },
+    /// Replacement may already be visible, but the host could not complete its
+    /// durability/content proof. The reducer must retain the old baseline and
+    /// refuse another save until an explicit disk observation reconciles it.
+    PublishedUnverified {
+        stage: AtomicSaveStage,
+        observed: Option<ObservedFileVersion>,
         message: String,
     },
     Cancelled,
@@ -266,6 +296,12 @@ pub(crate) enum SavePhase {
         stage: AtomicSaveStage,
         message: String,
     },
+    ReconcileRequired {
+        expected: ObservedFileVersion,
+        observed: Option<ObservedFileVersion>,
+        stage: AtomicSaveStage,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -273,13 +309,25 @@ pub(crate) enum SaveError {
     WrongDocument,
     GenerationExhausted,
     SaveInFlight,
+    ConflictRequiresReconcile,
+    ReconcileRequired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SaveReduction {
     Durable(DurableCheckpoint),
+    /// Preflight observed the same disk bytes through a newer regular-file
+    /// generation. The baseline is rebound and the draft remains dirty; the
+    /// caller may immediately offer a fresh, generation-bound Save.
+    ReboundEquivalent(VersionConflict),
     Conflict(VersionConflict),
     Failed {
+        stage: AtomicSaveStage,
+        message: String,
+    },
+    ReconcileRequired {
+        expected: ObservedFileVersion,
+        observed: Option<ObservedFileVersion>,
         stage: AtomicSaveStage,
         message: String,
     },
@@ -323,6 +371,12 @@ impl SaveReducer {
     pub(crate) fn begin(&mut self, snapshot: &DocumentSnapshot) -> Result<SavePlan, SaveError> {
         if snapshot.id != self.document {
             return Err(SaveError::WrongDocument);
+        }
+        if matches!(self.phase, SavePhase::Conflict { .. }) {
+            return Err(SaveError::ConflictRequiresReconcile);
+        }
+        if matches!(self.phase, SavePhase::ReconcileRequired { .. }) {
+            return Err(SaveError::ReconcileRequired);
         }
         let generation = SaveGeneration(self.allocate_generation()?);
         let bytes: Arc<[u8]> = Arc::from(snapshot.text.as_bytes());
@@ -392,13 +446,31 @@ impl SaveReducer {
                     source: DurableSource::AtomicFile,
                 })
             }
-            AtomicSaveResult::Conflict { observed } => {
-                let Some(kind) = detect_version_conflict(plan.expected, observed) else {
+            AtomicSaveResult::Conflict {
+                observed,
+                equivalent_rebind_allowed,
+            } => {
+                let detected = detect_version_conflict(plan.expected, observed);
+                if !equivalent_rebind_allowed {
+                    let kind = detected.unwrap_or(VersionConflict::Identity);
+                    self.phase = SavePhase::Conflict {
+                        expected: plan.expected,
+                        actual: observed,
+                        kind,
+                    };
+                    return SaveReduction::Conflict(kind);
+                }
+                let Some(kind) = detected else {
                     return self.fail(
                         AtomicSaveStage::Preflight,
                         "host reported a conflict for an unchanged target".to_string(),
                     );
                 };
+                if content_is_equivalent(plan.expected, observed) {
+                    self.observed = observed;
+                    self.phase = SavePhase::Idle;
+                    return SaveReduction::ReboundEquivalent(kind);
+                }
                 self.phase = SavePhase::Conflict {
                     expected: plan.expected,
                     actual: observed,
@@ -407,6 +479,24 @@ impl SaveReducer {
                 SaveReduction::Conflict(kind)
             }
             AtomicSaveResult::Failed { stage, message } => self.fail(stage, message),
+            AtomicSaveResult::PublishedUnverified {
+                stage,
+                observed,
+                message,
+            } => {
+                self.phase = SavePhase::ReconcileRequired {
+                    expected: plan.expected,
+                    observed,
+                    stage,
+                    message: message.clone(),
+                };
+                SaveReduction::ReconcileRequired {
+                    expected: plan.expected,
+                    observed,
+                    stage,
+                    message,
+                }
+            }
             AtomicSaveResult::Cancelled => {
                 self.phase = SavePhase::Idle;
                 SaveReduction::Cancelled
@@ -728,6 +818,9 @@ pub(crate) struct JournalAppendPlan {
     pub(crate) generation: JournalGeneration,
     pub(crate) base_durable: Seq,
     pub(crate) target_seq: Seq,
+    /// Exact durable journal image observed by the host that scheduled this
+    /// plan. `None` is a pure reducer plan and must be bound before filesystem I/O.
+    pub(crate) expected_image: Option<ContentFingerprint>,
     pub(crate) bytes: Arc<[u8]>,
     pub(crate) encoded_fingerprint: ContentFingerprint,
 }
@@ -736,6 +829,7 @@ pub(crate) struct JournalAppendPlan {
 pub(crate) struct JournalAppendProof {
     pub(crate) appended_len: usize,
     pub(crate) encoded_fingerprint: ContentFingerprint,
+    pub(crate) published_image: ContentFingerprint,
     pub(crate) file_synced: bool,
     pub(crate) renamed_over_journal: bool,
     pub(crate) directory_synced: bool,
@@ -926,6 +1020,7 @@ impl DraftJournalReducer {
             generation,
             base_durable,
             target_seq,
+            expected_image: None,
             encoded_fingerprint: ContentFingerprint::of(&bytes),
             bytes,
         };
@@ -1215,7 +1310,7 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use crate::document_store::{DocumentStore, DocumentTxnOutcome, TextEdit};
-    use aterm_spec::derive::native_file_watch_model;
+    use aterm_spec::derive::{config_file_commit_cas_model, native_file_watch_model};
     use aterm_spec::interp::admits;
 
     fn snapshot(text: &str) -> (DocumentStore, DocumentId, DocumentSnapshot) {
@@ -1257,6 +1352,7 @@ mod tests {
         JournalAppendProof {
             appended_len: plan.bytes.len(),
             encoded_fingerprint: plan.encoded_fingerprint,
+            published_image: ContentFingerprint::of(&plan.bytes),
             file_synced: true,
             renamed_over_journal: true,
             directory_synced: true,
@@ -1347,6 +1443,40 @@ mod tests {
             FileWatchReduction::Unchanged
         );
 
+        let equivalent_metadata = ObservedFileVersion::observed(b"old", Some(3), Some(11));
+        let equivalent_identity = ObservedFileVersion::observed(b"old", Some(4), Some(11));
+        for equivalent in [equivalent_metadata, equivalent_identity] {
+            assert!(matches!(
+                reduce_file_watch(FileWatchInput {
+                    baseline,
+                    observed: equivalent,
+                    document_dirty: true,
+                    save_in_flight: false,
+                }),
+                FileWatchReduction::RebindEquivalent { .. }
+            ));
+            assert!(matches!(
+                reduce_file_watch(FileWatchInput {
+                    baseline,
+                    observed: equivalent,
+                    document_dirty: true,
+                    save_in_flight: true,
+                }),
+                FileWatchReduction::DeferredSaving { .. }
+            ));
+        }
+        assert!(matches!(
+            reduce_file_watch(FileWatchInput {
+                baseline,
+                observed,
+                document_dirty: true,
+                save_in_flight: false,
+            }),
+            FileWatchReduction::ConflictDirty {
+                change: VersionConflict::Content
+            }
+        ));
+
         // Negative controls: either blind reload would lose local bytes, while
         // accepting an observation mid-save would invalidate the save proof.
         assert_ne!(reduce(true, false), reduce(false, false));
@@ -1356,28 +1486,39 @@ mod tests {
         // priority model. This drives the shipping reducer, not a duplicate.
         let model = native_file_watch_model();
         for changed in [false, true] {
-            for document_dirty in [false, true] {
-                for save_in_flight in [false, true] {
-                    let reduction = reduce_file_watch(FileWatchInput {
-                        baseline,
-                        observed: if changed { observed } else { baseline },
-                        document_dirty,
-                        save_in_flight,
-                    });
-                    let verdict = match reduction {
-                        FileWatchReduction::Unchanged => 1,
-                        FileWatchReduction::ReloadClean { .. } => 2,
-                        FileWatchReduction::ConflictDirty { .. } => 3,
-                        FileWatchReduction::DeferredSaving { .. } => 4,
-                    };
-                    let mut before = model.init_state();
-                    before.insert("changed", i64::from(changed));
-                    before.insert("dirty", i64::from(document_dirty));
-                    before.insert("saving", i64::from(save_in_flight));
-                    let mut after = before.clone();
-                    after.insert("verdict", verdict);
-                    assert_eq!(admits(&model, &before, &after), Some("Resolve"));
-                    assert!(model.check_invariant("PriorityIsDeterministic", &after));
+            for equivalent in [false, true] {
+                for document_dirty in [false, true] {
+                    for save_in_flight in [false, true] {
+                        let observed = if !changed {
+                            baseline
+                        } else if equivalent {
+                            equivalent_metadata
+                        } else {
+                            observed
+                        };
+                        let reduction = reduce_file_watch(FileWatchInput {
+                            baseline,
+                            observed,
+                            document_dirty,
+                            save_in_flight,
+                        });
+                        let verdict = match reduction {
+                            FileWatchReduction::Unchanged => 1,
+                            FileWatchReduction::ReloadClean { .. } => 2,
+                            FileWatchReduction::ConflictDirty { .. } => 3,
+                            FileWatchReduction::DeferredSaving { .. } => 4,
+                            FileWatchReduction::RebindEquivalent { .. } => 5,
+                        };
+                        let mut before = model.init_state();
+                        before.insert("changed", i64::from(changed));
+                        before.insert("equivalent", i64::from(equivalent));
+                        before.insert("dirty", i64::from(document_dirty));
+                        before.insert("saving", i64::from(save_in_flight));
+                        let mut after = before.clone();
+                        after.insert("verdict", verdict);
+                        assert_eq!(admits(&model, &before, &after), Some("Resolve"));
+                        assert!(model.check_invariant("PriorityIsDeterministic", &after));
+                    }
                 }
             }
         }
@@ -1386,6 +1527,7 @@ mod tests {
         // the baseline transition.
         let mut before = model.init_state();
         before.insert("changed", 1);
+        before.insert("equivalent", 0);
         before.insert("dirty", 1);
         before.insert("saving", 1);
         let mut inverted = before.clone();
@@ -1456,6 +1598,54 @@ mod tests {
     }
 
     #[test]
+    fn published_unverified_requires_explicit_reconciliation_before_retry() {
+        let (_store, id, snapshot) = snapshot("draft");
+        let original = ObservedFileVersion::observed(b"base", Some(1), Some(1));
+        let visible = ObservedFileVersion::observed(b"draft", Some(2), Some(2));
+        let mut reducer = SaveReducer::new(id, original);
+        let plan = reducer.begin(&snapshot).unwrap();
+        let reduced = reducer.complete(
+            plan.generation,
+            AtomicSaveResult::PublishedUnverified {
+                stage: AtomicSaveStage::SyncDirectory,
+                observed: Some(visible),
+                message: "directory sync failed".to_string(),
+            },
+        );
+        assert!(matches!(
+            reduced,
+            SaveReduction::ReconcileRequired {
+                expected,
+                observed: Some(actual),
+                stage: AtomicSaveStage::SyncDirectory,
+                ..
+            } if expected == original && actual == visible
+        ));
+        assert_eq!(
+            reducer.observed(),
+            original,
+            "old baseline must not advance"
+        );
+        assert_eq!(reducer.begin(&snapshot), Err(SaveError::ReconcileRequired));
+
+        // Tier-1 projection: the shipping reducer's distinct state is exactly
+        // the model's published-but-unverified transition, and the healthy
+        // model exposes the attempted retry as an explicit rejected self-loop.
+        let model = config_file_commit_cas_model();
+        let begun = model.successors("BeginManual", &model.init_state())[0].clone();
+        let locked = model.successors("LockManual", &begun)[0].clone();
+        let indeterminate = model.successors("ResolveManualIndeterminate", &locked)[0].clone();
+        assert_eq!(indeterminate["manual_phase"], 5);
+        assert_eq!(indeterminate["manual_committed"], 0);
+        let rejected = model.successors("RetryIndeterminate", &indeterminate);
+        assert_eq!(rejected, vec![indeterminate.clone()]);
+        assert!(model.check_invariant("IndeterminateDoesNotClaimDurability", &indeterminate));
+
+        reducer.accept_observation(visible).unwrap();
+        assert_eq!(reducer.begin(&snapshot).unwrap().expected, visible);
+    }
+
+    #[test]
     fn external_change_becomes_explicit_conflict_until_user_accepts_observation() {
         let (_store, id, snapshot) = snapshot("ours");
         let original = ObservedFileVersion::observed(b"base", Some(1), Some(1));
@@ -1465,14 +1655,86 @@ mod tests {
         assert_eq!(
             reducer.complete(
                 plan.generation,
-                AtomicSaveResult::Conflict { observed: external }
+                AtomicSaveResult::Conflict {
+                    observed: external,
+                    equivalent_rebind_allowed: true,
+                }
             ),
             SaveReduction::Conflict(VersionConflict::Content)
         );
         assert_eq!(reducer.observed(), original);
+        assert_eq!(
+            reducer.begin(&snapshot),
+            Err(SaveError::ConflictRequiresReconcile),
+            "a stale conflict baseline cannot authorize a blind retry"
+        );
         reducer.accept_observation(external).unwrap();
         assert_eq!(reducer.observed(), external);
         assert_eq!(reducer.begin(&snapshot).unwrap().expected, external);
+    }
+
+    #[test]
+    fn equivalent_generation_save_conflict_rebinds_without_authorizing_stale_write() {
+        let (_store, id, snapshot) = snapshot("ours");
+        let original = ObservedFileVersion::observed(b"base", Some(1), Some(1));
+        let replaced = ObservedFileVersion::observed(b"base", Some(2), Some(2));
+
+        let mut unvalidated = SaveReducer::new(id, original);
+        let unvalidated_plan = unvalidated.begin(&snapshot).unwrap();
+        assert_eq!(
+            unvalidated.complete(
+                unvalidated_plan.generation,
+                AtomicSaveResult::Conflict {
+                    observed: original,
+                    equivalent_rebind_allowed: false,
+                }
+            ),
+            SaveReduction::Conflict(VersionConflict::Identity),
+            "same bytes cannot rebind an invalidated path or symlink capability"
+        );
+        assert_eq!(unvalidated.observed(), original);
+
+        let mut reducer = SaveReducer::new(id, original);
+        let stale_plan = reducer.begin(&snapshot).unwrap();
+        assert_eq!(
+            stale_plan.preflight(replaced),
+            Err(VersionConflict::Identity)
+        );
+        assert_eq!(
+            reducer.complete(
+                stale_plan.generation,
+                AtomicSaveResult::Conflict {
+                    observed: replaced,
+                    equivalent_rebind_allowed: true,
+                }
+            ),
+            SaveReduction::ReboundEquivalent(VersionConflict::Identity)
+        );
+        assert_eq!(reducer.observed(), replaced);
+        assert_eq!(reducer.phase(), &SavePhase::Idle);
+
+        let rebound_plan = reducer.begin(&snapshot).unwrap();
+        assert_eq!(rebound_plan.expected, replaced);
+        assert_eq!(rebound_plan.preflight(replaced), Ok(()));
+
+        // Tier-1: the save-preflight path and watch path project the same
+        // byte-equivalent rebind verdict. A true content change remains the
+        // explicit-conflict negative control above.
+        let model = native_file_watch_model();
+        let mut before = model.init_state();
+        before.insert("changed", 1);
+        before.insert("equivalent", 1);
+        before.insert("dirty", 1);
+        before.insert("saving", 0);
+        let mut after = before.clone();
+        after.insert("verdict", 5);
+        assert_eq!(admits(&model, &before, &after), Some("Resolve"));
+        assert!(model.check_invariant("PriorityIsDeterministic", &after));
+
+        let mut unsafe_conflict = before.clone();
+        unsafe_conflict.insert("verdict", 3);
+        assert_eq!(admits(&model, &before, &unsafe_conflict), None);
+        assert!(!model.check_invariant("PriorityIsDeterministic", &unsafe_conflict));
     }
 
     #[test]

@@ -36,6 +36,9 @@ mod ledger;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
+#[path = "../src/mirror.rs"]
+#[allow(dead_code)]
+mod mirror;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
@@ -80,9 +83,9 @@ fn tmpdir(name: &str) -> TestTempDir {
     TestTempDir(dir)
 }
 
-fn state(cargo_short: &str, has_section: bool, published: bool) -> RemoteState {
+fn state(current_version: &str, has_section: bool, published: bool) -> RemoteState {
     RemoteState {
-        cargo_short: cargo_short.to_string(),
+        current_version: current_version.to_string(),
         changelog_has_section: has_section,
         published,
     }
@@ -92,9 +95,12 @@ fn state(cargo_short: &str, has_section: bool, published: bool) -> RemoteState {
 // the §5 remote-derived decision table (journal absent ⇒ derive from remote)
 // ---------------------------------------------------------------------------
 
-/// The whole table in one place, spec §5's sentence as executable rows:
-/// "Cargo.toml already 0.26 + `## [0.26]` section present + no published
-/// v0.26 release ⇒ recut" — everything else is a fresh cut (or a refusal).
+/// The whole table in one place, spec §5's sentence as executable rows, under
+/// the single-version scheme: `RemoteState.current_version` IS the release
+/// version derived from `[workspace.package] version` (DEV → 0), so the
+/// default cut NEVER invents a successor. "workspace-derived version already
+/// rolled into `## [X.Y.Z]` + no published vX.Y.Z release ⇒ recut" —
+/// everything else is a fresh cut of that same version (or a refusal).
 #[test]
 fn remote_derived_cut_mode_decision_table() {
     let fresh = |v: &str| CutMode::Fresh {
@@ -104,27 +110,27 @@ fn remote_derived_cut_mode_decision_table() {
         version: v.to_string(),
     };
 
-    // (cargo_short, section?, published?, --set-version) → expectation
+    // (workspace-derived version, section?, published?, --set-version) → want
     let table: &[(&str, bool, bool, Option<&str>, CutMode)] = &[
-        // Steady state after a successful 0.25 cut: next default is 0.26.
-        ("0.25", false, false, None, fresh("0.26")),
+        // Steady state: Cargo.toml says 0.3.1, so the cut is v0.3.0 — the
+        // operator's bump is the ONLY thing that advances the version.
+        ("0.3.0", false, false, None, fresh("0.3.0")),
         // Explicit override on a clean tree.
-        ("0.25", false, false, Some("1.0"), fresh("1.0")),
-        // THE wedge signature: bump+roll landed, nothing published ⇒ recut.
-        ("0.26", true, false, None, recut("0.26")),
+        ("0.3.0", false, false, Some("1.0.0"), fresh("1.0.0")),
+        // THE wedge signature: roll+claim landed, nothing published ⇒ recut.
+        ("0.2.0", true, false, None, recut("0.2.0")),
         // Same wedge, version named explicitly ⇒ still a recut.
-        ("0.26", true, false, Some("0.26"), recut("0.26")),
-        // 0.26 fully published: a plain cut moves on to 0.27.
-        ("0.26", true, true, None, fresh("0.27")),
-        // Wedged 0.26 exists but the operator wants a different version:
+        ("0.2.0", true, false, Some("0.2.0"), recut("0.2.0")),
+        // Wedged 0.2.0 exists but the operator wants a different version:
         // their call — the tag/cut-elsewhere gates still stand.
-        ("0.26", true, false, Some("0.27"), fresh("0.27")),
+        ("0.2.0", true, false, Some("0.3.0"), fresh("0.3.0")),
         // Bumped but never rolled (no section): fresh cut of the named
         // version — the roll happens inside the claim.
-        ("0.26", false, false, Some("0.26"), fresh("0.26")),
-        // Double-digit minor arithmetic.
-        ("0.9", false, false, None, fresh("0.10")),
-        ("1.99", false, false, None, fresh("1.100")),
+        ("0.2.0", false, false, Some("0.2.0"), fresh("0.2.0")),
+        // Negative control for the RETIRED ledger-tail bump: the old default
+        // path answered fresh("0.10.0") here. There is no arithmetic left.
+        ("0.9.0", false, false, None, fresh("0.9.0")),
+        ("1.99.0", false, false, None, fresh("1.99.0")),
     ];
     for (short, section, published, set, want) in table {
         let got = verify::derive_cut_mode(&state(short, *section, *published), *set)
@@ -133,18 +139,31 @@ fn remote_derived_cut_mode_decision_table() {
     }
 }
 
-/// Re-cutting an ALREADY-PUBLISHED version by name is refused with the yank
-/// remediation — republishing under an existing version needs a deliberate
-/// recovery command, never a plain cut.
+/// Cutting twice without bumping `[workspace.package] version` is refused —
+/// by name AND on the plain default path, which is the shape the operator
+/// actually hits. The message must name the Cargo.toml bump (with the exact
+/// next version) and keep the yank escape hatch.
 #[test]
 fn recutting_a_published_version_is_refused() {
-    let err = verify::derive_cut_mode(&state("0.26", true, true), Some("0.26"))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("already published") && err.contains("yank"),
-        "{err}"
-    );
+    for set in [Some("0.2.0"), None] {
+        let err = verify::derive_cut_mode(&state("0.2.0", true, true), set)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("v0.2.0 is already published"),
+            "{set:?}: {err}"
+        );
+        assert!(
+            err.contains("bump [workspace.package] version in Cargo.toml"),
+            "{set:?}: {err}"
+        );
+        assert!(err.contains("the next release is v0.3.0"), "{set:?}: {err}");
+        assert!(err.contains("cargo ship yank <build>"), "{set:?}: {err}");
+    }
+
+    // A published version with no rolled section is the same refusal: the
+    // guard keys on "published", never on the changelog.
+    assert!(verify::derive_cut_mode(&state("0.2.0", false, true), None).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +173,7 @@ fn recutting_a_published_version_is_refused() {
 fn journal() -> Journal {
     Journal {
         format: publish::JOURNAL_FORMAT,
-        version: "0.26".into(),
+        version: "0.26.0".into(),
         build_number: 1_783_918_101,
         commit: "aed5a06caed5a06caed5a06caed5a06caed5a06c".into(),
         min_build: None,
@@ -165,6 +184,9 @@ fn journal() -> Journal {
         release_id: None,
         draft_create_issued: false,
         upload_intents: Vec::new(),
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         done: vec![],
     }
 }
@@ -187,6 +209,11 @@ fn pipeline_step_order_is_the_spec_7_order() {
             "archive",
             "cask",
             "verify",
+            // The public-channel mirror runs AFTER the private release is
+            // fully verified and BEFORE the lease is released, so a mirror
+            // failure is loud and resumable rather than a silently
+            // private-only release the fleet can never see.
+            "mirror",
             "unlock"
         ]
     );
@@ -259,13 +286,20 @@ fn current_journal_done_state_is_an_exact_canonical_prefix() {
     valid.done = STEPS[..5].iter().map(|step| (*step).to_string()).collect();
     valid.release_id = Some(55);
     valid.draft_create_issued = true;
-    valid.upload_intents = vec!["aterm-0.26.dmg".into()];
+    valid.upload_intents = vec!["aterm-0.26.0.dmg".into()];
     valid.save(&path).unwrap();
     assert_eq!(Journal::load(&path).unwrap().unwrap(), valid);
 
-    let mut malformed_identity = journal();
-    malformed_identity.version = "0.26.1".into();
-    assert!(malformed_identity.save(&path).is_err());
+    // The retired two-component spelling is no longer a version this cutter
+    // will journal — a current-format journal carries canonical X.Y.Z only.
+    for malformed in ["0.26", "v0.26.0", "0.26.0.1", "01.26.0"] {
+        let mut malformed_identity = journal();
+        malformed_identity.version = malformed.into();
+        assert!(
+            malformed_identity.save(&path).is_err(),
+            "{malformed:?} must not reach disk"
+        );
+    }
     let mut malformed_owner = journal();
     malformed_owner.commit = "abcd".into();
     assert!(malformed_owner.save(&path).is_err());
@@ -278,7 +312,7 @@ fn completed_legacy_journal_stays_complete_instead_of_reclassifying_archive() {
     std::fs::write(
         &path,
         format!(
-            "version = \"0.52\"\nbuild_number = 520\ncommit = \"{}\"\n\
+            "version = \"0.52.0\"\nbuild_number = 520\ncommit = \"{}\"\n\
              done = [\"build\", \"selfcheck\", \"draft\", \"upload\", \"preflip\", \
              \"tag\", \"flip\", \"cask\", \"verify\"]\n",
             "a".repeat(40)
@@ -307,7 +341,7 @@ fn unfinished_legacy_journal_fails_closed_before_remote_resume() {
     std::fs::write(
         &path,
         format!(
-            "version = \"0.52\"\nbuild_number = 520\ncommit = \"{}\"\n\
+            "version = \"0.52.0\"\nbuild_number = 520\ncommit = \"{}\"\n\
              done = [\"build\", \"selfcheck\", \"draft\"]\n",
             "b".repeat(40)
         ),
@@ -319,7 +353,7 @@ fn unfinished_legacy_journal_fails_closed_before_remote_resume() {
     let error = legacy.ensure_resumable().unwrap_err().to_string();
     assert!(error.contains("format 1"), "{error}");
     assert!(error.contains("cannot be resumed safely"), "{error}");
-    assert!(error.contains("cargo ship recover v0.52"), "{error}");
+    assert!(error.contains("cargo ship recover v0.52.0"), "{error}");
     assert!(error.contains(&"b".repeat(40)), "{error}");
 }
 
@@ -328,7 +362,7 @@ fn completed_v4_loads_but_unfinished_v4_fails_closed() {
     let dir = tmpdir("journal-v4-policy");
     let path = dir.join("cut-state.toml");
     let completed = format!(
-        "format = 4\nversion = \"0.54\"\nbuild_number = 540\ncommit = \"{}\"\n\
+        "format = 4\nversion = \"0.54.0\"\nbuild_number = 540\ncommit = \"{}\"\n\
          release_id = 54\ndone = [{}]\n",
         "c".repeat(40),
         STEPS
@@ -346,7 +380,7 @@ fn completed_v4_loads_but_unfinished_v4_fails_closed() {
     std::fs::write(
         &path,
         format!(
-            "format = 4\nversion = \"0.54\"\nbuild_number = 540\ncommit = \"{}\"\n\
+            "format = 4\nversion = \"0.54.0\"\nbuild_number = 540\ncommit = \"{}\"\n\
              release_id = 54\ndone = [\"lock\", \"build\", \"selfcheck\", \"draft\"]\n",
             "c".repeat(40)
         ),
@@ -417,7 +451,7 @@ fn journal_rejects_min_build_above_its_claim() {
     std::fs::write(
         &path,
         format!(
-            "version = \"0.55\"\nbuild_number = 550\ncommit = \"{}\"\nmin_build = 551\n",
+            "version = \"0.55.0\"\nbuild_number = 550\ncommit = \"{}\"\nmin_build = 551\n",
             "a".repeat(40)
         ),
     )
@@ -471,16 +505,54 @@ fn version_helpers_port_the_shell_derivations() {
     assert_eq!(publish::workspace_version(decoy).unwrap(), "0.25.0");
     assert!(publish::workspace_version("[workspace]\n").is_err());
 
-    // short_version: the `${VERSION%.0}` strip, exactly.
-    assert_eq!(publish::short_version("0.25.0"), "0.25");
-    assert_eq!(publish::short_version("1.10.0"), "1.10");
+    // The workspace MAJOR.MINOR.0 passes through byte-exactly — the patch
+    // component is only reset by `release_version_from_workspace`.
+    let dev = "[workspace.package]\nversion = \"0.2.1\"\n";
+    assert_eq!(publish::workspace_version(dev).unwrap(), "0.2.1");
 
-    // bump_minor: numeric, not lexicographic.
-    assert_eq!(publish::bump_minor("0.25").unwrap(), "0.26");
-    assert_eq!(publish::bump_minor("0.9").unwrap(), "0.10");
-    assert!(publish::bump_minor("nope").is_err());
+    // THE cut-over rule: a release is the workspace version with DEV → 0.
+    assert_eq!(
+        publish::release_version_from_workspace("0.2.1").unwrap(),
+        "0.2.0"
+    );
+    assert_eq!(
+        publish::release_version_from_workspace("0.2.0").unwrap(),
+        "0.2.0",
+        "a DEV-0 workspace version is already its own release version"
+    );
+    assert_eq!(
+        publish::release_version_from_workspace("1.10.7").unwrap(),
+        "1.10.0"
+    );
+    for bad in ["0.2", "0.2.1.1", "v0.2.1", "01.2.1", "0.2.x", ""] {
+        let err = publish::release_version_from_workspace(bad)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[workspace.package] version is not canonical MAJOR.MINOR.0"),
+            "{bad:?} → {err}"
+        );
+    }
 
-    // The REAL workspace manifest parses and yields a MAJOR.MINOR.PATCH.
+    // bump_minor_release is numeric, not lexicographic, and stays canonical
+    // three-component. It is advisory only: it tells the operator what to
+    // bump Cargo.toml to, and no cut ever applies it.
+    assert_eq!(publish::bump_minor_release("0.2.0").unwrap(), "0.3.0");
+    assert_eq!(publish::bump_minor_release("0.9.0").unwrap(), "0.10.0");
+    assert_eq!(
+        publish::bump_minor_release("1.9.4").unwrap(),
+        "1.10.0",
+        "the bump resets the third component"
+    );
+    assert!(publish::bump_minor_release("nope").is_err());
+    assert!(publish::bump_minor_release("0.25").is_err());
+    assert!(
+        publish::bump_minor_release(&format!("0.{}.0", u64::MAX)).is_err(),
+        "MINOR overflow must fail closed, never wrap"
+    );
+
+    // The REAL workspace manifest parses, is canonical, and its release
+    // version is the same number with DEV reset.
     let real = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
         .expect("read the real Cargo.toml");
     let v = publish::workspace_version(&real).expect("real manifest must parse");
@@ -489,19 +561,105 @@ fn version_helpers_port_the_shell_derivations() {
         3,
         "workspace version is X.Y.Z, got {v}"
     );
+    let release = publish::release_version_from_workspace(&v)
+        .expect("the real workspace version must be canonical MAJOR.MINOR.0");
+    let mut parts = v.split('.');
+    assert_eq!(
+        release,
+        format!("{}.{}.0", parts.next().unwrap(), parts.next().unwrap()),
+        "the release version is the workspace version with DEV reset to 0"
+    );
+}
+
+/// A cut rolls the changelog and NOTHING else. The workspace
+/// `MAJOR.MINOR.0` version is now the single source of the release version,
+/// so the cutter reading it must never also rewrite it: bumping Cargo.toml
+/// stays the operator's deliberate act, and Cargo.lock is byte-untouched.
+#[test]
+fn release_file_regeneration_preserves_source_version_and_lock() {
+    let root = tmpdir("regen-preserves-source");
+    let cargo = "[workspace.package]\nversion = \"0.59.1\"\n";
+    let lock = "[[package]]\nname = \"aterm\"\nversion = \"0.59.1\"\n";
+    let changelog = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- Left the workspace version to the operator.\n\n## [0.58.0] - 2026-07-22\n\n- Prior release.\n";
+    std::fs::write(root.join("Cargo.toml"), cargo).unwrap();
+    std::fs::write(root.join("Cargo.lock"), lock).unwrap();
+    std::fs::write(root.join(changelog::CHANGELOG_FILE), changelog).unwrap();
+
+    // The version being cut is the workspace 0.59.1 with DEV reset.
+    let cut = publish::release_version_from_workspace(
+        &publish::workspace_version(cargo).expect("fixture manifest parses"),
+    )
+    .unwrap();
+    assert_eq!(cut, "0.59.0");
+    let paths = publish::regen_release_files(&root, &cut, "2026-07-23").unwrap();
+
+    assert_eq!(paths, vec![changelog::CHANGELOG_FILE.to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+        cargo,
+        "a cut never rewrites the workspace version it derived from"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("Cargo.lock")).unwrap(),
+        lock
+    );
+    let rolled = std::fs::read_to_string(root.join(changelog::CHANGELOG_FILE)).unwrap();
+    assert_eq!(
+        changelog::rolled_body(&rolled, &cut).unwrap(),
+        "### Fixed\n- Left the workspace version to the operator."
+    );
 }
 
 #[test]
-fn bump_workspace_version_touches_exactly_one_line() {
-    let cargo = "[workspace.package]\nversion = \"0.25.0\"\nlicense = \"Apache-2.0\"\n\n[workspace.dependencies]\nserde = { version = \"1\" }\n# version = \"trap comment\"\n";
-    let bumped = publish::bump_workspace_version(cargo, "0.26.0").unwrap();
+fn locked_metadata_gate_rejects_a_workspace_that_would_rewrite_its_lock() {
+    let root = tmpdir("locked-metadata");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"lock-gate-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+
+    let missing = gates::locked_metadata_gate(&root).unwrap_err().to_string();
+    assert!(missing.contains("Cargo.lock"), "{missing}");
+    assert!(!root.join("Cargo.lock").exists());
+
+    let stale_lock = "# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = \"lock-gate-fixture\"\nversion = \"0.0.9\"\n";
+    std::fs::write(root.join("Cargo.lock"), stale_lock).unwrap();
+    let error = gates::locked_metadata_gate(&root).unwrap_err().to_string();
+    assert!(error.contains("Cargo.lock"), "{error}");
     assert_eq!(
-        bumped,
-        "[workspace.package]\nversion = \"0.26.0\"\nlicense = \"Apache-2.0\"\n\n[workspace.dependencies]\nserde = { version = \"1\" }\n# version = \"trap comment\"\n",
-        "only the [workspace.package] version line may change"
+        std::fs::read_to_string(root.join("Cargo.lock")).unwrap(),
+        stale_lock
     );
-    // No [workspace.package] version ⇒ hard error, not a silent no-op commit.
-    assert!(publish::bump_workspace_version("[package]\nversion = \"1.0.0\"\n", "2.0.0").is_err());
+}
+
+#[test]
+fn claim_provenance_binds_the_release_to_the_claims_short_commit() {
+    let owner = "0123456789abcdef0123456789abcdef01234567";
+    let provenance = b"version=0.59.0\nbuild=1785000000\ncommit=0123456789ab\n";
+
+    publish::validate_claim_provenance(provenance, "0.59.0", 1_785_000_000, owner).unwrap();
+
+    assert!(
+        publish::validate_claim_provenance(
+            provenance,
+            "0.59.0",
+            1_785_000_000,
+            "fedcba9876543210fedcba9876543210fedcba98"
+        )
+        .is_err()
+    );
+    assert!(
+        publish::validate_claim_provenance(
+            b"version=0.59.0\nbuild=1785000000\ncommit=0123456789ab\ncommit=0123456789ab\n",
+            "0.59.0",
+            1_785_000_000,
+            owner
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -537,22 +695,22 @@ fn repo_slug_parses_the_repository_field_shapes() {
 /// half-flipped by a crashed attempt — resuming past it must not self-abort.
 #[test]
 fn monotonic_gate_accepts_only_strictly_newer_or_our_own_cut() {
-    let ok = |n, best| publish::monotonic_ok(n, "v0.26", best).is_ok();
+    let ok = |n, best| publish::monotonic_ok(n, "v0.26.0", best).is_ok();
     assert!(ok(100, None), "an empty repo cannot outrank us");
-    assert!(ok(100, Some(("v0.25", 99))), "strictly newer wins");
+    assert!(ok(100, Some(("v0.25.0", 99))), "strictly newer wins");
     assert!(
-        ok(100, Some(("v0.26", 100))),
+        ok(100, Some(("v0.26.0", 100))),
         "our own half-flipped release is fine"
     );
     assert!(
-        !ok(100, Some(("v0.99", 100))),
+        !ok(100, Some(("v0.99.0", 100))),
         "same build under another tag is a collision"
     );
     assert!(
-        !ok(100, Some(("v0.99", 101))),
+        !ok(100, Some(("v0.99.0", 101))),
         "an older n than live must abort"
     );
-    let err = publish::monotonic_ok(100, "v0.26", Some(("v0.99", 101))).unwrap_err();
+    let err = publish::monotonic_ok(100, "v0.26.0", Some(("v0.99.0", 101))).unwrap_err();
     assert!(err.to_string().contains("monotonic"), "{err}");
 }
 
@@ -694,91 +852,6 @@ fn detached_signature_verifier_matches_rfc8032_and_catches_mutations() {
     assert!(publish::canonical_update_pubkey("not-base64").is_err());
 }
 
-fn epoch_authority_text() -> String {
-    concat!(
-        "schema = 1\nepoch = 2\nactivation_version = \"0.55\"\n",
-        "current_pubkey = \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\"\n",
-        "current_fingerprint_sha256 = \"529d8b60583fdc58b13afdba7050de6b21c0740b86dd87e5af769a2afb6c30f4\"\n",
-        "retired_epoch = 1\n",
-        "retired_pubkey = \"D4Wh30llPpreRKNfFXs7pjXl0jUXMIZxgf6F9+U/24U=\"\n",
-        "retired_fingerprint_sha256 = \"b8d47d9179feb56b1cbbe61c000b81f18d1ac152507d8abd320e2a2297890f1f\"\n",
-        "retired_evidence_tag = \"v0.26\"\n",
-        "retired_manifest_asset_id = 469003404\n",
-        "retired_manifest_size = 9216\n",
-        "retired_manifest_sha256 = \"6c610f5b2ca35f05822612994a2805401c77e8a16a9d2ae57696c8a783a8d5ca\"\n",
-        "retired_signature_asset_id = 469003406\n",
-        "retired_signature_size = 64\n",
-        "retired_signature_sha256 = \"32b35eb82d934b6a24efd2ec84c334d4e4efcebe47976f2a5a7c4e87c2ecd8c8\"\n",
-        "transition_reason = \"lost-private-key\"\n",
-        "old_pinned_clients_require_manual_bootstrap = true\n",
-    )
-    .to_string()
-}
-
-#[test]
-fn permanent_epoch_authority_is_one_time_fingerprinted_and_monotonic() {
-    let authority = publish::parse_channel_signing_authority(&epoch_authority_text()).unwrap();
-    let committed = publish::parse_channel_signing_authority(include_str!(
-        "../../../release/channel-signing.toml"
-    ))
-    .unwrap();
-    assert_eq!(
-        committed, authority,
-        "test identity must equal committed authority"
-    );
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let loaded = publish::load_channel_signing_authority(&repo)
-        .expect("production load replays reviewed keys and vendored v0.26 evidence");
-    assert_eq!(loaded, authority);
-    publish::validate_fixture_key_non_equality(&authority)
-        .expect("production keys differ from every repeated-byte fixture seed");
-    assert_eq!(
-        publish::channel_signing_epoch_for_version(&authority, "0.54").unwrap(),
-        publish::ChannelSigningEpoch::Retired
-    );
-    assert_eq!(
-        publish::channel_signing_epoch_for_version(&authority, "0.55").unwrap(),
-        publish::ChannelSigningEpoch::Current
-    );
-    assert!(publish::validate_channel_epoch_target(&authority, &[], "0.54").is_err());
-    assert!(publish::validate_channel_epoch_target(&authority, &[], "0.56").is_err());
-    assert_eq!(
-        publish::validate_channel_epoch_target(&authority, &[], "0.55").unwrap(),
-        publish::ChannelSigningEpoch::Current
-    );
-    let activated = [archive_release(
-        "v0.55",
-        false,
-        &[
-            (1, manifest_out::MANIFEST_ASSET),
-            (2, manifest_out::MANIFEST_SIG_ASSET),
-        ],
-    )];
-    assert!(publish::validate_channel_epoch_target(&authority, &activated, "0.56").is_ok());
-
-    let bad_fingerprint = epoch_authority_text().replace(
-        "529d8b60583fdc58b13afdba7050de6b21c0740b86dd87e5af769a2afb6c30f4",
-        &"0".repeat(64),
-    );
-    assert!(publish::parse_channel_signing_authority(&bad_fingerprint).is_err());
-    assert!(
-        publish::parse_channel_signing_authority(&(epoch_authority_text() + "unexpected = true\n"))
-            .is_err()
-    );
-
-    let fixture_authority = epoch_authority_text()
-        .replace(
-            "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=",
-            "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
-        )
-        .replace(
-            "529d8b60583fdc58b13afdba7050de6b21c0740b86dd87e5af769a2afb6c30f4",
-            "fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889",
-        );
-    let fixture_authority = publish::parse_channel_signing_authority(&fixture_authority).unwrap();
-    assert!(publish::validate_fixture_key_non_equality(&fixture_authority).is_err());
-}
-
 #[test]
 fn release_asset_digest_replay_uses_the_updater_download_bound() {
     assert!(publish::validate_release_asset_download_size(1).is_ok());
@@ -799,7 +872,7 @@ fn release_asset_digest_replay_uses_the_updater_download_bound() {
     assert!(
         publish::validate_small_release_asset_size(manifest_out::MANIFEST_SIG_ASSET, 63).is_err()
     );
-    assert!(publish::validate_small_release_asset_size("aterm-0.55.dmg", 1).is_err());
+    assert!(publish::validate_small_release_asset_size("aterm-0.55.0.dmg", 1).is_err());
     assert_eq!(
         publish::read_bounded_release_asset(std::io::Cursor::new(vec![7_u8; 64]), 64).unwrap(),
         vec![7_u8; 64]
@@ -846,13 +919,13 @@ fn release_asset_digest_replay_uses_the_updater_download_bound() {
     );
 
     assert_eq!(
-        publish::parse_release_asset_identity_rows("", "v0.55", "asset.toml").unwrap(),
+        publish::parse_release_asset_identity_rows("", "v0.55.0", "asset.toml").unwrap(),
         None
     );
     assert_eq!(
         publish::parse_release_asset_identity_rows(
             "other.txt\t1\t7\nasset.toml\t42\t64\n",
-            "v0.55",
+            "v0.55.0",
             "asset.toml",
         )
         .unwrap(),
@@ -860,14 +933,14 @@ fn release_asset_digest_replay_uses_the_updater_download_bound() {
     );
     let duplicate = publish::parse_release_asset_identity_rows(
         "asset.toml\t42\t64\nasset.toml\t43\t64\n",
-        "v0.55",
+        "v0.55.0",
         "asset.toml",
     )
     .unwrap_err()
     .to_string();
     assert!(duplicate.contains("2 assets"), "{duplicate}");
     assert!(
-        publish::parse_release_asset_identity_rows("asset.toml\t42\t0\n", "v0.55", "asset.toml",)
+        publish::parse_release_asset_identity_rows("asset.toml\t42\t0\n", "v0.55.0", "asset.toml",)
             .is_err(),
         "an empty exact-ID object is never treated as an absent optional asset"
     );
@@ -887,138 +960,6 @@ fn production_release_asset_reads_never_use_name_based_downloads() {
 }
 
 #[test]
-fn epoch_verifier_allows_explicit_unsigned_bootstrap_but_never_unsigned_v055() {
-    let authority = publish::parse_channel_signing_authority(&epoch_authority_text()).unwrap();
-    let bootstrap = vec![
-        archive_release("v0.54", false, &[(1, manifest_out::MANIFEST_ASSET)]),
-        archive_release("atpkg-index-1", false, &[(2, "atpkg-index.toml.sig")]),
-        archive_release(
-            "v0.16.2601010000-windows",
-            false,
-            &[(3, "aterm-windows.zip")],
-        ),
-    ];
-    assert!(
-        !publish::verify_epoch_channel_head_signature_with(
-            &authority,
-            &bootstrap,
-            "v0.54",
-            b"",
-            None,
-            |_, _, _, _| unreachable!(),
-        )
-        .unwrap()
-    );
-    assert_eq!(
-        publish::select_recovery_signature_policy(
-            &authority,
-            &bootstrap,
-            "0.54",
-            verify::ReleaseState::Published,
-        )
-        .unwrap(),
-        (
-            publish::RecoveryEpochMode::RetiredNonPublishingOnly,
-            false,
-            None,
-        ),
-        "historical unsigned bootstrap may be finished, but never republished"
-    );
-    let mut malformed_channel = bootstrap.clone();
-    malformed_channel.push(archive_release(
-        "atpkg-index-3",
-        false,
-        &[(4, manifest_out::MANIFEST_ASSET)],
-    ));
-    let error = publish::verify_epoch_channel_head_signature_with(
-        &authority,
-        &malformed_channel,
-        "v0.54",
-        b"",
-        None,
-        |_, _, _, _| unreachable!(),
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("not numerically orderable"), "{error}");
-    assert!(
-        publish::validate_channel_epoch_target(&authority, &bootstrap, "0.54").is_err(),
-        "the compatible recovery policy must not weaken new-publication validation"
-    );
-
-    let signed_bootstrap = vec![archive_release(
-        "v0.54",
-        false,
-        &[
-            (1, manifest_out::MANIFEST_ASSET),
-            (2, manifest_out::MANIFEST_SIG_ASSET),
-        ],
-    )];
-    assert_eq!(
-        publish::select_recovery_signature_policy(
-            &authority,
-            &signed_bootstrap,
-            "0.54",
-            verify::ReleaseState::Published,
-        )
-        .unwrap(),
-        (
-            publish::RecoveryEpochMode::RetiredNonPublishingOnly,
-            true,
-            Some(authority.retired_pubkey.clone()),
-        ),
-        "an already-published signed historical cut is verified with the retired public key"
-    );
-    assert_eq!(
-        publish::select_recovery_signature_policy(
-            &authority,
-            &signed_bootstrap,
-            "0.54",
-            verify::ReleaseState::Draft,
-        )
-        .unwrap(),
-        (
-            publish::RecoveryEpochMode::RetiredNonPublishingOnly,
-            false,
-            None,
-        ),
-        "a historical draft is cleanup-only; no signing authority is needed or inferred"
-    );
-
-    let unsigned_activation = [archive_release(
-        "v0.55",
-        false,
-        &[(1, manifest_out::MANIFEST_ASSET)],
-    )];
-    assert!(
-        publish::verify_epoch_channel_head_signature_with(
-            &authority,
-            &unsigned_activation,
-            "v0.55",
-            b"",
-            None,
-            |_, _, _, _| unreachable!(),
-        )
-        .is_err()
-    );
-    assert_eq!(
-        publish::select_recovery_signature_policy(
-            &authority,
-            &unsigned_activation,
-            "0.55",
-            verify::ReleaseState::Published,
-        )
-        .unwrap(),
-        (
-            publish::RecoveryEpochMode::CurrentAuthority,
-            true,
-            Some(authority.current_pubkey.clone()),
-        ),
-        "current-epoch recovery remains bound to the permanent current key even when mutable signature metadata is missing"
-    );
-}
-
-#[test]
 fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
     let pubkey = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
     let signature = decode_hex(concat!(
@@ -1028,7 +969,7 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
         "d25bf5f0595bbe24655141438e7a100b"
     ));
     let head = archive_release(
-        "v0.55",
+        "v0.55.0",
         false,
         &[
             (1, manifest_out::MANIFEST_ASSET),
@@ -1038,12 +979,12 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
     let verify = |releases: &[publish::AppcastRelease], bytes: Vec<u8>| {
         publish::verify_channel_head_signature_with(
             releases,
-            "v0.55",
+            "v0.55.0",
             b"",
             Some(&signature),
             Some(pubkey),
             |_, _, tag, name| {
-                assert_eq!(tag, "v0.55");
+                assert_eq!(tag, "v0.55.0");
                 assert_eq!(name, manifest_out::MANIFEST_SIG_ASSET);
                 Ok(bytes.clone())
             },
@@ -1051,12 +992,12 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
     };
     assert!(verify(std::slice::from_ref(&head), signature.clone()).unwrap());
 
-    let missing = archive_release("v0.55", false, &[(1, manifest_out::MANIFEST_ASSET)]);
+    let missing = archive_release("v0.55.0", false, &[(1, manifest_out::MANIFEST_ASSET)]);
     // With no signature and no trusted pin the legacy channel is unsigned.
     assert!(
         !publish::verify_channel_head_signature_with(
             &[missing],
-            "v0.55",
+            "v0.55.0",
             b"",
             None,
             None,
@@ -1069,11 +1010,11 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
     assert!(
         publish::verify_channel_head_signature_with(
             &[archive_release(
-                "v0.55",
+                "v0.55.0",
                 false,
                 &[(1, manifest_out::MANIFEST_ASSET)],
             )],
-            "v0.55",
+            "v0.55.0",
             b"",
             None,
             Some(pubkey),
@@ -1083,7 +1024,7 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
     );
 
     let duplicate = archive_release(
-        "v0.55",
+        "v0.55.0",
         false,
         &[
             (1, manifest_out::MANIFEST_ASSET),
@@ -1094,11 +1035,11 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
     assert!(verify(&[duplicate], signature.clone()).is_err());
 
     let archive_fallback = archive_release(
-        "v0.55",
+        "v0.55.0",
         false,
         &[
             (1, manifest_out::MANIFEST_ASSET),
-            (2, "aterm-appcast-v0.55.toml.sig"),
+            (2, "aterm-appcast-v0.55.0.toml.sig"),
         ],
     );
     assert!(verify(&[archive_fallback], signature.clone()).is_err());
@@ -1112,12 +1053,12 @@ fn live_signature_replay_requires_exact_unique_valid_head_without_fallback() {
 fn live_archive_identity_requires_exact_version_build_commit_and_local_bytes() {
     let commit = "a".repeat(40);
     let manifest = format!(
-        "schema = 1\nversion = \"0.55\"\nbuild_number = 55\ncommit = \"{commit}\"\n\
-         dmg = \"aterm-0.55.dmg\"\nsha256 = \"{}\"\n",
+        "schema = 1\nversion = \"0.55.0\"\nbuild_number = 55\ncommit = \"{commit}\"\n\
+         dmg = \"aterm-0.55.0.dmg\"\nsha256 = \"{}\"\n",
         "0".repeat(64)
     );
     let expected = publish::ExpectedReleaseIdentity {
-        version: "0.55",
+        version: "0.55.0",
         build: 55,
         commit: &commit,
     };
@@ -1133,10 +1074,10 @@ fn live_archive_identity_requires_exact_version_build_commit_and_local_bytes() {
     .unwrap();
 
     for bad in [
-        manifest.replace("version = \"0.55\"", "version = \"0.56\""),
+        manifest.replace("version = \"0.55.0\"", "version = \"0.56.0\""),
         manifest.replace("build_number = 55", "build_number = 56"),
         manifest.replace(&commit, &"b".repeat(40)),
-        manifest.replace("aterm-0.55.dmg", "other.dmg"),
+        manifest.replace("aterm-0.55.0.dmg", "other.dmg"),
     ] {
         assert!(
             publish::validate_live_release_identity(
@@ -1252,7 +1193,7 @@ impl publish::AppcastArchiveRemote for FakeArchiveRemote {
 fn archive_fixture() -> Vec<publish::AppcastRelease> {
     vec![
         archive_release(
-            "v0.55",
+            "v0.55.0",
             false,
             &[
                 (1, manifest_out::MANIFEST_ASSET),
@@ -1260,67 +1201,76 @@ fn archive_fixture() -> Vec<publish::AppcastRelease> {
             ],
         ),
         archive_release(
-            "v0.54",
+            "v0.54.0",
             false,
             &[
                 (3, manifest_out::MANIFEST_ASSET),
                 (4, manifest_out::MANIFEST_SIG_ASSET),
             ],
         ),
-        archive_release("v0.53", false, &[(5, manifest_out::MANIFEST_ASSET)]),
+        archive_release("v0.53.0", false, &[(5, manifest_out::MANIFEST_ASSET)]),
         archive_release(
-            "v0.52",
+            "v0.52.0",
             false,
             &[
-                (6, "aterm-appcast-v0.52.toml"),
-                (7, "aterm-appcast-v0.52.toml.sig"),
+                (6, "aterm-appcast-v0.52.0.toml"),
+                (7, "aterm-appcast-v0.52.0.toml.sig"),
             ],
         ),
         // Drafts are outside the channel and remain byte/name untouched, even
         // if they carry exact names that would collide if published.
         archive_release(
-            "v0.56",
+            "v0.56.0",
             true,
             &[
                 (8, manifest_out::MANIFEST_ASSET),
                 (9, manifest_out::MANIFEST_SIG_ASSET),
-                (10, "aterm-appcast-v0.56.toml"),
+                (10, "aterm-appcast-v0.56.0.toml"),
             ],
         ),
     ]
 }
 
 #[test]
-fn signature_ratchet_sees_exact_and_archived_history_but_ignores_drafts() {
+fn signing_is_never_required_by_history_but_metadata_stays_coherent() {
+    // The ratchet is retired (Tier REPO): published `.sig` history — exact OR
+    // archived — never forces a signed successor. `channel_signature_required`
+    // is unconditionally false, but still surfaces incoherent metadata.
     let unsigned = vec![archive_release(
-        "v0.55",
+        "v0.55.0",
         false,
         &[(1, manifest_out::MANIFEST_ASSET)],
     )];
     assert!(!publish::channel_signature_required(&unsigned).unwrap());
 
     let exact = vec![archive_release(
-        "v0.26",
+        "v0.26.0",
         false,
         &[
             (1, manifest_out::MANIFEST_ASSET),
             (2, manifest_out::MANIFEST_SIG_ASSET),
         ],
     )];
-    assert!(publish::channel_signature_required(&exact).unwrap());
+    assert!(
+        !publish::channel_signature_required(&exact).unwrap(),
+        "an exact `.sig` in history no longer demands a signed successor"
+    );
 
     let archived = vec![archive_release(
-        "v0.26",
+        "v0.26.0",
         false,
         &[
-            (1, "aterm-appcast-v0.26.toml"),
-            (2, "aterm-appcast-v0.26.toml.sig"),
+            (1, "aterm-appcast-v0.26.0.toml"),
+            (2, "aterm-appcast-v0.26.0.toml.sig"),
         ],
     )];
-    assert!(publish::channel_signature_required(&archived).unwrap());
+    assert!(
+        !publish::channel_signature_required(&archived).unwrap(),
+        "archived `.sig` history no longer demands a signed successor"
+    );
 
     let draft_only = vec![archive_release(
-        "v0.56",
+        "v0.56.0",
         true,
         &[
             (1, manifest_out::MANIFEST_ASSET),
@@ -1329,31 +1279,37 @@ fn signature_ratchet_sees_exact_and_archived_history_but_ignores_drafts() {
     )];
     assert!(!publish::channel_signature_required(&draft_only).unwrap());
 
+    // Incoherent signed-asset metadata (a signature with no paired manifest) is
+    // still a hard error so the archive planner sees a consistent inventory.
     let orphan = vec![archive_release(
-        "v0.26",
+        "v0.26.0",
         false,
-        &[(2, "aterm-appcast-v0.26.toml.sig")],
+        &[(2, "aterm-appcast-v0.26.0.toml.sig")],
     )];
     assert!(publish::channel_signature_required(&orphan).is_err());
 }
 
 #[test]
-fn archive_refuses_unsigned_current_when_any_archived_signature_exists() {
+fn unsigned_successor_is_allowed_even_when_archived_signatures_exist() {
+    // Killed ratchet: an unsigned v0.55.0 head archives cleanly alongside a prior
+    // release that still carries archived `.sig` bytes. No signed head demanded.
     let releases = vec![
-        archive_release("v0.55", false, &[(1, manifest_out::MANIFEST_ASSET)]),
+        archive_release("v0.55.0", false, &[(1, manifest_out::MANIFEST_ASSET)]),
         archive_release(
-            "v0.26",
+            "v0.26.0",
             false,
             &[
-                (2, "aterm-appcast-v0.26.toml"),
-                (3, "aterm-appcast-v0.26.toml.sig"),
+                (2, "aterm-appcast-v0.26.0.toml"),
+                (3, "aterm-appcast-v0.26.0.toml.sig"),
             ],
         ),
     ];
-    let error = publish::plan_appcast_archive(&releases, "v0.55")
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("signed channel head"), "{error}");
+    let plan = publish::plan_appcast_archive(&releases, "v0.55.0")
+        .expect("unsigned successor is always permitted");
+    assert!(
+        plan.is_empty(),
+        "already-archived history needs no further renames: {plan:?}"
+    );
 }
 
 /// Happy-path conformance against the injected executor: every historical
@@ -1362,7 +1318,7 @@ fn archive_refuses_unsigned_current_when_any_archived_signature_exists() {
 #[test]
 fn archive_converges_to_one_exact_head_with_deterministic_reversible_renames() {
     let mut remote = FakeArchiveRemote::new(archive_fixture());
-    let renamed = publish::converge_appcast_archive(&mut remote, "v0.55").unwrap();
+    let renamed = publish::converge_appcast_archive(&mut remote, "v0.55.0").unwrap();
     assert_eq!(renamed, 3);
     assert_eq!(
         remote
@@ -1371,17 +1327,21 @@ fn archive_converges_to_one_exact_head_with_deterministic_reversible_renames() {
             .map(|rename| (rename.id, rename.from.as_str(), rename.to.as_str()))
             .collect::<Vec<_>>(),
         [
-            (3, "aterm-appcast.toml", "aterm-appcast-v0.54.toml"),
-            (4, "aterm-appcast.toml.sig", "aterm-appcast-v0.54.toml.sig"),
-            (5, "aterm-appcast.toml", "aterm-appcast-v0.53.toml"),
+            (3, "aterm-appcast.toml", "aterm-appcast-v0.54.0.toml"),
+            (
+                4,
+                "aterm-appcast.toml.sig",
+                "aterm-appcast-v0.54.0.toml.sig"
+            ),
+            (5, "aterm-appcast.toml", "aterm-appcast-v0.53.0.toml"),
         ]
     );
     assert_eq!(remote.asset_name(1), Some(manifest_out::MANIFEST_ASSET));
-    assert_eq!(remote.asset_name(3), Some("aterm-appcast-v0.54.toml"));
-    assert_eq!(remote.asset_name(4), Some("aterm-appcast-v0.54.toml.sig"));
-    assert_eq!(remote.asset_name(6), Some("aterm-appcast-v0.52.toml"));
+    assert_eq!(remote.asset_name(3), Some("aterm-appcast-v0.54.0.toml"));
+    assert_eq!(remote.asset_name(4), Some("aterm-appcast-v0.54.0.toml.sig"));
+    assert_eq!(remote.asset_name(6), Some("aterm-appcast-v0.52.0.toml"));
     assert_eq!(remote.asset_name(8), Some(manifest_out::MANIFEST_ASSET));
-    publish::prove_single_appcast_head(&remote.releases, "v0.55").unwrap();
+    publish::prove_single_appcast_head(&remote.releases, "v0.55.0").unwrap();
 }
 
 /// Journal-level partial resume: the first metadata PATCH survives an injected
@@ -1391,7 +1351,7 @@ fn archive_converges_to_one_exact_head_with_deterministic_reversible_renames() {
 fn archive_partial_patch_resumes_from_remote_metadata() {
     let mut remote = FakeArchiveRemote::new(vec![
         archive_release(
-            "v0.55",
+            "v0.55.0",
             false,
             &[
                 (1, manifest_out::MANIFEST_ASSET),
@@ -1399,7 +1359,7 @@ fn archive_partial_patch_resumes_from_remote_metadata() {
             ],
         ),
         archive_release(
-            "v0.54",
+            "v0.54.0",
             false,
             &[
                 (3, manifest_out::MANIFEST_ASSET),
@@ -1408,15 +1368,15 @@ fn archive_partial_patch_resumes_from_remote_metadata() {
         ),
     ]);
     remote.fail_after = Some(1);
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55")
+    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0")
         .unwrap_err()
         .to_string();
     assert!(err.contains("injected crash"), "{err}");
-    assert_eq!(remote.asset_name(3), Some("aterm-appcast-v0.54.toml"));
+    assert_eq!(remote.asset_name(3), Some("aterm-appcast-v0.54.0.toml"));
     assert_eq!(remote.asset_name(4), Some(manifest_out::MANIFEST_SIG_ASSET));
 
     assert_eq!(
-        publish::converge_appcast_archive(&mut remote, "v0.55").unwrap(),
+        publish::converge_appcast_archive(&mut remote, "v0.55.0").unwrap(),
         1,
         "resume performs only the unfinished signature PATCH"
     );
@@ -1444,7 +1404,7 @@ fn archive_name_collision_fails_before_any_patch() {
         name: manifest_out::MANIFEST_ASSET.into(),
     });
     let mut remote = FakeArchiveRemote::new(releases);
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55")
+    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0")
         .unwrap_err()
         .to_string();
     assert!(err.contains("name collision"), "{err}");
@@ -1462,7 +1422,7 @@ fn archive_name_collision_fails_before_any_patch() {
 fn no_archive_mutant_is_caught_by_fresh_remote_proof() {
     let mut remote = FakeArchiveRemote::new(archive_fixture());
     remote.no_archive_mutant = true;
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55")
+    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0")
         .unwrap_err()
         .to_string();
     assert!(
@@ -1478,47 +1438,47 @@ fn no_archive_mutant_is_caught_by_fresh_remote_proof() {
 fn exactly_one_head_invariant_accepts_only_current_published_exact_name() {
     let converged = vec![
         archive_release(
-            "v0.55",
+            "v0.55.0",
             false,
             &[
                 (1, manifest_out::MANIFEST_ASSET),
                 (4, manifest_out::MANIFEST_SIG_ASSET),
             ],
         ),
-        archive_release("v0.54", false, &[(2, "aterm-appcast-v0.54.toml")]),
-        archive_release("v0.56", true, &[(3, manifest_out::MANIFEST_ASSET)]),
+        archive_release("v0.54.0", false, &[(2, "aterm-appcast-v0.54.0.toml")]),
+        archive_release("v0.56.0", true, &[(3, manifest_out::MANIFEST_ASSET)]),
     ];
-    publish::prove_single_appcast_head(&converged, "v0.55").unwrap();
+    publish::prove_single_appcast_head(&converged, "v0.55.0").unwrap();
 
     let mut two_heads = converged.clone();
     two_heads[1].assets[0].name = manifest_out::MANIFEST_ASSET.into();
-    assert!(publish::prove_single_appcast_head(&two_heads, "v0.55").is_err());
+    assert!(publish::prove_single_appcast_head(&two_heads, "v0.55.0").is_err());
 
     let mut no_head = converged.clone();
-    no_head[0].assets[0].name = "aterm-appcast-v0.55.toml".into();
-    assert!(publish::prove_single_appcast_head(&no_head, "v0.55").is_err());
+    no_head[0].assets[0].name = "aterm-appcast-v0.55.0.toml".into();
+    assert!(publish::prove_single_appcast_head(&no_head, "v0.55.0").is_err());
 
     let mut stale_sig = converged;
     stale_sig[1].assets.push(publish::AppcastAsset {
         id: 5,
         name: manifest_out::MANIFEST_SIG_ASSET.into(),
     });
-    assert!(publish::prove_single_appcast_head(&stale_sig, "v0.55").is_err());
+    assert!(publish::prove_single_appcast_head(&stale_sig, "v0.55.0").is_err());
 }
 
 /// A resumed old cut is never allowed to rename a newer live head. This is
-/// independent of GitHub list order: the vMAJOR.MINOR channel protocol is the
-/// authority, and the entire plan fails before the first PATCH.
+/// independent of GitHub list order: the vMAJOR.MINOR.PATCH channel protocol
+/// is the authority, and the entire plan fails before the first PATCH.
 #[test]
 fn stale_archive_refuses_newer_exact_head_before_any_patch() {
     let mut releases = archive_fixture();
     releases[4].draft = false;
     let mut remote = FakeArchiveRemote::new(releases);
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55")
+    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0")
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("same-or-newer published channel tag v0.56"),
+        err.contains("same-or-newer published channel tag v0.56.0"),
         "{err}"
     );
     assert!(remote.renamed.is_empty(), "stale plan must mutate nothing");
@@ -1549,24 +1509,59 @@ fn stale_archive_refuses_newer_exact_head_before_any_patch() {
     );
 }
 
-/// The one-time migration must accept the repository's real pre-canonical
-/// numeric tag shape as older history, while a same/newer numeric extension is
-/// never mistaken for history.
+/// THE first-cut hazard of the cut-over, executable: the live channel head is
+/// the retired two-component v0.61, and the first release under the new scheme
+/// is v0.2.0 — which orders BELOW it on any two-field comparison. A retired
+/// release is not on this version line at all, so it cannot contest authority;
+/// it is still archived off the client's discovery surface like any history.
 #[test]
-fn archive_orders_legacy_numeric_tags_without_weakening_stale_head_guard() {
-    let current = archive_release("v0.55", false, &[(1, manifest_out::MANIFEST_ASSET)]);
-    let legacy = archive_release(
+fn archive_authority_ignores_retired_two_component_releases() {
+    let current = archive_release("v0.2.0", false, &[(1, manifest_out::MANIFEST_ASSET)]);
+    let retired = archive_release("v0.61", false, &[(2, manifest_out::MANIFEST_ASSET)]);
+    let plan = publish::plan_appcast_archive(&[current, retired], "v0.2.0")
+        .expect("a retired release cannot block the first cut under the new scheme");
+    assert_eq!(
+        plan.iter()
+            .map(|rename| (rename.tag.as_str(), rename.to.as_str()))
+            .collect::<Vec<_>>(),
+        [("v0.61", "aterm-appcast-v0.61.toml")],
+        "the retired head still loses its exact name"
+    );
+
+    // Convergence proves the single-head invariant against a real remote.
+    let mut remote = FakeArchiveRemote::new(vec![
+        archive_release("v0.2.0", false, &[(1, manifest_out::MANIFEST_ASSET)]),
+        archive_release("v0.61", false, &[(2, manifest_out::MANIFEST_ASSET)]),
+        archive_release("v0.25", false, &[(3, "aterm-appcast-v0.25.toml")]),
+    ]);
+    assert_eq!(
+        publish::converge_appcast_archive(&mut remote, "v0.2.0").unwrap(),
+        1,
+        "already-archived retired history needs no further renames"
+    );
+    assert_eq!(remote.asset_name(1), Some(manifest_out::MANIFEST_ASSET));
+    assert_eq!(remote.asset_name(2), Some("aterm-appcast-v0.61.toml"));
+    publish::prove_single_appcast_head(&remote.releases, "v0.2.0").unwrap();
+}
+
+/// The archive planner orders by the full three-component tag: the
+/// repository's real pre-canonical `v0.21.2607041853` shape is provably older
+/// history, while a same/newer PATCH extension is never mistaken for it.
+#[test]
+fn archive_orders_deep_numeric_tags_without_weakening_stale_head_guard() {
+    let current = archive_release("v0.55.0", false, &[(1, manifest_out::MANIFEST_ASSET)]);
+    let older = archive_release(
         "v0.21.2607041853",
         false,
         &[(2, manifest_out::MANIFEST_ASSET)],
     );
-    let plan = publish::plan_appcast_archive(&[current.clone(), legacy], "v0.55")
-        .expect("numeric three-component legacy tag is provably older");
+    let plan = publish::plan_appcast_archive(&[current.clone(), older], "v0.55.0")
+        .expect("a lower three-component tag is provably older");
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].tag, "v0.21.2607041853");
 
     let future = archive_release("v0.55.1", false, &[(3, manifest_out::MANIFEST_ASSET)]);
-    let err = publish::plan_appcast_archive(&[current, future], "v0.55")
+    let err = publish::plan_appcast_archive(&[current, future], "v0.55.0")
         .unwrap_err()
         .to_string();
     assert!(err.contains("same-or-newer"), "{err}");
@@ -1598,34 +1593,37 @@ fn archive_orders_legacy_numeric_tags_without_weakening_stale_head_guard() {
     );
 }
 
-/// Signed migration is all-or-nothing: hiding every historical signature while
-/// the intended current head is unsigned would make the pinned fleet see no
-/// stageable release.
+/// Killed ratchet: an unsigned current head archives cleanly even when the
+/// prior fixture history carried signatures. Nothing forces a signed head, so
+/// the whole migration converges to a single unsigned exact head.
 #[test]
-fn signed_archive_requires_current_signature_before_any_patch() {
+fn unsigned_current_head_archives_cleanly_alongside_signed_history() {
     let mut releases = archive_fixture();
     releases[0]
         .assets
         .retain(|asset| asset.name != manifest_out::MANIFEST_SIG_ASSET);
     let mut remote = FakeArchiveRemote::new(releases);
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("has no exact aterm-appcast.toml.sig"), "{err}");
-    assert!(remote.renamed.is_empty());
+    let renamed = publish::converge_appcast_archive(&mut remote, "v0.55.0")
+        .expect("unsigned successor is always permitted");
+    assert_eq!(renamed, 3);
+    publish::prove_single_appcast_head(&remote.releases, "v0.55.0").unwrap();
 
-    // Negative control for the retired caller-supplied bool: metadata keeps
-    // the ratchet active, so calling the same planner again cannot opt out.
-    assert!(publish::plan_appcast_archive(&remote.releases, "v0.55").is_err());
+    // The retired caller-supplied bool cannot re-arm a ratchet either: planning
+    // the same converged unsigned head again is a no-op, never a refusal.
+    assert!(
+        publish::plan_appcast_archive(&remote.releases, "v0.55.0")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Production listing parser retains exact and archived IDs under their
 /// deterministic names and represents asset-less releases for pagination.
 #[test]
 fn archive_listing_parser_is_lossless_for_relevant_metadata() {
-    let rows = r#"{"release_id":55,"tag":"v0.55","draft":false,"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[{"id":1,"name":"aterm-appcast.toml"},{"id":2,"name":"aterm-appcast.toml.sig"}]}
-{"release_id":54,"tag":"v0.54","draft":false,"target_commitish":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","assets":[{"id":3,"name":"aterm-appcast-v0.54.toml"},{"id":4,"name":"aterm-appcast-v0.54.toml.sig"}]}
-{"release_id":56,"tag":"v0.56","draft":true,"target_commitish":"cccccccccccccccccccccccccccccccccccccccc","assets":[{"id":5,"name":"aterm-appcast.toml"}]}
+    let rows = r#"{"release_id":55,"tag":"v0.55.0","draft":false,"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[{"id":1,"name":"aterm-appcast.toml"},{"id":2,"name":"aterm-appcast.toml.sig"}]}
+{"release_id":54,"tag":"v0.54.0","draft":false,"target_commitish":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","assets":[{"id":3,"name":"aterm-appcast-v0.54.0.toml"},{"id":4,"name":"aterm-appcast-v0.54.0.toml.sig"}]}
+{"release_id":56,"tag":"v0.56.0","draft":true,"target_commitish":"cccccccccccccccccccccccccccccccccccccccc","assets":[{"id":5,"name":"aterm-appcast.toml"}]}
 "#;
     let parsed = publish::parse_appcast_asset_listing(rows).unwrap();
     assert_eq!(parsed.len(), 3);
@@ -1647,11 +1645,11 @@ fn archive_listing_parser_is_lossless_for_relevant_metadata() {
         [
             publish::AppcastAsset {
                 id: 3,
-                name: "aterm-appcast-v0.54.toml".into(),
+                name: "aterm-appcast-v0.54.0.toml".into(),
             },
             publish::AppcastAsset {
                 id: 4,
-                name: "aterm-appcast-v0.54.toml.sig".into(),
+                name: "aterm-appcast-v0.54.0.toml.sig".into(),
             },
         ]
     );
@@ -1664,11 +1662,11 @@ fn archive_listing_parser_is_lossless_for_relevant_metadata() {
 /// guard exercised by the in-memory remote.
 #[test]
 fn archive_listing_preserves_duplicates_for_fail_closed_preflight() {
-    let rows = r#"{"release_id":55,"tag":"v0.55","draft":false,"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[{"id":1,"name":"aterm-appcast.toml"},{"id":2,"name":"aterm-appcast.toml"},{"id":3,"name":"aterm-appcast.toml.sig"}]}
+    let rows = r#"{"release_id":55,"tag":"v0.55.0","draft":false,"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[{"id":1,"name":"aterm-appcast.toml"},{"id":2,"name":"aterm-appcast.toml"},{"id":3,"name":"aterm-appcast.toml.sig"}]}
 "#;
     let parsed = publish::parse_appcast_asset_listing(rows).unwrap();
     assert_eq!(parsed[0].assets.len(), 3);
-    let err = publish::plan_appcast_archive(&parsed, "v0.55")
+    let err = publish::plan_appcast_archive(&parsed, "v0.55.0")
         .unwrap_err()
         .to_string();
     assert!(err.contains("duplicate assets"), "{err}");
@@ -1685,7 +1683,7 @@ fn cask_repin_rewrites_exactly_two_lines_of_the_real_cask() {
     ))
     .expect("read the real cask");
     let sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    let pinned = publish::repin_cask_text(&real, "0.26", sha).expect("re-pin");
+    let pinned = publish::repin_cask_text(&real, "0.26.0", sha).expect("re-pin");
 
     let old: Vec<&str> = real.lines().collect();
     let new: Vec<&str> = pinned.lines().collect();
@@ -1696,7 +1694,7 @@ fn cask_repin_rewrites_exactly_two_lines_of_the_real_cask() {
         2,
         "exactly version + sha256 lines change: {diff:?}"
     );
-    assert!(new[diff[0]].trim_start().starts_with("version \"0.26\""));
+    assert!(new[diff[0]].trim_start().starts_with("version \"0.26.0\""));
     assert!(
         new[diff[1]]
             .trim_start()
@@ -1710,13 +1708,13 @@ fn cask_repin_rewrites_exactly_two_lines_of_the_real_cask() {
     // Re-pinning the same values again is a byte no-op — that is how the
     // cask step detects "someone already landed this pin" after a reset.
     assert_eq!(
-        publish::repin_cask_text(&pinned, "0.26", sha).unwrap(),
+        publish::repin_cask_text(&pinned, "0.26.0", sha).unwrap(),
         pinned
     );
     // And the freshness probe reads the pin back.
-    assert_eq!(verify::cask_version(&pinned).as_deref(), Some("0.26"));
+    assert_eq!(verify::cask_version(&pinned).as_deref(), Some("0.26.0"));
 
-    assert!(publish::repin_cask_text("cask \"aterm\" do\nend\n", "0.26", sha).is_err());
+    assert!(publish::repin_cask_text("cask \"aterm\" do\nend\n", "0.26.0", sha).is_err());
 }
 
 #[test]
@@ -1747,11 +1745,11 @@ fn select_newest_summarizes_an_exhaustive_status_scan() {
         text: String::new(),
     };
     assert!(verify::select_newest(&[]).is_none());
-    let scanned = [p("v0.26", 200), p("v0.25", 100), p("v0.24-dup", 200)];
+    let scanned = [p("v0.26.0", 200), p("v0.25.0", 100), p("v0.24.0-dup", 200)];
     let best = verify::select_newest(&scanned).unwrap();
     assert_eq!(
         (best.tag.as_str(), best.build),
-        ("v0.26", 200),
+        ("v0.26.0", 200),
         "first max wins the tie"
     );
 }
@@ -1809,15 +1807,15 @@ fn historical_tag_binding_accepts_annotated_and_lightweight_exact_refs() {
     let annotated_commit = "a".repeat(40);
     let lightweight_commit = "b".repeat(40);
     let output = format!(
-        "{tag_object}\trefs/tags/v0.25\n{annotated_commit}\trefs/tags/v0.25^{{}}\n\
-         {lightweight_commit}\trefs/tags/v0.24\n"
+        "{tag_object}\trefs/tags/v0.25.0\n{annotated_commit}\trefs/tags/v0.25.0^{{}}\n\
+         {lightweight_commit}\trefs/tags/v0.24.0\n"
     );
     let git = HistoricalTagGit::with_stdout(output.into_bytes());
     publish::assert_remote_historical_tag_commits(
         &git,
         &[
-            ("v0.25", annotated_commit.as_str()),
-            ("v0.24", lightweight_commit.as_str()),
+            ("v0.25.0", annotated_commit.as_str()),
+            ("v0.24.0", lightweight_commit.as_str()),
         ],
     )
     .unwrap();
@@ -1829,24 +1827,24 @@ fn historical_tag_binding_rejects_missing_wrong_and_malformed_refs() {
     let wrong = "b".repeat(40);
     let missing = HistoricalTagGit::with_stdout(Vec::new());
     assert!(
-        publish::assert_remote_historical_tag_commits(&missing, &[("v0.25", commit.as_str())])
+        publish::assert_remote_historical_tag_commits(&missing, &[("v0.25.0", commit.as_str())])
             .is_err()
     );
 
     let wrong_git =
-        HistoricalTagGit::with_stdout(format!("{wrong}\trefs/tags/v0.25\n").into_bytes());
+        HistoricalTagGit::with_stdout(format!("{wrong}\trefs/tags/v0.25.0\n").into_bytes());
     assert!(
-        publish::assert_remote_historical_tag_commits(&wrong_git, &[("v0.25", commit.as_str())])
+        publish::assert_remote_historical_tag_commits(&wrong_git, &[("v0.25.0", commit.as_str())])
             .is_err()
     );
 
     let malformed_git = HistoricalTagGit::with_stdout(
-        format!("{commit}\trefs/tags/v0.25\n{commit}\trefs/tags/v0.25^{{}}\n").into_bytes(),
+        format!("{commit}\trefs/tags/v0.25.0\n{commit}\trefs/tags/v0.25.0^{{}}\n").into_bytes(),
     );
     assert!(
         publish::assert_remote_historical_tag_commits(
             &malformed_git,
-            &[("v0.25", commit.as_str())]
+            &[("v0.25.0", commit.as_str())]
         )
         .is_err()
     );
@@ -1857,7 +1855,7 @@ fn published_snapshot_preserves_symbolic_target_but_claim_capability_does_not() 
     let manifest_commit = "a".repeat(40);
     let historical = publish::ReleaseObjectIdentity {
         id: 349_821_802,
-        tag: "v0.25".into(),
+        tag: "v0.25.0".into(),
         draft: false,
         target_commitish: "main".into(),
     };
@@ -1884,7 +1882,7 @@ fn published_snapshot_preserves_symbolic_target_but_claim_capability_does_not() 
 
     let current = publish::ReleaseObjectIdentity {
         id: 55,
-        tag: "v0.55".into(),
+        tag: "v0.55.0".into(),
         draft: false,
         target_commitish: manifest_commit.to_ascii_uppercase(),
     };
@@ -1897,7 +1895,7 @@ fn published_snapshot_preserves_symbolic_target_but_claim_capability_does_not() 
     )
     .unwrap();
 
-    let mut scratch = yank_published("v0.25", historical.id, None);
+    let mut scratch = yank_published("v0.25.0", historical.id, None);
     scratch.release_id = Some(historical.id);
     scratch.release = Some(historical.clone());
     assert!(
@@ -1911,14 +1909,14 @@ fn published_snapshot_preserves_symbolic_target_but_claim_capability_does_not() 
 #[test]
 fn release_identity_parsers_do_not_lowercase_symbolic_targets() {
     let response =
-        br#"{"id":55,"tag_name":"v0.55","draft":false,"target_commitish":"Feature/Case"}"#;
+        br#"{"id":55,"tag_name":"v0.55.0","draft":false,"target_commitish":"Feature/Case"}"#;
     assert_eq!(
         publish::parse_release_object_response(response)
             .unwrap()
             .target_commitish,
         "Feature/Case"
     );
-    let rows = "55\tv0.55\tfalse\tFeature/Case\n";
+    let rows = "55\tv0.55.0\tfalse\tFeature/Case\n";
     assert_eq!(
         publish::parse_release_object_identity_rows(rows).unwrap()[0].target_commitish,
         "Feature/Case"
@@ -1937,18 +1935,39 @@ fn release_identity_queries_match_collection_and_object_json_shapes() {
 
 #[test]
 fn yank_successor_first_requires_newer_order_build_and_checked_floor() {
-    let bad = yank_published("v0.54", 54, None);
-    let successor = yank_published("v0.55", 55, Some(55));
+    let bad = yank_published("v0.54.0", 54, None);
+    let successor = yank_published("v0.55.0", 55, Some(55));
     assert!(verify::yank_successor_covers(&bad, &successor).unwrap());
-    assert!(!verify::yank_successor_covers(&bad, &yank_published("v0.55", 55, Some(54))).unwrap());
-    assert!(!verify::yank_successor_covers(&bad, &yank_published("v0.53", 56, Some(55))).unwrap());
-    assert!(verify::yank_successor_covers(&bad, &yank_published("v0.55", 54, Some(55))).is_err());
+    assert!(
+        !verify::yank_successor_covers(&bad, &yank_published("v0.55.0", 55, Some(54))).unwrap()
+    );
+    assert!(
+        !verify::yank_successor_covers(&bad, &yank_published("v0.53.0", 56, Some(55))).unwrap()
+    );
+    assert!(verify::yank_successor_covers(&bad, &yank_published("v0.55.0", 54, Some(55))).is_err());
 
-    let overflow = yank_published("v0.54", u64::MAX, None);
+    let overflow = yank_published("v0.54.0", u64::MAX, None);
     assert!(verify::yank_successor_covers(&overflow, &successor).is_err());
-    let mut mismatched = successor;
-    mismatched.version = "0.56".into();
+    let mut mismatched = successor.clone();
+    mismatched.version = "0.56.0".into();
     assert!(verify::yank_successor_covers(&bad, &mismatched).is_err());
+
+    // A retired two-component release is inert archive history that no client
+    // selects. It is not orderable against the current scheme, so it is
+    // refused at BOTH ends — never ordered, never a licence to delete.
+    let retired = yank_published("v0.61", 61, Some(61));
+    for (bad_end, successor_end) in [(&retired, &successor), (&bad, &retired)] {
+        let err = verify::yank_successor_covers(bad_end, successor_end)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("yank needs two current-scheme vMAJOR.MINOR.PATCH releases")
+                && err.contains("retired two-component release"),
+            "{} → {}: {err}",
+            bad_end.tag,
+            successor_end.tag
+        );
+    }
 }
 
 fn appcast(version: &str, build: u64) -> Vec<u8> {
@@ -1980,9 +1999,9 @@ fn release_metadata_row(
 #[test]
 fn client_arbitration_is_permutation_invariant_and_skips_older_503() {
     let rows = [
-        release_metadata_row("v0.9", false, 1, 0),
-        release_metadata_row("v0.10", false, 1, 0),
-        release_metadata_row("v0.8", false, 1, 0),
+        release_metadata_row("v0.9.0", false, 1, 0),
+        release_metadata_row("v0.10.0", false, 1, 0),
+        release_metadata_row("v0.8.0", false, 1, 0),
     ];
     for order in [
         [0usize, 1usize, 2usize],
@@ -1998,8 +2017,10 @@ fn client_arbitration_is_permutation_invariant_and_skips_older_503() {
             verify::scan_release_page(&listing, true, |_, tag, asset| {
                 fetched.push((tag.to_string(), asset.to_string()));
                 match tag {
-                    "v0.10" => Ok(appcast_with_floor("0.10", 10, Some(9))),
-                    "v0.9" | "v0.8" => Err(ledger::Error::new(format!("{tag} appcast: HTTP 503"))),
+                    "v0.10.0" => Ok(appcast_with_floor("0.10.0", 10, Some(9))),
+                    "v0.9.0" | "v0.8.0" => {
+                        Err(ledger::Error::new(format!("{tag} appcast: HTTP 503")))
+                    }
                     other => panic!("unexpected tag {other}"),
                 }
             })
@@ -2008,17 +2029,17 @@ fn client_arbitration_is_permutation_invariant_and_skips_older_503() {
         assert_eq!(release_count, 3);
         assert_eq!(
             fetched,
-            [("v0.10".to_string(), manifest_out::MANIFEST_ASSET.into())]
+            [("v0.10.0".to_string(), manifest_out::MANIFEST_ASSET.into())]
         );
         assert_eq!(scanned.len(), 1);
-        assert_eq!((scanned[0].tag.as_str(), scanned[0].build), ("v0.10", 10));
+        assert_eq!((scanned[0].tag.as_str(), scanned[0].build), ("v0.10.0", 10));
         assert_eq!(scanned[0].min_build, Some(9));
     }
 }
 
-/// The one-time channel migration has thirteen real numeric three-component
-/// exact heads. They remain orderable as older history, but only canonical
-/// v0.54 is authoritative and therefore only its manifest may be fetched.
+/// The repository's thirteen real pre-canonical exact heads are ordinary
+/// three-component candidates under the single-version scheme — they simply
+/// order BELOW the current head, so only v0.54.0's manifest may be fetched.
 #[test]
 fn client_arbitration_tolerates_real_lower_numeric_legacy_heads() {
     let legacy_tags = [
@@ -2041,13 +2062,13 @@ fn client_arbitration_tolerates_real_lower_numeric_legacy_heads() {
         .rev()
         .map(|tag| release_metadata_row(tag, false, 1, 0))
         .collect();
-    rows.insert(6, release_metadata_row("v0.54", false, 1, 0));
+    rows.insert(6, release_metadata_row("v0.54.0", false, 1, 0));
     let listing = rows.join("\n");
     let mut fetched = Vec::new();
     let (_, scanned) = verify::scan_release_page(&listing, true, |_, tag, asset| {
         fetched.push((tag.to_string(), asset.to_string()));
         match tag {
-            "v0.54" => Ok(appcast("0.54", 540)),
+            "v0.54.0" => Ok(appcast("0.54.0", 540)),
             legacy => panic!("legacy authority was fetched: {legacy}"),
         }
     })
@@ -2055,54 +2076,119 @@ fn client_arbitration_tolerates_real_lower_numeric_legacy_heads() {
 
     assert_eq!(
         fetched,
-        [("v0.54".to_string(), manifest_out::MANIFEST_ASSET.into())]
+        [("v0.54.0".to_string(), manifest_out::MANIFEST_ASSET.into())]
     );
-    assert_eq!((scanned[0].tag.as_str(), scanned[0].build), ("v0.54", 540));
+    assert_eq!(
+        (scanned[0].tag.as_str(), scanned[0].build),
+        ("v0.54.0", 540)
+    );
 }
 
-/// Nonnumeric exact heads cannot be proven historical; a same/newer numeric
-/// legacy extension wins numeric arbitration but is forbidden as authority.
+/// Garbage in the tag namespace fails closed rather than silently narrowing
+/// the candidate set: a tag that is neither canonical `vMAJOR.MINOR.PATCH`
+/// nor a retired two-component release aborts the whole scan before any
+/// download. Leading-zero spellings are refused too, so two tags can never
+/// share one numeric order.
 #[test]
-fn client_arbitration_refuses_unorderable_or_noncanonical_authority() {
-    for rejected in ["release-old", "v0.54.1", "v0.55.1"] {
+fn client_arbitration_refuses_unorderable_tags() {
+    for rejected in [
+        "release-old",
+        "v0.54.0.1",
+        "v01.54.0",
+        "v0.54.00",
+        "v0.54.",
+        "v0",
+        "0.54.0",
+    ] {
         let listing = [
-            release_metadata_row("v0.54", false, 1, 0),
+            release_metadata_row("v0.54.0", false, 1, 0),
             release_metadata_row(rejected, false, 1, 0),
         ]
         .join("\n");
         let mut fetched = false;
         let err = verify::scan_release_page(&listing, true, |_, _, _| {
             fetched = true;
-            Ok(appcast("0.54", 540))
+            Ok(appcast("0.54.0", 540))
         })
         .unwrap_err()
         .to_string();
-        assert!(!fetched, "metadata refusal must precede every download");
-        if rejected == "release-old" {
-            assert!(err.contains("not numerically orderable"), "{err}");
-        } else {
-            assert!(err.contains("not canonical vMAJOR.MINOR"), "{err}");
-        }
+        assert!(
+            !fetched,
+            "{rejected:?}: metadata refusal must precede every download"
+        );
+        assert!(
+            err.contains("is not numeric dotted vN.N.N"),
+            "{rejected:?} → {err}"
+        );
     }
+}
+
+/// The burned bridge, executable: retired two-component releases stay
+/// published in the archive and are neither candidates nor errors. A live
+/// v0.61 orders above v0.2.0 under the OLD two-field comparison, so without
+/// the skip the very first post-cut-over check would stall on it.
+#[test]
+fn client_arbitration_skips_retired_two_component_releases() {
+    let listing = [
+        release_metadata_row("v0.61", false, 1, 0),
+        release_metadata_row("v0.2.0", false, 1, 0),
+        release_metadata_row("v0.25", false, 1, 0),
+    ]
+    .join("\n");
+    let mut fetched = Vec::new();
+    let (release_count, scanned) = verify::scan_release_page(&listing, true, |_, tag, asset| {
+        fetched.push((tag.to_string(), asset.to_string()));
+        match tag {
+            "v0.2.0" => Ok(appcast("0.2.0", 1_790_000_000)),
+            retired => panic!("a retired two-component release was fetched: {retired}"),
+        }
+    })
+    .expect("retired releases are archive history, never an error");
+
+    assert_eq!(
+        release_count, 3,
+        "every row is still counted for pagination"
+    );
+    assert_eq!(
+        fetched,
+        [("v0.2.0".to_string(), manifest_out::MANIFEST_ASSET.into())]
+    );
+    assert_eq!(
+        (scanned[0].tag.as_str(), scanned[0].build),
+        ("v0.2.0", 1_790_000_000)
+    );
+
+    // With no current-scheme candidate at all, a page of retired releases
+    // selects NOTHING — it must never fall back to archive history.
+    let retired_only = [
+        release_metadata_row("v0.61", false, 1, 0),
+        release_metadata_row("v0.25", false, 1, 0),
+    ]
+    .join("\n");
+    let (_, none) = verify::scan_release_page(&retired_only, true, |_, tag, _| {
+        panic!("retired-only page must fetch nothing, got {tag}")
+    })
+    .expect("a retired-only page is empty, not malformed");
+    assert!(none.is_empty());
 }
 
 #[test]
 fn client_arbitration_rejects_malformed_and_duplicate_metadata_before_fetch() {
     let fixtures = [
-        release_metadata_row("v0.54", false, 2, 0),
+        release_metadata_row("v0.54.0", false, 2, 0),
         [
-            release_metadata_row("v0.54", false, 1, 0),
-            release_metadata_row("v0.54", false, 1, 0),
+            release_metadata_row("v0.54.0", false, 1, 0),
+            release_metadata_row("v0.54.0", false, 1, 0),
         ]
         .join("\n"),
-        "v0.54\tfalse\tnot-a-count\t0".to_string(),
-        "v0.54\tfalse\t1".to_string(),
+        "v0.54.0\tfalse\tnot-a-count\t0".to_string(),
+        "v0.54.0\tfalse\t1".to_string(),
     ];
     for listing in fixtures {
         let mut fetched = false;
         let err = verify::scan_release_page(&listing, true, |_, _, _| {
             fetched = true;
-            Ok(appcast("0.54", 540))
+            Ok(appcast("0.54.0", 540))
         })
         .unwrap_err()
         .to_string();
@@ -2119,8 +2205,8 @@ fn client_arbitration_rejects_malformed_and_duplicate_metadata_before_fetch() {
 #[test]
 fn authoritative_fetch_and_version_mismatch_never_fall_back() {
     let listing = [
-        release_metadata_row("v0.9", false, 1, 0),
-        release_metadata_row("v0.10", false, 1, 0),
+        release_metadata_row("v0.9.0", false, 1, 0),
+        release_metadata_row("v0.10.0", false, 1, 0),
     ]
     .join("\n");
 
@@ -2128,28 +2214,28 @@ fn authoritative_fetch_and_version_mismatch_never_fall_back() {
     let err = verify::scan_release_page(&listing, true, |_, tag, _| {
         fetched.push(tag.to_string());
         match tag {
-            "v0.10" => Err(ledger::Error::new("authoritative appcast: HTTP 503")),
+            "v0.10.0" => Err(ledger::Error::new("authoritative appcast: HTTP 503")),
             older => panic!("fallback fetched after authoritative failure: {older}"),
         }
     })
     .unwrap_err()
     .to_string();
-    assert_eq!(fetched, ["v0.10"]);
+    assert_eq!(fetched, ["v0.10.0"]);
     assert!(err.contains("HTTP 503"), "{err}");
 
     fetched.clear();
     let err = verify::scan_release_page(&listing, true, |_, tag, _| {
         fetched.push(tag.to_string());
         match tag {
-            "v0.10" => Ok(appcast("0.9", 10)),
+            "v0.10.0" => Ok(appcast("0.9.0", 10)),
             older => panic!("fallback fetched after version rejection: {older}"),
         }
     })
     .unwrap_err()
     .to_string();
-    assert_eq!(fetched, ["v0.10"]);
+    assert_eq!(fetched, ["v0.10.0"]);
     assert!(
-        err.contains("manifest version") && err.contains("0.10"),
+        err.contains("manifest version") && err.contains("0.10.0"),
         "{err}"
     );
 }
@@ -2160,11 +2246,11 @@ fn authoritative_fetch_and_version_mismatch_never_fall_back() {
 fn client_replay_ignores_archived_only_history() {
     let mut fetched = false;
     let (_, scanned) = verify::scan_release_page(
-        &release_metadata_row("v0.41", false, 0, 1),
+        &release_metadata_row("v0.41.0", false, 0, 1),
         true,
         |_, _, _| {
             fetched = true;
-            Ok(appcast("0.41", 410))
+            Ok(appcast("0.41.0", 410))
         },
     )
     .unwrap();
@@ -2178,16 +2264,16 @@ fn client_replay_ignores_archived_only_history() {
 #[test]
 fn no_stop_negative_control_reproduces_old_appcast_503() {
     let listing = [
-        release_metadata_row("v0.54", false, 1, 0),
-        release_metadata_row("v0.41", false, 0, 1),
+        release_metadata_row("v0.54.0", false, 1, 0),
+        release_metadata_row("v0.41.0", false, 0, 1),
     ]
     .join("\n");
     let mut fetched = Vec::new();
     let err = verify::scan_release_page(&listing, false, |_, tag, asset| {
         fetched.push((tag.to_string(), asset.to_string()));
         match tag {
-            "v0.54" => Ok(appcast("0.54", 540)),
-            "v0.41" => Err(ledger::Error::new("v0.41 appcast: HTTP 503")),
+            "v0.54.0" => Ok(appcast("0.54.0", 540)),
+            "v0.41.0" => Err(ledger::Error::new("v0.41.0 appcast: HTTP 503")),
             other => panic!("unexpected tag {other}"),
         }
     })
@@ -2196,14 +2282,14 @@ fn no_stop_negative_control_reproduces_old_appcast_503() {
     assert_eq!(
         fetched,
         [
-            ("v0.54".to_string(), manifest_out::MANIFEST_ASSET.into()),
+            ("v0.54.0".to_string(), manifest_out::MANIFEST_ASSET.into()),
             (
-                "v0.41".to_string(),
-                manifest_out::archived_manifest_asset("v0.41")
+                "v0.41.0".to_string(),
+                manifest_out::archived_manifest_asset("v0.41.0")
             )
         ]
     );
-    assert!(err.to_string().contains("v0.41 appcast: HTTP 503"));
+    assert!(err.to_string().contains("v0.41.0 appcast: HTTP 503"));
 }
 
 /// `cargo ship status` intentionally requests the exhaustive policy: drafts
@@ -2212,18 +2298,18 @@ fn no_stop_negative_control_reproduces_old_appcast_503() {
 #[test]
 fn exhaustive_page_preserves_all_published_appcasts() {
     let listing = [
-        release_metadata_row("v0.55", true, 1, 0),
-        release_metadata_row("v0.54", false, 1, 0),
-        release_metadata_row("v0.53", false, 0, 0),
-        release_metadata_row("v0.41", false, 0, 1),
+        release_metadata_row("v0.55.0", true, 1, 0),
+        release_metadata_row("v0.54.0", false, 1, 0),
+        release_metadata_row("v0.53.0", false, 0, 0),
+        release_metadata_row("v0.41.0", false, 0, 1),
     ]
     .join("\n");
     let mut fetched = Vec::new();
     let (page_len, scanned) = verify::scan_release_page(&listing, false, |_, tag, asset| {
         fetched.push((tag.to_string(), asset.to_string()));
         match tag {
-            "v0.54" => Ok(appcast("0.54", 540)),
-            "v0.41" => Ok(appcast("0.41", 410)),
+            "v0.54.0" => Ok(appcast("0.54.0", 540)),
+            "v0.41.0" => Ok(appcast("0.41.0", 410)),
             other => panic!("draft/appcast-less tag was fetched: {other}"),
         }
     })
@@ -2233,10 +2319,10 @@ fn exhaustive_page_preserves_all_published_appcasts() {
     assert_eq!(
         fetched,
         [
-            ("v0.54".to_string(), manifest_out::MANIFEST_ASSET.into()),
+            ("v0.54.0".to_string(), manifest_out::MANIFEST_ASSET.into()),
             (
-                "v0.41".to_string(),
-                manifest_out::archived_manifest_asset("v0.41")
+                "v0.41.0".to_string(),
+                manifest_out::archived_manifest_asset("v0.41.0")
             )
         ]
     );
@@ -2245,15 +2331,15 @@ fn exhaustive_page_preserves_all_published_appcasts() {
             .iter()
             .map(|published| (published.tag.as_str(), published.build))
             .collect::<Vec<_>>(),
-        [("v0.54", 540), ("v0.41", 410)]
+        [("v0.54.0", 540), ("v0.41.0", 410)]
     );
     assert_eq!(
         verify::select_newest(&scanned).map(|published| published.tag.as_str()),
-        Some("v0.54")
+        Some("v0.54.0")
     );
     assert_eq!(
         scanned[1].asset,
-        manifest_out::archived_manifest_asset("v0.41"),
+        manifest_out::archived_manifest_asset("v0.41.0"),
         "exhaustive status/yank history must retain renamed manifests"
     );
 }
@@ -2263,14 +2349,14 @@ fn exhaustive_page_preserves_all_published_appcasts() {
 #[test]
 fn exhaustive_history_rejects_duplicate_exact_or_archive_names() {
     for listing in [
-        release_metadata_row("v0.54", false, 2, 0),
-        release_metadata_row("v0.41", false, 0, 2),
-        release_metadata_row("v0.54", false, 1, 1),
+        release_metadata_row("v0.54.0", false, 2, 0),
+        release_metadata_row("v0.41.0", false, 0, 2),
+        release_metadata_row("v0.54.0", false, 1, 1),
     ] {
         let mut fetched = false;
         let err = verify::scan_release_page(&listing, false, |_, _, _| {
             fetched = true;
-            Ok(appcast("0.54", 540))
+            Ok(appcast("0.54.0", 540))
         })
         .unwrap_err()
         .to_string();
@@ -2312,13 +2398,13 @@ fn cli_parses_the_whole_spec_5_surface() {
     assert_eq!(
         parse(&[
             "recover",
-            "v0.55",
+            "v0.55.0",
             &"a".repeat(40),
             publish::RECOVERY_STOPPED_PROCESS_FLAG,
         ])
         .unwrap(),
         cli::Cmd::Recover {
-            version: "0.55".into(),
+            version: "0.55.0".into(),
             owner: "a".repeat(40),
         }
     );
@@ -2327,9 +2413,9 @@ fn cli_parses_the_whole_spec_5_surface() {
         cli::Cmd::Verify { version: None }
     );
     assert_eq!(
-        parse(&["verify", "v0.26"]).unwrap(),
+        parse(&["verify", "v0.26.0"]).unwrap(),
         cli::Cmd::Verify {
-            version: Some("0.26".into())
+            version: Some("0.26.0".into())
         },
         "the v prefix is normalized away"
     );
@@ -2344,7 +2430,7 @@ fn cli_parses_the_whole_spec_5_surface() {
         "cut",
         "--dry-run",
         "--set-version",
-        "v0.27",
+        "v0.27.0",
         "--min-build",
         "42",
         "--gate",
@@ -2355,7 +2441,7 @@ fn cli_parses_the_whole_spec_5_surface() {
     };
     assert!(abandon.is_none());
     assert!(opts.dry_run && opts.gate && opts.arm64_only && !opts.resume);
-    assert_eq!(opts.set_version.as_deref(), Some("0.27"));
+    assert_eq!(opts.set_version.as_deref(), Some("0.27.0"));
     assert_eq!(opts.min_build, Some(42));
 
     let cli::Cmd::Cut { opts, .. } =
@@ -2368,10 +2454,10 @@ fn cli_parses_the_whole_spec_5_surface() {
         Some("alabsystems/aterm-rehearsal")
     );
 
-    let cli::Cmd::Cut { abandon, .. } = parse(&["cut", "--abandon", "v0.26"]).unwrap() else {
+    let cli::Cmd::Cut { abandon, .. } = parse(&["cut", "--abandon", "v0.26.0"]).unwrap() else {
         panic!("expected Cut");
     };
-    assert_eq!(abandon.as_deref(), Some("0.26"));
+    assert_eq!(abandon.as_deref(), Some("0.26.0"));
 }
 
 #[test]
@@ -2379,12 +2465,19 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
     for (args, needle) in [
         (vec!["frobnicate"], "unknown command"),
         (vec!["cut", "--frobnicate"], "unknown cut flag"),
-        (vec!["cut", "--set-version", "0.26.1"], "MAJOR.MINOR"),
+        // --set-version now REQUIRES the canonical three-component form;
+        // the retired two-component spelling is just another malformed one.
+        (vec!["cut", "--set-version", "0.26"], "MAJOR.MINOR.PATCH"),
+        (
+            vec!["cut", "--set-version", "0.26.0.1"],
+            "MAJOR.MINOR.PATCH",
+        ),
+        (vec!["cut", "--set-version", "01.26.0"], "MAJOR.MINOR.PATCH"),
         (vec!["cut", "--min-build", "abc"], "not a u64"),
         (
             vec![
                 "recover",
-                "v0.55",
+                "v0.55.0",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ],
             "--old-publisher-stopped",
@@ -2393,7 +2486,7 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
         (vec!["cut", "--rehearse"], "OWNER/REPO"),
         (vec!["cut", "--resume", "--dry-run"], "--resume"),
         (vec!["cut", "--resume", "--min-build", "7"], "--resume"),
-        (vec!["cut", "--abandon", "v0.26", "--gate"], "--abandon"),
+        (vec!["cut", "--abandon", "v0.26.0", "--gate"], "--abandon"),
         (
             vec!["cut", "--dry-run", "--rehearse", "o/r"],
             "mutually exclusive",
@@ -2402,13 +2495,23 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
         (vec!["yank", "abc"], "not a build number"),
         (vec!["yank", "1", "2"], "exactly one"),
         (vec!["status", "extra"], "no arguments"),
-        (vec!["recover", "v0.55"], "full claim SHA"),
+        (vec!["recover", "v0.55.0"], "full claim SHA"),
         (
-            vec!["recover", "v0.55", "abc", "extra"],
+            vec!["recover", "v0.55.0", "abc", "extra"],
             "--old-publisher-stopped",
         ),
-        (vec!["verify", "v0.26", "extra"], "at most one"),
-        (vec!["verify", "not-a-version"], "MAJOR.MINOR"),
+        (vec!["verify", "v0.26.0", "extra"], "at most one"),
+        (vec!["verify", "not-a-version"], "MAJOR.MINOR.PATCH"),
+        (vec!["verify", "v0.26"], "MAJOR.MINOR.PATCH"),
+        (vec!["cut", "--abandon", "v0.26"], "MAJOR.MINOR.PATCH"),
+        (
+            vec![
+                "recover",
+                "v0.55",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ],
+            "MAJOR.MINOR.PATCH",
+        ),
     ] {
         let err = parse(&args).unwrap_err();
         assert!(
@@ -2423,7 +2526,7 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
     let owner = "a".repeat(40);
     let extra = parse(&[
         "recover",
-        "v0.55",
+        "v0.55.0",
         &owner,
         publish::RECOVERY_STOPPED_PROCESS_FLAG,
         "extra",
@@ -2435,7 +2538,7 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
     // repository. The boolean is an operator assertion, never a machine proof.
     let error = publish::run_recover_lost(
         &PathBuf::from("/definitely/not/an/aterm/repository"),
-        "0.55",
+        "0.55.0",
         &owner,
         false,
     )

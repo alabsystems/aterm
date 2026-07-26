@@ -115,6 +115,36 @@ fn set_memory_budget_evicts_cold_pages() {
     );
 }
 
+/// E10a: memory-pressure eviction is REAL retention loss and must be counted
+/// out-of-band; a user-requested line-limit truncation must NOT be.
+#[test]
+fn pressure_evictions_are_counted_and_limit_truncation_is_not() {
+    let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
+    for i in 0..50 {
+        sb.push_str(&format!("Pressure-count-line-{i}"));
+    }
+    assert_eq!(sb.pressure_evicted_lines(), 0, "no loss under budget");
+    let before = sb.line_count();
+    sb.set_memory_budget(1).expect("budget shrink enforces");
+    let lost = before - sb.line_count();
+    assert!(lost > 0, "the 1-byte budget really evicted");
+    assert_eq!(
+        sb.pressure_evicted_lines(),
+        lost as u64,
+        "every pressure-evicted line is counted, none double-counted"
+    );
+
+    // User-requested truncation: intentional, not loss — counter unchanged.
+    let counted = sb.pressure_evicted_lines();
+    sb.set_line_limit(Some(1));
+    assert!(sb.line_count() <= 1);
+    assert_eq!(
+        sb.pressure_evicted_lines(),
+        counted,
+        "set_line_limit truncation must not inflate the loss counter"
+    );
+}
+
 /// Cold tier budget enforcement (#5444): push_line triggers cold eviction under pressure.
 #[test]
 fn push_line_triggers_cold_eviction_when_over_budget() {

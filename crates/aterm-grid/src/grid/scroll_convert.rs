@@ -110,19 +110,28 @@ pub(crate) struct DeferredLine {
 }
 
 impl DeferredLine {
-    /// Create a deferred line by snapshotting a Row's cell data.
+    /// Create a deferred line by snapshotting a Row's cell data into `scratch`
+    /// — a recycled cell body from the [`CellPool`], or `Vec::new()` when the
+    /// caller has none.
     ///
     /// This is O(cells) memcpy but avoids the O(cols) text extraction,
     /// RLE attribute building, and String allocation of full conversion.
-    pub(crate) fn new(row: &Row, extras: ScrolledRowExtras) -> Self {
+    ///
+    /// LATENCY: taking the body from the pool instead of `to_vec()`-ing a fresh
+    /// one removes one malloc (and later one free) PER SCROLLED LINE from
+    /// inside the PTY reader's `term_lock` hold — the hold the UI thread's
+    /// keystroke-echo present waits behind. `clear` + `extend_from_slice` fully
+    /// defines both the length and every element from the row slice, so a
+    /// recycled body carries NO state from its previous line: content is
+    /// byte-identical to the old `to_vec()`.
+    pub(crate) fn new(row: &Row, extras: ScrolledRowExtras, mut scratch: Vec<Cell>) -> Self {
         let len = row.len();
-        let cells: Vec<Cell> = if len == 0 {
-            Vec::new()
-        } else {
-            row.as_slice()[..len as usize].to_vec()
-        };
+        scratch.clear();
+        if len != 0 {
+            scratch.extend_from_slice(&row.as_slice()[..len as usize]);
+        }
         Self {
-            cells,
+            cells: scratch,
             len,
             extras: if extras.is_empty() {
                 None
@@ -143,13 +152,57 @@ impl DeferredLine {
         self.cached.get_or_init(|| self.materialize())
     }
 
-    /// Convert into an owned [`Line`], consuming the deferred line.
+    /// Estimated HEAP bytes owned by this deferred line (excludes
+    /// `size_of::<DeferredLine>()` itself — the container counts that via its
+    /// backing capacity). Extras are counted shallow, matching the
+    /// `ring_extras` convention in `Grid::memory_used`.
+    pub(crate) fn heap_memory_used(&self) -> usize {
+        let mut total = self.cells.capacity() * std::mem::size_of::<Cell>();
+        if self.extras.is_some() {
+            total += std::mem::size_of::<ScrolledRowExtras>();
+        }
+        if let Some(line) = self.cached.get() {
+            total += line.memory_used();
+        }
+        total
+    }
+
+    /// Convert into an owned [`Line`], consuming the deferred line AND its cell
+    /// body. Test-only: every production consumption site goes through
+    /// [`into_line_recycled`](Self::into_line_recycled) so the body comes back to
+    /// the pool — a non-recycling variant on the flood path would silently
+    /// reintroduce the per-newline free/malloc this pool exists to remove.
     ///
     /// Returns the cached line if already materialized, otherwise performs
     /// the conversion.
+    #[cfg(test)]
     pub(crate) fn into_line(self) -> Line {
+        self.into_line_and_body().0
+    }
+
+    /// [`into_line`](Self::into_line), returning the now-free cell body to
+    /// `pool` for the next scroll-off to fill.
+    ///
+    /// Every consumption site the flood path reaches goes through here: without
+    /// it the bodies the reader just allocated are handed straight back to the
+    /// allocator at drain time, and the next 256/1000 scrolled lines malloc
+    /// again inside the reader's lock hold.
+    pub(crate) fn into_line_recycled(self, pool: &mut CellPool) -> Line {
+        let (line, body) = self.into_line_and_body();
+        pool.put(body);
+        line
+    }
+
+    /// Shared body of the two `into_line` forms: yields the materialized line
+    /// AND the cell `Vec` it was built from (already emptied of meaning — the
+    /// caller either drops it or pools it). Taking the body out FIRST keeps the
+    /// already-cached early-return recycling too; that path owns a body just as
+    /// much as the materializing one.
+    fn into_line_and_body(mut self) -> (Line, Vec<Cell>) {
+        let body = std::mem::take(&mut self.cells);
+
         if let Some(line) = self.cached.into_inner() {
-            return line;
+            return (line, body);
         }
 
         #[cfg(any(test, feature = "testing"))]
@@ -164,14 +217,15 @@ impl DeferredLine {
             if self.wrapped {
                 line.set_wrapped(true);
             }
-            return line;
+            return (line, body);
         }
-        let cells = &self.cells[..len];
-        if extras.is_empty() {
+        let cells = &body[..len];
+        let line = if extras.is_empty() {
             Self::materialize_no_extras(cells, self.wrapped)
         } else {
             Self::materialize_with_extras(cells, extras, self.wrapped)
-        }
+        };
+        (line, body)
     }
 
     /// Perform the O(cols) conversion from raw cells to Line.
@@ -289,23 +343,141 @@ impl DeferredLine {
 pub(crate) struct LazyBuffer {
     /// Pending deferred lines, ordered oldest to newest.
     lines: VecDeque<DeferredLine>,
+    /// Free-list of cell bodies recycled between deferred lines (see
+    /// [`CellPool`]). Lives HERE, not beside the buffer, so every producer and
+    /// every consumer of a `DeferredLine` is on the recycling path by
+    /// construction — a future consumption site cannot silently forget to
+    /// return the body, and the pool's bytes fold into
+    /// [`memory_used`](Self::memory_used) automatically.
+    pool: CellPool,
 }
 
 /// Maximum number of deferred lines before automatic drain to tiered scrollback.
 const DRAIN_THRESHOLD: usize = 1000;
+
+/// Bounded free-list of `Vec<Cell>` bodies, recycled between deferred lines.
+///
+/// WHY: every row that scrolls off the ring into tiered scrollback becomes a
+/// `DeferredLine`, whose cell snapshot used to be a fresh `to_vec()` — one
+/// malloc now, one free at drain time, PER NEWLINE. That malloc runs inside the
+/// single `term_lock` hold the PTY reader takes for a whole read batch: at 80
+/// columns a 64 KiB batch is ~800 newlines, so ~800 malloc/free pairs sit on the
+/// hold that the UI thread's keystroke-echo present is blocked behind. The
+/// bodies are strictly transient (staged, materialized, freed), so handing them
+/// back to the next scroll-off costs nothing and removes the allocator from the
+/// per-newline path entirely.
+///
+/// BOUND: production takes one body per scrolled line; consumption returns them
+/// in batches (the GUI compression worker drains 256 at a time, the inline drain
+/// up to `DRAIN_THRESHOLD`). So the pool is fullest right after a drain and
+/// empty just before the next one — the bodies in flight (staged + pooled) stay
+/// roughly constant rather than being new footprint. It is capped twice anyway,
+/// by buffer COUNT and by total pooled CELLS, so neither a very deep backlog nor
+/// a very wide window can turn the free-list into idle megabytes; whatever it
+/// does hold is reported through [`LazyBuffer::memory_used`], so the ring byte
+/// watermark still sees it.
+#[derive(Debug, Default)]
+pub(crate) struct CellPool {
+    /// Emptied cell bodies awaiting reuse (LIFO: the most recently returned
+    /// body is the most likely to still be cache-warm).
+    bufs: Vec<Vec<Cell>>,
+    /// Running sum of the pooled bodies' CAPACITIES, in cells. Maintained
+    /// incrementally so both the budget check on the hot `put` and
+    /// `memory_used` stay O(1) instead of walking the free-list.
+    pooled_cells: usize,
+}
+
+/// Free-list depth cap. Sized off the DRAIN BATCH, not the visible row count:
+/// the GUI's off-thread compression worker returns 256 bodies per batch, so a
+/// visible-rows-sized pool (~50) would recycle a fifth of them and leave the
+/// rest to the allocator — the malloc storm this pool exists to remove would
+/// mostly survive. Two batches of headroom absorbs a worker that wakes late.
+const POOL_MAX_BUFFERS: usize = 512;
+
+/// Total pooled cells cap — 512 KiB of `Cell` bodies. The count cap alone is a
+/// per-width bound (512 × cols × 8 B), which a 1000-column window would turn
+/// into 4 MB of idle free-list; this makes the ceiling absolute.
+const POOL_MAX_CELLS: usize = 64 * 1024;
+
+impl CellPool {
+    /// Take a body for a new deferred line, or a fresh empty `Vec` when the
+    /// pool is dry (the pool is an optimization, never a requirement).
+    #[inline]
+    fn take(&mut self) -> Vec<Cell> {
+        match self.bufs.pop() {
+            Some(buf) => {
+                // Capacity is immutable while a body sits in the pool, so this
+                // exactly undoes the `put` that added it.
+                self.pooled_cells = self.pooled_cells.saturating_sub(buf.capacity());
+                buf
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Return a consumed body to the free-list, or drop it if that would push
+    /// the pool past either cap.
+    #[inline]
+    fn put(&mut self, buf: Vec<Cell>) {
+        let cap = buf.capacity();
+        // A zero-capacity body owns no allocation, so pooling it buys nothing
+        // and would let empty-row churn crowd real bodies out of the depth cap.
+        if cap == 0
+            || self.bufs.len() >= POOL_MAX_BUFFERS
+            || self.pooled_cells + cap > POOL_MAX_CELLS
+        {
+            return;
+        }
+        self.pooled_cells += cap;
+        self.bufs.push(buf);
+    }
+
+    /// Drop every pooled body AND the free-list's own backing allocation.
+    fn clear(&mut self) {
+        self.bufs = Vec::new();
+        self.pooled_cells = 0;
+    }
+
+    /// Heap bytes held by the free-list (bodies + the `Vec<Vec<Cell>>` spine).
+    fn memory_used(&self) -> usize {
+        self.bufs.capacity() * std::mem::size_of::<Vec<Cell>>()
+            + self.pooled_cells * std::mem::size_of::<Cell>()
+    }
+
+    /// Test-only: pooled body count, for the recycling/bound tests.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.bufs.len()
+    }
+}
 
 impl LazyBuffer {
     /// Create a new empty lazy buffer.
     pub(crate) fn new() -> Self {
         Self {
             lines: VecDeque::new(),
+            pool: CellPool::default(),
         }
     }
 
-    /// Push a deferred line to the back of the buffer.
-    #[inline]
+    /// Push a pre-built deferred line to the back of the buffer. Test-only:
+    /// production stages rows through [`push_row`](Self::push_row) so the cell
+    /// body always comes from the pool.
+    #[cfg(test)]
     pub(crate) fn push(&mut self, deferred: DeferredLine) {
         self.lines.push_back(deferred);
+    }
+
+    /// Snapshot `row` into a POOLED cell body and stage it.
+    ///
+    /// The allocation-free counterpart of `push(DeferredLine::new(..))` and the
+    /// only form the scroll-off path should use: it is what keeps the malloc out
+    /// of the reader's `term_lock` hold (see [`CellPool`]).
+    #[inline]
+    pub(crate) fn push_row(&mut self, row: &Row, extras: ScrolledRowExtras) {
+        let scratch = self.pool.take();
+        self.lines
+            .push_back(DeferredLine::new(row, extras, scratch));
     }
 
     /// Number of pending deferred lines.
@@ -333,7 +505,13 @@ impl LazyBuffer {
     ///
     /// Returns an iterator of Lines in oldest-to-newest order.
     pub(crate) fn drain_all(&mut self) -> impl Iterator<Item = Line> + '_ {
-        self.lines.drain(..).map(DeferredLine::into_line)
+        // Disjoint field borrows: the drain owns `lines`, the recycling owns
+        // `pool`. Each materialized line hands its cell body back for the next
+        // scroll-off to fill.
+        let pool = &mut self.pool;
+        self.lines
+            .drain(..)
+            .map(move |deferred| deferred.into_line_recycled(&mut *pool))
     }
 
     /// Drain up to `n` of the OLDEST pending lines (front of the buffer),
@@ -346,7 +524,12 @@ impl LazyBuffer {
     /// `n` is clamped to the buffer length, so front-to-`n` is always valid.
     pub(crate) fn drain_front(&mut self, n: usize) -> impl Iterator<Item = Line> + '_ {
         let n = n.min(self.lines.len());
-        self.lines.drain(..n).map(DeferredLine::into_line)
+        // The steady-state consumption site under flood: the worker's bounded
+        // batch is exactly where the reader's per-newline bodies come back.
+        let pool = &mut self.pool;
+        self.lines
+            .drain(..n)
+            .map(move |deferred| deferred.into_line_recycled(&mut *pool))
     }
 
     /// Get a line by index within the lazy buffer (0 = oldest).
@@ -357,9 +540,34 @@ impl LazyBuffer {
         self.lines.get(idx).map(DeferredLine::to_line)
     }
 
-    /// Clear all pending lines.
+    /// Clear all pending lines, and release the recycling pool with them.
+    ///
+    /// Every caller is a history-INVALIDATING path (scrollback erase, store
+    /// detach with nothing to drain into, resize drain) — never the flood path —
+    /// so the right behaviour is to hand the memory back rather than keep a
+    /// cache alive across a "user cleared history" event. The pool refills for
+    /// free on the next drain.
     pub(crate) fn clear(&mut self) {
         self.lines.clear();
+        self.pool.clear();
+    }
+
+    /// Drop the recycled cell bodies without touching the staged lines.
+    ///
+    /// Called on a WIDTH change: pooled capacities were sized for the old
+    /// column count, so reusing them afterwards is either wasted memory (width
+    /// shrank) or a guaranteed realloc on first fill (width grew). Note this is
+    /// a footprint guard, NOT a correctness one — `DeferredLine::new` clears and
+    /// refills the body from the row slice, so a stale-width body could never
+    /// leak old content into a line.
+    pub(crate) fn clear_pool(&mut self) {
+        self.pool.clear();
+    }
+
+    /// Test-only: pooled cell-body count.
+    #[cfg(test)]
+    pub(crate) fn pooled_bodies(&self) -> usize {
+        self.pool.len()
     }
 
     /// Drop the `n` oldest deferred lines (front of the buffer) without
@@ -367,7 +575,32 @@ impl LazyBuffer {
     /// for a reflow and cannot absorb it (audit #4).
     pub(crate) fn drop_oldest(&mut self, n: usize) {
         let n = n.min(self.lines.len());
-        self.lines.drain(..n);
+        // Recycle even here: this is the FLOOD path (the compression worker fell
+        // behind), i.e. exactly when the reader is allocating a body per newline
+        // under its lock. Dropping these bodies to the allocator instead would
+        // leave the pool dry precisely when it is needed most.
+        let pool = &mut self.pool;
+        for mut deferred in self.lines.drain(..n) {
+            pool.put(std::mem::take(&mut deferred.cells));
+        }
+    }
+
+    /// Estimated bytes held by the staged (not yet drained) lines: the
+    /// backing `VecDeque` capacity plus each deferred line's heap (Wave-3
+    /// adversarial review: under flood backpressure this buffer holds up to
+    /// the THRU-5 cap of raw ~8 B/cell rows — real memory the ring byte
+    /// watermark previously could not see). O(staged) per call; the buffer
+    /// is drain-bounded, and this runs only on poll-time accounting queries.
+    pub(crate) fn memory_used(&self) -> usize {
+        let mut total = self.lines.capacity() * std::mem::size_of::<DeferredLine>();
+        for line in &self.lines {
+            total += line.heap_memory_used();
+        }
+        // Bodies parked in the recycling pool are REAL retained heap (bounded by
+        // POOL_MAX_CELLS) — same reason the staged lines are counted: memory the
+        // ring byte watermark must be able to see.
+        total += self.pool.memory_used();
+        total
     }
 }
 

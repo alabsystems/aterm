@@ -20,7 +20,7 @@ cargo build --locked -p aterm
 ./target/debug/aterm --version
 ```
 
-The final command should report `aterm 0.1.0`. Build from the workspace; the
+The final command should report `aterm 0.5.0`. Build from the workspace; the
 individual crates are not published to crates.io and their APIs are not stable
 yet.
 

@@ -15,10 +15,12 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+mod dirty_band_present_api;
 mod effects_api;
 mod notifications_api;
 mod predict_api;
 mod scroll_input_api;
+mod scrollback_tiers_api;
 
 use aterm_core::grid::{PendingScrollbackReflow, ReflowStep};
 use aterm_core::selection::SmartSelection;
@@ -199,6 +201,19 @@ pub struct AtermTerminal {
     // walk to O(cols). Keyed by (content_gen, display_offset, row) so any write,
     // resize, or scroll invalidates it; RefCell because the reads are `&self`.
     display_row_cache: std::cell::RefCell<DisplayRowCache>,
+    // This pane's membership in the module-global scrollback byte budget
+    // (audit E1): registered at construction, share applied at the frame/drain
+    // boundaries. pub(crate) so scrollback_tiers_api reaches it (the
+    // effects-field posture).
+    pub(crate) budget_share: aterm_core::terminal::scrollback_shared_budget::ScrollbackBudgetShare,
+    // Packed (x,y,w,h) dirty present bands of the last `render()` (audit E3)
+    // — the spill_rects export pattern. pub(crate) for dirty_band_present_api.
+    pub(crate) present_bands: Vec<i32>,
+    // The sub-row translate presented LAST frame: while nonzero (and on the
+    // frame it releases) the whole grid band shifted, so partial bands would
+    // lie — those frames export one full band (audit E3, fractional-scroll
+    // clause). pub(crate) for dirty_band_present_api.
+    pub(crate) last_present_frac: i32,
 }
 
 /// The single-slot per-row display-cell cache backing `cell_text`/`cell_is_wide`.
@@ -289,18 +304,25 @@ impl AtermTerminal {
             ligature_mode: aterm_render::LigatureMode::Enabled,
             ..Default::default()
         });
-        // `Terminal::new` clamps rows/cols to the grid's 1..=4096 ingress bound;
+        // The engine clamps rows/cols to the grid's 1..=4096 ingress bound;
         // read the CLAMPED dims back so `render()` (which sizes the framebuffer
         // from `self.rows`/`self.cols`) can never be driven past the grid by a raw
         // JS u16. Storing the args verbatim would leave a 65535×65535 framebuffer
         // request → unbounded alloc / wasm32 u32 overflow → OOB.
-        let mut term = Terminal::new(rows, cols);
+        // Tiered store attached at construction (audit E1) — deep history lives
+        // in the hot/warm LZ4 tiers, not raw ring cells; compression is drained
+        // at the render frame boundary (see scrollback_tiers_api).
+        let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
+        let budget_share = scrollback_tiers_api::register_budget_share(&term);
         // Poll-drain surface for OSC 9/99/777 (a web host has no callback
         // thread); authorization keeps the engine's fail-closed default.
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let rows = term.grid().rows() as usize;
         let cols = term.grid().cols() as usize;
         Ok(Self {
+            budget_share,
+            present_bands: Vec::new(),
+            last_present_frac: 0,
             term,
             renderer,
             rows,
@@ -709,13 +731,14 @@ impl AtermTerminal {
     }
 
     /// Set the engine's scrollback line limit (history lines retained behind the live
-    /// viewport). `lines == 0` means unlimited (bounded only by host memory). This
-    /// engine is ring-only (no tiered store), so the limit re-caps the retention ring
-    /// itself: shrinking evicts the oldest lines immediately, growing extends retention
-    /// lazily (no eager allocation). Targets the primary-content grid — reaching the
-    /// saved primary through an alt screen; the alt buffer keeps its spec'd zero
-    /// scrollback — and re-clamps the scroll position. Without this the engine keeps
-    /// its construction default (a 10k-line ring) on every pane.
+    /// viewport). `lines == 0` means unlimited (bounded only by the byte budgets). The
+    /// limit is ONE TOTAL retention count (audit E1) across the hot ring, staged
+    /// lines, and the tiered store together — the store takes the remainder after the
+    /// ring's fixed share, so "retain N lines" retains N, not N + ring. Targets the
+    /// primary-content grid — reaching the saved primary through an alt screen; the
+    /// alt buffer keeps its spec'd zero scrollback — and re-clamps the scroll
+    /// position. Without this the engine keeps its construction default
+    /// (`DEFAULT_LINE_LIMIT`, 100k total).
     pub fn set_scrollback_limit(&mut self, lines: u32) {
         let limit = if lines == 0 {
             None
@@ -958,6 +981,10 @@ impl AtermTerminal {
         // still re-attaches its rewrapped history within the grace window (the
         // countdown gives an updated host's idle-scheduled pump time to win).
         self.pump_reflow_on_render_tick();
+        // Frame-boundary scrollback maintenance (audit E1): apply a pending
+        // global-budget share, then promote one bounded staged batch into the
+        // LZ4 store — compression lives HERE, never on the ingest path.
+        self.drain_compress_backlog_on_render();
         // An appearance-only change (theme/palette/font) doesn't move any cell, so
         // the row-diff wouldn't repaint it — drop the cache to force one full frame.
         if self.force_full_repaint {
@@ -980,26 +1007,37 @@ impl AtermTerminal {
         // Present the banked sub-row scroll residual via the M1b band translate
         // (the whole canvas frame is grid — no spliced chrome rows). Stamped
         // every frame: the KEPT scratch would otherwise carry a stale shift.
-        self.scroll_input.stamp(&mut self.frame_scratch, self.rows, ch);
-        let view = self
-            .renderer
-            .render_input_cached(&mut self.win, &self.frame_scratch);
-        self.width = view.width();
-        self.height = view.height();
-        // aterm pixels are packed 0xTTRRGGBB — TT is the renderer's TRANSMITTANCE
-        // byte (255 - alpha; 0 = opaque, the historical/default bytes) — expand to
-        // RGBA8 for ImageData. At the default opacity every TT is 0, so the alpha
-        // is 0xff exactly as before; with `set_background_opacity` active,
-        // default-bg pixels come out translucent. (Field borrows are disjoint:
-        // `view` holds `self.win`, the loop writes `self.rgba`.)
-        let pixels = view.pixels();
-        self.rgba.clear();
-        self.rgba.reserve(pixels.len() * 4);
-        for &p in pixels {
-            self.rgba.push((p >> 16) as u8);
-            self.rgba.push((p >> 8) as u8);
-            self.rgba.push(p as u8);
-            self.rgba.push(0xff - (p >> 24) as u8);
+        self.scroll_input
+            .stamp(&mut self.frame_scratch, self.rows, ch);
+        // Dirty-band present (audit E3): a frame carrying (or releasing) a
+        // sub-row translate shifts the whole grid band, so it full-expands
+        // from the TRANSLATED view while the borrow is live; every other
+        // frame expands only the recorded damage from the untranslated cache
+        // after the borrow ends. aterm pixels are packed 0xTTRRGGBB — TT is
+        // the renderer's TRANSMITTANCE byte (255 − alpha; 0 = opaque) —
+        // expanded to straight RGBA8 for ImageData, band-scoped.
+        let frac_px = self.frame_scratch.scroll_frac_px;
+        let frac_full = frac_px != 0 || self.last_present_frac != 0;
+        self.last_present_frac = frac_px;
+        {
+            let view = self
+                .renderer
+                .render_input_cached(&mut self.win, &self.frame_scratch);
+            self.width = view.width();
+            self.height = view.height();
+            if frac_full {
+                let (w, h) = (self.width, self.height);
+                dirty_band_present_api::expand_full(
+                    view.pixels(),
+                    &mut self.rgba,
+                    &mut self.present_bands,
+                    w,
+                    h,
+                );
+            }
+        }
+        if !frac_full {
+            self.expand_damage_to_rgba();
         }
         // Refresh the chrome-band spill export from the SAME frame snapshot the
         // renderer just composed, so `spill_rev`/`spill_ptr` are coherent with
@@ -1785,6 +1823,162 @@ impl AtermTerminal {
     pub fn search_budgeted_cancel(&mut self) {
         self.term.cancel_budgeted_search();
     }
+
+    /// Release the search index's heap (fed E-1 `search_index_release`): drops
+    /// the cached full-content index AND any in-flight budgeted search so a
+    /// dormant/closed pane's index footprint returns to the allocator, making
+    /// federation idle-eviction REAL rather than a logical clear that retains
+    /// peak capacity. The next search rebuilds from the live buffer — one
+    /// rebuild paid, byte-identical results.
+    pub fn search_index_release(&mut self) {
+        self.term.release_search_index();
+    }
+
+    /// Batch row-range export for the P7 grid mirror (E9): the text/wrap/len
+    /// (+ per-column wide map) of `count` DISPLAY rows starting at `first_row`
+    /// (display_offset-aware, same coords as [`AtermTerminal::row_text`]) in ONE
+    /// wasm-boundary crossing, replacing the per-row `row_text` +
+    /// `row_is_wrapped` + `row_len` + per-cell `cell_is_wide` walk. Returns a
+    /// JSON array of exactly `count` records
+    /// `{text, wrapped, len, widths?}` in row order; `widths` is a per-column
+    /// digit string (`'2'` wide lead / `'1'` otherwise, length == cols) OMITTED
+    /// for all-narrow rows so the host reuses its cached all-`'1'` string.
+    /// `undefined` when the range is unavailable (a row is out of the live grid,
+    /// e.g. resize skew) — the host falls back to the per-row path that frame.
+    pub fn row_range_json(&self, first_row: u32, count: u32) -> Option<String> {
+        let rows = u32::try_from(self.rows).unwrap_or(u32::MAX);
+        let cols = self.cols;
+        let end = first_row.checked_add(count)?;
+        // Any row past the live grid ⇒ range unavailable this frame.
+        if end > rows {
+            return None;
+        }
+        let mut out = String::from("[");
+        for y in first_row..end {
+            if y != first_row {
+                out.push(',');
+            }
+            let row_u16 = u16::try_from(y).ok()?;
+            // Text matches the per-row `row_text` fallback exactly
+            // (display_row_text), so a path switch never spuriously re-dirties.
+            let text = self.term.display_row_text(y as usize).unwrap_or_default();
+            let wrapped = self.term.grid().row_is_wrapped(row_u16).unwrap_or(false);
+            let len = self
+                .term
+                .grid()
+                .row_len(row_u16)
+                .map_or(self.cols, usize::from);
+            // Per-column wide map from the same source `cell_is_wide` reads; the
+            // continuation spacer of a wide cell reports narrow, matching the
+            // host's `cell_is_wide(y,x) ? '2' : '1'` per-cell walk.
+            let cells = self.term.display_row_grapheme_cells(y as usize);
+            let mut widths = String::with_capacity(cols);
+            let mut any_wide = false;
+            match &cells {
+                Some(cells) => {
+                    for col in 0..cols {
+                        if cells.get(col).is_some_and(|(_, wide)| *wide) {
+                            widths.push('2');
+                            any_wide = true;
+                        } else {
+                            widths.push('1');
+                        }
+                    }
+                }
+                None => widths = "1".repeat(cols),
+            }
+            out.push_str("{\"text\":");
+            out.push_str(&json_string(&text));
+            out.push_str(",\"wrapped\":");
+            out.push_str(if wrapped { "true" } else { "false" });
+            out.push_str(",\"len\":");
+            out.push_str(&len.to_string());
+            if any_wide {
+                out.push_str(",\"widths\":");
+                out.push_str(&json_string(&widths));
+            }
+            out.push('}');
+        }
+        out.push(']');
+        Some(out)
+    }
+
+    /// Federated search summary (fed E-1): the span-marked, snippet-enriched
+    /// results for `query` in ONE call — superseding the bare-triplet
+    /// [`AtermTerminal::search`] + per-match `row_text` round-trip. Returns JSON
+    /// `{matches:[{absRow,col,len,snippet}], total, incomplete}` where `matches`
+    /// is capped to `max_matches` (0 = uncapped), `total` is the full match
+    /// count before the cap, `incomplete` is the engine's eviction/match-cap
+    /// truncation signal (which [`AtermTerminal::search`] drops), and `snippet`
+    /// is the match line's text (absolute-row coordinate, the same space
+    /// federated matches carry). Empty query or invalid regex ⇒
+    /// `{matches:[],total:0,incomplete:false}` (mirroring `search`'s silence).
+    ///
+    /// A bounded READ over an already-built full-content index — not a
+    /// from-scratch rebuild on the hot path
+    /// ([`Terminal::search_summary_results`]): after a
+    /// [`AtermTerminal::search_budgeted`] scan completes over the same query +
+    /// content snapshot, THAT retained index answers directly (zero rebuild);
+    /// otherwise the O(1)-reused one-shot index ([`Terminal::indexed_search`])
+    /// serves it, rebuilding only on a content-key miss. Either way only the
+    /// `≤max_matches` capped rows pay a snippet read. Keeps the E9a
+    /// [`AtermTerminal::search_meta`] `{incomplete,match_count}` shape as a
+    /// compat alias — this export supersedes it with snippets.
+    pub fn search_summary(
+        &mut self,
+        query: &str,
+        case_sensitive: bool,
+        is_regex: bool,
+        max_matches: u32,
+    ) -> Option<String> {
+        let empty = || Some("{\"matches\":[],\"total\":0,\"incomplete\":false}".to_owned());
+        if query.is_empty() {
+            return empty();
+        }
+        let (matches, total, incomplete) = {
+            let Ok(results) =
+                self.term
+                    .search_summary_results(query, case_sensitive, is_regex)
+            else {
+                return empty();
+            };
+            let total = results.matches.len();
+            let cap = if max_matches == 0 {
+                total
+            } else {
+                (max_matches as usize).min(total)
+            };
+            // Copy the capped (line, start_col, len) triplets out so the &self
+            // index borrow ends before the &self snippet reads below.
+            let matches: Vec<(u64, usize, usize)> = results.matches[..cap]
+                .iter()
+                .map(|m| (m.line as u64, m.start_col, m.len()))
+                .collect();
+            (matches, total, results.incomplete)
+        };
+        let mut out = String::from("{\"matches\":[");
+        for (i, (abs, col, len)) in matches.iter().enumerate() {
+            if i != 0 {
+                out.push(',');
+            }
+            let snippet = self.term.abs_row_text(*abs).unwrap_or_default();
+            out.push_str("{\"absRow\":");
+            out.push_str(&abs.to_string());
+            out.push_str(",\"col\":");
+            out.push_str(&col.to_string());
+            out.push_str(",\"len\":");
+            out.push_str(&len.to_string());
+            out.push_str(",\"snippet\":");
+            out.push_str(&json_string(&snippet));
+            out.push('}');
+        }
+        out.push_str("],\"total\":");
+        out.push_str(&total.to_string());
+        out.push_str(",\"incomplete\":");
+        out.push_str(if incomplete { "true" } else { "false" });
+        out.push('}');
+        Some(out)
+    }
 }
 
 /// Metadata for a legacy-contract search ([`AtermTerminal::search_meta`]).
@@ -1948,7 +2142,7 @@ pub fn encode_key_with_mode(
     base_layout_key: Option<char>,
     mode_bits: u32,
 ) -> Option<Vec<u8>> {
-    use aterm_types::keyboard::{KeyboardMode, encode_dom_key};
+    use aterm_types::keyboard::{encode_dom_key, KeyboardMode};
     let mode = KeyboardMode::from_bits_truncate(mode_bits as u16);
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }
@@ -2131,13 +2325,19 @@ impl AtermTerminal {
         let renderer = Renderer::from_system(px, Theme::default())?;
         // Same clamp-sync as `new`: store the grid's CLAMPED dims, never the raw
         // args, so the framebuffer can't be sized past the 1..=4096 grid bound.
-        let mut term = Terminal::new(rows, cols);
+        // Same tiered-store attachment as `new` (audit E1) so tests/benches
+        // measure the shipped engine shape.
+        let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
+        let budget_share = scrollback_tiers_api::register_budget_share(&term);
         // Same notification wiring as `new` (fail-closed until authorized).
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let rows = term.grid().rows() as usize;
         let cols = term.grid().cols() as usize;
         let theme = Theme::default();
         Some(Self {
+            budget_share,
+            present_bands: Vec::new(),
+            last_present_frac: 0,
             term,
             renderer,
             rows,
@@ -2244,6 +2444,122 @@ mod tests {
         assert!(
             meta.incomplete(),
             "the cap must surface out-of-band via search_meta"
+        );
+    }
+
+    #[test]
+    fn search_summary_carries_snippets_total_and_incomplete_superseding_meta() {
+        // fed E-1: search_summary returns absolute-row matches WITH line-text
+        // snippets + total + the incomplete flag in one call — the same result
+        // set the legacy `search` export returns, enriched.
+        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
+            return;
+        };
+        t.process(b"alpha beta\r\nalpha gamma\r\nno match here\r\n");
+        let json = t.search_summary("alpha", true, false, 0).expect("summary");
+        // total agrees with the legacy export's match count.
+        let legacy = t.search("alpha", true, false).len() / 3;
+        assert_eq!(legacy, 2);
+        assert!(
+            json.contains("\"total\":2"),
+            "total counts all matches: {json}"
+        );
+        assert!(
+            json.contains("\"incomplete\":false"),
+            "nothing truncated: {json}"
+        );
+        // Each match carries its span coords AND a text snippet from its line.
+        assert_eq!(
+            json.matches("\"absRow\":").count(),
+            2,
+            "one absRow per match: {json}"
+        );
+        assert!(
+            json.contains("\"snippet\":\"alpha beta\""),
+            "snippet is the match line: {json}"
+        );
+        assert!(
+            json.contains("\"snippet\":\"alpha gamma\""),
+            "second snippet: {json}"
+        );
+        assert!(json.contains("\"col\":0"), "start_col present: {json}");
+        // max_matches caps `matches` but not `total`.
+        let capped = t.search_summary("alpha", true, false, 1).expect("capped");
+        assert_eq!(
+            capped.matches("\"absRow\":").count(),
+            1,
+            "cap limits matches: {capped}"
+        );
+        assert!(
+            capped.contains("\"total\":2"),
+            "cap does not change total: {capped}"
+        );
+        // Empty query and invalid regex mirror the legacy export's silence.
+        let empty = t.search_summary("", true, false, 0).expect("empty");
+        assert_eq!(empty, "{\"matches\":[],\"total\":0,\"incomplete\":false}");
+        let bad = t.search_summary("(", true, true, 0).expect("bad regex");
+        assert_eq!(bad, "{\"matches\":[],\"total\":0,\"incomplete\":false}");
+    }
+
+    #[test]
+    fn search_index_release_reclaims_then_search_still_finds() {
+        // fed E-1 search_index_release: after eviction the next search rebuilds
+        // and still finds everything (real reclaim, never a false empty cache).
+        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
+            return;
+        };
+        t.process(b"NEEDLE here\r\nfiller\r\nNEEDLE again\r\n");
+        assert_eq!(t.search("NEEDLE", true, false).len() / 3, 2);
+        t.search_index_release();
+        assert_eq!(
+            t.search("NEEDLE", true, false).len() / 3,
+            2,
+            "post-release search rebuilds and finds the same matches"
+        );
+    }
+
+    #[test]
+    fn row_range_json_batches_rows_matching_the_per_row_exports() {
+        let Some(mut t) = AtermTerminal::new_from_system(6, 20, 16.0) else {
+            return;
+        };
+        t.process(b"hello\r\nc\xe6\xbc\xa2x\r\n");
+        // Batch export of the first 3 display rows in one call.
+        let json = t.row_range_json(0, 3).expect("range available");
+        // Exactly 3 records, text agrees with the per-row row_text fallback.
+        assert_eq!(
+            json.matches("\"text\":").count(),
+            3,
+            "one record per row: {json}"
+        );
+        assert!(
+            json.contains("\"text\":\"hello\""),
+            "narrow row text: {json}"
+        );
+        assert!(json.contains("\"text\":\"c漢x\""), "wide row text: {json}");
+        // The wide row carries a per-column widths map with a '2' lead; the
+        // all-narrow rows OMIT widths (host reuses its cached all-'1' string).
+        assert!(
+            json.contains("\"widths\":\"12"),
+            "wide lead marked '2': {json}"
+        );
+        assert_eq!(
+            json.matches("\"widths\":").count(),
+            1,
+            "only the wide row has widths: {json}"
+        );
+        // Text is byte-identical to the per-row export it replaces.
+        for y in 0..3u16 {
+            let rec_text = t.row_text(y).unwrap_or_default();
+            assert!(
+                json.contains(&json_string(&rec_text)),
+                "row {y} text {rec_text:?} in {json}"
+            );
+        }
+        // A range past the live grid is unavailable (resize-skew fallback).
+        assert!(
+            t.row_range_json(0, 999).is_none(),
+            "over-long range → undefined"
         );
     }
 
@@ -2888,8 +3204,8 @@ mod tests {
 
     #[test]
     fn scrolled_wrapped_row_len_and_wrap_flag_are_tier_aware() {
-        // P1 regression: after a ring-only (the only production web ctor)
-        // width-shrink reflow overflows wrapped rows into scrollback, a
+        // P1 regression: after a width-shrink reflow overflows wrapped rows
+        // into scrollback, a
         // scrolled-back HISTORY row returns correct TEXT (tier-aware via
         // visible_row_view) but row_len/row_is_wrapped resolved through Grid::row
         // — which is None past the ring base — so orc's wrapped-line stitching
@@ -2909,8 +3225,8 @@ mod tests {
 
         // Shrink width to 20: each 30-char line rewraps to a 20-col head + a
         // 10-col WRAPPED continuation, overflowing the 3-row window; the top rows
-        // spill to scrollback (the lazy buffer, in ring-only mode). Reflow is
-        // synchronous with no tiered store (pump is a no-op).
+        // spill to scrollback. A history this small rewraps inline (pump is a
+        // no-op).
         t.resize(3, 20);
         while t.pump_reflow() {}
 
@@ -3678,7 +3994,7 @@ mod tests {
         t.set_sparkle_words_enabled(true);
         // Idle cat one-shots off so "settled" means settled forever, not
         // "until the next scheduled blink" (that path is deadline-driven).
-        t.set_sparkle_feline("cat", None, 0.7, false, true, true, true, false);
+        t.set_sparkle_feline("cat", true, true, false);
         t.set_cursor_glow(true, "lumen", None, None, 260, 24, 0.7, 0.6, true);
         t.process(b"cat + fuck\r\n");
         let mut settled = false;
@@ -3708,9 +4024,9 @@ mod tests {
     //
     // The state machine under test: resize → (inline | stash) → pump* →
     // re-attach, plus the two never-pumped safety nets and the supersede
-    // path. Driven with a TIERED-store engine (the wasm ctor's `Terminal::new`
-    // attaches none today, so the deferred path is dormant there — these tests
-    // install one the way a native session has one).
+    // path. The ctor attaches the engine-default tiered store (audit E1);
+    // these tests install a TINY-ring one instead so nearly all scroll-off
+    // spills to the store and the deferred path is exercised densely.
 
     /// Swap the engine for one whose bulk history lives in the tiered store
     /// (tiny ring → nearly all scroll-off spills to tiered, like a real
@@ -3730,11 +4046,13 @@ mod tests {
 
     #[test]
     fn resize_without_tiered_store_never_defers() {
-        // The wasm ctor path (no tiered store): every resize is the plain
-        // bounded path — nothing stashes, nothing to pump.
+        // A ring-only engine (no tiered store — the pre-E1 ctor shape, still
+        // reachable via checkpoint-restore of old grids): every resize is the
+        // plain bounded path — nothing stashes, nothing to pump.
         let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
             return;
         };
+        t.term = Terminal::new(24, 80);
         for i in 0..50 {
             t.process(format!("line {i}\r\n").as_bytes());
         }
@@ -4054,8 +4372,7 @@ mod tests {
             };
             assert_eq!(step.cursor(), None, "complete step drops the cursor");
             assert_eq!(
-                all_matches,
-                one_shot,
+                all_matches, one_shot,
                 "budgeted != one-shot for {query:?} cs={cs} rx={rx}"
             );
             assert!(!step.incomplete_index(), "small buffer is exhaustive");

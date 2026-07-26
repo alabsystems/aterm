@@ -19,14 +19,13 @@
 //! `trust-ir/crates/trust-ir/docs/spec-module-format.md` (§2, the `.trust_ir`
 //! grammar). aterm-spec is intentionally NOT in the production release closure and
 //! has no `trust_ir` dependency; coupling it to the external Trust repo would be
-//! fragile. Instead we emit the documented text format DIRECTLY, byte-for-byte
-//! identical to `trust_ir`'s canonical writer (`display.rs::write_spec_module`):
+//! fragile. Instead we emit the documented text format directly, following the
+//! current v27 writer shape (`display.rs::write_spec_module`):
 //!
 //!   * module header `; TrustIr text format v1` + `module "<name>"`,
 //!   * each `spec_module "<name>" { … }` block preceded by ONE blank line,
 //!   * every free-form string quoted via Rust `{:?}` escaping (`"`→`\"`, `\`→`\\`,
-//!     newline→`\n`, tab→`\t`) — Rust's `Debug for str` IS that escaping, so we use
-//!     `format!("{s:?}")` and the bytes match the trust-ir writer exactly.
+//!     newline→`\n`, tab→`\t`) using `format!("{s:?}")`.
 //!
 //! Stability is checked from aterm with `trust-ir spec-link` over the assembled
 //! artifact in the gate (`aterm-gui` `spec_xref_gate`). The gate accepts only a
@@ -43,7 +42,7 @@
 //! (`by_name.get(machine)`), so the lowered artifact MUST rewrite every anchor's /
 //! waiver's `machine` to the canonical `SpecModule.name` it resolves to. We do that
 //! here (via `machine_matches`), so the artifact Ob.4-resolves in trust-ir exactly
-//! when it resolves in aterm — the two enforcers agree by construction.
+//! when it resolves in aterm — the two resolvers are intentionally aligned.
 
 use std::collections::BTreeSet;
 
@@ -51,10 +50,74 @@ use crate::derive::Model;
 use crate::xref::{ProofAnchor, ProofKind, RefinementAnchor, SpecModule, Waiver, machine_matches};
 
 /// Render a free-form string as a `trust-ir` text-format quoted token: Rust `{:?}`
-/// escaping (`"`→`\"`, `\`→`\\`, newline→`\n`, tab→`\t`), which is byte-identical to
-/// the `{:?}` the trust-ir canonical writer uses for every free-form field.
+/// escaping (`"`→`\"`, `\`→`\\`, newline→`\n`, tab→`\t`), matching the escaping
+/// used by the current trust-ir text writer for free-form fields.
 fn q(s: &str) -> String {
     format!("{s:?}")
+}
+
+/// Return a deterministic, Trust-v27-safe set of unresolved fallback anchors.
+///
+/// aterm's inventory records do not carry module-local Trust `FuncId`s yet. Trust
+/// therefore identifies these design-only anchors by its S0 fallback identity,
+/// `(action, rust_symbol)`. The macro-populated `rust_method` can be only a bare
+/// function name, so one fallback key may represent distinct CPU/GPU or impl sites
+/// and even different projections; repeated bindings can also be intentional.
+/// Emitting every colliding record would create duplicate S0 identities. Sort the
+/// full records first, preferring a usable projection, then keep exactly one record
+/// per current fallback identity. Consequently, `spec-link`
+/// analyzes this fallback-deduplicated view, not every original inventory record;
+/// aterm's in-process closure remains responsible for the full inventory. Once aterm
+/// can emit typed function identities this compatibility deduplication can be removed.
+fn canonical_fallback_anchors<'a>(
+    anchors: impl Iterator<Item = &'a RefinementAnchor>,
+) -> Vec<&'a RefinementAnchor> {
+    let mut anchors: Vec<_> = anchors.collect();
+    anchors.sort_by(|a, b| {
+        a.action
+            .cmp(b.action)
+            .then_with(|| a.rust_method.cmp(b.rust_method))
+            .then_with(|| a.project.is_empty().cmp(&b.project.is_empty()))
+            .then_with(|| a.project.cmp(b.project))
+            .then_with(|| a.location.cmp(b.location))
+            .then_with(|| a.machine.cmp(b.machine))
+    });
+    anchors.dedup_by(|a, b| a.action == b.action && a.rust_method == b.rust_method);
+    anchors
+}
+
+/// Count source anchor records omitted from the TrustIr artifact solely because they
+/// collide under Trust v27's unresolved fallback identity `(action, rust_symbol)`.
+///
+/// Only anchors that resolve to a registered `module` are counted, mirroring
+/// [`lower_to_ir`]. Dangling-machine records are a separate in-process closure error.
+/// A nonzero result means `spec-link` sees a compatibility-deduplicated structure,
+/// while aterm's local closure still checks the complete source inventory.
+// Skip: iterator accounting over inventory records; verification-reporting helper.
+#[cfg_attr(trust_verify, trust::skip)]
+#[must_use]
+pub fn fallback_anchor_deduplication_count(
+    modules: &[SpecModule],
+    refinements: &[&RefinementAnchor],
+) -> usize {
+    modules
+        .iter()
+        .map(|module| {
+            let matching = refinements
+                .iter()
+                .copied()
+                .filter(|anchor| machine_matches(anchor.machine, module.name()))
+                .count();
+            let emitted = canonical_fallback_anchors(
+                refinements
+                    .iter()
+                    .copied()
+                    .filter(|anchor| machine_matches(anchor.machine, module.name())),
+            )
+            .len();
+            matching - emitted
+        })
+        .sum()
 }
 
 /// Lower ONE registered [`SpecModule`] to its `spec_module "<name>" { … }` text
@@ -124,7 +187,9 @@ fn lower_module_block(
         if !a.project.is_empty() {
             s.push_str(&format!(" project {}", q(a.project)));
         }
-        s.push('\n');
+        // aterm does not yet own a typed Trust projection target. Spell out the
+        // conservative state instead of relying on a legacy parser default.
+        s.push_str(" target none\n");
     }
     // Waivers.
     for w in waivers {
@@ -173,8 +238,9 @@ fn emit_embedded_vars(s: &mut String, m: &Model) {
 
 /// Assemble ONE complete `.trust_ir` module: the v1 header + `module "<name>"`,
 /// then every registered [`SpecModule`] (embedded `Model`s and external ISOLATION
-/// `.tla`) as a `spec_module` block, with ALL collected `refinements`/`waivers`
-/// rendered as `anchor`/`waiver` lines inside the block whose name they resolve to.
+/// `.tla`) as a `spec_module` block, with the Trust-v27 fallback-deduplicated view of
+/// collected `refinements` plus resolving `waivers` rendered as `anchor`/`waiver`
+/// lines inside the block whose name they resolve to.
 ///
 /// The output is byte-for-byte valid trust-ir text. Every block is explicitly
 /// `enforcement design-only`: the standalone artifact has no compiler-owned
@@ -209,11 +275,12 @@ pub fn lower_to_ir(
 
     for module in modules {
         let canon = module.name();
-        let my_anchors: Vec<&RefinementAnchor> = refinements
-            .iter()
-            .copied()
-            .filter(|a| machine_matches(a.machine, canon))
-            .collect();
+        let my_anchors = canonical_fallback_anchors(
+            refinements
+                .iter()
+                .copied()
+                .filter(|a| machine_matches(a.machine, canon)),
+        );
         let my_waivers: Vec<&Waiver> = waivers
             .iter()
             .copied()
@@ -370,7 +437,7 @@ mod tests {
         );
         // Anchor + waiver machine REWRITTEN to canonical "Ring" (exact-match for trust-ir).
         assert!(
-            txt.contains("  anchor machine \"Ring\" action \"Push\" rust \"aterm_buffer::Ring::push\" span \"ring.rs:1:1\" project \"Ring::project\"\n"),
+            txt.contains("  anchor machine \"Ring\" action \"Push\" rust \"aterm_buffer::Ring::push\" span \"ring.rs:1:1\" project \"Ring::project\" target none\n"),
             "{txt}"
         );
         assert!(
@@ -386,11 +453,56 @@ mod tests {
         let txt = lower_to_ir("m", &modules, &[&a], &[], &[]);
         assert!(
             txt.contains(
-                "  anchor machine \"Ring\" action \"Push\" rust \"r::push\" span \"r.rs:1:1\"\n"
+                "  anchor machine \"Ring\" action \"Push\" rust \"r::push\" span \"r.rs:1:1\" target none\n"
             ),
             "no project clause: {txt}"
         );
         assert!(!txt.contains("project"), "{txt}");
+    }
+
+    #[test]
+    fn fallback_anchor_identity_is_deduplicated_deterministically() {
+        let modules = vec![SpecModule::Embedded(ring_model())];
+        let later = anchor(
+            "ring",
+            "Push",
+            "aterm_buffer::Ring::push",
+            "z.rs:9:9",
+            "Z::project",
+        );
+        let chosen = anchor(
+            "ring",
+            "Push",
+            "aterm_buffer::Ring::push",
+            "a.rs:1:1",
+            "A::project",
+        );
+        let no_projection = anchor("ring", "Push", "aterm_buffer::Ring::push", "0.rs:1:1", "");
+
+        let forward = lower_to_ir("m", &modules, &[&later, &no_projection, &chosen], &[], &[]);
+        let reversed = lower_to_ir("m", &modules, &[&chosen, &no_projection, &later], &[], &[]);
+
+        assert_eq!(
+            fallback_anchor_deduplication_count(&modules, &[&later, &no_projection, &chosen]),
+            2,
+            "three records with one fallback identity emit one and disclose two omissions"
+        );
+
+        assert_eq!(
+            forward, reversed,
+            "inventory order must not change Trust IR"
+        );
+        assert_eq!(
+            forward
+                .matches("action \"Push\" rust \"aterm_buffer::Ring::push\"")
+                .count(),
+            1,
+            "Trust S0 sees one unresolved fallback identity:\n{forward}"
+        );
+        assert!(
+            forward.contains("span \"a.rs:1:1\" project \"A::project\" target none"),
+            "deterministic usable projection wins:\n{forward}"
+        );
     }
 
     #[test]

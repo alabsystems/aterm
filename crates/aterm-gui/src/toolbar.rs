@@ -83,14 +83,14 @@
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    ToolbarHandle, install_window_toolbar, read_tab_chrome, read_tab_menus, set_strip_dark,
-    set_update_available, set_window_tabs,
+    ToolbarHandle, install_window_toolbar, read_tab_chrome, read_tab_menus, set_active_tab_color,
+    set_strip_dark, set_update_available, set_window_tabs,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use non_macos::{
-    ToolbarHandle, install_window_toolbar, read_tab_chrome, read_tab_menus, set_strip_dark,
-    set_update_available, set_window_tabs,
+    ToolbarHandle, install_window_toolbar, read_tab_chrome, read_tab_menus, set_active_tab_color,
+    set_strip_dark, set_update_available, set_window_tabs,
 };
 
 use crate::tab_bar::TabStripMetadata;
@@ -663,6 +663,10 @@ mod non_macos {
     /// strip's light/dark appearance to the theme is a no-op. Same one-uniform-
     /// signature rationale as [`set_update_available`].
     pub fn set_strip_dark(_handle: &ToolbarHandle, _dark: bool) {}
+
+    /// Off macOS there is no native strip; the selected-tab color override is
+    /// carried by the in-grid strip instead (`tab_bar::strip_colors_with_active`).
+    pub fn set_active_tab_color(_handle: &ToolbarHandle, _color: Option<[u8; 3]>) {}
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -1397,8 +1401,20 @@ mod macos {
                         // These AppKit colours resolve through the strip appearance pinned
                         // by `set_strip_dark`, so selection stays equally explicit in light
                         // and dark terminal themes without hard-coded white-on-dark logic.
-                        let panel = NSColor::selectedContentBackgroundColor()
-                            .colorWithAlphaComponent(0.42);
+                        // A user-picked `active_tab_color` override (the Tab Color
+                        // settings page) replaces the translucent system surface with
+                        // the exact chosen color; label ink flips by its luminance
+                        // (`active_label_color`), so any pick stays readable.
+                        let panel = match active_tab_color_override() {
+                            Some([r, g, b]) => NSColor::colorWithSRGBRed_green_blue_alpha(
+                                f64::from(r) / 255.0,
+                                f64::from(g) / 255.0,
+                                f64::from(b) / 255.0,
+                                1.0,
+                            ),
+                            None => NSColor::selectedContentBackgroundColor()
+                                .colorWithAlphaComponent(0.42),
+                        };
                         panel.set();
                         let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
                             pill, TAB_PILL_RADIUS, TAB_PILL_RADIUS,
@@ -1868,9 +1884,10 @@ mod macos {
                 // truncating single-line label; force single-line to be explicit and
                 // keep the row height exact).
                 lbl.setUsesSingleLineMode(true);
-                // Active = full label color; inactive = secondary (dim), Ghostty-like.
+                // Active = full label color (override-aware); inactive = secondary
+                // (dim), Ghostty-like.
                 let color = if active {
-                    NSColor::labelColor()
+                    active_label_color()
                 } else {
                     NSColor::secondaryLabelColor()
                 };
@@ -2147,6 +2164,24 @@ mod macos {
 
         /// Flip the ACTIVE flag IN PLACE (the diff path): recolour the label (full vs.
         /// secondary/dim), re-evaluate the close-× visibility (active always shows it), and
+        /// Re-resolve this tab's label ink against the CURRENT selected-tab color
+        /// override without changing its active state — the repaint half of
+        /// [`set_active_tab_color`], so a live config edit recolors the strip
+        /// in place (no tab rebuild, no focus change).
+        fn refresh_label_ink(&self) {
+            if let Some(lbl) = self.ivars().label.borrow().as_ref() {
+                // SAFETY: main-thread `setTextColor:` on the live retained label.
+                unsafe {
+                    let color = if self.ivars().active.get() {
+                        active_label_color()
+                    } else {
+                        NSColor::secondaryLabelColor()
+                    };
+                    lbl.setTextColor(Some(&color));
+                }
+            }
+        }
+
         /// repaint the accent. No-op when unchanged.
         fn set_active(&self, active: bool) {
             if self.ivars().active.get() == active {
@@ -2158,7 +2193,7 @@ mod macos {
                 // main-thread AppKit calls on the live label.
                 unsafe {
                     let color = if active {
-                        NSColor::labelColor()
+                        active_label_color()
                     } else {
                         NSColor::secondaryLabelColor()
                     };
@@ -2542,6 +2577,66 @@ mod macos {
     /// at toolbar install and again whenever the theme changes (config reload, OS
     /// light/dark flip on a split theme). AppKit invalidates the subtree on an
     /// effective-appearance change, so dynamic colours repaint without manual dirtying.
+    /// The user's selected-tab color override (config `active_tab_color`),
+    /// packed `0xFF_RR_GG_BB`; `0` = no override (today's translucent system
+    /// pill — "Transparent white" in the Tab Color settings page). Process-wide
+    /// like the strip appearance pin: every window's strip follows one config.
+    /// Read at draw time by `TabView::drawRect`/label ink, so it must be plain
+    /// atomic state (AppKit messages the views on the main thread only, but the
+    /// setter runs before a draw cycle exists).
+    static ACTIVE_TAB_COLOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// The live override as `[r, g, b]`, if one is pinned.
+    fn active_tab_color_override() -> Option<[u8; 3]> {
+        let packed = ACTIVE_TAB_COLOR.load(std::sync::atomic::Ordering::Relaxed);
+        (packed >> 24 == 0xFF).then_some({
+            [
+                ((packed >> 16) & 0xff) as u8,
+                ((packed >> 8) & 0xff) as u8,
+                (packed & 0xff) as u8,
+            ]
+        })
+    }
+
+    /// The ACTIVE tab's label ink for the current override: on a custom pill the
+    /// semantic `labelColor` may land white-on-white (or black-on-black), so the
+    /// ink flips black/white by the override's own luminance — the SAME
+    /// `bg_is_light` classifier the in-grid strip uses, so the two renderers
+    /// can never disagree about readability. No override ⇒ the semantic color.
+    fn active_label_color() -> Retained<NSColor> {
+        match active_tab_color_override() {
+            // SAFETY: plain color constructors on the main thread.
+            Some(rgb) => unsafe {
+                if crate::tab_bar::bg_is_light(rgb) {
+                    NSColor::blackColor()
+                } else {
+                    NSColor::whiteColor()
+                }
+            },
+            None => unsafe { NSColor::labelColor() },
+        }
+    }
+
+    /// Pin (or clear) the selected-tab color override and repaint the live strip:
+    /// every retained [`TabView`] re-resolves its label ink and redraws its pill.
+    /// Idempotent; called wherever the theme/config pins are re-synced
+    /// (`set_strip_dark`'s call sites) so a config edit applies live.
+    pub fn set_active_tab_color(handle: &ToolbarHandle, color: Option<[u8; 3]>) {
+        let packed = color.map_or(0, |c| {
+            0xFF00_0000 | (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
+        });
+        if ACTIVE_TAB_COLOR.swap(packed, std::sync::atomic::Ordering::Relaxed) == packed {
+            return;
+        }
+        for tab in handle.tabs.borrow().iter() {
+            tab.refresh_label_ink();
+            // SAFETY: main-thread `setNeedsDisplay:` on live retained views.
+            unsafe { tab.setNeedsDisplay(true) };
+        }
+        // SAFETY: as above, on the retained container.
+        unsafe { handle.container.setNeedsDisplay(true) };
+    }
+
     pub fn set_strip_dark(handle: &ToolbarHandle, dark: bool) {
         // SAFETY (both arms): `appearanceNamed:` with a system constant returns a
         // retained appearance (or nil, handled by the Option).

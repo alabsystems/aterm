@@ -689,7 +689,10 @@ mod tests {
         );
         for (packed, quad) in overlay
             .packed_quads
-            .as_chunks::<QUAD_WORDS>().0.iter().zip(overlay.overlay.quads())
+            .as_chunks::<QUAD_WORDS>()
+            .0
+            .iter()
+            .zip(overlay.overlay.quads())
         {
             assert_eq!(
                 *packed,
@@ -711,7 +714,10 @@ mod tests {
         }
         for (packed, halo) in overlay
             .packed_halos
-            .as_chunks::<HALO_WORDS>().0.iter().zip(overlay.overlay.halos())
+            .as_chunks::<HALO_WORDS>()
+            .0
+            .iter()
+            .zip(overlay.overlay.halos())
         {
             assert_eq!(
                 *packed,

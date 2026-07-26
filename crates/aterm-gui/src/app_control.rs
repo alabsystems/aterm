@@ -701,9 +701,14 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
             continue;
         };
         let cursor = spec.cursor_label.as_deref().unwrap_or("Unavailable");
-        let status = spec.status.as_deref().unwrap_or("Ready");
+        let painted_status = spec.status.as_deref().unwrap_or("Ready");
+        let semantic_status = spec
+            .semantic_status
+            .as_deref()
+            .or(spec.status.as_deref())
+            .unwrap_or("Ready");
         let minibuffer = spec.minibuffer.as_deref();
-        let footer = minibuffer.unwrap_or(status);
+        let footer = minibuffer.unwrap_or(painted_status);
         let modeline = format!("EDIT · {} · {cursor} | EMACS · {footer}", spec.label);
         lines.push(format!(
             "editor-view key={:?} mode=EDIT keymap=EMACS document={:?} dirty={} saving={} focused={} cursor={cursor:?}",
@@ -718,8 +723,13 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
             paint.key.as_str(),
         ));
         lines.push(format!(
-            "editor-status key={:?} value={status:?}",
+            "editor-status key={:?} value={semantic_status:?}",
             paint.key.as_str(),
+        ));
+        lines.push(format!(
+            "editor-painted-status key={:?} value={painted_status:?} truncated={}",
+            paint.key.as_str(),
+            semantic_status != painted_status,
         ));
         lines.push(format!(
             "editor-minibuffer key={:?} active={} value={:?}",
@@ -775,8 +785,23 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let diagnostics = row
+                .diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    format!(
+                        "{}..{}@{}..{}:{}",
+                        diagnostic.bytes.start,
+                        diagnostic.bytes.end,
+                        row.source.start.saturating_add(diagnostic.bytes.start),
+                        row.source.start.saturating_add(diagnostic.bytes.end),
+                        if diagnostic.error { "error" } else { "warning" },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             lines.push(format!(
-                "editor-row key={:?} line={} source={}..{} column={} text={:?} carets=[{}] selections=[{}]",
+                "editor-row key={:?} line={} source={}..{} column={} text={:?} carets=[{}] selections=[{}] diagnostics=[{}]",
                 paint.key.as_str(),
                 row.number.saturating_add(1),
                 row.source.start,
@@ -785,6 +810,7 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
                 row.text,
                 carets,
                 selections,
+                diagnostics,
             ));
         }
     }
@@ -1099,6 +1125,124 @@ mod tests {
     }
 
     #[test]
+    fn editor_inspection_exposes_semantic_and_painted_statuses_and_diagnostics() {
+        use crate::native_editor::{
+            EditorDiagnosticSpan, EditorViewportLine, EditorViewportProjection,
+        };
+        use crate::native_ui::{
+            Layout, Length, LogicalRect as UiLogicalRect, TextViewportSpec, UiContent, UiNode,
+            UiTree,
+        };
+
+        let semantic_status =
+            "Unknown config key `mystery`; open completion help for registered settings";
+        let compiled = UiTree::new(
+            UiNode::new(
+                "editor/buffer",
+                UiContent::TextViewport(TextViewportSpec {
+                    label: "aterm.toml".to_string(),
+                    document_key: "document:config@4".to_string(),
+                    selectable: true,
+                    projection: Some(EditorViewportProjection {
+                        first_line: 8,
+                        total_lines: 12,
+                        lines: vec![EditorViewportLine {
+                            number: 8,
+                            source: 100..114,
+                            column_start: 0,
+                            text: "mystery = true".to_string(),
+                            selections: Vec::new(),
+                            carets: vec![(14, true)],
+                            syntax: Vec::new(),
+                            diagnostics: vec![
+                                EditorDiagnosticSpan {
+                                    bytes: 0..7,
+                                    error: false,
+                                },
+                                EditorDiagnosticSpan {
+                                    bytes: 10..14,
+                                    error: true,
+                                },
+                            ],
+                        }],
+                    }),
+                    preedit: String::new(),
+                    status: Some("Unknown config key…".to_string()),
+                    semantic_status: Some(semantic_status.to_string()),
+                    minibuffer: None,
+                    cursor_label: Some("Ln 9, Col 15".to_string()),
+                    dirty: true,
+                    saving: false,
+                    focused: true,
+                    action: Some(ActionId::new("editor/focus-buffer")),
+                }),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+        )
+        .compile(UiLogicalRect::new(0.0, 0.0, 260.0, 180.0))
+        .unwrap();
+
+        let lines = editor_viewport_inspection_lines(&compiled);
+        assert!(lines.iter().any(|line| {
+            line.starts_with("editor-status ")
+                && line.contains(&format!("value={semantic_status:?}"))
+        }));
+        assert!(lines.iter().any(|line| {
+            line.starts_with("editor-painted-status ")
+                && line.contains("value=\"Unknown config key…\"")
+                && line.contains("truncated=true")
+        }));
+        assert!(lines.iter().any(|line| {
+            line.starts_with("editor-row ")
+                && line.contains("diagnostics=[0..7@100..107:warning,10..14@110..114:error]")
+        }));
+    }
+
+    #[test]
+    fn manual_controller_inspection_uses_live_config_diagnostics() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-control-manual-diagnostics-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, "font_px = \"not-a-number\"\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        if let Some(window) = app.windows.get_mut(&wid) {
+            window.cols = 35;
+            window.rows = 20;
+        }
+        app.ensure_and_open_config_editor_path_in_window(wid, &path)
+            .unwrap();
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let lines = app
+            .inspect_app(InspectRequest::View {
+                view,
+                projection: InspectionProjection::Text,
+            })
+            .unwrap();
+
+        assert!(lines.iter().any(|line| {
+            line.starts_with("editor-status ")
+                && line.contains("font_px")
+                && line.contains("not-a-number")
+        }));
+        assert!(lines.iter().any(|line| {
+            line.starts_with("editor-painted-status ") && line.contains("truncated=true")
+        }));
+        assert!(lines.iter().any(|line| {
+            line.starts_with("editor-row ")
+                && line.contains("diagnostics=[")
+                && line.contains(":error")
+        }));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn tabs_inspection_uses_effective_smart_title_with_stable_fallback() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -1287,7 +1431,11 @@ mod tests {
         let mut app = App::headless_for_test();
         if let Some(window) = app.windows.get_mut(&WindowId(0)) {
             window.cols = 140;
-            window.rows = 50;
+            // Fourteen complete Settings destinations need enough vertical
+            // room for the labeled medium rail. Keep this test above the
+            // intentional compact-category breakpoint so it continues to
+            // exercise width responsiveness rather than short-window fallback.
+            window.rows = 100;
         }
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
         let tabs = app.inspect_app(InspectRequest::Tabs).unwrap();
@@ -1388,18 +1536,25 @@ mod tests {
         assert_eq!(glass, inspected.compiled);
         assert!(
             (760.0..1_040.0).contains(&inspected.compiled.bounds.width),
-            "medium bounds: {:?}",
+            "medium-width bounds: {:?}",
             inspected.compiled.bounds
+        );
+        assert!(
+            inspected
+                .compiled
+                .semantic(&UiKey::new("settings/compact-toolbar"))
+                .is_none(),
+            "a 1,000×600 logical window has room for the labeled macOS-style rail"
         );
         assert_eq!(
             inspected
                 .compiled
                 .semantic(&UiKey::new("settings/navigation"))
-                .unwrap()
+                .expect("medium navigation rail")
                 .rect
                 .width,
             196.0,
-            "the resized artifact uses the labeled medium rail in every observer"
+            "the staged artifact must reflect the wide-to-medium breakpoint"
         );
 
         let tree = app
@@ -1544,7 +1699,10 @@ mod tests {
         let SemanticValue::Text(value) = &preview.value else {
             panic!("Typography preview has a text semantic value");
         };
-        assert!(value.contains("24 px monospace"));
+        assert!(
+            value.contains("at 24 pixels"),
+            "inactive inspection must use the owning window's font size: {value}"
+        );
 
         let wire = app
             .inspect_app(InspectRequest::View {
@@ -1553,7 +1711,7 @@ mod tests {
             })
             .unwrap();
         assert!(wire[1].contains("source=inactive-fallback"));
-        assert!(wire.iter().any(|line| line.contains("24 px monospace")));
+        assert!(wire.iter().any(|line| line.contains("at 24 pixels")));
     }
 
     #[test]

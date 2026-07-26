@@ -124,10 +124,6 @@ pub enum Action {
     /// Open the native Settings app's About route (default Ctrl+Shift+A off macOS,
     /// where the app menu carries "About aterm").
     ToggleAbout,
-    /// Toggle the sparkle-words master kill (`App::toggle_sparkle_words`) — an
-    /// instant panic-off that overrides config without a TOML edit. Unbound by
-    /// default; bind it in `[keybindings]`.
-    ToggleSparkleWords,
     /// Toggle PHOSPHOR matrix rain for the FRONT SESSION of the focused window
     /// (`App::toggle_matrix_rain`) — a per-session runtime override that wins
     /// over the `[matrix_rain]` config bit in EITHER direction (it can start
@@ -184,7 +180,6 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "jump_next_prompt",
     "toggle_settings",
     "toggle_about",
-    "toggle_sparkle_words",
     "toggle_matrix_rain",
     "toggle_serious_mode",
     "open_palette",
@@ -304,7 +299,6 @@ impl Action {
             "jump_next_prompt" => Action::JumpNextPrompt,
             "toggle_settings" => Action::ToggleSettings,
             "toggle_about" => Action::ToggleAbout,
-            "toggle_sparkle_words" => Action::ToggleSparkleWords,
             "toggle_matrix_rain" => Action::ToggleMatrixRain,
             "toggle_serious_mode" => Action::ToggleSeriousMode,
             "open_palette" => Action::OpenPalette,
@@ -957,6 +951,11 @@ mod tests {
             Action::parse("toggle_matrix_rain"),
             Some(Action::ToggleMatrixRain)
         );
+        assert_eq!(
+            Action::parse("toggle_sparkle_words"),
+            None,
+            "the hidden runtime master must not contradict the two Settings toggles"
+        );
         assert_eq!(Action::parse("unknown_action"), None);
         assert_eq!(Action::parse("switch_tab_0"), None); // out of 1..=9
         assert_eq!(Action::parse("switch_tab_99"), None);
@@ -1064,8 +1063,8 @@ mod tests {
                 Some(Action::NewTab),
                 "Ctrl+Shift+T new tab"
             );
-            // The in-window overlays are the ONLY way to reach Settings/About off
-            // macOS (no menu bar), so their default chords are load-bearing.
+            // The native Settings tab and in-window About surface are the ONLY
+            // way to reach them off macOS, so their default chords are load-bearing.
             assert_eq!(
                 kb.lookup(&ch("s"), cs),
                 Some(Action::ToggleSettings),

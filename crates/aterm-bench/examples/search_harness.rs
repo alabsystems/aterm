@@ -86,51 +86,15 @@ const WARMUP: usize = 1;
 /// ms depending on match count; a batch dominates timer granularity).
 const QUERY_BATCH: usize = 20;
 
-/// Trigram-DIVERSE corpus: line counter + rotating 40-glyph body (same shape as
-/// the scroll-scrub fill). Every line differs, trigram space is saturated — the
-/// worst case the audit's external harness measured at ~1283 B/line.
-fn rotating_corpus() -> Vec<u8> {
-    const GLYPHS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/-=";
-    let mut out = Vec::with_capacity(CORPUS_LINES * 50);
-    for line in 0..CORPUS_LINES {
-        out.extend_from_slice(line.to_string().as_bytes());
-        out.push(b' ');
-        for c in 0..40usize {
-            out.push(GLYPHS[(line + c) % GLYPHS.len()]);
-        }
-        out.extend_from_slice(b"\r\n");
-    }
-    out
-}
+/// Shared deterministic corpora (aterm-bench lib): the floor lane and the
+/// posting-container decision bench must measure the SAME bytes.
+use aterm_bench::{linkheavy_corpus, replog_corpus, rotating_corpus};
 
-/// REPETITIVE-LOG corpus (the audit's caveat): 8 real-shaped service-log
-/// templates cycling, only digits varying. Trigram-map small, per-line
-/// postings/Strings unchanged — the shape where a "the map shrank so we're
-/// fine" regression would hide.
-fn replog_corpus() -> Vec<u8> {
-    let templates: [&str; 8] = [
-        "INFO  svc-api    request completed method=GET path=/api/v1/items status=200",
-        "INFO  svc-api    request completed method=POST path=/api/v1/items status=201",
-        "DEBUG svc-cache  entry refreshed key=items shard=4 hit_rate=0.97",
-        "INFO  svc-worker job dequeued queue=default attempts=1",
-        "WARN  svc-api    slow request method=GET path=/api/v1/search status=200",
-        "ERROR svc-db     connection reset pool=primary retrying",
-        "INFO  svc-worker job finished queue=default result=ok",
-        "DEBUG svc-gc     sweep complete freed_kb=128 live_objects=40213",
-    ];
-    let mut out = Vec::with_capacity(CORPUS_LINES * 110);
-    for line in 0..CORPUS_LINES {
-        // Timestamp-ish prefix + latency suffix: digits vary per line, the
-        // template text (and its trigrams) repeats.
-        out.extend_from_slice(b"2026-07-22T12:");
-        out.extend_from_slice(format!("{:02}:{:02}", (line / 60) % 60, line % 60).as_bytes());
-        out.extend_from_slice(format!(".{:03}Z ", line % 1000).as_bytes());
-        out.extend_from_slice(templates[line % templates.len()].as_bytes());
-        out.extend_from_slice(format!(" latency_ms={}", line % 250).as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    out
-}
+/// LINK-HEAVY corpus height in LOGICAL lines (Wave-4A P7). Each logical line
+/// soft-wraps to 2 grid rows at 80 columns, so 25k logical lines occupy ~50k
+/// rows — the same indexed depth as the other corpora, fully retained inside
+/// `RING_LINES` (no eviction: the lane measures indexing, not retention).
+const LINKHEAVY_LINES: usize = 25_000;
 
 /// Fill a fresh ring-only terminal (the SHIPPING config — no tiered store) with
 /// the corpus, so the index covers scrollback + visible exactly as production.
@@ -268,13 +232,16 @@ fn measure_index_line(corpus: &[u8]) -> f64 {
 }
 
 fn main() {
-    let rotating = rotating_corpus();
-    let replog = replog_corpus();
+    let rotating = rotating_corpus(CORPUS_LINES);
+    let replog = replog_corpus(CORPUS_LINES);
+    let linkheavy = linkheavy_corpus(LINKHEAVY_LINES);
 
     // "jkl" rides the rotating alphabet through most lines; "ERROR" is a real
     // log level hitting 1-in-8 replog lines. Both HIT (verification measured).
     let rot = measure_corpus(&rotating, "jkl");
     let rep = measure_corpus(&replog, "ERROR");
+    // ".tgz" hits inside every logical line's visible URL (P7 lane).
+    let link = measure_corpus(&linkheavy, "tgz");
     let index_line_klps = measure_index_line(&rotating);
 
     eprintln!(
@@ -287,14 +254,22 @@ fn main() {
          {:.0} B/line ({} lines)",
         rep.build_klps, rep.query_qps, rep.match_count, rep.bytes_per_line, rep.indexed_lines,
     );
+    eprintln!(
+        "search_harness: linkheavy — build {:.1} klines/s | {:.0} q/s ({} matches) | \
+         {:.0} B/line ({} lines)",
+        link.build_klps, link.query_qps, link.match_count, link.bytes_per_line, link.indexed_lines,
+    );
     eprintln!("search_harness: index_scrollback_line primitive {index_line_klps:.1} klines/s");
 
     println!(
         "{{\"rotating_build_klps\":{:.3},\"rotating_query_qps\":{:.3},\
          \"rotating_lines_per_mib\":{:.3},\"replog_build_klps\":{:.3},\
          \"replog_query_qps\":{:.3},\"replog_lines_per_mib\":{:.3},\
+         \"linkheavy_build_klps\":{:.3},\"linkheavy_query_qps\":{:.3},\
+         \"linkheavy_lines_per_mib\":{:.3},\
          \"index_line_klps\":{:.3},\"rotating_bytes_per_line\":{:.1},\
-         \"replog_bytes_per_line\":{:.1},\"rotating_matches\":{},\"replog_matches\":{},\
+         \"replog_bytes_per_line\":{:.1},\"linkheavy_bytes_per_line\":{:.1},\
+         \"rotating_matches\":{},\"replog_matches\":{},\"linkheavy_matches\":{},\
          \"corpus_lines\":{CORPUS_LINES},\"n\":{N_ITERS},\"warmup\":{WARMUP}}}",
         rot.build_klps,
         rot.query_qps,
@@ -302,10 +277,15 @@ fn main() {
         rep.build_klps,
         rep.query_qps,
         rep.lines_per_mib,
+        link.build_klps,
+        link.query_qps,
+        link.lines_per_mib,
         index_line_klps,
         rot.bytes_per_line,
         rep.bytes_per_line,
+        link.bytes_per_line,
         rot.match_count,
         rep.match_count,
+        link.match_count,
     );
 }

@@ -322,7 +322,7 @@ fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
     let mut effects = EffectsPipeline::new();
     effects.set_sparkle_enabled(true);
     effects.set_sparkle_classes(true, true, false, true);
-    effects.set_sparkle_feline("cat", None, 0.7, true, true, true, true, false);
+    effects.set_sparkle_feline("cat", true, true, false);
     effects.set_sparkle_reduced_motion(true);
 
     let mut input = term.cell_frame(rows, cols);

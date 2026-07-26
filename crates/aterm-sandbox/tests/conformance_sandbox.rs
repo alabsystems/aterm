@@ -155,7 +155,9 @@ fn manifest_spec(name: &str) -> PathBuf {
 fn real_sandbox_apply_conforms_to_sandbox_spec() {
     // TIERED (VERIFY-1): a committed hand-written `.tla` — external-tool
     // obligation; runs only where the Trust toolchain is installed.
-    let Some(ty) = ty_escalation("Sandbox apply conformance") else { return };
+    let Some(ty) = ty_escalation("Sandbox apply conformance") else {
+        return;
+    };
     let dir = std::env::temp_dir().join(format!("aterm-sandbox-conf-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mk tempdir");
 

@@ -405,6 +405,9 @@ impl Scrollback {
             let excess = self.budgeted_bytes.saturating_sub(self.memory_budget);
             let evicted_lines = self.cold.evict_bytes(excess);
             self.line_count = self.line_count.saturating_sub(evicted_lines);
+            // Real retention LOSS (not a user limit): count it so the host can
+            // surface the truncation out-of-band (audit E10a).
+            self.pressure_evicted_lines += evicted_lines as u64;
             self.sync_accounting();
             changed = true;
         }

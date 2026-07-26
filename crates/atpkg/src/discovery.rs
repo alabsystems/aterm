@@ -83,11 +83,17 @@ pub fn resolve_account(cfg_account: Option<&str>) -> IndexRepo {
 /// mutating the process environment (which is `unsafe`/UB-prone under edition 2024).
 #[must_use]
 pub fn resolve_account_with(env: Option<&str>, cfg_account: Option<&str>) -> IndexRepo {
+    // PUBLISH_OWNER, not DEFAULT_OWNER: the index account is the account this
+    // project is published under, NOT wherever installed copies fetch updates from.
+    // Those were the same string until the updater's default channel was repointed
+    // at the public mirror — following it would have silently moved the package
+    // index's ACCOUNT-BOUND trust root (§8) to an owner whose root key is not the
+    // pinned one, turning a channel change into an authenticity change.
     let owner = aterm_update_core::pick_slug(
         ACCOUNT_ENV,
         env,
         cfg_account,
-        aterm_update_core::DEFAULT_OWNER,
+        aterm_update_core::PUBLISH_OWNER,
     );
     IndexRepo {
         owner,
@@ -105,11 +111,54 @@ mod tests {
         // (ATPKG_ACCOUNT is atpkg-specific and unset in dev/CI shells.)
         if std::env::var_os(ACCOUNT_ENV).is_none() {
             let r = resolve_account(None);
-            assert_eq!(r.owner, aterm_update_core::DEFAULT_OWNER);
+            assert_eq!(r.owner, aterm_update_core::PUBLISH_OWNER);
             assert_eq!(r.owner, "alabsystems");
             assert_eq!(r.repo, INDEX_REPO);
             assert_eq!(r.repo, "aterm"); // the index rides the aterm repo itself (§16)
             assert_eq!(r.slug(), "alabsystems/aterm");
+        }
+    }
+
+    /// The index account must track the PUBLISH owner, never the update channel.
+    ///
+    /// These were the same string until aterm's default update channel was repointed
+    /// at the public mirror (`[workspace.metadata.aterm] update_channel`). Binding
+    /// the index to `DEFAULT_OWNER` — as this module briefly did — silently moved the
+    /// package index's ACCOUNT-BOUND trust root (§8) to an owner whose root key is
+    /// not the pinned one, i.e. it turned a "where do bytes come from" change into an
+    /// authenticity change, and pointed installs at a repo with no index at all.
+    ///
+    /// Asserting the CONSTANT the resolver uses (not just today's literal) is what
+    /// makes this a tripwire: it keeps failing if the channel moves again.
+    #[test]
+    fn index_account_does_not_follow_the_update_channel() {
+        if std::env::var_os(ACCOUNT_ENV).is_none() {
+            assert_eq!(
+                resolve_account(None).owner,
+                aterm_update_core::PUBLISH_OWNER,
+                "the index account must be the publish owner"
+            );
+        }
+        // The two knobs are genuinely independent: in the private tree the channel is
+        // repointed at the public mirror while the index stays on the publish account.
+        //
+        // Scoped to the private staging namespace on purpose — `publish/` exports a
+        // PUBLIC source snapshot that rewrites `alabsystems` -> `alabsystems`
+        // throughout, so in THAT tree the two legally coincide (one public repo
+        // serving source, releases and the index — the documented "no separate
+        // mirror" configuration, not a regression). Same scoping as
+        // `aterm-release`'s `the_channel_is_never_pointed_back_at_the_private_staging_repo`.
+        if aterm_update_core::PUBLISH_OWNER == "alabsystems" {
+            assert_eq!(
+                aterm_update_core::DEFAULT_OWNER,
+                "alabsystems",
+                "the private tree's update channel is the public mirror"
+            );
+            assert_ne!(
+                aterm_update_core::PUBLISH_OWNER,
+                aterm_update_core::DEFAULT_OWNER,
+                "index account and update channel must not be the same knob"
+            );
         }
     }
 
@@ -132,11 +181,11 @@ mod tests {
             // so it can never redirect the index fetch off api.github.com.
             assert_eq!(
                 resolve_account(Some("evil.com/x")).owner,
-                aterm_update_core::DEFAULT_OWNER
+                aterm_update_core::PUBLISH_OWNER
             );
             assert_eq!(
                 resolve_account(Some("a b")).owner,
-                aterm_update_core::DEFAULT_OWNER
+                aterm_update_core::PUBLISH_OWNER
             );
         }
     }
@@ -161,7 +210,7 @@ mod tests {
         // invalid env AND no/invalid config → trusted default (never an attacker slug).
         assert_eq!(
             resolve_account_with(Some("e v i l"), Some("c/d")).owner,
-            aterm_update_core::DEFAULT_OWNER
+            aterm_update_core::PUBLISH_OWNER
         );
         // blank env is treated as absent.
         assert_eq!(

@@ -11,9 +11,7 @@
 //! system-font path lists empty (only `from_system*` populates them) and every
 //! test disables the M3 runtime resolver, exactly like a web host.
 
-use aterm_render::{
-    FaceId, MISSING_FONT_CLASS_EMOJI, MISSING_FONT_CLASS_TEXT, Renderer, Theme,
-};
+use aterm_render::{FaceId, MISSING_FONT_CLASS_EMOJI, MISSING_FONT_CLASS_TEXT, Renderer, Theme};
 
 fn dejavu() -> Vec<u8> {
     std::fs::read(concat!(
@@ -88,7 +86,8 @@ fn injecting_the_missing_face_stops_the_class() {
     let branch = '\u{E0A0}'; // Powerline branch: Nerd-Symbols-only coverage
     r.glyph_key(branch);
     assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_TEXT);
-    r.set_fallback_bytes(&nerd_symbols()).expect("nerd face parses");
+    r.set_fallback_bytes(&nerd_symbols())
+        .expect("nerd face parses");
     // The installer cleared the per-char memos, so the char re-probes and the
     // injected face now covers it: no new miss.
     let key = r.glyph_key(branch);
@@ -101,7 +100,8 @@ fn still_uncovered_chars_re_fire_after_injection() {
     let mut r = renderer();
     r.glyph_key('\u{0378}');
     assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_TEXT);
-    r.set_fallback_bytes(&nerd_symbols()).expect("nerd face parses");
+    r.set_fallback_bytes(&nerd_symbols())
+        .expect("nerd face parses");
     r.glyph_key('\u{0378}'); // memos cleared; still uncovered → re-fires
     assert_eq!(
         r.take_missing_font_classes(),
@@ -123,7 +123,8 @@ fn late_color_face_takes_over_after_notdef() {
     let mut r = renderer();
     r.glyph_key('😀'); // parks a `.notdef` in the TEXT-path `keys` memo
     assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_EMOJI);
-    r.set_color_font_bytes(emoji_bytes).expect("system emoji face parses");
+    r.set_color_font_bytes(emoji_bytes)
+        .expect("system emoji face parses");
     let key = r.glyph_key('😀');
     assert_eq!(
         key.source,

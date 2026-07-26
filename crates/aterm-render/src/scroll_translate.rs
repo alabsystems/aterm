@@ -21,9 +21,9 @@
 //!
 //! The windowed compose path splices non-terminal chrome into the SAME
 //! `RenderInput` rows as terminal content: the tab strip is PREPENDED at the top
-//! (`app_render::prepend_strip_rows`), the performance HUD is APPENDED at the
-//! bottom (`append_hud_rows`), and split-pane dividers sit between panes. Those
-//! rows must stay PINNED while the grid glides underneath them. So the translate
+//! (`app_render::prepend_strip_rows`), transient bars can occupy an edge row, and
+//! split-pane dividers sit between panes. Those rows must stay PINNED while the
+//! grid glides underneath them. So the translate
 //! is confined to the grid pixel band `[y0, y1)` derived from the frame's
 //! `[grid_top_row, grid_bot_row)` partition ([`grid_band_px`]); every pixel
 //! OUTSIDE that band is left byte-for-byte identical. That structural confinement
@@ -65,8 +65,8 @@
 //! genuine cross-crate architectural change, not a local tweak here:
 //!
 //! * The surface is FIXED at `pad*2 + rows*cell_h` and CHROME lives IN the
-//!   framebuffer (the HUD is appended below `grid_bot_row`, the tab strip above
-//!   `grid_top_row`). There is no spare band below the grid to hold an extra
+//!   framebuffer (the tab strip sits above `grid_top_row`; transient edge bars
+//!   can bound `grid_bot_row`). There is no spare band below the grid to hold an extra
 //!   row's pixels; the incoming row would have to be rastered into an
 //!   OFF-surface scratch (`w × cell_h`) and its top `frac` px composited into
 //!   the strip.
@@ -357,7 +357,7 @@ mod tests {
     fn whole_frame_shift_would_break_chrome() {
         let (w, h) = (5usize, 20usize);
         let base = checkerboard(w, h);
-        // Band is the middle; chrome is row 0 (strip) and the last row (HUD).
+        // Band is the middle; chrome occupies the first and last rows.
         let (y0, y1, frac) = (2usize, h - 2, 3usize);
         // Naive: shift EVERY row up by frac.
         let mut naive = base.clone();

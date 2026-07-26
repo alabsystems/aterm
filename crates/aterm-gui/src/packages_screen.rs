@@ -24,6 +24,87 @@ pub(crate) enum PackagesBusy {
     Install,
 }
 
+impl PackagesBusy {
+    fn completed_headline(self) -> &'static str {
+        match self {
+            Self::Check => "Package check completed",
+            Self::Install => "ALab toolset install completed",
+        }
+    }
+
+    fn failed_headline(self) -> &'static str {
+        match self {
+            Self::Check => "Package check failed",
+            Self::Install => "ALab toolset install failed",
+        }
+    }
+}
+
+/// The final result of the co-located `atpkg` process, distinct from the
+/// synchronous UI-thread admission result. Keeping this typed result beside
+/// the refreshed status report prevents an old successful `status.toml` from
+/// masquerading as the outcome of a process that failed to launch or exited
+/// non-zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PackagesCommandOutcome {
+    Succeeded {
+        operation: PackagesBusy,
+    },
+    Failed {
+        operation: PackagesBusy,
+        message: String,
+    },
+}
+
+impl PackagesCommandOutcome {
+    fn operation(&self) -> PackagesBusy {
+        match self {
+            Self::Succeeded { operation } | Self::Failed { operation, .. } => *operation,
+        }
+    }
+
+    fn headline(&self) -> &'static str {
+        match self {
+            Self::Succeeded { operation } => operation.completed_headline(),
+            Self::Failed { operation, .. } => operation.failed_headline(),
+        }
+    }
+
+    fn feedback(&self) -> String {
+        match self {
+            Self::Succeeded { operation } => operation.completed_headline().to_string(),
+            Self::Failed { operation, message } => {
+                format!("{}: {message}", operation.failed_headline())
+            }
+        }
+    }
+}
+
+/// One off-thread worker completion. A silent refresh carries no command
+/// outcome; a user verb must carry one matching the operation reserved by
+/// [`PackagesService::begin`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PackagesWorkerCompletion {
+    pub(crate) report: PackagesStatusReport,
+    pub(crate) command: Option<PackagesCommandOutcome>,
+}
+
+impl PackagesWorkerCompletion {
+    pub(crate) fn refresh(report: PackagesStatusReport) -> Self {
+        Self {
+            report,
+            command: None,
+        }
+    }
+
+    pub(crate) fn command(report: PackagesStatusReport, command: PackagesCommandOutcome) -> Self {
+        Self {
+            report,
+            command: Some(command),
+        }
+    }
+}
+
 /// One managed program's last-known state, projected read-only for the page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackagesProgramRow {
@@ -67,6 +148,10 @@ pub(crate) struct PackagesStatusReport {
     pub(crate) outcome: String,
     pub(crate) index_source: String,
     pub(crate) programs: Vec<PackagesProgramRow>,
+    /// Bounded, operator-readable diagnostic when some private package
+    /// metadata could not be admitted or parsed. A worker still publishes the
+    /// rest of the snapshot, so Settings never remains permanently “Reading”.
+    pub(crate) collection_error: Option<String>,
 }
 
 impl PackagesStatusReport {
@@ -84,6 +169,7 @@ impl PackagesStatusReport {
             outcome: String::new(),
             index_source: String::new(),
             programs: Vec::new(),
+            collection_error: None,
         }
     }
 
@@ -145,8 +231,24 @@ impl PackagesStatusReport {
             outcome: status.map(|s| s.outcome.clone()).unwrap_or_default(),
             index_source: status.map(|s| s.index_source.clone()).unwrap_or_default(),
             programs,
+            collection_error: None,
         }
     }
+}
+
+const MAX_PACKAGE_COLLECTION_ERRORS: usize = 4;
+
+fn collection_error_summary(errors: Vec<String>, total: usize) -> Option<String> {
+    if errors.is_empty() {
+        return None;
+    }
+    let mut summary = errors.join(" · ");
+    if total > errors.len() {
+        summary.push_str(" · … and ");
+        summary.push_str(&(total - errors.len()).to_string());
+        summary.push_str(" more metadata errors");
+    }
+    Some(summary)
 }
 
 /// Collect the packages report from the real machine — filesystem reads only
@@ -154,17 +256,48 @@ impl PackagesStatusReport {
 /// only): it stats the co-located binary and parses `status.toml`.
 pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
     let layout = atpkg::store::resolve(None);
-    let status = layout.as_ref().and_then(atpkg::status::read);
+    collect_packages_status_from_layout(available, layout.as_ref())
+}
+
+fn collect_packages_status_from_layout(
+    available: bool,
+    layout: Option<&atpkg::Layout>,
+) -> PackagesStatusReport {
+    let mut errors = Vec::new();
+    let mut error_count = 0usize;
+    let mut record_error = |message: String| {
+        error_count = error_count.saturating_add(1);
+        if errors.len() < MAX_PACKAGE_COLLECTION_ERRORS {
+            errors.push(message);
+        }
+    };
+    let status = layout.and_then(|layout| match atpkg::status::read_checked(layout) {
+        Ok(status) => status,
+        Err(error) => {
+            record_error(format!("Could not read status.toml: {error}"));
+            None
+        }
+    });
     let links: Vec<(String, Option<std::path::PathBuf>)> = layout
-        .as_ref()
-        .map(|layout| {
-            atpkg::linked_programs(layout)
+        .map(|layout| match atpkg::linked_programs_checked(layout) {
+            Ok(names) => names
                 .into_iter()
-                .map(|name| {
-                    let target = atpkg::linked_checkout(layout, &name);
-                    (name, target)
+                .filter_map(|name| match atpkg::linked_checkout_checked(layout, &name) {
+                    Ok(Some(target)) => Some((name, Some(target))),
+                    Ok(None) => {
+                        record_error(format!("Link marker {name:?} disappeared while reading"));
+                        None
+                    }
+                    Err(error) => {
+                        record_error(format!("Could not read link marker {name:?}: {error}"));
+                        None
+                    }
                 })
-                .collect()
+                .collect(),
+            Err(error) => {
+                record_error(format!("Could not enumerate package links: {error}"));
+                Vec::new()
+            }
         })
         .unwrap_or_default();
     // Mirror the CO-LOCATED CLI's own posture, not just the compiled pin:
@@ -173,7 +306,7 @@ pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
     // page must report the cause that is actually in force.
     let disabled_by_env = std::env::var_os("ATPKG_DISABLE").is_some();
     let override_root = std::env::var("ATPKG_ROOTKEY_OVERRIDE").is_ok_and(|k| !k.is_empty());
-    let manager_enabled = atpkg::enabled() || (override_root && !disabled_by_env);
+    let manager_enabled = atpkg::manager_enabled();
     let mut report = PackagesStatusReport::from_parts(
         available,
         manager_enabled,
@@ -183,6 +316,7 @@ pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
     );
     report.disabled_by_env = disabled_by_env;
     report.override_root = override_root;
+    report.collection_error = collection_error_summary(errors, error_count);
     report
 }
 
@@ -198,6 +332,22 @@ pub(crate) struct PackagesService {
     inflight: bool,
     busy: Option<PackagesBusy>,
     report: Option<PackagesStatusReport>,
+    last_command: Option<PackagesCommandOutcome>,
+}
+
+/// Scalar projection used only by Tier-1 conformance. Every field is read from
+/// the genuine reducer; `presented_result` additionally reads the shipping
+/// projection headline so the formal trace is bound to what Settings renders.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PackagesModelState {
+    pub(crate) sequence: u64,
+    pub(crate) inflight: bool,
+    pub(crate) operation: u8,
+    pub(crate) observed: bool,
+    pub(crate) last_operation: u8,
+    pub(crate) last_result: u8,
+    pub(crate) presented_result: u8,
 }
 
 impl PackagesService {
@@ -208,6 +358,7 @@ impl PackagesService {
             inflight: false,
             busy: None,
             report: None,
+            last_command: None,
         }
     }
 
@@ -217,6 +368,53 @@ impl PackagesService {
 
     pub(crate) fn busy(&self) -> Option<PackagesBusy> {
         self.busy
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_state(&self) -> PackagesModelState {
+        let operation = match (self.inflight, self.busy) {
+            (false, _) => 0,
+            (true, None) => 1,
+            (true, Some(PackagesBusy::Check)) => 2,
+            (true, Some(PackagesBusy::Install)) => 3,
+        };
+        let (last_operation, last_result) = match self.last_command.as_ref() {
+            None => (0, 0),
+            Some(PackagesCommandOutcome::Succeeded { operation }) => (
+                match operation {
+                    PackagesBusy::Check => 2,
+                    PackagesBusy::Install => 3,
+                },
+                1,
+            ),
+            Some(PackagesCommandOutcome::Failed { operation, .. }) => (
+                match operation {
+                    PackagesBusy::Check => 2,
+                    PackagesBusy::Install => 3,
+                },
+                2,
+            ),
+        };
+        let headline = self
+            .state(true, true, true, false, false)
+            .projection()
+            .headline;
+        let presented_result = if headline.ends_with("completed") {
+            1
+        } else if headline.ends_with("failed") {
+            2
+        } else {
+            0
+        };
+        PackagesModelState {
+            sequence: self.sequence,
+            inflight: self.inflight,
+            operation,
+            observed: self.report.is_some(),
+            last_operation,
+            last_result,
+            presented_result,
+        }
     }
 
     /// Begin one worker pass (`busy = None` ⇒ a silent status refresh).
@@ -230,19 +428,36 @@ impl PackagesService {
         self.sequence = self.sequence.saturating_add(1);
         self.inflight = true;
         self.busy = busy;
+        if busy.is_some() {
+            // The in-flight headline is now authoritative. Never leave the
+            // previous verb's result attached to a new attempt.
+            self.last_command = None;
+        }
         self.revision = self.revision.saturating_add(1);
         Some(self.sequence)
     }
 
     /// Reduce one worker completion. `false` ⇒ stale (reducer-inert means
-    /// presentation-inert too: the caller must not publish).
-    pub(crate) fn finish(&mut self, sequence: u64, report: PackagesStatusReport) -> bool {
+    /// presentation-inert too: the caller must not publish). A current but
+    /// protocol-mismatched result is inert as well: a refresh cannot settle a
+    /// verb, and a command result cannot settle a refresh reservation.
+    pub(crate) fn finish(&mut self, sequence: u64, completion: PackagesWorkerCompletion) -> bool {
         if !self.inflight || sequence != self.sequence {
+            return false;
+        }
+        let command_operation = completion
+            .command
+            .as_ref()
+            .map(PackagesCommandOutcome::operation);
+        if self.busy != command_operation {
             return false;
         }
         self.inflight = false;
         self.busy = None;
-        self.report = Some(report);
+        self.report = Some(completion.report);
+        if completion.command.is_some() {
+            self.last_command = completion.command;
+        }
         self.revision = self.revision.saturating_add(1);
         true
     }
@@ -268,8 +483,10 @@ impl PackagesService {
     pub(crate) fn state(
         &self,
         loop_enabled: bool,
+        master_enabled: bool,
         auto_update: bool,
         auto_install: bool,
+        loop_running: bool,
     ) -> PackagesState {
         PackagesState {
             observed: self.report.is_some(),
@@ -279,9 +496,12 @@ impl PackagesService {
                 .unwrap_or_else(PackagesStatusReport::unobserved),
             busy: self.busy,
             inflight: self.inflight,
+            last_command: self.last_command.clone(),
             loop_enabled,
+            master_enabled,
             auto_update,
             auto_install,
+            loop_running,
         }
     }
 }
@@ -301,11 +521,18 @@ pub(crate) struct PackagesState {
     /// admitted during a silent refresh would only be dropped by the host's
     /// one-worker rule, so the buttons disable for the (brief) window instead.
     inflight: bool,
+    /// Final result of the most recent UI-initiated verb. Silent refreshes keep
+    /// it; starting a new verb clears it.
+    last_command: Option<PackagesCommandOutcome>,
     /// Resolved `[packages]` flags (`enabled && auto_update`, `auto_update`,
     /// `auto_install`) — display only; the switches edit the config keys.
     loop_enabled: bool,
+    master_enabled: bool,
     auto_update: bool,
     auto_install: bool,
+    /// Immutable fact: the background updater thread actually started for this
+    /// process. Saved config may differ until the next launch.
+    loop_running: bool,
 }
 
 impl PackagesState {
@@ -317,17 +544,23 @@ impl PackagesState {
             report: PackagesStatusReport::unobserved(),
             busy: None,
             inflight: false,
+            last_command: None,
             loop_enabled: true,
+            master_enabled: true,
             auto_update: true,
             auto_install: false,
+            loop_running: false,
         }
     }
 
     /// Snapshot the exact state the Packages page paints.
     pub(crate) fn projection(&self) -> PackagesProjection {
         let report = &self.report;
-        let actions_enabled =
-            self.observed && report.available && report.manager_enabled && !self.inflight;
+        let actions_enabled = self.observed
+            && report.available
+            && report.manager_enabled
+            && report.collection_error.is_none()
+            && !self.inflight;
         let headline = if !self.observed {
             "Reading package status…".to_string()
         } else if let Some(busy) = self.busy {
@@ -335,17 +568,48 @@ impl PackagesState {
                 PackagesBusy::Check => "Checking toolchain packages…".to_string(),
                 PackagesBusy::Install => "Installing the ALab toolset…".to_string(),
             }
+        } else if let Some(command) = self.last_command.as_ref() {
+            command.headline().to_string()
         } else if !report.available {
             "Package manager unavailable".to_string()
         } else if !report.manager_enabled {
             "Package manager inert".to_string()
+        } else if report.collection_error.is_some() {
+            "Package status incomplete".to_string()
         } else if report.recorded {
             "Toolchain packages managed".to_string()
         } else {
             "No package activity yet".to_string()
         };
-        let detail = if !self.observed {
+        let recorded_detail = || {
+            let mut detail = String::new();
+            if !report.outcome.is_empty() {
+                detail.push_str(&report.outcome);
+            }
+            if !report.updated_at.is_empty() {
+                if !detail.is_empty() {
+                    detail.push_str("  ·  ");
+                }
+                detail.push_str(&report.updated_at);
+            }
+            (!detail.is_empty()).then_some(detail)
+        };
+        let mut detail = if !self.observed {
             None
+        } else if let Some(command) = self.last_command.as_ref() {
+            let mut detail = command.feedback();
+            if let Some(recorded) = recorded_detail() {
+                match command {
+                    PackagesCommandOutcome::Succeeded { .. } => {
+                        detail.push_str("  ·  Recorded status: ");
+                    }
+                    PackagesCommandOutcome::Failed { .. } => {
+                        detail.push_str("  ·  Earlier recorded status (not this attempt): ");
+                    }
+                }
+                detail.push_str(&recorded);
+            }
+            Some(detail)
         } else if !report.available {
             Some("No co-located atpkg binary beside this executable.".to_string())
         } else if !report.manager_enabled {
@@ -360,24 +624,44 @@ impl PackagesState {
                     .to_string()
             })
         } else if report.recorded {
-            let mut detail = String::new();
-            if !report.outcome.is_empty() {
-                detail.push_str(&report.outcome);
-            }
-            if !report.updated_at.is_empty() {
-                if !detail.is_empty() {
-                    detail.push_str("  ·  ");
-                }
-                detail.push_str(&report.updated_at);
-            }
-            (!detail.is_empty()).then_some(detail)
+            recorded_detail()
         } else {
             Some("atpkg has not run yet — check now to record a first status.".to_string())
         };
+        if self.observed
+            && let Some(error) = report.collection_error.as_deref()
+        {
+            let warning = format!("Package metadata warning: {error}");
+            match detail.as_mut() {
+                Some(detail) => {
+                    detail.push_str("  ·  ");
+                    detail.push_str(&warning);
+                }
+                None => detail = Some(warning),
+            }
+        }
+        let loop_status = match (self.loop_running, self.master_enabled, self.loop_enabled) {
+            (true, false, _) => {
+                "Started this launch · Automatic maintenance Saved Off · Won’t start next launch"
+            }
+            (false, false, _) => "Not started · Automatic maintenance Saved Off",
+            (true, true, false) => {
+                "Started this launch · Auto-update Saved Off · Won’t run next launch"
+            }
+            (false, true, true) => "Not started this launch · Saved On · Starts next launch",
+            (true, true, true) => "Started this launch",
+            (false, true, false) => "Not started · Auto-update Saved Off",
+        }
+        .to_string();
+        let command_feedback = self
+            .last_command
+            .as_ref()
+            .map(PackagesCommandOutcome::feedback);
         PackagesProjection {
             observed: self.observed,
             available: report.available,
             manager_enabled: report.manager_enabled,
+            disabled_by_env: report.disabled_by_env,
             // Under an override the compiled pin's digest is NOT the live
             // anchor — say what the CLI's own status says instead of showing
             // a fingerprint of a key that is not in force.
@@ -391,14 +675,19 @@ impl PackagesState {
             outcome: report.outcome.clone(),
             index_source: report.index_source.clone(),
             programs: report.programs.clone(),
+            collection_error: report.collection_error.clone(),
             busy: self.busy,
             refreshing: self.inflight && self.busy.is_none(),
             loop_enabled: self.loop_enabled,
+            master_enabled: self.master_enabled,
             auto_update: self.auto_update,
             auto_install: self.auto_install,
+            loop_running: self.loop_running,
+            loop_status,
             actions_enabled,
             headline,
             detail,
+            command_feedback,
         }
     }
 }
@@ -410,29 +699,52 @@ pub(crate) struct PackagesProjection {
     pub(crate) observed: bool,
     pub(crate) available: bool,
     pub(crate) manager_enabled: bool,
+    /// Typed admission cause retained from the worker report. Consumers must
+    /// not reverse-engineer ATPKG_DISABLE from operator-facing detail text.
+    pub(crate) disabled_by_env: bool,
     pub(crate) root_fingerprint: String,
     pub(crate) recorded: bool,
     pub(crate) updated_at: String,
     pub(crate) outcome: String,
     pub(crate) index_source: String,
     pub(crate) programs: Vec<PackagesProgramRow>,
+    pub(crate) collection_error: Option<String>,
     pub(crate) busy: Option<PackagesBusy>,
     /// A SILENT status-refresh worker is inflight (no `busy` label). Action
     /// admission must refuse during this brief window too — the host runs one
     /// worker at a time, and a raced click would otherwise be dropped.
     pub(crate) refreshing: bool,
     pub(crate) loop_enabled: bool,
+    pub(crate) master_enabled: bool,
     pub(crate) auto_update: bool,
     pub(crate) auto_install: bool,
+    pub(crate) loop_running: bool,
+    /// What is actually running now, plus any saved-vs-live mismatch. Derived
+    /// here so pixels, accessibility, and introspection use one truth source.
+    pub(crate) loop_status: String,
     /// Both action buttons: available AND enabled AND idle AND observed.
     pub(crate) actions_enabled: bool,
     pub(crate) headline: String,
     pub(crate) detail: Option<String>,
+    /// Final result text for replacing the initiating view's temporary
+    /// synchronous “request accepted” feedback.
+    pub(crate) command_feedback: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refresh(report: PackagesStatusReport) -> PackagesWorkerCompletion {
+        PackagesWorkerCompletion::refresh(report)
+    }
+
+    fn succeeded(
+        report: PackagesStatusReport,
+        operation: PackagesBusy,
+    ) -> PackagesWorkerCompletion {
+        PackagesWorkerCompletion::command(report, PackagesCommandOutcome::Succeeded { operation })
+    }
 
     fn status(outcome: &str) -> atpkg::Status {
         let mut programs = std::collections::BTreeMap::new();
@@ -473,7 +785,7 @@ mod tests {
         let report =
             PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status("ok")), &[]);
         assert!(
-            !service.finish(seq + 1, report.clone()),
+            !service.finish(seq + 1, succeeded(report.clone(), PackagesBusy::Check)),
             "a superseded worker cannot import facts"
         );
         assert_eq!(
@@ -482,15 +794,20 @@ mod tests {
             "stale finish is inert"
         );
         let before = service.revision();
-        assert!(service.finish(seq, report));
+        assert!(service.finish(seq, succeeded(report, PackagesBusy::Check)));
         assert_eq!(service.busy(), None);
         assert!(service.revision() > before);
-        let state = service.state(true, true, false);
+        let state = service.state(true, true, true, false, true);
         let projection = state.projection();
         assert!(projection.recorded);
         assert_eq!(projection.programs.len(), 1);
         assert_eq!(projection.programs[0].installed_build, Some(1971));
         assert!(projection.actions_enabled);
+        assert_eq!(projection.headline, "Package check completed");
+        assert_eq!(
+            projection.command_feedback.as_deref(),
+            Some("Package check completed")
+        );
     }
 
     /// A spawn-failure abort releases the reservation WITHOUT importing facts:
@@ -504,7 +821,7 @@ mod tests {
         assert!(service.abort(seq), "current abort releases");
         assert!(service.revision() > before, "the un-busy flip fans out");
         assert_eq!(service.busy(), None);
-        let state = service.state(true, true, false);
+        let state = service.state(true, true, true, false, true);
         assert!(
             state.projection().headline.contains("Reading"),
             "never-observed stays honestly unobserved after an abort"
@@ -514,12 +831,12 @@ mod tests {
         let seq = service.begin(Some(PackagesBusy::Check)).unwrap();
         let report =
             PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status("ok")), &[]);
-        assert!(service.finish(seq, report));
+        assert!(service.finish(seq, succeeded(report, PackagesBusy::Check)));
         let seq = service.begin(Some(PackagesBusy::Install)).unwrap();
         assert!(!service.abort(seq + 1), "stale abort is inert");
         assert_eq!(service.busy(), Some(PackagesBusy::Install));
         assert!(service.abort(seq));
-        let projection = service.state(true, true, false).projection();
+        let projection = service.state(true, true, true, false, true).projection();
         assert!(projection.recorded, "the prior report's facts survive");
         assert_eq!(projection.programs.len(), 1);
         assert!(projection.actions_enabled);
@@ -540,9 +857,15 @@ mod tests {
         let seq = service.begin(None).unwrap();
         assert!(service.finish(
             seq,
-            PackagesStatusReport::from_parts(false, false, String::new(), None, &[]),
+            refresh(PackagesStatusReport::from_parts(
+                false,
+                false,
+                String::new(),
+                None,
+                &[],
+            )),
         ));
-        let unavailable = service.state(true, true, false).projection();
+        let unavailable = service.state(true, true, true, false, true).projection();
         assert!(unavailable.headline.contains("unavailable"));
         assert!(
             unavailable
@@ -556,9 +879,15 @@ mod tests {
         let seq = service.begin(None).unwrap();
         assert!(service.finish(
             seq,
-            PackagesStatusReport::from_parts(true, false, "0000".into(), None, &[]),
+            refresh(PackagesStatusReport::from_parts(
+                true,
+                false,
+                "0000".into(),
+                None,
+                &[],
+            )),
         ));
-        let inert = service.state(true, true, false).projection();
+        let inert = service.state(true, true, true, false, true).projection();
         assert!(inert.headline.contains("inert"));
         assert!(
             inert.detail.as_deref().unwrap_or("").contains("root key"),
@@ -569,23 +898,165 @@ mod tests {
         let seq = service.begin(None).unwrap();
         assert!(service.finish(
             seq,
-            PackagesStatusReport::from_parts(
+            refresh(PackagesStatusReport::from_parts(
                 true,
                 true,
                 "fp".into(),
                 Some(&status("up to date")),
                 &[]
-            ),
+            )),
         ));
-        let live = service.state(true, true, false).projection();
+        let live = service.state(true, true, true, false, true).projection();
         assert!(live.actions_enabled);
         assert!(live.detail.as_deref().unwrap().contains("up to date"));
 
         // Busy while a verb runs: actions gate off and the headline says which.
         let _ = service.begin(Some(PackagesBusy::Install)).unwrap();
-        let busy = service.state(true, true, false).projection();
+        let busy = service.state(true, true, true, false, true).projection();
         assert!(busy.headline.contains("Installing"));
         assert!(!busy.actions_enabled);
+    }
+
+    #[test]
+    fn projection_retains_typed_atpkg_disable_cause() {
+        let mut report = PackagesStatusReport::from_parts(
+            true,
+            false,
+            "compiled-root-present".into(),
+            None,
+            &[],
+        );
+        report.disabled_by_env = true;
+        let mut service = PackagesService::new();
+        let seq = service.begin(None).unwrap();
+        assert!(service.finish(seq, refresh(report)));
+        let projection = service.state(true, true, true, false, true).projection();
+        assert!(projection.disabled_by_env);
+        assert!(!projection.manager_enabled);
+        assert!(
+            projection
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("ATPKG_DISABLE")
+        );
+    }
+
+    #[test]
+    fn projection_distinguishes_saved_loop_consent_from_this_launch() {
+        let service = PackagesService::new();
+        let stopping_next_launch = service.state(false, true, false, false, true).projection();
+        assert!(stopping_next_launch.loop_running);
+        assert!(
+            stopping_next_launch
+                .loop_status
+                .contains("Started this launch")
+        );
+        assert!(stopping_next_launch.loop_status.contains("Saved Off"));
+        assert!(
+            stopping_next_launch
+                .loop_status
+                .contains("Won’t run next launch")
+        );
+
+        let starting_next_launch = service.state(true, true, true, false, false).projection();
+        assert!(!starting_next_launch.loop_running);
+        assert!(
+            starting_next_launch
+                .loop_status
+                .contains("Not started this launch")
+        );
+        assert!(starting_next_launch.loop_status.contains("Saved On"));
+        assert!(
+            starting_next_launch
+                .loop_status
+                .contains("Starts next launch")
+        );
+
+        let hidden_master = service.state(false, false, true, false, false).projection();
+        assert!(!hidden_master.master_enabled);
+        assert!(
+            hidden_master
+                .loop_status
+                .contains("Automatic maintenance Saved Off"),
+            "the visible master—not the still-On auto-update child—explains the gate"
+        );
+    }
+
+    /// A failed process must outrank a stale successful status report, update
+    /// the initiating Settings feedback, and survive a later silent refresh.
+    #[test]
+    fn failed_command_cannot_redisplay_an_earlier_success_as_this_attempt() {
+        let mut service = PackagesService::new();
+        let old_report = PackagesStatusReport::from_parts(
+            true,
+            true,
+            "fp".into(),
+            Some(&status("up to date")),
+            &[],
+        );
+        let first = service.begin(None).unwrap();
+        assert!(service.finish(first, refresh(old_report.clone())));
+
+        let sequence = service.begin(Some(PackagesBusy::Check)).unwrap();
+        let failed = PackagesWorkerCompletion::command(
+            old_report.clone(),
+            PackagesCommandOutcome::Failed {
+                operation: PackagesBusy::Check,
+                message: "atpkg update exited with status 7".to_string(),
+            },
+        );
+        assert!(service.finish(sequence, failed));
+        let projection = service.state(true, true, true, false, true).projection();
+        assert_eq!(projection.headline, "Package check failed");
+        assert!(
+            projection
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("exited with status 7")
+        );
+        assert!(
+            projection
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("Earlier recorded status (not this attempt): up to date"),
+            "the old success is retained only as explicitly historical context"
+        );
+        assert!(
+            projection
+                .command_feedback
+                .as_deref()
+                .unwrap()
+                .starts_with("Package check failed")
+        );
+
+        let refresh_sequence = service.begin(None).unwrap();
+        assert!(service.finish(refresh_sequence, refresh(old_report)));
+        assert_eq!(
+            service
+                .state(true, true, true, false, true)
+                .projection()
+                .headline,
+            "Package check failed",
+            "a background status read cannot erase the last verb result"
+        );
+    }
+
+    /// Current sequence alone is insufficient: the completion kind/operation
+    /// must match the reservation before the reducer may clear busy.
+    #[test]
+    fn completion_kind_and_operation_must_match_the_reservation() {
+        let mut service = PackagesService::new();
+        let report = PackagesStatusReport::from_parts(true, true, "fp".into(), None, &[]);
+        let sequence = service.begin(Some(PackagesBusy::Install)).unwrap();
+        assert!(!service.finish(sequence, refresh(report.clone())));
+        assert_eq!(service.busy(), Some(PackagesBusy::Install));
+        assert!(!service.finish(sequence, succeeded(report.clone(), PackagesBusy::Check)));
+        assert_eq!(service.busy(), Some(PackagesBusy::Install));
+        assert!(service.finish(sequence, succeeded(report, PackagesBusy::Install)));
+        assert_eq!(service.busy(), None);
     }
 
     /// Dev-linked programs surface annotated — merged into an existing status
@@ -614,5 +1085,67 @@ mod tests {
         assert_eq!(orc.state, "linked");
         assert_eq!(orc.installed_build, None);
         assert!(report.programs.windows(2).all(|w| w[0].name <= w[1].name));
+    }
+
+    /// A hostile/corrupt metadata source settles the worker into an explicit,
+    /// non-busy error projection; it can never strand Packages on “Reading”.
+    #[test]
+    fn metadata_admission_error_completes_into_visible_nonreading_state() {
+        let mut service = PackagesService::new();
+        let sequence = service.begin(None).unwrap();
+        let mut report = PackagesStatusReport::from_parts(true, true, "fp".into(), None, &[]);
+        report.collection_error = Some(
+            "Could not read status.toml: package metadata is not a regular non-link file"
+                .to_string(),
+        );
+        assert!(service.finish(sequence, refresh(report)));
+
+        let projection = service.state(true, true, true, false, true).projection();
+        assert_eq!(projection.headline, "Package status incomplete");
+        assert!(!projection.refreshing);
+        assert!(!projection.actions_enabled);
+        assert!(
+            projection
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("regular non-link"),
+            "the checked-read diagnostic reaches the native Settings projection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_collector_turns_status_fifo_into_a_completed_error_report() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let prefix =
+            std::env::temp_dir().join(format!("aterm-packages-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(&prefix).unwrap();
+        let layout = atpkg::Layout {
+            prefix: prefix.clone(),
+        };
+        let status = layout.status();
+        let status_c = std::ffi::CString::new(status.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `status_c` is a live NUL-terminated path in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(status_c.as_ptr(), 0o600) }, 0);
+
+        let report = collect_packages_status_from_layout(true, Some(&layout));
+        assert!(
+            report
+                .collection_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("regular non-link"),
+            "the production collector surfaces the FIFO refusal"
+        );
+        let mut service = PackagesService::new();
+        let sequence = service.begin(None).unwrap();
+        assert!(service.finish(sequence, refresh(report)));
+        let projection = service.state(true, true, true, false, true).projection();
+        assert!(!projection.refreshing);
+        assert!(!projection.headline.contains("Reading"));
+        let _ = std::fs::remove_dir_all(prefix);
     }
 }

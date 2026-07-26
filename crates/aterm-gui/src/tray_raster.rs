@@ -28,6 +28,8 @@ use std::f32::consts::TAU;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+use aterm_grapheme::GraphemeClusters;
+
 /// Serialize the rare heavyweight Unicode-font warmups. Hot reload can replace
 /// a pending semantic fork; its dropped receiver prevents stale installation,
 /// while this gate prevents the old/new workers from concurrently parsing two
@@ -264,16 +266,23 @@ fn resolve_candidate_face(
     if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
-    let resolved = aterm_render::resolve_font_family(family)
-        .ok_or_else(|| format!("{family:?}"))
-        .and_then(|path| {
-            std::fs::read(&path)
+    // The `game:` scheme resolves to embedded bytes, never a file read — the
+    // same interception every other resolution path performs.
+    let resolved = if let Some(bytes) = aterm_render::game_font_for_family(family.trim()) {
+        Ok(ResolvedCandidateFace {
+            path: family.trim().to_string(),
+            bytes: aterm_render::intern_font_bytes(bytes.to_vec()),
+        })
+    } else {
+        aterm_render::resolve_config_font(family).and_then(|path| {
+            aterm_render::font_file::read_font_file(std::path::Path::new(&path))
                 .map(|bytes| ResolvedCandidateFace {
                     path,
                     bytes: aterm_render::intern_font_bytes(bytes),
                 })
-                .map_err(|_| format!("{family:?}"))
-        });
+                .map_err(|error| format!("font {family:?} could not be read ({error})"))
+        })
+    };
     cache.insert(key, resolved.clone());
     resolved
 }
@@ -303,7 +312,7 @@ fn build_semantic_candidate(
             renderer.set_primary_font_from_resolved_path(face.bytes.as_slice(), face.path)
         }) {
             Ok(()) => {}
-            Err(_) => unresolved.push(format!("regular {family:?}")),
+            Err(error) => unresolved.push(format!("regular {family:?}: {error}")),
         }
     }
     for (slot, label, family) in [
@@ -318,7 +327,7 @@ fn build_semantic_candidate(
             .and_then(|face| renderer.set_styled_font_bytes(slot, face.bytes.as_slice()))
         {
             Ok(()) => {}
-            Err(_) => unresolved.push(format!("{label} {family:?}")),
+            Err(error) => unresolved.push(format!("{label} {family:?}: {error}")),
         }
     }
     let mut installed_fallback = false;
@@ -331,7 +340,7 @@ fn build_semantic_candidate(
             }
         }) {
             Ok(()) => installed_fallback = true,
-            Err(_) => unresolved.push(format!("fallback {family:?}")),
+            Err(error) => unresolved.push(format!("fallback {family:?}: {error}")),
         }
     }
     if let Some(family) = candidate.symbol.as_deref() {
@@ -339,7 +348,7 @@ fn build_semantic_candidate(
             .and_then(|face| renderer.set_symbol_fallback_bytes(face.bytes.as_slice()))
         {
             Ok(()) => {}
-            Err(_) => unresolved.push(format!("symbol {family:?}")),
+            Err(error) => unresolved.push(format!("symbol {family:?}: {error}")),
         }
     }
     if let Some(family) = candidate.emoji.as_deref() {
@@ -347,7 +356,7 @@ fn build_semantic_candidate(
             .and_then(|face| renderer.set_color_font_arc(Arc::clone(&face.bytes)))
         {
             Ok(()) => {}
-            Err(_) => unresolved.push(format!("emoji {family:?}")),
+            Err(error) => unresolved.push(format!("emoji {family:?}: {error}")),
         }
     }
     renderer.set_synthetic_styles(candidate.synthetic_styles);
@@ -538,6 +547,13 @@ impl PreparedSemanticFont {
         &self.candidate == candidate
     }
 
+    /// Whether this immutable snapshot can paint the real terminal specimen.
+    /// Callers use this only to decide whether a non-renderer fallback is
+    /// needed; rasterization still forks the captured renderer below.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.renderer.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn renderer_ready(&self) -> bool {
         self.renderer.is_some()
@@ -633,6 +649,46 @@ pub(crate) fn set_chrome_fonts(
     // The service is owned by backend initialization, never demand-spawned by a
     // semantic compile or paint. Candidate requests remain lazy, but the one
     // parked worker already exists before a Settings view can ask for one.
+    if fonts.semantic_worker.is_none() {
+        fonts.semantic_worker = SemanticPrewarmWorker::spawn();
+    }
+    if let Some(worker) = fonts.semantic_worker.as_ref() {
+        worker.cancel_queued();
+    }
+}
+
+/// Fully parsed chrome/semantic font generation. Constructed by the font
+/// catalog worker; publishing it performs no path I/O or font parsing.
+pub(crate) struct PreparedChromeFonts {
+    primary: Option<ChromeFace>,
+    bold: Option<ChromeFace>,
+    semantic: Option<Renderer>,
+}
+
+pub(crate) fn prepare_chrome_fonts(
+    primary: Option<(std::sync::Arc<[u8]>, u32)>,
+    bold: Option<(std::sync::Arc<[u8]>, u32)>,
+    semantic: Option<Renderer>,
+) -> PreparedChromeFonts {
+    let parse = |slot: &Option<(std::sync::Arc<[u8]>, u32)>| {
+        slot.as_ref()
+            .and_then(|(bytes, index)| ChromeFace::from_bytes(bytes, *index))
+    };
+    PreparedChromeFonts {
+        primary: parse(&primary),
+        bold: parse(&bold),
+        semantic,
+    }
+}
+
+pub(crate) fn set_prepared_chrome_fonts(prepared: PreparedChromeFonts) {
+    let mut fonts = lock_fonts();
+    install_chrome_faces_locked(
+        &mut fonts,
+        prepared.primary,
+        prepared.bold,
+        prepared.semantic,
+    );
     if fonts.semantic_worker.is_none() {
         fonts.semantic_worker = SemanticPrewarmWorker::spawn();
     }
@@ -1270,6 +1326,116 @@ const UI_TRACKING_EM: f32 = -0.008;
 /// and rasterizer can never disagree about proportional widths.
 pub(crate) fn ui_text_width(s: &str, px: f32) -> f32 {
     ui_text_width_for(TextFace::Ui, s, px)
+}
+
+fn ui_text_wrap_ranges_impl(
+    text: &str,
+    px: f32,
+    maximum_width: f32,
+) -> (Vec<std::ops::Range<usize>>, usize) {
+    let maximum_width = maximum_width.max(1.0);
+    let graphemes = text
+        .grapheme_indices()
+        .map(|(byte, grapheme)| (byte, grapheme, grapheme.chars().all(char::is_whitespace)))
+        .collect::<Vec<_>>();
+    if graphemes.is_empty() {
+        return (std::iter::once(0..0).collect(), 0);
+    }
+
+    let fonts = lock_fonts();
+    let font = fonts.ui_font(TextFace::Ui).map(Arc::as_ref);
+    let piece_width = |piece: &str, previous: Option<char>| {
+        let Some(font) = font else {
+            return (
+                piece.chars().count() as f32 * px * 0.6,
+                piece.chars().last().or(previous),
+            );
+        };
+        let mut width = 0.0;
+        let mut previous = previous;
+        for character in piece.chars() {
+            if let Some(previous) = previous {
+                width += font.horizontal_kern(previous, character, px).unwrap_or(0.0);
+            }
+            width += font.metrics(character, px).advance_width + UI_TRACKING_EM * px;
+            previous = Some(character);
+        }
+        (width, previous)
+    };
+    let exact_width = |piece: &str| {
+        let Some(font) = font else {
+            return piece.chars().count() as f32 * px * 0.6;
+        };
+        let mut width = 0.0;
+        let mut previous: Option<char> = None;
+        for character in piece.chars() {
+            if let Some(previous) = previous {
+                width += font.horizontal_kern(previous, character, px).unwrap_or(0.0);
+            }
+            width += font.metrics(character, px).advance_width + UI_TRACKING_EM * px;
+            previous = Some(character);
+        }
+        width
+    };
+
+    let byte_at = |index: usize| {
+        graphemes
+            .get(index)
+            .map_or(text.len(), |(byte, _, _)| *byte)
+    };
+    let mut ranges = Vec::new();
+    let mut line_start = 0usize;
+    let mut index = 0usize;
+    let mut width = 0.0;
+    let mut previous = None;
+    let mut whitespace_break = None;
+    let mut scans = 0usize;
+    while index < graphemes.len() {
+        let (_, grapheme, whitespace) = graphemes[index];
+        let (advance, next) = piece_width(grapheme, previous);
+        scans += 1;
+        if index > line_start && width + advance > maximum_width {
+            let split = whitespace_break
+                .filter(|split| *split > line_start)
+                .unwrap_or(index);
+            let range = byte_at(line_start)..byte_at(split);
+            debug_assert!(
+                exact_width(&text[range.clone()]) <= maximum_width + 0.5 || split == line_start + 1
+            );
+            ranges.push(range);
+            line_start = split;
+            index = split;
+            width = 0.0;
+            previous = None;
+            whitespace_break = None;
+            continue;
+        }
+        width += advance;
+        previous = next;
+        index += 1;
+        if whitespace {
+            whitespace_break = Some(index);
+        }
+    }
+    let range = byte_at(line_start)..text.len();
+    debug_assert!(
+        exact_width(&text[range.clone()]) <= maximum_width + 0.5
+            || line_start + 1 == graphemes.len()
+    );
+    ranges.push(range);
+    (ranges, scans)
+}
+
+/// Exact, whitespace-preserving UI-face line breaks. The returned ranges are
+/// contiguous and cover `text` byte-for-byte; callers add visual newlines but
+/// never normalize the source. A single font lock and bounded suffix rescan
+/// keep the operation count linear for a near-cap unbroken token.
+pub(crate) fn ui_text_wrap_ranges(
+    text: &str,
+    px: f32,
+    maximum_width: f32,
+) -> Vec<std::ops::Range<usize>> {
+    ui_text_wrap_ranges_impl(text, px, maximum_width).0
 }
 
 /// Face-aware proportional measure.  Centered semibold labels use this when their
@@ -2670,10 +2836,10 @@ mod tests {
     fn demo_prims(cw: f32, ch: f32, theme: Theme) -> Vec<DrawPrim> {
         use crate::type_scale::TypeStep;
         use crate::widget::{TextFace, TextWeight, rgba, text_prim};
-        let c = crate::hud_bar::hud_colors(theme);
+        let c = crate::chrome_band::band_colors(theme);
         let label = rgba(c.label, 0xFF);
         let track = rgba(c.label, 0x33);
-        let good = rgba(c.good, 0xFF);
+        let good = rgba(c.value, 0xFF);
         let cap = TypeStep::Caption.px(12.0);
         let slot = (cw - 32.0) / 3.0;
         let mut prims = vec![text_prim(
@@ -3314,6 +3480,81 @@ mod tests {
         assert!(ui_text_width("Cursor", 20.0) > ui_text_width("Cursor", 10.0));
     }
 
+    #[test]
+    fn ui_text_wrap_is_lossless_width_bounded_and_linear_at_update_cap() {
+        let source = "x".repeat(256 * 1024);
+        let (ranges, scans) = ui_text_wrap_ranges_impl(&source, 13.0, 420.0);
+        assert!(!ranges.is_empty());
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges.last().map(|range| range.end), Some(source.len()));
+        assert!(
+            ranges.windows(2).all(|pair| pair[0].end == pair[1].start),
+            "responsive wrapping must cover the authored source contiguously"
+        );
+        assert!(
+            scans <= source.len() * 2,
+            "near-cap unbroken input must remain linear: {scans} scans for {} graphemes",
+            source.len()
+        );
+        assert!(
+            ranges
+                .iter()
+                .all(|range| { ui_text_width(&source[range.clone()], 13.0) <= 420.5 })
+        );
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &source[range.clone()])
+                .collect::<String>(),
+            source
+        );
+    }
+
+    #[test]
+    fn ui_text_wrap_preserves_repeated_and_unicode_whitespace_exactly() {
+        let source = "\t  alpha\u{2003}\u{2003}beta  終\t tail";
+        let ranges = ui_text_wrap_ranges(source, 13.0, 54.0);
+        assert!(ranges.len() > 1, "fixture must exercise a real wrap");
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &source[range.clone()])
+                .collect::<String>(),
+            source
+        );
+    }
+
+    #[test]
+    fn ui_text_wrap_allows_only_indivisible_oversized_graphemes_to_overflow() {
+        let oversized = "👨‍👩‍👧‍👦";
+        let source = format!("{oversized}xx");
+        assert_eq!(source.graphemes().count(), 3);
+        let maximum_width = ui_text_width("x", 13.0) + 0.5;
+        assert!(ui_text_width(oversized, 13.0) > maximum_width);
+
+        let ranges = ui_text_wrap_ranges(&source, 13.0, maximum_width);
+        assert_eq!(ranges.first().map(|range| range.start), Some(0));
+        assert_eq!(ranges.last().map(|range| range.end), Some(source.len()));
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &source[range.clone()])
+                .collect::<String>(),
+            source
+        );
+        let overflowing = ranges
+            .iter()
+            .filter(|range| {
+                ui_text_width(&source[range.start..range.end], 13.0) > maximum_width + 0.5
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(overflowing.len(), 1);
+        let overflow = overflowing[0];
+        assert_eq!(&source[overflow.start..overflow.end], oversized);
+        assert_eq!(source[overflow.start..overflow.end].graphemes().count(), 1);
+    }
+
     /// The UI faces rasterize SOMETHING even when the system stack is absent, and a
     /// real semibold face covers more ink than regular on supported desktops.
     #[test]
@@ -3813,7 +4054,7 @@ mod tests {
                 (bg & 0xff) as u8,
                 255,
             ];
-            let panel = crate::hud_bar::hud_colors(theme).bar_bg;
+            let panel = crate::chrome_band::band_colors(theme).bar_bg;
             let mut prims = vec![DrawPrim::Panel {
                 x: 0.0,
                 y: 0.0,

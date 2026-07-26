@@ -681,9 +681,7 @@ impl App {
         let pad = self.win_pad(wid);
         let pad_top = self.win_pad_top(wid);
         let head = self.win_head(wid);
-        let composed_rows = usize::from(ws.rows)
-            .saturating_add(usize::from(self.tab_strip_rows))
-            .saturating_add(usize::from(self.hud_rows.min(ws.hud_cap)));
+        let composed_rows = usize::from(ws.rows).saturating_add(usize::from(self.tab_strip_rows));
         let frame_w = usize::from(ws.cols)
             .saturating_mul(cw)
             .saturating_add(pad.saturating_mul(2));
@@ -1805,7 +1803,7 @@ impl App {
     /// Left release ending a drag: complete the selection — unless the pointer
     /// never left the press cell, in which case a plain click deselects.
     ///
-    /// COPY-ON-SELECT: when `copy_on_select` is enabled (config, default off) and
+    /// COPY-ON-SELECT: when `copy_on_select` is enabled (config, default on) and
     /// the release actually COMPLETED a selection (a real drag, not a deselecting
     /// click), the selected text is copied to the system clipboard right here — no
     /// explicit Cmd-C needed. The highlight is left intact (`copy_selection` does
@@ -2005,6 +2003,17 @@ impl App {
                                     .compiled
                                     .slider_value_at(&hit.key, x)
                                     .map(crate::native_app::SemanticInput::Number)
+                            })
+                            .or_else(|| {
+                                // The Tab Color wheel: a release inside the disk
+                                // carries the picked color as reducer-ready hex.
+                                artifact.compiled.color_wheel_color_at(&hit.key, x, y).map(
+                                    |[r, g, b]| {
+                                        crate::native_app::SemanticInput::Text(format!(
+                                            "#{r:02X}{g:02X}{b:02X}"
+                                        ))
+                                    },
+                                )
                             });
                         Some((artifact.view, artifact.generation, hit, value))
                     },
@@ -2983,10 +2992,9 @@ mod tests {
         };
         settings.search_input = TextInputState::new("foreground".to_string());
         settings.set_search("foreground".to_string());
-        // Global search is the result surface itself and never reserves a
-        // renderer-preview disclosure slice. Its top-ranked foreground result
-        // therefore remains at offset zero.
-        settings.page_scroll = 0;
+        // A short compact search gives its contextual live preview the first
+        // bounded slice and the matching native field the next one.
+        settings.page_scroll = 1;
         settings
             .legacy
             .fields
@@ -3110,6 +3118,26 @@ mod tests {
         let wid = WindowId(0);
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         let (_, settings_view) = app.active_native_view(wid).expect("Settings active");
+        app.dispatch_native_event(
+            wid,
+            crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("settings/compact-navigation"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let Some(AppViewState::Settings(settings)) =
+            app.native_runtime.view_state_mut(settings_view)
+        else {
+            panic!("Settings state");
+        };
+        // Short landscape category sheets intentionally show one complete row
+        // per virtual page. Put the pointer fixture on Modified's exact page
+        // instead of assuming the second route is simultaneously visible.
+        settings.page_scroll = crate::native_settings::SettingsRoute::ALL
+            .iter()
+            .position(|route| *route == crate::native_settings::SettingsRoute::Modified)
+            .expect("Modified route index");
 
         // Ordinary buttons still arm on press and activate only on a matched
         // release; no text position exists for their painted node.
@@ -3117,8 +3145,8 @@ mod tests {
         let route_button = compiled
             .hits
             .iter()
-            .find(|hit| hit.action.as_str() == "settings/route/appearance")
-            .expect("visible Appearance route button");
+            .find(|hit| hit.action.as_str() == "settings/route/modified")
+            .expect("visible Modified route button");
         let route_key = route_button.key.clone();
         assert_eq!(
             compiled.text_field_byte_at(&route_key, route_button.rect.x),
@@ -3144,7 +3172,7 @@ mod tests {
         };
         assert_eq!(
             settings.route,
-            crate::native_settings::SettingsRoute::Appearance
+            crate::native_settings::SettingsRoute::Modified
         );
 
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));

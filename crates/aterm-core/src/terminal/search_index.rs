@@ -166,6 +166,25 @@ impl Terminal {
     pub fn search_index_rebuilds(&self) -> u64 {
         self.search_index_rebuilds
     }
+
+    /// Release the search index's heap: drop both the cached full-content index
+    /// and any budgeted search — in-flight OR retained-completed (fed E-1: a
+    /// completed scan keeps its index for `search_summary` to read; release is
+    /// the eviction that frees it) — so their grown allocations return to the
+    /// allocator (fed E-1 `search_index_release` — real federation eviction of a
+    /// dormant pane's footprint, not a logical clear that retains capacity).
+    ///
+    /// Dropping the whole `CachedSearchIndex` reclaims strictly more than
+    /// [`SearchIndex::release`](aterm_search::SearchIndex::release) (the entire
+    /// struct, not just its containers) AND is the ONLY correct eviction: an
+    /// in-place `release()` would leave the cache KEY (`content_seq`) matching an
+    /// emptied index, so the next [`indexed_search`](Self::indexed_search) would
+    /// return zero matches as a false cache hit. After release the next search
+    /// rebuilds from the live buffer — byte-identical results, one rebuild paid.
+    pub fn release_search_index(&mut self) {
+        self.search_index = None;
+        self.budgeted_search = None;
+    }
 }
 
 #[cfg(test)]
@@ -419,6 +438,36 @@ mod tests {
             "the budget shrink really evicted matches ({} -> {})",
             before.len(),
             after.len()
+        );
+    }
+
+    /// `release_search_index` drops the cache so the next search REBUILDS (heap
+    /// reclaimed) yet returns byte-identical results — the federation-eviction
+    /// contract: real reclaim, never a false empty cache hit.
+    #[test]
+    fn release_drops_cache_then_next_search_rebuilds_identically() {
+        let mut t = Terminal::new(6, 40);
+        t.process(b"NEEDLE_alpha\r\n");
+        for i in 0..20 {
+            t.process(format!("filler line {i}\r\n").as_bytes());
+        }
+        let r1 = cached_results(&mut t, "NEEDLE_alpha");
+        assert_eq!(r1.len(), 1);
+        let rebuilds = t.search_index_rebuilds();
+
+        // Release with NO content change: an in-place clear would leave the
+        // content_seq key matching an emptied index (false hit, zero matches);
+        // dropping forces a rebuild.
+        t.release_search_index();
+        let r2 = cached_results(&mut t, "NEEDLE_alpha");
+        assert_eq!(
+            t.search_index_rebuilds(),
+            rebuilds + 1,
+            "release must force the next search to rebuild (real reclaim)"
+        );
+        assert_eq!(
+            r2, r1,
+            "post-release results are byte-identical (not empty)"
         );
     }
 

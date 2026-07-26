@@ -15,8 +15,7 @@ use winit::dpi::PhysicalSize;
 use crate::input::{InputEvent, Source};
 use crate::platform::AppRt;
 use crate::{
-    App, Backend, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget, WindowId, build_backend,
-    hud_bar, keybinding, term_lock,
+    App, Backend, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget, WindowId, keybinding, term_lock,
 };
 
 /// User config file (`$XDG_CONFIG_HOME/aterm/aterm.toml`, else
@@ -26,13 +25,10 @@ use crate::{
 /// v1 exposes the settings that were previously env-only; it will grow to mirror
 /// the engine's `TerminalConfig` (colours, cursor, scrollback) as themes land.
 ///
-/// `PartialEq` (derived through every embedded table) exists for ONE consumer:
-/// [`App::reload_config`]'s dedupe — a reload whose freshly parsed `Config`
-/// equals the currently applied one is a no-op and skips the side-effect storm
-/// (engine re-diffs, word-deco hard resets, settings popup cancels). This is
-/// what collapses the Settings-panel double reload (the panel's own
-/// `Wake::ConfigReload` followed by the mtime watcher's, ~500 ms later, for
-/// the same bytes) into a single application.
+/// `PartialEq` (derived through every embedded table) lets the prepared config
+/// admission path skip runtime side effects when a worker supplies a semantic
+/// no-op. Exact text, comments, and asset generations still advance through the
+/// versioned native config service independently of that runtime dedupe.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct Config {
@@ -62,10 +58,11 @@ pub(crate) struct Config {
     /// Theme: indexed palette colours, `#RRGGBB`, by 0-based index (0–15 are the
     /// ANSI/bright set; up to 256). e.g. `palette = ["#1d1f21", "#cc6666", …]`.
     pub(crate) palette: Option<Vec<String>>,
-    /// MOTION POLICY (W11): `"auto"` (DEFAULT — follow the OS "Reduce Motion"
-    /// accessibility setting, observed live on macOS), `"full"` (always animate),
-    /// or `"reduced"` (never animate). Governs every decorative animation — the
-    /// cursor aurora, sparkle words, the Scene panel, and the settings effect
+    /// MOTION POLICY (W11): `"auto"` (DEFAULT — follow Reduce Motion live on
+    /// macOS, sample the Windows animations switch at window attach, and use no
+    /// OS-driven reduction where no query exists), `"full"` (always animate), or
+    /// `"reduced"` (never animate). Governs every decorative animation — the
+    /// cursor aurora, sparkle words, matrix rain, and the Settings effect
     /// demo — through ONE resolved [`crate::motion::MotionPolicy`]. Unknown
     /// values fall back to `auto`. Unfocused windows always demote to static
     /// effects regardless of this value. Hot-reloadable.
@@ -86,7 +83,8 @@ pub(crate) struct Config {
     /// Cursor MOTION TRAIL — the "streaming trailer" effect. DEFAULT ON and
     /// exactly idle at rest; set `cursor_trail = false` to opt out.
     pub(crate) cursor_trail: Option<bool>,
-    /// Trail STYLE: `phaser` (DEFAULT — a full-spectrum additive hue sweep along the
+    /// Trail STYLE: `nyan rainbow` (DEFAULT — a momentum-driven banded rainbow
+    /// ribbon), `phaser` (a full-spectrum additive hue sweep along the
     /// swept path), `comet` (the cadence-comet: a directional fading comet of
     /// `TrailCell`s that ignites longer/hotter with fast sustained typing, wrapped in
     /// the additive light crown), `lumen` (the additive light crown only — comet +
@@ -122,6 +120,15 @@ pub(crate) struct Config {
     /// the melody are untouched. The bed DSP itself is kept intact behind
     /// this gate: a redesign tournament evaluates it next phase.
     pub(crate) trail_sound_bed: Option<bool>,
+    /// Trail sound STYLE (`trail_sound_style`, default `"auto"`): WHICH
+    /// palette speaks for the keystroke sounds. `"auto"` follows the visual
+    /// trail style (each style's signature palette — today's sound, bit for
+    /// bit); `"mechanical"` (aliases: `mech`, `thock`, `mechanical keyboard`)
+    /// swaps every keystroke to the mechanical-keyboard palette — switch
+    /// click + case thock percussion — whatever the trail looks like. The
+    /// style-agnostic gestures (cursor-move melody tones, the curse bonk's
+    /// clash shape) are unchanged; volume/on-off/bed gates apply as usual.
+    pub(crate) trail_sound_style: Option<String>,
     /// TONE MELODY (`tone_melody`, default ON): the trail-sound melody leans
     /// with the inferred MOOD of the line being typed — a tiny on-device
     /// classifier (`aterm_effects::tone`, multilingual char-n-gram net over
@@ -159,6 +166,12 @@ pub(crate) struct Config {
     pub(crate) cursor_trail_radius: Option<f32>,
     /// Landing-ring "ping" on a jump (LUMEN styles). Default true.
     pub(crate) cursor_trail_ring: Option<bool>,
+    /// TYPING WAKE length, in milliseconds of recent travel (`nyan rainbow`
+    /// style). The plume under the line you are typing shows exactly this much
+    /// of your recent hand movement, so the number IS its length: raise it for a
+    /// longer trail, lower it for a terser one, and set `0` to turn the wake off
+    /// while keeping the rainbow ribbon. Default 300 ms; clamped 0..=1500.
+    pub(crate) cursor_trail_wake_ms: Option<u64>,
     /// GPU-only cursor-comet BLOOM: a soft gaussian halo around the streak,
     /// composited at present time on the GPU (all wgpu backends — DX12/Vulkan/Metal);
     /// the CPU/software path is unaffected. DEFAULT ON. Set
@@ -215,11 +228,12 @@ pub(crate) struct Config {
     pub(crate) focus_boost: Option<bool>,
     /// M2 "ink that dries": newly-streamed cells FADE IN from the cell
     /// background to their final foreground over `stream_fade_ms` (the exact
-    /// linear-light blend on an ease-out envelope). DEFAULT ON. Hard bypasses
+    /// linear-light blend on an ease-out envelope). DEFAULT OFF when absent;
+    /// the generated starter file opts in explicitly. Hard bypasses
     /// keep latency-critical paths instant — keystroke echo, the alternate
     /// screen (vim/less), a viewport scrolled away from the bottom, and a
     /// Reduced motion policy (W11) all render exact bytes. Set
-    /// `stream_fade = false` to disable.
+    /// `stream_fade = true` to enable.
     pub(crate) stream_fade: Option<bool>,
     /// How long (milliseconds) fresh ink takes to dry — the stream-fade
     /// window. Default 90; clamped to 16..=1000 so a typo can't wedge the
@@ -265,6 +279,16 @@ pub(crate) struct Config {
     /// `$ATERM_FONT` then the built-in [`FONT_CANDIDATES`], so an unset / unknown
     /// family is byte-identical to before.
     pub(crate) font_family: Option<String>,
+    /// GAME-TITLE font (`game_font`): one of the bundled game-title faces by id
+    /// (`"roblox"`, `"minecraft"`, `"zelda"`, `"mariokart"`, `"animal-crossing"`
+    /// — [`aterm_render::GAME_FONTS`]). When set it OUTRANKS `font_family`: the
+    /// whole terminal renders in that face (resolved as the virtual family
+    /// `game:<id>` from embedded bytes, never the filesystem). Unset = the
+    /// normal font selection, byte-identical to before this key existed. The
+    /// Settings "Game Fonts" page drives this as five mutually-exclusive
+    /// toggles (all off ⇒ the key is cleared). Hot-reloadable. `$ATERM_FONT`
+    /// still outranks it (env > config, the one precedence law).
+    pub(crate) game_font: Option<String>,
     /// REAL BOLD face for SGR-bold cells (W6, ghostty's `font-family-bold`): a
     /// family name or file path, resolved like `font_family` and injected via the
     /// renderer's `set_bold_font` seam — a true heavier weight instead of the
@@ -301,8 +325,9 @@ pub(crate) struct Config {
     /// terminal body theme: `"auto"` (default — follow the OS light/dark setting,
     /// including live day-night switches), `"light"`, or `"dark"`. Maps to
     /// [`WindowTheme`] via [`Config::window_theme_or_default`]; an unknown value
-    /// warns and falls back to `auto`. macOS-only today (the field is parsed but
-    /// inert on other platforms). Replaces the old unconditional dark-chrome force.
+    /// warns and falls back to `auto`. This is cross-platform: AppKit sets the
+    /// native NSWindow appearance, Windows applies the DWM/winit titlebar theme,
+    /// and Linux forwards the choice to winit's system-decoration theme.
     pub(crate) window_theme: Option<String>,
     /// GPU-present COLOUR SPACE (M3 phase A): the colour space the window's
     /// CAMetalLayer is TAGGED with at surface attach — i.e. how ColorSync
@@ -316,10 +341,12 @@ pub(crate) struct Config {
     /// unknown values warn and fall back to `srgb`. Hot-reloadable; inert off
     /// macOS and on the CPU (softbuffer) present path.
     pub(crate) window_colorspace: Option<String>,
-    /// macOS: when `true`, the Option (Alt) modifier sends ESC-prefixed (Meta)
-    /// key sequences — the standard terminal expectation. When `false`, Option
-    /// produces the OS-composed character (`å`) instead. ABSENT keeps the current
-    /// default (Meta), so no config = byte-identical. See [`Config::option_as_meta_or_default`].
+    /// When `true`, the Alt/Option modifier sends ESC-prefixed (Meta) key
+    /// sequences — the standard terminal expectation. When `false`, a composed
+    /// text value supplied by the OS is forwarded instead (for example Option+A
+    /// → `å` on macOS); non-text Alt chords still use the terminal encoder.
+    /// ABSENT keeps the cross-platform default (Meta), so no config is unchanged.
+    /// See [`Config::option_as_meta_or_default`].
     pub(crate) option_as_meta: Option<bool>,
     /// Pastejacking guard: when `true` (the DEFAULT), a Cmd-V / menu paste of
     /// MULTI-LINE clipboard text is confirmed first (a native dialog) WHENEVER the
@@ -343,22 +370,9 @@ pub(crate) struct Config {
     /// explicit-copy behaviour). The selection is left highlighted either way,
     /// so Cmd-C still works. See [`Config::copy_on_select_or_default`].
     pub(crate) copy_on_select: Option<bool>,
-    /// MASTER switch for the WHOLE bottom HUD band (Resources + Engine + Scene at
-    /// once). Default ON. `false` hides every panel regardless of the per-panel
-    /// `show_*_hud` keys — which keep their values, so flipping this back on restores
-    /// the previous per-panel selection. See [`Config::show_hud_or_default`].
-    pub(crate) show_hud: Option<bool>,
-    /// Show the bottom RESOURCES HUD — total system vs this terminal session (CPU,
-    /// memory, GPU, disk, network). Default ON — the performance GUI ships enabled.
-    /// Toggleable live via the Performance control panel or View ▸ Show Resources HUD.
-    /// See [`Config::show_resources_hud_or_default`].
-    pub(crate) show_resources_hud: Option<bool>,
-    /// Show the aterm ENGINE HUD (render backend/fps/frame-time, latency, aterm memory,
-    /// app-fed streams). Default ON, like Resources — the performance GUI ships whole.
-    pub(crate) show_engine_hud: Option<bool>,
     /// Show the subtle TOP-RIGHT build/version badge (`v{version} · {build}`) so the
-    /// running build is answerable at a glance without opening About. Default ON.
-    /// Toggleable via the Settings overlay ▸ "Show build/version badge". See
+    /// running build is answerable at a glance without opening About. Default OFF.
+    /// Toggleable via the native Settings tab ▸ Window ▸ "Show build/version badge". See
     /// [`Config::show_build_badge_or_default`] and [`crate::build_badge`].
     pub(crate) show_build_badge: Option<bool>,
     /// User keyboard shortcuts: a `[keybindings]` table mapping chord strings
@@ -387,6 +401,14 @@ pub(crate) struct Config {
     /// (toolbar.rs) now carries the New Tab affordance. Set `tab_strip_rows = 1` in
     /// config to bring the in-grid strip back. Clamped to [`MAX_TAB_STRIP_ROWS`].
     pub(crate) tab_strip_rows: Option<u16>,
+    /// SELECTED-TAB color override (`active_tab_color`, `#RRGGBB`): paints the
+    /// ACTIVE tab's background with a user-picked color in BOTH tab renderers —
+    /// the native macOS toolbar pill and the in-grid strip. The label ink flips
+    /// black/white by the override's own luminance so the title stays readable
+    /// on any pick. ABSENT = today's translucent system default, byte-identical
+    /// (the Settings "Tab Color" page calls that "Transparent white"). Driven
+    /// by the Tab Color spectrum page; hot-reloadable.
+    pub(crate) active_tab_color: Option<String>,
     /// Generate a live Activity fallback as terminal output changes. Default ON;
     /// `false` disables generation while preserving both the stable Title and any
     /// authored Description supplied by the session.
@@ -562,14 +584,16 @@ pub(crate) struct Config {
     /// ink, decorations, and images stay opaque over their cell fills). THE MOVE:
     /// whenever this is `< 1.0` the per-cell minimum-contrast floor auto-engages
     /// at WCAG AA (4.5:1) — see [`Config::effective_minimum_contrast`] — so glass
-    /// can never make text illegible. GPU backend only; the CPU/softbuffer path
-    /// falls back to a solid background (warn-once). Hot-reloadable.
+    /// can never make text illegible. Implemented only by the macOS GPU window
+    /// path; every CPU path and non-macOS GPU window keeps a solid grid and is
+    /// diagnosed as such. Hot-reloadable.
     pub(crate) background_opacity: Option<f32>,
-    /// M5 true vibrancy: the macOS `NSVisualEffectView` MATERIAL blended behind
-    /// the translucent background — `none` | `hud` | `sidebar` | `under-window`
-    /// (aliases `underwindow`/`under_window`, case-insensitive). ABSENT / `none`
-    /// = no vibrancy view. Only takes effect when `background_opacity < 1.0` on
-    /// the GPU backend (macOS). Hot-reloadable.
+    /// M5 window MATERIAL — `none` | `hud` | `sidebar` | `under-window` (aliases
+    /// `underwindow`/`under_window`, case-insensitive). On macOS GPU this selects
+    /// the `NSVisualEffectView` blended behind a translucent background and thus
+    /// requires `background_opacity < 1.0`. On Windows GPU it independently maps
+    /// to Mica/Acrylic DWM chrome while the grid remains opaque. Other paths have
+    /// no material consumer. ABSENT / `none` disables it. Hot-reloadable.
     pub(crate) background_material: Option<String>,
     /// All-edge interior WINDOW PADDING in LOGICAL px (scaled by the display
     /// factor like the built-in default): the breathing room between the window
@@ -586,18 +610,20 @@ pub(crate) struct Config {
     /// the configured value inside the valid domain rather than letting the
     /// clamp silently rewrite it. Hot-reloadable, like `window_padding`.
     pub(crate) window_padding_top: Option<f32>,
-    /// Security opt-in: allow apps to READ the system clipboard via OSC 52
-    /// (`Pd = "?"`). Default OFF (fail-closed) — a clipboard read is an
-    /// exfiltration vector from untrusted output. Maps to `allow_osc52_query`.
+    /// Compatibility security opt-in for OSC 52 clipboard queries (`Pd = "?"`).
+    /// Default OFF (fail-closed). The GUI callback currently drops every Query
+    /// and returns no clipboard contents, so enabling this has no shipping GUI
+    /// effect; Manual diagnoses an authored `true` value.
     pub(crate) allow_osc52_query: Option<bool>,
-    /// Security opt-in: allow XTWINOPS window manipulation + geometry/title
-    /// reports (`CSI t`). Default OFF — title reports can fingerprint and window
-    /// moves can hide the window. Maps to `allow_window_ops`.
+    /// Security opt-in for XTWINOPS (`CSI t`). The GUI installs no window
+    /// callback, so only the engine's window-title and text-grid-size fallback
+    /// reports work; manipulation and most state/geometry requests are ignored.
+    /// Default OFF because even title/grid reports can fingerprint the host.
     pub(crate) allow_window_ops: Option<bool>,
     /// Security opt-in: allow desktop notifications (OSC 9 / 99 / 777). Default
     /// OFF. Maps to `allow_notifications`.
     pub(crate) allow_notifications: Option<bool>,
-    /// Security opt-in: allow apps to reconfigure the color palette (OSC 4/104).
+    /// Security opt-in: allow apps to set indexed colors (OSC 4 / numeric OSC 21).
     /// Default OFF. Maps to `allow_palette_reconfigure`.
     pub(crate) allow_palette_reconfigure: Option<bool>,
     /// Security opt-in: allow Kitty graphics NON-DIRECT transmission mediums to read
@@ -619,17 +645,19 @@ pub(crate) struct Config {
     /// [`crate::net_connections`].
     pub(crate) net: Option<NetConfig>,
     /// In-app self-update channel (`[update]`): which GitHub repo the silent updater
-    /// pulls notarized releases from. Absent ⇒ the compiled-in default
-    /// (`alabsystems/aterm`). The env vars `ATERM_UPDATE_OWNER`/`ATERM_UPDATE_REPO`
+    /// pulls notarized releases from. Absent ⇒ the compiled-in default channel
+    /// (`alabsystems/aterm`, the PUBLIC mirror — readable with no token, which is
+    /// what lets a freshly installed machine update). The env vars `ATERM_UPDATE_OWNER`/`ATERM_UPDATE_REPO`
     /// override these. The location is NOT the trust anchor — the compiled-in pinned
     /// Team ID + Apple notarization are — so repointing the channel cannot get an
     /// untrusted build installed. macOS-only in effect; parsed (and inert) elsewhere.
     /// See [`UpdateConfig`], crate `aterm-update`, and `docs/RELEASING.md`.
     pub(crate) update: Option<UpdateConfig>,
     /// Sparkle words (`[sparkle_words]`): decorate matched profanity words with a
-    /// randomized sparkle, cat/kitty words with a cat-paw, and orca words with a
-    /// splash. Absent ⇒ feature ON with every category (the on-by-default product
-    /// choice); set `enabled = false` to disable. See [`SparkleWordsConfig`].
+    /// randomized sparkle and cat/kitty words with a cat-paw. The retained Orca
+    /// config parses for compatibility but is suspended and has no runtime effect.
+    /// Absent ⇒ both live keyword toys are ON; set `enabled = false` to disable.
+    /// See [`SparkleWordsConfig`].
     pub(crate) sparkle_words: Option<SparkleWordsConfig>,
     /// PHOSPHOR matrix rain (`[matrix_rain]`): Matrix digital rain UNDER the
     /// text, in empty cells only. Absent ⇒ feature OFF (inverted vs sparkle —
@@ -783,10 +811,9 @@ impl<'de> serde::Deserialize<'de> for FontList {
     }
 }
 
-/// The `[sparkle_words]` table. Two independent, distinct effects:
-/// a randomized SPARKLE over profanity ("fuck" family, every major language) and a
-/// steady CAT-PAW over cat/kitty words. PURELY VISUAL — never affects copied text,
-/// logs, or recorded sessions.
+/// The `[sparkle_words]` table. Settings presents two independent keyword toys:
+/// Sparkle Words (non-feline word effects) and Keyword Kitties (cat/kitty effects).
+/// They are PURELY VISUAL — never affecting copied text, logs, or recorded sessions.
 ///
 /// ```toml
 /// [sparkle_words]
@@ -799,7 +826,6 @@ impl<'de> serde::Deserialize<'de> for FontList {
 ///
 /// [sparkle_words.feline]
 /// enabled  = true          # the friendly default
-/// color    = "#f7a8b8"
 /// ```
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
@@ -827,11 +853,14 @@ pub(crate) struct SparkleWordsConfig {
     pub(crate) toy_packs: Option<Vec<String>>,
     /// Global folded surfaces to never decorate, regardless of category.
     pub(crate) deny: Option<Vec<String>>,
-    /// The randomized profanity SPARKLE sub-table.
+    /// The non-feline Sparkle Words product settings. The historical table name is
+    /// retained for config compatibility; its `enabled` key gates profanity,
+    /// emphasis, custom/Toy Pack words, and the suspended orca class together.
     pub(crate) profanity: Option<SparkleProfanityConfig>,
     /// The steady feline CAT-PAW sub-table.
     pub(crate) feline: Option<SparkleFelineConfig>,
-    /// The randomized orca/cetacean SPLASH sub-table.
+    /// Retained compatibility-only Orca sub-table. It parses and round-trips,
+    /// but `ORCA_SUSPENDED` makes the whole subtree have no runtime effect.
     pub(crate) orca: Option<SparkleOrcaConfig>,
     /// The animated glyph-ink shimmer sub-table (v2).
     pub(crate) ink: Option<SparkleInkConfig>,
@@ -857,10 +886,82 @@ pub(crate) struct SparkleWordsConfig {
 /// per-pack byte/recipe/word caps enforced by `aterm-effects`.
 const MAX_ACTIVE_TOY_PACKS: usize = 8;
 
+/// Worst-case work for one worker/startup path-feed fingerprint pass: one
+/// lexicon, eight Toy Packs, and eight Trail Packs. Each bounded reader may
+/// consume one sentinel byte past its parser cap, for at most 17 opens and
+/// 2,883,601 bytes read. This is an I/O-volume bound, not a wall-clock promise
+/// for an unhealthy filesystem.
+const MAX_PATH_FEED_OPEN_ATTEMPTS: usize = 1 + 2 * MAX_ACTIVE_TOY_PACKS;
+const MAX_PATH_FEED_FINGERPRINT_READ_BYTES: usize =
+    (aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES + 1)
+        + MAX_ACTIVE_TOY_PACKS
+            * ((aterm_effects::spec::MAX_TOY_PACK_BYTES + 1)
+                + (aterm_effects::trail_pack::MAX_TRAIL_PACK_BYTES + 1));
+
 #[derive(Default)]
 struct LoadedToyPacks {
     spec_table: aterm_effects::spec::SpecTable,
     lexicon_toml: String,
+}
+
+/// Immutable word-decoration runtime compiled for one admitted config
+/// generation. File reads, Toy Pack compilation, and lexicon construction all
+/// happen before this value reaches the event loop; render-time recomputation
+/// only clones this memory-backed value through the Serious Mode gate.
+#[derive(Clone)]
+pub(crate) struct PreparedSparkleRuntime {
+    resolved: Option<crate::word_decorations::Resolved>,
+}
+
+impl PreparedSparkleRuntime {
+    /// Exact custom-spec consumers admitted for this already-prepared runtime
+    /// generation. The resolved table includes valid Toy Packs followed by
+    /// inline overrides, so Settings can disclose live dependencies without
+    /// reopening a manifest or treating an authored path as proof of an
+    /// effect shape.
+    pub(crate) fn consumer_capabilities(&self) -> aterm_effects::spec::SpecConsumerCapabilities {
+        let Some(resolved) = self.resolved.as_ref() else {
+            return Default::default();
+        };
+        let mut consumers = resolved.cfg.spec_table.consumer_capabilities();
+        let opts = aterm_lexicon::ScanOptions {
+            allow_bare_cat: resolved.cfg.allow_bare_cat,
+            cjk_single_char: resolved.cfg.cjk_single_char,
+            ignore: (!resolved.cfg.ignore.is_empty()).then_some(&resolved.cfg.ignore),
+        };
+        consumers.emphasis_class_default = resolved.lexicon.has_scannable_class_surface(
+            aterm_lexicon::Class::Emphasis,
+            &opts,
+            |form_hash| resolved.cfg.spec_table.override_for(form_hash).is_some(),
+        );
+        consumers
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SPARKLE_HOST_PREPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PATH_FEED_FINGERPRINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_sparkle_host_prepare_count() {
+    SPARKLE_HOST_PREPARES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn sparkle_host_prepare_count() -> usize {
+    SPARKLE_HOST_PREPARES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_path_feed_fingerprint_count() {
+    PATH_FEED_FINGERPRINTS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn path_feed_fingerprint_count() -> usize {
+    PATH_FEED_FINGERPRINTS.with(std::cell::Cell::get)
 }
 
 /// One immutable, validated Trail Pack catalog for one config generation.
@@ -887,6 +988,431 @@ pub(crate) const MAX_NYAN_SPRITE_FILE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_NYAN_SPRITE_DIMENSION: usize = 1024;
 const MAX_NYAN_SOURCE_ID_BYTES: usize = 2 * 1024;
 const MAX_NYAN_REASON_BYTES: usize = 320;
+
+/// The installed-theme directory is ambient user input.  Discovery retains a
+/// bounded, deterministic prefix and every individual file is read through a
+/// hard byte limit before it can enter a config snapshot.
+pub(crate) const MAX_USER_THEME_FILES: usize = 128;
+const MAX_USER_THEME_CANDIDATES: usize = 512;
+/// Total directory entries inspected before theme discovery fails closed.
+pub(crate) const MAX_USER_THEME_DIRECTORY_ENTRIES: usize = 4_096;
+pub(crate) const MAX_USER_THEME_FILE_BYTES: usize = aterm_types::scheme::MAX_USER_THEME_FILE_BYTES;
+const MAX_THEME_SOURCE_ID_BYTES: usize = 2 * 1024;
+const MAX_THEME_REASON_BYTES: usize = 320;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ThemeAssetResolution {
+    Ready(aterm_types::ColorScheme),
+    Invalid(std::sync::Arc<str>),
+}
+
+/// One bounded custom-theme file admitted before the event loop starts.
+///
+/// Invalid entries are deliberately retained for diagnostics but never appear
+/// in the picker.  A configured bad file therefore fails closed in the live
+/// renderer and Manual reports the same reason from the same catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThemeAsset {
+    name: String,
+    source_id: std::sync::Arc<str>,
+    fingerprint: u64,
+    resolution: ThemeAssetResolution,
+}
+
+/// Parsed custom themes for one immutable config generation.
+///
+/// Built-ins remain owned by `aterm-types`; this catalog contains only files.
+/// Consumers must resolve through [`Self::resolve`] rather than opening the
+/// theme directory themselves. The background directory observer parses a new
+/// catalog off-thread and the config reducer publishes it as another complete
+/// generation, keeping every live surface generation-consistent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ThemeCatalog {
+    entries: Vec<ThemeAsset>,
+    truncated: bool,
+}
+
+/// Live watcher failures that must retain the last admitted catalog. Invalid
+/// UTF-8, syntax, names, and oversized files are deterministic asset
+/// diagnostics and still produce an `Invalid` entry; these variants are host
+/// observation failures where publishing a replacement would make a transient
+/// permission/race look like user intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThemeCatalogWatchError {
+    DirectoryUnreadable,
+    EntryUnreadable,
+    FileUnavailable,
+}
+
+impl ThemeCatalog {
+    pub(crate) fn empty() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_schemes(
+        schemes: impl IntoIterator<Item = (String, aterm_types::ColorScheme)>,
+    ) -> std::sync::Arc<Self> {
+        let entries = schemes
+            .into_iter()
+            .map(|(name, scheme)| ThemeAsset {
+                fingerprint: stable_nyan_fingerprint(0x54, name.as_bytes(), 0, 0, &[]),
+                source_id: std::sync::Arc::from(name.clone()),
+                name,
+                resolution: ThemeAssetResolution::Ready(scheme),
+            })
+            .collect::<Vec<_>>();
+        std::sync::Arc::new(Self {
+            entries: normalize_theme_entries(entries),
+            truncated: false,
+        })
+    }
+
+    /// Scan and parse the user theme directory once on the cold startup path.
+    pub(crate) fn discover() -> std::sync::Arc<Self> {
+        let Some(directory) = aterm_types::scheme::user_theme_dir() else {
+            return Self::empty();
+        };
+        std::sync::Arc::new(Self::discover_in(&directory))
+    }
+
+    pub(crate) fn discover_in(directory: &std::path::Path) -> Self {
+        Self::discover_in_with(directory, false, || {}).unwrap_or_default()
+    }
+
+    /// Fallible counterpart used by the live directory watcher. Startup keeps
+    /// its historical best-effort fallback through [`Self::discover_in`], but a
+    /// running process must distinguish an actually empty/deleted directory
+    /// from a transient permission, mount, or enumeration failure. Publishing
+    /// `Default` for the latter would discard the last admitted custom-theme
+    /// generation and could silently move the renderer off the selected theme.
+    pub(crate) fn try_discover_in(
+        directory: &std::path::Path,
+    ) -> Result<Self, ThemeCatalogWatchError> {
+        Self::discover_in_with(directory, true, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_discover_in_after_scan(
+        directory: &std::path::Path,
+        after_scan: impl FnOnce(),
+    ) -> Result<Self, ThemeCatalogWatchError> {
+        Self::discover_in_with(directory, true, after_scan)
+    }
+
+    fn discover_in_with(
+        directory: &std::path::Path,
+        retain_on_file_failure: bool,
+        after_scan: impl FnOnce(),
+    ) -> Result<Self, ThemeCatalogWatchError> {
+        let mut candidates = std::collections::BTreeSet::new();
+        let mut truncated = false;
+        let read_dir = match std::fs::read_dir(directory) {
+            Ok(read_dir) => read_dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(_) => return Err(ThemeCatalogWatchError::DirectoryUnreadable),
+        };
+        let mut observed_entries = 0usize;
+        for result in read_dir.take(MAX_USER_THEME_DIRECTORY_ENTRIES + 1) {
+            observed_entries += 1;
+            if observed_entries > MAX_USER_THEME_DIRECTORY_ENTRIES {
+                return Ok(Self {
+                    entries: Vec::new(),
+                    truncated: true,
+                });
+            }
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(_) if retain_on_file_failure => {
+                    return Err(ThemeCatalogWatchError::EntryUnreadable);
+                }
+                Err(_) => continue,
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) if retain_on_file_failure => {
+                    return Err(ThemeCatalogWatchError::EntryUnreadable);
+                }
+                Err(_) => continue,
+            };
+            // `is_file` is false for symlinks: a theme cannot escape the
+            // admitted directory through an attacker-swapped link.
+            if !file_type.is_file()
+                || entry.path().extension() != Some(std::ffi::OsStr::new("conf"))
+            {
+                continue;
+            }
+            candidates.insert(entry.path());
+            if candidates.len() > MAX_USER_THEME_CANDIDATES {
+                candidates.pop_last();
+                truncated = true;
+            }
+        }
+        if candidates.len() > MAX_USER_THEME_FILES {
+            truncated = true;
+        }
+        after_scan();
+
+        let mut entries = Vec::new();
+        for path in candidates.into_iter().take(MAX_USER_THEME_FILES) {
+            let Some(name) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
+                continue;
+            };
+            // Built-ins always win, so an identically named file is neither
+            // advertised nor capable of changing the built-in palette.
+            if aterm_types::scheme::builtin(name).is_some() {
+                continue;
+            }
+            let source_id = bounded_nyan_text(&path.to_string_lossy(), MAX_THEME_SOURCE_ID_BYTES);
+            if let Err(reason) = safe_user_theme_name(name) {
+                entries.push(invalid_theme_asset(name, &source_id, reason));
+                continue;
+            }
+
+            let bytes = match read_bounded_theme_file(&path) {
+                Ok(bytes) => bytes,
+                Err(ThemeFileReadError::Unavailable(reason)) if retain_on_file_failure => {
+                    let _ = reason;
+                    return Err(ThemeCatalogWatchError::FileUnavailable);
+                }
+                Err(
+                    ThemeFileReadError::Unavailable(reason) | ThemeFileReadError::Invalid(reason),
+                ) => {
+                    entries.push(invalid_theme_asset(name, &source_id, &reason));
+                    continue;
+                }
+            };
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    entries.push(invalid_theme_asset(
+                        name,
+                        &source_id,
+                        "theme file is not valid UTF-8",
+                    ));
+                    continue;
+                }
+            };
+            match aterm_types::scheme::parse_scheme_str(text) {
+                Ok(scheme) => entries.push(ThemeAsset {
+                    name: name.to_string(),
+                    source_id,
+                    fingerprint: stable_nyan_fingerprint(
+                        0x54,
+                        path.to_string_lossy().as_bytes(),
+                        0,
+                        0,
+                        &bytes,
+                    ),
+                    resolution: ThemeAssetResolution::Ready(scheme),
+                }),
+                Err(error) => {
+                    entries.push(invalid_theme_asset(name, &source_id, &error.to_string()))
+                }
+            }
+        }
+        Ok(Self {
+            entries: normalize_theme_entries(entries),
+            truncated,
+        })
+    }
+
+    pub(crate) fn ready_names(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.resolution {
+                ThemeAssetResolution::Ready(_) => Some(entry.name.as_str()),
+                ThemeAssetResolution::Invalid(_) => None,
+            })
+    }
+
+    /// Resolve a built-in or parsed user-theme entry, case-insensitively. No
+    /// filesystem access is possible from this API. Case-fold collisions are
+    /// rejected during admission, so picker, renderer, engine, and diagnostics
+    /// all observe one unambiguous identity for a configured name.
+    pub(crate) fn resolve(&self, name: &str) -> Result<aterm_types::ColorScheme, String> {
+        if let Some(scheme) = aterm_types::scheme::builtin(name) {
+            return Ok(scheme);
+        }
+        match self
+            .entries
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(name))
+        {
+            Some(ThemeAsset {
+                resolution: ThemeAssetResolution::Ready(scheme),
+                ..
+            }) => Ok(scheme.clone()),
+            Some(ThemeAsset {
+                source_id,
+                resolution: ThemeAssetResolution::Invalid(reason),
+                ..
+            }) => Err(format!("{} is invalid ({reason})", source_id)),
+            None if self.truncated => Err(format!(
+                "not present in the bounded {MAX_USER_THEME_FILES}-theme active catalog"
+            )),
+            None => Err("not found in the active theme catalog".to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fingerprint(&self) -> u64 {
+        self.entries.iter().fold(
+            if self.truncated {
+                0x5452_554E_4341_5445
+            } else {
+                0x5448_454D_4553
+            },
+            |fingerprint, entry| fingerprint.rotate_left(7) ^ entry.fingerprint,
+        )
+    }
+}
+
+/// Canonicalize the custom-theme namespace with the same ASCII-insensitive
+/// identity used by built-ins, the native picker, and config resolution. A
+/// case-sensitive filesystem may contain both `Work.conf` and `work.conf`; it
+/// is safer to reject that ambiguous logical name than to let directory order
+/// decide which palette a user sees. One invalid sentinel retains the
+/// diagnostic while keeping both spellings out of the picker.
+fn normalize_theme_entries(mut entries: Vec<ThemeAsset>) -> Vec<ThemeAsset> {
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let mut normalized = Vec::with_capacity(entries.len());
+    while !entries.is_empty() {
+        let end = entries[1..]
+            .iter()
+            .position(|candidate| !candidate.name.eq_ignore_ascii_case(&entries[0].name))
+            .map_or(entries.len(), |offset| 1 + offset);
+        if end == 1 {
+            normalized.push(entries.remove(0));
+            continue;
+        }
+
+        let first = &entries[0];
+        let names = entries[..end]
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        normalized.push(invalid_theme_asset(
+            &first.name,
+            &first.source_id,
+            &format!("ambiguous theme filenames differ only by ASCII case: {names}"),
+        ));
+        entries.drain(..end);
+    }
+    normalized
+}
+
+fn invalid_theme_asset(name: &str, source_id: &std::sync::Arc<str>, reason: &str) -> ThemeAsset {
+    ThemeAsset {
+        name: name.to_string(),
+        source_id: std::sync::Arc::clone(source_id),
+        fingerprint: stable_nyan_fingerprint(0x49, source_id.as_bytes(), 0, 0, reason.as_bytes()),
+        resolution: ThemeAssetResolution::Invalid(bounded_nyan_text(
+            reason,
+            MAX_THEME_REASON_BYTES,
+        )),
+    }
+}
+
+fn safe_user_theme_name(name: &str) -> Result<(), &'static str> {
+    aterm_types::scheme::validate_user_theme_name(name)
+}
+
+enum ThemeFileReadError {
+    /// A transient/unsafe host observation. Live reload retains the prior
+    /// catalog; startup may still expose the reason as an invalid asset.
+    Unavailable(String),
+    /// Stable user-authored invalidity that belongs in catalog diagnostics.
+    Invalid(String),
+}
+
+fn read_bounded_theme_file(path: &std::path::Path) -> Result<Vec<u8>, ThemeFileReadError> {
+    let file = open_regular_theme_file(path).map_err(ThemeFileReadError::Unavailable)?;
+    let mut bytes = Vec::with_capacity(MAX_USER_THEME_FILE_BYTES.min(16 * 1024));
+    file.take((MAX_USER_THEME_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ThemeFileReadError::Unavailable(format!("unreadable ({error})")))?;
+    if bytes.len() > MAX_USER_THEME_FILE_BYTES {
+        return Err(ThemeFileReadError::Invalid(format!(
+            "larger than the {MAX_USER_THEME_FILE_BYTES}-byte theme limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Open one theme candidate without following a link swapped in after the
+/// directory scan, then verify the opened handle itself is a regular file.
+/// The directory entry check is only a cheap filter; this handle-level check is
+/// the security boundary shared by startup parsing and live watcher discovery.
+#[cfg(unix)]
+pub(crate) fn open_regular_theme_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("unreadable regular theme file ({error})"))?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("unreadable theme metadata ({error})"))?
+        .file_type()
+        .is_file()
+    {
+        return Err("theme source is not a regular file".to_string());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_regular_theme_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| format!("unreadable regular theme file ({error})"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("unreadable theme metadata ({error})"))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err("theme source is not a regular non-reparse file".to_string());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open_regular_theme_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("unreadable theme metadata ({error})"))?;
+    if !before.file_type().is_file() {
+        return Err("theme source is not a regular file".to_string());
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("unreadable regular theme file ({error})"))?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("unreadable theme metadata ({error})"))?
+        .file_type()
+        .is_file()
+    {
+        return Err("theme source changed away from a regular file".to_string());
+    }
+    Ok(file)
+}
 
 /// One fully-resolved custom Nyan cursor asset for an admitted config generation.
 ///
@@ -945,23 +1471,37 @@ impl NyanSpriteAsset {
 /// Every non-text config asset admitted at one revision.  `ConfigSnapshot`
 /// carries one outer `Arc<ConfigAssetCatalog>` and the live host, capture, and
 /// all Settings views clone that exact Arc; there is no independently-resolved
-/// Trail/Nyan lane that can lag the text generation.
+/// Trail/Nyan/theme/sparkle-consumer lane that can lag the text generation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ConfigAssetCatalog {
     pub(crate) trail_packs: std::sync::Arc<TrailPackCatalog>,
     pub(crate) nyan_sprite: NyanSpriteAsset,
+    pub(crate) themes: std::sync::Arc<ThemeCatalog>,
+    /// Shared-setting consumers derived from the exact admitted inline + Toy
+    /// Pack spec table and prepared lexicon. `Some(default())` is an
+    /// authoritative observation that no reachable word consumes shared
+    /// tuning. `None` is the real preliminary production generation while Toy
+    /// Packs/lexicon are pending worker preparation (and is also used by the
+    /// manifest-I/O-free test catalog). Settings presents that state as pending;
+    /// it never reopens a pack or infers effect shapes from authored paths.
+    pub(crate) sparkle_spec_consumers:
+        Option<std::sync::Arc<aterm_effects::spec::SpecConsumerCapabilities>>,
 }
 
 impl ConfigAssetCatalog {
+    #[cfg(test)]
     pub(crate) fn empty() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             trail_packs: TrailPackCatalog::empty(),
             nyan_sprite: NyanSpriteAsset::BuiltIn,
+            themes: ThemeCatalog::empty(),
+            sparkle_spec_consumers: None,
         })
     }
 }
 
 impl TrailPackCatalog {
+    #[cfg(test)]
     pub(crate) fn empty() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
     }
@@ -1014,6 +1554,8 @@ pub(crate) struct CursorGlowInputs<'a> {
     pub(crate) intensity: f32,
     pub(crate) radius: f32,
     pub(crate) ring: bool,
+    /// Seconds of recent travel the Nyan typing wake shows (0 ⇒ wake off).
+    pub(crate) wake_persist_s: f32,
 }
 
 /// `[sparkle_words.ink]` — the animated glyph-ink shimmer (v2): matched words'
@@ -1055,8 +1597,10 @@ pub(crate) struct SparkleEmphasisConfig {
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleProfanityConfig {
-    /// Decorate profanity at all. Default TRUE (the on-by-default product choice);
-    /// set false to keep the strong words off, e.g. for screenshares / HR contexts.
+    /// Enable the non-feline Sparkle Words toy. Default TRUE. This historical
+    /// location remains stable, but the switch also gates emphasis, custom/Toy
+    /// Pack words, and the suspended orca class so the Top Settings toggle is an
+    /// honest product-level off switch. Keyword Kitties remains independent.
     pub(crate) enabled: Option<bool>,
     /// `"rainbow"` (the v3 default: animated rainbow ink, `supernova_chance`%
     /// of episodes escalate to the FUCK SUPER NOVA) | `"nova"` = the v2
@@ -1102,34 +1646,34 @@ pub(crate) struct SparkleProfanityConfig {
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
-/// `[sparkle_words.feline]` — the steady cat-paw.
+/// `[sparkle_words.feline]` — the Keyword Kitties product.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleFelineConfig {
     /// Decorate cat/kitty words. Default TRUE (takes effect only when master on).
     pub(crate) enabled: Option<bool>,
-    /// `"cat"` (default) = the v2 peeking cat (design §5; auto-falls back to
-    /// the paw below 14 px cell height / 7 px width) | `"paw"` = the exact v1
-    /// steady paw. Unknown values fall back to `"cat"`.
+    /// `"cat"` (default) is the only graphic style. `"paw"` remains a legacy
+    /// compatibility value and selects ink-only rendering; cat-art v4 emits no
+    /// paw graphic. Unknown values fall back to `"cat"`.
     pub(crate) style: Option<String>,
-    /// Blink / ear-twitch one-shots (§5.6: ≤ 1 event/s window-wide,
-    /// focus-gated). Default TRUE; `false` ⇒ exact 0% between damage.
+    /// Retired idle-animation key. Parsed and preserved for compatibility, but
+    /// cat-art v4 has no idle scheduler and this value has no effect.
     pub(crate) idle: Option<bool>,
-    /// Pupils track the cursor (§5.8: present-driven, zero new wakes).
-    /// Default TRUE; `false` ⇒ centered pupils, no tracking.
+    /// Retired gaze key. Parsed and preserved for compatibility, but v4 eyes
+    /// are authored into the sprite and this value has no effect.
     pub(crate) gaze: Option<bool>,
     /// Fortune (1/512) / Nebula (1/1024) rare cats (§3.5/§5.4). Default TRUE.
     pub(crate) magic: Option<bool>,
-    /// Paw tint `#RRGGBB`. Default soft pink `#f7a8b8`.
+    /// Retired paw-tint key. Parsed and preserved; no v4 graphic consumes it.
     pub(crate) color: Option<String>,
-    /// Opacity 0.0..=1.0. Default 0.7.
+    /// Retired feline-opacity key. Parsed and preserved; no v4 graphic consumes it.
     pub(crate) intensity: Option<f32>,
     /// Decorate the bare 3-letter `cat` token (also the shell command). Default true.
     pub(crate) allow_bare_cat: Option<bool>,
     /// Decorate a lone CJK cat ideograph (`猫`) anywhere. Default false (high FP).
     pub(crate) cjk_single_char: Option<bool>,
-    /// Record sightings into the durable Kitty Log (`kitty-log.toml` — the
-    /// settings collection book, §F4). Default TRUE. HOST-side gate only: the
+    /// Record sightings into the durable, machine-owned Kitty Log
+    /// (`kitty-log.toml`, §F4). Default TRUE. HOST-side gate only: the
     /// effects engine always records (bounded per tick) and the App drains-
     /// and-drops when this is false — nothing is counted or written.
     pub(crate) log: Option<bool>,
@@ -1139,17 +1683,17 @@ pub(crate) struct SparkleFelineConfig {
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
-/// `[sparkle_words.orca]` — the randomized water-droplet SPLASH (ocean palette,
-/// droplets that spray upward). Aesthetics are fixed; it reuses the profanity sparkle's
-/// motion params (density / anim_ms / jitter / intensity).
+/// Compatibility shape for the suspended `[sparkle_words.orca]` feature. These
+/// fields remain deserializable so existing files survive unchanged; the
+/// runtime hard-gates the entire subtree with `ORCA_SUSPENDED`.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct SparkleOrcaConfig {
-    /// Decorate orca/cetacean words. Default TRUE (takes effect only when master on).
+    /// Historical enable bit. Parsed only; currently has no effect.
     pub(crate) enabled: Option<bool>,
-    /// Extra whole words to treat as orca (added to the lexicon).
+    /// Historical extra words. Parsed only; currently has no effect.
     pub(crate) extra_words: Option<Vec<String>>,
-    /// Folded surfaces to never decorate as orca.
+    /// Historical deny words. Parsed only; currently has no effect.
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
@@ -1288,8 +1832,10 @@ pub(crate) struct PackagesConfig {
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct NetConfig {
-    /// Inbound bind address for the TLS listener, e.g. `"0.0.0.0:7100"`. Absent ⇒
-    /// listener OFF. (`ATERM_NET_LISTEN` overrides.)
+    /// Inbound numeric `IP:port` bind address for the TLS listener, e.g.
+    /// `"0.0.0.0:7100"` or `"[::1]:7100"`. Hostnames are deliberately rejected
+    /// so startup and Manual validation never block on DNS. Absent ⇒ listener
+    /// OFF. (`ATERM_NET_LISTEN` overrides.)
     pub(crate) listen: Option<String>,
     /// Path to the operator's server certificate (DER). (`ATERM_NET_CERT` overrides.)
     pub(crate) cert: Option<String>,
@@ -1336,7 +1882,7 @@ pub(crate) struct Connection {
 
 /// The `[update]` table: where the in-app self-updater pulls releases from. Both
 /// fields optional; an absent table (or field) uses the compiled-in default
-/// (`alabsystems/aterm`). Resolution precedence is env > this config > default,
+/// channel (`alabsystems/aterm`, the public mirror). Resolution precedence is env > this config > default,
 /// applied by [`aterm_update::Source::resolve`] (the env vars are
 /// `ATERM_UPDATE_OWNER` / `ATERM_UPDATE_REPO`).
 ///
@@ -1419,6 +1965,41 @@ pub(crate) fn search_index_depth(config: &Config) -> usize {
         .map_or(aterm_core::search::DEFAULT_MAX_CACHED_LINES, |n| n as usize)
 }
 
+/// Resolve a raw plain or appearance-split theme selector with the runtime's
+/// deliberately permissive compatibility semantics. Existing hand-authored
+/// files may contain an unrecognized segment beside a valid `dark:`/`light:`
+/// side; the recognized side still applies while an omitted side is Default.
+/// Renderer config and Settings preview share this helper so diagnostics can
+/// flag malformed bytes without inventing different effective pixels.
+pub(crate) fn resolve_theme_name_value(
+    raw: Option<&str>,
+    appearance: aterm_types::Appearance,
+) -> Option<String> {
+    let raw = raw?;
+    // A "split" is any comma-segment whose key (before ':') is dark|light.
+    let is_split = raw.split(',').any(|seg| {
+        seg.split_once(':').is_some_and(|(k, _)| {
+            matches!(k.trim().to_ascii_lowercase().as_str(), "dark" | "light")
+        })
+    });
+    if !is_split {
+        return Some(raw.trim().to_string());
+    }
+    let want = match appearance {
+        aterm_types::Appearance::Light => "light",
+        aterm_types::Appearance::Dark => "dark",
+    };
+    for seg in raw.split(',') {
+        if let Some((key, name)) = seg.split_once(':')
+            && key.trim().eq_ignore_ascii_case(want)
+            && !name.trim().is_empty()
+        {
+            return Some(name.trim().to_string());
+        }
+    }
+    None
+}
+
 impl Config {
     /// Resolve the scheme NAME this config selects for `appearance`, honouring the
     /// optional OS-appearance SPLIT `theme = "dark:<name>,light:<name>"`.
@@ -1429,29 +2010,7 @@ impl Config {
     /// Keys and the surrounding whitespace are case/space-insensitive; the theme
     /// NAME keeps its original case (so `light:GitHub Light` resolves correctly).
     pub(crate) fn resolve_theme_name(&self, appearance: aterm_types::Appearance) -> Option<String> {
-        let raw = self.theme.as_deref()?;
-        // A "split" is any comma-segment whose key (before ':') is dark|light.
-        let is_split = raw.split(',').any(|seg| {
-            seg.split_once(':').is_some_and(|(k, _)| {
-                matches!(k.trim().to_ascii_lowercase().as_str(), "dark" | "light")
-            })
-        });
-        if !is_split {
-            return Some(raw.trim().to_string());
-        }
-        let want = match appearance {
-            aterm_types::Appearance::Light => "light",
-            aterm_types::Appearance::Dark => "dark",
-        };
-        for seg in raw.split(',') {
-            if let Some((key, name)) = seg.split_once(':')
-                && key.trim().eq_ignore_ascii_case(want)
-                && !name.trim().is_empty()
-            {
-                return Some(name.trim().to_string());
-            }
-        }
-        None // split form that omits this appearance's side → built-in Default
+        resolve_theme_name_value(self.theme.as_deref(), appearance)
     }
 
     /// Resolve the BASE color scheme this config selects for `appearance` (see
@@ -1460,13 +2019,17 @@ impl Config {
     /// when no theme — or an unresolvable / malformed one — is set. The per-key color
     /// overrides (`foreground`/…/`palette`) are layered ON TOP of this base by the
     /// callers, so they always win.
-    fn base_scheme_for(&self, appearance: aterm_types::Appearance) -> aterm_types::ColorScheme {
-        // Resolves SILENTLY (unresolvable/malformed name → Default): both `theme()`
-        // and `terminal_config()` call this, so warning here would double-print. The
-        // single "unknown theme" diagnostic is emitted in `terminal_config`.
+    fn base_scheme_for_with_themes(
+        &self,
+        appearance: aterm_types::Appearance,
+        themes: &ThemeCatalog,
+    ) -> aterm_types::ColorScheme {
+        // Resolves SILENTLY (unresolvable/malformed name → Default): both renderer
+        // and engine projections call this. The single diagnostic is emitted by
+        // `terminal_config_for_with_assets` from this exact admitted catalog.
         match self.resolve_theme_name(appearance) {
             None => aterm_types::ColorScheme::default(),
-            Some(name) => aterm_types::scheme::load(&name).unwrap_or_default(),
+            Some(name) => themes.resolve(&name).unwrap_or_default(),
         }
     }
 
@@ -1475,14 +2038,28 @@ impl Config {
     /// keys then override individual slots (unchanged precedence) so the window CLEAR
     /// colour matches a configured `background` and `selection_color` themes the
     /// highlight.
+    #[cfg(test)]
     pub(crate) fn theme(&self) -> Theme {
         self.theme_for(aterm_types::Appearance::Dark)
     }
 
     /// [`Self::theme`] resolved for a specific OS `appearance` — drives the live
     /// light↔dark scheme switch (see [`Self::resolve_theme_name`]).
+    #[cfg(test)]
     pub(crate) fn theme_for(&self, appearance: aterm_types::Appearance) -> Theme {
-        let tp = self.base_scheme_for(appearance).to_theme_parts();
+        self.theme_for_with_assets(appearance, &ThemeCatalog::default())
+    }
+
+    /// Renderer theme resolved exclusively from the immutable custom-theme
+    /// catalog carried by the active config snapshot.
+    pub(crate) fn theme_for_with_assets(
+        &self,
+        appearance: aterm_types::Appearance,
+        themes: &ThemeCatalog,
+    ) -> Theme {
+        let tp = self
+            .base_scheme_for_with_themes(appearance, themes)
+            .to_theme_parts();
         let mut t = Theme {
             fg: tp.fg,
             bg: tp.bg,
@@ -1505,11 +2082,10 @@ impl Config {
         t
     }
 
-    /// Whether the Option/Alt modifier should send ESC-prefixed (Meta) sequences.
-    /// The DEFAULT when the key is absent is `true` — aterm already routes Option
-    /// through the engine encoder, which ESC-prefixes Alt, so "absent = Meta" is
-    /// exactly today's behavior (no regression). Setting `option_as_meta = false`
-    /// opts into OS-composed characters (`å`) instead.
+    /// Whether Alt/Option should send ESC-prefixed (Meta) sequences. The
+    /// cross-platform DEFAULT is `true`, matching the engine encoder. Setting
+    /// `option_as_meta = false` forwards OS-composed text when one is available;
+    /// non-text Alt chords continue through the ordinary terminal encoder.
     pub(crate) fn option_as_meta_or_default(&self) -> bool {
         self.option_as_meta.unwrap_or(true)
     }
@@ -1654,7 +2230,7 @@ impl Config {
     }
 
     /// Whether the cursor motion-trail ("streaming trailer") is on. DEFAULT ON with the
-    /// `phaser` style (owner call — batteries-on delight): the trail ignites a ~260ms
+    /// `nyan rainbow` style (owner call — batteries-on delight): the trail ignites a ~260ms
     /// additive aurora on each cursor move and decays to EXACTLY 0% idle, so a still
     /// screen costs nothing. The GPU bloom pass is effect-frame-only and load-sheds
     /// under pressure. Opt out with `cursor_trail = false`.
@@ -1680,6 +2256,23 @@ impl Config {
         self.trail_sound_bed.unwrap_or(false)
     }
 
+    /// The parsed `trail_sound_style` voice (default `"auto"` → follow the
+    /// visual trail style, the exact pre-override identity). Borrow-free,
+    /// `eq_ignore_ascii_case` per call — the per-frame sound seam pays no
+    /// allocation (the `cursor_trail_style_raw` precedent). Unknown spellings
+    /// fall back to `auto` (the sound keeps playing; the Settings picker and
+    /// save-time validation keep the domain honest for panel edits).
+    pub(crate) fn trail_sound_voice(&self) -> aterm_effects::trail_sound::SoundVoice {
+        use aterm_effects::trail_sound::SoundVoice;
+        let raw = self.trail_sound_style.as_deref().unwrap_or("auto").trim();
+        for mech in ["mechanical", "mech", "thock", "mechanical keyboard"] {
+            if raw.eq_ignore_ascii_case(mech) {
+                return SoundVoice::Mech;
+            }
+        }
+        SoundVoice::Style
+    }
+
     /// Trail sound volume 0..1 (`trail_sound_volume`, default 0.4), clamped
     /// so a config typo can never make keystrokes loud. TOML accepts NaN/Inf;
     /// those fail silent rather than poisoning the audio graph.
@@ -1691,9 +2284,10 @@ impl Config {
         }
     }
 
-    /// The parsed `motion` policy mode (W11): `auto` (DEFAULT — follow the OS
-    /// "Reduce Motion" setting) / `full` / `reduced`; unknown strings fall back
-    /// to `auto`. Borrow-free parse per call, so the per-redraw caller
+    /// The parsed `motion` policy mode (W11): `auto` (DEFAULT — use the available
+    /// platform sample: live on macOS, attach-time on Windows, unavailable on
+    /// other platforms) / `full` / `reduced`; unknown strings fall back to
+    /// `auto`. Borrow-free parse per call, so the per-redraw caller
     /// (`App::motion_policy`) pays no allocation.
     pub(crate) fn motion_mode(&self) -> crate::motion::MotionMode {
         self.motion.as_deref().map_or(
@@ -1774,6 +2368,42 @@ impl Config {
             .map(|c| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b))
     }
 
+    /// The PRIMARY-FONT REQUEST with the game-font override applied: a valid
+    /// `game_font` selection wins as the virtual family `game:<id>` — or, for
+    /// a MIX of 2..=3 `+`-joined ids, `game:<id>+<id>[+<id>]` (every character
+    /// then deterministically picks one face of the mix). Otherwise the plain
+    /// `font_family` passes through verbatim. Unknown/duplicate ids are
+    /// DROPPED (and `"off"` never counts), so a typo can never blank the
+    /// terminal; more than three keeps the first three (the toggles cap there
+    /// anyway). Every font resolution site (startup, catalog worker,
+    /// diagnostics) funnels through this so the toggles can never half-apply.
+    pub(crate) fn font_family_request(&self) -> Option<String> {
+        let game = self.game_font.as_deref().and_then(|raw| {
+            let mut ids: Vec<&str> = Vec::new();
+            for id in raw.split('+').map(str::trim) {
+                if aterm_render::game_font_bytes(id).is_some()
+                    && !ids.contains(&id)
+                    && ids.len() < aterm_render::GAME_FONT_MIX_MAX
+                {
+                    ids.push(id);
+                }
+            }
+            (!ids.is_empty())
+                .then(|| format!("{}{}", aterm_render::GAME_FONT_SCHEME, ids.join("+")))
+        });
+        game.or_else(|| self.font_family.clone())
+    }
+
+    /// The selected-tab color override as `[r, g, b]`, if `active_tab_color` is
+    /// set and a valid `#RRGGBB`. `None` → both tab renderers keep today's
+    /// translucent system default ("Transparent white" in the Tab Color page).
+    pub(crate) fn active_tab_color_rgb(&self) -> Option<[u8; 3]> {
+        self.active_tab_color
+            .as_deref()
+            .and_then(parse_hex_color)
+            .map(|c| [c.r, c.g, c.b])
+    }
+
     /// The aurora accent-colour override as packed `0x00RRGGBB`, if set + valid.
     pub(crate) fn cursor_trail_accent_u32(&self) -> Option<u32> {
         self.cursor_trail_accent
@@ -1797,15 +2427,6 @@ impl Config {
             .trim()
     }
 
-    /// The RAW configured Nyan-sprite path (trimmed, NOT `~`-expanded). Startup
-    /// and config reload publish this borrowed value to the asynchronous loader;
-    /// path expansion, filesystem access, and decode all happen on its worker.
-    /// Empty/whitespace means the built-in homage.
-    pub(crate) fn cursor_nyan_sprite_raw(&self) -> Option<&str> {
-        let raw = self.cursor_nyan_sprite.as_deref()?.trim();
-        (!raw.is_empty()).then_some(raw)
-    }
-
     /// Aurora brightness, default 0.7, clamped 0.0..=1.0. A non-finite value
     /// (`intensity = nan` is valid TOML) FAILS OFF to `0.0`: `clamp` passes NaN
     /// through, and NaN defeats every downstream `intensity <= 0.0` disable
@@ -1818,6 +2439,19 @@ impl Config {
         } else {
             0.0
         }
+    }
+
+    /// TYPING-WAKE length in SECONDS of recent travel, default 0.30 s (the
+    /// engine's own [`aterm_effects::cursor_glow::NYAN_WAKE_PERSIST`]), clamped
+    /// to 0..=1.5 s. `0` turns the wake off and is a legitimate setting, not a
+    /// failure, so — unlike the aurora's intensity — there is nothing here that
+    /// can fail open: every representable `u64` maps into the closed range.
+    pub(crate) fn cursor_trail_wake_persist_or_default(&self) -> f32 {
+        let ms = self
+            .cursor_trail_wake_ms
+            .unwrap_or((aterm_effects::cursor_glow::NYAN_WAKE_PERSIST * 1000.0) as u64)
+            .min(1_500);
+        ms as f32 / 1000.0
     }
 
     /// Bloom-crown radius in cells, default 0.6, clamped 0.0..=2.0.
@@ -1953,37 +2587,81 @@ impl Config {
     /// config service calls it before advancing the revision, then publishes the
     /// returned outer Arc with the exact TOML text.  Present, capture, semantic
     /// Settings view construction, and effects code only clone/read the result.
-    pub(crate) fn resolve_asset_catalog(&self) -> std::sync::Arc<ConfigAssetCatalog> {
+    pub(crate) fn resolve_asset_catalog_with_themes(
+        &self,
+        themes: std::sync::Arc<ThemeCatalog>,
+    ) -> std::sync::Arc<ConfigAssetCatalog> {
+        // Sparkle Toy Packs are compiled by the font/config preparation lane.
+        // This preliminary catalog deliberately reports `None`: an inline-only
+        // projection is not an authoritative answer for the exact combined
+        // table and must never be published as though it were complete.
         std::sync::Arc::new(ConfigAssetCatalog {
             trail_packs: self.resolve_trail_pack_catalog(),
             nyan_sprite: resolve_nyan_sprite_asset(self.cursor_nyan_sprite.as_deref()),
+            themes,
+            sparkle_spec_consumers: None,
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolve_asset_catalog(&self) -> std::sync::Arc<ConfigAssetCatalog> {
+        self.resolve_asset_catalog_with_themes(ThemeCatalog::empty())
+    }
+
     /// Content fingerprints of every file the config references BY PATH — see
-    /// [`PathFeedFps`]. Reads each referenced file once (small manifest-scale
-    /// files, cold path only: config reload + [`App::recompute_sparkle`]). The
+    /// [`PathFeedFps`]. Streams each referenced file through the same bounded,
+    /// same-handle admission used by its loader (cold path only: config reload +
+    /// [`App::recompute_sparkle`]). The
     /// PATH participates in each stream (two files swapping contents must not
     /// cancel out) and so does readability (a file appearing or disappearing is
     /// a content change even though its bytes stay unknown). Pack lists are
     /// capped at the same `MAX_ACTIVE_TOY_PACKS` the consumers load, so an
     /// over-cap tail can neither mask nor fake a change.
     pub(crate) fn path_feed_fingerprints(&self) -> PathFeedFps {
+        #[cfg(test)]
+        PATH_FEED_FINGERPRINTS.with(|count| count.set(count.get().saturating_add(1)));
         use std::hash::{Hash, Hasher};
-        fn fold(hasher: &mut std::collections::hash_map::DefaultHasher, path: &str) {
+        fn fold(
+            hasher: &mut std::collections::hash_map::DefaultHasher,
+            path: &str,
+            max_bytes: usize,
+            remaining_opens: &mut usize,
+            remaining_bytes: &mut usize,
+        ) {
             path.hash(hasher);
-            match std::fs::read(sparkle_expand_tilde(path)) {
-                Ok(bytes) => {
+            let Some(read_ceiling) = max_bytes.checked_add(1) else {
+                false.hash(hasher);
+                return;
+            };
+            if *remaining_opens == 0 || *remaining_bytes < read_ceiling {
+                false.hash(hasher);
+                return;
+            }
+            *remaining_opens -= 1;
+            *remaining_bytes -= read_ceiling;
+            match aterm_effects::file_feed::fingerprint_bounded_regular_utf8(
+                &sparkle_expand_tilde(path),
+                max_bytes,
+            ) {
+                Ok(content_fingerprint) => {
                     true.hash(hasher);
-                    bytes.hash(hasher);
+                    content_fingerprint.hash(hasher);
                 }
                 Err(_) => false.hash(hasher),
             }
         }
+        let mut remaining_opens = MAX_PATH_FEED_OPEN_ATTEMPTS;
+        let mut remaining_bytes = MAX_PATH_FEED_FINGERPRINT_READ_BYTES;
         let mut deco = std::collections::hash_map::DefaultHasher::new();
         if let Some(sw) = self.sparkle_words.as_ref() {
             if let Some(lexicon) = sw.lexicon.as_deref() {
-                fold(&mut deco, lexicon);
+                fold(
+                    &mut deco,
+                    lexicon,
+                    aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES,
+                    &mut remaining_opens,
+                    &mut remaining_bytes,
+                );
             }
             for path in sw
                 .toy_packs
@@ -1992,7 +2670,13 @@ impl Config {
                 .iter()
                 .take(MAX_ACTIVE_TOY_PACKS)
             {
-                fold(&mut deco, path);
+                fold(
+                    &mut deco,
+                    path,
+                    aterm_effects::spec::MAX_TOY_PACK_BYTES,
+                    &mut remaining_opens,
+                    &mut remaining_bytes,
+                );
             }
         }
         let mut trail = std::collections::hash_map::DefaultHasher::new();
@@ -2003,7 +2687,13 @@ impl Config {
             .iter()
             .take(MAX_ACTIVE_TOY_PACKS)
         {
-            fold(&mut trail, path);
+            fold(
+                &mut trail,
+                path,
+                aterm_effects::trail_pack::MAX_TRAIL_PACK_BYTES,
+                &mut remaining_opens,
+                &mut remaining_bytes,
+            );
         }
         PathFeedFps {
             deco: deco.finish(),
@@ -2051,9 +2741,11 @@ impl Config {
     /// Resolve the complete cold-path pack/config bundle once. The native app
     /// calls this only from `recompute_sparkle` (startup, config reload, or a
     /// user re-enable), never from the per-frame effects tick.
-    fn sparkle_runtime_parts(
+    pub(crate) fn sparkle_runtime_parts(
         &self,
     ) -> Option<(crate::word_decorations::DecoConfig, Option<String>)> {
+        #[cfg(test)]
+        SPARKLE_HOST_PREPARES.with(|count| count.set(count.get().saturating_add(1)));
         if self
             .sparkle_words
             .as_ref()
@@ -2071,14 +2763,42 @@ impl Config {
         Some((cfg, override_toml))
     }
 
+    /// Compile the complete sparkle runtime on a host worker (or once during
+    /// startup, before the event loop begins). This is the only production
+    /// caller of the path-backed runtime resolver.
+    pub(crate) fn prepare_sparkle_runtime(&self) -> PreparedSparkleRuntime {
+        let resolved = self.sparkle_runtime_parts().map(|(cfg, override_toml)| {
+            let langs = self.sparkle_languages();
+            let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
+            let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(
+                &refs,
+                override_toml.as_deref(),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "aterm-gui: sparkle words lexicon override rejected ({error}); using builtin"
+                );
+                aterm_lexicon::Lexicon::with_languages(&refs)
+            });
+            for warning in sparkle_logged_warnings(lexicon.conflicts(), cfg.cjk_single_char) {
+                eprintln!("aterm-gui: sparkle_words lexicon: {warning}");
+            }
+            crate::word_decorations::Resolved {
+                cfg,
+                lexicon: std::sync::Arc::new(lexicon),
+            }
+        });
+        PreparedSparkleRuntime { resolved }
+    }
+
     /// Resolve the `[sparkle_words]` table into a renderer-ready [`DecoConfig`],
     /// applying every default + clamp. `None` when the feature is explicitly disabled or
     /// every category is off (the caller then renders byte-identically).
     ///
-    /// ON BY DEFAULT: an absent `[sparkle_words]` table (or an absent `enabled` key) turns
-    /// the feature ON with ALL THREE families decorating — profanity sparkle, feline
-    /// cat-paw, and orca splash. Set `enabled = false` (or a category's `enabled = false`)
-    /// to silence it; the `toggle_sparkle_words` keybinding is the instant panic-off.
+    /// ON BY DEFAULT: an absent `[sparkle_words]` table (or absent `enabled` key) turns
+    /// on the two live families—profanity sparkle and feline cat-paw. Orca settings
+    /// remain parseable for compatibility but are suspended by `ORCA_SUSPENDED`.
+    /// Set `enabled = false` (or a live category's `enabled = false`) to silence it.
     #[cfg(test)]
     pub(crate) fn sparkle_deco_config(&self) -> Option<crate::word_decorations::DecoConfig> {
         if self
@@ -2106,14 +2826,18 @@ impl Config {
         let orca_cfg = sw.orca.clone().unwrap_or_default();
         let ink_cfg = sw.ink.clone().unwrap_or_default();
         let emph = sw.emphasis.clone().unwrap_or_default();
-        // All families ON by default; the master `enabled` (default on) or each
-        // category's `enabled = false` opts out.
-        let profanity = prof.enabled.unwrap_or(true);
+        // Top Settings exposes exactly two independent keyword toys. Keep the
+        // historical profanity key as the stable config spelling, but resolve it
+        // as the product gate for every NON-FELINE word effect. Otherwise the
+        // visible "Sparkle Words" switch would leave emphasis/custom recipes live.
+        let sparkle_words = prof.enabled.unwrap_or(true);
+        let profanity = sparkle_words;
         let feline = fel.enabled.unwrap_or(true);
         // v3 §4: the orca class is SUSPENDED — the resolver ANDs the single
         // const gate (engine/lexicon/splash untouched; flip ORCA_SUSPENDED to
         // re-enable).
-        let orca = orca_cfg.enabled.unwrap_or(true) && !aterm_effects::ORCA_SUSPENDED;
+        let orca =
+            sparkle_words && orca_cfg.enabled.unwrap_or(true) && !aterm_effects::ORCA_SUSPENDED;
         let ink_enabled = ink_cfg.enabled.unwrap_or(true);
         // v3 §6: the custom-word spec table (per-word overrides, keyed by the
         // scanner's form_hash semantics — folded spaced surfaces, possessive
@@ -2121,12 +2845,26 @@ impl Config {
         let custom_entries = sw.custom.clone().unwrap_or_default();
         let (inline_specs, _) = aterm_effects::spec::build_custom(&custom_entries);
         // Inline config is the user's most local authority and overlays all
-        // imported packs, including every possessive/hash variant.
-        spec_table.overlay(inline_specs);
-        // v3 §6 emphasis resolve: `enabled && (ink_enabled || has_custom)` —
-        // a graphic-only or burst-only custom word must scan with ink off
-        // (custom words ride the emphasis class).
-        let emphasis = emph.enabled.unwrap_or(true) && (ink_enabled || spec_table.has_custom());
+        // imported packs, including every possessive/hash variant. A product-off
+        // Sparkle Words switch must make both sources inert, not merely hide the
+        // built-in profanity class.
+        if sparkle_words {
+            spec_table.overlay(inline_specs);
+        } else {
+            spec_table = aterm_effects::spec::SpecTable::default();
+        }
+        // v3 §6 default-emphasis resolve. `emph.enabled` gates only ordinary,
+        // non-overridden emphasis matches. Custom words are indexed under the
+        // emphasis class, but the engine resolves their override BEFORE its
+        // per-class gate (`WordDecorations::scan_row`: the class match runs
+        // only when `ov.is_none()`), so they intentionally remain independent
+        // of `emphasis.enabled`. Retain `has_custom` in this class-activity
+        // projection so a graphic-only or burst-only custom has an admitted
+        // emphasis lane with ink off; it is not evidence that the user's
+        // emphasis switch controls that custom recipe.
+        let emphasis = sparkle_words
+            && emph.enabled.unwrap_or(true)
+            && (ink_enabled || spec_table.has_custom());
         if !profanity && !feline && !orca && !emphasis {
             return None;
         }
@@ -2147,11 +2885,6 @@ impl Config {
             .filter_map(|s| parse_hex_color(s))
             .map(rgb_u32)
             .collect();
-        let feline_color = fel
-            .color
-            .as_deref()
-            .and_then(parse_hex_color)
-            .map_or(0x00F7_A8B8, rgb_u32);
         // OS reduced-motion query is a future refinement; honour the explicit
         // config flag for now.
         let reduced_motion = sw.reduced_motion.unwrap_or(false);
@@ -2188,24 +2921,25 @@ impl Config {
             // decorates the `cat` shell command); set `allow_bare_cat = false` to opt out.
             allow_bare_cat: fel.allow_bare_cat.unwrap_or(true),
             cjk_single_char: fel.cjk_single_char.unwrap_or(false),
-            feline_color,
-            feline_intensity: fel.intensity.unwrap_or(0.7).clamp(0.0, 1.0),
-            // §10: "paw" is the exact v1 path; anything else (incl. absent) is
-            // the v2 peeking cat.
-            feline_style: if fel.style.as_deref() == Some("paw") {
+            // `paw` is retained as a legacy ink-only mode. Cat is the only mode
+            // that emits a feline graphic under cat-art v4.
+            feline_style: if fel
+                .style
+                .as_deref()
+                .is_some_and(|style| style.trim().eq_ignore_ascii_case("paw"))
+            {
                 crate::word_decorations::FelineStyle::Paw
             } else {
                 crate::word_decorations::FelineStyle::Cat
             },
-            feline_idle: fel.idle.unwrap_or(true),
-            feline_gaze: fel.gaze.unwrap_or(true),
             feline_magic: fel.magic.unwrap_or(true),
             // §10 / v3 §3.1: "sparkle" is the exact v1 path, "nova" the v2
             // classic nova; anything else (incl. absent) is the v3 rainbow.
-            // Case-insensitive, mirroring the web `set_sparkle_profanity`
+            // Trimmed and case-insensitive, matching Manual's enum admission
+            // and mirroring the web `set_sparkle_profanity`
             // setter — a cased "Nova" must not silently fall through to
             // Rainbow (and its supernova escalation roll).
-            profanity_style: match prof.style.as_deref() {
+            profanity_style: match prof.style.as_deref().map(str::trim) {
                 Some(s) if s.eq_ignore_ascii_case("sparkle") => {
                     crate::word_decorations::ProfanityStyle::Sparkle
                 }
@@ -2216,6 +2950,11 @@ impl Config {
             },
             profanity_magic: prof.magic.unwrap_or(true),
             // v3 §3.2: escalation chance, 0..=100 (0 disables).
+            // Was `unwrap_or(30)` while the field's documented contract (see the
+            // `supernova_chance` doc comment) says "Default 10" — so the shipping
+            // default fired the 3.6 s screen-owning detonation ladder THREE TIMES as
+            // often as documented. The doc is the specification; the code now matches
+            // it. Set `supernova_chance = 30` explicitly to restore the old rate.
             supernova_chance: prof.supernova_chance.unwrap_or(10).min(100) as u8,
             spec_table,
             palette,
@@ -2248,7 +2987,10 @@ impl Config {
         let mut out = String::new();
         if let Some(path) = sw.lexicon.as_deref() {
             let expanded = sparkle_expand_tilde(path);
-            match std::fs::read_to_string(&expanded) {
+            match aterm_effects::file_feed::read_bounded_regular_utf8(
+                &expanded,
+                aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES,
+            ) {
                 Ok(contents) => {
                     let languages = self.sparkle_languages();
                     let refs: Vec<&str> = languages.iter().map(String::as_str).collect();
@@ -2320,6 +3062,16 @@ impl Config {
             .unwrap_or(true)
     }
 
+    /// The `[packages]` background-maintenance master bit (default TRUE).
+    /// Explicit package actions are still allowed while this is off; it gates
+    /// only the launch-time automatic updater thread.
+    pub(crate) fn packages_enabled(&self) -> bool {
+        self.packages
+            .as_ref()
+            .and_then(|p| p.enabled)
+            .unwrap_or(true)
+    }
+
     /// The `[packages]` `auto_install` RESOLVED bit (default FALSE — multi-GB
     /// toolchains need explicit consent; the Settings switch IS the consent
     /// click, `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §11). Consumed by the
@@ -2351,7 +3103,7 @@ impl Config {
             p.include.as_deref(),
             p.exclude.as_deref(),
         );
-        p.enabled.unwrap_or(true) && p.auto_update.unwrap_or(true)
+        self.packages_enabled() && p.auto_update.unwrap_or(true)
     }
 
     /// Resolve the `[matrix_rain]` table into engine-ready PARAMETERS
@@ -2778,13 +3530,13 @@ impl Config {
     /// backend will actually try.
     pub(crate) fn font_family_warning(family: Option<&str>) -> Option<String> {
         let fam = family.map(str::trim).filter(|s| !s.is_empty())?;
-        if aterm_render::resolve_font_family(fam).is_some() {
-            return None;
+        match aterm_render::resolve_config_font(fam) {
+            Ok(_) => None,
+            Err(error) => Some(format!(
+                "font_family {fam:?} is not an admissible font ({error}); keeping the current \
+                 working font (see `aterm list-fonts` for resolvable families)"
+            )),
         }
-        Some(format!(
-            "font_family {fam:?} does not resolve to a font file; using the built-in \
-             candidates (see `aterm list-fonts` for resolvable families)"
-        ))
     }
 
     /// Warn (the `font_family_warning` twin) when a configured
@@ -2816,60 +3568,13 @@ impl Config {
         }
     }
 
-    /// The MASTER bottom-HUD switch (DEFAULT OFF): `true` shows the whole band. The
-    /// per-panel `show_*_hud` values are ANDed with this by every consumer (startup
-    /// seed, config reload, the user-gesture toggles) — the keys themselves are never
-    /// rewritten by the master, so re-enabling restores the previous selection. Off by
-    /// default so a fresh terminal is a clean grid; opt in with `show_hud = true`.
-    pub(crate) fn show_hud_or_default(&self) -> bool {
-        self.show_hud.unwrap_or(false)
-    }
-
     /// Whether to show the OPTIONAL floating top-right build/version pill. Default OFF:
     /// the version now lives in the menu bar (the top-level `v<version>` menu, which
     /// opens About), so the floating pill is an opt-in extra rather than the primary
-    /// surface. Enable with `show_build_badge = true` or the Settings overlay. See
+    /// surface. Enable with `show_build_badge = true` or the native Settings tab. See
     /// [`crate::build_badge`].
     pub(crate) fn show_build_badge_or_default(&self) -> bool {
         self.show_build_badge.unwrap_or(false)
-    }
-
-    /// Whether to show the bottom Resources HUD (system vs session). Default ON — the
-    /// performance GUI ships enabled (toggle it from the Performance control panel, the
-    /// View menu, or `show_resources_hud = false` in aterm.toml).
-    pub(crate) fn show_resources_hud_or_default(&self) -> bool {
-        self.show_resources_hud.unwrap_or(true)
-    }
-
-    /// Whether to show the aterm Engine HUD (render speed / memory). Default ON;
-    /// disable with `show_engine_hud = false` or View ▸ Show Engine HUD.
-    pub(crate) fn show_engine_hud_or_default(&self) -> bool {
-        self.show_engine_hud.unwrap_or(true)
-    }
-
-    /// Mirror a live per-panel HUD gesture into THIS config, so later live decisions
-    /// that resolve through [`Config::hud_enabled`] (the master toggle's per-panel
-    /// wants, palette checkmarks) see the gesture immediately instead of waiting on
-    /// the ~500ms config-watcher reload of the file the gesture also wrote (which may
-    /// never land — persistence is best-effort).
-    pub(crate) fn set_hud_enabled(&mut self, id: hud_bar::PanelId, on: bool) {
-        match id {
-            hud_bar::PanelId::Resources => self.show_resources_hud = Some(on),
-            hud_bar::PanelId::Engine => self.show_engine_hud = Some(on),
-        }
-    }
-
-    /// Whether HUD panel `id` is enabled per THIS config — the seed for its settings
-    /// control (and the default the View menu / Performance panel resolve). Resources
-    /// and Engine default ON, Scene OFF (see the `*_or_default` resolvers above).
-    /// Deliberately NOT gated by the master [`Config::show_hud_or_default`] — the
-    /// per-panel settings rows must reflect the per-panel keys; consumers that decide
-    /// what is actually on screen fold the master in themselves.
-    pub(crate) fn hud_enabled(&self, id: hud_bar::PanelId) -> bool {
-        match id {
-            hud_bar::PanelId::Resources => self.show_resources_hud_or_default(),
-            hud_bar::PanelId::Engine => self.show_engine_hud_or_default(),
-        }
     }
 
     /// Resolve the window-chrome appearance ([`WindowTheme`]) from config. The
@@ -2940,12 +3645,10 @@ pub(crate) struct RenderKnobs {
     /// `background_opacity` → `Backend::set_background_opacity` (present-time,
     /// M5). `1.0` = solid (byte-identical default).
     pub(crate) background_opacity: f32,
-    /// `background_material` (M5 true vibrancy): the window-level
-    /// `NSVisualEffectView` blur. Resolved, validated and diffed; on the GPU
-    /// backend it drives `AppRt::window_set_vibrancy` (install/update/remove the
-    /// behind-window backdrop) whenever the window is also translucent
-    /// (`background_opacity < 1.0`). The CPU softbuffer surface has no non-opaque
-    /// composite, so a non-`none` material there warns once and has no effect.
+    /// `background_material` (M5): resolved, validated and diffed before driving
+    /// `AppRt::window_set_vibrancy`. macOS GPU installs a behind-window effect only
+    /// while translucent; Windows GPU installs a DWM backdrop independently. CPU
+    /// and unsupported-platform paths diagnose the setting as inert.
     pub(crate) background_material: BackgroundMaterial,
 }
 
@@ -3081,14 +3784,16 @@ impl FontConfig {
         let mut warns = Vec::new();
         let mut resolve = |key: &str, fam: Option<&str>| -> Option<String> {
             let fam = fam.map(str::trim).filter(|s| !s.is_empty())?;
-            let path = aterm_render::resolve_font_family(fam);
-            if path.is_none() {
-                warns.push(format!(
-                    "config {key}: {fam:?} does not resolve to a font file; ignored \
-                     (see `aterm list-fonts`)"
-                ));
+            match aterm_render::resolve_config_font(fam) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    warns.push(format!(
+                        "config {key}: {fam:?} is not an admissible font ({error}); ignored \
+                         (see `aterm list-fonts`)"
+                    ));
+                    None
+                }
             }
-            path
         };
         let styled_paths = [
             resolve("font_family_bold", cfg.font_family_bold.as_deref()),
@@ -3118,6 +3823,61 @@ impl FontConfig {
             },
             warns,
         )
+    }
+
+    /// Preserve the last working live face for an AUTHORED entry which failed
+    /// resolution/admission in `from_config`.
+    ///
+    /// `None` normally means “unset; restore discovery”. For an authored key,
+    /// however, `None` means the new value was rejected. Treating those two cases
+    /// alike would let an oversized/FIFO/missing edit clobber a working styled,
+    /// symbol, or emoji face. Valid siblings still advance independently.
+    #[cfg(test)]
+    pub(crate) fn preserve_rejected_from(&mut self, cfg: &Config, previous: &Self) {
+        fn preserve(authored: Option<&str>, next: &mut Option<String>, old: &Option<String>) {
+            if authored.is_some_and(|value| !value.trim().is_empty()) && next.is_none() {
+                next.clone_from(old);
+            }
+        }
+        preserve(
+            cfg.font_family_bold.as_deref(),
+            &mut self.styled_paths[0],
+            &previous.styled_paths[0],
+        );
+        preserve(
+            cfg.font_family_italic.as_deref(),
+            &mut self.styled_paths[1],
+            &previous.styled_paths[1],
+        );
+        preserve(
+            cfg.font_family_bold_italic.as_deref(),
+            &mut self.styled_paths[2],
+            &previous.styled_paths[2],
+        );
+        if cfg
+            .fallback_fonts
+            .as_ref()
+            .is_some_and(|fonts| !fonts.0.is_empty())
+            && self.fallback_fonts.is_empty()
+        {
+            self.fallback_fonts.clone_from(&previous.fallback_fonts);
+        }
+        if cfg
+            .symbol_font
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && self.symbol_font.is_none()
+        {
+            self.symbol_font.clone_from(&previous.symbol_font);
+        }
+        if cfg
+            .emoji_font
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && self.emoji_font.is_none()
+        {
+            self.emoji_font.clone_from(&previous.emoji_font);
+        }
     }
 }
 
@@ -3154,15 +3914,53 @@ fn accept_titlebar_band_pts(
     if !decorated {
         return measured_pts.max(0.0);
     }
-    if measured_pts <= 0.0 || measured_pts > TITLEBAR_BAND_SANITY_CAP_PTS {
+    if !titlebar_band_sane(measured_pts) {
         return prev_pts;
     }
     measured_pts
 }
 
+/// Whether a titlebar-band sample is a plausible real band (positive, within
+/// the sanity cap) — the ONE predicate `accept_titlebar_band_pts`'s commit
+/// path and `titlebar_band_decision`'s memory update share, so "commits" and
+/// "becomes the memory" can never drift apart.
+fn titlebar_band_sane(pts: f64) -> bool {
+    pts > 0.0 && pts <= TITLEBAR_BAND_SANITY_CAP_PTS
+}
+
+/// The full head decision for one titlebar-band sample:
+/// `(measured, fullscreen, decorated, memory) -> (applied, new_memory)`.
+///
+/// `applied` is [`accept_titlebar_band_pts`] with the last-good-windowed
+/// MEMORY as its fallback — NOT the currently applied band. The applied band
+/// is 0 for the whole of a fullscreen stay (forced, by design), so using it
+/// as the fallback would leave an exit-transition artifact sample nothing to
+/// restore but 0; the memory is what still remembers the real band across the
+/// stay (see the two-slot note on `WindowState::head_pts`).
+///
+/// `new_memory` advances ONLY when a sane decorated windowed sample commits —
+/// the acceptance success path. Everything else preserves it: fullscreen
+/// samples (the applied 0 is forced, not measured), undecorated samples (the
+/// band is legitimately gone, but the chrome may come back), and rejected
+/// artifacts (keeping them is the whole point).
+pub(crate) fn titlebar_band_decision(
+    measured_pts: f64,
+    fullscreen: bool,
+    decorated: bool,
+    memory_pts: f64,
+) -> (f64, f64) {
+    let applied = accept_titlebar_band_pts(measured_pts, fullscreen, decorated, memory_pts);
+    let memory = if !fullscreen && decorated && titlebar_band_sane(measured_pts) {
+        measured_pts
+    } else {
+        memory_pts
+    };
+    (applied, memory)
+}
+
 #[cfg(test)]
 mod titlebar_band_acceptance_tests {
-    use super::{TITLEBAR_BAND_SANITY_CAP_PTS, accept_titlebar_band_pts};
+    use super::{TITLEBAR_BAND_SANITY_CAP_PTS, accept_titlebar_band_pts, titlebar_band_decision};
 
     #[test]
     fn fullscreen_forces_zero_regardless_of_sample() {
@@ -3199,6 +3997,60 @@ mod titlebar_band_acceptance_tests {
         // band would inset a chromeless window forever.
         assert_eq!(accept_titlebar_band_pts(0.0, false, false, 55.0), 0.0);
         assert_eq!(accept_titlebar_band_pts(-1.0, false, false, 55.0), 0.0);
+    }
+
+    /// The defect this module's `prev = 55.0` cases silently assumed away:
+    /// `on_resize` used to feed the APPLIED band back as `prev_pts`, and the
+    /// applied band is forced to 0 for the whole of a fullscreen stay — so on
+    /// a bad exit sample the "keep the last good band" defense could only
+    /// ever keep 0. Driven through `titlebar_band_decision` (the exact caller
+    /// wiring; the AppKit measurement is the only thing faked), the two-slot
+    /// design must carry 55 across the stay and restore it on exit.
+    #[test]
+    fn band_memory_survives_a_fullscreen_stay_and_restores_on_exit_artifact() {
+        // Windowed, decorated, sane 55 pt band: commits AND becomes memory.
+        let (applied, memory) = titlebar_band_decision(55.0, false, true, 0.0);
+        assert_eq!((applied, memory), (55.0, 55.0));
+
+        // Enter fullscreen: the transition reads an inflated artifact. Head
+        // is forced to 0; the memory must NOT be clobbered.
+        let (applied, memory) = titlebar_band_decision(700.0, true, true, memory);
+        assert_eq!((applied, memory), (0.0, 55.0));
+
+        // Mid-stay resizes sample a genuine 0 (the titlebar is detached).
+        // Still forced 0 applied; still 55 remembered.
+        let (applied, memory) = titlebar_band_decision(0.0, true, true, memory);
+        assert_eq!((applied, memory), (0.0, 55.0));
+
+        // Exit fullscreen with the classic artifact: decorated + windowed but
+        // the sample still reads 0.0. The defense must restore 55, not "keep"
+        // the fullscreen 0 that the old single-slot wiring fed it.
+        let (applied, memory) = titlebar_band_decision(0.0, false, true, memory);
+        assert_eq!((applied, memory), (55.0, 55.0));
+    }
+
+    /// The memory slot advances ONLY on the acceptance success path — every
+    /// non-committing sample preserves it (rejected artifacts, fullscreen's
+    /// forced 0, and the undecorated truth-0, which applies but must not
+    /// poison the fallback for when the chrome returns).
+    #[test]
+    fn band_memory_advances_only_when_a_windowed_sample_commits() {
+        // Windowed rejected artifacts: applied falls back to memory, memory holds.
+        assert_eq!(titlebar_band_decision(0.0, false, true, 55.0), (55.0, 55.0));
+        assert_eq!(
+            titlebar_band_decision(TITLEBAR_BAND_SANITY_CAP_PTS + 1.0, false, true, 55.0),
+            (55.0, 55.0)
+        );
+        // Fullscreen: whatever the sample, applied is 0 and memory holds.
+        assert_eq!(titlebar_band_decision(38.0, true, true, 55.0), (0.0, 55.0));
+        // Undecorated: 0 applies (the band really is gone) but memory holds,
+        // so re-decorating can still recover a band through the artifact path.
+        assert_eq!(titlebar_band_decision(0.0, false, false, 55.0), (0.0, 55.0));
+        // The one advancing case: windowed + decorated + sane commits both.
+        assert_eq!(
+            titlebar_band_decision(38.0, false, true, 55.0),
+            (38.0, 38.0)
+        );
     }
 }
 
@@ -3256,19 +4108,19 @@ fn warn_background_material_unimplemented_once() {
     });
 }
 
-/// Window-CHROME appearance (titlebar + traffic lights), distinct from the
-/// terminal-body color scheme. Resolved from config `window_theme` via
-/// [`Config::window_theme_or_default`] and applied to the NSWindow appearance in
-/// `platform::AppRtMacOS::window_set_appearance` (macOS).
+/// Window-CHROME appearance, distinct from the terminal-body color scheme.
+/// Resolved from config `window_theme` via [`Config::window_theme_or_default`] and
+/// applied through the cross-platform [`crate::platform::AppRt::window_set_appearance`]
+/// seam (native AppKit/DWM chrome or winit's system-decoration theme).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum WindowTheme {
-    /// Follow the OS light/dark setting (no `NSAppearance` override), so the
-    /// chrome tracks live day-night appearance switches. The default.
+    /// Follow the OS light/dark setting, so chrome tracks live appearance switches.
+    /// The default.
     #[default]
     Auto,
-    /// Force light chrome (`NSAppearanceNameAqua`).
+    /// Force light window chrome.
     Light,
-    /// Force dark chrome (`NSAppearanceNameDarkAqua`).
+    /// Force dark window chrome.
     Dark,
 }
 
@@ -3398,7 +4250,7 @@ fn deco_feed_changed(old: &Config, new: &Config, fresh_deco_fp: u64, applied_dec
 }
 
 /// Expand a leading `~` / `~/` / `$HOME` to the user's home directory.
-fn sparkle_expand_tilde(path: &str) -> std::path::PathBuf {
+pub(crate) fn sparkle_expand_tilde(path: &str) -> std::path::PathBuf {
     if path == "~"
         && let Some(h) = std::env::var_os("HOME")
     {
@@ -3433,18 +4285,8 @@ fn invalid_nyan_sprite(source_id: &str, reason: impl AsRef<str>) -> NyanSpriteAs
 }
 
 fn read_bounded_nyan_png(path: &std::path::Path) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path).map_err(|error| format!("unreadable ({error})"))?;
-    let mut bytes = Vec::with_capacity(MAX_NYAN_SPRITE_FILE_BYTES.min(64 * 1024));
-    file.take((MAX_NYAN_SPRITE_FILE_BYTES as u64).saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("unreadable ({error})"))?;
-    if bytes.len() > MAX_NYAN_SPRITE_FILE_BYTES {
-        return Err(format!(
-            "encoded PNG exceeds the {} byte limit",
-            MAX_NYAN_SPRITE_FILE_BYTES
-        ));
-    }
-    Ok(bytes)
+    aterm_effects::file_feed::read_bounded_regular_file(path, MAX_NYAN_SPRITE_FILE_BYTES)
+        .map_err(|error| format!("unreadable ({error})"))
 }
 
 fn stable_nyan_fingerprint(tag: u8, source: &[u8], w: u16, h: u16, rgba: &[u8]) -> u64 {
@@ -3576,9 +4418,20 @@ impl Config {
 
     /// [`Self::terminal_config`] resolved for a specific OS `appearance` — picks the
     /// matching side of a `dark:…,light:…` split theme (see [`Self::resolve_theme_name`]).
+    #[cfg(test)]
     pub(crate) fn terminal_config_for(
         &self,
         appearance: aterm_types::Appearance,
+    ) -> Option<aterm_core::config::TerminalConfig> {
+        self.terminal_config_for_with_assets(appearance, &ThemeCatalog::default())
+    }
+
+    /// Engine config resolved against the same parsed theme catalog carried by
+    /// the active config snapshot. This path cannot reopen a theme file.
+    pub(crate) fn terminal_config_for_with_assets(
+        &self,
+        appearance: aterm_types::Appearance,
+        themes: &ThemeCatalog,
     ) -> Option<aterm_core::config::TerminalConfig> {
         let mut tc = aterm_core::config::TerminalConfig::default();
         let mut any = false;
@@ -3589,32 +4442,40 @@ impl Config {
         }
         if self.cursor_style.is_some() || self.cursor_blink.is_some() {
             let blink = self.cursor_blink.unwrap_or(true);
-            tc.cursor_style = match self.cursor_style.as_deref().unwrap_or("block") {
-                "block" if blink => CursorStyle::BlinkingBlock,
-                "block" => CursorStyle::SteadyBlock,
-                // The "_" underline OPTION is retired (owner: keep block + "|").
-                // Programs may still request underline via DECSCUSR — that is
-                // terminal protocol, not user configuration; a config asking for
-                // it falls back to the bar with a one-line note.
-                "underline" => {
-                    eprintln!(
-                        "aterm-gui: config cursor_style \"underline\" is retired; using \"bar\""
-                    );
-                    if blink {
-                        CursorStyle::BlinkingBar
-                    } else {
-                        CursorStyle::SteadyBar
-                    }
+            let cursor_style = self.cursor_style.as_deref().unwrap_or("block").trim();
+            // The "_" underline OPTION is retired (owner: keep block + "|").
+            // Programs may still request underline via DECSCUSR — that is
+            // terminal protocol, not user configuration; a config asking for
+            // it falls back to the bar with a one-line note.
+            tc.cursor_style = if cursor_style.eq_ignore_ascii_case("block") {
+                if blink {
+                    CursorStyle::BlinkingBlock
+                } else {
+                    CursorStyle::SteadyBlock
                 }
-                "bar" | "beam" if blink => CursorStyle::BlinkingBar,
-                "bar" | "beam" => CursorStyle::SteadyBar,
-                other => {
-                    eprintln!("aterm-gui: config cursor_style: expected block|bar, got {other:?}");
-                    if blink {
-                        CursorStyle::BlinkingBlock
-                    } else {
-                        CursorStyle::SteadyBlock
-                    }
+            } else if cursor_style.eq_ignore_ascii_case("underline") {
+                eprintln!("aterm-gui: config cursor_style \"underline\" is retired; using \"bar\"");
+                if blink {
+                    CursorStyle::BlinkingBar
+                } else {
+                    CursorStyle::SteadyBar
+                }
+            } else if cursor_style.eq_ignore_ascii_case("bar")
+                || cursor_style.eq_ignore_ascii_case("beam")
+            {
+                if blink {
+                    CursorStyle::BlinkingBar
+                } else {
+                    CursorStyle::SteadyBar
+                }
+            } else {
+                eprintln!(
+                    "aterm-gui: config cursor_style: expected block|bar, got {cursor_style:?}"
+                );
+                if blink {
+                    CursorStyle::BlinkingBlock
+                } else {
+                    CursorStyle::SteadyBlock
                 }
             };
             tc.cursor_blink = blink;
@@ -3625,30 +4486,20 @@ impl Config {
         // (last-wins). No theme = this block is skipped, so the per-key path stays
         // byte-identical to before.
         if let Some(name) = self.resolve_theme_name(appearance) {
-            // Single point that warns on a theme that does not resolve to a built-in
-            // OR a parseable user theme file (base_scheme_for resolves silently, so this
-            // never double-prints from theme() + here). A NotFound names the built-in
-            // set + the user theme dir; a Parse error surfaces the offending line.
+            // Single point that warns on a theme that is absent or invalid in
+            // the admitted startup catalog. The renderer's base resolver is
+            // silent so it cannot double-print this message.
             if !name.eq_ignore_ascii_case("default") {
-                match aterm_types::scheme::load(&name) {
+                match themes.resolve(&name) {
                     Ok(_) => {}
-                    Err(aterm_types::scheme::ThemeError::NotFound(_)) => {
-                        let where_ = aterm_types::scheme::user_theme_dir()
-                            .map(|p| format!(" or a file in {}", p.display()))
-                            .unwrap_or_default();
+                    Err(error) => {
                         eprintln!(
-                            "aterm-gui: config theme: unknown theme {name:?}; using Default (built-ins: {}{where_})",
-                            aterm_types::scheme::builtin_names().join(", ")
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "aterm-gui: config theme: failed to load {name:?} ({e}); using Default"
+                            "aterm-gui: config theme: {name:?} does not resolve ({error}); using Default"
                         );
                     }
                 }
             }
-            let s = self.base_scheme_for(appearance);
+            let s = self.base_scheme_for_with_themes(appearance, themes);
             tc.default_foreground = s.foreground;
             tc.default_background = s.background;
             if let Some(cur) = s.cursor {
@@ -3722,7 +4573,7 @@ impl Config {
         // BiDi mode (engine `BiDiConfig.mode`; applied by Terminal::apply_config).
         if let Some(b) = self.bidi.as_deref() {
             use aterm_core::config::BiDiMode;
-            match b.to_ascii_lowercase().as_str() {
+            match b.trim().to_ascii_lowercase().as_str() {
                 "disabled" | "off" => tc.bidi.mode = BiDiMode::Disabled,
                 "implicit" | "on" => tc.bidi.mode = BiDiMode::Implicit,
                 "explicit" => tc.bidi.mode = BiDiMode::Explicit,
@@ -3734,7 +4585,7 @@ impl Config {
         }
         // East-Asian Ambiguous width (engine `ambiguous_width_double`).
         if let Some(w) = self.ambiguous_width.as_deref() {
-            match w.to_ascii_lowercase().as_str() {
+            match w.trim().to_ascii_lowercase().as_str() {
                 "narrow" | "single" => tc.ambiguous_width_double = false,
                 "wide" | "double" => tc.ambiguous_width_double = true,
                 other => eprintln!(
@@ -3786,6 +4637,7 @@ impl Config {
     /// tools/visual-judge). Pinning the engine defaults to the theme makes a default
     /// cell paint exactly the colour the window clears to. `theme()` already folds in
     /// any `foreground`/`background` config, so an explicit theme is honoured too.
+    #[cfg(test)]
     pub(crate) fn applied_terminal_config(&self) -> aterm_core::config::TerminalConfig {
         self.applied_terminal_config_for(aterm_types::Appearance::Dark)
     }
@@ -3793,12 +4645,24 @@ impl Config {
     /// [`Self::applied_terminal_config`] resolved for a specific OS `appearance` — the
     /// engine config the GUI applies live when the desktop toggles light↔dark under a
     /// `dark:…,light:…` split theme (see [`Self::resolve_theme_name`]).
+    #[cfg(test)]
     pub(crate) fn applied_terminal_config_for(
         &self,
         appearance: aterm_types::Appearance,
     ) -> aterm_core::config::TerminalConfig {
-        let mut tc = self.terminal_config_for(appearance).unwrap_or_default();
-        let theme = self.theme_for(appearance);
+        self.applied_terminal_config_for_with_assets(appearance, &ThemeCatalog::default())
+    }
+
+    /// Complete engine projection from an admitted, immutable theme catalog.
+    pub(crate) fn applied_terminal_config_for_with_assets(
+        &self,
+        appearance: aterm_types::Appearance,
+        themes: &ThemeCatalog,
+    ) -> aterm_core::config::TerminalConfig {
+        let mut tc = self
+            .terminal_config_for_with_assets(appearance, themes)
+            .unwrap_or_default();
+        let theme = self.theme_for_with_assets(appearance, themes);
         let rgb = |c: u32| {
             Rgb::new(
                 ((c >> 16) & 0xff) as u8,
@@ -3813,7 +4677,7 @@ impl Config {
 }
 
 /// Resolve the config file path without creating anything.
-/// The `font_px_explicit` pin after a config reload: an explicit `$ATERM_FONT_PX` /
+/// The `font_px_explicit` pin after a config reload: an admitted `$ATERM_FONT_PX` /
 /// `config.font_px` pins outright; otherwise an effective px that DIFFERS from the
 /// (re-derived) scale default is a LIVE Cmd-+/− zoom this reload is preserving — it
 /// must KEEP its pin. Dropping the pin while keeping the zoomed px re-arms
@@ -3844,24 +4708,128 @@ pub(crate) fn config_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
 }
 
+/// One ambient launch override that currently outranks aterm.toml. Settings
+/// captures these facts into its view model, and Manual's host diagnostics use
+/// the same resolver, so preview, accessibility, save feedback, and validation
+/// cannot disagree about an environment-pinned value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveEnvironmentOverride {
+    pub(crate) variable: &'static str,
+    pub(crate) effective: String,
+}
+
+/// Resolve an active environment/CLI override for one config key. Invalid
+/// values are deliberately absent because the runtime also falls through to
+/// aterm.toml for them.
+pub(crate) fn active_environment_override(key: &str) -> Option<ActiveEnvironmentOverride> {
+    let resolved = |variable, effective| ActiveEnvironmentOverride {
+        variable,
+        effective,
+    };
+    match key {
+        "columns" => env_u16("ATERM_COLUMNS")
+            .map(|value| resolved("ATERM_COLUMNS", value.clamp(20, 500).to_string())),
+        "lines" => env_u16("ATERM_LINES")
+            .map(|value| resolved("ATERM_LINES", value.clamp(5, 300).to_string())),
+        "font_px" => {
+            font_px_environment_override().map(|value| resolved("ATERM_FONT_PX", value.to_string()))
+        }
+        "font_family" => std::env::var("ATERM_FONT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| resolved("ATERM_FONT", value)),
+        "window_theme"
+            if cfg!(target_os = "macos") && std::env::var_os("ATERM_NO_DARK_CHROME").is_some() =>
+        {
+            Some(resolved("ATERM_NO_DARK_CHROME", "auto".to_string()))
+        }
+        "gpu" if std::env::var_os("ATERM_CPU").is_some() => {
+            Some(resolved("ATERM_CPU", "CPU".to_string()))
+        }
+        "gpu" if std::env::var_os("ATERM_GPU").is_some() => {
+            Some(resolved("ATERM_GPU", "GPU".to_string()))
+        }
+        "tab_strip_rows" => std::env::var("ATERM_TAB_STRIP_ROWS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .map(|value| {
+                resolved(
+                    "ATERM_TAB_STRIP_ROWS",
+                    value.min(MAX_TAB_STRIP_ROWS).to_string(),
+                )
+            }),
+        "stem_gamma" => std::env::var("ATERM_STEM_GAMMA")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .map(|value| {
+                resolved(
+                    "ATERM_STEM_GAMMA",
+                    aterm_render::clamp_stem_gamma(value).to_string(),
+                )
+            }),
+        "shell" => std::env::var("ATERM_SHELL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| resolved("ATERM_SHELL", value)),
+        "net.listen" => std::env::var("ATERM_NET_LISTEN")
+            .ok()
+            .map(|value| resolved("ATERM_NET_LISTEN", value)),
+        "net.cert" => std::env::var("ATERM_NET_CERT")
+            .ok()
+            .map(|value| resolved("ATERM_NET_CERT", value)),
+        "net.key" => std::env::var("ATERM_NET_KEY")
+            .ok()
+            .map(|value| resolved("ATERM_NET_KEY", value)),
+        "update.owner" => std::env::var("ATERM_UPDATE_OWNER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| aterm_update_core::is_valid_slug(value))
+            .map(|value| resolved("ATERM_UPDATE_OWNER", value)),
+        "update.repo" => std::env::var("ATERM_UPDATE_REPO")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| aterm_update_core::is_valid_slug(value))
+            .map(|value| resolved("ATERM_UPDATE_REPO", value)),
+        "update.auto_apply" if std::env::var_os("ATERM_NO_AUTO_APPLY").is_some() => {
+            Some(resolved("ATERM_NO_AUTO_APPLY", "false".to_string()))
+        }
+        "packages.account" => std::env::var("ATPKG_ACCOUNT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| aterm_update_core::is_valid_slug(value))
+            .map(|value| resolved("ATPKG_ACCOUNT", value)),
+        _ => None,
+    }
+}
+
 /// Load the user config. A missing file is fine (defaults); a malformed file is
 /// reported and ignored rather than aborting the launch.
 pub(crate) fn load_config() -> Config {
     let Some(path) = config_path() else {
         return Config::default();
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Config::default(); // not present / unreadable → defaults
-    };
-    toml::from_str(&text).unwrap_or_else(|e| {
+    let observation =
+        match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
+            Ok(observation) => observation,
+            Err(error) => {
+                eprintln!(
+                    "aterm-gui: ignoring unreadable config {}: {error}",
+                    path.display()
+                );
+                return Config::default();
+            }
+        };
+    toml::from_str(&observation.text).unwrap_or_else(|e| {
         eprintln!("aterm-gui: ignoring invalid config {}: {e}", path.display());
         Config::default()
     })
 }
 
 /// Resolve the glyph size in physical px with the canonical precedence
-/// `$ATERM_FONT_PX > config.font_px > FONT_PX default`, clamped to the sane
-/// `FONT_PX_MIN..=FONT_PX_MAX` bounds. Shared by startup (`main`) and live
+/// `$ATERM_FONT_PX > config.font_px > FONT_PX default`. Only finite values inside
+/// `FONT_PX_MIN..=FONT_PX_MAX` are admitted; an invalid source falls through instead
+/// of being clamped. Shared by startup (`main`) and live
 /// hot-reload (`App::reload_config`) so a reload re-applies the SAME precedence —
 /// an env override still wins after the user edits the config file.
 pub(crate) fn resolve_font_px(config: &Config) -> f32 {
@@ -3869,6 +4837,27 @@ pub(crate) fn resolve_font_px(config: &Config) -> f32 {
         std::env::var("ATERM_FONT_PX").ok().as_deref(),
         config.font_px,
     )
+}
+
+/// Whether a valid environment/config size pins the physical glyph size.
+/// Merely authoring an invalid `font_px` must not disable the display-scaled
+/// default: admission and explicitness deliberately share the same predicate.
+pub(crate) fn font_px_is_explicit(config: &Config) -> bool {
+    font_px_is_explicit_with(
+        std::env::var("ATERM_FONT_PX").ok().as_deref(),
+        config.font_px,
+    )
+}
+
+/// ATERM_FONT_PX only counts as an explicit pin when the runtime would
+/// actually admit it. A malformed or out-of-domain inherited value falls
+/// through to config/default and must not accidentally disable HiDPI auto-size.
+pub(crate) fn font_px_environment_override() -> Option<f32> {
+    std::env::var("ATERM_FONT_PX")
+        .ok()?
+        .parse::<f32>()
+        .ok()
+        .filter(font_px_in_range)
 }
 
 /// Whether the GPU renderer should be requested at launch, resolved with the SAME
@@ -3883,6 +4872,20 @@ pub(crate) fn resolve_want_gpu(config: &Config) -> bool {
         std::env::var_os("ATERM_GPU").is_some(),
         config.gpu,
     )
+}
+
+/// Effective shell command captured by every newly-created session. The CLI
+/// flag collapses into `ATERM_SHELL` before the app starts, so this resolver is
+/// shared by startup and config reload: saved `shell` edits reach the next tab
+/// without waiting for a process restart while the launch override keeps its
+/// documented precedence.
+pub(crate) fn resolve_shell_override(config: &Config) -> Option<String> {
+    resolve_shell_override_with(std::env::var("ATERM_SHELL").ok(), config.shell.as_deref())
+}
+
+fn resolve_shell_override_with(env: Option<String>, configured: Option<&str>) -> Option<String> {
+    env.filter(|value| !value.is_empty())
+        .or_else(|| configured.map(str::to_string))
 }
 
 /// Pure precedence core for [`resolve_want_gpu`] with the two env presences and the
@@ -3944,6 +4947,25 @@ pub(crate) fn env_u16(key: &str) -> Option<u16> {
         .filter(|&n| n != 0)
 }
 
+/// Fresh-launch terminal width after the documented environment > config >
+/// default precedence and the same safety clamp used by window construction.
+pub(crate) fn resolve_initial_columns(config: &Config) -> u16 {
+    env_u16("ATERM_COLUMNS")
+        .or(config.columns)
+        .unwrap_or(80)
+        .clamp(20, 500)
+}
+
+/// Fresh-launch terminal height; the row twin of
+/// [`resolve_initial_columns`]. A seamless handoff may supply a carried frame
+/// ahead of this resolver, but a normal launch and `--show-config` share it.
+pub(crate) fn resolve_initial_lines(config: &Config) -> u16 {
+    env_u16("ATERM_LINES")
+        .or(config.lines)
+        .unwrap_or(24)
+        .clamp(5, 300)
+}
+
 /// An explicit render-scale override from `$ATERM_FORCE_SCALE` (set directly or by
 /// the `--scale` flag). `Some(f)` for a finite, positive value; `None` when unset
 /// or invalid. When set it overrides BOTH the headless 1.0 default and a real
@@ -3965,21 +4987,27 @@ pub(crate) fn resolve_force_scale() -> Option<f64> {
 /// A present-but-unparseable/out-of-range env value falls through to the config,
 /// matching the startup `.parse().ok().or(config).filter(in_range)` chain.
 pub(crate) fn resolve_font_px_with(env: Option<&str>, config: Option<f32>) -> f32 {
-    let in_range = |p: &f32| p.is_finite() && *p >= FONT_PX_MIN && *p <= FONT_PX_MAX;
     // Filter EACH source by range independently so an out-of-range env value falls
     // through to a valid config value (as documented) instead of `.or(config)`
     // pinning the bad env value and then `.filter` collapsing straight to default.
-    env.and_then(|s| s.parse::<f32>().ok())
-        .filter(&in_range)
-        .or(config.filter(&in_range))
-        .unwrap_or(FONT_PX)
+    admitted_font_px(env, config).unwrap_or(FONT_PX)
 }
 
-/// Max HUD rows a `win_rows`-tall window can show below a `strip`-row tab strip,
-/// always leaving at least one terminal row. The bottom of the HUD stack is dropped
-/// past this so the composed frame never exceeds the window (no off-glass clip).
-pub(crate) fn hud_cap_for(win_rows: u16, strip: u16) -> u16 {
-    win_rows.saturating_sub(strip).saturating_sub(1)
+fn font_px_in_range(value: &f32) -> bool {
+    value.is_finite() && *value >= FONT_PX_MIN && *value <= FONT_PX_MAX
+}
+
+fn admitted_font_px(env: Option<&str>, config: Option<f32>) -> Option<f32> {
+    env.and_then(|value| value.parse::<f32>().ok())
+        .filter(font_px_in_range)
+        .or(config.filter(font_px_in_range))
+}
+
+/// Pure explicit-pin counterpart of [`resolve_font_px_with`]. Keeping this on
+/// the same admission helper prevents an invalid authored value from pinning
+/// the 12px fallback and silently bypassing HiDPI auto-size.
+pub(crate) fn font_px_is_explicit_with(env: Option<&str>, config: Option<f32>) -> bool {
+    admitted_font_px(env, config).is_some()
 }
 
 /// Resolve one raw style against the exact catalog revision used by the host.
@@ -4097,6 +5125,9 @@ pub(crate) fn resolve_cursor_glow(
         beam: style_has_beam_of(glow_style, style_token),
         head_dx,
         pack: style.pack,
+        // The host's taste dial; the engine fails it OFF on a non-finite value,
+        // and the resolver has already clamped it into 0..=1.5 s.
+        wake_persist_s: inputs.wake_persist_s,
     }
 }
 
@@ -4189,7 +5220,9 @@ impl ReloadRenderSnapshot {
         // renderer. The engine was already live-applied earlier in reload_config;
         // re-derive it from the hybrid config (old render slice + all other new
         // settings) so those two surfaces remain one transaction too.
-        let terminal_config = app.config.applied_terminal_config_for(app.os_appearance);
+        let terminal_config = app
+            .config
+            .applied_terminal_config_for_with_assets(app.os_appearance, &app.config_assets.themes);
         for session in app.pool.iter() {
             term_lock(&session.term).apply_config(&terminal_config);
         }
@@ -4254,59 +5287,19 @@ fn restore_render_config_fields(target: &mut Config, previous: &Config) {
 
 impl App {
     /// Rebuild the cached sparkle-words state ([`App::sparkle`]) from the current
-    /// config + force-off flag. Runs only when `sparkle_dirty` is set (startup,
-    /// config reload, toggle) — never per frame — so the per-frame path neither
+    /// config and Serious Mode policy. Runs only when `sparkle_dirty` is set
+    /// (startup or config reload) — never per frame — so the per-frame path neither
     /// re-resolves config nor recompiles the lexicon. A malformed user lexicon
     /// override is logged and the builtin is used (config is not discarded).
     pub(crate) fn recompute_sparkle(&mut self) {
         self.sparkle_dirty = false;
-        // Fingerprint the path-referenced feed files as consumed by THIS rebuild
-        // (the single writer of `path_feed_fps`): the reload dedupe compares
-        // against it to keep touch-to-reload alive — a byte-equal `aterm.toml`
-        // re-save must still pick up pack/lexicon FILE edits (see
-        // `refresh_path_feeds`).
-        // (The Trail Pack registry itself now lives in the versioned
-        // `config_assets` catalog and is rebuilt by the config service, not
-        // here.)
-        self.path_feed_fps = self.config.path_feed_fingerprints();
-        self.sparkle = if self.sparkle_force_off
-            || !self
-                .serious_mode_policy()
-                .allows(crate::motion::SeriousEffect::WordDecorations)
+        self.sparkle = if !self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::WordDecorations)
         {
             None
         } else {
-            self.config
-                .sparkle_runtime_parts()
-                .map(|(cfg, override_toml)| {
-                    let langs = self.config.sparkle_languages();
-                    let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
-                    let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(
-                        &refs,
-                        override_toml.as_deref(),
-                    )
-                    .unwrap_or_else(|e| {
-                        eprintln!(
-                            "aterm-gui: sparkle_words lexicon override rejected ({e}); using builtin"
-                        );
-                        aterm_lexicon::Lexicon::with_languages(&refs)
-                    });
-                    // v3 §6: surface build-time data problems (a custom/extra word
-                    // that can never scan as written — single-char CJK without the
-                    // opt-in, mixed-script surfaces — or a cross-class collision)
-                    // instead of silently accepting the config. Filtered by the
-                    // RESOLVED scan options (the lexicon cannot see them): a
-                    // single-char-CJK warning is satisfied — not a problem — once
-                    // `cjk_single_char = true` is set.
-                    for warning in sparkle_logged_warnings(lexicon.conflicts(), cfg.cjk_single_char)
-                    {
-                        eprintln!("aterm-gui: sparkle_words lexicon: {warning}");
-                    }
-                    crate::word_decorations::Resolved {
-                        cfg,
-                        lexicon: std::sync::Arc::new(lexicon),
-                    }
-                })
+            self.prepared_sparkle.resolved.clone()
         };
     }
 
@@ -4349,29 +5342,6 @@ impl App {
             .and_then(|sw| sw.profanity.as_ref())
             .and_then(|p| p.bonk_detonation)
             .unwrap_or(false)
-    }
-
-    /// Flip the in-memory sparkle-words master kill (the `toggle_sparkle_words`
-    /// action / menu item) — an instant panic-off that overrides config without a
-    /// TOML edit. Marks the cache stale and flushes per-window occurrence state so
-    /// the next frame reflects the change.
-    pub(crate) fn toggle_sparkle_words(&mut self) {
-        self.sparkle_force_off = !self.sparkle_force_off;
-        self.sparkle_dirty = true;
-        for ws in self.windows.values_mut() {
-            // v3 §1.1 reset table: master toggle off→on is a hard_reset —
-            // fresh start is user intent, done marks clear too.
-            ws.word_decos.hard_reset();
-            ws.deco_scratch.clear();
-            // The panic-off kills EVERY v2 surface too: a stale ink scratch would
-            // otherwise recolor glyphs (and stale cat sprites keep a cat) for
-            // one more frame.
-            ws.ink_scratch.clear();
-            ws.free_scratch.clear();
-            if let Some(w) = ws.os_window.as_ref() {
-                w.request_redraw();
-            }
-        }
     }
 
     /// Rebuild the cached matrix-rain PARAMETER resolve ([`App::rain`]) from
@@ -4462,9 +5432,14 @@ impl App {
     /// `OK ` — every op (including the writes) answers with the same one-line
     /// status shape so a driver reads the post-state without a second round
     /// trip: `config_enabled=<bool> session_override=<none|on|off>
-    /// effective=<bool>`. `Err` when no window is focused or the front content
-    /// is not a terminal (native tabs have no session to toggle) — an honest
-    /// refusal, never a silent no-op.
+    /// effective=<bool> engine=<none|live> active=<bool>
+    /// scope=<window|focused-pane> focused=<bool> animating=<bool>` (the
+    /// engine tail is the split-pane-audit honesty fix: the render state is
+    /// observable, so a driver can SEE that a split renders rain in the
+    /// focused pane only — and that an unfocused/Reduced window animates
+    /// nothing at all, the W11 law). `Err` when no window is focused or the
+    /// front content is not a terminal (native tabs have no session to
+    /// toggle) — an honest refusal, never a silent no-op.
     pub(crate) fn rain_control(&mut self, op: crate::RainCtlOp) -> Result<String, String> {
         let Some(wid) = self.frontmost_window else {
             return Err("no focused window".to_string());
@@ -4486,11 +5461,53 @@ impl App {
             Some(true) => "on",
             Some(false) => "off",
         };
+        // ENGINE introspection (split-pane audit): `effective=true` alone once
+        // lied in a split (the engine was hard-dropped and nothing could
+        // render while every surface reported success). Rain now follows the
+        // FOCUSED pane on composed frames, and this tail makes the actual
+        // render state observable to a driver: whether this window holds a
+        // live engine, whether it is actively raining/draining (`is_active` —
+        // the wake-arming predicate), and which SCOPE the emission covers
+        // (`window` = single-pane/zoomed original path, `focused-pane` =
+        // split compose).
+        let (engine, active, diag) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.matrix_rain.as_ref())
+            .map_or(("none", false, String::new()), |e| {
+                ("live", e.is_active(), format!(" {}", e.diag_line()))
+            });
+        let scope = if self
+            .active_tree(wid)
+            .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
+        {
+            "focused-pane"
+        } else {
+            "window"
+        };
+        // The resolved MOTION facts (W11): rain is a serious animation, so an
+        // unfocused window (or Reduced motion) emits NOTHING even while
+        // `effective=true engine=live` — without these two fields "why isn't
+        // it raining" is undebuggable over the socket (split-pane audit).
+        // Resolved through the SAME fold the render tick uses — the
+        // `motion_focus` recording pin plus `motion_policy`'s load-shed
+        // latch — so the status can never claim animating=true while the
+        // live policy is Reduced (post-merge re-audit).
+        let raw_focused = self.windows.get(&wid).is_some_and(|ws| ws.focused);
+        let focused = self.motion_focus(wid, raw_focused);
+        let motion = self.motion_policy(focused);
         Ok(format!(
-            "config_enabled={} session_override={} effective={}",
+            "config_enabled={} session_override={} effective={} engine={} active={} scope={} \
+             focused={} animating={}{}",
             self.config.matrix_rain_enabled(),
             over,
             self.session_rain_enabled(sid),
+            engine,
+            active,
+            scope,
+            focused,
+            motion.animate(crate::motion::MotionEffect::MatrixRain),
+            diag,
         ))
     }
 
@@ -4582,8 +5599,12 @@ impl App {
         // completed transition (windowDid{Enter,Exit}FullScreen local patch),
         // and this block additionally fail-closes each sample: fullscreen
         // FORCES head 0 (the design invariant — the titlebar detaches); a
-        // windowed chrome'd sample of 0 or beyond the sanity cap keeps the
-        // previous accepted band instead of committing the artifact.
+        // windowed chrome'd sample of 0 or beyond the sanity cap restores the
+        // LAST-GOOD-WINDOWED band instead of committing the artifact. The
+        // fallback is `last_windowed_band_pts`, NOT `head_pts`: the applied
+        // `head_pts` is (correctly) 0 for the whole of a fullscreen stay, so
+        // falling back to it on a bad exit sample could only ever "keep" 0 —
+        // the memory slot is what still holds the real band to return to.
         if cfg!(target_os = "macos")
             && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone())
         {
@@ -4591,25 +5612,29 @@ impl App {
             let decorated = w.is_decorated();
             let measured_pts = self.apprt.titlebar_band_pts(&w);
             let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
-            let head_pts = accept_titlebar_band_pts(
+            let (head_pts, band_memory_pts) = titlebar_band_decision(
                 measured_pts,
                 fullscreen,
                 decorated,
-                self.windows.get(&wid).map_or(0.0, |ws| ws.head_pts),
+                self.windows
+                    .get(&wid)
+                    .map_or(0.0, |ws| ws.last_windowed_band_pts),
             );
             let head = (head_pts * scale).round() as usize;
-            if let Some(ws) = self.windows.get_mut(&wid)
-                && (ws.head_pts != head_pts || ws.metrics.head != head)
-            {
-                ws.head_pts = head_pts;
-                ws.metrics.head = head;
-                self.backend.set_head(head);
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                // The memory writes unconditionally (it may need to catch up —
+                // e.g. the first windowed sample after attach — while the
+                // applied band is unchanged); the backend retune stays gated
+                // on a real applied change.
+                ws.last_windowed_band_pts = band_memory_pts;
+                if ws.head_pts != head_pts || ws.metrics.head != head {
+                    ws.head_pts = head_pts;
+                    ws.metrics.head = head;
+                    self.backend.set_head(head);
+                }
             }
         }
-        let (rows, cols, hud_cap) = self.grid_dims_for(wid, size);
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.hud_cap = hud_cap;
-        }
+        let (rows, cols) = self.grid_dims_for(wid, size);
         // Phase 0.5: route through the seam so the window-resize and the control
         // `resize` verb share the one clamp + apply path. `echo_to_window: false`
         // is the KEY (RES-1 regression fix): the window ALREADY has this size (the
@@ -4631,21 +5656,21 @@ impl App {
         );
     }
 
-    /// The grid `(rows, cols, hud_cap)` window `wid` gets for raw window `size` — the
+    /// The grid `(rows, cols)` window `wid` gets for raw window `size` — the
     /// PURE half of [`Self::on_resize`] (which also applies it), shared with
     /// [`Self::apply_window_scale`]'s safety-net gate so both derive from the ONE law.
     ///
     /// W12: grids THIS window from ITS OWN cell metrics (mixed-DPI) — a resize of a
     /// background, different-DPI window must divide by that window's cell box, not
     /// whichever window the shared renderer is currently activated to. The grid
-    /// occupies the window MINUS its independent top/bottom interior borders —
-    /// the inverse of `frame_px`. The `0..cell-1` remainder is absorbed into
-    /// theme-bg bands at present time, so the swapchain can be the RAW window size
-    /// and the compositor never rescales. The tab strip (top) and HUD stack
-    /// (bottom) rows are reserved out of the terminal grid, FIT TO THE WINDOW (≥1
-    /// terminal row; HUD rows drop before the frame would exceed the glass —
-    /// `hud_cap`).
-    fn grid_dims_for(&self, wid: WindowId, size: PhysicalSize<u32>) -> (u16, u16, u16) {
+    /// occupies the window MINUS the `2·pad` interior border — the inverse of
+    /// `frame_px`; this is the PROVEN `aterm_render::pad_split` policy (maximal grid;
+    /// the `0..cell-1` remainder is absorbed into per-edge theme-bg bands at present
+    /// time, so the swapchain can be the RAW window size and the compositor never
+    /// rescales) — the same `cells` as the historical `max(usable/cell, 1)`, now the
+    /// law the ty model + lattice tests pin. The tab strip is reserved out of the
+    /// terminal grid while always leaving at least one terminal row.
+    fn grid_dims_for(&self, wid: WindowId, size: PhysicalSize<u32>) -> (u16, u16) {
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid);
         let cols = aterm_render::pad_split(size.width as usize, pad, cw).cells as u16;
@@ -4659,67 +5684,8 @@ impl App {
             pad,
             ch,
         ) as u16;
-        let hud_cap = hud_cap_for(win_rows, self.tab_strip_rows);
-        let eff_hud = self.hud_rows.min(hud_cap);
-        let rows = win_rows
-            .saturating_sub(self.tab_strip_rows)
-            .saturating_sub(eff_hud)
-            .max(1);
-        (rows, cols, hud_cap)
-    }
-
-    /// `hud_rows` = the TOTAL bottom rows reserved by the HUD = the sum of each ENABLED
-    /// widget's row count (Resources reserves 3, Engine 1). Kept in sync after any toggle
-    /// / config reload.
-    pub(crate) fn recompute_hud_rows(&mut self) {
-        self.hud_rows = self
-            .panels
-            .iter()
-            .filter(|p| p.enabled())
-            .map(|p| p.rows())
-            .sum();
-    }
-
-    /// Whether the panel with `id` is currently enabled (for menu state + toggles).
-    #[must_use]
-    pub(crate) fn panel_enabled(&self, id: hud_bar::PanelId) -> bool {
-        self.panels.iter().any(|p| p.id() == id && p.enabled())
-    }
-
-    /// Toggle a HUD panel on/off, re-gridding every window so the terminal grid
-    /// releases / reclaims the panel's bottom row (the bottom analog of changing
-    /// `tab_strip_rows`). Shared by the View-menu items and config reload. No-op when
-    /// already in the requested state.
-    pub(crate) fn set_panel(&mut self, id: hud_bar::PanelId, on: bool) {
-        let changed = self.panels.iter_mut().any(|p| {
-            if p.id() == id && p.enabled() != on {
-                p.set_enabled(on);
-                true
-            } else {
-                false
-            }
-        });
-        if !changed {
-            return;
-        }
-        self.recompute_hud_rows();
-        // Re-grid each window from its own OS size (the HUD now takes/frees rows),
-        // forcing a fresh present so the band appears/disappears immediately.
-        let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
-            .windows
-            .iter_mut()
-            .filter_map(|(wid, ws)| {
-                ws.last_present = None;
-                ws.next_hud_tick = None; // re-armed by about_to_wait if now on
-                ws.os_window.as_ref().map(|w| (*wid, w.inner_size()))
-            })
-            .collect();
-        for (wid, size) in sized {
-            self.on_resize(wid, size);
-            if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                w.request_redraw();
-            }
-        }
+        let rows = win_rows.saturating_sub(self.tab_strip_rows).max(1);
+        (rows, cols)
     }
 
     /// Live font zoom (Cmd-+/Cmd--/Cmd-0): rebuild the [`Backend`] at `px`, then
@@ -4802,6 +5768,11 @@ impl App {
     /// device-loss fallback from silently losing different subsets of typography,
     /// contrast, opacity, or configured faces.
     pub(crate) fn pin_backend_render_config(&mut self) {
+        self.pin_backend_render_config_core();
+        self.apply_font_config();
+    }
+
+    pub(crate) fn pin_backend_render_config_core(&mut self) {
         self.backend.set_text_shaping(self.text_shaping.clone());
         self.backend.set_text_blending(self.text_blending);
         self.backend.set_font_thicken(self.font_thicken);
@@ -4827,7 +5798,6 @@ impl App {
                 warn_background_material_unimplemented_once();
             }
         }
-        self.apply_font_config();
     }
 
     /// Rebuild the [`Backend`] from the CURRENT `self.font_px` + `self.theme`,
@@ -4838,6 +5808,16 @@ impl App {
     /// reload/zoom never crashes. No-op re-grid without a window (headless).
     #[must_use = "a failed rebuild leaves the prior renderer live and requires caller policy"]
     pub(crate) fn rebuild_backend(&mut self) -> bool {
+        self.rebuild_backend_with_prepared(None)
+    }
+
+    fn rebuild_backend_with_prepared(
+        &mut self,
+        prepared: Option<(
+            aterm_render::Renderer,
+            crate::tray_raster::PreparedChromeFonts,
+        )>,
+    ) -> bool {
         // Preserve the interior padding across the rebuild — a fresh backend starts
         // at `pad == 0`, so a font-zoom / config-reload would otherwise drop the
         // border. (The pad is a device-px constant for the session's scale; it does
@@ -4846,42 +5826,28 @@ impl App {
         let pad = self.backend.pad();
         let pad_top = self.backend.pad_top();
         let head = self.backend.head();
-        match self.backend.ready_mut() {
-            Backend::Gpu(g) => {
-                // In-place: keep the device + EVERY window's swapchain. Dropping the
-                // device would orphan every other window's surface, so the GPU path
-                // rebuilds the font/theme on the SAME device.
-                //
-                // Resolve the candidate face before publishing either family or
-                // theme. A discovery failure therefore leaves the old GPU face AND
-                // its configured-family authority untouched, matching the CPU
-                // candidate-build path below.
-                if let Err(e) =
-                    g.set_font_family_theme(self.font_family.clone(), self.font_px, self.theme)
-                {
-                    eprintln!("aterm-gui: GPU font/theme rebuild failed: {e}");
-                    return false; // keep the current backend; never crash a zoom/reload
-                }
-            }
-            Backend::Cpu(_) => {
-                // The CPU renderer owns no device, so a full rebuild is free and safe.
-                let Some(backend) = build_backend(
-                    self.font_px,
-                    self.use_gpu,
-                    self.theme,
-                    self.font_family.as_deref(),
-                ) else {
-                    return false;
-                };
-                self.backend = crate::BackendSlot::Ready(backend);
-            }
+        let mut prepared_chrome = None;
+        if let Some((mut renderer, chrome)) = prepared {
+            prepared_chrome = Some(chrome);
+            renderer.set_px(self.font_px);
+            self.backend.ready_mut().install_prepared_font(
+                renderer,
+                self.font_family.clone(),
+                self.theme,
+            );
+        } else if let Err(error) = self
+            .backend
+            .rebuild_font_from_admitted(self.font_px, self.theme)
+        {
+            eprintln!("aterm-gui: resident font generation rebuild failed: {error}");
+            return false;
         }
         self.backend.set_pad(pad);
         self.backend.set_pad_top(pad_top);
         self.backend.set_head(head);
         // Re-apply every configured shaping/typography/render/font setting. In
         // particular line_height lands before the re-grid below.
-        self.pin_backend_render_config();
+        self.pin_backend_render_config_core();
         // The atlas/face changed, so every window's offscreen + dirty-gate are stale.
         // Reset the per-window GPU caches (the swapchain stays valid — same device) and
         // the introspection scratch, and force a repaint. NOTE: the swapchains and OS
@@ -4946,7 +5912,11 @@ impl App {
         }
         // The primary face may have changed (family/zoom reload): re-hand the
         // resolved face + bold sibling to the chrome rasterizer.
-        self.sync_chrome_fonts();
+        if let Some(chrome) = prepared_chrome {
+            crate::tray_raster::set_prepared_chrome_fonts(chrome);
+        } else {
+            self.sync_chrome_fonts();
+        }
         // M5: a rebuild re-pinned the bg opacity on the new face; keep the
         // window-level vibrancy (backdrop + opacity flip) in step on the GPU
         // backend. Idempotent — no-op at the solid default / off macOS.
@@ -5069,10 +6039,13 @@ impl App {
         ];
         for (slot, (key, path)) in styled.into_iter().enumerate() {
             let Some(path) = path else { continue };
-            let bytes = match std::fs::read(path) {
+            let bytes = match aterm_render::font_file::read_font_file(std::path::Path::new(path)) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("aterm-gui: config {key}: cannot read {path:?} ({e}); ignored");
+                    eprintln!(
+                        "aterm-gui: config {key}: {path:?} failed bounded font admission \
+                         ({e}); keeping the current working face"
+                    );
                     continue;
                 }
             };
@@ -5082,7 +6055,10 @@ impl App {
                 self.backend.set_styled_font(slot, &bytes)
             };
             if let Err(e) = res {
-                eprintln!("aterm-gui: config {key}: {path:?} rejected ({e}); ignored");
+                eprintln!(
+                    "aterm-gui: config {key}: {path:?} rejected ({e}); \
+                     keeping the current working face"
+                );
             }
         }
         self.backend.set_config_fallback_fonts(&fc.fallback_fonts);
@@ -5149,6 +6125,7 @@ impl App {
             // flipped) theme darkness, so tab labels stay legible on the new backdrop.
             if let Some(handle) = toolbars.get(wid) {
                 crate::toolbar::set_strip_dark(handle, strip_dark);
+                crate::toolbar::set_active_tab_color(handle, self.config.active_tab_color_rgb());
             }
         }
         // This method is also called directly for OS light/dark flips outside
@@ -5302,7 +6279,7 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.win_px.map(|s| (s, (ws.rows, ws.cols))))
         {
-            let (rows, cols, _) = self.grid_dims_for(wid, size);
+            let (rows, cols) = self.grid_dims_for(wid, size);
             if (rows, cols) != cur {
                 self.on_resize(wid, size);
             }
@@ -5352,15 +6329,14 @@ impl App {
     /// the CONTENT of files the config names by path (trail-pack manifests, the
     /// sparkle lexicon, toy packs), and editing such a file then re-saving/
     /// `touch`ing `aterm.toml` is their documented hot-reload path. Compare the
-    /// fresh content fingerprints against the applied ones
-    /// ([`App::path_feed_fps`], written only by [`App::recompute_sparkle`]):
+    /// fresh content fingerprints against the applied worker generation
+    /// ([`App::path_feed_fps`]):
     ///
-    /// * unchanged ⇒ the reload stays a FULL no-op — the dedupe win is kept
+    /// * unchanged ⇒ admission stays a FULL runtime no-op — the dedupe win is kept
     ///   intact (no engine re-diffs, no word-deco reset, no settings-popup
-    ///   churn) for the settings-commit + watcher double reload;
-    /// * changed ⇒ arm `sparkle_dirty` so the pre-frame recompute re-reads
-    ///   every feed (lexicon, toy packs, trail-pack registry — one rebuild
-    ///   covers all three), hard-reset the per-window word decorations ONLY
+    ///   churn), while exact text authority still advances independently;
+    /// * changed ⇒ arm `sparkle_dirty` so the next frame activates the already
+    ///   compiled worker bundle, hard-reset the per-window word decorations ONLY
     ///   when the deco feed (lexicon/toys) changed — a trail-manifest edit
     ///   feeds cursor glow, never decorations — and request repaints so the
     ///   rebuild lands without waiting for organic damage. The remaining
@@ -5370,8 +6346,9 @@ impl App {
         if fresh == self.path_feed_fps {
             return;
         }
+        let previous = std::mem::replace(&mut self.path_feed_fps, fresh);
         self.sparkle_dirty = true;
-        if fresh.deco != self.path_feed_fps.deco {
+        if fresh.deco != previous.deco {
             // v3 §1.1 reset table: a lexicon rebuild is a hard_reset, matching
             // the changed-config path's `sparkle_feed_changed` arm.
             for ws in self.windows.values_mut() {
@@ -5385,19 +6362,81 @@ impl App {
         }
     }
 
-    /// Live config hot-reload (`Wake::ConfigReload`): the user edited
-    /// `~/.config/aterm/aterm.toml` and the watcher saw its mtime change. Re-read +
-    /// VALIDATE the file, then apply the new settings to every live session
-    /// WITHOUT a restart.
+    /// Publish one already-admitted immutable asset generation to the App and
+    /// every existing window. This is the sole post-construction writer of
+    /// [`App::config_assets`]: callers hand it the exact outer Arc carried by a
+    /// versioned config snapshot, and it performs only Arc clones plus scalar
+    /// effects-state installation. All path reads and PNG decoding happened
+    /// before the snapshot reached this seam.
     ///
-    /// VALIDATION / FAIL-SAFE: `load_config` is the same parser the startup path
-    /// uses — a malformed or partial mid-edit file fails to parse, is logged, and
-    /// yields `Config::default()`. We must NOT clobber the running config with
-    /// those defaults, so a parse failure is detected (re-read the raw text and
-    /// re-parse strictly) and the reload is REJECTED, leaving every session
-    /// exactly as it was. A missing/unreadable file is treated the same as a parse
-    /// failure here: a reload that produced all-defaults is a no-op against the
-    /// live state rather than a silent reset to built-ins.
+    /// Pointer identity is intentional. A fresh outer catalog can represent a
+    /// byte-identical `aterm.toml` whose same-path Nyan file changed, or a
+    /// theme-directory-only generation. Both must reach every window before
+    /// the next capture/effect tick. Re-publishing the same Arc is a complete
+    /// no-op, including no redraw request.
+    pub(crate) fn publish_config_assets(
+        &mut self,
+        assets: std::sync::Arc<ConfigAssetCatalog>,
+    ) -> usize {
+        if std::sync::Arc::ptr_eq(&self.config_assets, &assets) {
+            return 0;
+        }
+        self.config_assets = assets;
+        let window_ids = self.windows.keys().copied().collect::<Vec<_>>();
+        let installed = window_ids
+            .into_iter()
+            .filter(|id| self.install_window_config_assets(*id))
+            .count();
+        self.request_redraw_all_windows();
+        installed
+    }
+
+    /// Publish a parsed theme-directory generation produced by the background
+    /// watcher. No filesystem operation occurs here: the event loop swaps one
+    /// immutable catalog, reapplies the engine palette/chrome, and fans the same
+    /// snapshot to Settings and Manual diagnostics.
+    pub(crate) fn reload_theme_catalog(&mut self, themes: std::sync::Arc<ThemeCatalog>) {
+        let before = self.native_config_service.snapshot();
+        let snapshot = self.native_config_service.replace_theme_catalog(themes);
+        if snapshot.revision == before.revision {
+            return;
+        }
+        self.theme_catalog_generation = self.theme_catalog_generation.saturating_add(1);
+        self.publish_config_assets(std::sync::Arc::clone(&snapshot.assets));
+
+        let applied = self
+            .config
+            .applied_terminal_config_for_with_assets(self.os_appearance, &snapshot.assets.themes);
+        for session in self.pool.iter() {
+            term_lock(&session.term).apply_config(&applied);
+        }
+        self.session_factory.terminal_config = Some(applied);
+
+        let theme = self
+            .config
+            .theme_for_with_assets(self.os_appearance, &snapshot.assets.themes);
+        let changed = (theme.fg, theme.bg, theme.cursor, theme.selection)
+            != (
+                self.theme.fg,
+                self.theme.bg,
+                self.theme.cursor,
+                self.theme.selection,
+            );
+        if changed {
+            self.apply_theme_live(theme);
+        }
+        self.publish_native_config_snapshot(&snapshot);
+    }
+
+    /// Apply a worker-prepared exact config observation after the watcher read
+    /// `~/.config/aterm/aterm.toml`. Parsing, path-backed asset loading, and font
+    /// preparation happen off the event loop; this side installs the immutable
+    /// generation into every live session without a restart.
+    ///
+    /// VALIDATION / FAIL-SAFE: malformed, partial, unreadable, or unstable input
+    /// never reaches this typed seam and cannot replace the running config. Valid
+    /// UTF-8 malformed TOML still reaches Manual from the original observation so
+    /// its diagnostics can repair the exact rejected bytes.
     ///
     /// PRECEDENCE (no regression): font size flows through [`resolve_font_px`] —
     /// the SAME `$ATERM_FONT_PX > config > default` order as startup — so an env
@@ -5405,51 +6444,232 @@ impl App {
     /// hot-swapped here (`self.use_gpu` is fixed); only font size, the renderer
     /// theme, and the engine `TerminalConfig` (scrollback/cursor/colours/palette,
     /// diffed by `Terminal::apply_config`) are re-applied.
+    fn request_font_catalog_generation(
+        &mut self,
+        observation: crate::native_config_service::ConfigDiskObservation,
+        config: Config,
+        values: std::collections::BTreeMap<String, String>,
+    ) {
+        self.request_font_catalog_generation_with_assets(observation, config, values, None);
+    }
+
+    fn request_font_catalog_generation_with_assets(
+        &mut self,
+        observation: crate::native_config_service::ConfigDiskObservation,
+        config: Config,
+        values: std::collections::BTreeMap<String, String>,
+        prepared_assets: Option<std::sync::Arc<ConfigAssetCatalog>>,
+    ) {
+        let Some(primary) = self.backend.ready().primary_seed() else {
+            self.native_config_service.mark_reconciliation_required();
+            self.reject_config_watch_admission_for(
+                &observation.baseline,
+                crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
+            );
+            aterm_log::warn!("config reload: active renderer has no immutable primary font bytes");
+            return;
+        };
+        let Some(previous_sources) = self.backend.admitted_font_sources() else {
+            self.native_config_service.mark_reconciliation_required();
+            self.reject_config_watch_admission_for(
+                &observation.baseline,
+                crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
+            );
+            aterm_log::warn!("config reload: active renderer font generation is unavailable");
+            return;
+        };
+        let sequence = self.next_font_catalog_sequence.max(1);
+        self.next_font_catalog_sequence = sequence.saturating_add(1);
+        self.requested_font_catalog_sequence = sequence;
+        let request = crate::native_font_catalog::Request {
+            sequence,
+            theme_generation: self.theme_catalog_generation,
+            observation,
+            config,
+            values,
+            px: self.font_px,
+            appearance: self.os_appearance,
+            themes: std::sync::Arc::clone(&self.config_assets.themes),
+            prepared_assets: prepared_assets.filter(|assets| {
+                std::sync::Arc::ptr_eq(&assets.themes, &self.config_assets.themes)
+            }),
+            previous_family: self.font_family.clone(),
+            previous_font_config: self.font_config.clone(),
+            previous_sources,
+            previous_variations: self.font_variations.clone(),
+            previous_dark_nudge: self.font_weight_dark_nudge,
+            primary,
+        };
+        if let Some(lane) = self.native_font_catalog.as_mut() {
+            lane.request(request);
+        } else if self.proxy.is_none() {
+            self.finish_font_catalog_generation(crate::native_font_catalog::prepare(request));
+        } else {
+            self.native_config_service.mark_reconciliation_required();
+            self.reject_config_watch_admission_for(
+                &request.observation.baseline,
+                crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
+            );
+            aterm_log::warn!(
+                "config reload: font catalog worker unavailable; keeping current config"
+            );
+        }
+    }
+
+    pub(crate) fn finish_font_catalog_generation(
+        &mut self,
+        mut completion: crate::native_font_catalog::Completion,
+    ) {
+        if let Some(lane) = self.native_font_catalog.as_mut() {
+            lane.worker_drained();
+        }
+        match crate::native_font_catalog::completion_disposition(
+            self.requested_font_catalog_sequence,
+            completion.sequence,
+            self.theme_catalog_generation,
+            completion.theme_generation,
+        ) {
+            crate::native_font_catalog::CompletionDisposition::Publish => {}
+            crate::native_font_catalog::CompletionDisposition::RejectStaleConfig => return,
+            crate::native_font_catalog::CompletionDisposition::ReprepareLatestTheme => {
+                self.request_font_catalog_generation(
+                    completion.observation,
+                    completion.config,
+                    completion.values,
+                );
+                return;
+            }
+        }
+        if let Some(fonts) = completion.fonts.as_mut() {
+            fonts.renderer.set_px(self.font_px);
+        }
+        self.apply_prepared_config_generation(completion.into_generation());
+    }
+
+    #[cfg(test)]
     pub(crate) fn reload_config(&mut self) {
         // Re-read + strictly re-parse. A parse error (malformed/partial mid-edit
         // file) or an unreadable/absent file is REJECTED so the live config is
         // never replaced by defaults; the previous config stays intact.
         let Some(path) = config_path() else { return };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => {
-                aterm_log::warn!(
-                    "config reload: {} unreadable ({e}); keeping current config",
-                    path.display()
-                );
-                return;
-            }
-        };
-        let config: Config = match toml::from_str(&text) {
-            Ok(c) => c,
-            Err(e) => {
-                aterm_log::warn!(
-                    "config reload: {} is invalid ({e}); keeping current config",
-                    path.display()
-                );
-                return;
-            }
-        };
-        let config_snapshot = match self.sync_native_config_external(text.clone()) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                // A durable Settings write owns the config lane. Its completion
-                // re-wakes reload after the queued external text is admitted.
-                return;
-            }
+        // One stable read supplies Manual, strict parsing, and the versioned
+        // service. Sharing the bytes and file-generation baseline closes the
+        // watcher race where each consumer could previously see a different
+        // edit. Malformed-but-UTF-8 bytes still reach a clean Manual buffer and
+        // its diagnostics; the running Config changes only after strict parse.
+        let observation = match crate::native_config_service::VersionedConfigService::observe_path(
+            &path, false,
+        ) {
+            Ok(observation) => observation,
             Err(error) => {
+                aterm_log::warn!(
+                    "config reload: {error}; keeping current config and Manual document"
+                );
+                return;
+            }
+        };
+        self.reload_config_observation(observation);
+    }
+
+    /// Apply the exact bounded generation sampled by the config host. Watcher
+    /// callers must use this entry point instead of reopening the logical path:
+    /// acknowledgement and application then refer to one immutable observation.
+    pub(crate) fn reload_config_observation(
+        &mut self,
+        observation: crate::native_config_service::ConfigDiskObservation,
+    ) {
+        self.prepare_native_config_external_observation(observation);
+    }
+
+    /// Exact worker-prepared twin of [`Self::reload_config_observation`]. The
+    /// supplied asset catalog is reused only while its theme Arc is still the
+    /// current generation; a theme that overtook persistence is re-resolved by
+    /// the font worker and guarded by the theme-generation ticket.
+    pub(crate) fn reload_prepared_config_observation(
+        &mut self,
+        prepared: crate::native_config_service::PreparedConfigObservation,
+    ) {
+        let crate::native_config_service::PreparedConfigObservation {
+            observation,
+            config,
+            values,
+            assets,
+        } = prepared;
+        if let Err(error) = self.refresh_open_config_editor_observation(&observation) {
+            aterm_log::warn!("config reload: Manual refresh needs attention ({error})");
+        }
+        self.request_font_catalog_generation_with_assets(observation, config, values, Some(assets));
+    }
+
+    pub(crate) fn apply_prepared_config_generation(
+        &mut self,
+        generation: crate::native_font_catalog::PreparedConfigGeneration,
+    ) {
+        if self.native_config_inflight || self.native_config_service.reconciliation_required() {
+            self.defer_prepared_config_generation(generation);
+            if !self.native_config_inflight
+                && let Err(error) = self.pump_native_config()
+            {
+                self.surface_native_config_lane_error(error);
+            }
+            return;
+        }
+        self.apply_prepared_config_generation_unfenced(generation);
+    }
+
+    /// Admit a deferred runtime generation after a reconciliation worker has
+    /// sampled the same exact config baseline. The matching sample is the
+    /// ordering proof that clears the write fence; routing this back through
+    /// [`Self::apply_prepared_config_generation`] would see that still-closed
+    /// fence, defer the same payload again, and reconcile forever.
+    pub(crate) fn apply_reconciled_prepared_config_generation(
+        &mut self,
+        generation: crate::native_font_catalog::PreparedConfigGeneration,
+    ) {
+        debug_assert!(!self.native_config_inflight);
+        debug_assert!(self.native_config_service.reconciliation_required());
+        self.apply_prepared_config_generation_unfenced(generation);
+    }
+
+    fn apply_prepared_config_generation_unfenced(
+        &mut self,
+        generation: crate::native_font_catalog::PreparedConfigGeneration,
+    ) {
+        let crate::native_font_catalog::PreparedConfigGeneration {
+            observation,
+            config,
+            values,
+            assets: prepared_assets,
+            path_feed_fps: fresh_feeds,
+            sparkle: prepared_sparkle,
+            fonts: mut prepared_fonts,
+            warnings: mut font_prepare_warnings,
+        } = generation;
+        let admitted_baseline = observation.baseline.clone();
+        let config_snapshot = match self.native_config_service.synchronize_observation_prepared(
+            observation,
+            config.clone(),
+            values,
+            prepared_assets,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.native_config_service.mark_reconciliation_required();
+                self.reject_config_watch_admission_for(
+                    &admitted_baseline,
+                    crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
+                );
                 aterm_log::warn!("native config service rejected watcher snapshot: {error}");
                 return;
             }
         };
+        self.prepared_sparkle = prepared_sparkle;
 
-        // DEDUPE (the double-reload storm): an in-panel Settings commit writes
-        // the file AND posts `Wake::ConfigReload` immediately, then the mtime
-        // watcher posts a SECOND reload within ~500 ms for the SAME bytes.
-        // Re-applying an identical config is pure side-effect churn — engine
+        // SEMANTIC DEDUPE: re-applying an identical prepared config is pure
+        // side-effect churn — engine
         // re-diffs on every tab, per-window word-deco hard resets, settings
         // popup cancels, a possible font/backend probe — so a parse that
-        // EQUALS the currently applied config stops here (the native snapshot
+        // equals the currently applied config stops here (the native snapshot
         // above still saw the latest raw text, so an in-place formatting-only
         // edit stays synced). Field-by-field `PartialEq`, not an mtime
         // heuristic: a `touch` with unchanged content is equally a no-op.
@@ -5461,9 +6681,15 @@ impl App {
         // still refreshes those feeds when their content fingerprints drifted
         // (`refresh_path_feeds`); only a reload where BOTH the parsed config
         // AND the referenced files are unchanged is the full no-op.
-        let fresh_feeds = config.path_feed_fingerprints();
-        if config == self.config {
+        if config == self.config && prepared_fonts.is_none() {
+            // Semantic equality does not mean transaction equality: comments,
+            // formatting, and explicit-default edits still advance the native
+            // service revision. Fan that snapshot out before returning so the
+            // next Settings patch does not start from a stale base revision.
+            self.publish_config_assets(std::sync::Arc::clone(&config_snapshot.assets));
+            self.publish_native_config_snapshot(&config_snapshot);
             self.refresh_path_feeds(fresh_feeds);
+            self.finish_native_config_external_admission(&admitted_baseline);
             return;
         }
 
@@ -5495,7 +6721,7 @@ impl App {
         // is overwritten below: (a) whether the keys that FEED the word
         // decorations changed (the `[sparkle_words]` table / lexicon inputs, or
         // the theme its palette derives from) — only then is the per-window
-        // `hard_reset` warranted; (b) whether the Settings overlay's editable
+        // `hard_reset` warranted; (b) whether the retired Settings test scaffold's editable
         // field CATALOGUE drifted (keys added/removed/reordered) — only then can
         // an open popup's anchor row point at the wrong control after the
         // rebuild. A value-only edit (e.g. rapid cursor-trail style switching
@@ -5508,6 +6734,7 @@ impl App {
             fresh_feeds.deco,
             self.path_feed_fps.deco,
         );
+        self.path_feed_fps = fresh_feeds;
         let popup_anchors_drifted = {
             let old = crate::prefs::editable_fields(&self.config);
             let new = crate::prefs::editable_fields(&config);
@@ -5526,11 +6753,38 @@ impl App {
         // `App::sync_app_theme_to_appearance`). Resolve the engine/renderer theme for
         // the CURRENT OS appearance so a reload preserves the active light/dark side.
         self.config = config.clone();
+        // Selected-tab color override (`active_tab_color`): pinned UNCONDITIONALLY
+        // on every reload — a pure tab-color edit changes neither theme nor font,
+        // so no rebuild branch below would re-sync the native strip. The setter is
+        // an idempotent atomic compare, so the no-change case costs nothing.
+        {
+            let override_rgb = self.config.active_tab_color_rgb();
+            for handle in self._toolbars.values() {
+                crate::toolbar::set_active_tab_color(handle, override_rgb);
+            }
+            // The in-grid strip caches painted rows behind a fingerprint that
+            // does not carry the override; drop the cache so the next splice
+            // repaints with the new active-tab color. The PRESENT early-out
+            // must be bypassed too (post-merge re-audit): the RepaintKey's
+            // strip term carries titles/count, not this override, so without
+            // `last_present = None` a pure tab-color edit could sit invisible
+            // until some other change forced a present (the E3 rebuild branch
+            // already clears both).
+            for ws in self.windows.values_mut() {
+                ws.last_strip_fp = None;
+                ws.last_present = None;
+            }
+        }
+        // `motion = "reduced"` is a live accessibility edge. Reconcile it at the
+        // same generation-admission point that publishes the new config: every
+        // retained glide lands immediately on its pinned target and is dropped,
+        // instead of surviving until another wheel input or deadline tick.
+        self.settle_reduced_scroll_motion(std::time::Instant::now());
         // Serious mode is an effective App projection, not a rewrite of any
         // individual effect setting. Apply its edge immediately after publishing the
         // new source config so a disable restores values from THIS generation.
         self.apply_serious_mode(config.serious_mode_or_default());
-        self.config_assets = std::sync::Arc::clone(&config_snapshot.assets);
+        self.publish_config_assets(std::sync::Arc::clone(&config_snapshot.assets));
         self.publish_native_config_snapshot(&config_snapshot);
         // Smart-title Settings are live authority, not restart-only metadata: revoke
         // queued provider work immediately and repaint tab/window composition even if
@@ -5541,10 +6795,6 @@ impl App {
         // keystroke. Keeps a live style/predict change taking effect immediately.
         self.predict_mode_cache = None;
         self.nyan_style_cache = None;
-        // File IO + PNG decode belong to the pre-armed sprite worker. Config
-        // reload merely publishes the newest raw path through a bounded,
-        // nonblocking channel; any older completion is generation-rejected.
-        crate::nyan_sprite_loader::sync_config(self);
         // Sparkle words: a reload can change `languages`/category toggles/lexicon, so
         // mark the App cache stale (rebuilt before the next frame) and flush each
         // window's cached occurrence set — otherwise, on a byte-idle grid, the stale
@@ -5568,15 +6818,15 @@ impl App {
         // that actually feed the decorations changed (`sparkle_feed_changed`
         // above). An unrelated edit (a cursor-trail style switch, a font tweak)
         // must not wipe every window's live decorations mid-animation — the
-        // collateral half of the double-reload audit.
+        // collateral half of the semantic-admission audit.
         if sparkle_feed_changed {
             for ws in self.windows.values_mut() {
                 ws.word_decos.hard_reset();
             }
         }
-        // Keep any OPEN Settings overlay authoritative against the freshly-loaded config:
-        // a live hot-reload (the file watcher OR an in-panel edit's own
-        // `Wake::ConfigReload`) rebuilds the displayed control list from the new
+        // Keep any OPEN retired Settings test scaffold authoritative against the
+        // freshly admitted worker generation: a live watcher observation rebuilds
+        // the displayed control list from the new
         // values, preserving the selection/scroll. Uses the local `config` (not
         // `self.config`) so it doesn't double-borrow `self` against `windows`.
         let trail_pack_ids = self.config_assets.trail_packs.ids.clone();
@@ -5610,7 +6860,10 @@ impl App {
                 s.rebuild_fields(crate::prefs::editable_fields(&config), band, wrap);
             }
         }
-        let applied_tc = config.applied_terminal_config_for(self.os_appearance);
+        let applied_tc = config.applied_terminal_config_for_with_assets(
+            self.os_appearance,
+            &config_snapshot.assets.themes,
+        );
         for s in self.pool.iter() {
             term_lock(&s.term).apply_config(&applied_tc);
         }
@@ -5621,6 +6874,14 @@ impl App {
         // (Existing sessions keep their spawn-time policy; new Cmd-T tabs pick this up.)
         self.session_factory.allow_kitty_file_transfer =
             config.allow_kitty_file_transfer.unwrap_or(false);
+        // Shell policy is also spawn-time, not process-time: preserve the
+        // launch CLI/environment override, otherwise publish the reloaded
+        // config to the factory so the next Cmd-T session uses it. Existing
+        // PTYs necessarily keep the command they were spawned with.
+        self.session_factory.shell_override = resolve_shell_override(&config);
+        self.session_factory
+            .shell_args
+            .clone_from(&config.shell_args);
         // `temporal_recording` is likewise a session-factory opt-in (not part of
         // `TerminalConfig`); refresh it on reload so a live edit reaches new Cmd-T
         // tabs. Existing sessions keep their spawn-time wiring. Mirrors the default.
@@ -5652,10 +6913,11 @@ impl App {
         // W5h: an unresolvable `font_family` warns (like themes) instead of
         // silently reducing to the built-in candidates. Uses the same
         // effective family (env > config > platform default) the rebuild will try.
-        let effective_family_now = crate::effective_font_family(config.font_family.as_deref());
-        if let Some(w) = Config::font_family_warning(effective_family_now.as_deref()) {
-            warns.push(format!("config {w}"));
-        }
+        let requested_effective_family = prepared_fonts
+            .as_ref()
+            .and_then(|prepared| prepared.family.clone())
+            .or_else(|| self.font_family.clone());
+        warns.append(&mut font_prepare_warnings);
         // An unrecognized `cursor_trail_style` silently disables the whole cursor
         // effect (the `glow_config` gate) — warn on the same banner instead of
         // letting the typo'd style just make the trail vanish.
@@ -5683,8 +6945,10 @@ impl App {
         // W6: re-resolve the per-style / fallback font keys (families → paths),
         // riding the same banner for unresolvable entries. The diff against the
         // cached resolved config decides below whether the backend is touched.
-        let (new_font_config, font_cfg_warns) = FontConfig::from_config(&config);
-        warns.extend(font_cfg_warns);
+        let new_font_config = prepared_fonts
+            .as_ref()
+            .map(|prepared| prepared.config.clone())
+            .unwrap_or_else(|| self.font_config.clone());
         for w in &warns {
             eprintln!("aterm-gui: {w}");
         }
@@ -5700,7 +6964,8 @@ impl App {
         self.option_as_meta = config.option_as_meta_or_default();
         self.confirm_multiline_paste = config.confirm_multiline_paste_or_default();
         // Copy-on-select is a live input-policy toggle: a reload that flips it takes
-        // effect on the next selection (dropping the key reverts to the off default).
+        // effect on the next selection (dropping the key restores the on-by-default
+        // policy).
         self.copy_on_select = config.copy_on_select_or_default();
 
         // Tab-strip rows are window chrome: a change re-splits the window between the
@@ -5729,30 +6994,19 @@ impl App {
             }
         }
 
-        // HUD panels are bottom chrome: toggling any re-grids the window between the
-        // terminal and the HUD stack, exactly like the tab strip above. The master
-        // `show_hud` gates every panel: master off ⇒ the whole band drops, while the
-        // per-panel keys keep their values for when it comes back.
-        let hud_master = config.show_hud_or_default();
-        for id in hud_bar::PanelId::ALL {
-            let want = hud_master && config.hud_enabled(id);
-            if want != self.panel_enabled(id) {
-                self.set_panel(id, want);
-            }
-        }
-
         // Window chrome appearance (titlebar light/dark/auto): re-apply live so a
         // `window_theme` edit takes effect without a restart, AND update the cached
         // field so windows opened AFTER the reload use the new value (attach reads
-        // `self.window_theme`). No-op off macOS. Light/Dark re-apply is idempotent;
-        // the Auto branch clears the forced appearance (see `window_set_appearance`).
+        // `self.window_theme`). Cross-platform: AppKit/DWM/winit each consume the
+        // same value. Light/Dark re-apply is idempotent; Auto clears the forced
+        // appearance and resumes the platform's system-theme behavior.
         let new_window_theme = config.window_theme_or_default();
         if new_window_theme != self.window_theme {
             self.window_theme = new_window_theme;
         }
         {
-            // On Windows, Auto resolves to match the terminal body (see
-            // `window_theme_for_chrome`); elsewhere this is the raw config value.
+            // Every platform receives the raw Light/Dark/Auto policy; Auto keeps
+            // following the live OS appearance through the platform seam.
             let chrome_theme = self.window_theme_for_chrome();
             let apprt = &self.apprt;
             for ws in self.windows.values() {
@@ -5850,14 +7104,14 @@ impl App {
         // font size, and font family. Rebuild the backend ONLY when something it
         // bakes in actually changed (theme, resolved font px, or family) — a
         // metadata-only save (e.g. a comment edit) then costs nothing visible.
-        let new_theme = config.theme_for(self.os_appearance);
+        let new_theme =
+            config.theme_for_with_assets(self.os_appearance, &config_snapshot.assets.themes);
         // Re-derive the AUTO default font with the SAME HiDPI logic
         // `attach_os_window` / `on_scale_factor_changed` use, so editing an
         // unrelated key (e.g. a colour) on a Retina display does NOT shrink the
-        // font back to the FONT_PX (12px) base. An explicit env/config font is honored
-        // verbatim (and re-pins `font_px_explicit`).
-        let font_explicit_now =
-            std::env::var_os("ATERM_FONT_PX").is_some() || config.font_px.is_some();
+        // font back to the FONT_PX (12px) base. An admitted explicit env/config font
+        // is honored verbatim (and re-pins `font_px_explicit`).
+        let font_explicit_now = font_px_is_explicit(&config);
         let new_default_font_px = if font_explicit_now {
             resolve_font_px(&config)
         } else {
@@ -5916,7 +7170,10 @@ impl App {
         // see a spurious change from resolution drift): a `--font`/$ATERM_FONT
         // override set at launch stays in force across a config reload rather than
         // being clobbered by the reloaded config `font_family`.
-        let effective_family = crate::effective_font_family(config.font_family.as_deref());
+        // A rejected configured family is not a request to swap to a built-in
+        // face. Keep the last admitted family/face on glass and surface the exact
+        // admission failure above. A later valid edit advances normally.
+        let effective_family = requested_effective_family;
         let family_changed = effective_family != self.font_family;
         // Text shaping (ligatures / font_features). Update the source of truth BEFORE
         // a possible rebuild so `rebuild_backend` re-applies the NEW shaping; if no
@@ -5945,9 +7202,9 @@ impl App {
         let new_knobs = RenderKnobs::from_config(&config);
         let knob_changes = self.render_knobs.diff(&new_knobs);
         self.render_knobs = new_knobs;
-        // W6 font config: update the source of truth BEFORE a possible rebuild
-        // (rebuild_backend re-applies it); a font-config-only edit rides the
-        // appearance push branch below.
+        // W6 font config: update the source of truth before installing the
+        // already-prepared renderer generation. Resolving families, admitting
+        // files, and parsing faces all happened on the catalog worker.
         let font_cfg_changed = new_font_config != self.font_config;
         self.font_config = new_font_config;
         // W9 variable-font requests: same source-of-truth-before-rebuild
@@ -5968,8 +7225,13 @@ impl App {
         // Theme-only edits fall to the live fast path below; a rebuild is reserved
         // for changes the backend actually bakes in (font px/family, cell geometry,
         // or a variable-font re-instantiation).
-        let backend_rebuild_needed =
-            font_changed || family_changed || geometry_knob_changed || variations_changed;
+        let prepared_font_refresh = prepared_fonts.is_some();
+        let backend_rebuild_needed = font_changed
+            || family_changed
+            || geometry_knob_changed
+            || variations_changed
+            || font_cfg_changed
+            || prepared_font_refresh;
         // W12 ORDERING (mirrors `set_font_px`): commit the effective px and re-resolve
         // every window's per-window metric authority BEFORE any rebuild re-grids —
         // `on_resize` divides each window by `win_cell_size` (= `ws.metrics`), so a
@@ -6012,8 +7274,13 @@ impl App {
         if backend_rebuild_needed {
             self.theme = new_theme;
             self.font_family = effective_family;
+            let prepared = prepared_fonts
+                .take()
+                .map(|fonts| (fonts.renderer, fonts.chrome));
             let rebuild_succeeded = self
-                .finish_reload_render_transaction_with(reload_render_before, Self::rebuild_backend);
+                .finish_reload_render_transaction_with(reload_render_before, move |app| {
+                    app.rebuild_backend_with_prepared(prepared)
+                });
             // Publish theme-dependent native chrome only after the fallible face
             // commit. Otherwise a rejected family could leave the titlebar on the
             // new theme while the terminal renderer stays on the old one.
@@ -6035,6 +7302,10 @@ impl App {
                     // as apply_theme_live): labels must contrast with the NEW backdrop.
                     if let Some(handle) = toolbars.get(wid) {
                         crate::toolbar::set_strip_dark(handle, strip_dark);
+                        crate::toolbar::set_active_tab_color(
+                            handle,
+                            self.config.active_tab_color_rgb(),
+                        );
                     }
                 }
             }
@@ -6044,10 +7315,10 @@ impl App {
             // fontdue re-parse, atlas drop, per-window re-grid — would be pure
             // waste on the event loop. Push the theme onto the LIVE backend
             // instead; every colour-save while iterating on a scheme (and every
-            // settings-overlay colour edit, which posts its own ConfigReload) is
-            // then a repaint, not a font parse. ENRICHED with our appearance knobs:
-            // a single save can flip the theme AND a shaping/typography/font-config/
-            // render knob, and none of those force a rebuild — apply them live here
+            // native Settings colour edit admitted through the serialized config
+            // lane) is then a repaint, not a font parse. ENRICHED with our appearance knobs:
+            // a single save can flip the theme AND a shaping/typography/render
+            // knob, and none of those force a rebuild — apply them live here
             // too. `apply_theme_live` does all the per-window cache invalidation, so
             // there is no duplicate repaint. (`font_px` was committed above, before
             // the metrics refresh.)
@@ -6065,16 +7336,8 @@ impl App {
             for &change in &knob_changes {
                 self.apply_render_knob(change);
             }
-            // W6: a per-style / fallback font edit re-pins the resolved config.
-            if font_cfg_changed {
-                self.apply_font_config();
-            }
             self.apply_theme_live(new_theme);
-        } else if shaping_changed
-            || typography_changed
-            || font_cfg_changed
-            || !knob_changes.is_empty()
-        {
+        } else if shaping_changed || typography_changed || !knob_changes.is_empty() {
             // Shaping/typography-only edit (no font/theme/family change, so no backend
             // rebuild): push the new settings straight onto the live backend. These
             // flips change glyph APPEARANCE but not cell CONTENT, so every cache that
@@ -6093,13 +7356,6 @@ impl App {
             // unreachable here — it takes the rebuild branch above).
             for &change in &knob_changes {
                 self.apply_render_knob(change);
-            }
-            // W6: a per-style / fallback font edit re-pins the resolved config
-            // (glyph appearance changed, cell content did not — the setters
-            // drop the shared glyph caches / GPU atlas where needed, and the
-            // per-window present caches are invalidated just below).
-            if font_cfg_changed {
-                self.apply_font_config();
             }
             for ws in self.windows.values_mut() {
                 ws.last_present = None;
@@ -6129,16 +7385,14 @@ impl App {
         // config-change work; steady semantic paint stays allocation-free.
         if !backend_rebuild_needed
             && !theme_changed
-            && (shaping_changed
-                || typography_changed
-                || font_cfg_changed
-                || !knob_changes.is_empty())
+            && (shaping_changed || typography_changed || !knob_changes.is_empty())
         {
             self.sync_chrome_fonts();
         }
         // Surface `font_features` that can't take effect, now that the new shaping is
         // on the backend — a no-op becomes a visible hint instead of silent confusion.
         self.warn_font_feature_issues();
+        self.finish_native_config_external_admission(&admitted_baseline);
     }
 
     /// Re-resolve EVERY window's per-window [`MetricsView`] from the live font
@@ -6445,6 +7699,42 @@ copy_on_select = true
 
 #[cfg(test)]
 mod descriptive_title_config_tests {
+
+    /// The TYPING-WAKE dial's config contract (Settings ▸ Cursor & Motion ▸
+    /// "Typing wake"): an absent key takes the engine's own default, `0` is a
+    /// real OFF setting rather than a failure, an absurd value clamps instead of
+    /// escaping, and the whole `u64` domain maps into the closed range — there
+    /// is nothing a config file can write here that reaches the engine unbounded.
+    #[test]
+    fn cursor_trail_wake_dial_defaults_clamps_and_turns_off() {
+        use crate::app_config::Config;
+        let cfg = Config::default();
+        assert!(
+            (cfg.cursor_trail_wake_persist_or_default()
+                - aterm_effects::cursor_glow::NYAN_WAKE_PERSIST)
+                .abs()
+                < 1e-6,
+            "an unset key takes the engine default"
+        );
+        let with = |ms: u64| -> f32 {
+            Config {
+                cursor_trail_wake_ms: Some(ms),
+                ..Config::default()
+            }
+            .cursor_trail_wake_persist_or_default()
+        };
+        assert_eq!(with(0), 0.0, "0 ms is a real OFF setting");
+        assert!((with(600) - 0.6).abs() < 1e-6, "ms → seconds");
+        assert!((with(1_500) - 1.5).abs() < 1e-6, "the ceiling is reachable");
+        assert!(
+            (with(u64::MAX) - 1.5).abs() < 1e-6,
+            "an absurd value clamps, never escapes"
+        );
+        // Round-trips through the real TOML surface the settings writer emits.
+        let parsed: Config = toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
+        assert_eq!(parsed.cursor_trail_wake_ms, Some(900));
+        assert!((parsed.cursor_trail_wake_persist_or_default() - 0.9).abs() < 1e-6);
+    }
     use super::{
         Config, DEFAULT_TITLE_SUMMARY_MODEL, TitleFormat, TitleSummaryProvider,
         TitleSummaryProxyMode,
@@ -6667,11 +7957,34 @@ window_title_format = "description"
 
 #[cfg(test)]
 mod cfg_engine_tests {
-    use super::{Config, MAX_NYAN_SPRITE_FILE_BYTES, NyanSpriteAsset};
+    use super::{
+        Config, MAX_NYAN_SPRITE_FILE_BYTES, MAX_USER_THEME_FILE_BYTES, MAX_USER_THEME_FILES,
+        NyanSpriteAsset, ThemeCatalog, ThemeCatalogWatchError, open_regular_theme_file,
+    };
     use aterm_core::config::BiDiMode;
 
     fn cfg(toml: &str) -> Config {
         toml::from_str(toml).expect("valid toml")
+    }
+
+    #[test]
+    fn shell_override_resolver_keeps_launch_precedence_for_new_sessions() {
+        assert_eq!(
+            super::resolve_shell_override_with(None, Some("/bin/zsh")),
+            Some("/bin/zsh".to_string())
+        );
+        assert_eq!(
+            super::resolve_shell_override_with(
+                Some("/opt/homebrew/bin/fish".to_string()),
+                Some("/bin/zsh")
+            ),
+            Some("/opt/homebrew/bin/fish".to_string())
+        );
+        assert_eq!(
+            super::resolve_shell_override_with(Some(String::new()), Some("/bin/zsh")),
+            Some("/bin/zsh".to_string()),
+            "an empty environment value does not mask the config"
+        );
     }
 
     fn nyan_fixture(name: &str) -> std::path::PathBuf {
@@ -6696,6 +8009,170 @@ mod cfg_engine_tests {
         assert!(!Config::default().serious_mode_or_default());
         assert!(cfg("serious_mode = true").serious_mode_or_default());
         assert!(!cfg("serious_mode = false").serious_mode_or_default());
+    }
+
+    fn theme_fixture_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-theme-catalog-{}-{}-{name}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_theme(path: &std::path::Path, foreground: &str, background: &str) {
+        std::fs::write(
+            path,
+            format!("foreground = {foreground}\nbackground = {background}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn theme_catalog_is_sorted_bounded_safe_and_parse_validated() {
+        let dir = theme_fixture_dir("bounded");
+        for index in (0..(MAX_USER_THEME_FILES + 2)).rev() {
+            write_theme(
+                &dir.join(format!("Theme-{index:03}.conf")),
+                "#ddeeff",
+                "#102030",
+            );
+        }
+        let catalog = ThemeCatalog::discover_in(&dir);
+        let names = catalog.ready_names().collect::<Vec<_>>();
+        assert_eq!(names.len(), MAX_USER_THEME_FILES);
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(names[0], "Theme-000");
+        assert_eq!(names[MAX_USER_THEME_FILES - 1], "Theme-127");
+        assert!(catalog.truncated);
+        assert_ne!(catalog.fingerprint(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn theme_catalog_hides_unsafe_malformed_oversized_and_symlink_entries() {
+        let dir = theme_fixture_dir("invalid");
+        write_theme(&dir.join("Work.conf"), "#123456", "#abcdef");
+        write_theme(&dir.join("dark:Trap.conf"), "#ffffff", "#000000");
+        write_theme(&dir.join(" Bad.conf"), "#ffffff", "#000000");
+        std::fs::write(dir.join("Broken.conf"), "foreground = #ffffff\n").unwrap();
+        let oversized = std::fs::File::create(dir.join("Huge.conf")).unwrap();
+        oversized
+            .set_len((MAX_USER_THEME_FILE_BYTES + 1) as u64)
+            .unwrap();
+        drop(oversized);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("Work.conf"), dir.join("Alias.conf")).unwrap();
+            let fifo = dir.join("Pipe.conf");
+            let fifo_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: `fifo_path` is a valid NUL-terminated path and the return
+            // value is checked before the no-follow/nonblocking open is tested.
+            assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        }
+
+        let catalog = ThemeCatalog::discover_in(&dir);
+        assert_eq!(catalog.ready_names().collect::<Vec<_>>(), ["Work"]);
+        for invalid in ["dark:Trap", " Bad", "Broken", "Huge"] {
+            assert!(
+                catalog.resolve(invalid).is_err(),
+                "{invalid} must fail closed"
+            );
+        }
+        #[cfg(unix)]
+        {
+            assert!(catalog.resolve("Alias").is_err());
+            assert!(
+                open_regular_theme_file(&dir.join("Alias.conf")).is_err(),
+                "the handle-level open must reject a symlink even if it is swapped in after scanning"
+            );
+            assert!(
+                open_regular_theme_file(&dir.join("Pipe.conf")).is_err(),
+                "the nonblocking handle-level open must reject a FIFO without waiting for a writer"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_theme_file_swap_retains_valid_catalog_until_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let dir = theme_fixture_dir("live-file-swap");
+        let work = dir.join("Work.conf");
+        write_theme(&work, "#123456", "#abcdef");
+        let active = ThemeCatalog::try_discover_in(&dir).expect("initial valid catalog");
+        assert!(active.resolve("Work").is_ok());
+
+        let rejected = ThemeCatalog::try_discover_in_after_scan(&dir, || {
+            std::fs::remove_file(&work).unwrap();
+            symlink(dir.join("missing.conf"), &work).unwrap();
+        });
+        assert_eq!(rejected, Err(ThemeCatalogWatchError::FileUnavailable));
+        assert!(
+            active.resolve("Work").is_ok(),
+            "a rejected live generation leaves the prior active theme intact"
+        );
+
+        std::fs::remove_file(&work).unwrap();
+        write_theme(&work, "#fedcba", "#101820");
+        let recovered = ThemeCatalog::try_discover_in(&dir).expect("recovered catalog");
+        assert!(recovered.resolve("Work").is_ok());
+        assert_ne!(recovered, active);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn theme_catalog_has_one_case_insensitive_identity_and_rejects_collisions() {
+        let dir = theme_fixture_dir("case-identity");
+        write_theme(&dir.join("Work.conf"), "#123456", "#abcdef");
+        let catalog = ThemeCatalog::discover_in(&dir);
+        assert_eq!(catalog.ready_names().collect::<Vec<_>>(), ["Work"]);
+        assert_eq!(catalog.resolve("work"), catalog.resolve("WORK"));
+
+        // These can coexist on a case-sensitive host (the in-memory constructor
+        // makes that generation portable to case-insensitive test hosts).
+        // Neither spelling may silently win, because the picker and config
+        // resolver intentionally expose one case-insensitive namespace.
+        let collided = ThemeCatalog::from_schemes([
+            (
+                "Work".to_string(),
+                aterm_types::scheme::builtin("Dracula").unwrap(),
+            ),
+            (
+                "work".to_string(),
+                aterm_types::scheme::builtin("GitHub Light").unwrap(),
+            ),
+        ]);
+        assert!(collided.ready_names().next().is_none());
+        let upper = collided.resolve("Work").unwrap_err();
+        let lower = collided.resolve("work").unwrap_err();
+        assert_eq!(upper, lower);
+        assert!(upper.contains("differ only by ASCII case"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn one_theme_catalog_drives_identical_preview_renderer_and_engine_colors() {
+        let dir = theme_fixture_dir("projection");
+        write_theme(&dir.join("Work.conf"), "#123456", "#abcdef");
+        let catalog = ThemeCatalog::discover_in(&dir);
+        let config = cfg("theme = \"work\"");
+        let scheme = catalog.resolve("Work").unwrap();
+        assert_eq!(catalog.resolve("work").unwrap(), scheme);
+        let renderer = config.theme_for_with_assets(aterm_types::Appearance::Dark, &catalog);
+        let engine =
+            config.applied_terminal_config_for_with_assets(aterm_types::Appearance::Dark, &catalog);
+        assert_eq!(renderer.fg, scheme.to_theme_parts().fg);
+        assert_eq!(renderer.bg, scheme.to_theme_parts().bg);
+        assert_eq!(engine.default_foreground, scheme.foreground);
+        assert_eq!(engine.default_background, scheme.background);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -6732,6 +8209,29 @@ mod cfg_engine_tests {
     }
 
     #[test]
+    fn preliminary_asset_catalog_never_claims_inline_only_sparkle_authority() {
+        let config = cfg(concat!(
+            "[[sparkle_words.custom]]\n",
+            "words = [\"typedword\"]\n",
+            "burst = { kind = \"nova\", chance = 100 }\n",
+        ));
+        assert!(
+            config
+                .prepare_sparkle_runtime()
+                .consumer_capabilities()
+                .nova_burst,
+            "negative control: the authored inline recipe has a real consumer"
+        );
+        assert!(
+            config
+                .resolve_asset_catalog()
+                .sparkle_spec_consumers
+                .is_none(),
+            "a catalog that has not compiled Toy Packs must remain explicitly unobserved"
+        );
+    }
+
+    #[test]
     fn nyan_asset_missing_or_oversized_source_is_explicit_invalid() {
         let missing = nyan_fixture("missing");
         let catalog = config_with_nyan(&missing).resolve_asset_catalog();
@@ -6753,6 +8253,43 @@ mod cfg_engine_tests {
                 if bounded_reason.contains("exceeds")
         ));
         let _ = std::fs::remove_file(oversized);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nyan_asset_refuses_writerless_fifo_and_final_symlink() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let fifo = nyan_fixture("writerless-fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: `fifo_c` is a live NUL-terminated pathname and mkfifo retains
+        // no pointer. `nyan_fixture` gives this test a unique final component.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert!(
+            matches!(
+                config_with_nyan(&fifo).resolve_asset_catalog().nyan_sprite,
+                NyanSpriteAsset::Invalid { .. }
+            ),
+            "a writerless FIFO must fail immediately instead of parking config admission"
+        );
+
+        let target = nyan_fixture("symlink-target");
+        let linked = nyan_fixture("symlink-final");
+        std::fs::write(&target, b"not consulted").expect("write symlink target");
+        std::os::unix::fs::symlink(&target, &linked).expect("create final symlink");
+        assert!(
+            matches!(
+                config_with_nyan(&linked)
+                    .resolve_asset_catalog()
+                    .nyan_sprite,
+                NyanSpriteAsset::Invalid { .. }
+            ),
+            "a final-component symlink must not be followed"
+        );
+
+        let _ = std::fs::remove_file(fifo);
+        let _ = std::fs::remove_file(linked);
+        let _ = std::fs::remove_file(target);
     }
 
     #[test]
@@ -6868,6 +8405,70 @@ mod cfg_engine_tests {
         assert!(warns[1].contains("fallback_fonts"));
     }
 
+    /// UI apply fail-safe: an authored path which fails bounded admission is a
+    /// rejected replacement, not an instruction to clear the last working face.
+    /// The exact size policy reaches the Settings/Manual diagnostic.
+    #[test]
+    fn w6_rejected_oversized_face_preserves_last_working_font() {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-font-config-oversized-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("oversized.ttf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(aterm_render::font_file::MAX_FONT_FILE_BYTES as u64 + 1)
+            .unwrap();
+        let config = cfg(&format!(
+            "font_family_bold = {}\n",
+            super::toml_basic_string(&path.to_string_lossy())
+        ));
+        let (mut next, warnings) = super::FontConfig::from_config(&config);
+        let mut working = super::FontConfig::default();
+        working.styled_paths[0] = Some("/admitted/working-bold.ttf".to_string());
+        next.preserve_rejected_from(&config, &working);
+
+        assert_eq!(next.styled_paths[0], working.styled_paths[0]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("font_family_bold"), "{warnings:?}");
+        assert!(
+            warnings[0].contains(&format!(
+                "font file exceeds the {}-byte limit",
+                aterm_render::font_file::MAX_FONT_FILE_BYTES
+            )),
+            "{warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn w6_writerless_fifo_is_diagnosed_without_entering_live_font_config() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("aterm-font-config-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("face.fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the CString is live for the call and the private fixture path
+        // does not alias another test's FIFO.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let config = cfg(&format!(
+            "font_family_italic = {}\n",
+            super::toml_basic_string(&path.to_string_lossy())
+        ));
+        let (resolved, warnings) = super::FontConfig::from_config(&config);
+        assert!(resolved.styled_paths[1].is_none());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("font_family_italic"));
+        assert!(warnings[0].contains("not an admissible font"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Focus-boost default — ON (the anti-starvation lane costs nothing when
     /// idle and only touches the shell root + conhost), and the opt-out
     /// spelling `focus_boost = false` is honoured.
@@ -6928,19 +8529,50 @@ mod cfg_engine_tests {
     }
 
     #[test]
-    fn bidi_explicit_and_case_insensitive() {
-        let tc = cfg("bidi = \"Explicit\"").terminal_config().unwrap();
-        assert_eq!(tc.bidi.mode, BiDiMode::Explicit);
+    fn cursor_style_runtime_is_trimmed_and_ascii_case_insensitive() {
+        use aterm_core::terminal::CursorStyle;
+
+        for (source, expected) in [
+            ("cursor_style = \" BAR \"", CursorStyle::BlinkingBar),
+            (
+                "cursor_style = \"Beam\"\ncursor_blink = false",
+                CursorStyle::SteadyBar,
+            ),
+            (
+                "cursor_style = \"Underline\"\ncursor_blink = false",
+                CursorStyle::SteadyBar,
+            ),
+        ] {
+            assert_eq!(
+                cfg(source).terminal_config().unwrap().cursor_style,
+                expected,
+                "registered spelling must resolve identically in the runtime: {source}"
+            );
+        }
     }
 
     #[test]
-    fn ambiguous_width_wide_maps_to_double() {
-        let tc = cfg("ambiguous_width = \"wide\"").terminal_config().unwrap();
+    fn bidi_runtime_is_trimmed_case_insensitive_and_accepts_registered_aliases() {
+        let tc = cfg("bidi = \" Explicit \"").terminal_config().unwrap();
+        assert_eq!(tc.bidi.mode, BiDiMode::Explicit);
+        let tc = cfg("bidi = \" ON \"").terminal_config().unwrap();
+        assert_eq!(tc.bidi.mode, BiDiMode::Implicit);
+    }
+
+    #[test]
+    fn ambiguous_width_runtime_is_trimmed_case_insensitive_and_accepts_aliases() {
+        let tc = cfg("ambiguous_width = \" wide \"")
+            .terminal_config()
+            .unwrap();
         assert!(tc.ambiguous_width_double);
-        let tc = cfg("ambiguous_width = \"narrow\"")
+        let tc = cfg("ambiguous_width = \" NARROW \"")
             .terminal_config()
             .unwrap();
         assert!(!tc.ambiguous_width_double);
+        let tc = cfg("ambiguous_width = \" DOUBLE \"")
+            .terminal_config()
+            .unwrap();
+        assert!(tc.ambiguous_width_double);
     }
 
     #[test]
@@ -7149,11 +8781,11 @@ mod cfg_engine_tests {
         assert!(!tc.allow_palette_reconfigure);
     }
 
-    /// Sparkle words are ON by default with EVERY category — an absent `[sparkle_words]`
-    /// table materializes the defaults (profanity + feline + orca + bare-`cat`), and an
-    /// explicit `enabled = false` still fully opts out.
+    /// The two live Sparkle-word products are ON by default—an absent
+    /// `[sparkle_words]` table enables profanity + feline + bare-`cat`; retained
+    /// Orca config stays suspended, and an explicit master-off fully opts out.
     #[test]
-    fn sparkle_words_default_on_all_categories() {
+    fn sparkle_words_default_on_for_the_two_live_products() {
         let deco = Config::default()
             .sparkle_deco_config()
             .expect("sparkle words are ON by default (absent table → defaults)");
@@ -7183,11 +8815,9 @@ mod cfg_engine_tests {
         assert_eq!(deco.ink_strength, 0.75);
         assert_eq!(deco.ink_sweep_ms, 2200);
         assert!(!deco.ink_loop, "one sweep per appearance by default");
-        // v2.1 feline sub-keys: peeking cat + idle life + gaze + magic all
-        // default ON (§10).
+        // Cat is the only graphic mode. Retired compatibility keys do not enter
+        // the runtime effects carrier at all.
         assert_eq!(deco.feline_style, crate::word_decorations::FelineStyle::Cat);
-        assert!(deco.feline_idle, "blink/twitch one-shots on by default");
-        assert!(deco.feline_gaze, "cursor gaze on by default");
         assert!(deco.feline_magic, "Fortune/Nebula windows on by default");
     }
 
@@ -7201,6 +8831,11 @@ mod cfg_engine_tests {
             crate::word_decorations::ProfanityStyle::Rainbow,
             "rainbow is the v3 default"
         );
+        // 10, matching the `supernova_chance` field's DOCUMENTED contract ("Default
+        // 10"). The resolver shipped `unwrap_or(30)` — so the escalation ladder, whose
+        // nuke tier owns the screen for 3.6 s including a 260 ms full-screen flash and
+        // can ignite from a word still being typed, fired three times as often as
+        // documented. This test pinned the code rather than the contract.
         assert_eq!(deco.supernova_chance, 10, "10% escalation by default");
         let deco = cfg("[sparkle_words.profanity]\nstyle = \"nova\"\nsupernova_chance = 250")
             .sparkle_deco_config()
@@ -7221,27 +8856,27 @@ mod cfg_engine_tests {
         );
     }
 
-    /// FIX IV regression: the native style match is case-INsensitive, like
+    /// FIX IV regression: the native style match is trimmed and case-INsensitive, like
     /// the web `set_sparkle_profanity` setter — `style = "Nova"` selects the
     /// classic nova (it must not silently become Rainbow + supernova roll),
     /// `"SPARKLE"` the v1 sparkle.
     #[test]
-    fn sparkle_profanity_style_matches_case_insensitively() {
-        let deco = cfg("[sparkle_words.profanity]\nstyle = \"Nova\"")
+    fn sparkle_profanity_style_matches_trimmed_and_case_insensitively() {
+        let deco = cfg("[sparkle_words.profanity]\nstyle = \" Nova \"")
             .sparkle_deco_config()
             .unwrap();
         assert_eq!(
             deco.profanity_style,
             crate::word_decorations::ProfanityStyle::Nova,
-            "\"Nova\" resolves to the classic nova, not Rainbow"
+            "\" Nova \" resolves to the classic nova, not Rainbow"
         );
-        let deco = cfg("[sparkle_words.profanity]\nstyle = \"SPARKLE\"")
+        let deco = cfg("[sparkle_words.profanity]\nstyle = \" SPARKLE \"")
             .sparkle_deco_config()
             .unwrap();
         assert_eq!(
             deco.profanity_style,
             crate::word_decorations::ProfanityStyle::Sparkle,
-            "\"SPARKLE\" resolves to the v1 sparkle"
+            "\" SPARKLE \" resolves to the v1 sparkle"
         );
         // Unknown strings still fail open to the v3 rainbow default.
         let deco = cfg("[sparkle_words.profanity]\nstyle = \"comet\"")
@@ -7294,6 +8929,41 @@ mod cfg_engine_tests {
         assert!(over.contains("forms = [\"Ultrathink\"]"), "{over}");
         assert!(over.contains("cjk = true"), "{over}");
         assert!(over.contains("forms = [\"猫神\"]"), "{over}");
+    }
+
+    /// Top Settings promises two independent keyword toys. Turning Sparkle Words
+    /// off must suppress every non-feline route, including custom specs that used
+    /// to bypass the profanity flag, while Keyword Kitties remains live.
+    #[test]
+    fn sparkle_words_product_toggle_suppresses_all_non_feline_effects() {
+        let c = cfg(concat!(
+            "[sparkle_words.profanity]\nenabled = false\n",
+            "[sparkle_words.emphasis]\nenabled = true\nextra_words = [\"wow\"]\n",
+            "[[sparkle_words.custom]]\nwords = [\"ultrathink\"]\n",
+            "burst = { kind = \"starburst\", chance = 100 }\n",
+        ));
+        let deco = c
+            .sparkle_deco_config()
+            .expect("keyword kitties remain independently enabled");
+        assert!(!deco.profanity, "built-in sparkle words are off");
+        assert!(!deco.emphasis, "emphasis cannot bypass the product switch");
+        assert!(
+            !deco.orca,
+            "every non-feline class shares the product switch"
+        );
+        assert!(deco.feline, "keyword kitties remain independently on");
+        assert!(
+            !deco.spec_table.has_custom(),
+            "custom and Toy Pack effects cannot bypass the product switch"
+        );
+
+        assert!(
+            cfg("[sparkle_words.profanity]\nenabled = false\n\
+                 [sparkle_words.feline]\nenabled = false")
+            .sparkle_deco_config()
+            .is_none(),
+            "turning both top-level toys off produces no decoration engine"
+        );
     }
 
     #[test]
@@ -7359,6 +9029,77 @@ mod cfg_engine_tests {
     }
 
     #[test]
+    fn render_recompute_uses_only_the_prepared_sparkle_generation() {
+        let pack = write_toy_pack("render-no-host-io", &["preparedword"], "glow");
+        let config = config_with_toy_packs(std::slice::from_ref(&pack), "");
+        let prepared = config.prepare_sparkle_runtime();
+
+        // Make any accidental render-time reopen observable independently of
+        // the counter: the admitted source no longer exists after preparation.
+        std::fs::remove_file(&pack).expect("remove admitted Toy Pack source");
+        super::reset_sparkle_host_prepare_count();
+        let mut app = crate::App::headless_for_test();
+        app.config = config;
+        app.prepared_sparkle = prepared;
+        app.sparkle_dirty = true;
+        super::reset_sparkle_host_prepare_count();
+
+        app.recompute_sparkle();
+        assert_eq!(
+            super::sparkle_host_prepare_count(),
+            0,
+            "render-time recompute must not open/compile any configured feed"
+        );
+        assert!(
+            app.sparkle.as_ref().is_some_and(|resolved| resolved
+                .cfg
+                .spec_table
+                .override_for(aterm_lexicon::form_hash("preparedword"))
+                .is_some()),
+            "the immutable prepared Toy Pack remains active after its source disappears"
+        );
+        let _ = std::fs::remove_dir_all(pack.parent().expect("fixture parent"));
+    }
+
+    #[test]
+    fn prepared_config_apply_does_not_refingerprint_path_feeds() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-prepared-apply-no-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, "# comment-only generation\n").unwrap();
+        let observation =
+            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                .unwrap();
+        let config = Config::default();
+        let assets = config.resolve_asset_catalog();
+        let feeds = config.path_feed_fingerprints();
+        let sparkle = config.prepare_sparkle_runtime();
+        let mut app = crate::App::headless_for_test();
+        super::reset_path_feed_fingerprint_count();
+
+        app.apply_prepared_config_generation(
+            crate::native_font_catalog::PreparedConfigGeneration {
+                observation,
+                config,
+                values: std::collections::BTreeMap::new(),
+                assets,
+                path_feed_fps: feeds,
+                sparkle,
+                fonts: None,
+                warnings: Vec::new(),
+            },
+        );
+        assert_eq!(
+            super::path_feed_fingerprint_count(),
+            0,
+            "the event-loop reducer must consume the worker's immutable fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn malformed_external_lexicon_does_not_drop_valid_toy_pack_layer() {
         let pack = write_toy_pack("lexicon-isolation", &["packstillworks"], "glow");
         let external = pack
@@ -7393,6 +9134,35 @@ mod cfg_engine_tests {
 
         std::fs::remove_dir_all(pack.parent().expect("fixture parent"))
             .expect("remove isolation fixtures");
+    }
+
+    #[test]
+    fn external_lexicon_cap_is_exact_and_enforced_by_the_runtime_loader() {
+        let path = nyan_fixture("lexicon-cap");
+        let prefix = "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"boundedword\"]\n#";
+        let mut exact = prefix.to_string();
+        exact.push_str(
+            &"x".repeat(aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES - prefix.len()),
+        );
+        std::fs::write(&path, &exact).expect("write exact-limit lexicon");
+        let config = cfg(&format!(
+            "[sparkle_words]\nlexicon = {}\n",
+            super::toml_basic_string(&path.to_string_lossy())
+        ));
+        assert!(
+            config
+                .sparkle_override_toml()
+                .is_some_and(|source| source.contains("boundedword")),
+            "a regular lexicon exactly at the cap is admitted"
+        );
+
+        exact.push('x');
+        std::fs::write(&path, exact).expect("write over-limit lexicon");
+        assert!(
+            config.sparkle_override_toml().is_none(),
+            "the same lexicon one byte over the cap is skipped"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -7529,35 +9299,49 @@ mod cfg_engine_tests {
         );
     }
 
-    /// `[sparkle_words.feline]` v2.1 keys round-trip: `style`/`idle`/`gaze`/
-    /// `magic` parse, opt out independently, and unknown styles fall back to
-    /// the peeking cat.
+    /// The legacy paw mode remains parseable as ink-only. The four retired
+    /// feline controls round-trip as source data but never enter live state.
     #[test]
-    fn sparkle_feline_v2_keys_round_trip() {
-        let deco = cfg(
-            "[sparkle_words.feline]\nstyle = \"paw\"\nidle = false\ngaze = false\nmagic = false",
-        )
-        .sparkle_deco_config()
-        .expect("feline table keeps the feature on");
+    fn sparkle_feline_legacy_values_round_trip_without_claiming_removed_effects() {
+        let config = cfg(
+            "[sparkle_words.feline]\nstyle = \"paw\"\nidle = false\ngaze = false\ncolor = \"#112233\"\nintensity = 0.25\nmagic = false",
+        );
+        let feline = config
+            .sparkle_words
+            .as_ref()
+            .and_then(|sparkle| sparkle.feline.as_ref())
+            .expect("compatibility values parse");
+        assert_eq!(feline.idle, Some(false));
+        assert_eq!(feline.gaze, Some(false));
+        assert_eq!(feline.color.as_deref(), Some("#112233"));
+        assert_eq!(feline.intensity, Some(0.25));
+
+        let deco = config
+            .sparkle_deco_config()
+            .expect("feline table keeps the feature on");
         assert_eq!(
             deco.feline_style,
             crate::word_decorations::FelineStyle::Paw,
-            "style = \"paw\" selects the exact v1 path"
-        );
-        assert!(
-            !deco.feline_idle,
-            "idle = false ⇒ no one-shot deadlines ever arm"
-        );
-        assert!(
-            !deco.feline_gaze,
-            "gaze = false ⇒ centered pupils, no tracking"
+            "style = \"paw\" selects the legacy ink-only mode"
         );
         assert!(!deco.feline_magic, "magic = false ⇒ ordinary builds only");
-        // Unknown style values fall back to the peeking cat (documented §10).
+        // Unknown style values fall back to the only graphic mode.
         let deco = cfg("[sparkle_words.feline]\nstyle = \"lion\"")
             .sparkle_deco_config()
             .unwrap();
         assert_eq!(deco.feline_style, crate::word_decorations::FelineStyle::Cat);
+    }
+
+    #[test]
+    fn sparkle_feline_style_runtime_is_trimmed_and_ascii_case_insensitive() {
+        let deco = cfg("[sparkle_words.feline]\nstyle = \" Paw \"")
+            .sparkle_deco_config()
+            .expect("feline table keeps the feature on");
+        assert_eq!(
+            deco.feline_style,
+            crate::word_decorations::FelineStyle::Paw,
+            "the registered cased spelling must select legacy ink-only Paw at runtime"
+        );
     }
 
     /// `[sparkle_words.feline] log` (§F4.7): the STARTER_CONFIG key
@@ -7579,7 +9363,7 @@ mod cfg_engine_tests {
             c.sparkle_deco_config().is_some(),
             "log = false never disables the decorations themselves"
         );
-        let c = cfg("[sparkle_words.feline]\nidle = true");
+        let c = cfg("[sparkle_words.feline]\nmagic = true");
         assert_eq!(
             c.sparkle_words
                 .as_ref()
@@ -7681,6 +9465,78 @@ mod cfg_engine_tests {
             deco.ignore.contains("turbo"),
             "emphasis ignore_words fold (case-folded) into the deny set"
         );
+    }
+
+    #[test]
+    fn prepared_emphasis_capability_matches_scannable_unoverridden_runtime_words() {
+        let capability = |source: &str| {
+            cfg(source)
+                .prepare_sparkle_runtime()
+                .consumer_capabilities()
+                .emphasis_class_default
+        };
+        assert!(capability(
+            "[sparkle_words.emphasis]\nextra_words = [\"megathink\"]\n"
+        ));
+        for source in [
+            "[sparkle_words.emphasis]\nextra_words = []\n",
+            "[sparkle_words.emphasis]\nextra_words = [\"   \"]\n",
+            "[sparkle_words.emphasis]\nextra_words = [\"two words\"]\n",
+            "[sparkle_words.emphasis]\nextra_words = [\"kitty\"]\n",
+            "[sparkle_words.emphasis]\nextra_words = [\"megathink\"]\nignore_words = [\"MEGATHINK\"]\n",
+            concat!(
+                "[sparkle_words.emphasis]\nextra_words = [\"megathink\"]\n",
+                "[[sparkle_words.custom]]\nwords = [\"megathink\"]\n",
+                "graphic = { collection = \"cats\" }\n",
+            ),
+        ] {
+            assert!(
+                !capability(source),
+                "no class-default emphasis match should survive: {source}"
+            );
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("aterm-emphasis-capability-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lexicon = dir.join("lexicon.toml");
+        std::fs::write(
+            &lexicon,
+            concat!(
+                "[[entry]]\nclass = \"emphasis\"\nlang = \"en\"\n",
+                "mode = \"forms\"\nforms = [\"fromfile\"]\n",
+                "[[entry]]\nclass = \"emphasis\"\nlang = \"zh\"\n",
+                "mode = \"forms\"\ncjk = true\nforms = [\"超\"]\n",
+            ),
+        )
+        .unwrap();
+        let path = super::toml_basic_string(&lexicon.to_string_lossy());
+        assert!(capability(&format!("[sparkle_words]\nlexicon = {path}\n")));
+        assert!(
+            !capability(&format!(
+                "[sparkle_words]\nlexicon = {path}\n\
+                 [[sparkle_words.custom]]\nwords = [\"fromfile\"]\n\
+                 graphic = {{ collection = \"cats\" }}\n\
+                 [sparkle_words.emphasis]\nignore_words = [\"超\"]\n"
+            )),
+            "custom ownership plus ignore removes every external default consumer"
+        );
+
+        std::fs::write(
+            &lexicon,
+            concat!(
+                "[[entry]]\nclass = \"emphasis\"\nlang = \"zh\"\n",
+                "mode = \"forms\"\ncjk = true\nforms = [\"超\"]\n",
+            ),
+        )
+        .unwrap();
+        assert!(!capability(&format!("[sparkle_words]\nlexicon = {path}\n")));
+        assert!(capability(&format!(
+            "[sparkle_words]\nlexicon = {path}\n\
+             [sparkle_words.feline]\ncjk_single_char = true\n"
+        )));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -8384,43 +10240,6 @@ mod window_padding_tests {
 }
 
 #[cfg(test)]
-mod hud_fit_tests {
-    use super::hud_cap_for;
-
-    #[test]
-    fn chrome_fits_the_window_and_never_clips() {
-        // Plenty of room: all desired HUD rows fit.
-        assert_eq!(hud_cap_for(100, 1), 98);
-        // Exactly enough for a 4-panel stack + 1-row strip + 1 terminal row.
-        assert_eq!(hud_cap_for(6, 1), 4);
-        // One row too short for 4 panels → cap drops to 3 (bottom panel hidden).
-        assert_eq!(hud_cap_for(5, 1), 3);
-        // Window only fits terminal + strip → no HUD rows.
-        assert_eq!(hud_cap_for(2, 1), 0);
-        assert_eq!(hud_cap_for(1, 0), 0);
-
-        // Invariant across sizes: terminal stays >=1 row AND the composed frame
-        // (terminal + strip + effective HUD) never exceeds the window.
-        for win in 1u16..=40 {
-            for strip in 0u16..=2 {
-                for desired_hud in 0u16..=4 {
-                    let eff = desired_hud.min(hud_cap_for(win, strip));
-                    let term = win.saturating_sub(strip).saturating_sub(eff).max(1);
-                    assert!(term >= 1, "win={win} strip={strip}: terminal underflowed");
-                    if win > strip {
-                        assert!(
-                            term + strip + eff <= win,
-                            "win={win} strip={strip} hud={desired_hud}: frame {} > window",
-                            term + strip + eff
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod headless_boot_metrics_tests {
     #[test]
     fn asymmetric_vertical_padding_round_trips_resize_with_remainder() {
@@ -8429,7 +10248,6 @@ mod headless_boot_metrics_tests {
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
         app.tab_strip_rows = 0;
-        app.hud_rows = 0;
         app.backend.set_pad(12);
         app.backend.set_pad_top(2);
         app.backend.set_head(5);
@@ -8442,11 +10260,11 @@ mod headless_boot_metrics_tests {
         let (cw, ch) = app.win_cell_size(wid);
         let (rows, cols) = (24usize, 80usize);
         let exact = PhysicalSize::new((cols * cw + 24) as u32, (rows * ch + 5 + 2 + 12) as u32);
-        assert_eq!(app.grid_dims_for(wid, exact), (24, 80, 23));
+        assert_eq!(app.grid_dims_for(wid, exact), (24, 80));
 
         let remainder = ch.saturating_sub(1);
         let with_remainder = PhysicalSize::new(exact.width, exact.height + remainder as u32);
-        assert_eq!(app.grid_dims_for(wid, with_remainder), (24, 80, 23));
+        assert_eq!(app.grid_dims_for(wid, with_remainder), (24, 80));
 
         let old_symmetric_rows =
             aterm_render::pad_split((exact.height as usize).saturating_sub(5), 12, ch).cells;
@@ -8720,10 +10538,8 @@ mod reload_dedupe_tests {
         toml::from_str(toml).expect("valid toml")
     }
 
-    /// The reload dedupe's equality gate (`reload_config`'s early return):
-    /// two parses of the same content are EQUAL — so the mtime watcher's
-    /// second `Wake::ConfigReload` for the bytes a Settings commit just wrote
-    /// is a no-op — and equality is PARSE-level, not byte-level, so a
+    /// The prepared-admission dedupe's equality gate: two parses of the same
+    /// content are EQUAL, and equality is semantic rather than byte-level, so a
     /// comment/whitespace-only edit (or a bare `touch`) also dedupes; while a
     /// real one-key edit (the rapid trail-style switch) compares UNEQUAL and
     /// still applies.
@@ -8794,8 +10610,92 @@ mod reload_dedupe_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn path_feed_fingerprints_enforce_the_loader_specific_caps() {
+        assert_eq!(super::MAX_PATH_FEED_OPEN_ATTEMPTS, 17);
+        assert_eq!(super::MAX_PATH_FEED_FINGERPRINT_READ_BYTES, 2_883_601);
+        let dir = std::env::temp_dir().join(format!("aterm-feed-caps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lexicon = dir.join("lexicon.toml");
+        let toy = dir.join("toy.toml");
+        let trail = dir.join("trail.toml");
+        let config = cfg(&format!(
+            "cursor_trail_packs = [{:?}]\n[sparkle_words]\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
+            trail.to_string_lossy(),
+            lexicon.to_string_lossy(),
+            toy.to_string_lossy(),
+        ));
+        let missing = config.path_feed_fingerprints();
+
+        std::fs::write(
+            &lexicon,
+            vec![b'x'; aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(
+            &toy,
+            vec![b'x'; aterm_effects::spec::MAX_TOY_PACK_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(
+            &trail,
+            vec![b'x'; aterm_effects::trail_pack::MAX_TRAIL_PACK_BYTES + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            config.path_feed_fingerprints(),
+            missing,
+            "oversized inputs are rejected exactly like the loaders, not hashed past their caps"
+        );
+
+        std::fs::write(&lexicon, "# admitted lexicon\n").unwrap();
+        std::fs::write(&toy, "# admitted toy manifest bytes\n").unwrap();
+        std::fs::write(&trail, "# admitted trail manifest bytes\n").unwrap();
+        let admitted = config.path_feed_fingerprints();
+        assert_ne!(admitted.deco, missing.deco);
+        assert_ne!(admitted.trail, missing.trail);
+        assert!(
+            aterm_effects::file_feed::read_bounded_regular_utf8(
+                &lexicon,
+                aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES,
+            )
+            .is_ok(),
+            "regular lexicon negative control is admitted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_feed_fingerprint_and_loaders_refuse_a_writerless_fifo() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::env::temp_dir().join(format!("aterm-feed-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        // SAFETY: `path_c` is a live NUL-terminated pathname and mkfifo retains
+        // no pointer. The path is unique to this test process.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let config = cfg(&format!(
+            "cursor_trail_packs = [{0:?}]\n[sparkle_words]\nlexicon = {0:?}\ntoy_packs = [{0:?}]\n",
+            path.to_string_lossy(),
+        ));
+        let fifo_fingerprint = config.path_feed_fingerprints();
+        assert!(
+            config.resolve_trail_pack_catalog().packs.is_empty(),
+            "Trail Pack loader returns without waiting for a FIFO writer"
+        );
+        let _ = config.sparkle_runtime_parts();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            config.path_feed_fingerprints(),
+            fifo_fingerprint,
+            "a FIFO and a missing file are both rejected admissions"
+        );
+    }
+
     /// The BYTE-EQUAL reload path (`refresh_path_feeds`) — the touch-to-reload
-    /// regression proof: (1) a double reload with NOTHING changed anywhere
+    /// regression proof: (1) a repeated exact observation with NOTHING changed anywhere
     /// stays a full no-op, including no word-deco reset (the dedupe's original
     /// win); (2) an edit to the lexicon FILE alone — config bytes identical —
     /// re-arms the pre-frame recompute AND hard-resets the per-window word
@@ -8817,8 +10717,10 @@ mod reload_dedupe_tests {
             pack.display(),
             lex.display()
         ));
-        // The startup/render-loop step: consume the feeds + capture their
-        // fingerprints (the applied state the dedupe compares against).
+        // The startup/worker step: compile feeds and carry their fingerprints
+        // in the same immutable generation; render only activates that bundle.
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.path_feed_fps = app.config.path_feed_fingerprints();
         app.recompute_sparkle();
         assert!(!app.sparkle_dirty, "recompute clears the dirty latch");
 
@@ -8872,7 +10774,8 @@ mod reload_dedupe_tests {
         );
 
         // (3) Trail-manifest edit ⇒ registry re-read WITHOUT a deco reset.
-        app.recompute_sparkle(); // the pre-frame rebuild consumes (2)'s edit
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.recompute_sparkle(); // memory-only activation of (2)'s worker bundle
         seed_scan(&mut app);
         std::fs::write(&pack, "# pack v2\n").unwrap();
         let fresh = app.config.path_feed_fingerprints();
@@ -9409,27 +11312,34 @@ mod matrix_rain_app_tests {
         let mut app = crate::App::headless_for_test();
         assert_eq!(
             app.rain_control(crate::RainCtlOp::Status).as_deref(),
-            Ok("config_enabled=false session_override=none effective=false"),
+            Ok(
+                "config_enabled=false session_override=none effective=false \
+                 engine=none active=false scope=window focused=true animating=true"
+            ),
             "status is a pure read"
         );
         assert_eq!(
             app.rain_control(crate::RainCtlOp::On).as_deref(),
-            Ok("config_enabled=false session_override=on effective=true"),
+            Ok("config_enabled=false session_override=on effective=true \
+                 engine=none active=false scope=window focused=true animating=true"),
         );
         assert_eq!(
             app.rain_control(crate::RainCtlOp::Toggle).as_deref(),
-            Ok("config_enabled=false session_override=off effective=false"),
+            Ok("config_enabled=false session_override=off effective=false \
+                 engine=none active=false scope=window focused=true animating=true"),
         );
         app.config = cfg("[matrix_rain]\nenabled = true");
         app.rain_dirty = true;
         assert_eq!(
             app.rain_control(crate::RainCtlOp::Status).as_deref(),
-            Ok("config_enabled=true session_override=off effective=false"),
+            Ok("config_enabled=true session_override=off effective=false \
+                 engine=none active=false scope=window focused=true animating=true"),
             "the off override keeps winning over the enabled config"
         );
         assert_eq!(
             app.rain_control(crate::RainCtlOp::Off).as_deref(),
-            Ok("config_enabled=true session_override=off effective=false"),
+            Ok("config_enabled=true session_override=off effective=false \
+                 engine=none active=false scope=window focused=true animating=true"),
             "off is idempotent"
         );
     }

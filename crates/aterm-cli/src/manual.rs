@@ -704,7 +704,10 @@ mod tests {
         // "every aterm session" exposes a socket.
         let (page, code) = render(Some("introspection"), None);
         assert_eq!(code, 0);
-        assert!(page.contains("window"), "must scope the socket to the window mode");
+        assert!(
+            page.contains("window"),
+            "must scope the socket to the window mode"
+        );
         assert!(
             page.contains("--headless") || page.contains("ATERM_HEADLESS"),
             "must name the headless socket host"
@@ -731,7 +734,14 @@ mod tests {
             agent.contains("ENV HYGIENE"),
             "agent brief must document env stripping"
         );
-        for token in ["CLAUDE", "ANTHROPIC_", "COPILOT_", "CODEX_", "CURSOR_", "AI_"] {
+        for token in [
+            "CLAUDE",
+            "ANTHROPIC_",
+            "COPILOT_",
+            "CODEX_",
+            "CURSOR_",
+            "AI_",
+        ] {
             assert!(
                 agent.contains(token),
                 "env-hygiene note must name the {token} deny prefix"

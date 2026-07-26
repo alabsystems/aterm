@@ -299,6 +299,36 @@ impl Terminal {
     // Smart Selection API
     // ========================================================================
 
+    /// Text of an ABSOLUTE terminal row (the search index's native coordinate),
+    /// reconstructed from the SAME sources `build_search_index` indexes so a
+    /// snippet equals the line the match was found in: history rows via the
+    /// bounded `get_history_line` read, visible rows via `get_line_text`.
+    /// `None` when `abs` is below the oldest retained row (evicted) or past the
+    /// live viewport. Feeds `search_summary`'s snippet field (fed E-1) without
+    /// depending on the index's soon-to-be-dropped String cache (E-4).
+    #[must_use]
+    pub fn abs_row_text(&self, abs: u64) -> Option<String> {
+        use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
+        let grid = &self.grid;
+        let oldest = grid.oldest_absolute_row();
+        if abs < oldest {
+            return None;
+        }
+        let rel = usize::try_from(abs - oldest).ok()?;
+        let scrollback = grid.scrollback_lines();
+        if rel < scrollback {
+            return grid
+                .get_history_line(rel)
+                .map(|l| line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES));
+        }
+        let visible_row = rel - scrollback;
+        if visible_row >= usize::from(self.rows()) {
+            return None;
+        }
+        let r = i32::try_from(visible_row).ok()?;
+        self.get_line_text(r, None)
+    }
+
     /// Get smart word boundaries at a position on a display-relative row.
     ///
     /// This uses context-aware selection rules to identify semantic text units

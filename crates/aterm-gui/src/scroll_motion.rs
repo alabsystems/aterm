@@ -10,7 +10,9 @@
 //! wrappers), so the M1 PROVE bullets are machine-checked over deliberate
 //! input lattices under plain `cargo test`, and the glide's wake discipline
 //! has an abstract ty twin (`aterm_spec::derive::scroll_glide_model`, checked
-//! by the real Trust `ty` in aterm-spec's `derived_ring_ty`).
+//! by the real Trust `ty` in aterm-spec's `derived_ring_ty`). That same model
+//! includes the host's Full→Reduced settle transition: land at the intended
+//! target and disarm in one edge, with no Reduced-policy deadline retained.
 //!
 //! # Invariants (proven)
 //!
@@ -26,9 +28,10 @@
 //!    monotonically toward the target, and the wrapper disarms (`sample`
 //!    returns `done`, after which the host drops the state → no armed
 //!    deadline, no perpetual wake). Tier-0: `scroll_glide_model` (ty proves
-//!    bounded wakes + disarm-only-at-target at `Buggy=0`, and REQUIRES a
-//!    counterexample from the wake-without-progress mutant at `Buggy=1`);
-//!    Tier-1: the lattice tests below drive this shipping code.
+//!    bounded wakes + disarm-only-at-target + immediate Reduced settlement at
+//!    `Buggy=0`, and REQUIRES a counterexample from the retained-policy-tail
+//!    mutant at `Buggy=1`); Tier-1: the lattice tests below drive this shipping
+//!    code and app_input's conformance test drives the host settle reducer.
 //! 3. **Spring overshoot-freedom** ([`spring_displacement`]): the release
 //!    curve is the CRITICALLY DAMPED solution `x(t) = x0·(1+ωt)·e^{-ωt}`
 //!    (damping ratio ζ = 1 by construction — the `(1+ωt)e^{-ωt}` form IS the
@@ -406,7 +409,9 @@ mod tests {
     //! discipline also carries a Tier-0 abstract twin
     //! (`aterm_spec::derive::scroll_glide_model`) checked by the real Trust
     //! `ty` (proves at `Buggy=0`, counterexample at `Buggy=1`); these tests
-    //! bind the same invariants to the code that ships. Division and
+    //! bind ordinary convergence to the code that ships, while app_input's
+    //! `reduced_motion_settle_conforms_to_scroll_glide_model` binds the policy
+    //! transition. Division and
     //! transcendentals are outside the ty `Expr` language, so the lattices
     //! here are the always-on proof layer for (1) and (3) — the documented
     //! waiver, mirroring the box-drawing rounding law's size-lattice proof.

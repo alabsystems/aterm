@@ -261,9 +261,15 @@ impl ColorPalette {
             match rest.len() {
                 3 => {
                     // #RGB
-                    let r = u8::from_str_radix(rest.get(0..1)?, 16).ok()?.saturating_mul(17);
-                    let g = u8::from_str_radix(rest.get(1..2)?, 16).ok()?.saturating_mul(17);
-                    let b = u8::from_str_radix(rest.get(2..3)?, 16).ok()?.saturating_mul(17);
+                    let r = u8::from_str_radix(rest.get(0..1)?, 16)
+                        .ok()?
+                        .saturating_mul(17);
+                    let g = u8::from_str_radix(rest.get(1..2)?, 16)
+                        .ok()?
+                        .saturating_mul(17);
+                    let b = u8::from_str_radix(rest.get(2..3)?, 16)
+                        .ok()?
+                        .saturating_mul(17);
                     Some(Rgb::new(r, g, b))
                 }
                 6 => {

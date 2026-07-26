@@ -37,6 +37,11 @@ web-time = { workspace = true }
 # consumes the existing backend-neutral SceneAtlas/SpriteQuad contract.
 font8x8 = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Native config-referenced visual feeds are opened O_NONBLOCK/O_NOFOLLOW on
+# Unix before their same-handle regular-file check.
+libc = { workspace = true }
+
 [dev-dependencies]
 # The ty models the sparkle tests run (identity episodes, flash limiter).
 aterm-spec = { workspace = true }

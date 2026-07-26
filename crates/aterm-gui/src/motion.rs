@@ -32,23 +32,24 @@
 //!   shipping resolver itself.
 
 /// The `motion` config value: how aterm decides whether decorative animations
-/// run. `Auto` (the default and the value for any unknown string) follows the
-/// OS "Reduce Motion" accessibility setting.
+/// run. `Auto` (the default and the value for any unknown string) consumes the
+/// platform sample: live Reduce Motion on macOS, an attach-time animations
+/// sample on Windows, and no OS-driven reduction where no query exists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum MotionMode {
-    /// Follow the OS reduce-motion accessibility setting (default).
+    /// Follow the available platform reduce-motion sample (default).
     #[default]
     Auto,
     /// Always animate (an explicit user override of the OS setting).
     Full,
-    /// Never animate (an explicit user override, useful off macOS where the
-    /// OS flag cannot be queried yet).
+    /// Never animate (an explicit user override, especially useful where the
+    /// OS flag is unavailable or cannot be observed live).
     Reduced,
 }
 
 impl MotionMode {
     /// Parse a config string (case-insensitive, trimmed); unknown → [`Self::Auto`]
-    /// (follow the OS — the safe accessibility default).
+    /// (use the platform accessibility sample when available).
     pub(crate) fn parse(s: &str) -> Self {
         let s = s.trim();
         if s.eq_ignore_ascii_case("full") {
@@ -74,8 +75,8 @@ pub(crate) enum MotionEffect {
     /// static path (steady residual spark / cat-paw still draw — they are not
     /// motion).
     WordSparkles,
-    /// The settings-overlay cursor-effect demo lane (`next_demo_tick` arming in
-    /// `about_to_wait`): 0 ⇒ the demo phase freezes (a static preview frame).
+    /// The retained Settings test-scaffold cursor-effect demo lane
+    /// (`next_demo_tick` arming in `about_to_wait`): 0 ⇒ the demo phase freezes.
     SettingsDemo,
     /// The M1 smooth-scroll wheel GLIDE (`App::scroll_wheel_animated`): 0 ⇒ the
     /// viewport snaps instantly (no eased motion, no glide deadlines armed).

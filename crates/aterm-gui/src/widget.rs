@@ -45,7 +45,7 @@ pub(crate) enum TextWeight {
 /// pictograms; `Ui` is the native PROPORTIONAL system face (SF Pro on macOS, mono
 /// fallback elsewhere) for panel chrome; `UiBold` is the UI face with a synthesized
 /// semibold weight for headings. `Mono` is the semantic default — a prim opts INTO the
-/// UI face, so pre-existing cards (About / Palette / HUD) stay pixel-identical.
+/// UI face, so pre-existing cards (About / Palette) stay pixel-identical.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TextFace {
     Mono,
@@ -431,6 +431,31 @@ pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {
 /// wheel's state/marker/commit math AND the per-pixel [`DrawPrim::HsvDisk`] raster
 /// ([`crate::tray_raster`]), so the committed colour and the painted disk can
 /// never disagree.
+/// RGB → HSV (`h` in 0..1 turns, `s`/`v` in 0..1) — the inverse of
+/// [`hsv_to_rgb`], used by the Tab Color wheel to place its marker at the
+/// committed color's polar position on the SAME disk the raster paints.
+pub(crate) fn rgb_to_hsv(rgb: [u8; 3]) -> (f32, f32, f32) {
+    let [r, g, b] = rgb.map(|c| f32::from(c) / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let h = if delta <= f32::EPSILON {
+        0.0
+    } else if (max - r).abs() <= f32::EPSILON {
+        ((g - b) / delta).rem_euclid(6.0) / 6.0
+    } else if (max - g).abs() <= f32::EPSILON {
+        ((b - r) / delta + 2.0) / 6.0
+    } else {
+        ((r - g) / delta + 4.0) / 6.0
+    };
+    let s = if max <= f32::EPSILON {
+        0.0
+    } else {
+        delta / max
+    };
+    (h, s, max)
+}
+
 pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [u8; 3] {
     let h = h.rem_euclid(1.0) * 6.0;
     let f = h.fract();

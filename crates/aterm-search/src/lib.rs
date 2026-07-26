@@ -8,8 +8,16 @@
 //!
 //! - Bloom filter for fast negative lookups (O(1) per trigram check)
 //! - Trigram index for candidate filtering via posting-list intersection
-//! - SparseBitmap (BTreeSet) for line number storage
+//! - SparseBitmap (ascending sorted Vec) for line number storage
 //! - Generic interfaces for integrating with grid/scrollback providers
+//!
+//! ## Lifecycle-Driven Document Identity (E2 redesign)
+//!
+//! [`LifecycleSearchIndex`] wraps the trigram engine behind compact per-epoch
+//! document ids and an explicit grid→index lifecycle event alphabet
+//! ([`SearchLifecycleEvent`]): append/replace/evict/reflow/clear/alt-screen.
+//! Gated by a differential equivalence oracle against the legacy
+//! absolute-row-keyed path (`lifecycle_oracle_tests.rs`).
 //!
 //! ## Streaming Search
 //!
@@ -53,6 +61,8 @@ mod budgeted;
 mod grapheme;
 mod index;
 mod iterators;
+mod lifecycle_driver;
+mod lifecycle_index;
 mod literal;
 pub mod streaming;
 mod types;
@@ -63,8 +73,15 @@ pub use index::{
     DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError,
     max_cached_for_retained,
 };
+pub use lifecycle_driver::SearchLifecycleDriver;
+pub use lifecycle_index::{
+    AbsRowMatch, LifecycleSearchIndex, LifecycleSearchResults, SearchLifecycleEvent,
+    U32PayloadResults, UpsertOutcome,
+};
 pub use types::{DirectedFind, SearchDirection, SearchMatch, SearchResults};
 
+#[cfg(test)]
+mod lifecycle_oracle_tests;
 #[cfg(test)]
 mod tests;
 
@@ -418,6 +435,10 @@ impl TerminalSearch {
     /// qualifying match. `inclusive` controls whether a match exactly at the
     /// anchor qualifies; `wrap` retries from the opposite buffer edge when the
     /// directional suffix/prefix has no match.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "public compatibility surface: each search-policy flag is independently meaningful"
+    )]
     pub fn find_direction_opts(
         &self,
         query: &str,
@@ -504,6 +525,21 @@ impl TerminalSearch {
     /// Clear the search index.
     pub fn clear(&mut self) {
         self.index.clear();
+        self.indexed_scrollback_lines = 0;
+        self.bump_generation();
+    }
+
+    /// Release the index's backing allocations (idle eviction primitive).
+    ///
+    /// Same observable reset as [`clear`](Self::clear) — the index is emptied
+    /// and the generation bumped so any in-flight match coordinates are treated
+    /// as stale — but the grown `HashMap`/`Vec` capacity is actually returned to
+    /// the allocator instead of retained. An idle-eviction policy calls this to
+    /// reclaim a dormant terminal's search footprint; the next indexing pass
+    /// regrows the maps from empty. Use [`clear`](Self::clear) instead when the
+    /// index will immediately be refilled and the peak capacity is worth keeping.
+    pub fn release(&mut self) {
+        self.index.release();
         self.indexed_scrollback_lines = 0;
         self.bump_generation();
     }

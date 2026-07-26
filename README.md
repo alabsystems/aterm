@@ -24,7 +24,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Source release:** the public aterm series starts at `v0.1.0`. This repository
+> **Source release:** this snapshot is `v0.5.0`. This repository
 > contains the buildable product source and authentic product captures for a
 > macOS-first preview. It does **not** include a prebuilt binary, installer,
 > public updater channel, or bundled ALab tool packages.
@@ -42,7 +42,7 @@ cargo build --locked -p aterm
 ```
 
 Confirm the public version with `./target/debug/aterm --version`; it should print
-`aterm 0.1.0`. Build from the workspace rather than using `cargo install`:
+`aterm 0.5.0`. Build from the workspace rather than using `cargo install`:
 aterm's crates are not independently published to crates.io yet. Linux and
 Windows code is present, but macOS is the exercised preview target for this
 first public source release.
@@ -183,7 +183,7 @@ aterm ty --help       # explicit-state specification checker
 aterm trust --help    # compiler toolchain
 ```
 
-That describes ALab's managed environment. The `v0.1.0` source snapshot does
+That describes ALab's managed environment. The `v0.5.0` source snapshot does
 not ship those packages, and tool availability varies by channel and platform.
 
 ## Use aterm in your own project
@@ -374,4 +374,4 @@ Unless a file says otherwise, aterm is licensed under the
 [Apache License 2.0](LICENSE). MIT-licensed project components use
 [LICENSE-MIT](LICENSE-MIT), and bundled or derived third-party material retains
 its own terms. See [NOTICE](NOTICE) for the distribution inventory and
-[PUBLICATION.md](PUBLICATION.md) for the `v0.1.0` source-snapshot boundary.
+[PUBLICATION.md](PUBLICATION.md) for the `v0.5.0` source-snapshot boundary.

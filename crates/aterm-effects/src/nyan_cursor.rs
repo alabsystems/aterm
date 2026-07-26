@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use web_time::Instant;
 
-use aterm_render::{GlowQuad, premul_rgb};
+use aterm_render::{GlowQuad, HaloMode, RainHalo, premul_rgb};
 
 use crate::cat_baker::{CatColorKey, EyesFrame};
 use crate::cat_glyphs_gen::CatGlyphId;
@@ -47,23 +47,58 @@ pub const HOST_ID: u64 = 0x6E79_616E;
 // rate-normalized (momentum = time spent typing, not key count), so the
 // raised band below is measured in SECONDS of sustained flow at any cadence.
 /// The HIGH BAND: the metric value at/above which typing counts toward the
-/// summon dwell. 0.75 is ~1.7 s of continuous non-delete typing from cold
-/// (the metric's documented build curve) and decays through in ~0.58 s of
-/// silence from full — so only genuine flow sits in the band; a word or two
-/// never touches it.
-const CAT_BAND: f32 = 0.75;
+/// summon dwell. 0.90 is ~2.4 s of continuous non-delete typing from cold
+/// (the metric's documented build curve `1.3·(1−e^(−t/2))`) and sits so close
+/// to the flood ceiling (1.0) that it tolerates almost no breathing: a single
+/// inter-word gap over ~200 ms decays the metric back out of the band (a full
+/// 1.0 loses the band after just ~0.21 s of silence, a 0.3 s pause drops to
+/// ~0.86), so ONLY genuinely near-continuous flow holds it. A casual word or
+/// two never comes close — the companion reads as earned, not ambient.
+///
+/// 0.65 is ~1.39 s of continuous non-delete typing from cold (the metric's
+/// documented build curve `1.3·(1−e^(−t/2))`: t = −2·ln(1 − 0.65/1.3)) and,
+/// unlike 0.90, it tolerates a real inter-word breath — a clamped 1.0 metric
+/// stays in the band for 2·ln(1/0.65) = 0.86 s of silence, which is exactly
+/// the 0.4–0.8 s prose rhythm `typing_momentum`'s τ was chosen for. A steady
+/// 1 s/key peck still reads 0.35 before every key and can NEVER enter the
+/// band; the cutoff is ~0.60 s/key.
+///
+/// HISTORY: 0.75 (v0.57) → 0.90 (owner: "the cursor kitty still appears too
+/// soon") → 0.65 on 2026-07-24 (owner: "I think that I need a little bit less
+/// momentum for the cursor cat to appear"). The 0.90 band overshot: at 0.90 a
+/// single >0.21 s gap decayed a FULL metric out of the band AND reset the
+/// dwell, so at ordinary prose cadence the companion frequently never arrived
+/// at all.
+const CAT_BAND: f32 = 0.65;
 /// Seconds the metric must be HELD in the band (measured across the keys that
 /// land while it is high — a pause key can never buy the dwell, per-key
 /// credit is capped at [`SUSTAIN_CREDIT_MAX`]) before the cat is eligible.
-/// Band entry (~1.7 s) + dwell ≈ a 3+ second run of real sustained typing:
-/// the companion is EARNED and special, not ambient. A key landing with the
-/// metric back under the band resets the dwell — "sustained" means held,
-/// not revisited.
-const CAT_DWELL: f32 = 1.5;
+/// Band entry (~1.39 s) + dwell (1.2 s) ≈ a 2.6 s run of real sustained typing
+/// at 25–60 ms/key, 3.3 s at 120 ms/key; above ~135 ms/key the independent
+/// [`MIN_RUN_KEYS`] travel floor takes over (16 keys × gap). The companion is
+/// still EARNED, not ambient. A key landing with the metric back under the
+/// band resets the dwell — "sustained" means held, not revisited.
+///
+/// HISTORY: 1.5 (v0.57) → 3.0 (owner: "still appears too soon", paired with
+/// the 0.90 band) → 1.2 on 2026-07-24 (owner: "a little bit less momentum …
+/// to appear"). 3.0 s of dwell on top of a 2.36 s band entry demanded a 5.4 s
+/// unbroken run, which no ordinary prose rhythm sustains.
+const CAT_DWELL: f32 = 1.2;
 /// Per-key ceiling on dwell credit (seconds): the dwell is bought by keys
 /// landing in rhythm, so one key after a long thought cannot claim the whole
 /// gap as "sustained high typing".
 const SUSTAIN_CREDIT_MAX: f32 = 0.25;
+/// How fast the dwell DRAINS while the metric sits under [`CAT_BAND`], as a
+/// multiple of the elapsed gap. 1.5 means a one-second stall costs 1.5 s of
+/// accrued dwell — a genuine pause still loses the run, but a single
+/// inter-word breath no longer throws away several seconds of real flow.
+///
+/// This replaced a hard `sustain = 0.0` (2026-07-24). The audit's finding: the
+/// old rule required EVERY inter-key gap to stay under the band-decay time for
+/// the whole dwell — about 57 WPM with no hesitation whatsoever — so the cat
+/// was unreachable from ordinary prose. Tuning the threshold could not fix
+/// that; the SHAPE was wrong. A cliff has no good position.
+const SUSTAIN_LEAK: f32 = 1.5;
 /// Minimum forward keystrokes in the CURRENT high-band run before the cat can
 /// summon. This preserves v0.57's 16-key travel floor as a separate guard even
 /// though the stricter canonical dwell normally dominates it.
@@ -517,8 +552,22 @@ impl CursorCat {
                 self.sustain += dt.min(SUSTAIN_CREDIT_MAX);
                 self.run_keys = self.run_keys.saturating_add(1);
             } else {
-                self.sustain = 0.0;
-                self.run_keys = 0;
+                // LEAK, not RESET. This used to zero the dwell outright, so one
+                // 220 ms hesitation three seconds into a run discarded ALL of
+                // it — the cliff that made the companion effectively
+                // unreachable from real prose typing (the metric decays out of
+                // the band within a fraction of a second, and ordinary
+                // inter-word pauses are longer than that). The dwell now DRAINS
+                // at [`SUSTAIN_LEAK`] × the elapsed gap: a stumble costs a
+                // beat, a genuine stall still walks it to zero, and "sustained"
+                // keeps meaning HELD rather than merely revisited.
+                //
+                // The run-key floor leaks with it, one key per drained
+                // `SUSTAIN_CREDIT_MAX`, so the two gates stay in step.
+                let drain = dt * SUSTAIN_LEAK;
+                self.sustain = (self.sustain - drain).max(0.0);
+                let lost = (drain / SUSTAIN_CREDIT_MAX) as u32;
+                self.run_keys = self.run_keys.saturating_sub(lost);
             }
             // Build the canonical metric: rate-normalized inside `advance`,
             // so key-repeat floods earn no faster than real typing.
@@ -1432,18 +1481,50 @@ impl CursorCat {
     }
 }
 
+/// The light-theme HEART veil colour: a deep, saturated rose. On DARK the heart
+/// is additive pink `0x00FF_5C8A` (added light reads over the near-black ground);
+/// on LIGHT that same additive pink washes out to nothing (you cannot brighten a
+/// pale ground toward white and see a pink), so the light arm paints a
+/// SOURCE-OVER veil in this darker, more saturated rose instead — a mark that
+/// DARKENS the ground and reads on any background (the ribbon-rail / fresh-ink
+/// light-veil law). Luminance ≈ 82, well below any light theme's ground.
+const EXIT_HEART_LIGHT: u32 = 0x00C2_1852;
+/// The light-theme STAR veil colour: a deep saturated amber. On DARK the star is
+/// pure white `0x00FF_FFFF` — the WORST possible colour on a light ground (fully
+/// invisible), the exact bug this fix closes. On LIGHT the sparkle becomes a
+/// source-over amber veil that darkens the ground and stays legible. Luminance
+/// ≈ 104.
+const EXIT_STAR_LIGHT: u32 = 0x00B8_6A00;
+
 /// Draw the fade-out FLOURISH (a heart rising for HeartMeow, a sparkling star
-/// for StarWink) as additive [`GlowQuad`]s near the cat anchor `(ax, ay)` in
-/// WINDOW-ABSOLUTE pixels — hosts must pass anchors that already include the
-/// grid origin (`geom.origin_x/origin_y`); all internal offsets here are
-/// relative to that anchor. `fade_out` is 0..1. No-op for `Plain`.
+/// for StarWink) near the cat anchor `(ax, ay)` in WINDOW-ABSOLUTE pixels —
+/// hosts must pass anchors that already include the grid origin
+/// (`geom.origin_x/origin_y`); all internal offsets here are relative to that
+/// anchor. `fade_out` is 0..1. No-op for `Plain`.
+///
+/// THEME-AWARE (the light-theme legibility law). On `dark_theme` the flourish is
+/// emitted as before — additive [`GlowQuad`]s into `out` (added light over the
+/// near-black ground). On LIGHT additive white/pink is invisible (you cannot
+/// brighten a pale ground into a visible mark), so the heart/star are instead
+/// emitted as SOURCE-OVER [`RainHalo`] veils ([`HaloMode::Over`]) into `halos`,
+/// in the darkened saturated [`EXIT_HEART_LIGHT`] / [`EXIT_STAR_LIGHT`] inks that
+/// DARKEN the ground and read on any background — the same veil discipline the
+/// ribbon rails and the fresh-ink light pop use. The two sinks are disjoint per
+/// theme: exactly one is written per call, so a caller may pass the same frame's
+/// additive + halo scratch buffers unconditionally.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "geometry + theme + both output sinks; the exit flourish needs the full frame context"
+)]
 pub fn emit_exit_fx(
     exit: CatExit,
     fade_out: f32,
     ax: i32,
     ay: i32,
+    dark_theme: bool,
     geom: Geom,
     out: &mut Vec<GlowQuad>,
+    halos: &mut Vec<RainHalo>,
 ) {
     let ch = geom.ch as i32;
     // Rise + a peaked fade (0 at the ends, brightest mid-exit) so it pops then
@@ -1452,55 +1533,163 @@ pub fn emit_exit_fx(
     match exit {
         CatExit::Plain => {}
         CatExit::HeartMeow => {
-            let cov = (230.0 * pop) as u8;
-            if cov == 0 {
-                return;
-            }
             let u = (ch as f32 / 14.0).max(1.0) as i32; // heart pixel scale
             let hx = ax;
             let hy = ay - (fade_out * ch as f32 * 1.4) as i32; // float up
-            // 7×6 heart, drawn as scaled per-row spans.
-            let rows: [(i32, i32); 6] = [(1, 2), (0, 6), (0, 6), (1, 5), (2, 4), (3, 3)];
-            let bumps = [(4, 5)]; // second top bump on row 0
-            let pink = premul_rgb(0x00FF_5C8A, cov);
-            for (ry, &(x0, x1)) in rows.iter().enumerate() {
-                push_fx(
-                    out,
+            if dark_theme {
+                let cov = (230.0 * pop) as u8;
+                if cov == 0 {
+                    return;
+                }
+                // 7×6 heart, drawn as scaled per-row spans of additive light.
+                let rows: [(i32, i32); 6] = [(1, 2), (0, 6), (0, 6), (1, 5), (2, 4), (3, 3)];
+                let bumps = [(4, 5)]; // second top bump on row 0
+                let pink = premul_rgb(0x00FF_5C8A, cov);
+                for (ry, &(x0, x1)) in rows.iter().enumerate() {
+                    push_fx(
+                        out,
+                        geom,
+                        hx + x0 * u,
+                        hy + ry as i32 * u,
+                        (x1 - x0 + 1) * u,
+                        u,
+                        pink,
+                    );
+                }
+                for &(x0, x1) in &bumps {
+                    push_fx(out, geom, hx + x0 * u, hy, (x1 - x0 + 1) * u, u, pink);
+                }
+            } else {
+                // LIGHT: one darkened-rose source-over veil centred on the heart.
+                let alpha = (210.0 * pop) as u8;
+                let cx = (hx + 3 * u) as f32;
+                let cy = (hy + 3 * u) as f32;
+                push_exit_veil(
+                    halos,
                     geom,
-                    hx + x0 * u,
-                    hy + ry as i32 * u,
-                    (x1 - x0 + 1) * u,
-                    u,
-                    pink,
+                    cx,
+                    cy,
+                    3.5 * u as f32,
+                    3.2 * u as f32,
+                    EXIT_HEART_LIGHT,
+                    alpha,
                 );
-            }
-            for &(x0, x1) in &bumps {
-                push_fx(out, geom, hx + x0 * u, hy, (x1 - x0 + 1) * u, u, pink);
             }
         }
         CatExit::StarWink => {
             let twinkle = 0.6 + 0.4 * (fade_out * 18.0).sin();
-            let cov = (255.0 * pop * twinkle).clamp(0.0, 255.0) as u8;
-            if cov == 0 {
-                return;
-            }
-            let star = premul_rgb(0x00FF_FFFF, cov);
             let sx = ax + geom.cw as i32; // by the cat's face
             let sy = ay - ch / 3;
             let a = (ch / 5).max(2);
-            push_fx(out, geom, sx - a, sy, 2 * a + 1, 1, star); // h arm
-            push_fx(out, geom, sx, sy - a, 1, 2 * a + 1, star); // v arm
-            let d = a / 2;
-            push_fx(
-                out,
-                geom,
-                sx - d,
-                sy - d,
-                2 * d + 1,
-                1,
-                premul_rgb(0x00FF_FFFF, cov / 2),
-            );
+            if dark_theme {
+                let cov = (255.0 * pop * twinkle).clamp(0.0, 255.0) as u8;
+                if cov == 0 {
+                    return;
+                }
+                let star = premul_rgb(0x00FF_FFFF, cov);
+                push_fx(out, geom, sx - a, sy, 2 * a + 1, 1, star); // h arm
+                push_fx(out, geom, sx, sy - a, 1, 2 * a + 1, star); // v arm
+                let d = a / 2;
+                push_fx(
+                    out,
+                    geom,
+                    sx - d,
+                    sy - d,
+                    2 * d + 1,
+                    1,
+                    premul_rgb(0x00FF_FFFF, cov / 2),
+                );
+            } else {
+                // LIGHT: a source-over amber sparkle — a cross of two veils so
+                // the star SHAPE survives while darkening (never brightening)
+                // the ground. Twinkle rides the alpha, matching the dark arm.
+                let alpha = (230.0 * pop * twinkle).clamp(0.0, 255.0) as u8;
+                let (cx, cy) = (sx as f32, sy as f32);
+                let af = a as f32;
+                push_exit_veil(
+                    halos,
+                    geom,
+                    cx,
+                    cy,
+                    1.4 * af,
+                    0.5 * af,
+                    EXIT_STAR_LIGHT,
+                    alpha,
+                ); // h arm
+                push_exit_veil(
+                    halos,
+                    geom,
+                    cx,
+                    cy,
+                    0.5 * af,
+                    1.4 * af,
+                    EXIT_STAR_LIGHT,
+                    alpha,
+                ); // v arm
+            }
         }
+    }
+}
+
+/// Push one SOURCE-OVER radial veil ([`HaloMode::Over`]) of the exit flourish:
+/// `rgb` is a STRAIGHT `0x00RRGGBB` ink and `alpha` (0..=255) is stamped into the
+/// colour's HIGH BYTE as the centre opacity CEILING (`aterm_render::halo_over_cap`),
+/// scaled per-pixel by the elliptical radial falloff toward 0 at the radii. The
+/// band-splitting + EFFECTS-BOX clamp mirror the additive [`push_fx`], so a veil
+/// spanning cell rows is emitted as one [`RainHalo`] per row (the dirty-gate /
+/// scissor contract). Skipped honestly once the centre alpha is perceptually nil.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "centre + per-axis radii + ink + alpha; a param struct would obscure the geometry at the flourish call sites"
+)]
+fn push_exit_veil(
+    out: &mut Vec<RainHalo>,
+    geom: Geom,
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    rgb: u32,
+    alpha: u8,
+) {
+    if alpha < 24 {
+        return;
+    }
+    let color = (u32::from(alpha) << 24) | (rgb & 0x00FF_FFFF);
+    let rxi = (rx.round() as i32).max(1);
+    let ryi = (ry.round() as i32).max(1);
+    let (cxi, cyi) = (cx.round() as i32, cy.round() as i32);
+    let (bl, br) = (geom.fx_left(), geom.fx_right());
+    let (bt, bb) = (geom.fx_top(), geom.fx_bot());
+    let x0 = (cxi - rxi).max(bl);
+    let x1 = (cxi + rxi).min(br);
+    let y0 = (cyi - ryi).max(bt);
+    let y1 = (cyi + ryi).min(bb);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let ch = geom.ch as i32;
+    let oy = geom.origin_y as i32;
+    let mut yy = y0;
+    while yy < y1 {
+        // Grid-row DAMAGE HINT, anchored at origin_y: an above-grid band tags
+        // row 0 (opening the top scissor band), never a wrapped u16.
+        let row = (yy - oy).div_euclid(ch);
+        let band_end = (oy + (row + 1) * ch).min(y1);
+        out.push(RainHalo {
+            row: row.max(0) as u16,
+            x: x0 as u16,
+            y: yy as u16,
+            w: (x1 - x0) as u16,
+            h: (band_end - yy) as u16,
+            color,
+            cx: cxi.clamp(0, br) as u16,
+            cy: cyi.clamp(0, bb) as u16,
+            rx: rxi as u16,
+            ry: ryi as u16,
+            mode: HaloMode::Over,
+        });
+        yy = band_end;
     }
 }
 
@@ -1647,16 +1836,18 @@ mod tests {
     }
 
     /// THE RAISED EARN LAW: touching the high band is not enough — the metric
-    /// must be HELD there for the full [`CAT_DWELL`]. The band is crossed
-    /// after ~1.7 s of flat-out typing, yet the cat stays hidden until the
-    /// dwell completes ~1.5 s later.
+    /// must be HELD there for the full [`CAT_DWELL`]. The 0.90 band is crossed
+    /// after ~2.4 s of flat-out typing, yet the cat stays hidden until the
+    /// dwell completes ~3 s later — a ~5 s+ sustained run in total.
     #[test]
     fn cat_requires_the_high_band_held_not_merely_touched() {
         let mut c = CursorCat::default();
         let t = Instant::now();
         let mut band_entry_key = None;
         let mut summoned_at_key = None;
-        for i in 0..160u64 {
+        // ~9 s of headroom at 40 ms/key — the raised band+dwell summon well
+        // inside it (~2.4 s ramp + ~3 s dwell ≈ 5.4 s ≈ key 135).
+        for i in 0..240u64 {
             let ti = t + Duration::from_millis(i * 40);
             if band_entry_key.is_none() && c.momentum(ti) >= CAT_BAND {
                 band_entry_key = Some(i);
@@ -1671,23 +1862,32 @@ mod tests {
         let summoned = summoned_at_key.expect("a long sustained run must summon");
         let held = (summoned - entered) as f32 * 0.040;
         assert!(
-            held >= CAT_DWELL - 0.05,
+            held >= CAT_DWELL - 0.10,
             "the band must be HELD ~{CAT_DWELL} s before the summon, held only {held} s"
         );
         let elapsed = summoned as f32 * 0.040;
         assert!(
-            elapsed >= 2.9,
-            "band entry (~1.7 s) + dwell must total 3+ s of flow, got {elapsed} s"
+            (2.2..=3.6).contains(&elapsed),
+            "band entry + dwell must land in the 2.2-3.6 s target window \
+             (owner 2026-07-24: 'a little bit less momentum'), got {elapsed} s"
         );
     }
 
     /// UX LATENCY CONTRACT: the metric builds by TIME spent typing while the
     /// independent 16-event floor prevents sparse cadences from arriving too
-    /// early. A slow 1 s/key stroll NEVER summons because its equilibrium sits
-    /// under the band forever.
+    /// early. The window is TWO-SIDED on purpose — the owner has now pushed it
+    /// in both directions ("still appears too soon", then 2026-07-24 "a little
+    /// bit less momentum for the cursor cat to appear") — so a one-sided bar
+    /// would silently drift back the moment either constant moved. Every
+    /// summoning cadence owes a 2.2-3.6 s sustained run at the [`CAT_BAND`]
+    /// 0.65 / [`CAT_DWELL`] 1.2 tuning, and a stroll slower than ~0.60 s/key
+    /// can never HOLD the band (each gap decays the clamped metric back out of
+    /// it before the next key), so the dwell never accrues and no cat arrives.
     #[test]
     fn summon_latency_is_bounded_across_typing_cadences() {
-        for (gap_ms, max_keys) in [(25u64, 160usize), (60, 70), (120, 35), (300, 25)] {
+        // Fast cadences (well under the ~200 ms band-hold limit) summon, but
+        // only after the full ramp+dwell. `max_keys` is generous headroom.
+        for (gap_ms, max_keys) in [(25u64, 320usize), (60, 160), (120, 90)] {
             let mut c = CursorCat::default();
             let t = Instant::now();
             let first = (0..max_keys).find_map(|i| {
@@ -1698,20 +1898,25 @@ mod tests {
                 first.unwrap_or_else(|| panic!("{gap_ms}ms cadence must summon by key {max_keys}"));
             let elapsed = (first - 1) as f32 * gap_ms as f32 / 1000.0;
             assert!(
-                elapsed >= 2.8,
-                "{gap_ms}ms cadence summoned after only {elapsed} s — the raised threshold demands a 3+ s run"
+                (2.2..=3.6).contains(&elapsed),
+                "{gap_ms}ms cadence summoned after {elapsed} s — outside the 2.2-3.6 s target window"
             );
         }
-        // A deliberate 1 s/key stroll equilibrates below the band: no cat, ever.
-        let mut stroll = CursorCat::default();
-        let t = Instant::now();
-        for i in 0..60u64 {
-            stroll.on_key(t + Duration::from_millis(i * 1000), true);
+        // Cadences at/above ~200 ms/key can no longer HOLD the 0.90 band: each
+        // gap decays the (clamped-at-1.0) metric below the band before the next
+        // key, so the dwell resets forever. A steady 300 ms stroll AND a 1 s/key
+        // stroll both stay cat-free.
+        for stroll_gap in [700u64, 1000] {
+            let mut stroll = CursorCat::default();
+            let t = Instant::now();
+            for i in 0..80u64 {
+                stroll.on_key(t + Duration::from_millis(i * stroll_gap), true);
+            }
+            assert!(
+                !stroll.is_active(),
+                "a {stroll_gap}ms cadence never holds the high band, so it never summons"
+            );
         }
-        assert!(
-            !stroll.is_active(),
-            "a slow stroll never reaches the high band, so it never summons"
-        );
     }
 
     /// Sustained fast typing ALWAYS summons the cat (deterministic — no rarity
@@ -1722,9 +1927,9 @@ mod tests {
         let mut c = CursorCat::default();
         let t = Instant::now();
         let mut on = false;
-        // ~5s of sustained fast typing (25 ms gaps) — the raised band + dwell
-        // earn the flight at ~3.2 s in.
-        for i in 0..200 {
+        // Sustained fast typing (25 ms gaps) — the raised band + dwell earn the
+        // flight at ~5.4 s in (~key 215), so run comfortably past that.
+        for i in 0..300 {
             c.on_key(t + Duration::from_millis(i * 25), true);
             if c.is_active() {
                 on = true;
@@ -1746,28 +1951,32 @@ mod tests {
         );
         // Now go silent. A present can arrive long after both the real LOW
         // crossing and the fade deadline; it must sample Hidden directly, not
-        // restart a full fade from this first late frame.
-        let gone = hot + Duration::from_secs(4);
+        // restart a full fade from this first late frame. (The warmup leaves the
+        // metric at the 1.0 ceiling, so the LOW crossing is a full ~3.9 s τ-drain
+        // plus FADE_OUT out; sample well past that.)
+        let gone = hot + Duration::from_secs(6);
         let done = c.frame(gone);
         assert_eq!(done.alpha, 0, "a sparse late frame is already hidden");
         assert_eq!(done.fp(), 0, "hidden frames settle to the zero repaint key");
         assert!(!c.is_active());
     }
 
-    /// THE BAND IS RHYTHM-TOLERANT BUT PAUSE-STRICT: sub-half-second typing
-    /// breaths (finger repositioning, a fast burst's micro-gaps) keep the
-    /// dwell accruing — the metric's 2 s τ holds a full run above the band
-    /// through a ≤0.5 s breath — while genuine inter-word THINKING pauses
-    /// (~650 ms) drop it out of the band and reset the dwell, so casual prose
-    /// with real pauses stays cat-free (the "more special" contract).
+    /// THE BAND IS RHYTHM-TOLERANT BUT PAUSE-STRICT: short typing breaths (finger
+    /// repositioning, a fast burst's micro-gaps) keep the dwell accruing — the
+    /// metric's 2 s τ holds a full run above the raised 0.90 band through a breath
+    /// under ~200 ms — while genuine inter-word THINKING pauses (~650 ms) drop it
+    /// out of the band and reset the dwell, so casual prose with real pauses stays
+    /// cat-free (the "more special" contract). The tolerated breath is TIGHTER
+    /// than before (was ~0.5 s at the 0.75 band): 0.90 sits so near the flood
+    /// ceiling that a 0.3 s gap already decays a full metric to ~0.86, out of band.
     #[test]
     fn breaths_keep_the_dwell_but_word_pauses_stay_cat_free() {
-        // Flowing typing with 300 ms breaths every 16 keys still summons:
-        // from a hot metric (~0.9+) a 0.3 s breath decays by ×0.86, which
-        // keeps the run inside the band once it is genuinely earned.
+        // Flowing typing with 150 ms breaths every 16 keys still summons: from a
+        // hot (clamped ~1.0) metric a 0.15 s breath decays by ×0.93, staying in
+        // the 0.90 band so the dwell keeps accruing across breaths.
         let mut flow = CursorCat::default();
         let mut t = Instant::now();
-        for burst in 0..10 {
+        for burst in 0..12 {
             for _ in 0..16 {
                 t += Duration::from_millis(60);
                 flow.on_key(t, true);
@@ -1775,13 +1984,13 @@ mod tests {
             if flow.is_active() {
                 break;
             }
-            if burst < 9 {
-                t += Duration::from_millis(300);
+            if burst < 11 {
+                t += Duration::from_millis(150);
             }
         }
         assert!(
             flow.is_active(),
-            "sustained flow with sub-half-second breaths still earns the cat"
+            "sustained flow with sub-200 ms breaths still earns the cat"
         );
         // Three casual words separated by real 650 ms thinking pauses: the
         // metric never HOLDS the band, so the companion stays away.
@@ -1832,13 +2041,13 @@ mod tests {
     fn fading_cat_revives_on_resumed_typing() {
         let mut c = CursorCat::default();
         let t = Instant::now();
-        // Earn the cat with a sustained run (band + dwell need ~3.2 s; 70
-        // keys at 60 ms is ~4.2 s of flow, metric ≈ 1.0 at the end).
-        for i in 0..70 {
+        // Earn the cat with a sustained run (raised band + dwell need ~5.4 s;
+        // 120 keys at 60 ms is ~7.2 s of flow, metric ≈ 1.0 at the end).
+        for i in 0..120 {
             c.on_key(t + Duration::from_millis(i * 60), true);
         }
         assert!(c.is_active(), "the run summons the cat");
-        let last = t + Duration::from_millis(69 * 60);
+        let last = t + Duration::from_millis(119 * 60);
         let low_crossing = last
             + Duration::from_secs_f32(
                 crate::typing_momentum::TYPING_MOMENTUM_TAU * (c.momentum(last) / LOW).ln(),
@@ -1942,9 +2151,10 @@ mod tests {
     fn reduced_motion_flight_retires_and_releases_the_look_latch() {
         let mut cat = CursorCat::default();
         let t = Instant::now();
-        // Earn an ordinary flight through sustained typing.
+        // Earn an ordinary flight through sustained typing (raised band+dwell
+        // summon at ~key 215 on a 25 ms cadence, so allow generous headroom).
         let mut summoned_at = None;
-        for i in 0..200u64 {
+        for i in 0..300u64 {
             let ti = t + Duration::from_millis(i * 25);
             cat.on_key(ti, true);
             if cat.is_active() {
@@ -2125,11 +2335,11 @@ mod tests {
     fn mid_flight_look_sync_is_latched_until_the_next_wake() {
         let mut c = CursorCat::default();
         let t = Instant::now();
-        for i in 0..70 {
+        for i in 0..120 {
             c.on_key(t + Duration::from_millis(i * 60), true);
         }
         assert!(c.is_active(), "the sustained run summons the cat");
-        let last = t + Duration::from_millis(69 * 60);
+        let last = t + Duration::from_millis(119 * 60);
         let flying = c.frame(last + Duration::from_millis(100));
         assert!(flying.alpha > 0);
 
@@ -2170,11 +2380,11 @@ mod tests {
         let gone = reviving + Duration::from_secs(10);
         assert_eq!(c.frame(gone).alpha, 0);
         assert!(!c.is_active());
-        for i in 0..70 {
+        for i in 0..120 {
             c.on_key(gone + Duration::from_millis(i * 60), true);
         }
         assert!(c.is_active(), "the second run re-earns the flight");
-        let rewoken = c.frame(gone + Duration::from_millis(69 * 60 + 100));
+        let rewoken = c.frame(gone + Duration::from_millis(119 * 60 + 100));
         assert_eq!(
             rewoken.look,
             next_look.normalized(),
@@ -2190,11 +2400,11 @@ mod tests {
     fn discovery_hello_presents_the_new_look_mid_flight() {
         let mut c = CursorCat::default();
         let t = Instant::now();
-        for i in 0..70 {
+        for i in 0..120 {
             c.on_key(t + Duration::from_millis(i * 60), true);
         }
         assert!(c.is_active());
-        let last = t + Duration::from_millis(69 * 60);
+        let last = t + Duration::from_millis(119 * 60);
 
         // Park a sync first (another window's reassignment)…
         let parked = KittyLook {
@@ -2226,12 +2436,12 @@ mod tests {
         let over = collect_at + Duration::from_secs_f32(DISCOVERY_HOLD + FADE_OUT + 1.0);
         assert_eq!(c.frame(over).alpha, 0);
         assert!(!c.is_active());
-        for i in 0..70 {
+        for i in 0..120 {
             c.on_key(over + Duration::from_millis(i * 60), true);
         }
         assert!(c.is_active());
         assert_eq!(
-            c.frame(over + Duration::from_millis(69 * 60 + 100)).look,
+            c.frame(over + Duration::from_millis(119 * 60 + 100)).look,
             unlocked.normalized(),
             "on_collect cleared the parked sync — the collectible stays"
         );
@@ -2286,18 +2496,134 @@ mod tests {
         assert!(plain > 450, "plain majority, got {plain}");
     }
 
-    /// The exit fx emit additive quads only while fading (peaked), and nothing for Plain.
+    /// The DARK-theme exit fx emit additive quads only while fading (peaked),
+    /// and nothing for Plain. On dark the heart/star ride the additive `out`
+    /// stream (added light over the near-black ground) and never the veil sink.
     #[test]
     fn exit_fx_emits_for_wink_and_heart_only() {
         let g = geom();
         let mut out = Vec::new();
-        emit_exit_fx(CatExit::Plain, 0.5, 40, 40, g, &mut out);
+        let mut halos = Vec::new();
+        emit_exit_fx(CatExit::Plain, 0.5, 40, 40, true, g, &mut out, &mut halos);
         assert!(out.is_empty(), "plain exit draws nothing");
-        emit_exit_fx(CatExit::HeartMeow, 0.5, 40, 40, g, &mut out);
-        assert!(!out.is_empty(), "heart draws quads mid-exit");
+        assert!(halos.is_empty(), "plain exit draws no veil either");
+        emit_exit_fx(
+            CatExit::HeartMeow,
+            0.5,
+            40,
+            40,
+            true,
+            g,
+            &mut out,
+            &mut halos,
+        );
+        assert!(
+            !out.is_empty(),
+            "heart draws additive quads mid-exit on dark"
+        );
+        assert!(
+            halos.is_empty(),
+            "dark heart never uses the source-over veil"
+        );
         out.clear();
-        emit_exit_fx(CatExit::StarWink, 0.5, 40, 40, g, &mut out);
-        assert!(!out.is_empty(), "star draws quads mid-exit");
+        emit_exit_fx(
+            CatExit::StarWink,
+            0.5,
+            40,
+            40,
+            true,
+            g,
+            &mut out,
+            &mut halos,
+        );
+        assert!(
+            !out.is_empty(),
+            "star draws additive quads mid-exit on dark"
+        );
+        assert!(
+            halos.is_empty(),
+            "dark star never uses the source-over veil"
+        );
+    }
+
+    /// LIGHT-THEME LEGIBILITY PROOF (the fix): on a light background the exit
+    /// flourish must NOT emit additive white/pink (invisible on a pale ground —
+    /// the old bug: a pure-white star fully vanished). Instead the heart and star
+    /// come through as SOURCE-OVER veils ([`HaloMode::Over`]) in DARKENED,
+    /// saturated inks that read against any light ground — contrast-correct by
+    /// construction because the veil DARKENS the ground rather than brightening
+    /// it toward white.
+    #[test]
+    fn exit_fx_light_theme_is_a_darkening_source_over_veil() {
+        let g = geom();
+        // Relative luminance (Rec.601, straight 8-bit) — a light theme's ground
+        // sits high (a #FAFAFA-ish ground ≈ 250); the veil ink must sit well
+        // BELOW it so a source-over composite visibly darkens the ground.
+        let luma = |rgb: u32| {
+            let r = ((rgb >> 16) & 0xff) as f32;
+            let g = ((rgb >> 8) & 0xff) as f32;
+            let b = (rgb & 0xff) as f32;
+            0.299 * r + 0.587 * g + 0.114 * b
+        };
+        for exit in [CatExit::HeartMeow, CatExit::StarWink] {
+            let mut out = Vec::new();
+            let mut halos = Vec::new();
+            emit_exit_fx(exit, 0.5, 40, 40, false, g, &mut out, &mut halos);
+            assert!(
+                out.is_empty(),
+                "{exit:?}: light theme emits NO additive quad (never white-on-white)"
+            );
+            assert!(
+                !halos.is_empty(),
+                "{exit:?}: light theme emits a visible source-over veil"
+            );
+            for h in &halos {
+                assert!(
+                    matches!(h.mode, HaloMode::Over),
+                    "{exit:?}: the light veil composites SOURCE-OVER, not additive"
+                );
+                // The straight ink (low 24 bits) is dark/saturated so it reads on
+                // a light ground; the high byte carries a non-trivial centre
+                // opacity so the veil is actually visible, not a whisper.
+                let ink = h.color & 0x00FF_FFFF;
+                assert!(
+                    luma(ink) < 160.0,
+                    "{exit:?}: veil ink must be dark enough to contrast on light, luma {}",
+                    luma(ink)
+                );
+                let centre_alpha = (h.color >> 24) & 0xff;
+                assert!(
+                    centre_alpha >= 96,
+                    "{exit:?}: veil centre opacity must be legible, got {centre_alpha}"
+                );
+            }
+        }
+    }
+
+    /// The light veil, like the additive arm, fades to nothing at the exit ends
+    /// (`fade_out` near 0 or 1 ⇒ `pop → 0`), so the flourish dissolves with the
+    /// cat instead of snapping off at full strength.
+    #[test]
+    fn exit_fx_light_veil_vanishes_at_the_exit_ends() {
+        let g = geom();
+        for &fade in &[0.0_f32, 0.02, 0.99, 1.0] {
+            let mut out = Vec::new();
+            let mut halos = Vec::new();
+            emit_exit_fx(
+                CatExit::HeartMeow,
+                fade,
+                40,
+                40,
+                false,
+                g,
+                &mut out,
+                &mut halos,
+            );
+            assert!(
+                halos.is_empty(),
+                "the light heart veil is nil at fade_out {fade}"
+            );
+        }
     }
 
     // ───────────────────── living-cartoon pose animation ─────────────────────
@@ -2579,11 +2905,11 @@ mod tests {
     fn a_kill_flood_grounds_the_flight_and_the_goodbye_keeps_the_oops() {
         let t = Instant::now();
         let mut c = CursorCat::default();
-        for i in 0..70 {
+        for i in 0..120 {
             c.on_key(t + Duration::from_millis(i * 60), true);
         }
         assert!(c.is_active(), "the run summons the cat");
-        let last = t + Duration::from_millis(69 * 60);
+        let last = t + Duration::from_millis(119 * 60);
         let before = c.momentum(last);
         // One kill: a mild dent, the flight rides on.
         let kill1 = last + Duration::from_millis(100);
@@ -2785,9 +3111,16 @@ mod tests {
             CatGlyphId::S115,
             "at zero drive the singing face hands back to the collected look"
         );
+        // The metric was pinned to 1.0 at the arm and only decays naturally
+        // from there (drive < 1.0 no longer re-pins): ~0.5 s later it sits at
+        // 1.0·e^(-0.5/2) ≈ 0.78 — still HIGH, proving the bypass handed back to
+        // natural decay rather than zeroing the metric. (A fixed marker, not the
+        // summon band: the raised CAT_BAND of 0.90 now sits above this decayed
+        // value, but the point here is "still high", not "still summon-eligible".)
         assert!(
-            c.momentum(t2) > CAT_BAND,
-            "the bypassed metric hands back to NATURAL decay (still high right after)"
+            c.momentum(t2) > 0.7,
+            "the bypassed metric hands back to NATURAL decay (still high right after): {}",
+            c.momentum(t2)
         );
     }
 

@@ -33,6 +33,7 @@ mod effects_api;
 mod notifications_api;
 mod predict_api;
 mod scroll_input_api;
+mod scrollback_tiers_api;
 
 use aterm_core::grid::{PendingScrollbackReflow, ReflowStep};
 use aterm_core::selection::SmartSelection;
@@ -255,6 +256,11 @@ pub struct AtermGpuTerminal {
     // row collapses the walk to O(cols). Keyed by (content_gen, display_offset,
     // row) so any write, resize, or scroll invalidates it. Mirrors aterm-wasm.
     display_row_cache: std::cell::RefCell<GpuDisplayRowCache>,
+    // This pane's membership in the module-global scrollback byte budget
+    // (audit E1): registered at construction, share applied at the frame/drain
+    // boundaries. pub(crate) so scrollback_tiers_api reaches it. Mirrors
+    // aterm-wasm.
+    pub(crate) budget_share: aterm_core::terminal::scrollback_shared_budget::ScrollbackBudgetShare,
 }
 
 /// The single-slot per-row display-cell cache backing `cell_text`/`cell_is_wide`.
@@ -359,20 +365,24 @@ impl AtermGpuTerminal {
         // No filesystem on the web: a real miss surfaces via
         // `take_missing_font_classes` (E1 lazy fonts), never system discovery.
         cpu.set_runtime_font_discovery(false);
-        // `Terminal::new` clamps rows/cols to the grid's 1..=4096 ingress bound (a
+        // The engine clamps rows/cols to the grid's 1..=4096 ingress bound (a
         // hostile JS caller can hand any u16, e.g. `new AtermGpuTerminal(8192,8192,…)`);
         // read the CLAMPED dims back and store THOSE. `render`/`render_offscreen`/`init`
         // size the GPU framebuffer from these `self.rows`/`self.cols` (via `frame_size`
         // → `offscreen_texture`/swapchain), so keeping a separate unclamped copy would
         // drive an oversized texture (wgpu validation abort) or a ~tens-of-GB alloc and
         // diverge the framebuffer from the grid the engine actually holds.
-        let mut term = Terminal::new(rows, cols);
+        // Tiered store attached at construction (audit E1); compression drains
+        // at the render frame boundary (see scrollback_tiers_api).
+        let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
+        let budget_share = scrollback_tiers_api::register_budget_share(&term);
         // Poll-drain surface for OSC 9/99/777 (a web host has no callback
         // thread); authorization keeps the engine's fail-closed default.
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let rows = term.grid().rows() as usize;
         let cols = term.grid().cols() as usize;
         Ok(Self {
+            budget_share,
             term,
             cpu,
             rows,
@@ -828,13 +838,14 @@ impl AtermGpuTerminal {
     }
 
     /// Set the engine's scrollback line limit (history lines retained behind the live
-    /// viewport). `lines == 0` means unlimited (bounded only by host memory). This
-    /// engine is ring-only (no tiered store), so the limit re-caps the retention ring
-    /// itself: shrinking evicts the oldest lines immediately, growing extends retention
-    /// lazily (no eager allocation). Targets the primary-content grid — reaching the
-    /// saved primary through an alt screen; the alt buffer keeps its spec'd zero
-    /// scrollback — and re-clamps the scroll position. Without this the engine keeps
-    /// its construction default (a 10k-line ring) on every pane.
+    /// viewport). `lines == 0` means unlimited (bounded only by the byte budgets). The
+    /// limit is ONE TOTAL retention count (audit E1) across the hot ring, staged
+    /// lines, and the tiered store together — the store takes the remainder after the
+    /// ring's fixed share, so "retain N lines" retains N, not N + ring. Targets the
+    /// primary-content grid — reaching the saved primary through an alt screen; the
+    /// alt buffer keeps its spec'd zero scrollback — and re-clamps the scroll
+    /// position. Without this the engine keeps its construction default
+    /// (`DEFAULT_LINE_LIMIT`, 100k total).
     pub fn set_scrollback_limit(&mut self, lines: u32) {
         let limit = if lines == 0 {
             None
@@ -1939,7 +1950,7 @@ pub fn encode_key_with_mode(
     base_layout_key: Option<char>,
     mode_bits: u32,
 ) -> Option<Vec<u8>> {
-    use aterm_types::keyboard::{KeyboardMode, encode_dom_key};
+    use aterm_types::keyboard::{encode_dom_key, KeyboardMode};
     let mode = KeyboardMode::from_bits_truncate(mode_bits as u16);
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }
@@ -2298,6 +2309,10 @@ impl AtermGpuTerminal {
         // Deferred-reflow safety net #1: a host that never calls `pump_reflow`
         // still re-attaches its rewrapped history within the grace window.
         self.pump_reflow_on_render_tick();
+        // Frame-boundary scrollback maintenance (audit E1): apply a pending
+        // global-budget share, then promote one bounded staged batch — LZ4
+        // lives HERE, never on the ingest path (SCROLL-1).
+        self.drain_compress_backlog_on_render();
         let (rows, cols) = (self.rows, self.cols);
         // Refill the kept scratch in place rather than allocating a fresh snapshot
         // each rAF frame; `term`, `frame_scratch`, and `gpu` are disjoint fields, so
@@ -2346,6 +2361,8 @@ impl AtermGpuTerminal {
         // Same deferred-reflow safety net as `render` (a harness that only
         // drives the offscreen path must not strand a detached store either).
         self.pump_reflow_on_render_tick();
+        // Same frame-boundary scrollback maintenance as `render`.
+        self.drain_compress_backlog_on_render();
         let (rows, cols) = (self.rows, self.cols);
         // Same kept-scratch refill as `render`: `cell_frame_into` fully overwrites
         // the buffer, so sharing one scratch across both paths is correct.
@@ -2420,12 +2437,16 @@ impl AtermGpuTerminal {
     pub fn new_from_system(rows: u16, cols: u16, px: f32) -> Option<AtermGpuTerminal> {
         let theme = Theme::default();
         let cpu = Renderer::from_system(px, theme)?;
-        let mut term = Terminal::new(rows, cols);
+        // Same tiered-store attachment as `new` (audit E1) so tests/benches
+        // measure the shipped engine shape.
+        let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
+        let budget_share = scrollback_tiers_api::register_budget_share(&term);
         // Same notification wiring as `new` (fail-closed until authorized).
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let rows = term.grid().rows() as usize;
         let cols = term.grid().cols() as usize;
         Some(Self {
+            budget_share,
             term,
             cpu,
             rows,
@@ -2579,9 +2600,9 @@ mod tests {
         assert_eq!(hits[0], 246, "the first match is the oldest RETAINED row");
     }
 
-    /// Mirrors `aterm-wasm`'s set_scrollback_limit test: this ring-only engine
-    /// must treat the limit as its real retention bound (shrink evicts oldest
-    /// immediately; grow extends past the 10k construction ring).
+    /// Mirrors `aterm-wasm`'s set_scrollback_limit test: the limit is the ONE
+    /// total retention bound across ring + staged + store (audit E1) — shrink
+    /// evicts oldest immediately; grow widens the store share.
     #[test]
     fn set_scrollback_limit_governs_ring_retention() {
         let Some(mut t) = AtermGpuTerminal::new_from_system(5, 40, 16.0) else {
@@ -2710,6 +2731,47 @@ mod tests {
         let (cw, ch) = t.cpu.cell_size();
         t.effects.apply(&mut t.term, &mut t.frame_scratch, cw, ch);
         t.spill.update(&t.cpu, &t.frame_scratch);
+    }
+
+    /// Snapshot equality ACROSS TWO ENGINE INSTANCES.
+    ///
+    /// `RenderInput`'s `PartialEq` compares the three sprite atlases by published
+    /// `Arc` IDENTITY, never `version` (the split-pane audit: baker versions are
+    /// deterministic per engine instance, so a rebuilt engine replays its
+    /// predecessor's versions with different texels — identity is the only sound
+    /// key for the damage gates). Identity is therefore a PER-INSTANCE property:
+    /// two engines that bake byte-identical atlases still publish different
+    /// `Arc`s, so `==` reports unequal for frames that are pixel-for-pixel the
+    /// same. Determinism is a claim about CONTENT, so compare atlas VALUES here,
+    /// then neutralize the identity difference and let the real `PartialEq` judge
+    /// every other field — that way this helper cannot drift as fields are added.
+    fn same_snapshot_across_instances(a: &RenderInput, b: &RenderInput) -> bool {
+        fn atlas_value_eq(
+            x: &Option<std::sync::Arc<aterm_render::SceneAtlas>>,
+            y: &Option<std::sync::Arc<aterm_render::SceneAtlas>>,
+        ) -> bool {
+            match (x, y) {
+                (None, None) => true,
+                (Some(x), Some(y)) => {
+                    x.width == y.width
+                        && x.height == y.height
+                        && x.version == y.version
+                        && x.rgba == y.rgba
+                }
+                _ => false,
+            }
+        }
+        if !atlas_value_eq(&a.cat_atlas, &b.cat_atlas)
+            || !atlas_value_eq(&a.free_atlas, &b.free_atlas)
+            || !atlas_value_eq(&a.rain_atlas, &b.rain_atlas)
+        {
+            return false;
+        }
+        let mut aligned = b.clone();
+        aligned.cat_atlas.clone_from(&a.cat_atlas);
+        aligned.free_atlas.clone_from(&a.free_atlas);
+        aligned.rain_atlas.clone_from(&a.rain_atlas);
+        *a == aligned
     }
 
     /// SPILL BAND on the GPU engine's CPU face (present is wasm-only; spill is
@@ -2897,7 +2959,7 @@ mod tests {
                 fill_frame(t);
             }
             assert!(
-                a.frame_scratch == b.frame_scratch,
+                same_snapshot_across_instances(&a.frame_scratch, &b.frame_scratch),
                 "same bytes + dt stream must produce identical snapshots (step {step})"
             );
         }
@@ -2917,7 +2979,7 @@ mod tests {
             fill_frame(t);
         }
         assert!(
-            a.frame_scratch == plain.frame_scratch,
+            same_snapshot_across_instances(&a.frame_scratch, &plain.frame_scratch),
             "toggled off must restore the byte-identical snapshot"
         );
     }
@@ -2977,9 +3039,13 @@ mod tests {
 
     #[test]
     fn resize_without_tiered_store_never_defers() {
+        // A ring-only engine (no tiered store — the pre-E1 ctor shape, still
+        // reachable via checkpoint-restore of old grids): every resize is the
+        // plain bounded path — nothing stashes, nothing to pump.
         let Some(mut t) = AtermGpuTerminal::new_from_system(24, 80, 16.0) else {
             return;
         };
+        t.term = Terminal::new(24, 80);
         for i in 0..50 {
             t.process(format!("line {i}\r\n").as_bytes());
         }
@@ -2991,7 +3057,7 @@ mod tests {
 
     #[test]
     fn scrolled_wrapped_row_len_and_wrap_flag_are_tier_aware() {
-        // P1 regression (twin of the aterm-wasm test): after a ring-only
+        // P1 regression (twin of the aterm-wasm test): after a
         // width-shrink reflow overflows wrapped rows into scrollback, a
         // scrolled-back HISTORY row returned correct TEXT but row_len /
         // row_is_wrapped resolved through Grid::row (None past the ring base).

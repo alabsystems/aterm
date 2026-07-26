@@ -16,19 +16,19 @@ use aterm_core::terminal::RenderCell;
 use aterm_render::Theme;
 
 use crate::app_config::Config;
-use crate::hud_bar;
+use crate::chrome_band;
 use crate::prefs::{self, EditField, EditKind};
 use crate::tray_raster::{row_baseline, ui_text_width};
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
 
-/// Transient per-window modal state for the settings overlay. While a window holds
-/// `Some(SettingsState)`, keystrokes drive this panel instead of the PTY (the gate in
-/// `app_input.rs`). Mirrors the `SearchState` per-window `Option<_>` pattern.
+/// Shared semantic state embedded in each native Settings tab. The native view owns
+/// routing and input; the retired card painter also consumes this model in compatibility
+/// tests until that scaffolding is removed.
 pub(crate) struct SettingsState {
-    /// Snapshot of the editable controls for the live config, in row order. Rebuilt
-    /// from `App.config` on open and after every persisted change (so the displayed
-    /// value tracks the file). OWNED — [`EditField`] is not `Clone`, so it is moved in.
+    /// Snapshot of the editable controls for the live config, in row order. Native
+    /// Settings rebuilds it from its config snapshot after every persisted change, so
+    /// the displayed value tracks the file. OWNED — [`EditField`] is moved in.
     pub(crate) fields: Vec<EditField>,
     /// Index of the highlighted row in `fields`.
     pub(crate) selected: usize,
@@ -48,21 +48,15 @@ pub(crate) struct SettingsState {
     /// Whether the search bar is FOCUSED: while true, typed keys edit `query` instead of
     /// navigating, `\u{21B5}`/`\u{2193}` drop focus into the (filtered) list, and Esc clears.
     pub(crate) searching: bool,
-    /// The anchored popup MENU for a Theme / long-Enum row, `Some` while open. While
-    /// `Some`, keys drive the menu (Esc precedence: menu > search filter > close overlay)
-    /// and the painter draws the popover over the card. Commit goes through the SAME
-    /// persist seam as every other change (`App::settings_commit_value`).
+    /// Retired-card popup state for compatibility interaction and painter tests. Native
+    /// Settings owns its choice-picker state separately.
     pub(crate) menu: Option<MenuState>,
-    /// The anchored COLOUR-WHEEL popover for a Color row (design §7), `Some` while
-    /// open — mutually exclusive with `menu` (opening either closes the other).
-    /// While `Some`, keys drive the wheel (Esc precedence: wheel > menu > edit >
-    /// search > panes > close) and nothing persists until ↵ commits through the
-    /// same `App::settings_commit_value` seam.
+    /// Retired-card colour-wheel state for compatibility interaction and painter tests.
+    /// It remains mutually exclusive with [`Self::menu`]; native Settings owns its
+    /// editor/picker state separately.
     pub(crate) wheel: Option<WheelState>,
-    /// Animation phase for the preview peek's cursor-effect DEMO, bumped ~30fps by
-    /// the event loop while a cursor-effect row is focused (see `next_demo_tick` in
-    /// `main.rs`). Hashed into [`Self::fingerprint`], so each bump re-rasterizes the
-    /// card — the ONE sanctioned animation in the otherwise clockless pure painter.
+    /// Retired preview-card demo phase. Compatibility tests fold it into
+    /// [`Self::fingerprint`] to verify that a tick invalidates the pure painter.
     pub(crate) demo_phase: u32,
     /// The ACTIVE sidebar category (design §2.2): the content pane shows only this
     /// [`prefs::Section`]'s group-boxes. Changing it resets `scroll` (per-category
@@ -72,13 +66,8 @@ pub(crate) struct SettingsState {
     /// or the content pane (↑↓ move the control selection). Tab toggles; ← never
     /// leaves content (adjust beats navigate — Tab is the pane switcher).
     pub(crate) pane: SettingsPane,
-    /// SNAPSHOT of the Kitty Log (§F4.6) the collection-book page paints —
-    /// taken by `App::sync_settings_kitty_log` on open / category switch /
-    /// drain-while-open, so the painter stays a pure function of this state
-    /// (no live App reads). Its `revision` folds into [`Self::fingerprint`]
-    /// ONLY while the Kitty Log category is active (no other page paints it).
-    /// Boxed: the snapshot is cold state and native Settings views carry this model
-    /// alongside their semantic controller.
+    /// Snapshot used by the retired collection-book painter, kept here so its
+    /// compatibility render remains a pure function with no live application reads.
     pub(crate) kitty_log: Box<crate::kitty_log::KittyLogView>,
     /// Whether the LANDING page (design §L) is up INSTEAD of the two-pane panel:
     /// the ⌘, hero — mint ground, colour blotches, "aterm Settings", the
@@ -155,10 +144,10 @@ pub(crate) enum SettingsPane {
     Content,
 }
 
-/// Per-frame render context the PURE painter cannot know on its own: facts about the
-/// host the App tracks (no AppKit here — the App reads the OS, the painter reads this).
-/// Threaded from `splice_settings_panel` through [`crate::overlay::OverlayModel::tray`];
-/// Settings reads the OS appearance, About reads the display scale; Palette ignores it.
+/// Retired-card render context kept for compatibility tests: facts the pure painter
+/// cannot know on its own. It is threaded through the legacy
+/// [`crate::overlay::OverlayModel::tray`] path; production native Settings receives
+/// equivalent host facts through its renderer-native view context.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct PreviewCtx {
     /// Whether the OS appearance is currently dark — resolves the `window_theme=auto`
@@ -619,8 +608,8 @@ impl SettingsState {
         self.scroll = (self.scroll as isize + delta).clamp(0, max as isize) as usize;
     }
 
-    /// Rebuild the control list from a freshly-loaded config (the open-overlay half
-    /// of `App::reload_config`), preserving the selection and re-clamping `scroll`
+    /// Rebuild the control list from a freshly-loaded config while Settings is open,
+    /// preserving the selection and re-clamping `scroll`
     /// PER MODE the way every gesture does: grouped `scroll` is a [`GroupRow`] index
     /// while `selected` stays an absolute field index, so the v1 `scroll.min(selected)`
     /// clamp compared incommensurable units and yanked the band after an in-panel save.
@@ -1001,8 +990,17 @@ impl SettingsState {
 
     /// The CURRENT displayed value for a row: the configured seed, else the effective
     /// placeholder (so an unset key shows what is actually in effect, never blank).
+    /// Authored Enum aliases are projected onto their canonical option so the native
+    /// picker does not mislabel a runtime-valid alias as a custom value. Unknown and
+    /// dynamic values remain verbatim, and unset placeholders retain their explanatory
+    /// `"(default)"` / `"(follow OS)"` annotation.
     pub(crate) fn display_value(f: &EditField) -> &str {
-        f.seed.as_deref().unwrap_or(f.placeholder.as_str())
+        let raw = f.seed.as_deref().unwrap_or(f.placeholder.as_str());
+        if f.seed.is_some() && matches!(f.kind, EditKind::Enum { .. }) {
+            enum_recognized(f).unwrap_or(raw)
+        } else {
+            raw
+        }
     }
 
     /// Move the highlight by `delta` over the VISIBLE (filtered) rows, CLAMPING at the
@@ -1044,12 +1042,9 @@ impl SettingsState {
         }
     }
 
-    /// A fingerprint of everything that affects the painted panel (selection, scroll,
-    /// status line, and each control's displayed value), folded into the frame's
-    /// [`crate::main`]`::RepaintKey` so opening / moving / editing / closing the overlay
-    /// forces exactly one present — WITHOUT a `last_present` side-channel. An OPEN panel
-    /// never fingerprints to `0`; `0` is reserved by the key term for "closed" (idle ⇒
-    /// byte-identical key, exactly like `tab_strip`/`glow_fp`).
+    /// A fingerprint of everything that affects the retired card painter. Compatibility
+    /// tests use it to prove state changes repaint without coupling to PTY writes;
+    /// production native Settings has its own damage/repaint authority.
     pub(crate) fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1116,17 +1111,15 @@ impl SettingsState {
         h.finish() | 1 // never 0 while open (0 is the closed sentinel)
     }
 
-    /// `(scroll, total, visible)` for `controls front` (see `OverlayModel::scroll_extent`):
-    /// rows scrolled past, the full field count, and the fields actually shown on the card.
+    /// `(scroll, total, visible)` for compatibility inspection: rows scrolled past,
+    /// the full field count, and the fields projected by this semantic model.
     pub(crate) fn scroll_extent(&self) -> (usize, usize, usize) {
         (self.scroll, self.fields.len(), self.shown_indices().len())
     }
 
-    /// Machine-readable LIVE-state lines for the `controls prefs` introspection verb — the
-    /// selection, scroll, in-flight edit buffer, status, and the search filter, followed by
-    /// ONLY the visible controls (exactly what the card paints when a filter is active), so
-    /// screen == introspection. The overlay-CLOSED fallback (`editable_fields` over the live
-    /// config) still lives in `read_aux_controls`; this method serves the open overlay.
+    /// Legacy overlay-model serialization retained for model-level regression tests.
+    /// Production `controls prefs` compiles the native Settings semantic tree and never
+    /// calls this serializer.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let vis = self.shown_indices();
         let mut out = Vec::with_capacity(vis.len() + 3);
@@ -1276,34 +1269,37 @@ impl SettingsState {
 
 /// Resolve a documented config ALIAS to its canonical option spelling. The config loaders
 /// (`app_config`) accept aliases that are NOT in the picker's canonical option set (e.g.
-/// cursor_style `beam` == `bar`); without this the panel would show `options[0]` and
-/// contradict the effective config. Returns `None` when `token` is not a known alias.
+/// cursor_style `beam` == `bar`); without this native Settings would misclassify the
+/// authored value as a custom option. Returns `None` when `token` is not a known alias.
 fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
     // Trail-style aliases (rainbow → nyan, ember → fire, …) resolve through the
     // shared table in `prefs` — the same source `--validate-config` and the
-    // load-time unknown-style warning consult, so the panel row, the demo lane,
+    // load-time unknown-style warning consult, so the native row, preview lane,
     // and the live effect can never disagree about an aliased spelling.
+    let token = token.trim();
     if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
-        return prefs::CURSOR_TRAIL_STYLE_ALIASES
-            .iter()
-            .find(|(a, _)| token.eq_ignore_ascii_case(a))
-            .map(|&(_, canonical)| canonical);
+        return prefs::cursor_trail_style_canonical(token);
     }
     Some(match (key, token.to_ascii_lowercase().as_str()) {
-        (prefs::EDIT_CURSOR_STYLE, "beam") => "bar",
+        (prefs::EDIT_CURSOR_STYLE, "beam" | "underline") => "bar",
         (prefs::EDIT_BIDI, "off") => "disabled",
         (prefs::EDIT_BIDI, "on") => "implicit",
         (prefs::EDIT_AMBIGUOUS_WIDTH, "single") => "narrow",
         (prefs::EDIT_AMBIGUOUS_WIDTH, "double") => "wide",
+        (prefs::EDIT_PREDICTIVE_ECHO, "auto" | "on" | "true") => "adaptive",
+        (prefs::EDIT_PREDICTIVE_ECHO, "force") => "always",
+        (prefs::EDIT_TEXT_BLENDING, "linear_corrected") => "linear-corrected",
+        (prefs::EDIT_MOTION, "reduce") => "reduced",
+        (prefs::EDIT_WINDOW_COLORSPACE, "displayp3" | "p3") => "display-p3",
+        (prefs::EDIT_BACKGROUND_MATERIAL, "underwindow" | "under_window") => "under-window",
+        (prefs::EDIT_BACKGROUND_MATERIAL, "") => "none",
         _ => return None,
     })
 }
 
-/// The canonical current option spelling for an Enum row (used by the painter AND the
-/// cycle): the displayed value with any `" (default)"` placeholder suffix stripped, matched
-/// case-insensitively against the option set, then through the documented alias map (so a
-/// configured `beam`/`off`/`double` shows its true option), and only THEN falling back to
-/// the first option for a genuinely unrecognized spelling.
+/// The canonical current option spelling for compatibility projection and shared stepping.
+/// It resolves annotated defaults and documented aliases before defensively falling back
+/// to the first option for a genuinely unrecognized spelling.
 pub(crate) fn enum_current(f: &EditField) -> &'static str {
     let EditKind::Enum { options } = f.kind else {
         return "";
@@ -1318,10 +1314,7 @@ fn enum_recognized(f: &EditField) -> Option<&'static str> {
     let EditKind::Enum { options } = f.kind else {
         return None;
     };
-    let raw = SettingsState::display_value(f);
-    // Placeholders read like "lumen (default)"; the value domain is single-token, so the
-    // first whitespace-delimited token is the candidate spelling.
-    let token = raw.split_whitespace().next().unwrap_or(raw);
+    let token = enum_candidate(f);
     options
         .iter()
         .find(|o| token.eq_ignore_ascii_case(o))
@@ -1329,12 +1322,24 @@ fn enum_recognized(f: &EditField) -> Option<&'static str> {
         .or_else(|| enum_alias(f.key, token).filter(|c| options.contains(c)))
 }
 
+/// The semantic Enum spelling before canonical alias resolution. Authored seeds are
+/// preserved in full (including multi-word styles and future custom values); only an
+/// unset row's human-facing placeholder annotation is removed.
+fn enum_candidate(f: &EditField) -> &str {
+    let Some(seed) = f.seed.as_deref() else {
+        let placeholder = f.placeholder.trim();
+        return placeholder
+            .split_once(" (")
+            .map_or(placeholder, |(value, _)| value)
+            .trim();
+    };
+    seed.trim()
+}
+
 /// The (key, value) edit to persist when the user ACTIVATES (Enter/Space/click) the
 /// given control: a Bool toggles, an Enum advances to its next option (wrapping). The
-/// free-form kinds (Float/Integer/Text) return `None` — the caller opens the in-panel
-/// text editor for them instead. Popup-chip rows (Theme / long Enum, [`uses_popup`]) are
-/// routed to the anchored menu by `App::settings_activate` BEFORE this is consulted, so
-/// the Theme/long-Enum arms here only serve short segmented cycling.
+/// free-form kinds (Float/Integer/Text) return `None` so the native text editor can own
+/// them. Choice-picker rows are routed before this compatibility helper is consulted.
 pub(crate) fn cycle_edit(f: &EditField) -> Option<(&'static str, Option<String>)> {
     match f.kind {
         EditKind::Bool => {
@@ -1433,8 +1438,7 @@ pub(crate) fn popup_options_with(f: &EditField, pack_ids: &[String]) -> Vec<Stri
             // `pack:<id>` or an unrecognized spelling), leads verbatim + highlighted
             // so opening + Enter is a no-op and it is stepped FROM, never clobbered.
             if enum_recognized(f).is_none() {
-                let raw = SettingsState::display_value(f);
-                let token = raw.split_whitespace().next().unwrap_or(raw);
+                let token = enum_candidate(f);
                 if !token.is_empty() {
                     out.push(token.to_string());
                 }
@@ -1475,10 +1479,7 @@ pub(crate) fn popup_current_index(f: &EditField, options: &[String]) -> usize {
         }
         EditKind::Enum { .. } => match enum_recognized(f) {
             Some(o) => o.to_string(),
-            None => {
-                let raw = SettingsState::display_value(f);
-                raw.split_whitespace().next().unwrap_or(raw).to_string()
-            }
+            None => enum_candidate(f).to_string(),
         },
         _ => return 0,
     };
@@ -1561,9 +1562,8 @@ const SEL_WASH_ALPHA: u8 = 0x22;
 /// [`SEL_WASH_ALPHA`] so a test can tell the menu highlight from the row selection.
 const MENU_WASH_ALPHA: u8 = 0x30;
 
-/// Theme-derived colour ROLES for the settings surface (each `[u8; 3]`, applied with an
-/// alpha via [`rgba`]). Rebuilt per repaint from the live [`Theme`] so the overlay
-/// re-tints with the terminal — no hardcoded palette (the "no Apple hex" rule).
+/// Theme-derived colour roles for the retired card painter. They are rebuilt from the
+/// live [`Theme`] so compatibility snapshots re-tint without a hardcoded palette.
 #[derive(Clone, Copy)]
 pub(crate) struct Roles {
     pub(crate) surface: [u8; 3],
@@ -1931,11 +1931,11 @@ fn segmented(
     x0
 }
 
-/// `f32::clamp(lo, hi)` panics when `lo > hi`. Overlay geometry can invert the
-/// bounds at extreme sizes — a tiny font drops the max widget height below the
+/// `f32::clamp(lo, hi)` panics when `lo > hi`. Retired-card geometry can invert
+/// bounds in extreme compatibility fixtures — a tiny font drops the max widget below the
 /// 8px floor; an ultra-narrow grid (≤15 cols) drops the available input width
 /// below the desired minimum. Pin to the achievable (upper) bound in that case
-/// instead of panicking and crashing the whole overlay.
+/// instead of panicking.
 #[inline]
 pub(crate) fn fit(value: f32, lo: f32, hi: f32) -> f32 {
     // Inverted bounds (degenerate layout): pin to the achievable upper bound,
@@ -2223,9 +2223,8 @@ fn build_widget(
     }
 }
 
-/// The total overlay height (rows) the panel wants: a title row, a footer row, one row
-/// per control, AND one header row per distinct section present (so a tall-enough window
-/// shows the whole sectioned list without scrolling).
+/// Total height requested by the retired card painter. Kept for compatibility-layout
+/// tests; production native Settings uses renderer-native layout constraints.
 pub(crate) fn wanted_rows(fields: &[EditField]) -> usize {
     fields.len() + distinct_sections(fields) + 2
 }
@@ -2243,7 +2242,7 @@ fn distinct_sections(fields: &[EditField]) -> usize {
     seen.count_ones() as usize
 }
 
-/// One rendered BODY row of the overlay: a section header, or a control (by field index).
+/// One body row in the retired card painter: a section header or control index.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BodyRow {
     Header(prefs::Section),
@@ -2352,11 +2351,9 @@ pub(crate) fn flat_rows_before(
     }
 }
 
-/// Device-pixel geometry for the P3 frosted card: cell size + glyph height (all DEVICE
-/// px — the space the renderer + framebuffer work in, so `scale == 1.0`), the grid width
-/// `cols`, and the overlay height `panel_rows`. Built by `splice_settings_panel` from the
-/// live renderer's `cell_size()` / `font_px`. The card's `pad` placement is applied at
-/// composite time, so prims here are card-relative (origin = card top-left).
+/// Device-pixel geometry for the retired frosted-card painter. It remains compiled for
+/// compatibility snapshots and hit-test tests; production native Settings does not use
+/// this terminal-grid geometry.
 pub(crate) struct SettingsGeom {
     pub cw: f32,
     pub ch: f32,
@@ -2375,7 +2372,7 @@ pub(crate) struct SettingsGeom {
 pub(crate) const FULL_LAYOUT_MIN_COLS: usize = 96;
 /// Cols below which the sidebar collapses to an icon strip (graft #3's fallback ladder).
 pub(crate) const SIDEBAR_STRIP_COLS: usize = 64;
-/// Cols below which even the icon strip hides (degenerate headless overlays).
+/// Width below which the icon strip hides in degenerate retired-card fixtures.
 const SIDEBAR_HIDE_COLS: usize = 24;
 /// Sidebar width, cells: full (labels) / collapsed (icon strip).
 const SIDEBAR_FULL_CELLS: f32 = 26.0;
@@ -2384,7 +2381,7 @@ const SIDEBAR_STRIP_CELLS: f32 = 8.0;
 const CONTENT_TOP_ROW: usize = 3;
 /// The pinned preview card's fixed height, rows (rows 3..12 at full layout).
 const PREVIEW_CARD_ROWS: usize = 9;
-/// Shortest overlay that still reserves the preview band (leaves ≥ 2 control rows).
+/// Shortest retired card that still reserves the preview band (leaves ≥2 controls).
 const PREVIEW_MIN_PANEL_ROWS: usize = 18;
 /// First sidebar category row (six 2-cell rows: 4-5, 6-7, … 14-15 — design §2.2).
 pub(crate) const SIDEBAR_CAT_ROW0: usize = 4;
@@ -2473,7 +2470,7 @@ pub(crate) fn sidebar_hit(row: usize, panel_rows: usize) -> Option<SidebarHit> {
     let i = row.checked_sub(SIDEBAR_CAT_ROW0)? / 2;
     // Mirror the painter's clip (`row0 + 2 > footer_row` breaks): a category whose
     // full 2-cell row does not fit above the footer is never painted, so its TOP
-    // cell must not hit either — otherwise a short overlay would switch categories
+    // cell must not hit either — otherwise a short retired card would switch categories
     // on a click over blank sidebar.
     if SIDEBAR_CAT_ROW0 + i * 2 + 2 > panel_rows.saturating_sub(1) {
         return None;
@@ -3349,7 +3346,7 @@ fn preview_card(
     let gw = x_right - x_left;
     let top = y_top + cw * 0.25;
     let gh = (y_bot - cw * 0.25) - top;
-    // Degenerate band (a too-narrow / too-short overlay): draw nothing rather than a
+    // Degenerate retired-card band: draw nothing rather than a
     // zero/negative-size panel (`fit` keeps every length non-negative regardless).
     if gw <= cw * 2.0 || gh <= ch * 2.0 {
         return;
@@ -3874,8 +3871,8 @@ fn category_tint(sec: prefs::Section, r: &Roles, theme: Theme) -> [u8; 3] {
         // Packages: the parcel tile shares the window-furniture neutrality —
         // toolchain plumbing, not a personalization surface.
         prefs::Section::Packages => lerp_rgb(u32_rgb(theme.selection), r.text_secondary, 0.35),
-        // The feline default paw tint (`[sparkle_words.feline] color`, §10) —
-        // the one fixed-brand tile: the collection book is ABOUT the pink paw.
+        // The Kitty Log's fixed rose accent. This is UI branding, not the
+        // retired `[sparkle_words.feline] color` compatibility key.
         prefs::Section::KittyLog => [0xF7, 0xA8, 0xB8],
     }
 }
@@ -4314,7 +4311,7 @@ fn paint_sidebar(
     for (i, sec) in prefs::Section::ORDER.iter().enumerate() {
         let row0 = SIDEBAR_CAT_ROW0 + i * 2;
         if row0 + 2 > pg.footer_row {
-            break; // a too-short overlay clips trailing categories, never the footer
+            break; // a short retired card clips trailing categories, never the footer
         }
         let y0 = row0 as f32 * ch;
         let rh = 2.0 * ch;
@@ -4402,23 +4399,6 @@ fn paint_sidebar(
                 rgba(lcolor, 0xFF),
             ));
         }
-    }
-}
-
-/// Halve a prim's alpha in place — the 50 % dim for per-panel HUD rows while the master
-/// `show_hud` is off (visual only; the rows stay active, design §3.2).
-fn halve_alpha(p: &mut DrawPrim) {
-    match p {
-        DrawPrim::Panel { fill, .. } => fill[3] /= 2,
-        DrawPrim::Capsule { fill, track, .. } => {
-            fill[3] /= 2;
-            track[3] /= 2;
-        }
-        DrawPrim::Dot { color, .. }
-        | DrawPrim::Text { color, .. }
-        | DrawPrim::Stroke { color, .. }
-        | DrawPrim::Line { color, .. } => color[3] /= 2,
-        _ => {}
     }
 }
 
@@ -4539,13 +4519,6 @@ fn paint_group_band(
         push_box(prims, s0, n);
     }
 
-    // Master HUD state for the per-panel dim (visual only — the rows stay active).
-    let hud_on = state
-        .fields
-        .iter()
-        .find(|f| f.key == prefs::EDIT_SHOW_HUD)
-        .is_none_or(bool_on);
-
     // Pass 2 — row content over the boxes.
     let mut in_run = false; // whether the previous visible row was a control (same box)
     for &(i, off) in &visible {
@@ -4647,20 +4620,15 @@ fn paint_group_band(
                         breathe: false,
                     });
                 }
-                // Per-panel HUD rows indent + dim to 50 % while the master is off.
-                let hud_row = crate::hud_bar::PanelId::ALL
-                    .iter()
-                    .any(|p| p.config_key() == f.key);
-                let dim = hud_row && !hud_on;
                 let lstep = TypeStep::Body.px(px);
                 prims.push(text_prim(
-                    if hud_row { label_x + cw * 1.5 } else { label_x },
+                    label_x,
                     row_baseline(y0, 2.0 * ch, lstep.get()),
                     f.label.to_string(),
                     lstep,
                     TextWeight::Regular,
                     TextFace::Ui,
-                    rgba(r.text_primary, if dim { 0x80 } else { 0xFF }),
+                    rgba(r.text_primary, 0xFF),
                 ));
                 let editing = if selected {
                     state.editing.as_deref()
@@ -4670,7 +4638,6 @@ fn paint_group_band(
                 // Centre the widget over the 2-cell row by feeding build_widget the
                 // MIDDLE 1-cell band — widget metrics stay identical to a 1-cell row,
                 // so `widget_hit_left`'s scratch replay keeps matching the pixels.
-                let before = prims.len();
                 build_widget(
                     prims,
                     f,
@@ -4684,11 +4651,6 @@ fn paint_group_band(
                     selected,
                     editing,
                 );
-                if dim {
-                    for p in &mut prims[before..] {
-                        halve_alpha(p);
-                    }
-                }
             }
         }
     }
@@ -4744,7 +4706,7 @@ fn paint_kitty_book_band(
     let book = crate::kitty_log::kitty_book(&state.kitty_log.log);
     // 1-cell text rows, truncated at the band edge (the book is a fixed 26
     // cells — header + 5 captions + 20 rows — so it fits every full-layout
-    // geometry; a short headless overlay simply clips the tail).
+    // geometry; a short retired-card fixture simply clips the tail).
     let mut cell = 0usize;
     let put = |prims: &mut Vec<DrawPrim>,
                cell: usize,
@@ -5728,7 +5690,7 @@ fn wheel_hint_w(px: f32) -> f32 {
 /// Compute the open wheel's placement: anchored under its Color row's widget
 /// (right-aligned at the content value edge, like [`menu_geom`]), flipping ABOVE
 /// the row when the footer is too close — always inside the card. The disk
-/// shrinks before the popover would spill a short card (headless overlays).
+/// shrinks before the popover would spill a short retired-card test fixture.
 /// `None` when no wheel is open.
 pub(crate) fn wheel_geom(state: &SettingsState, g: &SettingsGeom) -> Option<WheelGeom> {
     let wst = state.wheel.as_ref()?;
@@ -5929,11 +5891,11 @@ pub(crate) fn widget_hit_left(state: &SettingsState, g: &SettingsGeom, idx: usiz
 /// A full-width blank row of `cols` cells in `fg`/`bg` (the `seam` overline marks the
 /// panel's top edge on row 0).
 pub(crate) fn blank_row(cols: usize, fg: [u8; 3], bg: [u8; 3], seam: bool) -> Vec<RenderCell> {
-    vec![hud_bar::cell(' ', fg, bg, false, seam); cols]
+    vec![chrome_band::cell(' ', fg, bg, false, seam); cols]
 }
 
 /// Write `s` into `row` starting at column `col`, clamped to the row width. Each glyph
-/// becomes a `hud_bar::cell` in `fg`/`bg`. Multi-cell-wide glyphs are not expected here
+/// becomes a `chrome_band::cell` in `fg`/`bg`. Multi-cell-wide glyphs are not expected here
 /// (labels/values are ASCII + a few BMP arrows), so one char == one cell.
 pub(crate) fn write_str(
     row: &mut [RenderCell],
@@ -5948,7 +5910,7 @@ pub(crate) fn write_str(
         if col >= cols {
             break;
         }
-        row[col] = hud_bar::cell(ch, fg, bg, bold, false);
+        row[col] = chrome_band::cell(ch, fg, bg, bold, false);
         col += 1;
     }
 }
@@ -6069,9 +6031,8 @@ mod tests {
             cycle_edit(&field("beam")).unwrap().1.as_deref(),
             Some("block")
         );
-        // The retired underline option is no longer in the list — a config
-        // still carrying it falls back to the first option, like any unknown.
-        assert_eq!(enum_current(&field("underline")), "block");
+        // The loader still accepts retired `underline` and renders it as a bar.
+        assert_eq!(enum_current(&field("underline")), "bar");
         // A genuinely unknown spelling falls back to the first option.
         assert_eq!(enum_current(&field("zzz")), "block");
 
@@ -6098,6 +6059,136 @@ mod tests {
         // An unknown spelling still falls back to the first option here (the
         // popup's verbatim-preserve arm lives in `popup_options`).
         assert_eq!(enum_current(&trail("plasma")), "phaser");
+    }
+
+    #[test]
+    fn enum_runtime_aliases_normalize_in_structured_display() {
+        let field = |key: &'static str, seed: &str| EditField {
+            label: key,
+            key,
+            kind: crate::prefs::edit_kind(key),
+            seed: Some(seed.to_string()),
+            placeholder: String::new(),
+        };
+        let aliases = [
+            (crate::prefs::EDIT_CURSOR_STYLE, "beam", "bar"),
+            (crate::prefs::EDIT_CURSOR_STYLE, "underline", "bar"),
+            (crate::prefs::EDIT_BIDI, "off", "disabled"),
+            (crate::prefs::EDIT_BIDI, "on", "implicit"),
+            (crate::prefs::EDIT_AMBIGUOUS_WIDTH, "single", "narrow"),
+            (crate::prefs::EDIT_AMBIGUOUS_WIDTH, "double", "wide"),
+            (crate::prefs::EDIT_PREDICTIVE_ECHO, "auto", "adaptive"),
+            (crate::prefs::EDIT_PREDICTIVE_ECHO, "on", "adaptive"),
+            (crate::prefs::EDIT_PREDICTIVE_ECHO, "true", "adaptive"),
+            (crate::prefs::EDIT_PREDICTIVE_ECHO, "force", "always"),
+            (
+                crate::prefs::EDIT_TEXT_BLENDING,
+                "linear_corrected",
+                "linear-corrected",
+            ),
+            (crate::prefs::EDIT_MOTION, "reduce", "reduced"),
+            (
+                crate::prefs::EDIT_WINDOW_COLORSPACE,
+                "displayp3",
+                "display-p3",
+            ),
+            (crate::prefs::EDIT_WINDOW_COLORSPACE, "p3", "display-p3"),
+            (
+                crate::prefs::EDIT_BACKGROUND_MATERIAL,
+                "underwindow",
+                "under-window",
+            ),
+            (
+                crate::prefs::EDIT_BACKGROUND_MATERIAL,
+                "under_window",
+                "under-window",
+            ),
+            (crate::prefs::EDIT_BACKGROUND_MATERIAL, "", "none"),
+        ];
+        for (key, alias, canonical) in aliases {
+            let f = field(key, alias);
+            assert_eq!(
+                SettingsState::display_value(&f),
+                canonical,
+                "structured display for {key}={alias:?}"
+            );
+            assert_eq!(enum_current(&f), canonical, "current {key}={alias:?}");
+            let EditKind::Enum { options } = f.kind else {
+                panic!("alias key {key} must remain an enum");
+            };
+            let popup = popup_options(&f);
+            assert_eq!(
+                popup.len(),
+                options.len(),
+                "recognized alias {key}={alias:?} must not become a custom option"
+            );
+            assert_eq!(popup[popup_current_index(&f, &popup)], canonical);
+            let canonical_index = options
+                .iter()
+                .position(|option| option.eq_ignore_ascii_case(canonical))
+                .unwrap();
+            assert_eq!(
+                cycle_edit(&f).unwrap().1.as_deref(),
+                Some(options[(canonical_index + 1) % options.len()]),
+                "cycling must start from the runtime value of {key}={alias:?}"
+            );
+        }
+
+        for &(alias, canonical) in crate::prefs::CURSOR_TRAIL_STYLE_ALIASES {
+            let f = field(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, alias);
+            assert_eq!(SettingsState::display_value(&f), canonical, "{alias}");
+            assert_eq!(enum_current(&f), canonical, "{alias}");
+            assert_eq!(
+                popup_options(&f).len(),
+                crate::prefs::CURSOR_TRAIL_STYLES.len(),
+                "trail alias {alias:?} must not become a custom option"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_candidate_preserves_annotated_defaults_and_full_custom_values() {
+        let trail = EditField {
+            label: "Trail style",
+            key: crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+            kind: EditKind::Enum {
+                options: crate::prefs::CURSOR_TRAIL_STYLES,
+            },
+            seed: None,
+            placeholder: "nyan rainbow (default)".to_string(),
+        };
+        assert_eq!(
+            SettingsState::display_value(&trail),
+            "nyan rainbow (default)",
+            "native display keeps the explanatory default annotation"
+        );
+        assert_eq!(enum_current(&trail), "nyan rainbow");
+        assert_eq!(
+            popup_options(&trail).len(),
+            crate::prefs::CURSOR_TRAIL_STYLES.len(),
+            "the multi-word default is canonical, not a custom entry"
+        );
+
+        let motion = EditField {
+            label: "Motion",
+            key: crate::prefs::EDIT_MOTION,
+            kind: crate::prefs::edit_kind(crate::prefs::EDIT_MOTION),
+            seed: None,
+            placeholder: crate::prefs::motion_auto_placeholder().to_string(),
+        };
+        assert_eq!(enum_current(&motion), "auto");
+
+        let custom = EditField {
+            seed: Some("future multi word value".to_string()),
+            ..trail
+        };
+        assert_eq!(
+            SettingsState::display_value(&custom),
+            "future multi word value"
+        );
+        let popup = popup_options(&custom);
+        assert_eq!(popup[0], "future multi word value");
+        assert_eq!(popup_current_index(&custom, &popup), 0);
     }
 
     fn geom(panel_rows: usize) -> SettingsGeom {
@@ -6134,12 +6225,12 @@ mod tests {
             .count()
     }
 
-    /// Opening the Settings overlay at EXTREME geometry must not panic. The
-    /// widget painter clamps several lengths, and `f32::clamp(lo, hi)` aborts
+    /// The cfg(test)-only retired overlay painter must not panic at extreme geometry.
+    /// Its widget painter clamps several lengths, and `f32::clamp(lo, hi)` aborts
     /// when `lo > hi`: a tiny font drops the max widget height (`px*1.1`) below
     /// the 8px floor, and an ultra-narrow grid (≤15 cols) drops the available
     /// input width below the desired minimum. Either crashed the app the instant
-    /// Settings opened. (audit/501cecb clamp panics — exercises sites 664/670/836)
+    /// the old card opened. (audit/501cecb clamp panics — exercises sites 664/670/836)
     #[test]
     fn settings_tray_survives_extreme_geometry() {
         let mut s = SettingsState::from_config(&cfg());
@@ -6180,7 +6271,7 @@ mod tests {
         };
         let _ = tray(&s, &both);
 
-        // A short headless overlay at every ladder rung (icon strip / hidden sidebar).
+        // A short headless retired-overlay fixture at every layout ladder rung.
         for cols in [132, 96, 80, 64, 50, 24, 12] {
             let short = SettingsGeom {
                 cw: 8.0,
@@ -6672,7 +6763,7 @@ mod tests {
     /// focuses a different control (its category follows); `ATERM_SETTINGS_PREVIEW_DARK=1`
     /// renders the auto titlebar's dark-leading split.
     #[test]
-    fn preview_settings_overlay() {
+    fn preview_retired_settings_overlay() {
         let Ok(path) = std::env::var("ATERM_SETTINGS_PREVIEW") else {
             return;
         };
@@ -6857,7 +6948,7 @@ mod tests {
     }
 
     /// Graft #1: the 7 per-effect checkbox rows are GONE — `cursor_trail_style` is
-    /// ONE "Trail effect" popup row (Enum over [`CURSOR_TRAIL_STYLES`]) whose open
+    /// ONE "Cursor trail" popup row (Enum over [`CURSOR_TRAIL_STYLES`]) whose open
     /// menu's HIGHLIGHTED option drives the animated demo lane, so browsing the
     /// menu live-demos each look. Nothing persists while browsing; Esc restores.
     #[test]
@@ -6868,7 +6959,7 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "exactly one trail-style row");
         let idx = rows[0];
-        assert_eq!(s.fields[idx].label, "Trail effect");
+        assert_eq!(s.fields[idx].label, "Cursor trail");
         assert!(
             matches!(s.fields[idx].kind, EditKind::Enum { options } if options == CURSOR_TRAIL_STYLES),
             "the popup offers the whole style list"
@@ -7280,13 +7371,14 @@ mod tests {
             step_edit(&font("13"), 1, true).unwrap().1.as_deref(),
             Some("23")
         );
+        assert_eq!(r.max, 200.0, "test tracks the full runtime range");
         assert_eq!(
-            step_edit(&font("30"), 1, true).unwrap().1.as_deref(),
-            Some("32"),
+            step_edit(&font("195"), 1, true).unwrap().1.as_deref(),
+            Some("200"),
             "a big step clamps to max"
         );
         assert_eq!(
-            step_edit(&font("32"), 1, false),
+            step_edit(&font("200"), 1, false),
             None,
             "at the max rail: no-op"
         );
@@ -7400,8 +7492,8 @@ mod tests {
         );
     }
 
-    /// `controls settings` exposes the open menu (anchor key, highlight, options) so a
-    /// driver can assert exactly what the popover shows; closed ⇒ no `menu` line.
+    /// The legacy overlay serializer exposes the open menu (anchor key, highlight,
+    /// options) for exact model-level assertions; closed ⇒ no `menu` line.
     #[test]
     fn controls_lines_expose_menu_state() {
         let mut s = SettingsState::from_config(&cfg());
@@ -7596,7 +7688,7 @@ mod tests {
         assert!(strip.icon_strip);
         assert_eq!(strip.sidebar_w_cells, 8.0, "icon strip below 64 cols");
 
-        // Too short for the preview even at full width (the headless overlay clamp).
+        // Too short for the preview even at full width (retired-overlay test clamp).
         assert!(!pane_geom_cells(132, 12).preview_shown());
 
         // Degenerate headless geometry stays well-formed (start ≤ end everywhere).
@@ -7624,13 +7716,13 @@ mod tests {
         };
         assert_eq!(
             caps(prefs::Section::Appearance),
-            // Full-coverage growth: the M5 Glass box plus one box per
+            // Full-coverage growth: the Transparency box plus one box per
             // decorative nested table (sparkle words / matrix rain).
             [
                 "Theme",
                 "Colors",
                 "Text & Contrast",
-                "Glass",
+                "Transparency",
                 "Sparkle words",
                 "Matrix rain"
             ]
@@ -7645,6 +7737,7 @@ mod tests {
                 "Cursor",
                 "Effect policy",
                 "Trail effect",
+                "Motion",
                 "Trail color",
                 "Light & GPU",
                 "Stream fade"
@@ -7652,17 +7745,26 @@ mod tests {
         );
         assert_eq!(
             caps(prefs::Section::Typography),
-            ["Font", "Shaping", "Metrics", "Rendering"]
+            ["Font", "Shaping", "Line layout", "Rendering"]
         );
         assert_eq!(
             caps(prefs::Section::Window),
-            ["Size", "Smart Titles", "Chrome", "Session"]
+            [
+                "Size",
+                "Smart Titles",
+                "Window padding",
+                "Chrome",
+                "Session"
+            ]
         );
-        assert_eq!(caps(prefs::Section::Input), ["Clipboard", "Keyboard"]);
-        assert_eq!(caps(prefs::Section::Performance), ["Bottom HUD", "System"]);
+        assert_eq!(
+            caps(prefs::Section::Input),
+            ["Clipboard", "Paste safety", "Keyboard"]
+        );
+        assert_eq!(caps(prefs::Section::Performance), ["System"]);
         assert_eq!(
             caps(prefs::Section::Terminal),
-            ["Scrollback", "Text Semantics", "Shell", "Updates"]
+            ["Scrollback", "Text direction & width", "Shell", "Updates"]
         );
         assert_eq!(
             caps(prefs::Section::Security),
@@ -7704,7 +7806,7 @@ mod tests {
             prefs::EDIT_SELECTION_INACTIVE,
             prefs::EDIT_BOLD_IS_BRIGHT,
             prefs::EDIT_FAINT_OPACITY,
-            // M5 Glass: opacity then material.
+            // Transparency: opacity then material.
             prefs::EDIT_BACKGROUND_OPACITY,
             prefs::EDIT_BACKGROUND_MATERIAL,
         ];
@@ -8095,10 +8197,9 @@ mod tests {
         );
     }
 
-    /// `controls settings` reflects the two panes (screen == introspection): the state
-    /// line carries pane/category, the `preview` line reports the card's live subject
-    /// (graft #3), and only the ACTIVE category's fields serialize outside search mode
-    /// — exactly what the content pane paints.
+    /// The legacy overlay serializer reflects both panes: the state line carries
+    /// pane/category, the `preview` line reports the card's live subject (graft #3),
+    /// and only the active category's fields serialize outside search mode.
     #[test]
     fn controls_lines_reflect_panes_and_preview() {
         let mut s = SettingsState::from_config(&cfg());
@@ -8139,7 +8240,7 @@ mod tests {
         assert_eq!(shown, s.visible_indices().len());
     }
 
-    /// Design §4.6 (audit): `controls settings` serializes the SIDEBAR (active
+    /// Design §4.6 (legacy-model audit): the overlay serializer records the SIDEBAR (active
     /// category + the full section list) and interleaves `group label="…"` lines
     /// before their fields in grouped mode — the painted two-pane/group-box
     /// structure, machine-readable (screen == introspection). The flat filtered
@@ -8266,26 +8367,43 @@ mod tests {
             2,
             "the Permissions footnote wraps to two rows: {notes:?}"
         );
-        assert!(notes[0].starts_with("All off by default."), "{notes:?}");
+        let source = prefs::group_footnote("Permissions").expect("Permissions footnote");
         assert!(
-            notes[1].ends_with("request these."),
-            "wrap loses no text: {notes:?}"
+            notes[0].starts_with("Off by default."),
+            "the first wrapped row retains the current default-policy disclosure: {notes:?}"
         );
-        for n in &notes {
-            assert!(
-                n.chars().count() <= wrap,
-                "each row respects the wrap: {n:?}"
-            );
-        }
+        assert_eq!(
+            notes.join(" "),
+            source,
+            "the two-row layout retains the complete current capability disclosure"
+        );
+        assert!(
+            notes[0].chars().count() <= wrap,
+            "the first row respects the authored wrap: {:?}",
+            notes[0]
+        );
+        assert!(
+            notes[1].ends_with("macOS and Windows."),
+            "the current platform disclosure remains in the retained remainder: {notes:?}"
+        );
 
         // Painted fit: both rows are drawn and end inside the box's right edge
-        // (the band at 38 rows holds the whole Permissions group).
+        // (the band at 38 rows holds the whole Permissions group). The retained
+        // second-row source may be visually elided by the containment backstop,
+        // so match either the exact row or its painted ellipsis prefix.
         let box_right = g.cols as f32 * g.cw - g.cw * 2.5;
         let painted: Vec<(f32, f32)> = tray(&s, &g)
             .prims
             .iter()
             .filter_map(|p| match p {
-                DrawPrim::Text { x, s: txt, px, .. } if notes.contains(&txt.as_str()) => {
+                DrawPrim::Text { x, s: txt, px, .. }
+                    if notes.iter().any(|note| {
+                        *note == txt
+                            || txt
+                                .strip_suffix('…')
+                                .is_some_and(|prefix| note.starts_with(prefix))
+                    }) =>
+                {
                     // footnotes paint in the UI face — measure with its metric
                     Some((*x, *x + ui_text_width(txt, *px)))
                 }
@@ -8300,12 +8418,21 @@ mod tests {
             );
         }
 
-        // At the dedicated window's 132 cols the same note fits ONE row again.
-        let one = category_layout(&s.fields, s.category, footnote_wrap_chars(132))
+        // The current disclosure fits on one row at the dedicated window's
+        // 132 columns. Crossing to the wide rung may reflow it, but must retain
+        // the complete source rather than dropping the footnote.
+        let wide_notes = category_layout(&s.fields, s.category, footnote_wrap_chars(132))
             .iter()
-            .filter(|r| matches!(r, GroupRow::Footnote(_)))
-            .count();
-        assert_eq!(one, 1, "wide layouts keep the single-row footnote");
+            .filter_map(|row| match row {
+                GroupRow::Footnote(note) => Some(*note),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wide_notes,
+            vec![source],
+            "wide layout retains the disclosure"
+        );
     }
 
     #[test]
@@ -8550,7 +8677,7 @@ mod tests {
     /// Design §5.4: while the wheel is open the preview mock renders the CANDIDATE
     /// colour on the driven element — a background scrub re-tints the mock's bg
     /// panel with the UNCOMMITTED colour — and each quantized scrub step repaints.
-    /// `controls settings` serializes the same candidate (screen == introspection).
+    /// The legacy overlay serializer records the same candidate.
     #[test]
     fn wheel_scrub_tints_preview_and_serializes() {
         let mut s = wheel_state(crate::prefs::EDIT_BACKGROUND, None);

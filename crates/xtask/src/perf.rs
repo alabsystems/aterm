@@ -679,13 +679,17 @@ pub(crate) const SEARCH_LANE: FloorLane = FloorLane {
         "replog_build_klps",
         "replog_query_qps",
         "replog_lines_per_mib",
+        "linkheavy_build_klps",
+        "linkheavy_query_qps",
+        "linkheavy_lines_per_mib",
         "index_line_klps",
     ],
     baseline_file: "perf-baseline-search.json",
     comment: "aterm SEARCH-BENCH baseline (E0): full-rebuild klines/s, cached-query q/s, and \
-              retained-index lines-per-MiB on the trigram-diverse (rotating) and repetitive-log \
-              (replog) corpora, plus the incremental index_scrollback_line primitive. All \
-              BIGGER-IS-BETTER. Re-record with ATERM_PERF_RECORD=1 cargo run -p xtask -- gate perf.",
+              retained-index lines-per-MiB on the trigram-diverse (rotating), repetitive-log \
+              (replog), and hyperlink-heavy (linkheavy, Wave-4A P7) corpora, plus the \
+              incremental index_scrollback_line primitive. All BIGGER-IS-BETTER. Re-record \
+              with ATERM_PERF_RECORD=1 cargo run -p xtask -- gate perf.",
 };
 
 pub(crate) const RESTORE_LANE: FloorLane = FloorLane {

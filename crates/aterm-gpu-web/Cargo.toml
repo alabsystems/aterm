@@ -1,6 +1,6 @@
 [package]
 name = "aterm-gpu-web"
-version = "0.0.1"
+version.workspace = true
 edition = "2021"
 description = "wasm-bindgen binding: the aterm engine (aterm-core) + the aterm-gpu WebGPU renderer (wgpu -> WebGPU on wasm32), rendering a terminal onto a <canvas> in the Electron renderer. The GPU sibling of the aterm-wasm crate (which is the CPU/putImageData path)."
 license = "MIT"

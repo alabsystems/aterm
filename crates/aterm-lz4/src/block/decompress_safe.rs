@@ -140,7 +140,8 @@ fn does_token_fit(token: u8) -> bool {
 /// Decompress all bytes of `input` into `output`.
 ///
 /// Returns the number of bytes written (decompressed) into `output`.
-#[inline(always)] // (always) necessary to get the best performance in non LTO builds
+#[inline(always)]
+// (always) necessary to get the best performance in non LTO builds
 // The hot decode loop reads 16 bytes unchecked (`input[..].try_into().unwrap()`)
 // only inside the `does_token_fit && input_pos <= safe_input_pos && ...` fast-path
 // guard, whose manual-invariant chain (safe_input_pos = len - 16 - 2) the fail-closed
@@ -439,7 +440,8 @@ pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, DecompressErro
 /// # Panics
 /// May panic if the parameter `min_uncompressed_size` is smaller than the
 /// uncompressed data.
-#[cfg_attr(trust_verify, trust::skip)] // idiomatic allocation panic (vec!); wrapped logic verified in the inner fn
+#[cfg_attr(trust_verify, trust::skip)]
+// idiomatic allocation panic (vec!); wrapped logic verified in the inner fn
 // #[inline] so the MIR crosses the crate boundary: callers' Trust gates
 // (aterm-scrollback) bundle and VERIFY this body instead of assuming an
 // absent callee. Semantics unchanged.

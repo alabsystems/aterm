@@ -288,10 +288,11 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> Vec<Defe
         // live cell stayed narrow there; demote to match).
         let unit = advance_grapheme_unit_wide(text, &mut byte_idx);
         let chars_consumed = unit.chars;
-        let is_wide = unit.wide && !(unit.vs16_widened && col + 1 >= cols);
+        let attrs = line.get_attr(unit_char_start);
+        let is_wide = super::scroll_materialize::stored_unit_is_wide(unit, attrs)
+            && !(unit.vs16_widened && col + 1 >= cols);
         char_idx += chars_consumed;
         let unit_str = &text[unit_byte_start..byte_idx];
-        let attrs = line.get_attr(unit_char_start);
         let style = LineCellStyle {
             fg: PackedColor(attrs.fg),
             bg: PackedColor(attrs.bg),
@@ -386,11 +387,13 @@ fn place_line_cell(
 /// Set a normal (non-complex) cell, handling wide chars.
 fn set_cell(row: &mut Row, col: u16, cols: u16, c: char, s: &LineCellStyle, is_wide: bool) -> u16 {
     use crate::{Cell, CellFlags};
+    let flags = if is_wide {
+        s.flags.union(CellFlags::WIDE)
+    } else {
+        s.flags.difference(CellFlags::WIDE)
+    };
     if is_wide && col + 1 < cols {
-        row.set(
-            col,
-            Cell::with_style(c, s.fg, s.bg, s.flags.union(CellFlags::WIDE)),
-        );
+        row.set(col, Cell::with_style(c, s.fg, s.bg, flags));
         row.set(
             col + 1,
             Cell::with_style(' ', s.fg, s.bg, CellFlags::WIDE_CONTINUATION),
@@ -399,7 +402,7 @@ fn set_cell(row: &mut Row, col: u16, cols: u16, c: char, s: &LineCellStyle, is_w
     } else if is_wide {
         col // wide at last column — can't fit
     } else {
-        row.set(col, Cell::with_style(c, s.fg, s.bg, s.flags));
+        row.set(col, Cell::with_style(c, s.fg, s.bg, flags));
         col.saturating_add(1)
     }
 }
@@ -420,7 +423,7 @@ fn set_complex_cell(
     let flags = if is_wide {
         s.flags.union(CellFlags::WIDE)
     } else {
-        s.flags
+        s.flags.difference(CellFlags::WIDE)
     };
     let mut cell = Cell::with_style(' ', s.fg, s.bg, flags);
     cell.set_overflow_index(0);

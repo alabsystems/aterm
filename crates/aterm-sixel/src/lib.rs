@@ -154,8 +154,8 @@ impl SixelImage {
         // `<= height/2`), so this is byte-identical to `height.div_ceil(cell_h)`.
         let ch = usize::from(cell_h);
         let cell_h = if ch == 0 { 1 } else { ch };
-        let ceil = (self.height / cell_h)
-            .saturating_add(usize::from(!self.height.is_multiple_of(cell_h)));
+        let ceil =
+            (self.height / cell_h).saturating_add(usize::from(!self.height.is_multiple_of(cell_h)));
         ceil.max(usize::from(self.height > 0))
     }
 
@@ -168,8 +168,8 @@ impl SixelImage {
         // `saturating_add` is behavior-identical.
         let cw = usize::from(cell_w);
         let cell_w = if cw == 0 { 1 } else { cw };
-        let ceil = (self.width / cell_w)
-            .saturating_add(usize::from(!self.width.is_multiple_of(cell_w)));
+        let ceil =
+            (self.width / cell_w).saturating_add(usize::from(!self.width.is_multiple_of(cell_w)));
         ceil.max(usize::from(self.width > 0))
     }
 }

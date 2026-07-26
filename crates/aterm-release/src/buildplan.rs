@@ -65,7 +65,7 @@ pub struct BuildPlan {
     /// cargo child (→ ATERM_BUILD_NUMBER + ATERM_BUILD_TIME via the untouched
     /// build.rs — spec decision 11).
     pub build_number: u64,
-    /// Display version ("0.26") — names the dSYM zip `aterm-0.26-dSYM.zip`.
+    /// Release version ("0.2.0") — names the dSYM zip `aterm-0.2.0-dSYM.zip`.
     pub short_version: String,
     /// `--arm64-only`: skip the x86_64 slice (single-arch pass-through
     /// instead of lipo). The universal build is the default (spec decision 18).
@@ -247,6 +247,26 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
         validate_slice_update_pin_reports(expected, &[("final universal binary", &diagnose)])?;
         println!("    updater pin: final universal runtime cross-check passed");
     }
+    validate_app_version_reports(
+        &plan.short_version,
+        &[("final universal binary", &diagnose)],
+    )?;
+    let version_output = Command::new(&shipped[0])
+        .arg("--version")
+        .current_dir(&plan.repo_root)
+        .output()
+        .map_err(|error| format!("execute final universal binary --version: {error}"))?;
+    if !version_output.status.success() {
+        return Err(format!(
+            "app-version probe failed: final universal binary --version exited {}",
+            version_output.status
+        ));
+    }
+    validate_cli_app_version(&plan.short_version, &version_output.stdout)?;
+    println!(
+        "    app version: {} (diagnostics + CLI identity gates passed)",
+        plan.short_version
+    );
     let compiler_line = diagnose
         .lines()
         .find_map(|l| l.strip_prefix("compiler:"))
@@ -281,7 +301,7 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
 fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&plan.repo_root)
-        .args(["build", "--release", "-p", pkg]);
+        .args(["build", "--release", "--locked", "-p", pkg]);
     if let Some(triple) = target {
         cmd.args(["--target", triple]);
     }
@@ -330,7 +350,12 @@ fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), St
     cmd.env_remove("RUSTC")
         .env_remove("RUSTC_BOOTSTRAP")
         .env_remove("RUSTFLAGS")
-        .env_remove("RUSTUP_TOOLCHAIN");
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("ATERM_APP_RELEASE_VERSION");
+    // The value comes from the validated release context, never the ambient
+    // environment or release.conf. Both architecture builds receive the same
+    // exact app identity while Cargo.toml remains on its source-version line.
+    cmd.env("ATERM_APP_RELEASE_VERSION", &plan.short_version);
     let lane = if target.is_some() {
         cmd.env("RUSTUP_TOOLCHAIN", "stable");
         "upstream stable (+r) compat"
@@ -765,6 +790,56 @@ fn verify_shipped_update_pin_slices(
     )
 }
 
+/// Require every diagnostics report to carry exactly one app-version field
+/// equal to the ledger-derived release identity.
+pub fn validate_app_version_reports(
+    expected: &str,
+    reports: &[(&str, &str)],
+) -> Result<(), String> {
+    for (label, report) in reports {
+        let fields: Vec<&str> = report
+            .lines()
+            .filter_map(|line| line.strip_prefix("version:"))
+            .map(str::trim)
+            .collect();
+        let [field] = fields.as_slice() else {
+            return Err(format!(
+                "{label} reported {} diagnostics version fields; expected exactly one",
+                fields.len()
+            ));
+        };
+        let observed = field.split_once(" (").map(|(version, _)| version);
+        if observed != Some(expected) {
+            return Err(format!(
+                "{label} diagnostics app version {observed:?} differs from claimed {expected:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Require the one-binary CLI identity to be exactly `aterm <claimed>`.
+pub fn validate_cli_app_version(expected: &str, stdout: &[u8]) -> Result<(), String> {
+    validate_named_cli_app_version("aterm", expected, stdout)
+}
+
+/// Require an argv0 alias identity to be exactly `<name> <claimed>`.
+pub fn validate_named_cli_app_version(
+    name: &str,
+    expected: &str,
+    stdout: &[u8],
+) -> Result<(), String> {
+    let observed =
+        std::str::from_utf8(stdout).map_err(|_| format!("{name} --version output is not UTF-8"))?;
+    let wanted = format!("{name} {expected}\n");
+    if observed != wanted {
+        return Err(format!(
+            "{name} --version output {observed:?} differs from {wanted:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Pure report validator used by the native-slice and final-universal runtime
 /// cross-checks. Each report must contain exactly one stable diagnostics field
 /// and independently equal the authority.
@@ -1027,8 +1102,9 @@ mod tests {
 
     use super::{
         LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, SECTION_64_LEN,
-        SEGMENT_COMMAND_64_LEN, parse_thin_macho_update_pin, validate_embedded_update_pin,
-        validate_final_slice_records, validate_lipo_architectures,
+        SEGMENT_COMMAND_64_LEN, parse_thin_macho_update_pin, validate_app_version_reports,
+        validate_cli_app_version, validate_embedded_update_pin, validate_final_slice_records,
+        validate_lipo_architectures, validate_named_cli_app_version,
         validate_slice_update_pin_reports,
     };
 
@@ -1134,6 +1210,27 @@ mod tests {
         assert!(validate_slice_update_pin_reports(EXPECTED, &[("arm64", "")]).is_err());
         let duplicate = format!("{}update-pin-sha256: {EXPECTED}\n", report(EXPECTED));
         assert!(validate_slice_update_pin_reports(EXPECTED, &[("arm64", &duplicate)]).is_err());
+    }
+
+    #[test]
+    fn app_version_reports_and_cli_identities_must_match_claim_exactly() {
+        let report = "aterm diagnostics\nversion:   0.2.0 (abc123, built now)\nrenderer: gpu\n";
+        assert!(validate_app_version_reports("0.2.0", &[("universal", report)]).is_ok());
+        assert!(validate_app_version_reports("0.3.0", &[("universal", report)]).is_err());
+        // The dev-build spelling of the same workspace version is NOT the
+        // release version: only DEV == 0 ships.
+        assert!(validate_app_version_reports("0.2.1", &[("universal", report)]).is_err());
+        assert!(validate_app_version_reports("0.2.0", &[("universal", "")]).is_err());
+        let duplicate = format!("{report}version:   0.2.0 (abc123, built now)\n");
+        assert!(validate_app_version_reports("0.2.0", &[("universal", &duplicate)]).is_err());
+
+        assert!(validate_cli_app_version("0.2.0", b"aterm 0.2.0\n").is_ok());
+        assert!(validate_cli_app_version("0.2.0", b"aterm 0.2.1\n").is_err());
+        assert!(validate_named_cli_app_version("aterm-gui", "0.2.0", b"aterm-gui 0.2.0\n").is_ok());
+        assert!(validate_named_cli_app_version("aterm-ctl", "0.2.0", b"aterm-ctl 0.2.0\n").is_ok());
+        assert!(
+            validate_named_cli_app_version("aterm-ctl", "0.2.0", b"aterm-gui 0.2.0\n").is_err()
+        );
     }
 
     #[test]

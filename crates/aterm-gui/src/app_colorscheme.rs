@@ -89,7 +89,8 @@ impl App {
     /// A NO-OP when the appearance is unchanged, and (for a plain, non-split `theme`)
     /// the re-resolved scheme is identical, so a single theme never re-themes on an OS
     /// toggle and the renderer is rebuilt ONLY when the chrome actually changes. Re-
-    /// resolves from the retained live [`Config`](crate::Config) — no disk read — and
+    /// resolves from the retained live [`Config`](crate::Config) and immutable
+    /// admitted theme catalog — no disk read — and
     /// re-applies the engine palette + rebuilds the backend exactly as a live
     /// `reload_config` does, so the switch is seamless.
     pub(crate) fn sync_app_theme_to_appearance(&mut self, appearance: aterm_types::Appearance) {
@@ -100,7 +101,9 @@ impl App {
 
         // Engine config (default fg/bg + ANSI palette) for the new appearance, applied
         // to every live session and pinned into the factory so future tabs inherit it.
-        let applied_tc = self.config.applied_terminal_config_for(appearance);
+        let applied_tc = self
+            .config
+            .applied_terminal_config_for_with_assets(appearance, &self.config_assets.themes);
         for s in self.pool.iter() {
             term_lock(&s.term).apply_config(&applied_tc);
         }
@@ -112,7 +115,9 @@ impl App {
 
         // Renderer chrome. `Theme` is a 4×u32 POD without `PartialEq`; compare fields
         // (the renderer bakes these in, so any change needs a backend rebuild).
-        let new_theme = self.config.theme_for(appearance);
+        let new_theme = self
+            .config
+            .theme_for_with_assets(appearance, &self.config_assets.themes);
         let theme_changed = (
             new_theme.fg,
             new_theme.bg,

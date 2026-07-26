@@ -24,7 +24,9 @@ impl<T: Ord + Clone> Clone for VerifySet<T> {
     // by design), the `Mutex::default`/`Line::clone` class. Verify-only.
     #[cfg_attr(trust_verify, trust::skip)]
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -224,7 +226,9 @@ impl<K: Ord + Clone, V: Clone> Clone for VerifyMap<K, V> {
     // class. Verify-only.
     #[cfg_attr(trust_verify, trust::skip)]
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -433,7 +437,9 @@ impl<T: Clone> Clone for VerifyDeque<T> {
     // `Clone` (open-trait user code) — the VerifySet/VerifyMap class.
     #[cfg_attr(trust_verify, trust::skip)]
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 

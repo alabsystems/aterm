@@ -42,6 +42,18 @@ pub enum VerifyOutcome {
         /// The active build, if any.
         build: Option<u64>,
     },
+    /// A LOWER-ASSURANCE source-built companion (`docs/COMPANION-TOOLS.md`): the store tree
+    /// matches the sidecar's self-computed `tree_root`, so it is intact — but its trust basis
+    /// is the owner manifest + pinned commit, NOT an owner Ed25519 signature. Informational
+    /// (exit 0), and MUST never read as a signature `Match`.
+    SourceBuilt {
+        /// The active source build.
+        build: u64,
+        /// The pinned commit it was built from.
+        commit: String,
+        /// Whether the on-disk tree still matches the sidecar's recorded self-tree-root.
+        intact: bool,
+    },
     /// The program has no active build (not installed / not on PATH).
     NotInstalled,
     /// The on-disk tree could not be read to recompute its root.
@@ -89,7 +101,25 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
     let Some(build) = active else {
         return VerifyOutcome::NotInstalled;
     };
+    // A recorded SIGNED root always takes precedence (below): a signed reinstall over a reused
+    // build number must verify as signed even if a stale source sidecar lingers. Only when
+    // there is NO signed record do we consult the source-build provenance sidecar — and only
+    // when its own `build` field matches the active build — reporting the lower-assurance
+    // SourceBuilt outcome (intact-checked) instead of a fail-closed NoSignedRoot.
     if recorded_root.is_empty() {
+        if let Some(prov) = crate::sourcebuild::read_provenance(layout, program, build)
+            && prov.provenance == "source"
+            && prov.build == build
+        {
+            let intact = crate::tree::tree_root(&layout.build_dir(program, build))
+                .map(|got| got.eq_ignore_ascii_case(&prov.tree_root))
+                .unwrap_or(false);
+            return VerifyOutcome::SourceBuilt {
+                build,
+                commit: prov.commit,
+                intact,
+            };
+        }
         return VerifyOutcome::NoSignedRoot { build: Some(build) };
     }
     if recorded_build != Some(build) {

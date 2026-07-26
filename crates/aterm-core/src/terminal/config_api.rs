@@ -3,7 +3,7 @@
 
 //! Configuration hot-reload API for Terminal.
 //!
-//! Contains `apply_config()` and `current_config()`.
+//! Contains `apply_config()`.
 //! Extracted from mod.rs to reduce file size.
 
 use super::Terminal;
@@ -51,7 +51,8 @@ impl Terminal {
     /// - **Font**: descriptor (family, size, weight, italic)
     /// - **Colors**: foreground, background, palette
     /// - **Modes**: auto-wrap, focus reporting, bracketed paste
-    /// - **Performance**: memory budget
+    /// - **Text policy**: ambiguous width, style attributes, BiDi projection
+    /// - **Performance**: memory budget and synchronized-output timeout
     #[allow(
         clippy::too_many_lines,
         reason = "flat field-by-field config application"
@@ -211,8 +212,9 @@ impl Terminal {
         }
 
         // Style-attribute policy (W5): bold-to-bright promotion + faint opacity.
-        // Render-time only (consumed by `render_row`'s color resolution), so the
-        // change takes effect on the next frame without touching cell content.
+        // This is resolved at render time, so existing cells do not need to be
+        // rewritten. They DO need to be repainted: without full damage the
+        // frontend's damage-epoch early-out can swallow a style-only reload.
         let new_faint = if config.faint_opacity.is_finite() {
             config.faint_opacity.clamp(0.0, 1.0)
         } else {
@@ -224,6 +226,7 @@ impl Terminal {
             self.color.bold_is_bright = config.bold_is_bright;
             self.color.faint_opacity = new_faint;
             changes.push(ConfigChange::StylePolicy);
+            self.grid.damage_mut().mark_full();
         }
 
         // Memory budget
@@ -252,6 +255,10 @@ impl Terminal {
             self.modes.bidi_direction = config.bidi.direction;
             // Note: bidi_box_mirroring, bidi_autodetection, bidi_arrow_swap are
             // escape-sequence-only modes (DEC ?2500, ?2501, ?1243) with no config equivalent
+            self.invalidate_bidi_all();
+            // BiDi is also a render-time projection of existing cells. Force a
+            // frame so static RTL text is reordered immediately after reload.
+            self.grid.damage_mut().mark_full();
             changes.push(ConfigChange::BiDi);
         }
 
@@ -274,5 +281,120 @@ impl Terminal {
         }
 
         changes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BiDiMode, ConfigChange, TerminalConfig};
+
+    fn clean_terminal_with_defaults() -> (Terminal, TerminalConfig) {
+        let mut terminal = Terminal::new(4, 16);
+        let config = TerminalConfig::default();
+        terminal.apply_config(&config);
+        terminal.take_damage();
+        (terminal, config)
+    }
+
+    #[test]
+    fn style_policy_reload_damages_static_cells_exactly_when_changed() {
+        let (mut terminal, mut config) = clean_terminal_with_defaults();
+        let before = terminal.damage_epoch();
+
+        config.bold_is_bright = !config.bold_is_bright;
+        let changes = terminal.apply_config(&config);
+        assert!(changes.contains(&ConfigChange::StylePolicy));
+        assert!(terminal.has_damage(), "static styled cells need a repaint");
+        assert_eq!(terminal.damage_epoch(), before + 1);
+
+        terminal.take_damage();
+        let unchanged = terminal.apply_config(&config);
+        assert!(!unchanged.contains(&ConfigChange::StylePolicy));
+        assert!(!terminal.has_damage(), "an identical reload stays a no-op");
+    }
+
+    #[test]
+    fn bidi_reload_damages_static_cells_exactly_when_changed() {
+        let (mut terminal, mut config) = clean_terminal_with_defaults();
+        let before = terminal.damage_epoch();
+
+        config.bidi.mode = if config.bidi.mode == BiDiMode::Disabled {
+            BiDiMode::Implicit
+        } else {
+            BiDiMode::Disabled
+        };
+        let changes = terminal.apply_config(&config);
+        assert!(changes.contains(&ConfigChange::BiDi));
+        assert!(terminal.has_damage(), "static RTL cells need a repaint");
+        assert_eq!(terminal.damage_epoch(), before + 1);
+
+        terminal.take_damage();
+        let unchanged = terminal.apply_config(&config);
+        assert!(!unchanged.contains(&ConfigChange::BiDi));
+        assert!(!terminal.has_damage(), "an identical reload stays a no-op");
+    }
+
+    #[test]
+    fn ambiguous_width_reload_changes_new_text_without_reflowing_existing_cells() {
+        const AMBIGUOUS: &str = "\u{00B7}"; // MIDDLE DOT, East Asian Width=A
+        let (mut terminal, mut config) = clean_terminal_with_defaults();
+        config.ambiguous_width_double = true;
+        assert!(
+            terminal
+                .apply_config(&config)
+                .contains(&ConfigChange::AmbiguousWidth)
+        );
+        terminal.process(AMBIGUOUS.as_bytes());
+        assert!(terminal.grid().cell(0, 0).unwrap().is_wide());
+        assert!(terminal.grid().is_wide_continuation_at(0, 1));
+        terminal.take_damage();
+
+        config.ambiguous_width_double = false;
+        assert!(
+            terminal
+                .apply_config(&config)
+                .contains(&ConfigChange::AmbiguousWidth)
+        );
+        assert!(
+            !terminal.has_damage(),
+            "policy reload must not pretend it reflowed existing geometry"
+        );
+        assert!(
+            terminal.grid().cell(0, 0).unwrap().is_wide(),
+            "the previously received glyph keeps its two-cell geometry"
+        );
+
+        terminal.process(AMBIGUOUS.as_bytes());
+        assert_eq!(terminal.grid().cell(0, 2).unwrap().char(), '\u{00B7}');
+        assert!(
+            !terminal.grid().cell(0, 2).unwrap().is_wide(),
+            "subsequent input uses the newly selected narrow policy"
+        );
+    }
+
+    #[cfg(feature = "bidi")]
+    #[test]
+    fn bidi_reload_reprojects_already_received_rtl_text() {
+        let (mut terminal, mut config) = clean_terminal_with_defaults();
+        terminal.process("\u{05D0}\u{05D1}\u{05D2}".as_bytes());
+        let visual: Vec<char> = terminal.cell_frame(4, 16).cells[0]
+            .iter()
+            .take(3)
+            .map(|cell| cell.ch)
+            .collect();
+        assert_eq!(visual, vec!['\u{05D2}', '\u{05D1}', '\u{05D0}']);
+        terminal.take_damage();
+
+        config.bidi.mode = BiDiMode::Disabled;
+        let changes = terminal.apply_config(&config);
+        assert!(changes.contains(&ConfigChange::BiDi));
+        assert!(terminal.has_damage());
+        let logical: Vec<char> = terminal.cell_frame(4, 16).cells[0]
+            .iter()
+            .take(3)
+            .map(|cell| cell.ch)
+            .collect();
+        assert_eq!(logical, vec!['\u{05D0}', '\u{05D1}', '\u{05D2}']);
     }
 }

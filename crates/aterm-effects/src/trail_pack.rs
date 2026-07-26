@@ -463,31 +463,7 @@ impl std::error::Error for TrailPackError {}
 /// [`crate::spec::read_toy_pack_file`]). Hosts call this before
 /// [`compile_trail_pack_toml`].
 pub fn read_trail_pack_file(path: &Path) -> std::io::Result<String> {
-    use std::io::Read;
-    let metadata = std::fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "trail pack path is not a regular file",
-        ));
-    }
-    let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "trail pack path is not a regular file",
-        ));
-    }
-    let limit = MAX_TRAIL_PACK_BYTES + 1;
-    let capacity = metadata.len().min(limit as u64) as usize;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(limit as u64).read_to_end(&mut bytes)?;
-    String::from_utf8(bytes).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("trail pack is not UTF-8: {error}"),
-        )
-    })
+    crate::file_feed::read_bounded_regular_utf8(path, MAX_TRAIL_PACK_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1396,38 @@ mod tests {
         // Every stored f32 is on the quantization grid.
         assert_eq!(p.beam.cell_frac, quant(p.beam.cell_frac));
         assert_eq!(p.crown.radius_cells, quant(p.crown.radius_cells));
+    }
+
+    #[test]
+    fn trail_pack_file_reader_admits_regular_and_rejects_oversize() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "aterm-trail-pack-reader-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create Trail Pack reader fixtures");
+        let regular = root.join("regular.toml");
+        std::fs::write(&regular, SYNTHWAVE).expect("write regular Trail Pack");
+        assert_eq!(
+            read_trail_pack_file(&regular).expect("read regular Trail Pack"),
+            SYNTHWAVE
+        );
+
+        let oversized = root.join("oversized.toml");
+        std::fs::write(&oversized, vec![b'x'; MAX_TRAIL_PACK_BYTES + 1])
+            .expect("write oversized Trail Pack");
+        let error = read_trail_pack_file(&oversized).expect_err("oversized Trail Pack rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains(&MAX_TRAIL_PACK_BYTES.to_string()),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).expect("remove Trail Pack reader fixtures");
     }
 
     #[test]

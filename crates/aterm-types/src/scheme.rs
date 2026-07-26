@@ -17,6 +17,10 @@
 
 use crate::{ColorPalette, Rgb};
 
+/// Maximum bytes admitted from one user theme definition. Shared by direct
+/// loaders and GUI catalog discovery so every entry point has the same bound.
+pub const MAX_USER_THEME_FILE_BYTES: usize = 256 * 1024;
+
 /// Whether a scheme is meant for a dark or light background. Drives the optional
 /// `dark:…,light:…` auto-split (a future GUI concern); carried here so a scheme
 /// is self-describing.
@@ -850,13 +854,27 @@ fn strip_inline_comment(value: &str) -> &str {
 // Skip: fs read + parse (absent std bodies); every failure returns Err (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn load(name: &str) -> Result<ColorScheme, ThemeError> {
+    if let Err(reason) = validate_user_theme_name(name) {
+        return Err(ThemeError::Parse {
+            line: 0,
+            reason: reason.to_string(),
+        });
+    }
     if let Some(s) = builtin(name) {
         return Ok(s);
     }
     let Some(path) = user_theme_path(name) else {
         return Err(ThemeError::NotFound(name.to_string()));
     };
-    match std::fs::read(&path) {
+    let read = || -> Result<Vec<u8>, std::io::Error> {
+        use std::io::Read as _;
+        let file = std::fs::File::open(&path)?;
+        let mut bytes = Vec::with_capacity(MAX_USER_THEME_FILE_BYTES.min(16 * 1024));
+        file.take((MAX_USER_THEME_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    match read() {
         // Explicit strict UTF-8 decode (`String::from_utf8`, not
         // `read_to_string`'s implicit validation) so the hardened gate sees
         // the reject path. Behavior-identical: valid UTF-8 decodes to the
@@ -864,6 +882,9 @@ pub fn load(name: &str) -> Result<ColorScheme, ThemeError> {
         // `ErrorKind::InvalidData` error whose `to_string()` is exactly this
         // message — the only thing callers ever observed through
         // `ThemeError::Io`.
+        Ok(bytes) if bytes.len() > MAX_USER_THEME_FILE_BYTES => Err(ThemeError::Io(format!(
+            "theme file exceeds the {MAX_USER_THEME_FILE_BYTES}-byte limit"
+        ))),
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => parse_scheme_str(&text),
             Err(_) => Err(ThemeError::Io(
@@ -892,12 +913,47 @@ pub fn user_theme_dir() -> Option<std::path::PathBuf> {
 /// The candidate file path for a named user theme (`<theme dir>/<name>.conf`), or
 /// `None` if no config home is resolvable.
 fn user_theme_path(name: &str) -> Option<std::path::PathBuf> {
+    validate_user_theme_name(name).ok()?;
     // Trust gate: concatenation instead of `format!`; byte-identical.
     user_theme_dir().map(|d| {
         let mut file = String::from(name);
         file.push_str(".conf");
         d.join(file)
     })
+}
+
+/// Validate the literal grammar shared by direct loading and the GUI's bounded
+/// theme catalog. Theme names are file stems, never paths or OS-split syntax.
+/// Keeping this at the lowest layer makes `load` traversal-safe even for callers
+/// outside the GUI.
+pub fn validate_user_theme_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("theme name is empty");
+    }
+    if name != name.trim() {
+        return Err("theme name has leading or trailing whitespace");
+    }
+    if name == "." || name == ".." {
+        return Err("theme name cannot be a path component");
+    }
+    if name.chars().any(char::is_control) {
+        return Err("theme name contains a control character");
+    }
+    if name
+        .chars()
+        .any(|character| matches!(character, '/' | '\\'))
+    {
+        return Err("theme name contains a path separator");
+    }
+    if name.contains(',') {
+        return Err("theme name contains a comma reserved for appearance splits");
+    }
+    if name.split_once(':').is_some_and(|(key, _)| {
+        matches!(key.trim().to_ascii_lowercase().as_str(), "dark" | "light")
+    }) {
+        return Err("theme name is ambiguous with dark:/light: split syntax");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -927,6 +983,36 @@ mod tests {
             if *name != "Default" {
                 assert!(builtin(name).is_some(), "{name} must resolve via builtin()");
             }
+        }
+    }
+
+    #[test]
+    fn user_theme_name_grammar_rejects_paths_splits_and_normalization_traps() {
+        for unsafe_name in [
+            "",
+            ".",
+            "..",
+            " ../Nord",
+            "../Nord",
+            "/tmp/Nord",
+            r"C:\\tmp\\Nord",
+            "Nord ",
+            "Nord\nDark",
+            "dark:Foo",
+            "LIGHT:Foo",
+            "Foo,Bar",
+        ] {
+            assert!(
+                validate_user_theme_name(unsafe_name).is_err(),
+                "unsafe theme name accepted: {unsafe_name:?}"
+            );
+            assert!(
+                matches!(load(unsafe_name), Err(ThemeError::Parse { line: 0, .. })),
+                "direct loader must reject before forming a path: {unsafe_name:?}"
+            );
+        }
+        for safe_name in ["Nord", "My Theme", "Tokyo-Night_2", "work:blue"] {
+            assert_eq!(validate_user_theme_name(safe_name), Ok(()));
         }
     }
 

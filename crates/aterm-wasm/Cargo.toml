@@ -1,6 +1,6 @@
 [package]
 name = "aterm-wasm"
-version = "0.0.1"
+version.workspace = true
 edition = "2021"
 description = "wasm-bindgen binding: the aterm engine + CPU rasterizer (aterm-render) -> RGBA frames, for rendering a terminal on a <canvas> in the Electron renderer. The in-page replacement substrate for @xterm/xterm's rendering."
 license = "MIT"

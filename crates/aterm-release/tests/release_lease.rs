@@ -26,6 +26,9 @@ mod ledger;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
+#[path = "../src/mirror.rs"]
+#[allow(dead_code)]
+mod mirror;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
@@ -483,7 +486,7 @@ fn recovery_admits_only_the_exact_cask_write_or_stage_left_by_a_crash() {
     let cask = repo.join(cask_rel);
     std::fs::create_dir_all(cask.parent().unwrap()).unwrap();
     let baseline = format!(
-        "cask \"aterm\" do\n  version \"0.54\"\n  sha256 \"{}\"\nend\n",
+        "cask \"aterm\" do\n  version \"0.54.0\"\n  sha256 \"{}\"\nend\n",
         "0".repeat(64)
     );
     std::fs::write(&cask, &baseline).unwrap();
@@ -493,11 +496,11 @@ fn recovery_admits_only_the_exact_cask_write_or_stage_left_by_a_crash() {
 
     let dist = repo.join("dist");
     std::fs::create_dir_all(&dist).unwrap();
-    std::fs::write(dist.join("aterm-0.55.dmg"), b"exact recovered dmg bytes").unwrap();
+    std::fs::write(dist.join("aterm-0.55.0.dmg"), b"exact recovered dmg bytes").unwrap();
     let owner = command(&repo, &["rev-parse", "HEAD"]);
     let journal = publish::Journal {
         format: publish::JOURNAL_FORMAT,
-        version: "0.55".into(),
+        version: "0.55.0".into(),
         build_number: 55,
         commit: owner,
         min_build: None,
@@ -508,23 +511,26 @@ fn recovery_admits_only_the_exact_cask_write_or_stage_left_by_a_crash() {
         release_id: Some(55),
         draft_create_issued: true,
         upload_intents: Vec::new(),
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         done: publish::STEPS
             .iter()
             .take_while(|step| **step != "cask")
             .map(|step| (*step).to_string())
             .collect(),
     };
-    let sha = dmg::sha256_file(&dist.join("aterm-0.55.dmg")).unwrap();
+    let sha = dmg::sha256_file(&dist.join("aterm-0.55.0.dmg")).unwrap();
     std::fs::write(
         dist.join(manifest_out::MANIFEST_ASSET),
         format!(
-            "schema = 1\nversion = \"0.55\"\nbuild_number = 55\ncommit = \"{}\"\n\
-             dmg = \"aterm-0.55.dmg\"\nsha256 = \"{sha}\"\n",
+            "schema = 1\nversion = \"0.55.0\"\nbuild_number = 55\ncommit = \"{}\"\n\
+             dmg = \"aterm-0.55.0.dmg\"\nsha256 = \"{sha}\"\n",
             journal.commit
         ),
     )
     .unwrap();
-    let expected = publish::repin_cask_text(&baseline, "0.55", &sha).unwrap();
+    let expected = publish::repin_cask_text(&baseline, "0.55.0", &sha).unwrap();
 
     // Crash immediately after fs::write.
     std::fs::write(&cask, &expected).unwrap();

@@ -747,7 +747,7 @@ fn width_reflow_tiered_history_precedes_visible_overflow() {
 fn width_reflow_tiered_restore_honors_line_limit() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 8, 2, scrollback);
-    grid.storage.set_scrollback_line_limit(Some(4));
+    grid.storage.set_store_line_limit(Some(4));
 
     // Scroll H0..H9 into history (H10/H11 stay visible).
     for i in 0..12u16 {

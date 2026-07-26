@@ -24,6 +24,11 @@ pub(crate) struct MockGrid {
     /// populated via [`with_scrollback_lines`](MockGrid::with_scrollback_lines).
     scrollback: Vec<Vec<char>>,
     wrapped_lines: HashSet<usize>,
+    /// Cells that are the SECOND half of a double-width character, as the real
+    /// grid stores them: the cell holds a literal `' '` and carries the
+    /// continuation flag. Without modelling this a mock cannot exercise CJK
+    /// word motion at all — the bug only exists because that spacer is a space.
+    wide_conts: HashSet<(i32, u16)>,
 }
 
 impl MockGrid {
@@ -37,6 +42,7 @@ impl MockGrid {
             content,
             scrollback: Vec::new(),
             wrapped_lines: HashSet::new(),
+            wide_conts: HashSet::new(),
         }
     }
 
@@ -92,7 +98,49 @@ impl MockGrid {
     }
 }
 
+impl MockGrid {
+    /// Lay `text` on `line` treating every char in `wide` as DOUBLE-WIDTH: it
+    /// occupies two cells, the second holding `' '` and flagged as a
+    /// continuation — exactly how the real grid stores it.
+    pub(crate) fn with_wide_text(mut self, line: i32, text: &str, wide: &str) -> Self {
+        let mut col: u16 = 0;
+        for ch in text.chars() {
+            if usize::from(col) >= usize::from(self.cols) {
+                break;
+            }
+            if line >= 0 && (line as usize) < self.content.len() {
+                self.content[line as usize][col as usize] = ch;
+            }
+            if wide.contains(ch) {
+                let cont = col + 1;
+                if usize::from(cont) < usize::from(self.cols) {
+                    if line >= 0 && (line as usize) < self.content.len() {
+                        self.content[line as usize][cont as usize] = ' ';
+                    }
+                    self.wide_conts.insert((line, cont));
+                }
+                col += 2;
+            } else {
+                col += 1;
+            }
+        }
+        self
+    }
+}
+
 impl BufferAccess for MockGrid {
+    fn is_wide(&self, line: i32, col: u16) -> bool {
+        self.wide_conts.contains(&(line, col.saturating_add(1)))
+    }
+
+    fn line_wide_continuations(&self, line: i32) -> Option<Vec<bool>> {
+        Some(
+            (0..self.cols)
+                .map(|c| self.wide_conts.contains(&(line, c)))
+                .collect(),
+        )
+    }
+
     fn char_at(&self, line: i32, col: u16) -> Option<char> {
         if line < 0 {
             let rev = usize::try_from(-line - 1).ok()?;

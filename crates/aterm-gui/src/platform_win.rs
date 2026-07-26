@@ -156,18 +156,6 @@ const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
 const SPI_GETHIGHCONTRAST: u32 = 0x0042;
 const HCF_HIGHCONTRASTON: u32 = 0x0000_0001;
 
-/// Whether a `0x00RRGGBB` colour is "dark" (perceived luma below mid), used to pick
-/// a dark vs light title bar that MATCHES the terminal background (`window_theme =
-/// auto`). Rec. 601 luma; the 0.5 threshold splits typical dark terminal themes
-/// (near-black bg → dark caption) from light ones. Pure + unit-tested.
-pub(crate) fn color_is_dark(bg: u32) -> bool {
-    let r = f32::from(((bg >> 16) & 0xff) as u8);
-    let g = f32::from(((bg >> 8) & 0xff) as u8);
-    let b = f32::from((bg & 0xff) as u8);
-    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
-    luma < 128.0
-}
-
 /// The `HWND` behind a winit [`Window`], or `None` when there is no Win32 handle
 /// (headless / not-yet-realized). Mirrors `main.rs::window_hwnd`.
 fn hwnd_of(window: &Window) -> Option<isize> {
@@ -603,25 +591,6 @@ pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32)
             px[3] = 255;
         }
         Ok((buf, w as u32, h as u32))
-    }
-}
-
-#[cfg(test)]
-mod dark_tests {
-    use super::color_is_dark;
-
-    /// The title-bar-matches-terminal decision: typical dark terminal backgrounds
-    /// read dark; light ones read light; the threshold sits between them.
-    #[test]
-    fn color_is_dark_splits_dark_and_light_backgrounds() {
-        assert!(color_is_dark(0x000000)); // black
-        assert!(color_is_dark(0x1e1e1e)); // common dark editor bg
-        assert!(color_is_dark(0x0c0c0c)); // Windows console dark
-        assert!(!color_is_dark(0xffffff)); // white
-        assert!(!color_is_dark(0xf5f5f5)); // light bg
-        // Pure green is bright enough (luma ~150) to read light; pure blue is dark.
-        assert!(!color_is_dark(0x00ff00));
-        assert!(color_is_dark(0x0000ff));
     }
 }
 

@@ -37,7 +37,7 @@ pub fn semantic_word_right(grid: &dyn BufferAccess, point: ViPoint, separators: 
     let mut cur = point;
 
     // Skip current word characters (non-separators).
-    while !is_separator(cache.char_at(grid, cur), separators) {
+    while !is_separator(cache.word_char_at(grid, cur), separators) {
         match point_forward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -45,7 +45,7 @@ pub fn semantic_word_right(grid: &dyn BufferAccess, point: ViPoint, separators: 
     }
 
     // Skip separators / spaces.
-    while is_separator(cache.char_at(grid, cur), separators) {
+    while is_separator(cache.word_char_at(grid, cur), separators) {
         match point_forward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -64,7 +64,7 @@ pub fn semantic_word_left(grid: &dyn BufferAccess, point: ViPoint, separators: &
     };
 
     // Skip separators backward.
-    while is_separator(cache.char_at(grid, cur), separators) {
+    while is_separator(cache.word_char_at(grid, cur), separators) {
         match point_backward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -72,10 +72,10 @@ pub fn semantic_word_left(grid: &dyn BufferAccess, point: ViPoint, separators: &
     }
 
     // Skip word characters backward until a separator is found.
-    while !is_separator(cache.char_at(grid, cur), separators) {
+    while !is_separator(cache.word_char_at(grid, cur), separators) {
         match point_backward(grid, cur) {
             Some(p) => {
-                if is_separator(cache.char_at(grid, p), separators) {
+                if is_separator(cache.word_char_at(grid, p), separators) {
                     return cur;
                 }
                 cur = p;
@@ -101,7 +101,7 @@ pub fn semantic_word_right_end(
     };
 
     // Skip separators.
-    while is_separator(cache.char_at(grid, cur), separators) {
+    while is_separator(cache.word_char_at(grid, cur), separators) {
         match point_forward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -112,7 +112,7 @@ pub fn semantic_word_right_end(
     loop {
         match point_forward(grid, cur) {
             Some(p) => {
-                if is_separator(cache.char_at(grid, p), separators) {
+                if is_separator(cache.word_char_at(grid, p), separators) {
                     return cur;
                 }
                 cur = p;
@@ -135,7 +135,7 @@ pub fn semantic_word_left_end(
     };
 
     // Skip current word characters backward.
-    while !is_separator(cache.char_at(grid, cur), separators) {
+    while !is_separator(cache.word_char_at(grid, cur), separators) {
         match point_backward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -143,7 +143,7 @@ pub fn semantic_word_left_end(
     }
 
     // Skip separators backward.
-    while is_separator(cache.char_at(grid, cur), separators) {
+    while is_separator(cache.word_char_at(grid, cur), separators) {
         match point_backward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -164,7 +164,7 @@ pub fn whitespace_word_right(grid: &dyn BufferAccess, point: ViPoint) -> ViPoint
     let mut cur = point;
 
     // Skip non-whitespace.
-    while !is_whitespace(cache.char_at(grid, cur)) {
+    while !is_whitespace(cache.word_char_at(grid, cur)) {
         match point_forward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -172,7 +172,7 @@ pub fn whitespace_word_right(grid: &dyn BufferAccess, point: ViPoint) -> ViPoint
     }
 
     // Skip whitespace.
-    while is_whitespace(cache.char_at(grid, cur)) {
+    while is_whitespace(cache.word_char_at(grid, cur)) {
         match point_forward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -191,7 +191,7 @@ pub fn whitespace_word_left(grid: &dyn BufferAccess, point: ViPoint) -> ViPoint 
     };
 
     // Skip whitespace backward.
-    while is_whitespace(cache.char_at(grid, cur)) {
+    while is_whitespace(cache.word_char_at(grid, cur)) {
         match point_backward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -199,10 +199,10 @@ pub fn whitespace_word_left(grid: &dyn BufferAccess, point: ViPoint) -> ViPoint 
     }
 
     // Skip non-whitespace backward until whitespace is found.
-    while !is_whitespace(cache.char_at(grid, cur)) {
+    while !is_whitespace(cache.word_char_at(grid, cur)) {
         match point_backward(grid, cur) {
             Some(p) => {
-                if is_whitespace(cache.char_at(grid, p)) {
+                if is_whitespace(cache.word_char_at(grid, p)) {
                     return cur;
                 }
                 cur = p;
@@ -223,7 +223,7 @@ pub fn whitespace_word_right_end(grid: &dyn BufferAccess, point: ViPoint) -> ViP
     };
 
     // Skip whitespace.
-    while is_whitespace(cache.char_at(grid, cur)) {
+    while is_whitespace(cache.word_char_at(grid, cur)) {
         match point_forward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -234,7 +234,7 @@ pub fn whitespace_word_right_end(grid: &dyn BufferAccess, point: ViPoint) -> ViP
     loop {
         match point_forward(grid, cur) {
             Some(p) => {
-                if is_whitespace(cache.char_at(grid, p)) {
+                if is_whitespace(cache.word_char_at(grid, p)) {
                     return cur;
                 }
                 cur = p;
@@ -253,7 +253,7 @@ pub fn whitespace_word_left_end(grid: &dyn BufferAccess, point: ViPoint) -> ViPo
     };
 
     // Skip non-whitespace backward.
-    while !is_whitespace(cache.char_at(grid, cur)) {
+    while !is_whitespace(cache.word_char_at(grid, cur)) {
         match point_backward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -261,7 +261,7 @@ pub fn whitespace_word_left_end(grid: &dyn BufferAccess, point: ViPoint) -> ViPo
     }
 
     // Skip whitespace backward.
-    while is_whitespace(cache.char_at(grid, cur)) {
+    while is_whitespace(cache.word_char_at(grid, cur)) {
         match point_backward(grid, cur) {
             Some(p) => cur = p,
             None => return cur,
@@ -375,6 +375,56 @@ mod tests {
             result,
             ViPoint::new(-1, 0),
             "b should walk back to the word start in scrollback"
+        );
+    }
+
+    /// CJK RUNS ARE WORDS (2026-07-24). A double-width character stores a
+    /// literal `' '` in its continuation cell, and `' '` is both a
+    /// `DEFAULT_SEPARATORS` member and whitespace for WORD motions — so before
+    /// this fix `日本語` read as `日 · 本 · 語` and every motion stepped ONE
+    /// GLYPH. Alacritty, which these motions are ported from, skips the spacer
+    /// explicitly; aterm did not.
+    #[test]
+    fn cjk_runs_are_crossed_as_one_word() {
+        // Columns:  0=日 1=cont 2=本 3=cont 4=語 5=cont 6=' ' 7=n 8=e 9=x 10=t
+        let grid = MockGrid::new(4, 24).with_wide_text(0, "日本語 next", "日本語");
+
+        // `w` from inside the run must reach the NEXT word, not the next glyph.
+        let after = semantic_word_right(&grid, ViPoint::new(0, 0), DEFAULT_SEPARATORS);
+        assert_eq!(
+            after,
+            ViPoint::new(0, 7),
+            "w stepped inside the CJK run instead of crossing it"
+        );
+
+        // `W` (whitespace-delimited) must agree — same root cause, same fix.
+        let after_w = whitespace_word_right(&grid, ViPoint::new(0, 0));
+        assert_eq!(
+            after_w,
+            ViPoint::new(0, 7),
+            "W stepped inside the CJK run instead of crossing it"
+        );
+
+        // …and coming back crosses the whole run to its first cell.
+        let back = semantic_word_left(&grid, ViPoint::new(0, 7), DEFAULT_SEPARATORS);
+        assert_eq!(
+            back,
+            ViPoint::new(0, 0),
+            "b stopped inside the CJK run instead of at its start"
+        );
+    }
+
+    /// The fix must not merge across a REAL space. A space that is genuinely a
+    /// space — not a continuation spacer — still separates.
+    #[test]
+    fn a_real_space_between_cjk_runs_still_separates() {
+        // 日本 | space | 語 — the middle space is real, not a continuation.
+        let grid = MockGrid::new(4, 24).with_wide_text(0, "日本 語", "日本語");
+        let after = semantic_word_right(&grid, ViPoint::new(0, 0), DEFAULT_SEPARATORS);
+        assert_eq!(
+            after,
+            ViPoint::new(0, 5),
+            "a real space between CJK runs must still break the word"
         );
     }
 }

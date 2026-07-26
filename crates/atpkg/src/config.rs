@@ -26,6 +26,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Maximum `aterm.toml` size consumed by the co-located package verbs.
+/// Matches the native config service's 512-KiB admission budget.
+pub const MAX_PACKAGES_CONFIG_BYTES: usize = 512 * 1024;
+
 /// The `[packages]` table. All-Option (an absent key and a default-valued key are
 /// indistinguishable); defaults live ONLY in the resolver methods below.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
@@ -76,7 +80,10 @@ impl PackagesConfig {
     /// (`None` ⇒ compiled default; `ATPKG_ACCOUNT` env still beats this).
     #[must_use]
     pub fn account(&self) -> Option<&str> {
-        self.account.as_deref().map(str::trim).filter(|a| !a.is_empty())
+        self.account
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
     }
 
     /// Whether the `update` pass ALSO bootstraps missing default-set members.
@@ -208,7 +215,17 @@ pub fn load() -> PackagesConfig {
     let Some(path) = config_path() else {
         return PackagesConfig::default();
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    load_from_path(&path)
+}
+
+fn load_from_path(path: &Path) -> PackagesConfig {
+    // The config file itself may legitimately be a dotfile-manager symlink.
+    // Resolve only that bounded final-link chain, then admit/read the selected
+    // regular target through one non-blocking, bounded handle.
+    let Ok(text) = crate::metadata_io::read_bounded_regular_utf8_follow_final_links(
+        path,
+        MAX_PACKAGES_CONFIG_BYTES,
+    ) else {
         return PackagesConfig::default(); // not present / unreadable → defaults
     };
     parse_packages(&text)
@@ -234,7 +251,10 @@ mod tests {
         let cfg = parse_packages("font_px = 12.0\n[matrix_rain]\nenabled = true\n");
         assert_eq!(cfg.channel(), "stable");
         assert_eq!(cfg.account(), None);
-        assert!(!cfg.auto_install(), "auto_install must default OFF (consent)");
+        assert!(
+            !cfg.auto_install(),
+            "auto_install must default OFF (consent)"
+        );
         assert!(cfg.include().is_empty());
         assert!(cfg.exclude().is_empty());
         assert!(cfg.links.is_empty());
@@ -308,14 +328,57 @@ mod tests {
             "env-org"
         );
         // …and an invalid config account can never redirect (falls to default).
+        // PUBLISH_OWNER, not DEFAULT_OWNER: the package index is account-bound and
+        // deliberately does NOT follow the updater's public-mirror channel.
         let bad = parse_packages("[packages]\naccount = \"evil.com/x\"\n");
         assert_eq!(
             crate::resolve_account_with(None, bad.account()).owner,
-            aterm_update_core::DEFAULT_OWNER
+            aterm_update_core::PUBLISH_OWNER
         );
         // Blank config account is treated as unset.
         let blank = parse_packages("[packages]\naccount = \"\"\n");
         assert_eq!(blank.account(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_fifo_returns_defaults_and_symlinked_config_remains_supported() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("atpkg-config-admission-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("fifo.toml");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` is a live NUL-terminated path in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            load_from_path(&fifo).channel(),
+            "stable",
+            "a writerless config FIFO must return the finite default immediately"
+        );
+
+        let target = root.join("target.toml");
+        let logical = root.join("aterm.toml");
+        std::fs::write(&target, "[packages]\nchannel = \"nightly\"\n").unwrap();
+        std::os::unix::fs::symlink(&target, &logical).unwrap();
+        assert_eq!(load_from_path(&logical).channel(), "nightly");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_sparse_config_returns_bounded_defaults() {
+        let root =
+            std::env::temp_dir().join(format!("atpkg-config-oversized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("aterm.toml");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_PACKAGES_CONFIG_BYTES + 1) as u64)
+            .unwrap();
+        assert_eq!(load_from_path(&path).channel(), "stable");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -345,7 +408,10 @@ mod tests {
         );
         // Everything else is Invalid: relative paths, deep slugs, URL metacharacters.
         assert_eq!(classify_link("src/ay/x", Some(home)), LinkTarget::Invalid);
-        assert_eq!(classify_link("evil.com?x/y", Some(home)), LinkTarget::Invalid);
+        assert_eq!(
+            classify_link("evil.com?x/y", Some(home)),
+            LinkTarget::Invalid
+        );
         assert_eq!(classify_link("a b/repo", Some(home)), LinkTarget::Invalid);
         assert_eq!(classify_link("", Some(home)), LinkTarget::Invalid);
     }

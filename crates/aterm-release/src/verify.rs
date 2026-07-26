@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Post-publish verify (release spec §7 step 7; also the standalone
-//! `ship verify [vX.Y]`): replay the CLIENT's release-selection rule (the
-//! greatest canonical `vMAJOR.MINOR` non-draft release carrying the exact
+//! `ship verify [vX.Y.Z]`): replay the CLIENT's release-selection rule (the
+//! greatest canonical `vMAJOR.MINOR.PATCH` non-draft release carrying the exact
 //! appcast name) against the live API with no cache and require it to select our cut; download the
 //! published manifest and assert BYTE-identity with the local artifact; `HEAD`
 //! the DMG URL → 200. Prints PASS + release URL, or the exact remediation.
@@ -22,7 +22,7 @@ use aterm_update_core::Manifest;
 
 use crate::ledger::{self, Error, Result};
 use crate::manifest_out;
-use crate::publish::{self, gh_retry, step};
+use crate::publish::{self, TagKind, gh_retry, step};
 
 // ---------------------------------------------------------------------------
 // the canonical client scan, replayed against the live API
@@ -59,8 +59,9 @@ pub struct Published {
 /// Scan all release metadata via the API (≤10 pages of 100 — the client's own
 /// caps) before downloading any manifest. `stop_early` is the exact updater
 /// replay: only `aterm-appcast.toml` is eligible, the greatest canonical numeric
-/// `vMAJOR.MINOR` tag is authoritative independent of REST row order, and exactly
-/// that one manifest is fetched. `stop_early: false` is the operator/history view:
+/// `vMAJOR.MINOR.PATCH` tag is authoritative independent of REST row order
+/// (retired two-component tags are skipped, exactly as the client skips them),
+/// and exactly that one manifest is fetched. `stop_early: false` is the operator/history view:
 /// each release falls back to `aterm-appcast-<tag>.toml`, preserving the complete
 /// build set for status/yank after the single-head migration.
 ///
@@ -99,10 +100,11 @@ pub(crate) fn validate_unbound_published_target(published: &Published) -> Result
 }
 
 /// Production scan for the origin channel. In addition to the immutable
-/// release-object closure, every canonical two-component protocol release is
-/// bound to its exact remote tag (annotated or legacy-lightweight). Older
-/// three-component archive rows predate that invariant and remain accounting
-/// history only; several intentionally tag the post-release merge descendant.
+/// release-object closure, every canonical `vMAJOR.MINOR.PATCH` release is
+/// bound to its exact remote tag (annotated or legacy-lightweight). Retired
+/// two-component rows and the older dotted archive rows predate that invariant
+/// and remain accounting history only; several intentionally tag the
+/// post-release merge descendant.
 pub fn scan_published_in_repo(repo: &Path, slug: &str, stop_early: bool) -> Result<Vec<Published>> {
     let git = ledger::GitCli::new(repo);
     let found = scan_published_snapshot(slug, stop_early)?;
@@ -205,51 +207,14 @@ fn scan_published_snapshot(slug: &str, stop_early: bool) -> Result<Vec<Published
     Ok(found)
 }
 
-/// Numeric order for both the canonical two-component protocol and the exact
-/// appcast heads published before it. Every component participates in
-/// lexicographic numeric ordering, so `v0.21.2607041853 < v0.54` while
-/// `v0.54.1 > v0.54`.
-fn parse_numeric_tag(tag: &str) -> Result<Vec<u64>> {
-    let version = tag.strip_prefix('v').ok_or_else(|| {
-        Error::new(format!(
-            "published appcast tag {tag:?} is not numerically orderable"
-        ))
-    })?;
-    let mut components = Vec::new();
-    for component in version.split('.') {
-        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(Error::new(format!(
-                "published appcast tag {tag:?} is not numerically orderable"
-            )));
-        }
-        components.push(component.parse::<u64>().map_err(|_| {
-            Error::new(format!(
-                "published appcast tag {tag:?} has an out-of-range numeric component"
-            ))
-        })?);
-    }
-    if components.len() < 2 {
-        return Err(Error::new(format!(
-            "published appcast tag {tag:?} is not numerically orderable"
-        )));
-    }
-    Ok(components)
-}
-
+/// The canonical version a candidate tag names: `"v0.2.0"` → `"0.2.0"`.
+/// Tag classification itself lives in [`publish::parse_release_tag`], so the
+/// publisher's rule and the CLIENT's (`aterm-update/src/github.rs`) cannot
+/// drift: canonical `vMAJOR.MINOR.PATCH` is a candidate, a retired
+/// two-component `vMAJOR.MINOR` is [`TagKind::Legacy`] (skipped, never an
+/// error), anything else fails closed.
 fn parse_canonical_tag(tag: &str) -> Result<String> {
-    let components = parse_numeric_tag(tag)?;
-    let [major, minor] = components.as_slice() else {
-        return Err(Error::new(format!(
-            "authoritative appcast tag {tag:?} is not canonical vMAJOR.MINOR"
-        )));
-    };
-    let canonical_version = format!("{major}.{minor}");
-    if tag.strip_prefix('v') != Some(canonical_version.as_str()) {
-        return Err(Error::new(format!(
-            "authoritative appcast tag {tag:?} is not canonical vMAJOR.MINOR"
-        )));
-    }
-    Ok(canonical_version)
+    publish::canonical_channel_tag_version(tag)
 }
 
 #[derive(Debug)]
@@ -380,7 +345,13 @@ pub(crate) fn scan_release_page(
                     manifest_out::MANIFEST_ASSET
                 )));
             }
-            let tag_order = parse_numeric_tag(release.tag)?;
+            // Retired-scheme releases stay published but are never installed,
+            // so the publisher's replay must skip them exactly as the client
+            // does — otherwise a still-published v0.61 would out-order every
+            // current-scheme candidate and stall the whole check.
+            let TagKind::Candidate(tag_order) = publish::parse_release_tag(release.tag)? else {
+                continue;
+            };
             if !seen_tags.insert(tag_order.clone()) {
                 return Err(Error::new(format!(
                     "duplicate published update candidates have the same numeric tag order as {}",
@@ -397,9 +368,9 @@ pub(crate) fn scan_release_page(
         let Some((release, _)) = selected else {
             return Ok((page_len, Vec::new()));
         };
-        // Lower numeric dotted legacy heads are safely orderable during the
-        // one-time archive migration. Channel authority itself must use the
-        // current canonical two-component protocol.
+        // Every selected candidate was already proved three-component; this
+        // re-derives the canonical version string, pinning the tag's exact
+        // spelling to the version the manifest must carry.
         let version = parse_canonical_tag(release.tag)?;
         let published = fetch_authoritative(
             release.release_id,
@@ -517,11 +488,13 @@ pub fn release_state(slug: &str, tag: &str) -> Result<ReleaseState> {
 /// caller (network) so the decision itself is pure and table-testable.
 #[derive(Debug, Clone)]
 pub struct RemoteState {
-    /// `[workspace.package]` version with the `.0` stripped, e.g. "0.26".
-    pub cargo_short: String,
-    /// Does CHANGELOG.md already carry `## [cargo_short]`?
+    /// The version this cut would publish: the `[workspace.package]`
+    /// `MAJOR.MINOR.0` version, e.g. "0.5.0". There is
+    /// no second lineage — the ledger supplies build numbers, not versions.
+    pub current_version: String,
+    /// Does CHANGELOG.md already carry `## [current_version]`?
     pub changelog_has_section: bool,
-    /// Does a NON-DRAFT release `v<cargo_short>` exist? (A draft is not
+    /// Does a NON-DRAFT release `v<current_version>` exist? (A draft is not
     /// published — it is exactly the wedge recut exists to finish.)
     pub published: bool,
 }
@@ -529,53 +502,46 @@ pub struct RemoteState {
 /// What kind of cut to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CutMode {
-    /// Normal: bump + roll + claim.
+    /// Normal: roll the changelog into `## [version]` and claim.
     Fresh { version: String },
-    /// The §5 wedge signature (bump + roll landed on main, nothing published):
-    /// skip bump/roll, reuse the rolled section, claim a FRESH n.
+    /// The §5 wedge signature (roll + claim landed on main, nothing published):
+    /// skip the roll, reuse the rolled section, claim a FRESH n.
     Recut { version: String },
 }
 
-/// Derive the cut mode from remote-visible state (spec §5: "Cargo.toml
-/// already 0.26 + `## [0.26]` section present + no published v0.26 release ⇒
-/// recut") — this is what lets ANY machine finish a wedged cut with no
-/// journal.
+/// Derive the cut mode from remote-visible state (spec §5: "the workspace
+/// version derives 0.2.0 + `## [0.2.0]` section present + no published v0.2.0
+/// release ⇒ recut") — this is what lets ANY machine finish a wedged cut with
+/// no journal.
+///
+/// Under the single-version scheme the default version is not a bump of
+/// anything: it is [`RemoteState::current_version`] itself. So "cut twice
+/// without bumping Cargo.toml" lands squarely on the already-published guard,
+/// whose message names the exact fix.
 pub fn derive_cut_mode(s: &RemoteState, set_version: Option<&str>) -> Result<CutMode> {
     let pending = s.changelog_has_section && !s.published;
-    match set_version {
-        Some(v) if v == s.cargo_short => {
-            if pending {
-                Ok(CutMode::Recut {
-                    version: v.to_string(),
-                })
-            } else if s.changelog_has_section && s.published {
-                Err(Error::new(format!(
-                    "v{v} is already published — cut the next version, or retire a bad \
-                     build with `cargo ship yank <build>`"
-                )))
-            } else {
-                Ok(CutMode::Fresh {
-                    version: v.to_string(),
-                })
-            }
-        }
-        // An explicit different version is the operator's call — the tag +
-        // cut-elsewhere gates still stand between it and a collision.
-        Some(v) => Ok(CutMode::Fresh {
+    // An explicit DIFFERENT version is the operator's call — the tag +
+    // cut-elsewhere gates still stand between it and a collision.
+    if let Some(v) = set_version
+        && v != s.current_version
+    {
+        return Ok(CutMode::Fresh {
             version: v.to_string(),
-        }),
-        None => {
-            if pending {
-                Ok(CutMode::Recut {
-                    version: s.cargo_short.clone(),
-                })
-            } else {
-                Ok(CutMode::Fresh {
-                    version: publish::bump_minor(&s.cargo_short)?,
-                })
-            }
-        }
+        });
     }
+    let version = s.current_version.clone();
+    if pending {
+        return Ok(CutMode::Recut { version });
+    }
+    if s.published {
+        return Err(Error::new(format!(
+            "v{version} is already published — bump [workspace.package] version in \
+             Cargo.toml (MINOR: the next release is v{}), or retire a bad build with \
+             `cargo ship yank <build>`",
+            publish::bump_minor_release(&version)?
+        )));
+    }
+    Ok(CutMode::Fresh { version })
 }
 
 // ---------------------------------------------------------------------------
@@ -799,7 +765,7 @@ fn head_status(url: &str) -> Result<String> {
 // the standalone commands: verify / status / yank / abandon
 // ---------------------------------------------------------------------------
 
-/// `cargo ship verify [vX.Y]` — re-run the post-publish check anytime.
+/// `cargo ship verify [vX.Y.Z]` — re-run the post-publish check anytime.
 pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
     let slug = slug_of(repo)?;
     publish::assert_origin_repo_binding(&ledger::GitCli::new(repo), &slug)?;
@@ -845,38 +811,34 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
 pub fn run_status(repo: &Path) -> Result<()> {
     let slug = slug_of(repo)?;
     println!("aterm-release · status ({slug})");
-    let authority = publish::load_channel_signing_authority(repo)?;
     step(
         "signing",
-        &format!(
-            "epoch {} activates at v{} · current key {}… · retired key {}…",
-            authority.epoch,
-            authority.activation_version,
-            &authority.current_fingerprint_sha256[..12],
-            &authority.retired_fingerprint_sha256[..12]
-        ),
-    );
-    step(
-        "",
-        "lost epoch-1 secret: old-key-pinned v0.26 requires manual/bootstrap installation; unsigned-pin v0.27–v0.54 can migrate to signed v0.55",
+        "Tier REPO channel: gh auth + SHA-256 + monotonic build number · update signing is optional (a configured key signs; no key is required to cut)",
     );
 
     let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read Cargo.toml: {e}")))?;
     let full = publish::workspace_version(&cargo_text)?;
-    let short = publish::short_version(&full);
+    let release_version = publish::release_version_from_workspace(&full)?;
     step(
-        "version",
-        &format!(
-            "{full} (Cargo.toml) — next default cut v{}",
-            publish::bump_minor(&short)?
-        ),
+        "source",
+        &format!("{full} (Cargo.toml [workspace.package] MAJOR.MINOR.0 — the ONE version)"),
     );
 
     let ledger_text = fs::read_to_string(repo.join(ledger::LEDGER_FILE))
         .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))?;
     let records = ledger::parse(&ledger_text)?;
+    // The ledger tail is deliberately NOT shape-checked: pre-cut-over lines
+    // carry retired two-component versions and are real, append-only history.
     let tail = ledger::tail(&ledger_text)?;
+    step(
+        "app",
+        &format!(
+            "next cut v{release_version} (workspace {full}, DEV → 0) — the cut after that \
+             needs [workspace.package] version bumped to publish v{}",
+            publish::bump_minor_release(&release_version)?
+        ),
+    );
     step(
         "ledger",
         &format!(
@@ -1023,8 +985,20 @@ pub fn yank_successor_covers(bad: &Published, successor: &Published) -> Result<b
         .build
         .checked_add(1)
         .ok_or_else(|| Error::new("cannot yank u64::MAX: min_build successor would overflow"))?;
-    let bad_order = parse_numeric_tag(&bad.tag)?;
-    let successor_order = parse_numeric_tag(&successor.tag)?;
+    // Both ends must be current-scheme candidates. A retired two-component
+    // release is inert archive history no client will ever select, so it is
+    // neither a yank target nor a successor — and "not orderable against the
+    // current scheme" must fail, never license a deletion.
+    let (TagKind::Candidate(bad_order), TagKind::Candidate(successor_order)) = (
+        publish::parse_release_tag(&bad.tag)?,
+        publish::parse_release_tag(&successor.tag)?,
+    ) else {
+        return Err(Error::new(format!(
+            "yank needs two current-scheme vMAJOR.MINOR.PATCH releases; {} → {} includes a \
+             retired two-component release, which is archive history no client selects",
+            bad.tag, successor.tag
+        )));
+    };
     Ok(successor_order > bad_order
         && successor.build > bad.build
         && successor
@@ -1424,7 +1398,7 @@ pub fn run_yank(repo: &Path, build: u64) -> Result<()> {
     Ok(())
 }
 
-/// `cargo ship cut --abandon vX.Y` (spec §5): delete any draft release, any
+/// `cargo ship cut --abandon vX.Y.Z` (spec §5): delete any draft release, any
 /// tag the failed cut minted (local AND origin — spec decision 5's "a failed
 /// cut never leaves a public tag"), and the local journal; the claim commit
 /// stays (the ledger is append-only). A later cut of the version recuts with

@@ -38,7 +38,7 @@ use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
 use aterm_render::{GlowQuad, InkCell, RainHalo, SpriteQuad, TrailCell, WordDecoration};
 
-use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, NYAN_WAKE_PERSIST};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
 use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainConfig, RainHue, RainTickInput,
@@ -185,6 +185,7 @@ impl EffectsPipeline {
                 beam: true,
                 head_dx: 0.5,
                 pack: None,
+                wake_persist_s: NYAN_WAKE_PERSIST,
             },
             trail: CursorTrail::default(),
             trail_cfg: TrailConfig {
@@ -515,6 +516,9 @@ impl EffectsPipeline {
             } else {
                 None
             },
+            // The host's typing-wake preference survives a reconfigure exactly
+            // like its intensity/colour choices do.
+            wake_persist_s: self.glow_cfg.wake_persist_s,
         };
         if !enabled {
             self.glow.reset();
@@ -651,20 +655,11 @@ impl EffectsPipeline {
         self.refresh_sparkle_cfg();
     }
 
-    /// Feline knobs (native `[sparkle_words.feline]`): `style` = "cat" (v2
-    /// peeking cat, the default) or "paw" (exact v1); `color` `None` = the
-    /// native soft-pink default; `intensity` clamps 0..=1.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one call mirrors the native feline table; a builder would relocate the list"
-    )]
+    /// Feline knobs (native `[sparkle_words.feline]`): `style = "cat"` emits
+    /// the authored cat; legacy `"paw"` is ink-only and emits no paw graphic.
     pub fn set_sparkle_feline(
         &mut self,
         style: &str,
-        color: Option<u32>,
-        intensity: f32,
-        idle: bool,
-        gaze: bool,
         magic: bool,
         allow_bare_cat: bool,
         cjk_single_char: bool,
@@ -674,10 +669,6 @@ impl EffectsPipeline {
         } else {
             crate::word_decorations::FelineStyle::Cat
         };
-        self.deco_cfg.feline_color = color.unwrap_or(0x00F7_A8B8) & 0x00FF_FFFF;
-        self.deco_cfg.feline_intensity = intensity.clamp(0.0, 1.0);
-        self.deco_cfg.feline_idle = idle;
-        self.deco_cfg.feline_gaze = gaze;
         self.deco_cfg.feline_magic = magic;
         self.deco_cfg.allow_bare_cat = allow_bare_cat;
         self.deco_cfg.cjk_single_char = cjk_single_char;
@@ -1032,6 +1023,12 @@ impl EffectsPipeline {
         }
         self.pending_keys = 0;
 
+        // Why: native suppresses unfocused animation with a motion-policy
+        // AMPLITUDE fold (app_render: `intensity *=` / `enabled &=`) that the web
+        // path never ported, so visible-unfocused split panes animated at full
+        // strength. Composition forms so a load-shed envelope can stack here.
+        let motion_amp: f32 = if self.focused { 1.0 } else { 0.0 };
+
         // Cursor wake: comet trail (opaque) + aurora (additive), exactly one
         // of which is enabled by style in the native app — both are honored
         // here so the embedder's config surface decides. Ignite a COPY of the
@@ -1043,6 +1040,7 @@ impl EffectsPipeline {
             self.typing_cadence.intensity(now),
             self.typing_cadence.warmth(now),
         );
+        trail_cfg.enabled &= self.focused;
         let trail_fp = self
             .trail
             .tick(cur, now, &trail_cfg, &mut self.trail_scratch);
@@ -1051,7 +1049,9 @@ impl EffectsPipeline {
         // buffer's stale content is never read — the swap hands the host the
         // fresh frame without an O(len) copy per channel per frame.
         std::mem::swap(&mut input.cursor_trail, &mut self.trail_scratch);
-        if trail_cfg.enabled {
+        // Keyed on the STORED flag, not the focus-gated local: the colour is a
+        // config value, so unfocusing must not freeze it at a stale publish.
+        if self.trail_cfg.enabled {
             input.cursor_trail_color = trail_cfg.color;
         }
         // Window-space layout under the embedder's chrome (set_chrome). The
@@ -1059,9 +1059,15 @@ impl EffectsPipeline {
         // win == grid extents), so window-absolute emissions coincide with the
         // historical grid-relative ones byte-for-byte.
         let glow_geom = self.chrome_geom(rows, cols, cell_w, cell_h);
+        // Why: a COPY — zeroing the stored intensity would destroy the user's
+        // configured value, which only `set_cursor_glow` ever republishes.
+        // `intensity <= 0` is the engine's documented unfocus channel (it cools
+        // the thermal integrators instead of wiping them, as `enabled=false` would).
+        let mut glow_cfg = self.glow_cfg;
+        glow_cfg.intensity *= motion_amp;
         let glow_fp = self
             .glow
-            .tick(cur, now, &self.glow_cfg, glow_geom, &mut self.glow_scratch);
+            .tick(cur, now, &glow_cfg, glow_geom, &mut self.glow_scratch);
         std::mem::swap(&mut input.cursor_glow_add, &mut self.glow_scratch);
         // The glow engine's OTHER output streams, spliced exactly like the
         // native app's block (app_render): the RADIAL halos (fire embers /
@@ -1598,6 +1604,278 @@ mod tests {
         }
     }
 
+    /// THE focus gate. The engine was built expecting the host to deliver
+    /// unfocus as amplitude 0 (`cursor_glow`'s documented contract); native does
+    /// so via its motion policy, the web path never did — so a split pane that
+    /// is unfocused but still VISIBLE animated at full strength. The focused
+    /// half runs first so the unfocused assertion can never pass vacuously.
+    #[test]
+    fn unfocused_pane_emits_no_glow_but_focused_one_does() {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        let mut term = Terminal::new(6, 20);
+        let (mut lit, mut fp_focused) = (false, 0u64);
+        for ch in [b"a", b"b", b"c"] {
+            term.process(ch);
+            p.advance(30.0);
+            let mut input = term.cell_frame(6, 20);
+            fp_focused = p.apply(&mut term, &mut input, 10, 19);
+            lit |= !input.cursor_glow_add.is_empty();
+        }
+        assert!(lit, "a focused pane emits cursor light");
+        assert_ne!(fp_focused, 0, "emitted light folds a nonzero fingerprint");
+
+        // Unfocused, still ticking, still MOVING: the gate must zero all of it.
+        p.set_focused(false);
+        for ch in [b"d", b"e", b"f"] {
+            term.process(ch);
+            p.advance(30.0);
+            let mut input = term.cell_frame(6, 20);
+            let fp = p.apply(&mut term, &mut input, 10, 19);
+            assert!(
+                input.cursor_glow_add.is_empty(),
+                "an unfocused pane emits no aurora"
+            );
+            assert!(input.glow_halo.is_empty(), "no radial halo while unfocused");
+            assert!(input.fire_patch.is_empty(), "no fire field while unfocused");
+            assert!(
+                input.glow_under.is_empty(),
+                "no under-ink flame while unfocused"
+            );
+            assert!(input.char_fg.is_empty(), "no charred ink while unfocused");
+            assert!(
+                input.fire_halo.is_empty(),
+                "no contrast halo while unfocused"
+            );
+            assert_eq!(fp, 0, "an unfocused pane folds the identity fingerprint");
+        }
+    }
+
+    /// The perf half: a dark pane must genuinely SETTLE, or the host's shared
+    /// rAF keeps re-booking it and the gate buys nothing. Non-Fire style — Fire
+    /// deliberately keeps a bounded ember tail. Two gated ticks: the first arms
+    /// the lazy-cooling clock, the second cools through it.
+    #[test]
+    fn unfocused_glow_settles_so_the_host_stops_rebooking_the_pane() {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        let mut term = Terminal::new(6, 20);
+        for ch in [b"a", b"b", b"c"] {
+            term.process(ch);
+            p.advance(30.0);
+            let mut input = term.cell_frame(6, 20);
+            p.apply(&mut term, &mut input, 10, 19);
+        }
+        assert!(p.is_active(), "a live focused glow holds the engine active");
+
+        p.set_focused(false);
+        for _ in 0..2 {
+            p.advance(16.0);
+            let mut input = term.cell_frame(6, 20);
+            p.apply(&mut term, &mut input, 10, 19);
+        }
+        assert!(
+            !p.is_active(),
+            "an idle unfocused pane settles so the shared rAF can drop it"
+        );
+    }
+
+    /// Refocus must not fire a comet across the ground the cursor covered while
+    /// dark. The gated branches keep tracking the cursor precisely so that
+    /// `last` is current on the way back — which is why a `reset()` here would
+    /// be actively harmful (it nulls `last` and CREATES the phantom).
+    #[test]
+    fn refocus_resumes_without_a_phantom_comet() {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_trail(true, 260, 24, None, 0x0050_FA7B);
+        let mut term = Terminal::new(6, 20);
+        term.process(b"ab");
+        p.advance(30.0);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
+
+        // Travel a long way while dark.
+        p.set_focused(false);
+        for ch in [b"c", b"d", b"e", b"f", b"g", b"h"] {
+            term.process(ch);
+            p.advance(30.0);
+            let mut input = term.cell_frame(6, 20);
+            p.apply(&mut term, &mut input, 10, 19);
+        }
+
+        // Refocus WITHOUT moving: a tracked `last` means nothing to sweep.
+        p.set_focused(true);
+        p.advance(30.0);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            input.cursor_trail.is_empty(),
+            "refocus at a stationary cursor sweeps no cells"
+        );
+    }
+
+    /// The trail's gated branch is a hard clear (native does the identical
+    /// `enabled &=`), but the trail COLOUR is a config value, not animation —
+    /// it must keep being published so an unfocused frame carries a defined
+    /// colour rather than a stale one. Cadence is cold here, and `ignite` leaves
+    /// the colour untouched at intensity 0, so the published value is exact.
+    #[test]
+    fn unfocused_trail_clears_its_comet_but_still_publishes_the_colour() {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_trail(true, 260, 24, None, 0x0050_FA7B);
+        let mut term = Terminal::new(6, 20);
+        let mut swept = false;
+        for ch in [b"a", b"b", b"c"] {
+            term.process(ch);
+            p.advance(30.0);
+            let mut input = term.cell_frame(6, 20);
+            p.apply(&mut term, &mut input, 10, 19);
+            swept |= !input.cursor_trail.is_empty();
+        }
+        assert!(swept, "a focused pane sweeps a comet");
+        assert!(p.trail.is_active(), "sparks are live before the gate");
+
+        // One SHORT dark frame: well inside the 260 ms spark life, so an ungated
+        // trail would still be carrying a live comet here. Fresh input each
+        // frame, so a skipped colour publish leaves the default rather than a
+        // stale value from the focused run.
+        p.set_focused(false);
+        p.advance(30.0);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            input.cursor_trail.is_empty(),
+            "the gate clears the comet while its sparks would still be alive"
+        );
+        assert!(
+            !p.trail.is_active(),
+            "the trail settles on its first dark tick"
+        );
+        assert_ne!(
+            input.cursor_trail_color, 0,
+            "the colour is still published while unfocused"
+        );
+
+        // Once the cadence goes cold `ignite` leaves the colour untouched, so
+        // the published value is exactly the configured one.
+        p.advance(1000.0);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            input.cursor_trail_color, 0x0050_FA7B,
+            "the colour is keyed on the stored flag, not the focus-gated local"
+        );
+    }
+
+    /// SCOPE GUARD. Word decorations are deliberately NOT focus-gated: the focus
+    /// deferral was removed 2026-07-17 because entrances replayed en masse on
+    /// refocus, and `latch-at-birth` replaced it. Two pipelines driven in
+    /// lockstep — one focused, one not — must emit identical decoration frames.
+    /// If this goes red, someone has re-gated decorations and reopened that bug.
+    #[test]
+    fn focus_does_not_alter_word_decoration_emission() {
+        let drive = |focused: bool| {
+            let mut p = EffectsPipeline::new();
+            p.set_sparkle_enabled(true);
+            p.set_focused(focused);
+            let mut term = Terminal::new(4, 24);
+            term.process(b"\r\n\r\na nice kitty");
+            let mut input = RenderInput::default();
+            p.advance(10.0);
+            term.cell_frame_into(&mut input, 4, 24);
+            p.apply(&mut term, &mut input, 10, 20);
+            let mut frames = Vec::new();
+            for _ in 0..60 {
+                p.advance(100.0);
+                term.cell_frame_into(&mut input, 4, 24);
+                p.apply(&mut term, &mut input, 10, 20);
+                frames.push((
+                    input.free_sprites.len(),
+                    input.word_decorations.clone(),
+                    input.ink.clone(),
+                ));
+            }
+            frames
+        };
+        let focused = drive(true);
+        let unfocused = drive(false);
+        assert!(
+            focused.iter().any(|(sprites, _, _)| *sprites > 0),
+            "the focused cat actually played (else this proves nothing)"
+        );
+        assert_eq!(
+            focused, unfocused,
+            "decorations are out of scope for the focus gate (latch-at-birth, 2026-07-17)"
+        );
+    }
+
+    /// The gate scales a COPY. Zeroing the stored intensity would silently
+    /// destroy the user's configured value — only `set_cursor_glow` ever
+    /// republishes it, and the host posts that on a settings change alone.
+    #[test]
+    fn unfocusing_never_consumes_the_configured_glow_intensity() {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        let configured = p.glow_cfg.intensity;
+        let mut term = Terminal::new(6, 20);
+        p.set_focused(false);
+        for ch in [b"a", b"b", b"c"] {
+            term.process(ch);
+            p.advance(30.0);
+            let mut input = term.cell_frame(6, 20);
+            p.apply(&mut term, &mut input, 10, 19);
+        }
+        assert_eq!(
+            p.glow_cfg.intensity, configured,
+            "the stored intensity survives an unfocused stretch byte-unchanged"
+        );
+
+        // And it comes back at full strength.
+        p.set_focused(true);
+        let mut relit = false;
+        for ch in [b"d", b"e", b"f"] {
+            term.process(ch);
+            p.advance(30.0);
+            let mut input = term.cell_frame(6, 20);
+            p.apply(&mut term, &mut input, 10, 19);
+            relit |= !input.cursor_glow_add.is_empty();
+        }
+        assert!(relit, "refocus restores the light");
+    }
+
     fn composer_toggle_model() -> aterm_spec::derive::Model {
         use aterm_spec::ty_model;
         ty_model! {
@@ -1759,7 +2037,7 @@ mod tests {
         // FIX 8: enable the opt-in (a cfg refresh, not a lexicon rebuild) —
         // the requires-warning is satisfied and disappears; the genuinely
         // unscannable mixed-script warning stays.
-        p.set_sparkle_feline("cat", None, 0.7, true, true, true, true, true);
+        p.set_sparkle_feline("cat", true, true, true);
         let warns = p.sparkle_lexicon_warnings();
         assert!(
             !warns
@@ -1775,7 +2053,7 @@ mod tests {
         );
         // Flipping the opt-in back off re-applies it (filtered at read, so a
         // knob change never needs a rebuild to stay honest).
-        p.set_sparkle_feline("cat", None, 0.7, true, true, true, true, false);
+        p.set_sparkle_feline("cat", true, true, false);
         assert!(
             p.sparkle_lexicon_warnings()
                 .iter()
@@ -1824,7 +2102,7 @@ mod tests {
         );
 
         // Knob setter = hard_reset: the SAME word plays again.
-        p.set_sparkle_feline("cat", None, 0.7, true, true, true, true, false);
+        p.set_sparkle_feline("cat", true, true, false);
         p.advance(10.0);
         term.cell_frame_into(&mut input, 4, 24);
         p.apply(&mut term, &mut input, 10, 20); // release present (reveal 0)

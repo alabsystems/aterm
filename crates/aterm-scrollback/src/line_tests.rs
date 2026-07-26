@@ -131,6 +131,31 @@ fn cell_attrs_serialize_roundtrip() {
 }
 
 #[test]
+fn cell_attrs_from_raw_preserves_main_cell_wide_geometry() {
+    const BOLD: u16 = 1 << 0;
+    const WIDE: u16 = 1 << 9;
+    const CONTINUATION_OR_PROTECTED: u16 = 1 << 10;
+    const USES_STYLE_ID: u16 = 1 << 14;
+    const COMPLEX: u16 = 1 << 15;
+
+    let attrs = CellAttrs::from_raw(
+        DEFAULT_FG,
+        DEFAULT_BG,
+        BOLD | WIDE | CONTINUATION_OR_PROTECTED | USES_STYLE_ID | COMPLEX,
+    );
+    assert_eq!(
+        attrs.flags,
+        BOLD | WIDE,
+        "Line keeps the wide main cell's write-time geometry, but not contextual spacer/storage bits"
+    );
+    assert_eq!(
+        CellAttrs::deserialize(&attrs.serialize()),
+        Some(attrs),
+        "the existing u16 wire field round-trips WIDE without a format change"
+    );
+}
+
+#[test]
 fn line_with_attrs() {
     let mut rle: Rle<CellAttrs> = Rle::new();
     // Simulate: 5 chars with red fg, 5 chars with default
@@ -150,6 +175,48 @@ fn line_with_attrs() {
     assert_eq!(line.get_attr(0).fg, 0x01_FF0000);
     assert_eq!(line.get_attr(4).fg, 0x01_FF0000);
     assert_eq!(line.get_attr(5).fg, DEFAULT_FG);
+}
+
+/// E6a: the run-cursor is byte-identical to `get_attr` at EVERY index —
+/// monotone walks, repeated indices, past-the-end reads, and the backward
+/// rewind — over many-run and no-attr lines.
+#[test]
+fn attr_cursor_matches_get_attr_everywhere() {
+    // 7 runs of varying length, alternating styles.
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    let styles = [
+        CellAttrs::new(0x01_FF0000, DEFAULT_BG, 0),
+        CellAttrs::DEFAULT,
+        CellAttrs::new(0x01_00FF00, DEFAULT_BG, 1),
+    ];
+    let lens = [3usize, 1, 4, 2, 5, 1, 4];
+    for (i, &len) in lens.iter().enumerate() {
+        for _ in 0..len {
+            rle.push(styles[i % styles.len()]);
+        }
+    }
+    let total: usize = lens.iter().sum();
+    let line = Line::with_attrs(&"x".repeat(total), rle);
+
+    // Monotone walk incl. repeats and past-the-end.
+    let mut cursor = line.attr_cursor();
+    for idx in [0usize, 0, 1, 2, 3, 3, 7, 8, 9, 12, 15, 19, 20, 25, 100] {
+        assert_eq!(
+            cursor.attr_at(idx),
+            line.get_attr(idx),
+            "monotone cursor diverged at {idx}"
+        );
+    }
+    // Backward rewind stays correct.
+    assert_eq!(cursor.attr_at(2), line.get_attr(2), "rewind to 2");
+    assert_eq!(cursor.attr_at(11), line.get_attr(11), "re-advance to 11");
+
+    // A line with no attrs: DEFAULT everywhere, no panic.
+    let plain = Line::from("plain");
+    let mut cursor = plain.attr_cursor();
+    for idx in [0usize, 3, 40] {
+        assert_eq!(cursor.attr_at(idx), CellAttrs::DEFAULT);
+    }
 }
 
 #[test]

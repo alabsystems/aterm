@@ -271,35 +271,20 @@ impl AtermGpuTerminal {
         self.effects.set_sparkle_alt_screen_suppression(on);
     }
 
-    /// Feline knobs (native `[sparkle_words.feline]`): `style` = "cat" (the
-    /// v2 peeking cat, default) or "paw" (the exact v1 steady paw); `color`
-    /// omitted = the native soft pink; `intensity` clamps 0..=1; `idle` =
-    /// sparse blink/ear-twitch one-shots (focus-gated, ≤1/s); `gaze` = pupils
-    /// track the cursor (present-driven, zero new wakes); `magic` = rare
-    /// Fortune/Nebula cats; `allow_bare_cat` = decorate the literal 3-letter
-    /// `cat`; `cjk_single_char` = match a lone cat ideograph (high-FP).
-    #[allow(clippy::too_many_arguments)]
+    /// Feline knobs (native `[sparkle_words.feline]`): `style = "cat"` emits
+    /// the authored cat; legacy `"paw"` is ink-only and emits no paw graphic.
+    /// `magic` enables rare Fortune/Nebula cats;
+    /// `allow_bare_cat` decorates the literal 3-letter `cat`; and
+    /// `cjk_single_char` matches a lone cat ideograph (high-FP).
     pub fn set_sparkle_feline(
         &mut self,
         style: &str,
-        color: Option<u32>,
-        intensity: f32,
-        idle: bool,
-        gaze: bool,
         magic: bool,
         allow_bare_cat: bool,
         cjk_single_char: bool,
     ) {
-        self.effects.set_sparkle_feline(
-            style,
-            color,
-            intensity,
-            idle,
-            gaze,
-            magic,
-            allow_bare_cat,
-            cjk_single_char,
-        );
+        self.effects
+            .set_sparkle_feline(style, magic, allow_bare_cat, cjk_single_char);
     }
 
     /// Profanity knobs (native `[sparkle_words.profanity]`): `style` =

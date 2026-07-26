@@ -21,7 +21,7 @@ use crate::platform::AppRt;
 use crate::spawn::spawn_session;
 use crate::{
     App, Backend, BackendSlot, CloseOutcome, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget,
-    Session, TabIndex, WindowId, WindowState, build_backend, pane, seed_cell_px,
+    Session, TabIndex, WindowId, WindowState, pane, seed_cell_px,
 };
 
 /// Authority currently owning the native window title.
@@ -87,24 +87,11 @@ impl App {
         self.frontmost_window.and_then(|id| self.windows.get(&id))
     }
 
-    /// The window-CHROME theme to actually apply, resolving config `window_theme`.
-    /// On macOS/Linux this is the raw config value (`Auto` → the OS/CSD default).
-    /// On WINDOWS, `Auto` (the default) resolves to match the TERMINAL body — a dark
-    /// grid gets a dark title bar, a light grid a light one — so the caption never
-    /// clashes with the terminal (the seamless native look; a light caption over a
-    /// dark grid reads as broken). An explicit `Light`/`Dark` still forces the chrome.
+    /// The window-CHROME theme to apply from config `window_theme`.
+    /// `Auto` remains `Auto` on every platform so AppKit/winit/DWM can follow the
+    /// live system appearance; Light and Dark are explicit overrides. Terminal
+    /// palette selection is deliberately independent.
     pub(crate) fn window_theme_for_chrome(&self) -> crate::app_config::WindowTheme {
-        #[cfg(windows)]
-        {
-            use crate::app_config::WindowTheme;
-            if matches!(self.window_theme, WindowTheme::Auto) {
-                return if crate::platform_win::color_is_dark(self.theme.bg) {
-                    WindowTheme::Dark
-                } else {
-                    WindowTheme::Light
-                };
-            }
-        }
         self.window_theme
     }
 
@@ -197,7 +184,7 @@ impl App {
             .expect("tab/view identity space");
         self.pool.insert(session);
         let metrics = self.unattached_window_metrics();
-        let mut ws = WindowState::new_terminal(
+        let ws = WindowState::new_terminal(
             term,
             master,
             sink,
@@ -209,10 +196,8 @@ impl App {
             vec![layout],
             crate::tab_model::TabSet::new(tab),
         );
-        if let Some(sprite) = self.nyan_sprite_loader.installed() {
-            ws.word_decos.set_nyan_sprite_shared(Some(sprite));
-        }
         self.windows.insert(wid, ws);
+        self.install_window_config_assets(wid);
         // The new window becomes frontmost (the standard "open and focus" behavior).
         self.frontmost_window = Some(wid);
         debug_assert!(
@@ -353,6 +338,7 @@ impl App {
         // shaping/typography/render/font configuration used by every rebuild and
         // fallback path so startup cannot drift from runtime recovery.
         self.pin_backend_render_config();
+        self.backend.seal_admitted_font_sources();
         // Once-only font-feature diagnostics — now that the backend carries the
         // shaping AND the resolved font config, so the font probe is accurate.
         self.warn_font_feature_issues();
@@ -401,9 +387,7 @@ impl App {
             let (cw, ch) = seed_cell_px(self.font_px);
             let pad = self.cfg_pad_for_scale(1.0);
             let vertical_pad = pad.saturating_add(self.cfg_pad_top_for_scale(1.0));
-            let total_rows = rows
-                .saturating_add(self.tab_strip_rows)
-                .saturating_add(self.hud_rows);
+            let total_rows = rows.saturating_add(self.tab_strip_rows);
             PhysicalSize::new(
                 (cols as usize * cw + pad.saturating_mul(2)) as u32,
                 (total_rows as usize * ch + vertical_pad) as u32,
@@ -478,8 +462,9 @@ impl App {
         }
         // W11 MotionPolicy: seed the OS "Reduce Motion" flag at ATTACH and subscribe
         // to its change notification once (the observer target is retained for the
-        // process life, like `_menu`). Off macOS both are graceful no-ops (`false` /
-        // `None`), so this re-runs harmlessly per attach there.
+        // process life, like `_menu`). Windows has a real attach-time query but no
+        // live observer, so it re-samples on each attach. Linux/other platforms
+        // currently return `false` / `None`, leaving explicit config in control.
         if self._reduce_motion.is_none()
             && let Some(proxy) = self.proxy.as_ref()
         {
@@ -546,14 +531,32 @@ impl App {
             // translucent black on near-black. Re-synced on every theme change
             // (apply_theme_live + the reload rebuild branch).
             crate::toolbar::set_strip_dark(&handle, crate::tab_bar::theme_is_dark(self.theme.bg));
+            // Pin the user's selected-tab color override (config `active_tab_color`)
+            // at install too, so a fresh window's strip matches the live config.
+            crate::toolbar::set_active_tab_color(&handle, self.config.active_tab_color_rgb());
             self._toolbars.insert(wid, handle);
         }
         // Measure the band AFTER the mask + toolbar: `contentLayoutRect` now
         // reflects the full chrome (titlebar + unified toolbar) above the usable
         // content — the ONE truth the resize law re-derives against.
         let head_pts = self.apprt.titlebar_band_pts(&window);
+        // Seed the last-good-windowed band memory from the same sample (via the
+        // one decision law — only a sane decorated windowed measurement seeds).
+        // Without this, a fullscreen entered before any windowed resize would
+        // leave the memory at 0 and a bad exit sample would have nothing to
+        // restore. The applied `head_pts` stays the verbatim measurement — the
+        // deliberate post-chrome ordering above makes attach the trusted read.
+        let (_, band_memory_pts) = crate::app_config::titlebar_band_decision(
+            head_pts,
+            window.fullscreen().is_some(),
+            window.is_decorated(),
+            self.windows
+                .get(&wid)
+                .map_or(0.0, |ws| ws.last_windowed_band_pts),
+        );
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.head_pts = head_pts;
+            ws.last_windowed_band_pts = band_memory_pts;
         }
         // HiDPI / Retina auto-scale. aterm rasterizes glyphs at `font_px` PHYSICAL
         // pixels and works in physical units throughout, so on a 2× Retina display
@@ -768,25 +771,24 @@ impl App {
                     eprintln!(
                         "aterm-gui: GPU surface creation failed: {e}; falling back to the CPU renderer"
                     );
-                    match build_backend(
-                        self.font_px,
-                        false,
-                        self.theme,
-                        self.font_family.as_deref(),
-                    ) {
-                        Some(cpu) => {
-                            self.backend = BackendSlot::Ready(cpu);
+                    match self
+                        .backend
+                        .cpu_renderer_from_admitted(self.font_px, self.theme)
+                    {
+                        Ok(cpu) => {
+                            self.backend = BackendSlot::Ready(Backend::Cpu(cpu));
                             self.use_gpu = false;
                             crate::metrics::set_backend_gpu(false);
                             self.backend.set_pad(self.cfg_pad_for_scale(scale));
                             self.backend.set_pad_top(self.cfg_pad_top_for_scale(scale));
                             self.backend.set_head(head);
-                            self.pin_backend_render_config();
+                            self.pin_backend_render_config_core();
                             self.warn_font_feature_issues();
                             self.sync_chrome_fonts();
                             // Do NOT return — fall through to the softbuffer path.
                         }
-                        None => {
+                        Err(error) => {
+                            eprintln!("aterm-gui: resident CPU font fallback failed: {error}");
                             drop(window);
                             return false;
                         }
@@ -988,6 +990,14 @@ impl App {
             crate::DeferredHandoffMutation::CloseWindow(wid),
         )) {
             return;
+        }
+        match self.prepare_window_native_shutdown(wid, crate::native_app::CloseScope::Window) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                aterm_log::warn!("window native close barrier: {error}");
+                return;
+            }
         }
         match self.prepare_window_document_shutdown(wid) {
             Ok(true) => {}
@@ -1227,6 +1237,14 @@ impl App {
                 return;
             }
         }
+        match self.prepare_quit_native_shutdown() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                aterm_log::warn!("quit native close barrier: {error}");
+                return;
+            }
+        }
         match self.prepare_quit_document_shutdown() {
             Ok(true) => {}
             Ok(false) => {
@@ -1267,6 +1285,19 @@ impl App {
         if let Some(window) = anchor {
             let busy = self.any_foreground_job();
             if !self.confirm_destructive_close(window, true, busy) {
+                let _ = crate::menu::cancel_native_termination(generation);
+                return;
+            }
+        }
+
+        match self.prepare_quit_native_shutdown() {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = crate::menu::cancel_native_termination(generation);
+                return;
+            }
+            Err(error) => {
+                aterm_log::warn!("native terminate app-close barrier: {error}");
                 let _ = crate::menu::cancel_native_termination(generation);
                 return;
             }
@@ -1805,16 +1836,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_created_after_sprite_publication_inherits_custom_art() {
+    fn automatic_window_chrome_remains_system_owned_independent_of_terminal_palette() {
         let mut app = App::headless_for_test();
-        app.nyan_sprite_loader
-            .set_installed_for_test((1, 1, Arc::from([0xff, 0x22, 0xaa, 0xff])));
+        app.window_theme = crate::app_config::WindowTheme::Auto;
+        app.theme.bg = 0x000000;
+        assert_eq!(
+            app.window_theme_for_chrome(),
+            crate::app_config::WindowTheme::Auto
+        );
+        app.theme.bg = 0xffffff;
+        assert_eq!(
+            app.window_theme_for_chrome(),
+            crate::app_config::WindowTheme::Auto,
+            "terminal colors must not silently replace system-following chrome"
+        );
+
+        app.window_theme = crate::app_config::WindowTheme::Dark;
+        assert_eq!(
+            app.window_theme_for_chrome(),
+            crate::app_config::WindowTheme::Dark,
+            "an explicit chrome override remains explicit"
+        );
+    }
+
+    #[test]
+    fn window_created_after_config_asset_publication_inherits_custom_art() {
+        let mut app = App::headless_for_test();
+        let rgba: Arc<[u8]> = Arc::from([0xff, 0x22, 0xaa, 0xff]);
+        let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
+            trail_packs: crate::app_config::TrailPackCatalog::empty(),
+            nyan_sprite: crate::app_config::NyanSpriteAsset::Ready {
+                source_id: Arc::from("test.png"),
+                w: 1,
+                h: 1,
+                rgba: Arc::clone(&rgba),
+                fp: 7,
+            },
+            themes: crate::app_config::ThemeCatalog::empty(),
+            sparkle_spec_consumers: Default::default(),
+        });
+        assert_eq!(app.publish_config_assets(assets), 1);
         let sid = app.next_session_id;
         let wid = app.insert_logical_window(crate::stub_session(sid), 24, 80);
         assert!(
             app.windows[&wid].word_decos.has_custom_nyan_sprite(),
             "a post-publication window must not silently fall back to built-in art"
         );
+        assert!(Arc::ptr_eq(
+            app.windows[&wid].word_decos.nyan_sprite_rgba().unwrap(),
+            &rgba
+        ));
     }
 
     /// An explicit font size is never auto-scaled — on ANY display.

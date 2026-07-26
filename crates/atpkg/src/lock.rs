@@ -163,7 +163,10 @@ mod tests {
         let l = temp_layout("fresh");
         assert!(!l.prefix.exists(), "fixture: no prefix yet");
         let guard = try_lock_store(&l).expect("lockable before the store exists");
-        assert!(l.store_lock().is_file(), "store.lock created under the prefix");
+        assert!(
+            l.store_lock().is_file(),
+            "store.lock created under the prefix"
+        );
         #[cfg(unix)]
         {
             let dir_mode = std::fs::metadata(&l.prefix).unwrap().permissions().mode();
@@ -188,7 +191,10 @@ mod tests {
             Ok(_) => panic!("a file-shaped prefix cannot yield a store lock"),
             Err(e) => e,
         };
-        assert!(matches!(err, StoreLockError::Io(..)), "refusal is Io: {err:?}");
+        assert!(
+            matches!(err, StoreLockError::Io(..)),
+            "refusal is Io: {err:?}"
+        );
         assert!(
             err.to_string().contains("refusing to mutate the store"),
             "the Io refusal is fail-closed too: {err}"

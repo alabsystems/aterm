@@ -30,7 +30,11 @@
 //! and the native tab-app contracts [`derive::native_control_routing_model`],
 //! [`derive::native_tab_identity_model`],
 //! [`derive::native_settings_singleton_model`],
+//! [`derive::native_settings_draft_close_model`],
+//! [`derive::manual_config_handoff_model`],
+//! [`derive::native_packages_worker_model`],
 //! [`derive::native_config_transaction_model`],
+//! [`derive::native_config_observation_handoff_model`],
 //! [`derive::native_document_publication_model`],
 //! [`derive::native_close_plan_model`], [`derive::native_async_delivery_model`],
 //! and [`derive::native_updater_model`].

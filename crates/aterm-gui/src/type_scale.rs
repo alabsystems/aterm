@@ -19,7 +19,7 @@
 /// applied to the chrome's base size (the terminal `font_px` for the
 /// Settings/Palette overlay cards; the NATIVE `BASE_PT × display scale` for the
 /// About dialog — `crate::about`; [`crate::widget`]'s fixed tray base for the
-/// HUD tray).
+/// compact tray).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TypeStep {
     /// The wordmark ("aterm" in About). 1.6×.

@@ -15,6 +15,12 @@ use crate::scrollback::Scrollback;
 use super::Terminal;
 use aterm_types::Rgb;
 
+/// Engine-default hot-ring cap for a TIERED terminal (audit E1). The ring is
+/// the fixed fast tier in front of the compressed store — deep enough that
+/// interactive scroll-back over recent output never touches a decode path,
+/// small enough that the compressed tiers (not raw cells) hold deep history.
+pub const TIERED_RING_CAP_DEFAULT: usize = 1_000;
+
 /// Builder for creating [`Terminal`] instances with custom configuration.
 ///
 /// Provides a fluent API for configuring terminal options before construction.
@@ -105,6 +111,40 @@ impl TerminalBuilder {
     #[must_use]
     pub fn scrollback(mut self, scrollback: Scrollback) -> Self {
         self.scrollback = Some(scrollback);
+        self
+    }
+
+    /// Attach the ENGINE-DEFAULT tiered scrollback (audit E1): hot+warm(+cold)
+    /// store with the crate-default tier sizes and memory budget, behind a
+    /// [`TIERED_RING_CAP_DEFAULT`]-line hot ring, capped so the ONE total
+    /// retention limit (ring + staged + store — see
+    /// [`Terminal::set_scrollback_line_limit`](super::Terminal::set_scrollback_line_limit))
+    /// starts at `DEFAULT_LINE_LIMIT` exactly.
+    ///
+    /// This is the constructor embedding daemons should use instead of a bare
+    /// `ring_buffer_size(N)` (which retains raw uncompressed cells, ~640 B/line
+    /// at 80 cols, content-independent): the tiered store retains attributed
+    /// history at ~1/3 to 1/10 that, and unlocks the off-thread history-reflow
+    /// path. The cold-tier codec follows the BUILD, not the call site — LZ4 in
+    /// the default no-platform build, zstd (+ optional disk spill) under the
+    /// `disk-tier`/`zstd` features; introspect via
+    /// [`TierCapabilities::current`](crate::scrollback::TierCapabilities::current).
+    ///
+    /// NOTE for hosts without a compression-drain thread: scrolled-off lines are
+    /// promoted (LZ4) inline in ~1000-line batches on the feeding thread. A
+    /// throughput-critical host should mirror the GUI session:
+    /// `set_compress_offload_active(true)` + a worker draining
+    /// `drain_lazy_bounded(...)` off the PTY-read path.
+    #[must_use]
+    pub fn tiered_scrollback_defaults(mut self) -> Self {
+        let mut scrollback = Scrollback::with_defaults();
+        // Store share = total − ring share, so the unified getter round-trips
+        // DEFAULT_LINE_LIMIT as the out-of-the-box total.
+        scrollback.set_line_limit(Some(
+            aterm_scrollback::DEFAULT_LINE_LIMIT.saturating_sub(TIERED_RING_CAP_DEFAULT),
+        ));
+        self.scrollback = Some(scrollback);
+        self.ring_buffer_size = Some(TIERED_RING_CAP_DEFAULT);
         self
     }
 

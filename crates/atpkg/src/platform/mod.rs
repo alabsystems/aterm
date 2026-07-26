@@ -165,6 +165,18 @@ pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(any(windows, test))]
+const MAX_CMD_SHIM_BYTES: usize = 64 * 1024;
+
+/// Read the Windows `.cmd` shim through the package-metadata admission seam
+/// before parsing it. Compiled in Unix tests as a cross-platform regression for
+/// the Windows backend's otherwise-unexercised file behavior.
+#[cfg(any(windows, test))]
+pub(crate) fn read_cmd_shim_target(path: &Path) -> Option<PathBuf> {
+    let content = crate::metadata_io::read_bounded_regular_utf8(path, MAX_CMD_SHIM_BYTES).ok()?;
+    parse_cmd_shim_target(&content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +235,40 @@ mod tests {
         assert!(!cmd_target_is_injection_safe(Path::new(
             "C:\\x\\ay.exe\r\n@calc"
         )));
+    }
+
+    #[test]
+    fn cmd_shim_reader_rejects_sparse_oversize() {
+        let root =
+            std::env::temp_dir().join(format!("atpkg-cmd-shim-sparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("ay.cmd");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_CMD_SHIM_BYTES + 1) as u64).unwrap();
+        assert!(read_cmd_shim_target(&path).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_shim_reader_rejects_fifo_and_symlink_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("atpkg-cmd-shim-special-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("ay.cmd");
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_c` is a live NUL-terminated path in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        assert!(read_cmd_shim_target(&path).is_none());
+        std::fs::remove_file(&path).unwrap();
+        let target = root.join("target.cmd");
+        std::fs::write(&target, cmd_shim_content(Path::new("C:\\ay.exe"))).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_cmd_shim_target(&path).is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

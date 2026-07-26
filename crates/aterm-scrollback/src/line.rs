@@ -77,8 +77,8 @@ pub struct CellAttrs {
     pub fg: u32,
     /// Packed background color (same format as fg).
     pub bg: u32,
-    /// Cell flags (bold, italic, underline, etc.).
-    /// Excludes WIDE/WIDE_CONTINUATION/COMPLEX flags.
+    /// Cell flags (bold, italic, underline, etc.) plus the main-cell WIDE bit.
+    /// Excludes WIDE_CONTINUATION/PROTECTED, USES_STYLE_ID, and COMPLEX.
     pub flags: u16,
 }
 
@@ -108,14 +108,15 @@ impl CellAttrs {
         self.fg == DEFAULT_FG && self.bg == DEFAULT_BG && self.flags == 0
     }
 
-    /// Mask for visual flags we care about in scrollback.
-    /// Excludes WIDE (bit 9), WIDE_CONTINUATION/PROTECTED (bit 10),
-    /// USES_STYLE_ID (bit 14), and COMPLEX (bit 15) which are cell-specific.
-    /// Includes bits 0-8 (bold through double_underline) plus
-    /// bits 11-13 (superscript, subscript, curly_underline).
-    const VISUAL_FLAGS_MASK: u16 = 0x39FF; // bits 0-8, 11-13
+    /// Mask for visual flags and write-time width geometry preserved in scrollback.
+    /// Includes bits 0-9 (bold through WIDE) plus bits 11-13 (superscript,
+    /// subscript, curly_underline). Excludes WIDE_CONTINUATION/PROTECTED (bit
+    /// 10), USES_STYLE_ID (bit 14), and COMPLEX (bit 15), which cannot be
+    /// interpreted independently from their live-grid context.
+    const VISUAL_FLAGS_MASK: u16 = 0x3BFF; // bits 0-9, 11-13
 
-    /// Create from raw cell values, filtering to visual-only flags.
+    /// Create from raw cell values, filtering to visual flags plus main-cell
+    /// write-time width geometry.
     #[must_use]
     #[inline]
     pub const fn from_raw(fg: u32, bg: u32, flags: u16) -> Self {
@@ -374,6 +375,25 @@ impl Line {
             run_start = run_end;
         }
         CellAttrs::DEFAULT
+    }
+
+    /// Sequential attr reader over this line's RLE runs (audit E6a).
+    ///
+    /// [`get_attr`](Self::get_attr) rescans the runs from the START on every
+    /// call, so a per-cell materialization walk pays O(cols × runs) — the
+    /// accidental attr term the scrolled-frame audit flagged. The cursor
+    /// remembers the last run and its cumulative start: monotone
+    /// non-decreasing indices (a left-to-right cell walk) advance it forward
+    /// in amortized O(1) — O(runs) TOTAL per line — and a backward index
+    /// rewinds to the start (correct, just unaccelerated). Byte-identical to
+    /// `get_attr` at every index.
+    #[must_use]
+    pub fn attr_cursor(&self) -> AttrRunCursor<'_> {
+        AttrRunCursor {
+            runs: attr_runs(self.attrs.as_deref()),
+            i: 0,
+            run_start: 0,
+        }
     }
 
     /// Check if this line has styled content (non-default attributes).
@@ -656,6 +676,44 @@ impl Line {
         // strict-gate-provable fn-item access shape (see `attr_runs`); the
         // `None` arm's `&[]` has len 0, matching the previous `map_or(0, ..)`.
         attr_runs(self.attrs.as_deref()).len()
+    }
+}
+
+/// Sequential run-cursor over a [`Line`]'s attribute RLE — see
+/// [`Line::attr_cursor`]. Borrows the line's runs; cheap to construct (no
+/// allocation), one per materialized row.
+#[derive(Debug)]
+pub struct AttrRunCursor<'a> {
+    runs: &'a [aterm_rle::Run<CellAttrs>],
+    /// Index of the run the cursor is parked on.
+    i: usize,
+    /// Cumulative char index where `runs[i]` starts.
+    run_start: u32,
+}
+
+impl AttrRunCursor<'_> {
+    /// The attribute at `char_idx` — byte-identical to
+    /// [`Line::get_attr`] at every index, amortized O(1) for monotone
+    /// non-decreasing indices. Same overflow discipline as `get_attr`: the
+    /// `saturating_add` can never fire under the Rle total-length invariant.
+    #[must_use]
+    pub fn attr_at(&mut self, char_idx: usize) -> CellAttrs {
+        let idx = u32::try_from(char_idx).unwrap_or(u32::MAX);
+        if idx < self.run_start {
+            // Backward query: rewind (rare — the materialize walk is
+            // monotone; correctness over speed here).
+            self.i = 0;
+            self.run_start = 0;
+        }
+        while let Some(run) = self.runs.get(self.i) {
+            let run_end = self.run_start.saturating_add(run.length);
+            if idx < run_end {
+                return run.value;
+            }
+            self.run_start = run_end;
+            self.i += 1;
+        }
+        CellAttrs::DEFAULT
     }
 }
 

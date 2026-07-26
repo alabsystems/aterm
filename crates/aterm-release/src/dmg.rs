@@ -36,7 +36,7 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<DmgOut,
         ));
     }
     let dmg = out_dir.join(format!("aterm-{short_version}.dmg"));
-    // Volume name matches make-dmg.sh ("aterm 0.26") — what Finder shows when
+    // Volume name matches make-dmg.sh ("aterm 0.2.0") — what Finder shows when
     // the image is mounted.
     let volname = format!("aterm {short_version}");
     let _ = std::fs::remove_file(&dmg);

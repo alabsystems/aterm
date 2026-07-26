@@ -40,13 +40,13 @@ use winit::window::{CursorIcon, UserAttentionType, Window, WindowId as WinitWind
 
 mod about;
 mod accessibility;
-/// P2: cross-platform AccessKit tree for the Settings overlay (non-default feature).
+/// Cross-platform AccessKit adapter for transient/compatibility overlays; native
+/// Settings and Manual use `native_accessibility` below.
 #[cfg(feature = "a11y-accesskit")]
 mod accesskit_tree;
 mod app_about;
 mod app_colorscheme;
 mod app_config;
-mod app_fed;
 mod app_input;
 mod app_introspect;
 mod app_mouse;
@@ -64,6 +64,7 @@ mod bench_knobs;
 mod build_badge;
 mod build_info;
 mod cast;
+mod chrome_band;
 mod cli;
 /// Native Win32 clipboard backend (CF_UNICODETEXT via user32/kernel32 FFI) — the
 /// Windows twin of `clipboard_x11`.
@@ -119,7 +120,6 @@ mod document_store;
 mod document_store_conformance;
 mod find_bar;
 mod front_content;
-mod hud_bar;
 /// D3: the un-bypassable self-feed floor (per-session injection token bucket).
 mod inject_floor;
 mod input;
@@ -135,7 +135,6 @@ mod logging;
 mod markdown;
 mod menu;
 mod metrics;
-mod metrics_service;
 /// W11: MotionPolicy — the single accessibility gate for decorative animation.
 mod motion;
 #[cfg(feature = "a11y-accesskit")]
@@ -144,6 +143,8 @@ mod native_app;
 mod native_appearance;
 #[cfg(test)]
 mod native_config_conformance;
+mod native_config_host;
+mod native_config_language;
 mod native_config_service;
 #[cfg(test)]
 mod native_control_conformance;
@@ -153,9 +154,12 @@ mod native_document_journal;
 mod native_editor;
 #[cfg(test)]
 mod native_editor_conformance;
+mod native_font_catalog;
 #[cfg(test)]
 mod native_lifecycle_conformance;
 mod native_markdown;
+#[cfg(test)]
+mod native_packages_conformance;
 mod native_settings;
 #[doc(hidden)]
 pub use native_settings::{SettingsPageScrollCommand, settings_page_scroll_transition};
@@ -171,11 +175,9 @@ mod net_connections;
 mod net_listen;
 mod notice;
 mod notify;
-mod nyan_sprite_loader;
 mod overlay;
 mod packages_screen;
 mod pane;
-mod perf_panel;
 mod platform;
 mod settings_preview;
 /// Tone-of-typing tracker (typed-provenance seam → `aterm_effects::tone`
@@ -216,6 +218,8 @@ mod seamless {
         IncomingHandoff::default()
     }
 }
+#[cfg(target_os = "macos")]
+mod memory_pressure;
 /// Per-session tooltip/context-menu composer (session-metadata stage 2).
 mod session_chrome;
 mod session_store;
@@ -227,7 +231,6 @@ mod spawn;
 /// M2 "ink that dries": streamed output fades in; see [`stream_fade::StreamFade`].
 mod stream_fade;
 mod subscribe;
-mod sysmetrics;
 mod tab_bar;
 mod tab_model;
 #[cfg(test)]
@@ -246,7 +249,7 @@ mod watchdog;
 mod widget;
 
 use app_config::{
-    Config, config_path, env_u16, resolve_font_px, resolve_force_scale, resolve_tab_strip_rows,
+    Config, config_path, resolve_font_px, resolve_force_scale, resolve_tab_strip_rows,
 };
 use app_search::SearchState;
 use cli::{Cli, parse_cli};
@@ -349,10 +352,23 @@ fn plain_url_at(cells: &[RenderCell], col: usize) -> Option<(String, usize, usiz
 /// yields `None`, and the caller keeps the current backend (zoom is a no-op
 /// rather than a crash).
 fn build_backend(px: f32, use_gpu: bool, theme: Theme, family: Option<&str>) -> Option<Backend> {
-    if use_gpu && let Ok(g) = aterm_gpu::GpuRenderer::new_with_family(family, px, theme) {
+    // A configured family must take the strict CPU constructor below: the GPU
+    // convenience constructor intentionally falls through to built-ins, which
+    // is useful at cold launch but wrong for live reload (a path swapped after
+    // validation would silently clobber the current working font). An already-
+    // GPU backend rebuilds in place through its strict `set_font_theme` path.
+    if use_gpu
+        && family.is_none()
+        && let Ok(g) = aterm_gpu::GpuRenderer::new_with_family(None, px, theme)
+    {
         return Some(Backend::Gpu(GpuBackend::new(g)));
     }
-    Renderer::from_system_with_family(family, px, theme).map(Backend::Cpu)
+    match family {
+        Some(family) => Renderer::from_configured_font_family(family, px, theme)
+            .ok()
+            .map(Backend::Cpu),
+        None => Renderer::from_system(px, theme).map(Backend::Cpu),
+    }
 }
 
 /// The GUI app's out-of-the-box default font family, tried ahead of the library's
@@ -486,7 +502,7 @@ fn seed_cell_px(px: f32) -> (usize, usize) {
 /// [`App::on_scale_factor_changed`] (on a display/DPI change) previously spelled out
 /// inline — so a window's auto font size is a pure function of its OWN scale factor
 /// (W12: per-window metrics for mixed DPI). Honored only for the auto font (no
-/// `$ATERM_FONT_PX` / `config.font_px`) and when no scale is force-pinned.
+/// admitted `$ATERM_FONT_PX` / `config.font_px`) and when no scale is force-pinned.
 fn font_px_for_scale(scale: f64) -> f32 {
     (FONT_PX * scale as f32)
         .round()
@@ -553,7 +569,7 @@ impl MetricsView {
         }
     }
 
-    /// A window's ACTUAL metrics: the live `font_px` (which an explicit
+    /// A window's ACTUAL metrics: the live `font_px` (which an admitted explicit
     /// `$ATERM_FONT_PX` / `config.font_px` / live zoom pins verbatim, bypassing the
     /// scale derivation) paired with the `pad` and `head` applied for its scale /
     /// chrome. This records the truth regardless of whether the font auto-scaled,
@@ -571,12 +587,6 @@ impl MetricsView {
 /// Half-period of the cursor blink: a `Blinking*` DECSCUSR cursor toggles
 /// on/off every this long (the classic terminal cadence).
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
-
-/// Refresh cadence for the performance HUD (View ▸ Show Performance HUD). A focused
-/// window with the HUD on re-presents this often so the streaming fps/latency/
-/// sparkline stay live even on an idle screen; the loop returns to pure `Wait`
-/// (0% idle) the moment the HUD is off or the window loses focus.
-const HUD_INTERVAL: Duration = Duration::from_millis(300);
 
 /// SYNC-1 release classification grace: an expired frame-hold deadline is left
 /// armed this long so the release REDRAW (which reads the live sync state)
@@ -663,44 +673,6 @@ const fn native_preview_may_tick(
     overlay_open: bool,
 ) -> bool {
     (recorded || (has_os_window && focused)) && !overlay_open
-}
-
-/// One bounded refresh per second is enough for human-readable live metrics.
-/// Unlike effect previews this is not animation: a Diagnostics page never
-/// joins a frame cadence, and an ineligible page contributes no deadline.
-const NATIVE_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Pure lifecycle verdict shared by the arm and fire seams of the native
-/// Diagnostics sampler. Public only so the derived formal model's conformance
-/// test can exhaustively bind to the exact shipping decision.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativeDiagnosticsDeadlineDecision {
-    Disarm,
-    Arm,
-    Keep,
-    Refresh,
-}
-
-#[doc(hidden)]
-pub const fn native_diagnostics_deadline_decision(
-    route_visible: bool,
-    has_os_window: bool,
-    focused: bool,
-    recorded: bool,
-    overlay_open: bool,
-    armed: bool,
-    due: bool,
-) -> NativeDiagnosticsDeadlineDecision {
-    if !route_visible || !native_preview_may_tick(has_os_window, focused, recorded, overlay_open) {
-        NativeDiagnosticsDeadlineDecision::Disarm
-    } else if armed && due {
-        NativeDiagnosticsDeadlineDecision::Refresh
-    } else if armed {
-        NativeDiagnosticsDeadlineDecision::Keep
-    } else {
-        NativeDiagnosticsDeadlineDecision::Arm
-    }
 }
 
 /// Whether an introspection capture may read compositor pixels after trying to
@@ -895,6 +867,20 @@ const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
 /// byte-identical.
 const RESIZE_THROTTLE: Duration = Duration::from_millis(50);
 
+/// RESIZE SOUND QUIET: how long after a window's last APPLIED reflow the
+/// trail/bonk sound seams stay muted. A resize makes every full-screen TUI
+/// (claude, vim, a pager) repaint its whole frame, and the PTY-output-driven
+/// sound engine would read that repaint as a storm of typed keys and cursor
+/// jumps — glissandos nobody played. The window covers the reflow's own
+/// cursor relocation AND the SIGWINCH → app-repaint round trip (a couple
+/// hundred ms for a busy TUI); a drag re-stamps `last_resize_at` per applied
+/// tick, so the whole drag stays quiet and sound returns one beat after the
+/// final size lands. Cues still DRAIN under the mute (gain `None`), so no
+/// backlog ever replays on unmute. Cost of a false positive: one soft click
+/// missed if a key lands within this window of a resize — inaudible next to
+/// the storm it prevents.
+const RESIZE_SOUND_QUIET: Duration = Duration::from_millis(600);
+
 /// Multi-click window: a left press within this many milliseconds of the
 /// previous press, in the SAME cell, advances the click count (1 -> 2 -> 3,
 /// then wraps back to 1).
@@ -1078,35 +1064,6 @@ fn paste_needs_confirm(text: &str, bracketed: bool) -> bool {
     let body = text.strip_suffix('\n').unwrap_or(text);
     let body = body.strip_suffix('\r').unwrap_or(body);
     body.contains('\n') || body.contains('\r')
-}
-
-/// Native confirmation for a risky multi-line paste (macOS NSAlert). Returns `true`
-/// to proceed, `false` to cancel. Runs on the main thread (Cmd-V / menu Paste always
-/// do); off the main thread, or off macOS, it proceeds (the pure guard already
-/// decided this is worth confirming, and there is no UI to ask). GUI-only — the
-/// control `paste` verb never calls this.
-#[cfg(target_os = "macos")]
-fn confirm_multiline_paste_dialog(lines: usize) -> bool {
-    use objc2_app_kit::NSAlert;
-    use objc2_foundation::{MainThreadMarker, NSString};
-    let Some(mtm) = MainThreadMarker::new() else {
-        return true;
-    };
-    // SAFETY: standard AppKit NSAlert usage, on the main thread (mtm proves it). The
-    // returned objects are managed by objc2's `Retained`; `runModal` pumps its own
-    // modal run loop and returns the clicked button's response code.
-    unsafe {
-        let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str("Paste multiple lines?"));
-        alert.setInformativeText(&NSString::from_str(&format!(
-            "The clipboard holds {lines} lines and bracketed paste is off, so each line \
-             could run as a command. Paste anyway?"
-        )));
-        // Button 1 = Paste (NSAlertFirstButtonReturn, 1000); button 2 = Cancel.
-        let _ = alert.addButtonWithTitle(&NSString::from_str("Paste"));
-        let _ = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-        alert.runModal() == objc2_app_kit::NSAlertFirstButtonReturn
-    }
 }
 
 /// Windows twin of the NSAlert above: a Yes/No `MessageBoxW`, owned by the pasting
@@ -1557,10 +1514,6 @@ enum Wake {
     /// toolbar push + in-grid fingerprint/redraw). Posted only on an ACTUAL
     /// change, so it runs at `meta set` rate, never per frame or per output.
     MetaChanged { session: u64 },
-    /// The dedicated configured-Nyan worker published one bounded decoded
-    /// result. The UI performs only a nonblocking, generation-checked poll; all
-    /// filesystem IO and PNG decoding already completed off-thread.
-    NyanSpriteReady,
     /// The bounded smart-title worker finished its one in-flight model request.
     /// The result stays in its single-slot channel; the UI only performs a
     /// nonblocking generation/config-checked poll.
@@ -1659,6 +1612,16 @@ enum Wake {
     ReadChrome {
         reply: std::sync::mpsc::Sender<Vec<String>>,
     },
+    /// `panes` wants a window's ACTIVE-tab pane layout (tree geometry +
+    /// focus + zoom), which is main-thread `App` state. Same read-only
+    /// round-trip shape as [`Wake::ReadChrome`] (split-pane audit: a headless
+    /// driver must be able to ASSERT split state and aim per-pane actions).
+    /// `session` = cross-session target (the window whose active tab displays
+    /// it — the `image` routing rule); `None` = the front window.
+    ReadPanes {
+        session: Option<u64>,
+        reply: std::sync::mpsc::Sender<Vec<String>>,
+    },
     /// `dims` needs the selected terminal grid and main-thread window geometry
     /// from one coherent event turn. The handler samples `term` with `try_lock`
     /// and then projects it through the LIVE font/padding metrics and raw surface
@@ -1669,22 +1632,48 @@ enum Wake {
         term: Arc<Mutex<Terminal>>,
         reply: std::sync::mpsc::Sender<Result<control::DimsSnapshot, &'static str>>,
     },
-    /// The user edited `~/.config/aterm/aterm.toml` (the config-watcher thread
-    /// saw its mtime change). The main thread — the SOLE owner of the renderer,
-    /// window, and per-tab engines — re-reads + validates the file and applies
-    /// the new font/theme/engine config to every live session (see
-    /// [`App::reload_config`]). A malformed mid-edit file is rejected with a
-    /// warning, leaving the previous config intact.
+    /// Retired overlay test seam. Shipping changes supply exact bytes through
+    /// `ConfigReloadObserved`; no durable completion can request a pathname
+    /// reopen on the event loop.
+    #[cfg(test)]
     ConfigReload,
+    /// Exact bounded config generation sampled by the background watcher. The
+    /// event loop applies these bytes directly; it never reopens the pathname
+    /// after the watcher has acknowledged the generation.
+    ConfigReloadObserved(native_config_service::ConfigDiskObservation),
+    /// Typed, de-duplicated config/theme watcher failure or recovery. The main
+    /// thread updates persistent native Settings and Manual status only; the
+    /// previously admitted config/catalog remains active on every failure.
+    ConfigWatchStatus(config_watcher::WatchStatusEvent),
+    /// The background config watcher observed an installed-theme directory
+    /// generation and parsed it into a bounded immutable catalog. The event
+    /// loop only publishes/applies these already-resolved values.
+    ThemeCatalogChanged(Arc<app_config::ThemeCatalog>),
     /// Serialized native Settings worker finished atomically persisting one
     /// versioned config snapshot. Completion returns to the main thread only
     /// after rename succeeds/fails; reducers are never called from the worker.
     NativeConfigFinished {
-        instance: tab_model::AppInstanceId,
-        view: tab_model::ViewId,
-        reply: native_app::ReplyToken<native_app::ConfigPatchOutcome>,
-        outcome: native_app::ConfigPatchOutcome,
+        origin: app_native::NativeConfigOrigin,
+        completion: app_native::NativeConfigPersistenceCompletion,
     },
+    /// The serialized config worker sampled and prepared one authoritative disk
+    /// generation after a lost/indeterminate observation. No pathname or asset
+    /// source is reopened by the event-loop reducer.
+    NativeConfigReconciled {
+        completion: app_native::NativeConfigReconciliationCompletion,
+    },
+    /// Raw watcher bytes were parsed and their referenced assets resolved on
+    /// the serialized config worker. The main thread receives only immutable
+    /// memory authority tied to the watcher's exact baseline.
+    NativeConfigExternalPrepared {
+        completion: app_native::NativeConfigExternalPreparationCompletion,
+    },
+    /// Filesystem/font-backed Manual diagnostics completed away from the event
+    /// loop. The document/revision guard is reduced before any presentation is
+    /// invalidated, so old keystrokes can never publish stale warnings.
+    NativeConfigDiagnosticsFinished(native_config_host::Completion),
+    /// Complete immutable font/config-asset generation prepared off-thread.
+    FontCatalogPrepared(Box<native_font_catalog::Completion>),
     /// The sole native updater worker completed. Reduction and revision fan-out
     /// happen on the UI thread even if its initiating Settings view closed.
     NativeUpdateFinished {
@@ -1697,7 +1686,7 @@ enum Wake {
     /// Settings view.
     NativePackagesFinished {
         sequence: u64,
-        report: packages_screen::PackagesStatusReport,
+        completion: packages_screen::PackagesWorkerCompletion,
     },
     /// Ordered ledger + installed-bundle facts collected entirely off the event
     /// loop. Only this completion may import durable stage authority into the
@@ -1735,6 +1724,8 @@ enum Wake {
         generation: native_document_io::SaveGeneration,
         saved_bytes: Arc<[u8]>,
         result: native_document_io::AtomicSaveResult,
+        config_observation:
+            Option<Result<native_config_service::PreparedConfigObservation, String>>,
     },
     /// One exact, atomically replaced crash-journal image reached file and
     /// directory durability. Generation reduction remains on the UI thread.
@@ -1776,15 +1767,15 @@ enum Wake {
     /// strictly-newer build. The main thread shows the persistent "relaunch to apply"
     /// nudge (`App.relaunch`) unless the user already `[ Later ]`-dismissed THIS build.
     UpdateStaged { build: u64, version: String },
-    /// `settings [open|close|toggle]` control verb: drive the cross-platform in-window
-    /// settings overlay from the control socket (so a driver can open it then introspect
+    /// `settings [open|close|toggle]` control verb: drive the cross-platform native
+    /// Settings tab from the control socket (so a driver can open it then introspect
     /// it via `controls settings` / `image`). `open`: `Some(true)` open, `Some(false)`
     /// close, `None` toggle. Runs on the main thread (the sole `App` mutator) and replies
     /// the resulting open state.
-    /// `settings set|unset` (control socket): commit ONE settings field by key
-    /// through the overlay's validated seam (overlay open or not, headless too).
-    /// Replies the writer outcome (`saved: …` / `…: unchanged`) or an error
-    /// (unknown key / domain-rejected write) on the one-shot channel.
+    /// `settings set|unset` (control socket): enqueue ONE settings field by key
+    /// in the process-global versioned config lane (Settings open or not,
+    /// headless too). The worker completion owns this one-shot: conflicts and
+    /// post-publication uncertainty are ERR replies, never textual OK statuses.
     SetSettingsField {
         key: String,
         value: Option<String>,
@@ -1825,15 +1816,16 @@ enum Wake {
     },
     SettingsOverlay {
         open: Option<bool>,
-        /// `Some(is_open)` after driving the overlay; `None` when there is no front window
-        /// (so the verb reports an error instead of a misleading `OK settings closed`).
+        /// `Some(is_open)` after driving the native tab; `None` when there is no front
+        /// window (so the verb reports an error instead of a misleading
+        /// `OK settings closed`).
         reply: std::sync::mpsc::Sender<Option<bool>>,
     },
-    /// `settings section <name>`: land the OPEN settings surface on a category
-    /// (skipping the §L landing hero) — the socket driver's Get-started + sidebar
-    /// click in one hop, since a driver has no window keystrokes.
+    /// `settings section <name>`: land the OPEN native Settings tab on a stable route.
+    /// The control thread has already resolved visible labels and compatibility aliases,
+    /// so retired categories cannot cross this typed main-thread boundary.
     SettingsShowSection {
-        section: crate::prefs::Section,
+        route: crate::native_settings::SettingsRoute,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
     /// P2 accessibility: an event from a window's `accesskit_winit::Adapter` — an
@@ -1842,15 +1834,6 @@ enum Wake {
     /// the non-default `a11y-accesskit` feature; the production `Wake` never has it.
     #[cfg(feature = "a11y-accesskit")]
     Accessibility(accesskit_winit::Event),
-    /// A checkbox in the native Performance control panel (`perf_panel.rs`) was
-    /// toggled. The main thread — the SOLE owner of the HUD panel registry + window
-    /// geometry — applies + persists via [`App::user_set_panel`] (re-grids the window
-    /// so the band appears/disappears immediately, writes the `show_*_hud` key, and
-    /// revives a switched-off master `show_hud` when a panel is turned on). On
-    /// non-macOS targets the variant exists but is never constructed (no panel),
-    /// keeping `Wake` platform-independent.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    SetHudPanel { id: hud_bar::PanelId, on: bool },
     /// Phase 0.5 (A.2.3): a control verb built one or more engine-neutral
     /// [`InputEvent`]s and needs the main thread — the SOLE owner of term
     /// geometry + gesture state + the encoders — to apply them via
@@ -1868,6 +1851,20 @@ enum Wake {
         batch: Vec<InputEvent>,
         src: Source,
         reply: Option<std::sync::mpsc::Sender<InputOutcome>>,
+        /// The session the batch is FOR, when the caller resolved an explicit
+        /// one (`@<sid>`); `None` is the historical "whatever tab is front"
+        /// contract every flagless verb and every hardware path uses.
+        ///
+        /// This exists so a control verb that names a session which HAPPENS to be
+        /// the active tab can be applied through the App input seam — with the
+        /// blink reset, viewport snap, selection clear, typing-momentum hints and
+        /// the `video ... keys` ledger that seam owns — instead of egressing
+        /// straight to the sink on the control thread, which silently skipped all
+        /// of them. The check must happen HERE, on the event loop, because it is
+        /// the only place that can answer "is this still the front tab?" without
+        /// racing a tab switch: `input_to_session` re-resolves and falls back to
+        /// the hidden-session path if the answer turned out to be no.
+        session: Option<u64>,
     },
     /// The Linux/X11 paste worker finished reading a FOREIGN clipboard owner off the
     /// UI thread — `text` is the clipboard body to deliver into `wid` (the paste's
@@ -1882,6 +1879,22 @@ enum Wake {
         wid: WindowId,
         text: String,
         source: Source,
+    },
+    /// The multi-line paste SHEET was answered (macOS). The pastejacking confirmation
+    /// is a window sheet rather than an app-modal `NSAlert`, so it cannot block the
+    /// event loop and cannot depend on the app holding activation to receive a
+    /// keystroke — a sheet is key whenever its parent window is, which is what makes
+    /// Return reliably fire its default button. Because the sheet is asynchronous, the
+    /// paste it guards has to resume on a later loop turn: the completion handler posts
+    /// this, and `user_event` finishes the delivery through
+    /// [`App::deliver_paste_confirmed`]. `proceed` is false when the user cancelled, in
+    /// which case the text is dropped exactly as the blocking dialog dropped it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    PasteConfirmed {
+        wid: WindowId,
+        text: String,
+        source: Source,
+        proceed: bool,
     },
     /// A macOS menu-bar item was clicked (see `menu.rs`). The item's action
     /// target posts this off the AppKit menu-tracking call; `user_event`
@@ -2008,14 +2021,10 @@ enum Wake {
         path: control_auth::ConfinedImage,
         reply: std::sync::mpsc::Sender<Result<(u32, u32), String>>,
     },
-    /// Capture an AUXILIARY GUI screen — the Settings overlay (composited into the
-    /// front window) or the Performance control panel's `NSWindow` — to a CONFINED
-    /// PNG, the `window prefs` / `window perf` introspection verbs. Generalizes
-    /// [`Wake::CaptureWindow`] (which only sees the frontmost TERMINAL window via
-    /// `front()`) to the aux targets: `prefs` delegates to the front capture (the
-    /// overlay is in the front pixels), `perf` resolves the directly-owned panel's
-    /// `windowNumber()`, which `front()` is structurally blind to. The control thread
-    /// posts this + a one-shot reply and BLOCKS; the main thread reuses the SAME
+    /// Capture the front window after an auxiliary target has been opened, to a confined
+    /// PNG for compatibility verbs such as `window prefs`. Settings/About/Update are
+    /// routes in the native Settings tab; Menu is the transient palette. The control
+    /// thread posts this + a one-shot reply and BLOCKS; the main thread reuses the SAME
     /// `capture_window_pixels` path, replying `Ok((w, h))` or `Err(msg)` (window not
     /// open / capture failure / off-macOS). The variant exists on every target so `Wake`
     /// stays platform-independent.
@@ -2025,12 +2034,10 @@ enum Wake {
         path: control_auth::ConfinedImage,
         reply: std::sync::mpsc::Sender<Result<(u32, u32), String>>,
     },
-    /// Read an AUXILIARY window's CONTROLS as text — the `controls prefs` / `controls
-    /// perf` introspection verbs — so an AI can SEE the settings/perf GUIs' labels +
-    /// current values + states (the analogue of `chrome` for aux windows). The main
-    /// thread builds the text from the PURE model (`prefs::editable_fields` /
-    /// `perf_panel::perf_panel_lines` over the live config + panel state — no AppKit
-    /// needed), so this works HEADLESS too. Mirrors the `Wake::ReadChrome` round-trip.
+    /// Read the native Settings tab's current route and compiled semantic controls as
+    /// text for the compatibility `controls prefs` introspection verb. This works
+    /// headlessly and never serializes the retired overlay model. Mirrors the
+    /// `Wake::ReadChrome` round-trip.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ReadAuxControls {
         target: app_introspect::AuxTarget,
@@ -2051,30 +2058,23 @@ enum Wake {
         request: app_control::OpenRequest,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
-    /// PART-B OVERLAY-DRIVE FENCE: report the FRONT window's currently-open modal
-    /// overlay kind (`Settings`/`About`/`Palette`/`Update`), or `None` when no overlay is
-    /// open — the SAME `App::overlay()` slot `controls front` reads. The control thread
-    /// (which cannot touch `App`) blocks on this reply-bearing hop so the dispatch gate
-    /// can refuse a SCOPED-edge input-injection verb while a PRIVILEGED overlay is up
-    /// (closing the residual where a human-opened overlay could be DRIVEN by a scoped
-    /// edge). Read-only; never mutates. Owner callers skip the hop entirely.
-    FrontOverlayKind {
-        reply: std::sync::mpsc::Sender<Option<overlay::OverlayKind>>,
+    /// PART-B FRONT-DRIVE FENCE: report what currently consumes input in the FRONT
+    /// window. This includes both transient overlays and the native Settings tab;
+    /// checking only `App::overlay()` left the native tab indistinguishable from a
+    /// terminal at the control-policy seam. The control thread blocks on this
+    /// reply-bearing observation before authorizing scoped input. Read-only; never
+    /// mutates. Owner and cross-session callers skip the hop entirely.
+    FrontControlSurface {
+        reply: std::sync::mpsc::Sender<control::FrontControlSurface>,
     },
-    /// OPEN an auxiliary GUI screen — the `open prefs` / `open perf` introspection
-    /// verbs — so a driver can bring the Settings overlay / Performance panel UP
-    /// programmatically (the missing piece that lets `controls`/`window` then
-    /// introspect a CLOSED screen). Reuses the SAME `App::settings_enter` /
-    /// `App::open_performance_panel` the menu items call; the main thread (the sole
-    /// AppKit owner) opens the surface and replies `Ok(())`, or `Err(msg)` (no front
-    /// window / headless / off-macOS for `perf`). The variant exists on every target
-    /// so `Wake` stays platform-independent.
+    /// Open an auxiliary target so a driver can inspect it. Settings aliases resolve to
+    /// native tab routes; Menu resolves to the transient palette. The main thread opens
+    /// the surface and replies `Ok(())` or `Err(msg)`.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     OpenAuxWindow {
         target: app_introspect::AuxTarget,
-        /// `open <target> close` — dismiss the own-rendered overlay instead,
-        /// through the SAME exit paths the Escape key uses, so a driver that
-        /// opened a surface can put the glass back without synthesizing keys.
+        /// `open <target> close` — close a native Settings presentation through the tab
+        /// lifecycle, or dismiss the Menu palette through its overlay exit path.
         close: bool,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
@@ -2557,7 +2557,7 @@ mod bottom_padding_geometry_tests {
         project_visible_pad_crop, try_shift_window_absolute_effects_y, visible_frame_height,
     };
     use aterm_core::render::FreeSprite;
-    use aterm_render::{FirePatch, Frame, GlowQuad, RainHalo, RenderInput, SpriteQuad};
+    use aterm_render::{FirePatch, Frame, GlowQuad, RainHalo, RenderInput};
 
     #[test]
     fn visible_height_keeps_base_bottom_instead_of_absorbing_removed_top() {
@@ -2775,10 +2775,6 @@ mod bottom_padding_geometry_tests {
             cy: 32,
             ..RainHalo::default()
         }];
-        input.scene_over = vec![SpriteQuad {
-            y: 33,
-            ..SpriteQuad::default()
-        }];
         input.free_sprites = vec![FreeSprite {
             y: 34,
             ..FreeSprite::default()
@@ -2795,7 +2791,6 @@ mod bottom_padding_geometry_tests {
         );
         assert_eq!(input.nova_add[0].y, 30);
         assert_eq!((input.rain_add[0].y, input.rain_add[0].cy), (31, 32));
-        assert_eq!(input.scene_over[0].y, 33);
         assert_eq!(input.free_sprites[0].y, 34);
 
         assert!(try_shift_window_absolute_effects_y(&mut input, -7));
@@ -2818,6 +2813,68 @@ mod bottom_padding_geometry_tests {
 }
 
 impl Backend {
+    fn primary_seed(&self) -> Option<native_font_catalog::PrimarySeed> {
+        match self {
+            Backend::Cpu(renderer) => {
+                renderer
+                    .chrome_primary_face()
+                    .map(|(bytes, _)| native_font_catalog::PrimarySeed {
+                        path: renderer.primary_source_path().map(str::to_string),
+                        bytes,
+                    })
+            }
+            Backend::Gpu(renderer) => {
+                renderer
+                    .chrome_primary_face()
+                    .map(|(bytes, _)| native_font_catalog::PrimarySeed {
+                        path: renderer.primary_source_path().map(str::to_string),
+                        bytes,
+                    })
+            }
+        }
+    }
+
+    fn admitted_font_sources(&self) -> aterm_render::AdmittedFontSources {
+        match self {
+            Backend::Cpu(renderer) => renderer.admitted_font_sources(),
+            Backend::Gpu(renderer) => renderer.admitted_font_sources(),
+        }
+    }
+
+    fn seal_admitted_font_sources(&mut self) -> aterm_render::AdmittedFontSources {
+        match self {
+            Backend::Cpu(renderer) => renderer.seal_admitted_font_sources(),
+            Backend::Gpu(renderer) => renderer.seal_admitted_font_sources(),
+        }
+    }
+
+    fn rebuild_font_from_admitted(&mut self, px: f32, theme: Theme) -> Result<(), String> {
+        match self {
+            Backend::Cpu(renderer) => {
+                *renderer = renderer.rebuild_from_admitted(px, theme)?;
+                Ok(())
+            }
+            Backend::Gpu(renderer) => renderer.rebuild_font_from_admitted(px, theme),
+        }
+    }
+
+    fn cpu_renderer_from_admitted(&self, px: f32, theme: Theme) -> Result<Renderer, String> {
+        match self {
+            Backend::Cpu(renderer) => renderer.rebuild_from_admitted(px, theme),
+            Backend::Gpu(renderer) => renderer
+                .fork_semantic_surface(px, theme)
+                .ok_or_else(|| "sealed GPU font generation could not be rebuilt".to_string()),
+        }
+    }
+
+    fn install_prepared_font(&mut self, renderer: Renderer, family: Option<String>, theme: Theme) {
+        match self {
+            Backend::Cpu(current) => *current = renderer,
+            Backend::Gpu(current) => {
+                current.install_prepared_font(family, renderer, theme);
+            }
+        }
+    }
     /// Pixel size of one cell, `(width, height)` — from the live renderer.
     fn cell_size(&self) -> (usize, usize) {
         match self {
@@ -3404,6 +3461,28 @@ impl BackendSlot {
 
     fn set_styled_font(&mut self, slot: usize, bytes: &[u8]) -> Result<(), String> {
         self.ready_mut().set_styled_font(slot, bytes)
+    }
+
+    fn admitted_font_sources(&self) -> Option<aterm_render::AdmittedFontSources> {
+        match self {
+            Self::Pending(_) => None,
+            Self::Ready(backend) => Some(backend.admitted_font_sources()),
+        }
+    }
+
+    fn seal_admitted_font_sources(&mut self) -> Option<aterm_render::AdmittedFontSources> {
+        match self {
+            Self::Pending(_) => None,
+            Self::Ready(backend) => Some(backend.seal_admitted_font_sources()),
+        }
+    }
+
+    fn rebuild_font_from_admitted(&mut self, px: f32, theme: Theme) -> Result<(), String> {
+        self.ready_mut().rebuild_font_from_admitted(px, theme)
+    }
+
+    fn cpu_renderer_from_admitted(&self, px: f32, theme: Theme) -> Result<Renderer, String> {
+        self.ready().cpu_renderer_from_admitted(px, theme)
     }
 
     fn set_synthetic_styles(&mut self, on: bool) {
@@ -4436,7 +4515,31 @@ impl PresentRetry {
         if reason.autonomous_retry() && self.autonomous_retries < PRESENT_RETRY_CAP {
             let shift = u32::from(self.autonomous_retries);
             let factor = 1u32 << shift;
-            let delay = PRESENT_RETRY_BASE.saturating_mul(factor);
+            // A FIRST `GpuReconfigured` drop has already repaired its own cause: the
+            // acquire returned Outdated/Lost and the surface was reconfigured on the
+            // spot, so the very next attempt can succeed. Backing off 16 ms there
+            // bought nothing and cost real time — most visibly it put a hard +16 ms
+            // floor on time-to-first-pixel for every new window/tab (whose first
+            // acquire routinely finds a not-yet-composited CAMetalLayer), and froze a
+            // streaming screen for a full backoff step after any transient
+            // Space-switch / display-wake reconfigure. Retry immediately once; a
+            // SECOND consecutive drop means the condition is real and enters the
+            // ladder unchanged.
+            //
+            // Strictly FUTURE, not zero: `take_due` clears the deadline before
+            // requesting its redraw, but the retry state machine's conformance model
+            // binds "an autonomous retry is never immediate/past", and a `WaitUntil`
+            // armed at exactly `now` is a needless edge for that invariant to defend.
+            // 1 ms removes ~94% of the floor and keeps the property intact.
+            const RECONFIGURE_FAST_RETRY: std::time::Duration =
+                std::time::Duration::from_millis(1);
+            let delay = if self.autonomous_retries == 0
+                && reason == metrics::PresentDropReason::GpuReconfigured
+            {
+                RECONFIGURE_FAST_RETRY
+            } else {
+                PRESENT_RETRY_BASE.saturating_mul(factor)
+            };
             self.autonomous_retries += 1;
             let deadline = now + delay;
             self.deadline = Some(deadline);
@@ -4620,12 +4723,24 @@ struct WindowState {
     /// (see `AppRt::titlebar_band_pts`). Kept in points — not px — so a scale
     /// change recomputes the device-px headroom (`round(head_pts · scale)`)
     /// without an AppKit round-trip. 0.0 for chromeless / non-macOS windows.
+    ///
+    /// TWO-SLOT BAND DESIGN: this slot is the APPLIED band — what the window is
+    /// rendering with right now, including the fullscreen-forced 0. Its sibling
+    /// [`Self::last_windowed_band_pts`] is the last-good-windowed MEMORY. They
+    /// must stay separate: fullscreen legitimately applies 0 here, so if this
+    /// slot doubled as the acceptance fallback, a whole fullscreen stay would
+    /// erase the band and an exit-transition artifact sample (a decorated
+    /// windowed 0) could only ever "keep" 0 — the defense would defend nothing.
     head_pts: f64,
-    /// Max HUD rows this window is TALL ENOUGH to show (the rest of the desired
-    /// `App::hud_rows` are dropped from the bottom of the stack rather than rendered
-    /// off-glass). `u16::MAX` = unconstrained (no resize yet / headless); set by
-    /// `on_resize`. Effective HUD rows = `min(App::hud_rows, hud_cap)`.
-    hud_cap: u16,
+    /// Last GOOD windowed titlebar band in POINTS: the most recent decorated,
+    /// non-fullscreen sample that passed acceptance (see
+    /// `titlebar_band_decision`). This is the `prev_pts` fallback that
+    /// `accept_titlebar_band_pts` restores when a decorated windowed sample is
+    /// an artifact (0 or beyond the sanity cap). Fullscreen forces the APPLIED
+    /// slot above to 0 but must never clobber this memory — it is precisely
+    /// what the exit-fullscreen transition needs to climb back to. 0.0 until
+    /// the first sane decorated windowed measurement (attach or resize).
+    last_windowed_band_pts: f64,
     mods: ModifiersState,
     /// Last cell (row, col) the cursor moved over, in the FOCUSED PANE's LOCAL grid
     /// coordinates (window cell minus the focused pane's offset), updated on
@@ -4750,10 +4865,6 @@ struct WindowState {
     /// `quit_safety::CLOSE_WARNING_TITLE` and a second request closes; `new_events`
     /// restores the live title at expiry. `None` keeps the loop in pure `Wait`.
     close_warning_until: Option<Instant>,
-    /// The next performance-HUD refresh deadline. Armed ONLY while the HUD is on
-    /// and this window is focused; `None` otherwise (so the loop stays at pure
-    /// `Wait`/0% idle when the HUD is off). Mirrors [`Self::next_blink`].
-    next_hud_tick: Option<Instant>,
     /// SYNC-1: DEC-2026 synchronized-output frame-hold release deadline. Armed (to
     /// `frame_started + sync_timeout`) the first present that observes the single
     /// pane's engine in synchronized output; while armed AND unexpired the present is
@@ -5120,6 +5231,12 @@ struct WindowState {
     /// coalescing it — echo latency beats bulk-output pacing, and the bypass is
     /// bounded by the typing rate.
     input_hot: bool,
+    /// When the keystroke pacing bypass ([`Self::input_hot`]) may retire. Re-armed by
+    /// every key, so a typing burst holds the bypass continuously instead of losing it
+    /// to the first unrelated output frame. `None` ⇒ nothing pending (retire on the
+    /// next present). See the arming site in `App::input` for why a deadline, rather
+    /// than the first content present, is the honest correlation.
+    input_hot_until: Option<std::time::Instant>,
     /// THIS window's monitor refresh period, re-sampled whenever the window lands
     /// on a different monitor (`None` → the app-wide primary-monitor default in
     /// `App::frame_interval`). A window on a 120 Hz panel then coalesces at 8.3 ms
@@ -5143,10 +5260,6 @@ struct WindowState {
     /// use the bounded demo cadence; a blink-only preview arms exactly one wake
     /// at its next visual edge instead of sharing the 30 fps overlay timer.
     next_native_preview_tick: Option<Instant>,
-    /// Bounded live-metrics refresh for the active native Diagnostics route.
-    /// Armed only for a real watcher (focused glass or an explicit recording),
-    /// and disarmed for hidden routes, overlays, or unwatched/headless windows.
-    next_native_diagnostics_tick: Option<Instant>,
     /// The title currently shown in the window chrome. Mirrors the engine's
     /// program-set title (OSC 0/2); `redraw()` calls `set_title` only when this
     /// diverges, so a program that updates its title (shell cwd, vim, ssh) is
@@ -5366,6 +5479,18 @@ struct WindowState {
 }
 
 impl WindowState {
+    /// Whether this window is inside the [`RESIZE_SOUND_QUIET`] window: within
+    /// that duration of the last APPLIED reflow (`last_resize_at`, stamped by
+    /// every interactive resize tick and the trailing drag settle — a live
+    /// drag therefore stays continuously quiet; `pending_resize` needs no
+    /// separate check because a coalesced size implies a stamp within
+    /// [`RESIZE_THROTTLE`]). The sound seams resolve their gain to `None`
+    /// while this holds, so a TUI's resize repaint storm drains silently.
+    fn resize_sound_quiet(&self, now: Instant) -> bool {
+        self.last_resize_at
+            .is_some_and(|t| now.saturating_duration_since(t) < RESIZE_SOUND_QUIET)
+    }
+
     /// Resolve terminal capability only when canonical front identity agrees
     /// with the mirror. A stale or native front fails closed.
     fn front_terminal(&self) -> Option<&front_content::TerminalMirror> {
@@ -5424,11 +5549,18 @@ impl WindowState {
     /// (the drop path returned above), so the frame displayed. Stamp the present clock
     /// and clear the keystroke-echo pacing bypass. Model: `displayed' = 1`.
     fn on_present_displayed(&mut self) {
-        self.last_present_at = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.last_present_at = Some(now);
         self.present_retry.on_presented();
-        // The keystroke that armed the pacing bypass has had its echo presented;
-        // subsequent output coalesces normally until the next key.
-        self.input_hot = false;
+        // Retire the keystroke pacing bypass only once its echo window has ELAPSED —
+        // not on the first content present, which under concurrent output is a spew
+        // frame that has nothing to do with the keystroke (see the arming site in
+        // `App::input`). Fails open: the deadline always expires, so a key that never
+        // echoes cannot hold the bypass.
+        if self.input_hot_until.is_none_or(|until| now >= until) {
+            self.input_hot = false;
+            self.input_hot_until = None;
+        }
     }
 
     /// Record any frame that genuinely reached the platform present seam. Kept
@@ -5440,8 +5572,8 @@ impl WindowState {
 
     /// Rows the in-window Settings overlay occupies in the COMPOSED frame: the control
     /// list + title + footer ([`crate::settings::wanted_rows`]), clamped to the rows the
-    /// frame actually has (`input_scratch.cells.len()` — the whole composed height incl.
-    /// the tab strip + HUD). `0` when the panel is closed. The SINGLE source consulted by
+    /// frame actually has (`input_scratch.cells.len()` — the whole composed height,
+    /// including the tab strip). `0` when the panel is closed. The SINGLE source consulted by
     /// the painter ([`crate::App::splice_settings_panel`]), the scroll clamp
     /// ([`crate::App::settings_move`]/`settings_select`), and the mouse hit-test
     /// ([`crate::App::settings_row_at`]) — so on a short window the band the panel paints
@@ -5614,10 +5746,18 @@ impl WindowState {
     /// frames go through `redraw_compose` (single-pane frames take the original
     /// path). Shared by [`Self::cursor_fx_active`] and the `about_to_wait`
     /// cadence fold so the wake set and the compose tick set can never drift.
+    ///
+    /// ZOOM-AWARE (split-pane audit): a ZOOMED tab composes to exactly ONE
+    /// full-window rect at `(0, 0)` — `compute_layout` returns the focused
+    /// pane alone, `visible_plan` sizes its terminal to the whole window — so
+    /// its coordinates coincide with single-pane window-content coords and
+    /// frames take the ORIGINAL single-pane path: matrix rain, selection,
+    /// vi copy-mode, the scroll pill, and the stream fade all stay live in a
+    /// zoomed pane instead of silently vanishing behind a `tree.len()` gate.
     fn is_split(&self) -> bool {
         self.layouts
             .get(self.tabs.active)
-            .is_some_and(|t| t.len() > 1)
+            .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
     }
 
     /// The Settings overlay for this window, if it is the OPEN variant. The accessor shim
@@ -5857,7 +5997,7 @@ impl WindowState {
             // permanently split native layout from the framebuffer at an explicit font.
             metrics,
             head_pts: 0.0, // no chrome measured until attach_os_window queries AppKit
-            hud_cap: u16::MAX, // unconstrained until the first on_resize fits the chrome
+            last_windowed_band_pts: 0.0, // no good windowed sample yet either
             mods: ModifiersState::empty(),
             last_mouse_cell: (0, 0),
             last_mouse_window_cell: (0, 0),
@@ -5888,7 +6028,6 @@ impl WindowState {
             vi_pending_g: false,
             vi_pending_inline: None,
             close_warning_until: None,
-            next_hud_tick: None,
             bell_flash: BellFlash::new(),
             cursor_glow: crate::cursor_glow::CursorGlow::default(),
             cursor_rainbow: crate::cursor_rainbow::CursorRainbow::default(),
@@ -5954,12 +6093,12 @@ impl WindowState {
             redraw_pending: false,
             present_retry: PresentRetry::default(),
             input_hot: false,
+            input_hot_until: None,
             frame_interval: None,
             monitor: None,
             last_edr_query: None,
             next_demo_tick: None,
             next_native_preview_tick: None,
-            next_native_diagnostics_tick: None,
             current_title: "aterm".to_string(),
             store_title: (u64::MAX, String::new()),
             input_scratch: RenderInput::empty(),
@@ -6086,6 +6225,17 @@ pub(crate) fn automatic_update_activity_retry_at(now: Instant) -> Instant {
 struct AutoApplyManualOnly {
     build: u64,
     dmg_sha256: [u8; 32],
+    /// When this latch may LAPSE back into automatic apply.
+    ///
+    /// A GENUINE failure (child died, proof mismatch, native safety loss) sets
+    /// `None` — sticky, exactly as before: repeating it would only fail again.
+    /// An ACTIVITY-shaped exhaustion sets a deadline instead. Activity
+    /// revocation is fully rolled back and says nothing about the artifact; it
+    /// only says the terminal was busy, which on the machine this feature
+    /// exists for is the permanent condition. A latch that never lapsed meant
+    /// three unlucky moments retired automatic apply until the next relaunch —
+    /// which is precisely the "staged, never applied" state the field reported.
+    retry_at: Option<std::time::Instant>,
 }
 
 /// Bounded automatic re-attempt budget for one exact artifact whose overlap
@@ -6103,7 +6253,36 @@ struct AutoOverlapRetry {
     build: u64,
     dmg_sha256: [u8; 32],
     cycles: u8,
+    /// When the most recent activity-revoked attempt was budgeted. A busy hour
+    /// must not permanently spend an artifact's budget: after
+    /// [`ACTIVITY_RETRY_BUDGET_REPLENISH`] of not attempting, the budget starts
+    /// over. Bounded either way — the backoff schedule still paces attempts.
+    last_attempt: std::time::Instant,
 }
+
+/// One completed pre-park verification of the staged candidate.
+#[derive(Clone, Debug)]
+struct HandoffPreverification {
+    build: u64,
+    commit: String,
+    at: std::time::Instant,
+    passed: bool,
+}
+
+/// How long a pre-park verification verdict may substitute for re-running the
+/// check inside the parked window. Short enough that a bundle replaced behind
+/// our back is re-verified within a couple of update cycles; the authoritative
+/// gate at swap time is unaffected either way.
+const HANDOFF_PREVERIFY_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Idle gap after which an artifact's activity-revoked retry budget replenishes.
+const ACTIVITY_RETRY_BUDGET_REPLENISH: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// How long an ACTIVITY-shaped manual-only latch holds before automatic apply
+/// is allowed to try again. Long enough not to thrash, short enough that a
+/// machine left running overnight still ends up updated.
+const ACTIVITY_MANUAL_ONLY_LAPSE: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
 /// Result produced by the bounded overlap waiter. `ProofReady` means only that
 /// the child painted and proved the exact adopted PTY set; the main thread must
@@ -6149,37 +6328,92 @@ enum UpdateHandoffEventClass {
     /// Structural or PTY-mode-changing: revokes a pending attempt (epoch
     /// bump plus worker cancel poke). Resize/scale change the grid the
     /// carried proof committed to; closes/quits are deferred destructive
-    /// intent; pastes can straddle a bracketed-paste mode flip sitting
-    /// unread in the kernel queue; mouse clicks/wheel mutate
-    /// selection/viewport presentation that the carried frame would
-    /// contradict.
+    /// intent; a drop writes a path into a session; `Ime` can straddle a
+    /// half-built preedit that cannot carry across `_exit`.
     Revoking,
 }
 
 /// Classify a winit window event against a pending update overlap.
 ///
-/// The REVOKING side is the default arm: an unforeseen future event class
-/// fails closed (revokes) rather than silently riding through an overlap.
-/// `Ime` is deliberately revoking even though its `Commit` text would deliver
-/// fine: a half-built preedit is process-local composition state that cannot
-/// carry across `_exit`, so committing mid-composition would eat it.
+/// EXHAUSTIVE BY CONSTRUCTION (2026-07): there is no `_` arm. A new `winit`
+/// variant is a COMPILE ERROR demanding a deliberate decision, which is the
+/// only form of "fail closed" that actually works — the old blanket
+/// `_ => Revoking` silently swept in fifteen reachable macOS events, including
+/// every mouse click and every scroll, and made the overlap unachievable on a
+/// machine anybody was using. Each arm below states why it is where it is.
+///
+/// THE TEST FOR "TOLERATED": does this event change something the child must
+/// re-prove? The proof commits to the session set, the window/tab/pane layout,
+/// and the visible-screen checkpoints. Selection, scroll position and hover are
+/// none of those — and are not carried across the swap in ANY case (the carry
+/// is `checkpoint_visible`, so viewport/selection state resets on a seamless
+/// update exactly as it does on a cold one). Revoking on them bought nothing
+/// and cost every attempt.
 #[must_use]
 fn update_handoff_window_event_class(event: &WindowEvent) -> UpdateHandoffEventClass {
     match event {
+        // ---- EXEMPT: pure presentation, does not even touch the activity clock.
+        // The frozen frame must keep painting for the whole overlap.
         WindowEvent::RedrawRequested | WindowEvent::Occluded(_) | WindowEvent::Focused(_) => {
             UpdateHandoffEventClass::Exempt
         }
-        // Keystrokes deliver to the persisting masters (see `input_to_session`
-        // for the per-event byte policy and the accepted encoding-mode bound);
-        // pointer/modifier noise decides nothing the proof depends on.
-        WindowEvent::KeyboardInput { .. }
-        | WindowEvent::ModifiersChanged(_)
-        | WindowEvent::CursorMoved { .. }
+
+        // ---- TOLERATED: buffered through; paces future attempts, never revokes.
+        // Keystrokes/text deliver to the persisting masters (see `input_to_session`
+        // for the per-event byte policy); their echo waits in the kernel for the
+        // child's fresh parser.
+        WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_) => {
+            UpdateHandoffEventClass::Tolerated
+        }
+        // Pointer position/hover: decides nothing the proof depends on.
+        WindowEvent::CursorMoved { .. }
         | WindowEvent::CursorEntered { .. }
         | WindowEvent::CursorLeft { .. }
         | WindowEvent::AxisMotion { .. }
         | WindowEvent::TouchpadPressure { .. } => UpdateHandoffEventClass::Tolerated,
-        _ => UpdateHandoffEventClass::Revoking,
+        // Clicks and scroll: they move selection and viewport, neither of which
+        // is carried across the swap. On the only machine that matters these are
+        // continuous, so revoking on them is equivalent to disabling the feature.
+        WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
+            UpdateHandoffEventClass::Tolerated
+        }
+        // Trackpad gestures: presentation-only, same reasoning as scroll, and
+        // trivially fired by accident on a laptop.
+        WindowEvent::PinchGesture { .. }
+        | WindowEvent::PanGesture { .. }
+        | WindowEvent::RotationGesture { .. }
+        | WindowEvent::DoubleTapGesture { .. } => UpdateHandoffEventClass::Tolerated,
+        // Hovering a file over the window and away again writes nothing. Only
+        // the DROP is structural (below).
+        WindowEvent::HoveredFile(_) | WindowEvent::HoveredFileCancelled => {
+            UpdateHandoffEventClass::Tolerated
+        }
+        // The window MOVED, it did not RESIZE: `outer_x`/`outer_y` ride the
+        // window carry and are re-read when the child is spawned; the grid the
+        // proof committed to is unchanged. This one streams continuously during
+        // a drag and used to kill an overlap outright.
+        WindowEvent::Moved(_) => UpdateHandoffEventClass::Tolerated,
+        // The SYSTEM light/dark switch at sunset, with no user intent toward
+        // this window at all. Appearance is not proof input.
+        WindowEvent::ThemeChanged(_) => UpdateHandoffEventClass::Tolerated,
+        // Bookkeeping reply to our own activation request.
+        WindowEvent::ActivationTokenDone { .. } => UpdateHandoffEventClass::Tolerated,
+
+        // ---- REVOKING: genuinely invalidates the committed identity.
+        // Grid geometry is part of the layout the proof commits to.
+        WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            UpdateHandoffEventClass::Revoking
+        }
+        // Deferred destructive intent against the parked session set.
+        WindowEvent::CloseRequested | WindowEvent::Destroyed => UpdateHandoffEventClass::Revoking,
+        // A drop writes a path into a live session — real bytes, real ordering.
+        WindowEvent::DroppedFile(_) => UpdateHandoffEventClass::Revoking,
+        // A half-built preedit is PROCESS-LOCAL composition state that cannot
+        // survive `_exit`; committing mid-composition would eat it.
+        WindowEvent::Ime(_) => UpdateHandoffEventClass::Revoking,
+        // Not emitted by the macOS backend; its byte semantics are undefined
+        // for this seam, so it keeps the fail-closed disposition.
+        WindowEvent::Touch(_) => UpdateHandoffEventClass::Revoking,
     }
 }
 
@@ -6221,11 +6455,13 @@ struct UpdateHandoffCompletion {
     /// How many times the main thread re-posted THIS ProofReady completion to
     /// itself to let the run loop dispatch AppKit-queued hardware input first.
     /// Queued-but-undispatched events would die with `_exit`, so Commit defers
-    /// until the OS queue is drained through the normal input path (which
-    /// delivers the bytes to the still-open PTY masters). The counter bounds
-    /// the spin; exhaustion is treated as activity revocation, and the
-    /// worker's own 15 s decision deadline is the absolute backstop.
-    input_drain_spins: u8,
+    /// until the OS queue has been dispatched through the normal input path
+    /// (which delivers the bytes to the still-open PTY masters). Each respin
+    /// yields the main thread briefly, so this counts loop iterations that
+    /// really dispatched events rather than a microsecond-scale busy spin; the
+    /// wall-clock budget in `finish_update_handoff` is the primary bound and
+    /// the worker's own 15 s decision deadline is the absolute backstop.
+    input_drain_spins: u32,
 }
 
 /// One attempt-wide linearization point for the overlap handoff.  The worker
@@ -6426,6 +6662,12 @@ struct PendingUpdateHandoff {
     #[cfg(unix)]
     arbiter: HandoffAttemptArbiter,
     teardown: DeferredHandoffTeardown,
+    /// When this attempt's pre-Commit input drain began (first ProofReady
+    /// observation on the main thread). The drain is bounded on the WALL CLOCK,
+    /// not on a respin count: respin counts are consumed in microseconds and so
+    /// bounded nothing, which is why a continuously-used terminal exhausted the
+    /// budget instantly and reported `ActivityRevoked` forever.
+    commit_drain_started: Option<std::time::Instant>,
     /// Set by the main-thread final-admission gate when it REJECTED this
     /// attempt for an activity-shaped reason (session/layout/epoch drift,
     /// deferred teardown, a session death, or an undrainable OS input queue).
@@ -6667,6 +6909,10 @@ struct App {
     /// worker at a time, off-thread status collection, revision fan-out.
     /// Construction is filesystem-free, matching the updater doctrine.
     native_packages_service: packages_screen::PackagesService,
+    /// Whether the launch-time package update loop actually started. Config
+    /// reload can change the saved next-launch intent but cannot stop or mint
+    /// this detached thread, so Settings projects both facts.
+    package_update_loop_running: bool,
     native_update_reconcile_worker: Option<app_native::NativeUpdateReconcileSender>,
     next_native_update_reconcile_sequence: u64,
     last_native_update_reconcile_sequence: u64,
@@ -6680,7 +6926,23 @@ struct App {
     pending_native_update_reconcile_purpose: Option<app_native::NativeUpdateReconcilePurpose>,
     native_config_inflight: bool,
     native_config_pending: std::collections::VecDeque<app_native::NativeConfigRequest>,
-    native_config_external_pending: Option<String>,
+    /// Single bounded latest-wins worker for Manual's host-backed diagnostics.
+    /// Headless test Apps run the same analysis inline through the host seam.
+    native_config_host: Option<native_config_host::HostDiagnosticsLane>,
+    native_font_catalog: Option<native_font_catalog::Lane>,
+    next_font_catalog_sequence: u64,
+    requested_font_catalog_sequence: u64,
+    theme_catalog_generation: u64,
+    /// Latest user-requested Serious Mode state across the serialized durable
+    /// config lane. This projection advances on intent, while live policy waits
+    /// for durable completion; rapid toggles therefore compose instead of
+    /// repeatedly inverting the same stale runtime value.
+    serious_mode_queued_projection: Option<bool>,
+    native_config_external_pending: Option<app_native::DeferredNativeConfigGeneration>,
+    /// Monotonic event-loop receipt order for prepared watcher generations.
+    /// Reconciliation completions carry the sequence sampled at dispatch so a
+    /// later watcher edit can never be mistaken for an older superseded one.
+    native_config_external_sequence: u64,
     /// Canonical bytes shared by Markdown and Editor instances. Native views
     /// retain only stable document identities and immutable snapshots.
     document_store: document_store::DocumentStore,
@@ -6780,7 +7042,7 @@ struct App {
     theme: Theme,
     /// The live parsed [`Config`], retained so an OS light↔dark switch can re-resolve a
     /// `dark:…,light:…` split theme (see [`App::sync_app_theme_to_appearance`]) without
-    /// re-reading disk. Replaced on every `reload_config`.
+    /// re-reading disk. Replaced on every admitted prepared config generation.
     config: Config,
     /// Per-session live descriptions plus the one-worker, latest-wins inference
     /// coordinator. OSC title identity remains in each `Terminal`; this is separate
@@ -6793,17 +7055,21 @@ struct App {
     /// the user's requested effects exactly.
     serious_mode: bool,
     /// App-cached resolved sparkle-words state (config + compiled lexicon), rebuilt
-    /// only when `sparkle_dirty` is set (config reload / toggle), so the per-frame
+    /// only when `sparkle_dirty` is set (startup/config reload), so the per-frame
     /// render path does NOT re-resolve config or rebuild the lexicon. `None` when
-    /// the feature is off or force-disabled. See [`word_decorations::Resolved`].
+    /// the feature is off or suppressed by Serious Mode. See
+    /// [`word_decorations::Resolved`].
     sparkle: Option<crate::word_decorations::Resolved>,
+    /// Latest fully compiled word-decoration runtime. Unlike `sparkle`, this is
+    /// retained while Serious Mode is active so re-enabling is memory-only.
+    prepared_sparkle: app_config::PreparedSparkleRuntime,
     /// Set when [`App::sparkle`] must be rebuilt before the next frame (startup,
-    /// config reload, or a `toggle_sparkle_words` flip).
+    /// config reload, or a Serious Mode policy change).
     sparkle_dirty: bool,
     /// Content fingerprints of the files the APPLIED config references by path
-    /// (sparkle lexicon + toy packs, trail-pack manifests), captured by
-    /// [`App::recompute_sparkle`] — its ONLY writer — from the same rebuild that
-    /// consumed them. The reload dedupe compares fresh fingerprints against this
+    /// (sparkle lexicon + toy packs, trail-pack manifests), captured by the
+    /// off-thread config generation that compiled those sources. The reload
+    /// dedupe compares fresh fingerprints against this
     /// so a byte-equal `aterm.toml` re-save still hot-reloads an edited
     /// pack/lexicon FILE (the documented touch-to-reload path), while a double
     /// reload with nothing changed anywhere stays a full no-op. See
@@ -6826,9 +7092,6 @@ struct App {
     /// Whether the resolved `cursor_trail_style` is `Nyan` (the only style that arms
     /// the cursor-cat momentum) — the cached twin of [`Self::predict_mode_cache`].
     nyan_style_cache: Option<bool>,
-    /// In-memory master kill for sparkle words (the `toggle_sparkle_words` action /
-    /// menu item) — an instant panic-off that overrides config without a TOML edit.
-    sparkle_force_off: bool,
     /// App-cached resolved matrix-rain PARAMETERS, rebuilt only when
     /// `rain_dirty` is set (config reload / appearance flip / toggle) — the
     /// per-frame path never re-resolves. `None` only before the first
@@ -6852,10 +7115,6 @@ struct App {
     /// windows sharing one session can never mint the same `(session, ident)`
     /// episode and lose a granted summon to the Kitty Log's dedupe ring.
     kitty_summon_seq: u64,
-    /// Pre-armed process-wide loader for the optional configured Nyan PNG.
-    /// Redraw owns only an atomic-ready + `try_recv` control half; filesystem
-    /// reads and PNG decode live exclusively on its bounded worker.
-    nyan_sprite_loader: crate::nyan_sprite_loader::NyanSpriteLoader,
     /// The OS desktop appearance currently in effect (light/dark), seeded at window
     /// attach from `Window::theme()` and updated on `WindowEvent::ThemeChanged`. Drives
     /// which side of a split `theme` is active. Defaults to `Dark` (the engine default)
@@ -7073,16 +7332,16 @@ struct App {
     /// ([`App::apply_font_config`]) and diffed on hot-reload. GLOBAL
     /// (window-uniform).
     font_config: app_config::FontConfig,
-    /// macOS: whether Option/Alt sends ESC-prefixed (Meta) sequences (config
-    /// `option_as_meta`, default `true`). When `false`, Option types the OS-
-    /// composed character instead. Read in `on_key`. GLOBAL (window-uniform).
+    /// Whether Alt/Option sends ESC-prefixed (Meta) sequences (config
+    /// `option_as_meta`, default `true`). On macOS, `false` lets Option type the
+    /// OS-composed character instead. Read in `on_key`. GLOBAL (window-uniform).
     option_as_meta: bool,
     /// Whether a multi-line Cmd-V / menu paste is confirmed when bracketed paste is
     /// off (config `confirm_multiline_paste`, default `true`). Read in
     /// `paste_clipboard`. Live-reloadable. GLOBAL (window-uniform).
     confirm_multiline_paste: bool,
     /// Whether a completed mouse selection auto-copies to the system clipboard
-    /// (config `copy_on_select`, default `false` — ghostty's own default). Read in
+    /// (config `copy_on_select`, default `true`). Read in
     /// `finish_selection` when a drag-select settles. Live-reloadable. GLOBAL
     /// (window-uniform).
     copy_on_select: bool,
@@ -7137,13 +7396,6 @@ struct App {
     /// when not headless); `None` while no menu exists (headless, off macOS, or
     /// before `resumed`). The type is `()` off macOS (`menu::MenuHandle`).
     _menu: Option<menu::MenuHandle>,
-    /// Retained backing objects for the native Performance control panel (macOS): the
-    /// `NSWindow` + the checkbox action target. Set when View ▸ Performance Panel… opens
-    /// the window; replaced on re-open (dropping the old handle closes the old window).
-    /// `None` until first opened, off macOS, or headless. The type is `()` off macOS
-    /// (`perf_panel::PerfPanelHandle`). Consulted by introspection (`window perf` /
-    /// `controls perf`) to find the panel's `NSWindow`.
-    _perf_panel: Option<perf_panel::PerfPanelHandle>,
     /// Retained native window-toolbar backing objects (macOS), keyed BY WINDOW and
     /// kept alive for each window's life — AppKit holds a toolbar's delegate and an
     /// item's target only WEAKLY, so dropping a handle silently kills that window's
@@ -7185,19 +7437,6 @@ struct App {
     /// (window-uniform): read by every window's `splice_tab_strip`/`strip_col_at`.
     /// NOTE: the per-frame laid-out `tab_segments` are PER-WINDOW (in `WindowState`).
     tab_strip_rows: u16,
-    /// The stackable HUD widgets (Resources: system vs session; Engine: aterm's own
-    /// render/memory). Each reserves [`hud_bar::Panel::rows`] bottom rows when enabled;
-    /// the framework lives in `hud_bar`. Order here is the stack order top→bottom
-    /// (nearest the terminal first).
-    panels: Vec<Box<dyn hud_bar::Panel>>,
-    /// The SINGLE metrics sampler. Sampled once per HUD tick; the cell HUD, the GPU
-    /// widget tray, and the read-only `widgets` control verb all read its snapshot, so
-    /// metrics are collected in exactly one place (see [`crate::metrics_service`]).
-    metrics_service: metrics_service::MetricsService,
-    /// Rows reserved at the BOTTOM for the HUD = the SUM of each ENABLED widget's row
-    /// count — the bottom analog of [`Self::tab_strip_rows`]. `0` = no HUD (byte-identical
-    /// `+0` geometry everywhere). Kept in sync by [`App::recompute_hud_rows`].
-    hud_rows: u16,
     /// Transient in-window banner listing config-load/reload warnings (dropped
     /// `[key_sequences]`/`[keybindings]` rules). GLOBAL like the config it reflects;
     /// painted into every window, auto-expires after `NOTICE_TTL`. `None` = no banner.
@@ -7246,6 +7485,25 @@ struct App {
     auto_apply_manual_only: Option<AutoApplyManualOnly>,
     /// Bounded activity-revoked overlap re-attempt budget; see [`AutoOverlapRetry`].
     auto_overlap_retry: Option<AutoOverlapRetry>,
+    /// PRE-PARK staged-candidate verification (seamless seam 1, hoisted 2026-07).
+    ///
+    /// `codesign --deep --strict` over the whole staged `.app` plus two
+    /// `PlistBuddy` spawns under a file lock measures 0.2–0.3 s. It used to run
+    /// as the handoff worker's FIRST action — INSIDE the window where every
+    /// reader is parked and a cancel poke aborts the attempt — so a fifth of the
+    /// exposure bought nothing. It is now run OPPORTUNISTICALLY off-thread as
+    /// soon as a stage is armed, long before any reader is parked, and the
+    /// verdict is cached here. A cancel during THAT work costs literally
+    /// nothing: the terminal is untouched.
+    ///
+    /// SAFETY: this is not, and never was, an authorization. The child re-runs
+    /// the COMPLETE gate under the apply lock at swap time (`aterm-update`'s
+    /// TOCTOU defence, unchanged), so a stale cached `Ok` can at worst spawn a
+    /// candidate that then refuses to swap — the ordinary `PreparationFailed`
+    /// rollback. A cached verdict is also scoped to the exact
+    /// `(target_build, target_commit)` and expires, so it can never be read
+    /// across a different artifact.
+    handoff_preverified: std::sync::Arc<std::sync::Mutex<Option<HandoffPreverification>>>,
     /// Exactly one asynchronous overlap-update child may own adoption authority.
     /// While present, second manual/debug applies are rejected and clean quit is
     /// deferred until the proof completion returns to the main thread.
@@ -7397,12 +7655,14 @@ impl App {
     /// every current decorative tail and stops audio before returning. Disabling only
     /// removes the override: individual effect preferences and per-session overrides
     /// were never changed, so they resolve normally on the next frame.
+    #[cfg(test)]
     pub(crate) fn set_serious_mode(&mut self, enabled: bool) -> bool {
         self.config.serious_mode = Some(enabled);
         self.apply_serious_mode(enabled)
     }
 
     /// Flip serious mode and return the new effective state.
+    #[cfg(test)]
     pub(crate) fn toggle_serious_mode(&mut self) -> bool {
         self.set_serious_mode(!self.serious_mode)
     }
@@ -7476,14 +7736,14 @@ impl App {
     fn automatic_update_activity_quiet(&self, now: Instant) -> bool {
         self.automatic_update_activity_quiet_with_pending_input(
             now,
-            crate::platform::pending_user_input_event(),
+            crate::platform::recent_user_input_event(AUTOMATIC_UPDATE_QUIET_EPOCH),
         )
     }
 
     /// Deterministic core of [`Self::automatic_update_activity_quiet`]. Keeping
-    /// the AppKit queue observation at the boundary lets the regression harness
-    /// drive the genuine session clocks without depending on which OS thread the
-    /// test runner selected.
+    /// the platform input-source observation at the boundary lets the regression
+    /// harness drive the genuine session clocks without depending on ambient
+    /// hardware input or which OS thread the test runner selected.
     fn automatic_update_activity_quiet_with_pending_input(
         &self,
         now: Instant,
@@ -7712,16 +7972,6 @@ impl App {
         true
     }
 
-    /// The frontmost tab's shell child PID — the PTY child / process-group leader whose
-    /// job tree the metrics service measures for THIS tab's CPU/RSS. `None` when no
-    /// window/session is active or the pid is unset.
-    pub(crate) fn frontmost_tab_pid(&self) -> Option<i32> {
-        let wid = self.frontmost_window?;
-        let sid = self.front_terminal(wid)?.session;
-        let pid = self.pool.sessions.get(&sid)?.session.pid;
-        (pid > 0).then_some(pid)
-    }
-
     /// Re-sample `wid`'s frame-pacing interval from the monitor it ACTUALLY
     /// occupies. `resumed` samples only the PRIMARY monitor once, which over- or
     /// under-paces any window living on a different-refresh display (a 120 Hz
@@ -7899,12 +8149,17 @@ impl App {
         self.front_terminal(wid).cloned()
     }
 
-    /// Canonical content-agnostic geometry for the visible tab.  Logical units
+    /// Canonical content-agnostic geometry for one stable tab. Logical units
     /// are terminal cells so terminal rectangles are always integral and native
-    /// rectangles share the exact same divider/hit-test topology.
-    fn active_visible_leaf_plan(&self, wid: WindowId) -> Option<tab_model::VisibleLeafPlan> {
+    /// rectangles share the exact same divider/hit-test topology. Hidden tabs
+    /// use the same current window bounds they will receive when activated.
+    fn visible_leaf_plan_for_tab(
+        &self,
+        wid: WindowId,
+        tab_id: tab_model::TabId,
+    ) -> Option<tab_model::VisibleLeafPlan> {
         let ws = self.windows.get(&wid)?;
-        let tab = ws.tab_set.active()?;
+        let tab = ws.tab_set.get(tab_id)?;
         Some(tab.visible_plan(
             tab_model::LogicalRect::new(
                 0.0,
@@ -7924,6 +8179,12 @@ impl App {
                 ),
             },
         ))
+    }
+
+    /// Canonical content-agnostic geometry for the visible tab.
+    fn active_visible_leaf_plan(&self, wid: WindowId) -> Option<tab_model::VisibleLeafPlan> {
+        let tab = self.windows.get(&wid)?.tab_set.active_id()?;
+        self.visible_leaf_plan_for_tab(wid, tab)
     }
 
     fn active_tab_has_native(&self, wid: WindowId) -> bool {
@@ -8065,6 +8326,19 @@ impl App {
             ws.cursor_trail.reset();
             ws.last_blink_at = None;
             ws.blink_reseed = true;
+            // PHOSPHOR rain: a RETAINED engine now watches a DIFFERENT grid
+            // (tab switch / pane-focus move / session migration). Its rescan
+            // gate compares per-terminal damage epochs, and two unrelated
+            // terminals' counters can collide — silently keeping the OLD
+            // grid's occupancy (rain falling through the new tab's text) and
+            // its sampled material alphabet (split-pane audit). Rebaseline
+            // the grid-derived state; field/weather survive the switch. The
+            // hidden damage band is old-grid row state exactly like the poof
+            // probe above — drop it with the same rationale.
+            if let Some(engine) = ws.matrix_rain.as_mut() {
+                engine.note_grid_replaced();
+            }
+            ws.rain_hidden_band.clear();
         }
         if !terminal_front {
             // Native content owns no terminal pixels, so retain terminal episode
@@ -8384,9 +8658,10 @@ impl App {
         // A real CPU renderer (the test env has a system monospace font, exactly as
         // the renderer crate's own tests rely on). `headless_for_test` doesn't render,
         // but `backend` is a non-optional field; a real one keeps the App honest.
-        let backend = BackendSlot::Ready(Backend::Cpu(
-            Renderer::from_system(FONT_PX, theme).expect("system font for test backend"),
-        ));
+        let mut test_renderer =
+            Renderer::from_system(FONT_PX, theme).expect("system font for test backend");
+        test_renderer.seal_admitted_font_sources();
+        let backend = BackendSlot::Ready(Backend::Cpu(test_renderer));
 
         // Minted ONCE from a single root authority (this harness never spawns through
         // it); both caps are granted from the one authority, mirroring real `main`.
@@ -8431,11 +8706,16 @@ impl App {
         pool.insert(session0);
         let apprt = platform::platform_apprt();
         native_appearance::install_preferences(apprt.native_appearance_preferences());
-        let native_config_service =
+        let mut native_config_service =
             native_config_service::VersionedConfigService::new(String::new())
                 .expect("empty config is valid TOML");
-        let config_assets = native_config_service.snapshot().assets;
 
+        let startup_config = Config::default();
+        let prepared_sparkle = startup_config.prepare_sparkle_runtime();
+        native_config_service
+            .complete_startup_sparkle_consumers(prepared_sparkle.consumer_capabilities());
+        let config_assets = native_config_service.snapshot().assets;
+        let path_feed_fps = startup_config.path_feed_fingerprints();
         App {
             apprt,
             system_reduce_motion: false,
@@ -8448,6 +8728,7 @@ impl App {
                 10, "test", true,
             ),
             native_packages_service: packages_screen::PackagesService::new(),
+            package_update_loop_running: false,
             native_update_reconcile_worker: None,
             next_native_update_reconcile_sequence: 1,
             last_native_update_reconcile_sequence: 0,
@@ -8455,7 +8736,14 @@ impl App {
             pending_native_update_reconcile_purpose: None,
             native_config_inflight: false,
             native_config_pending: std::collections::VecDeque::new(),
+            native_config_host: None,
+            native_font_catalog: None,
+            next_font_catalog_sequence: 1,
+            requested_font_catalog_sequence: 0,
+            theme_catalog_generation: 0,
+            serious_mode_queued_projection: None,
             native_config_external_pending: None,
+            native_config_external_sequence: 0,
             document_store: document_store::DocumentStore::new(),
             native_documents: app_documents::DocumentHostRuntime::new(),
             editor_workspace: native_editor::EditorWorkspace::new(),
@@ -8478,25 +8766,22 @@ impl App {
             font_px_explicit: false,
             use_gpu: false,
             theme,
-            config: Config::default(),
+            config: startup_config,
             title_summaries: title_summary::Coordinator::new(None),
             serious_mode: false,
             sparkle: None,
+            prepared_sparkle,
             sparkle_dirty: true,
-            // Zero until the first `recompute_sparkle` fingerprints the real
-            // feeds (`sparkle_dirty` starts true); a reload racing that first
-            // frame merely re-arms the recompute — idempotent.
-            path_feed_fps: app_config::PathFeedFps::default(),
+            // Exact startup feed generation; first-frame activation is memory-only.
+            path_feed_fps,
             config_assets,
             predict_mode_cache: None,
             nyan_style_cache: None,
-            sparkle_force_off: false,
             rain: None,
             rain_dirty: true,
             // In-memory only: tests must never read/write the user's real ledger.
             kitty_log: crate::kitty_log::KittyLogHost::in_memory(),
             kitty_summon_seq: 0,
-            nyan_sprite_loader: crate::nyan_sprite_loader::NyanSpriteLoader::disabled(),
             os_appearance: aterm_types::Appearance::default(),
             font_family: None,
             text_shaping: aterm_render::TextShapingConfig::default(),
@@ -8555,19 +8840,12 @@ impl App {
             search_last_query: String::new(),
             search_last_anchor: None,
             _menu: None,
-            _perf_panel: None,
             _toolbars: BTreeMap::new(),
             session_chrome: std::collections::HashMap::new(),
             session_chrome_retry: std::collections::HashSet::new(),
             session_chrome_expiry: SessionChromeExpiryScan::default(),
             title_drift: TitleDrift::default(),
             tab_strip_rows: 0,
-            panels: vec![
-                Box::new(hud_bar::ResourcePanel::new(false)),
-                Box::new(hud_bar::EnginePanel::new(false)),
-            ],
-            metrics_service: metrics_service::MetricsService::new(std::time::Instant::now()),
-            hud_rows: 0,
             config_notice: None,
             notice: None,
             level_up_done: false,
@@ -8580,6 +8858,7 @@ impl App {
             auto_apply_intent: None,
             auto_apply_manual_only: None,
             auto_overlap_retry: None,
+            handoff_preverified: std::sync::Arc::default(),
             pending_update_handoff: None,
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
@@ -8970,6 +9249,12 @@ impl App {
                 }
             }
         }
+        // Focus participates in W11's resolved motion policy. If this edge
+        // demoted SmoothScroll to Reduced, land the retained glide NOW on its
+        // pinned terminal; do not leave its deadline for `about_to_wait` to arm.
+        // Video recording's explicit motion-focus pin is honored by the policy
+        // check inside this shared reducer.
+        self.settle_scroll_motion_if_reduced(wid, Instant::now());
         // W5c: with `selection_inactive` configured, a focus flip re-colours the
         // selection band at the present seam — but the band is NOT part of the
         // damage key, so invalidate this window's present caches (the theme-edit
@@ -9120,8 +9405,8 @@ impl App {
 
     /// DEFAULT-2: build the accessibility snapshot of window `id`'s terminal grid from the
     /// just-rendered `input_scratch` — the SAME cells the frame was drawn from. Drops the
-    /// top `tab_strip_rows` (tab-strip chrome) and bottom `hud_rows` (HUD chrome), and
-    /// re-bases the cursor row back into terminal-grid coordinates (the composed frame
+    /// top `tab_strip_rows` (tab-strip chrome), and re-bases the cursor row back into
+    /// terminal-grid coordinates (the composed frame
     /// shifts it down by the strip). Feature-independent so BOTH publishers (AppKit
     /// NSAccessibility, AccessKit) build byte-identical text. `None` for an unknown window.
     ///
@@ -9136,9 +9421,7 @@ impl App {
     fn grid_snapshot(&self, id: WindowId) -> Option<accessibility::AccessibleSnapshot> {
         let ws = self.windows.get(&id)?;
         let strip = self.tab_strip_rows as usize;
-        let hud = self.hud_rows as usize;
-        let end = ws.input_scratch.cells.len().saturating_sub(hud);
-        let cells = ws.input_scratch.cells.get(strip..end).unwrap_or(&[]);
+        let cells = ws.input_scratch.cells.get(strip..).unwrap_or(&[]);
         let cursor = ws.input_scratch.cursor_visible.then_some((
             ws.input_scratch.cursor_row.saturating_sub(strip),
             ws.input_scratch.cursor_col,
@@ -9269,16 +9552,130 @@ impl App {
         {
             let bracketed = term_lock(&terminal.term).modes().bracketed_paste;
             if paste_needs_confirm(&text, bracketed) {
+                // macOS: present a window SHEET and return. The paste resumes in
+                // `Wake::PasteConfirmed`. A sheet is the correct pattern for a
+                // window-scoped confirmation and, critically, is key whenever its
+                // parent window is — so Return fires its default button without the
+                // app-modal path's dependency on this app holding activation.
+                #[cfg(target_os = "macos")]
+                {
+                    // `None` ⇒ the sheet is up and will resume the paste itself.
+                    // `Some(text)` ⇒ no AppKit window to attach one to (headless, or
+                    // before `attach_os_window`), so hand the text back and deliver it:
+                    // the guard has no UI to ask through, matching the posture of the
+                    // no-dialog platform fallback below.
+                    if let Some(text) = self.present_multiline_paste_sheet(wid, text, source) {
+                        self.deliver_paste_confirmed(wid, text, source);
+                    }
+                    return;
+                }
                 #[cfg(windows)]
-                let proceed =
-                    confirm_multiline_paste_dialog(text.lines().count(), self.window_hwnd(wid));
-                #[cfg(not(windows))]
-                let proceed = confirm_multiline_paste_dialog(text.lines().count());
-                if !proceed {
-                    return; // user cancelled
+                {
+                    if !confirm_multiline_paste_dialog(text.lines().count(), self.window_hwnd(wid))
+                    {
+                        return; // user cancelled
+                    }
+                }
+                #[cfg(not(any(target_os = "macos", windows)))]
+                {
+                    if !confirm_multiline_paste_dialog(text.lines().count()) {
+                        return; // user cancelled
+                    }
                 }
             }
         }
+        self.deliver_paste_confirmed(wid, text, source);
+    }
+
+    /// Present the multi-line paste confirmation as a WINDOW SHEET on `wid`, resuming
+    /// the paste through `Wake::PasteConfirmed`. Returns `false` when no sheet could be
+    /// presented (no AppKit window, no proxy, not on the main thread), leaving the
+    /// caller to fall back.
+    ///
+    /// Why a sheet and not the app-modal `NSAlert` this replaces: an app-modal alert
+    /// receives keystrokes only while the APPLICATION is active, and it blocks the
+    /// winit event loop inside `runModal` for as long as it is up. A sheet is owned by
+    /// the window, is key whenever that window is, and returns immediately — so the
+    /// default button's Return equivalent fires reliably and a modal confirmation can
+    /// never park the loop that serves rendering and input for every other window.
+    #[cfg(target_os = "macos")]
+    fn present_multiline_paste_sheet(
+        &mut self,
+        wid: WindowId,
+        text: String,
+        source: Source,
+    ) -> Option<String> {
+        use objc2_app_kit::{NSAlert, NSView};
+        use objc2_foundation::{MainThreadMarker, NSString};
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return Some(text);
+        };
+        let Some(proxy) = self.proxy.clone() else {
+            return Some(text);
+        };
+        // Reach the NSWindow exactly as the toolbar / colour-space code does:
+        // winit Window -> AppKit RawWindowHandle -> NSView -> NSWindow.
+        let ns_window = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.os_window.as_ref())
+            .and_then(|w| w.window_handle().ok())
+            .and_then(|handle| match handle.as_raw() {
+                // SAFETY: `ns_view` points at this window's live NSView (owned by winit
+                // for the window's lifetime); borrowed only on the main thread, as
+                // AppKit requires, to read its `window`.
+                RawWindowHandle::AppKit(h) => {
+                    let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
+                    view.window()
+                }
+                _ => None,
+            });
+        let Some(ns_window) = ns_window else {
+            return Some(text);
+        };
+
+        let lines = text.lines().count();
+        // The completion handler is `Fn`, but the paste payload can only be delivered
+        // once — park it in a cell the handler `take`s. A sheet answers exactly once,
+        // so a second call (which AppKit does not make) would simply find `None` and
+        // deliver nothing rather than duplicating the paste.
+        let payload = std::cell::RefCell::new(Some((wid, text, source)));
+        let handler = block2::RcBlock::new(move |response: objc2_app_kit::NSModalResponse| {
+            let Some((wid, text, source)) = payload.borrow_mut().take() else {
+                return;
+            };
+            let proceed = response == objc2_app_kit::NSAlertFirstButtonReturn;
+            let _ = proxy.send_event(Wake::PasteConfirmed {
+                wid,
+                text,
+                source,
+                proceed,
+            });
+        });
+
+        // SAFETY: standard NSAlert construction + `beginSheetModalForWindow:` on the
+        // main thread (`mtm` proves it), against a live NSWindow retained by winit.
+        unsafe {
+            let alert = NSAlert::new(mtm);
+            alert.setMessageText(&NSString::from_str("Paste multiple lines?"));
+            alert.setInformativeText(&NSString::from_str(&format!(
+                "The clipboard holds {lines} lines and bracketed paste is off, so each line \
+                 could run as a command. Paste anyway?"
+            )));
+            // First button added is the default and carries Return; Cancel takes Escape.
+            let _ = alert.addButtonWithTitle(&NSString::from_str("Paste"));
+            let _ = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            alert.beginSheetModalForWindow_completionHandler(&ns_window, Some(&handler));
+        }
+        None
+    }
+
+    /// The delivery half of [`Self::deliver_paste`], split out so the asynchronous
+    /// macOS sheet can resume it from `Wake::PasteConfirmed` without re-running the
+    /// pastejacking guard (which would ask twice).
+    fn deliver_paste_confirmed(&mut self, wid: WindowId, text: String, source: Source) {
         // Route through the seam so paste-formatting + the snap-to-bottom side
         // effect converge with the controller `paste` verb.
         self.input(wid, InputEvent::Paste(text), source);
@@ -9969,17 +10366,7 @@ impl ApplicationHandler<Wake> for App {
             let mut glide_due: Vec<WindowId> = Vec::new();
             let mut overscroll_due: Vec<WindowId> = Vec::new();
             let mut native_preview_due: Vec<WindowId> = Vec::new();
-            let mut native_diagnostics_due: Vec<WindowId> = Vec::new();
             let native_recording_window = self.video_rec.as_ref().map(|rec| rec.window);
-            let native_diagnostics_views: std::collections::BTreeMap<_, _> = self
-                .windows
-                .keys()
-                .filter_map(|wid| {
-                    self.active_native_diagnostics_view(*wid)
-                        .map(|view| (*wid, view))
-                })
-                .collect();
-            let mut hud_ticked = false;
             // M1: whether the scroll-pill fade ramp animates (focused term folded
             // per window below) — mirrors `about_to_wait`'s arming exactly.
             let pill_fade_full = self
@@ -10067,13 +10454,6 @@ impl ApplicationHandler<Wake> for App {
                     }
                     dirty = true;
                 }
-                // Performance-HUD refresh tick: re-arm and repaint so the streaming
-                // readout advances. `about_to_wait` disarms it when the HUD is off.
-                if ws.next_hud_tick.is_some_and(|d| now >= d) {
-                    ws.next_hud_tick = Some(now + HUD_INTERVAL);
-                    dirty = true;
-                    hud_ticked = true;
-                }
                 // Cursor motion-trail tick: re-present so the comet advances/fades.
                 // Disarm here; `about_to_wait` re-arms iff sparks are still alive
                 // after the redraw decays them. Stash the fired deadline so the
@@ -10129,28 +10509,6 @@ impl ApplicationHandler<Wake> for App {
                 if ws.next_native_preview_tick.is_some_and(|d| now >= d) {
                     ws.next_native_preview_tick = None;
                     native_preview_due.push(*id);
-                }
-                let diagnostics_due = ws
-                    .next_native_diagnostics_tick
-                    .is_some_and(|deadline| now >= deadline);
-                match native_diagnostics_deadline_decision(
-                    native_diagnostics_views.contains_key(id),
-                    ws.os_window.is_some(),
-                    ws.focused,
-                    native_recording_window == Some(*id),
-                    ws.overlay.is_some(),
-                    ws.next_native_diagnostics_tick.is_some(),
-                    diagnostics_due,
-                ) {
-                    NativeDiagnosticsDeadlineDecision::Disarm => {
-                        ws.next_native_diagnostics_tick = None;
-                    }
-                    NativeDiagnosticsDeadlineDecision::Refresh => {
-                        ws.next_native_diagnostics_tick = None;
-                        native_diagnostics_due.push(*id);
-                    }
-                    NativeDiagnosticsDeadlineDecision::Arm
-                    | NativeDiagnosticsDeadlineDecision::Keep => {}
                 }
                 // Predictive echo: a pending guess reached its glitch-expiry → repaint
                 // so the overlay flushes the stale ghost (no further input/output needed).
@@ -10229,16 +10587,6 @@ impl ApplicationHandler<Wake> for App {
             if level_up_animating || level_up_gone {
                 to_redraw.extend(self.windows.keys().copied());
             }
-            // Sample the interval-driven panels (CPU/net/app-fed) once per tick,
-            // outside the window borrow. Frame-coupled panels (Perf) feed at present.
-            if hud_ticked {
-                // The ONE metrics sample per tick, before panels read it.
-                let tab_pid = self.frontmost_tab_pid();
-                self.metrics_service.sample(tab_pid, None, now);
-                for p in &mut self.panels {
-                    p.poll(now);
-                }
-            }
             let native_preview_phase_ms =
                 u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
             for wid in native_preview_due {
@@ -10255,60 +10603,16 @@ impl ApplicationHandler<Wake> for App {
                 // from `Continuous` directly to `None`; still invalidate this final
                 // frame once so provisional fallback pixels cannot remain on glass.
                 // Subsequent scheduling recomputes the animation and returns to Wait.
-                let settings_view = self.active_native_view(wid).and_then(|(_, view)| {
-                    matches!(
-                        self.native_runtime.view_state(view),
-                        Some(crate::native_app::AppViewState::Settings(_))
-                    )
-                    .then_some(view)
-                });
-                if unobscured && let Some(view) = settings_view {
-                    let _ = self.active_native_settings_preview(wid, native_preview_phase_ms);
-                    self.invalidate_native_view_cache(
-                        wid,
-                        view,
-                        crate::native_app::DamageRegion::All,
-                    );
+                if unobscured
+                    && self.invalidate_active_native_settings_preview(wid, native_preview_phase_ms)
+                {
                     to_redraw.push(wid);
-                }
-            }
-            let mut diagnostics_headless = Vec::new();
-            for wid in native_diagnostics_due {
-                let eligible = self.windows.get(&wid).is_some_and(|window| {
-                    native_diagnostics_deadline_decision(
-                        self.active_native_diagnostics_view(wid).is_some(),
-                        window.os_window.is_some(),
-                        window.focused,
-                        native_recording_window == Some(wid),
-                        window.overlay.is_some(),
-                        true,
-                        true,
-                    ) == NativeDiagnosticsDeadlineDecision::Refresh
-                });
-                if eligible && let Some(view) = self.active_native_diagnostics_view(wid) {
-                    self.invalidate_native_view_cache(
-                        wid,
-                        view,
-                        crate::native_app::DamageRegion::All,
-                    );
-                    if self
-                        .windows
-                        .get(&wid)
-                        .is_some_and(|window| window.os_window.is_some())
-                    {
-                        to_redraw.push(wid);
-                    } else if native_recording_window == Some(wid) {
-                        diagnostics_headless.push(wid);
-                    }
                 }
             }
             for id in to_redraw {
                 if let Some(w) = self.windows.get(&id).and_then(|ws| ws.os_window.as_ref()) {
                     w.request_redraw();
                 }
-            }
-            for id in diagnostics_headless {
-                self.redraw_window(id);
             }
             // Service the selection-autoscroll ticks outside the window borrow: each
             // scrolls one step + grows the held selection, and re-arms its own deadline
@@ -10377,6 +10681,12 @@ impl ApplicationHandler<Wake> for App {
         // One persistent automatic-update intent shares the event loop's existing
         // deadline fold. No updater polling thread, timer source, or wake exists when
         // this is `None`; a transient block/failure retries without another stage wake.
+        // An activity-shaped manual-only latch LAPSES on the same fold, so a
+        // busy hour costs a delay rather than the whole automatic lane until
+        // the next relaunch. Genuine-failure latches carry no deadline.
+        if self.lapse_expired_auto_apply_manual_only() {
+            self.rearm_native_auto_apply_after_lapse();
+        }
         if self
             .auto_apply_intent
             .is_some_and(|intent| Instant::now() >= intent.retry_at)
@@ -10456,6 +10766,13 @@ impl ApplicationHandler<Wake> for App {
         // flash; arm winit's single timer at the earliest deadline, and sleep in
         // pure `Wait` iff none is armed (preserving the 0%-idle property for
         // steady/unfocused/hidden/headless sessions).
+        //
+        // Reconcile retained scroll state before folding any deadline. This is
+        // the scheduler's defensive edge for every policy source (including
+        // adaptive shedding): Reduced motion lands the pinned target and drops
+        // the glide/residual here, so the loop can never arm a Reduced-policy
+        // ScrollGlide deadline.
+        self.settle_reduced_scroll_motion(Instant::now());
         let mut deadline: Option<Instant> = None;
         let mut deadline_owner = metrics::DeadlineOwner::None;
         if let Some(candidate) = self.boot_health_confirmation_retry_at {
@@ -10473,15 +10790,6 @@ impl ApplicationHandler<Wake> for App {
         // `&mut WindowState` in hand.
         let headless = self.headless;
         let frame_interval = self.frame_interval; // read before borrowing windows
-        // "HUD on" = any panel ENABLED, not `hud_rows > 0`: an enabled panel can
-        // reserve 0 rows (the Scene band while the registry is empty pre-rewrite), and
-        // the tick it arms is ALSO what keeps `metrics_service.sample` streaming for
-        // the `widgets`/`image` introspection — keying on reserved rows would freeze
-        // that readout for a scene-only HUD config. A 0-row tick's repaint is deduped
-        // by the `hud_rows == 0` present guard, so this costs no redundant presents;
-        // panels' enabled state already honors the master `show_hud`, so all-off still
-        // disarms to pure `Wait` (the 0%-idle property).
-        let hud_on = self.panels.iter().any(|p| p.enabled()); // read before borrowing windows
         // W11 motion policy for a FOCUSED window (the demo timer below already
         // requires focus, so `focused = true` is exact here): a Reduced policy
         // freezes the settings-card effect demo (its phase never advances — a
@@ -10504,12 +10812,6 @@ impl ApplicationHandler<Wake> for App {
                 self.active_native_settings_preview(*wid, native_preview_phase_ms)
                     .map(|(_, animation)| (*wid, animation))
             })
-            .collect();
-        let native_diagnostics_windows: std::collections::BTreeSet<_> = self
-            .windows
-            .keys()
-            .filter(|wid| self.active_native_diagnostics_view(**wid).is_some())
-            .copied()
             .collect();
         // Cursor companions follow the same focused-window motion policy as
         // the render path. Reduced mode does not join the 60 fps effect pump;
@@ -10536,13 +10838,6 @@ impl ApplicationHandler<Wake> for App {
         let rain_tick_interval = self
             .rain
             .map(|c| Duration::from_millis(1000 / u64::from(c.fps)));
-        // Arm/park the background slow-probe sampler (IOKit GPU/disk + the session
-        // process-tree walk) on the SAME predicate: it must stream for any enabled
-        // panel (even a 0-row scene-only HUD) and fully park when every panel is off,
-        // whatever path flipped the enabled state (set_panel / config reload / master
-        // show_hud) — this is the convergence point they all reach. Steady state is
-        // one uncontended lock + compare; the all-off 0%-idle property holds.
-        crate::sysmetrics::set_slow_probes_active(hud_on);
         let native_preview_recording_window = self.video_rec.as_ref().map(|rec| rec.window);
         for (id, ws) in self.windows.iter_mut() {
             // Input hinting is shared with normal mode and may have charged a cursor
@@ -10714,26 +11009,6 @@ impl ApplicationHandler<Wake> for App {
                     d,
                     metrics::DeadlineOwner::FrameCap,
                 );
-            }
-            // Performance HUD: a focused window with the HUD on re-presents every
-            // HUD_INTERVAL so the streaming fps/latency/sparkline keep updating on an
-            // otherwise-idle screen. HEADLESS too — there is no window to repaint, but
-            // `new_events` still runs `poll`, so the resource readout (CPU/disk/net
-            // rates need successive samples) stays live for the `image`/`metrics`
-            // introspection an AI driving aterm reads. Disarmed (→ pure `Wait`, the
-            // 0%-idle property) whenever the HUD is OFF.
-            if hud_on && (headless || (ws.os_window.is_some() && ws.focused)) {
-                let d = *ws
-                    .next_hud_tick
-                    .get_or_insert_with(|| Instant::now() + HUD_INTERVAL);
-                fold_owned_deadline(
-                    &mut deadline,
-                    &mut deadline_owner,
-                    d,
-                    metrics::DeadlineOwner::Hud,
-                );
-            } else {
-                ws.next_hud_tick = None;
             }
             // LUMEN cursor aurora: while any light is alive on a
             // focused window, re-present so the comet/bloom/ring/sparks animate, then
@@ -10907,39 +11182,6 @@ impl ApplicationHandler<Wake> for App {
                     metrics::DeadlineOwner::NativePreview,
                 );
             }
-            // Diagnostics is live data, not an animation. Keep one bounded 1 Hz
-            // refresh only while this exact route has a real watcher; hidden
-            // tabs, unfocused glass, overlays, and unrecorded headless targets
-            // disarm completely and return to the event loop's ordinary Wait.
-            match native_diagnostics_deadline_decision(
-                native_diagnostics_windows.contains(id),
-                ws.os_window.is_some(),
-                ws.focused,
-                native_preview_recording_window == Some(*id),
-                ws.overlay.is_some(),
-                ws.next_native_diagnostics_tick.is_some(),
-                false,
-            ) {
-                NativeDiagnosticsDeadlineDecision::Disarm => {
-                    ws.next_native_diagnostics_tick = None;
-                }
-                NativeDiagnosticsDeadlineDecision::Arm => {
-                    ws.next_native_diagnostics_tick =
-                        Some(native_preview_now + NATIVE_DIAGNOSTICS_INTERVAL);
-                }
-                NativeDiagnosticsDeadlineDecision::Keep => {}
-                NativeDiagnosticsDeadlineDecision::Refresh => {
-                    unreachable!("the arm seam never supplies a due deadline")
-                }
-            }
-            if let Some(deadline_at) = ws.next_native_diagnostics_tick {
-                fold_owned_deadline(
-                    &mut deadline,
-                    &mut deadline_owner,
-                    deadline_at,
-                    metrics::DeadlineOwner::NativeDiagnostics,
-                );
-            }
             // Predictive echo: while a guess is pending, arm a wake at its glitch-expiry
             // so a stale prediction self-clears (the overlay flushes it on the repaint)
             // even with no further input or output. NOT focus-gated (an Always ghost on a
@@ -10955,11 +11197,11 @@ impl ApplicationHandler<Wake> for App {
                     metrics::DeadlineOwner::Predictor,
                 );
             }
-            // M1 smooth-scroll glide: frame-paced wakes while the ease is in
-            // flight, capped at its end; `new_events` ticks it and DROPS the
-            // state once the sample lands → disarmed (0% idle). Not focus-gated:
-            // the gesture that armed it keeps its ≤180ms tail even if focus
-            // moves mid-glide (the state pins the engine it drives).
+            // M1 smooth-scroll glide: frame-paced wakes while a Full-policy ease
+            // is in flight, capped at its end; `new_events` ticks it and DROPS the
+            // state once the sample lands → disarmed (0% idle). The prepass above
+            // has already landed/dropped every Reduced-policy glide, including a
+            // focus-loss transition, so no accessibility-disabled tail is armed.
             if let Some(st) = &ws.scroll_glide {
                 let d = st
                     .glide
@@ -11005,12 +11247,10 @@ impl ApplicationHandler<Wake> for App {
                     );
                 }
             }
-            // Sparkle-cat idle life (design §5.6): the blink / ear-twitch
-            // one-shot. Armed ONLY while focused (the animation focus gate —
-            // an unfocused window fires no idle events and stays at pure
-            // Wait); self-disarming (None once no settled cats remain, or
-            // under feline.idle = false / reduced_motion). Gaze (§5.8) never
-            // arms anything here — it is present-driven by design.
+            // Compatibility seam for the retired Sparkle-cat idle scheduler.
+            // Cat-art v4 keeps `next_deadline()` permanently disarmed; retaining
+            // the fold makes older effects-engine implementations safe without
+            // manufacturing a wake in the shipping implementation.
             if ws.os_window.is_some()
                 && ws.focused
                 && let Some(d) = ws.word_decos.next_deadline(Instant::now())
@@ -11408,6 +11648,23 @@ impl ApplicationHandler<Wake> for App {
             // Readerless incoming child is a painted candidate, not yet an
             // independent workspace. Freeze control/menu/structural mutations
             // until Commit so it cannot close or replace an adopted session.
+            //
+            // RELEASE THE COALESCING LATCH BEFORE SWALLOWING. `Wake::Output` is
+            // edge-triggered: the reader arms `output_wake_pending` on a clear→armed
+            // edge and only the handler's clear (below, at the top of the Output arm)
+            // lets it re-post. Returning here without clearing leaves the arm set, so
+            // `gated_output_wake` takes its "armed and fresh" fast path and suppresses
+            // EVERY subsequent send for the full `WAKE_LATCH_EXPIRY_NS` (100 ms) — the
+            // session's grid keeps mutating while its screen is frozen, immediately
+            // after an update, which reads as "the update broke it". Self-healing via
+            // the expiry, but 100 ms of frozen glass at the most scrutinized moment in
+            // the app. The event is being DROPPED, so the reader must be free to
+            // re-post it rather than be silenced.
+            if let Wake::Output { session, .. } = &ev
+                && let Some(s) = self.pool.get(*session)
+            {
+                s.output_wake_pending.store(0, Ordering::Relaxed);
+            }
             return;
         }
         // (#7 tail) Ordering guard: winit delivers `resumed` (→ attach_os_window →
@@ -11450,9 +11707,6 @@ impl ApplicationHandler<Wake> for App {
             // between frames so a keystroke echoes immediately. Nothing posts this
             // variant anymore; the arm is a defensive no-op.
             Wake::EffectFrame { window: _ } => {}
-            Wake::NyanSpriteReady => {
-                let _ = self.poll_nyan_sprite_and_fanout();
-            }
             Wake::TitleSummaryReady => self.poll_title_summaries(),
             Wake::Output { session, window } => {
                 // Re-arm wake coalescing FIRST: clear this session's in-flight
@@ -11475,10 +11729,23 @@ impl ApplicationHandler<Wake> for App {
                     ScrollbackMaintenanceEvent::OrdinaryOutput,
                     false,
                 );
+                // VISIBILITY GATE (touch-to-glass audit): this handler runs at the PTY
+                // reader's BATCH rate — hundreds to thousands of times per second under
+                // a flood — and the two subsystem calls gated on it below (title
+                // observation, search invalidation) both reach for the terminal mutex.
+                // Running them for a session that NO window is showing spends UI-thread
+                // time, and terminal-mutex round trips, on a screen nobody can see: a
+                // background tab's flood used to pay the whole sequence and then find no
+                // window to redraw. One map scan replaces that. The scan is the same
+                // active-tab predicate the redraw fan-out below uses, so anything that
+                // will actually be repainted is still observed.
+                let session_visible = self.is_visible_session(session);
                 // SMART TITLES: best-effort, nonblocking terminal snapshot. The
                 // deterministic description is immediate; optional model IO stays on
                 // the single bounded worker and returns through TitleSummaryReady.
-                self.note_title_activity(session);
+                if session_visible {
+                    self.note_title_activity(session);
+                }
                 // P1.3 NOTIFY HOOK: ONE non-blocking line — wake every live
                 // subscriber of this session so it re-reads the latest state and
                 // pushes a coalesced delta. The notify is a single-slot
@@ -11501,7 +11768,12 @@ impl ApplicationHandler<Wake> for App {
                 // protected footer. Unlike ordinary output, that piecewise
                 // coordinate change cannot re-anchor Cmd-F matches with one
                 // base_y delta, so refresh an active search before presenting.
-                self.search_refresh_for_output(session);
+                // Gated on visibility for the same reason: a find bar belongs to a
+                // window, so a session no window is showing has no search state that
+                // could be stale on glass.
+                if session_visible {
+                    self.search_refresh_for_output(session);
+                }
                 // Repaint every window that currently DISPLAYS this session in a
                 // VISIBLE pane of its active tab (the focused pane OR a split
                 // sibling). A background tab's output updates its off-screen grid
@@ -11898,6 +12170,13 @@ impl ApplicationHandler<Wake> for App {
                 let lines = self.read_native_chrome();
                 let _ = reply.send(lines);
             }
+            // The front window's ACTIVE-tab pane layout — a pure read of the
+            // tree geometry (split-pane audit introspection). A dropped
+            // receiver (dead client) just makes send() fail; ignore.
+            Wake::ReadPanes { session, reply } => {
+                let lines = self.read_pane_layout(session);
+                let _ = reply.send(lines);
+            }
             // Assemble one coherent session/window/frame/surface geometry record
             // from the main-thread-owned per-window state. A dropped control
             // client only drops the reply; this read never mutates App state.
@@ -11980,10 +12259,7 @@ impl ApplicationHandler<Wake> for App {
             Wake::CaptureWindow { path, reply } => {
                 self.capture_window(path, reply);
             }
-            // The `window prefs` / `window perf` verbs: capture an AUXILIARY GUI window
-            // (Preferences / Performance panel) — which `front()` can't see — by its own
-            // window number, reusing the same confined capture path. The AppKit half
-            // runs here; the encode worker replies post-write.
+            // Capture an own-rendered auxiliary surface through the confined image path.
             Wake::CaptureAuxWindow {
                 target,
                 path,
@@ -11991,13 +12267,10 @@ impl ApplicationHandler<Wake> for App {
             } => {
                 self.capture_aux_window(target, path, reply);
             }
-            // The `controls prefs` / `controls perf` verbs: dump an aux window's controls
-            // (labels + values + states) as text, from the pure model (works headless).
+            // Dump an auxiliary surface's controls. Native Settings compiles its
+            // exact semantic tree; the remaining compatibility surfaces use their
+            // concrete pure serializers.
             Wake::ReadAuxControls { target, reply } => {
-                // The Kitty Log page renders from a SNAPSHOT (§F4.6); refresh an
-                // open overlay's copy first so `controls prefs` reads the counts
-                // the next paint would show (drain-while-open, headless included).
-                self.sync_settings_kitty_log();
                 let lines = self.read_aux_controls(target);
                 let _ = reply.send(lines);
             }
@@ -12010,16 +12283,13 @@ impl ApplicationHandler<Wake> for App {
             Wake::OpenApp { request, reply } => {
                 let _ = reply.send(self.open_app(request));
             }
-            // Part-B overlay-drive fence: report the front window's open overlay kind so
-            // the control dispatch can refuse a scoped-edge input verb while a privileged
-            // overlay is up. Pure read of the same `App::overlay()` slot `controls front`
-            // uses — no mutation, headless-safe.
-            Wake::FrontOverlayKind { reply } => {
-                let kind = self.front().and_then(|ws| ws.overlay()).map(|o| o.kind());
-                let _ = reply.send(kind);
+            // Part-B front-drive fence: observe BOTH overlay ownership and native
+            // Settings ownership in one main-loop turn. Overlay wins because it is
+            // the immediate input consumer when both identities exist.
+            Wake::FrontControlSurface { reply } => {
+                let _ = reply.send(self.front_control_surface());
             }
-            // The `open prefs` / `open perf` verbs: bring an aux GUI window UP (reusing the
-            // same open path the menu uses), so a driver can then `window`/`controls` it.
+            // Bring an auxiliary surface up so a driver can then inspect it.
             Wake::OpenAuxWindow {
                 target,
                 close,
@@ -12032,21 +12302,39 @@ impl ApplicationHandler<Wake> for App {
                 };
                 let _ = reply.send(result);
             }
-            // The user edited the config file (the watcher saw its mtime change):
-            // re-read + validate + apply to every live session. A malformed
-            // mid-edit file is rejected (the previous config stays intact).
+            // Explicit local resample; the watcher itself supplies immutable
+            // exact observations and never makes the UI reopen the pathname.
+            #[cfg(test)]
             Wake::ConfigReload => self.reload_config(),
-            Wake::NativeConfigFinished {
-                instance,
-                view,
-                reply,
-                outcome,
-            } => self.finish_native_config_write(instance, view, reply, outcome),
+            Wake::ConfigReloadObserved(observation) => {
+                self.note_config_watch_candidate(observation.baseline.clone());
+                self.reload_config_observation(observation);
+            }
+            Wake::ConfigWatchStatus(event) => self.apply_config_watch_status(event),
+            Wake::ThemeCatalogChanged(themes) => self.reload_theme_catalog(themes),
+            Wake::NativeConfigFinished { origin, completion } => {
+                self.finish_native_config_write(origin, completion)
+            }
+            Wake::NativeConfigReconciled { completion } => {
+                self.finish_native_config_reconciliation(completion)
+            }
+            Wake::NativeConfigExternalPrepared { completion } => {
+                self.finish_native_config_external_preparation(completion)
+            }
+            Wake::NativeConfigDiagnosticsFinished(completion) => {
+                self.finish_config_host_diagnostics(completion);
+            }
+            Wake::FontCatalogPrepared(completion) => {
+                self.finish_font_catalog_generation(*completion);
+            }
             Wake::NativeUpdateFinished { ticket, status } => {
                 self.finish_native_update_check(ticket, status);
             }
-            Wake::NativePackagesFinished { sequence, report } => {
-                self.finish_native_packages(sequence, report);
+            Wake::NativePackagesFinished {
+                sequence,
+                completion,
+            } => {
+                self.finish_native_packages(sequence, completion);
             }
             Wake::NativeUpdateReconcileFinished { purpose, facts } => {
                 self.finish_native_update_reconcile(purpose, facts);
@@ -12090,6 +12378,7 @@ impl ApplicationHandler<Wake> for App {
                 generation,
                 saved_bytes,
                 result,
+                config_observation,
             } => {
                 if let Err(error) = self.finish_native_document_save(
                     document,
@@ -12097,6 +12386,7 @@ impl ApplicationHandler<Wake> for App {
                     generation,
                     saved_bytes,
                     result,
+                    config_observation,
                 ) {
                     aterm_log::warn!("native document save: {error}");
                     // A failed whole-app plan is no longer an implicit future
@@ -12128,10 +12418,10 @@ impl ApplicationHandler<Wake> for App {
             // tick, sparkles go static, the scene re-geometries, the demo freezes.
             Wake::ReduceMotionChanged => {
                 let v = self.apprt.reduce_motion();
-                let motion_changed = self.system_reduce_motion != v;
-                if motion_changed {
-                    self.system_reduce_motion = v;
-                }
+                // `motion = "full"` may override this OS fact; the shared edge
+                // reducer checks effective per-window policy and settles only
+                // windows that actually became Reduced.
+                let motion_changed = self.apply_system_reduce_motion(v, Instant::now());
                 let appearance_changed = native_appearance::install_preferences(
                     self.apprt.native_appearance_preferences(),
                 );
@@ -12207,7 +12497,8 @@ impl ApplicationHandler<Wake> for App {
                     );
                 }
             }
-            // `settings` control verb: drive the in-window overlay, reply the open state.
+            // `settings` control verb: drive the native Settings tab and reply its open
+            // state. The enum variant keeps the historical wire-facing name only.
             Wake::SpawnSession { cwd, reply } => {
                 let _ = reply.send(self.spawn_tab_session(cwd));
             }
@@ -12215,7 +12506,7 @@ impl ApplicationHandler<Wake> for App {
                 let _ = reply.send(self.close_session_by_id(session));
             }
             Wake::SetSettingsField { key, value, reply } => {
-                let _ = reply.send(self.set_settings_field(&key, value));
+                self.queue_control_settings_field(key, value, reply);
             }
             Wake::InvokeMenuAction { name, reply } => {
                 let _ = reply.send(self.invoke_menu_action_by_name(el, &name));
@@ -12223,8 +12514,8 @@ impl ApplicationHandler<Wake> for App {
             Wake::RainControl { op, reply } => {
                 let _ = reply.send(self.rain_control(op));
             }
-            Wake::SettingsShowSection { section, reply } => {
-                let _ = reply.send(self.settings_show_section(section));
+            Wake::SettingsShowSection { route, reply } => {
+                let _ = reply.send(self.settings_show_route(route));
             }
             Wake::SettingsOverlay { open, reply } => {
                 if self.headless && self.front().is_none() {
@@ -12232,45 +12523,33 @@ impl ApplicationHandler<Wake> for App {
                     // contradictory `OK settings closed`.
                     let _ = reply.send(None);
                 } else {
-                    let is_open = |app: &Self| app.settings_tab_open();
-                    match open {
-                        Some(true) if !is_open(self) => {
-                            let _ =
-                                self.open_settings_tab(crate::native_settings::SettingsRoute::Home);
-                        }
-                        Some(false) if is_open(self) => {
-                            self.close_settings_tabs();
-                        }
-                        None if is_open(self) => {
-                            self.close_settings_tabs();
-                        }
-                        None => {
-                            let _ =
-                                self.open_settings_tab(crate::native_settings::SettingsRoute::Home);
-                        }
-                        _ => {}
-                    }
-                    let _ = reply.send(Some(is_open(self)));
+                    let state = self.apply_settings_open_request(open);
+                    // Closing the only Settings tab can empty a native-only
+                    // restored/detached window. The tab host deliberately marks
+                    // that window `pending_close` because only this main-loop
+                    // handler owns the ActiveEventLoop needed to tear it down.
+                    // Run the same escalation as every other last-tab command
+                    // before replying, so `OK settings closed` never leaves a
+                    // zero-tab OS window behind.
+                    self.escalate_pending_close(el);
+                    let _ = reply.send(Some(state));
                 }
             }
             // P2: an AccessKit adapter event (initial-tree request / OS action / deactivate).
             #[cfg(feature = "a11y-accesskit")]
             Wake::Accessibility(event) => self.on_accessibility_event(event),
-            // A Performance-control-panel checkbox toggled: apply it LIVE (re-grids the
-            // window so the HUD band appears/disappears immediately) and persist the
-            // `show_*_hud` key so it survives a restart (turning a panel ON also
-            // revives a switched-off master `show_hud` — see `user_set_panel`). Main
-            // thread only — the sole owner of the panel registry + geometry.
-            Wake::SetHudPanel { id, on } => {
-                self.user_set_panel(id, on);
-            }
             // Phase 0.5 (A.2.3): apply a controller-built batch on the main thread
             // (the sole owner of term geometry + gesture state + the encoders), IN
             // ORDER, so a press/move/release gesture lands atomically in this one
             // turn. `src` is recorded for audit and NEVER branched in `input`. The
             // reply (if any) carries the LAST event's outcome — sufficient for the
             // single-event reply-bearing verbs (resize, refused scroll).
-            Wake::Input { batch, src, reply } => {
+            Wake::Input {
+                batch,
+                src,
+                reply,
+                session,
+            } => {
                 // The control socket's input targets the active/front window (its
                 // design contract). At n==1 this is the only window.
                 let Some(wid) = self.frontmost_window else {
@@ -12308,7 +12587,11 @@ impl ApplicationHandler<Wake> for App {
                             VIDEO_KEY_LOG_CAP,
                         );
                     }
-                    outcome = self.input(wid, ev, src);
+                    // `None` (flagless / hardware) keeps the historical
+                    // front-tab routing byte-for-byte; `Some` re-resolves the
+                    // named session here, on the one thread that can, and takes
+                    // the hidden path if it is no longer the active tab.
+                    outcome = self.input_to_session(wid, ev, src, session);
                 }
                 // Esc and close-button paths can defer a logical window close until
                 // after the input batch; finish that transaction here.
@@ -12322,6 +12605,18 @@ impl ApplicationHandler<Wake> for App {
             // closed while the read was in flight) is tolerated — `input` is a no-op
             // for an absent window. Never constructed off Linux (see the variant).
             Wake::PasteReady { wid, text, source } => self.deliver_paste(wid, text, source),
+            // The pastejacking sheet was answered. `deliver_paste_confirmed` (not
+            // `deliver_paste`) so the guard does not ask a second time.
+            Wake::PasteConfirmed {
+                wid,
+                text,
+                source,
+                proceed,
+            } => {
+                if proceed {
+                    self.deliver_paste_confirmed(wid, text, source);
+                }
+            }
             // A macOS menu item was clicked (menu.rs posted it). Dispatch into the
             // SAME command method the matching keybinding uses — no behavior is
             // duplicated; the menu is just a second entry point. `el` is needed
@@ -12448,6 +12743,15 @@ impl ApplicationHandler<Wake> for App {
                 if event.state == winit::event::ElementState::Pressed {
                     let queued_ns = crate::platform::current_event_queue_age_ns().unwrap_or(0);
                     crate::metrics::note_key_arrival_queued(queued_ns);
+                    // THRU-2 interactivity signal, armed at the TRUE hardware arrival —
+                    // BEFORE `on_key` takes the terminal mutex (vi_repeat_action,
+                    // on_key_vi_mode, snap_to_bottom) and before the seam's consolidated
+                    // press-path scope. Arming it deep inside `input_to_session` (where
+                    // `note_input` lives) left those first acquisitions queueing behind
+                    // the reader's WHOLE-burst term-lock holds while `input_pending()`
+                    // was still false: the fix existed but sat at the wrong point in the
+                    // sequence, so only the final `seam_egress` lock ever benefited.
+                    crate::metrics::note_typing_hot();
                     // VIDEO introspection input-attempt log (opt-in `keys`, owner-only,
                     // recording-lifetime): stamp before routing on the SAME clock as
                     // frame capture. This is not a delivery receipt; later frame-diff
@@ -12780,12 +13084,12 @@ fn co_located_atpkg() -> Option<std::path::PathBuf> {
 /// records its own `status.toml` (§9). The gate reads launch-time config only: flipping
 /// the switch takes effect at the next launch (documented; the loop itself is stateless
 /// between passes).
-fn spawn_pkg_update_check(config: &Config) {
+fn spawn_pkg_update_check(config: &Config) -> bool {
     if !config.packages_update_loop_enabled() {
-        return;
+        return false;
     }
     let Some(atpkg) = co_located_atpkg() else {
-        return;
+        return false;
     };
     std::thread::Builder::new()
         .name("atpkg-update".into())
@@ -12794,6 +13098,19 @@ fn spawn_pkg_update_check(config: &Config) {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(6 * 60 * 60);
+            // First-run / self-heal SEED: reconcile the compiled-in companions manifest
+            // (docs/COMPANION-TOOLS.md — the SOURCE-BUILD, keyless lane, e.g. `ay`) so those
+            // tools are present on first launch and after an app update adds new ones.
+            // Complementary to the signed default-set bootstrap the `update` loop already does.
+            // Idempotent; the source-build lane stays DEFAULT-OFF unless the machine opted in
+            // (`ATPKG_SOURCE_BUILD=1`), so this never builds without consent, and store mutation
+            // is serialized by atpkg's own store-wide lock. Runs once BEFORE the loop, off the
+            // event loop; output discarded (atpkg records its own seed-status.toml).
+            let _ = std::process::Command::new(&atpkg)
+                .arg("seed")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
             loop {
                 let _ = std::process::Command::new(&atpkg)
                     .arg("update")
@@ -12806,7 +13123,7 @@ fn spawn_pkg_update_check(config: &Config) {
                 std::thread::sleep(Duration::from_secs(interval));
             }
         })
-        .ok();
+        .is_ok()
 }
 
 /// Set ONCE in `main` (single-threaded launcher) from `$ATERM_UPDATED_FROM`: `true` when
@@ -12925,8 +13242,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let seamless_nonce = incoming_handoff.nonce.clone();
     let seamless_expected = incoming_handoff.expected.clone();
     let seamless_layout = incoming_handoff.layout.clone();
-    let seamless_layout_digest = seamless_layout.as_ref().and_then(seamless::layout_digest);
+    // BOTH digests come from `take_incoming`, which computed them over the exact
+    // bytes it consumed from the outgoing process. Recomputing either one here
+    // from the parsed value would reintroduce the cross-version `AdoptionMismatch`
+    // (this binary's codec is not a byte fixed point on the previous binary's wire).
+    let seamless_layout_digest = incoming_handoff.layout_digest;
     let seamless_screen_digest = incoming_handoff.screen_digest;
+    // Prove we are the binary the outgoing process authorized BEFORE any proof is
+    // computed, so a wrong-build candidate refuses loudly instead of silently
+    // producing a digest the parent cannot match.
+    let seamless_target = seamless::take_target_identity();
     let seamless_legacy_layout_bridge = incoming_handoff.legacy_layout_bridge;
     let seamless_window = incoming_handoff.window;
     let mut seamless_adopt: Vec<crate::spawn::Adopted> = incoming_handoff.adopted;
@@ -12948,6 +13273,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         seamless_nonce.clone(),
         seamless_layout_digest,
         seamless_screen_digest,
+        seamless_target,
         &adopted_fds,
     );
     let ready_raw_fd = ready.as_ref().map(seamless::ReadySignal::raw_fd);
@@ -13060,15 +13386,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Capture user config ONCE. The service validates the text and resolves its
     // Trail Pack catalog as one generation; startup derives App.config from that
     // same snapshot so a concurrent file edit cannot pair config A with catalog B.
-    let native_config_service = native_config_service::VersionedConfigService::load_current()
+    let mut native_config_service = native_config_service::VersionedConfigService::load_current()
         .unwrap_or_else(|error| {
             eprintln!("aterm-gui: native config service: {error}");
-            native_config_service::VersionedConfigService::new(String::new())
+            native_config_service::VersionedConfigService::new_runtime(String::new())
                 .expect("empty config is valid TOML")
         });
     let startup_config_snapshot = native_config_service.snapshot();
-    let config: Config = toml::from_str(&startup_config_snapshot.text)
-        .expect("VersionedConfigService admitted a valid Config");
+    let config = (*startup_config_snapshot.config).clone();
     // Initial grid size: env `ATERM_COLUMNS`/`ATERM_LINES` (set by --columns/--lines)
     // win, else config `columns`/`lines`, else 24×80 — all clamped sane. This is the
     // TERMINAL grid; the window is grown by `tab_strip_rows` extra pixel rows for the
@@ -13085,30 +13410,27 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let carry_frame = seamless_window;
     let cols = carry_frame
         .map(|w| w.cols)
-        .or_else(|| env_u16("ATERM_COLUMNS"))
-        .or(config.columns)
-        .unwrap_or(80)
+        .unwrap_or_else(|| app_config::resolve_initial_columns(&config))
         .clamp(20, 500);
     let rows = carry_frame
         .map(|w| w.rows)
-        .or_else(|| env_u16("ATERM_LINES"))
-        .or(config.lines)
-        .unwrap_or(24)
+        .unwrap_or_else(|| app_config::resolve_initial_lines(&config))
         .clamp(5, 300);
     // Rows reserved at the TOP of the window for the visible tab strip (env > config
     // > default 1). `0` is the byte-identical no-strip path.
     let tab_strip_rows = resolve_tab_strip_rows(&config);
-    // Glyph rasterization size in PHYSICAL pixels. $ATERM_FONT_PX overrides the
-    // config / 12 px default (clamped to a sane 6..=200), e.g. 24 on a 2× Retina
+    // Glyph rasterization size in PHYSICAL pixels. A valid $ATERM_FONT_PX overrides
+    // a valid config value / the 12px base (values outside 6..=200 fall through),
+    // e.g. 24 on a 2× Retina
     // display for native-size text — see the HiDPI note at window creation.
     // Precedence lives in `resolve_font_px` so a live config reload re-applies it
     // identically (an env override still wins after an edit).
     let mut font_px: f32 = resolve_font_px(&config);
-    // Was the size set EXPLICITLY (env or config), or is it the built-in default?
+    // Was an admitted size set EXPLICITLY (env or config), or is this the auto base?
     // The HiDPI auto-scale in `resumed()` only kicks in for the default, so an
     // explicit size is never double-scaled. (Mirrors `resolve_font_px`'s
-    // env > config > default precedence: either source counts as explicit.)
-    let font_px_explicit = std::env::var_os("ATERM_FONT_PX").is_some() || config.font_px.is_some();
+    // env > config > default precedence: either valid source counts as explicit.)
+    let font_px_explicit = app_config::font_px_is_explicit(&config);
     // GPU (Metal) is the DEFAULT on macOS: the CPU renderer re-rasterizes every
     // glyph on heavy full-screen colour output (the dominant per-frame cost for
     // streaming TUIs like Claude Code), while the GPU path re-encodes cached glyph
@@ -13129,7 +13451,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         };
     // Renderer theme (window clear colour, cursor, selection) from config; the
     // engine themes the CELLS, this themes the chrome around them.
-    let theme = config.theme();
+    let theme = config.theme_for_with_assets(
+        aterm_types::Appearance::Dark,
+        &startup_config_snapshot.assets.themes,
+    );
     // Opt into GPU (wgpu/Metal) rasterization with ATERM_GPU=1; falls back to
     // the CPU renderer if no GPU/font is available. Built FIRST so we can skip
     // the standalone CPU renderer entirely when the GPU path is live (the GPU
@@ -13144,7 +13469,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // `effective_font_family` for why env-first is load-bearing. This
     // resolved value seeds `App.font_family`, so every later rebuild (zoom, config
     // reload, GPU-loss recovery) re-applies the same face.
-    let font_family: Option<String> = effective_font_family(config.font_family.as_deref());
+    let requested_font_family: Option<String> =
+        effective_font_family(config.font_family_request().as_deref());
+    // Record only an ADMISSIBLE configured family as the live rebuild source.
+    // Cold construction still has the library's built-in fallback, but keeping
+    // an invalid path in App state would let a later zoom/reload retry it and
+    // silently substitute a different face. `None` truthfully names the built-in
+    // candidate regime the startup renderer actually uses after rejection.
+    let startup_font_family_warning =
+        app_config::Config::font_family_warning(requested_font_family.as_deref());
+    let font_family = startup_font_family_warning
+        .is_none()
+        .then_some(requested_font_family)
+        .flatten();
     // Cold-launch overlap (#7): the backend build — GPU adapter/device init + font
     // resolve/raster, the two dominant serial startup costs — shares NO state with
     // the PTY spawn / engine / event loop, so build it on a background thread and
@@ -13376,14 +13713,18 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     };
     let proxy: EventLoopProxy<Wake> = event_loop.create_proxy();
 
-    // Live config hot-reload: a lightweight thread `stat`s the config file every
-    // ~500 ms and posts `Wake::ConfigReload` when its mtime changes, so an edit to
-    // `~/.config/aterm/aterm.toml` re-applies font/theme/engine settings to every
-    // live session without a restart (see `App::reload_config`). No-op when there
-    // is no config PATH (no `$XDG_CONFIG_HOME` and no `$HOME`) — the no-config
-    // startup path is unchanged. The file need not exist yet; creating it later
-    // also fires a reload.
-    config_watcher::spawn(config_path(), event_loop.create_proxy());
+    // Live config hot-reload: one background worker samples a bounded exact
+    // config generation and a cheap metadata/identity theme stamp every ~500 ms.
+    // Exact config bytes and prepared theme catalogs cross the event loop; the UI
+    // never reopens a watcher pathname. Typed failures keep the previous live
+    // generation and appear in native Settings/Manual until a recovery edge.
+    // No-op when neither config nor user-theme path can be resolved.
+    config_watcher::spawn(
+        config_path(),
+        native_config_service.observed_disk_baseline().cloned(),
+        Arc::clone(&startup_config_snapshot.assets.themes),
+        event_loop.create_proxy(),
+    );
 
     // Silent background update check: off the event loop, on its own thread. It
     // talks to the private GitHub Release, verifies a notarized + Team-ID-pinned
@@ -13415,7 +13756,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         let staged_proxy = event_loop.create_proxy();
         aterm_update::spawn_background_check(
             build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
-            build_info::version_display(),
             aterm_update::Source::resolve(cfg_owner, cfg_repo),
             Some(Box::new(move |title, body| {
                 let _ = health_proxy.send_event(Wake::UpdateHealth { title, body });
@@ -13444,9 +13784,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // its own signed channel and is inert on a build with no pinned root key. A no-op for
     // dev/`cargo run` (no co-located `atpkg`), skipped headless (no background network),
     // and gated on the `[packages]` loop flags (enabled + auto_update, default on).
-    if !headless {
-        spawn_pkg_update_check(&config);
-    }
+    let package_update_loop_running = !headless && spawn_pkg_update_check(&config);
 
     // Latency self-introspection state (see App::trace_latency). The epoch is a
     // shared monotonic origin so each tab's reader thread and the UI thread
@@ -13480,16 +13818,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // env var, flag last-writer-wins) > config `shell` > platform default. The
         // env read is safe (reads are not the set_var hazard); the flag's write ran
         // early in parse_cli. `shell_args` is config-only.
-        shell_override: std::env::var("ATERM_SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| config.shell.clone()),
+        shell_override: app_config::resolve_shell_override(&config),
         shell_args: config.shell_args.clone(),
         cwd,
         sandbox_wrap,
         // Always Some: pins the engine default fg/bg to the theme so unstyled cells
         // paint the themed background, not spec-black (see `applied_terminal_config`).
-        terminal_config: Some(config.applied_terminal_config()),
+        terminal_config: Some(config.applied_terminal_config_for_with_assets(
+            aterm_types::Appearance::Dark,
+            &startup_config_snapshot.assets.themes,
+        )),
         // BROKEN-2: seeded to the engine default (`Dark`); session 0 is corrected at
         // window attach and `sync_app_theme_to_appearance` keeps this current, so tabs
         // spawned later inherit the live OS scheme.
@@ -13728,6 +14066,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 event_loop.create_proxy(),
                 image_queue.clone(),
                 plan.clone(),
+                config.clone(),
                 // Publish the root graph entry from inside spawn, AFTER bind, so it
                 // never races the stale sweep (vs. writing it here pre-bind).
                 Some((session0.ctx.self_id.clone(), session0.ctx.nonce)),
@@ -13815,10 +14154,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let mut pool = SessionPool::default();
     pool.insert(session0);
 
+    // Complete the preliminary catalog with the exact inline + Toy Pack table
+    // before any view can observe revision 1. Runtime rendering and Settings
+    // now share this one already-compiled generation.
+    let prepared_sparkle = config.prepare_sparkle_runtime();
+    native_config_service
+        .complete_startup_sparkle_consumers(prepared_sparkle.consumer_capabilities());
     // One revisioned config authority owns every filesystem-backed visual
     // asset. The live host, capture, windows, and semantic Settings views clone
     // this exact outer catalog Arc.
-    let config_assets = startup_config_snapshot.assets;
+    let config_assets = native_config_service.snapshot().assets;
 
     // Resolve keybindings + key_sequences, COLLECTING any dropped-rule warnings so a
     // Finder-launched .app can surface them in-window (stderr is invisible there).
@@ -13831,7 +14176,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // candidates with ZERO output — warn once (like themes) and ride the same
     // in-window config-notice banner. `font_family` here is already the
     // effective env-over-config value the backend build actually tried.
-    if let Some(w) = app_config::Config::font_family_warning(font_family.as_deref()) {
+    if let Some(w) = startup_font_family_warning {
         cfg_warns.push(format!("config {w}"));
     }
     // An unrecognized `cursor_trail_style` silently disables the whole cursor
@@ -13870,6 +14215,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .map_err(|error| eprintln!("aterm-gui: {error}"))
             .ok()
     };
+    // Headless windows are still interactive through the control socket and
+    // render real frames. Keep config parsing/host probes off their event loop
+    // exactly as for a visible window; only unit-test Apps omit this worker.
+    let native_config_host = native_config_host::HostDiagnosticsLane::spawn(proxy.clone())
+        .map_err(|error| eprintln!("aterm-gui: {error}"))
+        .ok();
+    let native_font_catalog = native_font_catalog::Lane::spawn(proxy.clone())
+        .map_err(|error| eprintln!("aterm-gui: {error}"))
+        .ok();
+    let path_feed_fps = config.path_feed_fingerprints();
     let mut app = App {
         apprt,
         system_reduce_motion: false,
@@ -13882,6 +14237,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         native_config_service,
         native_updater_service: app_native::load_native_updater_service(),
         native_packages_service: packages_screen::PackagesService::new(),
+        package_update_loop_running,
         native_update_reconcile_worker,
         next_native_update_reconcile_sequence: 1,
         last_native_update_reconcile_sequence: 0,
@@ -13889,7 +14245,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         pending_native_update_reconcile_purpose: None,
         native_config_inflight: false,
         native_config_pending: std::collections::VecDeque::new(),
+        native_config_host,
+        native_font_catalog,
+        next_font_catalog_sequence: 1,
+        requested_font_catalog_sequence: 0,
+        theme_catalog_generation: 0,
+        serious_mode_queued_projection: None,
         native_config_external_pending: None,
+        native_config_external_sequence: 0,
         document_store: document_store::DocumentStore::new(),
         native_documents: app_documents::DocumentHostRuntime::new(),
         editor_workspace: native_editor::EditorWorkspace::new(),
@@ -13916,22 +14279,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         title_summaries: title_summary::Coordinator::new(Some(proxy.clone())),
         serious_mode: config.serious_mode_or_default(),
         sparkle: None,
+        prepared_sparkle,
         sparkle_dirty: true,
-        // Zero until the first `recompute_sparkle` fingerprints the real feeds
-        // (`sparkle_dirty` starts true); a reload racing that first frame
-        // merely re-arms the recompute — idempotent.
-        path_feed_fps: app_config::PathFeedFps::default(),
+        // Exact startup feed generation; first-frame activation is memory-only.
+        path_feed_fps,
         config_assets,
         predict_mode_cache: None,
         nyan_style_cache: None,
-        sparkle_force_off: false,
         rain: None,
         rain_dirty: true,
         // One fail-open startup read of `kitty-log.toml` (a config_path sibling);
         // Containment / no-config-dir degrade to in-memory-only silently.
         kitty_log: crate::kitty_log::KittyLogHost::load(app_config::config_path()),
         kitty_summon_seq: 0,
-        nyan_sprite_loader: crate::nyan_sprite_loader::NyanSpriteLoader::spawn(proxy.clone()),
         os_appearance: aterm_types::Appearance::default(),
         // GLOBAL config (window-uniform): font family, Option-as-Meta, keybindings.
         font_family,
@@ -14007,8 +14367,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         search_last_anchor: None,
         // Installed in `resumed` once the window exists (non-headless macOS only).
         _menu: None,
-        // Opened lazily on View ▸ Performance Panel… in `dispatch_menu_action`.
-        _perf_panel: None,
         // Native window toolbars, keyed per window; installed in `attach_os_window`.
         _toolbars: BTreeMap::new(),
         // Composed tab-chrome (tooltip + context menu) cache, filled on the
@@ -14020,20 +14378,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         title_drift: TitleDrift::default(),
         // GLOBAL tab-strip config (per-frame `tab_segments` live in WindowState).
         tab_strip_rows,
-        // HUD widget stack — each enabled widget reserves its rows at the bottom
-        // (Resources = 3, Engine = 1). Resources + Engine default on, Scene off
-        // (config keys / View menu toggle them); the master `show_hud` gates them
-        // all without touching the per-panel keys. `hud_rows` is recomputed below.
-        panels: vec![
-            Box::new(hud_bar::ResourcePanel::new(
-                config.show_hud_or_default() && config.show_resources_hud_or_default(),
-            )),
-            Box::new(hud_bar::EnginePanel::new(
-                config.show_hud_or_default() && config.show_engine_hud_or_default(),
-            )),
-        ],
-        metrics_service: metrics_service::MetricsService::new(std::time::Instant::now()),
-        hud_rows: 0,
         config_notice: None,
         notice: None,
         level_up_done: false,
@@ -14045,6 +14389,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         auto_apply_intent: None,
         auto_apply_manual_only: None,
         auto_overlap_retry: None,
+        handoff_preverified: std::sync::Arc::default(),
         pending_update_handoff: None,
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
@@ -14059,13 +14404,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         perf_shed_dwell: crate::app_render::PERF_SHED_DWELL_MIN,
         perf_env_at_flip: 1.0,
     };
-    // Queue the optional custom cursor sprite before the first present. The
-    // pre-armed worker owns all file/decode work; startup continues immediately.
-    crate::nyan_sprite_loader::sync_config(&mut app);
+    // Install the exact startup catalog into the already-created first window.
+    // This is Arc/scalar-only: the config service completed every bounded path
+    // read and optional PNG decode before App construction.
+    app.install_window_config_assets(WindowId(0));
     // HEADLESS only: the backend is already built. Windowed startup reaches the
     // same canonical pin in `finalize_backend` after its deferred join.
     if headless {
         app.pin_backend_render_config();
+        app.backend.seal_admitted_font_sources();
         // Warn once about configured `font_features` that can't take effect (typo'd
         // tokens, or tags the active font lacks) — now that the backend carries the
         // shaping AND the resolved font config, so the font probe is accurate. A
@@ -14079,7 +14426,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // redraw retune can ever wipe them mid-recording (the frames=0 class).
         app.seed_headless_boot_metrics();
     }
-    app.recompute_hud_rows();
     app.config_notice = config_notice::ConfigNotice::new(cfg_warns, std::time::Instant::now());
     // Startup reconciliation is asynchronous and ordered like every later stage wake.
     // No ledger parse or installed-bundle probe can delay the first event-loop turn.
@@ -14094,7 +14440,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     #[cfg(target_os = "macos")]
     {
         let mp_proxy = event_loop.create_proxy();
-        crate::sysmetrics::install_memory_pressure_source(move |critical| {
+        crate::memory_pressure::install(move |critical| {
             let _ = mp_proxy.send_event(Wake::MemoryPressure { critical });
         });
     }
@@ -14787,6 +15133,7 @@ mod overlap_handoff_tests {
             cancel,
             arbiter,
             teardown: crate::DeferredHandoffTeardown::None,
+            commit_drain_started: None,
             revoked_by_activity: false,
         });
         cancelled
@@ -15198,7 +15545,10 @@ mod overlap_handoff_tests {
         ] {
             assert_eq!(update_handoff_window_event_class(&paint), Class::Exempt);
         }
-        // Pointer/modifier noise buffers through.
+        // Pointer/modifier noise buffers through — INCLUDING clicks, scroll,
+        // gestures, window drags, hover and the sunset theme flip. Every one of
+        // these used to hit the old `_ => Revoking` default arm, which is why no
+        // seamless handoff ever completed on a machine in use.
         for tolerated in [
             WindowEvent::CursorMoved {
                 device_id: DeviceId::dummy(),
@@ -15211,17 +15561,6 @@ mod overlap_handoff_tests {
                 device_id: DeviceId::dummy(),
             },
             WindowEvent::ModifiersChanged(winit::event::Modifiers::default()),
-        ] {
-            assert_eq!(
-                update_handoff_window_event_class(&tolerated),
-                Class::Tolerated
-            );
-        }
-        // Structural / mode-changing / unknown-future events revoke.
-        for revoking in [
-            WindowEvent::Resized(PhysicalSize::new(800, 600)),
-            WindowEvent::CloseRequested,
-            WindowEvent::Moved(PhysicalPosition::new(1, 1)),
             WindowEvent::MouseInput {
                 device_id: DeviceId::dummy(),
                 state: ElementState::Pressed,
@@ -15232,11 +15571,38 @@ mod overlap_handoff_tests {
                 delta: MouseScrollDelta::LineDelta(0.0, 1.0),
                 phase: TouchPhase::Moved,
             },
+            WindowEvent::PinchGesture {
+                device_id: DeviceId::dummy(),
+                delta: 0.25,
+                phase: TouchPhase::Moved,
+            },
+            WindowEvent::DoubleTapGesture {
+                device_id: DeviceId::dummy(),
+            },
+            WindowEvent::Moved(PhysicalPosition::new(1, 1)),
+            WindowEvent::ThemeChanged(winit::window::Theme::Dark),
             WindowEvent::HoveredFileCancelled,
         ] {
             assert_eq!(
+                update_handoff_window_event_class(&tolerated),
+                Class::Tolerated,
+                "{tolerated:?} must buffer through the overlap"
+            );
+        }
+        // Only events that genuinely invalidate the committed identity revoke:
+        // grid geometry, destructive intent, a real byte-writing drop, and a
+        // mid-composition preedit that cannot survive `_exit`.
+        for revoking in [
+            WindowEvent::Resized(PhysicalSize::new(800, 600)),
+            WindowEvent::CloseRequested,
+            WindowEvent::Destroyed,
+            WindowEvent::DroppedFile(std::path::PathBuf::from("/tmp/x")),
+            WindowEvent::Ime(winit::event::Ime::Preedit("a".to_string(), None)),
+        ] {
+            assert_eq!(
                 update_handoff_window_event_class(&revoking),
-                Class::Revoking
+                Class::Revoking,
+                "{revoking:?} must revoke the overlap"
             );
         }
 
@@ -15257,6 +15623,7 @@ mod overlap_handoff_tests {
                 batch: Vec::new(),
                 src: crate::input::Source::Human,
                 reply: None,
+                session: None,
             },
         ] {
             assert_eq!(update_handoff_wake_class(&tolerated), Class::Tolerated);
@@ -19052,10 +19419,14 @@ mod early_out_tests {
         let source = include_str!("app_render.rs");
         let single = section(
             source,
-            "The HUD streams its own values",
+            "---- SHORT LOCK A (snapshot)",
             "---- LOCK B (commit)",
         );
-        let split = section(source, "HUD on → never early-out", "FOCUSED-PANE clip box");
+        let split = section(
+            source,
+            "Same appearance term as the single-pane key",
+            "FOCUSED-PANE clip box",
+        );
         for (path, body) in [("single", single), ("split", split)] {
             assert_eq!(
                 body.matches("should_repaint_or_recover(").count(),
@@ -19255,10 +19626,8 @@ mod term_guard_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, DEMO_TICK_INTERVAL, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
-        NativeDiagnosticsDeadlineDecision, WindowId, find_url_span, is_safe_url,
-        native_diagnostics_deadline_decision, native_preview_deadline, native_preview_may_tick,
-        run_capture_present_barrier,
+        App, DEMO_TICK_INTERVAL, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, WindowId, find_url_span,
+        is_safe_url, native_preview_deadline, native_preview_may_tick, run_capture_present_barrier,
     };
     use crate::app_config::Config;
 
@@ -19502,43 +19871,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_diagnostics_refresh_has_one_bounded_watcher_owned_lifecycle() {
-        use NativeDiagnosticsDeadlineDecision::{Arm, Disarm, Keep, Refresh};
-
-        let decide = |route, glass, focus, recorded, modal, armed, due| {
-            native_diagnostics_deadline_decision(route, glass, focus, recorded, modal, armed, due)
-        };
-        assert_eq!(decide(true, true, true, false, false, false, false), Arm);
-        assert_eq!(decide(true, true, true, false, false, true, false), Keep);
-        assert_eq!(decide(true, true, true, false, false, true, true), Refresh);
-        assert_eq!(
-            decide(true, false, false, true, false, false, false),
-            Arm,
-            "a headless recording is an explicit watcher"
-        );
-        assert_eq!(
-            decide(true, true, true, false, false, false, true),
-            Arm,
-            "an unarmed stale due bit never mints an unowned refresh"
-        );
-        for blocked in [
-            (false, true, true, false, false),
-            (true, true, false, false, false),
-            (true, false, true, false, false),
-            (true, true, true, false, true),
-            (true, false, false, false, false),
-        ] {
-            assert_eq!(
-                decide(
-                    blocked.0, blocked.1, blocked.2, blocked.3, blocked.4, true, true
-                ),
-                Disarm,
-                "ineligible Diagnostics state must erase an armed deadline: {blocked:?}"
-            );
-        }
-    }
-
     fn url_at(line: &str, col: usize) -> Option<String> {
         let chars: Vec<char> = line.chars().collect();
         find_url_span(&chars, col).map(|(u, _, _)| u)
@@ -19732,91 +20064,114 @@ mod tests {
         );
     }
 
-    /// The legacy `controls prefs` alias reflects the LIVE native Settings tab — the
-    /// "introspect your own settings" guarantee remains backward compatible without
-    /// reviving the retired overlay or its parallel controller.
+    /// The legacy `controls prefs` alias keeps its line prefixes while projecting the
+    /// exact LIVE native Settings tree. Route identity, visible preference rows, and
+    /// canonical `ui` records must agree with paint; compatibility-only config can
+    /// never reappear as a claimed visual control.
     #[test]
-    fn controls_prefs_reflects_live_open_overlay() {
+    fn controls_prefs_projects_current_native_top_settings_tree() {
         use crate::app_introspect::AuxTarget;
         let mut app = crate::App::headless_for_test();
-        // Closed: a fresh-from-config snapshot.
+
+        // A closed native tab has no visible route or controls. Preserve the
+        // historical first line for callers that only test open/closed.
         let closed = app.read_aux_controls(AuxTarget::Prefs);
         assert_eq!(closed[0], "state open=false");
-        assert!(closed.iter().any(|l| l.starts_with("prefs fields=")));
-        // Open: the native view's compatibility projection is serialized.
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
-        let open = app.read_aux_controls(AuxTarget::Prefs);
-        assert!(open[0].starts_with("state open=true"), "got {:?}", open[0]);
-        assert!(open[0].contains("selected="));
+        assert!(closed.iter().any(|line| line == "prefs fields=0"));
         assert!(
-            open.iter().any(|l| l.starts_with("field key=")),
-            "fields are serialized for the open overlay"
-        );
-        // Unfiltered: the state line reports the filter is off, the two-pane state
-        // (pane/category), and only the ACTIVE category's controls — what is painted.
-        assert!(open[0].contains("searching=false"), "got {:?}", open[0]);
-        assert!(open[0].contains("pane=sidebar"), "got {:?}", open[0]);
-        assert!(open[0].contains("category=Appearance"), "got {:?}", open[0]);
-        assert!(
-            open.iter().any(|l| l.starts_with("preview key=")),
-            "the pinned preview card serializes its subject"
-        );
-        let unfiltered_fields = open.iter().filter(|l| l.starts_with("field key=")).count();
-
-        // With an active search filter the introspected view must MIRROR the
-        // painted (filtered) view — carry the query/searching state and emit only
-        // the matching controls — or `controls prefs` would report rows the screen
-        // never shows (the introspection==painted contract this commit upholds).
-        let (_, view) = app
-            .active_native_view(crate::WindowId(0))
-            .expect("native Settings active");
-        app.dispatch_native_view_event(
-            crate::WindowId(0),
-            view,
-            crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                id: crate::native_ui::ActionId::new("settings/search"),
-                value: Some(crate::native_app::SemanticInput::Text("font".to_string())),
-            }),
-        )
-        .expect("native search action");
-        let filtered = app.read_aux_controls(AuxTarget::Prefs);
-        assert!(
-            filtered[0].contains("searching=true"),
-            "got {:?}",
-            filtered[0]
-        );
-        assert!(
-            filtered[0].contains("query=\"font\""),
-            "got {:?}",
-            filtered[0]
-        );
-        let filtered_fields = filtered
-            .iter()
-            .filter(|l| l.starts_with("field key="))
-            .count();
-        // "Narrows" means fewer than the FULL field set (the closed snapshot's
-        // `prefs fields=<total>`), not fewer than the small default category —
-        // a broad query like "font" legitimately out-counts one grouped pane.
-        let total_fields: usize = closed
-            .iter()
-            .find_map(|l| l.strip_prefix("prefs fields=")?.trim().parse().ok())
-            .expect("closed snapshot reports the total field count");
-        assert!(
-            unfiltered_fields > 0,
-            "the open pane serializes its controls"
-        );
-        assert!(
-            filtered_fields > 0 && filtered_fields < total_fields,
-            "the filter narrows the serialized field set ({filtered_fields} of {total_fields})"
-        );
-        // The emitted field count matches the `shown=` the painter would draw. (The
-        // `prefs fields=` line follows the state + preview lines; find, don't index.)
-        assert!(
-            filtered
+            closed
                 .iter()
-                .any(|l| *l == format!("prefs fields={filtered_fields}")),
-            "field count line agrees with the emitted fields: got {filtered:?}"
+                .any(|line| line == "native surface=native-tab route=- controls=0 semantics=0")
         );
+
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let open = app.read_aux_controls(AuxTarget::Prefs);
+        assert!(
+            open[0].contains("state open=true")
+                && open[0].contains("pane=native-tab")
+                && open[0].contains("surface=native-tab")
+                && open[0].contains("route=/home")
+                && open[0].contains("page=\"Top Settings\"")
+                && open[0].contains("category=Top Settings"),
+            "native route identity is explicit: {:?}",
+            open[0]
+        );
+        assert!(
+            !open[0].contains("pane=sidebar") && !open[0].contains("category=Appearance"),
+            "the retired overlay cannot leak into native inspection: {:?}",
+            open[0]
+        );
+
+        let (wid, instance, view) = app
+            .native_settings_view_target()
+            .map(|(wid, instance, view, _)| (wid, instance, view))
+            .expect("native Settings target");
+        let viewport = app
+            .native_ui_viewport_for(wid, view)
+            .expect("exact native viewport");
+        let compiled = app
+            .compiled_native_ui_for(wid, instance, view, viewport)
+            .expect("native Settings semantic tree compiles");
+        let expected_ui = compiled.controls_lines();
+        let emitted_ui = open
+            .iter()
+            .filter(|line| line.starts_with("ui "))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted_ui, expected_ui,
+            "compatibility inspection appends the exact compiled native semantics"
+        );
+        let actionable = compiled
+            .semantics
+            .iter()
+            .filter(|node| node.action.is_some())
+            .count();
+        assert!(open.iter().any(|line| {
+            line == &format!(
+                "native surface=native-tab route=/home controls={actionable} semantics={}",
+                compiled.semantics.len()
+            )
+        }));
+
+        let expected_field_keys = compiled
+            .semantics
+            .iter()
+            .filter_map(|node| {
+                node.key
+                    .as_str()
+                    .strip_prefix("settings/control/")
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        let emitted_field_keys = open
+            .iter()
+            .filter_map(|line| {
+                line.strip_prefix("field key=")?
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(emitted_field_keys, expected_field_keys);
+        assert!(
+            open.iter()
+                .any(|line| line == &format!("prefs fields={}", expected_field_keys.len())),
+            "compatibility field count binds the visible native setting controls"
+        );
+        assert!(expected_field_keys.contains(&crate::prefs::EDIT_THEME.to_string()));
+
+        for removed in [
+            "sparkle_words.orca.enabled",
+            "matrix_rain.materialize",
+            "matrix_rain.ink_text",
+            "matrix_rain.phosphor",
+        ] {
+            assert!(
+                !open.iter().any(|line| line.contains(removed)),
+                "removed/inert control {removed} must not be claimed visible: {open:?}"
+            );
+        }
     }
 
     /// The settings demo tick arms ONLY while the preview card is painted: the
@@ -20024,7 +20379,7 @@ mod tests {
     #[test]
     fn font_px_precedence_env_beats_config_beats_default() {
         use super::{FONT_PX, FONT_PX_MAX, FONT_PX_MIN};
-        use crate::app_config::resolve_font_px_with;
+        use crate::app_config::{font_px_is_explicit_with, resolve_font_px_with};
         // env wins over config.
         assert_eq!(resolve_font_px_with(Some("24"), Some(18.0)), 24.0);
         // No env → config wins over the built-in default.
@@ -20047,6 +20402,14 @@ mod tests {
         // In-range bounds are honoured.
         assert_eq!(resolve_font_px_with(Some("6"), None), FONT_PX_MIN);
         assert_eq!(resolve_font_px_with(None, Some(200.0)), FONT_PX_MAX);
+
+        // Explicitness uses the exact same admission law. Invalid authored
+        // values are diagnostics, not a hidden request to disable HiDPI auto-size.
+        assert!(!font_px_is_explicit_with(None, None));
+        assert!(!font_px_is_explicit_with(None, Some(0.0)));
+        assert!(!font_px_is_explicit_with(Some("big"), Some(f32::NAN)));
+        assert!(font_px_is_explicit_with(Some("big"), Some(18.0)));
+        assert!(font_px_is_explicit_with(Some("24"), Some(9999.0)));
     }
 
     /// FAIL-SAFE: a malformed / partial mid-edit config must be REJECTED so a
@@ -21968,8 +22331,9 @@ mod path_confine_conformance {
 ///   4. Machine exists — every named `machine` resolves to a registered `SpecModule`
 ///      (embedded `Model` OR external `.tla` parsed from aterm-spec-models).
 ///
-/// (Obligation 2 — symbol resolves to a live DefId — needs a compiler-owned
-/// Linked artifact. This text-only Phase-3 artifact is explicitly design-only.)
+/// (Obligation 2 — symbol resolves to a live DefId — requires typed Trust `FuncId`s.
+/// aterm does not own those identities yet, so its TrustIr artifact is explicitly
+/// design-only and the external report is non-certifying.)
 #[cfg(test)]
 mod spec_xref_gate {
     use std::collections::BTreeSet;
@@ -21979,22 +22343,322 @@ mod spec_xref_gate {
     use aterm_spec::tla_check::TlaSpec;
     use aterm_spec::xref::{self, SpecModule};
 
-    // Toolchain-independent closure and derived-model checks always run. External
-    // `ty`/`trust-ir` agreement runs wherever those Trust tools are installed and
-    // reports a prominent escalation notice otherwise.
+    // VERIFICATION GATE (honesty ratchet, batteries-on) in `aterm_spec::verify`, for
+    // BOTH `ty` and `trust-ir`. The in-process closure is always authoritative, `ty`
+    // additionally checks the bounded models when installed, and TrustIr v27
+    // independently analyzes the emitted cross-reference. That artifact is explicitly
+    // design-only until aterm can emit typed FuncIds/projection targets, so a clean
+    // external analysis is reported prominently as NON-CERTIFYING rather than being
+    // mislabeled as a Trust-native proof.
 
-    /// Run `trust-ir spec-link <module>` and return (success, combined-report). The
-    /// report (stdout+stderr) is the per-machine coverage + any violation lines. When
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SpecLinkDisposition {
+        Certifying,
+        ExplicitDesignOnly,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SpecLinkCoverageMode {
+        Linked,
+        DesignOnly,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SpecLinkCoverageRow<'a> {
+        machine: &'a str,
+        covered: usize,
+        total: usize,
+        mode: SpecLinkCoverageMode,
+    }
+
+    fn is_numbered_spec_link_violation(line: &str) -> bool {
+        let Some(line) = line.trim_start().strip_prefix('[') else {
+            return false;
+        };
+        let Some((index, violation)) = line.split_once("] [") else {
+            return false;
+        };
+        if parse_canonical_usize(index).is_none() {
+            return false;
+        }
+        let Some((tag, detail)) = violation.split_once("] ") else {
+            return false;
+        };
+        if detail.is_empty() {
+            return false;
+        }
+        tag.strip_prefix("Ob.")
+            .and_then(|tag| tag.split_once(' '))
+            .is_some_and(|(obligation, name)| {
+                parse_canonical_usize(obligation).is_some() && !name.is_empty()
+            })
+            || ["L1 ", "L2 ", "S0 ", "S1 ", "S2 "]
+                .iter()
+                .any(|prefix| tag.strip_prefix(prefix).is_some_and(|tag| !tag.is_empty()))
+    }
+
+    /// Fail closed on every structural/Ob/L1/L2/S0-S2 diagnostic TrustIr v27 emits.
+    /// Parse diagnostics only in their protocol positions: arbitrary model or manifest
+    /// paths may truthfully contain marker-like text such as `spec-link failed:` or
+    /// `[Ob.` and must not become false failures.
+    fn report_has_spec_link_failure(report: &str) -> bool {
+        report.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("error:")
+                || line.starts_with("spec-link failed:")
+                || is_numbered_spec_link_violation(line)
+        })
+    }
+
+    /// Parse only TrustIr's primary machine-count header. Other `spec-link:` lines
+    /// (currently the successful harness-manifest summary) are not headers and must
+    /// never make an otherwise honest report look like it has duplicate headers.
+    fn parse_spec_link_header(line: &str) -> Option<(usize, &str)> {
+        let header = line.strip_prefix("spec-link: ")?;
+        let (count, path) = header.split_once(" machine(s) in ")?;
+        let count = parse_canonical_usize(count)?;
+        (!path.is_empty()).then_some((count, path))
+    }
+
+    fn parse_canonical_usize(raw: &str) -> Option<usize> {
+        let value = raw.parse::<usize>().ok()?;
+        (raw == value.to_string()).then_some(value)
+    }
+
+    fn parse_counted_noun(value: &str, singular: &str, plural: &str) -> Option<usize> {
+        let (count, noun) = value.split_once(' ')?;
+        let count = parse_canonical_usize(count)?;
+        let expected = if count == 1 { singular } else { plural };
+        (noun == expected).then_some(count)
+    }
+
+    /// Recognize the one auxiliary `spec-link:` success line TrustIr v27 emits when
+    /// a required harness manifest was checked. Keep this structural so arbitrary or
+    /// malformed `spec-link:` output still fails closed.
+    fn is_harness_manifest_summary(line: &str) -> bool {
+        let Some(summary) = line.strip_prefix("spec-link: harness manifest ") else {
+            return false;
+        };
+        let Some((path, counts)) = summary.rsplit_once(" (") else {
+            return false;
+        };
+        if path.is_empty() {
+            return false;
+        }
+        let Some((harness_count, proof_count)) = counts.split_once("), checked ") else {
+            return false;
+        };
+        parse_counted_noun(harness_count, "harness", "harnesses").is_some()
+            && parse_counted_noun(proof_count, "proof binding", "proof bindings").is_some()
+    }
+
+    /// Parse one complete TrustIr v27 coverage row. This deliberately validates the
+    /// whole grammar rather than treating a machine-name prefix and enforcement-mode
+    /// suffix as evidence: origin, coverage ratio, anchored/waived accounting, and
+    /// trailing text must all be exactly what TrustIr emits.
+    fn parse_spec_link_coverage_row(line: &str) -> Option<SpecLinkCoverageRow<'_>> {
+        let row = line.strip_prefix("machine \"")?;
+        let (machine, row) = row.split_once("\" [")?;
+        if machine.is_empty()
+            || !machine
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return None;
+        }
+
+        let (origin, row) = row.rsplit_once("] coverage ")?;
+        let valid_origin = origin == "embedded"
+            || origin
+                .strip_prefix("external(")
+                .and_then(|path| path.strip_suffix(')'))
+                .is_some_and(|path| !path.trim().is_empty());
+        if !valid_origin {
+            return None;
+        }
+
+        let (fraction, row) = row.split_once(" = ")?;
+        let (covered, total) = fraction.split_once('/')?;
+        let covered = parse_canonical_usize(covered)?;
+        let total = parse_canonical_usize(total)?;
+        let (percentage, row) = row.split_once("% (")?;
+
+        let (accounting, mode) = if let Some(accounting) = row.strip_suffix(") [linked]") {
+            (accounting, SpecLinkCoverageMode::Linked)
+        } else {
+            let accounting = row.strip_suffix(") [design-only]")?;
+            (accounting, SpecLinkCoverageMode::DesignOnly)
+        };
+        let (anchored, waived) = accounting.split_once(" anchored, ")?;
+        let waived = waived.strip_suffix(" waived")?;
+        let anchored = parse_canonical_usize(anchored)?;
+        let waived = parse_canonical_usize(waived)?;
+
+        if anchored.checked_add(waived)? != covered || covered > total {
+            return None;
+        }
+        let ratio = if total == 0 {
+            100.0
+        } else {
+            covered as f64 / total as f64 * 100.0
+        };
+        if percentage != format!("{ratio:.1}") {
+            return None;
+        }
+
+        Some(SpecLinkCoverageRow {
+            machine,
+            covered,
+            total,
+            mode,
+        })
+    }
+
+    fn parse_spec_link_coverage(report: &str) -> Option<Vec<SpecLinkCoverageRow<'_>>> {
+        report
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("machine"))
+            .map(parse_spec_link_coverage_row)
+            .collect()
+    }
+
+    /// Classify only the two honest outcomes aterm can consume:
+    ///
+    /// * a genuine exit-0 `certifying` report, or
+    /// * TrustIr v27's exit-1 but violation-free report where every module and every
+    ///   non-certification reason is explicitly `design-only`.
+    ///
+    /// Any mixed mode, unexpected exit status, structural error, unresolved proof, or
+    /// external projection reason is rejected.
+    fn classify_spec_link(exit_code: Option<i32>, report: &str) -> Option<SpecLinkDisposition> {
+        if report_has_spec_link_failure(report) {
+            return None;
+        }
+
+        let statuses: Vec<_> = report
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("spec-link-status:"))
+            .collect();
+        let [status] = statuses.as_slice() else {
+            return None;
+        };
+        let mut headers = Vec::new();
+        let mut harness_summaries = 0usize;
+        for line in report
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("spec-link:"))
+        {
+            if let Some(header) = parse_spec_link_header(line) {
+                headers.push(header);
+            } else if is_harness_manifest_summary(line) {
+                harness_summaries += 1;
+            } else {
+                // A new or malformed `spec-link:` record must be understood before
+                // the gate can consume it; never silently ignore protocol drift.
+                return None;
+            }
+        }
+        let [(header_count, _header_path)] = headers.as_slice() else {
+            return None;
+        };
+        if harness_summaries > 1 {
+            return None;
+        }
+        let coverage = parse_spec_link_coverage(report)?;
+        let reasons: Vec<_> = report
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("spec-link-noncert:"))
+            .collect();
+        let coverage_machines: Vec<_> = coverage.iter().map(|row| row.machine).collect();
+        let unique_coverage: BTreeSet<_> = coverage_machines.iter().copied().collect();
+        if coverage.is_empty()
+            || *header_count != coverage.len()
+            || unique_coverage.len() != coverage.len()
+        {
+            return None;
+        }
+
+        if exit_code == Some(0)
+            && *status == "spec-link-status: certifying"
+            && coverage
+                .iter()
+                .all(|row| row.mode == SpecLinkCoverageMode::Linked && row.covered == row.total)
+            && reasons.is_empty()
+        {
+            return Some(SpecLinkDisposition::Certifying);
+        }
+
+        let design_only_reasons_match = reasons.len() == coverage_machines.len()
+            && coverage_machines.iter().all(|machine| {
+                let description = format!("machine {machine:?} is explicitly design-only");
+                let expected =
+                    format!("spec-link-noncert: code=design-only detail={description:?}");
+                reasons
+                    .iter()
+                    .filter(|reason| **reason == expected.as_str())
+                    .count()
+                    == 1
+            });
+        if exit_code == Some(1)
+            && *status == "spec-link-status: non-certifying"
+            && coverage
+                .iter()
+                .all(|row| row.mode == SpecLinkCoverageMode::DesignOnly)
+            && design_only_reasons_match
+        {
+            Some(SpecLinkDisposition::ExplicitDesignOnly)
+        } else {
+            None
+        }
+    }
+
+    /// Trust's coverage line must name the exact action count and report 100% for
+    /// every machine aterm's inventory actively lowered. Enforcement mode must agree
+    /// with the classified overall disposition.
+    fn report_has_exact_full_coverage(
+        report: &str,
+        machine: &str,
+        expected_actions: usize,
+        disposition: SpecLinkDisposition,
+    ) -> bool {
+        let Some(coverage) = parse_spec_link_coverage(report) else {
+            return false;
+        };
+        let mut matches = coverage.iter().filter(|row| row.machine == machine);
+        let Some(row) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return false;
+        }
+        let expected_mode = match disposition {
+            SpecLinkDisposition::Certifying => SpecLinkCoverageMode::Linked,
+            SpecLinkDisposition::ExplicitDesignOnly => SpecLinkCoverageMode::DesignOnly,
+        };
+        expected_actions > 0
+            && row.covered == expected_actions
+            && row.total == expected_actions
+            && row.mode == expected_mode
+    }
+
+    /// Run `trust-ir spec-link <module>` and return (exact exit code, combined-report). The
+    /// report (stdout+stderr) is the per-machine coverage plus certification state and
+    /// any violation lines. A violation-free explicit-design-only report intentionally
+    /// exits 1 in TrustIr v27; callers must pass it through [`classify_spec_link`]
+    /// instead of treating that exit as either certification or failure. When
     /// `manifest` is `Some`, also pass `--harness-manifest <m> --require-manifest` so
-    /// L1 (proof_name resolution) is enforced — and is PROMOTED to a hard error if any
-    /// proof binding is present but the manifest is missing (TRUST_VACUITY_GATE §2.1).
+    /// L1 (proof_name resolution) is checked and missing bindings remain hard errors.
     fn run_spec_link(
         trust_ir: &std::path::Path,
         module: &std::path::Path,
         manifest: Option<&std::path::Path>,
-    ) -> (bool, String) {
+    ) -> (Option<i32>, String) {
         let mut cmd = Command::new(trust_ir);
-        // aterm emits the canonical TEXT format (`lower_to_ir`); trust-ir 0.2.0
+        // aterm emits the documented v27 TEXT shape (`lower_to_ir`); trust-ir 0.2.0
         // auto-detects the `.trust_ir` extension as BINARY, so pin the format.
         cmd.arg("spec-link").arg("--format").arg("text").arg(module);
         if let Some(m) = manifest {
@@ -22010,7 +22674,306 @@ mod spec_xref_gate {
         if !err.trim().is_empty() {
             report.push_str(&err);
         }
-        (out.status.success(), report)
+        (out.status.code(), report)
+    }
+
+    #[test]
+    fn spec_link_report_classification_accepts_only_honest_zero_violation_states() {
+        let certifying = concat!(
+            "spec-link: 1 machine(s) in good.trust_ir\n",
+            "  machine \"Ring\" [embedded] coverage 1/1 = 100.0% (1 anchored, 0 waived) [linked]\n",
+            "spec-link-status: certifying\n",
+        );
+        assert_eq!(
+            classify_spec_link(Some(0), certifying),
+            Some(SpecLinkDisposition::Certifying)
+        );
+        assert!(report_has_exact_full_coverage(
+            certifying,
+            "Ring",
+            1,
+            SpecLinkDisposition::Certifying
+        ));
+        let marker_text_in_header_path =
+            certifying.replace("good.trust_ir", "/tmp/spec-link failed:/[Ob./good.trust_ir");
+        assert_eq!(
+            classify_spec_link(Some(0), &marker_text_in_header_path),
+            Some(SpecLinkDisposition::Certifying),
+            "failure-marker text inside a primary-header path is not a diagnostic"
+        );
+
+        let design_only = concat!(
+            "spec-link: 1 machine(s) in exploratory.trust_ir\n",
+            "  machine \"Ring\" [embedded] coverage 1/1 = 100.0% (1 anchored, 0 waived) [design-only]\n",
+            "spec-link: harness manifest /tmp/harness-manifest.json (432 harnesses), checked 8 proof bindings\n",
+            "spec-link-status: non-certifying\n",
+            "spec-link-noncert: code=design-only detail=\"machine \\\"Ring\\\" is explicitly design-only\"\n",
+        );
+        assert_eq!(
+            classify_spec_link(Some(1), design_only),
+            Some(SpecLinkDisposition::ExplicitDesignOnly)
+        );
+        assert!(report_has_exact_full_coverage(
+            design_only,
+            "Ring",
+            1,
+            SpecLinkDisposition::ExplicitDesignOnly
+        ));
+        assert_eq!(
+            classify_spec_link(
+                Some(1),
+                &design_only.replace(
+                    "/tmp/harness-manifest.json",
+                    "/tmp/build (final)/harness-manifest.json"
+                )
+            ),
+            Some(SpecLinkDisposition::ExplicitDesignOnly),
+            "a valid harness-manifest path may itself contain ` (`"
+        );
+        assert_eq!(
+            classify_spec_link(
+                Some(1),
+                &design_only.replace(
+                    "/tmp/harness-manifest.json",
+                    "/tmp/spec-link failed:/[Ob./harness-manifest.json"
+                )
+            ),
+            Some(SpecLinkDisposition::ExplicitDesignOnly),
+            "failure-marker text inside a harness path is not a diagnostic"
+        );
+        let singular_manifest = design_only.replace(
+            "(432 harnesses), checked 8 proof bindings",
+            "(1 harness), checked 1 proof binding",
+        );
+        assert_eq!(
+            classify_spec_link(Some(1), &singular_manifest),
+            Some(SpecLinkDisposition::ExplicitDesignOnly),
+            "TrustIr uses singular nouns only for an exact count of one"
+        );
+
+        let external = certifying.replace(
+            "[embedded]",
+            "[external(/tmp/spec-link failed:/[Ob./spec ] coverage models/Ring.tla)]",
+        );
+        assert_eq!(
+            classify_spec_link(Some(0), &external),
+            Some(SpecLinkDisposition::Certifying),
+            "the external(nonempty path) origin variant is part of TrustIr's grammar"
+        );
+        assert!(report_has_exact_full_coverage(
+            &external,
+            "Ring",
+            1,
+            SpecLinkDisposition::Certifying
+        ));
+
+        let zero_action = certifying.replace(
+            "coverage 1/1 = 100.0% (1 anchored, 0 waived)",
+            "coverage 0/0 = 100.0% (0 anchored, 0 waived)",
+        );
+        assert_eq!(
+            classify_spec_link(Some(0), &zero_action),
+            Some(SpecLinkDisposition::Certifying),
+            "TrustIr defines an empty action set as vacuously 100.0% covered"
+        );
+
+        let partial_design_only = design_only.replace(
+            "coverage 1/1 = 100.0% (1 anchored, 0 waived)",
+            "coverage 1/3 = 33.3% (1 anchored, 0 waived)",
+        );
+        assert_eq!(
+            classify_spec_link(Some(1), &partial_design_only),
+            Some(SpecLinkDisposition::ExplicitDesignOnly),
+            "a DesignOnly row may truthfully report partial coverage"
+        );
+        assert!(!report_has_exact_full_coverage(
+            &partial_design_only,
+            "Ring",
+            1,
+            SpecLinkDisposition::ExplicitDesignOnly
+        ));
+
+        for poisoned in [
+            format!("{design_only}spec-link failed: bad.trust_ir (1 violation)\n"),
+            format!("{design_only}error: structurally invalid TrustIr\n"),
+            format!("{design_only}  [0] [Ob.1 action-exists] undeclared action\n"),
+            format!("{design_only}  [0] [L1 proof-resolves] missing harness\n"),
+            format!("{design_only}  [0] [L2 projection-present] missing projection\n"),
+            format!("{design_only}  [0] [S0 fallback-identity] duplicate anchor\n"),
+            format!(
+                "{design_only}spec-link-noncert: code=external-projection-unresolved detail=bad\n"
+            ),
+            design_only.replace(
+                "spec-link-noncert: code=design-only detail=\"machine \\\"Ring\\\" is explicitly design-only\"\n",
+                "",
+            ),
+            format!(
+                "{design_only}spec-link-noncert: code=design-only detail=\"machine \\\"Ring\\\" is explicitly design-only\"\n"
+            ),
+            format!("{design_only}spec-link: harness manifest malformed\n"),
+            format!(
+                "{design_only}spec-link: harness manifest /tmp/other.json (1 harness), checked 1 proof binding\n"
+            ),
+            design_only.replace("432 harnesses", "1 harnesses"),
+            design_only.replace("432 harnesses", "2 harness"),
+            design_only.replace("8 proof bindings", "1 proof bindings"),
+            design_only.replace("8 proof bindings", "2 proof binding"),
+            design_only.replace("[embedded]", "[external()]"),
+            design_only.replace("[embedded]", "[external( )]"),
+            design_only.replace("[embedded]", "[garbage]"),
+            design_only.replace(
+                "coverage 1/1 = 100.0% (1 anchored, 0 waived)",
+                "coverage 1/1 = 100.0% (0 anchored, 0 waived)",
+            ),
+            design_only.replace(
+                "coverage 1/1 = 100.0% (1 anchored, 0 waived)",
+                "coverage 2/1 = 200.0% (2 anchored, 0 waived)",
+            ),
+            design_only.replace("1/1 = 100.0%", "1/1 = 99.9%"),
+            design_only.replace("1/1 = 100.0%", "1/1 = 100%"),
+            design_only.replace("coverage 1/1", "coverage 01/1"),
+            design_only.replace("[design-only]\n", "[design-only] trailing\n"),
+            design_only.replace("machine \\\"Ring\\\"", "machine \\\"Other\\\""),
+        ] {
+            assert_eq!(
+                classify_spec_link(Some(1), &poisoned),
+                None,
+                "must fail closed:\n{poisoned}"
+            );
+        }
+        let certifying_with_reason = format!(
+            "{certifying}spec-link-noncert: code=design-only detail=\"machine \\\"Ring\\\" is explicitly design-only\"\n"
+        );
+        assert_eq!(classify_spec_link(Some(0), &certifying_with_reason), None);
+        assert_eq!(
+            classify_spec_link(
+                Some(0),
+                &format!("{certifying}spec-link-status: non-certifying\n")
+            ),
+            None,
+            "contradictory status lines must fail closed"
+        );
+        assert_eq!(
+            classify_spec_link(Some(0), "spec-link-status: certifying\n"),
+            None,
+            "certifying output needs nonempty linked coverage"
+        );
+        assert_eq!(
+            classify_spec_link(Some(0), &certifying.replace("[linked]", "[design-only]")),
+            None,
+            "certifying output cannot carry design-only coverage"
+        );
+        assert_eq!(classify_spec_link(Some(0), design_only), None);
+        assert_eq!(classify_spec_link(Some(1), certifying), None);
+        assert_eq!(classify_spec_link(None, certifying), None, "signal/crash");
+        assert_eq!(classify_spec_link(Some(2), design_only), None, "exit 2");
+
+        let duplicate_certifying_status = format!("{certifying}spec-link-status: certifying\n");
+        assert_eq!(
+            classify_spec_link(Some(0), &duplicate_certifying_status),
+            None,
+            "duplicate same status must fail closed"
+        );
+        let missing_header = certifying.replace("spec-link: 1 machine(s) in good.trust_ir\n", "");
+        assert_eq!(classify_spec_link(Some(0), &missing_header), None);
+        let incorrect_header_count =
+            certifying.replace("spec-link: 1 machine(s)", "spec-link: 2 machine(s)");
+        assert_eq!(classify_spec_link(Some(0), &incorrect_header_count), None);
+        let noncanonical_header_count =
+            certifying.replace("spec-link: 1 machine(s)", "spec-link: 01 machine(s)");
+        assert_eq!(
+            classify_spec_link(Some(0), &noncanonical_header_count),
+            None
+        );
+        let duplicate_header =
+            format!("spec-link: 1 machine(s) in duplicate.trust_ir\n{certifying}");
+        assert_eq!(classify_spec_link(Some(0), &duplicate_header), None);
+        let malformed_header = format!("spec-link: not-a-header\n{certifying}");
+        assert_eq!(classify_spec_link(Some(0), &malformed_header), None);
+        let garbage_coverage = certifying.replace(
+            "machine \"Ring\" [embedded] coverage 1/1 = 100.0% (1 anchored, 0 waived) [linked]",
+            "machine \"Ring\" [garbage coverage 1/1 = 100.0%] [linked]",
+        );
+        assert_eq!(
+            classify_spec_link(Some(0), &garbage_coverage),
+            None,
+            "a name prefix and linked suffix cannot disguise a malformed coverage row"
+        );
+        assert!(!report_has_exact_full_coverage(
+            &garbage_coverage,
+            "Ring",
+            1,
+            SpecLinkDisposition::Certifying
+        ));
+        let partial_linked = certifying.replace(
+            "coverage 1/1 = 100.0% (1 anchored, 0 waived)",
+            "coverage 1/3 = 33.3% (1 anchored, 0 waived)",
+        );
+        assert_eq!(
+            classify_spec_link(Some(0), &partial_linked),
+            None,
+            "TrustIr cannot certify a linked machine with partial coverage"
+        );
+        let duplicate_coverage = certifying
+            .replace("spec-link: 1 machine(s)", "spec-link: 2 machine(s)")
+            .replace(
+                "spec-link-status: certifying\n",
+                concat!(
+                    "  machine \"Ring\" [embedded] coverage 1/1 = 100.0% ",
+                    "(1 anchored, 0 waived) [linked]\n",
+                    "spec-link-status: certifying\n",
+                ),
+            );
+        assert_eq!(
+            classify_spec_link(Some(0), &duplicate_coverage),
+            None,
+            "duplicate machine coverage must fail closed"
+        );
+
+        // Regression for the exact live assembled-module shape that exposed the
+        // parser bug: the complete live set of unique machine rows plus
+        // TrustIr's successful auxiliary
+        // `spec-link: harness manifest ...` line. That auxiliary record is not a
+        // second primary header and must not invalidate an honest DesignOnly report.
+        let live_modules = registered_modules();
+        assert_eq!(
+            live_modules.len(),
+            116,
+            "update the live TrustIr report-shape regression when the registry changes"
+        );
+        let mut live_report = format!(
+            "spec-link: {} machine(s) in /tmp/aterm_spec_xref.trust_ir\n",
+            live_modules.len()
+        );
+        for module in &live_modules {
+            let name = module.name();
+            let actions = module.action_names().len();
+            let origin = match module {
+                SpecModule::Embedded(_) => "embedded".to_string(),
+                SpecModule::External(spec) => format!("external({})", spec.file_path),
+            };
+            let percentage = if actions == 0 { "100.0" } else { "0.0" };
+            live_report.push_str(&format!(
+                "  machine {name:?} [{origin}] coverage 0/{actions} = {percentage}% \
+                 (0 anchored, 0 waived) [design-only]\n"
+            ));
+        }
+        live_report.push_str(
+            "spec-link: harness manifest /tmp/harness-manifest.json (432 harnesses), \
+             checked 8 proof bindings\n",
+        );
+        live_report.push_str("spec-link-status: non-certifying\n");
+        for module in &live_modules {
+            let description = format!("machine {:?} is explicitly design-only", module.name());
+            live_report.push_str(&format!(
+                "spec-link-noncert: code=design-only detail={description:?}\n"
+            ));
+        }
+        assert_eq!(
+            classify_spec_link(Some(1), &live_report),
+            Some(SpecLinkDisposition::ExplicitDesignOnly),
+            "the real 100-machine DesignOnly report shape must classify honestly"
+        );
     }
 
     /// Generate the harness manifest the L1 resolution needs by invoking the always-run
@@ -22033,6 +22996,44 @@ mod spec_xref_gate {
             .arg("harness-manifest")
             .status()
             .expect("run `cargo run -p xtask -- harness-manifest`");
+        // Why: a NESTED checkout (aterm under orc's rust/) inherits the host repo's
+        // ancestor cargo config, whose vendored-offline [source] replacement lacks
+        // aterm's deps and fails the in-tree spawn above. Retry with the SAME cargo
+        // binary that runs this test (env `CARGO` — keeps the outer lane's toolchain;
+        // rustup's cwd-based pick would regress it) from a config-neutral cwd against
+        // the explicit workspace manifest. Never silent: the notice records the lane.
+        let status = if status.success() {
+            status
+        } else {
+            eprintln!(
+                "spec_xref_closure: in-tree `cargo run -p xtask` failed (host-repo cargo \
+                 config?) — retrying from a config-neutral cwd via env CARGO"
+            );
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            // Why: the neutral cwd also loses the repo's .cargo/config.toml rustflags
+            // (cargo config discovery is cwd-based, not manifest-based), so the retry
+            // would verify strictly and fail; forward the SAME temporary opt-out.
+            let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+            if !rustflags.contains("-Zno-trust-verify") {
+                if !rustflags.is_empty() {
+                    rustflags.push(' ');
+                }
+                rustflags.push_str("-Zno-trust-verify=yes");
+            }
+            Command::new(cargo)
+                .current_dir(std::env::temp_dir())
+                .env("RUSTFLAGS", rustflags)
+                .arg("run")
+                .arg("-q")
+                .arg("--manifest-path")
+                .arg(root.join("Cargo.toml"))
+                .arg("-p")
+                .arg("xtask")
+                .arg("--")
+                .arg("harness-manifest")
+                .status()
+                .expect("run `cargo run -p xtask -- harness-manifest` (neutral cwd)")
+        };
         assert!(status.success(), "xtask harness-manifest failed");
         let path = root
             .join("target")
@@ -22090,8 +23091,8 @@ mod spec_xref_gate {
     /// does not COMPILE on this target (the ConPTY twin has no fork window and no
     /// fd write loop), so their anchors cannot exist here and those machines stay
     /// report-only. The four machines whose subjects ship on Windows stay fully
-    /// gated (active + ratio 1.0 + exact action counts), so the anti-vacuity
-    /// linkage proof is intact.
+    /// gated (active + ratio 1.0 + exact action counts), so their local
+    /// coverage/closure gate remains intact.
     #[cfg(windows)]
     const ISOLATION: &[(&str, usize)] = &[
         ("sandbox", 1),      // Apply
@@ -22106,8 +23107,8 @@ mod spec_xref_gate {
         // the Tier-1 conformances, the verifier ledger) are toolchain-free — the
         // conformances discharge on the in-process interpreter and escalate to
         // `ty` per transition wherever it is installed. Proof #4 (strict-vacuity)
-        // and Proof #5 (trust-ir spec-link) are external-tool obligations and run
-        // only with the toolchain (prominent notice otherwise).
+        // and Analysis #5 (TrustIr design-only spec-link) are external-tool
+        // obligations and run only with the toolchain (prominent notice otherwise).
 
         // ---- Proof #1: inventory ACTUALLY collected the anchors, cross-crate. ----
         let refs: Vec<_> = xref::refinements().collect();
@@ -22734,29 +23735,42 @@ mod spec_xref_gate {
             );
         }
 
-        // ---- Proof #5 (Phase 3 + TRUST_VACUITY_GATE §2.1/§2.2): TRUST independently
-        // checks the text artifact's structural teeth. The artifact has source labels
-        // but no compiler-owned FuncIds, so every module explicitly declares
-        // `enforcement design-only`; accepting it as a certifying Linked report would
-        // be an overclaim. Require a clean design-only report instead:
-        //   * S0/S1 + Ob.1/Ob.4 — identities, ownership, actions and machines resolve;
-        //   * L2 — every present anchor carries a non-empty `project` label;
-        //   * L1 — every lowered proof name resolves against the harness manifest.
-        // Ob.3 total coverage remains fail-closed in Proofs #2/#3 above.
+        // ---- Analysis #5 (Phase 3 + TRUST_VACUITY_GATE §2.1/§2.2): TRUST
+        // independently analyzes the obligations available in explicit design-only
+        // mode. Lower the registered modules + a fallback-deduplicated view of the
+        // collected anchors/waivers + PROOF anchors to the documented v27 `.trust_ir`
+        // text shape, generate the harness manifest, then run `trust-ir spec-link
+        // --harness-manifest … --require-manifest` and require:
+        //   * no structural, Ob.1/Ob.4, L1, L2, or S0-S2 violation;
+        //   * every lowered proof name resolves against the exact manifest;
+        //   * every actively-lowered machine has its exact action count at 100%, with
+        //     Ob.3 still enforced by aterm's independent in-Rust closure because Trust
+        //     does not enforce total coverage for a design-only machine;
+        //   * either a genuine certifying exit 0, or TrustIr v27's explicit
+        //     design-only, violation-free non-certifying result.
+        //
+        // aterm cannot honestly select `linked` until it emits real module-local
+        // FuncIds and typed projection targets. Design-only analysis is an independent
+        // integrity check, NOT external certification; the notice below keeps that
+        // boundary visible.
         if let Some(trust_ir) = aterm_spec::verify::trust_ir_escalation(
-            "spec_xref_closure (Phase-3 Trust-native spec-link, Proof #5)",
+            "spec_xref_closure (Phase-3 TrustIr design-only analysis, Analysis #5)",
         ) {
+            let fallback_deduplicated =
+                aterm_spec::ir::fallback_anchor_deduplication_count(&modules, &refs);
             let module_txt =
                 aterm_spec::ir::lower_to_ir("aterm_spec_xref", &modules, &refs, &waivers, &proofs);
             let lowered = aterm_spec::ir::lowered_machine_names(&modules, &refs);
             eprintln!(
                 "spec_xref_closure: assembled .trust_ir — {} bytes, {} SpecModule block(s), {} \
-                 actively-lowered machine(s): {:?}; {} proof line(s) lowered",
+                 actively-lowered machine(s): {:?}; {} proof line(s) lowered; {} colliding source \
+                 anchor record(s) omitted from TrustIr's unresolved S0 fallback view",
                 module_txt.len(),
                 modules.len(),
                 lowered.len(),
                 lowered,
                 proofs.len(),
+                fallback_deduplicated,
             );
 
             let ir_dir = std::env::temp_dir().join(format!("aterm_spec_ir_{}", std::process::id()));
@@ -22767,76 +23781,94 @@ mod spec_xref_gate {
             // The harness manifest the L1 resolution needs (generated by the always-run
             // xtask node — the SAME generator the build-graph spec-link uses).
             let manifest = harness_manifest();
-            let (certifying, report) = run_spec_link(&trust_ir, &ir_path, Some(&manifest));
+            let (exit_code, report) = run_spec_link(&trust_ir, &ir_path, Some(&manifest));
             eprintln!(
                 "--- trust-ir spec-link report (REAL assembled module, L1+L2 armed) ---\n{report}"
             );
-            // trust-ir v27 fail-closes CERTIFICATION (exit 0) to typed `Linked` machines:
-            // an anchor certifies only with a resolved FuncId action+projection identity,
-            // which the BINARY temporal lowering carries but this TEXT artifact — opaque
-            // `rust_symbol`/`project` strings, no FuncIds — structurally cannot. So every
-            // text machine is classified `design-only` and the CLI never exits 0, no matter
-            // how correct the cross-reference is. What aterm's in-Rust `check_closure`
-            // enforces, and what TRUST must independently AGREE on, is the ABSENCE of
-            // spec<->source OBLIGATION VIOLATIONS (S0/S1/S2, Ob.1/Ob.3/Ob.4, L1/L2) — which
-            // the CLI reports as a `spec-link failed: … (N violations)` block. Assert that
-            // block is absent: TRUST found zero obligation violations, i.e. it agrees with
-            // aterm's closure. (Certification additionally demands the typed-Linked tier a
-            // text producer cannot reach, so `certifying` is expected false and not gated on.)
-            assert!(
-                aterm_spec::ir::spec_link_report_is_clean(certifying, &report),
-                "trust-ir spec-link FAILED on the REAL design-only module — the report contains a \
-                 structural violation or an unexpected non-certification reason. \
-                 Report:\n{report}\n--- module ({} bytes) ---\n{module_txt}",
-                module_txt.len(),
-            );
+            let disposition = classify_spec_link(exit_code, &report).unwrap_or_else(|| {
+                panic!(
+                    "trust-ir spec-link produced neither a certifying result nor an explicit \
+                     design-only zero-violation analysis — structural/Ob/L1/L2/S0-S2 failures \
+                     remain hard errors. Report:\n{report}\n--- module ({} bytes) ---\n{module_txt}",
+                    module_txt.len(),
+                )
+            });
+            if disposition == SpecLinkDisposition::Certifying {
+                assert_eq!(
+                    fallback_deduplicated, 0,
+                    "a certifying TrustIr result cannot stand in for source anchors omitted by \
+                    unresolved fallback-identity deduplication"
+                );
+            }
             // L1 evidence: the report must show the manifest was consulted and every proof
             // binding resolved (not silently skipped).
-            assert!(
-                report.contains("harness manifest") && report.contains("proof binding"),
-                "trust-ir report must show the harness manifest was consulted for L1; report:\n{report}"
+            let proof_binding = format!(
+                "checked {} proof binding{}",
+                proofs.len(),
+                if proofs.len() == 1 { "" } else { "s" }
             );
-            // The TRUST report must reference each ISOLATION machine by its canonical
-            // (CamelCase) name — proof the lowering canonicalized lower_snake anchors to
-            // the SpecModule.name trust-ir resolves by exact match (Ob.4).
-            for canon in [
-                "TerminalModes",
-                "Sandbox",
-                "PathConfine",
-                "ForkExec",
-                "WriteAll",
-                "AltScreen",
-                "GpuEncode",
-            ] {
+            assert!(
+                report.contains("harness manifest") && report.contains(&proof_binding),
+                "trust-ir report must show the exact harness manifest/proof binding count for L1 \
+                 ({proof_binding:?}); report:\n{report}"
+            );
+            // Every actively-lowered machine must appear under its canonical name with
+            // its exact declared action count fully covered. This is stricter than merely
+            // finding a machine-name substring in a design-only report.
+            for canon in &lowered {
+                let expected_actions = modules
+                    .iter()
+                    .find(|module| module.name() == canon.as_str())
+                    .unwrap_or_else(|| panic!("lowered machine {canon:?} has no module"))
+                    .coverage_actions()
+                    .len();
                 assert!(
-                    report.contains(canon),
-                    "trust-ir report should mention canonical machine `{canon}`; report:\n{report}"
+                    report_has_exact_full_coverage(&report, canon, expected_actions, disposition),
+                    "trust-ir report must give actively-lowered machine {canon:?} exact \
+                     {expected_actions}/{expected_actions} coverage in {disposition:?} mode; \
+                     report:\n{report}"
                 );
+            }
+            match disposition {
+                SpecLinkDisposition::Certifying => eprintln!(
+                    "trust-ir spec-link: CERTIFYING — typed Trust linkage was present and every \
+                     checked obligation passed."
+                ),
+                SpecLinkDisposition::ExplicitDesignOnly => eprintln!(
+                    "NOTICE — trust-ir spec-link is VIOLATION-FREE BUT NON-CERTIFYING: every \
+                     aterm SpecModule is explicitly design-only (`target none`) because aterm \
+                     does not yet own Trust FuncIds/typed projection targets. This external run \
+                     analyzed the emitted fallback-deduplicated structure, coverage reporting, \
+                     and proof names; it did not inspect {fallback_deduplicated} colliding source \
+                     anchor record(s) omitted from that view. The in-Rust full-inventory closure \
+                     and Tier-1 conformance remain the authority."
+                ),
             }
             let _ = std::fs::remove_dir_all(&ir_dir);
         }
 
         eprintln!(
-            "spec_xref_closure: GREEN — obligations 1/3/4 hold for terminal_modes + {} ISOLATION \
-             machines; Tier-1 conformances discharged (interpreter default, ty escalation); the \
-             strict-vacuity + trust-ir structural design-only escalation tiers ran wherever the \
-             Trust toolchain is installed (Phase 3).",
+            "spec_xref_closure: LOCAL GREEN — obligations 1/3/4 hold for terminal_modes + {} \
+             ISOLATION machines; Tier-1 conformances discharged (interpreter default, ty \
+             escalation). TrustIr analysis ran when installed; an explicit design-only result \
+             is non-certifying and is never counted as external proof (Phase 3).",
             ISOLATION.len()
         );
     }
 
     /// PROOF THAT TRUST HAS TEETH, driven FROM ATERM (TRUST_NATIVE_TLA, Phase 3,
-    /// item 4). The companion to `spec_xref_closure`'s Proof #5: that gate requires a
-    /// structurally clean design-only report; this test proves `trust-ir spec-link`
-    /// genuinely REJECTS a violating module — so the structural pass is non-vacuous
-    /// and TRUST is really enforcing, not rubber-stamping.
+    /// item 4). The companion to `spec_xref_closure`'s Analysis #5: that gate requires
+    /// the REAL assembled module to be violation-free; this test proves `trust-ir
+    /// spec-link` genuinely REJECTS a violating module, even in explicit design-only
+    /// mode. The positive control may be either certifying or explicit design-only, but
+    /// the latter is never presented as certification.
     ///
     /// We assemble a module with a deliberately BOGUS anchor (an action the machine
     /// does not declare), run `trust-ir spec-link`, and assert it EXITS 1 with the
     /// `[Ob.1]` (action-exists) violation — the same obligation aterm's in-Rust
     /// `check_closure` would flag. Then we assemble the same module WITHOUT the bogus
-    /// anchor and require a clean design-only report, so the failure is attributable
-    /// solely to the bad anchor (a controlled negative/positive pair).
+    /// anchor and confirm it is violation-free, so the failure is attributable solely
+    /// to the bad anchor (a controlled negative/positive pair).
     #[test]
     fn trust_ir_has_teeth() {
         use aterm_spec::xref::{RefinementAnchor, SpecModule};
@@ -22852,8 +23884,7 @@ mod spec_xref_gate {
         // A single embedded model (the ring) is enough to demonstrate the obligation.
         let modules = vec![SpecModule::Embedded(aterm_spec::derive::ring_model())];
 
-        // A VALID anchor (Push exists in Ring). Ring has one action, so the GOOD
-        // module is also fully covered by aterm's in-process Ob.3 gate.
+        // A VALID anchor (Push exists in Ring), so the GOOD module is fully covered.
         let good_anchor = RefinementAnchor {
             machine: "ring",
             action: "Push",
@@ -22891,12 +23922,20 @@ mod spec_xref_gate {
             "bogus anchor must be present in the lowered module:\n{bad_txt}"
         );
 
-        let (bad_ok, bad_report) = run_spec_link(&trust_ir, &bad_path, None);
+        let (bad_exit_code, bad_report) = run_spec_link(&trust_ir, &bad_path, None);
         eprintln!("--- trust-ir spec-link report (BOGUS module) ---\n{bad_report}");
+        assert_eq!(
+            bad_exit_code,
+            Some(1),
+            "the explicit DesignOnly negative control must fail with exact exit code 1; \
+             signals/crashes and other nonzero exits do not demonstrate the intended rejection. \
+             Report:\n{bad_report}"
+        );
         assert!(
-            !bad_ok,
-            "trust-ir spec-link must REJECT a module with an undeclared anchor action \
-             (exit 1) — TRUST has no teeth otherwise. Report:\n{bad_report}"
+            classify_spec_link(bad_exit_code, &bad_report).is_none()
+                && report_has_spec_link_failure(&bad_report),
+            "trust-ir spec-link must REJECT a module with an undeclared anchor action; an \
+             explicit design-only status must not hide the violation. Report:\n{bad_report}"
         );
         assert!(
             bad_report.contains("[Ob.1") && bad_report.contains("MeltDown"),
@@ -22904,36 +23943,33 @@ mod spec_xref_gate {
              report:\n{bad_report}"
         );
 
-        // ---- Positive: drop the bogus anchor -> clean design-only structural report ----
+        // ---- Positive: drop the bogus anchor -> the SAME module is violation-free ----
         // Cover the remaining action (Ring has only Push) — already covered by the
         // good anchor, so no waiver needed; the good module is fully bound.
         let good_txt =
             aterm_spec::ir::lower_to_ir("aterm_teeth_good", &modules, &[&good_anchor], &[], &[]);
         let good_path = dir.join("good.trust_ir");
         std::fs::write(&good_path, &good_txt).expect("write good module");
-        let (good_certifying, good_report) = run_spec_link(&trust_ir, &good_path, None);
+        let (good_exit_code, good_report) = run_spec_link(&trust_ir, &good_path, None);
         eprintln!("--- trust-ir spec-link report (CONTROL good module) ---\n{good_report}");
-        // v27 classifies this TEXT module `design-only` (no typed FuncIds), so — like every
-        // aterm text artifact — it never exits 0; certification is unreachable for a text
-        // producer regardless of correctness. The teeth do NOT live in the exit code: they
-        // live in the OBLIGATION delta between the two modules. The control must be
-        // VIOLATION-FREE, in particular free of the `[Ob.1]` action-exists violation the
-        // bogus module trips, so the bad module's rejection is attributable SOLELY to the
-        // undeclared `MeltDown` action. If spec-link ever stopped enforcing Ob.1 the bad
-        // module would ALSO go violation-free and the negative assertion above (`[Ob.1]`
-        // naming `MeltDown`) would fail — the teeth are the controlled violation pair, not
-        // the shared design-only tier.
+        let good_disposition =
+            classify_spec_link(good_exit_code, &good_report).unwrap_or_else(|| {
+                panic!(
+                    "the same module WITHOUT the bogus anchor must be certifying OR explicit \
+                 design-only and violation-free, so rejection remains attributable solely to \
+                the undeclared action. Report:\n{good_report}"
+                )
+            });
         assert!(
-            aterm_spec::ir::spec_link_report_is_clean(good_certifying, &good_report),
-            "the same module WITHOUT the bogus anchor must be structurally clean — so the \
-             rejection is attributable solely to the undeclared action. Report:\n{good_report}"
+            report_has_exact_full_coverage(&good_report, "Ring", 1, good_disposition),
+            "the controlled good Ring must report exact 1/1 coverage; report:\n{good_report}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!(
-            "trust_ir_has_teeth: TRUST rejected the bogus anchor with [Ob.1] and reported the \
-             controlled good module structurally clean/design-only — `trust-ir spec-link` \
-             genuinely enforces the cross-reference without a Linked-certification overclaim."
+            "trust_ir_has_teeth: TRUST rejected the bogus anchor with [Ob.1] and accepted the \
+             controlled good module as {good_disposition:?}. ExplicitDesignOnly means \
+             violation-free analysis, not external certification."
         );
     }
 }
@@ -22944,17 +23980,21 @@ mod spec_xref_gate {
 /// headlessly, like the pane-tree math in `pane.rs`.
 #[cfg(test)]
 mod compose_tests {
-    use crate::app_render::{blit_pane_into, divider_cell, fill_divider_grid};
+    use crate::app_render::{blit_pane_into, divider_cell, fill_divider_grid, terminal_blank_cell};
     use aterm_core::terminal::Terminal;
     use aterm_render::{RenderInput, Theme};
 
     /// A pane snapshot of `text` rendered into the top row of a `rows`x`cols` grid.
-    fn pane_snapshot(text: &str, rows: usize, cols: usize) -> RenderInput {
+    fn pane_snapshot(
+        text: &str,
+        rows: usize,
+        cols: usize,
+    ) -> (RenderInput, aterm_core::terminal::RenderCell) {
         let mut term = Terminal::new(rows as u16, cols as u16);
         term.process(text.as_bytes());
         let mut snap = RenderInput::empty();
         term.cell_frame_into(&mut snap, rows, cols);
-        snap
+        (snap, terminal_blank_cell(&term))
     }
 
     /// `fill_divider_grid` produces a full `rows`x`cols` grid of identical seam
@@ -22986,6 +24026,32 @@ mod compose_tests {
         assert!(!dst.cursor_visible);
     }
 
+    /// An implicit blank is resolved from the pane's LIVE terminal defaults, not
+    /// the host theme. OSC 10/11 update these defaults, and DECSCNM swaps them.
+    #[test]
+    fn terminal_blank_tracks_live_defaults_and_decscnm() {
+        let mut term = Terminal::new(1, 2);
+        term.set_default_foreground(aterm_core::terminal::Rgb {
+            r: 16,
+            g: 32,
+            b: 48,
+        });
+        term.set_default_background(aterm_core::terminal::Rgb {
+            r: 64,
+            g: 80,
+            b: 96,
+        });
+
+        let normal = terminal_blank_cell(&term);
+        assert_eq!(normal.fg, [16, 32, 48]);
+        assert_eq!(normal.bg, [64, 80, 96]);
+
+        term.process(b"\x1b[?5h");
+        let reversed = terminal_blank_cell(&term);
+        assert_eq!(reversed.fg, normal.bg, "DECSCNM swaps default fg");
+        assert_eq!(reversed.bg, normal.fg, "DECSCNM swaps default bg");
+    }
+
     /// `blit_pane_into` places a pane's cells at the given offset and leaves the
     /// surrounding divider cells untouched — the 2x1 composite seam stays a seam.
     #[test]
@@ -22995,16 +24061,61 @@ mod compose_tests {
         // 1x5 window: [pane A (cols 0..2)] [divider col 2] [pane B (cols 3..5)].
         let mut dst = RenderInput::empty();
         fill_divider_grid(&mut dst, 1, 5, theme);
-        let left = pane_snapshot("AB", 1, 2); // 'A','B'
-        let right = pane_snapshot("CD", 1, 2); // 'C','D'
-        blit_pane_into(&mut dst, &left, 0, 0);
-        blit_pane_into(&mut dst, &right, 0, 3);
+        let (left, left_blank) = pane_snapshot("AB", 1, 2); // 'A','B'
+        let (right, right_blank) = pane_snapshot("CD", 1, 2); // 'C','D'
+        blit_pane_into(&mut dst, &left, 0, 0, left_blank);
+        blit_pane_into(&mut dst, &right, 0, 3, right_blank);
         let row = &dst.cells[0];
         assert_eq!(row[0].ch, 'A');
         assert_eq!(row[1].ch, 'B');
         assert_eq!(row[2], seam, "the divider column is left as a seam cell");
         assert_eq!(row[3].ch, 'C');
         assert_eq!(row[4].ch, 'D');
+    }
+
+    /// A terminal snapshot deliberately keeps unwritten row tails sparse. The
+    /// pane blit must still paint the pane's FULL declared rectangle with the
+    /// terminal's implicit blank cell; otherwise the divider-grid sentinel leaks
+    /// through as broad gray bands after short lines and across empty rows.
+    #[test]
+    fn blit_ragged_rows_paints_full_pane_rectangles() {
+        let theme = Theme::default();
+        let seam = divider_cell(theme);
+        let mut term = Terminal::new(3, 5);
+        term.set_default_foreground(aterm_core::terminal::Rgb {
+            r: 211,
+            g: 212,
+            b: 213,
+        });
+        term.set_default_background(aterm_core::terminal::Rgb { r: 7, g: 11, b: 13 });
+        // The final materialized cell has a non-default background. Padding must
+        // use the implicit terminal blank, never clone this cell's SGR style.
+        term.process(b"AB\x1b[1;41mC");
+        let mut pane = RenderInput::empty();
+        term.cell_frame_into(&mut pane, 3, 5);
+        let blank = terminal_blank_cell(&term);
+        assert_eq!(pane.cells[0].len(), 3, "row 0 is intentionally ragged");
+        assert_ne!(
+            pane.cells[0][2].bg, blank.bg,
+            "the last materialized cell is a negative control with styled bg"
+        );
+        assert!(pane.cells[1].is_empty(), "row 1 is intentionally sparse");
+        assert!(pane.cells[2].is_empty(), "row 2 is intentionally sparse");
+
+        // 3x11 window: [left pane 0..5] [divider 5] [right pane 6..11].
+        let mut dst = RenderInput::empty();
+        fill_divider_grid(&mut dst, 3, 11, theme);
+        blit_pane_into(&mut dst, &pane, 0, 0, blank);
+        blit_pane_into(&mut dst, &pane, 0, 6, blank);
+
+        for (r, row) in dst.cells.iter().enumerate() {
+            assert_eq!(row[5], seam, "only the separator column remains seam");
+            for c in 0..5 {
+                let expected = pane.cells[r].get(c).copied().unwrap_or(blank);
+                assert_eq!(row[c], expected, "left pane mismatch at ({r},{c})");
+                assert_eq!(row[6 + c], expected, "right pane mismatch at ({r},{c})");
+            }
+        }
     }
 
     /// A blit that would overflow the composite (a degenerate too-small window) is
@@ -23015,8 +24126,8 @@ mod compose_tests {
         let mut dst = RenderInput::empty();
         fill_divider_grid(&mut dst, 1, 3, theme);
         // A 1x5 pane blitted at col_off 1 into a 3-wide composite: only cols 1,2 fit.
-        let wide = pane_snapshot("VWXYZ", 1, 5);
-        blit_pane_into(&mut dst, &wide, 0, 1);
+        let (wide, blank) = pane_snapshot("VWXYZ", 1, 5);
+        blit_pane_into(&mut dst, &wide, 0, 1, blank);
         assert_eq!(dst.cells[0].len(), 3, "the composite row is not grown");
         assert_eq!(dst.cells[0][1].ch, 'V');
         assert_eq!(dst.cells[0][2].ch, 'W');
@@ -23081,10 +24192,10 @@ mod compose_tests {
         let mut dst = RenderInput::empty();
         fill_divider_grid(&mut dst, 1, 5, theme);
         // A 1x2 right pane (blitted at col_off 3) carrying an image at its local col 0.
-        let mut right = pane_snapshot("CD", 1, 2);
+        let (mut right, blank) = pane_snapshot("CD", 1, 2);
         let im = test_image_ref();
         right.images[0].push((0, im.clone()));
-        blit_pane_into(&mut dst, &right, 0, 3);
+        blit_pane_into(&mut dst, &right, 0, 3, blank);
         assert_eq!(
             dst.images.len(),
             1,
@@ -23559,36 +24670,6 @@ mod tab_strip_math_tests {
         assert_eq!(frame_a.cells, frame_b.cells);
         assert_eq!(frame_a.rows, frame_b.rows);
         assert_eq!(frame_a.cursor_row, frame_b.cursor_row);
-    }
-
-    /// An EMPTY HUD (`hud_rows == 0` → no rows to append) is a no-op: the frame is
-    /// byte-identical. This is the single most important daily-driver invariant — the
-    /// DEFAULT-OFF path for every non-HUD user must not perturb the rendered frame —
-    /// and it is the bottom-splice twin of `prepend_empty_is_noop`.
-    #[test]
-    fn append_empty_is_noop() {
-        let mut term = Terminal::new(2, 4);
-        term.process(b"AB\r\nCD");
-        let mut frame = RenderInput::empty();
-        term.cell_frame_into(&mut frame, 2, 4);
-        let snapshot = frame.cells.clone();
-        let rows = frame.rows;
-        let cursor = frame.cursor_row;
-        let seq = frame.snapshot_seq;
-        crate::app_render::append_hud_rows(&mut frame, Vec::new());
-        assert_eq!(
-            frame.cells, snapshot,
-            "no HUD → grid unchanged (byte-identical)"
-        );
-        assert_eq!(frame.rows, rows, "row count unchanged");
-        assert_eq!(
-            frame.cursor_row, cursor,
-            "cursor unchanged (HUD sits below grid)"
-        );
-        assert_eq!(
-            frame.snapshot_seq, seq,
-            "no snapshot churn on the no-op path"
-        );
     }
 
     /// SELECTION AUTOSCROLL trigger: a pointer INSIDE the grid never autoscrolls

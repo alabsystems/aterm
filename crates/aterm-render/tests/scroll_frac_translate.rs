@@ -33,12 +33,12 @@ fn seeded_terminal() -> Terminal {
 }
 
 /// Build a frame snapshot with a chrome partition: row 0 is designated tab-strip
-/// chrome, the last row is designated HUD chrome, and the middle is the terminal
+/// chrome, the last row is designated bottom chrome, and the middle is the terminal
 /// grid — the exact `[grid_top_row, grid_bot_row)` layout the compose path emits.
 fn frame_with_partition(t: &mut Terminal, frac: i32) -> aterm_core::render::RenderInput {
     let mut input = t.cell_frame(ROWS, COLS);
     input.grid_top_row = 1; // row 0 = tab strip (chrome)
-    input.grid_bot_row = ROWS - 1; // last row = HUD (chrome)
+    input.grid_bot_row = ROWS - 1; // last row = bottom chrome
     input.scroll_frac_px = frac;
     input
 }

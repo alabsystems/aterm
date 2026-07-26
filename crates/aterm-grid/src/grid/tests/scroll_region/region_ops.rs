@@ -287,12 +287,15 @@ fn grid_repeated_top_anchored_scrolls_coalesce_footer_row_splices() {
     assert_eq!(grid.take_selection_row_update(), None);
 }
 
-/// Never-written displaced rows carry no transcript: a top-anchored region
-/// scroll over them archives NOTHING — no minted blank history line, no
-/// scrollbar growth, no footer splice. (A fresh Codex session scrolls its
-/// region before anything printed at the physical top; archiving those rows
-/// used to fill the ring with blanks that a later rows-grow reveal painted
-/// as a dead band above the content.)
+/// FRESH-SESSION blank displaced rows carry no transcript: while the grid
+/// holds no history at all, a top-anchored region scroll over them archives
+/// NOTHING — no minted blank history line, no scrollbar growth, no footer
+/// splice. (A fresh Codex session scrolls its region before anything printed
+/// at the physical top; archiving those rows used to fill the ring with
+/// blanks that a later rows-grow reveal painted as a dead band above the
+/// content.) The gate is scoped to that band alone — once ANY history
+/// exists, blank displaced rows archive like written ones (pinned below by
+/// `grid_top_anchored_scroll_archives_interior_blank_between_written_lines`).
 #[test]
 fn grid_top_anchored_scroll_of_never_written_rows_mints_no_history() {
     let mut grid = Grid::with_scrollback(5, 10, 10);
@@ -322,6 +325,130 @@ fn grid_top_anchored_scroll_of_never_written_rows_mints_no_history() {
             .trim_end(),
         "A"
     );
+    grid.assert_invariants();
+}
+
+/// A blank row displaced BETWEEN written lines is transcript: Codex streams
+/// "A", a paragraph break (a row it "prints" by printing nothing), then "B",
+/// one insert-history scroll at a time. The separator is displaced alone —
+/// blankness must not drop it once any history exists. (Pre-fix, the
+/// never-written gate keyed on `Row::len == 0` for the whole displaced set,
+/// which also holds for that separator, so the paragraph break silently
+/// vanished from history.)
+#[test]
+fn grid_top_anchored_scroll_archives_interior_blank_between_written_lines() {
+    let mut grid = Grid::with_scrollback(5, 10, 10);
+    grid.set_scroll_region(0, 2);
+    // Region content: A, blank separator (never written), B.
+    grid.set_cursor(0, 0);
+    grid.write_char('A');
+    grid.set_cursor(2, 0);
+    grid.write_char('B');
+
+    grid.scroll_region_up(1); // displaces A — archives, history begins
+    grid.scroll_region_up(1); // displaces the blank separator ALONE
+    grid.scroll_region_up(1); // displaces B
+
+    assert_eq!(
+        grid.scrollback_lines(),
+        3,
+        "the paragraph break must be retained in history"
+    );
+    for (index, expected) in ["A", "", "B"].into_iter().enumerate() {
+        assert_eq!(
+            grid.get_history_line(index)
+                .expect("every displaced row enters history")
+                .to_string()
+                .trim_end(),
+            expected,
+            "history line {index}"
+        );
+    }
+    grid.assert_invariants();
+}
+
+/// A written row erased back to blank (EL/ED with the default background sets
+/// `Row::len` to 0 — indistinguishable from never-written by len alone) is
+/// still transcript once history exists: the erase is part of what the
+/// application displayed, so the displaced row archives as an empty line
+/// rather than being dropped.
+#[test]
+fn grid_top_anchored_scroll_archives_written_then_erased_row() {
+    let mut grid = Grid::with_scrollback(5, 10, 10);
+    grid.set_scroll_region(0, 2);
+    // Leave the fresh-session band: archive one written row first.
+    grid.set_cursor(0, 0);
+    grid.write_char('A');
+    grid.scroll_region_up(1);
+    assert_eq!(grid.scrollback_lines(), 1);
+
+    // Write a row, then EL-erase it with the default background template.
+    grid.set_cursor(0, 0);
+    for c in "gone".chars() {
+        grid.write_char(c);
+    }
+    grid.set_cursor(0, 0);
+    grid.erase_line();
+    grid.scroll_region_up(1);
+
+    assert_eq!(
+        grid.scrollback_lines(),
+        2,
+        "an erased row is transcript, not a fresh-session blank"
+    );
+    assert_eq!(
+        grid.get_history_line(1)
+            .expect("displaced erased row enters history")
+            .to_string()
+            .trim_end(),
+        ""
+    );
+    grid.assert_invariants();
+}
+
+/// A fresh-session batch scroll whose displaced set MIXES leading
+/// never-written rows with written content drops ONLY the leading blank
+/// prefix: history starts at the first written row (no blank minted at the
+/// top of empty history), the footer splice covers only the archived count,
+/// and the visible result equals a single scroll of the full amount.
+#[test]
+fn grid_fresh_session_mixed_batch_scroll_drops_only_leading_blank_prefix() {
+    let mut grid = Grid::with_scrollback(5, 10, 10);
+    grid.set_scroll_region(0, 2);
+    // Rows 0-1 never written; row 2 written; footer rows written.
+    grid.set_cursor(2, 0);
+    grid.write_char('X');
+    grid.set_cursor(3, 0);
+    grid.write_char('D');
+    grid.set_cursor(4, 0);
+    grid.write_char('E');
+
+    grid.scroll_region_up(3);
+
+    assert_eq!(
+        grid.scrollback_lines(),
+        1,
+        "history starts at the first written row — no leading blanks minted"
+    );
+    assert_eq!(
+        grid.get_history_line(0)
+            .expect("first written displaced row enters history")
+            .to_string()
+            .trim_end(),
+        "X"
+    );
+    assert_eq!(
+        grid.take_absolute_row_update(),
+        Some(crate::AbsoluteRowUpdate::Splice { at: 3, inserted: 1 }),
+        "the footer splice covers only the archived suffix"
+    );
+    for (row, expected) in [' ', ' ', ' ', 'D', 'E'].into_iter().enumerate() {
+        assert_eq!(
+            grid.cell(row as u16, 0).unwrap().char(),
+            expected,
+            "visible row {row} must match a single scroll of the full amount"
+        );
+    }
     grid.assert_invariants();
 }
 

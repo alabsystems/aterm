@@ -30,7 +30,9 @@ fn ty_model_checks_every_spec() {
     // interpreter form (it evaluates derived `Model`s, not TLA+ text), so this
     // external-tool obligation runs only where the Trust toolchain is
     // installed — absent, the prominent notice names exactly what did not run.
-    let Some(ty) = ty_escalation("specs") else { return };
+    let Some(ty) = ty_escalation("specs") else {
+        return;
+    };
 
     let dir = specs_dir();
     let mut checked = 0usize;

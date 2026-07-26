@@ -23,6 +23,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::select::Candidate;
 
+const MAX_CACHE_CANDIDATES: usize = 24;
+const MAX_CACHED_INDEX_BYTES: usize = 5_000_000;
+const MAX_CACHED_SIGNATURE_BYTES: usize = 4_096;
+const MAX_INDEX_CACHE_BYTES: usize = 144 * 1024 * 1024;
+
 /// One cached index candidate: its label + base64 index/sig bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedCandidate {
@@ -60,7 +65,13 @@ impl IndexCache {
     /// swallowed so a cache-write failure never fails an install. Written `0600` via
     /// temp + rename so a reader never sees a half-written cache.
     pub fn store(&self, source_id: &str, candidates: &[Candidate]) {
-        if candidates.is_empty() {
+        if candidates.is_empty()
+            || candidates.len() > MAX_CACHE_CANDIDATES
+            || candidates.iter().any(|candidate| {
+                candidate.index_bytes.len() > MAX_CACHED_INDEX_BYTES
+                    || candidate.sig.len() > MAX_CACHED_SIGNATURE_BYTES
+            })
+        {
             return; // never overwrite a good cache with an empty success
         }
         let doc = CacheDoc {
@@ -79,6 +90,9 @@ impl IndexCache {
         let Ok(text) = toml::to_string(&doc) else {
             return;
         };
+        if text.len() > MAX_INDEX_CACHE_BYTES {
+            return;
+        }
         let Some(parent) = self.path.parent() else {
             return;
         };
@@ -100,15 +114,20 @@ impl IndexCache {
     /// garbage cache is inert rather than trusted.
     #[must_use]
     pub fn load(&self, source_id: &str) -> Option<Vec<Candidate>> {
-        let text = fs::read_to_string(&self.path).ok()?;
+        let text = crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_INDEX_CACHE_BYTES)
+            .ok()?;
         let doc: CacheDoc = toml::from_str(&text).ok()?;
-        if doc.source != source_id {
+        if doc.source != source_id || doc.candidate.len() > MAX_CACHE_CANDIDATES {
             return None; // SAME-SOURCE GUARD: a dir: cache never satisfies a github: fetch
         }
         let mut out = Vec::with_capacity(doc.candidate.len());
         for c in doc.candidate {
             let index_bytes = STANDARD.decode(c.index_b64.as_bytes()).ok()?;
             let sig = STANDARD.decode(c.sig_b64.as_bytes()).ok()?;
+            if index_bytes.len() > MAX_CACHED_INDEX_BYTES || sig.len() > MAX_CACHED_SIGNATURE_BYTES
+            {
+                return None;
+            }
             out.push(Candidate {
                 label: c.label,
                 index_bytes,
@@ -193,6 +212,39 @@ mod tests {
             1,
             "good cache preserved"
         );
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn sparse_oversized_and_overcount_cache_fail_closed() {
+        let p = tmp("bounded");
+        let file = fs::File::create(&p).unwrap();
+        file.set_len((MAX_INDEX_CACHE_BYTES + 1) as u64).unwrap();
+        assert!(IndexCache::new(p.clone()).load("any").is_none());
+
+        let candidates = vec![cand("x"); MAX_CACHE_CANDIDATES + 1];
+        let cache = IndexCache::new(p.clone());
+        fs::write(&p, "sentinel").unwrap();
+        cache.store("any", &candidates);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "sentinel");
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_symlink_cache_return_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let p = tmp("special");
+        let p_c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `p_c` is a live NUL-terminated path in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(p_c.as_ptr(), 0o600) }, 0);
+        assert!(IndexCache::new(p.clone()).load("any").is_none());
+        fs::remove_file(&p).unwrap();
+        let target = p.with_file_name("cache-target");
+        IndexCache::new(target.clone()).store("any", &[cand("one")]);
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+        assert!(IndexCache::new(p.clone()).load("any").is_none());
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 }

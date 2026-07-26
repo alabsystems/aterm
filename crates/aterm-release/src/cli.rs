@@ -3,10 +3,11 @@
 
 //! CLI surface (release spec §5): hand-rolled `std::env::args` parsing (no
 //! third-party arg crate — same rule as `aterm-ctl`) for the whole command
-//! surface: `cut [--dry-run] [--resume] [--abandon vX.Y] [--set-version X.Y]
+//! surface: `cut [--dry-run] [--resume] [--abandon vX.Y.Z]
+//! [--set-version X.Y.Z]
 //! [--min-build N] [--gate] [--rehearse OWNER/REPO] [--arm64-only]`,
-//! `recover vX.Y <claim-sha> --old-publisher-stopped`, `status`,
-//! `verify [vX.Y]`, `yank <build>`.
+//! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
+//! `verify [vX.Y.Z]`, `yank <build>`.
 
 use std::process::Command;
 
@@ -16,7 +17,7 @@ use crate::{publish, verify};
 pub const USAGE: &str = "aterm-release — the `cargo ship` release cutter
 
 USAGE
-  cargo ship cut [--dry-run] [--resume] [--abandon vX.Y] [--set-version X.Y]
+  cargo ship cut [--dry-run] [--resume] [--abandon vX.Y.Z] [--set-version X.Y.Z]
                  [--min-build N] [--gate] [--rehearse OWNER/REPO]
                  [--arm64-only]
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
@@ -25,9 +26,11 @@ USAGE
                            dist/; zero commits, zero uploads
         --resume           re-enter the journaled cut (dist/cut-state.toml) at
                            its first incomplete step
-        --abandon vX.Y     delete that version's draft release + the local
+        --abandon vX.Y.Z   delete that version's draft release + the local
                            journal (the claim commit stays; a later cut recuts)
-        --set-version X.Y  override the default MINOR bump
+        --set-version X.Y.Z
+                           override the version derived from
+                           [workspace.package] version (DEV → 0)
         --min-build N      emit an operator apply floor into the manifest
         --gate             additionally run tools/verify.sh --full inline
         --rehearse O/R     full real cut published to the scratch repo O/R
@@ -36,12 +39,13 @@ USAGE
 
   cargo ship status        version · ledger tail · dangling claims · newest
                            published build · cask-pin freshness
-  cargo ship recover vX.Y <full-claim-sha> --old-publisher-stopped
+  cargo ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
                            explicit killed-machine recovery: exact-CAS rotate
                            its fence only after operator stop proof; abandon
                            unpublished state or validate + finish a published
                            exact-identity cut
-  cargo ship verify [vX.Y] re-run the post-publish check anytime
+  cargo ship verify [vX.Y.Z]
+                           re-run the post-publish check anytime
   cargo ship yank <build>  publish + fully verify a min_build-ratcheted
                            successor FIRST; only then remove the inert bad
                            tag and release (crash-convergent cleanup)
@@ -165,11 +169,11 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             "--gate" => opts.gate = true,
             "--arm64-only" => opts.arm64_only = true,
             "--abandon" => {
-                let v = it.next().ok_or("--abandon needs a version (vX.Y)")?;
+                let v = it.next().ok_or("--abandon needs a version (vX.Y.Z)")?;
                 abandon = Some(normalize_version(v)?);
             }
             "--set-version" => {
-                let v = it.next().ok_or("--set-version needs a version (X.Y)")?;
+                let v = it.next().ok_or("--set-version needs a version (X.Y.Z)")?;
                 opts.set_version = Some(normalize_version(v)?);
             }
             "--min-build" => {
@@ -225,7 +229,8 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
     Ok(Cmd::Cut { opts, abandon })
 }
 
-/// Accept "0.26" or "v0.26"; store the bare MAJOR.MINOR everywhere.
+/// Accept "0.2.0" or "v0.2.0"; store the bare canonical MAJOR.MINOR.PATCH
+/// everywhere. Two-component spellings are the retired scheme and are refused.
 fn normalize_version(v: &str) -> std::result::Result<String, String> {
     let bare = v.strip_prefix('v').unwrap_or(v);
     ledger::check_version_shape(bare).map_err(|e| e.to_string())?;

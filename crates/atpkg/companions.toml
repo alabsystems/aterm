@@ -1,0 +1,63 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# companions.toml — the COMPILED-IN manifest of aterm's batteries-included companion
+# tools. Baked into `atpkg` via `include_str!` (crates/atpkg/src/companions.rs), so it
+# rides aterm's OWN notarized/signed release and is the source of truth for what ships
+# batteries-included — decoupled from the atpkg SIGNED INDEX, so the source-build lane
+# works even when atpkg's root key is absent (the keyless POC).
+#
+# Adding the NEXT public repo is PURE DATA: one more [[companion]] block, no code change.
+# A load-time validator (companions::Manifest::validate + the manifest_is_valid unit
+# test that fails the build) enforces the invariants noted per field.
+#
+# Trust: the OWNER manifest is authoritative. The runtime NEVER reads a fetched repo's
+# unsigned [workspace.metadata.atpkg] — `expose`/`build_args` here are what aterm's
+# release signature attests. See docs/COMPANION-TOOLS.md.
+
+schema = 3            # bump on any field-shape change; feeds seed-marker staleness
+
+# ---- global seed policy (compiled defaults; env may only TIGHTEN, never loosen) -------
+[seed]
+source_build_default = false   # DEFAULT-OFF. Set ATPKG_SOURCE_BUILD=1 to opt a machine
+                               # in. Toolchain presence is NEVER consent to build.
+build_timeout_secs   = 1800    # hard wall-clock; the build process-tree is killed past it
+build_rss_limit_mb   = 4096    # advisory RSS ceiling for the build subprocess (TODO prod watchdog)
+retry_cap            = 3       # source-build attempts per pinned commit, then quiescent
+target_free_gb_min   = 8       # HARD free-space gate (not advisory) before a source build
+
+# ------------------------------------------------------------------------- ay (live) --
+# The public solver. Builds cleanly on ambient stable Rust; usable as `ay` / `aterm ay`.
+[[companion]]
+name              = "ay"
+repo              = "alabsystems/ay"
+# MANDATORY 40-hex pin = the source-build trust basis. After a FULL (non-shallow) clone
+# the checked-out HEAD is asserted byte-equal to this; a moving ref is never trusted.
+commit            = "8af5cbb3a7aa7779f7a429c1f5772b59737b6cd1"
+# MANDATORY for a source-buildable policy: pins the build CLOSURE, not just the repo
+# tree. Re-checked post-fetch; the build runs `--locked` against exactly this lock.
+cargo_lock_sha256 = "5ead6ece266701790822f094b44a4bb913e4b5240e2d710ab90322deed43fb3d"
+# OWNER-AUTHORITATIVE, MANDATORY. NEVER read from the repo's unsigned metadata at
+# runtime. Every name must pass store::shim_allowed (validator-checked).
+#
+# The flagship `ay` is the batteries-included headline and builds cleanly on stable via the
+# recipe below (proven end-to-end). The repo ALSO declares a wider public set
+# (ay-maxsat/ay-pb/ay-qbf/ay-lrat-check via `--workspace --features ay/cli`), but that
+# whole-workspace build currently hits an UPSTREAM `ay-pb` mimalloc link error
+# (`_mi_option_set`) in a clean/hardened build — so the owner manifest (authoritative)
+# pins the working subset. Widen `expose`/`build_args` once the upstream build is fixed.
+expose            = ["ay"]
+build_args        = ["-p", "ay", "--features", "cli"]   # owner-authoritative, MANDATORY (proven recipe)
+policy            = "source-or-prebuilt"   # source-or-prebuilt | prebuilt-only | source-only
+min_toolchain     = "1.74.0"               # refuse source-build below this rustc; "" = any stable
+size_hint_mb      = 62                      # UX copy + free-space precheck
+coherence         = ""                      # VALIDATOR: non-empty REQUIRES policy=prebuilt-only
+default           = true                    # in the first-run seed set
+tier              = "headline"              # headline | chain | optional
+
+# --- The generalization to the wider chain (ty / clean / trust) is DATA-ONLY and lives
+# --- in docs/COMPANION-TOOLS.md, not here: those are prebuilt-only, coherence-grouped,
+# --- and require the signed index + owner keys that do not exist on this machine yet, so
+# --- adding them live would only ever hit the "skip loudly (no prebuilt)" lane. The
+# --- validator's `coherence != "" => policy == prebuilt-only` rule guarantees they can
+# --- never be mistakenly source-built on a user's box.

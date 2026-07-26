@@ -51,6 +51,9 @@
 // a block cursor is the CPU's exact recipe (cursor-colour bg quad + cut-out glyph).
 
 use std::collections::{BTreeSet, HashMap};
+// The sprite-atlas texture cache holds the exact published `SceneAtlas`
+// snapshot it uploaded and skips on `Arc::ptr_eq` (see `SpriteTex::src`).
+use std::sync::Arc;
 
 // FxHashMap for the per-drawable-cell glyph atlas lookups (same fast non-DoS hasher the
 // CPU renderer + the engine grid/core caches use): the glyph atlas `map` is keyed on the
@@ -63,7 +66,7 @@ use aterm_hash::FxHashMap;
 use aterm_core::terminal::{CursorStyle, UnderlineStyle};
 use aterm_render::{
     DirtyDecision, Frame, GlyphImage, GlyphKey, Rasterizer, RenderInput, RenderView, Renderer,
-    Theme, compute_dirty_rows, is_unchanged_frame,
+    SceneAtlas, Theme, compute_dirty_rows, is_unchanged_frame,
 };
 
 use crate::GpuContext;
@@ -652,37 +655,27 @@ fn fs_deco_add(in: GlyphVsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color.rgb * a, a);
 }
 
-// SCENE ("Living Panels") sprites sample an RGBA8 scene atlas (the meadow/cat art).
-// The per-instance `color.rgb` is a MULTIPLY tint (one grayscale cat → any fur colour)
-// and `color.a` an opacity multiplier. OVER (the world): output (tint*atlas.rgb, a)
+// RGBA8 sprites use a per-instance multiply tint and opacity. The output
 // into ALPHA_BLENDING on the sRGB view ⇒ dst*(1-a)+rgb*a == the CPU pass-1c sprite stamp.
 @fragment
 // The tint multiply and the opacity multiply are QUANTIZED to 8 bits with
 // round-half BEFORE the sRGB decode, exactly reproducing the CPU stamp's
 // intermediate byte: the cat/free path's mul8(c,f) = (c*f+127)/255 and the
-// bilinear scene path's (t*tint*255 + 0.5) as u8. round(x255*y255/255) equals
+// scaled-sprite path's (t*tint*255 + 0.5) as u8. round(x255*y255/255) equals
 // mul8 in the float domain (c = x255/255, f = y255/255), so the tinted colour
 // lands on the SAME 8-bit lattice the CPU linearizes and the linear-light
 // composite that follows is parity-exact rather than diverging by the ~1 LSB
 // the un-quantized f32 product injected on mid-ramp tints (the design 9 tint
 // divergence). At the cat's identity tint (0xFFFFFF, a=255) the quantization
 // is a no-op (round(c*1*255)/255 == c), so cat parity is unchanged; the
-// bilinear scene/free paths already quantize CPU-side, so this matches them.
-fn fs_scene_over(in: GlyphVsOut) -> @location(0) vec4<f32> {
+// free-sprite paths already quantize CPU-side, so this matches them.
+fn fs_sprite_over(in: GlyphVsOut) -> @location(0) vec4<f32> {
     let c = textureSample(atlas_tex, atlas_samp, in.uv);
     let tinted = round(c.rgb * in.color.rgb * 255.0) / 255.0;
     let a = round(c.a * in.color.a * 255.0) / 255.0;
     return vec4<f32>(s2l(tinted), a);
 }
 
-// SCENE additive light (sun/fireflies/comet): premultiplied One/One on the Unorm view,
-// RAW like the glow ⇒ dst + (tint*atlas.rgb)*a == the CPU add_sat(dst, premul).
-@fragment
-fn fs_scene_add(in: GlyphVsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(atlas_tex, atlas_samp, in.uv);
-    let a = c.a * in.color.a;
-    return vec4<f32>(c.rgb * in.color.rgb * a, a);
-}
 "#;
 
 /// On-glass blit: a fullscreen triangle generated from `@builtin(vertex_index)`
@@ -1417,6 +1410,87 @@ fn normalize_present_crop(
     })
 }
 
+/// Is this half-open `[x0, y0, x1, y1]` rect empty (covers no texel)?
+fn rect_is_empty(r: [u32; 4]) -> bool {
+    r[0] >= r[2] || r[1] >= r[3]
+}
+
+/// Union two OPTIONAL half-open rects where `None` means "the whole `(w, h)`
+/// surface / unknown", clamped to `(w, h)`. `None` is absorbing: it is the
+/// conservative answer, so any tracker that loses precision degrades to a
+/// full-surface operation rather than to a stale one. An EMPTY rect is the unit,
+/// so "nothing changed" never widens the union.
+fn union_rect_opt(
+    a: Option<[u32; 4]>,
+    b: Option<[u32; 4]>,
+    (w, h): (u32, u32),
+) -> Option<[u32; 4]> {
+    let (a, b) = (a?, b?);
+    let clamp = |r: [u32; 4]| [r[0].min(w), r[1].min(h), r[2].min(w), r[3].min(h)];
+    let (a, b) = (clamp(a), clamp(b));
+    Some(match (rect_is_empty(a), rect_is_empty(b)) {
+        (true, true) => [0, 0, 0, 0],
+        (true, false) => b,
+        (false, true) => a,
+        (false, false) => [
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ],
+    })
+}
+
+/// Record that `rect` of a window's `offscreen` was just written (`None` == the
+/// whole texture / unknown extent), accumulating into
+/// [`WindowGpu::offscreen_dirty_since_sync`] so the next
+/// `compose_present_offscreen` re-copies exactly that much into its throwaway
+/// present copy. SEVERAL writers can run between two composites (a scissored
+/// encode then a tray bake, say), hence the union rather than an overwrite.
+///
+/// The safety property this exists for: `None` is absorbing, so a writer that
+/// does not know its extent — or a future writer that forgets to call this at all
+/// and instead trips one of the `None` paths — costs a full copy, never a stale
+/// region on the glass.
+fn note_offscreen_written(win: &mut WindowGpu, rect: Option<[u32; 4]>, dims: (u32, u32)) {
+    win.offscreen_dirty_since_sync = union_rect_opt(win.offscreen_dirty_since_sync, rect, dims);
+}
+
+/// Pack the frame's ENABLED stream groups (indexed in DRAW ORDER) into as few
+/// render passes as the two attachment views allow: walk the groups and start a
+/// new pass only when the view a group needs differs from the previous enabled
+/// group's. Returns `(pass_of, pass_srgb, passes)` — `pass_of[g] == usize::MAX`
+/// for a disabled group (matches no pass index), `pass_srgb[p]` is whether pass
+/// `p` attaches the sRGB-typed view.
+///
+/// WHY: on a TBDR GPU (Metal) the load/store actions are per-ATTACHMENT, so every
+/// extra pass on the offscreen costs a full-framebuffer tile load + store that the
+/// dirty-row scissor cannot restrict — ~23 MB each at 3024x1964x4B, paid even by a
+/// pass that draws nothing. Merging two neighbours that already write the SAME
+/// view with Load/Store under the same scissor deletes a boundary and nothing
+/// else, so the result is byte-identical; the function deliberately preserves
+/// draw ORDER (it never hoists a group past another), because the additive and
+/// source-over streams do not commute.
+fn coalesce_frame_passes<const N: usize>(
+    enabled: &[bool; N],
+    srgb: &[bool; N],
+) -> ([usize; N], [bool; N], usize) {
+    let mut pass_of = [usize::MAX; N];
+    let mut pass_srgb = [true; N];
+    let mut passes = 0usize;
+    for g in 0..N {
+        if !enabled[g] {
+            continue;
+        }
+        if passes == 0 || pass_srgb[passes - 1] != srgb[g] {
+            pass_srgb[passes] = srgb[g];
+            passes += 1;
+        }
+        pass_of[g] = passes - 1;
+    }
+    (pass_of, pass_srgb, passes)
+}
+
 /// Destination scissor for effects composited after the blit. Crown shaders use
 /// raw source coordinates, so without this intersection they can re-light rows
 /// the frontend deliberately cropped into background bands.
@@ -1489,10 +1563,14 @@ pub struct GpuSurface {
     /// WITHOUT re-querying the driver every frame. `false` ⇒ the platform has no
     /// non-opaque composite here, so a translucent request stays honestly solid.
     post_mult: bool,
-    /// VIDEO introspection: whether the swapchain was configured with `COPY_SRC`
-    /// (the surface caps offered it — always true on DX12 flip-model, common on
-    /// Vulkan, often absent on Metal). Gates the `video` frame tap: where false,
-    /// the verb replies unsupported rather than degrading to a lookalike capture.
+    /// VIDEO introspection: whether the surface caps OFFER `COPY_SRC` (always
+    /// true on DX12 flip-model and on wgpu-hal's Metal backend, common on Vulkan).
+    /// Gates the `video` frame tap: where false, the verb replies unsupported
+    /// rather than degrading to a lookalike capture. NOT the configured usage —
+    /// the swapchain is attached `RENDER_ATTACHMENT`-only and only arms `COPY_SRC`
+    /// while a tap is live, because on Metal the bit clears the drawable's
+    /// `framebufferOnly` and costs the surface its lossless compression on every
+    /// frame (see `surface_usage` / the `want_usage` reconcile).
     copyable: bool,
 }
 
@@ -1872,14 +1950,22 @@ struct DecoAtlas {
     atlas_w: usize,
 }
 
-/// The uploaded RGBA8 SCENE atlas: the resident texture's bind group (sampled by the
-/// scene pipelines), its texel dims (for UV normalization), and the source atlas
+/// An uploaded RGBA8 sprite atlas: its resident bind group, texel dimensions
+/// (for UV normalization), and the source atlas
 /// `version` so the upload is skipped on an unchanged frame and re-done on a rebake.
-struct SceneTex {
+struct SpriteTex {
     bind: wgpu::BindGroup,
     w: u32,
     h: u32,
-    version: u64,
+    /// The exact published snapshot these texels were uploaded from. The skip
+    /// test is `Arc::ptr_eq` on this handle — NOT `(version, w, h)`: baker
+    /// versions are deterministic PER ENGINE INSTANCE (the fingerprint
+    /// contract), so a rebuilt engine replays its predecessor's sequence and
+    /// a version key would alias stale texels (split-pane audit). Every
+    /// publish is a fresh `Arc` by construction, and holding the clone here
+    /// pins the allocation so pointer identity can never be reused while the
+    /// texture lives.
+    src: Arc<SceneAtlas>,
 }
 
 /// One persisted, on-GPU glyph atlas: the CPU-side packed [`Atlas`] (so we can
@@ -1907,6 +1993,14 @@ pub struct WindowGpu {
     // shader execution. Keeping the stamp per-window lets the frontend drive
     // load shedding without folding FIFO/nextDrawable pacing into the signal.
     last_present_work_ns: u64,
+    // Wall time the most recent present spent BLOCKED in `get_current_texture()`
+    // (`nextDrawable` on Metal). Distinct from `last_present_work_ns`: this is
+    // pure WAITING on the swapchain/compositor, not work we did. A sustained
+    // non-trivial value is the direct, causal signal that the GPU cannot keep up
+    // with the frames being asked of it — which is exactly what shedding the
+    // bloom/shimmer relieves, and what the CPU-encode-only load-shed EMA is blind
+    // to. 0 until the first successful acquire.
+    last_acquire_wait_ns: u64,
     // The resident offscreen render target + its blit-source bind group. `None`
     // until the first frame; reused at the same `(w, h)`, recreated only on a
     // dimension change. See `Offscreen`.
@@ -1997,6 +2091,25 @@ pub struct WindowGpu {
     // recreated on a resize. PER-WINDOW alongside the offscreen. See
     // `ensure_present_offscreen` / `encode_bloom_halo`.
     pub(crate) present_offscreen: Option<PresentOffscreen>,
+    // The region of `offscreen` that has CHANGED since `present_offscreen` was
+    // last synced to it, as `Some([x0, y0, x1, y1])` (half-open), or `None` for
+    // "unknown / everything". Lets `compose_present_offscreen` copy a RECT instead
+    // of the whole frame: at 3024x1964x4B the unconditional full copy was ~23 MB
+    // read + ~23 MB write on every glow frame — i.e. on every keystroke echo while
+    // the comet is alive — to refresh, typically, one dirty text row.
+    //
+    // The bookkeeping is fail-safe by shape: `None` (a full copy) is the default
+    // and EVERY writer of `offscreen` other than the scissored encode sets it back
+    // to `None`. Only `encode_frame` narrows it, and only to the exact scissor rect
+    // it clipped its own draws to — so a writer that forgot to invalidate would
+    // have to be a new one, and a full repaint (scissor `None`) already widens to
+    // the whole frame. See `note_offscreen_written` / `compose_present_offscreen`.
+    pub(crate) offscreen_dirty_since_sync: Option<[u32; 4]>,
+    // The region of `present_offscreen` the LAST sync's effects (comet halo,
+    // heat shimmer) wrote — i.e. where it diverges from `offscreen` and must be
+    // re-copied before this frame's effects composite over it. `None` == the whole
+    // frame (an unscissored halo composite, or no valid sync at all).
+    pub(crate) present_offscreen_fx: Option<[u32; 4]>,
     // HEAT-SHIMMER staging scratch: a frame-sized texture the shimmer pass
     // copies its source region into before resampling it with displaced UVs —
     // sampling and writing the SAME texture in one pass is impossible, and an
@@ -2030,6 +2143,15 @@ impl WindowGpu {
     #[must_use]
     pub fn last_present_work_ns(&self) -> u64 {
         self.last_present_work_ns
+    }
+
+    /// Wall time the most recent present spent BLOCKED acquiring a swapchain
+    /// drawable (`nextDrawable` on Metal). Pure waiting, not work — the causal
+    /// measure of GPU/compositor back-pressure, and the signal a CPU-encode-only
+    /// load-shed EMA cannot see. 0 before the first successful acquire.
+    #[must_use]
+    pub fn last_acquire_wait_ns(&self) -> u64 {
+        self.last_acquire_wait_ns
     }
 
     /// M3 phase B: record the screen's EDR maximum for this window (raw; the
@@ -2295,37 +2417,28 @@ pub struct GpuRenderer {
     /// The sparkle-word sprite coverage atlas (R8), rebuilt when the cell size
     /// changes. `None` until the first frame that carries decorations.
     deco_atlas: Option<DecoAtlas>,
-    /// SCENE ("Living Panels") sprite pipelines: `scene_over` (RGBA8 atlas, src-over,
-    /// sRGB view) draws the world UNDER the text; `scene_add` (One/One additive, Unorm
-    /// view) draws the sun/firefly/comet glow. Both reuse `vs_glyph` + the glyph layout.
-    scene_over_pipeline: wgpu::RenderPipeline,
-    scene_add_pipeline: wgpu::RenderPipeline,
-    /// The uploaded RGBA8 scene atlas texture + bind group, version-cached so it
-    /// re-uploads only on a skin/theme rebake. `None` until the first scene frame.
-    scene_atlas: Option<SceneTex>,
-    /// LINEAR sampler for the scene atlas (smooth sprite scaling — unlike the NEAREST
-    /// glyph `sampler`). Compatible with `atlas_bgl` (its sampler type is Filtering).
-    scene_sampler: wgpu::Sampler,
+    /// Shared RGBA8 sprite pipeline used by rain, cats, and free sprites.
+    sprite_over_pipeline: wgpu::RenderPipeline,
     /// The uploaded RGBA8 peeking-CAT atlas (Sparkle Words v2 `cat_quads`) +
-    /// bind group, version-cached like `scene_atlas` (re-uploads only when the
-    /// host `CatBaker` bumps `SceneAtlas::version`). Bound with the NEAREST
+    /// bind group, version-cached so it re-uploads only when the host
+    /// `CatBaker` bumps `SceneAtlas::version`. Bound with the NEAREST
     /// glyph `sampler` — cats are baked at exact destination size (1:1), so no
     /// filtering happens on either backend (the CPU stamp is integer-stepped
     /// NEAREST too). `None` until the first cat frame.
-    cat_atlas: Option<SceneTex>,
+    cat_atlas: Option<SpriteTex>,
     /// The uploaded RGBA8 FREE-sprite atlas (`RenderInput::free_atlas`, the
     /// arbitrary-rect `FreeSprite` layer) + bind group, version-cached like
     /// `cat_atlas`. Bound with the NEAREST glyph `sampler` — v1 free sprites are
     /// the cat regime (bake == dest size, 1:1; `FreeSampler::Linear` deferred).
     /// `None` until the first free-sprite frame.
-    free_atlas: Option<SceneTex>,
+    free_atlas: Option<SpriteTex>,
     /// The uploaded RGBA8 PHOSPHOR rain-glyph atlas (`RenderInput::rain_atlas`,
     /// the `RainBaker` white-coverage tiles) + bind group, version-cached like
     /// `cat_atlas`. Bound with the NEAREST glyph `sampler` — rain tiles are
     /// baked at exact cell size (1:1, the cat regime), so the GPU must read the
     /// same unfiltered texel the CPU's integer-stepped NEAREST stamp reads.
     /// `None` until the first rain frame.
-    rain_atlas: Option<SceneTex>,
+    rain_atlas: Option<SpriteTex>,
     /// Bloom tunables (config `cursor_trail_bloom_strength`/`_radius`), set via
     /// [`GpuRenderer::set_bloom_params`]. Default to [`BLOOM_STRENGTH`]/[`BLOOM_RADIUS`].
     bloom_strength: f32,
@@ -2466,6 +2579,12 @@ pub struct GpuRenderer {
     // frame's instances — the proportional-to-dirty-rows win the benchmark
     // reports.
     last_instances: usize,
+    // TEST/DIAGNOSTIC: how many render passes the LAST `encode_frame` opened on
+    // the offscreen attachment. Each pass is a full-framebuffer TBDR tile load +
+    // store (~23 MB at 3024x1964x4B) regardless of the dirty-row scissor, so this
+    // is the offscreen's per-frame bandwidth in units the pass coalescer moves —
+    // the observable the coalescing test pins.
+    last_frame_passes: u32,
     // NOTE: image_cache (GpuImageCache) and image_plane (Option<ImagePlane>) moved
     // to per-window `WindowGpu` so window B's inline images never leak into window
     // A — the shared GpuRenderer must hold no per-window image state.
@@ -2769,22 +2888,15 @@ struct Instances {
     /// drawn with the paw and under the cursor — the GPU twin of the CPU `Add`
     /// branch. Empty for a frame with no profanity match.
     wdeco_add: Vec<GlyphInstance>,
-    /// SCENE ("Living Panels") source-over sprite quads (the meadow/cat world), drawn
-    /// UNDER the text via `scene_over_pipeline`. Empty for a frame with no active scene.
-    scene_over: Vec<GlyphInstance>,
-    /// SCENE additive-light sprite quads (sun/fireflies/comet), drawn via
-    /// `scene_add_pipeline` (One/One). Empty when no scene light is live.
-    scene_add: Vec<GlyphInstance>,
     /// PHOSPHOR rain glyph sprites (`rain_quads`), drawn UNDER the text in
-    /// `emit_base_pre` BETWEEN `scene_over` and `cat_over` (cats walk on rain)
-    /// — same src-over scene pipeline, sampling the RAIN atlas through the
+    /// `emit_base_pre` before `cat_over` (cats walk on rain), sampling the RAIN atlas through the
     /// NEAREST sampler (bake == dest size, 1:1). Built UNCONDITIONALLY (no
     /// `row_active` filter), like cats/free: the dirty-band scissor clips, and
     /// `compute_dirty_rows`' band fill guarantees every admitted pixel lands on
     /// a rebuilt row. Empty for a rain-free frame.
     rain_under: Vec<GlyphInstance>,
     /// Peeking-CAT sprite quads (Sparkle Words v2 `cat_quads`), drawn UNDER the
-    /// text in `emit_base_pre` right after `scene_over` — same src-over pipeline,
+    /// text in `emit_base_pre` after rain — same src-over pipeline,
     /// but sampling the CAT atlas through the NEAREST sampler (bake == dest size,
     /// 1:1 — no filtering on either backend). Empty for a cat-free frame.
     cat_over: Vec<GlyphInstance>,
@@ -2826,8 +2938,6 @@ impl Instances {
         self.rain_add_over.clear();
         self.wdeco_over.clear();
         self.wdeco_add.clear();
-        self.scene_over.clear();
-        self.scene_add.clear();
         self.rain_under.clear();
         self.cat_over.clear();
         self.free_under.clear();
@@ -2868,8 +2978,6 @@ struct VertexBuffers {
     bloom_glow: VertexBuffer,
     wdeco_over: VertexBuffer,
     wdeco_add: VertexBuffer,
-    scene_over: VertexBuffer,
-    scene_add: VertexBuffer,
     rain_under: VertexBuffer,
     cat_over: VertexBuffer,
     free_under: VertexBuffer,
@@ -2903,8 +3011,6 @@ impl VertexBuffers {
             bloom_glow: VertexBuffer::new(device, "aterm-gpu bloom halo source (ungated glow)"),
             wdeco_over: VertexBuffer::new(device, "aterm-gpu sparkle-word paw instances"),
             wdeco_add: VertexBuffer::new(device, "aterm-gpu sparkle-word sparkle instances"),
-            scene_over: VertexBuffer::new(device, "aterm-gpu scene over instances"),
-            scene_add: VertexBuffer::new(device, "aterm-gpu scene add instances"),
             rain_under: VertexBuffer::new(device, "aterm-gpu rain under instances"),
             cat_over: VertexBuffer::new(device, "aterm-gpu cat over instances"),
             free_under: VertexBuffer::new(device, "aterm-gpu free under-text instances"),
@@ -3360,12 +3466,11 @@ struct ShimmerRegion {
 /// bind the atlas. Base over/replace pipelines target the sRGB view when `srgb`
 /// (downlevel/GLES falls back to the plain Unorm view — see header); the additive
 /// pipelines always target the plain Unorm view.
-/// The 13 per-cell-stream pipelines [`build_cell_pipelines`] returns, in
+/// The 12 per-cell-stream pipelines [`build_cell_pipelines`] returns, in
 /// declaration order: bg, cursor_blend, glyph, color_glyph, glow_add,
 /// rain_glow, rain_glow_over, fire_add, fire_over, deco_over, deco_add,
-/// scene_over, scene_add.
+/// and the shared RGBA8 sprite-over pipeline.
 type CellPipelines = (
-    wgpu::RenderPipeline,
     wgpu::RenderPipeline,
     wgpu::RenderPipeline,
     wgpu::RenderPipeline,
@@ -3790,12 +3895,8 @@ fn build_cell_pipelines(
         cache: None,
     });
 
-    // SCENE pipelines (Living Panels): mirror the deco pipelines exactly — same glyph
-    // layout/vertex/attrs, sampling an RGBA8 scene atlas bound in group 1. `scene_over`
-    // is ALPHA_BLENDING on the sRGB view (== the CPU pass-1c src-over stamp); `scene_add` is
-    // One/One premultiplied additive on the Unorm view, COLOR write-mask (== CPU add_sat)
-    // for the sun / firefly / comet glow.
-    let scene_over_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    // Shared RGBA8 sprite pipeline for rain, cats, and free sprites.
+    let sprite_over_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu scene-over pipeline"),
         layout: Some(&glyph_layout),
         vertex: wgpu::VertexState {
@@ -3813,7 +3914,7 @@ fn build_cell_pipelines(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_scene_over"),
+            entry_point: Some("fs_sprite_over"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: base_target,
@@ -3824,39 +3925,6 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
-    let scene_add_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu scene-add pipeline"),
-        layout: Some(&glyph_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_glyph"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<GlyphInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &GLYPH_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_scene_add"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: additive_target,
-                blend: Some(wgpu::BlendState {
-                    color: add,
-                    alpha: add,
-                }),
-                write_mask: wgpu::ColorWrites::COLOR,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-
     (
         bg_pipeline,
         cursor_blend_pipeline,
@@ -3869,8 +3937,7 @@ fn build_cell_pipelines(
         fire_over_pipeline,
         deco_over_pipeline,
         deco_add_pipeline,
-        scene_over_pipeline,
-        scene_add_pipeline,
+        sprite_over_pipeline,
     )
 }
 
@@ -4099,17 +4166,6 @@ impl GpuRenderer {
 
         let (uniform_buf, uniform_bgl, uniform_bg) = build_uniform_resources(device);
         let (atlas_bgl, sampler) = build_atlas_resources(device);
-        // LINEAR sampler for the SCENE atlas — the sprites scale to the band, so bilinear
-        // reads keep the cats/sky smooth (the glyph `sampler` is NEAREST for coverage
-        // exactness). `atlas_bgl`'s sampler binding is Filtering, so this is compatible.
-        let scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("aterm-gpu scene linear"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
-
         // Single source of truth for every offscreen colour-target format (see
         // crate::format_plan): base OVER/REPLACE + cursor + deco_over passes attach
         // off.view_srgb; the additive glow/deco-add, bloom, and tray passes attach
@@ -4128,8 +4184,7 @@ impl GpuRenderer {
             fire_over_pipeline,
             deco_over_pipeline,
             deco_add_pipeline,
-            scene_over_pipeline,
-            scene_add_pipeline,
+            sprite_over_pipeline,
         ) = build_cell_pipelines(
             device,
             &shader,
@@ -4187,10 +4242,7 @@ impl GpuRenderer {
             deco_over_pipeline,
             deco_add_pipeline,
             deco_atlas: None,
-            scene_over_pipeline,
-            scene_add_pipeline,
-            scene_atlas: None,
-            scene_sampler,
+            sprite_over_pipeline,
             cat_atlas: None,
             free_atlas: None,
             rain_atlas: None,
@@ -4234,6 +4286,7 @@ impl GpuRenderer {
             full_repaints: 0,
             tray_uploads: 0,
             last_instances: 0,
+            last_frame_passes: 0,
         })
     }
 
@@ -4263,10 +4316,20 @@ impl GpuRenderer {
         px: f32,
         theme: Theme,
     ) -> Result<(), String> {
-        self.set_font_family_theme_with(family, px, theme, Renderer::from_system_with_family)
+        // A configured family is strict: an unreadable, special, oversized, or
+        // rejected source fails the candidate rebuild instead of silently
+        // substituting the built-in face. Resolve before publishing either the
+        // family or theme so the complete prior renderer authority stays live.
+        let cpu = match family.as_deref() {
+            Some(configured) => Renderer::from_configured_font_family(configured, px, theme)?,
+            None => Renderer::from_system(px, theme).ok_or("no system monospace font")?,
+        };
+        self.font_family = family;
+        self.set_face(cpu, theme);
+        Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), test))]
     fn set_font_family_theme_with(
         &mut self,
         family: Option<String>,
@@ -4278,6 +4341,21 @@ impl GpuRenderer {
         self.font_family = family;
         self.set_face(cpu, theme);
         Ok(())
+    }
+
+    /// Install an already-admitted face and publish its configured family as
+    /// one frontend transaction. The caller performed source admission before
+    /// touching the live renderer, so this path must not rediscover or silently
+    /// substitute a font.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn install_prepared_font(
+        &mut self,
+        family: Option<String>,
+        renderer: Renderer,
+        theme: Theme,
+    ) {
+        self.font_family = family;
+        self.set_face(renderer, theme);
     }
 
     /// Swap in an already-built CPU face + theme IN PLACE (no device rebuild, no
@@ -4344,8 +4422,9 @@ impl GpuRenderer {
         self.resident_keys.clear();
         self.mono_res = None;
         self.color_res = None;
-        // Cat/free atlases: same belt as `invalidate_atlas` — version-keyed, so
-        // this only costs one re-upload on the next cat/free frame.
+        // Cat/free atlases: same belt as `invalidate_atlas` — identity-keyed
+        // (`Arc::ptr_eq`, see `SpriteTex::src`), so this only costs one
+        // re-upload on the next cat/free frame.
         self.cat_atlas = None;
         self.free_atlas = None;
     }
@@ -4678,6 +4757,37 @@ impl GpuRenderer {
         self.cpu.chrome_primary_face()
     }
 
+    /// Immutable source-path metadata for the wrapped primary generation.
+    #[must_use]
+    pub fn primary_source_path(&self) -> Option<&str> {
+        self.cpu.primary_source_path()
+    }
+
+    /// Exact Arc-backed source snapshot for the wrapped font generation. This is
+    /// filesystem-free and collision-free; see
+    /// [`aterm_render::Renderer::admitted_font_sources`].
+    #[must_use]
+    pub fn admitted_font_sources(&self) -> aterm_render::AdmittedFontSources {
+        self.cpu.admitted_font_sources()
+    }
+
+    /// Worker-only settlement of every path-backed face in the wrapped
+    /// generation. Native GUI code normally seals the CPU renderer before it is
+    /// installed into this wrapper; this forward keeps alternate hosts on the
+    /// same contract.
+    pub fn seal_admitted_font_sources(&mut self) -> aterm_render::AdmittedFontSources {
+        self.cpu.seal_admitted_font_sources()
+    }
+
+    /// Rebuild the wrapped font at `px`/`theme` using only the sealed retained
+    /// sources, preserving the GPU device/pipelines/surfaces and invalidating the
+    /// font-dependent atlases exactly once.
+    pub fn rebuild_font_from_admitted(&mut self, px: f32, theme: Theme) -> Result<(), String> {
+        let cpu = self.cpu.rebuild_from_admitted(px, theme)?;
+        self.set_face(cpu, theme);
+        Ok(())
+    }
+
     /// The wrapped CPU face's real BOLD sibling of the primary family for the
     /// GUI chrome. See [`Renderer::chrome_bold_face`].
     #[must_use]
@@ -4772,6 +4882,16 @@ impl GpuRenderer {
     #[must_use]
     pub fn last_instances(&self) -> usize {
         self.last_instances
+    }
+
+    /// TEST/DIAGNOSTIC: how many render passes the LAST encoded frame opened on
+    /// the offscreen. On a TBDR GPU each one is a whole-attachment tile load +
+    /// store that the dirty-row scissor cannot restrict, so this is the frame's
+    /// offscreen bandwidth multiplier — see the pass coalescer in `encode_frame`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_frame_passes(&self) -> u32 {
+        self.last_frame_passes
     }
 
     /// Cell size (pixels), straight from the CPU renderer so geometry matches.
@@ -5717,7 +5837,7 @@ impl GpuRenderer {
     /// offscreen by the SIGNED `input.scroll_frac_px` device pixels — UP for a
     /// positive glide residual, DOWN for a negative elastic-overscroll bounce — IN
     /// the offscreen texture, so both the on-glass blit and the readback see the
-    /// identical pixel-shifted frame. Chrome rows (the spliced tab strip / HUD /
+    /// identical pixel-shifted frame. Chrome rows (the spliced tab strip / edge bars /
     /// dividers, all OUTSIDE the band) are never touched — the chrome-invariance
     /// theorem.
     ///
@@ -5769,6 +5889,13 @@ impl GpuRenderer {
             (y0, y0 + mag)
         };
         let off_tex = off.tex.clone();
+        // This MUTATES the offscreen outside any encode scissor, so the throwaway
+        // present copy can no longer be trusted anywhere: force a full re-copy on
+        // the next `compose_present_offscreen`. (A sub-row-scroll frame also forces
+        // a full repaint and the in-place bake, so this is belt-and-braces — but
+        // the tracker's whole safety argument is that EVERY offscreen writer says
+        // so, not that the callers happen to be arranged safely.)
+        note_offscreen_written(win, None, (w, h));
         // Reuse the resident scratch when its dims already match; (re)create on the
         // first fractional frame or after a resize. COPY_DST (dest of the down-copy)
         // + COPY_SRC (source of the up-copy); same format as the offscreen so the
@@ -6057,20 +6184,40 @@ impl GpuRenderer {
     /// guaranteed on every backend, so this never fails. On macOS/Metal, Mailbox is NOT
     /// offered (wgpu-hal's Metal backend exposes only Fifo/Immediate), so this selects
     /// Fifo — plain vsync, tear-free.
-    /// The swapchain usage: `RENDER_ATTACHMENT`, plus `COPY_SRC` when the surface
-    /// caps offer it — the VIDEO-introspection frame tap copies the presented
-    /// texture (the exact bytes handed to present, including the swapchain-only
-    /// glow/chrome passes every offscreen readback structurally misses). Set once
-    /// at configure; on DX12 flip-model backbuffers are natively copyable so the
-    /// flag adds no per-frame cost. Returns (usage, copyable).
+    /// The swapchain usage at attach: `RENDER_ATTACHMENT` ONLY. Returns
+    /// `(usage, copyable)`, where `copyable` records merely that the surface caps
+    /// OFFER `COPY_SRC` — the VIDEO-introspection tap's support gate — without
+    /// configuring it.
+    ///
+    /// LATENCY: `COPY_SRC` used to be configured unconditionally whenever the caps
+    /// advertised it, and wgpu-hal's Metal backend ALWAYS advertises it. That is
+    /// not free on this platform: wgpu-hal sets
+    /// `CAMetalLayer.framebufferOnly = (usage == COLOR_TARGET)` exactly (see
+    /// wgpu-hal `metal/surface.rs`), so one extra usage bit flipped every window's
+    /// drawable to `framebufferOnly = NO` — which forfeits Metal's lossless
+    /// drawable compression for BOTH our blit's write and the WindowServer's
+    /// composite read of the same surface, on every frame, for a feature
+    /// (`win.video`) that is `None` unless an introspection recording is in
+    /// flight. The bandwidth tax landed squarely on the keystroke-echo frame.
+    /// The flag is now armed on demand instead — see the `want_copy_src`
+    /// reconcile in `present_input_with_crop`, which runs BEFORE the acquire so a
+    /// recording armed before the very first present still taps a copyable
+    /// drawable.
     fn surface_usage(caps: &wgpu::SurfaceCapabilities) -> (wgpu::TextureUsages, bool) {
         let copyable = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
-        let usage = if copyable {
+        (wgpu::TextureUsages::RENDER_ATTACHMENT, copyable)
+    }
+
+    /// The swapchain usage a window presenting with `recording` taps needs:
+    /// `RENDER_ATTACHMENT`, plus `COPY_SRC` only while a VIDEO tap is live AND the
+    /// surface caps offer it. Pure so the reconcile below and the test can share
+    /// one definition.
+    fn swapchain_usage_for(copyable: bool, recording: bool) -> wgpu::TextureUsages {
+        if copyable && recording {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
         } else {
             wgpu::TextureUsages::RENDER_ATTACHMENT
-        };
-        (usage, copyable)
+        }
     }
 
     fn pick_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
@@ -6082,7 +6229,34 @@ impl GpuRenderer {
         // pump, backed the echo pipeline up to ~180ms input->present — unusable
         // typing. Input latency wins over animation smoothness, unconditionally.)
         if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
+            return wgpu::PresentMode::Mailbox;
+        }
+        // macOS HAS NO MAILBOX — the preference above is DEAD on the platform aterm
+        // ships on, so this function always fell through to Fifo, the exact mode the
+        // comment above rules out "unconditionally". wgpu-hal's Metal backend
+        // advertises [Fifo, Immediate] and nothing else (metal/adapter.rs: present_modes),
+        // and Fifo maps to `CAMetalLayer.displaySyncEnabled = true` which — together
+        // with `setAllowsNextDrawableTimeout(false)` — makes `nextDrawable()` an
+        // UNBOUNDED block on the winit main thread once the drawable pool is
+        // exhausted. That park is what queues keyDowns in the NSEvent queue (measured
+        // at up to ~84ms; see `desired_frame_latency`). Immediate releases drawables as
+        // soon as the GPU is done rather than at vblank, so the acquire stops parking;
+        // WindowServer still composites at the display refresh, so a windowed surface
+        // does not tear.
+        //
+        // `ATERM_GPU_PRESENT_MODE=fifo` restores the old behavior in one flag.
+        let forced = std::env::var("ATERM_GPU_PRESENT_MODE").ok();
+        match forced.as_deref().map(str::trim) {
+            Some("fifo") => return wgpu::PresentMode::Fifo,
+            Some("immediate") if caps.present_modes.contains(&wgpu::PresentMode::Immediate) => {
+                return wgpu::PresentMode::Immediate;
+            }
+            _ => {}
+        }
+        if cfg!(target_os = "macos")
+            && caps.present_modes.contains(&wgpu::PresentMode::Immediate)
+        {
+            wgpu::PresentMode::Immediate
         } else {
             wgpu::PresentMode::Fifo
         }
@@ -6326,9 +6500,23 @@ impl GpuRenderer {
         // change (rare), so a steady present never re-creates the swapchain. The
         // matching `layer.opaque` / NSVisualEffectView toggles are driven from the
         // frontend (aterm-gui `apply_render_knob` / window attach).
+        //
+        // VIDEO tap: reconcile the swapchain USAGE the same way, in the same
+        // (rare) reconfigure. `COPY_SRC` is armed ONLY while a recording is in
+        // flight, because on Metal that one bit clears the drawable's
+        // `framebufferOnly` and costs the whole surface its lossless compression
+        // every frame (see `surface_usage`). Derived from `win.video` rather than
+        // from a separate flag so the tap and the usage CANNOT desync: the only
+        // consumer of `COPY_SRC` is `tap.enqueue_copy` below, which runs iff
+        // `win.video.is_some()`, and this reconcile runs before the acquire — so a
+        // recording armed before the window's very first present configures the
+        // copyable swapchain on that same present, and `video_finish` drops back to
+        // the compressed default on the next one.
         let want_alpha = Self::present_alpha_mode(self.cpu.background_opacity(), surf.post_mult);
-        if surf.config.alpha_mode != want_alpha {
+        let want_usage = Self::swapchain_usage_for(surf.copyable, win.video.is_some());
+        if surf.config.alpha_mode != want_alpha || surf.config.usage != want_usage {
             surf.config.alpha_mode = want_alpha;
+            surf.config.usage = want_usage;
             surf.surface.configure(&self.ctx.device, &surf.config);
         }
 
@@ -6338,6 +6526,14 @@ impl GpuRenderer {
         // longer matches; reconfigure and skip this frame (the next redraw
         // presents). Timeout/Occluded/Validation: skip this frame.
         use wgpu::CurrentSurfaceTexture as C;
+        // ACQUIRE WAIT — the single largest suspected typing stall on macOS, and
+        // until now the only slice of the present path with NO instrument: it fell
+        // between `note_pre_present` (which ends before this call) and
+        // `last_present_work_ns` (which starts after it), so it was inferable only as
+        // `redraw_total - compose - raster_submit`, contaminated by the post-present
+        // tail. A blocking `nextDrawable` here is what queues keyDowns in the OS
+        // event queue; measure it directly.
+        let acquire_started = std::time::Instant::now();
         let frame = match surf.surface.get_current_texture() {
             C::Success(f) | C::Suboptimal(f) => f,
             C::Outdated | C::Lost => {
@@ -6350,6 +6546,8 @@ impl GpuRenderer {
             C::Occluded => return Err(SurfacePresentFailure::Occluded),
             C::Validation => return Err(SurfacePresentFailure::Validation),
         };
+        win.last_acquire_wait_ns =
+            u64::try_from(acquire_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -6502,7 +6700,21 @@ impl GpuRenderer {
         // The offscreen stays a clean halo-free scissor base either way, so
         // `present_prev` diffing is unaffected.
         let use_present_off = fx_present && !bake_in_place;
-        if use_present_off && let Some(n) = self.compose_present_offscreen(win, input) {
+        // ONE command buffer for the rest of the present. The composite below and
+        // the letterbox blit further down used to commit SEPARATE Metal command
+        // buffers (a glow frame cost three commits: encode, composite, blit), and
+        // each commit is real driver work on the frame that carries the keystroke
+        // echo. Commands in one buffer execute in RECORD order, which is exactly
+        // the order the two submits produced, so nothing is reordered. Created
+        // here — AFTER the tray bake and the sub-row shift, which submit their own
+        // encoders — so those still land first.
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aterm-gpu present (composite + blit)"),
+            });
+        if use_present_off && let Some(n) = self.compose_present_offscreen(win, input, &mut enc) {
             ungated_built = Some(n);
         }
 
@@ -6744,12 +6956,6 @@ impl GpuRenderer {
             b: (bg & 0xff) as f64 / 255.0,
             a: 1.0,
         };
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu blit"),
-            });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("aterm-gpu blit pass"),
@@ -6980,9 +7186,12 @@ impl GpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: VIRTUAL_PRESENT_FORMAT,
-            // The usage a COPYABLE swapchain configures (`surface_usage` with
-            // COPY_SRC offered): render attachment for the blit pass, copy
-            // source for the tap.
+            // The usage a RECORDING swapchain configures
+            // (`swapchain_usage_for(copyable = true, recording = true)`): render
+            // attachment for the blit pass, copy source for the tap. The virtual
+            // target exists ONLY to serve a recording, so it carries COPY_SRC
+            // unconditionally — unlike the on-glass swapchain, which arms the bit
+            // only while a tap is live (it costs Metal drawable compression).
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -7368,6 +7577,12 @@ impl GpuRenderer {
         if matches!(&win.present_offscreen, Some(p) if p.w == w && p.h == h) {
             return;
         }
+        // A FRESH texture holds undefined texels, so the incremental copy in
+        // `compose_present_offscreen` has nothing valid to build on: force the
+        // next sync to be a full-frame copy. (Missing this would leak
+        // uninitialized tiles onto the glass for one frame after every resize.)
+        win.offscreen_dirty_since_sync = None;
+        win.present_offscreen_fx = None;
         let tex = self.ctx.offscreen_texture(w, h);
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         let src_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -7413,6 +7628,14 @@ impl GpuRenderer {
     /// (`present_offscreen`), never a Load-preserved scissor band, so there is
     /// nothing to clip and the light cannot accumulate. `glow_count > 0` is the
     /// caller's precondition.
+    ///
+    /// Returns the composite's FOOTPRINT on `target_view` — `Some([x0, y0, x1,
+    /// y1])` when the bbox scissor applied, `None` when the whole target was
+    /// covered. `compose_present_offscreen` needs it to know which part of its
+    /// throwaway copy diverges from the clean offscreen and must be re-copied next
+    /// frame; deriving it from the same code that sets the scissor keeps the two
+    /// from drifting apart (a footprint narrower than the real one would strand
+    /// last frame's halo on the glass).
     #[allow(
         clippy::too_many_arguments,
         reason = "one GPU pass encoder threading the encoder, target, uniforms and glyph buffers"
@@ -7426,7 +7649,8 @@ impl GpuRenderer {
         bbox: Option<[u32; 4]>,
         dims: (u32, u32),
         extract_first: u32,
-    ) {
+        fx_clip: Option<(u16, u16, u16, u16)>,
+    ) -> Option<[u32; 4]> {
         // Refresh the tunables for this target's half-res texel size.
         let bu = BloomUniform {
             texel: [1.0 / bt.bw as f32, 1.0 / bt.bh as f32],
@@ -7493,19 +7717,67 @@ impl GpuRenderer {
             // exactly 0 (One/One additive of 0 is a no-op), so this is
             // BYTE-EXACT — it just skips shading the dead majority of the
             // frame. A tiny/edge bbox that collapses falls back to no scissor.
-            if let Some([x0, y0, x1, y1]) = bbox {
+            // The FOCUSED-PANE fx clip (split-pane audit): the blur's dilated
+            // reach deliberately extends PAST the glow bbox, which on a split
+            // frame bled additive light across the divider into the neighbour
+            // pane. Intersect the composite scissor with the pane box so the
+            // spill is cut at the seam (the source quads are already
+            // host-clipped to the pane; only the painted spill needs fencing).
+            let clip = fx_clip.map(|(cx0, cy0, cx1, cy1)| {
+                [
+                    u32::from(cx0),
+                    u32::from(cy0),
+                    u32::from(cx1),
+                    u32::from(cy1),
+                ]
+            });
+            let (w, h) = dims;
+            let scissor = if let Some([x0, y0, x1, y1]) = bbox {
                 let d =
                     ((2.0 * self.bloom_radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32 + 1;
-                let (w, h) = dims;
                 let sx0 = x0.saturating_sub(d);
                 let sy0 = y0.saturating_sub(d);
                 let sx1 = (x1 + d).min(w);
                 let sy1 = (y1 + d).min(h);
-                if sx1 > sx0 && sy1 > sy0 {
+                Some([sx0, sy0, sx1, sy1])
+            } else {
+                // No bbox (edge/tiny collapse) previously meant whole-frame:
+                // a pane clip still bounds the composite.
+                clip.map(|_| [0, 0, w, h])
+            };
+            let scissor = match (scissor, clip) {
+                (Some([sx0, sy0, sx1, sy1]), Some([cx0, cy0, cx1, cy1])) => Some([
+                    sx0.max(cx0),
+                    sy0.max(cy0),
+                    sx1.min(cx1).min(w),
+                    sy1.min(cy1).min(h),
+                ]),
+                (s, None) => s,
+                (None, Some(_)) => unreachable!("clip-only case handled above"),
+            };
+            match (scissor, clip) {
+                (Some([sx0, sy0, sx1, sy1]), _) if sx1 > sx0 && sy1 > sy0 => {
                     pass.set_scissor_rect(sx0, sy0, sx1 - sx0, sy1 - sy0);
+                    pass.draw(0..3, 0..1);
+                    Some([sx0, sy0, sx1, sy1])
+                }
+                // An empty PANE intersection paints nothing (every candidate
+                // pixel lies beyond the pane box) — skip the draw entirely.
+                // Nothing was painted, so nothing diverges from the clean
+                // offscreen: report the EMPTY footprint, which is the caller's
+                // own encoding for "nothing" (it seeds `fx` with [0,0,0,0]) and
+                // which `union_rect_opt` absorbs. Reporting `None` here would
+                // claim the WHOLE target was covered and force a needless
+                // full re-copy every split frame.
+                (Some(_), Some(_)) => Some([0, 0, 0, 0]),
+                // Legacy collapse fallback (no pane clip): a tiny/edge bbox
+                // that collapses falls back to an unscissored draw, which
+                // covers the whole target — `None` in this contract.
+                (Some(_), None) | (None, _) => {
+                    pass.draw(0..3, 0..1);
+                    None
                 }
             }
-            pass.draw(0..3, 0..1);
         }
     }
 
@@ -7521,10 +7793,33 @@ impl GpuRenderer {
     /// offscreen resident. Returns the UNGATED glow instance count when the
     /// bloom built + uploaded `vbufs.bloom_glow` (the crown passes reuse the
     /// buffer), `None` when nothing was built (shimmer-only, or no offscreen).
+    ///
+    /// LATENCY — INCREMENTAL COPY. The sync used to be an unconditional
+    /// whole-texture `copy_texture_to_texture`: at 3024x1964x4B that is ~23 MB
+    /// read + ~23 MB write on EVERY glow frame, i.e. on every keystroke echo while
+    /// the comet is alive, to refresh (typically) one dirty text row. But
+    /// `present_offscreen` is a persistent texture, so last frame's copy is still
+    /// in it; the only places it can disagree with the clean offscreen are (a)
+    /// wherever the offscreen has since been written — tracked exactly, in
+    /// `offscreen_dirty_since_sync`, by the encode's own scissor rect — and (b)
+    /// wherever the LAST sync's effects wrote over the copy
+    /// (`present_offscreen_fx`). Copying that union restores the byte-exact clean
+    /// frame everywhere, so the composited result is identical to the full-copy
+    /// version while the traffic drops to the dirty band. Both trackers degrade to
+    /// `None` ("everything") for any writer that is not the scissored encode, so
+    /// the failure mode of an unaccounted writer is a full copy, not stale glass.
+    ///
+    /// LATENCY — ONE COMMAND BUFFER. `enc` is the CALLER's encoder (the same one
+    /// that records the letterbox blit), not a private one that submitted itself.
+    /// The glow present used to commit three command buffers per frame — encode,
+    /// composite, blit — and a Metal commit is not free on the latency path. GPU
+    /// order within one command buffer is exactly the record order, so folding the
+    /// composite into the blit encoder cannot reorder any pass.
     fn compose_present_offscreen(
         &mut self,
         win: &mut WindowGpu,
         input: &RenderInput,
+        enc: &mut wgpu::CommandEncoder,
     ) -> Option<u32> {
         let (w, h) = win.offscreen.as_ref().map(|o| (o.w, o.h))?;
         self.ensure_present_offscreen(win, w, h);
@@ -7543,61 +7838,89 @@ impl GpuRenderer {
         if shimmer_region.is_some() {
             self.ensure_shimmer_scratch(win, w, h);
         }
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aterm-gpu present-offscreen bloom composite"),
-            });
+        // What of the resident copy is no longer the clean offscreen: the rows the
+        // offscreen has been repainted in since the last sync, PLUS the region last
+        // sync's halo/haze wrote over the copy (dropping that term would leave the
+        // previous frame's halo baked into the copy — a smeared comet trail on
+        // glass). `None` on either side means "unknown" and forces the full copy.
+        let stale =
+            union_rect_opt(win.offscreen_dirty_since_sync, win.present_offscreen_fx, (w, h));
         let off = win.offscreen.as_ref().expect("offscreen resident");
         let po = win
             .present_offscreen
             .as_ref()
             .expect("ensure_present_offscreen set it");
-        // The clean base+aurora → present_offscreen (byte-exact same-format copy).
-        enc.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &off.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &po.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        // Composite the halo over the copy (whole frame — a throwaway target, so no
-        // scissor and no accumulation). An empty glow leaves the copy as the clean
-        // frame, exactly what a no-halo present blits.
+        // The clean base+aurora → present_offscreen (byte-exact same-format copy;
+        // a sub-rect copy of the same format is byte-exact over its extent, and
+        // every texel outside it already holds the identical clean pixel).
+        let copy_rect = stale.unwrap_or([0, 0, w, h]);
+        if copy_rect[2] > copy_rect[0] && copy_rect[3] > copy_rect[1] {
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &off.tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: copy_rect[0],
+                        y: copy_rect[1],
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &po.tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: copy_rect[0],
+                        y: copy_rect[1],
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: copy_rect[2] - copy_rect[0],
+                    height: copy_rect[3] - copy_rect[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        // Composite the halo over the copy (a throwaway target, so no accumulation
+        // — the copy above has already restored the clean frame everywhere the
+        // previous halo touched). An empty glow leaves the copy as the clean frame,
+        // exactly what a no-halo present blits.
+        let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
         if glow_count > 0
             && let Some(bt) = off.bloom.as_ref()
         {
-            self.encode_bloom_halo(
-                &mut enc,
+            let halo = self.encode_bloom_halo(
+                enc,
                 &po.view,
                 bt,
                 glow_count,
                 glow_bbox,
                 (w, h),
                 extract_first,
+                input.fx_clip,
             );
+            fx = union_rect_opt(fx, halo, (w, h));
         }
         // HEAT SHIMMER, after the halo: the haze refracts the FINISHED frame.
         // Same throwaway-target argument as the halo; a `None` region encodes
         // nothing, leaving the copy byte-identical to a shimmer-off present.
         if let Some(region) = &shimmer_region {
             let scratch = win.shimmer_scratch.as_ref().expect("ensured above");
-            self.encode_shimmer(&mut enc, scratch, &po.tex, &po.view, region);
+            self.encode_shimmer(enc, scratch, &po.tex, &po.view, region);
+            // `encode_shimmer` scissors its refraction pass to exactly this rect.
+            fx = union_rect_opt(
+                fx,
+                Some([region.x0, region.y0, region.x1, region.y1]),
+                (w, h),
+            );
         }
-        self.ctx.queue.submit([enc.finish()]);
+        // The copy now matches the offscreen everywhere except `fx`; record that so
+        // next frame copies back only what it must. (Deliberately AFTER the encode
+        // — an early return above must leave the trackers conservative.)
+        win.offscreen_dirty_since_sync = Some([0, 0, 0, 0]);
+        win.present_offscreen_fx = fx;
         self.enable_bloom.then_some(glow_count)
     }
 
@@ -7626,7 +7949,7 @@ impl GpuRenderer {
         let Some(bt) = off.bloom.as_ref() else {
             return glow_count;
         };
-        self.encode_bloom_halo(
+        let halo = self.encode_bloom_halo(
             &mut enc,
             &off.view,
             bt,
@@ -7634,8 +7957,13 @@ impl GpuRenderer {
             glow_bbox,
             dims,
             extract_first,
+            input.fx_clip,
         );
         self.ctx.queue.submit([enc.finish()]);
+        // Baked INTO the offscreen, outside any encode scissor: the throwaway
+        // present copy must re-copy at least this much (see
+        // `note_offscreen_written`).
+        note_offscreen_written(win, halo, dims);
         glow_count
     }
 
@@ -7694,6 +8022,27 @@ impl GpuRenderer {
         if x0 >= x1 || y0 >= y1 {
             return None;
         }
+        // FOCUSED-PANE fx clip (split-pane audit): the refraction pass both
+        // PAINTS haze over its region and SAMPLES displaced pixels within it
+        // (`region_min/max` drive the shader's sample clamp), so on a split
+        // frame an unfenced region near a divider hazed over — and refracted
+        // the text of — the NEIGHBOUR pane. Intersect the region rect with
+        // the pane box: the drawn haze AND the sample clamp both stop at the
+        // seam. The per-column heat bands stay anchored to the UNFENCED
+        // `band_x0`/`band_w` (computed below from the pre-clip x-range), so
+        // the surviving columns keep byte-identical heat.
+        let fx = input.fx_clip.map_or((0, 0, w, h), |(cx0, cy0, cx1, cy1)| {
+            (
+                u32::from(cx0),
+                u32::from(cy0),
+                u32::from(cx1),
+                u32::from(cy1),
+            )
+        });
+        let (rx0, ry0, rx1, ry1) = (x0.max(fx.0), y0.max(fx.1), x1.min(fx.2), y1.min(fx.3));
+        if rx0 >= rx1 || ry0 >= ry1 {
+            return None;
+        }
         // Per-column heat over the pass rect (the widened margins naturally
         // carry zero heat, so the haze dies out before the rolloff even acts).
         let band_w = (x1 - x0) as f32 / SHIMMER_BANDS as f32;
@@ -7723,14 +8072,16 @@ impl GpuRenderer {
             }
         }
         Some(ShimmerRegion {
-            x0,
-            y0,
-            x1,
-            y1,
+            x0: rx0,
+            y0: ry0,
+            x1: rx1,
+            y1: ry1,
             fw: w,
             fh: h,
             hot_top: hot_top as f32,
             rise,
+            // Band anchoring stays on the PRE-CLIP x-range (see the fx-clip
+            // note above): clipping the rect must not re-bin the heat.
             band_x0: x0 as f32,
             band_w,
             heat,
@@ -7923,6 +8274,14 @@ impl GpuRenderer {
         let scratch = win.shimmer_scratch.as_ref().expect("ensured above");
         self.encode_shimmer(&mut enc, scratch, &off.tex, &off.view, &region);
         self.ctx.queue.submit([enc.finish()]);
+        // Refracted INTO the offscreen, outside any encode scissor: the throwaway
+        // present copy must re-copy at least the region rect the pass scissored to
+        // (see `note_offscreen_written`).
+        note_offscreen_written(
+            win,
+            Some([region.x0, region.y0, region.x1, region.y1]),
+            (w, h),
+        );
     }
 
     /// TEST HELPER (byte-identity gate): run the SCISSORED present-path encode for
@@ -7945,7 +8304,18 @@ impl GpuRenderer {
         let tex = if (self.enable_bloom && !input.cursor_glow_add.is_empty())
             || self.shimmer_live(input)
         {
-            self.compose_present_offscreen(win, input);
+            // `compose_present_offscreen` records into the CALLER's encoder (the
+            // on-glass path folds it into the blit's command buffer); this arm has
+            // no blit, so it owns and submits one — the readback below must see
+            // the composited texels.
+            let mut enc =
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("aterm-gpu readback present-offscreen composite"),
+                    });
+            self.compose_present_offscreen(win, input, &mut enc);
+            self.ctx.queue.submit([enc.finish()]);
             win.present_offscreen
                 .as_ref()
                 .expect("compose_present_offscreen set it")
@@ -7977,9 +8347,10 @@ impl GpuRenderer {
     /// TEST HELPER (the present-real theorem's SWAPCHAIN arm): run the REAL
     /// swapchain present — the SAME [`Self::present_to_view`] compose-and-blit
     /// seam `present_input` runs after its acquire — against a fresh stand-in
-    /// texture carrying exactly a copyable swapchain's configuration (the
-    /// `surface_usage` `RENDER_ATTACHMENT | COPY_SRC`, the `pick_surface_format`
-    /// SDR default), sized `(w, h)` like the true window client area. The
+    /// texture carrying exactly a RECORDING swapchain's configuration
+    /// (`swapchain_usage_for(true, true)` == `RENDER_ATTACHMENT | COPY_SRC`, the
+    /// `pick_surface_format` SDR default), sized `(w, h)` like the true window
+    /// client area. The
     /// window's VIDEO tap (arm it with [`Self::video_begin_standin_for_test`])
     /// copies the presented bytes in the same encoder, exactly as on glass; only
     /// `present()` — pure WSI, no pixel effect — is absent, since a headless
@@ -8664,6 +9035,10 @@ impl GpuRenderer {
             let off = win.offscreen.as_ref().expect("encode_frame sets offscreen");
             (off.w, off.h)
         };
+        // The card composites into the offscreen outside any encode scissor —
+        // invalidate the throwaway present copy's incremental sync (see
+        // `note_offscreen_written`).
+        note_offscreen_written(win, None, (fw, fh));
         let want = TrayUniform {
             rect: [
                 tray.dx as f32,
@@ -8850,140 +9225,20 @@ impl GpuRenderer {
             .expect("GPU poll failed");
     }
 
-    /// Build the atlas + instances, encode the single render pass onto the
-    /// RESIDENT offscreen target (`win.offscreen`, reused at the same `(w, h)`
-    /// and rebuilt only on a resize), and submit. Returns the frame's `(w, h)`;
-    /// the rendered texture (+ its blit-source bind group) live on
-    /// `win.offscreen` for the caller to read back or present.
-    ///
-    /// `scope` selects FULL (Clear + every row — the always-correct path,
-    /// byte-identical to the original encode) or SCISSORED (`RepaintScope::Dirty`):
-    /// the offscreen already holds the prior frame, so we preserve it with
-    /// `LoadOp::Load`, build instances ONLY for the dirty rows, and scissor the
-    /// pass to the dirty rows' bounding band. A re-shaded dirty row gets the
-    /// IDENTICAL instances (same values, same order) the full path would build for
-    /// it, and rows are disjoint vertical bands (double-HEIGHT, the only cross-band
-    /// case, forces FULL), so the scissored band is bit-identical to a full render
-    /// and the untouched rows are preserved verbatim.
-    ///
-    /// SPEC: the bg-instance path of this method is the real implementation of the
-    /// external `GpuEncode.tla` model (TRUST_NATIVE_TLA Phase 2, GPU FRAME-ENCODE
-    /// safety). The CPU cell walk that `bg_inst.push(BgInstance { … })` per
-    /// non-default-bg cell is the spec's `Append`; the frame encode that uploads +
-    /// slices `bg_buf` is `Encode`, gated by [`should_slice`] (the real
-    /// `NeverSliceEmpty` precondition — slice ONLY when `bgInst > 0`, the exact
-    /// 4ab4eb9 fix for the empty-buffer wgpu panic). Tier-1 conformance drives the
-    /// real [`should_slice`] decision over the bg-instance count
-    /// (`tests/conformance_gpuencode.rs`); the full GPU encode needs a live device,
-    /// so the slice DECISION is what is bound, which is exactly the modeled property.
-    // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): both actions project the real
-    // bg-instance buffer onto the spec's `<<bgInst, sliced>>` — `Append` bumps the
-    // instance count, `Encode` is the `should_slice`-gated slice decision. The
-    // projection `conformance_gpuencode.rs` drives is named `aterm_gpu::renderer::
-    // project_bg_encode`; L2 requires the projection NAME be present (Trust does not
-    // execute it — the slice DECISION is the aterm-side Tier-1 binding).
-    #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
-            machine = "gpu_encode",
-            action = "Append",
-            project = "aterm_gpu::renderer::project_bg_encode"
-        )
-    )]
-    /// (Re)upload the SCENE atlas texture when the frame carries one whose `version`
-    /// differs from the resident copy (a skin/theme rebake), or clear it when the frame
-    /// has no scene atlas. RGBA8Unorm, sampled by the scene pipelines through `atlas_bgl`
-    /// with the LINEAR `scene_sampler`. The atlas width (512) makes `bytes_per_row` (2048)
-    /// a multiple of 256, so no row padding is needed.
-    fn ensure_scene_atlas(&mut self, input: &RenderInput) {
-        let Some(src) = input.scene_atlas.as_deref() else {
-            self.scene_atlas = None;
-            return;
-        };
-        let need = (src.width as usize)
-            .saturating_mul(src.height as usize)
-            .saturating_mul(4);
-        if src.width == 0 || src.height == 0 || src.rgba.len() < need {
-            self.scene_atlas = None;
-            return;
-        }
-        if matches!(&self.scene_atlas, Some(s) if s.version == src.version && s.w == src.width && s.h == src.height)
-        {
-            return;
-        }
-        let device = &self.ctx.device;
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu scene atlas"),
-            size: wgpu::Extent3d {
-                width: src.width,
-                height: src.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &src.rgba[..need],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(src.width * 4),
-                rows_per_image: Some(src.height),
-            },
-            wgpu::Extent3d {
-                width: src.width,
-                height: src.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("aterm-gpu scene atlas bind"),
-                layout: &self.atlas_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
-                    },
-                ],
-            });
-        self.scene_atlas = Some(SceneTex {
-            bind,
-            w: src.width,
-            h: src.height,
-            version: src.version,
-        });
-    }
-
     /// (Re)upload the peeking-CAT atlas (Sparkle Words v2 `cat_quads`) when the frame
-    /// carries one whose `version` differs from the resident copy (a `CatBaker` rebake —
-    /// blink frame, cell-metric change), or clear it when the frame has no cat atlas.
-    /// The `ensure_scene_atlas` pattern verbatim, with ONE deliberate difference: the
-    /// bind group carries the NEAREST glyph `sampler`, not the LINEAR `scene_sampler` —
+    /// carries a DIFFERENT published snapshot than the resident copy (`Arc::ptr_eq`
+    /// on `SpriteTex::src` — a rebake publishes a fresh `Arc`; blink frame,
+    /// cell-metric change), or clear it when the frame has no cat atlas.
+    /// The bind group carries the NEAREST glyph `sampler` —
     /// cats are baked at exact destination size (1:1), so the GPU must read the same
     /// unfiltered texel the CPU's integer-stepped NEAREST stamp reads (§5.1's two
     /// sampling regimes).
     fn ensure_cat_atlas(&mut self, input: &RenderInput) {
-        let Some(src) = input.cat_atlas.as_deref() else {
+        let Some(src_arc) = input.cat_atlas.as_ref() else {
             self.cat_atlas = None;
             return;
         };
+        let src = src_arc.as_ref();
         let need = (src.width as usize)
             .saturating_mul(src.height as usize)
             .saturating_mul(4);
@@ -8991,8 +9246,8 @@ impl GpuRenderer {
             self.cat_atlas = None;
             return;
         }
-        if matches!(&self.cat_atlas, Some(s) if s.version == src.version && s.w == src.width && s.h == src.height)
-        {
+        // Identity skip, not `(version, w, h)`: see `SpriteTex::src`.
+        if matches!(&self.cat_atlas, Some(s) if Arc::ptr_eq(&s.src, src_arc)) {
             return;
         }
         let device = &self.ctx.device;
@@ -9048,26 +9303,27 @@ impl GpuRenderer {
                     },
                 ],
             });
-        self.cat_atlas = Some(SceneTex {
+        self.cat_atlas = Some(SpriteTex {
             bind,
             w: src.width,
             h: src.height,
-            version: src.version,
+            src: Arc::clone(src_arc),
         });
     }
 
     /// (Re)upload the FREE-sprite atlas (`RenderInput::free_atlas`, the
-    /// arbitrary-rect `FreeSprite` layer) when the frame carries one whose
-    /// `version` differs from the resident copy, or clear it when the frame has
-    /// no free atlas. The `ensure_cat_atlas` pattern verbatim: ONE bind group
+    /// arbitrary-rect `FreeSprite` layer) when the frame carries a different
+    /// published snapshot than the resident copy (`Arc::ptr_eq`, see
+    /// `SpriteTex::src`), or clear it when the frame has no free atlas. The `ensure_cat_atlas` pattern verbatim: ONE bind group
     /// over `atlas_bgl` carrying the NEAREST glyph `sampler` — v1 free sprites
     /// are the cat regime (bake == dest size, 1:1; `FreeSampler::Linear` and its
     /// LINEAR bind group are deferred).
     fn ensure_free_atlas(&mut self, input: &RenderInput) {
-        let Some(src) = input.free_atlas.as_deref() else {
+        let Some(src_arc) = input.free_atlas.as_ref() else {
             self.free_atlas = None;
             return;
         };
+        let src = src_arc.as_ref();
         let need = (src.width as usize)
             .saturating_mul(src.height as usize)
             .saturating_mul(4);
@@ -9075,8 +9331,8 @@ impl GpuRenderer {
             self.free_atlas = None;
             return;
         }
-        if matches!(&self.free_atlas, Some(s) if s.version == src.version && s.w == src.width && s.h == src.height)
-        {
+        // Identity skip, not `(version, w, h)`: see `SpriteTex::src`.
+        if matches!(&self.free_atlas, Some(s) if Arc::ptr_eq(&s.src, src_arc)) {
             return;
         }
         let device = &self.ctx.device;
@@ -9132,27 +9388,29 @@ impl GpuRenderer {
                     },
                 ],
             });
-        self.free_atlas = Some(SceneTex {
+        self.free_atlas = Some(SpriteTex {
             bind,
             w: src.width,
             h: src.height,
-            version: src.version,
+            src: Arc::clone(src_arc),
         });
     }
 
     /// (Re)upload the PHOSPHOR rain-glyph atlas (`RenderInput::rain_atlas`, the
-    /// `RainBaker` white-coverage tiles) when the frame carries one whose
-    /// `version` differs from the resident copy (a rebake — cell-metric or ramp
-    /// change), or clear it when the frame has no rain atlas. The
+    /// `RainBaker` white-coverage tiles) when the frame carries a different
+    /// published snapshot than the resident copy (`Arc::ptr_eq`, see
+    /// `SpriteTex::src` — a rebake publishes a fresh `Arc`; cell-metric or
+    /// ramp change), or clear it when the frame has no rain atlas. The
     /// `ensure_cat_atlas` pattern verbatim: ONE bind group over `atlas_bgl`
     /// carrying the NEAREST glyph `sampler` — rain tiles are baked at exact
     /// cell size (1:1, the cat regime), so the GPU must read the same
     /// unfiltered texel the CPU's integer-stepped NEAREST stamp reads.
     fn ensure_rain_atlas(&mut self, input: &RenderInput) {
-        let Some(src) = input.rain_atlas.as_deref() else {
+        let Some(src_arc) = input.rain_atlas.as_ref() else {
             self.rain_atlas = None;
             return;
         };
+        let src = src_arc.as_ref();
         let need = (src.width as usize)
             .saturating_mul(src.height as usize)
             .saturating_mul(4);
@@ -9160,8 +9418,10 @@ impl GpuRenderer {
             self.rain_atlas = None;
             return;
         }
-        if matches!(&self.rain_atlas, Some(s) if s.version == src.version && s.w == src.width && s.h == src.height)
-        {
+        // Identity skip, not `(version, w, h)`: baker versions replay across
+        // rebuilt engines (deterministic fingerprints), so a version key
+        // aliases stale texels — see `SpriteTex::src` (split-pane audit).
+        if matches!(&self.rain_atlas, Some(s) if Arc::ptr_eq(&s.src, src_arc)) {
             return;
         }
         let device = &self.ctx.device;
@@ -9217,14 +9477,59 @@ impl GpuRenderer {
                     },
                 ],
             });
-        self.rain_atlas = Some(SceneTex {
+        self.rain_atlas = Some(SpriteTex {
             bind,
             w: src.width,
             h: src.height,
-            version: src.version,
+            src: Arc::clone(src_arc),
         });
     }
 
+    /// Build the atlas + instances, encode the single render pass onto the
+    /// RESIDENT offscreen target (`win.offscreen`, reused at the same `(w, h)`
+    /// and rebuilt only on a resize), and submit. Returns the frame's `(w, h)`;
+    /// the rendered texture (+ its blit-source bind group) live on
+    /// `win.offscreen` for the caller to read back or present.
+    ///
+    /// `scope` selects FULL (Clear + every row — the always-correct path,
+    /// byte-identical to the original encode) or SCISSORED (`RepaintScope::Dirty`):
+    /// the offscreen already holds the prior frame, so we preserve it with
+    /// `LoadOp::Load`, build instances ONLY for the dirty rows, and scissor the
+    /// pass to the dirty rows' bounding band. A re-shaded dirty row gets the
+    /// IDENTICAL instances (same values, same order) the full path would build for
+    /// it, and rows are disjoint vertical bands (double-HEIGHT, the only cross-band
+    /// case, forces FULL), so the scissored band is bit-identical to a full render
+    /// and the untouched rows are preserved verbatim.
+    ///
+    /// SPEC: the bg-instance path of this method is the real implementation of the
+    /// external `GpuEncode.tla` model (TRUST_NATIVE_TLA Phase 2, GPU FRAME-ENCODE
+    /// safety). The CPU cell walk that `bg_inst.push(BgInstance { … })` per
+    /// non-default-bg cell is the spec's `Append`; the frame encode that uploads +
+    /// slices `bg_buf` is `Encode`, gated by [`should_slice`] (the real
+    /// `NeverSliceEmpty` precondition — slice ONLY when `bgInst > 0`, the exact
+    /// 4ab4eb9 fix for the empty-buffer wgpu panic). Tier-1 conformance drives the
+    /// real [`should_slice`] decision over the bg-instance count
+    /// (`tests/conformance_gpuencode.rs`); the full GPU encode needs a live device,
+    /// so the slice DECISION is what is bound, which is exactly the modeled property.
+    // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): both actions project the real
+    // bg-instance buffer onto the spec's `<<bgInst, sliced>>` — `Append` bumps the
+    // instance count, `Encode` is the `should_slice`-gated slice decision. The
+    // projection `conformance_gpuencode.rs` drives is named `aterm_gpu::renderer::
+    // project_bg_encode`; L2 requires the projection NAME be present (Trust does not
+    // execute it — the slice DECISION is the aterm-side Tier-1 binding).
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "gpu_encode",
+            action = "Append",
+            project = "aterm_gpu::renderer::project_bg_encode"
+        )
+    )]
+    // (post-merge re-audit) This doc block + the `Append` anchor had been
+    // stranded above `ensure_cat_atlas` when that helper was inserted between
+    // them and `encode_frame` — doc comments are attributes, so the spec
+    // anchor silently bound to the WRONG method. Both anchors now attach to
+    // `encode_frame`, the method the SPEC paragraph actually describes.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -9308,10 +9613,9 @@ impl GpuRenderer {
         // underline can appear on any frame, and the rebuild check is a cheap
         // per-frame no-op once the atlas matches the geometry.
         self.ensure_deco_atlas(cw, ch);
-        // SCENE atlas upload (version-cached) — done HERE, before the `&self` atlas/glyph
-        // borrows below, since it takes `&mut self`. A no-op when the frame has no scene.
-        self.ensure_scene_atlas(input);
-        // CAT atlas upload, beside the scene's (version-keyed on `cat_atlas.version`).
+        // Sprite atlas uploads (version-cached) happen HERE, before the
+        // `&self` atlas/glyph borrows below, since they take `&mut self`.
+        // CAT atlas upload is version-keyed on `cat_atlas.version`.
         self.ensure_cat_atlas(input);
         // FREE-sprite atlas upload, the same version-keyed pattern.
         self.ensure_free_atlas(input);
@@ -10772,10 +11076,10 @@ impl GpuRenderer {
         // CLEARS the target (LoadOp::Clear) — matching the CPU's all-background
         // frame. We also slice each buffer to EXACTLY this frame's byte length so
         // stale tail bytes from a larger previous frame are never bound or drawn.
-        // SCENE ("Living Panels") + CAT: build this frame's sprite instances (SpriteQuad →
+        // Build this frame's sprite instances (SpriteQuad →
         // GlyphInstance) for the already-uploaded atlases. UVs normalize against each
-        // atlas's texel dims; `flip_x` mirrors the source-u window. Empty when no scene/cat.
-        fn build_scene(
+        // atlas's texel dims; `flip_x` mirrors the source-u window.
+        fn build_sprites(
             dst: &mut Vec<GlyphInstance>,
             quads: &[aterm_core::render::SpriteQuad],
             saw: f32,
@@ -10807,33 +11111,13 @@ impl GpuRenderer {
                         (q.tint & 0xff) as u8,
                         q.alpha,
                     ],
-                    // W2: scene sprites blend un-remapped (fs_scene_*): bg unused.
+                    // Sprite textures blend un-remapped: bg unused.
                     bg: [0, 0, 0, 0],
                 });
             }
         }
         let padf = pad as f32;
         let grid_topf = grid_top as f32;
-        if let Some((saw, sah)) = self.scene_atlas.as_ref().map(|s| (s.w as f32, s.h as f32)) {
-            build_scene(
-                &mut self.inst.scene_over,
-                &input.scene_over,
-                saw,
-                sah,
-                padf,
-                grid_topf,
-                |_| true,
-            );
-            build_scene(
-                &mut self.inst.scene_add,
-                &input.scene_add,
-                saw,
-                sah,
-                padf,
-                grid_topf,
-                |_| true,
-            );
-        }
         // PHOSPHOR rain sprites (`rain_quads`): the same SpriteQuad → GlyphInstance
         // build against the RAIN atlas dims (NEAREST, 1:1 — the cat regime).
         // ROW-FILTERED by `row_active` (round-3 audit): every rain quad is
@@ -10845,7 +11129,7 @@ impl GpuRenderer {
         // A sparse-damage frame during a 2048-quad downpour thus builds and
         // uploads only the dirty rows' instances instead of the whole field.
         if let Some((raw, rah)) = self.rain_atlas.as_ref().map(|s| (s.w as f32, s.h as f32)) {
-            build_scene(
+            build_sprites(
                 &mut self.inst.rain_under,
                 &input.rain_quads,
                 raw,
@@ -10860,7 +11144,7 @@ impl GpuRenderer {
         // src-over scene pipeline but bind the CAT atlas group, whose sampler is
         // NEAREST (bake == dest size, 1:1 — no filtering on either backend).
         if let Some((caw, cah)) = self.cat_atlas.as_ref().map(|s| (s.w as f32, s.h as f32)) {
-            build_scene(
+            build_sprites(
                 &mut self.inst.cat_over,
                 &input.cat_quads,
                 caw,
@@ -10917,15 +11201,14 @@ impl GpuRenderer {
                         (s.tint & 0xff) as u8,
                         s.alpha,
                     ],
-                    // W2: free sprites blend un-remapped (fs_scene_over): bg unused.
+                    // W2: free sprites blend un-remapped (fs_sprite_over): bg unused.
                     bg: [0, 0, 0, 0],
                 });
             }
         }
-        // Scene/cat/free atlas bind groups for the draws below (None when absent this
+        // Cat/free/rain atlas bind groups for the draws below (None when absent this
         // frame; the corresponding streams are then empty, so the draw_stream gate
         // skips them).
-        let scene_bind = self.scene_atlas.as_ref().map(|s| &s.bind);
         let cat_bind = self.cat_atlas.as_ref().map(|s| &s.bind);
         let free_bind = self.free_atlas.as_ref().map(|s| &s.bind);
         let rain_bind = self.rain_atlas.as_ref().map(|s| &s.bind);
@@ -11016,15 +11299,6 @@ impl GpuRenderer {
             self.vbufs
                 .wdeco_add
                 .upload(device, queue, bytemuck::cast_slice(&self.inst.wdeco_add));
-        let scene_over_buf = self.vbufs.scene_over.upload(
-            device,
-            queue,
-            bytemuck::cast_slice(&self.inst.scene_over),
-        );
-        let scene_add_buf =
-            self.vbufs
-                .scene_add
-                .upload(device, queue, bytemuck::cast_slice(&self.inst.scene_add));
         let rain_under_buf = self.vbufs.rain_under.upload(
             device,
             queue,
@@ -11218,6 +11492,18 @@ impl GpuRenderer {
                 )
             }
         };
+        // Tell the throwaway present copy how much of the offscreen this encode is
+        // about to invalidate. The scissor rect is EXACT — it clips every draw in
+        // every pass below — so a scissored typing frame lets
+        // `compose_present_offscreen` re-copy the dirty band instead of the whole
+        // 23 MB frame. A FULL repaint (scissor `None`) rewrites everything and so
+        // reports `None`; a recreate already reported `None` via
+        // `ensure_present_offscreen`'s sibling reset when the copy is rebuilt.
+        note_offscreen_written(
+            win,
+            scissor.map(|(sx, sy, sw, sh)| [sx, sy, sx + sw, sy + sh]),
+            (w, h),
+        );
 
         let off = win.offscreen.as_ref().expect("offscreen set above");
         // Base OVER/REPLACE passes attach the sRGB-typed `view_srgb` so fixed-function
@@ -11276,8 +11562,6 @@ impl GpuRenderer {
             FireOver,
             DecoOver,
             DecoAdd,
-            SceneOver,
-            SceneAdd,
             RainUnder,
             CatOver,
             FreeUnder,
@@ -11289,7 +11573,6 @@ impl GpuRenderer {
             Color,
             Image,
             Deco,
-            Scene,
             Rain,
             Cat,
             Free,
@@ -11363,20 +11646,8 @@ impl GpuRenderer {
                     &self.bg_pipeline,
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
-                // SCENE world sprites, UNDER the text (after the cell bg, before glyphs).
-                draw_stream!(
-                    $p,
-                    $cp,
-                    $ca,
-                    scene_over_buf,
-                    self.inst.scene_over,
-                    Pipe::SceneOver,
-                    &self.scene_over_pipeline,
-                    scene_bind.map(|b| (Atlas::Scene, b))
-                );
-                // PHOSPHOR rain sprites, right after scene_over and BEFORE the
-                // cats — the CPU stamps rain in pass 1c between scene_over and
-                // cat_quads, so cats walk ON rain by construction. Same src-over
+                // PHOSPHOR rain sprites, before the cats and glyphs, so cats
+                // walk on rain by construction. Same src-over
                 // pipeline; the RAIN atlas bind group carries the NEAREST
                 // sampler (1:1 regime).
                 draw_stream!(
@@ -11386,12 +11657,12 @@ impl GpuRenderer {
                     rain_under_buf,
                     self.inst.rain_under,
                     Pipe::RainUnder,
-                    &self.scene_over_pipeline,
+                    &self.sprite_over_pipeline,
                     rain_bind.map(|b| (Atlas::Rain, b))
                 );
-                // Peeking-CAT sprites, right after scene_over — the same under-text
-                // slot (the CPU stamps both in pass 1c inside render_row, so the
-                // z-order matches by construction). Same src-over pipeline; the CAT
+                // Peeking-CAT sprites in the same under-text slot (the CPU stamps
+                // both in pass 1c inside render_row, so the z-order matches by
+                // construction). Same src-over pipeline; the CAT
                 // atlas bind group carries the NEAREST sampler (1:1 regime).
                 draw_stream!(
                     $p,
@@ -11400,12 +11671,12 @@ impl GpuRenderer {
                     cat_over_buf,
                     self.inst.cat_over,
                     Pipe::CatOver,
-                    &self.scene_over_pipeline,
+                    &self.sprite_over_pipeline,
                     cat_bind.map(|b| (Atlas::Cat, b))
                 );
                 // FREE-floating UNDER-TEXT sprites, right after cat_over and
                 // before the glyphs: free under-sprites draw OVER legacy
-                // scene/cat and UNDER text. Same src-over pipeline; the FREE
+                // cats and UNDER text. Same src-over pipeline; the FREE
                 // atlas bind group carries the NEAREST sampler (v1 regime).
                 draw_stream!(
                     $p,
@@ -11414,7 +11685,7 @@ impl GpuRenderer {
                     free_under_buf,
                     self.inst.free_under,
                     Pipe::FreeUnder,
-                    &self.scene_over_pipeline,
+                    &self.sprite_over_pipeline,
                     free_bind.map(|b| (Atlas::Free, b))
                 );
                 // Comet EMBER BED (cursor motion trail): pre-blended solid
@@ -11568,15 +11839,11 @@ impl GpuRenderer {
                 // CPU phase B2b.)
             };
         }
-        // The historical fused base emit: bg half then fg half, back-to-back in
-        // the SAME pass — used whenever `glow_under` is empty, so every
-        // glow_under-free frame issues the EXACT pre-split draw sequence.
-        macro_rules! emit_base_pre {
-            ($p:ident, $cp:ident, $ca:ident) => {
-                emit_base_bg!($p, $cp, $ca);
-                emit_base_fg!($p, $cp, $ca);
-            };
-        }
+        // (The historical fused `emit_base_pre` — bg half then fg half in ONE
+        // pass — is no longer a separate macro: the pass coalescer below puts the
+        // two halves in the same pass automatically whenever the `glow_under`
+        // group that would separate them is empty, which is every glow_under-free
+        // frame. Same two emits, same order, same pass.)
         macro_rules! emit_glow {
             ($p:ident, $cp:ident, $ca:ident) => {
                 // LUMEN aurora: PREMULTIPLIED ADDITIVE light, on the Unorm view.
@@ -11662,21 +11929,6 @@ impl GpuRenderer {
                 );
             };
         }
-        macro_rules! emit_scene_add {
-            ($p:ident, $cp:ident, $ca:ident) => {
-                // SCENE additive light (sun/fireflies/comet), on the Unorm view.
-                draw_stream!(
-                    $p,
-                    $cp,
-                    $ca,
-                    scene_add_buf,
-                    self.inst.scene_add,
-                    Pipe::SceneAdd,
-                    &self.scene_add_pipeline,
-                    scene_bind.map(|b| (Atlas::Scene, b))
-                );
-            };
-        }
         macro_rules! emit_wdeco_over {
             ($p:ident, $cp:ident, $ca:ident) => {
                 // Sparkle-word "paw" decoration (ALPHA_BLENDING) — sRGB view.
@@ -11707,7 +11959,7 @@ impl GpuRenderer {
                     free_over_buf,
                     self.inst.free_over,
                     Pipe::FreeOver,
-                    &self.scene_over_pipeline,
+                    &self.sprite_over_pipeline,
                     free_bind.map(|b| (Atlas::Free, b))
                 );
             };
@@ -11786,146 +12038,137 @@ impl GpuRenderer {
 
         // The ADDITIVE streams (glow aurora, sparkle-add) — and the HaloMode::Over
         // radial veils, which ride the same pass — must composite on the Unorm
-        // view (byte-exact add / source-over). When ALL are empty — the common
-        // case and every parity test — the whole frame is ONE sRGB pass (no extra
-        // TBDR tile round-trips). Otherwise split, keeping the EXACT draw order:
-        //   A(sRGB) bg..curl | B(Unorm) glow | C(sRGB) wdeco_over | D(Unorm)
-        //   wdeco_add | E(sRGB) cursor.
-        // A live `glow_under` (EMBERFORGE flame body) splits pass A itself —
-        //   A1(sRGB) bg..trail | A2(Unorm) glow_under | A3(sRGB) glyph..curl
-        // — so its light lands UNDER the glyph ink; a glow_under-free frame never
-        // opens A2/A3 (the fused pass A is byte-identical to before).
-        let has_additive = !self.inst.glow_add.is_empty()
-            || !self.inst.glow_halo.is_empty()
-            || !self.inst.glow_halo_over.is_empty()
-            || !self.inst.glow_under.is_empty()
-            || !self.inst.fire_add.is_empty()
-            || !self.inst.fire_over.is_empty()
-            || !self.inst.nova_add.is_empty()
-            || !self.inst.rain_add.is_empty()
-            || !self.inst.rain_add_over.is_empty()
-            || !self.inst.wdeco_add.is_empty()
-            || !self.inst.scene_add.is_empty();
-        if !has_additive {
-            let mut pass = open_pass!(view_srgb, load_op);
+        // view (byte-exact add / source-over), while the base OVER/REPLACE streams
+        // need the sRGB-typed view (linear-light blend). One render pass attaches
+        // ONE view, so the frame is a SEQUENCE of view-tagged stream groups in a
+        // FIXED draw order:
+        //   base_bg(sRGB) | glow_under(Unorm) | base_fg(sRGB) | glow(Unorm)
+        //   | wdeco_over(sRGB) | wdeco_add(Unorm) | free_over(sRGB) | cursor(sRGB)
+        //
+        // PASS COALESCING — the TBDR bandwidth fix on the keystroke-echo frame.
+        // Every pass on this attachment is a FULL-FRAMEBUFFER tile load + store:
+        // in Metal the load/store actions are per-ATTACHMENT and the dirty-row
+        // scissor does NOT restrict them, so a 3024x1964x4B offscreen pays ~23 MB
+        // of traffic per pass even when the pass draws nothing. The previous shape
+        // opened one pass per non-empty group and reached six on a frame with the
+        // aurora, the sparkle words and the cursor all live — ~140 MB of tile
+        // traffic to echo ONE character, on exactly the frame the user feels.
+        //
+        // So: walk the groups in draw order and start a new pass ONLY when the
+        // required view differs from the previous ENABLED group's; consecutive
+        // groups sharing a view emit back-to-back inside one pass. BYTE-IDENTICAL
+        // by construction — no draw is reordered and no stream changes view; the
+        // only thing deleted is a pass boundary between two neighbours that were
+        // already writing the same view with Load/Store under the same scissor,
+        // which is a no-op. (Deleting a boundary also carries the pipeline/atlas
+        // trackers across, dropping redundant rebinds — same GPU state, fewer
+        // commands.)
+        //
+        // It deliberately does NOT hoist an additive group ACROSS an intervening
+        // source-over group to force the two Unorm groups together: add and over
+        // do not commute. `over` after `add` is `s·a + (d+A)·(1−a)`; `add` after
+        // `over` is `s·a + d·(1−a) + A` — they differ by `A·a` wherever the two
+        // overlap, e.g. a sparkle riding the same cell as its paw decoration. That
+        // reorder would move pixels, so the fuse happens exactly when it is sound:
+        // when the group between the two additive groups is empty (the common
+        // sparkle-words frame, which emits `wdeco_add` and no `wdeco_over` paws)
+        // the aurora and the sparkle-add land in ONE Unorm pass.
+        //
+        // A frame with NO additive stream (every parity test, ordinary typing with
+        // the effects off) falls out of the same rule as ONE sRGB pass carrying
+        // the whole draw sequence — the historical fused path, unchanged.
+        const G_BASE_BG: usize = 0;
+        const G_GLOW_UNDER: usize = 1;
+        const G_BASE_FG: usize = 2;
+        const G_GLOW: usize = 3;
+        const G_WDECO_OVER: usize = 4;
+        const G_WDECO_ADD: usize = 5;
+        const G_FREE_OVER: usize = 6;
+        const G_CURSOR: usize = 7;
+        const GROUPS: usize = 8;
+        // `enabled` / `srgb` per group, in DRAW ORDER. Each `enabled` term mirrors
+        // EXACTLY the skip conditions of the draws inside its emit macro
+        // (`draw_stream!`'s `buf.is_some()`, plus the `deco_bind` / `free_bind` /
+        // `image_plane` guards), so a disabled group had zero draws and dropping
+        // it cannot change a pixel. Gating on BUFFER presence (not instance
+        // emptiness) also covers the max-buffer-size degradation path where
+        // `upload` returned `None` for a non-empty stream. `G_BASE_BG` is
+        // UNCONDITIONALLY enabled: it anchors pass 0, which carries `load_op` — a
+        // `Clear` that must run even when every stream is empty.
+        let mut enabled = [false; GROUPS];
+        let mut srgb = [true; GROUPS];
+        enabled[G_BASE_BG] = true;
+        // EMBERFORGE under-glyph light: splits the base in two so the flame body
+        // lands UNDER the glyph ink. With it empty, base_bg and base_fg are
+        // neighbours on the same view and coalesce back into the single historical
+        // base pass.
+        enabled[G_GLOW_UNDER] =
+            glow_under_buf.is_some() || fire_add_buf.is_some() || fire_over_buf.is_some();
+        srgb[G_GLOW_UNDER] = false;
+        enabled[G_BASE_FG] = glyph_buf.is_some()
+            || glyph_halo_buf.is_some()
+            || color_buf.is_some()
+            || (win.image_plane.is_some() && image_buf.is_some())
+            || deco_buf.is_some()
+            || (deco_bind.is_some() && curl_buf.is_some());
+        enabled[G_GLOW] = glow_add_buf.is_some()
+            || glow_halo_buf.is_some()
+            || glow_halo_over_buf.is_some()
+            || nova_add_buf.is_some()
+            || rain_add_buf.is_some()
+            || rain_add_over_buf.is_some();
+        srgb[G_GLOW] = false;
+        enabled[G_WDECO_OVER] = deco_bind.is_some() && wdeco_over_buf.is_some();
+        enabled[G_WDECO_ADD] = deco_bind.is_some() && wdeco_add_buf.is_some();
+        srgb[G_WDECO_ADD] = false;
+        enabled[G_FREE_OVER] = free_bind.is_some() && free_over_buf.is_some();
+        enabled[G_CURSOR] = cursor_block_buf.is_some()
+            || cursor_glyph_buf.is_some()
+            || cursor_color_buf.is_some()
+            || cursor_buf.is_some();
+
+        // group -> pass index (`usize::MAX` == disabled, matches no pass), plus
+        // the view each pass attaches. Shared by the plan below and the encode.
+        let (pass_of, pass_srgb, passes) = coalesce_frame_passes(&enabled, &srgb);
+
+        for p in 0..passes {
+            // Only pass 0 carries `load_op` (the Clear/Load decision above); every
+            // later pass Loads what its predecessor stored on the same attachment.
+            let load = if p == 0 { load_op } else { wgpu::LoadOp::Load };
+            let mut pass = if pass_srgb[p] {
+                open_pass!(view_srgb, load)
+            } else {
+                open_pass!(view, load)
+            };
             let mut cur_pipe: Option<Pipe> = None;
             let mut cur_atlas: Option<Atlas> = None;
-            emit_base_pre!(pass, cur_pipe, cur_atlas);
-            emit_wdeco_over!(pass, cur_pipe, cur_atlas);
-            emit_free_over!(pass, cur_pipe, cur_atlas);
-            emit_cursor!(pass, cur_pipe, cur_atlas);
-            let _ = (cur_pipe, cur_atlas);
-        } else {
-            // Open a pass ONLY when it has something to draw: on TBDR (Metal) a
-            // Load+Store pass costs a full-attachment tile load + store even when
-            // it draws NOTHING, so the typical aurora frame (glow live, sparkle
-            // words idle) would pay two empty full-screen round-trips for C and D.
-            // Each gate mirrors EXACTLY the skip conditions of the draws inside
-            // (`draw_stream!`'s `buf.is_some()`, plus `deco_bind.is_some()` for the
-            // wdeco streams), so an omitted pass had zero draws — the draw order
-            // among OPENED passes is unchanged and the output is byte-identical.
-            // Gating on BUFFER presence (not instance emptiness) also skips the
-            // max-buffer-size degradation path where `upload` returned `None` for
-            // a non-empty stream. Pass A (A1 on the glow_under split) stays
-            // UNCONDITIONAL: it carries `load_op`, which may be a `Clear` that
-            // must run even with all streams empty.
-            if glow_under_buf.is_some() || fire_add_buf.is_some() || fire_over_buf.is_some() {
-                // EMBERFORGE split: the base pass parts around the under-glyph
-                // light. A1 draws everything UNDER the glyph ink (bg + sprite
-                // streams) on the sRGB view; A2 One/One-adds the flame body on
-                // the Unorm view (byte-exact == CPU `add_sat`, the pass-B
-                // contract); A3 draws the glyph ink and the rest of the base on
-                // the sRGB view again. Same draws, same order, same views per
-                // stream as the fused pass — only the pass boundaries (Load-
-                // preserving, same scissor) move, so a glow_under-free frame
-                // and the split frame agree byte-for-byte outside the added
-                // light. A3 is gated like the other split passes: each term
-                // mirrors the exact skip conditions of the draws inside.
-                {
-                    let mut pass = open_pass!(view_srgb, load_op);
-                    let mut cur_pipe: Option<Pipe> = None;
-                    let mut cur_atlas: Option<Atlas> = None;
-                    emit_base_bg!(pass, cur_pipe, cur_atlas);
-                    let _ = (cur_pipe, cur_atlas);
-                }
-                {
-                    let mut pass = open_pass!(view, wgpu::LoadOp::Load);
-                    let mut cur_pipe: Option<Pipe> = None;
-                    let mut cur_atlas: Option<Atlas> = None;
-                    emit_glow_under!(pass, cur_pipe, cur_atlas);
-                    let _ = (cur_pipe, cur_atlas);
-                }
-                if glyph_buf.is_some()
-                    || glyph_halo_buf.is_some()
-                    || color_buf.is_some()
-                    || (win.image_plane.is_some() && image_buf.is_some())
-                    || deco_buf.is_some()
-                    || (deco_bind.is_some() && curl_buf.is_some())
-                {
-                    let mut pass = open_pass!(view_srgb, wgpu::LoadOp::Load);
-                    let mut cur_pipe: Option<Pipe> = None;
-                    let mut cur_atlas: Option<Atlas> = None;
-                    emit_base_fg!(pass, cur_pipe, cur_atlas);
-                    let _ = (cur_pipe, cur_atlas);
-                }
-            } else {
-                let mut pass = open_pass!(view_srgb, load_op);
-                let mut cur_pipe: Option<Pipe> = None;
-                let mut cur_atlas: Option<Atlas> = None;
-                emit_base_pre!(pass, cur_pipe, cur_atlas);
-                let _ = (cur_pipe, cur_atlas);
+            if pass_of[G_BASE_BG] == p {
+                emit_base_bg!(pass, cur_pipe, cur_atlas);
             }
-            if glow_add_buf.is_some()
-                || glow_halo_buf.is_some()
-                || glow_halo_over_buf.is_some()
-                || nova_add_buf.is_some()
-                || rain_add_buf.is_some()
-                || rain_add_over_buf.is_some()
-                || scene_add_buf.is_some()
-            {
-                let mut pass = open_pass!(view, wgpu::LoadOp::Load);
-                let mut cur_pipe: Option<Pipe> = None;
-                let mut cur_atlas: Option<Atlas> = None;
+            if pass_of[G_GLOW_UNDER] == p {
+                emit_glow_under!(pass, cur_pipe, cur_atlas);
+            }
+            if pass_of[G_BASE_FG] == p {
+                emit_base_fg!(pass, cur_pipe, cur_atlas);
+            }
+            if pass_of[G_GLOW] == p {
                 emit_glow!(pass, cur_pipe, cur_atlas);
-                emit_scene_add!(pass, cur_pipe, cur_atlas);
-                let _ = (cur_pipe, cur_atlas);
             }
-            if deco_bind.is_some() && wdeco_over_buf.is_some() {
-                let mut pass = open_pass!(view_srgb, wgpu::LoadOp::Load);
-                let mut cur_pipe: Option<Pipe> = None;
-                let mut cur_atlas: Option<Atlas> = None;
+            if pass_of[G_WDECO_OVER] == p {
                 emit_wdeco_over!(pass, cur_pipe, cur_atlas);
-                let _ = (cur_pipe, cur_atlas);
             }
-            if deco_bind.is_some() && wdeco_add_buf.is_some() {
-                let mut pass = open_pass!(view, wgpu::LoadOp::Load);
-                let mut cur_pipe: Option<Pipe> = None;
-                let mut cur_atlas: Option<Atlas> = None;
+            if pass_of[G_WDECO_ADD] == p {
                 emit_wdeco_add!(pass, cur_pipe, cur_atlas);
-                let _ = (cur_pipe, cur_atlas);
             }
-            // FREE over-text sprites keep their pre-cursor slot on the additive
-            // split too (sRGB view, src-over). Gated like the wdeco passes so an
-            // empty stream opens no pass (mirrors draw_stream!'s skip).
-            if free_bind.is_some() && free_over_buf.is_some() {
-                let mut pass = open_pass!(view_srgb, wgpu::LoadOp::Load);
-                let mut cur_pipe: Option<Pipe> = None;
-                let mut cur_atlas: Option<Atlas> = None;
+            if pass_of[G_FREE_OVER] == p {
                 emit_free_over!(pass, cur_pipe, cur_atlas);
-                let _ = (cur_pipe, cur_atlas);
             }
-            if cursor_block_buf.is_some()
-                || cursor_glyph_buf.is_some()
-                || cursor_color_buf.is_some()
-                || cursor_buf.is_some()
-            {
-                let mut pass = open_pass!(view_srgb, wgpu::LoadOp::Load);
-                let mut cur_pipe: Option<Pipe> = None;
-                let mut cur_atlas: Option<Atlas> = None;
+            if pass_of[G_CURSOR] == p {
                 emit_cursor!(pass, cur_pipe, cur_atlas);
-                let _ = (cur_pipe, cur_atlas);
             }
+            let _ = (cur_pipe, cur_atlas);
         }
+        self.last_frame_passes = passes as u32;
 
         // GPU-only BLOOM (the "more amazing on GPU" layer) is NO LONGER composited
         // here. The comet halo is a soft ADDITIVE layer; compositing it into this
@@ -12070,6 +12313,192 @@ fn theme_color_alpha(c: u32, a: f64) -> wgpu::Color {
 #[cfg(test)]
 mod tests {
     use aterm_render::GlowQuad;
+
+    /// The offscreen frame's stream groups in DRAW ORDER, mirroring the
+    /// `G_*` constants in `encode_frame`. `true` == the group needs the
+    /// sRGB-typed view (base / source-over), `false` == the plain Unorm view
+    /// (One/One additive, byte-exact with the CPU `add_sat`).
+    const GROUP_SRGB: [bool; 8] = [
+        true,  // base_bg
+        false, // glow_under (EMBERFORGE flame body)
+        true,  // base_fg
+        false, // glow (aurora / nova / rain halos)
+        true,  // wdeco_over (sparkle-word paw)
+        false, // wdeco_add (sparkle)
+        true,  // free_over
+        true,  // cursor
+    ];
+
+    /// The coalescer must be MAXIMAL and ORDER-PRESERVING for every possible set
+    /// of live streams: passes are numbered in draw order, a pass holds only
+    /// groups that share its view, and two consecutive enabled groups end up in
+    /// DIFFERENT passes only when their views actually differ. Together those
+    /// three properties say exactly "the emitted sequence is the old per-group
+    /// sequence with same-view neighbours merged" — which is byte-identical,
+    /// since a pass boundary between two Load/Store draws on one view is a no-op.
+    /// Exhaustive over all 256 enable patterns.
+    #[test]
+    fn frame_passes_coalesce_maximally_without_reordering() {
+        for bits in 0u32..256 {
+            let mut enabled = [false; 8];
+            for (g, e) in enabled.iter_mut().enumerate() {
+                *e = bits & (1 << g) != 0;
+            }
+            let (pass_of, pass_srgb, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
+            let live: Vec<usize> = (0..8).filter(|&g| enabled[g]).collect();
+            assert_eq!(
+                passes,
+                live.windows(2)
+                    .filter(|w| GROUP_SRGB[w[0]] != GROUP_SRGB[w[1]])
+                    .count()
+                    + usize::from(!live.is_empty()),
+                "pass count must be exactly one plus the number of VIEW CHANGES \
+                 between consecutive live groups (bits {bits:#010b})"
+            );
+            for &g in &live {
+                assert_eq!(
+                    pass_srgb[pass_of[g]], GROUP_SRGB[g],
+                    "group {g} must be emitted into a pass attaching ITS view"
+                );
+            }
+            for w in live.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                if GROUP_SRGB[a] == GROUP_SRGB[b] {
+                    assert_eq!(
+                        pass_of[a], pass_of[b],
+                        "same-view neighbours {a}/{b} must share one pass — an \
+                         unmerged boundary is a whole-framebuffer tile load+store"
+                    );
+                } else {
+                    assert_eq!(
+                        pass_of[b],
+                        pass_of[a] + 1,
+                        "a view change must advance by exactly one pass, never \
+                         reorder ({a} -> {b})"
+                    );
+                }
+            }
+            for g in 0..8 {
+                if !enabled[g] {
+                    assert_eq!(
+                        pass_of[g],
+                        usize::MAX,
+                        "a disabled group must match no pass index"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two shapes that decide the felt cost of a keystroke echo with the
+    /// user's effects live. Sparkle words that emit only the ADDITIVE stream let
+    /// the aurora and the sparkles share ONE Unorm pass (3 passes total, down from
+    /// 4); adding the source-over paw stream between them must NOT fuse them,
+    /// because add and over do not commute — `over` after `add` is
+    /// `s·a + (d+A)(1−a)`, `add` after `over` is `s·a + d(1−a) + A`, differing by
+    /// `A·a` on every overlapping texel. Refusing that "visually inert" reorder is
+    /// the point; this pins both halves so neither can be traded for the other.
+    #[test]
+    fn additive_groups_fuse_only_when_no_over_group_separates_them() {
+        // base_bg, base_fg, glow, wdeco_add, cursor — the rainbow-cursor +
+        // sparkle-words typing frame.
+        let mut enabled = [false; 8];
+        enabled[0] = true; // base_bg
+        enabled[2] = true; // base_fg
+        enabled[3] = true; // glow
+        enabled[5] = true; // wdeco_add
+        enabled[7] = true; // cursor
+        let (pass_of, _, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
+        assert_eq!(passes, 3, "base(sRGB) | glow+sparkle(Unorm) | cursor(sRGB)");
+        assert_eq!(
+            pass_of[3], pass_of[5],
+            "aurora and sparkle-add are neighbours on the Unorm view — one pass"
+        );
+        assert_eq!(pass_of[0], pass_of[2], "the base halves stay fused");
+
+        // Same frame plus the paw decoration (source-over) BETWEEN the two
+        // additive groups: the fuse must be declined.
+        enabled[4] = true; // wdeco_over
+        let (pass_of, _, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
+        assert_eq!(passes, 5, "the intervening over-stream forces the split");
+        assert_ne!(
+            pass_of[3], pass_of[5],
+            "fusing across a source-over draw would shift pixels by A·a"
+        );
+        assert!(
+            pass_of[3] < pass_of[4] && pass_of[4] < pass_of[5],
+            "draw order must survive the split verbatim"
+        );
+    }
+
+    /// A frame with NO additive stream must still collapse to the ONE sRGB pass
+    /// the historical fused path used — every parity test and every effects-off
+    /// keystroke lives here, so a regression to multiple passes would tax the
+    /// quietest possible frame.
+    #[test]
+    fn effects_free_frame_is_a_single_pass() {
+        let mut enabled = [false; 8];
+        enabled[0] = true; // base_bg
+        enabled[2] = true; // base_fg
+        enabled[6] = true; // free_over
+        enabled[7] = true; // cursor
+        let (pass_of, pass_srgb, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
+        assert_eq!(passes, 1);
+        assert!(pass_srgb[0]);
+        assert!([0, 2, 6, 7].iter().all(|&g| pass_of[g] == 0));
+    }
+
+    /// The incremental present-copy tracker's safety property: `None` ("unknown
+    /// extent") is ABSORBING, so any writer that cannot describe what it touched
+    /// costs a full copy — never a stale region blitted to glass. The empty rect
+    /// is the unit, so an idle frame's zero-height dirty band never widens the
+    /// copy, and both sides are clamped into the surface.
+    #[test]
+    fn union_rect_opt_is_conservative_and_clamped() {
+        let dims = (100, 50);
+        assert_eq!(super::union_rect_opt(None, Some([0, 0, 1, 1]), dims), None);
+        assert_eq!(super::union_rect_opt(Some([0, 0, 1, 1]), None, dims), None);
+        // Empty is the unit in both positions.
+        assert_eq!(
+            super::union_rect_opt(Some([0, 0, 0, 0]), Some([2, 3, 4, 5]), dims),
+            Some([2, 3, 4, 5])
+        );
+        assert_eq!(
+            super::union_rect_opt(Some([2, 3, 4, 5]), Some([9, 9, 9, 9]), dims),
+            Some([2, 3, 4, 5])
+        );
+        // Real union, and an out-of-surface rect is clamped rather than handed to
+        // `copy_texture_to_texture` (which would abort on validation).
+        assert_eq!(
+            super::union_rect_opt(Some([1, 2, 3, 4]), Some([10, 0, 200, 80]), dims),
+            Some([1, 0, 100, 50])
+        );
+    }
+
+    /// The swapchain must be attached RENDER_ATTACHMENT-only: on Metal any extra
+    /// usage bit clears `CAMetalLayer.framebufferOnly`, which costs the drawable
+    /// its lossless compression for our blit write AND the WindowServer's
+    /// composite read on EVERY frame. `COPY_SRC` is armed only while a VIDEO tap
+    /// is actually recording — and only where the surface offers it at all.
+    #[test]
+    fn swapchain_arms_copy_src_only_while_recording() {
+        use wgpu::TextureUsages as U;
+        assert_eq!(
+            super::GpuRenderer::swapchain_usage_for(true, false),
+            U::RENDER_ATTACHMENT,
+            "an idle window must not forfeit drawable compression"
+        );
+        assert_eq!(
+            super::GpuRenderer::swapchain_usage_for(true, true),
+            U::RENDER_ATTACHMENT | U::COPY_SRC,
+            "a live recording needs the presented texture to be copyable"
+        );
+        assert_eq!(
+            super::GpuRenderer::swapchain_usage_for(false, true),
+            U::RENDER_ATTACHMENT,
+            "a surface with no COPY_SRC cap must never be asked for it"
+        );
+    }
 
     /// REGRESSION (inline-image plane panic, renderer.rs:2158): the decoded LRU
     /// is bounded to `GpuImageCache::MAX`, but the per-frame placement map that
@@ -12666,6 +13095,40 @@ ab\r\n",
             aterm_types::text_shaping::LigatureMode::Disabled,
             "shaping must survive the face rebuild, not reset to Enabled"
         );
+    }
+
+    #[test]
+    fn admitted_rebuild_preserves_device_and_exact_sources() {
+        const FONT: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+        let theme = Theme::default();
+        let mut cpu = aterm_render::Renderer::from_bytes(FONT, 16.0, theme)
+            .expect("embedded fixture font parses");
+        cpu.set_styled_font_bytes(1, FONT)
+            .expect("styled fixture parses");
+        cpu.set_fallback_bytes(FONT)
+            .expect("fallback fixture parses");
+        cpu.set_symbol_fallback_bytes(FONT)
+            .expect("symbol fixture parses");
+        cpu.set_color_font_arc(aterm_render::intern_font_bytes(FONT.to_vec()))
+            .expect("emoji fixture parses");
+        let sources = cpu.seal_admitted_font_sources();
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                eprintln!("SKIP: no GPU available: {error}");
+                return;
+            }
+        };
+        let adapter_name = ctx.adapter_name.clone();
+        let backend = ctx.backend.clone();
+        let limits = ctx.device.limits();
+        let mut gpu = GpuRenderer::from_parts(ctx, cpu, None, theme).expect("GPU renderer");
+        gpu.rebuild_font_from_admitted(24.0, theme)
+            .expect("sealed bytes-only GPU rebuild");
+        assert_eq!(gpu.admitted_font_sources(), sources);
+        assert_eq!(gpu.ctx.adapter_name, adapter_name);
+        assert_eq!(gpu.ctx.backend, backend);
+        assert_eq!(gpu.ctx.device.limits(), limits);
     }
 
     /// REGRESSION (FIX B): `ensure_deco_atlas` capped only the atlas WIDTH

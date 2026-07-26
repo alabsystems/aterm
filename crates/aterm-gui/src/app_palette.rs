@@ -47,8 +47,8 @@ impl App {
     }
 
     /// The live predicates that resolve per-row enabled/checked, read off the front window —
-    /// the same conditions the native `validateMenuItem:` path uses (selection present, HUD
-    /// bands on, Settings open, full-screen, tab count) — plus the update-flow state the
+    /// the same conditions the native `validateMenuItem:` path uses (selection present,
+    /// Settings open, full-screen, tab count) — plus the update-flow state the
     /// Version section's dynamic row mirrors (staged nudge / post-update realized arrow).
     /// `pub(crate)`: the `controls menu` closed-palette fallback (`app_introspect`)
     /// resolves a fresh snapshot against the same predicates.
@@ -98,9 +98,6 @@ impl App {
             .is_some_and(|wid| self.front_terminal(wid).is_some());
         PaletteLive {
             has_selection,
-            hud_master: self.config.show_hud_or_default(),
-            resources_hud: self.panel_enabled(crate::hud_bar::PanelId::Resources),
-            engine_hud: self.panel_enabled(crate::hud_bar::PanelId::Engine),
             settings_open: self.settings_tab_open(),
             rain_on,
             serious_mode: self.serious_mode_enabled(),
@@ -208,6 +205,54 @@ impl App {
         }
         // Refresh the accessibility tree so a screen reader sees the open palette.
         self.overlay_a11y_update();
+    }
+
+    /// Surface the exact recovery capabilities returned by a blocked native
+    /// close. The caller has already focused `view`; this method preserves that
+    /// stable target and opens a recovery-only palette in the owning window so
+    /// Cmd-W, tab-close, control, window-close, and quit never look inert.
+    pub(crate) fn palette_enter_native_close_recovery(
+        &mut self,
+        wid: crate::WindowId,
+        instance: crate::tab_model::AppInstanceId,
+        view: crate::tab_model::ViewId,
+        commands: Vec<crate::native_app::Command>,
+    ) -> Result<(), String> {
+        if commands.is_empty() {
+            return Err("native close was blocked without a recovery command".to_string());
+        }
+        let generation = self
+            .native_runtime
+            .view_generation(view)
+            .ok_or_else(|| "blocked native view no longer has a generation".to_string())?;
+        let app = self
+            .native_runtime
+            .app(instance)
+            .ok_or_else(|| "blocked native app no longer exists".to_string())?;
+        let mut state = PaletteState::native_close_recovery(NativeCommandScope {
+            window: wid,
+            instance,
+            view,
+            generation,
+            section: format!("{} Close Recovery", app.descriptor().name),
+            commands,
+        });
+        state.resolve(&self.palette_live());
+
+        let window = self
+            .windows
+            .get_mut(&wid)
+            .ok_or_else(|| "blocked native close window disappeared".to_string())?;
+        window.overlay = Some(crate::overlay::Overlay::Palette(state));
+        window.scroll_residual = 0.0;
+        if let Some(os_window) = &window.os_window {
+            os_window.request_redraw();
+        }
+        self.settle_pointer_drags(wid);
+        let _ = self.palette_claims_pointer(wid);
+        self.invalidate_native_ui_cache(wid);
+        self.overlay_a11y_update();
+        Ok(())
     }
 
     /// Close the command palette on the front window (no-op if already closed).
@@ -404,7 +449,7 @@ impl App {
                     TKey::Named(TNamed::Escape) => self.palette_exit(),
                     TKey::Named(TNamed::ArrowUp) => self.palette_move(-1),
                     TKey::Named(TNamed::ArrowDown) => self.palette_move(1),
-                    TKey::Named(TNamed::Enter) => self.palette_activate(),
+                    TKey::Named(TNamed::Enter | TNamed::NumpadEnter) => self.palette_activate(),
                     TKey::Named(TNamed::Backspace) => self.palette_backspace(),
                     TKey::Named(TNamed::Space) => self.palette_filter_push(' '),
                     TKey::Character(c) if !c.is_control() => self.palette_filter_push(*c),

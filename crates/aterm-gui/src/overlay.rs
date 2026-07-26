@@ -9,13 +9,12 @@
 //! [`Overlay`] enum. Mutual exclusion is now STRUCTURAL — one slot can only hold one
 //! variant. Settings exists here only under `cfg(test)`; shipping Settings is a native tab.
 //!
-//! Each variant's model fans out to the SAME observers through the [`OverlayModel`] trait:
-//! pixels ([`OverlayModel::tray`]), machine-readable introspection text
-//! ([`OverlayModel::controls_lines`]), the repaint fingerprint
+//! Each variant's model fans out to the SAME paint/lifecycle observers through the
+//! [`OverlayModel`] trait: pixels ([`OverlayModel::tray`]), the repaint fingerprint
 //! ([`OverlayModel::fingerprint`]), and — under the `a11y-accesskit` feature — the
-//! cross-platform accessibility tree ([`OverlayModel::a11y`]). Because the fan-out is an
-//! exhaustive `match` and every method is required, a surface left out of one path is a
-//! COMPILE error, not a silent divergence.
+//! cross-platform accessibility tree ([`OverlayModel::a11y`]). Concrete compatibility
+//! introspection calls each surviving overlay model's inherent serializer; native
+//! Settings inspection compiles the native semantic tree instead.
 
 use aterm_render::Theme;
 
@@ -25,9 +24,8 @@ use crate::settings::{PreviewCtx, SettingsGeom, SettingsState};
 use crate::update_screen::UpdateState;
 use crate::widget::TrayInput;
 
-/// The one-model-fans-out contract shared by every overlay surface. `tray`,
-/// `controls_lines`, and `fingerprint` all read the SAME `&self`, so the pixels, the
-/// introspection text, and the repaint key can never read divergent state.
+/// The paint/lifecycle contract shared by every overlay surface. `tray` and
+/// `fingerprint` read the SAME `&self`, so pixels and the repaint key cannot diverge.
 pub(crate) trait OverlayModel {
     /// The INNER repaint fingerprint (never `0` while open). The [`Overlay`] wrapper folds
     /// in the variant discriminant + forces non-zero so two surfaces can never collide in
@@ -46,17 +44,13 @@ pub(crate) trait OverlayModel {
     /// reads the OS appearance, About reads the display scale; Palette ignores it.
     fn tray(&self, geom: &SettingsGeom, theme: Theme, ctx: PreviewCtx) -> TrayInput;
 
-    /// Machine-readable LIVE-state lines for the `controls` introspection verb — the same
-    /// state the card paints, so screen == introspection.
-    fn controls_lines(&self) -> Vec<String>;
-
     /// The `controls front` truncation signal: `(scroll, total, visible)` — rows scrolled
     /// past the top, the full model row count, and rows actually shown on the card. Read
-    /// from the SAME `&self` the tray + `controls_lines` read, so the status line can never
-    /// diverge from the pixels. Non-scrolling surfaces (About/Update) return `(0, total, visible)`.
+    /// from the SAME `&self` as the tray. Non-scrolling surfaces (About/Update) return
+    /// `(0, total, visible)`.
     fn scroll_extent(&self) -> (usize, usize, usize);
     /// The cross-platform accessibility tree ([`accesskit::TreeUpdate`]) for this surface,
-    /// built from the SAME `&self` the pixels + `controls_lines` read — a FIFTH observer
+    /// built from the SAME `&self` the pixels read — another observer
     /// (screen readers) that can never diverge from the glass. Feature-gated because the
     /// AccessKit dep is opt-in; when present it is REQUIRED for every variant, so a surface
     /// left out is a compile error (the same exhaustive-fan-out guarantee as the rest).
@@ -73,9 +67,6 @@ impl OverlayModel for SettingsState {
     }
     fn tray(&self, geom: &SettingsGeom, theme: Theme, ctx: PreviewCtx) -> TrayInput {
         crate::settings::settings_tray(self, geom, theme, ctx)
-    }
-    fn controls_lines(&self) -> Vec<String> {
-        SettingsState::controls_lines(self)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         SettingsState::scroll_extent(self)
@@ -99,9 +90,6 @@ impl OverlayModel for AboutState {
     fn tray(&self, geom: &SettingsGeom, theme: Theme, ctx: PreviewCtx) -> TrayInput {
         crate::about::about_tray(self, geom, theme, ctx.scale)
     }
-    fn controls_lines(&self) -> Vec<String> {
-        AboutState::controls_lines(self)
-    }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         AboutState::scroll_extent(self)
     }
@@ -123,9 +111,6 @@ impl OverlayModel for UpdateState {
     fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
         crate::update_screen::update_tray(self, geom, theme)
     }
-    fn controls_lines(&self) -> Vec<String> {
-        UpdateState::controls_lines(self)
-    }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         UpdateState::scroll_extent(self)
     }
@@ -146,9 +131,6 @@ impl OverlayModel for PaletteState {
     }
     fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
         crate::palette::palette_tray(self, geom, theme)
-    }
-    fn controls_lines(&self) -> Vec<String> {
-        PaletteState::controls_lines(self)
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
         PaletteState::scroll_extent(self)
@@ -187,25 +169,6 @@ impl OverlayKind {
             OverlayKind::Update => "update",
         }
     }
-
-    /// Whether this overlay is a surface a scoped control edge must NOT drive
-    /// (Part-B overlay-drive fence). EVERY overlay is app CHROME, not the program a
-    /// scoped edge is authorized to type into — so all four are fenced, with no
-    /// carve-out a future overlay could silently inherit: Settings flips default-OFF
-    /// security knobs, Palette is a GATEWAY that dispatches every `MenuAction`, Update
-    /// is the staged-update re-exec surface, and About — despite looking informational
-    /// — binds `c` → `about_copy` (writes the OS clipboard via the same `pbcopy` as
-    /// Cmd-C) and `o` → `open_about_site` (spawns a browser), both reachable by an
-    /// injected `key` while About is up. A scoped edge drives the PROGRAM, never chrome.
-    pub(crate) fn is_privileged(self) -> bool {
-        match self {
-            #[cfg(test)]
-            OverlayKind::Settings => true,
-            #[cfg(test)]
-            OverlayKind::About | OverlayKind::Update => true,
-            OverlayKind::Palette => true,
-        }
-    }
 }
 
 /// The single modal-overlay slot on a window. Exactly one variant is live at a time;
@@ -233,8 +196,8 @@ impl Overlay {
     /// collide in the `settings_card` fp cache (which would reuse the WRONG surface's card
     /// — a silent WYSIWYG corruption), and `| 1` keeps `0` reserved for "closed".
     pub(crate) fn fingerprint(&self) -> u64 {
-        // The INNER hash comes from the model (the same `OverlayModel` fan-out the tray +
-        // controls text read); the wrapper folds in the variant tag + forces non-zero.
+        // The INNER hash comes from the same `OverlayModel` that paints the tray; the
+        // wrapper folds in the variant tag + forces non-zero.
         let inner = self.model().fingerprint();
         let tag: u64 = match self {
             #[cfg(test)]
@@ -248,8 +211,8 @@ impl Overlay {
         (tag.rotate_left(56) ^ inner) | 1
     }
 
-    /// The active surface's model as a trait object — the single point the shared splice,
-    /// the fingerprint, and the introspection text all fan out from.
+    /// The active surface's model as a trait object — the single point the shared splice
+    /// and repaint fingerprint fan out from.
     pub(crate) fn model(&self) -> &dyn OverlayModel {
         match self {
             #[cfg(test)]

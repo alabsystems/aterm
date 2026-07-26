@@ -71,6 +71,17 @@ pub struct GridStorage {
     /// `Grid::ASYNC_COMPRESS_BACKPRESSURE` (the worker fell behind), so memory
     /// stays bounded and history is never lost.
     pub(crate) compress_offload_active: bool,
+    /// Monotonic count of STAGED history lines dropped by flood backpressure
+    /// (the lazy-buffer THRU-5 cap while a compress worker is behind, and the
+    /// detached-reflow-window cap) — real retention loss, surfaced OUT-OF-BAND
+    /// (audit E10a: never a sentinel line in content). User-requested limit
+    /// shrinks are NOT counted.
+    pub(crate) flood_truncated_lines: u64,
+    /// Ring-byte watermark budget (audit E10a): an approximate byte budget the
+    /// host sets so ring-only "unlimited" retention still reports memory
+    /// pressure ([`Grid::ring_watermark_level`]). `None` (default) = no
+    /// watermark, level reads Green.
+    pub(crate) ring_byte_watermark: Option<usize>,
     /// Monotonic generation bumped whenever off-screen scrollback is erased
     /// (ED3 / full reset). Captured when the store is detached for reflow and
     /// re-checked on re-attach: if it advanced, the reflowed (pre-erase) store is
@@ -163,6 +174,8 @@ impl GridStorage {
             lazy_buffer: LazyBuffer::new(),
             scrollback_detached_for_reflow: false,
             compress_offload_active: false,
+            flood_truncated_lines: 0,
+            ring_byte_watermark: None,
             scrollback_clear_gen: 0,
             ring_extras: VecDeque::new(),
             generations: GenerationTracker::new(),
@@ -1367,8 +1380,14 @@ mod tests {
         let mut g = make_storage(24, 80);
         let sb = aterm_scrollback::Scrollback::new(100, 1000, 1_000_000);
         g.storage.attach_scrollback(sb);
-        g.storage.set_scrollback_line_limit(Some(500));
-        assert_eq!(g.storage.scrollback_line_limit(), Some(500));
+        // The raw writer takes the store SHARE; the getter reports the ONE
+        // unified total = share + ring cap (audit E1), so the pair composes
+        // to the same arithmetic `Grid::set_scrollback_line_limit` applies.
+        g.storage.set_store_line_limit(Some(500));
+        assert_eq!(
+            g.storage.scrollback_line_limit(),
+            Some(500 + g.storage.max_scrollback)
+        );
     }
 
     // =========================================================================

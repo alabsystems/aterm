@@ -6,9 +6,13 @@
 //! (TRUST_VACUITY_GATE §3.2/§3.3).
 //!
 //! Each RED fixture is a deliberately-broken anchor/proof/spec that MUST produce its
-//! flag; a GREEN control proves the same machinery passes when the defect is removed.
-//! A red fixture that does NOT flag (a false negative) FAILS this meta-test — that is
-//! precisely the "no false negatives in the known set" the design asks for.
+//! flag; a GREEN control proves the same machinery is violation-free when the defect
+//! is removed. aterm's lowered modules are explicitly `design-only`, so a clean
+//! `trust-ir spec-link` analysis intentionally exits 1 and reports an exact
+//! non-certifying/design-only reason for each machine. The controls distinguish that
+//! honest result from both certification and a hard-error exit. A red fixture that
+//! does NOT flag (a false negative) FAILS this meta-test — that is precisely the "no
+//! false negatives in the known set" the design asks for.
 //!
 //! The fixtures map onto the four findings the armed Trust now bites on:
 //!   * **L1** (finding 1) — a typo'd `proof_name` that resolves to no harness in the
@@ -32,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aterm_spec::derive::ring_model;
-use aterm_spec::ir::{lower_to_ir, spec_link_report_is_clean};
+use aterm_spec::ir::lower_to_ir;
 use aterm_spec::tla_check::TlaSpec;
 use aterm_spec::verify::{trust_ir_escalation, ty_escalation};
 use aterm_spec::xref::{ProofAnchor, ProofKind, RefinementAnchor, SpecModule};
@@ -66,20 +70,156 @@ fn spec_link(module: &Path, manifest: Option<&Path>) -> Option<(i32, String)> {
     Some((out.status.code().unwrap_or(-1), combined))
 }
 
-/// A structurally clean artifact emitted by `lower_to_ir` is deliberately
-/// design-only: it must fail closed with the exact non-certifying exit while
-/// carrying no structural/user failure. Exit 0 is reserved for a certifying
-/// Trust-IR artifact, and exit 2 is a parse/I/O failure.
-fn assert_clean_design_only(code: i32, report: &str, label: &str) {
-    assert_eq!(
-        code, 1,
-        "{label} MUST exit 1 as explicitly non-certifying design-only IR. Report:\n{report}"
+/// Structural/Ob/L1/L2/S0-S2 diagnostics remain hard failures even when the
+/// artifact explicitly selects design-only enforcement.
+fn report_has_spec_link_failure(report: &str) -> bool {
+    report.contains("spec-link failed:")
+        || report.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("error:")
+                || line.contains("[Ob.")
+                || line.contains("[L1 ")
+                || line.contains("[L2 ")
+                || line.contains("[S0 ")
+                || line.contains("[S1 ")
+                || line.contains("[S2 ")
+        })
+}
+
+/// Match the one honest non-certifying outcome these fixtures may produce.
+///
+/// This deliberately mirrors the stricter consumer contract: exit 1 alone is
+/// never acceptance. There must be exactly one machine, exact full coverage in
+/// design-only mode, exactly one non-certifying status, and exactly one reason
+/// whose quoted machine identity matches the coverage line.
+fn is_exact_explicit_design_only(
+    code: i32,
+    report: &str,
+    machine: &str,
+    expected_actions: usize,
+) -> bool {
+    if code != 1 || expected_actions == 0 || report_has_spec_link_failure(report) {
+        return false;
+    }
+
+    let headers: Vec<_> = report
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("spec-link: ") && line.contains(" machine(s) in "))
+        .collect();
+    if headers.len() != 1 || !headers[0].starts_with("spec-link: 1 machine(s) in ") {
+        return false;
+    }
+
+    let statuses: Vec<_> = report
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("spec-link-status:"))
+        .collect();
+    if statuses != ["spec-link-status: non-certifying"] {
+        return false;
+    }
+
+    let coverage: Vec<_> = report
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("machine \""))
+        .collect();
+    let machine_prefix = format!("machine {machine:?} ");
+    let exact_counts = format!(
+        "coverage {expected_actions}/{expected_actions} = 100.0% \
+         ({expected_actions} anchored, 0 waived)"
     );
+    if coverage.len() != 1
+        || !coverage[0].starts_with(&machine_prefix)
+        || !coverage[0].contains(&exact_counts)
+        || !coverage[0].ends_with("[design-only]")
+    {
+        return false;
+    }
+
+    let reasons: Vec<_> = report
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("spec-link-noncert:"))
+        .collect();
+    let detail = format!("machine {machine:?} is explicitly design-only");
+    let expected_reason = format!("spec-link-noncert: code=design-only detail={detail:?}");
+    reasons.len() == 1 && reasons[0] == expected_reason
+}
+
+fn assert_exact_explicit_design_only(
+    code: i32,
+    report: &str,
+    machine: &str,
+    expected_actions: usize,
+    label: &str,
+) {
     assert!(
-        spec_link_report_is_clean(false, report),
-        "{label} must be structurally clean with only design-only non-certification; \
-         report:\n{report}"
+        is_exact_explicit_design_only(code, report, machine, expected_actions),
+        "{label} must be violation-free but explicitly design-only/non-certifying: exact exit 1, \
+         exact full coverage, and one machine-matched design-only reason are required. \
+         Report:\n{report}"
     );
+}
+
+/// Poison the accepted shape in every important direction so the GREEN controls
+/// can never regress to "any exit 1 is good enough."
+#[test]
+fn explicit_design_only_contract_rejects_poisoned_reports() {
+    let exact_reason = concat!(
+        "spec-link-noncert: code=design-only detail=\"machine \\\"Ring\\\" ",
+        "is explicitly design-only\"\n",
+    );
+    let clean = concat!(
+        "spec-link: 1 machine(s) in clean.trust_ir\n",
+        "  machine \"Ring\" [embedded] coverage 1/1 = 100.0% (1 anchored, 0 waived) [design-only]\n",
+        "spec-link-status: non-certifying\n",
+        "spec-link-noncert: code=design-only detail=\"machine \\\"Ring\\\" is explicitly design-only\"\n",
+    );
+    assert!(is_exact_explicit_design_only(1, clean, "Ring", 1));
+
+    for poisoned in [
+        (0, clean.to_string()),
+        (
+            1,
+            format!("{clean}  [0] [Ob.1 action-exists] undeclared action\n"),
+        ),
+        (1, clean.replace("non-certifying", "certifying")),
+        (1, format!("{clean}spec-link-status: certifying\n")),
+        (1, clean.replace("[design-only]", "[linked]")),
+        (1, clean.replace("coverage 1/1", "coverage 0/1")),
+        (1, clean.replace(exact_reason, "")),
+        (1, format!("{clean}{exact_reason}")),
+        (
+            1,
+            clean.replace("machine \"Ring\" [", "machine \"Other\" ["),
+        ),
+        (
+            1,
+            format!(
+                "{clean}  machine \"Other\" [embedded] coverage 1/1 = 100.0% \
+                 (1 anchored, 0 waived) [design-only]\n"
+            ),
+        ),
+        (
+            1,
+            clean.replace(
+                "machine \\\"Ring\\\" is explicitly design-only",
+                "machine \\\"Other\\\" is explicitly design-only",
+            ),
+        ),
+        (
+            1,
+            format!("{clean}spec-link-noncert: code=external-projection-unresolved detail=bad\n"),
+        ),
+    ] {
+        assert!(
+            !is_exact_explicit_design_only(poisoned.0, &poisoned.1, "Ring", 1),
+            "poisoned report must fail closed:\n{}",
+            poisoned.1
+        );
+    }
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -144,9 +284,14 @@ fn red_l1_typo_proof_name_flags() {
         report.contains("[L1 proof-resolves]") && report.contains("ring_push_DOES_NOT_EXIST"),
         "RED L1 must report [L1 proof-resolves] naming the typo'd harness; report:\n{report}"
     );
+    assert!(
+        !is_exact_explicit_design_only(code, &report, "Ring", 1),
+        "RED L1's hard proof-resolution failure must never classify as clean design-only"
+    );
 
     // GREEN control: fix the proof_name to one the manifest contains. The
-    // structure is clean, while the artifact remains explicitly non-certifying.
+    // binding is violation-free, but the explicitly design-only artifact remains
+    // non-certifying and therefore exits 1 by contract.
     let good = ProofAnchor {
         proof_name: "ring_push_refines",
         ..typo
@@ -157,7 +302,19 @@ fn red_l1_typo_proof_name_flags() {
     let Some((code, report)) = spec_link(&good_path, Some(&manifest)) else {
         return;
     };
-    assert_clean_design_only(code, &report, "GREEN L1 control (resolved proof_name)");
+    assert_exact_explicit_design_only(
+        code,
+        &report,
+        "Ring",
+        1,
+        "GREEN L1 control (resolved proof_name)",
+    );
+    assert!(
+        report.contains("harness manifest")
+            && report.contains("(1 harness), checked 1 proof binding"),
+        "GREEN L1 must prove the manifest was consulted and exactly one proof resolved; \
+        report:\n{report}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -186,9 +343,13 @@ fn red_l2_empty_projection_flags() {
         report.contains("[L2 projection-present]") && report.contains("Push"),
         "RED L2 must report [L2 projection-present] for action Push; report:\n{report}"
     );
+    assert!(
+        !is_exact_explicit_design_only(code, &report, "Ring", 1),
+        "RED L2's hard projection failure must never classify as clean design-only"
+    );
 
-    // GREEN control: supply a non-empty projection name. The structure is
-    // clean, while the artifact remains explicitly non-certifying.
+    // GREEN control: supply a non-empty projection name. This removes the L2
+    // violation but does not pretend design-only linkage is certification.
     let with_proj = anchor("ring", "Push", "aterm_buffer::Ring::project");
     let good_txt = lower_to_ir("ctl_l2", &modules, &[&with_proj], &[], &[]);
     let good_path = dir.join("ctl_l2.trust_ir");
@@ -196,7 +357,13 @@ fn red_l2_empty_projection_flags() {
     let Some((code, report)) = spec_link(&good_path, None) else {
         return;
     };
-    assert_clean_design_only(code, &report, "GREEN L2 control (non-empty project)");
+    assert_exact_explicit_design_only(
+        code,
+        &report,
+        "Ring",
+        1,
+        "GREEN L2 control (non-empty project)",
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -260,9 +427,13 @@ fn red_l3_external_anchor_on_typeok_flags_in_rust_and_artifact() {
         report.contains("[Ob.1 action-exists]") && report.contains("TypeOK"),
         "RED L3 must report [Ob.1 action-exists] naming TypeOK; report:\n{report}"
     );
+    assert!(
+        !is_exact_explicit_design_only(code, &report, "Fixture", 1),
+        "RED L3's hard action-existence failure must never classify as clean design-only"
+    );
 
-    // GREEN control: anchor the REAL Next action (Apply). The structure is
-    // clean, while the artifact remains explicitly non-certifying.
+    // GREEN control: anchor the REAL Next action (Apply). The artifact is now
+    // violation-free, while remaining explicitly design-only/non-certifying.
     let good = anchor("Fixture", "Apply", "fixture::project");
     let good_txt = lower_to_ir("ctl_l3", &modules, &[&good], &[], &[]);
     let good_path = dir.join("ctl_l3.trust_ir");
@@ -270,9 +441,11 @@ fn red_l3_external_anchor_on_typeok_flags_in_rust_and_artifact() {
     let Some((code, report)) = spec_link(&good_path, None) else {
         return;
     };
-    assert_clean_design_only(
+    assert_exact_explicit_design_only(
         code,
         &report,
+        "Fixture",
+        1,
         "GREEN L3 control (anchor on the real Next action Apply)",
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -375,8 +548,8 @@ fn red_window_routing_corrupted_close_is_rejected_by_ty() {
 }
 
 // ===========================================================================
-// CLEAN control — the all-real lowering is structurally clean (Ob.1/4 + L1 + L2)
-// and explicitly non-certifying. The in-process closure owns Ob.3 certification.
+// CLEAN control — the all-real, fully-fixed lowering is violation-free
+// (Ob.1/3/4 + L1 + L2), but is never mislabeled as externally certifying.
 // Mirrors §3.3: a real anchor with a non-empty projection + a resolved proof.
 // ===========================================================================
 
@@ -400,11 +573,12 @@ fn clean_control_full_pass() {
     let Some((code, report)) = spec_link(&path, Some(&manifest)) else {
         return;
     };
-    assert_clean_design_only(code, &report, "CLEAN control");
+    assert_exact_explicit_design_only(code, &report, "Ring", 1, "CLEAN control");
     assert!(
-        report.contains("harness manifest") && report.contains("checked 1 proof binding"),
-        "clean control should show the manifest and exact resolved proof count; \
-         report:\n{report}"
+        report.contains("harness manifest")
+            && report.contains("(1 harness), checked 1 proof binding"),
+        "clean control must show the manifest was consulted and exactly one proof binding \
+         resolved; report:\n{report}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

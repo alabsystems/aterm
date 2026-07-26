@@ -7,15 +7,65 @@
 //! Two entry points, both no-ops unless the running process is a real installed
 //! `.app` bundle and the updater is configured + enabled:
 //!
-//! * [`apply_staged_if_ready`] — call **very early in `main()`**, before any
-//!   window/thread. If a previous run staged a verified, *newer* build, this
-//!   atomically swaps it into place and re-execs the new binary (the swap is
-//!   invisible: same PID/tty/parent). Otherwise it returns and the current build
-//!   keeps running.
+//! * [`apply_staged_if_ready_preserving_fds_exact`] — call **very early in
+//!   `main()`**, before any window/thread. If a previous run staged a verified,
+//!   *newer* build, this atomically swaps it into place and re-execs the new binary
+//!   (the swap is invisible: same PID/tty/parent). Otherwise it returns and the
+//!   current build keeps running. This is the ONE apply entry point the shipping
+//!   GUI calls (`aterm-gui`'s `lib.rs`, the boot apply); the plainer
+//!   [`apply_staged_if_ready`] and [`apply_staged_if_ready_preserving_fds`]
+//!   wrappers exist for callers with no descriptors or no commit to bind, and
+//!   nothing in this workspace uses them.
 //! * [`spawn_background_check`] — call once the GUI is up. Spawns a detached
 //!   thread that talks to the private GitHub Release, downloads the newer DMG,
 //!   verifies it, and stages it for the *next* launch. It never touches the UI
 //!   and never blocks the event loop.
+//!
+//! # Delivery model: what actually reaches a machine, and when
+//!
+//! Read this before adding a scheduler. The updater has exactly two moving parts,
+//! and the honest bound on "how stale can a machine be" follows from them:
+//!
+//! * **Staging** happens on [`spawn_background_check`]'s thread, which runs its
+//!   FIRST check immediately at launch and then on the `cadence` schedule. So a
+//!   running app stages a new release within ~a minute of publish; an app that is
+//!   started stages within seconds of start.
+//! * **Applying** happens either at the top of the next `main()` (always works), or
+//!   in-session through the seamless handoff (which, as of 2026-07-24, has never
+//!   been observed to complete on a real machine — see `docs/RFC-proof-carrying-dsu.md`).
+//!
+//! Composing those: a machine that never runs aterm is never updated, but it also
+//! never *needs* to be — and the first launch after a release stages it, so the
+//! machine is at worst **one launch behind**, not indefinitely stale.
+//!
+//! ## Why there is no LaunchAgent
+//!
+//! An obvious proposal is a `launchd` agent that checks periodically so a machine
+//! is current before it is even launched. It was considered and REJECTED, for
+//! reasons that are about cost and honesty, not taste:
+//!
+//! 1. **It would buy exactly one launch.** Per the bound above, the agent's only
+//!    effect is that a release stages before the launch rather than during it —
+//!    the swap still waits for a `main()`. It cannot update an app nobody runs,
+//!    because applying an update means re-execing a process.
+//! 2. **There is nothing for it to run.** Every verified path (release selection,
+//!    signature/digest checks, DMG mount, staging) lives in this crate, reachable
+//!    only from the one shipped Mach-O — and that binary is the GUI: invoking it
+//!    from `launchd` opens a terminal window. A headless entry point would mean a
+//!    second signed binary inside the notarized bundle, changing what
+//!    `crates/aterm-release` assembles and what `codesign`/`spctl` are asked to
+//!    accept. Re-implementing the pipeline in a shell script instead would create
+//!    a second, unverified download path — the precise shape of the build-826
+//!    incident (`health`).
+//! 3. **The lane lock is process-local.** `check_lane` is a `Mutex` inside one
+//!    process. An agent checking while the app checks would serialize only on the
+//!    coarser `stage_lock` flock, after both have already spent the network round
+//!    trips.
+//!
+//! The gap worth closing is therefore the seamless APPLY, not the check cadence.
+//! If a LaunchAgent is ever revisited, (2) is the precondition: a headless
+//! `aterm update check` verb in the one binary, and a bundle assembly that signs
+//! it. Do not ship a plist before that exists.
 //!
 //! # Trust model (tiered — works with NO Apple Developer ID, stronger with a key)
 //!
@@ -51,6 +101,8 @@
 #[cfg(target_os = "macos")]
 mod bundle;
 #[cfg(target_os = "macos")]
+mod cadence;
+#[cfg(target_os = "macos")]
 mod github;
 #[cfg(target_os = "macos")]
 mod health;
@@ -58,6 +110,8 @@ mod health;
 mod install;
 #[cfg(target_os = "macos")]
 mod manifest;
+#[cfg(target_os = "macos")]
+mod no_token;
 #[cfg(target_os = "macos")]
 mod paths;
 #[cfg(target_os = "macos")]
@@ -105,7 +159,8 @@ fn read_ledger_text(path: &std::path::Path) -> Option<String> {
 /// wrappers: the GUI calls `aterm_update::Source::resolve(cfg_owner, cfg_repo)` and
 /// threads the resulting `Source` into [`spawn_background_check`], so the type it
 /// passes must be the very same `aterm_update_core::Source` the inherent `resolve`
-/// (carrying aterm's `alabsystems`/`aterm` defaults + `ATERM_UPDATE_OWNER`/`_REPO`
+/// (carrying aterm's compiled-in `alabsystems`/`aterm` channel defaults + the
+/// `ATERM_UPDATE_OWNER`/`_REPO`
 /// env keys) is defined on. A newtype here would break that call site.
 pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 
@@ -235,7 +290,12 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> ApplyOutcome {
-    install::apply_staged_if_ready(current_build, Some(current_commit), handoff_fds, handoff_env)
+    install::apply_staged_if_ready(
+        current_build,
+        Some(current_commit),
+        handoff_fds,
+        handoff_env,
+    )
 }
 
 /// Overlap-handoff PRE-PARK verification: authenticate the staged candidate
@@ -420,7 +480,6 @@ fn check_lane() -> &'static std::sync::Mutex<()> {
 #[cfg(target_os = "macos")]
 pub fn spawn_background_check(
     current_build: u64,
-    current_version: &'static str,
     source: Source,
     notify: Option<HealthNotify>,
     on_staged: Option<StagedNotify>,
@@ -443,17 +502,32 @@ pub fn spawn_background_check(
         .spawn(move || {
             // Re-check on a short cadence so a running session picks a release up
             // within ~a minute of publish (the owner's "no passive scheduler —
-            // immediate" directive; the GUI then AUTO-APPLIES the stage through the
-            // seamless handoff). Cost honesty: a check with NO provisioned token goes
-            // idle before any network (check_and_stage's token gate), and WITH one it
-            // spends a couple of authenticated requests per cycle — ~100/h against
-            // the 5000/h budget, plus the release-list fetch dedups staging work on
-            // an unchanged release. `ATERM_UPDATE_INTERVAL_SECS` overrides; 0 means
-            // check once and stop.
-            let interval = std::env::var("ATERM_UPDATE_INTERVAL_SECS")
+            // immediate" directive). The GUI then ATTEMPTS an auto-apply through the
+            // seamless handoff; as of 2026-07-24 that handoff has never been observed
+            // to complete on a real machine, so in practice this cadence buys a fast
+            // STAGE and the swap still happens at the next launch. Do not describe
+            // this loop as delivering a seamless update until a field log shows one.
+            // Cost honesty: a check spends a couple of requests per cycle. WITH a
+            // token that is ~100/h against the 5000/h budget; WITHOUT one (the public
+            // channel, no credential provisioned) the budget is ~60/h PER IP and the
+            // cadence has to be far slower or every check is rate-limited — hence the
+            // per-lane interval below, adopted as soon as a check reveals which lane
+            // this machine is on. `ATERM_UPDATE_INTERVAL_SECS` overrides BOTH (and is
+            // then never second-guessed); 0 means check once and stop.
+            //
+            // This is the BASE interval only. The wait actually taken is jittered and
+            // backs off while checks fail, and returns early when the Mac turns out to
+            // have been asleep — see `cadence`, which owns all three policies.
+            let configured = std::env::var("ATERM_UPDATE_INTERVAL_SECS")
                 .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(75);
+                .and_then(|s| s.parse::<u64>().ok());
+            let interval = configured.unwrap_or(cadence::AUTHENTICATED_INTERVAL_SECS);
+            let mut schedule = cadence::Cadence::new(std::time::Duration::from_secs(interval));
+            let mut failures = cadence::FailureLog::default();
+            // Once per process: a channel this machine cannot read is a configuration
+            // defect, not an event, so it is announced once and then lives in
+            // `status.toml` (rewritten every check) rather than nagging.
+            let mut notified_no_token = false;
             // Per-process dedup, seeded from the clock at thread start so history
             // never re-notifies on every launch: the persistent-failure notice
             // requires the streak's latest failure to postdate this thread (RFC3339
@@ -464,8 +538,10 @@ pub fn spawn_background_check(
             loop {
                 match check_lane().try_lock() {
                     Ok(_lane) => {
-                        match github::check_and_stage(current_build, current_version, &source) {
+                        match github::check_and_stage(current_build, &source) {
                             Ok(Some(v)) => {
+                                emit(failures.success());
+                                schedule.succeeded();
                                 log(&format!(
                                     "staged update {v} — the GUI auto-applies it now (or next launch)"
                                 ));
@@ -479,8 +555,36 @@ pub fn spawn_background_check(
                                     cb(b, v);
                                 }
                             }
-                            Ok(None) => {}
-                            Err(e) => warn(&format!("update check failed: {e}")),
+                            Ok(None) if no_token::is_stranded() => {
+                                // Not a success: GitHub answered that this machine
+                                // cannot read the channel at all. Back off, because a
+                                // 75 s retry of something that cannot succeed only
+                                // re-spawns `security`/`gh` and burns requests
+                                // forever. The backoff clears on the first readable
+                                // check, so fixing the channel (or provisioning a
+                                // token) mid-session is noticed within one
+                                // MAX_BACKOFF at worst.
+                                schedule.failed();
+                            }
+                            Ok(None) if github::rate_limited() => {
+                                // GitHub asked us to slow down. That is a CADENCE
+                                // problem, not a broken updater: lengthen the wait
+                                // (the entire remedy) but emit no failure line and no
+                                // ledger entry, so a machine sharing an IP's ~60/hour
+                                // anonymous budget never accrues the streak that
+                                // fires "your update pipeline is likely broken".
+                                schedule.failed();
+                            }
+                            Ok(None) => {
+                                // A completed check that found nothing to do is a
+                                // SUCCESS: the network and the token both worked.
+                                emit(failures.success());
+                                schedule.succeeded();
+                            }
+                            Err(e) => {
+                                emit(Some(failures.failure(&e)));
+                                schedule.failed();
+                            }
                         }
                     }
                     Err(std::sync::TryLockError::WouldBlock) => {
@@ -490,6 +594,20 @@ pub fn spawn_background_check(
                         drop(poisoned.into_inner());
                         warn("update check lane recovered after a worker panic");
                     }
+                }
+                // A machine that cannot READ its release channel can never update, and
+                // nothing else in the updater will ever report a failure for it (this
+                // is deliberately not a health-ledger failure — a configuration state
+                // is not a transient fault). Raise it on the SAME channel the
+                // broken-pipeline notice uses, once, so the user actually learns that
+                // this Mac is stranded.
+                if no_token::is_stranded()
+                    && !notified_no_token
+                    && let Some(cb) = notify.as_ref()
+                {
+                    notified_no_token = true;
+                    let (title, body) = no_token::notification();
+                    cb(title, body);
                 }
                 if let (Some(cb), Some(staging)) = (notify.as_ref(), paths::Staging::resolve()) {
                     let h = health::Health::read(&staging.health());
@@ -521,17 +639,59 @@ pub fn spawn_background_check(
                 if interval == 0 {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_secs(interval));
+                // Adopt the cadence the credential lane can actually afford, now that
+                // a completed check has revealed it. An explicitly configured interval
+                // is never overridden — an operator who set one owns the consequence.
+                if configured.is_none() {
+                    schedule.set_base(std::time::Duration::from_secs(
+                        match github::lane() {
+                            github::Lane::Anonymous => cadence::ANONYMOUS_INTERVAL_SECS,
+                            github::Lane::Authenticated | github::Lane::Unknown => {
+                                cadence::AUTHENTICATED_INTERVAL_SECS
+                            }
+                        },
+                    ));
+                }
+                // Jittered, backed-off, wake-aware wait. A detected wake returns early
+                // and clears the backoff — the outage the backoff was about belonged
+                // to a network this Mac is no longer on — then lets the network
+                // associate before the next check, instead of burning a guaranteed
+                // DNS failure the moment the lid opens.
+                let (delay, waited) = cadence::wait(&schedule);
+                if let cadence::Waited::Woke(gap) = waited {
+                    log(&format!(
+                        "woke after ~{}s of system sleep (during a {}s wait) — letting \
+                         the network settle for {}s, then checking",
+                        gap.as_secs(),
+                        delay.as_secs(),
+                        cadence::WAKE_SETTLE.as_secs()
+                    ));
+                    schedule.woke();
+                    // Suppress the "still failing" carry-over too: a pre-sleep DNS
+                    // failure is not evidence about the post-wake network.
+                    failures = cadence::FailureLog::default();
+                    std::thread::sleep(cadence::WAKE_SETTLE);
+                }
             }
         })
         .ok();
+}
+
+/// Route a [`cadence::LogAction`] to the app log. `None` (nothing to say) is the
+/// common case, so the call sites stay one line.
+#[cfg(target_os = "macos")]
+fn emit(action: Option<cadence::LogAction>) {
+    match action {
+        Some(cadence::LogAction::Warn(text)) => warn(&text),
+        Some(cadence::LogAction::Log(text)) => log(&text),
+        Some(cadence::LogAction::Suppress) | None => {}
+    }
 }
 
 /// Non-macOS no-op.
 #[cfg(not(target_os = "macos"))]
 pub fn spawn_background_check(
     _current_build: u64,
-    _current_version: &'static str,
     _source: Source,
     _notify: Option<HealthNotify>,
     _on_staged: Option<StagedNotify>,
@@ -544,6 +704,13 @@ pub fn spawn_background_check(
 /// so status consumers can reason about it; the macOS `health` ledger enforces the
 /// same threshold.
 pub const PERSISTENT_AFTER: u32 = 3;
+
+/// Serializes the tests that mutate the PROCESS-GLOBAL "this machine cannot read its
+/// release channel" latch (`no_token::STRANDED`, `github::LANE`). Cargo runs a crate's
+/// tests in parallel threads of ONE process, so without this an assertion about the
+/// latch can observe a sibling test's transient state and fail intermittently.
+#[cfg(test)]
+pub(crate) static STRANDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A snapshot of the updater's state for the "Check for Updates" menu and the
 /// `aterm-ctl update` query. Read from the durable status/ready markers, so it reflects
@@ -886,7 +1053,7 @@ pub fn status(_current_build: u64) -> Option<UpdateStatus> {
 /// to tens of seconds), so callers MUST run it off the UI/event-loop thread. A no-op
 /// that just reports current state when the updater is disabled or not an installed app.
 #[cfg(target_os = "macos")]
-pub fn check_now(current_build: u64, current_version: &str, source: &Source) -> UpdateStatus {
+pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
     if enabled() {
         // Take the lane if it is free (or poison-recover it) and run the check; if it is
         // BUSY, remember that so we can join the in-flight transaction below. The
@@ -895,14 +1062,14 @@ pub fn check_now(current_build: u64, current_version: &str, source: &Source) -> 
         // so the lock-order census does not read a `check_lane`→`check_lane` self-edge.
         let joined = match check_lane().try_lock() {
             Ok(_lane) => {
-                if let Err(e) = github::check_and_stage(current_build, current_version, source) {
+                if let Err(e) = github::check_and_stage(current_build, source) {
                     warn(&format!("manual update check failed: {e}"));
                 }
                 false
             }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 let _lane = poisoned.into_inner();
-                if let Err(e) = github::check_and_stage(current_build, current_version, source) {
+                if let Err(e) = github::check_and_stage(current_build, source) {
                     warn(&format!(
                         "manual update check failed after lane recovery: {e}"
                     ));
@@ -936,7 +1103,7 @@ pub fn check_now(current_build: u64, current_version: &str, source: &Source) -> 
 
 /// Non-macOS stub.
 #[cfg(not(target_os = "macos"))]
-pub fn check_now(current_build: u64, _current_version: &str, _source: &Source) -> UpdateStatus {
+pub fn check_now(current_build: u64, _source: &Source) -> UpdateStatus {
     UpdateStatus::empty(false, current_build, "auto-update is macOS-only".into())
 }
 

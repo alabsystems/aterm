@@ -20,7 +20,7 @@ use winit::window::Window;
 
 use crate::{
     App, BLINK_INTERVAL, Backend, PresentDropAccounting, PresentTarget, RepaintKey,
-    SelectionFingerprint, WindowId, hud_bar, metrics, pane, platform::AppRt,
+    SelectionFingerprint, WindowId, chrome_band, metrics, pane, platform::AppRt,
     rearm_failed_gpu_recovery, request_recovery_redraw, tab_bar, term_lock,
 };
 
@@ -79,6 +79,28 @@ const SYNC_HOLD_CAP: std::time::Duration = std::time::Duration::from_millis(150)
 /// trip the adaptive-effect latch.
 fn causal_render_cost_ns(compose_ns: u64, raster_submit_ns: u64) -> u64 {
     compose_ns.saturating_add(raster_submit_ns)
+}
+
+/// The portion of a swapchain-acquire wait that CANNOT be healthy display pacing,
+/// and therefore is genuine GPU/compositor back-pressure.
+///
+/// [`causal_render_cost_ns`] deliberately excludes acquisition so that ordinary
+/// vsync pacing never sheds effects — correct, but it left the load-shed latch
+/// blind in the one direction that matters most: the effects the latch sheds
+/// (`set_bloom` / `set_shimmer`) are pure GPU passes whose CPU encode cost is a
+/// few microseconds whether the GPU is idle or saturated. So on a GPU-bound
+/// machine the bloom could eat milliseconds of GPU per frame, the drawable pool
+/// stay exhausted, and the EMA still see ~0.3 ms and never shed — the safety
+/// valve was inert for its two primary levers.
+///
+/// The discriminator: with a drawable pool of `latency + 1`, waiting up to ONE
+/// refresh is normal pacing; waiting LONGER than a full frame interval means the
+/// pool is exhausted because the GPU has not finished prior frames. Only that
+/// excess is charged, so a healthy FIFO/Immediate present contributes exactly 0
+/// and the existing hysteresis/dwell machinery is reused unchanged.
+fn gpu_backpressure_excess_ns(acquire_wait_ns: u64, frame_interval: std::time::Duration) -> u64 {
+    let fi = u64::try_from(frame_interval.as_nanos()).unwrap_or(u64::MAX);
+    acquire_wait_ns.saturating_sub(fi)
 }
 
 /// Shipping decision at the failed-present seam. A latched device loss is not
@@ -154,6 +176,61 @@ fn forge_cursor_fill(
         && matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::Fire))
     .then(fill)
     .flatten()
+}
+
+const INACTIVE_CURSOR_FILL: u32 = 0x00FF_FFFF;
+
+/// Resolve the host-owned cursor fill after the window-focus style override.
+///
+/// `HollowBlock` is not a terminal DECSCUSR style: the window host installs it
+/// exclusively for a real unfocused window. Give that inactive outline a quiet
+/// neutral white instead of inheriting the active theme/OSC-12 colour (normally
+/// green). Every other style keeps its active/effect fill unchanged, including
+/// glass-less virtual captures where no focus override is installed.
+#[inline]
+fn window_cursor_fill(
+    cursor_override: Option<CursorStyle>,
+    active_fill: Option<u32>,
+) -> Option<u32> {
+    if cursor_override == Some(CursorStyle::HollowBlock) {
+        Some(INACTIVE_CURSOR_FILL)
+    } else {
+        active_fill
+    }
+}
+
+#[cfg(test)]
+mod window_cursor_fill_tests {
+    use super::{INACTIVE_CURSOR_FILL, window_cursor_fill};
+    use aterm_core::terminal::CursorStyle;
+
+    #[test]
+    fn inactive_hollow_cursor_is_white_even_with_an_active_effect_fill() {
+        assert_eq!(
+            window_cursor_fill(Some(CursorStyle::HollowBlock), None),
+            Some(INACTIVE_CURSOR_FILL)
+        );
+        assert_eq!(
+            window_cursor_fill(Some(CursorStyle::HollowBlock), Some(0x0050_FA7B)),
+            Some(INACTIVE_CURSOR_FILL),
+            "an inactive window must not retain the active green/effect fill"
+        );
+    }
+
+    #[test]
+    fn focused_and_effect_shape_overrides_keep_their_fill() {
+        assert_eq!(window_cursor_fill(None, None), None);
+        assert_eq!(
+            window_cursor_fill(None, Some(0x0050_FA7B)),
+            Some(0x0050_FA7B),
+            "a focused cursor keeps its active fill"
+        );
+        assert_eq!(
+            window_cursor_fill(Some(CursorStyle::Bolt), Some(0x00AA_44FF)),
+            Some(0x00AA_44FF),
+            "non-focus shape overrides keep their effect fill"
+        );
+    }
 }
 
 /// Run the two fallible stages of one CPU-surface present as a transaction.
@@ -247,33 +324,46 @@ fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Option<
     (raw_focused && configured && volume > 0.0).then_some(volume)
 }
 
+/// The per-event trail-audio POLICY the host resolves once per drain and
+/// stamps on every emitted [`SoundEvent`] — the knobs ride together so the
+/// synth stays policy-free.
+struct TrailSoundPolicy {
+    /// The `trail_sound_style` override (default `Style` = follow the visual
+    /// trail style).
+    voice: aterm_effects::trail_sound::SoundVoice,
+    /// Resolved gain (`None` = muted: focus/knob/volume law — see
+    /// [`trail_sound_gain`]).
+    gain: Option<f32>,
+    /// The window's cached tone-of-typing verdict (`tone_infer`). The host
+    /// resolves it (knob off ⇒ the neutral `Technical` identity) exactly
+    /// like it resolves gain.
+    tone: aterm_effects::tone::Tone,
+    /// The `trail_sound_bed` knob (default OFF — the owner dislikes the
+    /// drone): with it off no event ever feeds the synth's bed layer, so
+    /// the ambient texture contributes exactly zero samples while the notes
+    /// keep playing.
+    bed: bool,
+}
+
 /// Drain every visual spawn cue and optionally emit its allocation-free sound
 /// twin. Both single-pane and split-pane composition route through this seam,
 /// so muting never leaves a backlog and layouts cannot silently lose audio.
+#[allow(clippy::too_many_arguments)] // Explicit policy axes keep cue emission allocation-free.
 fn drain_trail_sound_cues(
     glow: &mut crate::cursor_glow::CursorGlow,
     style: crate::cursor_glow::GlowStyle,
     cols: u16,
-    gain: Option<f32>,
-    // The window's cached tone-of-typing verdict (`tone_infer`), stamped on
-    // every trail gesture — the per-event policy carriage `gain` pioneered.
-    // The host resolves it (knob off ⇒ the neutral `Technical` identity)
-    // exactly like it resolves gain, so the synth stays policy-free.
-    tone: aterm_effects::tone::Tone,
-    // The `trail_sound_bed` knob (default OFF — the owner dislikes the
-    // drone), riding the same per-event policy seam: with it off no event
-    // ever feeds the synth's bed layer, so the ambient texture contributes
-    // exactly zero samples while the notes keep playing.
-    bed: bool,
+    policy: TrailSoundPolicy,
     mut emit: impl FnMut(aterm_effects::trail_sound::SoundEvent),
 ) -> usize {
     let mut emitted = 0;
     for cue in glow.drain_sound_cues() {
-        let Some(gain) = gain else {
+        let Some(gain) = policy.gain else {
             continue;
         };
         emit(aterm_effects::trail_sound::SoundEvent {
             style,
+            voice: policy.voice,
             kind: aterm_effects::trail_sound::SoundGesture::Trail(cue.kind),
             pan: if cols > 1 {
                 let last = (cols - 1) as f32;
@@ -284,8 +374,8 @@ fn drain_trail_sound_cues(
             heat: cue.heat,
             hue: cue.hue,
             gain,
-            tone,
-            bed,
+            tone: policy.tone,
+            bed: policy.bed,
         });
         emitted += 1;
     }
@@ -325,6 +415,9 @@ pub(crate) struct CurseDrain {
 pub(crate) fn drain_curse_bonk_cues(
     decos: &mut aterm_effects::word_decorations::WordDecorations,
     style: crate::cursor_glow::GlowStyle,
+    // The `trail_sound_style` override — the bonk's clash SHAPE is
+    // style-agnostic, but its register anchor follows the speaking palette.
+    voice: aterm_effects::trail_sound::SoundVoice,
     cols: u16,
     gain: Option<f32>,
     detonations: bool,
@@ -354,6 +447,7 @@ pub(crate) fn drain_curse_bonk_cues(
             // palette anchor) so the wrong note is wrong against the melody
             // actually playing; the gesture itself is style-agnostic.
             style,
+            voice,
             kind: aterm_effects::trail_sound::SoundGesture::Words(
                 aterm_effects::trail_sound::WordGesture::Bonk,
             ),
@@ -385,7 +479,7 @@ mod curse_bonk_drain_tests {
     use std::time::Instant;
 
     use aterm_core::terminal::Terminal;
-    use aterm_effects::trail_sound::{SoundGesture, WordGesture};
+    use aterm_effects::trail_sound::{SoundGesture, SoundVoice, WordGesture};
     use aterm_effects::word_decorations::{EffectGeom, WordDecorations};
     use aterm_lexicon::Lexicon;
 
@@ -405,6 +499,33 @@ mod curse_bonk_drain_tests {
             "reduced motion"
         );
         assert_eq!(bonk_sound_gain(true, true, false, 0.0), None, "zero volume");
+    }
+
+    /// The RESIZE QUIET law: a window inside [`crate::RESIZE_SOUND_QUIET`] of
+    /// its last applied reflow mutes the sound seams (a TUI's resize repaint
+    /// storm must not read as typing), a window that never resized is never
+    /// quiet, and the mute expires once the window elapses.
+    #[test]
+    fn resize_quiets_the_sound_seams_and_expires() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let now = std::time::Instant::now();
+        assert!(
+            !app.windows.get(&wid).unwrap().resize_sound_quiet(now),
+            "a never-resized window must not be quiet"
+        );
+        app.windows.get_mut(&wid).unwrap().last_resize_at = Some(now);
+        assert!(
+            app.windows.get(&wid).unwrap().resize_sound_quiet(now),
+            "a just-reflowed window must be quiet"
+        );
+        assert!(
+            !app.windows
+                .get(&wid)
+                .unwrap()
+                .resize_sound_quiet(now + crate::RESIZE_SOUND_QUIET),
+            "the quiet window must expire"
+        );
     }
 
     /// The drain seam end to end over a REAL typed-curse tick: an enabled
@@ -443,9 +564,15 @@ mod curse_bonk_drain_tests {
         let mut wd = WordDecorations::default();
         typed_curse(&mut wd, t0);
         let mut events = Vec::new();
-        let drained = drain_curse_bonk_cues(&mut wd, style, geom.cols, Some(0.4), false, |ev| {
-            events.push(ev)
-        });
+        let drained = drain_curse_bonk_cues(
+            &mut wd,
+            style,
+            SoundVoice::Style,
+            geom.cols,
+            Some(0.4),
+            false,
+            |ev| events.push(ev),
+        );
         assert_eq!(drained.emitted, 1);
         assert_eq!(drained.wince_hits, 1);
         assert_eq!(events.len(), 1);
@@ -464,17 +591,29 @@ mod curse_bonk_drain_tests {
         // dropped AND the vec is emptied — nothing replays on unmute.
         let mut wd2 = WordDecorations::default();
         typed_curse(&mut wd2, t0);
-        let drained = drain_curse_bonk_cues(&mut wd2, style, geom.cols, None, false, |_| {
-            panic!("a muted drain must not emit")
-        });
+        let drained = drain_curse_bonk_cues(
+            &mut wd2,
+            style,
+            SoundVoice::Style,
+            geom.cols,
+            None,
+            false,
+            |_| panic!("a muted drain must not emit"),
+        );
         assert_eq!(drained.emitted, 0);
         assert_eq!(
             drained.wince_hits, 1,
             "visual reaction is sound-independent"
         );
-        let drained = drain_curse_bonk_cues(&mut wd2, style, geom.cols, Some(0.4), false, |_| {
-            panic!("the muted frame's cue must not backlog into the unmute")
-        });
+        let drained = drain_curse_bonk_cues(
+            &mut wd2,
+            style,
+            SoundVoice::Style,
+            geom.cols,
+            Some(0.4),
+            false,
+            |_| panic!("the muted frame's cue must not backlog into the unmute"),
+        );
         assert_eq!(drained, super::CurseDrain::default());
     }
 }
@@ -537,34 +676,168 @@ pub(crate) fn phase_locked_effect_deadline(
 }
 
 #[cfg(test)]
-mod nyan_publication_order_tests {
+mod config_asset_publication_tests {
     use std::sync::Arc;
 
-    use crate::App;
+    use crate::{App, WindowId};
+
+    fn catalog(
+        nyan_sprite: crate::app_config::NyanSpriteAsset,
+        themes: Arc<crate::app_config::ThemeCatalog>,
+    ) -> Arc<crate::app_config::ConfigAssetCatalog> {
+        Arc::new(crate::app_config::ConfigAssetCatalog {
+            trail_packs: crate::app_config::TrailPackCatalog::empty(),
+            nyan_sprite,
+            themes,
+            sparkle_spec_consumers: Default::default(),
+        })
+    }
+
+    fn assert_exact_catalog_on_every_window(
+        app: &App,
+        expected: &Arc<crate::app_config::ConfigAssetCatalog>,
+    ) {
+        assert!(Arc::ptr_eq(&app.config_assets, expected));
+        assert!(app.windows.values().all(|window| {
+            window
+                .installed_config_assets
+                .as_ref()
+                .is_some_and(|installed| Arc::ptr_eq(installed, expected))
+        }));
+    }
 
     #[test]
-    fn redraw_drain_before_worker_wake_still_fans_out_to_every_window() {
+    fn authoritative_publication_installs_ready_invalid_and_builtin_before_effect_paths() {
         let mut app = App::headless_for_test();
         let sid = app.next_session_id;
         let second = app.insert_logical_window(crate::stub_session(sid), 24, 80);
         assert_eq!(app.windows.len(), 2);
-        assert!(app.nyan_sprite_loader.publish_current_for_test(Some((
-            1,
-            1,
-            Arc::from([0x12, 0x34, 0x56, 0xff]),
-        ))));
 
-        // RedrawRequested wins the event-order race and drains the result while
-        // NyanSpriteReady is conceptually still queued. The production helper
-        // must target both logical windows now; the later wake sees no result.
-        assert_eq!(app.poll_nyan_sprite_and_fanout(), 2);
+        let rgba: Arc<[u8]> = Arc::from([0x12, 0x34, 0x56, 0xff]);
+        let ready = catalog(
+            crate::app_config::NyanSpriteAsset::Ready {
+                source_id: Arc::from("same.png"),
+                w: 1,
+                h: 1,
+                rgba: Arc::clone(&rgba),
+                fp: 11,
+            },
+            crate::app_config::ThemeCatalog::empty(),
+        );
+        assert_eq!(app.publish_config_assets(Arc::clone(&ready)), 2);
+        assert_exact_catalog_on_every_window(&app, &ready);
+        for window in app.windows.values() {
+            assert_eq!(window.word_decos.nyan_sprite_source_fingerprint(), Some(11));
+            assert!(Arc::ptr_eq(
+                window.word_decos.nyan_sprite_rgba().expect("custom RGBA"),
+                &rgba
+            ));
+        }
+
+        // Both presentation preparation paths observe that publication already
+        // installed the generation; neither needs a late worker/poll repair.
+        assert!(!app.install_window_config_assets(WindowId(0)));
+        app.splice_word_decorations(second, std::time::Instant::now());
+        assert_exact_catalog_on_every_window(&app, &ready);
+
+        let invalid = catalog(
+            crate::app_config::NyanSpriteAsset::Invalid {
+                source_id: Arc::from("same.png"),
+                bounded_reason: Arc::from("replacement is invalid"),
+            },
+            crate::app_config::ThemeCatalog::empty(),
+        );
+        assert_eq!(app.publish_config_assets(Arc::clone(&invalid)), 2);
+        assert_exact_catalog_on_every_window(&app, &invalid);
         assert!(
             app.windows
                 .values()
-                .all(|ws| ws.word_decos.has_custom_nyan_sprite())
+                .all(|window| window.word_decos.nyan_sprite_source_fingerprint().is_none())
         );
-        assert_eq!(app.poll_nyan_sprite_and_fanout(), 0);
-        assert!(app.windows[&second].word_decos.has_custom_nyan_sprite());
+
+        let builtin = catalog(
+            crate::app_config::NyanSpriteAsset::BuiltIn,
+            crate::app_config::ThemeCatalog::empty(),
+        );
+        assert_eq!(app.publish_config_assets(Arc::clone(&builtin)), 2);
+        assert_exact_catalog_on_every_window(&app, &builtin);
+        assert!(
+            app.windows
+                .values()
+                .all(|window| { window.word_decos.nyan_sprite_source_fingerprint() == Some(0) })
+        );
+        assert_eq!(
+            app.publish_config_assets(Arc::clone(&builtin)),
+            0,
+            "re-publishing the identical outer Arc is a complete no-op"
+        );
+    }
+
+    #[test]
+    fn same_path_content_and_theme_only_generations_fan_out_exact_arcs() {
+        let mut app = App::headless_for_test();
+        let sid = app.next_session_id;
+        let second = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+
+        let first_rgba: Arc<[u8]> = Arc::from([0x10, 0x20, 0x30, 0xff]);
+        let first = catalog(
+            crate::app_config::NyanSpriteAsset::Ready {
+                source_id: Arc::from("unchanged/path.png"),
+                w: 1,
+                h: 1,
+                rgba: Arc::clone(&first_rgba),
+                fp: 21,
+            },
+            crate::app_config::ThemeCatalog::empty(),
+        );
+        assert_eq!(app.publish_config_assets(first), 2);
+
+        // The authored path and TOML can be byte-identical while the file's
+        // content changes. A new catalog identity must replace the exact RGBA
+        // Arc in every existing window before capture or effects preparation.
+        let second_rgba: Arc<[u8]> = Arc::from([0xaa, 0xbb, 0xcc, 0xff]);
+        let replacement = catalog(
+            crate::app_config::NyanSpriteAsset::Ready {
+                source_id: Arc::from("unchanged/path.png"),
+                w: 1,
+                h: 1,
+                rgba: Arc::clone(&second_rgba),
+                fp: 22,
+            },
+            crate::app_config::ThemeCatalog::empty(),
+        );
+        assert_eq!(app.publish_config_assets(Arc::clone(&replacement)), 2);
+        assert_exact_catalog_on_every_window(&app, &replacement);
+        assert!(app.windows.values().all(|window| {
+            window.word_decos.nyan_sprite_source_fingerprint() == Some(22)
+                && Arc::ptr_eq(
+                    window
+                        .word_decos
+                        .nyan_sprite_rgba()
+                        .expect("replacement RGBA"),
+                    &second_rgba,
+                )
+        }));
+        app.splice_word_decorations(second, std::time::Instant::now());
+        assert_exact_catalog_on_every_window(&app, &replacement);
+
+        // A theme-directory-only generation still changes the outer catalog.
+        // Nyan pixels remain the same allocation, while every window adopts the
+        // new exact outer Arc immediately.
+        let themes = crate::app_config::ThemeCatalog::from_schemes([(
+            "Publication Test".to_string(),
+            aterm_types::scheme::builtin("Dracula").expect("builtin theme"),
+        )]);
+        let theme_only = catalog(replacement.nyan_sprite.clone(), themes);
+        assert_eq!(app.publish_config_assets(Arc::clone(&theme_only)), 2);
+        assert_exact_catalog_on_every_window(&app, &theme_only);
+        assert!(app.windows.values().all(|window| {
+            Arc::ptr_eq(
+                window.word_decos.nyan_sprite_rgba().expect("retained RGBA"),
+                &second_rgba,
+            )
+        }));
+        assert!(!app.install_window_config_assets(WindowId(0)));
     }
 }
 
@@ -1019,6 +1292,16 @@ fn union_native_render_damage(
     derived: crate::native_app::DamageRegion,
 ) -> crate::native_app::DamageRegion {
     use crate::native_app::DamageRegion;
+    // `All` is an authority boundary, not a hint.  Settings route/service
+    // reducers use it when a semantic transition can alter several retained
+    // regions at once (for example Top Settings -> Packages).  Narrowing that
+    // request to the compiler's bounding rectangle made the transparent tile
+    // replace unchanged sidebar pixels with zeroes while the compiled semantic
+    // tree still reported every route.  Local animations request `Rect`
+    // explicitly and retain the regional fast path below.
+    if requested == DamageRegion::All || derived == DamageRegion::All {
+        return DamageRegion::All;
+    }
     let (
         DamageRegion::Rect {
             x: first_x,
@@ -1034,9 +1317,7 @@ fn union_native_render_damage(
         },
     ) = (requested, derived)
     else {
-        // A reducer's `All` means "derive if possible" at this pure compiler
-        // boundary. A derived `All` remains authoritative and cannot narrow.
-        return derived;
+        unreachable!("All damage returned above")
     };
     let x = first_x.min(second_x);
     let y = first_y.min(second_y);
@@ -1262,14 +1543,91 @@ mod native_damage_tests {
                 crate::native_app::DamageRegion::All,
                 compiled_native_paint_damage(&before, &after).unwrap(),
             ),
+            crate::native_app::DamageRegion::All,
+            "a reducer's full semantic repaint must never become a transparent tile patch"
+        );
+        assert_eq!(
+            union_native_render_damage(
+                crate::native_app::DamageRegion::Rect {
+                    x: 220,
+                    y: 100,
+                    width: 8,
+                    height: 9,
+                },
+                compiled_native_paint_damage(&before, &after).unwrap(),
+            ),
             crate::native_app::DamageRegion::Rect {
                 x: 212,
                 y: 91,
                 width: 181,
                 height: 45,
             },
-            "the pure compiler may safely narrow a reducer's unknown/full request"
+            "an explicitly local repaint still uses the compiler-derived tile"
         );
+    }
+
+    #[test]
+    fn desktop_settings_route_repaint_keeps_full_damage_authoritative() {
+        let bounds = crate::native_ui::LogicalRect::new(0.0, 0.0, 1_200.0, 810.0);
+        let stable_sidebar = paint(
+            "settings/navigation",
+            crate::native_ui::LogicalRect::new(0.0, 0.0, 216.0, 810.0),
+            "Settings navigation",
+        );
+        let route_rect = crate::native_ui::LogicalRect::new(216.0, 0.0, 984.0, 810.0);
+        let before = crate::native_ui::CompiledUi {
+            bounds,
+            paint: vec![
+                stable_sidebar.clone(),
+                paint("settings/page", route_rect, "Top Settings"),
+            ],
+            ..crate::native_ui::CompiledUi::default()
+        };
+        let after = crate::native_ui::CompiledUi {
+            bounds,
+            paint: vec![
+                stable_sidebar,
+                paint("settings/page", route_rect, "Packages"),
+            ],
+            ..crate::native_ui::CompiledUi::default()
+        };
+        let derived = compiled_native_paint_damage(&before, &after).unwrap();
+        assert!(matches!(
+            derived,
+            crate::native_app::DamageRegion::Rect { .. }
+        ));
+        assert_eq!(
+            union_native_render_damage(crate::native_app::DamageRegion::All, derived),
+            crate::native_app::DamageRegion::All,
+            "Top -> Packages at the shipped desktop viewport must repaint the retained page, including its sidebar"
+        );
+
+        // Bind the policy check to the real Settings reducer and retained
+        // raster path as well.  The route action asks for a full repaint, and
+        // the next preparation must perform one instead of turning the page
+        // diff into a transparent regional patch.
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, view) = app.active_native_view(wid).expect("native Settings view");
+        assert!(app.prepare_native_input_scratch(wid));
+        let full_rasters = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("Top Settings retained raster")
+            .full_rasters;
+
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Packages));
+        assert!(app.prepare_native_input_scratch(wid));
+        let packages = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("Packages retained raster");
+        assert!(matches!(
+            packages.last_work,
+            crate::NativeRasterWork::Full { .. }
+        ));
+        assert_eq!(packages.full_rasters, full_rasters + 1);
     }
 
     #[test]
@@ -1409,6 +1767,46 @@ mod native_damage_tests {
         ));
         assert_eq!(resized.full_rasters, full_before_geometry + 1);
         assert_eq!(resized.regional_rasters, regional_before_geometry);
+    }
+
+    #[test]
+    fn settings_preview_tick_patches_only_the_retained_preview_band() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::CursorMotion));
+        let (_, view) = app.active_native_view(wid).expect("native Settings view");
+        assert!(app.prepare_native_input_scratch(wid));
+        let before = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("retained Cursor & Motion raster");
+        let full_rasters = before.full_rasters;
+        let regional_rasters = before.regional_rasters;
+        let total_pixels = u64::from(before.width) * u64::from(before.height);
+        let before_pixels = before.rgba.clone();
+
+        assert!(
+            app.invalidate_active_native_settings_preview(wid, 720),
+            "the default live cursor preview is ticking"
+        );
+        assert!(app.prepare_native_input_scratch(wid));
+        let ticked = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("retained raster after preview tick");
+        let crate::NativeRasterWork::Region { rect, pixels } = ticked.last_work else {
+            panic!("a preview tick widened to a full-page raster")
+        };
+        assert!(pixels < total_pixels);
+        assert_eq!(ticked.full_rasters, full_rasters);
+        assert_eq!(ticked.regional_rasters, regional_rasters + 1);
+        assert_bytes_outside_region_unchanged(
+            &before_pixels,
+            &ticked.rgba,
+            ticked.width,
+            ticked.height,
+            rect,
+        );
     }
 
     #[test]
@@ -1665,6 +2063,51 @@ pub(crate) fn cursor_cat_color_key(
         min_background_band,
         max_background_band,
     )
+}
+
+/// Whether ordinary forward-typing momentum is allowed to own the cursor cat.
+///
+/// The trail master owns the Nyan companion just as surely as it owns the
+/// ribbon behind it.  Collection/typed hellos deliberately do not use this
+/// predicate: they are bounded, independently promised presentations and the
+/// host ORs `collection_hello` around this ordinary-flight gate.
+#[inline]
+pub(crate) fn ordinary_nyan_cursor_cat_enabled(
+    cursor_trail_enabled: bool,
+    style: crate::cursor_glow::GlowStyle,
+) -> bool {
+    cursor_trail_enabled && matches!(style, crate::cursor_glow::GlowStyle::Nyan)
+}
+
+/// Consume one echo-correlated cursor pulse and forward it only when the Nyan
+/// companion's trail owner is enabled. The pulse is consumed even while gated
+/// off so toggling the owner cannot replay stale typing.
+#[inline]
+pub(crate) fn forward_nyan_cursor_cat_momentum(
+    cursor_trail_enabled: bool,
+    style: crate::cursor_glow::GlowStyle,
+    pulse: Option<Instant>,
+    cat: &mut crate::nyan_cursor::CursorCat,
+) {
+    if ordinary_nyan_cursor_cat_enabled(cursor_trail_enabled, style)
+        && let Some(at) = pulse
+    {
+        cat.on_key(at, true);
+    }
+}
+
+/// Exact host presentation gate shared by glass and styled captures. A
+/// collection hello bypasses both the ordinary trail owner and the animation
+/// requirement; an ordinary flight must satisfy both.
+#[inline]
+pub(crate) fn cursor_cat_presentation_enabled(
+    animate_cat: bool,
+    cursor_trail_enabled: bool,
+    style: crate::cursor_glow::GlowStyle,
+    collection_hello: bool,
+) -> bool {
+    collection_hello
+        || (animate_cat && ordinary_nyan_cursor_cat_enabled(cursor_trail_enabled, style))
 }
 
 #[cfg(test)]
@@ -2778,28 +3221,6 @@ pub(crate) fn prepend_strip_rows(
     dst.snapshot_seq = dst.snapshot_seq.wrapping_add(1);
 }
 
-/// Append `hud_rows` painted HUD rows at the BOTTOM of the composed frame `dst`,
-/// keeping every per-row vector aligned. The bottom analog of [`prepend_strip_rows`]:
-/// it does NOT move the cursor (the HUD sits BELOW the terminal grid + cursor), it
-/// just grows the grid downward. Because the renderer maps row `r` to pixel band
-/// `pad + r*cell_h`, the appended rows land in the bottom band automatically. Pure /
-/// unit-testable; an empty `hud_rows` is a no-op (byte-identical).
-pub(crate) fn append_hud_rows(dst: &mut RenderInput, hud_rows: Vec<Vec<RenderCell>>) {
-    let n = hud_rows.len();
-    if n == 0 {
-        return;
-    }
-    for row in hud_rows {
-        dst.cells.push(row);
-        dst.clusters.push(Vec::new());
-        dst.combining.push(Vec::new());
-        dst.images.push(Vec::new());
-        dst.line_sizes.push(aterm_core::grid::LineSize::SingleWidth);
-    }
-    dst.rows += n;
-    dst.snapshot_seq = dst.snapshot_seq.wrapping_add(1);
-}
-
 /// Decide whether the native host must extract an authoritative live grid
 /// snapshot for rain. Literal-mode sampling is independent of the damage
 /// epoch so a classic-to-literal config reload cannot wait for unrelated PTY
@@ -2865,6 +3286,85 @@ pub(crate) fn update_rain_hidden_band(
     }
 }
 
+/// Translate one pane's PANE-LOCAL rain emission into window-content coords
+/// and clip it to the pane's grid-interior box (split-pane audit: rain light
+/// must never cross a divider). Rain streams are GRID-INTERIOR pixels + a
+/// viewport row tag (unlike the window-absolute cursor-effect streams), so
+/// the shift is `row += row_off`, `x += col_off·cell_w`, `y += row_off·cell_h`
+/// — the tab-strip splice discipline. Quads land inside the pane box by
+/// construction (the emitter is bounded by the pane-local geometry); the clip
+/// is defensive for halo spill, and a clipped halo renders byte-identical
+/// pixels over the surviving area because its falloff is a pure function of
+/// the (shifted) centre + per-quad params — the FirePatch continuity law.
+/// Quads that would leave the u16 pixel space drop whole (nothing to draw
+/// there anyway).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pane placement (row/col offset + rows/cols) and cell metrics are one flat geometry tuple; a wrapper struct would relocate the list, not simplify it"
+)]
+pub(crate) fn translate_rain_into_pane(
+    quads: &mut Vec<aterm_render::SpriteQuad>,
+    add: &mut Vec<aterm_render::RainHalo>,
+    row_off: u16,
+    col_off: u16,
+    pane_rows: u16,
+    pane_cols: u16,
+    cell_w: u32,
+    cell_h: u32,
+) {
+    let dx = u32::from(col_off) * cell_w;
+    let dy = u32::from(row_off) * cell_h;
+    let x1 = (u32::from(col_off) + u32::from(pane_cols)) * cell_w;
+    let y1 = (u32::from(row_off) + u32::from(pane_rows)) * cell_h;
+    let clip = move |x: u32, y: u32, w: u32, h: u32| -> Option<(u16, u16, u16, u16)> {
+        let (nx0, ny0) = (x + dx, y + dy);
+        let nx1 = nx0.saturating_add(w).min(x1);
+        let ny1 = ny0.saturating_add(h).min(y1);
+        // LAZY `then` (the pane_clip closure's law): `then_some` would
+        // evaluate the subtractions even when the guard is false.
+        (nx1 > nx0 && ny1 > ny0 && nx1 <= u32::from(u16::MAX) && ny1 <= u32::from(u16::MAX)).then(
+            || {
+                (
+                    nx0 as u16,
+                    ny0 as u16,
+                    (nx1 - nx0) as u16,
+                    (ny1 - ny0) as u16,
+                )
+            },
+        )
+    };
+    quads.retain_mut(|q| {
+        let Some((x, y, w, h)) = clip(
+            u32::from(q.x),
+            u32::from(q.y),
+            u32::from(q.w),
+            u32::from(q.h),
+        ) else {
+            return false;
+        };
+        (q.x, q.y, q.w, q.h) = (x, y, w, h);
+        q.row = q.row.saturating_add(row_off);
+        true
+    });
+    add.retain_mut(|q| {
+        let Some((x, y, w, h)) = clip(
+            u32::from(q.x),
+            u32::from(q.y),
+            u32::from(q.w),
+            u32::from(q.h),
+        ) else {
+            return false;
+        };
+        (q.x, q.y, q.w, q.h) = (x, y, w, h);
+        q.row = q.row.saturating_add(row_off);
+        // The falloff CENTRE shifts with the quad (it may lie outside the
+        // clipped rect — the radial math is absolute, so light stays exact).
+        q.cx = (u32::from(q.cx) + dx).min(u32::from(u16::MAX)) as u16;
+        q.cy = (u32::from(q.cy) + dy).min(u32::from(u16::MAX)) as u16;
+        true
+    });
+}
+
 /// A divider cell for the gaps BETWEEN split panes: a blank glyph filled with a
 /// mid-tone background so the 1-cell line reads as a visible seam regardless of
 /// font glyph coverage. The colour is a 50/50 blend of the theme's foreground and
@@ -2891,11 +3391,56 @@ pub(crate) fn divider_cell(theme: Theme) -> RenderCell {
     }
 }
 
+/// Resolve the cell that an UNMATERIALIZED terminal column represents. Grid rows
+/// are intentionally sparse: a missing tail is `Cell::EMPTY`, not a request to
+/// inherit the last stored cell's SGR. Resolve that implicit cell from the pane's
+/// live defaults so OSC 10/11 and terminal-wide reverse video (DECSCNM) survive
+/// split composition exactly like materialized cells do.
+pub(crate) fn terminal_blank_cell(term: &Terminal) -> RenderCell {
+    let (fg, bg) = aterm_core::terminal::color_resolve::resolve_colors(
+        &aterm_core::grid::Cell::EMPTY,
+        None,
+        term.color_palette(),
+        term.default_foreground(),
+        term.default_background(),
+        term.reverse_video(),
+    );
+    RenderCell {
+        ch: ' ',
+        fg: [fg.r, fg.g, fg.b],
+        bg: [bg.r, bg.g, bg.b],
+        wide: false,
+        emoji_presentation: false,
+        bold: false,
+        italic: false,
+        underline: aterm_core::terminal::UnderlineStyle::None,
+        strikethrough: false,
+        overline: false,
+        underline_color: None,
+    }
+}
+
 /// SPLIT-PANE composition: fill `dst` with a `rows`×`cols` grid of divider cells
 /// (the seam colour), reset to no cursor / no clusters / single-width rows. The
 /// per-pane blit then overwrites each pane's rectangle; the cells left untouched
 /// are exactly the 1-cell divider gaps between panes.
 pub(crate) fn fill_divider_grid(dst: &mut RenderInput, rows: usize, cols: usize, theme: Theme) {
+    fill_divider_grid_cells(dst, rows, cols, theme);
+    clear_effect_overlays_for_compose(dst);
+}
+
+/// The CELL half of [`fill_divider_grid`]: divider-seam grid + cluster/
+/// combining/image/line-size/cursor resets, effect overlays UNTOUCHED. The
+/// composed `image`/`snapshot` capture uses this alone (split-pane audit): a
+/// capture must show the retained last-present effect quads WYSIWYG, not wipe
+/// them — the live compose path clears them separately because it re-produces
+/// every overlay each frame.
+pub(crate) fn fill_divider_grid_cells(
+    dst: &mut RenderInput,
+    rows: usize,
+    cols: usize,
+    theme: Theme,
+) {
     let seam = divider_cell(theme);
     dst.rows = rows;
     dst.cols = cols;
@@ -2911,7 +3456,7 @@ pub(crate) fn fill_divider_grid(dst: &mut RenderInput, rows: usize, cols: usize,
     // Inline-image placements are per-row sparse like clusters/combining; reset them
     // to exactly `rows` empty rows each compose frame, mirroring `cell_frame_into`'s
     // `images.resize_with(rows, Vec::new)`. Without this, the chrome splices
-    // (`prepend_strip_rows`/`append_hud_rows`) are the only mutators of `dst.images`
+    // `prepend_strip_rows` is the only chrome mutator of `dst.images`
     // in the compose path, so it grows unbounded (leak) and drifts out of length
     // alignment with `cells`, corrupting the per-row damage gate.
     dst.images.clear();
@@ -2929,6 +3474,14 @@ pub(crate) fn fill_divider_grid(dst: &mut RenderInput, rows: usize, cols: usize,
     dst.cursor_visible = false;
     dst.cursor_row = 0;
     dst.cursor_col = 0;
+    dst.display_offset = 0;
+}
+
+/// The EFFECT-OVERLAY half of [`fill_divider_grid`]: clear every host-owned
+/// bling channel so a compose frame starts overlay-free (each active effect
+/// re-installs its own quads afterwards; empty vecs + `None` atlases are
+/// byte-identical off).
+pub(crate) fn clear_effect_overlays_for_compose(dst: &mut RenderInput) {
     dst.cursor_glow_add.clear();
     dst.glow_halo.clear();
     dst.fire_patch.clear();
@@ -2949,38 +3502,53 @@ pub(crate) fn fill_divider_grid(dst: &mut RenderInput, rows: usize, cols: usize,
     dst.free_sprites.clear();
     dst.free_atlas = None;
     dst.nova_add.clear();
-    // PHOSPHOR rain is single-pane only too (its occupancy bitset lives in
-    // single-pane window-content coords): the compose path carries none, and
-    // empty vecs / a None atlas are byte-identical off.
+    // PHOSPHOR rain: the compose path re-installs the FOCUSED pane's
+    // translated emission after this clear (split-pane audit) — starting
+    // channel-empty keeps a suspended/drained frame byte-identical off.
     dst.rain_quads.clear();
     dst.rain_atlas = None;
     dst.rain_add.clear();
-    dst.display_offset = 0;
 }
 
 /// Blit one pane's snapshot `src` (sized to the pane's sub-rect) into the
 /// composite `dst` at cell offset `(row_off, col_off)`. Copies the resolved cells,
+/// fills each sparse row's omitted tail through `src.cols` with `blank`, then copies
 /// the sparse emoji-cluster / combining-mark / inline-image per-row data
-/// (column-shifted by `col_off`), and the per-row line size. Bounds-checked so a
-/// pane that slightly overflows a degenerate tiny window can never write past the
-/// composite.
+/// (column-shifted by `col_off`) and the per-row line size. Bounds-checked so a pane
+/// that slightly overflows a degenerate tiny window can never write past the
+/// composite. Painting the full declared pane rectangle is what confines the
+/// divider-grid sentinel to actual divider columns.
 pub(crate) fn blit_pane_into(
     dst: &mut RenderInput,
     src: &RenderInput,
     row_off: usize,
     col_off: usize,
+    blank: RenderCell,
 ) {
     let dst_cols = dst.cols;
-    for (sr, src_row) in src.cells.iter().enumerate() {
-        let dr = row_off + sr;
+    for sr in 0..src.rows {
+        let Some(dr) = row_off.checked_add(sr) else {
+            break;
+        };
         let Some(dst_row) = dst.cells.get_mut(dr) else {
             break;
         };
-        for (sc, cell) in src_row.iter().enumerate() {
-            let dc = col_off + sc;
-            if let Some(slot) = dst_row.get_mut(dc) {
-                *slot = *cell;
+        let src_row = src.cells.get(sr);
+        let materialized = src_row.map_or(0, |row| row.len().min(src.cols));
+        if let Some(src_row) = src_row {
+            for (sc, cell) in src_row.iter().take(materialized).enumerate() {
+                let Some(dc) = col_off.checked_add(sc) else {
+                    break;
+                };
+                if let Some(slot) = dst_row.get_mut(dc) {
+                    *slot = *cell;
+                }
             }
+        }
+        let blank_start = col_off.saturating_add(materialized).min(dst_row.len());
+        let pane_end = col_off.saturating_add(src.cols).min(dst_row.len());
+        if blank_start < pane_end {
+            dst_row[blank_start..pane_end].fill(blank);
         }
         if let Some(ls) = src.line_sizes.get(sr)
             && let Some(dst_ls) = dst.line_sizes.get_mut(dr)
@@ -3389,6 +3957,38 @@ mod comet_trail_tests {
 }
 
 #[cfg(test)]
+mod gpu_backpressure_tests {
+    use super::gpu_backpressure_excess_ns;
+    use std::time::Duration;
+
+    /// Healthy display pacing must contribute EXACTLY zero to the load-shed EMA —
+    /// that invariant is why swapchain acquire was excluded from the causal cost in
+    /// the first place, and breaking it would shed every effect on an idle machine
+    /// that simply presents at the refresh rate.
+    #[test]
+    fn healthy_pacing_charges_nothing() {
+        let fi = Duration::from_micros(8333); // 120 Hz
+        assert_eq!(gpu_backpressure_excess_ns(0, fi), 0);
+        assert_eq!(gpu_backpressure_excess_ns(1_000_000, fi), 0); // 1 ms wait
+        // A wait of exactly one full refresh is still pacing, not back-pressure.
+        assert_eq!(gpu_backpressure_excess_ns(8_333_000, fi), 0);
+    }
+
+    /// Past a full refresh the drawable pool is exhausted because the GPU has not
+    /// finished prior frames — genuine back-pressure, and the ONLY condition under
+    /// which shedding the (pure-GPU) bloom and shimmer passes can help.
+    #[test]
+    fn exhausted_pool_charges_only_the_excess() {
+        let fi = Duration::from_micros(8333);
+        assert_eq!(gpu_backpressure_excess_ns(10_333_000, fi), 2_000_000);
+        assert_eq!(gpu_backpressure_excess_ns(25_000_000, fi), 16_667_000);
+        // At 60 Hz the same absolute wait is proportionally less alarming.
+        let fi60 = Duration::from_micros(16667);
+        assert_eq!(gpu_backpressure_excess_ns(25_000_000, fi60), 8_333_000);
+    }
+}
+
+#[cfg(test)]
 mod motion_policy_tests {
     use super::{PERF_HYSTERESIS_FRAMES, causal_render_cost_ns};
     use crate::App;
@@ -3792,7 +4392,7 @@ mod motion_policy_tests {
 pub(crate) struct CursorFxInputs {
     /// The animation clock (ONE `Instant` per redraw / capture).
     pub now: Instant,
-    /// Window grid rows (terminal content — no strip/HUD rows).
+    /// Window grid rows (terminal content — no tab-strip rows).
     pub rows: usize,
     /// Window grid cols.
     pub cols: usize,
@@ -3906,19 +4506,6 @@ fn visible_match_range(
 }
 
 impl App {
-    /// Consume at most the worker's ready publication and schedule every
-    /// logical window when it installs. Returning the logical target count is
-    /// a deterministic test seam for the ordering where RedrawRequested drains
-    /// the result before the already-queued `Wake::NyanSpriteReady` arrives.
-    pub(crate) fn poll_nyan_sprite_and_fanout(&mut self) -> usize {
-        if !crate::nyan_sprite_loader::poll_and_install(self) {
-            return 0;
-        }
-        let targets = self.windows.len();
-        self.request_redraw_all_windows();
-        targets
-    }
-
     /// The predictive-echo mode, resolved once per config generation (the
     /// cache is invalidated by `reload_config`) instead of re-parsing the
     /// config string on every keystroke — and now on every presented frame:
@@ -4348,7 +4935,7 @@ impl App {
     }
 
     /// Glyph rasterization size (physical px) for window `wid`, from its own
-    /// per-window [`MetricsView`] (mixed-DPI) — so an overlay card / HUD element
+    /// per-window [`MetricsView`] (mixed-DPI) — so an overlay card
     /// on a different-DPI window sizes its UI font from THAT window's px, not the
     /// shared renderer's currently-active size. Falls back to the shared `font_px`
     /// for an unknown window.
@@ -4377,11 +4964,7 @@ impl App {
     /// window-create / resize / grid-resize path routes through this so the strip
     /// AND the interior padding are always accounted for in lockstep.
     pub(crate) fn window_frame_px(&self, rows: u16, cols: u16) -> PhysicalSize<u32> {
-        self.frame_px(
-            rows.saturating_add(self.tab_strip_rows)
-                .saturating_add(self.hud_rows),
-            cols,
-        )
+        self.frame_px(rows.saturating_add(self.tab_strip_rows), cols)
     }
 
     /// Resolve the MOTION POLICY (W11) for a window whose focus state is
@@ -4476,6 +5059,30 @@ impl App {
     /// Hysteresis band: shed above [`PERF_SHED_FACTOR`]× the frame budget, re-engage
     /// below [`PERF_CLEAR_FACTOR`]× it, each debounced by [`PERF_HYSTERESIS_FRAMES`]
     /// consecutive qualifying content presents (`perf_run`).
+    /// GPU/compositor back-pressure charged to this window's most recent present,
+    /// as the load-shed EMA's second input. See [`gpu_backpressure_excess_ns`] for
+    /// why only the excess over one frame interval counts, and why the latch was
+    /// blind to GPU-bound overload without it. Zero on the CPU backend and on any
+    /// healthily-paced present.
+    fn gpu_backpressure_ns(&self, id: WindowId) -> u64 {
+        let Some(ws) = self.windows.get(&id) else {
+            return 0;
+        };
+        gpu_backpressure_excess_ns(
+            self.last_acquire_wait_ns(id),
+            ws.frame_interval.unwrap_or(self.frame_interval),
+        )
+    }
+
+    /// Wall time this window's most recent present spent BLOCKED acquiring a
+    /// swapchain drawable. 0 on the CPU backend (no swapchain to wait on).
+    fn last_acquire_wait_ns(&self, id: WindowId) -> u64 {
+        match self.windows.get(&id).and_then(|ws| ws.present.as_ref()) {
+            Some(PresentTarget::Gpu { window_gpu, .. }) => window_gpu.last_acquire_wait_ns(),
+            _ => 0,
+        }
+    }
+
     pub(crate) fn note_present_cost(
         &mut self,
         present_ns: u64,
@@ -4541,6 +5148,13 @@ impl App {
         self.perf_flip_at = Some(now);
         self.perf_reduced = shed;
         self.perf_run = 0;
+        if shed {
+            // Adaptive shedding is another Full→Reduced policy source. Settle
+            // retained scroll motion on the latch edge itself; explicit
+            // `motion = "full"` / adaptive opt-out remain Full because the
+            // shared resolver checks the effective policy before mutating.
+            self.settle_reduced_scroll_motion(now);
+        }
     }
 
     /// The SOFT load-shed envelope in [0, 1] at `now`: ramps toward 0 while the
@@ -4627,6 +5241,7 @@ impl App {
                 intensity: self.config.cursor_trail_intensity_or_default(),
                 radius: self.config.cursor_trail_radius_or_default(),
                 ring: self.config.cursor_trail_ring_or_default(),
+                wake_persist_s: self.config.cursor_trail_wake_persist_or_default(),
             },
             style,
             self.theme.cursor,
@@ -4887,11 +5502,13 @@ impl App {
         // from one echo-correlated source and cannot diverge. Key-only input
         // that never echoes forward (a password prompt, vim vertical nav)
         // pulses on neither, so it summons no cat over a dark ribbon.
-        if matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::Nyan)
-            && let Some(at) = ws.cursor_glow.take_momentum_pulse()
-        {
-            ws.cursor_cat.on_key(at, true);
-        }
+        let momentum_pulse = ws.cursor_glow.take_momentum_pulse();
+        forward_nyan_cursor_cat_momentum(
+            self.config.cursor_trail_or_default(),
+            glow_cfg.style,
+            momentum_pulse,
+            &mut ws.cursor_cat,
+        );
         // TRAIL SOUND: hand the spawn edge's cues to the synth. The engine
         // only records cues when it actually spawned light, so every gate the
         // aurora honours (style off, reduced motion ⇒ intensity 0, unfocused
@@ -4903,7 +5520,10 @@ impl App {
         {
             let gain = trail_sound_gain(
                 raw_focused,
-                self.config.trail_sounds_or_default() && terminal_sound_allowed,
+                self.config.trail_sounds_or_default()
+                    && terminal_sound_allowed
+                    // Resize repaint storms drain silently (RESIZE_SOUND_QUIET).
+                    && !ws.resize_sound_quiet(std::time::Instant::now()),
                 self.config.trail_sound_volume(),
             );
             // The melody's tone: the window's cached typed-line verdict, or
@@ -4919,9 +5539,12 @@ impl App {
                 &mut ws.cursor_glow,
                 glow_cfg.style,
                 cols.min(u16::MAX as usize) as u16,
-                gain,
-                tone,
-                self.config.trail_sound_bed_or_default(),
+                TrailSoundPolicy {
+                    voice: self.config.trail_sound_voice(),
+                    gain,
+                    tone,
+                    bed: self.config.trail_sound_bed_or_default(),
+                },
                 |event| self.trail_audio.push(event),
             );
         }
@@ -5269,11 +5892,13 @@ impl App {
             return None;
         }
         let (_, view) = self.active_native_view(wid)?;
+        let viewport = self.native_ui_viewport(wid).ok()?;
         match self.native_runtime.view_state(view) {
             Some(crate::native_app::AppViewState::Settings(state)) => {
                 let motion = self.native_view_motion_cx(wid, view);
                 let font_px = self.win_font_px(wid);
-                let mut animation = state.preview_animation(phase_ms, motion, font_px, self.theme);
+                let mut animation =
+                    state.preview_animation(phase_ms, motion, font_px, self.theme, viewport);
                 // Explicit host preparation seam: the backend-owned parked
                 // service is requested/polled here, before view compilation or
                 // paint. Its bounded one-shot convergence cadence invalidates
@@ -5289,6 +5914,31 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    /// Advance one active Settings preview and dirty only the logical preview
+    /// band retained on glass.  The scheduler calls this after the preview has
+    /// already been presented once, so the retained compiled tree is the exact
+    /// geometry authority.  If that authority is unavailable we fail closed to
+    /// a full repaint; route, service, and appearance transitions continue to
+    /// request `All` independently.
+    pub(crate) fn invalidate_active_native_settings_preview(
+        &mut self,
+        wid: WindowId,
+        phase_ms: u64,
+    ) -> bool {
+        let Some((view, _animation)) = self.active_native_settings_preview(wid, phase_ms) else {
+            return false;
+        };
+        let damage = self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.leaf_render_cache.get(&view))
+            .and_then(|cache| cache.native.as_ref())
+            .and_then(|raster| preview_damage_from_compiled(&raster.compiled))
+            .unwrap_or(crate::native_app::DamageRegion::All);
+        self.invalidate_native_view_cache(wid, view, damage);
+        true
     }
 
     /// Append the active modal surface after native application primitives.
@@ -5340,10 +5990,10 @@ impl App {
         let Some((instance, view)) = self.active_native_view(id) else {
             return false;
         };
-        let Some((rows, cols, hud_cap)) = self
+        let Some((rows, cols)) = self
             .windows
             .get(&id)
-            .map(|ws| (usize::from(ws.rows), usize::from(ws.cols), ws.hud_cap))
+            .map(|ws| (usize::from(ws.rows), usize::from(ws.cols)))
         else {
             return false;
         };
@@ -5367,13 +6017,7 @@ impl App {
                 .saturating_add(pad.saturating_mul(2)),
         )
         .unwrap_or(u32::MAX);
-        let trailing_pad = if self.hud_rows.min(hud_cap) == 0 {
-            pad
-        } else {
-            0
-        };
-        let height =
-            u32::try_from(rows.saturating_mul(ch).saturating_add(trailing_pad)).unwrap_or(u32::MAX);
+        let height = u32::try_from(rows.saturating_mul(ch).saturating_add(pad)).unwrap_or(u32::MAX);
         #[cfg(feature = "a11y-accesskit")]
         let overlay_open = self
             .windows
@@ -5480,11 +6124,14 @@ impl App {
 
         let tab_strip = self.redraw_tab_strip_state(id);
         let dy = self.native_content_origin_y(id) as u32;
-        let blank = hud_bar::blank_cell(theme);
+        let blank = chrome_band::blank_cell(theme);
         let Some(ws) = self.windows.get_mut(&id) else {
             return false;
         };
         fill_divider_grid(&mut ws.input_scratch, rows, cols, theme);
+        // No pane fx clip on a native tab (the reused scratch may carry a
+        // prior split frame's box — present-time post-fx must not inherit it).
+        ws.input_scratch.fx_clip = None;
         for row in &mut ws.input_scratch.cells {
             row.fill(blank);
         }
@@ -5518,10 +6165,6 @@ impl App {
             });
         }
         self.splice_tab_strip_with(id, tab_strip);
-        // Native tabs reserve the same bottom HUD rows as terminal tabs. Append
-        // them in the canonical preparation seam so glass and `image` both use
-        // the exact composed row count (and never centre a shorter native frame).
-        self.splice_hud_bar(id);
         #[cfg(feature = "a11y-accesskit")]
         if !overlay_open {
             self.stage_native_accessibility(id, view, &compiled);
@@ -5586,13 +6229,14 @@ impl App {
                         .unwrap_or_default();
                     let sub_rows = (leaf.rect.size.height.round() as usize).max(1);
                     let sub_cols = (leaf.rect.size.width.round() as usize).max(1);
-                    let terminal_title = {
+                    let (terminal_title, blank) = {
                         let mut terminal = term_lock(&term);
                         terminal.cell_frame_into(&mut cache.input, sub_rows, sub_cols);
+                        let blank = terminal_blank_cell(&terminal);
                         terminal.take_damage();
                         // Lock diet: an Arc clone under the hold; the owned
                         // String materializes after the guard drops (below).
-                        terminal.title_arc()
+                        (terminal.title_arc(), blank)
                     };
                     cache.native = None;
                     cache.native_damage = None;
@@ -5605,7 +6249,7 @@ impl App {
                             window.input_scratch.cursor_style = cache.input.cursor_style;
                             window.input_scratch.cursor_visible = true;
                         }
-                        blit_pane_into(&mut window.input_scratch, &cache.input, row, col);
+                        blit_pane_into(&mut window.input_scratch, &cache.input, row, col, blank);
                         window.leaf_render_cache.insert(leaf.view, cache);
                     }
                     if leaf.focused && !terminal_title.is_empty() {
@@ -5771,9 +6415,6 @@ impl App {
             self.stage_visible_native_accessibility(id);
         }
         self.splice_tab_strip_with(id, tab_strip);
-        // Heterogeneous native/terminal composites share the native early-return
-        // path, so they must append the reserved HUD here too.
-        self.splice_hud_bar(id);
         Some(title)
     }
 
@@ -6031,13 +6672,6 @@ impl App {
             None => return,
             Some(_) => {}
         }
-        // One atomic-ready probe on the common path; a ready result is drained
-        // with `try_recv` and generation-checked. The loader control half has no
-        // filesystem or PNG decoder capability, so redraw can never perform IO.
-        // The worker wake may still be queued behind this redraw. Fan out now
-        // so a sibling window cannot miss the publication merely because this
-        // window won the result-channel race.
-        let _ = self.poll_nyan_sprite_and_fanout();
         // Frame wall-clock start, read back into the `metrics` verb's
         // `last_frame_render_ms` on an actual present (early-out frames return before
         // `record_present`, so they never count). One `Instant::now()` per redraw.
@@ -6209,7 +6843,14 @@ impl App {
         // SPLIT PANES: a multi-pane tab composes the frame from EVERY visible pane
         // (see `redraw_compose`), so its early-out folds all visible panes' damage.
         // The single-pane path below is the EXACT original, byte-identical.
-        let multi_pane = self.active_tree(id).is_some_and(|t| t.len() > 1);
+        // ZOOM-AWARE (split-pane audit): a zoomed tab composes to ONE
+        // full-window rect at `(0, 0)` whose terminal `visible_plan` sizes to
+        // the whole window — coordinate-identical to a single-pane tab — so it
+        // takes the original single-pane path (rain/selection/vi/pill/fade all
+        // live), matching `WindowState::is_split`.
+        let multi_pane = self
+            .active_tree(id)
+            .is_some_and(|t| t.len() > 1 && !t.is_zoomed());
         // A single-pane ⇄ split layout change relocates the cursor between coordinate
         // spaces (single-pane window-content vs compose pane-local), so reset the cursor
         // animators on the transition — otherwise the next tick spawns a one-frame comet
@@ -6228,13 +6869,25 @@ impl App {
             // view; a layout-space change invalidates it (the next single-pane
             // frame re-baselines — settled ink, nothing fades).
             ws.stream_fade.reset();
-            // PHOSPHOR rain is single-pane only (v1): its occupancy bitset is
-            // scanned in single-pane window-content coords, so a layout-space
-            // change drops the engine (rebuilt lazily on the next single-pane
-            // frame; the drop also disarms the rain timer via `is_active`).
-            ws.matrix_rain = None;
+            // PHOSPHOR rain: RETAIN the engine across the layout transition
+            // (suspend-not-drop, split-pane audit — v1 dropped it here, so
+            // opening a split killed rain window-wide in one frame, merely
+            // VISITING a split tab wiped an unrelated tab's field, and
+            // un-splitting restarted from empty). The occupancy bitset and
+            // material bank ARE coordinate-space state, so rebaseline them
+            // (`note_grid_replaced` forces the next Tier-A rescan in the new
+            // space); the field/weather survive — the swap is a viewpoint
+            // change, not a restart. Stale quads must not leak across the
+            // space change, so the emit scratches clear here and the hidden
+            // damage band (window-content rows) drops with them. The compose
+            // path now runs its own focused-pane rain tick, so a retained
+            // engine winds down honestly there (never a leaked wake).
+            if let Some(engine) = ws.matrix_rain.as_mut() {
+                engine.note_grid_replaced();
+            }
             ws.rain_scratch.clear();
             ws.rain_add_scratch.clear();
+            ws.rain_hidden_band.clear();
         }
         // The tab-strip titles must be read OUTSIDE the term lock (reading each tab's
         // title try-locks its term — non-blocking, keep-stale on contention, see
@@ -6264,10 +6917,9 @@ impl App {
             self.recompute_matrix_rain();
         }
         // Kitty Log (§F4): the host-side recorder gate, read before the `ws`
-        // borrow below (a couple of Option reads — no cache to invalidate);
-        // and the drain-while-open snapshot sync — a sighting recorded last
-        // frame bumps the host revision, so this refreshes an open overlay's
-        // copy and requests ITS redraw (the settings_fp fold then presents it).
+        // borrow below (a couple of Option reads — no cache to invalidate).
+        // The retired Settings overlay's snapshot sync is test-only; native
+        // Settings receives its projection through the native app service.
         let kitty_log_on = self.kitty_log_enabled();
         // Curse-BONK policy, read before the `ws` borrow like the Kitty Log
         // recorder gate (§F4.7): the profanity bonk knobs, the shared trail
@@ -6277,7 +6929,6 @@ impl App {
         let bonk_detonations = self.curse_bonk_detonation_enabled();
         let bonk_volume = self.config.trail_sound_volume();
         let bonk_style = self.glow_config().style;
-        self.sync_settings_kitty_log();
         let title = if multi_pane {
             match self.redraw_compose(
                 id,
@@ -6778,9 +7429,13 @@ impl App {
                         self.trail_audio
                             .push(aterm_effects::trail_sound::SoundEvent {
                                 style: crate::cursor_glow::GlowStyle::Nyan,
+                                // The sing-along riff is its own authored song
+                                // — the `trail_sound_style` override never
+                                // re-voices it.
+                                voice: aterm_effects::trail_sound::SoundVoice::Style,
                                 kind: aterm_effects::trail_sound::SoundGesture::Celebration(
                                     aterm_effects::trail_sound::CelebrationGesture::RiffBar {
-                                        bar: (bar & 0xff) as u8,
+                                        bar: (bar & 0xffff) as u16,
                                     },
                                 ),
                                 pan: 0.0,
@@ -6835,37 +7490,29 @@ impl App {
             let nyan_enabled = win_focused
                 && !deco_suspend
                 && sparkle_on
-                && ((animate_cat && matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::Nyan))
-                    || cat_frame.collection_hello
+                && cursor_cat_presentation_enabled(
+                    animate_cat,
+                    glow_cfg.enabled,
+                    glow_cfg.style,
+                    cat_frame.collection_hello,
+                )
+                || (win_focused
+                    && !deco_suspend
+                    && sparkle_on
                     // The reduced-motion STATIC CELEBRATION presents like a
                     // hello: `cat_frame.sing` is non-zero only when the host
                     // resolved a live Nyan-gated drive above, so this arm can
                     // never draw a non-Nyan or idle frame.
-                    || cat_frame.sing > 0.0);
+                    && cat_frame.sing > 0.0);
             let nyan_alpha = if nyan_enabled { cat_frame.alpha } else { 0 };
             let glow_fp = glow_fp ^ if nyan_enabled { cat_frame.fp() } else { 0 };
             // On the way out, the cat sometimes does a flourish — a heart rising
-            // (heart meow) or a sparkling star (star wink) — drawn as additive
-            // light in the aurora layer near the cat's leading edge.
-            if nyan_alpha > 0
-                && cat_frame.fade_out > 0.0
-                && !matches!(cat_frame.exit, crate::nyan_cursor::CatExit::Plain)
-                && let Some((crow, ccol)) = cur
-            {
-                // WINDOW-ABSOLUTE anchor (emit_exit_fx's contract — the effects
-                // layer adds no renderer offset; adversarial review caught the
-                // grid-relative form drawing the flourish origin-up-left).
-                let ax = i32::from(glow_geom.origin_x) + (i32::from(ccol) + 1) * glow_cw as i32;
-                let ay = i32::from(glow_geom.origin_y) + crow as i32 * glow_ch as i32;
-                crate::nyan_cursor::emit_exit_fx(
-                    cat_frame.exit,
-                    cat_frame.fade_out,
-                    ax,
-                    ay,
-                    glow_geom,
-                    &mut ws.glow_scratch,
-                );
-            }
+            // (heart meow) or a sparkling star (star wink). It is emitted LATER
+            // (just after the halo stream is assembled below) because its
+            // LIGHT-theme arm is a SOURCE-OVER veil that must land in `glow_halo`
+            // — which is cleared+refilled from `cursor_glow.halos()` after this
+            // point — while its DARK-theme arm is additive light. See the
+            // `emit_exit_fx` call site below the `glow_halo` refill.
             // Sparkle-word decorations: rescan the visible grid only when it changed
             // (the damage epoch advanced), animate every frame (motion policy
             // permitting — Reduced forces the static path), and fingerprint for
@@ -7009,13 +7656,18 @@ impl App {
                     // detonation kind (typed provenance stays typed-only).
                     let bonk_gain = bonk_sound_gain(
                         ws.focused,
-                        bonk_enabled,
+                        bonk_enabled
+                            // Resize repaint storms drain silently
+                            // (RESIZE_SOUND_QUIET) — a re-scanned curse on a
+                            // reflowed frame is a repaint, not a keystroke.
+                            && !ws.resize_sound_quiet(std::time::Instant::now()),
                         tick_cfg.reduced_motion,
                         bonk_volume,
                     );
                     let curse_drain = drain_curse_bonk_cues(
                         &mut ws.word_decos,
                         bonk_style,
+                        self.config.trail_sound_voice(),
                         effect_geom.cols,
                         bonk_gain,
                         bonk_detonations,
@@ -7099,7 +7751,7 @@ impl App {
                     fp
                 }
             } else {
-                // Master off (config or toggle_sparkle_words panic-off): every
+                // Master off in config: every
                 // sparkle scratch — ink + cats + novas included — clears to
                 // byte-identical off. v3 §1.1 reset table: the master toggle is a
                 // hard_reset (fresh start is user intent — done marks clear too).
@@ -7445,11 +8097,7 @@ impl App {
                 }
                 return;
             }
-            // The HUD streams its own values (fps/latency/sparkline) independent of
-            // terminal damage, so when it is on we never take the content early-out —
-            // the HUD_INTERVAL timer drives a bounded ~3fps refresh.
-            if self.hud_rows == 0
-                && !deco_rescan
+            if !deco_rescan
                 // A rain refresh refilled the snapshot too — the frame MUST
                 // present (covers the engine-reset-with-unchanged-epoch edges:
                 // toggle re-enable, layout return) or stale quads strand.
@@ -7593,6 +8241,33 @@ impl App {
             ws.input_scratch
                 .glow_halo
                 .extend_from_slice(ws.cursor_glow.halos());
+            // The cat's fade-out FLOURISH (heart meow / star wink) rides the same
+            // frame streams, emitted HERE so its theme arms land correctly: the
+            // LIGHT-theme SOURCE-OVER veil appends to `glow_halo` (just refilled
+            // above), the DARK-theme additive quads append to the already-cloned
+            // `cursor_glow_add`. `emit_exit_fx` writes exactly one sink per theme.
+            // Both streams are spliced together by the tab strip below, so the
+            // flourish tracks the grid exactly as it did from `glow_scratch`.
+            if nyan_alpha > 0
+                && cat_frame.fade_out > 0.0
+                && !matches!(cat_frame.exit, crate::nyan_cursor::CatExit::Plain)
+                && let Some((crow, ccol)) = cur
+            {
+                // WINDOW-ABSOLUTE anchor (emit_exit_fx's contract — the effects
+                // layer adds no renderer offset).
+                let ax = i32::from(glow_geom.origin_x) + (i32::from(ccol) + 1) * glow_cw as i32;
+                let ay = i32::from(glow_geom.origin_y) + crow as i32 * glow_ch as i32;
+                crate::nyan_cursor::emit_exit_fx(
+                    cat_frame.exit,
+                    cat_frame.fade_out,
+                    ax,
+                    ay,
+                    glow_cfg.dark_theme,
+                    glow_geom,
+                    &mut ws.input_scratch.cursor_glow_add,
+                    &mut ws.input_scratch.glow_halo,
+                );
+            }
             // …and the PER-PIXEL FIRE (campaign 2): the flame body evaluated at
             // every device pixel by the shared field.
             ws.input_scratch.fire_patch.clear();
@@ -7620,14 +8295,18 @@ impl App {
             // fill, else the comet NUCLEUS fill, else the water DROPLET fill,
             // else the beam EMITTER fill — all ride the same contrast-floored
             // seam (None ⇒ ordinary themed cursor; at most one is Some — the
-            // styles are mutually exclusive).
-            ws.input_scratch.cursor_fill_override = rainbow_fill
-                .or(forge_fill)
-                .or(phaser_fill)
-                .or(bolt_fill)
-                .or(comet_fill)
-                .or(droplet_fill)
-                .or(beamrod_fill);
+            // styles are mutually exclusive). The focus resolver wins last:
+            // a real inactive window uses a neutral white hollow outline.
+            ws.input_scratch.cursor_fill_override = window_cursor_fill(
+                cursor_override,
+                rainbow_fill
+                    .or(forge_fill)
+                    .or(phaser_fill)
+                    .or(bolt_fill)
+                    .or(comet_fill)
+                    .or(droplet_fill)
+                    .or(beamrod_fill),
+            );
             // Present-time latency hint (TYPING-2): a keystroke-echo frame defers the
             // whole-framebuffer present-time bloom halo to the next settle frame. Read
             // before the `ws.input_hot = false` reset below.
@@ -7677,6 +8356,10 @@ impl App {
             } else {
                 ws.matrix_rain.as_mut().and_then(|e| e.rain_atlas())
             };
+            // Single-pane frames carry NO pane fx clip — clear any box a prior
+            // composed frame left on the reused scratch (present-time post-fx
+            // must cover the whole window again).
+            ws.input_scratch.fx_clip = None;
             // Live default-bg (folded with DECSCNM reverse-video) + cursor colour, so
             // the renderer's PADDING band and the cursor track OSC 11/111 and OSC 12/112
             // (and DECSCNM ?5), not just the static config theme. Both were resolved
@@ -7697,11 +8380,6 @@ impl App {
         if let Some((pos, vis)) = single_pane_ime_caret {
             self.report_ime_cursor_area(id, pos, (0, 0), vis);
         }
-        // HUD observer sample: capture terminal composition HERE, before the HUD
-        // paints itself, so enabling the observer cannot inflate the number it
-        // displays. This is intentionally distinct from the causal render metric
-        // and load-shed signal resolved after raster/encode-submit below.
-        let hud_observer_ns = u64::try_from(frame_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         // Predictive local echo: reconcile pending guesses against the now-current
         // grid, then overlay any survivors onto the terminal-sized `input_scratch`
         // BEFORE the tab-strip splice shifts everything together. This block is the
@@ -7828,9 +8506,9 @@ impl App {
         // disabled, so `input_scratch` is then the terminal grid exactly as before
         // (byte-identical). Both the single-pane and composed paths funnel here.
         self.splice_tab_strip_with(id, tab_strip);
-        // M1b sub-row scroll: NOW that the tab strip is prepended (the grid slid
-        // down by `strip` chrome rows) but BEFORE the HUD is appended below, the
-        // terminal-content band is exactly `[strip, input_scratch.rows)`. Record
+        // M1b sub-row scroll: after the tab strip is prepended (the grid slid down
+        // by `strip` chrome rows), the terminal-content band is exactly
+        // `[strip, input_scratch.rows)`. Record
         // that partition + the banked sub-row residual so the CPU present translate
         // (and the GPU band shift) glide the grid by the pixel — chrome pinned.
         // Multi-pane frames set frac 0 (whole-composite shift would slide every
@@ -7846,13 +8524,10 @@ impl App {
             ws.input_scratch.grid_bot_row = 0;
         }
         // SPLICE the Cmd-F find bar over the bottom terminal row (a no-op when not
-        // searching). BEFORE the HUD so the bar sits at the grid's bottom edge, above any
-        // HUD panels, and `cells.len()` is still the terminal band.
+        // searching).
         self.splice_find_bar(id);
-        // SPLICE the performance HUD into the bottom row (a no-op when off).
-        self.splice_hud_bar(id);
         // OVERLAY the modal Settings panel over the TOP rows (a no-op when closed), last
-        // so it paints on top of the grid + tab strip + HUD.
+        // so it paints on top of the grid + tab strip.
         self.splice_settings_panel(id);
         // Subtle top-right build/version badge — paint-only, its own slot; the composite
         // prefers the modal card, so it shows only when no overlay is open. A no-op when
@@ -7915,7 +8590,15 @@ impl App {
                 return;
             }
         };
-        let render_ns = causal_render_cost_ns(compose_ns, raster_submit_ns);
+        // The drawable-park slice, now measured rather than inferred: it sits between
+        // `note_pre_present` and the renderer's post-acquire work timer, so before this
+        // it existed only as a noisy subtraction out of `redraw_total`. On macOS it is
+        // the single largest known typing-stall mechanism (a blocked `nextDrawable`
+        // parks the winit thread and queues keyDowns behind it).
+        let acquire_wait_ns = self.last_acquire_wait_ns(id);
+        metrics::note_acquire_wait(acquire_wait_ns);
+        let render_ns = causal_render_cost_ns(compose_ns, raster_submit_ns)
+            .saturating_add(self.gpu_backpressure_ns(id));
         // OVERLAP HANDOFF reveal: this window's first REAL frame just presented —
         // put it on glass NOW (it was created hidden), so the only pixels that
         // ever cover the parked parent's frozen frame are the carried content.
@@ -7971,12 +8654,6 @@ impl App {
         // `nextDrawable` stall under GPU contention hides (2026-07-05 incident
         // candidate). `frame_started` is this redraw's entry stamp.
         metrics::record_redraw_total(frame_started.elapsed().as_nanos() as u64);
-        // Feed the HUD's rolling sample ring (fps window + sparkline) from the SAME
-        // real presents the metrics counters see.
-        let hud_now = std::time::Instant::now();
-        for p in &mut self.panels {
-            p.on_present(hud_observer_ns, present_latency_ns, hud_now);
-        }
         // Frame-pacing: stamp this present so the soft cap in the `Wake::Output`
         // handler coalesces sub-`MIN_FRAME_INTERVAL` bursts against it. Reached only
         // on a REAL present (the D-1 early-out returns before this when the screen is
@@ -8061,8 +8738,13 @@ impl App {
         // that value is dominated by the deliberate frame-pacing/coalescing hold and a
         // process-global output stamp shared across every session, so on a perfectly
         // healthy machine (render ~0.1 ms) it still reads tens of ms during ordinary
-        // streaming and would shed the effects for no reason. Swapchain/buffer acquire
-        // and final present are excluded for the same reason. The included render work
+        // streaming and would shed the effects for no reason. Swapchain acquire is
+        // excluded up to ONE frame interval for the same reason — but the EXCESS past
+        // a full interval is charged (`gpu_backpressure_ns`), because a pool that stays
+        // exhausted longer than a refresh is the GPU failing to keep up, not pacing.
+        // Without that term the latch was blind to GPU-bound overload, which is the one
+        // regime its two levers (bloom, shimmer — both pure GPU passes with ~constant
+        // CPU encode cost) actually relieve. The included render work
         // is what shedding actually lowers, making the feedback loop causal. On a latch
         // TRANSITION only, gate the GPU
         // bloom pass off (entering) or restore the configured value (leaving) and log the
@@ -8147,10 +8829,14 @@ impl App {
     /// so the non-blocking, keep-stale title read runs for every non-empty enabled
     /// strip. Strip disabled remains byte-identical to the pre-strip path.
     ///
-    /// Refills the window's reused `strip_titles_scratch` IN PLACE (no per-frame
-    /// `Vec<String>`/`String` alloc after warmup) and returns only the fingerprint;
-    /// the splice reads the same buffer. The buffer stays resident in the window, so
-    /// it survives the redraw early-out too.
+    /// Refills the window's reused `strip_titles_scratch` IN PLACE and returns
+    /// only the fingerprint; the splice reads the same buffer. The buffer stays
+    /// resident in the window, so it survives the redraw early-out too. On
+    /// steady frames the refill performs no `Vec<String>`/`String` allocation
+    /// after warmup: raw-title reads reuse each slot, and Smart-Title
+    /// composition is either the clean-title fast path (slot kept verbatim) or
+    /// a per-session cache hit `clone_from`d into the same slot — a label only
+    /// recomposes (and allocates) when its title or description changed.
     fn redraw_tab_strip_state(&mut self, id: WindowId) -> u64 {
         let tab_count = self.windows.get(&id).map_or(0, |ws| ws.tab_set.len());
         if self.tab_strip_enabled() && tab_count > 0 {
@@ -8286,16 +8972,21 @@ impl App {
                             slot.push_str(fallback);
                         }
                     }
-                    let composed = self.title_summaries.compose(
+                    // Compose IN PLACE through the coordinator's per-session
+                    // label cache: a clean title with no description is kept
+                    // verbatim, and an unchanged (title, description) pair is
+                    // `clone_from`d out of the cache into this resident slot —
+                    // either way a steady frame does no sanitize/grapheme work
+                    // and no fresh allocation. Only an actual title/description
+                    // change composes (and allocates) once.
+                    self.title_summaries.compose_label_into(
                         Some(view.session),
-                        slot.as_str(),
                         authored_description.as_deref(),
                         self.config.tab_title_format_or_default(),
                         &self.config,
                         " · ",
+                        slot,
                     );
-                    slot.clear();
-                    slot.push_str(&composed);
                 }
                 Some(crate::tab_model::View::Native(_)) | None => {
                     slot.clear();
@@ -8410,16 +9101,22 @@ impl App {
         eprintln!(
             "aterm-gui: GPU device lost — downgrading to the CPU renderer so windows keep rendering"
         );
-        let Some(cpu) =
-            crate::build_backend(self.font_px, false, self.theme, self.font_family.as_deref())
-        else {
-            eprintln!("aterm-gui: could not build the CPU fallback renderer after GPU loss");
-            return GpuRecoveryOutcome::BackendUnavailable;
+        let cpu = match self
+            .backend
+            .cpu_renderer_from_admitted(self.font_px, self.theme)
+        {
+            Ok(cpu) => cpu,
+            Err(error) => {
+                eprintln!(
+                    "aterm-gui: could not rebuild the resident CPU fallback after GPU loss: {error}"
+                );
+                return GpuRecoveryOutcome::BackendUnavailable;
+            }
         };
-        self.backend = crate::BackendSlot::Ready(cpu);
+        self.backend = crate::BackendSlot::Ready(crate::Backend::Cpu(cpu));
         self.use_gpu = false;
         metrics::set_backend_gpu(false);
-        self.pin_backend_render_config();
+        self.pin_backend_render_config_core();
         // Rebuild each window's present target as a CPU softbuffer surface over the
         // still-live OS window, dropping the dead GPU swapchain. Mirrors the softbuffer
         // setup in `attach_os_window`'s CPU arm. A window whose softbuffer surface
@@ -8761,9 +9458,14 @@ impl App {
                 // copy, as does a surface whose length no longer matches the raw
                 // window size (a transient mid-resize buffer).
                 let damage = ws.cpu_cache.last_damage();
+                // A rescued E7 scroll blit shifted the renderer's CACHE rows, but the
+                // retained SURFACE (a separate softbuffer) was not shifted — a
+                // dirty-band copy would strand the moved rows. The cache already holds
+                // the correct full frame, so fall back to the always-safe full copy.
                 let full = chrome
                     || chrome_prev
                     || damage == DamageOutcome::Full
+                    || matches!(damage, DamageOutcome::Scroll { .. })
                     || buf.age() != 1
                     || buf.len() != dw * dh;
                 let commit = if full {
@@ -9071,16 +9773,21 @@ impl App {
             self.config.trail_sounds_or_default()
                 && self
                     .serious_mode_policy()
-                    .allows(crate::motion::SeriousEffect::TerminalSound),
+                    .allows(crate::motion::SeriousEffect::TerminalSound)
+                // Resize repaint storms drain silently (RESIZE_SOUND_QUIET).
+                && !self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|ws| ws.resize_sound_quiet(std::time::Instant::now())),
             self.config.trail_sound_volume(),
         );
         let (glow_cw, glow_ch) = self.win_cell_size(wid);
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
-        // Predictive-echo config + ghost template, read before the borrows below —
-        // the FOCUSED pane reconciles/paints exactly like the single-pane path.
+        // Predictive-echo config, read before the borrows below — the FOCUSED pane
+        // reconciles/paints exactly like the single-pane path. Its empty-row ghost
+        // template is the per-terminal `blank` captured under the pane lock below.
         // Cached per config generation (see `predict_mode`), not re-parsed per frame.
         let pmode = self.predict_mode();
-        let pred_blank = self.pred_blank_cell();
         let ws = self.windows.get(&wid)?;
         let tree = &ws.layouts[ws.tabs.active];
         let focus = tree.focus();
@@ -9112,6 +9819,32 @@ impl App {
         // (`None` ⇒ scrolled back / history shifted — the engine keeps its
         // previous probe). Chars ride `ws.poof_row_buf`, window-column aligned.
         let mut focus_probe: Option<(u16, u16)> = None;
+        // PHOSPHOR rain, compose path (split-pane audit): the FOCUSED pane
+        // rains — the aurora/comet law ("effects follow focus, clipped to the
+        // pane") applied to the ambient effect. These locals snapshot the
+        // focused pane's rain inputs under its pass-1 lock, the single-pane
+        // LOCK A capture's split twin; the engine block below the loop
+        // consumes them unlocked.
+        let mut focus_epoch = 0u64;
+        let mut focus_content_seq = 0u64;
+        let mut focus_cmd_done: Option<(u64, i32)> = None;
+        let mut focus_shell_edge = false;
+        let mut focus_alt = false;
+        let mut focus_d_off = 0usize;
+        let mut focus_sel_clone = aterm_core::selection::TextSelection::new();
+        let mut pane_default_bg_u32 = 0u32;
+        // VI-1 (compose, split-pane audit): the focused pane's on-viewport vi
+        // (copy-mode) cursor in PANE-LOCAL coords — v1 wired vi only on the
+        // single-pane path, so in a split the vi cursor neither painted nor
+        // repainted (navigation was blind). Steers the repaint key, the
+        // painted cursor override, and the rain cursor band, exactly like the
+        // single-pane `vi_screen`.
+        let mut focus_vi_screen: Option<(usize, usize)> = None;
+        let mut rain_refresh = false;
+        // Suspended until the focused pane proves live: a torn-down focused
+        // session (impossible mid-redraw, but the loop tolerates it) must
+        // wind the engine down, never tick it on stale inputs.
+        let mut rain_suspend = true;
         // Clone each pane's `term` handle OUT of the `&self`/`ws` borrow so the
         // mutating composition loop below can write this window's `input_scratch`/
         // `pane_scratch` freely. Cheap: an `Arc` clone per visible pane. Panes whose
@@ -9120,6 +9853,22 @@ impl App {
             .iter()
             .filter_map(|r| self.pool.get(r.session).map(|s| (*r, s.term.clone())))
             .collect();
+        // Effective rain state for the FOCUSED pane's session (its runtime
+        // override, else the config bit — per-session semantics: in a split
+        // where only one pane enabled rain, rain follows that pane's focus).
+        // ENGAGED while on OR while this window still holds an engine that
+        // must wind down through the suspended/drain path (the single-pane
+        // `rain_cfg` law verbatim; the D-1 zero-cost pin holds — no engine is
+        // ever constructed for a never-enabled session).
+        let rain_session_on = self.session_rain_enabled(focus);
+        let load_shed = self.load_shed_active();
+        let rain_cfg = self.rain.filter(|_| {
+            rain_session_on
+                || self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|w| w.matrix_rain.is_some())
+        });
         for (r, term) in &panes {
             let mut term = term_lock(term);
             // Per-pane damage is window-scoped via the per-window `last_present`
@@ -9184,9 +9933,220 @@ impl App {
                         ws.cursor_glow.drop_row_probe();
                     }
                     ws.poof_scrollback = Some(sb);
+                    // VI-1: the pane-local vi cursor (see the declaration) —
+                    // `None` when vi is off or scrolled off-viewport.
+                    focus_vi_screen = term
+                        .vi_is_active()
+                        .then(|| term.vi_cursor_point())
+                        .and_then(|p| {
+                            vi_screen_row(p.line, d_off as i32, usize::from(r.rows)).map(|row| {
+                                (
+                                    row,
+                                    (p.col as usize).min(usize::from(r.cols).saturating_sub(1)),
+                                )
+                            })
+                        });
+                    // PHOSPHOR rain input snapshot — the single-pane LOCK A
+                    // capture's split twin, all under this SAME pane lock.
+                    focus_epoch = term.damage_epoch();
+                    focus_content_seq = term.content_seq();
+                    focus_cmd_done = term
+                        .last_completed_command()
+                        .and_then(|m| Some((term.completed_command_seq(), m.exit_code?)));
+                    focus_shell_edge = rain_shell_execute_rising_edge(
+                        &mut ws.rain_shell_executing,
+                        r.session,
+                        term.shell_state() == aterm_core::terminal::ShellState::Executing,
+                    );
+                    focus_alt = pane_alt;
+                    focus_d_off = d_off;
+                    focus_sel_clone = term.text_selection().clone();
+                    // The PANE's live default bg (DECSCNM-folded) — the rain
+                    // occupancy eligibility ground, exactly like single-pane.
+                    let dbg = if term.modes().reverse_video() {
+                        term.default_foreground()
+                    } else {
+                        term.default_background()
+                    };
+                    pane_default_bg_u32 = aterm_render::rgb_to_u32([dbg.r, dbg.g, dbg.b]);
+                    let rain_suppress_alt =
+                        pane_alt && rain_cfg.is_some_and(|c| c.suppress_in_alt_screen);
+                    rain_suspend = rain_suppress_alt || load_shed || !rain_session_on;
+                    // Hidden-cursor damage band (design §6), folded BEFORE any
+                    // take_damage — pane-LOCAL rows, matching the pane-local
+                    // geometry the engine ticks at on this path.
+                    if rain_cfg.is_some() && !rain_suspend {
+                        update_rain_hidden_band(
+                            &mut ws.rain_hidden_band,
+                            term.grid().damage(),
+                            usize::from(r.rows),
+                        );
+                    }
+                    // Tier-A refresh gate + extraction, the LOCK A etiquette:
+                    // extract AND consume together under one lock. Pass 2
+                    // re-extracts for the blit; a PTY write racing between the
+                    // passes leaves occupancy one frame stale at worst (the
+                    // epoch key term forces the corrective present).
+                    rain_refresh = rain_refresh_needed(
+                        rain_cfg.is_some(),
+                        rain_suspend,
+                        false,
+                        d_off,
+                        ws.matrix_rain.as_deref(),
+                        focus_epoch,
+                    );
+                    if rain_refresh {
+                        term.cell_frame_into(
+                            &mut ws.pane_scratch,
+                            usize::from(r.rows),
+                            usize::from(r.cols),
+                        );
+                        term.take_damage();
+                    }
                 }
             }
         }
+        // PHOSPHOR rain engine tick, compose path (split-pane audit): the
+        // single-pane rain block's split twin, ticking the SAME retained
+        // per-window engine at the FOCUSED pane's geometry off the pass-1
+        // snapshot. Emission is pane-LOCAL; `translate_rain_into_pane` shifts
+        // it into window-content coords and clips it to the pane's interior
+        // box (rain never crosses a divider). The fingerprint joins the
+        // compose RepaintKey — mixed with the pane origin, so the SAME field
+        // at a MOVED pane (divider drag) still presents — and is EXACTLY 0
+        // when off/suspended/drained (byte-identical to the pre-rain compose).
+        let rain_fp = if let Some(cfg) = rain_cfg {
+            let ws = self.windows.get_mut(&wid)?;
+            if rain_suspend {
+                // Alt-suppression / load-shed / session-off / torn-down focus:
+                // the suspended wind-down, exactly like single-pane — weather
+                // starves, the drain completes, `is_active` self-disarms.
+                if let Some(engine) = ws.matrix_rain.as_mut() {
+                    engine.tick_suspended(now);
+                }
+                // Keep the completion latch BASELINED while suspended (the
+                // single-pane law: suspension-era completions absorb silently).
+                ws.rain_last_cmd = Some((focus, focus_cmd_done.map_or(0, |(e, _)| e)));
+                ws.rain_scratch.clear();
+                ws.rain_add_scratch.clear();
+                0
+            } else {
+                // Lazy build on the first enabled tick — toggling rain ON
+                // inside a split works exactly like single-pane (zero-cost
+                // pin: a never-enabled session never constructs an engine).
+                let engine = ws.matrix_rain.get_or_insert_with(|| {
+                    Box::new(crate::matrix_rain::MatrixRain::new(
+                        crate::rain_config_for_window(cfg, wid),
+                    ))
+                });
+                engine.set_reduced_motion(!policy.animate(crate::motion::MotionEffect::MatrixRain));
+                engine.set_visibility(if raw_focused {
+                    crate::matrix_rain::RainVisibility::Focused
+                } else {
+                    crate::matrix_rain::RainVisibility::VisibleUnfocused
+                });
+                engine.note_activity(focus_content_seq);
+                if focus_shell_edge {
+                    engine.note_signal(crate::matrix_rain::RainSignal::Execute as u32, 4);
+                }
+                // EXIT STATUS → weather, keyed (session, seq) — the
+                // single-pane block verbatim (a pane-focus switch
+                // re-baselines; only a same-session new completion notes).
+                {
+                    let seq = focus_cmd_done.map_or(0, |(e, _)| e);
+                    let key = (focus, seq);
+                    if ws.rain_last_cmd != Some(key) {
+                        let same_session = ws.rain_last_cmd.is_some_and(|(sid, _)| sid == focus);
+                        ws.rain_last_cmd = Some(key);
+                        if same_session && let Some((_, code)) = focus_cmd_done {
+                            engine.note_exit_status(code != 0);
+                        }
+                    }
+                }
+                if rain_refresh && engine.can_emit() {
+                    // Pass 1 extracted the focused pane into `pane_scratch`
+                    // under its lock at this same epoch; scan those cells
+                    // here on host state, no lock held.
+                    let needs_grid_rescan = engine.needs_rescan(focus_epoch);
+                    let needs_material_sample = engine.needs_material_sample()
+                        || (needs_grid_rescan && cfg.output_material);
+                    if needs_grid_rescan {
+                        engine.rescan_from_cells(
+                            &ws.pane_scratch.cells,
+                            &ws.pane_scratch.line_sizes,
+                            &ws.pane_scratch.images,
+                            usize::from(focus_dims.0),
+                            usize::from(focus_dims.1),
+                            pane_default_bg_u32,
+                            focus_epoch,
+                        );
+                    }
+                    if needs_material_sample {
+                        engine.sample_material(
+                            &ws.pane_scratch.cells,
+                            usize::from(focus_dims.0),
+                            (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
+                            &ws.rain_hidden_band,
+                        );
+                    }
+                }
+                let effect_geom = crate::word_decorations::EffectGeom {
+                    cell_w: glow_cw as u16,
+                    cell_h: glow_ch as u16,
+                    rows: focus_dims.0,
+                    cols: focus_dims.1,
+                };
+                // Tier-B live inputs, all pane-LOCAL (cursor, hidden band,
+                // selection, scroll/alt gates) — the pane-local twin of the
+                // single-pane RainTickInput. In vi copy-mode the band follows
+                // the PAINTED vi cursor (the one the user steers), exactly
+                // like single-pane.
+                let input = crate::matrix_rain::RainTickInput {
+                    cursor: focus_vi_screen
+                        .map(|(r, c)| (r as u16, c as u16))
+                        .or((focus_vis && !focus_scrolled).then_some(focus_cur_pos)),
+                    hidden_band: &ws.rain_hidden_band,
+                    sel: Some(crate::word_decorations::SelView {
+                        sel: &focus_sel_clone,
+                        display_offset: focus_d_off as i32,
+                    }),
+                    display_offset: focus_d_off as i32,
+                    is_alt_screen: focus_alt,
+                };
+                let fp = engine.tick(
+                    now,
+                    effect_geom,
+                    &input,
+                    &mut ws.rain_scratch,
+                    &mut ws.rain_add_scratch,
+                );
+                translate_rain_into_pane(
+                    &mut ws.rain_scratch,
+                    &mut ws.rain_add_scratch,
+                    focus_off.0,
+                    focus_off.1,
+                    focus_dims.0,
+                    focus_dims.1,
+                    glow_cw as u32,
+                    glow_ch as u32,
+                );
+                if fp == 0 {
+                    0
+                } else {
+                    // Fold the pane origin so a divider drag with an
+                    // identical pane-local field still presents. `fp != 0`
+                    // stays nonzero (rotate+xor of a nonzero fp with a
+                    // <2^32 term cannot produce 0 only probabilistically —
+                    // so OR in a sentinel bit to make "live field" exact).
+                    (fp.rotate_left(17) ^ (u64::from(focus_off.0) << 16 | u64::from(focus_off.1)))
+                        | 1
+                }
+            }
+        } else {
+            // Fully off with no lingering engine: nothing runs, nothing is
+            // constructed (the D-1 zero-cost pin, compose edition).
+            0
+        };
         // Fold the LIVE theme ground — the single-pane `tick_cursor_fx` fold's
         // compose twin. glow_config() hardcodes `dark_theme: true` (the resolver
         // has no per-window background), and without this fold a light-theme
@@ -9294,9 +10254,12 @@ impl App {
                 &mut ws.cursor_glow,
                 glow_cfg.style,
                 cols.min(u16::MAX as usize) as u16,
-                sound_gain,
-                tone,
-                self.config.trail_sound_bed_or_default(),
+                TrailSoundPolicy {
+                    voice: self.config.trail_sound_voice(),
+                    gain: sound_gain,
+                    tone,
+                    bed: self.config.trail_sound_bed_or_default(),
+                },
                 |event| self.trail_audio.push(event),
             );
             // The FORGE cursor fill (fire style) — the single-pane seam's compose
@@ -9346,17 +10309,21 @@ impl App {
             invert,
             drag_hover,
             cursor_override,
-            cursor_row: focus_cur_pos.0 as usize,
-            cursor_col: focus_cur_pos.1 as usize,
-            cursor_visible: focus_vis,
+            // VI-1: while copy-mode steers, ITS cursor is the key's cursor —
+            // a vi motion damages no cell, so these terms are what force the
+            // post-motion repaint in a split (the single-pane law).
+            cursor_row: focus_vi_screen.map_or(focus_cur_pos.0 as usize, |(r, _)| r),
+            cursor_col: focus_vi_screen.map_or(focus_cur_pos.1 as usize, |(_, c)| c),
+            cursor_visible: focus_vis || focus_vi_screen.is_some(),
             cursor_style: focus_style,
             glow_fp,
             trail_fp,
             // Split-pane compose does not run the sparkle-words scan (single-pane only).
             deco_fp: 0,
-            // PHOSPHOR rain is single-pane only too (the deco_fp precedent):
-            // the layout transition dropped the engine, so 0 = byte-identical off.
-            rain_fp: 0,
+            // PHOSPHOR rain: the FOCUSED pane's field fingerprint (pane-origin
+            // mixed — see the engine block above); 0 when off/suspended/drained,
+            // byte-identical to the pre-rain compose.
+            rain_fp,
             selection: focus_selection,
             tab_strip,
             settings_fp,
@@ -9373,15 +10340,13 @@ impl App {
             // Same appearance term as the single-pane key (see `RepaintKey`).
             system_dark: repaint_system_dark(self.os_appearance),
         };
-        // HUD on → never early-out (it streams independently; see redraw_window).
         // Displayed (or just-erased) predictions bypass the skip exactly like the
         // single-pane path: a ghost paints/erases without perturbing the RepaintKey.
         let recovery_redraw_outstanding = self
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.present_retry.recovery_redraw_outstanding);
-        if self.hud_rows == 0
-            && !should_repaint_or_recover(last_present, key, recovery_redraw_outstanding)
+        if !should_repaint_or_recover(last_present, key, recovery_redraw_outstanding)
             && self
                 .windows
                 .get(&wid)
@@ -9417,6 +10382,14 @@ impl App {
         // first, then overlay each pane.
         let ws = self.windows.get_mut(&wid)?;
         fill_divider_grid(&mut ws.input_scratch, rows, cols, theme);
+        // FOCUSED-PANE fx clip for the PRESENT-TIME GPU post-fx (split-pane
+        // audit): the bloom composite and the heat-shimmer refraction operate
+        // on the finished frame AFTER the host-side quad clip above, so their
+        // blur/displacement could still paint (and sample) across a divider.
+        // Hand them the same pane box; the renderer intersects its pass
+        // regions with it. `None` (degenerate focus) = no clip, matching the
+        // quad-clip fallback.
+        ws.input_scratch.fx_clip = pane_clip;
         // The composed (multi-pane) path doesn't resolve a single per-window live
         // OSC 11 background (which pane's would win is ambiguous), so reset to
         // UNSET: the renderer falls back to the configured theme — byte-identical
@@ -9449,9 +10422,10 @@ impl App {
             // parse thread's per-batch lock acquisition never queues behind them.
             // `pred_paint`: None = nothing pending; Some(false) = expiry flush
             // only (scrolled into history); Some(true) = paint survivors.
-            let (title, pred_paint) = {
+            let (title, pred_paint, blank) = {
                 let mut term = term_lock(term);
                 term.cell_frame_into(&mut ws.pane_scratch, sub_rows, sub_cols);
+                let blank = terminal_blank_cell(&term);
                 if r.session == focus {
                     // Stamp the focused pane's absolute-row metadata from the SAME
                     // `cell_frame_into` snapshot as the cells being composited. This
@@ -9503,7 +10477,7 @@ impl App {
                 } else {
                     None
                 };
-                (term.title_arc(), pred_paint)
+                (term.title_arc(), pred_paint, blank)
             };
             // ---- Pane guard dropped: host-state-only prediction work. The
             // ghosts paint into the pane-local snapshot just extracted, so a
@@ -9515,7 +10489,7 @@ impl App {
                 }
                 Some(true) => {
                     let preds = ws.predictor.overlay(now).to_vec();
-                    if paint_prediction_ghosts(&mut ws.pane_scratch, &preds, sub_cols, pred_blank) {
+                    if paint_prediction_ghosts(&mut ws.pane_scratch, &preds, sub_cols, blank) {
                         painted_pred = true;
                         focus_pred_last = preds.last().map(|p| (p.row, p.col));
                         focus_sub_cols = sub_cols;
@@ -9537,6 +10511,7 @@ impl App {
                 &ws.pane_scratch,
                 r.row_off as usize,
                 r.col_off as usize,
+                blank,
             );
             if r.session == focus {
                 focus_title = title;
@@ -9580,14 +10555,42 @@ impl App {
         // inherits a stale rainbow fill), but the fire FORGE fill composes: the
         // fire style's warm-metal cursor is a shipped product law (v0.31), and
         // dropping it here left splits with full flames around a theme-green
-        // block. `None` for every other style — byte-identical to before.
-        ws.input_scratch.cursor_fill_override = forge_fill;
+        // block. `None` for every other style while focused; a real inactive
+        // window instead uses the same neutral white hollow outline as the
+        // single-pane path.
+        ws.input_scratch.cursor_fill_override = window_cursor_fill(cursor_override, forge_fill);
         // The cadence-comet trail was likewise produced in WINDOW coords off the
         // focused pane's cursor; copy it + its heated colour in (empty when idle / not
         // the comet style → byte-identical to no trail). `fill_divider_grid` cleared
         // any stale single-pane trail, so this is the sole compose producer.
         ws.input_scratch.cursor_trail.clone_from(&ws.trail_scratch);
         ws.input_scratch.cursor_trail_color = trail_cfg.color;
+        // PHOSPHOR rain (compose): install the FOCUSED pane's emission — the
+        // engine block above already translated it into window-content coords
+        // and clipped it to the pane's interior box. `fill_divider_grid`
+        // cleared the channels, so this is the sole compose producer; the
+        // versioned atlas Arc rides ONLY when quads do (the free_atlas idiom
+        // — a rain-free split frame is byte-identical to the pre-rain input).
+        // The tab-strip splice below shifts row + pixel y with the grid,
+        // exactly like the single-pane path.
+        //
+        // ACCEPTED one-frame race (post-merge re-audit): these quads were
+        // emitted against the PASS-1 occupancy snapshot, while the cells
+        // beneath them come from the PASS-2 re-extraction — a PTY write
+        // landing between the passes can leave rain over a just-occupied
+        // cell for ONE frame. Deliberately NOT gated on snapshot-seq
+        // equality: under heavy output the passes race often, so a gate
+        // would flicker the whole field off at exactly the moments rain is
+        // most alive — worse than a one-frame overlap the semantic-clearance
+        // margin already softens. The advanced damage epoch forces the
+        // corrective present immediately after.
+        ws.input_scratch.rain_quads.clone_from(&ws.rain_scratch);
+        ws.input_scratch.rain_add.clone_from(&ws.rain_add_scratch);
+        ws.input_scratch.rain_atlas = if ws.rain_scratch.is_empty() {
+            None
+        } else {
+            ws.matrix_rain.as_mut().and_then(|e| e.rain_atlas())
+        };
         // CURSOR-EFFECT light must not cross pane dividers (audit: a cursor at
         // a pane edge washed its crown/beam over the divider and the neighbour
         // pane's text; the GPU bloom then blurred it further across). Clip every
@@ -9605,7 +10608,11 @@ impl App {
                 let ny0 = y.max(cy0);
                 let nx1 = x.saturating_add(w).min(cx1);
                 let ny1 = y.saturating_add(h).min(cy1);
-                (nx1 > nx0 && ny1 > ny0).then_some((nx0, ny0, nx1 - nx0, ny1 - ny0))
+                // LAZY `then`, not `then_some`: a quad wholly outside the box
+                // yields `nx1 < nx0`, and `then_some`'s eagerly-evaluated
+                // argument underflowed there (debug-build panic on the first
+                // fully-clipped quad; discarded wrap in release).
+                (nx1 > nx0 && ny1 > ny0).then(|| (nx0, ny0, nx1 - nx0, ny1 - ny0))
             };
             ws.input_scratch
                 .cursor_glow_add
@@ -9665,6 +10672,16 @@ impl App {
             ws.input_scratch.cursor_row = focus_off.0 as usize + pr as usize;
             ws.input_scratch.cursor_col =
                 focus_off.1 as usize + (pc as usize + 1).min(focus_sub_cols.saturating_sub(1));
+        }
+        // VI-1 (compose): paint the vi (copy-mode) cursor INSTEAD of the
+        // terminal cursor while steering — the focused pane's vi point mapped
+        // through its display offset, offset into WINDOW coords. Runs AFTER
+        // the prediction advance so copy-mode navigation wins (there is no
+        // type-ahead while navigating) — the single-pane override's twin.
+        if let Some((vr, vc)) = focus_vi_screen {
+            ws.input_scratch.cursor_row = usize::from(focus_off.0) + vr;
+            ws.input_scratch.cursor_col = usize::from(focus_off.1) + vc;
+            ws.input_scratch.cursor_visible = true;
         }
         // Record whether THIS present painted a guess, so the early-out repaints
         // the frame that ERASES a ghost (same contract as the single-pane path).
@@ -9795,7 +10812,13 @@ impl App {
                 let mut row = vec![tab_bar::blank_cell(theme); cols];
                 if r + 1 == strip && !segments.is_empty() {
                     strip_images = tab_bar::paint_strip_with_metadata(
-                        &mut row, &segments, &titles, &metadata, active, theme,
+                        &mut row,
+                        &segments,
+                        &titles,
+                        &metadata,
+                        active,
+                        theme,
+                        self.config.active_tab_color_rgb(),
                     );
                 }
                 rows.push(row);
@@ -9839,9 +10862,8 @@ impl App {
     /// the banked sub-row residual on `input_scratch`, so the present translate
     /// (CPU [`aterm_render::scroll_translate`] / the GPU band shift) glides the grid
     /// by the pixel while chrome stays pinned. Called from the compose tail AFTER
-    /// [`Self::splice_tab_strip_with`] (the grid has slid down by the chrome rows)
-    /// and BEFORE [`Self::splice_hud_bar`] (nothing appended below the grid yet), so
-    /// the terminal band is exactly `[strip, input_scratch.rows)`.
+    /// [`Self::splice_tab_strip_with`] (the grid has slid down by the chrome rows),
+    /// so the terminal band is exactly `[strip, input_scratch.rows)`.
     ///
     /// The residual is presented ONLY under a Full [`crate::motion::MotionPolicy`]
     /// for [`crate::motion::MotionEffect::SmoothScroll`]; Reduced motion (or an
@@ -9877,12 +10899,6 @@ impl App {
         };
     }
 
-    /// Splice the HUD panel STACK into the bottom rows of the composed frame (the
-    /// bottom analog of [`Self::splice_tab_strip_with`]): one themed `RenderCell` row
-    /// per ENABLED panel, top→bottom in registry order. A no-op when no panel is on
-    /// (`hud_rows == 0`). Called from both the on-screen present and the headless
-    /// `image`/`snapshot` paths, so the HUD is WYSIWYG and introspectable. Rows are
-    /// rebuilt each present (they stream), but they are a handful of rows — trivial.
     /// Paint the Cmd-F FIND BAR over the TOP terminal row (directly below the tab strip;
     /// adaptively floated to the bottom when the current match sits on the top row) while
     /// find mode is active (`ws.search`), so the search is VISIBLE on glass — the live
@@ -9890,10 +10906,8 @@ impl App {
     /// readout + a match highlight (FIND-1). Overwrites the row in place (like [`Self::splice_config_notice`])
     /// and PINS it as chrome: its row is excluded from the M1b sub-row scroll band so the
     /// smooth-scroll pixel translate never slides the bar with the grid (the same treatment
-    /// the prepended tab strip + appended HUD get). No-op ⇒ byte-identical frame when no
-    /// find is in flight. Called just BEFORE [`Self::splice_hud_bar`] in every present +
-    /// capture path, so `cells.len()` is still exactly the terminal band (the HUD is not yet
-    /// appended) — its last row is the grid's bottom edge — and the bar sits above any HUD
+    /// as the prepended tab strip). No-op ⇒ byte-identical frame when no
+    /// find is in flight. Its last row is the grid's bottom edge, and the bar is
     /// and is captured WYSIWYG by the `image`/`snapshot` introspection path. The `text`/
     /// `screen` verbs read the engine, not this scratch, so the bar never pollutes the
     /// machine-readable terminal text.
@@ -9919,7 +10933,34 @@ impl App {
         // panes at pane row/col offsets this splice does not track — so a highlight-all tint
         // would land in the wrong pane. Suppress the tint there; the bar row and the current
         // match's selection (painted by the pane's own renderer) are still correct.
-        let multi_pane = self.active_tree(wid).is_some_and(|t| t.len() > 1);
+        // Zoom-aware (split-pane audit): a ZOOMED pane renders through the
+        // single-pane path in window-content coords, so the tint is correct
+        // there and stays on.
+        let multi_pane = self
+            .active_tree(wid)
+            .is_some_and(|t| t.len() > 1 && !t.is_zoomed());
+        // The current match's row is FOCUSED-PANE-relative in a split, while
+        // the bar placement below reasons in WINDOW terminal-band rows —
+        // translate by the focused pane's row offset (split-pane audit: a
+        // BOTTOM pane's row-0 match does not sit under a top bar, so floating
+        // the bar away was needless; a top pane's offsets keep working).
+        let focus_row_off: i64 = if multi_pane {
+            self.active_tree(wid)
+                .and_then(|t| {
+                    let focus = t.focus();
+                    let (rows, cols) = self
+                        .windows
+                        .get(&wid)
+                        .map_or((0, 0), |ws| (ws.rows, ws.cols));
+                    t.compute_layout(rows, cols)
+                        .iter()
+                        .find(|r| r.session == focus)
+                        .map(|r| i64::from(r.row_off))
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let (match_base_y, match_absolute_row_revision) = self
             .windows
             .get(&wid)
@@ -9995,14 +11036,14 @@ impl App {
         // stays visible; the seam always rides the bar's content-facing edge. The apply
         // path lands scrollback matches on row 1 (below the bar) so this float is the
         // exception — the clamp at the oldest history line — not the common step.
-        let bar_row = if term_rows > 1 && cur_term_row == Some(0) {
+        let bar_row = if term_rows > 1 && cur_term_row.map(|r| r + focus_row_off) == Some(0) {
             term_bottom
         } else {
             0
         };
         let frame_bar_row = strip + bar_row;
         let seam_at_top = bar_row == term_bottom;
-        // Tint off the live OSC-11 background (like splice_hud_bar / splice_notice) so the
+        // Tint off the live OSC-11 background (like splice_notice) so the
         // bar stays WCAG-AA legible on a program-recoloured background.
         let mut theme = self.theme;
         if let Some(ws) = self.windows.get(&wid) {
@@ -10163,8 +11204,6 @@ impl App {
         });
         ws.input_scratch.nova_add.retain(|q| q.row != bar_row16);
         ws.input_scratch.cat_quads.retain(|q| q.row != bar_row16);
-        ws.input_scratch.scene_over.retain(|q| q.row != bar_row16);
-        ws.input_scratch.scene_add.retain(|q| q.row != bar_row16);
         ws.input_scratch.rain_quads.retain(|q| q.row != bar_row16);
         ws.input_scratch.rain_add.retain(|q| q.row != bar_row16);
         // Free sprites have no row tag: their signed grid-interior pixel extent
@@ -10201,59 +11240,8 @@ impl App {
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
     }
 
-    pub(crate) fn splice_hud_bar(&mut self, wid: WindowId) {
-        if self.hud_rows == 0 || !self.windows.contains_key(&wid) {
-            return;
-        }
-        // `cap` = HUD rows this window can show (`min(hud_rows, hud_cap)`); a window too
-        // short for the full stack drops the bottom panels rather than producing a frame
-        // taller than the window. `u16::MAX` cap (no resize yet / headless) ⇒ all shown.
-        let (cols, cap) = match self.windows.get(&wid) {
-            Some(ws) => (ws.cols as usize, self.hud_rows.min(ws.hud_cap) as usize),
-            None => return,
-        };
-        if cap == 0 {
-            return;
-        }
-        // Harmonize the HUD with a live OSC-11 background: when a program recoloured the
-        // default bg (already snapshotted into `input_scratch.default_bg` above), tint
-        // the HUD off the LIVE colour — a subtle overlay on the CURRENT background —
-        // instead of the static theme, so the chrome doesn't read as a stale two-tone
-        // strip beneath a recoloured body. `hud_colors` re-derives every text colour's
-        // contrast against the new bar bg, so the HUD stays WCAG-AA legible. With no
-        // OSC 11 the value is `COLOR_UNSET` ⇒ the theme bg ⇒ byte-identical.
-        let mut theme = self.theme;
-        if let Some(ws) = self.windows.get(&wid) {
-            let live = ws.input_scratch.default_bg;
-            if live != aterm_core::render::COLOR_UNSET {
-                theme.bg = live;
-            }
-        }
-        // Build each enabled widget's block of rows (top of the stack first), flattened
-        // and capped to `cap` total rows (a short window drops the bottom). Each widget
-        // paints into `rows()` pre-blanked rows. `self.panels` and `self.windows` are
-        // disjoint fields, so the read-then-get_mut below is borrow-clean.
-        let mut rows: Vec<Vec<RenderCell>> = Vec::with_capacity(cap);
-        for p in self.panels.iter().filter(|p| p.enabled()) {
-            if rows.len() >= cap {
-                break;
-            }
-            let mut block: Vec<Vec<RenderCell>> = (0..p.rows() as usize)
-                .map(|_| vec![hud_bar::blank_cell(theme); cols])
-                .collect();
-            p.paint(&mut block, theme);
-            rows.extend(block);
-        }
-        rows.truncate(cap);
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            append_hud_rows(&mut ws.input_scratch, rows);
-        }
-    }
-
     /// The theme an overlay card on window `wid` tints with. Tracks the live
-    /// OSC-11 background exactly as `splice_hud_bar` does, so a card over a real
-    /// terminal tints off the CURRENT bg (and `hud_colors` keeps its text WCAG-AA
-    /// legible).
+    /// OSC-11 background so a card over a real terminal tints off the current bg.
     pub(crate) fn overlay_card_theme(&self, wid: WindowId) -> Theme {
         let mut theme = self.theme;
         if let Some(ws) = self.windows.get(&wid) {
@@ -10266,13 +11254,12 @@ impl App {
     }
 
     /// OVERLAY the modal Settings panel over the TOP `panel_rows` rows of the composed
-    /// frame (a no-op — byte-identical — when this window has no open overlay). Unlike
-    /// the HUD (which APPENDS rows, growing the frame downward), the settings panel
-    /// OVERWRITES existing rows in place so it covers the content like a modal without
+    /// frame (a no-op — byte-identical — when this window has no open overlay). The
+    /// settings panel overwrites existing rows in place so it covers the content without
     /// changing the frame geometry (no swapchain / PTY resize). It rides inside the same
     /// `input_scratch` both renderers consume, so it is byte-parity-correct AND captured
     /// WYSIWYG by the image/snapshot introspection path. Called LAST in the chrome seam
-    /// (after the tab strip + HUD) so it paints on top.
+    /// (after the tab strip) so it paints on top.
     pub(crate) fn splice_settings_panel(&mut self, wid: WindowId) {
         // Single source for the overlay height (C2): closed ⇒ 0 ⇒ no-op (byte-identical
         // to no panel); a frame too short for even the title ⇒ 0 too.
@@ -10720,7 +11707,7 @@ impl App {
     /// the top rows in place — no geometry change — mirroring [`Self::splice_settings_panel`].
     /// `None` ⇒ no-op (byte-identical frame; no `snapshot_seq` bump). GLOBAL (App-level),
     /// so it draws into every window. Called LAST in `redraw_window`, so it sits on top of
-    /// grid + strip + HUD + settings; while up it covers the tab strip + the top of the
+    /// grid + strip + settings; while up it covers the tab strip + the top of the
     /// grid for ~`NOTICE_TTL` (the same trade-off the modal settings panel makes). Unlike
     /// settings it does NOT hide the cursor (a banner isn't modal).
     pub(crate) fn splice_config_notice(&mut self, wid: WindowId) {
@@ -10741,8 +11728,8 @@ impl App {
             Some(ws) => ws.cols as usize,
             None => return,
         };
-        // Tint off the live OSC-11 background (like splice_settings_panel / splice_hud_bar)
-        // so `hud_colors` keeps the banner text WCAG-AA legible on a recoloured bg.
+        // Tint off the live OSC-11 background (like splice_settings_panel) so the
+        // band colors keep the banner text WCAG-AA legible on a recoloured bg.
         let mut theme = self.theme;
         if let Some(ws) = self.windows.get(&wid) {
             let live = ws.input_scratch.default_bg;
@@ -10853,19 +11840,13 @@ impl App {
     /// this surface, filling the sub-cell remainder with the terminal background.
     /// Sourcing the cached `win_px` (not a fresh `inner_size()` query) keeps a
     /// recorder replay deterministic. Headless / pre-attach (`win_px == None`) keeps
-    /// the GPU renderer's RAW transport-size fallback: terminal rows, tab strip,
-    /// effective HUD rows, and its legacy `2·pad` allocation. Visible captures
-    /// crop that transport to `pad_top + pad`. No-op on the CPU backend or a
-    /// window without a live GPU surface; `resize_surface` is
+    /// the historical frame-size fallback (the padded full-window grid: terminal
+    /// rows + tab strip + independent top/base-bottom padding). No-op on the CPU
+    /// backend or a window without a live GPU surface; `resize_surface` is
     /// idempotent, so a call with the size already applied does no reconfigure.
     fn sync_gpu_surface_size(&mut self, wid: WindowId) {
-        // The band-splice gates decide the headless fallback frame's extra rows,
-        // matched to `redraw_window`.
-        let eff_hud = self
-            .hud_rows
-            .min(self.windows.get(&wid).map_or(u16::MAX, |ws| ws.hud_cap));
         let strip = if self.windows.contains_key(&wid) {
-            (self.tab_strip_rows + eff_hud) as usize
+            self.tab_strip_rows as usize
         } else {
             0
         };
@@ -10889,19 +11870,17 @@ impl App {
     }
 
     /// HEADLESS PRESENT-REAL: the device-pixel size of window `wid`'s full
-    /// VISIBLE composed frame with no glass (terminal rows + tab/HUD rows +
-    /// independent top/base-bottom padding). The GPU offscreen keeps its larger
-    /// raw transport allocation, but `present_virtual_cropped` blits only this
-    /// visible interval. Sizes the `virtual_begin` target + tap so the first
-    /// virtual frame matches the tap's geometry (a mismatch
+    /// composed frame with NO glass — the SAME fallback math as
+    /// [`Self::sync_gpu_surface_size`]'s `win_px == None` arm (terminal rows +
+    /// tab strip for a chromed window, + independent top/base-bottom padding
+    /// border), which is exactly the offscreen `encode_frame` produces for the
+    /// spliced `input_scratch`. Sizes the `virtual_begin` target + tap so the
+    /// first `present_virtual` frame matches the tap's geometry (a mismatch
     /// would finalize the recording on frame one). `None` when the window or
     /// the GPU backend is gone.
     pub(crate) fn headless_frame_px(&mut self, wid: WindowId) -> Option<(u32, u32)> {
-        let eff_hud = self
-            .hud_rows
-            .min(self.windows.get(&wid).map_or(u16::MAX, |ws| ws.hud_cap));
         let strip = if self.windows.contains_key(&wid) {
-            (self.tab_strip_rows + eff_hud) as usize
+            self.tab_strip_rows as usize
         } else {
             0
         };
@@ -10964,6 +11943,42 @@ impl App {
             w.request_redraw();
         }
     }
+}
+
+fn preview_damage_from_compiled(
+    compiled: &crate::native_ui::CompiledUi,
+) -> Option<crate::native_app::DamageRegion> {
+    let mut union: Option<crate::native_ui::LogicalRect> = None;
+    for node in &compiled.paint {
+        if !matches!(
+            node.content,
+            crate::native_ui::UiContent::SettingsPreview(_)
+        ) {
+            continue;
+        }
+        let rect = node.rect.intersect(node.clip)?.intersect(compiled.bounds)?;
+        union = Some(match union {
+            Some(existing) => {
+                let x = existing.x.min(rect.x);
+                let y = existing.y.min(rect.y);
+                let right = existing.right().max(rect.right());
+                let bottom = existing.bottom().max(rect.bottom());
+                crate::native_ui::LogicalRect::new(x, y, right - x, bottom - y)
+            }
+            None => rect,
+        });
+    }
+    let rect = union?;
+    let x = rect.x.floor().max(0.0) as u32;
+    let y = rect.y.floor().max(0.0) as u32;
+    let right = rect.right().ceil().max(0.0) as u32;
+    let bottom = rect.bottom().ceil().max(0.0) as u32;
+    (right > x && bottom > y).then_some(crate::native_app::DamageRegion::Rect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    })
 }
 
 /// Per-step input-line budget for the native `aterm-reflow` worker's chunked
@@ -11039,6 +12054,7 @@ mod native_preview_scheduler_tests {
                 app.native_view_motion_cx(wid, view),
                 app.win_font_px(wid),
                 app.theme,
+                app.native_ui_viewport(wid).unwrap(),
             ),
             _ => panic!("Settings view state"),
         };
@@ -11265,6 +12281,70 @@ mod strip_title_lock_tests {
         term_lock(&term).process(b"\x1b]2;world\x07");
         app.refill_strip_titles(wid, &mut titles);
         assert_eq!(titles, vec!["world".to_string()]);
+    }
+
+    /// Per-frame Smart-Title composition must be served from the coordinator's
+    /// label cache: refills over unchanged inputs perform zero compositions
+    /// (clean-title fast path or cache hit), and a title or description change
+    /// recomposes exactly once.
+    #[test]
+    fn strip_refill_serves_unchanged_labels_from_the_compose_cache() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term_lock(&term).process(b"\x1b]2;build shell\x07");
+
+        // No description + presentation-clean title: the fast path keeps the
+        // raw slot verbatim and composes nothing at all.
+        let mut titles = Vec::new();
+        app.refill_strip_titles(wid, &mut titles);
+        assert_eq!(titles, vec!["build shell".to_string()]);
+        let fast = app.title_summaries.compose_runs();
+        app.refill_strip_titles(wid, &mut titles);
+        assert_eq!(
+            app.title_summaries.compose_runs(),
+            fast,
+            "a clean title with no description must not compose"
+        );
+
+        // A live generated description forces real composition; unchanged
+        // inputs must then hit the per-session cache.
+        app.config.descriptive_titles = Some(true);
+        app.config.title_summary_provider = Some(crate::app_config::TitleSummaryProvider::Builtin);
+        app.note_title_activity(0);
+        app.title_summaries
+            .set_test_activity(0, "Compiling the release build");
+        app.refill_strip_titles(wid, &mut titles);
+        assert_eq!(
+            titles,
+            vec!["build shell · Compiling the release build".to_string()]
+        );
+        let warm = app.title_summaries.compose_runs();
+        app.refill_strip_titles(wid, &mut titles);
+        app.refill_strip_titles(wid, &mut titles);
+        assert_eq!(
+            titles,
+            vec!["build shell · Compiling the release build".to_string()]
+        );
+        assert_eq!(
+            app.title_summaries.compose_runs(),
+            warm,
+            "unchanged title+description frames must be cache hits"
+        );
+
+        // A title change invalidates and recomposes exactly once...
+        term_lock(&term).process(b"\x1b]2;linker\x07");
+        app.refill_strip_titles(wid, &mut titles);
+        assert_eq!(
+            titles,
+            vec!["linker · Compiling the release build".to_string()]
+        );
+        assert_eq!(app.title_summaries.compose_runs(), warm + 1);
+        // ...and so does a description change.
+        app.title_summaries.set_test_activity(0, "Linking objects");
+        app.refill_strip_titles(wid, &mut titles);
+        assert_eq!(titles, vec!["linker · Linking objects".to_string()]);
+        assert_eq!(app.title_summaries.compose_runs(), warm + 2);
     }
 
     /// The NATIVE toolbar strip path ([`crate::App::tab_titles`], driven by
@@ -11551,14 +12631,6 @@ mod find_bar_splice_tests {
             row: 0,
             ..Default::default()
         });
-        input.scene_over.push(aterm_render::SpriteQuad {
-            row: 0,
-            ..Default::default()
-        });
-        input.scene_add.push(aterm_render::SpriteQuad {
-            row: 0,
-            ..Default::default()
-        });
         input.rain_quads.push(aterm_render::SpriteQuad {
             row: 0,
             ..Default::default()
@@ -11580,8 +12652,6 @@ mod find_bar_splice_tests {
         assert!(input.word_decorations.is_empty());
         assert!(input.nova_add.is_empty());
         assert!(input.cat_quads.is_empty());
-        assert!(input.scene_over.is_empty());
-        assert!(input.scene_add.is_empty());
         assert!(input.rain_quads.is_empty());
         assert!(input.rain_add.is_empty());
         assert!(input.free_sprites.is_empty());
@@ -12992,10 +14062,112 @@ mod rain_host_tests {
 
     use super::{
         prepend_strip_rows, rain_refresh_needed, rain_shell_execute_rising_edge,
-        update_rain_hidden_band,
+        translate_rain_into_pane, update_rain_hidden_band,
     };
     use crate::matrix_rain::{EffectGeom, MatrixRain, RainConfig, RainSignal, RainTickInput};
     use aterm_core::grid::damage::{Damage, DamageTracker};
+
+    fn q(row: u16, x: u16, y: u16, w: u16, h: u16) -> aterm_render::SpriteQuad {
+        aterm_render::SpriteQuad {
+            row,
+            x,
+            y,
+            w,
+            h,
+            ax: 0,
+            ay: 0,
+            aw: 8,
+            ah: 16,
+            tint: 0x00FF_FFFF,
+            alpha: 255,
+            flip_x: false,
+        }
+    }
+
+    fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, cx: u16, cy: u16) -> aterm_render::RainHalo {
+        aterm_render::RainHalo {
+            row,
+            x,
+            y,
+            w,
+            h,
+            color: 0x0020_FF40,
+            cx,
+            cy,
+            rx: 12,
+            ry: 8,
+            mode: aterm_render::HaloMode::Add,
+        }
+    }
+
+    /// SPLIT-PANE compose (split-pane audit): pane-local rain emission
+    /// translates by `(row_off·ch, col_off·cw)` px + `row_off` row tags, and
+    /// every surviving quad/halo lies inside the pane's grid-interior box —
+    /// rain light can never cross a divider.
+    #[test]
+    fn translate_rain_into_pane_confines_emission_to_the_pane_box() {
+        let (cw, ch) = (8u32, 16u32);
+        let (row_off, col_off, rows, cols) = (5u16, 42u16, 10u16, 38u16);
+        // A quad at the pane origin, one mid-pane, one hugging the pane's
+        // bottom-right cell — all pane-local, all in-bounds.
+        let mut quads = vec![
+            q(0, 0, 0, 8, 16),
+            q(4, 80, 64, 8, 16),
+            q(9, (u32::from(cols - 1) * cw) as u16, (9 * ch) as u16, 8, 16),
+        ];
+        // A halo whose quad pokes past the pane's right edge (emitter spill):
+        // it must clip to the box, keeping its centre shift exact. A second
+        // halo WHOLLY beyond the pane's right edge must drop WITHOUT panicking
+        // (the eager-`then_some` subtraction underflowed there in debug builds
+        // — the field-crash regression).
+        let mut add = vec![
+            halo(0, ((u32::from(cols) - 1) * cw) as u16, 0, 24, 16, 300, 8),
+            halo(1, (u32::from(cols) * cw + 40) as u16, 16, 24, 16, 340, 24),
+        ];
+        translate_rain_into_pane(&mut quads, &mut add, row_off, col_off, rows, cols, cw, ch);
+        let x0 = u32::from(col_off) * cw;
+        let y0 = u32::from(row_off) * ch;
+        let x1 = (u32::from(col_off) + u32::from(cols)) * cw;
+        let y1 = (u32::from(row_off) + u32::from(rows)) * ch;
+        assert_eq!(quads.len(), 3, "in-bounds quads all survive");
+        for quad in &quads {
+            assert!(u32::from(quad.x) >= x0 && u32::from(quad.x) + u32::from(quad.w) <= x1);
+            assert!(u32::from(quad.y) >= y0 && u32::from(quad.y) + u32::from(quad.h) <= y1);
+            assert!(
+                (row_off..row_off + rows).contains(&quad.row),
+                "row tag shifted"
+            );
+        }
+        assert_eq!(
+            quads[0].x, x0 as u16,
+            "origin quad lands at the pane origin"
+        );
+        assert_eq!(quads[0].y, y0 as u16);
+        assert_eq!(add.len(), 1, "spilling halo clips, not drops");
+        let h0 = &add[0];
+        assert!(
+            u32::from(h0.x) + u32::from(h0.w) <= x1,
+            "halo clipped at the divider"
+        );
+        assert_eq!(
+            u32::from(h0.cx),
+            300 + x0,
+            "falloff centre shifts with the pane"
+        );
+        assert_eq!(u32::from(h0.cy), 8 + y0);
+    }
+
+    /// Quads that would leave the u16 pixel space (a pane deep in a huge
+    /// window) drop whole instead of wrapping.
+    #[test]
+    fn translate_rain_into_pane_drops_u16_overflow() {
+        let (cw, ch) = (8u32, 16u32);
+        let mut quads = vec![q(0, 65_000, 0, 40, 16)];
+        let mut add = Vec::new();
+        // col_off far enough right that 65000 + col_off*8 exceeds u16::MAX.
+        translate_rain_into_pane(&mut quads, &mut add, 0, 100, 5, 8200, cw, ch);
+        assert!(quads.is_empty(), "overflowing quad drops whole");
+    }
 
     fn shell_execute_edge_model() -> aterm_spec::derive::Model {
         use aterm_spec::ty_model;

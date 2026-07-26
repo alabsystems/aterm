@@ -73,6 +73,65 @@ fn materialize_from_line_roundtrip_wide_chars() {
     assert!(mat.cells[1].flags().contains(CellFlags::WIDE_CONTINUATION));
 }
 
+/// East-Asian-Ambiguous width is a write-time terminal policy. Once printed,
+/// the main cell's WIDE bit and continuation are the geometry authority: moving
+/// the row through Line-backed scrollback must not reclassify it with the
+/// default narrow Unicode table.
+#[test]
+fn line_roundtrip_preserves_write_time_ambiguous_width() {
+    use crate::grid::scroll_materialize::materialize_from_line;
+
+    const AMBIGUOUS: char = '\u{00B7}'; // MIDDLE DOT, East Asian Width=A
+    assert_eq!(aterm_grapheme::char_width(AMBIGUOUS), 1);
+    assert_eq!(aterm_grapheme::char_width_cjk(AMBIGUOUS), 2);
+
+    let fg = PackedColor::indexed(2);
+    let bg = PackedColor::DEFAULT_BG;
+    let mut wide_grid = Grid::new(2, 6);
+    wide_grid
+        .row_mut(0)
+        .unwrap()
+        .set(0, Cell::with_style(AMBIGUOUS, fg, bg, CellFlags::WIDE));
+    wide_grid.row_mut(0).unwrap().set(
+        1,
+        Cell::with_style(' ', fg, bg, CellFlags::WIDE_CONTINUATION),
+    );
+    wide_grid
+        .row_mut(0)
+        .unwrap()
+        .set(2, Cell::with_style('Z', fg, bg, CellFlags::empty()));
+
+    let wide_line = Grid::row_to_line_static(wide_grid.row(0).unwrap());
+    let materialized = materialize_from_line(&wide_line, 6);
+    assert_eq!(materialized.cells[0].char(), AMBIGUOUS);
+    assert!(materialized.cells[0].is_wide());
+    assert!(materialized.cells[1].is_wide_continuation());
+    assert_eq!(materialized.cells[2].char(), 'Z');
+
+    let mut restored = Grid::new(2, 6);
+    restored.fill_row_from_line(0, &wide_line, 6);
+    assert_eq!(restored.cell(0, 0).unwrap().char(), AMBIGUOUS);
+    assert!(restored.cell(0, 0).unwrap().is_wide());
+    assert!(restored.is_wide_continuation_at(0, 1));
+    assert_eq!(restored.cell(0, 2).unwrap().char(), 'Z');
+
+    // Negative control: the same ambiguous scalar written narrow has no stored
+    // WIDE bit, so both Line consumers keep it at one column.
+    let mut narrow_grid = Grid::new(2, 6);
+    narrow_grid
+        .row_mut(0)
+        .unwrap()
+        .set(0, Cell::with_style(AMBIGUOUS, fg, bg, CellFlags::empty()));
+    narrow_grid
+        .row_mut(0)
+        .unwrap()
+        .set(1, Cell::with_style('Z', fg, bg, CellFlags::empty()));
+    let narrow_line = Grid::row_to_line_static(narrow_grid.row(0).unwrap());
+    let narrow = materialize_from_line(&narrow_line, 6);
+    assert!(!narrow.cells[0].is_wide());
+    assert_eq!(narrow.cells[1].char(), 'Z');
+}
+
 #[test]
 fn materialize_keeps_decsca_protected_text() {
     // PROTECTED (DECSCA) shares bit 10 with WIDE_CONTINUATION. Row→line

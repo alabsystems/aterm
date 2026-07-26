@@ -2,27 +2,129 @@
 // Copyright 2026 Andrew Yates
 
 //! build.rs — derive the updater's DEFAULT release source (owner/repo) from the
-//! SINGLE source of truth: the `[workspace.package] repository` URL, inherited into
-//! this crate's `CARGO_PKG_REPOSITORY` via `repository.workspace = true`. Emitting it
-//! here (consumed by `env!` in `src/source.rs`) keeps "where aterm lives" in exactly
-//! one place — the manifest — instead of a literal duplicated across the crate and the
-//! release scripts. The runtime env/config knobs (`ATERM_UPDATE_OWNER`/`_REPO`,
-//! `[update]` config) still override this compiled-in default.
+//! SINGLE tracked source of truth in the WORKSPACE manifest, emitting it (consumed
+//! by `env!` in `src/source.rs`) so "where installed copies look for updates" lives
+//! in exactly one place instead of a literal duplicated across crates and scripts.
 //!
-//! Best-effort: an absent or non-`github.com/<owner>/<repo>` URL degrades to
-//! `alabsystems/aterm` rather than failing the build.
+//! Precedence, highest first:
+//!
+//! 1. `[workspace.metadata.aterm] update_channel = "OWNER/REPO"` — the PUBLIC
+//!    update channel. This is the key that matters: releases are cut privately
+//!    and mirrored to it by `cargo ship cut`'s `mirror` step, so a shipped build
+//!    can read the channel with no credential at all.
+//! 2. `[workspace.package] repository` (inherited here as `CARGO_PKG_REPOSITORY`)
+//!    — the source/publish repo, used when no separate channel is declared.
+//! 3. the compiled-in `alabsystems/aterm` fallback.
+//!
+//! Rungs 2+3 are ALSO emitted on their own as `ATERM_PUBLISH_OWNER`/`_REPO`, the
+//! account this project is published under, which is independent of where installed
+//! copies fetch updates from. Consumers whose trust is account-bound (atpkg's signed
+//! package index) read that pair, so repointing `update_channel` at a mirror cannot
+//! silently move them.
+//!
+//! The runtime knobs (`ATERM_UPDATE_OWNER`/`_REPO`, `[update]` config) still
+//! override whatever is emitted here.
+//!
+//! Best-effort by construction: an unreadable manifest, an absent key, or a
+//! non-`OWNER/REPO` value degrades to the next rung rather than failing the build.
+//! The parse is hand-rolled on purpose — a build-dependency on a TOML crate would
+//! add a link to the build-time trust chain of every client binary for two string
+//! reads.
+
+use std::path::PathBuf;
 
 fn main() {
+    // `[workspace.metadata]` is NOT exposed to build scripts by cargo, so the
+    // workspace manifest is read directly. It is two levels up from this crate
+    // (`crates/aterm-update-core/`); resolve it from CARGO_MANIFEST_DIR rather
+    // than the process cwd, which cargo does not guarantee.
+    let workspace_manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default())
+        .join("..")
+        .join("..")
+        .join("Cargo.toml");
+    let workspace_text = std::fs::read_to_string(&workspace_manifest).unwrap_or_default();
+
+    let channel = table_string(&workspace_text, "workspace.metadata.aterm", "update_channel")
+        .and_then(|slug| {
+            split_owner_repo(&slug).map(|(owner, repo)| (owner.to_string(), repo.to_string()))
+        });
+
     let url = std::env::var("CARGO_PKG_REPOSITORY").unwrap_or_default();
-    let (owner, repo) = parse_github_owner_repo(&url).unwrap_or(("alabsystems", "aterm"));
+    // The SOURCE/publish repo, derived from `repository` alone and NEVER from
+    // `update_channel`. Emitted separately because the two slugs answer different
+    // questions and only coincidentally matched before the public mirror existed:
+    // consumers that mean "the account this project is published under" (atpkg's
+    // signed package index, whose trust is account-bound) must not follow the
+    // update channel when it is repointed at a mirror.
+    let (publish_owner, publish_repo) =
+        parse_github_owner_repo(&url).unwrap_or(("alabsystems", "aterm"));
+    let (owner, repo) = match channel {
+        Some(slug) => slug,
+        None => (publish_owner.to_string(), publish_repo.to_string()),
+    };
     println!("cargo:rustc-env=ATERM_DEFAULT_OWNER={owner}");
     println!("cargo:rustc-env=ATERM_DEFAULT_REPO={repo}");
-    // Re-derive if the `repository` field changes. It is inherited via
-    // `repository.workspace = true`, so the authoritative file is the WORKSPACE-root
-    // manifest (two levels up); watch this crate's manifest too for belt-and-suspenders.
+    println!("cargo:rustc-env=ATERM_PUBLISH_OWNER={publish_owner}");
+    println!("cargo:rustc-env=ATERM_PUBLISH_REPO={publish_repo}");
+    // Re-derive if either input changes. `repository` is inherited via
+    // `repository.workspace = true` and `update_channel` lives only in the
+    // workspace root, so that manifest is the authoritative file; watch this
+    // crate's manifest too for belt-and-suspenders.
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_REPOSITORY");
+}
+
+/// Read one `key = "value"` string out of one `[table]` of a TOML document.
+///
+/// Deliberately minimal: it recognizes exactly the shape this repository's
+/// manifest uses (a line-oriented `[header]`, then `key = "value"` with optional
+/// surrounding whitespace and an optional trailing `# comment`). Anything else —
+/// an inline table, a multi-line string — is treated as absent, which falls
+/// through to the next precedence rung instead of guessing.
+fn table_string(toml: &str, table: &str, key: &str) -> Option<String> {
+    let header = format!("[{table}]");
+    let mut in_table = false;
+    for line in toml.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_table = line == header;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let Some((name, rest)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        // The value is the first double-quoted run; a trailing `# comment` is
+        // outside it and therefore ignored for free.
+        let rest = rest.trim().strip_prefix('"')?;
+        let (value, _) = rest.split_once('"')?;
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Split a bare `OWNER/REPO` slug, rejecting anything that is not exactly two
+/// non-empty segments of the GitHub name alphabet. Fail closed: a bad value must
+/// fall through to the next precedence rung, never become a path-injecting slug.
+/// This mirrors `source::is_valid_slug`, which re-checks the value at runtime.
+fn split_owner_repo(slug: &str) -> Option<(&str, &str)> {
+    let (owner, repo) = slug.trim().split_once('/')?;
+    let ok = |segment: &str| {
+        !segment.is_empty()
+            && segment.len() <= 100
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    (ok(owner) && ok(repo)).then_some((owner, repo))
 }
 
 /// Extract `(owner, repo)` from a GitHub repository URL, accepting the `https://`

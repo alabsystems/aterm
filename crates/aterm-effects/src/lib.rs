@@ -21,8 +21,9 @@
 //! - **Empty == byte-identical off.** All emitters return fingerprint `0` and
 //!   empty vectors when disabled; the renderers' empty-overlay paths are proven
 //!   byte-identical by the render suites.
-//! - **Idle-to-zero.** `is_active()` (+ `next_deadline()` for the cat one-shots)
-//!   report when nothing is animating so the host returns to 0% idle.
+//! - **Idle-to-zero.** `is_active()` reports when nothing is animating;
+//!   the retained cat `next_deadline()` seam is permanently disarmed in v4,
+//!   so the host returns to 0% idle.
 //! - **Flash safety is structural.** The WCAG 2.3.1 posture (≥350 ms twinkle
 //!   floors, the window-wide nova ignition limiter, `reduced_motion`) lives in
 //!   the state machines and their config clamps — hosts expose it, embedders
@@ -49,11 +50,15 @@ pub mod cursor_glow;
 pub mod cursor_phaser;
 pub mod cursor_rainbow;
 pub mod cursor_trail;
+/// Hardened, bounded file admission shared by every native visual-feed loader.
+pub mod file_feed;
 pub mod genome;
 pub mod kitty_registry;
 pub mod matrix_overlay;
 pub mod matrix_rain;
 pub mod nova;
+/// The mushroom cloud — the rarest f-bomb detonation tier.
+pub mod nuke;
 pub mod nyan_cursor;
 /// FULL NYAN SING-ALONG — the held-key celebration: repeat detector +
 /// beat clock + the ♪/♫ music-note sprite field (see the module doc).

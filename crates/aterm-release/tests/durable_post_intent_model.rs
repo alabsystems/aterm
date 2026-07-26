@@ -27,6 +27,9 @@ mod ledger;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
+#[path = "../src/mirror.rs"]
+#[allow(dead_code)]
+mod mirror;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
@@ -47,7 +50,7 @@ use std::process::Command;
 fn journal() -> Journal {
     Journal {
         format: publish::JOURNAL_FORMAT,
-        version: "0.55".into(),
+        version: "0.55.0".into(),
         build_number: 55,
         commit: "a".repeat(40),
         min_build: None,
@@ -58,6 +61,9 @@ fn journal() -> Journal {
         release_id: None,
         draft_create_issued: false,
         upload_intents: Vec::new(),
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         done: Vec::new(),
     }
 }
@@ -69,8 +75,8 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         dist: root.join("nested/dist"),
         journal_path,
         slug: "owner/repo".into(),
-        version: "0.55".into(),
-        tag: "v0.55".into(),
+        version: "0.55.0".into(),
+        tag: "v0.55.0".into(),
         build: 55,
         commit: "a".repeat(40),
         min_build: None,
@@ -81,10 +87,18 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         release_id: None,
         draft_create_issued: false,
         upload_intents: Vec::new(),
+        // No public update channel in this fixture: the model covers the
+        // PRIVATE side's one-shot POST intents, and the mirror's twin set must
+        // start empty so a converged private upload cannot be mistaken for
+        // authority on the channel.
+        mirror_slug: None,
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         kind: CutKind::Real,
         lease: None,
         fence: None,
-        notes_section: "0.55".into(),
+        notes_section: "0.55.0".into(),
         journal: with_journal.then(journal),
     }
 }
@@ -150,16 +164,20 @@ fn real_guard_and_fsynced_journal_refine_one_shot_model() {
     let persisted = ctx.journal.as_mut().unwrap();
     persisted.release_id = Some(55);
     persisted.save(&ctx.journal_path).unwrap();
-    let upload_permit = ctx.persist_upload_intent("aterm-0.55.dmg").unwrap();
+    let upload_permit = ctx.persist_upload_intent("aterm-0.55.0.dmg").unwrap();
     drop(upload_permit);
     let uploaded = Journal::load(&ctx.journal_path).unwrap().unwrap();
-    assert_eq!(uploaded.upload_intents, ["aterm-0.55.dmg"]);
-    assert!(ctx.persist_upload_intent("aterm-0.55.dmg").is_err());
+    assert_eq!(uploaded.upload_intents, ["aterm-0.55.0.dmg"]);
+    assert!(ctx.persist_upload_intent("aterm-0.55.0.dmg").is_err());
 
     // A real publication context without a journal cannot mint authority.
     let mut unjournaled = context(&root, false);
     assert!(unjournaled.persist_draft_create_intent().is_err());
-    assert!(unjournaled.persist_upload_intent("aterm-0.55.dmg").is_err());
+    assert!(
+        unjournaled
+            .persist_upload_intent("aterm-0.55.0.dmg")
+            .is_err()
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -351,14 +369,14 @@ fn exact_cask_commit_proof_rejects_an_extra_path() {
         &["config", "user.email", "cask-proof@example.invalid"],
     );
     let cask = "packaging/homebrew/aterm.rb";
-    std::fs::write(root.join(cask), "version \"0.54\"\n").unwrap();
+    std::fs::write(root.join(cask), "version \"0.54.0\"\n").unwrap();
     std::fs::write(root.join("README"), "base\n").unwrap();
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", "base"]);
     let base = git(&root, &["rev-parse", "HEAD"]);
 
-    let expected = "version \"0.55\"\n";
-    let message = "release: v0.55 cask pin";
+    let expected = "version \"0.55.0\"\n";
+    let message = "release: v0.55.0 cask pin";
     std::fs::write(root.join(cask), expected).unwrap();
     git(&root, &["add", "--", cask]);
     git(&root, &["commit", "-m", message, "--only", "--", cask]);
@@ -366,14 +384,21 @@ fn exact_cask_commit_proof_rejects_an_extra_path() {
     let cli = ledger::GitCli::new(&root);
     publish::prove_exact_cask_commit(&cli, &exact, &base, cask, expected, message).unwrap();
 
-    std::fs::write(root.join(cask), "version \"0.56\"\n").unwrap();
+    std::fs::write(root.join(cask), "version \"0.56.0\"\n").unwrap();
     std::fs::write(root.join("README"), "mutated\n").unwrap();
     git(&root, &["add", "."]);
     git(&root, &["commit", "-m", message]);
     let extra = git(&root, &["rev-parse", "HEAD"]);
     assert!(
-        publish::prove_exact_cask_commit(&cli, &extra, &exact, cask, "version \"0.56\"\n", message)
-            .is_err()
+        publish::prove_exact_cask_commit(
+            &cli,
+            &extra,
+            &exact,
+            cask,
+            "version \"0.56.0\"\n",
+            message
+        )
+        .is_err()
     );
     let _ = std::fs::remove_dir_all(root);
 }

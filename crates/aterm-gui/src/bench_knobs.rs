@@ -9,9 +9,9 @@
 
 use std::sync::OnceLock;
 
-/// `ATERM_FLOOD_QUIET=1`: skip SPAWNING the default-on effect/audio threads
-/// (nyan-sprite loader worker, trail-audio worker and thus its CoreAudio
-/// AudioQueue) so a flood measurement sees zero unrelated thread wakeups.
+/// `ATERM_FLOOD_QUIET=1`: skip SPAWNING the default-on trail-audio worker (and
+/// thus its CoreAudio AudioQueue) so a flood measurement sees zero unrelated
+/// thread wakeups.
 pub(crate) fn flood_quiet() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATERM_FLOOD_QUIET").is_ok_and(|v| v == "1"))

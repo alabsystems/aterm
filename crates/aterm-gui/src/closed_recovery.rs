@@ -312,6 +312,7 @@ mod tests {
             restore_tag: "future.canvas".to_string(),
             route: None,
             uri: None,
+            config_editor: false,
             source_anchor: 0,
             selection: None,
             editor_selections: Vec::new(),

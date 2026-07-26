@@ -216,12 +216,12 @@ impl<E: std::fmt::Display> std::fmt::Display for TurnError<E> {
     }
 }
 
+/// The `aterm drive` CLI (binary-era `aterm-drive`), callable in-process.
+pub mod drive_cli;
 /// Re-export so callers can match on a compile failure without depending on
 /// `regex` directly (it is validated through `aterm-observe`).
 /// The `aterm fleet` CLI (binary-era `aterm-fleet`), callable in-process.
 pub mod fleet_cli;
-/// The `aterm drive` CLI (binary-era `aterm-drive`), callable in-process.
-pub mod drive_cli;
 
 pub mod regex_error {
     pub use ::aterm_observe::regex_compile_error::Error;

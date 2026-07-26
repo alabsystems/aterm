@@ -764,8 +764,15 @@ fn retention_shrink_bumps_content_gen_only_when_lines_evict() {
     grid.assert_invariants();
 }
 
+// =========================================================================
+// Unified TOTAL retention limit on tiered grids (audit E1, Codex-required):
+// `set_scrollback_line_limit(L)` caps ring + lazy + store TOGETHER. The old
+// contract ("the limit lands on the store, the ring rides on top") silently
+// retained L + ring-cap lines; these tests pin the ONE-total replacement.
+// =========================================================================
+
 #[test]
-fn tiered_limit_still_governs_the_store_not_the_ring() {
+fn tiered_limit_is_one_total_across_ring_and_store() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
     write_numbered_lines(&mut grid, 0, 100);
@@ -776,17 +783,226 @@ fn tiered_limit_still_governs_the_store_not_the_ring() {
     assert_eq!(
         grid.scrollback_line_limit(),
         Some(20),
-        "tiered: the limit lands on the store"
+        "the getter round-trips the ONE total the setter took"
     );
     assert_eq!(
         grid.storage.ring_buffer_scrollback(),
         ring_sb,
-        "tiered: the hot ring cap is a perf knob, not retention — unchanged"
+        "limit >= ring cap: the hot ring keeps its fixed fast-tier role"
     );
     assert_eq!(
         grid.scrollback_lines(),
-        20 + ring_sb,
-        "tiered retention = store limit + hot ring, as before"
+        20,
+        "TOTAL retention (ring + lazy + store) equals the limit, not limit + ring"
+    );
+    // The store's share is exactly the remainder after the ring's share.
+    assert_eq!(
+        grid.scrollback()
+            .map(aterm_scrollback::ScrollbackStorage::line_limit),
+        Some(Some(20 - ring_sb)),
+        "store share = total - ring cap"
+    );
+
+    // The total keeps governing future retention at steady state.
+    write_numbered_lines(&mut grid, 100, 50);
+    let _ = grid.scrollback_mut(); // quiescent point: drain staged lazy lines
+    assert_eq!(
+        grid.scrollback_lines(),
+        20,
+        "steady state stays at the total"
+    );
+    // Eviction is oldest-first across the tiers: the newest history line is
+    // the last one that scrolled off, and absolute numbering is contiguous.
+    let newest = grid.scrollback_lines() - 1;
+    assert_eq!(history_text(&grid, newest), "L147");
+    assert_eq!(history_text(&grid, 0), "L128");
+    grid.assert_invariants();
+}
+
+#[test]
+fn tiered_limit_below_ring_cap_recaps_the_ring() {
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
+    write_numbered_lines(&mut grid, 0, 100);
+    assert!(grid.storage.ring_buffer_scrollback() > 5);
+
+    grid.set_scrollback_line_limit(Some(5));
+    assert_eq!(
+        grid.scrollback_line_limit(),
+        Some(5),
+        "limit < ring cap still round-trips the total"
+    );
+    assert_eq!(
+        grid.scrollback_lines(),
+        5,
+        "the ring alone must not retain more than the total"
+    );
+    assert_eq!(
+        grid.storage.ring_buffer_scrollback(),
+        5,
+        "the ring was re-capped (store share is zero)"
+    );
+    // Newest-5 survive, oldest evicted (oldest-first semantics).
+    assert_eq!(history_text(&grid, 4), "L97");
+    assert_eq!(history_text(&grid, 0), "L93");
+
+    // A later RAISE widens only the store share — the hot-tier size is a
+    // construction decision and does not grow back.
+    grid.set_scrollback_line_limit(Some(30));
+    assert_eq!(grid.scrollback_line_limit(), Some(30));
+    write_numbered_lines(&mut grid, 100, 60);
+    let _ = grid.scrollback_mut();
+    assert_eq!(grid.scrollback_lines(), 30, "raised total governs");
+    assert!(
+        grid.storage.ring_buffer_scrollback() <= 5,
+        "ring cap stayed at the shrunk value; the raise landed on the store share"
+    );
+    grid.assert_invariants();
+}
+
+#[test]
+fn tiered_limit_equal_to_ring_cap_discards_evictions_without_store_churn() {
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
+    grid.set_scrollback_line_limit(Some(8)); // total == ring cap → store share 0
+    write_numbered_lines(&mut grid, 0, 100);
+
+    assert_eq!(
+        grid.scrollback_lines(),
+        8,
+        "total == ring cap: the ring is the whole retention"
+    );
+    // Evicted ring rows are discarded directly (stages_evicted_rows): a
+    // per-line materialize+push+truncate cycle through a zero-share store
+    // would tax the PTY-drain hot path for nothing.
+    assert_eq!(
+        grid.storage.lazy_buffer_lines() + grid.tiered_scrollback_lines(),
+        0,
+        "no staged or stored lines with a zero store share"
+    );
+    assert_eq!(history_text(&grid, 7), "L97");
+    grid.assert_invariants();
+}
+
+// =========================================================================
+// Out-of-band truncation accounting (audit E10a): retention loss the user
+// did not ask for is COUNTED, never surfaced as sentinel content.
+// =========================================================================
+
+#[test]
+fn flood_backpressure_drops_are_counted_out_of_band() {
+    let scrollback = Scrollback::new(100, 1000, 100_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
+    // A compress worker owns the drain but never runs (the starved-worker
+    // flood): staged lines accumulate to the THRU-5 cap, then the oldest drop.
+    grid.set_compress_offload_active(true);
+    let over = 500;
+    write_numbered_lines(&mut grid, 0, Grid::ASYNC_COMPRESS_BACKPRESSURE + over + 8);
+    assert!(
+        grid.truncated_lines() > 0,
+        "backpressure drops must register in the loss counter"
+    );
+    // The retained set holds no sentinel — its lines are exactly the written
+    // content (check the oldest retained line's shape).
+    let oldest = history_text(&grid, 0);
+    assert!(
+        oldest.starts_with('L'),
+        "no sentinel content is ever injected (oldest retained: {oldest:?})"
+    );
+    // A user-requested shrink is NOT loss: the counter must not move.
+    let counted = grid.truncated_lines();
+    grid.set_scrollback_line_limit(Some(5));
+    assert_eq!(
+        grid.truncated_lines(),
+        counted,
+        "user limit shrink is intentional, never counted as truncation"
+    );
+    grid.assert_invariants();
+}
+
+#[test]
+fn ring_watermark_reports_pressure_only_when_configured() {
+    use aterm_scrollback::WatermarkLevel;
+    let mut grid = Grid::with_scrollback(3, 20, 50_000);
+    grid.set_scrollback_line_limit(None); // ring-only "unlimited" mode
+    write_numbered_lines(&mut grid, 0, 2_000);
+    assert_eq!(
+        grid.ring_watermark_level(),
+        WatermarkLevel::Green,
+        "no configured budget → no watermark (the pre-E10a behavior)"
+    );
+    let used = grid.memory_used();
+    assert!(used > 0);
+    // Budget far above use → Green; at ~use → Red; between → Yellow.
+    grid.set_ring_byte_watermark(Some(used * 10));
+    assert_eq!(grid.ring_watermark_level(), WatermarkLevel::Green);
+    grid.set_ring_byte_watermark(Some(used));
+    assert_eq!(
+        grid.ring_watermark_level(),
+        WatermarkLevel::Red,
+        "at 100% of budget the level is Red (>= the 95% threshold)"
+    );
+    grid.set_ring_byte_watermark(Some(used + used / 8));
+    assert_eq!(
+        grid.ring_watermark_level(),
+        WatermarkLevel::Yellow,
+        "~89% of budget sits in the Yellow band (80%..95%)"
+    );
+}
+
+/// Staged lazy-buffer bytes count toward `memory_used` — and hence toward the
+/// ring byte watermark (Wave-3 adversarial review): under flood backpressure
+/// the deferred scroll-off lines are real memory the store has not absorbed
+/// yet. Pins the inclusion exactly: clearing the staged lines (capacity
+/// retained) removes exactly their per-line heap from the estimate.
+#[test]
+fn staged_lazy_buffer_bytes_count_toward_memory_used() {
+    let scrollback = Scrollback::new(100, 10_000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
+    // Stage well below the drain threshold so the deferred lines stay parked.
+    write_numbered_lines(&mut grid, 0, 500);
+    assert!(
+        grid.storage.lazy_buffer.len() >= 400,
+        "precondition: scroll-off lines are STAGED, not yet drained"
+    );
+    let with_staged = grid.memory_used();
+    let lazy_with = grid.storage.lazy_buffer.memory_used();
+    grid.storage.lazy_buffer.clear();
+    let lazy_cleared = grid.storage.lazy_buffer.memory_used();
+    assert!(
+        lazy_with > lazy_cleared,
+        "staged lines carry heap bytes beyond the retained backing capacity"
+    );
+    assert_eq!(
+        grid.memory_used(),
+        with_staged - (lazy_with - lazy_cleared),
+        "memory_used must include exactly the staged lazy-buffer bytes"
+    );
+}
+
+#[test]
+fn tiered_limit_none_is_unlimited_total() {
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
+    // Scrollback::new defaults to DEFAULT_LINE_LIMIT — the getter reports
+    // that store share folded back into a total.
+    assert_eq!(
+        grid.scrollback_line_limit(),
+        Some(aterm_scrollback::DEFAULT_LINE_LIMIT + 8),
+        "construction default round-trips as a total too"
+    );
+    grid.set_scrollback_line_limit(None);
+    assert_eq!(
+        grid.scrollback_line_limit(),
+        None,
+        "None = unlimited total (store unlimited, ring stays its fixed cap)"
+    );
+    write_numbered_lines(&mut grid, 0, 100);
+    let _ = grid.scrollback_mut();
+    assert_eq!(
+        grid.scrollback_lines(),
+        98,
+        "nothing evicted when unlimited"
     );
     grid.assert_invariants();
 }

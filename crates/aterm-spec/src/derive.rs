@@ -2475,211 +2475,6 @@ pub fn presentation_gate_model() -> Model {
     }
 }
 
-/// METRICS FRESHNESS GATE (introspection G3) — the abstract twin of `aterm-gui`'s
-/// [`MetricsSnapshot::staled`](../../aterm_gui/metrics_service): a poll-driven figure
-/// presented as LIVE must never be older than the `Stale` TTL, so a stalled/parked
-/// sampler decays to honest `n/a` rather than rendering its last value forever. The
-/// real-code binding is aterm-gui's `staleness_gate_matches_freshness_model` (the
-/// shipping gate driven in lockstep with this model, with a no-revert negative control).
-///
-/// Scalar projection `<<age, live>>`: `age` = ticks since the last fresh sample, `live`
-/// = whether the figure is still reported as available. `Sample` resets to a fresh live
-/// figure (`age = 0`, `live = 1`); `Tick` ages the figure one step (guarded `age <=
-/// Stale`, so `age` is bounded at `Stale + 1`) and, IN THE SAME STEP, drops `live` to 0
-/// exactly when the new age crosses `Stale` — an ATOMIC expiry (no transient live-and-
-/// stale state). `Stale` is the TTL in ticks (5, matching `STALE = 5s`).
-///
-/// `Buggy = 0` (committed): `Tick` expires the figure, so `FreshWhenLive` holds — a
-/// live figure is never staler than `Stale`. `Buggy = 1`: the gate FAILS to expire
-/// (keeps `live = 1` past `Stale`), so `ty` reaches `live = 1 ∧ age > Stale` → a
-/// counterexample. Thus `ty` PROVES the freshness invariant and CATCHES the no-revert
-/// bug (a stalled sampler rendering a stale value as live).
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — nested
-// `vec!`/struct literals whose aggregate-operand count exceeds the
-// VC-generation work budget, so its obligations are left Unknown
-// fail-closed regardless. No runtime logic and no panic surface beyond
-// the idiomatic allocs; the MODEL it returns is what `ty` machine-checks.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn freshness_model() -> Model {
-    // live' = if (age+1 > Stale) then (if Buggy then keep-live else expire) else live.
-    // TLA primed semantics read the PRE-state, so `age + 1` is the value `age'` takes.
-    let live_next = if_(
-        gt(add(var("age"), int(1)), cst("Stale")),
-        if_(eq(cst("Buggy"), int(1)), int(1), int(0)),
-        int(1),
-    );
-    Model {
-        name: "Freshness",
-        consts: vec![("Stale", 5), ("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "age",
-                init: 0,
-            },
-            StateVar {
-                name: "live",
-                init: 1,
-            },
-        ],
-        fn_vars: vec![],
-        actions: vec![
-            Action {
-                // A fresh sample landed: reset the age and present it as live.
-                name: "Sample",
-                guard: None,
-                updates: vec![
-                    Update {
-                        var: "age",
-                        expr: int(0),
-                    },
-                    Update {
-                        var: "live",
-                        expr: int(1),
-                    },
-                ],
-            },
-            Action {
-                // One tick older; the correct gate expires `live` as age crosses Stale.
-                // Guard bounds age at Stale+1, keeping the state space finite.
-                name: "Tick",
-                guard: Some(le(var("age"), cst("Stale"))),
-                updates: vec![
-                    Update {
-                        var: "age",
-                        expr: add(var("age"), int(1)),
-                    },
-                    Update {
-                        var: "live",
-                        expr: live_next,
-                    },
-                ],
-            },
-        ],
-        invariants: vec![Invariant {
-            // A figure reported as live is never staler than the TTL.
-            name: "FreshWhenLive",
-            expr: or_(eq(var("live"), int(0)), le(var("age"), cst("Stale"))),
-        }],
-    }
-}
-
-/// NETWORK-HEALTH HONESTY LATTICE (introspection G3) — the abstract twin of `aterm-gui`'s
-/// [`net_health_classify`](../../aterm_gui/sysmetrics): the coarse Online/Slow/Offline/
-/// Unknown classifier must never claim a state it cannot prove. The real-code binding is
-/// aterm-gui's `net_health_matches_model` (the shipping classifier enumerated over its
-/// whole finite input domain, with a `Buggy`-flip control mislabelling an unreachable
-/// link as Online).
-///
-/// Scalar projection `<<reach, health>>`: `reach` = 1 iff there is a POSITIVE
-/// reachability proof (a live default route, not merely a present link), `health` = the
-/// classifier output (`0` Unknown, `1` Offline, `2` Slow, `3` Online). Each `Probe*`
-/// action sets both atomically for one probe outcome, spreading the input space:
-/// reachable-fast → Online, reachable-degraded → Slow, unreachable → Offline (or, under
-/// `Buggy`, a dishonest Online), probe-undecided → Unknown.
-///
-/// `Buggy = 0` (committed): `Online`/`Slow` are set ONLY with `reach = 1`, and `Offline`
-/// only with `reach = 0`, so both honesty invariants hold. `Buggy = 1`: the unreachable
-/// probe reports `Online` with `reach = 0`, so `ty` reaches `health = Online ∧ reach = 0`
-/// → a counterexample. Thus `ty` PROVES the honesty lattice and CATCHES a classifier
-/// that fabricates reachability.
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — nested
-// `vec!`/struct literals whose aggregate-operand count exceeds the
-// VC-generation work budget, so its obligations are left Unknown
-// fail-closed regardless. No runtime logic and no panic surface beyond
-// the idiomatic allocs; the MODEL it returns is what `ty` machine-checks.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn net_health_model() -> Model {
-    Model {
-        name: "NetHealth",
-        consts: vec![("Buggy", 0)],
-        vars: vec![
-            StateVar {
-                name: "reach",
-                init: 0,
-            },
-            StateVar {
-                name: "health",
-                init: 0,
-            },
-        ],
-        fn_vars: vec![],
-        actions: vec![
-            Action {
-                // Positive reachable proof, fast link → Online.
-                name: "ProbeOnline",
-                guard: None,
-                updates: vec![
-                    Update {
-                        var: "reach",
-                        expr: int(1),
-                    },
-                    Update {
-                        var: "health",
-                        expr: int(3),
-                    },
-                ],
-            },
-            Action {
-                // Positive reachable proof, transient/slow link → Slow.
-                name: "ProbeSlow",
-                guard: None,
-                updates: vec![
-                    Update {
-                        var: "reach",
-                        expr: int(1),
-                    },
-                    Update {
-                        var: "health",
-                        expr: int(2),
-                    },
-                ],
-            },
-            Action {
-                // No reachable proof → Offline. Buggy=1 dishonestly reports Online.
-                name: "ProbeOffline",
-                guard: None,
-                updates: vec![
-                    Update {
-                        var: "reach",
-                        expr: int(0),
-                    },
-                    Update {
-                        var: "health",
-                        expr: if_(eq(cst("Buggy"), int(1)), int(3), int(1)),
-                    },
-                ],
-            },
-            Action {
-                // The probe couldn't decide → Unknown (never a fabricated state).
-                name: "ProbeUnknown",
-                guard: None,
-                updates: vec![
-                    Update {
-                        var: "reach",
-                        expr: int(0),
-                    },
-                    Update {
-                        var: "health",
-                        expr: int(0),
-                    },
-                ],
-            },
-        ],
-        invariants: vec![
-            Invariant {
-                // Online is claimed only with a positive reachability proof.
-                name: "HonestOnline",
-                expr: or_(neq(var("health"), int(3)), eq(var("reach"), int(1))),
-            },
-            Invariant {
-                // Offline is claimed only without a reachability proof.
-                name: "HonestOffline",
-                expr: or_(neq(var("health"), int(1)), eq(var("reach"), int(0))),
-            },
-        ],
-    }
-}
-
 /// LIGATURE SLICING GATE (M4) — the conservative shaping-acceptance policy that
 /// admits EXACTLY the two grid-mappable shape forms and rejects everything else.
 /// The real decision is aterm-render's pure
@@ -3622,30 +3417,37 @@ pub fn emacs_search_repeat_work_model() -> Model {
     }
 }
 
-/// SCROLL-GLIDE CONVERGENCE (M1) — the smooth-scroll wheel glide's wake
-/// discipline: an armed glide makes strict progress toward its target on every
-/// wake, disarms EXACTLY when it lands there, and therefore wakes a BOUNDED
-/// number of times per arm (no perpetual wake — the 0%-idle discipline). The
-/// abstract twin of aterm-gui's `scroll_motion::Glide` sampling loop (the
-/// real-code binding is aterm-gui's `glide_disarms_in_bounded_wakes` /
-/// `glide_converges_monotonically_and_exactly` lattice tests, which drive the
-/// shipping `Glide`/`glide_position` on fixed wake cadences).
+/// SCROLL-GLIDE CONVERGENCE + POLICY SETTLEMENT (M1/W11) — the smooth-scroll
+/// wheel glide's lifecycle discipline. Under Full motion, an armed glide makes
+/// strict progress toward its target on every wake, disarms EXACTLY when it
+/// lands there, and therefore wakes a BOUNDED number of times per arm (no
+/// perpetual wake — the 0%-idle discipline). A Full→Reduced edge is stronger:
+/// it atomically lands at the intended target and disarms, so Reduced owns no
+/// glide deadline. The abstract twin of aterm-gui's `scroll_motion::Glide`
+/// sampling + `App::settle_scroll_motion_at_target` reducer. The real-code
+/// binding includes `glide_disarms_in_bounded_wakes`,
+/// `glide_converges_monotonically_and_exactly`, and
+/// `reduced_motion_settle_conforms_to_scroll_glide_model`.
 ///
-/// Scalar projection `<<pos, target, armed, wakes>>` over a 0..N position lane
-/// (N = 3): `Arm` starts a glide at a nondeterministic target (wake counter
-/// reset), `Retarget` redirects it mid-flight (a chained wheel notch — the
-/// clock restarts, so the counter resets too), and `Wake` is one deadline
-/// firing: the position steps one unit toward the target and the glide disarms
-/// iff it arrived. `wakes` saturates at N+1 so the state space stays finite.
+/// Scalar projection `<<pos, target, armed, wakes, reduced>>` over a 0..N
+/// position lane (N = 3): `Arm` starts a Full-policy glide at a nondeterministic
+/// target (wake counter reset), `Retarget` redirects it mid-flight (a chained
+/// wheel notch — the clock restarts, so the counter resets too), and `Wake` is
+/// one Full-policy deadline firing: the position steps one unit toward the
+/// target and the glide disarms iff it arrived. `SetReduced` is the accessibility
+/// edge: position becomes target and armed becomes 0 in the same transition;
+/// `SetFull` re-enables future arms. `wakes` saturates at N+1 so the state space
+/// stays finite.
 ///
-/// `Buggy` gates the perpetual-wake defect class: with `Buggy = 0` (committed)
-/// every wake advances the position, so at most N wakes elapse before the
-/// disarm (`BoundedWakes`: `wakes <= N`) and a disarmed glide sits exactly on
-/// its target (`DisarmedAtTarget`). With `Buggy = 1` a wake fires WITHOUT
-/// advancing (the ease never reaches its end — the self-rearming deadline
-/// bug), so `wakes` climbs past N and `ty` reports the counterexample. Thus
-/// `ty` PROVES the glide's bounded-wake convergence (Buggy=0) and CATCHES the
-/// perpetual wake (Buggy=1).
+/// `Buggy` gates the policy-edge defect found by the settings audit: with
+/// `Buggy = 0` (committed), every Full wake advances, at most N wakes elapse
+/// before disarm (`BoundedWakes`), every disarmed glide sits at its target
+/// (`DisarmedAtTarget`), and Reduced is both disarmed and landed
+/// (`ReducedSettled`). With `Buggy = 1`, `SetReduced` retains the intermediate
+/// position and armed deadline — the old whole-row sampling behavior — so
+/// `ReducedSettled` yields a counterexample. Thus `ty` proves both ordinary
+/// convergence and immediate Reduced settlement, and catches the actual stale-
+/// deadline mutant.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor — nested
 // `vec!`/struct literals whose aggregate-operand count exceeds the
 // VC-generation work budget, so its obligations are left Unknown
@@ -3653,20 +3455,16 @@ pub fn emacs_search_repeat_work_model() -> Model {
 // the idiomatic allocs; the MODEL it returns is what `ty` machine-checks.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn scroll_glide_model() -> Model {
-    // One wake's position step: toward the target by 1 (the abstract ease
-    // tick); under Buggy the position is left where it was.
+    // One Full-policy wake's position step: toward the target by 1 (the
+    // abstract ease tick).
     let step = || {
         if_(
-            gt(cst("Buggy"), int(0)),
-            var("pos"),
+            gt(var("pos"), var("target")),
+            sub(var("pos"), int(1)),
             if_(
-                gt(var("pos"), var("target")),
-                sub(var("pos"), int(1)),
-                if_(
-                    gt(var("target"), var("pos")),
-                    add(var("pos"), int(1)),
-                    var("pos"),
-                ),
+                gt(var("target"), var("pos")),
+                add(var("pos"), int(1)),
+                var("pos"),
             ),
         )
     };
@@ -3690,6 +3488,10 @@ pub fn scroll_glide_model() -> Model {
                 name: "wakes",
                 init: 0,
             },
+            StateVar {
+                name: "reduced",
+                init: 0,
+            },
         ],
         fn_vars: vec![],
         actions: vec![
@@ -3697,7 +3499,7 @@ pub fn scroll_glide_model() -> Model {
                 // A wheel notch arrives on an idle viewport: aim anywhere in
                 // the 0..N lane and arm the glide (wake counter restarts).
                 name: "Arm",
-                guard: Some(le(var("armed"), int(0))),
+                guard: Some(and_(le(var("armed"), int(0)), le(var("reduced"), int(0)))),
                 updates: vec![
                     Update {
                         var: "target",
@@ -3717,7 +3519,7 @@ pub fn scroll_glide_model() -> Model {
                 // A chained wheel notch mid-glide: redirect the target; the
                 // ease clock restarts, so the per-arm wake budget does too.
                 name: "Retarget",
-                guard: Some(gt(var("armed"), int(0))),
+                guard: Some(and_(gt(var("armed"), int(0)), le(var("reduced"), int(0)))),
                 updates: vec![
                     Update {
                         var: "target",
@@ -3730,11 +3532,11 @@ pub fn scroll_glide_model() -> Model {
                 ],
             },
             Action {
-                // One armed deadline fires: step toward the target (committed)
-                // or stall (Buggy), count the wake (saturating at N+1 to keep
-                // the space finite), and disarm iff the step LANDED on target.
+                // One Full-policy armed deadline fires: step toward the target,
+                // count the wake (saturating at N+1 to keep the space finite),
+                // and disarm iff the step LANDED on target.
                 name: "Wake",
-                guard: Some(gt(var("armed"), int(0))),
+                guard: Some(and_(gt(var("armed"), int(0)), le(var("reduced"), int(0)))),
                 updates: vec![
                     Update {
                         var: "pos",
@@ -3754,12 +3556,42 @@ pub fn scroll_glide_model() -> Model {
                     },
                 ],
             },
+            Action {
+                // Full→Reduced accessibility edge. Committed code lands and
+                // disarms atomically. Buggy retains both the intermediate row and
+                // its armed deadline, matching the audited scheduler defect.
+                name: "SetReduced",
+                guard: Some(le(var("reduced"), int(0))),
+                updates: vec![
+                    Update {
+                        var: "pos",
+                        expr: if_(gt(cst("Buggy"), int(0)), var("pos"), var("target")),
+                    },
+                    Update {
+                        var: "armed",
+                        expr: if_(gt(cst("Buggy"), int(0)), var("armed"), int(0)),
+                    },
+                    Update {
+                        var: "reduced",
+                        expr: int(1),
+                    },
+                ],
+            },
+            Action {
+                // Restoring Full motion permits a later wheel gesture to arm.
+                name: "SetFull",
+                guard: Some(gt(var("reduced"), int(0))),
+                updates: vec![Update {
+                    var: "reduced",
+                    expr: int(0),
+                }],
+            },
         ],
         invariants: vec![
             Invariant {
                 // The no-perpetual-wake bound: one arm's ease is over within N
-                // wakes (the farthest target is N cells away and every wake
-                // advances). The Buggy stall drives `wakes` to N+1.
+                // wakes (the farthest target is N cells away and every Full
+                // wake advances).
                 name: "BoundedWakes",
                 expr: le(var("wakes"), int(3)),
             },
@@ -3769,6 +3601,15 @@ pub fn scroll_glide_model() -> Model {
                 name: "DisarmedAtTarget",
                 expr: or_(gt(var("armed"), int(0)), eq(var("pos"), var("target"))),
             },
+            Invariant {
+                // Reduced motion has no retained ease/deadline and rests exactly
+                // on the intended target in the same policy transition.
+                name: "ReducedSettled",
+                expr: or_(
+                    le(var("reduced"), int(0)),
+                    and_(le(var("armed"), int(0)), eq(var("pos"), var("target"))),
+                ),
+            },
         ],
     }
 }
@@ -3777,7 +3618,7 @@ pub fn scroll_glide_model() -> Model {
 /// render-side sub-row translate enforces: a frame row is shifted by the
 /// fractional-pixel residual IFF it lies in the terminal-content grid band
 /// `[GridTop, GridBot)`. Chrome rows (the prepended tab strip below `GridTop`,
-/// the appended HUD / split dividers at/above `GridBot`) are PINNED. This is the
+/// transient edge bars, and split dividers at/above `GridBot`) are PINNED. This is the
 /// abstract twin of aterm-render's `scroll_translate::translate_grid_band_in_place`
 /// (which writes ONLY the band's pixels); the Tier-1 binding is that module's
 /// exhaustive `chrome_pixels_are_invariant` lattice test plus the real-renderer
@@ -3788,7 +3629,7 @@ pub fn scroll_glide_model() -> Model {
 /// invariant `ShiftOnlyInBand` states `shifted(row) <= in_band(row)` where
 /// `in_band(row) = row ∈ [GridTop, GridBot)` and `shifted(row) = row ∈ [GridTop,
 /// GridBot + Buggy)`: a shifted row is always in-band. `Buggy = 1` widens the
-/// shift to `GridBot` inclusive — leaking the translate onto the first HUD chrome
+/// shift to `GridBot` inclusive — leaking the translate onto the first bottom-chrome
 /// row (`row == GridBot`), the exact defect the band scissor exists to exclude —
 /// so `ty` PROVES the policy at `Buggy = 0` and CATCHES the leak at `Buggy = 1`.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor — nested
@@ -3808,7 +3649,7 @@ pub fn grid_translate_model() -> Model {
     };
     Model {
         name: "GridTranslate",
-        // GridTop=1 (row 0 is the tab strip), GridBot=3 (rows 3.. are HUD chrome).
+        // GridTop=1 (row 0 is the tab strip), GridBot=3 (rows 3.. are bottom chrome).
         consts: vec![("Buggy", 0), ("GridTop", 1), ("GridBot", 3)],
         vars: vec![StateVar {
             name: "row",
@@ -9449,7 +9290,13 @@ pub fn one_shot_peek_model() -> Model {
     }
 }
 
-/// CURSOR-CAT collectible discovery lifecycle. A newly collected look gets a
+/// CURSOR-CAT host gate and collectible discovery lifecycle. Ordinary Nyan
+/// momentum is owned by the cursor-trail master: input while that master is
+/// off cannot arm or draw an ordinary flight, and turning it off retracts an
+/// existing ordinary host arm. A collection hello is a separate bounded
+/// promise and remains drawable with that master off.
+///
+/// A newly collected look gets a
 /// guaranteed, bounded hello even when ordinary cursor momentum is cold:
 /// `Hidden -> Discovery -> Fade -> Hidden`. `visible` is deliberately separate
 /// from `forced`: the former is the draw obligation, while the latter is the
@@ -9467,7 +9314,9 @@ pub fn one_shot_peek_model() -> Model {
 /// Hidden. It must not manufacture a late, fully opaque Fade frame and another
 /// animation tail merely because no intermediate frame callbacks arrived.
 ///
-/// At `Buggy = 1`, `HiddenTick` consumes the wall clock while `presented` stays
+/// At `Buggy = 1`, `TypeWhileTrailOff` reproduces the host leak by arming an
+/// ordinary Nyan cat behind a disabled trail master. `HiddenTick` also consumes
+/// the wall clock while `presented` stays
 /// fixed. Enough hidden samples therefore walk Discovery through Fade to
 /// Hidden without delivering the promised hold. The same switch makes
 /// `LongPresentableGap` strand an expired hello in a visible Fade. `ty` proves
@@ -9502,6 +9351,29 @@ pub fn cursor_cat_model() -> Model {
             var forced = 0;      // discovery bypasses style/momentum dismissal
             var presented_once = 0; // at least one real visible frame was delivered
             var wall_expired = 0;   // presentable clock is beyond hold + fade
+            var trail_master = 0;   // host's ordinary Nyan owner gate
+            var ordinary_armed = 0; // ordinary momentum owns host presentation
+            var ordinary_visible = 0; // ordinary branch may be drawn
+            action EnableTrail when (trail_master == 0) {
+                trail_master = 1;
+            }
+            action DisableTrail when (trail_master == 1) {
+                trail_master = 0;
+                ordinary_armed = 0;
+                ordinary_visible = 0;
+            }
+            action TypeOrdinary when (trail_master == 1) {
+                ordinary_armed = 1;
+                ordinary_visible = 1;
+            }
+            action TypeWhileTrailOff when (trail_master == 0) {
+                ordinary_armed = if Buggy == 1 { 1 } else { ordinary_armed };
+                ordinary_visible = if Buggy == 1 { 1 } else { ordinary_visible };
+            }
+            action SettleOrdinary when (ordinary_armed == 1) {
+                ordinary_armed = 0;
+                ordinary_visible = 0;
+            }
             action Collect when (phase == 0 && collections == 0) {
                 phase = 1; elapsed = 0; presented = 0; hidden = 0;
                 presentable = 1; collections = 1; visible = 1; forced = 1;
@@ -9570,12 +9442,22 @@ pub fn cursor_cat_model() -> Model {
                     visible == 0 && forced == 0
                 } else { wall_expired == 0 };
             invariant VisibleFrameWasPresented: visible <= presented_once;
+            invariant TrailMasterOwnsOrdinary:
+                if trail_master == 0 {
+                    ordinary_armed == 0 && ordinary_visible == 0
+                } else { ordinary_visible == ordinary_armed };
+            invariant HelloIndependentOfTrailMaster:
+                if trail_master == 0 && phase > 0 && presentable == 1 {
+                    visible == 1
+                } else { visible <= 1 };
             invariant PresentedOnceBounded: presented_once <= 1;
             invariant WallExpiredBounded: wall_expired <= 1;
             invariant TimeBounded: elapsed <= TotalTicks;
             invariant PresentedBounded: presented <= TotalTicks;
             invariant HiddenBounded: hidden <= MaxHidden;
             invariant PhaseBounded: phase <= 2;
+            invariant OrdinaryGateBounded:
+                trail_master <= 1 && ordinary_armed <= 1 && ordinary_visible <= 1;
         }
     }
 }
@@ -12547,6 +12429,150 @@ pub fn kitty_sidecar_durability_model() -> Model {
     }
 }
 
+/// Nonblocking Kitty Log flush-worker lifecycle. The ordinary capacity-one
+/// lane, a host-retained tail, the shutdown-only exit lane, the worker pending
+/// accumulator, and durable storage form one ownership equation. A tail
+/// retained while the ordinary lane is full moves only through
+/// `BeginExit → OfferTail → DrainNormal → AbsorbTail`; it can never disappear
+/// merely because normal delivery was saturated.
+///
+/// Active lock contention is a stuttering observation: it leaves the worker
+/// accumulator eligible for a later flush without consuming the terminal
+/// budget. Only after exit begins and both delivery lanes drain does exit lock
+/// contention advance the finite retry counter. An ordinary filesystem call
+/// that never returns advances the event-loop-owned deadline and detaches at
+/// `DeadlineCap`. Detachment
+/// retains the conceptual pending batch: best-effort observability may lose a
+/// crash window, but the UI thread never pretends it persisted. `Buggy = 1`
+/// reproduces the retired one-lane exit path: `OfferTail` clears the host tail
+/// while the full ordinary lane prevents ownership from reaching the exit lane.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn kitty_flush_worker_model() -> Model {
+    crate::ty_model! {
+        KittyFlushWorker {
+            const Buggy = 0;
+            // A slow worker may own one pending batch while the capacity-one
+            // ordinary lane holds a second and the host retains a third tail.
+            const BatchCap = 3;
+            const RetryCap = 4;
+            const DeadlineCap = 2;
+            var accepted = 0;
+            var normal_lane = 0;
+            var host_tail = 0;
+            var exit_lane = 0;
+            var pending = 0;
+            var persisted = 0;
+            var exiting = 0;
+            var retries = 0;
+            var joined = 0;
+            var stalled = 0;
+            var deadline = 0;
+            var detached = 0;
+            action QueueNormal when (
+                exiting == 0 && normal_lane == 0 && accepted <= BatchCap - 1
+            ) {
+                accepted = accepted + 1;
+                normal_lane = 1;
+            }
+            action RetainTailOnFull when (
+                exiting == 0 && normal_lane == 1 && host_tail == 0 &&
+                accepted <= BatchCap - 1
+            ) {
+                accepted = accepted + 1;
+                host_tail = 1;
+            }
+            action DrainNormal when (
+                normal_lane == 1 && joined == 0 && detached == 0 && stalled == 0
+            ) {
+                normal_lane = 0;
+                pending = pending + 1;
+            }
+            action Flush when (
+                pending > 0 && joined == 0 && detached == 0 && stalled == 0 &&
+                (exiting == 0 || retries <= RetryCap - 1)
+            ) {
+                persisted = persisted + pending;
+                pending = 0;
+            }
+            action Contend when (
+                pending > 0 && joined == 0 && detached == 0 && stalled == 0 &&
+                exiting == 1 && normal_lane == 0 && host_tail == 0 && exit_lane == 0 &&
+                retries <= RetryCap - 1
+            ) {
+                retries = retries + 1;
+            }
+            action BeginExit when (exiting == 0) {
+                exiting = 1;
+            }
+            action OfferTail when (
+                exiting == 1 && host_tail == 1 && exit_lane == 0 &&
+                joined == 0 && detached == 0
+            ) {
+                host_tail = 0;
+                exit_lane = if Buggy == 1 { 0 } else { 1 };
+            }
+            action AbsorbTail when (
+                exiting == 1 && normal_lane == 0 && exit_lane == 1 &&
+                joined == 0 && detached == 0 && stalled == 0
+            ) {
+                exit_lane = 0;
+                pending = pending + 1;
+            }
+            action StallIo when (
+                pending > 0 && exiting == 1 && joined == 0 && detached == 0 &&
+                stalled == 0 && retries <= RetryCap - 1
+            ) {
+                stalled = 1;
+            }
+            action TickDeadline when (
+                stalled == 1 && detached == 0 && deadline <= DeadlineCap - 1
+            ) {
+                deadline = deadline + 1;
+            }
+            action Detach when (
+                exiting == 1 && stalled == 1 && detached == 0 &&
+                deadline == DeadlineCap
+            ) {
+                detached = 1;
+            }
+            action Join when (
+                exiting == 1 && joined == 0 && detached == 0 && stalled == 0 &&
+                normal_lane == 0 && host_tail == 0 && exit_lane == 0 &&
+                (pending == 0 || retries == RetryCap)
+            ) {
+                joined = 1;
+            }
+            invariant BatchBounded: accepted <= BatchCap;
+            invariant NormalLaneBounded: normal_lane <= 1;
+            invariant HostTailBounded: host_tail <= 1;
+            invariant ExitLaneBounded: exit_lane <= 1;
+            invariant RetryBounded: retries <= RetryCap;
+            invariant DeadlineBounded: deadline <= DeadlineCap;
+            invariant AcceptedConserved:
+                accepted == normal_lane + host_tail + exit_lane + pending + persisted;
+            invariant ExitLaneOnlyAfterExit: exit_lane <= exiting;
+            invariant JoinedOnlyAfterExit: joined <= exiting;
+            invariant StalledOnlyDuringExit: stalled <= exiting;
+            invariant DetachedOnlyAfterExit: detached <= exiting;
+            invariant OneExitDisposition: joined + detached <= 1;
+            invariant DetachedOnlyAtDeadline:
+                if detached == 1 {
+                    deadline == DeadlineCap
+                } else {
+                    1 == 1
+                };
+            invariant JoinedHasFiniteOutcome:
+                if joined == 1 {
+                    normal_lane == 0 && host_tail == 0 && exit_lane == 0 &&
+                    (pending == 0 || retries == RetryCap)
+                } else {
+                    1 == 1
+                };
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Native tab-app platform models (`docs/NATIVE_TAB_APPS_DESIGN.md`, section 8).
 //
@@ -13267,10 +13293,15 @@ pub fn native_markdown_viewport_model() -> Model {
     }
 }
 
-/// Renderer-sized editor caret reveal. Compact resize installs the real eight
-/// visible rows and moves the stable line anchor with a two-row breathing band.
-/// `Buggy=1` reproduces the retired fixed-36-row guess, which leaves line 20
-/// outside an eight-row phone/landscape body.
+/// Renderer-sized editor caret reveal and stable scrolling. Compact resize
+/// installs the real eight visible rows and moves the stable line anchor with a
+/// two-row breathing band; a viewport taller than its document clamps the
+/// stable anchor to line zero. Overscroll stores the last *full* viewport
+/// anchor, so the first reverse step moves immediately.
+///
+/// `Buggy=1` reproduces the retired failures: the fixed-36-row guess hides line
+/// 20 on a compact body, an EOF anchor strands a short document's content above
+/// the viewport, and a scroll fling retains EOF debt beyond the painted anchor.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_editor_viewport_model() -> Model {
@@ -13280,9 +13311,17 @@ pub fn native_editor_viewport_model() -> Model {
             const CaretLine = 20;
             const CompactLines = 8;
             const DesktopGuess = 36;
+            const ShortDocumentLines = 3;
+            const TallViewportLines = 40;
+            const ScrollDocumentLines = 13;
+            const ScrollViewportLines = 4;
             var anchor_line = 0;
             var visible_lines = 36;
+            var short_anchor_line = 2;
+            var short_visible_lines = 4;
             var resized = 0;
+            var scroll_anchor_line = 0;
+            var scroll_phase = 0;
             action Resize when (resized == 0) {
                 visible_lines = CompactLines;
                 anchor_line = if Buggy == 1 {
@@ -13290,7 +13329,21 @@ pub fn native_editor_viewport_model() -> Model {
                 } else {
                     CaretLine - CompactLines + 3
                 };
+                short_visible_lines = TallViewportLines;
+                short_anchor_line = if Buggy == 1 { 2 } else { 0 };
                 resized = 1;
+            }
+            action Overscroll when (scroll_phase == 0) {
+                scroll_anchor_line = if Buggy == 1 {
+                    ScrollDocumentLines - 1
+                } else {
+                    ScrollDocumentLines - ScrollViewportLines
+                };
+                scroll_phase = 1;
+            }
+            action ReverseScroll when (scroll_phase == 1) {
+                scroll_anchor_line = scroll_anchor_line - 1;
+                scroll_phase = 2;
             }
             invariant CaretVisibleAfterResize:
                 if resized == 1 {
@@ -13299,6 +13352,22 @@ pub fn native_editor_viewport_model() -> Model {
                 } else {
                     visible_lines == DesktopGuess
                 };
+            invariant ShortDocumentFullyVisible:
+                if resized == 1 {
+                    ShortDocumentLines <= short_visible_lines &&
+                    short_anchor_line == 0
+                } else {
+                    short_visible_lines == 4 && short_anchor_line == 2
+                };
+            invariant StoredScrollAnchorPresentable:
+                scroll_anchor_line <= ScrollDocumentLines - ScrollViewportLines;
+            invariant FirstReverseStepMoves:
+                if scroll_phase == 2 {
+                    scroll_anchor_line == ScrollDocumentLines - ScrollViewportLines - 1
+                } else {
+                    scroll_anchor_line <= ScrollDocumentLines - 1
+                };
+            invariant ScrollPhaseBounded: scroll_phase <= 2;
         }
     }
 }
@@ -13389,6 +13458,451 @@ pub fn native_editor_command_palette_model() -> Model {
                 submitted == exact_selected_dispatch;
             invariant ResultsBounded: results <= 4;
             invariant PhaseBounded: query_phase <= 2;
+        }
+    }
+}
+
+/// Bounded Settings ▸ Manual completion lifecycle. Merely presenting LSP-like
+/// assistance never steals ordinary Enter/Down editing, Ctrl-Space explicitly
+/// enters selection, every selected result remains inside the responsive
+/// window, Escape dismisses only the exact context, and acceptance dispatches
+/// the exact selected candidate. `Buggy=1` models the keyboard-hostile/stale
+/// window shortcuts: ordinary Enter is consumed, the visible window stays on
+/// page zero, and acceptance dispatches candidate zero.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn manual_config_completion_model() -> Model {
+    crate::ty_model! {
+        ManualConfigCompletion {
+            const Buggy = 0;
+            const Results = 8;
+            const Capacity = 3;
+            const MaxContext = 3;
+            var context = 1;
+            var assist_visible = 1;
+            var interacting = 0;
+            var selected = 0;
+            var window_start = 0;
+            var dismissed_context = 0;
+            var document_edits = 0;
+            var ordinary_enter = 0;
+            var caret = 0;
+            var ordinary_down = 0;
+            var expected_accept = 0;
+            var accepted = 0;
+
+            action OrdinaryEnter when (
+                assist_visible == 1 && interacting == 0 && context <= MaxContext - 1
+            ) {
+                context = context + 1;
+                document_edits = if Buggy == 1 { document_edits } else { document_edits + 1 };
+                ordinary_enter = ordinary_enter + 1;
+                selected = 0;
+                window_start = 0;
+            }
+            action OrdinaryDown when (
+                assist_visible == 1 && interacting == 0 && context <= MaxContext - 1
+            ) {
+                context = context + 1;
+                caret = caret + 1;
+                ordinary_down = ordinary_down + 1;
+                selected = 0;
+                window_start = 0;
+            }
+            action EnterSelection when (assist_visible == 1 && interacting == 0) {
+                interacting = 1;
+            }
+            action TabEnterSelection when (assist_visible == 1 && interacting == 0) {
+                interacting = 1;
+            }
+            action MoveNext when (interacting == 1 && selected <= Results - 2) {
+                selected = selected + 1;
+                window_start = if Buggy == 1 {
+                    window_start
+                } else {
+                    if selected + 1 <= Capacity - 1 {
+                        0
+                    } else {
+                        if selected + 1 <= Capacity + Capacity - 1 { Capacity } else { 6 }
+                    }
+                };
+            }
+            action MovePrevious when (interacting == 1 && selected > 0) {
+                selected = selected - 1;
+                window_start = if selected - 1 <= Capacity - 1 {
+                    0
+                } else {
+                    if selected - 1 <= Capacity + Capacity - 1 { Capacity } else { 6 }
+                };
+            }
+            action AcceptSelected when (interacting == 1) {
+                expected_accept = selected + 1;
+                accepted = if Buggy == 1 { 1 } else { selected + 1 };
+                interacting = 0;
+                assist_visible = 0;
+            }
+            action Dismiss when (assist_visible == 1) {
+                assist_visible = 0;
+                interacting = 0;
+                dismissed_context = context;
+            }
+            action ChangeDismissedContext when (
+                assist_visible == 0 && dismissed_context == context && context <= MaxContext - 1
+            ) {
+                context = context + 1;
+                assist_visible = 1;
+                selected = 0;
+                window_start = 0;
+            }
+            action Settled when (accepted > 0) {
+                accepted = accepted;
+            }
+
+            invariant SelectionWithinResults: selected <= Results - 1;
+            invariant SelectedCandidateVisible:
+                if assist_visible == 1 {
+                    window_start <= selected && selected <= window_start + Capacity - 1
+                } else {
+                    selected <= Results - 1
+                };
+            invariant WindowWithinResults: window_start <= Results - 1;
+            invariant OrdinaryEnterEditsDocument: ordinary_enter == document_edits;
+            invariant OrdinaryDownMovesCaret: ordinary_down == caret;
+            invariant AcceptsExactSelected:
+                if accepted > 0 { accepted == expected_accept } else { expected_accept == 0 };
+            invariant ExactContextDismissal:
+                if dismissed_context == context && dismissed_context > 0 {
+                    assist_visible == 0
+                } else {
+                    assist_visible <= 1
+                };
+            invariant StateIsBounded:
+                context <= MaxContext && assist_visible <= 1 && interacting <= 1 &&
+                selected <= Results - 1 && window_start <= Results - 1 &&
+                document_edits <= MaxContext && ordinary_enter <= MaxContext &&
+                caret <= MaxContext && ordinary_down <= MaxContext && accepted <= Results;
+        }
+    }
+}
+
+/// Bounded Manual problem-navigation lifecycle. F8 and Shift-F8 wrap through
+/// every retained diagnostic (including a one-problem document), move to the
+/// exact selected problem, reveal it, and expose the complete message through
+/// the semantic status lane. `Buggy=1` reproduces the paint-only navigator that
+/// rotates an index without moving/revealing the caret and truncates the only
+/// announced message.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn manual_config_problem_navigation_model() -> Model {
+    crate::ty_model! {
+        ManualConfigProblemNavigation {
+            const Buggy = 0;
+            const MaxProblems = 3;
+            var problems = 0;
+            var selected = 0;
+            var target = 0;
+            var caret_target = 0;
+            var revealed = 0;
+            var semantic_full = 0;
+            var jumps = 0;
+
+            action LoadOne when (problems == 0) {
+                problems = 1;
+                selected = 0;
+            }
+            action LoadThree when (problems == 0) {
+                problems = 3;
+                selected = 0;
+            }
+            action JumpNext when (problems > 0 && jumps <= 3) {
+                selected = if problems == 1 {
+                    0
+                } else {
+                    if selected <= problems - 2 { selected + 1 } else { 0 }
+                };
+                target = if problems == 1 {
+                    1
+                } else {
+                    if selected <= problems - 2 { selected + 2 } else { 1 }
+                };
+                caret_target = if Buggy == 1 {
+                    caret_target
+                } else {
+                    if problems == 1 {
+                        1
+                    } else {
+                        if selected <= problems - 2 { selected + 2 } else { 1 }
+                    }
+                };
+                revealed = if Buggy == 1 { 0 } else { 1 };
+                semantic_full = if Buggy == 1 { 0 } else { 1 };
+                jumps = jumps + 1;
+            }
+            action JumpPrevious when (problems > 0 && jumps <= 3) {
+                selected = if problems == 1 {
+                    0
+                } else {
+                    if selected > 0 { selected - 1 } else { problems - 1 }
+                };
+                target = if problems == 1 {
+                    1
+                } else {
+                    if selected > 0 { selected } else { problems }
+                };
+                caret_target = if Buggy == 1 {
+                    caret_target
+                } else {
+                    if problems == 1 {
+                        1
+                    } else {
+                        if selected > 0 { selected } else { problems }
+                    }
+                };
+                revealed = if Buggy == 1 { 0 } else { 1 };
+                semantic_full = if Buggy == 1 { 0 } else { 1 };
+                jumps = jumps + 1;
+            }
+            action Settled when (jumps > 0) {
+                jumps = jumps;
+            }
+
+            invariant SelectionWithinProblems:
+                if problems > 0 { selected <= problems - 1 } else { selected == 0 };
+            invariant JumpMovesToExactProblem:
+                if jumps > 0 { target == selected + 1 && caret_target == target } else {
+                    target == 0 && caret_target == 0
+                };
+            invariant JumpRevealsProblem:
+                if jumps > 0 { revealed == 1 } else { revealed == 0 };
+            invariant FullProblemIsSemantic:
+                if jumps > 0 { semantic_full == 1 } else { semantic_full == 0 };
+            invariant StateIsBounded:
+                problems <= MaxProblems && selected <= MaxProblems - 1 &&
+                target <= MaxProblems && caret_target <= MaxProblems &&
+                revealed <= 1 && semantic_full <= 1 && jumps <= 4;
+        }
+    }
+}
+
+/// Bounded Settings → Manual handoff. The host, never the Settings payload,
+/// owns the canonical `aterm.toml` path; repeated requests reuse one editor,
+/// focus it, and preserve the requested target exactly. An authored key/search
+/// is selected and revealed, while an absent key seeds Search and keeps config
+/// completion ready to insert it. `Buggy=1` reproduces the unsafe redirect,
+/// duplicate-editor, lost-selection, and inert-fallback shortcuts.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn manual_config_handoff_model() -> Model {
+    crate::ty_model! {
+        ManualConfigHandoff {
+            const Buggy = 0;
+            const MaxRequests = 2;
+            // request_kind: 0 none, 1 authored key, 2 absent key, 3 matching search.
+            // outcome: 0 none, 1 exact selection, 2 seeded Search fallback.
+            var requests = 0;
+            var request_kind = 0;
+            var outcome = 0;
+            var selected_exact = 0;
+            var search_exact = 0;
+            var completion_ready = 0;
+            var canonical_path_authority = 1;
+            var editor_instances = 0;
+            var focused = 0;
+
+            action RevealAuthoredKey when (requests <= MaxRequests - 1) {
+                requests = requests + 1;
+                request_kind = 1;
+                outcome = 1;
+                selected_exact = if Buggy == 1 { 0 } else { 1 };
+                search_exact = 0;
+                completion_ready = 0;
+                canonical_path_authority = if Buggy == 1 {
+                    0
+                } else { canonical_path_authority };
+                editor_instances = if editor_instances == 0 {
+                    1
+                } else {
+                    if Buggy == 1 { editor_instances + 1 } else { editor_instances }
+                };
+                focused = 1;
+            }
+            action SeedAbsentKey when (requests <= MaxRequests - 1) {
+                requests = requests + 1;
+                request_kind = 2;
+                outcome = 2;
+                selected_exact = 0;
+                search_exact = if Buggy == 1 { 0 } else { 1 };
+                completion_ready = if Buggy == 1 { 0 } else { 1 };
+                canonical_path_authority = if Buggy == 1 {
+                    0
+                } else { canonical_path_authority };
+                editor_instances = if editor_instances == 0 {
+                    1
+                } else {
+                    if Buggy == 1 { editor_instances + 1 } else { editor_instances }
+                };
+                focused = 1;
+            }
+            action RevealMatchingSearch when (requests <= MaxRequests - 1) {
+                requests = requests + 1;
+                request_kind = 3;
+                outcome = 1;
+                selected_exact = if Buggy == 1 { 0 } else { 1 };
+                search_exact = 0;
+                completion_ready = 0;
+                canonical_path_authority = if Buggy == 1 {
+                    0
+                } else { canonical_path_authority };
+                editor_instances = if editor_instances == 0 {
+                    1
+                } else {
+                    if Buggy == 1 { editor_instances + 1 } else { editor_instances }
+                };
+                focused = 1;
+            }
+
+            invariant HostOwnsCanonicalPath: canonical_path_authority == 1;
+            invariant OneManualEditor: editor_instances <= 1;
+            invariant EveryRequestFocused:
+                if requests > 0 { focused == 1 && editor_instances == 1 } else {
+                    focused == 0 && editor_instances == 0
+                };
+            invariant AuthoredTargetSelected:
+                if request_kind == 1 || request_kind == 3 {
+                    outcome == 1 && selected_exact == 1 && search_exact == 0 &&
+                    completion_ready == 0
+                } else { selected_exact == 0 };
+            invariant AbsentTargetSeedsSearch:
+                if request_kind == 2 {
+                    outcome == 2 && selected_exact == 0 && search_exact == 1 &&
+                    completion_ready == 1
+                } else { search_exact == 0 };
+            invariant StateIsBounded:
+                requests <= MaxRequests && request_kind <= 3 && outcome <= 2 &&
+                selected_exact <= 1 && search_exact <= 1 && completion_ready <= 1 &&
+                canonical_path_authority <= 1 && editor_instances <= 1 && focused <= 1;
+        }
+    }
+}
+
+/// Process-global Settings Packages worker lifecycle. Exactly one refresh or
+/// user verb owns the current sequence; only a matching completion may settle
+/// it. Starting a new verb clears the prior result, while a silent refresh
+/// preserves it. Most importantly, the presented result is the current
+/// process result—not an older successful `status.toml`. `Buggy=1` reproduces
+/// the stale-success presentation after a failed command.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_packages_worker_model() -> Model {
+    crate::ty_model! {
+        NativePackagesWorker {
+            const Buggy = 0;
+            const MaxSequence = 6;
+            // operation: 0 idle, 1 refresh, 2 check/update, 3 install default set.
+            // result/presented_result: 0 none, 1 success, 2 failure.
+            var sequence = 0;
+            var inflight = 0;
+            var operation = 0;
+            var observed = 0;
+            var last_operation = 0;
+            var last_result = 0;
+            var presented_result = 0;
+
+            action BeginRefresh when (inflight == 0 && sequence <= MaxSequence - 1) {
+                sequence = sequence + 1;
+                inflight = 1;
+                operation = 1;
+                observed = observed;
+                last_operation = last_operation;
+                last_result = last_result;
+                presented_result = presented_result;
+            }
+            action BeginCheck when (inflight == 0 && sequence <= MaxSequence - 1) {
+                sequence = sequence + 1;
+                inflight = 1;
+                operation = 2;
+                observed = observed;
+                last_operation = 0;
+                last_result = 0;
+                presented_result = 0;
+            }
+            action BeginInstall when (inflight == 0 && sequence <= MaxSequence - 1) {
+                sequence = sequence + 1;
+                inflight = 1;
+                operation = 3;
+                observed = observed;
+                last_operation = 0;
+                last_result = 0;
+                presented_result = 0;
+            }
+            action FinishRefresh when (inflight == 1 && operation == 1) {
+                sequence = sequence;
+                inflight = 0;
+                operation = 0;
+                observed = 1;
+                last_operation = last_operation;
+                last_result = last_result;
+                presented_result = presented_result;
+            }
+            action FinishCheckSuccess when (inflight == 1 && operation == 2) {
+                sequence = sequence;
+                inflight = 0;
+                operation = 0;
+                observed = 1;
+                last_operation = 2;
+                last_result = 1;
+                presented_result = 1;
+            }
+            action FinishCheckFailure when (inflight == 1 && operation == 2) {
+                sequence = sequence;
+                inflight = 0;
+                operation = 0;
+                observed = 1;
+                last_operation = 2;
+                last_result = 2;
+                presented_result = if Buggy == 1 { 1 } else { 2 };
+            }
+            action FinishInstallSuccess when (inflight == 1 && operation == 3) {
+                sequence = sequence;
+                inflight = 0;
+                operation = 0;
+                observed = 1;
+                last_operation = 3;
+                last_result = 1;
+                presented_result = 1;
+            }
+            action FinishInstallFailure when (inflight == 1 && operation == 3) {
+                sequence = sequence;
+                inflight = 0;
+                operation = 0;
+                observed = 1;
+                last_operation = 3;
+                last_result = 2;
+                presented_result = if Buggy == 1 { 1 } else { 2 };
+            }
+            action Abort when (inflight == 1) {
+                sequence = sequence;
+                inflight = 0;
+                operation = 0;
+                observed = observed;
+                last_operation = last_operation;
+                last_result = last_result;
+                presented_result = presented_result;
+            }
+
+            invariant SingleFlightHasOneKind:
+                if inflight == 1 {
+                    operation > 0 && operation <= 3
+                } else { operation == 0 };
+            invariant CommandResultHasOrigin:
+                if last_result > 0 {
+                    last_operation == 2 || last_operation == 3
+                } else { last_operation == 0 };
+            invariant FinalResultIsPresented: presented_result == last_result;
+            invariant StateIsBounded:
+                sequence <= MaxSequence && inflight <= 1 && operation <= 3 &&
+                observed <= 1 && last_operation <= 3 && last_result <= 2 &&
+                presented_result <= 2;
         }
     }
 }
@@ -13682,6 +14196,86 @@ pub fn native_settings_singleton_model() -> Model {
     }
 }
 
+/// Native Settings retains text drafts across navigation/publication, blocks
+/// every close scope while a draft exists, and keeps explicit recovery visible.
+/// Discard All is destructive only after a separately observable confirmation
+/// step. `Buggy=1` reproduces both unsafe shortcuts: treating a dirty close as
+/// Ready and letting the first discard gesture destroy the draft.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_settings_draft_close_model() -> Model {
+    crate::ty_model! {
+        NativeSettingsDraftClose {
+            const Buggy = 0;
+            const MaxPreservations = 2;
+            // close_result: 0 not attempted, 1 Blocked, 2 Ready.
+            var draft = 0;
+            var discard_armed = 0;
+            var close_result = 0;
+            var recovery_visible = 0;
+            var preservations = 0;
+            action Edit when (draft == 0) {
+                draft = 1;
+                discard_armed = 0;
+                close_result = 0;
+                recovery_visible = 1;
+                preservations = 0;
+            }
+            action PreserveDraft when (
+                draft == 1 && preservations <= MaxPreservations - 1
+            ) {
+                draft = draft;
+                discard_armed = 0;
+                close_result = 0;
+                recovery_visible = 1;
+                preservations = preservations + 1;
+            }
+            action AttemptDirtyClose when (draft == 1) {
+                draft = draft;
+                close_result = if Buggy == 1 { 2 } else { 1 };
+                recovery_visible = if Buggy == 1 { 0 } else { 1 };
+            }
+            action ArmDiscard when (draft == 1 && discard_armed == 0) {
+                draft = if Buggy == 1 { 0 } else { draft };
+                discard_armed = 1;
+                close_result = 0;
+                recovery_visible = if Buggy == 1 { 0 } else { 1 };
+            }
+            action CancelDiscard when (draft == 1 && discard_armed == 1) {
+                discard_armed = 0;
+                close_result = 0;
+                recovery_visible = 1;
+            }
+            action ConfirmDiscard when (draft == 1 && discard_armed == 1) {
+                draft = 0;
+                discard_armed = 0;
+                close_result = 0;
+                recovery_visible = 0;
+            }
+            action SaveDraft when (draft == 1) {
+                draft = 0;
+                discard_armed = 0;
+                close_result = 0;
+                recovery_visible = 0;
+            }
+            action AttemptCleanClose when (draft == 0) {
+                close_result = 2;
+                recovery_visible = 0;
+            }
+            invariant DirtyNeverReady:
+                if draft == 1 { close_result <= 1 } else { close_result <= 2 };
+            invariant DirtyRecoveryVisible:
+                if draft == 1 { recovery_visible == 1 } else { recovery_visible == 0 };
+            invariant ConfirmationOwnsDraft:
+                if discard_armed == 1 { draft == 1 } else { draft <= 1 };
+            invariant FlagsBounded:
+                draft <= 1 && discard_armed <= 1 && recovery_visible <= 1;
+            invariant ResultBounded: close_result <= 2;
+            invariant PreservationBounded: preservations <= MaxPreservations;
+        }
+    }
+}
+
 /// Versioned preference patches use touched-key expectations rather than blind
 /// whole-file overwrite. A stale patch may cross an unrelated-key edit, but a
 /// same-key patch or conditional undo conflicts. Reset All is one atomic action.
@@ -13797,12 +14391,521 @@ pub fn native_config_transaction_model() -> Model {
     }
 }
 
+/// Exact config observations cross a serialized worker/event-loop handoff.
+/// Once an external generation is known, queued semantic writes remain fenced
+/// until that exact generation is admitted or a reconciliation sample orders it
+/// against a concurrent publication. Failed reconciliation retains the newest
+/// candidate, and a newer candidate that arrives after sampling must be
+/// resampled rather than silently discarded or admitted as the older sample.
+/// `Buggy=1` exposes all three historical failures: lost deferred bytes, a blind
+/// queued write, and stale-sample admission.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_config_observation_handoff_model() -> Model {
+    crate::ty_model! {
+        NativeConfigObservationHandoff {
+            const Buggy = 0;
+            // phase: 0 idle, 1 durable write, 2 reconciliation sample.
+            var phase = 0;
+            // Exact latest external generation (0 means none retained).
+            var pending = 0;
+            var sampled = 0;
+            var gate = 0;
+            var queued = 0;
+            var admitted = 0;
+            var reconciliation_failed = 0;
+            var dropped_candidate = 0;
+            var blind_write = 0;
+            var stale_admission = 0;
+
+            action QueueWrite when (queued == 0) {
+                queued = 1;
+            }
+            action BeginWrite when (
+                phase == 0 && gate == 0 && pending == 0
+            ) {
+                phase = 1;
+            }
+            action StartQueuedWrite when (
+                phase == 0 && queued == 1 && gate == 0 && pending == 0
+            ) {
+                phase = 1;
+                queued = 0;
+            }
+            action ObserveFirst when (pending == 0) {
+                pending = 1;
+                gate = 1;
+            }
+            action ObserveNewer when (pending == 1) {
+                pending = 2;
+                gate = 1;
+            }
+            action FinishWrite when (phase == 1) {
+                phase = 0;
+                gate = if pending > 0 { 1 } else { gate };
+            }
+            action StartReconcile when (
+                phase == 0 && gate == 1 && pending > 0
+            ) {
+                phase = 2;
+                sampled = pending;
+                reconciliation_failed = 0;
+            }
+            action FailReconcile when (phase == 2) {
+                phase = 0;
+                pending = if Buggy == 1 { 0 } else { pending };
+                sampled = 0;
+                reconciliation_failed = 1;
+                dropped_candidate = if Buggy == 1 { 1 } else { dropped_candidate };
+            }
+            action RetryReconcile when (
+                phase == 0 && gate == 1 && pending > 0 &&
+                reconciliation_failed == 1
+            ) {
+                phase = 2;
+                sampled = pending;
+                reconciliation_failed = 0;
+            }
+            action ResampleNewer when (
+                phase == 2 && pending > sampled
+            ) {
+                sampled = pending;
+            }
+            action AdmitExact when (
+                phase == 2 && pending == sampled
+            ) {
+                phase = 0;
+                admitted = pending;
+                pending = 0;
+                sampled = 0;
+                gate = 0;
+                reconciliation_failed = 0;
+            }
+            action StartBlindWrite when (
+                Buggy == 1 && phase == 0 && queued == 1 &&
+                (gate == 1 || pending > 0)
+            ) {
+                phase = 1;
+                queued = 0;
+                blind_write = 1;
+            }
+            action AdmitStaleSample when (
+                Buggy == 1 && phase == 2 && pending > sampled
+            ) {
+                phase = 0;
+                admitted = sampled;
+                pending = 0;
+                sampled = 0;
+                gate = 0;
+                stale_admission = 1;
+            }
+
+            invariant DeferredGenerationNeverLost: dropped_candidate == 0;
+            invariant UnknownAuthorityFencesWrites: blind_write == 0;
+            invariant LatestExactGenerationWins: stale_admission == 0;
+            invariant Bounds:
+                phase <= 2 && pending <= 2 && sampled <= 2 && admitted <= 2 &&
+                gate <= 1 && queued <= 1 && reconciliation_failed <= 1 &&
+                dropped_candidate <= 1 && blind_write <= 1 && stale_admission <= 1;
+        }
+    }
+}
+
+/// Process-global Serious Mode commands retain semantic desired values while
+/// another config write is in flight. The request at the queue head is rebased
+/// against the service's current optimistic revision/value before it reduces;
+/// live policy changes only at durable completion. The mutant captures the
+/// expected value at enqueue time, reproducing the stale third toggle in an
+/// ON→OFF→ON burst.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn serious_mode_intent_queue_model() -> Model {
+    crate::ty_model! {
+        SeriousModeIntentQueue {
+            const Buggy = 0;
+            const MaxIssued = 3;
+            var live = 0;
+            var service = 0;
+            var projection = 0;
+            var inflight = 0;
+            var current_desired = 0;
+            var queue_count = 0;
+            var q1 = 0;
+            var q2 = 0;
+            var q1_expected = 0;
+            var q2_expected = 0;
+            var issued = 0;
+            var completed = 0;
+            var conflict = 0;
+            var last_desired = 0;
+            // 0 none, 1 native toggle, 2 legacy absolute set. This preserves
+            // source identity when a set happens to have the same value as a
+            // toggle, so Tier-1 conformance cannot pass through ambiguity.
+            var intent_kind = 0;
+            action StartToggle when (
+                inflight == 0 && issued <= MaxIssued - 1
+            ) {
+                current_desired = if projection == 0 { 1 } else { 0 };
+                service = if projection == 0 { 1 } else { 0 };
+                projection = if projection == 0 { 1 } else { 0 };
+                inflight = 1;
+                issued = issued + 1;
+                last_desired = if projection == 0 { 1 } else { 0 };
+                intent_kind = 1;
+            }
+            action QueueToggle when (
+                inflight == 1 && queue_count <= 1 && issued <= MaxIssued - 1
+            ) {
+                q1 = if queue_count == 0 {
+                    if projection == 0 { 1 } else { 0 }
+                } else { q1 };
+                q2 = if queue_count == 1 {
+                    if projection == 0 { 1 } else { 0 }
+                } else { q2 };
+                q1_expected = if queue_count == 0 { service } else { q1_expected };
+                q2_expected = if queue_count == 1 { service } else { q2_expected };
+                queue_count = queue_count + 1;
+                projection = if projection == 0 { 1 } else { 0 };
+                issued = issued + 1;
+                last_desired = if projection == 0 { 1 } else { 0 };
+                intent_kind = 1;
+            }
+            // Legacy/control callers express an absolute semantic value rather
+            // than a toggle. They share the same serialized queue and rebase
+            // discipline; these actions make that mixed lane explicit.
+            action StartSetOn when (
+                inflight == 0 && issued <= MaxIssued - 1 && projection == 0
+            ) {
+                current_desired = 1;
+                service = 1;
+                projection = 1;
+                inflight = 1;
+                issued = issued + 1;
+                last_desired = 1;
+                intent_kind = 2;
+            }
+            action StartSetOff when (
+                inflight == 0 && issued <= MaxIssued - 1 && projection == 1
+            ) {
+                current_desired = 0;
+                service = 0;
+                projection = 0;
+                inflight = 1;
+                issued = issued + 1;
+                last_desired = 0;
+                intent_kind = 2;
+            }
+            action QueueSetOn when (
+                inflight == 1 && queue_count <= 1 && issued <= MaxIssued - 1
+            ) {
+                q1 = if queue_count == 0 { 1 } else { q1 };
+                q2 = if queue_count == 1 { 1 } else { q2 };
+                q1_expected = if queue_count == 0 { service } else { q1_expected };
+                q2_expected = if queue_count == 1 { service } else { q2_expected };
+                queue_count = queue_count + 1;
+                projection = 1;
+                issued = issued + 1;
+                last_desired = 1;
+                intent_kind = 2;
+            }
+            action QueueSetOff when (
+                inflight == 1 && queue_count <= 1 && issued <= MaxIssued - 1
+            ) {
+                q1 = if queue_count == 0 { 0 } else { q1 };
+                q2 = if queue_count == 1 { 0 } else { q2 };
+                q1_expected = if queue_count == 0 { service } else { q1_expected };
+                q2_expected = if queue_count == 1 { service } else { q2_expected };
+                queue_count = queue_count + 1;
+                projection = 0;
+                issued = issued + 1;
+                last_desired = 0;
+                intent_kind = 2;
+            }
+            action Complete when (inflight == 1) {
+                live = current_desired;
+                service = if queue_count == 0 {
+                    service
+                } else {
+                    if Buggy == 1 && (q1_expected > service || service > q1_expected) {
+                        service
+                    } else { q1 }
+                };
+                current_desired = if queue_count == 0 { current_desired } else { q1 };
+                inflight = if queue_count == 0 {
+                    0
+                } else {
+                    if Buggy == 1 && (q1_expected > service || service > q1_expected) {
+                        0
+                    } else { 1 }
+                };
+                q1 = if queue_count <= 1 { 0 } else { q2 };
+                q2 = 0;
+                q1_expected = if queue_count <= 1 { 0 } else { q2_expected };
+                q2_expected = 0;
+                queue_count = if queue_count == 0 { 0 } else { queue_count - 1 };
+                projection = if queue_count == 0 { current_desired } else { projection };
+                completed = completed + 1;
+                conflict = if (
+                    queue_count > 0 && Buggy == 1 &&
+                    (q1_expected > service || service > q1_expected)
+                ) { 1 } else { conflict };
+            }
+            invariant NoSerializedConflict: conflict == 0;
+            invariant IdleIsAuthoritative:
+                if inflight == 0 { live == service && live == projection } else { live <= 1 };
+            invariant ProjectionTracksLatestIntent: projection == last_desired;
+            invariant QueueBounded: queue_count <= 2;
+            invariant CompletionBounded: completed <= issued;
+            invariant IssuedBounded: issued <= MaxIssued;
+            invariant ValuesBoolean:
+                live <= 1 && service <= 1 && projection <= 1 && current_desired <= 1 &&
+                q1 <= 1 && q2 <= 1 && q1_expected <= 1 && q2_expected <= 1 &&
+                last_desired <= 1 && intent_kind <= 2;
+        }
+    }
+}
+
+/// Filesystem commit authority shared by Manual and structured Settings. Both
+/// writers capture a file generation, canonical target generation, and logical
+/// link-chain generation before they contend for one lock. Under the lock, an
+/// unchanged triple may publish, including through a stable identity-bound
+/// dotfiles symlink; a stale file, retargeted chain, or recreated link must
+/// conflict. A durable Manual publication synchronizes the process config service
+/// in that same completion transition. A publication whose post-rename proof
+/// fails enters an explicit reconcile-required phase and may not retry against its
+/// old baseline. `Buggy=1` admits blind second winners, split-target/changed-link
+/// writes, delayed Manual synchronization, and blind retry after indeterminate
+/// publication.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn config_file_commit_cas_model() -> Model {
+    crate::ty_model! {
+        ConfigFileCommitCas {
+            const Buggy = 0;
+            // disk/service: 0 initial, 1 Manual bytes, 2 Settings bytes.
+            var disk = 0;
+            var service = 0;
+            // target: 0 original logical target, 1 retargeted symlink.
+            var target = 0;
+            // link: identity generation of the complete logical symlink chain.
+            var link = 0;
+            // phases: 0 idle, 1 baseline captured, 2 lock held,
+            // 3 durable, 4 conflict, 5 published but reconcile-required.
+            var manual_phase = 0;
+            var settings_phase = 0;
+            var manual_base = 0;
+            var settings_base = 0;
+            var manual_target = 0;
+            var settings_target = 0;
+            var manual_link = 0;
+            var settings_link = 0;
+            var manual_symlink = 0;
+            var settings_symlink = 0;
+            // 0 free, 1 Manual, 2 Settings.
+            var lock_owner = 0;
+            var manual_committed = 0;
+            var settings_committed = 0;
+            var double_winner = 0;
+            var stale_publication = 0;
+            var split_target_commit = 0;
+            var symlink_publication = 0;
+            var manual_unsynchronized = 0;
+            var manual_indeterminate = 0;
+            var settings_indeterminate = 0;
+            var blind_retry = 0;
+
+            action BeginManual when (manual_phase == 0) {
+                manual_phase = 1;
+                manual_base = disk;
+                manual_target = target;
+                manual_link = link;
+            }
+            action BeginSettings when (settings_phase == 0) {
+                settings_phase = 1;
+                settings_base = disk;
+                settings_target = target;
+                settings_link = link;
+            }
+            action BeginManualSymlink when (manual_phase == 0) {
+                manual_phase = 1;
+                manual_base = disk;
+                manual_target = target;
+                manual_link = link;
+                manual_symlink = 1;
+            }
+            action BeginSettingsSymlink when (settings_phase == 0) {
+                settings_phase = 1;
+                settings_base = disk;
+                settings_target = target;
+                settings_link = link;
+                settings_symlink = 1;
+            }
+            action Retarget when (target == 0) {
+                target = 1;
+                link = 1;
+            }
+            action Relink when (link == 0) {
+                link = 1;
+            }
+            action LockManual when (manual_phase == 1 && lock_owner == 0) {
+                manual_phase = 2;
+                lock_owner = 1;
+            }
+            action LockSettings when (settings_phase == 1 && lock_owner == 0) {
+                settings_phase = 2;
+                lock_owner = 2;
+            }
+            action ResolveManual when (manual_phase == 2 && lock_owner == 1) {
+                disk = if (
+                    manual_base == disk && manual_target == target &&
+                    manual_link == link
+                ) { 1 } else { if Buggy == 1 { 1 } else { disk } };
+                service = if (
+                    manual_base == disk && manual_target == target &&
+                    manual_link == link
+                ) { if Buggy == 1 { service } else { 1 } } else { service };
+                manual_committed = if (
+                    (manual_base == disk && manual_target == target &&
+                     manual_link == link) || Buggy == 1
+                ) { 1 } else { manual_committed };
+                double_winner = if (
+                    Buggy == 1 && settings_committed == 1 &&
+                    manual_base == settings_base
+                ) { 1 } else { double_winner };
+                stale_publication = if (
+                    Buggy == 1 && disk > manual_base
+                ) { 1 } else { stale_publication };
+                split_target_commit = if (
+                    Buggy == 1 && target > manual_target
+                ) { 1 } else { split_target_commit };
+                symlink_publication = if (
+                    Buggy == 1 && link > manual_link
+                ) { 1 } else { symlink_publication };
+                manual_unsynchronized = if (
+                    Buggy == 1 && manual_base == disk && manual_target == target &&
+                    manual_link == link
+                ) { 1 } else { manual_unsynchronized };
+                manual_phase = if (
+                    (manual_base == disk && manual_target == target &&
+                     manual_link == link) || Buggy == 1
+                ) { 3 } else { 4 };
+                lock_owner = 0;
+            }
+            action ResolveSettings when (
+                settings_phase == 2 && lock_owner == 2
+            ) {
+                disk = if (
+                    settings_base == disk && settings_target == target &&
+                    settings_link == link
+                ) { 2 } else { if Buggy == 1 { 2 } else { disk } };
+                service = if (
+                    (settings_base == disk && settings_target == target &&
+                     settings_link == link) || Buggy == 1
+                ) { 2 } else { service };
+                settings_committed = if (
+                    (settings_base == disk && settings_target == target &&
+                     settings_link == link) || Buggy == 1
+                ) { 1 } else { settings_committed };
+                double_winner = if (
+                    Buggy == 1 && manual_committed == 1 &&
+                    settings_base == manual_base
+                ) { 1 } else { double_winner };
+                stale_publication = if (
+                    Buggy == 1 && disk > settings_base
+                ) { 1 } else { stale_publication };
+                split_target_commit = if (
+                    Buggy == 1 && target > settings_target
+                ) { 1 } else { split_target_commit };
+                symlink_publication = if (
+                    Buggy == 1 && link > settings_link
+                ) { 1 } else { symlink_publication };
+                settings_phase = if (
+                    (settings_base == disk && settings_target == target &&
+                     settings_link == link) || Buggy == 1
+                ) { 3 } else { 4 };
+                lock_owner = 0;
+            }
+            action ResolveManualIndeterminate when (
+                manual_phase == 2 && lock_owner == 1 &&
+                manual_base == disk && manual_target == target &&
+                manual_link == link
+            ) {
+                disk = 1;
+                manual_phase = 5;
+                manual_indeterminate = 1;
+                lock_owner = 0;
+            }
+            action ResolveSettingsIndeterminate when (
+                settings_phase == 2 && lock_owner == 2 &&
+                settings_base == disk && settings_target == target &&
+                settings_link == link
+            ) {
+                disk = 2;
+                settings_phase = 5;
+                settings_indeterminate = 1;
+                lock_owner = 0;
+            }
+            action ReconcileManual when (manual_phase == 5) {
+                service = disk;
+                manual_phase = 4;
+                manual_indeterminate = 0;
+            }
+            action ReconcileSettings when (settings_phase == 5) {
+                service = disk;
+                settings_phase = 4;
+                settings_indeterminate = 0;
+            }
+            // A retry attempt is a real, reachable input, but the healthy
+            // machine rejects it without changing authority or publication
+            // state. The mutant turns that same attempt into a blind retry.
+            // Keeping rejection explicit avoids encoding a promised response
+            // as a vacuous/dead action.
+            action RetryIndeterminate when (
+                manual_phase == 5 || settings_phase == 5
+            ) {
+                blind_retry = if Buggy == 1 { 1 } else { blind_retry };
+            }
+
+            invariant SameBaselineHasOneWinner: double_winner == 0;
+            invariant NoStalePublication: stale_publication == 0;
+            invariant NoSplitTargetCommit: split_target_commit == 0;
+            invariant NoChangedLinkPublication: symlink_publication == 0;
+            invariant ManualDurableSynchronizesImmediately:
+                manual_unsynchronized == 0 &&
+                if manual_phase == 3 && settings_phase == 5 {
+                    service <= 2
+                } else {
+                    if manual_phase == 3 { service == disk } else { service <= 2 }
+                };
+            invariant IndeterminateDoesNotClaimDurability:
+                if manual_phase == 5 {
+                    manual_committed == 0 && manual_indeterminate == 1
+                } else {
+                    if settings_phase == 5 {
+                        settings_committed == 0 && settings_indeterminate == 1
+                    } else { manual_indeterminate + settings_indeterminate == 0 }
+                };
+            invariant ReconcileBeforeRetry: blind_retry == 0;
+            invariant OneSerializedCommitOwner: lock_owner <= 2;
+            invariant Bounded:
+                disk <= 2 && service <= 2 && target <= 1 && link <= 1 &&
+                manual_phase <= 5 && settings_phase <= 5 &&
+                manual_link <= 1 && settings_link <= 1 &&
+                manual_symlink <= 1 && settings_symlink <= 1 &&
+                manual_committed <= 1 && settings_committed <= 1 &&
+                symlink_publication <= 1 && manual_indeterminate <= 1 &&
+                settings_indeterminate <= 1 && blind_retry <= 1;
+        }
+    }
+}
+
 /// Every admitted config revision publishes text, its validated Trail Pack
-/// catalog, and its resolved Nyan sprite as one immutable snapshot. Settings,
-/// the live host, and capture may observe a generation only after all three
-/// payloads reach it. The two explicit mutant actions independently retain a
-/// stale Trail or stale Nyan generation, proving neither half of the asset
-/// aggregate is accidentally protected only by the other.
+/// catalog, resolved Nyan sprite, parsed custom-theme catalog, and exact
+/// inline + Toy Pack consumer projection as one immutable snapshot. Settings,
+/// the live host, and capture may observe a generation only after every
+/// payload reaches it. Explicit mutant actions
+/// independently retain each stale asset generation, proving no member is
+/// accidentally protected only by another.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn config_catalog_snapshot_model() -> Model {
@@ -13814,6 +14917,12 @@ pub fn config_catalog_snapshot_model() -> Model {
             var text_generation = 0;
             var trail_generation = 0;
             var nyan_generation = 0;
+            var theme_generation = 0;
+            var sparkle_generation = 0;
+            // Distinguishes a byte-identical path-asset refresh from an
+            // ordinary text patch in Tier-1 traces without weakening the
+            // shared atomic-generation invariant.
+            var asset_refresh = 0;
             var view_one_generation = 0;
             var view_two_generation = 0;
             var live_generation = 0;
@@ -13823,52 +14932,111 @@ pub fn config_catalog_snapshot_model() -> Model {
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
                 nyan_generation = revision + 1;
+                theme_generation = revision + 1;
+                sparkle_generation = revision + 1;
+                asset_refresh = 0;
             }
             action AdmitExternal when (revision == 1) {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
                 nyan_generation = revision + 1;
+                theme_generation = revision + 1;
+                sparkle_generation = revision + 1;
+                asset_refresh = 0;
+            }
+            // A byte-identical external observation may still resolve a new
+            // path-backed asset generation. The text is re-admitted as part of
+            // the same immutable snapshot identity; consumers never combine
+            // the retained text Arc with an independently refreshed catalog.
+            action RefreshAssets when (revision == 0) {
+                revision = revision + 1;
+                text_generation = revision + 1;
+                trail_generation = revision + 1;
+                nyan_generation = revision + 1;
+                theme_generation = revision + 1;
+                sparkle_generation = revision + 1;
+                asset_refresh = 1;
+            }
+            // The theme-directory watcher parses off-thread and republishes a
+            // complete outer snapshot even when config text is byte-identical.
+            action RefreshThemes when (revision == 0) {
+                revision = revision + 1;
+                text_generation = revision + 1;
+                trail_generation = revision + 1;
+                nyan_generation = revision + 1;
+                theme_generation = revision + 1;
+                sparkle_generation = revision + 1;
+                asset_refresh = 2;
             }
             action AdmitStaleTrail when (Buggy == 1 && revision == 0) {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = trail_generation;
                 nyan_generation = revision + 1;
+                theme_generation = revision + 1;
+                sparkle_generation = revision + 1;
+                asset_refresh = 0;
             }
             action AdmitStaleNyan when (Buggy == 1 && revision == 0) {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
                 nyan_generation = nyan_generation;
+                theme_generation = revision + 1;
+                sparkle_generation = revision + 1;
+                asset_refresh = 0;
+            }
+            action AdmitStaleTheme when (Buggy == 1 && revision == 0) {
+                revision = revision + 1;
+                text_generation = revision + 1;
+                trail_generation = revision + 1;
+                nyan_generation = revision + 1;
+                theme_generation = theme_generation;
+                sparkle_generation = revision + 1;
+                asset_refresh = 0;
+            }
+            action AdmitStaleSparkle when (Buggy == 1 && revision == 0) {
+                revision = revision + 1;
+                text_generation = revision + 1;
+                trail_generation = revision + 1;
+                nyan_generation = revision + 1;
+                theme_generation = revision + 1;
+                sparkle_generation = sparkle_generation;
+                asset_refresh = 0;
             }
             action PublishOne when (
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision
+                nyan_generation == revision && theme_generation == revision &&
+                sparkle_generation == revision
             ) {
                 view_one_generation = revision;
             }
             action PublishTwo when (
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision
+                nyan_generation == revision && theme_generation == revision &&
+                sparkle_generation == revision
             ) {
                 view_two_generation = revision;
             }
             action PublishLive when (
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision
+                nyan_generation == revision && theme_generation == revision &&
+                sparkle_generation == revision
             ) {
                 live_generation = revision;
             }
             action PublishCapture when (
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision
+                nyan_generation == revision && theme_generation == revision &&
+                sparkle_generation == revision
             ) {
                 capture_generation = revision;
             }
             invariant SnapshotAtomic:
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision;
+                nyan_generation == revision && theme_generation == revision &&
+                sparkle_generation == revision;
             invariant ViewsNeverAhead:
                 view_one_generation <= revision && view_two_generation <= revision &&
                 live_generation <= revision && capture_generation <= revision;
@@ -13876,16 +15044,24 @@ pub fn config_catalog_snapshot_model() -> Model {
                 view_one_generation <= text_generation &&
                 view_one_generation <= trail_generation &&
                 view_one_generation <= nyan_generation &&
+                view_one_generation <= theme_generation &&
+                view_one_generation <= sparkle_generation &&
                 view_two_generation <= text_generation &&
                 view_two_generation <= trail_generation &&
                 view_two_generation <= nyan_generation &&
+                view_two_generation <= theme_generation &&
+                view_two_generation <= sparkle_generation &&
                 live_generation <= text_generation &&
                 live_generation <= trail_generation &&
                 live_generation <= nyan_generation &&
+                live_generation <= theme_generation &&
+                live_generation <= sparkle_generation &&
                 capture_generation <= text_generation &&
                 capture_generation <= trail_generation &&
-                capture_generation <= nyan_generation;
-            invariant RevisionBounded: revision <= MaxRevision;
+                capture_generation <= nyan_generation &&
+                capture_generation <= theme_generation &&
+                capture_generation <= sparkle_generation;
+            invariant RevisionBounded: revision <= MaxRevision && asset_refresh <= 2;
         }
     }
 }
@@ -14051,11 +15227,11 @@ pub fn native_document_publication_model() -> Model {
     }
 }
 
-/// File-watch observations are a four-way decision with strict precedence:
-/// an in-flight save defers every changed observation, otherwise dirty local
-/// bytes surface a conflict, otherwise clean bytes reload atomically. An equal
-/// observation is always a no-op. The mutant checks dirty before saving and is
-/// caught when both facts are true.
+/// File-watch observations are a five-way decision with strict precedence: an
+/// in-flight save defers every changed observation; otherwise byte-equivalent
+/// generations rebind only the baseline; otherwise dirty local bytes surface a
+/// conflict and clean bytes reload atomically. An equal observation is always
+/// a no-op. The mutant checks dirty before both higher-priority decisions.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_file_watch_model() -> Model {
@@ -14063,15 +15239,20 @@ pub fn native_file_watch_model() -> Model {
         NativeFileWatch {
             const Buggy = 0;
             var changed = 0;
+            var equivalent = 0;
             var dirty = 0;
             var saving = 0;
-            // 0 unresolved, 1 unchanged, 2 reload, 3 conflict, 4 deferred.
+            // 0 unresolved, 1 unchanged, 2 reload, 3 conflict, 4 deferred,
+            // 5 rebind byte-equivalent generation.
             var verdict = 0;
             action ObserveChange when (changed == 0 && verdict == 0) {
                 changed = 1;
             }
             action MarkDirty when (dirty == 0 && verdict == 0) {
                 dirty = 1;
+            }
+            action MarkEquivalent when (equivalent == 0 && verdict == 0) {
+                equivalent = 1;
             }
             action BeginSave when (saving == 0 && verdict == 0) {
                 saving = 1;
@@ -14083,6 +15264,8 @@ pub fn native_file_watch_model() -> Model {
                     3
                 } else if saving == 1 {
                     4
+                } else if equivalent == 1 {
+                    5
                 } else if dirty == 1 {
                     3
                 } else {
@@ -14095,6 +15278,8 @@ pub fn native_file_watch_model() -> Model {
                         1
                     } else if saving == 1 {
                         4
+                    } else if equivalent == 1 {
+                        5
                     } else if dirty == 1 {
                         3
                     } else {
@@ -14103,8 +15288,124 @@ pub fn native_file_watch_model() -> Model {
                 } else {
                     verdict == 0
                 };
-            invariant InputsBounded: changed + dirty + saving <= 3;
-            invariant VerdictBounded: verdict <= 4;
+            invariant InputsBounded: changed + equivalent + dirty + saving <= 4;
+            invariant VerdictBounded: verdict <= 5;
+        }
+    }
+}
+
+/// Failure/recovery protocol shared by the live config and theme watchers. A
+/// healthy→failed edge publishes exactly one warning and latches the previous
+/// catalog; repeated identical failures are presentation-inert. The first
+/// successful theme observation, or exact admission of the newest config
+/// candidate, publishes exactly one recovery and clears the warning. A stale
+/// config completion is inert. The mutant repeats a failure wake, clears the
+/// warning, changes the retained catalog during a failed epoch, and admits an
+/// older config candidate, so the obligations are demonstrably non-vacuous.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn watcher_failure_recovery_model() -> Model {
+    crate::ty_model! {
+        WatcherFailureRecovery {
+            const Buggy = 0;
+            const MaxEpoch = 2;
+            var failed = 0;
+            var status_failed = 0;
+            var failure_epochs = 0;
+            var failure_wakes = 0;
+            var recovery_wakes = 0;
+            var catalog = 0;
+            var latched_catalog = 0;
+            var latest_candidate = 0;
+            var pending_candidate = 0;
+            var recovered_candidate = 0;
+            action ObserveFailure when (
+                failed == 0 && failure_epochs <= MaxEpoch - 1
+            ) {
+                failed = 1;
+                status_failed = 1;
+                failure_epochs = failure_epochs + 1;
+                failure_wakes = failure_wakes + 1;
+                latched_catalog = catalog;
+                latest_candidate = 0;
+                pending_candidate = 0;
+                recovered_candidate = 0;
+            }
+            action RepeatFailure when (failed == 1) {
+                status_failed = if Buggy == 1 { 0 } else { status_failed };
+                failure_wakes = if Buggy == 1 {
+                    failure_wakes + 1
+                } else {
+                    failure_wakes
+                };
+                catalog = if Buggy == 1 {
+                    if catalog == MaxEpoch { 0 } else { catalog + 1 }
+                } else {
+                    catalog
+                };
+            }
+            action ObserveCandidateOne when (failed == 1) {
+                latest_candidate = 1;
+                pending_candidate = 1;
+            }
+            action ObserveCandidateTwo when (
+                failed == 1 && latest_candidate == 1
+            ) {
+                latest_candidate = 2;
+                pending_candidate = 2;
+            }
+            action AdmitCandidateOne when (
+                failed == 1 && pending_candidate > 0
+            ) {
+                failed = if pending_candidate == 1 || Buggy == 1 { 0 } else { failed };
+                status_failed = if pending_candidate == 1 || Buggy == 1 {
+                    0
+                } else {
+                    status_failed
+                };
+                recovery_wakes = if pending_candidate == 1 || Buggy == 1 {
+                    recovery_wakes + 1
+                } else {
+                    recovery_wakes
+                };
+                recovered_candidate = if pending_candidate == 1 || Buggy == 1 {
+                    1
+                } else {
+                    recovered_candidate
+                };
+                pending_candidate = if pending_candidate == 1 || Buggy == 1 {
+                    0
+                } else {
+                    pending_candidate
+                };
+            }
+            action AdmitCandidateTwo when (
+                failed == 1 && pending_candidate == 2
+            ) {
+                failed = 0;
+                status_failed = 0;
+                recovery_wakes = recovery_wakes + 1;
+                recovered_candidate = 2;
+                pending_candidate = 0;
+            }
+            action Recover when (failed == 1 && latest_candidate == 0) {
+                failed = 0;
+                status_failed = 0;
+                recovery_wakes = recovery_wakes + 1;
+            }
+            action HealthyCatalogEdge when (failed == 0) {
+                catalog = if catalog == MaxEpoch { 0 } else { catalog + 1 };
+            }
+            invariant FailureStatusExact: status_failed == failed;
+            invariant FailureWakeDeduped: failure_wakes == failure_epochs;
+            invariant RecoveryWakeBounded: recovery_wakes <= failure_wakes;
+            invariant FailedPollRetainsCatalog:
+                if failed == 1 { catalog == latched_catalog } else { catalog <= MaxEpoch };
+            invariant ConfigRecoveryAdmitsLatest:
+                recovered_candidate == 0 || recovered_candidate == latest_candidate;
+            invariant CandidateGenerationBounded:
+                latest_candidate <= 2 && pending_candidate <= 2 && recovered_candidate <= 2;
+            invariant EpochsBounded: failure_epochs <= MaxEpoch;
         }
     }
 }
@@ -14112,8 +15413,10 @@ pub fn native_file_watch_model() -> Model {
 /// Crash-journal serialization has one in-flight generation, coalesces edits to
 /// the latest desired head, accepts durability only for the exact fsync proof,
 /// and rebases/prunes only after an atomic file-save proof. A checkpoint may
-/// retain a newer draft beyond the saved baseline. Mutants accept a stale
-/// completion or prune against an unproven file baseline.
+/// retain a newer draft beyond the saved baseline. The filesystem image has an
+/// independent generation captured under the process-shared lock; append and
+/// rewrite reject if another process wins. Mutants accept a stale completion,
+/// publish over a different journal image, or prune against an unproven file baseline.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_draft_journal_model() -> Model {
@@ -14135,6 +15438,10 @@ pub fn native_draft_journal_model() -> Model {
             var stale_rejected = 0;
             var stale_accepted = 0;
             var unsafe_prune = 0;
+            var journal_disk_generation = 0;
+            var plan_disk_generation = 0;
+            var disk_conflict_rejected = 0;
+            var wrong_image_accepted = 0;
             action Edit when (edit_seq <= MaxSeq - 1) {
                 edit_seq = edit_seq + 1;
                 desired_seq = desired_seq + 1;
@@ -14146,10 +15453,18 @@ pub fn native_draft_journal_model() -> Model {
                 inflight = 1;
                 target_seq = desired_seq;
                 generation = generation + 1;
+                plan_disk_generation = journal_disk_generation;
             }
-            action AcceptJournal when (inflight == 1) {
+            action AcceptJournal when (
+                inflight == 1 && journal_disk_generation <= MaxGeneration - 1 &&
+                (plan_disk_generation == journal_disk_generation || Buggy == 1)
+            ) {
                 durable_seq = target_seq;
                 inflight = 0;
+                wrong_image_accepted = if (
+                    Buggy == 1 && journal_disk_generation > plan_disk_generation
+                ) { 1 } else { wrong_image_accepted };
+                journal_disk_generation = journal_disk_generation + 1;
             }
             action ProveFileSave when (desired_seq > file_durable_seq) {
                 file_durable_seq = desired_seq;
@@ -14171,15 +15486,34 @@ pub fn native_draft_journal_model() -> Model {
                 };
                 checkpoint_ready = 0;
                 generation = generation + 1;
+                plan_disk_generation = journal_disk_generation;
                 unsafe_prune = if Buggy == 1 && checkpoint_ready == 0 {
                     1
                 } else {
                     unsafe_prune
                 };
             }
-            action AcceptCheckpoint when (inflight == 2) {
+            action AcceptCheckpoint when (
+                inflight == 2 && journal_disk_generation <= MaxGeneration - 1 &&
+                (plan_disk_generation == journal_disk_generation || Buggy == 1)
+            ) {
                 durable_seq = target_seq;
                 inflight = 0;
+                wrong_image_accepted = if (
+                    Buggy == 1 && journal_disk_generation > plan_disk_generation
+                ) { 1 } else { wrong_image_accepted };
+                journal_disk_generation = journal_disk_generation + 1;
+            }
+            action ExternalJournalCommit when (
+                inflight > 0 && journal_disk_generation <= MaxGeneration - 1
+            ) {
+                journal_disk_generation = journal_disk_generation + 1;
+            }
+            action RejectJournalDiskConflict when (
+                inflight > 0 && journal_disk_generation > plan_disk_generation
+            ) {
+                inflight = 0;
+                disk_conflict_rejected = 1;
             }
             action RejectStaleProof when (
                 inflight > 0 && generation > 1 &&
@@ -14205,8 +15539,119 @@ pub fn native_draft_journal_model() -> Model {
             invariant PruneOnlyAfterFileDurable: baseline_seq <= file_durable_seq;
             invariant StaleProofIsNoOp: stale_accepted == 0;
             invariant NoUnsafePrune: unsafe_prune == 0;
+            invariant JournalImageCas: wrong_image_accepted == 0;
             invariant SequenceBounded: edit_seq <= MaxSeq;
-            invariant GenerationBounded: generation <= MaxGeneration;
+            invariant GenerationBounded:
+                generation <= MaxGeneration &&
+                journal_disk_generation <= MaxGeneration &&
+                plan_disk_generation <= MaxGeneration;
+        }
+    }
+}
+
+/// Durable restore-manifest publication and single-use consumption. Writers
+/// serialize a unique temporary publication under the same process-shared lock
+/// used by takers. A taker atomically claims the visible name, synchronizes that
+/// removal, and only then may return a manifest. The mutant returns before the
+/// claim is durable or reuses a fixed temporary alias.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn restore_manifest_single_use_model() -> Model {
+    crate::ty_model! {
+        RestoreManifestSingleUse {
+            const Buggy = 0;
+            // 0 free, 1 taker A, 2 taker B, 3 writer.
+            var lock_owner = 0;
+            var visible = 1;
+            // 0 unclaimed, 1 A, 2 B.
+            var claim_owner = 0;
+            var claim_synced = 0;
+            var returned = 0;
+            var unique_temporary = 0;
+            var unsafe_return = 0;
+            var fixed_alias_corrupted = 0;
+
+            action LockTakeA when (lock_owner == 0) {
+                lock_owner = 1;
+            }
+            action LockTakeB when (lock_owner == 0) {
+                lock_owner = 2;
+            }
+            action ClaimA when (lock_owner == 1 && visible == 1) {
+                visible = 0;
+                claim_owner = 1;
+            }
+            action ClaimB when (lock_owner == 2 && visible == 1) {
+                visible = 0;
+                claim_owner = 2;
+            }
+            action SyncClaim when (claim_owner > 0 && claim_synced == 0) {
+                claim_synced = 1;
+            }
+            action ReturnA when (
+                lock_owner == 1 && claim_owner == 1 &&
+                (claim_synced == 1 || Buggy == 1)
+            ) {
+                returned = returned + 1;
+                unsafe_return = if claim_synced == 0 { 1 } else { unsafe_return };
+                claim_owner = 0;
+                claim_synced = 0;
+                lock_owner = 0;
+            }
+            action ReturnB when (
+                lock_owner == 2 && claim_owner == 2 &&
+                (claim_synced == 1 || Buggy == 1)
+            ) {
+                returned = returned + 1;
+                unsafe_return = if claim_synced == 0 { 1 } else { unsafe_return };
+                claim_owner = 0;
+                claim_synced = 0;
+                lock_owner = 0;
+            }
+            action ObserveAbsentA when (
+                lock_owner == 1 && visible == 0 && claim_owner == 0
+            ) {
+                lock_owner = 0;
+            }
+            action ObserveAbsentB when (
+                lock_owner == 2 && visible == 0 && claim_owner == 0
+            ) {
+                lock_owner = 0;
+            }
+            action LockWriter when (lock_owner == 0 && returned == 0) {
+                lock_owner = 3;
+            }
+            action CreateUniqueTemporary when (
+                lock_owner == 3 && unique_temporary == 0
+            ) {
+                unique_temporary = 1;
+            }
+            action PublishManifest when (
+                lock_owner == 3 && unique_temporary == 1
+            ) {
+                visible = 1;
+                unique_temporary = 0;
+                lock_owner = 0;
+            }
+            // A fixed-alias attempt is an explicit rejected input in the safe
+            // machine. Keeping the rejection reachable makes strict vacuity
+            // distinguish this mutation from the independent early-return
+            // mutation that shares the model's Buggy switch.
+            action ReuseFixedTemporary when (lock_owner == 3) {
+                fixed_alias_corrupted =
+                    if Buggy == 1 { 1 } else { fixed_alias_corrupted };
+            }
+
+            invariant AtMostOneConsumer: returned <= 1;
+            invariant ReturnOnlyAfterDurableClaim: unsafe_return == 0;
+            invariant ClaimRemovesVisibleName:
+                if claim_owner > 0 { visible == 0 } else { visible <= 1 };
+            invariant UniqueTemporaryNeverAliases: fixed_alias_corrupted == 0;
+            invariant OwnerBounded: lock_owner <= 3 && claim_owner <= 2;
+            invariant FlagsBounded:
+                visible <= 1 && claim_synced <= 1 && returned <= 1 &&
+                unique_temporary <= 1 && unsafe_return <= 1 &&
+                fixed_alias_corrupted <= 1;
         }
     }
 }
@@ -14300,6 +15745,112 @@ pub fn native_close_plan_model() -> Model {
                     edit_seq <= MaxSeq
                 };
             invariant SequenceBounded: edit_seq <= MaxSeq;
+        }
+    }
+}
+
+/// A document owns the latest explicit Save/close durability intent while an
+/// older atomic file generation is in flight. Completion either hands off to
+/// that newer target (remaining visibly in-flight) or settles once the latest
+/// requested sequence is durable. A close may commit only after its frozen
+/// sequence is covered. The mutant drops the latch at the first completion,
+/// reproducing both a false "Saved" publication and a wedged close/Quit plan.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_save_intent_latch_model() -> Model {
+    crate::ty_model! {
+        NativeSaveIntentLatch {
+            const Buggy = 0;
+            const MaxSeq = 3;
+            var head = 0;
+            var durable = 0;
+            var inflight = 0;
+            var target = 0;
+            var requested = 0;
+            var latched = 0;
+            var close_waiting = 0;
+            var close_seq = 0;
+            var closed = 0;
+            var settled = 1;
+            action Edit when (closed == 0 && close_waiting == 0 && head <= MaxSeq - 1) {
+                head = head + 1;
+                settled = 0;
+            }
+            action BeginSave when (inflight == 0 && durable <= head - 1) {
+                inflight = 1;
+                target = head;
+                requested = head;
+                latched = 0;
+                settled = 0;
+            }
+            action RequestSave when (inflight == 1) {
+                requested = head;
+                latched = 1;
+                settled = 0;
+            }
+            action BeginCloseIdle when (
+                close_waiting == 0 && inflight == 0 && durable <= head - 1
+            ) {
+                close_waiting = 1;
+                close_seq = head;
+                requested = head;
+                latched = 0;
+                inflight = 1;
+                target = head;
+                settled = 0;
+            }
+            action BeginCloseInflight when (
+                close_waiting == 0 && inflight == 1
+            ) {
+                close_waiting = 1;
+                close_seq = head;
+                requested = head;
+                latched = 1;
+                settled = 0;
+            }
+            action CompleteAndPump when (
+                inflight == 1 && requested > target
+            ) {
+                durable = target;
+                target = if Buggy == 1 { target } else { requested };
+                inflight = if Buggy == 1 { 0 } else { 1 };
+                latched = 0;
+                settled = if Buggy == 1 { 1 } else { 0 };
+            }
+            action CompleteChain when (
+                inflight == 1 && requested > target
+            ) {
+                durable = if Buggy == 1 { target } else { requested };
+                target = if Buggy == 1 { target } else { requested };
+                inflight = 0;
+                latched = 0;
+                settled = 1;
+            }
+            action CompleteFinal when (
+                inflight == 1 && requested <= target
+            ) {
+                durable = target;
+                inflight = 0;
+                latched = 0;
+                settled = 1;
+            }
+            action CommitClose when (
+                close_waiting == 1 && inflight == 0 && close_seq <= durable
+            ) {
+                close_waiting = 0;
+                closed = 1;
+            }
+            invariant SettledCoversLatestRequest:
+                if settled == 1 { requested <= durable } else { durable <= head };
+            invariant WaitingCloseHasCompletionPump:
+                if close_waiting == 1 && inflight == 0 { close_seq <= durable }
+                else { close_seq <= head };
+            invariant ClosedSequenceIsDurable:
+                if closed == 1 { close_seq <= durable } else { durable <= head };
+            invariant DurableNotFuture: durable <= head;
+            invariant TargetNotFuture: target <= head;
+            invariant RequestedNotFuture: requested <= head;
+            invariant SequenceBounded: head <= MaxSeq;
         }
     }
 }
@@ -19934,169 +21485,214 @@ pub fn top_anchored_scroll_history_model() -> Model {
     }
 }
 
-/// Generation and one-slot accounting for the asynchronous Nyan sprite loader.
-///
-/// A full request slot retains exactly one latest pending generation; a stale
-/// generation or wrong path is consumed without publication. An accepted exact
-/// result installs once and obligates redraw fanout regardless of whether a
-/// redraw/introspection poll or the worker wake won the result-channel race.
-/// The worker's blocking file/decode lane is abstracted behind `WorkerCompletes`;
-/// this model covers process/thread interleavings, not filesystem durability.
-/// The mutant publishes stale results and permits an accepted result to miss
-/// sibling-window fanout.
+/// Settings ▸ Manual host diagnostics run on one worker behind a one-entry
+/// request channel and a one-entry latest-wins pending slot. The modeled
+/// revision is the monotonic identity of a `(document revision, host analysis
+/// generation)` pair, so byte-identical environment refreshes participate in
+/// the same stale-completion law as text edits. Every request remains
+/// represented until it completes; only the exact current identity may publish.
+/// `Buggy=1` retains the older pending request when a third generation arrives
+/// while the channel is full, reproducing stale diagnostics or loss of the
+/// final edit.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn nyan_sprite_loader_model() -> Model {
+pub fn manual_config_diagnostics_lane_model() -> Model {
     crate::ty_model! {
-        NyanSpriteLoader {
+        ManualConfigDiagnosticsLane {
             const Buggy = 0;
-            const MaxGeneration = 3;
-            var current_generation = 0;
-            var desired_path = 0;
-            var request_count = 0;
-            var request_generation = 0;
-            var request_path = 0;
-            var pending_count = 0;
-            var pending_generation = 0;
-            var pending_path = 0;
-            var active_count = 0;
-            var active_generation = 0;
-            var active_path = 0;
-            var result_count = 0;
-            var result_generation = 0;
-            var result_path = 0;
-            var installed_generation = 0;
-            var installed_path = 0;
-            var accepted = 0;
-            var fanout_requested = 0;
+            const MaxRevision = 3;
+            var current_revision = 0;
+            var channel_revision = 0;
+            var active_revision = 0;
+            var pending_revision = 0;
+            var completed_revision = 0;
+            var published_revision = 0;
             var stale_published = 0;
 
-            action RequestFirst when (current_generation == 0 && request_count == 0) {
-                current_generation = 1;
-                desired_path = 1;
-                request_count = 1;
-                request_generation = 1;
-                request_path = 1;
-                installed_generation = 0;
-                installed_path = 0;
+            action RequestFirst when (current_revision == 0) {
+                current_revision = 1;
+                channel_revision = 1;
             }
-            action RequestSecondWhileFull when (
-                current_generation == 1 && request_count == 1 && pending_count == 0
-            ) {
-                current_generation = 2;
-                desired_path = 2;
-                pending_count = 1;
-                pending_generation = 2;
-                pending_path = 2;
-                installed_generation = 0;
-                installed_path = 0;
+            action RequestSecond when (current_revision == 1) {
+                current_revision = 2;
+                channel_revision = if channel_revision == 0 { 2 } else { channel_revision };
+                pending_revision = if channel_revision == 0 { 0 } else { 2 };
+                published_revision = 0;
             }
-            action RequestThirdReplacesPending when (
-                current_generation == 2 && request_count == 1 && pending_count == 1
-            ) {
-                current_generation = 3;
-                desired_path = 3;
-                pending_generation = 3;
-                pending_path = 3;
-                installed_generation = 0;
-                installed_path = 0;
+            action RequestThird when (current_revision == 2) {
+                current_revision = 3;
+                channel_revision = if channel_revision == 0 { 3 } else { channel_revision };
+                pending_revision = if channel_revision == 0 {
+                    0
+                } else {
+                    if Buggy == 1 { 2 } else { 3 }
+                };
+                published_revision = 0;
             }
-            action WorkerTakesQueued when (
-                request_count == 1 && active_count == 0
+            action WorkerTakes when (
+                channel_revision > 0 && active_revision == 0
             ) {
-                request_count = 0;
-                active_count = 1;
-                active_generation = request_generation;
-                active_path = request_path;
-                request_generation = 0;
-                request_path = 0;
-            }
-            action RetryLatestPending when (
-                request_count == 0 && pending_count == 1
-            ) {
-                request_count = 1;
-                request_generation = pending_generation;
-                request_path = pending_path;
-                pending_count = 0;
-                pending_generation = 0;
-                pending_path = 0;
+                active_revision = channel_revision;
+                channel_revision = 0;
             }
             action WorkerCompletes when (
-                active_count == 1 && result_count == 0
+                active_revision > 0 && completed_revision == 0
             ) {
-                active_count = 0;
-                result_count = 1;
-                result_generation = active_generation;
-                result_path = active_path;
-                active_generation = 0;
-                active_path = 0;
+                completed_revision = active_revision;
+                active_revision = 0;
             }
-            action CorruptCurrentResultPath when (
-                result_count == 1 && result_generation == current_generation &&
-                result_path == desired_path
+            action DispatchLatestPending when (
+                channel_revision == 0 && pending_revision > 0
             ) {
-                result_path = 0;
+                channel_revision = pending_revision;
+                pending_revision = 0;
             }
-            action AcceptCurrentResult when (
-                result_count == 1 && result_generation == current_generation &&
-                result_path == desired_path
+            action AcceptCurrent when (
+                completed_revision > 0 && completed_revision == current_revision
             ) {
-                result_count = 0;
-                installed_generation = result_generation;
-                installed_path = result_path;
-                result_generation = 0;
-                result_path = 0;
-                accepted = 1;
-                fanout_requested = if Buggy == 1 { 0 } else { 1 };
+                published_revision = completed_revision;
+                completed_revision = 0;
             }
-            action RejectStaleGeneration when (
-                result_count == 1 && current_generation > result_generation
+            action RejectStale when (
+                completed_revision > 0 && current_revision > completed_revision
             ) {
-                result_count = 0;
-                installed_generation = if Buggy == 1 {
-                    result_generation
-                } else { installed_generation };
-                installed_path = if Buggy == 1 { result_path } else { installed_path };
-                result_generation = 0;
-                result_path = 0;
+                published_revision = if Buggy == 1 {
+                    completed_revision
+                } else { published_revision };
                 stale_published = if Buggy == 1 { 1 } else { stale_published };
+                completed_revision = 0;
             }
-            action RejectWrongPath when (
-                result_count == 1 && result_generation == current_generation &&
-                result_path == 0 && desired_path > 0
+            action Settled when (
+                published_revision == MaxRevision && completed_revision == 0
             ) {
-                result_count = 0;
-                installed_generation = if Buggy == 1 {
-                    result_generation
-                } else { installed_generation };
-                installed_path = if Buggy == 1 { result_path } else { installed_path };
-                result_generation = 0;
-                result_path = 0;
-                stale_published = if Buggy == 1 { 1 } else { stale_published };
-            }
-            action SettledAccepted when (accepted == 1) {
-                accepted = 1;
+                published_revision = published_revision;
             }
 
-            invariant RequestChannelCapacityOne: request_count <= 1;
-            invariant ResultChannelCapacityOne: result_count <= 1;
-            invariant PendingCoalescerCapacityOne: pending_count <= 1;
-            invariant PendingAlwaysNamesLatestGeneration:
-                if pending_count == 1 {
-                    pending_generation == current_generation && pending_path == desired_path
+            invariant LatestRequestRemainsRepresented:
+                if current_revision > published_revision {
+                    current_revision == channel_revision ||
+                    current_revision == active_revision ||
+                    current_revision == pending_revision ||
+                    current_revision == completed_revision
                 } else {
-                    pending_generation == 0 && pending_path == 0
+                    published_revision == current_revision
                 };
-            invariant InstalledResultIsCurrentAndExact:
-                if installed_generation > 0 {
-                    installed_generation == current_generation && installed_path == desired_path
+            invariant PendingSlotNamesLatest:
+                if pending_revision > 0 {
+                    pending_revision == current_revision
                 } else {
-                    installed_path == 0
+                    pending_revision == 0
                 };
-            invariant StaleResultNeverPublishes: stale_published == 0;
-            invariant AcceptedCurrentResultRequestsSiblingFanout:
-                if accepted == 1 { fanout_requested == 1 } else { fanout_requested == 0 };
-            invariant GenerationBounded: current_generation <= MaxGeneration;
+            invariant StaleCompletionNeverPublishes: stale_published == 0;
+            invariant PublicationIsCurrentOrEmpty:
+                published_revision == 0 || published_revision == current_revision;
+            invariant RevisionsBounded:
+                current_revision <= MaxRevision &&
+                channel_revision <= MaxRevision && active_revision <= MaxRevision &&
+                pending_revision <= MaxRevision && completed_revision <= MaxRevision &&
+                published_revision <= MaxRevision;
+        }
+    }
+}
+
+/// Config/font generation publication: a completion may publish only when its
+/// ticket is still the newest request. The mutant accepts generation one after
+/// generation two was requested, reproducing a stale face/config rollback.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn font_catalog_generation_model() -> Model {
+    crate::ty_model! {
+        FontCatalogGeneration {
+            const Buggy = 0;
+            var requested = 0;
+            var completed = 0;
+            var published = 0;
+            var stale_published = 0;
+
+            action RequestFirst when (requested == 0) { requested = 1; }
+            action RequestSecond when (requested == 1) { requested = 2; }
+            action CompleteFirst when (requested == 2 && completed == 0) {
+                completed = 1;
+            }
+            action RejectStale when (completed == 1) {
+                published = if Buggy == 1 { 1 } else { published };
+                stale_published = if Buggy == 1 { 1 } else { stale_published };
+                completed = 0;
+            }
+            action CompleteSecond when (requested == 2 && completed == 0) {
+                completed = 2;
+            }
+            action PublishCurrent when (completed == requested) {
+                published = completed;
+                completed = 0;
+            }
+
+            invariant StaleCompletionNeverPublishes: stale_published == 0;
+            invariant PublicationIsCurrentOrEmpty:
+                published == 0 || published == requested;
+            invariant GenerationsBounded:
+                requested <= 2 && completed <= 2 && published <= 2;
+        }
+    }
+}
+
+/// A theme-catalog generation can overtake an expensive font/config prepare.
+/// The current config observation must be re-prepared against that newer theme
+/// rather than publishing assets derived from the old theme or being dropped.
+/// The mutant publishes the sequence-current but theme-stale completion.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn font_theme_generation_model() -> Model {
+    crate::ty_model! {
+        FontThemeGeneration {
+            const Buggy = 0;
+            var requested = 0;
+            var theme = 0;
+            var completed = 0;
+            var completed_theme = 0;
+            var published = 0;
+            var published_theme = 0;
+            var stale_published = 0;
+
+            action RequestConfig when (requested == 0) { requested = 1; }
+            action ThemeChanged when (requested == 1 && theme == 0) { theme = 1; }
+            action CompleteOldTheme when (
+                requested == 1 && theme == 1 && completed == 0
+            ) {
+                completed = 1;
+                completed_theme = 0;
+            }
+            action ReprepareLatestTheme when (
+                completed == requested && theme > completed_theme
+            ) {
+                published = if Buggy == 1 { completed } else { published };
+                published_theme = if Buggy == 1 {
+                    completed_theme
+                } else { published_theme };
+                stale_published = if Buggy == 1 { 1 } else { stale_published };
+                requested = 2;
+                completed = 0;
+            }
+            action CompleteLatestTheme when (
+                requested == 2 && theme == 1 && completed == 0
+            ) {
+                completed = 2;
+                completed_theme = 1;
+            }
+            action PublishCurrent when (
+                completed == requested && completed_theme == theme
+            ) {
+                published = completed;
+                published_theme = completed_theme;
+                completed = 0;
+            }
+
+            invariant StaleThemeNeverPublishes: stale_published == 0;
+            invariant PublishedThemeIsCurrentOrEmpty:
+                published == 0 || published_theme == theme;
+            invariant GenerationsBounded:
+                requested <= 2 && theme <= 1 && completed <= 2 &&
+                completed_theme <= 1 && published <= 2 && published_theme <= 1;
         }
     }
 }
@@ -22185,123 +23781,6 @@ pub fn settings_page_scroll_model() -> Model {
     }
 }
 
-/// Native Settings Diagnostics owns a retained one-shot refresh deadline. The
-/// deadline exists only while Diagnostics is the visible native route and the
-/// surface has a real watcher: either a focused OS window or an active recording
-/// (including headless recording). Opening a modal overlay, hiding the route,
-/// blurring an ordinary window, or stopping a headless recording disarms it.
-/// A due deadline refreshes exactly once and is consumed before a later scheduler
-/// pass may arm the next interval. `Buggy=1` reproduces the invisible-route wake
-/// leak by omitting `route_visible` from the eligibility decision.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn native_diagnostics_deadline_model() -> Model {
-    crate::ty_model! {
-        NativeDiagnosticsDeadline {
-            const Buggy = 0;
-            var route_visible = 0;
-            var has_os_window = 0;
-            var focused = 0;
-            var recorded = 0;
-            var overlay_open = 0;
-            // Inputs to the pure shipping decision seam.
-            var armed = 0;
-            var due = 0;
-            // 0 Disarm, 1 Arm, 2 Keep, 3 Refresh.
-            var decision = 0;
-            var refreshed = 0;
-            var observed_armed = 0;
-            var observed_due = 0;
-            var resolved = 0;
-            action ShowRoute { route_visible = 1; resolved = 0; }
-            action HideRoute { route_visible = 0; resolved = 0; }
-            action AttachWindow { has_os_window = 1; resolved = 0; }
-            action DetachWindow { has_os_window = 0; resolved = 0; }
-            action Focus { focused = 1; resolved = 0; }
-            action Blur { focused = 0; resolved = 0; }
-            action StartRecording { recorded = 1; resolved = 0; }
-            action StopRecording { recorded = 0; resolved = 0; }
-            action OpenOverlay { overlay_open = 1; resolved = 0; }
-            action CloseOverlay { overlay_open = 0; resolved = 0; }
-            action ArmInput { armed = 1; resolved = 0; }
-            action DisarmInput { armed = 0; resolved = 0; }
-            action MarkDue { due = 1; resolved = 0; }
-            action ClearDue { due = 0; resolved = 0; }
-            action Decide {
-                observed_armed = armed;
-                observed_due = due;
-                decision = if (
-                    route_visible + Buggy > 0 && overlay_open == 0 &&
-                    recorded + recorded + has_os_window + focused > 1
-                ) {
-                    if armed == 0 { 1 } else if due == 1 { 3 } else { 2 }
-                } else {
-                    0
-                };
-                refreshed = if (
-                    route_visible + Buggy > 0 && overlay_open == 0 &&
-                    recorded + recorded + has_os_window + focused > 1 &&
-                    armed == 1 && due == 1
-                ) { 1 } else { 0 };
-                armed = if (
-                    route_visible + Buggy > 0 && overlay_open == 0 &&
-                    recorded + recorded + has_os_window + focused > 1
-                ) {
-                    if armed == 0 { 1 } else if due == 1 { 0 } else { 1 }
-                } else {
-                    0
-                };
-                // A due deadline is a one-shot. Arm creates a new, not-yet-due
-                // deadline; Disarm removes it.
-                due = 0;
-                resolved = 1;
-            }
-            invariant DecisionMatchesLifecycle:
-                if resolved == 0 {
-                    decision <= 3
-                } else if (
-                    route_visible == 1 && overlay_open == 0 &&
-                    recorded + recorded + has_os_window + focused > 1
-                ) {
-                    if observed_armed == 0 {
-                        decision == 1 && armed == 1 && refreshed == 0
-                    } else if observed_due == 1 {
-                        decision == 3 && armed == 0 && refreshed == 1
-                    } else {
-                        decision == 2 && armed == 1 && refreshed == 0
-                    }
-                } else {
-                    decision == 0 && armed == 0 && refreshed == 0
-                };
-            invariant DisarmedWhenUnwatched:
-                if resolved == 0 {
-                    armed <= 1
-                } else if (
-                    route_visible == 1 && overlay_open == 0 &&
-                    recorded + recorded + has_os_window + focused > 1
-                ) {
-                    armed <= 1
-                } else {
-                    armed == 0
-                };
-            invariant RefreshOnlyWhileWatched:
-                if resolved + refreshed <= 1 {
-                    refreshed <= 1
-                } else {
-                    route_visible == 1 && overlay_open == 0 &&
-                    recorded + recorded + has_os_window + focused > 1 &&
-                    observed_armed == 1 && observed_due == 1
-                };
-            invariant DeadlineConsumed:
-                if resolved == 1 { due == 0 } else { due <= 1 };
-            invariant InputsBounded:
-                route_visible + has_os_window + focused + recorded + overlay_open <= 5 &&
-                armed <= 1 && due <= 1 && observed_armed <= 1 && observed_due <= 1;
-            invariant DecisionBounded: decision <= 3 && refreshed <= 1;
-        }
-    }
-}
-
 /// A native control mutation may stage pixels before the compositor accepts a
 /// present. Screenshot capture is authorized only after that present succeeds.
 /// A capture makes at most `AttemptLimit` present attempts and then fails closed;
@@ -23393,6 +24872,100 @@ pub fn hyperlink_scheme_cap_model() -> Model {
 
             invariant Bounded: orca + others <= Cap;
             invariant NeverAllowRefused: never == 0;
+        }
+    }
+}
+
+/// Module-wide scrollback budget sharing (audit E1, Codex-required global cap):
+/// N panes in one memory space each apply `min(configured, global / live)` at
+/// their own touch points, so the applied budgets sum within the ONE global cap
+/// at every quiescent point — panes cannot multiply the per-pane budget into an
+/// OOM. Two panes bound the membership lattice (join/leave/apply in all
+/// orders); `fresh*` tracks "applied since the last membership change", so the
+/// invariant is exact at quiescence and honestly waived while a share is stale
+/// (bounded staleness: one touch). `Buggy=1` is the global-less bug — each pane
+/// applies its full configured budget — which two fresh panes must expose.
+///
+/// PROVES `QuiescentSumBounded` + `DepartedHoldsNothing` at `Buggy=0`; at
+/// `Buggy=1` two fresh live panes overrun the global (counterexample required).
+/// Tier-1: `aterm-core/tests/conformance_shared_budget.rs` drives the real
+/// `ScrollbackBudgetShare` registry (and real `Terminal` eviction) in lockstep.
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
+// models above) — the MODEL it returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+#[must_use]
+pub fn shared_budget_model() -> Model {
+    crate::ty_model! {
+        SharedScrollbackBudget {
+            const Global = 6;  // module-wide budget (scaled bytes)
+            const HalfShare = 3;    // Global/2 — the two-pane equal share (no division in exprs)
+            const Cfg = 6;     // per-pane configured budget (> HalfShare so the share binds)
+            const Buggy = 0;   // 1 = apply configured budget, ignore the global divide
+
+            var live2 = 0;  // pane 2 registered (pane 1 is always live)
+            var a1 = 6;     // pane 1 APPLIED budget (= Cfg: a fresh store carries
+                            // its configured budget until first touch)
+            var a2 = 0;     // pane 2 APPLIED budget
+            var fresh1 = 0; // pane 1 applied since the last membership change
+            var fresh2 = 0;
+            var steps = 0;  // run bound
+
+            // Pane 2 registers (its store constructed at Cfg): both shares go
+            // stale until each pane's next touch.
+            action Join when (live2 == 0 && steps <= 5) {
+                live2 = 1;
+                a2 = Cfg;
+                fresh1 = 0;
+                fresh2 = 0;
+                steps = steps + 1;
+            }
+            // Pane 2 drops: its Scrollback (and applied share) is freed with it.
+            action Leave when (live2 == 1 && steps <= 5) {
+                live2 = 0;
+                a2 = 0;
+                fresh1 = 0;
+                fresh2 = 0;
+                steps = steps + 1;
+            }
+            // Pane 1 touched: pending_effective() -> set_memory_budget.
+            action Apply1 when (steps <= 5) {
+                a1 = if Buggy == 1 {
+                    Cfg
+                } else if live2 == 1 {
+                    if Cfg > HalfShare { HalfShare } else { Cfg }
+                } else if Cfg > Global {
+                    Global
+                } else {
+                    Cfg
+                };
+                fresh1 = 1;
+                steps = steps + 1;
+            }
+            action Apply2 when (live2 == 1 && steps <= 5) {
+                a2 = if Buggy == 1 {
+                    Cfg
+                } else if Cfg > HalfShare {
+                    HalfShare
+                } else {
+                    Cfg
+                };
+                fresh2 = 1;
+                steps = steps + 1;
+            }
+
+            // THE global contract: once every live pane has applied its current
+            // share, applied budgets sum within the ONE global cap.
+            invariant QuiescentSumBounded:
+                if fresh1 == 0 {
+                    0 <= 1
+                } else if live2 == 1 && fresh2 == 0 {
+                    0 <= 1
+                } else {
+                    a1 + a2 <= Global
+                };
+            // A departed pane holds no share.
+            invariant DepartedHoldsNothing:
+                if live2 == 0 { a2 == 0 } else { 0 <= 1 };
         }
     }
 }

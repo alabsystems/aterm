@@ -202,7 +202,7 @@ fn show_config_report() -> String {
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     let or = |s: String, dflt: &str| if s.is_empty() { dflt.to_string() } else { s };
     let mut out = String::new();
-    out.push_str(&format!("version={}\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!("version={}\n", aterm_types::version::APP_VERSION));
     // Shell resolution: $SHELL everywhere; on Windows (where $SHELL is rarely
     // set outside MSYS shells) fall back to %COMSPEC%, the value the console
     // world actually launches — an honest report of the origin, not a fake
@@ -414,7 +414,7 @@ fn doctor_checks(
     out.push('\n');
     out.push_str(&format!(
         "version: {} ({cols}x{rows})\n\n",
-        env!("CARGO_PKG_VERSION")
+        aterm_types::version::APP_VERSION
     ));
     out.push_str(if all_ok {
         "health: OK — aterm is ready to run\n"
@@ -568,7 +568,7 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
             std::process::exit(0);
         }
         CliAction::Version => {
-            println!("aterm {}", env!("CARGO_PKG_VERSION"));
+            println!("aterm {}", aterm_types::version::APP_VERSION);
             std::process::exit(0);
         }
         CliAction::Diag { cmd, arg } => {
@@ -690,7 +690,6 @@ pub fn is_tool_candidate(first: Option<&str>) -> bool {
 /// (verbs/tools handled there; flags via [`parse_args`]); `quiet` is the
 /// parsed `-q`/`--quiet`.
 pub fn session_main(quiet: bool) -> ! {
-
     // One-line greeting, INTERACTIVE sessions only. The passthrough is so
     // transparent that a bare `aterm` is indistinguishable from nothing — a
     // fresh prompt, no window, no banner — which reads as "it did nothing"
@@ -706,7 +705,7 @@ pub fn session_main(quiet: bool) -> ! {
             eprintln!(
                 "aterm {} — transparent session started (start with `aterm help` · your shell \
                  runs unchanged while the engine models it · `exit` leaves · `--quiet` silences)",
-                env!("CARGO_PKG_VERSION")
+                aterm_types::version::APP_VERSION
             );
         }
     }
@@ -1185,7 +1184,13 @@ mod tests {
     #[test]
     fn no_args_runs_with_no_override() {
         // A Finder/.app launch: no flags → launch, env/default decides the mode.
-        assert_eq!(decide(&[]), CliAction::Run { containment: None, quiet: false });
+        assert_eq!(
+            decide(&[]),
+            CliAction::Run {
+                containment: None,
+                quiet: false
+            }
+        );
     }
 
     #[test]
@@ -1341,7 +1346,13 @@ mod tests {
     fn double_dash_ends_options_and_bare_form_runs() {
         // A lone `--` ends option parsing; aterm takes no operands, so a bare `--`
         // is a clean no-op run (not an "unknown option").
-        assert_eq!(decide(&["--"]), CliAction::Run { containment: None, quiet: false });
+        assert_eq!(
+            decide(&["--"]),
+            CliAction::Run {
+                containment: None,
+                quiet: false
+            }
+        );
         // Flags BEFORE `--` still apply.
         assert_eq!(
             decide(&["--sandbox", "--"]),

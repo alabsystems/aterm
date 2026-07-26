@@ -33,7 +33,6 @@ use crate::row::LineSize;
 
 use super::Grid;
 use super::row_u16;
-use super::scroll_convert::DeferredLine;
 use crate::Row;
 
 impl Grid {
@@ -318,12 +317,7 @@ impl Grid {
         );
         let row_count = self.storage.rows.len();
         let ring_sb = self.storage.ring_buffer_scrollback();
-        // Treat the store as present while it is detached for an off-thread reflow,
-        // so evicted rows are still staged to `lazy_buffer` (flushed on re-attach)
-        // instead of dropped — otherwise output produced during the reflow window
-        // punches a gap in history (audit bug B).
-        let has_scrollback =
-            self.storage.scrollback.is_some() || self.storage.scrollback_detached_for_reflow;
+        let has_scrollback = self.storage.stages_evicted_rows();
 
         if rows_to_reuse == 1 && !has_scrollback {
             self.reuse_one_scrolled_row_no_scrollback(cols, row_count, ring_sb);
@@ -367,6 +361,9 @@ impl Grid {
                         .len()
                         .saturating_sub(Self::ASYNC_COMPRESS_BACKPRESSURE);
                     self.storage.lazy_buffer.drop_oldest(over);
+                    // Real retention loss under flood — surfaced OUT-OF-BAND
+                    // via the truncation counter, never a sentinel (E10a).
+                    self.storage.flood_truncated_lines += over as u64;
                 }
             } else {
                 self.drain_lazy_buffer();
@@ -450,12 +447,7 @@ impl Grid {
         row_count: usize,
         ring_sb: usize,
     ) {
-        // Treat the store as present while it is detached for an off-thread reflow,
-        // so evicted rows are still staged to `lazy_buffer` (flushed on re-attach)
-        // instead of dropped — otherwise output produced during the reflow window
-        // punches a gap in history (audit bug B).
-        let has_scrollback =
-            self.storage.scrollback.is_some() || self.storage.scrollback_detached_for_reflow;
+        let has_scrollback = self.storage.stages_evicted_rows();
 
         // The reused bottom rows inherit the current SGR background (BCE fill). Read
         // before the extraction below — nothing between mutates it (byte-identical to
@@ -532,9 +524,18 @@ impl Grid {
         // Lazy scrollback promotion: snapshot the row as a DeferredLine
         // (O(cells) memcpy) instead of the O(cols) row_to_line conversion.
         // The line is materialized lazily on first read access.
+        //
+        // `push_row` fills a RECYCLED cell body from the lazy buffer's pool
+        // rather than `to_vec`-ing a fresh one. This runs once per newline
+        // inside the PTY reader's single `term_lock` hold for a whole read
+        // batch (~800 newlines for a 64 KiB batch at 80 columns), so the malloc
+        // it removes was ~800 malloc/free pairs of pure lock-hold — time the UI
+        // thread's keystroke-echo present spends blocked, i.e. time the user
+        // feels as typing lag under flood.
         if has_scrollback {
-            let deferred = DeferredLine::new(&self.storage.rows[oldest], extras);
-            self.storage.lazy_buffer.push(deferred);
+            self.storage
+                .lazy_buffer
+                .push_row(&self.storage.rows[oldest], extras);
         }
 
         let evicted_page = self.storage.rows[oldest].page_id();
@@ -577,6 +578,8 @@ impl Grid {
         if len > DETACHED_LAZY_CAP {
             let drop_n = len - DETACHED_LAZY_CAP;
             self.storage.lazy_buffer.drop_oldest(drop_n);
+            // Real retention loss (reflow-window cap) — counted out-of-band (E10a).
+            self.storage.flood_truncated_lines += drop_n as u64;
             aterm_log::warn!(
                 "reflow window: lazy buffer exceeded {DETACHED_LAZY_CAP} lines; \
                  dropped {drop_n} oldest staged line(s) to bound memory"
@@ -726,6 +729,17 @@ impl Grid {
         }
         // Full-screen scrolls, including 1-row terminals, enter scrollback.
         // Only non-full degenerate regions are no-ops (#7751).
+        //
+        // The fresh-session blank gate below deliberately does NOT extend to
+        // this full-screen path: unconditional archival of every scrolled row
+        // is xterm parity, and it is load-bearing pinned semantics — the
+        // Tier-1 spec bindings (`conformance_retention.rs`,
+        // `conformance_offload.rs`) model every quiescent full-screen scroll
+        // as exactly one retained line, and
+        // `ring_extras_len_equals_ring_buffer_scrollback` pins the ring
+        // growth per scroll. So a fresh session that pads a blank screen with
+        // LFs still mints blank scrollback here (as xterm does), while the
+        // Codex-shaped top-anchored region path gets the gate.
         if self
             .storage
             .scroll_region
@@ -744,10 +758,8 @@ impl Grid {
         // not. Reset here defensively so every path is safe. (#5019)
         self.reset_display_offset_with_damage();
 
-        let top_u16 = self.storage.scroll_region.top;
-        let bottom_u16 = self.storage.scroll_region.bottom;
-        let top = usize::from(top_u16);
-        let bottom = usize::from(bottom_u16);
+        let top = usize::from(self.storage.scroll_region.top);
+        let bottom = usize::from(self.storage.scroll_region.bottom);
 
         // Clamp before selecting the archival path: unlike a full-screen scroll,
         // a partial region cannot consume more rows than it contains.
@@ -764,26 +776,56 @@ impl Grid {
         // shape, where output must remain ephemeral.  A tiered grid may use a
         // zero-sized ring, so store presence also enables archival.
         //
-        // NEVER-WRITTEN displaced rows are the exception: archiving them mints
-        // blank history lines (a fresh Codex session scrolls its region up
-        // before anything has printed at the physical top), and a later
-        // rows-grow reveal then paints that minted blankness as a dead band
-        // above the content. A row that was never touched carries no
-        // transcript — scroll it as history-free instead. Any written row
-        // (even one holding only whitespace glyphs or BCE color) still
-        // archives exactly as before.
+        // The ONE exception to "displaced rows archive" is the fresh-session
+        // blank band (see `fresh_session_blank_prefix`): while the grid holds
+        // no history at all, a leading run of blank displaced rows carries no
+        // transcript, and archiving it mints blank history lines that a later
+        // rows-grow reveal paints as a dead band above the content. Blank
+        // rows AFTER the first written row — and every blank row once ANY
+        // history exists — are transcript (a paragraph break a TUI displays
+        // by printing nothing, or a written row ED/EL-erased back to blank)
+        // and archive like any written row.
         let history_enabled = self.storage.max_scrollback > 0
             || self.storage.scrollback.is_some()
             || self.storage.scrollback_detached_for_reflow;
-        if top == 0 && history_enabled && !self.displaced_rows_never_written(n) {
-            self.scroll_top_anchored_region_up_with_history(n, bottom);
-            return;
+        if top == 0 && history_enabled {
+            let blank_prefix = self.fresh_session_blank_prefix(n);
+            if blank_prefix < n {
+                // Drop the leading fresh-session blanks (if any) with a
+                // history-free scroll, then archive from the first written
+                // row onward. Two sequential scrolls of the same region
+                // compose to the same visible result as one scroll of `n`,
+                // while history receives exactly the transcript-bearing
+                // suffix of the displaced set.
+                if blank_prefix > 0 {
+                    self.scroll_region_up_history_free(top, bottom, blank_prefix);
+                }
+                self.scroll_top_anchored_region_up_with_history(n - blank_prefix, bottom);
+                return;
+            }
+            // blank_prefix == n: the whole displaced set is fresh-session
+            // blank — fall through to the history-free scroll below.
         }
 
         // Scroll within an interior or history-free region only (no scrollback).
+        self.scroll_region_up_history_free(top, bottom, n);
+    }
+
+    /// The non-archival region scroll: shift rows `[top..=bottom]` up by `n`
+    /// within the viewport, BCE-fill the vacated bottom rows, and shift the
+    /// region's `CellExtras` — history and `absolute_row_counter` are
+    /// untouched. This is the interior-region / history-free /
+    /// fresh-session-blank path; the archival top-anchored path is
+    /// [`Self::scroll_top_anchored_region_up_with_history`].
+    ///
+    /// REQUIRES: 0 < n <= bottom - top + 1, bottom < visible_rows,
+    /// display_offset == 0 (callers reset via
+    /// `reset_display_offset_with_damage`).
+    fn scroll_region_up_history_free(&mut self, top: usize, bottom: usize, n: usize) {
+        debug_assert!(n > 0 && n <= bottom - top + 1);
+        debug_assert!(bottom < usize::from(self.storage.visible_rows));
 
         // Shift rows up within the region using pre-computed physical indices.
-        // display_offset == 0 is guaranteed by reset_display_offset_with_damage above.
         self.storage.shift_visible_rows_up(top, bottom, n);
 
         // Clear the bottom n rows of the region with BCE fill (#7522).
@@ -798,6 +840,8 @@ impl Grid {
         }
 
         // Batch shift CellExtras within the region: O(E) regardless of n
+        let top_u16 = row_u16(top);
+        let bottom_u16 = row_u16(bottom);
         let shift_n = row_u16(n);
         self.storage
             .extras
@@ -813,19 +857,36 @@ impl Grid {
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
     }
 
-    /// Whether every viewport row a region scroll of `n` would displace
-    /// through the physical top (rows `0..n`) was NEVER written: `Row::len`
-    /// is 0 only for rows no cell write or BCE erase ever touched, so this
-    /// cannot misclassify whitespace-only or background-colored content.
-    /// Used to keep never-written rows out of the archival path — they carry
-    /// no transcript, and archiving them mints blank history lines.
-    fn displaced_rows_never_written(&self, n: usize) -> bool {
-        (0..n).all(|row| {
-            u16::try_from(row)
-                .ok()
-                .and_then(|r| self.storage.row(r))
-                .is_some_and(Row::is_empty)
-        })
+    /// Length of the LEADING run of blank rows among the `n` viewport rows a
+    /// scroll would displace through the physical top (rows `0..n`) — but
+    /// ONLY while the grid carries no history at all (`scrollback_lines() ==
+    /// 0`, which covers the ring window, the lazy staging buffer, AND the
+    /// tiered store). Once any history exists this returns 0 unconditionally.
+    ///
+    /// `Row::len == 0` means BLANK, not never-written: a row erased with the
+    /// default background also has len 0 (`erase_with` keeps len at 0 for a
+    /// default-color fill — the ED/EL path), and so does a separator line a
+    /// TUI "prints" by printing nothing. Blank lines BETWEEN written lines
+    /// are transcript (Codex's paragraph breaks vanished when blankness alone
+    /// dropped them), so blankness must never drop a row once anything has
+    /// been archived. The one shape where dropping is safe is the
+    /// fresh-session band this gate exists for: a brand-new grid that scrolls
+    /// before anything was archived displaces leading blanks that cannot
+    /// separate transcript (nothing precedes them, nothing is retained), and
+    /// archiving them mints blank history that a later rows-grow reveal
+    /// paints as a dead band above the content.
+    fn fresh_session_blank_prefix(&self, n: usize) -> usize {
+        if self.storage.scrollback_lines() > 0 {
+            return 0;
+        }
+        (0..n)
+            .take_while(|&row| {
+                u16::try_from(row)
+                    .ok()
+                    .and_then(|r| self.storage.row(r))
+                    .is_some_and(Row::is_empty)
+            })
+            .count()
     }
 
     /// Archive a full-width, top-anchored partial region while preserving the

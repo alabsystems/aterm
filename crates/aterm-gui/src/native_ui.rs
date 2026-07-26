@@ -158,14 +158,14 @@ impl LogicalRect {
 /// paint-visible nor actionable, so introspection must not report it as real
 /// clipping. Keeping this decision in one helper also makes every paint audit
 /// agree about the exact same compiled geometry.
-fn materially_clipped(rect: LogicalRect, clip: LogicalRect) -> bool {
-    const EDGE_EPSILON: f32 = 0.01;
+const CLIP_EDGE_EPSILON: f32 = 0.01;
 
+fn materially_clipped(rect: LogicalRect, clip: LogicalRect) -> bool {
     clip.is_empty()
-        || clip.x > rect.x + EDGE_EPSILON
-        || clip.y > rect.y + EDGE_EPSILON
-        || clip.right() + EDGE_EPSILON < rect.right()
-        || clip.bottom() + EDGE_EPSILON < rect.bottom()
+        || clip.x > rect.x + CLIP_EDGE_EPSILON
+        || clip.y > rect.y + CLIP_EDGE_EPSILON
+        || clip.right() + CLIP_EDGE_EPSILON < rect.right()
+        || clip.bottom() + CLIP_EDGE_EPSILON < rect.bottom()
 }
 
 /// Logical-pixel insets.
@@ -552,7 +552,59 @@ pub(crate) struct SliderSpec {
     pub(crate) display_value: String,
 }
 
+/// The `audit_id` naming the Tab Color HSV wheel — the ONE
+/// [`UiContent::Custom`] node with a special paint lowering (an
+/// [`crate::widget::DrawPrim::HsvDisk`] + the committed-color marker) and a
+/// positional pointer mapping ([`CompiledUi::color_wheel_color_at`]).
+pub(crate) const TAB_COLOR_WHEEL_AUDIT: &str = "settings.tab-color.wheel";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
+
+/// The wheel's disk geometry within its painted node rect: centered, with a
+/// small breathing margin so the marker ring never clips at full saturation.
+pub(crate) struct ColorWheelGeometry {
+    pub(crate) cx: f32,
+    pub(crate) cy: f32,
+    pub(crate) r: f32,
+}
+
+pub(crate) fn color_wheel_geometry(rect: LogicalRect) -> ColorWheelGeometry {
+    ColorWheelGeometry {
+        cx: rect.x + rect.width * 0.5,
+        cy: rect.y + rect.height * 0.5,
+        r: ((rect.width.min(rect.height)) * 0.5 - 8.0).max(10.0),
+    }
+}
+
+/// The color under `(x, y)` on the disk painted in `rect`, or `None` outside
+/// it. Hue/saturation use EXACTLY the raster's per-pixel convention (clockwise
+/// turns from 12 o'clock; radius = saturation; full value).
+pub(crate) fn color_wheel_rgb_at(rect: LogicalRect, x: f32, y: f32) -> Option<[u8; 3]> {
+    let geometry = color_wheel_geometry(rect);
+    let dx = x - geometry.cx;
+    let dy = y - geometry.cy;
+    let distance = (dx * dx + dy * dy).sqrt();
+    if distance > geometry.r {
+        return None;
+    }
+    let hue = dx.atan2(-dy).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+    let saturation = (distance / geometry.r).min(1.0);
+    Some(crate::widget::hsv_to_rgb(hue, saturation, 1.0))
+}
+
+/// The marker position for a committed color on the wheel in `rect` — the
+/// exact inverse of [`color_wheel_rgb_at`]'s polar mapping (value is projected
+/// onto the full-value disk, so a dark pick still marks its hue/saturation).
+pub(crate) fn color_wheel_marker_at(rect: LogicalRect, rgb: [u8; 3]) -> (f32, f32) {
+    let geometry = color_wheel_geometry(rect);
+    let (hue, saturation, _) = crate::widget::rgb_to_hsv(rgb);
+    let theta = hue * std::f32::consts::TAU;
+    (
+        geometry.cx + geometry.r * saturation * theta.sin(),
+        geometry.cy - geometry.r * saturation * theta.cos(),
+    )
+}
+
 pub(crate) struct SliderGeometry {
     pub(crate) track_x: f32,
     pub(crate) track_right: f32,
@@ -744,8 +796,23 @@ fn grapheme_boundary_at_or_before(text: &str, requested: usize) -> usize {
         .unwrap_or(0)
 }
 
+fn grapheme_boundary_at_or_after(text: &str, requested: usize) -> usize {
+    let requested = requested.min(text.len());
+    if requested == 0 || requested == text.len() {
+        return requested;
+    }
+    text.grapheme_indices()
+        .map(|(offset, _)| offset)
+        .find(|offset| *offset >= requested)
+        .unwrap_or(text.len())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RichTextSpec {
+    /// Exact authored/projected source exposed to semantics. Paint may insert
+    /// responsive line breaks, but accessibility and inspection never receive
+    /// that whitespace-normalized visual projection in place of the source.
+    pub(crate) semantic_text: String,
     pub(crate) text: String,
     pub(crate) selectable: bool,
 }
@@ -800,7 +867,12 @@ pub(crate) struct TextViewportSpec {
     /// paint path.
     pub(crate) projection: Option<crate::native_editor::EditorViewportProjection>,
     pub(crate) preedit: String,
+    /// Bounded paint string shown in the footer.
     pub(crate) status: Option<String>,
+    /// Complete status value announced by accessibility. This is deliberately
+    /// separate from `status`: fitting a narrow footer must never truncate a
+    /// diagnostic before it reaches the semantic tree.
+    pub(crate) semantic_status: Option<String>,
     pub(crate) minibuffer: Option<String>,
     pub(crate) cursor_label: Option<String>,
     pub(crate) dirty: bool,
@@ -1087,14 +1159,8 @@ pub(crate) fn text_viewport_byte_at(
     let line = spec.projection.as_ref()?.lines.get(row)?;
     let target_column = line.column_start as f32 + (x - geometry.text_x) / geometry.cell_w;
     let mut column = line.column_start;
-    for (byte, character) in line.text.char_indices() {
-        let cells = if character == '\t' {
-            4 - column % 4
-        } else if character.is_control() {
-            0
-        } else {
-            1
-        };
+    for (byte, grapheme) in line.text.grapheme_indices() {
+        let cells = crate::native_editor::editor_grapheme_columns(grapheme, column);
         let next = column.saturating_add(cells);
         if target_column < (column + next) as f32 * 0.5 {
             return Some(line.source.start.saturating_add(byte));
@@ -1197,8 +1263,8 @@ impl UiContent {
             }
             Self::RichText(spec) => SemanticProjection {
                 role: SemanticRole::RichText,
-                label: spec.text.clone(),
-                value: SemanticValue::Text(spec.text.clone()),
+                label: spec.semantic_text.clone(),
+                value: SemanticValue::Text(spec.semantic_text.clone()),
                 state: None,
                 action: None,
                 focusable: spec.selectable,
@@ -1286,6 +1352,10 @@ pub(crate) struct UiNode {
     pub(crate) layout: Layout,
     pub(crate) content: UiContent,
     pub(crate) children: Vec<UiNode>,
+    /// Render this node without adding a second accessibility/focus/hit-test
+    /// projection. This is reserved for responsive visual copies whose parent
+    /// already carries the complete semantic label.
+    pub(crate) paint_only: bool,
 }
 
 impl UiNode {
@@ -1295,6 +1365,7 @@ impl UiNode {
             layout: Layout::default(),
             content,
             children: Vec::new(),
+            paint_only: false,
         }
     }
 
@@ -1305,6 +1376,11 @@ impl UiNode {
 
     pub(crate) fn children(mut self, children: Vec<Self>) -> Self {
         self.children = children;
+        self
+    }
+
+    pub(crate) fn paint_only(mut self) -> Self {
+        self.paint_only = true;
         self
     }
 }
@@ -1404,6 +1480,17 @@ impl UiTree {
             },
         };
         compiler.node(&self.root, viewport, viewport, None)?;
+        // From the AUTHORED tree, not the clipped observers — see the field doc.
+        fn find_default(node: &UiNode) -> Option<(UiKey, ActionId)> {
+            if let UiContent::Button(control) = &node.content
+                && control.style == StyleRef::Primary
+                && control.state.enabled
+            {
+                return Some((node.key.clone(), control.action.clone()));
+            }
+            node.children.iter().find_map(find_default)
+        }
+        compiler.output.default_action = find_default(&self.root);
         Ok(compiler.output)
     }
 }
@@ -1443,6 +1530,20 @@ pub(crate) struct CompiledUi {
     pub(crate) hits: Vec<HitRegion>,
     pub(crate) semantics: Vec<SemanticNode>,
     pub(crate) focus_order: Vec<UiKey>,
+    /// The page's DEFAULT button — what a bare Return activates when NO
+    /// control holds keyboard focus, mirroring the native "Return fires the
+    /// highlighted default button" convention: the first enabled
+    /// `StyleRef::Primary` button in authoring (= visual) order. Pages follow
+    /// the platform rule of one primary-styled action per state (Software
+    /// Update swaps Primary between "Check for Updates" and "Install &
+    /// Relaunch" as a build stages), so "first" is the unique one. Recorded
+    /// from the AUTHORED tree before viewport clipping — a route's default is
+    /// semantic, not visual, so Return works even with the button scrolled out
+    /// of view (clipped subtrees are absent from every other observer here).
+    /// A focused control and a focused text field's Submit take precedence at
+    /// the call site, and Space never falls back to this (Space activates only
+    /// the focused control on macOS).
+    pub(crate) default_action: Option<(UiKey, ActionId)>,
 }
 
 impl CompiledUi {
@@ -1453,6 +1554,27 @@ impl CompiledUi {
 
     pub(crate) fn semantic(&self, key: &UiKey) -> Option<&SemanticNode> {
         self.semantics.iter().find(|node| &node.key == key)
+    }
+
+    /// Snap one pointer position through the exact HSV disk painted for `key`
+    /// (the Tab Color wheel — a [`UiContent::Custom`] node whose `audit_id` is
+    /// [`TAB_COLOR_WHEEL_AUDIT`]). Returns the picked `[r, g, b]` only for a
+    /// point INSIDE the disk, using the SAME polar-hue math the rasterizer
+    /// paints (`tray_raster::hsv_disk`), so the committed color and the pixel
+    /// under the pointer can never disagree. Anywhere else (including the
+    /// node's corners outside the disk) is `None` — a miss, not a pick.
+    pub(crate) fn color_wheel_color_at(&self, key: &UiKey, x: f32, y: f32) -> Option<[u8; 3]> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let paint = self.paint.iter().find(|node| &node.key == key)?;
+        let UiContent::Custom(spec) = &paint.content else {
+            return None;
+        };
+        if spec.audit_id != TAB_COLOR_WHEEL_AUDIT {
+            return None;
+        }
+        color_wheel_rgb_at(paint.rect, x, y)
     }
 
     /// Snap one pointer x-coordinate through the exact slider track painted for
@@ -1671,11 +1793,11 @@ impl CompiledUi {
                         }
                     };
                     lines.push(format!(
-                        "paint-preview key={:?} scene={:?} animation={} semantic-state={:?} paint-fingerprint={:016x}",
+                        "paint-preview key={:?} scene={:?} animation={} audit-state={:?} paint-fingerprint={:016x}",
                         paint.key.as_str(),
                         spec.semantic_label(),
                         animation,
-                        spec.semantic_value(),
+                        spec.audit_value(),
                         spec.paint_fingerprint(),
                     ));
                 }
@@ -1732,8 +1854,10 @@ impl CompiledUi {
         )
     }
 
-    /// Stable fingerprint of every visible semantic value plus exact compiled
-    /// geometry. The host folds this into its repaint and raster-cache keys.
+    /// Stable fingerprint of every visible semantic value and paint projection
+    /// plus exact compiled geometry. The host folds this into its repaint and
+    /// raster-cache keys; responsive paint-only copy must therefore participate
+    /// even though accessibility deliberately does not publish it.
     pub(crate) fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -1745,17 +1869,30 @@ impl CompiledUi {
         for line in self.controls_lines() {
             line.hash(&mut hash);
         }
-        // Preview animation phase is paint state, not an accessibility value.
-        // Fold it explicitly so the retained native raster never stale-serves
-        // one deterministic phase while semantics remain correctly stable.
+        // Paint can intentionally differ from semantics (compact button labels,
+        // responsive status copy, editor windows, preview animation). Hash the
+        // typed paint product itself so none of those projections can stale-serve
+        // an old retained raster. Large custom paint types keep their bounded
+        // purpose-built hashes; ordinary controls use their complete Debug
+        // projection, which is deterministic for these value-only structs.
         for node in &self.paint {
+            node.key.hash(&mut hash);
+            node.rect.x.to_bits().hash(&mut hash);
+            node.rect.y.to_bits().hash(&mut hash);
+            node.rect.width.to_bits().hash(&mut hash);
+            node.rect.height.to_bits().hash(&mut hash);
+            node.clip.x.to_bits().hash(&mut hash);
+            node.clip.y.to_bits().hash(&mut hash);
+            node.clip.width.to_bits().hash(&mut hash);
+            node.clip.height.to_bits().hash(&mut hash);
+            ui_content_kind(&node.content).hash(&mut hash);
             match &node.content {
                 UiContent::SettingsPreview(spec) => spec.paint_fingerprint().hash(&mut hash),
                 UiContent::MarkdownBlock(spec) => {
                     markdown_paint_fingerprint(node, spec).hash(&mut hash);
                 }
                 UiContent::TextViewport(spec) => text_viewport_fingerprint(spec).hash(&mut hash),
-                _ => {}
+                content => format!("{content:?}").hash(&mut hash),
             }
         }
         hash.finish() | 1
@@ -1834,6 +1971,7 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
     spec.selectable.hash(hash);
     spec.preedit.hash(hash);
     spec.status.hash(hash);
+    spec.semantic_status.hash(hash);
     spec.minibuffer.hash(hash);
     spec.cursor_label.hash(hash);
     spec.dirty.hash(hash);
@@ -1854,6 +1992,7 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
         line.source.end.hash(hash);
         line.column_start.hash(hash);
         line.text.hash(hash);
+        line.selections.len().hash(hash);
         for selection in &line.selections {
             selection.bytes.start.hash(hash);
             selection.bytes.end.hash(hash);
@@ -1861,6 +2000,26 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
             selection.primary.hash(hash);
         }
         line.carets.hash(hash);
+        line.syntax.len().hash(hash);
+        for syntax in &line.syntax {
+            syntax.bytes.start.hash(hash);
+            syntax.bytes.end.hash(hash);
+            let class = match syntax.class {
+                crate::native_editor::EditorSyntaxClass::Table => 0_u8,
+                crate::native_editor::EditorSyntaxClass::Key => 1,
+                crate::native_editor::EditorSyntaxClass::String => 2,
+                crate::native_editor::EditorSyntaxClass::Number => 3,
+                crate::native_editor::EditorSyntaxClass::Boolean => 4,
+                crate::native_editor::EditorSyntaxClass::Comment => 5,
+            };
+            class.hash(hash);
+        }
+        line.diagnostics.len().hash(hash);
+        for diagnostic in &line.diagnostics {
+            diagnostic.bytes.start.hash(hash);
+            diagnostic.bytes.end.hash(hash);
+            diagnostic.error.hash(hash);
+        }
     }
 }
 
@@ -1947,8 +2106,8 @@ fn finish_text_fit(
     authored_available: f32,
     available: f32,
 ) -> TextFitAudit {
-    let clip_truncated =
-        materially_clipped(node.rect, node.clip) || available + f32::EPSILON < authored_available;
+    let clip_truncated = materially_clipped(node.rect, node.clip)
+        || available + CLIP_EDGE_EPSILON < authored_available;
     TextFitAudit {
         key: node.key.clone(),
         kind,
@@ -1982,7 +2141,11 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
             let (label, text_x, text_right) = if control.spec.visual_icon.is_some() {
                 if navigation && node.rect.width >= 96.0 {
                     (
-                        &control.spec.label,
+                        control
+                            .spec
+                            .visual_label
+                            .as_ref()
+                            .unwrap_or(&control.spec.label),
                         node.rect.x + 40.0,
                         node.rect.right() - 12.0,
                     )
@@ -2402,8 +2565,11 @@ fn text_viewport_paint_audit(node: &PaintNode, spec: &TextViewportSpec) -> Strin
             .iter()
             .take(painted_rows)
             .filter(|line| {
-                let columns = editor_display_column(&line.text, line.text.len(), line.column_start)
-                    .saturating_sub(line.column_start);
+                let columns = crate::native_editor::editor_display_column(
+                    &line.text,
+                    line.text.len(),
+                    line.column_start,
+                );
                 columns as f32 * geometry.cell_w > row_available + 0.5
             })
             .count()
@@ -2457,6 +2623,12 @@ fn text_typography(spec: &TextSpec) -> (TypeStep, crate::widget::TextFace) {
         }
         SemanticRole::Heading if matches!(spec.style, StyleRef::Quiet | StyleRef::Accent) => {
             (TypeStep::Caption, TextFace::UiBold)
+        }
+        // Compact native pages use Plain for a large-type heading: Body-bold
+        // remains visibly hierarchical at the platform maximum without
+        // forcing route names to ellipsize in a 320-point host.
+        SemanticRole::Heading if spec.style == StyleRef::Plain => {
+            (TypeStep::Body, TextFace::UiBold)
         }
         SemanticRole::Heading => (TypeStep::Title, TextFace::UiBold),
         _ if spec.style == StyleRef::Code => (TypeStep::Body, TextFace::Mono),
@@ -2670,11 +2842,13 @@ fn paint_compiled_node(
                     let icon_rect = LogicalRect::new(rect.x + 6.0, rect.y, 28.0, rect.height);
                     paint_button_icon(prims, icon_rect, icon, color);
                     let size = native_type_px(TypeStep::Secondary);
-                    let label = elide_ui_label(
-                        &control.spec.label,
-                        (rect.width - 52.0).max(0.0),
-                        size.get(),
-                    );
+                    let visual_label = control
+                        .spec
+                        .visual_label
+                        .as_ref()
+                        .unwrap_or(&control.spec.label);
+                    let label =
+                        elide_ui_label(visual_label, (rect.width - 52.0).max(0.0), size.get());
                     prims.push(text_prim(
                         rect.x + 40.0,
                         row_baseline(rect.y, rect.height, size.get()),
@@ -2968,6 +3142,49 @@ fn paint_compiled_node(
             spec.paint(prims, rect, theme, roles);
         }
         UiContent::Custom(spec) => {
+            // The Tab Color wheel is the ONE custom node with a raster lowering:
+            // the shared HSV disk primitive plus a two-tone marker ring at the
+            // committed color's polar position (spec.value = "#rrggbb"). Every
+            // other custom node keeps the plain label projection below.
+            if spec.audit_id == TAB_COLOR_WHEEL_AUDIT {
+                let geometry = color_wheel_geometry(rect);
+                prims.push(crate::widget::DrawPrim::HsvDisk {
+                    cx: geometry.cx,
+                    cy: geometry.cy,
+                    r: geometry.r,
+                    value: 1.0,
+                });
+                if let Some(rgb) = spec
+                    .value
+                    .as_deref()
+                    .and_then(crate::app_config::parse_hex_color)
+                {
+                    let rgb = [rgb.r, rgb.g, rgb.b];
+                    let (mx, my) = color_wheel_marker_at(rect, rgb);
+                    // Contrast ring first, then the committed color's dot — the
+                    // marker reads on every hue at every saturation.
+                    let ring = if crate::tab_bar::bg_is_light(rgb) {
+                        [0u8, 0, 0]
+                    } else {
+                        [255u8, 255, 255]
+                    };
+                    prims.push(crate::widget::DrawPrim::Dot {
+                        cx: mx,
+                        cy: my,
+                        r: 7.0,
+                        color: rgba(ring, 255),
+                        breathe: false,
+                    });
+                    prims.push(crate::widget::DrawPrim::Dot {
+                        cx: mx,
+                        cy: my,
+                        r: 5.0,
+                        color: rgba(rgb, 255),
+                        breathe: false,
+                    });
+                }
+                return;
+            }
             let size = native_type_px(TypeStep::Body);
             prims.push(text_prim(
                 rect.x,
@@ -2990,6 +3207,33 @@ fn elide_ui_label(value: &str, max_width: f32, px: f32) -> String {
     elide_text_label(value, max_width, px, crate::widget::TextFace::Ui)
 }
 
+/// Project a complete semantic button label into a bounded renderer label.
+///
+/// Callers keep the original text in [`ButtonSpec::label`] and put this value
+/// in `visual_label`. This is intentionally the same typography and UTF-8-safe
+/// elision path used by the painter, which lets responsive authoring avoid a
+/// knowingly overflowing intermediate label while preserving full semantics.
+pub(crate) fn fit_native_button_label(value: &str, max_width: f32) -> String {
+    elide_ui_label(value, max_width, native_type_px(TypeStep::Secondary).get())
+}
+
+/// Bounded visual projection for a one-line native body label. The caller's
+/// semantic wrapper remains responsible for the complete authored copy.
+pub(crate) fn fit_native_text_label(value: &str, max_width: f32) -> String {
+    elide_ui_label(value, max_width, native_type_px(TypeStep::Body).get())
+}
+
+/// Bounded visual projection for one-line native status copy. The owning
+/// semantic Group remains responsible for the complete message.
+pub(crate) fn fit_native_status_label(value: &str, max_width: f32) -> String {
+    elide_text_label(
+        value,
+        max_width,
+        native_type_px(TypeStep::Caption).get(),
+        crate::widget::TextFace::Ui,
+    )
+}
+
 fn visual_text_width(value: &str, px: f32, face: crate::widget::TextFace) -> f32 {
     if face == crate::widget::TextFace::Mono {
         crate::tray_raster::measure_text(value, px, crate::widget::TextWeight::Regular)
@@ -2999,20 +3243,32 @@ fn visual_text_width(value: &str, px: f32, face: crate::widget::TextFace) -> f32
 }
 
 fn elide_text_label(value: &str, max_width: f32, px: f32, face: crate::widget::TextFace) -> String {
-    const MAX_VISUAL_CHARS: usize = 256;
+    const MAX_VISUAL_GRAPHEMES: usize = 256;
 
     if max_width <= 0.0 {
         return String::new();
     }
-    let mut output: String = value.chars().take(MAX_VISUAL_CHARS).collect();
-    let mut elided = output.len() != value.len();
+    let mut capped_end = value.len();
+    let mut elided = false;
+    for (index, (offset, _)) in value.grapheme_indices().enumerate() {
+        if index == MAX_VISUAL_GRAPHEMES {
+            capped_end = offset;
+            elided = true;
+            break;
+        }
+    }
+    let mut output = value[..capped_end].to_string();
     if !elided && visual_text_width(&output, px, face) <= max_width {
         return output;
     }
     let ellipsis = "…";
     let ellipsis_width = visual_text_width(ellipsis, px, face);
     while !output.is_empty() && visual_text_width(&output, px, face) + ellipsis_width > max_width {
-        output.pop();
+        let Some((offset, _)) = output.grapheme_indices().last() else {
+            output.clear();
+            break;
+        };
+        output.truncate(offset);
         elided = true;
     }
     if elided && ellipsis_width <= max_width {
@@ -3748,10 +4004,25 @@ fn paint_text_viewport(
                 });
             }
             for selection in &line.selections {
-                let start_col =
-                    editor_display_column(&line.text, selection.bytes.start, line.column_start);
-                let end_col =
-                    editor_display_column(&line.text, selection.bytes.end, line.column_start);
+                let visual_start = grapheme_boundary_at_or_before(
+                    &line.text,
+                    selection.bytes.start.min(line.text.len()),
+                );
+                let visual_end = grapheme_boundary_at_or_after(
+                    &line.text,
+                    selection.bytes.end.min(line.text.len()),
+                )
+                .max(visual_start);
+                let start_col = crate::native_editor::editor_display_column(
+                    &line.text,
+                    visual_start,
+                    line.column_start,
+                );
+                let end_col = crate::native_editor::editor_display_column(
+                    &line.text,
+                    visual_end,
+                    line.column_start,
+                );
                 let cells = end_col
                     .saturating_sub(start_col)
                     .saturating_add(usize::from(selection.continues))
@@ -3785,11 +4056,15 @@ fn paint_text_viewport(
                 line,
                 cell_w,
                 secondary,
-                rgba(roles.text_primary, 255),
+                roles,
             );
 
             for (byte, primary) in &line.carets {
-                let col = editor_display_column(&line.text, *byte, line.column_start);
+                let col = crate::native_editor::editor_display_column(
+                    &line.text,
+                    *byte,
+                    line.column_start,
+                );
                 let x = text_x + col as f32 * cell_w;
                 prims.push(DrawPrim::Stroke {
                     x,
@@ -3809,6 +4084,9 @@ fn paint_text_viewport(
                 });
                 if *primary && !spec.preedit.is_empty() {
                     let preedit = spec.preedit.replace(['\r', '\n'], "↵");
+                    let preedit_columns =
+                        crate::native_editor::editor_display_column(&preedit, preedit.len(), 0)
+                            .max(1);
                     prims.push(text_prim(
                         x + 2.0,
                         row_baseline(y, line_h, secondary.get()),
@@ -3821,7 +4099,7 @@ fn paint_text_viewport(
                     prims.push(DrawPrim::Stroke {
                         x: x + 2.0,
                         y: y + line_h - 2.0,
-                        w: (preedit.chars().count().max(1) as f32 * cell_w).max(2.0),
+                        w: (preedit_columns as f32 * cell_w).max(2.0),
                         h: 1.0,
                         radius: 0.0,
                         width: 1.0,
@@ -3906,18 +4184,111 @@ fn paint_editor_line_text(
     line: &crate::native_editor::EditorViewportLine,
     cell_w: f32,
     size: crate::type_scale::StepPx,
+    roles: crate::settings::Roles,
+) {
+    use crate::native_editor::EditorSyntaxClass;
+
+    paint_editor_text_range(
+        prims,
+        (text_x, baseline),
+        line,
+        0..line.text.len(),
+        cell_w,
+        size,
+        crate::widget::rgba(roles.text_primary, 255),
+    );
+    for span in &line.syntax {
+        let color = match span.class {
+            EditorSyntaxClass::Table => crate::widget::rgba(roles.accent, 255),
+            EditorSyntaxClass::Key => {
+                crate::widget::rgba(mix_rgb(roles.text_primary, roles.accent, 0.62), 255)
+            }
+            EditorSyntaxClass::String => crate::widget::rgba(roles.success, 255),
+            EditorSyntaxClass::Number => {
+                crate::widget::rgba(mix_rgb(roles.accent, roles.success, 0.42), 255)
+            }
+            EditorSyntaxClass::Boolean => {
+                crate::widget::rgba(mix_rgb(roles.accent, roles.danger, 0.28), 255)
+            }
+            EditorSyntaxClass::Comment => crate::widget::rgba(roles.text_tertiary, 255),
+        };
+        paint_editor_text_range(
+            prims,
+            (text_x, baseline),
+            line,
+            span.bytes.clone(),
+            cell_w,
+            size,
+            color,
+        );
+    }
+    for diagnostic in &line.diagnostics {
+        let visual_start =
+            grapheme_boundary_at_or_before(&line.text, diagnostic.bytes.start.min(line.text.len()));
+        let visual_end =
+            grapheme_boundary_at_or_after(&line.text, diagnostic.bytes.end.min(line.text.len()))
+                .max(visual_start);
+        let start = crate::native_editor::editor_display_column(
+            &line.text,
+            visual_start,
+            line.column_start,
+        );
+        let end =
+            crate::native_editor::editor_display_column(&line.text, visual_end, line.column_start);
+        let cells = end.saturating_sub(start).max(1);
+        prims.push(crate::widget::DrawPrim::Stroke {
+            x: text_x + start as f32 * cell_w,
+            y: baseline + 2.0,
+            w: cells as f32 * cell_w,
+            h: 1.0,
+            radius: 0.0,
+            width: 1.0,
+            color: crate::widget::rgba(
+                if diagnostic.error {
+                    roles.danger
+                } else {
+                    roles.accent
+                },
+                255,
+            ),
+        });
+    }
+}
+
+fn paint_editor_text_range(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    origin_px: (f32, f32),
+    line: &crate::native_editor::EditorViewportLine,
+    bytes: std::ops::Range<usize>,
+    cell_w: f32,
+    size: crate::type_scale::StepPx,
     color: crate::widget::Rgba,
 ) {
     use crate::widget::{TextFace, TextWeight, text_prim};
 
-    let origin = line.column_start;
-    let mut column = origin;
-    let mut run_start = 0;
-    let mut run_column = origin;
+    let (text_x, baseline) = origin_px;
 
-    for (byte, character) in line.text.char_indices() {
-        if character != '\t' && !character.is_control() {
-            column = column.saturating_add(1);
+    let start = grapheme_boundary_at_or_before(&line.text, bytes.start.min(line.text.len()));
+    let end = grapheme_boundary_at_or_after(&line.text, bytes.end.min(line.text.len())).max(start);
+    if start == end {
+        return;
+    }
+
+    let origin = line.column_start;
+    let mut column = origin.saturating_add(crate::native_editor::editor_display_column(
+        &line.text,
+        start,
+        line.column_start,
+    ));
+    let mut run_start = start;
+    let mut run_column = column;
+
+    for (relative, grapheme) in line.text[start..end].grapheme_indices() {
+        let byte = start + relative;
+        if grapheme != "\t" && !grapheme.chars().any(char::is_control) {
+            column = column.saturating_add(crate::native_editor::editor_grapheme_columns(
+                grapheme, column,
+            ));
             continue;
         }
 
@@ -3933,8 +4304,8 @@ fn paint_editor_line_text(
             ));
         }
 
-        if character == '\t' {
-            let cells = 4 - column % 4;
+        if grapheme == "\t" {
+            let cells = crate::native_editor::editor_grapheme_columns(grapheme, column);
             prims.push(text_prim(
                 text_x + column_offset(column, origin) as f32 * cell_w,
                 baseline,
@@ -3947,15 +4318,15 @@ fn paint_editor_line_text(
             column = column.saturating_add(cells);
         }
 
-        run_start = byte + character.len_utf8();
+        run_start = byte + grapheme.len();
         run_column = column;
     }
 
-    if run_start < line.text.len() {
+    if run_start < end {
         prims.push(text_prim(
             text_x + column_offset(run_column, origin) as f32 * cell_w,
             baseline,
-            line.text[run_start..].to_string(),
+            line.text[run_start..end].to_string(),
             size,
             TextWeight::Regular,
             TextFace::Mono,
@@ -3966,26 +4337,6 @@ fn paint_editor_line_text(
 
 fn column_offset(column: usize, origin: usize) -> usize {
     column.saturating_sub(origin)
-}
-
-fn editor_display_column(text: &str, byte: usize, column_start: usize) -> usize {
-    let byte = byte.min(text.len());
-    let byte = (0..=byte)
-        .rev()
-        .find(|candidate| text.is_char_boundary(*candidate))
-        .unwrap_or(0);
-    text[..byte]
-        .chars()
-        .fold(column_start, |column, character| {
-            if character == '\t' {
-                column.saturating_add(4 - column % 4)
-            } else if character.is_control() {
-                column
-            } else {
-                column.saturating_add(1)
-            }
-        })
-        .saturating_sub(column_start)
 }
 
 fn paint_control_surface(
@@ -4104,6 +4455,7 @@ pub(crate) enum CompileError {
     EmptyKey,
     DuplicateKey(UiKey),
     CustomWithoutAudit(UiKey),
+    PaintOnlyAction(UiKey),
     ObserverMismatch(UiKey),
 }
 
@@ -4135,41 +4487,47 @@ impl Compiler {
             return Err(CompileError::CustomWithoutAudit(node.key.clone()));
         }
 
+        let projection = node.content.semantic();
+        if node.paint_only && (projection.action.is_some() || projection.focusable) {
+            return Err(CompileError::PaintOnlyAction(node.key.clone()));
+        }
+
         let own_clip = inherited_clip.intersect(rect);
         let Some(visible) = own_clip else {
             // A clipped subtree is not materialized in any observer.  Virtualized
             // views can compile requested semantic ranges separately.
             return Ok(());
         };
-        let projection = node.content.semantic();
         self.output.paint.push(PaintNode {
             key: node.key.clone(),
             rect,
             clip: visible,
             content: node.content.clone(),
         });
-        self.output.semantics.push(SemanticNode {
-            key: node.key.clone(),
-            parent: parent.cloned(),
-            rect: visible,
-            role: projection.role,
-            label: projection.label,
-            value: projection.value,
-            state: projection.state,
-            action: projection.action.clone(),
-            audit_id: projection.audit_id,
-        });
-        if projection.focusable {
-            self.output.focus_order.push(node.key.clone());
-        }
-        if let Some(action) = projection.action
-            && projection.state.is_none_or(|state| state.enabled)
-        {
-            self.output.hits.push(HitRegion {
+        if !node.paint_only {
+            self.output.semantics.push(SemanticNode {
                 key: node.key.clone(),
+                parent: parent.cloned(),
                 rect: visible,
-                action,
+                role: projection.role,
+                label: projection.label,
+                value: projection.value,
+                state: projection.state,
+                action: projection.action.clone(),
+                audit_id: projection.audit_id,
             });
+            if projection.focusable {
+                self.output.focus_order.push(node.key.clone());
+            }
+            if let Some(action) = projection.action
+                && projection.state.is_none_or(|state| state.enabled)
+            {
+                self.output.hits.push(HitRegion {
+                    key: node.key.clone(),
+                    rect: visible,
+                    action,
+                });
+            }
         }
 
         let content_rect = rect.inset(node.layout.padding);
@@ -4182,8 +4540,13 @@ impl Compiler {
             return Ok(());
         }
         let child_rects = layout_children(node, content_rect)?;
+        let semantic_parent = if node.paint_only {
+            parent
+        } else {
+            Some(&node.key)
+        };
         for (child, child_rect) in node.children.iter().zip(child_rects) {
-            self.node(child, child_rect, child_clip, Some(&node.key))?;
+            self.node(child, child_rect, child_clip, semantic_parent)?;
         }
         Ok(())
     }
@@ -4306,6 +4669,35 @@ mod tests {
         assert!(crate::tray_raster::ui_text_width(&label, px) <= 104.0);
         assert!(std::str::from_utf8(label.as_bytes()).is_ok());
         assert_eq!(elide_ui_label("Nord", 104.0, px), "Nord");
+    }
+
+    #[test]
+    fn responsive_button_and_status_labels_preserve_complete_graphemes() {
+        for (source, expected) in [("A👩‍💻WWWW", "A👩‍💻…"), ("AéWWWW", "Aé…"), ("A🇺🇳WWWW", "A🇺🇳…")]
+        {
+            for step in [TypeStep::Secondary, TypeStep::Caption] {
+                let px = native_type_px(step).get();
+                let max_width = visual_text_width(expected, px, crate::widget::TextFace::Ui) + 0.01;
+                let fitted = if step == TypeStep::Secondary {
+                    fit_native_button_label(source, max_width)
+                } else {
+                    fit_native_status_label(source, max_width)
+                };
+                assert_eq!(fitted, expected, "{source:?} at {step:?}");
+            }
+        }
+
+        let capped_source = format!("{}👩‍💻W", "a".repeat(255));
+        let capped_expected = format!("{}👩‍💻…", "a".repeat(255));
+        assert_eq!(
+            elide_text_label(
+                &capped_source,
+                100_000.0,
+                native_type_px(TypeStep::Secondary).get(),
+                crate::widget::TextFace::Ui,
+            ),
+            capped_expected
+        );
     }
 
     #[test]
@@ -4432,7 +4824,7 @@ mod tests {
         }));
         assert!(preview_audit.iter().any(|line| {
             line.starts_with("paint-preview key=\"settings/preview\"")
-                && line.contains("semantic-state=")
+                && line.contains("audit-state=")
                 && line.contains("animation=")
                 && line.contains("paint-fingerprint=")
         }));
@@ -4520,6 +4912,8 @@ mod tests {
                                 primary: true,
                             }],
                             carets: vec![(10, true)],
+                            syntax: Vec::new(),
+                            diagnostics: Vec::new(),
                         },
                         EditorViewportLine {
                             number: 41,
@@ -4528,11 +4922,14 @@ mod tests {
                             text: String::new(),
                             selections: Vec::new(),
                             carets: Vec::new(),
+                            syntax: Vec::new(),
+                            diagnostics: Vec::new(),
                         },
                     ],
                 }),
                 preedit: "λ".to_string(),
                 status: Some("Saved".to_string()),
+                semantic_status: Some("Saved".to_string()),
                 minibuffer: None,
                 cursor_label: Some("Ln 41, Col 11".to_string()),
                 dirty: true,
@@ -4545,6 +4942,8 @@ mod tests {
 
     #[test]
     fn editor_fingerprint_tracks_every_paint_only_viewport_state() {
+        use crate::native_editor::{EditorDiagnosticSpan, EditorSyntaxClass, EditorSyntaxSpan};
+
         let compile = |tree: &UiTree| {
             tree.compile(LogicalRect::new(0.0, 0.0, 640.0, 360.0))
                 .unwrap()
@@ -4573,6 +4972,30 @@ mod tests {
         };
         spec.projection.as_mut().unwrap().lines[0].selections[0].bytes = 0..3;
         assert_ne!(base_fp, compile(&selection));
+
+        let mut syntax = editor_viewport();
+        let UiContent::TextViewport(spec) = &mut syntax.root.content else {
+            panic!("editor viewport fixture")
+        };
+        spec.projection.as_mut().unwrap().lines[0]
+            .syntax
+            .push(EditorSyntaxSpan {
+                bytes: 0..3,
+                class: EditorSyntaxClass::Key,
+            });
+        assert_ne!(base_fp, compile(&syntax));
+
+        let mut diagnostic = editor_viewport();
+        let UiContent::TextViewport(spec) = &mut diagnostic.root.content else {
+            panic!("editor viewport fixture")
+        };
+        spec.projection.as_mut().unwrap().lines[0]
+            .diagnostics
+            .push(EditorDiagnosticSpan {
+                bytes: 4..10,
+                error: true,
+            });
+        assert_ne!(base_fp, compile(&diagnostic));
     }
 
     fn form() -> UiTree {
@@ -4664,18 +5087,273 @@ mod tests {
     }
 
     #[test]
+    fn editor_viewport_paints_native_syntax_runs_and_diagnostic_underlines() {
+        use crate::native_editor::{EditorDiagnosticSpan, EditorSyntaxClass, EditorSyntaxSpan};
+        use crate::widget::DrawPrim;
+
+        let mut tree = editor_viewport();
+        let UiContent::TextViewport(spec) = &mut tree.root.content else {
+            panic!("editor viewport fixture")
+        };
+        let line = &mut spec.projection.as_mut().unwrap().lines[0];
+        line.syntax.push(EditorSyntaxSpan {
+            bytes: 0..3,
+            class: EditorSyntaxClass::Key,
+        });
+        line.diagnostics.push(EditorDiagnosticSpan {
+            bytes: 4..10,
+            error: true,
+        });
+
+        let compiled = tree
+            .compile(LogicalRect::new(0.0, 0.0, 760.0, 420.0))
+            .unwrap();
+        let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+        assert!(
+            prims
+                .iter()
+                .any(|primitive| matches!(primitive, DrawPrim::Text { s, .. } if s == "let"))
+        );
+        assert!(prims.iter().any(|primitive| {
+            matches!(
+                primitive,
+                DrawPrim::Stroke { h, w, .. } if *h == 1.0 && *w > 1.0
+            )
+        }));
+    }
+
+    #[test]
+    fn editor_selection_caret_and_diagnostic_share_grapheme_cell_geometry() {
+        use crate::native_editor::{
+            EditorDiagnosticSpan, EditorSelectionSpan, EditorViewportLine, EditorViewportProjection,
+        };
+        use crate::type_scale::TypeStep;
+        use crate::widget::DrawPrim;
+
+        let text = "e\u{301}中👩‍💻".to_string();
+        let after_accent = "e\u{301}".len();
+        let after_cjk = after_accent + "中".len();
+        let after_woman = after_cjk + "👩".len();
+        let text_len = text.len();
+        let spec = TextViewportSpec {
+            label: "unicode.toml".to_string(),
+            document_key: "document:unicode@1".to_string(),
+            selectable: true,
+            projection: Some(EditorViewportProjection {
+                first_line: 0,
+                total_lines: 1,
+                lines: vec![EditorViewportLine {
+                    number: 0,
+                    source: 0..text_len,
+                    column_start: 0,
+                    text,
+                    selections: vec![
+                        EditorSelectionSpan {
+                            bytes: 0..after_accent,
+                            continues: false,
+                            primary: true,
+                        },
+                        EditorSelectionSpan {
+                            bytes: after_cjk..after_woman,
+                            continues: false,
+                            primary: false,
+                        },
+                    ],
+                    carets: vec![(text_len, true)],
+                    syntax: Vec::new(),
+                    diagnostics: vec![
+                        EditorDiagnosticSpan {
+                            bytes: after_accent..after_cjk,
+                            error: true,
+                        },
+                        EditorDiagnosticSpan {
+                            bytes: after_cjk..after_woman,
+                            error: false,
+                        },
+                    ],
+                }],
+            }),
+            preedit: String::new(),
+            status: None,
+            semantic_status: None,
+            minibuffer: None,
+            cursor_label: None,
+            dirty: false,
+            saving: false,
+            focused: true,
+            action: Some(ActionId::new("editor/focus-buffer")),
+        };
+        let rect = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
+        let geometry = text_viewport_geometry(rect);
+        let prims = UiTree::new(UiNode::new("editor/unicode", UiContent::TextViewport(spec)))
+            .compile(rect)
+            .unwrap()
+            .tray(aterm_render::Theme::default(), 13.0)
+            .prims;
+        let close = |left: f32, right: f32| (left - right).abs() < 0.01;
+
+        assert!(
+            prims.iter().any(
+                |primitive| matches!(primitive, DrawPrim::Text { s, .. } if s == "e\u{301}中👩‍💻")
+            )
+        );
+        assert!(
+            prims.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    DrawPrim::Panel { x, y, w, h, fill: [_, _, _, 86], .. }
+                        if close(*x, geometry.text_x)
+                            && close(*y, geometry.body_y + 1.0)
+                            && close(*w, geometry.cell_w)
+                            && close(*h, geometry.line_h - 2.0)
+                )
+            }),
+            "the composed selection occupies exactly one cell"
+        );
+        assert!(
+            prims.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    DrawPrim::Panel { x, w, fill: [_, _, _, 54], .. }
+                        if close(*x, geometry.text_x + geometry.cell_w * 3.0)
+                            && close(*w, geometry.cell_w * 2.0)
+                )
+            }),
+            "a selection ending inside a ZWJ sequence expands to its two-cell grapheme"
+        );
+
+        let diagnostic_y = crate::tray_raster::row_baseline(
+            geometry.body_y,
+            geometry.line_h,
+            native_type_px(TypeStep::Secondary).get(),
+        ) + 2.0;
+        assert!(
+            prims.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    DrawPrim::Stroke { x, y, w, h, .. }
+                        if close(*x, geometry.text_x + geometry.cell_w)
+                            && close(*y, diagnostic_y)
+                            && close(*w, geometry.cell_w * 2.0)
+                            && close(*h, 1.0)
+                )
+            }),
+            "the CJK diagnostic occupies exactly two cells"
+        );
+        assert!(
+            prims.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    DrawPrim::Stroke { x, y, w, h, .. }
+                        if close(*x, geometry.text_x + geometry.cell_w * 3.0)
+                            && close(*y, diagnostic_y)
+                            && close(*w, geometry.cell_w * 2.0)
+                            && close(*h, 1.0)
+                )
+            }),
+            "a diagnostic ending inside a ZWJ sequence expands to its two-cell grapheme"
+        );
+        assert!(
+            prims.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    DrawPrim::Stroke { x, y, w, h, .. }
+                        if close(*x, geometry.text_x + geometry.cell_w * 5.0)
+                            && close(*y, geometry.body_y + 2.0)
+                            && close(*w, 1.0)
+                            && close(*h, geometry.line_h - 4.0)
+                )
+            }),
+            "the caret follows the one-cell accent, two-cell CJK, and two-cell ZWJ emoji"
+        );
+    }
+
+    #[test]
+    fn editor_preedit_underlines_use_complete_grapheme_cell_widths() {
+        use crate::native_editor::{EditorViewportLine, EditorViewportProjection};
+        use crate::widget::DrawPrim;
+
+        let rect = LogicalRect::new(0.0, 0.0, 760.0, 420.0);
+        let geometry = text_viewport_geometry(rect);
+        let close = |left: f32, right: f32| (left - right).abs() < 0.01;
+        for (preedit, cells) in [("e\u{301}", 1usize), ("中", 2), ("👩‍💻", 2)] {
+            let spec = TextViewportSpec {
+                label: "ime.toml".to_string(),
+                document_key: "document:ime@1".to_string(),
+                selectable: true,
+                projection: Some(EditorViewportProjection {
+                    first_line: 0,
+                    total_lines: 1,
+                    lines: vec![EditorViewportLine {
+                        number: 0,
+                        source: 0..0,
+                        column_start: 0,
+                        text: String::new(),
+                        selections: Vec::new(),
+                        carets: vec![(0, true)],
+                        syntax: Vec::new(),
+                        diagnostics: Vec::new(),
+                    }],
+                }),
+                preedit: preedit.to_string(),
+                status: None,
+                semantic_status: None,
+                minibuffer: None,
+                cursor_label: None,
+                dirty: false,
+                saving: false,
+                focused: true,
+                action: Some(ActionId::new("editor/focus-buffer")),
+            };
+            let prims = UiTree::new(UiNode::new("editor/ime", UiContent::TextViewport(spec)))
+                .compile(rect)
+                .unwrap()
+                .tray(aterm_render::Theme::default(), 13.0)
+                .prims;
+            assert!(
+                prims.iter().any(|primitive| {
+                    matches!(primitive, DrawPrim::Text { s, .. } if s == preedit)
+                }),
+                "the complete preedit cluster is painted for {preedit:?}"
+            );
+            assert!(
+                prims.iter().any(|primitive| {
+                    matches!(
+                        primitive,
+                        DrawPrim::Stroke { x, y, w, h, .. }
+                            if close(*x, geometry.text_x + 2.0)
+                                && close(*y, geometry.body_y + geometry.line_h - 2.0)
+                                && close(*w, cells as f32 * geometry.cell_w)
+                                && close(*h, 1.0)
+                    )
+                }),
+                "preedit underline width drifted for {preedit:?}"
+            );
+        }
+    }
+
+    #[test]
     fn editor_display_columns_are_utf8_safe_and_tab_aligned() {
-        assert_eq!(editor_display_column("α\tβ", 0, 0), 0);
-        assert_eq!(editor_display_column("α\tβ", "α".len(), 0), 1);
-        assert_eq!(editor_display_column("α\tβ", "α\t".len(), 0), 4);
+        let column = crate::native_editor::editor_display_column;
+        assert_eq!(column("α\tβ", 0, 0), 0);
+        assert_eq!(column("α\tβ", "α".len(), 0), 1);
+        assert_eq!(column("α\tβ", "α\t".len(), 0), 4);
         // Deliberately land inside β; the mapping retreats to its UTF-8 boundary.
-        assert_eq!(editor_display_column("α\tβ", "α\t".len() + 1, 0), 4);
-        assert_eq!(editor_display_column("α\tβ", "α\tβ".len(), 0), 5);
+        assert_eq!(column("α\tβ", "α\t".len() + 1, 0), 4);
+        assert_eq!(column("α\tβ", "α\tβ".len(), 0), 5);
         assert_eq!(
-            editor_display_column("\tβ", "\t".len(), 3),
+            column("\tβ", "\t".len(), 3),
             1,
             "a shifted line keeps the canonical tab-stop phase"
         );
+
+        let composed = "e\u{301}中👩‍💻";
+        let after_accent = "e\u{301}".len();
+        let after_cjk = after_accent + "中".len();
+        assert_eq!(column(composed, 1, 0), 0, "never enter a combining cluster");
+        assert_eq!(column(composed, after_accent, 0), 1);
+        assert_eq!(column(composed, after_cjk, 0), 3);
+        assert_eq!(column(composed, composed.len(), 0), 5);
     }
 
     #[test]
@@ -5071,10 +5749,13 @@ mod tests {
                     text: "α\tβ".to_string(),
                     selections: Vec::new(),
                     carets: vec![(0, true)],
+                    syntax: Vec::new(),
+                    diagnostics: Vec::new(),
                 }],
             }),
             preedit: String::new(),
             status: None,
+            semantic_status: None,
             minibuffer: None,
             cursor_label: None,
             dirty: false,
@@ -5137,6 +5818,77 @@ mod tests {
             );
         }
 
+        let unicode_text = "e\u{301}中👩‍💻".to_string();
+        let unicode_start = 300usize;
+        let after_accent = unicode_start + "e\u{301}".len();
+        let after_cjk = after_accent + "中".len();
+        let unicode_end = unicode_start + unicode_text.len();
+        let unicode = TextViewportSpec {
+            label: "graphemes.txt".to_string(),
+            document_key: "document:3@1".to_string(),
+            selectable: true,
+            projection: Some(EditorViewportProjection {
+                first_line: 0,
+                total_lines: 1,
+                lines: vec![EditorViewportLine {
+                    number: 0,
+                    source: unicode_start..unicode_end,
+                    column_start: 0,
+                    text: unicode_text,
+                    selections: Vec::new(),
+                    carets: vec![(0, true)],
+                    syntax: Vec::new(),
+                    diagnostics: Vec::new(),
+                }],
+            }),
+            preedit: String::new(),
+            status: None,
+            semantic_status: None,
+            minibuffer: None,
+            cursor_label: None,
+            dirty: false,
+            saving: false,
+            focused: true,
+            action: Some(ActionId::new("editor/focus-buffer")),
+        };
+        for tenth_cell in 0..=50 {
+            let mapped = text_viewport_byte_at(
+                &unicode,
+                rect,
+                geometry.text_x + tenth_cell as f32 * 0.1 * geometry.cell_w,
+                y,
+            )
+            .unwrap();
+            assert!(
+                [unicode_start, after_accent, after_cjk, unicode_end].contains(&mapped),
+                "pointer mapping returned a byte inside a grapheme: {mapped}"
+            );
+        }
+        assert_eq!(
+            text_viewport_byte_at(&unicode, rect, geometry.text_x + 0.4 * geometry.cell_w, y,),
+            Some(unicode_start)
+        );
+        assert_eq!(
+            text_viewport_byte_at(&unicode, rect, geometry.text_x + 0.6 * geometry.cell_w, y,),
+            Some(after_accent)
+        );
+        assert_eq!(
+            text_viewport_byte_at(&unicode, rect, geometry.text_x + 1.9 * geometry.cell_w, y,),
+            Some(after_accent)
+        );
+        assert_eq!(
+            text_viewport_byte_at(&unicode, rect, geometry.text_x + 2.1 * geometry.cell_w, y,),
+            Some(after_cjk)
+        );
+        assert_eq!(
+            text_viewport_byte_at(&unicode, rect, geometry.text_x + 3.9 * geometry.cell_w, y,),
+            Some(after_cjk)
+        );
+        assert_eq!(
+            text_viewport_byte_at(&unicode, rect, geometry.text_x + 4.1 * geometry.cell_w, y,),
+            Some(unicode_end)
+        );
+
         let shifted = TextViewportSpec {
             label: "shifted.txt".to_string(),
             document_key: "document:2@1".to_string(),
@@ -5151,10 +5903,13 @@ mod tests {
                     text: "\tX".to_string(),
                     selections: Vec::new(),
                     carets: vec![(1, true)],
+                    syntax: Vec::new(),
+                    diagnostics: Vec::new(),
                 }],
             }),
             preedit: String::new(),
             status: None,
+            semantic_status: None,
             minibuffer: None,
             cursor_label: None,
             dirty: false,
@@ -5254,6 +6009,69 @@ mod tests {
     }
 
     #[test]
+    fn default_action_is_the_first_enabled_primary_button_in_authoring_order() {
+        // A disabled Primary earlier in focus order is skipped, a Secondary is
+        // never the default, and the enabled Primary wins even when it is not
+        // first; a page with no enabled Primary button has no default at all.
+        let disabled_primary = Control::new(ButtonSpec::new("Stale"), ActionId::new("stale"))
+            .state(ControlState {
+                enabled: false,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Primary);
+        let secondary = Control::new(ButtonSpec::new("Check"), ActionId::new("check"))
+            .style(StyleRef::Secondary);
+        let primary = Control::new(ButtonSpec::new("Install"), ActionId::new("install"))
+            .style(StyleRef::Primary);
+        let row = |key: &str, control| {
+            UiNode::new(key, UiContent::Button(control))
+                .layout(Layout::default().height(Length::Fixed(40.0)))
+        };
+        let tree = UiTree::new(
+            UiNode::new("root", UiContent::Group(GroupSpec::new("root")))
+                .layout(Layout::column())
+                .children(vec![
+                    row("stale", disabled_primary),
+                    row("check", secondary),
+                    row("install", primary),
+                ]),
+        );
+        let compiled = tree
+            .compile(LogicalRect::new(0.0, 0.0, 200.0, 120.0))
+            .unwrap();
+        let (key, action) = compiled.default_action.clone().expect("enabled Primary");
+        assert_eq!(key, UiKey::new("install"));
+        assert_eq!(action, ActionId::new("install"));
+
+        // The default survives viewport clipping: a route's default is
+        // semantic, so Return must fire it even scrolled out of view — while
+        // every clipped observer (paint/semantics/focus) omits the button.
+        let clipped = tree
+            .compile(LogicalRect::new(0.0, 0.0, 200.0, 1.0))
+            .unwrap();
+        assert!(
+            clipped
+                .paint
+                .iter()
+                .all(|node| node.key != UiKey::new("install"))
+        );
+        assert_eq!(
+            clipped.default_action,
+            Some((UiKey::new("install"), ActionId::new("install")))
+        );
+
+        let no_primary = UiTree::new(
+            UiNode::new("root", UiContent::Group(GroupSpec::new("root")))
+                .layout(Layout::column())
+                .children(vec![button("check", "Check")]),
+        );
+        let compiled = no_primary
+            .compile(LogicalRect::new(0.0, 0.0, 200.0, 120.0))
+            .unwrap();
+        assert_eq!(compiled.default_action, None);
+    }
+
+    #[test]
     fn clipped_geometry_is_shared_by_hit_and_semantics() {
         let tree = UiTree::new(
             UiNode::new("root", UiContent::Group(GroupSpec::new("root")))
@@ -5310,6 +6128,94 @@ mod tests {
     }
 
     #[test]
+    fn paint_only_copy_renders_without_duplicate_semantics() {
+        let complete = "On, currently silent while this window is unfocused.";
+        let tree = UiTree::new(
+            UiNode::new(
+                "status",
+                UiContent::Group(GroupSpec {
+                    label: Some(complete.to_string()),
+                    role: SemanticRole::Status,
+                    style: StyleRef::Quiet,
+                }),
+            )
+            .children(vec![
+                UiNode::new(
+                    "status/visual",
+                    UiContent::Text(TextSpec {
+                        text: "Window unfocused".to_string(),
+                        role: SemanticRole::Status,
+                        style: StyleRef::Quiet,
+                    }),
+                )
+                .paint_only(),
+            ]),
+        );
+
+        let compiled = tree
+            .compile(LogicalRect::new(0.0, 0.0, 240.0, 40.0))
+            .unwrap();
+        assert_eq!(compiled.paint.len(), 2);
+        assert!(
+            compiled
+                .paint
+                .iter()
+                .any(|node| node.key == UiKey::new("status/visual"))
+        );
+        assert_eq!(compiled.semantics.len(), 1);
+        assert_eq!(
+            compiled.semantic(&UiKey::new("status")).unwrap().label,
+            complete
+        );
+        assert!(compiled.semantic(&UiKey::new("status/visual")).is_none());
+        compiled.validate_parity().unwrap();
+    }
+
+    #[test]
+    fn paint_only_copy_participates_in_the_retained_raster_fingerprint() {
+        let compile = |visual: &str| {
+            UiTree::new(
+                UiNode::new(
+                    "status",
+                    UiContent::Group(GroupSpec {
+                        label: Some("Complete status that never changes".to_string()),
+                        role: SemanticRole::Status,
+                        style: StyleRef::Quiet,
+                    }),
+                )
+                .children(vec![
+                    UiNode::new(
+                        "status/visual",
+                        UiContent::Text(TextSpec {
+                            text: visual.to_string(),
+                            role: SemanticRole::Status,
+                            style: StyleRef::Quiet,
+                        }),
+                    )
+                    .paint_only(),
+                ]),
+            )
+            .compile(LogicalRect::new(0.0, 0.0, 240.0, 40.0))
+            .unwrap()
+        };
+        let first = compile("Visual A");
+        let second = compile("Visual B");
+
+        assert_eq!(first.semantics, second.semantics);
+        assert_ne!(first.paint, second.paint);
+        assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn paint_only_controls_fail_closed() {
+        let tree = UiTree::new(button("hidden-action", "Hidden action").paint_only());
+        assert_eq!(
+            tree.compile(LogicalRect::new(0.0, 0.0, 120.0, 40.0)),
+            Err(CompileError::PaintOnlyAction(UiKey::new("hidden-action")))
+        );
+    }
+
+    #[test]
     fn fixed_and_fill_layout_is_deterministic() {
         let tree = UiTree::new(
             UiNode::new("root", UiContent::Group(GroupSpec::new("root")))
@@ -5335,5 +6241,47 @@ mod tests {
             compiled.semantic(&UiKey::new("content")).unwrap().rect,
             LogicalRect::new(84.0, 0.0, 116.0, 100.0)
         );
+    }
+
+    /// The Tab Color wheel's pointer mapping and marker placement are exact
+    /// inverses on the SAME polar convention the raster paints (clockwise
+    /// turns from 12 o'clock, radius = saturation, full value): a pick at the
+    /// marker of any committed color re-picks that color, the disk centre is
+    /// white (saturation 0), and a point outside the disk is a miss — so a
+    /// click can never commit a color the pixels did not show.
+    #[test]
+    fn color_wheel_pick_and_marker_round_trip() {
+        let rect = LogicalRect::new(10.0, 20.0, 240.0, 240.0);
+        let geometry = color_wheel_geometry(rect);
+        assert_eq!(
+            color_wheel_rgb_at(rect, geometry.cx, geometry.cy),
+            Some([255, 255, 255]),
+            "disk centre is the zero-saturation white axis"
+        );
+        assert_eq!(
+            color_wheel_rgb_at(rect, geometry.cx + geometry.r + 2.0, geometry.cy),
+            None,
+            "outside the disk is a miss, not a pick"
+        );
+        // 12 o'clock at full radius is pure red (hue 0, saturation 1).
+        let top = color_wheel_rgb_at(rect, geometry.cx, geometry.cy - geometry.r + 0.5).unwrap();
+        assert!(
+            top[0] > 250 && top[1] < 8 && top[2] < 8,
+            "top is red: {top:?}"
+        );
+        for rgb in [[255, 42, 165], [255, 233, 74], [18, 171, 52], [64, 64, 255]] {
+            let (mx, my) = color_wheel_marker_at(rect, rgb);
+            let picked = color_wheel_rgb_at(rect, mx, my).expect("marker is on the disk");
+            // The disk projects onto full value, so compare against the same
+            // projection of the committed color (hue+saturation preserved).
+            let (hue, saturation, _) = crate::widget::rgb_to_hsv(rgb);
+            let projected = crate::widget::hsv_to_rgb(hue, saturation, 1.0);
+            for channel in 0..3 {
+                assert!(
+                    (i32::from(picked[channel]) - i32::from(projected[channel])).abs() <= 3,
+                    "marker roundtrip drifted for {rgb:?}: picked {picked:?} vs {projected:?}"
+                );
+            }
+        }
     }
 }

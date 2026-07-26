@@ -3,12 +3,12 @@
 
 //! The subtle top-right BUILD/VERSION badge: a tiny, faint [`DrawPrim`] pill showing
 //! `v{version} · {build}` so "which build am I on" is answerable at a glance without
-//! opening About. Default ON, toggleable via `show_build_badge` (config) or the Settings
-//! overlay ▸ "Show build/version badge". It is NON-INTERACTIVE (paint only) — it never
+//! opening About. Default OFF, toggleable via `show_build_badge` or the native Settings
+//! tab ▸ Window ▸ "Show build/version badge". It is NON-INTERACTIVE (paint only) — it never
 //! captures the mouse — so it
 //! lives in its OWN paint-only `badge_card` slot rather than the modal `settings_card`,
-//! and the composite picks the modal FIRST (`settings_card.or(badge_card)`): a Settings /
-//! About / palette overlay covers the badge while open, and it returns when the overlay
+//! and the composite picks the modal FIRST (`settings_card.or(badge_card)`): an About or
+//! palette overlay covers the badge while open, and it returns when that overlay
 //! closes. Built from the SAME [`DrawPrim`] chrome vocabulary as the About dialog (a
 //! rounded pill, hairline border, dim text) so it reads as native window chrome, not
 //! terminal grid cells. ONE structured source ([`crate::build_info`]) drives it.
@@ -20,10 +20,11 @@ use crate::tray_raster::row_baseline;
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
 
-/// The badge caption, e.g. `v0.22 · 1783203308` — the plain MAJOR.MINOR display version
-/// plus the build number (a release's `RELEASES.ledger` claim; HEAD's committer epoch on
-/// a dev build — see `build_info::BUILD_NUMBER`). Compact by design — a glanceable
-/// identity, not the full provenance (compiler flavor / commit / signature live in About).
+/// The badge caption, e.g. `v0.59 · 1783203308` — the shared app/source display
+/// version plus the build number (a release's `RELEASES.ledger` claim; HEAD's
+/// committer epoch on a dev build — see `build_info::BUILD_NUMBER`). Compact by
+/// design — a glanceable identity, not the full provenance (compiler flavor /
+/// commit / signature live in About).
 pub(crate) fn badge_text() -> String {
     format!(
         "v{} \u{00b7} {}",
@@ -129,9 +130,9 @@ mod tests {
     fn text_has_version_and_build() {
         let t = badge_text();
         assert!(t.starts_with('v'), "leads with v: {t}");
-        // The badge shows the plain MAJOR.MINOR display version + the build number; the
-        // compiler-provenance suffix (+{r|t}.{slug}) is NOT here — it moved to the About /
-        // ctl metadata rows when the version simplified to bare MAJOR.MINOR.
+        // The badge shows the shared app/source display version + the build
+        // number. Compiler provenance is not encoded here; it has its own
+        // About/control metadata rows.
         assert!(
             t.contains(crate::build_info::version_display()),
             "has display version: {t}"

@@ -69,8 +69,7 @@ fn bulk_3byte(bytes: &[u8], out: &mut ArrayVec<char, RUN_CAP>) -> usize {
         if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
             break;
         }
-        let cp =
-            (u32::from(b0 & 0x0F) << 12) | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F);
+        let cp = (u32::from(b0 & 0x0F) << 12) | (u32::from(b1 & 0x3F) << 6) | u32::from(b2 & 0x3F);
         // Overlong (< 0x800) and surrogates (0xD800..=0xDFFF) are handed back to
         // the scalar path, which emits the U+FFFD replacement exactly as before.
         if cp < 0x800 || (0xD800..=0xDFFF).contains(&cp) {
@@ -246,8 +245,8 @@ mod tests {
     fn bulk_matches_scalar_two_and_four_byte() {
         for s in [
             "αβγδεζηθικλμνξοπρστυφχψω".repeat(3), // 2-byte Greek
-            "𝕏𝕐𝕑𝔸𝔹ℂ𝕆".repeat(3),              // 4-byte SMP math
-            "🚀🎨🔥💧🌈🎉".repeat(3),           // 4-byte emoji
+            "𝕏𝕐𝕑𝔸𝔹ℂ𝕆".repeat(3),                  // 4-byte SMP math
+            "🚀🎨🔥💧🌈🎉".repeat(3),             // 4-byte emoji
         ] {
             let (rc, ri) = ref_run(s.as_bytes());
             let (bc, bi) = bulk_run(s.as_bytes());
@@ -354,7 +353,11 @@ mod tests {
                 };
                 bytes.push(b);
             }
-            assert_eq!(ref_run(&bytes), bulk_run(&bytes), "diverged on {bytes:02x?}");
+            assert_eq!(
+                ref_run(&bytes),
+                bulk_run(&bytes),
+                "diverged on {bytes:02x?}"
+            );
         }
     }
 }

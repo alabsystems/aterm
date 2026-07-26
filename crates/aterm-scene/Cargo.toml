@@ -6,30 +6,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm shared animation kit — deterministic RGB mixing, easing, and a sprite atlas/rasterizer used by the effects engine. (Also carries an unused 'Living Panels' scene framework with no live consumer.)"
-
-[features]
-# `bridge` adds the (optional) translation from this crate's local sprites into the
-# renderer-facing `aterm_core::render::SpriteQuad`/`SceneAtlas`. Off by default so the
-# pure engine stays dependency-free; the GUI/renderers enable it.
-bridge = ["dep:aterm-core"]
-
-[dependencies]
-# Pure engine by default — NO dependencies, NO platform. The renderer-facing quad types
-# live in aterm-core; the optional `bridge` feature pulls it in to translate local sprites
-# into `SpriteQuad`s. Keeping the default closure empty makes the engine trivially portable
-# (wasm, headless tests, third-party scenes) and keeps it an extractable, stable-ABI SDK.
-aterm-core = { workspace = true, optional = true }
+description = "aterm shared deterministic colour, easing, vector, and tile-raster primitives"
 
 [dev-dependencies]
 proptest.workspace = true
-# Atlas/frame PNG dumps for visual iteration (gated behind ATERM_SCENE_DUMP); dev-only,
-# never in the runtime closure.
-png = "0.17"
-# Formal bounded-state model (`ty_model!`) for the entity pool — authored in-idiom and
-# checked via the model's executable interpreter (no external toolchain). Dev-only so the
-# shipped crate stays dependency-free.
-aterm-spec.workspace = true
 
 [lints]
 workspace = true

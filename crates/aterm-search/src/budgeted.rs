@@ -259,11 +259,7 @@ impl BudgetedSearch {
                 .first()
                 .is_none_or(|first| first.line >= lowest)
         );
-        SearchResults::new(
-            self.matches[start..end].to_vec(),
-            evicted || capped,
-            lowest,
-        )
+        SearchResults::new(self.matches[start..end].to_vec(), evicted || capped, lowest)
     }
 
     /// Verify matches on the just-indexed row `abs_row`, appending to
@@ -511,20 +507,17 @@ mod tests {
         assert!(oracle.incomplete, "cap plus eviction must be reported");
         assert_eq!(oracle.matches.len(), MAX_SEARCH_MATCHES);
         assert!(
-            oracle.matches.iter().all(|m| m.line >= oracle.lowest_retained_line),
+            oracle
+                .matches
+                .iter()
+                .all(|m| m.line >= oracle.lowest_retained_line),
             "oracle only returns the retained suffix"
         );
 
         for slice in [1, 3, ROWS] {
-            let mut search = BudgetedSearch::with_max_cached_lines(
-                "a",
-                true,
-                false,
-                0,
-                rows.len(),
-                CACHE_LINES,
-            )
-            .expect("budgeted construction");
+            let mut search =
+                BudgetedSearch::with_max_cached_lines("a", true, false, 0, rows.len(), CACHE_LINES)
+                    .expect("budgeted construction");
             while !search.is_complete() {
                 for _ in 0..slice {
                     if search.is_complete() {

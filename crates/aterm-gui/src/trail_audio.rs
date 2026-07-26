@@ -31,6 +31,15 @@ use std::time::Duration;
 
 use aterm_effects::trail_sound::SoundEvent;
 
+/// Whether this build has a real platform audio-output host. The synth is
+/// portable, but non-macOS [`TrailAudio`] implementations intentionally discard
+/// cues; Settings uses this exact capability to describe the saved toggle
+/// without claiming that sound is currently playing.
+#[must_use]
+pub(crate) const fn output_available() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// Output sample rate. 48 kHz is the native rate of every modern Mac output
 /// path; the hardware resampler handles the rest.
 const SAMPLE_RATE: f64 = 48_000.0;
@@ -1086,7 +1095,7 @@ mod tests {
 
     use aterm_effects::cursor_glow::GlowStyle;
     use aterm_effects::trail_sound::{
-        CHANNELS, SoundEvent, SoundGesture, SoundKind, TrailSynth, WordGesture,
+        CHANNELS, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth, WordGesture,
     };
 
     use super::mac::{QueueCycle, prime_and_start, stop_and_reclaim};
@@ -1098,6 +1107,7 @@ mod tests {
     fn cue() -> SoundEvent {
         SoundEvent {
             style: GlowStyle::Water,
+            voice: SoundVoice::Style,
             kind: SoundGesture::Trail(SoundKind::Typed),
             pan: 0.0,
             heat: 0.4,
@@ -1134,6 +1144,11 @@ mod tests {
             SoundGesture::Trail(SoundKind::Navigation),
             SoundGesture::Trail(SoundKind::Kill),
             SoundGesture::Trail(SoundKind::Jump),
+            // The cursor-movement gestures — a Glide is one immediate tone; a
+            // Sweep's FIRST run-note has delay 0, so both speak in the first
+            // post-cue buffer exactly like every other audible cue.
+            SoundGesture::Trail(SoundKind::Glide { dir: 1 }),
+            SoundGesture::Trail(SoundKind::Sweep { dir: -1 }),
             SoundGesture::Words(WordGesture::Bonk),
         ];
 
@@ -1142,6 +1157,7 @@ mod tests {
                 let mut synth = TrailSynth::new(super::SAMPLE_RATE as f32, 0x5EED_50FD);
                 synth.push(SoundEvent {
                     style,
+                    voice: SoundVoice::Style,
                     kind,
                     pan: 0.0,
                     heat: 0.4,
@@ -1158,6 +1174,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// WHY THE HOST MUST NEVER FAN ONE COALESCED ECHO OUT INTO N CUES.
+    ///
+    /// The tempting fix for "three glyphs echoed in one frame click once" is
+    /// to push one cue per crossed cell. It does not work, and it is worse
+    /// than doing nothing — this pins both halves so nobody re-lands it:
+    ///
+    /// 1. NO EXTRA CLICKS. Discrete voices are admitted by a wall-clock gap
+    ///    (`MIN_GAP`, ~45 ms) measured between `push` calls. A fan-out arrives
+    ///    in ONE drain, i.e. at one instant, so the first event is admitted and
+    ///    every sibling is thinned. Same voice count as a single cue.
+    /// 2. IT DUCKS THE REAL ONES. Thinned events still pay into the synth's
+    ///    rate estimate before they are dropped, and the rate drives the
+    ///    loudness duck — so the fan-out makes the NEXT genuine keystroke
+    ///    audibly quieter (measured below) while adding nothing of its own.
+    ///
+    /// Density can only come from spacing cues in REAL TIME, which is what
+    /// cueing at the physical keypress does (`CursorGlow::cue_keystroke`).
+    #[test]
+    fn batched_cues_add_no_voices_and_duck_the_next_keystroke() {
+        // Render ~10 buffers (~107 ms) so the batch's own voices have decayed
+        // and the min-gap can no longer thin the follow-up keystroke: whatever
+        // difference remains is the rate/duck inflation, nothing else.
+        fn batch_then_next_peak(n: usize) -> (usize, f32) {
+            let mut synth = TrailSynth::new(super::SAMPLE_RATE as f32, 0x5EED_50FD);
+            for _ in 0..n {
+                synth.push(cue());
+            }
+            let voices = synth.live_voices();
+            let mut buf = [0.0; super::BUFFER_FRAMES * CHANNELS];
+            for _ in 0..10 {
+                synth.render(&mut buf);
+            }
+            synth.push(cue());
+            let mut next = [0.0; super::BUFFER_FRAMES * CHANNELS];
+            synth.render(&mut next);
+            (voices, next.iter().fold(0.0f32, |a, s| a.max(s.abs())))
+        }
+
+        let (one_voices, one_peak) = batch_then_next_peak(1);
+        for n in [2usize, 3, 8] {
+            let (voices, _) = batch_then_next_peak(n);
+            assert_eq!(
+                voices, one_voices,
+                "{n} same-instant cues must yield the SAME voices as one — \
+                 the min-gap thins every sibling, so a fan-out is inaudible"
+            );
+        }
+        let (_, eight_peak) = batch_then_next_peak(8);
+        assert!(
+            eight_peak < one_peak * 0.95,
+            "a fan-out must be shown to DUCK the next keystroke \
+             (one: {one_peak:.6}, eight: {eight_peak:.6}) — that is the \
+             regression this test exists to keep out"
+        );
     }
 
     fn wait_until(label: &str, pred: impl Fn() -> bool) {
@@ -1760,6 +1832,7 @@ mod tests {
         for i in 0..10 {
             audio.push(SoundEvent {
                 style: GlowStyle::Water,
+                voice: SoundVoice::Style,
                 kind: SoundGesture::Trail(SoundKind::Typed),
                 pan: -0.8 + i as f32 * 0.16,
                 heat: 0.4,
@@ -1773,6 +1846,7 @@ mod tests {
         }
         audio.push(SoundEvent {
             style: GlowStyle::Water,
+            voice: SoundVoice::Style,
             kind: SoundGesture::Trail(SoundKind::Jump),
             pan: -0.9,
             heat: 0.6,

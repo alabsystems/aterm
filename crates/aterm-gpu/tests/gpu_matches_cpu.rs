@@ -2453,7 +2453,7 @@ fn scroll_seeded_term(rows: usize, cols: usize) -> Terminal {
 /// M1b SUB-ROW SCROLL PARITY: the GPU grid-band pixel shift matches the CPU
 /// present translate for a FRACTIONAL-scroll frame at an asymmetric grid
 /// origin (`head != 0`, `pad_top != pad`). With a chrome partition (row 0 =
-/// tab strip, last row = HUD) and a nonzero `scroll_frac_px`, (1) the
+/// tab strip, last row = bottom chrome) and a nonzero `scroll_frac_px`, (1) the
 /// CPU and GPU translated frames agree within the standard parity tolerance,
 /// (2) chrome rows (outside `[grid_top_row, grid_bot_row)`) are byte-identical
 /// to the frac-0 frame on BOTH backends (chrome invariance), and (3) some grid
@@ -2494,7 +2494,7 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
         grid_top, PAD,
         "regression must exercise the asymmetric origin"
     );
-    // The chrome partition: row 0 = strip, last row = HUD; middle = terminal grid.
+    // The chrome partition: row 0 = strip, last row = bottom chrome; middle = terminal grid.
     let with_partition = |t: &mut Terminal, frac: i32| {
         let mut input = t.cell_frame(rows, cols);
         input.grid_top_row = 1;

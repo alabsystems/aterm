@@ -46,6 +46,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("tree-root") => return cmd_tree_root(args.get(1)),
         Some("verify-index") => return cmd_verify_index(args.get(1), args.get(2), args.get(3)),
         Some("install") => return cmd_install(args.get(1)),
+        Some("seed") => return cmd_seed(&args[1..]),
         Some("update") => return cmd_update(args.get(1)),
         Some("sync") => return cmd_sync(),
         Some("rollback") => return cmd_rollback(args.get(1)),
@@ -61,8 +62,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some(other) => {
             eprintln!(
                 "atpkg: unknown verb '{other}' (try: doctor, which, list, run, uninstall, \
-                 install, update, sync, rollback, pin, unpin, gc, verify, link, unlink, refresh, \
-                 tree-root, verify-index, relocate)"
+                 install, seed, update, sync, rollback, pin, unpin, gc, verify, link, unlink, \
+                 refresh, tree-root, verify-index, relocate)"
             );
             return ExitCode::from(2);
         }
@@ -97,6 +98,7 @@ fn verb_mutates_store(verb: &str) -> bool {
     matches!(
         verb,
         "install"
+            | "seed"
             | "update"
             | "sync"
             | "rollback"
@@ -137,7 +139,7 @@ fn status() {
         };
         println!(
             "atpkg: enabled ({anchor}). Verbs: doctor, which, list, run, uninstall, \
-             install, update, sync, rollback, pin, unpin, gc, verify, link, unlink, refresh."
+             install, seed, update, sync, rollback, pin, unpin, gc, verify, link, unlink, refresh."
         );
     } else {
         println!("atpkg: disabled (no root key pinned or overridden) -- inert");
@@ -202,6 +204,15 @@ fn cmd_run(rest: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
     let Some(target) = crate::which(&layout, tool) else {
+        // A batteries-included companion mid-build reports PROGRESS, not "not installed" —
+        // the eager-early-typing user hits this exactly when the promise matters most.
+        if let Some(entry) = companion_installing(&layout, tool) {
+            eprintln!(
+                "atpkg: {tool} is still installing (attempt {}) — run `aterm pkg status` to watch",
+                entry.attempts
+            );
+            return ExitCode::from(75); // EX_TEMPFAIL — try again shortly
+        }
         eprintln!("atpkg: {tool} is not installed (try: atpkg install {tool})");
         return ExitCode::from(127);
     };
@@ -215,6 +226,75 @@ fn cmd_run(rest: &[String]) -> ExitCode {
     let err = crate::platform::exec_or_run(&mut command);
     eprintln!("atpkg: failed to exec {}: {err}", target.display());
     ExitCode::from(127)
+}
+
+/// The ledger entry for the companion that exposes `tool`, IF that companion is currently
+/// building — so `atpkg run <tool>` (thus `aterm <tool>`) can report progress mid-build.
+fn companion_installing(
+    layout: &crate::store::Layout,
+    tool: &str,
+) -> Option<crate::seed::LedgerEntry> {
+    let manifest = crate::companions::load().ok()?;
+    let comp = manifest
+        .companions
+        .iter()
+        .find(|c| c.expose.iter().any(|e| e == tool))?;
+    let ledger = crate::seed::Ledger::read(layout);
+    ledger
+        .companions
+        .get(&comp.name)
+        .filter(|e| e.state == "building")
+        .cloned()
+}
+
+/// `atpkg seed [--force]` — the SOURCE-BUILD (keyless) batteries-included lane: reconcile the
+/// compiled-in companions manifest (`docs/COMPANION-TOOLS.md`, starting with `ay`) by building
+/// each missing/repinned companion from its pinned public source into the store and shimming
+/// it. Complementary to the SIGNED `atpkg install --default-set` bootstrap (§11): a companion
+/// already installed by either lane is skipped (idempotent — running both is safe). Source-
+/// build is DEFAULT-OFF (opt-in `ATPKG_SOURCE_BUILD=1`) and runs even when the manager is inert
+/// (its trust basis is the owner manifest + the pinned commit, not the signed index). Store
+/// mutation is serialized by the store-wide lock held at the dispatch edge (`seed` is in
+/// `verb_mutates_store`). `--force` ignores the per-commit retry cap.
+fn cmd_seed(rest: &[String]) -> ExitCode {
+    let force = rest.iter().any(|a| a == "--force" || a == "-f");
+    let Some(layout) = layout() else {
+        return ExitCode::from(1);
+    };
+    let manifest = match crate::companions::load() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("atpkg: companions manifest invalid: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut log = |line: &str| println!("atpkg: {line}");
+    let results = crate::seed::reconcile_source(&layout, &manifest, force, &mut log);
+
+    let mut failed = 0u32;
+    let mut ready = 0u32;
+    for r in &results {
+        match r.state.as_str() {
+            "ready" | "reused" => {
+                ready += 1;
+                println!("atpkg: {} {} — {}", r.name, r.state, r.detail);
+            }
+            "failed" => {
+                failed += 1;
+                eprintln!("atpkg: {} FAILED — {}", r.name, r.detail);
+            }
+            _ => println!("atpkg: {} skipped — {}", r.name, r.detail),
+        }
+    }
+    println!(
+        "atpkg: seed complete ({ready} ready, {failed} failed, {} companion(s) considered)",
+        results.len()
+    );
+    if failed > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// `atpkg relocate <stage-root> [--sign <id>] [--advisory]` — PRODUCER-side
@@ -506,8 +586,7 @@ pub(crate) fn resolve_pkg_token(layout: &crate::store::Layout) -> (String, Optio
             .parent()
             .unwrap_or(&layout.prefix)
             .to_path_buf();
-        aterm_update_core::token::resolve_with_source(&support)
-            .map(|(t, src)| (t, src.to_string()))
+        aterm_update_core::token::resolve_with_source(&support).map(|(t, src)| (t, src.to_string()))
     })
 }
 
@@ -563,13 +642,6 @@ fn resolve_root_key(override_key: Option<&str>, pinned: &str) -> String {
     }
 }
 
-/// Pure enablement: SOME non-empty root key (overridden or pinned) AND not opted out. The
-/// override can ENABLE the manager without a rebuild, but because the resolved key is always
-/// what `sig::verify_index_with` verifies under, it can never bypass the signature gate.
-fn root_enabled(override_key: Option<&str>, pinned: &str, opted_out: bool) -> bool {
-    !opted_out && !resolve_root_key(override_key, pinned).is_empty()
-}
-
 /// The root public key the network verbs verify under: the out-of-band [`root_override`] when
 /// set, else the compile-time [`crate::PINNED_PKG_ROOTKEY`]. Every flow entry point takes THIS
 /// in place of a bare pin, so trusting a mirror/second account needs no rebuild.
@@ -580,11 +652,7 @@ fn effective_root_key() -> String {
 /// Whether the manager may act on the network verbs: SOME root key to verify under (pinned OR
 /// overridden) AND the user has not opted out via `ATPKG_DISABLE`.
 fn manager_enabled() -> bool {
-    root_enabled(
-        root_override().as_deref(),
-        crate::PINNED_PKG_ROOTKEY,
-        std::env::var_os("ATPKG_DISABLE").is_some(),
-    )
+    crate::manager_enabled()
 }
 
 /// Install/force-upgrade one program to its `channel`-pinned build, advancing the durable
@@ -1038,9 +1106,9 @@ fn install_default_set(
             .any(|m| crate::linkmode::is_linked(layout, m))
         {
             match &group.group {
-                Some(g) => println!(
-                    "atpkg: coherence group '{g}' has a dev-linked member — skipped whole"
-                ),
+                Some(g) => {
+                    println!("atpkg: coherence group '{g}' has a dev-linked member — skipped whole")
+                }
                 None => println!("atpkg: {} dev-linked — skipped", group.members[0]),
             }
             continue;
@@ -1120,7 +1188,9 @@ fn install_default_set(
                     }
                     Ok((crate::TxnOutcome::UpToDate, _)) => {}
                     Ok((crate::TxnOutcome::Pinned(held), _)) => {
-                        println!("atpkg: coherence group '{g}' held by local pin {held:?} — skipped");
+                        println!(
+                            "atpkg: coherence group '{g}' held by local pin {held:?} — skipped"
+                        );
                     }
                     Ok((crate::TxnOutcome::Tombstoned(members), _)) => {
                         eprintln!(
@@ -1128,7 +1198,13 @@ fn install_default_set(
                              nothing installed"
                         );
                     }
-                    Ok((crate::TxnOutcome::Aborted { failed, during_flip }, _)) => {
+                    Ok((
+                        crate::TxnOutcome::Aborted {
+                            failed,
+                            during_flip,
+                        },
+                        _,
+                    )) => {
                         failures += 1;
                         let phase = if during_flip {
                             "flip (already-flipped members rolled back)"
@@ -1337,18 +1413,16 @@ fn reconcile_links(layout: &crate::store::Layout, cfg: &crate::config::PackagesC
                                     out.linked.join(", ")
                                 }
                             ),
-                            Err(e) => eprintln!(
-                                "atpkg: [packages.links] {program}: link failed: {e}"
-                            ),
+                            Err(e) => {
+                                eprintln!("atpkg: [packages.links] {program}: link failed: {e}")
+                            }
                         }
                     }
                     Some(existing) if existing == want => {
                         // Already ours at the right target: idempotent re-assert
                         // (picks up newly-built bins), quiet on the happy path.
                         if let Err(e) = crate::refresh(layout, program) {
-                            eprintln!(
-                                "atpkg: [packages.links] {program}: refresh failed: {e}"
-                            );
+                            eprintln!("atpkg: [packages.links] {program}: refresh failed: {e}");
                         }
                     }
                     Some(existing) => {
@@ -1648,11 +1722,27 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
     let mut bad = 0u32;
     for (name, o) in &outcomes {
         use crate::verify::VerifyOutcome::{
-            BuildMismatch, Drift, Match, NoSignedRoot, NotInstalled, Unreadable, WiredSysroot,
+            BuildMismatch, Drift, Match, NoSignedRoot, NotInstalled, SourceBuilt, Unreadable,
+            WiredSysroot,
         };
         match o {
             Match { build } => {
                 println!("atpkg: {name} build {build} OK (matches signed tree_root)")
+            }
+            SourceBuilt { build, commit, intact } => {
+                if *intact {
+                    println!(
+                        "atpkg: {name} build {build} OK (SOURCE-BUILT from {}, lower-assurance: \
+                         trust basis = manifest + pinned commit, NOT owner-signed)",
+                        commit.get(..12).unwrap_or(commit)
+                    );
+                } else {
+                    bad += 1;
+                    eprintln!(
+                        "atpkg: {name} build {build} DRIFT — source-built tree no longer matches its \
+                         recorded self-tree-root"
+                    );
+                }
             }
             WiredSysroot { build } => println!(
                 "atpkg: {name} build {build} OK (rustup-linked sysroot bundle; verified at install, \
@@ -1860,6 +1950,7 @@ mod tests {
     fn store_lock_verb_roster_is_exact() {
         for mutator in [
             "install",
+            "seed",
             "update",
             "sync",
             "rollback",
@@ -1940,15 +2031,19 @@ mod tests {
     #[test]
     fn override_can_enable_without_a_rebuild_but_never_bypasses_disable() {
         // No pin, no override ⇒ inert.
-        assert!(!root_enabled(None, "", false));
+        assert!(!crate::manager_enabled_with("", None, false));
         // Override with no compile-time pin ⇒ enabled (the without-a-rebuild path).
-        assert!(root_enabled(Some("OVERRIDE_KEY"), "", false));
+        assert!(crate::manager_enabled_with("", Some("OVERRIDE_KEY"), false));
         // A pin alone ⇒ enabled.
-        assert!(root_enabled(None, "PINNED_KEY", false));
+        assert!(crate::manager_enabled_with("PINNED_KEY", None, false));
         // ATPKG_DISABLE opt-out wins even with a valid key present.
-        assert!(!root_enabled(Some("OVERRIDE_KEY"), "PINNED_KEY", true));
+        assert!(!crate::manager_enabled_with(
+            "PINNED_KEY",
+            Some("OVERRIDE_KEY"),
+            true
+        ));
         // An empty override never enables on its own.
-        assert!(!root_enabled(Some(""), "", false));
+        assert!(!crate::manager_enabled_with("", Some(""), false));
     }
 
     // ---- token chain precedence (pure split — no env mutation, no subprocess) ----
@@ -1973,7 +2068,10 @@ mod tests {
         assert_eq!(src.as_deref(), Some("gh auth token"));
         // No env → the chain.
         let (t, src) = pick_pkg_token(None, || {
-            Some(("ghp_keychain".into(), "keychain item aterm-update-token".into()))
+            Some((
+                "ghp_keychain".into(),
+                "keychain item aterm-update-token".into(),
+            ))
         });
         assert_eq!(t, "ghp_keychain");
         assert_eq!(src.as_deref(), Some("keychain item aterm-update-token"));
@@ -2119,13 +2217,7 @@ mod tests {
         let layout = temp_layout("bootstrap");
         // Dev-link `lk` (the hard-skip member).
         let co = checkout("bootstrap", "lk");
-        crate::link(
-            &layout,
-            "lk",
-            &co,
-            &[PathBuf::from("target/release/lk")],
-        )
-        .unwrap();
+        crate::link(&layout, "lk", &co, &[PathBuf::from("target/release/lk")]).unwrap();
         let cfg = crate::config::PackagesConfig {
             exclude: Some(vec!["ny".into()]),
             ..Default::default()
@@ -2134,11 +2226,18 @@ mod tests {
         let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
         assert_eq!(failures, 0, "skips are never failures");
         let active = crate::active_builds(&layout);
-        assert_eq!(active.get("ay").copied(), Some(18), "missing member installed");
+        assert_eq!(
+            active.get("ay").copied(),
+            Some(18),
+            "missing member installed"
+        );
         assert!(!active.contains_key("ny"), "excluded member narrowed out");
         assert!(!active.contains_key("zz"), "yanked pin never installs");
         assert!(!active.contains_key("lk"), "dev-linked member hard-skipped");
-        assert!(crate::is_linked(&layout, "lk"), "the dev link survives untouched");
+        assert!(
+            crate::is_linked(&layout, "lk"),
+            "the dev link survives untouched"
+        );
         // Idempotence: a second pass finds ay installed and re-installs nothing.
         let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
         assert_eq!(failures, 0);
@@ -2242,13 +2341,23 @@ mod tests {
         let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
         assert_eq!(failures, 1, "one failure for the aborted group");
         let active = crate::active_builds(&layout);
-        assert!(!active.contains_key("ta"), "no partial tuple: ta not active");
-        assert!(!active.contains_key("tb"), "no partial tuple: tb not active");
+        assert!(
+            !active.contains_key("ta"),
+            "no partial tuple: ta not active"
+        );
+        assert!(
+            !active.contains_key("tb"),
+            "no partial tuple: tb not active"
+        );
         assert!(
             !layout.build_dir("ta", 4).exists(),
             "the staged sibling was discarded on abort"
         );
-        assert_eq!(active.get("ay").copied(), Some(18), "the singleton still installs");
+        assert_eq!(
+            active.get("ay").copied(),
+            Some(18),
+            "the singleton still installs"
+        );
         let _ = std::fs::remove_dir_all(&layout.prefix);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2267,11 +2376,21 @@ mod tests {
         };
         let fetcher = crate::DirFetcher::new(dir.clone());
         let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
-        assert_eq!(failures, 0, "a config-narrowed tuple is a diagnostic, not a failure");
+        assert_eq!(
+            failures, 0,
+            "a config-narrowed tuple is a diagnostic, not a failure"
+        );
         let active = crate::active_builds(&layout);
-        assert!(!active.contains_key("ta"), "no partial tuple over a narrowing");
+        assert!(
+            !active.contains_key("ta"),
+            "no partial tuple over a narrowing"
+        );
         assert!(!active.contains_key("tb"));
-        assert_eq!(active.get("ay").copied(), Some(18), "the singleton still installs");
+        assert_eq!(
+            active.get("ay").copied(),
+            Some(18),
+            "the singleton still installs"
+        );
         let _ = std::fs::remove_dir_all(&layout.prefix);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2284,12 +2403,14 @@ mod tests {
         let dir = scratch("unindexed");
         write_registry(&dir, "stable");
         let layout = temp_layout("unindexed");
-        let cfg = crate::config::parse_packages(
-            "[packages.links]\nghost = \"alabsystems/ghost\"\n",
-        );
+        let cfg =
+            crate::config::parse_packages("[packages.links]\nghost = \"alabsystems/ghost\"\n");
         let fetcher = crate::DirFetcher::new(dir.clone());
         let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
-        assert_eq!(failures, 0, "the refusal is a loud diagnostic, not a loop failure");
+        assert_eq!(
+            failures, 0,
+            "the refusal is a loud diagnostic, not a loop failure"
+        );
         assert!(
             !crate::active_builds(&layout).contains_key("ghost"),
             "an unindexed program is unreachable by construction"
@@ -2310,13 +2431,22 @@ mod tests {
             co.display().to_string()
         ));
         reconcile_links(&layout, &cfg);
-        assert!(crate::is_linked(&layout, "ay"), "config path became a dev-link");
+        assert!(
+            crate::is_linked(&layout, "ay"),
+            "config path became a dev-link"
+        );
         assert_eq!(
             crate::linked_checkout(&layout, "ay").unwrap(),
             std::path::absolute(&co).unwrap()
         );
-        assert!(!crate::is_linked(&layout, "missing"), "missing checkout links nothing");
-        assert!(!crate::is_linked(&layout, "bad"), "invalid value acts on nothing");
+        assert!(
+            !crate::is_linked(&layout, "missing"),
+            "missing checkout links nothing"
+        );
+        assert!(
+            !crate::is_linked(&layout, "bad"),
+            "invalid value acts on nothing"
+        );
         // Idempotent second pass: still linked, same checkout, and a newly-built bin
         // is picked up by the quiet refresh.
         std::fs::write(co.join("target/release").join("ay2"), b"#!/bin/true\n").unwrap();
@@ -2341,13 +2471,7 @@ mod tests {
         let layout = temp_layout("foreign");
         let hand = checkout("foreign-hand", "ay");
         let config_wants = checkout("foreign-cfg", "ay");
-        crate::link(
-            &layout,
-            "ay",
-            &hand,
-            &[PathBuf::from("target/release/ay")],
-        )
-        .unwrap();
+        crate::link(&layout, "ay", &hand, &[PathBuf::from("target/release/ay")]).unwrap();
         let cfg = crate::config::parse_packages(&format!(
             "[packages.links]\nay = {:?}\n",
             config_wants.display().to_string()
@@ -2360,7 +2484,9 @@ mod tests {
         );
         assert_eq!(
             crate::platform::resolve_shim(&layout.shim("ay")).unwrap(),
-            std::path::absolute(&hand).unwrap().join("target/release/ay"),
+            std::path::absolute(&hand)
+                .unwrap()
+                .join("target/release/ay"),
             "the shim still points into the hand-made checkout"
         );
         let _ = std::fs::remove_dir_all(&layout.prefix);

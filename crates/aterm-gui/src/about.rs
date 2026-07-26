@@ -5,11 +5,12 @@
 //! opaque rounded [`DrawPrim`] card floating centred over the terminal, showing the app
 //! wordmark, tagline, and build provenance (version / build / commit / built /
 //! signature) as plain display lines, with a single `OK` button. It replaces the
-//! macOS-only native `NSAboutPanel` so "which build am I on" is captured WYSIWYG on
-//! every platform + serialised by the `controls about` verb. ONE structured source
-//! ([`crate::build_info::about_fields`]) drives the pixels AND the introspection text,
-//! and ONE pure [`about_layout`] drives the painter, the mouse hit-test, AND the
-//! selectable-text model ([`SelLine`]), so they can never disagree.
+//! macOS-only native `NSAboutPanel`. Shipping About now renders in the native Settings
+//! `/about` route, where `controls about` serializes that route's exact compiled semantic
+//! frame. This former card model remains a structured source and regression fixture: ONE
+//! source ([`crate::build_info::about_fields`]) drives its pixels and test projection,
+//! and ONE pure [`about_layout`] drives its painter, mouse hit-test, and selectable-text
+//! model ([`SelLine`]), so those observers cannot disagree.
 //!
 //! The card behaves like a native info panel, not terminal cells: its type is sized
 //! off a FIXED native base ([`BASE_PT`] × the display scale), the byline's site is a
@@ -91,9 +92,9 @@ pub(crate) struct AboutState {
 }
 
 /// The whole provenance block as clipboard-ready `key: value` lines — the SAME
-/// [`crate::build_info::about_fields`] rows the painter draws and
-/// [`AboutState::controls_lines`] serializes, so what lands on the clipboard can
-/// never disagree with what is on screen. A free function of the build (no
+/// [`crate::build_info::about_fields`] rows the painter and retired test projection
+/// consume, so what lands on the clipboard can never disagree with what is on screen.
+/// A free function of the build (no
 /// per-window state), so the copy path needs no `AboutState` borrow. The copy
 /// verb falls back to this when no pointer selection is active.
 #[must_use]
@@ -239,8 +240,9 @@ impl AboutState {
         (0, n, n)
     }
 
-    /// Machine-readable lines for the `controls about` introspection verb — the same
-    /// provenance the card paints, so screen == introspection.
+    /// Test projection for the retired standalone About card. The shipping
+    /// `controls about` alias serializes the compiled native Settings `/about` tree.
+    #[cfg(test)]
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.rows.len() + 2);
         out.push(format!("about rows={}", self.rows.len()));
@@ -280,11 +282,10 @@ impl AboutState {
     }
 }
 
-/// The About dialog's accessibility tree — the FIFTH observer of the SAME [`AboutState`] the
-/// pixels ([`about_tray`]) and the `controls about` verb ([`AboutState::controls_lines`])
-/// read, so a screen reader can never disagree with the glass. Every `(key, value)` row (one
-/// per `about {k}={v}` control line) becomes a [`accesskit::Role::Label`] node — label = key,
-/// value = value — EXCEPT the `site` row, which is a [`accesskit::Role::Link`] carrying
+/// The retired About card's accessibility tree reads the same [`AboutState`] as its pixels
+/// ([`about_tray`]), so its regression observers cannot disagree. Every `(key, value)` row
+/// becomes a [`accesskit::Role::Label`] node — label = key, value = value — EXCEPT the
+/// `site` row, which is a [`accesskit::Role::Link`] carrying
 /// [`accesskit::Action::Click`] (open the browser — the `about action=open-site` line, same
 /// as the pointer's byline link / the `o` key). A single [`accesskit::Role::Button`] "OK"
 /// also carries `Click` (the OS activate that closes the dialog, matching the
@@ -1415,11 +1416,9 @@ mod tests {
         assert_eq!(pushes, pops, "clip stack balanced");
     }
 
-    /// ANTI-DIVERGENCE: the a11y tree's node/label set is in bijection with the
-    /// `controls about` key set — every `about {k}={v}` line has a Label node (label=k,
-    /// value=v), the `about rows={n}` count equals the Label-node count, and `about
-    /// action=close` maps to exactly one clickable OK button. One model fans out to both,
-    /// so pixels/introspection/a11y cannot drift.
+    /// ANTI-DIVERGENCE for the retired card fixture: its test projection and a11y
+    /// node/label set stay in bijection. Shipping `controls about` is separately bound
+    /// to the compiled native Settings route in `app_introspect`.
     #[cfg(feature = "a11y-accesskit")]
     #[test]
     fn about_a11y_nodeset_matches_controls_keys() {

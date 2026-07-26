@@ -81,10 +81,10 @@ mod v025 {
 /// The spec §4 example cut, verbatim field values.
 fn spec4_inputs<'a>(body: &'a str) -> manifest_out::ManifestInputs<'a> {
     manifest_out::ManifestInputs {
-        version: "0.26",
+        version: "0.2.0",
         build_number: 1_783_918_101,
         commit: "aed5a06caed5a06caed5a06caed5a06caed5a06c",
-        dmg_name: "aterm-0.26.dmg",
+        dmg_name: "aterm-0.2.0.dmg",
         dmg_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         repo_slug: "alabsystems/aterm",
         min_os: "11.0",
@@ -108,9 +108,10 @@ const TRICKY_BODY: &str = "### Added\n\
 // the bridge proofs
 // ---------------------------------------------------------------------------
 
-/// The core §4 assertion set: the emitted v0.26 manifest parses under the
-/// FROZEN v0.25 struct with schema ≤ 1, every required field intact, and a
-/// build number above the fleet floor.
+/// The core §4 assertion set: the emitted manifest parses under the FROZEN
+/// v0.25 struct with schema ≤ 1, every required field intact, and a build
+/// number above the fleet floor. The version it carries is today's canonical
+/// `MAJOR.MINOR.PATCH` release string; the wire format itself never changed.
 #[test]
 fn emitted_v026_manifest_parses_under_the_frozen_v025_struct() {
     let m = manifest_out::build(&spec4_inputs(TRICKY_BODY));
@@ -124,14 +125,14 @@ fn emitted_v026_manifest_parses_under_the_frozen_v025_struct() {
         old.schema
     );
     assert_eq!(old.schema, 1, "the bridge emits schema = 1, permanently");
-    assert_eq!(old.version, "0.26");
+    assert_eq!(old.version, "0.2.0");
     assert_eq!(old.build_number, 1_783_918_101);
     assert!(
         old.build_number > V025_FLOOR,
         "build_number must beat every fleet floor.toml"
     );
     assert_eq!(
-        old.dmg, "aterm-0.26.dmg",
+        old.dmg, "aterm-0.2.0.dmg",
         "the client resolves the DMG asset by this name"
     );
     assert_eq!(
@@ -155,9 +156,10 @@ fn emitted_v026_manifest_parses_under_the_frozen_v025_struct() {
     );
 }
 
-/// The v0.26 field set includes keys v0.25 never had (url, min_os, team_id,
-/// pub_date). Decision 6 leaned on "v0.25 ignores unknowns" — prove it: the
-/// keys are REALLY in the emitted bytes, and the frozen parser still accepts.
+/// The post-v0.25 field set includes keys v0.25 never had (url, min_os,
+/// team_id, pub_date). Decision 6 leaned on "v0.25 ignores unknowns" — prove
+/// it: the keys are REALLY in the emitted bytes, and the frozen parser still
+/// accepts.
 #[test]
 fn new_v026_keys_are_present_but_invisible_to_v025() {
     let m = manifest_out::build(&spec4_inputs("### Added\n- something"));
@@ -170,7 +172,7 @@ fn new_v026_keys_are_present_but_invisible_to_v025() {
     }
     assert!(
         text.contains(
-            "https://github.com/alabsystems/aterm/releases/download/v0.26/aterm-0.26.dmg"
+            "https://github.com/alabsystems/aterm/releases/download/v0.2.0/aterm-0.2.0.dmg"
         ),
         "install.sh greps this exact URL out of the manifest:\n{text}"
     );
@@ -212,7 +214,7 @@ fn publisher_refuses_min_build_above_its_own_claim() {
     );
 
     let raw = format!(
-        "schema = 1\nversion = \"0.26\"\nbuild_number = {}\nsha256 = \"x\"\n\
+        "schema = 1\nversion = \"0.2.0\"\nbuild_number = {}\nsha256 = \"x\"\n\
          dmg = \"a.dmg\"\nmin_build = {}\n",
         inputs.build_number,
         inputs.build_number + 1
@@ -289,7 +291,7 @@ fn emitted_bytes_round_trip_the_shared_type_exactly() {
 #[test]
 fn the_frozen_v025_parser_rejects_a_future_schema() {
     let err = v025::Manifest::parse(
-        "schema = 2\nversion = \"9.9\"\nbuild_number = 99\nsha256 = \"x\"\ndmg = \"a.dmg\"\n",
+        "schema = 2\nversion = \"9.9.0\"\nbuild_number = 99\nsha256 = \"x\"\ndmg = \"a.dmg\"\n",
     )
     .unwrap_err();
     assert!(err.contains("newer than supported"), "{err}");

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 
 use aterm_buffer::Seq;
-use aterm_grapheme::GraphemeClusters;
+use aterm_grapheme::{GraphemeClusters, grapheme_display_width};
 
 use crate::document_store::{
     DocumentId, DocumentStore, DocumentTxnOutcome, DocumentViewId, EditDelta, TextEdit,
@@ -150,12 +150,21 @@ impl EditorBufferView {
     }
 
     pub(crate) fn scroll_lines(&mut self, text: &str, delta: i32) {
-        let current = line_number(text, self.viewport_anchor);
+        let total_lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        // Store the same stable anchor the renderer can actually present.  A
+        // wheel fling used to retain an EOF line here while paint clamped only
+        // its temporary clone to the last full viewport.  Reverse scrolling
+        // then appeared inert until that invisible debt had been repaid.
+        // `viewport_lines()` also gives a not-yet-reconciled zero-capacity view
+        // the only useful interpretation: one visible line.
+        let last_full_viewport_anchor = total_lines.saturating_sub(self.viewport_lines());
+        let current = line_number(text, self.viewport_anchor).min(last_full_viewport_anchor);
         let target = if delta < 0 {
             current.saturating_sub(delta.unsigned_abs() as usize)
         } else {
             current.saturating_add(delta as usize)
-        };
+        }
+        .min(last_full_viewport_anchor);
         self.viewport_anchor = byte_of_line(text, target);
     }
 
@@ -172,18 +181,24 @@ impl EditorBufferView {
     }
 
     pub(crate) fn ensure_primary_visible(&mut self, text: &str, visible_lines: usize) {
-        let visible_lines = visible_lines.max(1);
-        self.viewport_lines = visible_lines.clamp(1, 256);
+        let visible_lines = visible_lines.clamp(1, 256);
+        self.viewport_lines = visible_lines;
         let caret_line = line_number(text, self.primary_selection().head);
-        let anchor_line = line_number(text, self.viewport_anchor);
+        let total_lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let last_full_viewport_anchor = total_lines.saturating_sub(visible_lines);
+        let mut anchor_line =
+            line_number(text, self.viewport_anchor).min(last_full_viewport_anchor);
         if caret_line < anchor_line {
-            self.viewport_anchor = byte_of_line(text, caret_line);
+            anchor_line = caret_line;
         } else if caret_line >= anchor_line.saturating_add(visible_lines) {
-            self.viewport_anchor = byte_of_line(
-                text,
-                caret_line.saturating_sub(visible_lines.saturating_sub(3)),
-            );
+            anchor_line = caret_line.saturating_sub(visible_lines.saturating_sub(3));
         }
+        // A document replacement can map both the caret and the old anchor to
+        // EOF. Clamp after caret reveal as well: a short document must start at
+        // line zero when the viewport can show it in full, rather than leaving
+        // authored diagnostics above a synthetic trailing blank line.
+        anchor_line = anchor_line.min(last_full_viewport_anchor);
+        self.viewport_anchor = byte_of_line(text, anchor_line);
     }
 
     /// Place or extend the primary selection from a pointer hit expressed as a
@@ -200,7 +215,7 @@ impl EditorBufferView {
         if self.minibuffer_active() {
             return false;
         }
-        let position = clamp_to_char_boundary(text, position.min(text.len()));
+        let position = clamp_to_grapheme_boundary(text, position.min(text.len()));
         let before = self.selections.clone();
         let before_primary = self.primary;
         if extend && !self.selections.is_empty() {
@@ -1001,7 +1016,12 @@ impl EditorWorkspace {
                 let snapshot = snapshot_for_view(store, view)?;
                 let desired = view.desired_column.unwrap_or_else(|| {
                     let head = view.primary_selection().head;
-                    head.saturating_sub(line_start(&snapshot.text, head))
+                    let start = line_start(&snapshot.text, head);
+                    editor_display_column(
+                        &snapshot.text[start..line_end(&snapshot.text, head)],
+                        head.saturating_sub(start),
+                        0,
+                    )
                 });
                 view.desired_column = Some(desired);
                 let preserve_anchor = view.mark_active;
@@ -1015,7 +1035,12 @@ impl EditorWorkspace {
                 let snapshot = snapshot_for_view(store, view)?;
                 let desired = view.desired_column.unwrap_or_else(|| {
                     let head = view.primary_selection().head;
-                    head.saturating_sub(line_start(&snapshot.text, head))
+                    let start = line_start(&snapshot.text, head);
+                    editor_display_column(
+                        &snapshot.text[start..line_end(&snapshot.text, head)],
+                        head.saturating_sub(start),
+                        0,
+                    )
                 });
                 view.desired_column = Some(desired);
                 let preserve_anchor = view.mark_active;
@@ -1050,14 +1075,15 @@ impl EditorWorkspace {
                 let count = view.take_count();
                 let preserve_anchor = view.mark_active;
                 for selection in &mut view.selections {
-                    let mut at = selection.head;
-                    for _ in 0..count {
-                        at = if command == EditorCommand::MoveWordBackward {
-                            previous_word_boundary(&snapshot.text, at)
-                        } else {
-                            next_word_boundary(&snapshot.text, at)
-                        };
-                    }
+                    let at = if command == EditorCommand::MoveWordBackward {
+                        previous_word_boundary(&snapshot.text, selection.head, count)
+                    } else {
+                        let mut at = selection.head;
+                        for _ in 0..count {
+                            at = next_word_boundary(&snapshot.text, at);
+                        }
+                        at
+                    };
                     selection.move_head(at, preserve_anchor);
                 }
                 view.desired_column = None;
@@ -1546,25 +1572,29 @@ fn editor_word_character(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
 
-fn previous_word_boundary(text: &str, position: usize) -> usize {
-    let mut at = clamp_to_char_boundary(text, position.min(text.len()));
-    while at > 0 {
-        let before = previous_boundary(text, at);
-        let character = text[before..at].chars().next().unwrap_or(' ');
-        if editor_word_character(character) {
+fn previous_word_boundary(text: &str, position: usize, count: usize) -> usize {
+    let position = clamp_to_char_boundary(text, position.min(text.len()));
+    let count = count.clamp(1, 10_000);
+    let mut recent_starts = VecDeque::with_capacity(count);
+    let mut in_word = false;
+    for (byte, grapheme) in text.grapheme_indices() {
+        if byte.saturating_add(grapheme.len()) > position {
             break;
         }
-        at = before;
-    }
-    while at > 0 {
-        let before = previous_boundary(text, at);
-        let character = text[before..at].chars().next().unwrap_or(' ');
-        if !editor_word_character(character) {
-            break;
+        let is_word = grapheme.chars().next().is_some_and(editor_word_character);
+        if is_word && !in_word {
+            if recent_starts.len() == count {
+                recent_starts.pop_front();
+            }
+            recent_starts.push_back(byte);
         }
-        at = before;
+        in_word = is_word;
     }
-    at
+    if recent_starts.len() == count {
+        recent_starts.front().copied().unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 fn next_word_boundary(text: &str, position: usize) -> usize {
@@ -1609,10 +1639,7 @@ fn previous_line_position(text: &str, position: usize, desired_column: usize) ->
     }
     let previous_end = current_start.saturating_sub(1);
     let previous_start = line_start(text, previous_end);
-    clamp_to_char_boundary(
-        text,
-        previous_start.saturating_add(desired_column.min(previous_end - previous_start)),
-    )
+    byte_at_editor_display_column(text, previous_start, previous_end, desired_column)
 }
 
 fn next_line_position(text: &str, position: usize, desired_column: usize) -> usize {
@@ -1623,10 +1650,7 @@ fn next_line_position(text: &str, position: usize, desired_column: usize) -> usi
     }
     let next_start = current_end.saturating_add(1);
     let next_end = line_end(text, next_start);
-    clamp_to_char_boundary(
-        text,
-        next_start.saturating_add(desired_column.min(next_end - next_start)),
-    )
+    byte_at_editor_display_column(text, next_start, next_end, desired_column)
 }
 
 fn clamp_to_char_boundary(text: &str, mut position: usize) -> usize {
@@ -1635,6 +1659,44 @@ fn clamp_to_char_boundary(text: &str, mut position: usize) -> usize {
         position -= 1;
     }
     position
+}
+
+/// Clamp an externally supplied editor position to the preceding user-visible
+/// character boundary. Pointer mapping already emits these boundaries; keeping
+/// the reducer seam defensive prevents accessibility or a future adapter from
+/// installing a caret between a base, combining mark, emoji joiner, or flag RI.
+fn clamp_to_grapheme_boundary(text: &str, position: usize) -> usize {
+    let position = clamp_to_char_boundary(text, position);
+    if position == 0 || position == text.len() {
+        return position;
+    }
+    let start = line_start(text, position);
+    let end = line_end(text, position);
+    // Include the line-feed in segmentation when one exists. Its grapheme
+    // start proves an ordinary LF line-end is addressable, while UAX #29 keeps
+    // CRLF together and therefore retreats a position between CR and LF to the
+    // start of that pair.
+    let scan_end = end.saturating_add(usize::from(end < text.len()));
+    text[start..scan_end]
+        .grapheme_indices()
+        .map(|(offset, _)| start.saturating_add(offset))
+        .take_while(|boundary| *boundary <= position)
+        .last()
+        .unwrap_or(start)
+}
+
+fn byte_at_editor_display_column(text: &str, start: usize, end: usize, target: usize) -> usize {
+    let mut column = 0usize;
+    let mut byte = start;
+    for (offset, grapheme) in text[start..end].grapheme_indices() {
+        let width = editor_grapheme_columns(grapheme, column);
+        if column.saturating_add(width) > target {
+            break;
+        }
+        column = column.saturating_add(width);
+        byte = start.saturating_add(offset).saturating_add(grapheme.len());
+    }
+    byte
 }
 
 fn line_number(text: &str, position: usize) -> usize {
@@ -1671,6 +1733,34 @@ pub(crate) struct EditorSelectionSpan {
 /// Keeping source byte ranges beside the display text lets pointer and
 /// accessibility adapters map back to the canonical document without a second
 /// independently wrapped representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditorSyntaxClass {
+    Table,
+    Key,
+    String,
+    Number,
+    Boolean,
+    Comment,
+}
+
+/// One UTF-8-safe syntax run relative to [`EditorViewportLine::text`]. Language
+/// services prepare these runs before paint; the renderer only lowers the
+/// already-bounded visible projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EditorSyntaxSpan {
+    pub(crate) bytes: Range<usize>,
+    pub(crate) class: EditorSyntaxClass,
+}
+
+/// One UTF-8-safe diagnostic underline relative to the visible line. The
+/// human-readable diagnostic remains in the editor modeline/assist projection;
+/// paint needs only severity and source cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EditorDiagnosticSpan {
+    pub(crate) bytes: Range<usize>,
+    pub(crate) error: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EditorViewportLine {
     pub(crate) number: usize,
@@ -1682,6 +1772,8 @@ pub(crate) struct EditorViewportLine {
     pub(crate) text: String,
     pub(crate) selections: Vec<EditorSelectionSpan>,
     pub(crate) carets: Vec<(usize, bool)>,
+    pub(crate) syntax: Vec<EditorSyntaxSpan>,
+    pub(crate) diagnostics: Vec<EditorDiagnosticSpan>,
 }
 
 /// Visible-only editor projection. Large documents never copy or lay out more
@@ -1773,6 +1865,8 @@ pub(crate) fn project_viewport(
             text: line_text,
             selections,
             carets,
+            syntax: Vec::new(),
+            diagnostics: Vec::new(),
         });
 
         if full_end == text.len() {
@@ -1797,7 +1891,46 @@ enum HorizontalWindowAnchor {
     /// Bounded fallback for a pathological line whose prefix alone exceeds the
     /// per-line projection budget. The byte offset remains UTF-8-clamped per row
     /// and, crucially, keeps the primary caret in the retained source band.
-    ByteOffset(usize),
+    ByteOffset {
+        line_start: usize,
+        window_start: usize,
+    },
+}
+
+/// Display cells occupied by one complete editor grapheme at `column`.
+///
+/// Tabs retain the editor's canonical four-cell phase. Every other cluster
+/// uses the same Unicode width authority as the terminal, including CJK,
+/// combining sequences, flags, and ZWJ emoji. This function is crate-visible
+/// so native UI hit testing and paint geometry cannot drift from projection.
+pub(crate) fn editor_grapheme_columns(grapheme: &str, column: usize) -> usize {
+    if grapheme == "\t" {
+        4 - column % 4
+    } else if grapheme.chars().any(char::is_control) {
+        // The editor suppresses control clusters rather than asking the font
+        // rasterizer to render a terminal-style replacement cell. Geometry
+        // must make the same choice or projection, hit testing, and paint
+        // disagree (and a control-only line defeats the visible-cell bound).
+        0
+    } else {
+        grapheme_display_width(grapheme)
+    }
+}
+
+/// Display-cell offset of the complete graphemes ending at or before `byte`.
+/// `column_start` supplies tab phase for a horizontally projected row; the
+/// returned value is relative to that origin.
+pub(crate) fn editor_display_column(text: &str, byte: usize, column_start: usize) -> usize {
+    let requested = clamp_to_char_boundary(text, byte.min(text.len()));
+    let mut column = column_start;
+    for (offset, grapheme) in text.grapheme_indices() {
+        let end = offset.saturating_add(grapheme.len());
+        if end > requested {
+            break;
+        }
+        column = column.saturating_add(editor_grapheme_columns(grapheme, column));
+    }
+    column.saturating_sub(column_start)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1816,8 +1949,16 @@ fn horizontal_window_anchor(
     let left_target = column_budget.saturating_mul(3) / 4;
     if caret.saturating_sub(line_start) <= byte_budget {
         let mut columns = 0usize;
-        for character in text[line_start..caret].chars() {
-            columns = columns.saturating_add(editor_character_columns(character, columns));
+        let end = line_end(text, caret);
+        for (offset, grapheme) in text[line_start..end].grapheme_indices() {
+            if line_start
+                .saturating_add(offset)
+                .saturating_add(grapheme.len())
+                > caret
+            {
+                break;
+            }
+            columns = columns.saturating_add(editor_grapheme_columns(grapheme, columns));
         }
         return HorizontalWindowAnchor::Columns(columns.saturating_sub(left_target));
     }
@@ -1826,13 +1967,26 @@ fn horizontal_window_anchor(
         clamp_to_char_boundary(text, caret.saturating_sub(byte_budget).max(line_start));
     let mut window_start = caret;
     let mut left_columns = 0usize;
-    for (relative, character) in text[search_start..caret].char_indices().rev() {
-        let columns = if character == '\t' {
+    // The workspace grapheme iterator is forward-only. Materialize at most the
+    // already-bounded 32 KiB fallback window, then walk it backwards. Do not
+    // select the artificial first cluster when the scan begins mid-line: it
+    // may be the suffix of a pathological cluster that started before the
+    // byte budget. If no later boundary exists, showing from the caret is the
+    // bounded fail-safe and never emits a partial grapheme.
+    let graphemes = text[search_start..caret]
+        .grapheme_indices()
+        .collect::<Vec<_>>();
+    for (relative, grapheme) in graphemes.into_iter().rev() {
+        if relative == 0 && search_start > line_start {
+            break;
+        }
+        // Reverse traversal cannot recover the absolute phase of an earlier
+        // tab without scanning the unbounded prefix. Four is its conservative
+        // maximum; the exact forward pass begins again at the projected origin.
+        let columns = if grapheme == "\t" {
             4
-        } else if character.is_control() {
-            0
         } else {
-            1
+            editor_grapheme_columns(grapheme, 0)
         };
         if left_columns.saturating_add(columns) > left_target {
             break;
@@ -1840,7 +1994,10 @@ fn horizontal_window_anchor(
         window_start = search_start.saturating_add(relative);
         left_columns = left_columns.saturating_add(columns);
     }
-    HorizontalWindowAnchor::ByteOffset(window_start.saturating_sub(line_start))
+    HorizontalWindowAnchor::ByteOffset {
+        line_start,
+        window_start,
+    }
 }
 
 /// Choose one UTF-8-safe, width-bounded slice using the workspace's shared
@@ -1861,50 +2018,57 @@ fn bounded_line_window(
         HorizontalWindowAnchor::Columns(target) => {
             let mut at = start;
             let mut columns = 0usize;
-            for (relative, character) in text[start..end].char_indices() {
+            for (relative, grapheme) in text[start..end].grapheme_indices() {
                 if columns >= target {
                     break;
                 }
-                let character_columns = editor_character_columns(character, columns);
-                if columns.saturating_add(character_columns) > target {
+                let grapheme_columns = editor_grapheme_columns(grapheme, columns);
+                if columns.saturating_add(grapheme_columns) > target {
                     break;
                 }
-                columns = columns.saturating_add(character_columns);
+                columns = columns.saturating_add(grapheme_columns);
                 at = start
                     .saturating_add(relative)
-                    .saturating_add(character.len_utf8());
+                    .saturating_add(grapheme.len());
             }
             (at, columns)
         }
-        HorizontalWindowAnchor::ByteOffset(offset) => {
-            let at = clamp_to_char_boundary(text, start.saturating_add(offset).min(end));
-            let mut columns = 0usize;
-            for character in text[start..at].chars() {
-                columns = columns.saturating_add(editor_character_columns(character, columns));
+        HorizontalWindowAnchor::ByteOffset {
+            line_start,
+            window_start,
+        } => {
+            // Only the pathological primary line owns a proven bounded
+            // grapheme start. Other visible rows begin at their real line
+            // boundary rather than reusing a byte offset that could bisect a
+            // different cluster (and would require scanning an unbounded
+            // prefix merely to recover tab phase).
+            if start == line_start {
+                (window_start.clamp(start, end), 0)
+            } else {
+                (start, 0)
             }
-            (at, columns)
         }
     };
 
     let mut window_end = window_start;
     let mut columns = column_start;
-    for (relative, character) in text[window_start..end].char_indices() {
+    for (relative, grapheme) in text[window_start..end].grapheme_indices() {
         let next = window_start
             .saturating_add(relative)
-            .saturating_add(character.len_utf8());
+            .saturating_add(grapheme.len());
         if next.saturating_sub(window_start) > byte_budget {
             break;
         }
-        let character_columns = editor_character_columns(character, columns);
+        let grapheme_columns = editor_grapheme_columns(grapheme, columns);
         if columns
-            .saturating_add(character_columns)
+            .saturating_add(grapheme_columns)
             .saturating_sub(column_start)
             > column_budget
             && window_end > window_start
         {
             break;
         }
-        columns = columns.saturating_add(character_columns);
+        columns = columns.saturating_add(grapheme_columns);
         window_end = next;
         if columns.saturating_sub(column_start) >= column_budget {
             break;
@@ -1912,25 +2076,16 @@ fn bounded_line_window(
     }
     if window_end == window_start && window_start < end {
         window_end = text[window_start..end]
-            .chars()
+            .graphemes()
             .next()
-            .map_or(window_start, |character| {
-                window_start.saturating_add(character.len_utf8()).min(end)
+            .filter(|grapheme| grapheme.len() <= byte_budget)
+            .map_or(window_start, |grapheme| {
+                window_start.saturating_add(grapheme.len()).min(end)
             });
     }
     HorizontalLineWindow {
         source: window_start..window_end,
         column_start,
-    }
-}
-
-fn editor_character_columns(character: char, column: usize) -> usize {
-    if character == '\t' {
-        4 - column % 4
-    } else if character.is_control() {
-        0
-    } else {
-        1
     }
 }
 
@@ -2014,8 +2169,12 @@ impl Keymap {
             (&["C-n"][..], EditorCommand::MoveLineDown),
             (&["C-a"][..], EditorCommand::MoveLineStart),
             (&["C-e"][..], EditorCommand::MoveLineEnd),
-            (&["M-b"][..], EditorCommand::MoveWordBackward),
-            (&["M-f"][..], EditorCommand::MoveWordForward),
+            // Both spellings of word motion: the emacs one and the macOS one.
+            // ⌥←/⌥→ are what a Mac user reaches for; `M-b`/`M-f` are what an
+            // emacs user reaches for. Binding only the latter made the arrows
+            // silently dead.
+            (&["M-b", "M-left"][..], EditorCommand::MoveWordBackward),
+            (&["M-f", "M-right"][..], EditorCommand::MoveWordForward),
             (&["Backspace"][..], EditorCommand::DeleteBackward),
             (&["C-d"][..], EditorCommand::DeleteForward),
             (&["C-Space"][..], EditorCommand::SetMark),
@@ -2271,6 +2430,45 @@ mod tests {
     }
 
     #[test]
+    fn vertical_motion_preserves_display_cells_across_zwj_and_cjk_lines() {
+        let text = "abcd\n👩‍💻xyz\n中xyz";
+        let (mut store, mut workspace, mut view, _) = editor(text);
+        view.selections = vec![Selection::caret("abcd".len())];
+
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::MoveLineDown)
+            .unwrap();
+        let emoji_target = "abcd\n".len() + "👩‍💻xy".len();
+        assert_eq!(view.primary_selection().head, emoji_target);
+        assert!(
+            text.grapheme_indices()
+                .any(|(byte, _)| byte == emoji_target)
+        );
+
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::MoveLineDown)
+            .unwrap();
+        let cjk_target = "abcd\n👩‍💻xyz\n".len() + "中xy".len();
+        assert_eq!(view.primary_selection().head, cjk_target);
+        assert!(text.grapheme_indices().any(|(byte, _)| byte == cjk_target));
+
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::MoveLineUp)
+            .unwrap();
+        assert_eq!(view.primary_selection().head, emoji_target);
+    }
+
+    #[test]
+    fn editor_cell_widths_share_tab_unicode_and_suppressed_control_semantics() {
+        assert_eq!(editor_grapheme_columns("\t", 0), 4);
+        assert_eq!(editor_grapheme_columns("\t", 3), 1);
+        assert_eq!(editor_grapheme_columns("e\u{301}", 0), 1);
+        assert_eq!(editor_grapheme_columns("中", 0), 2);
+        assert_eq!(editor_grapheme_columns("👩‍💻", 0), 2);
+        assert_eq!(editor_grapheme_columns("\u{0001}", 17), 0);
+    }
+
+    #[test]
     fn viewport_scroll_and_caret_reveal_use_stable_line_anchors() {
         let text = (0..100)
             .map(|line| format!("line {line}\n"))
@@ -2287,25 +2485,122 @@ mod tests {
     }
 
     #[test]
+    fn viewport_scroll_stores_only_presentable_anchors_at_every_capacity() {
+        let text = (0..12)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let (_, _, mut view, _) = editor(&text);
+        view.reconcile_viewport(&text, 4);
+
+        view.scroll_lines(&text, i32::MAX);
+        assert_eq!(line_number(&text, view.viewport_anchor), 9);
+        let bottom = view.viewport_anchor;
+        view.scroll_lines(&text, -1);
+        assert_eq!(line_number(&text, view.viewport_anchor), 8);
+        assert!(view.viewport_anchor < bottom, "one reverse step moves now");
+
+        // Short and empty documents have no scrollable full-viewport anchor.
+        for short in ["", "one", "one\ntwo"] {
+            let (_, _, mut short_view, _) = editor(short);
+            short_view.reconcile_viewport(short, 40);
+            short_view.scroll_lines(short, i32::MAX);
+            assert_eq!(short_view.viewport_anchor, 0);
+            short_view.scroll_lines(short, i32::MIN);
+            assert_eq!(short_view.viewport_anchor, 0);
+        }
+
+        // A view may receive wheel input before its first geometry reconcile.
+        // Zero renderer capacity is normalized to one row, never underflowed.
+        let (_, _, mut zero_view, _) = editor(&text);
+        zero_view.viewport_lines = 0;
+        zero_view.scroll_lines(&text, i32::MAX);
+        assert_eq!(line_number(&text, zero_view.viewport_anchor), 12);
+        zero_view.scroll_lines(&text, -1);
+        assert_eq!(line_number(&text, zero_view.viewport_anchor), 11);
+    }
+
+    #[test]
+    fn short_replacement_documents_clamp_the_viewport_to_the_first_line() {
+        for text in ["# Manual\nfont_px = [ \n", "# Manual\nfont_px = 14\n"] {
+            let (_, _, mut view, _) = editor(text);
+            // External replacement maps a former tail caret and scroll anchor
+            // to the new EOF. The renderer has much more room than this file.
+            view.viewport_anchor = text.len();
+            view.selections = vec![Selection::caret(text.len())];
+
+            assert!(view.reconcile_viewport(text, 40));
+            assert_eq!(line_number(text, view.viewport_anchor), 0);
+            let projection = project_viewport(text, &view, 40, usize::MAX);
+            assert_eq!(projection.first_line, 0);
+            assert_eq!(projection.total_lines, 3);
+            assert_eq!(projection.lines.len(), 3);
+        }
+    }
+
+    #[test]
     fn real_viewport_reconciliation_conforms_to_renderer_capacity_model() {
         let text = (0..30)
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
         let (_, _, mut view, _) = editor(&text);
         view.selections = vec![Selection::caret(byte_of_line(&text, 20))];
+        let short_text = "# Manual\nfont_px = 14\n";
+        let (_, _, mut short_view, _) = editor(short_text);
+        short_view.viewport_anchor = short_text.len();
+        short_view.selections = vec![Selection::caret(short_text.len())];
 
         let model = native_editor_viewport_model();
         let before = model.init_state();
         assert!(view.reconcile_viewport(&text, 8));
+        assert!(short_view.reconcile_viewport(short_text, 40));
         let mut after = before.clone();
         after.insert(
             "anchor_line",
             line_number(&text, view.viewport_anchor) as i64,
         );
         after.insert("visible_lines", view.viewport_lines() as i64);
+        after.insert(
+            "short_anchor_line",
+            line_number(short_text, short_view.viewport_anchor) as i64,
+        );
+        after.insert("short_visible_lines", short_view.viewport_lines() as i64);
         after.insert("resized", 1);
         assert_eq!(admits(&model, &before, &after), Some("Resize"));
         assert!(model.check_invariant("CaretVisibleAfterResize", &after));
+        assert!(model.check_invariant("ShortDocumentFullyVisible", &after));
+
+        // The shipping scroll transition stores the same bottom anchor paint
+        // presents, then makes immediate progress on one reverse input.
+        let scroll_text = (0..12)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let (_, _, mut scroll_view, _) = editor(&scroll_text);
+        scroll_view.reconcile_viewport(&scroll_text, 4);
+        scroll_view.scroll_lines(&scroll_text, i32::MAX);
+        let scroll_before = model.init_state();
+        let mut at_bottom = scroll_before.clone();
+        at_bottom.insert(
+            "scroll_anchor_line",
+            line_number(&scroll_text, scroll_view.viewport_anchor) as i64,
+        );
+        at_bottom.insert("scroll_phase", 1);
+        assert_eq!(
+            admits(&model, &scroll_before, &at_bottom),
+            Some("Overscroll")
+        );
+        assert!(model.check_invariant("StoredScrollAnchorPresentable", &at_bottom));
+        scroll_view.scroll_lines(&scroll_text, -1);
+        let mut one_line_up = at_bottom.clone();
+        one_line_up.insert(
+            "scroll_anchor_line",
+            line_number(&scroll_text, scroll_view.viewport_anchor) as i64,
+        );
+        one_line_up.insert("scroll_phase", 2);
+        assert_eq!(
+            admits(&model, &at_bottom, &one_line_up),
+            Some("ReverseScroll")
+        );
+        assert!(model.check_invariant("FirstReverseStepMoves", &one_line_up));
 
         // Negative control: retaining the old desktop anchor after installing
         // the compact row count hides the caret and is not a real transition.
@@ -2314,6 +2609,13 @@ mod tests {
         fixed_desktop.insert("resized", 1);
         assert_eq!(admits(&model, &before, &fixed_desktop), None);
         assert!(!model.check_invariant("CaretVisibleAfterResize", &fixed_desktop));
+
+        // Negative control: leaving a short replacement anchored at its EOF is
+        // not the shipping transition and violates full-document visibility.
+        let mut stranded_short = after;
+        stranded_short.insert("short_anchor_line", 2);
+        assert_eq!(admits(&model, &before, &stranded_short), None);
+        assert!(!model.check_invariant("ShortDocumentFullyVisible", &stranded_short));
     }
 
     #[test]
@@ -2421,6 +2723,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_horizontal_window_never_splits_zwj_or_combining_graphemes() {
+        let text = format!("{}👩‍💻x", "a".repeat(31));
+        let (_, _, mut view, _) = editor(&text);
+        view.selections = vec![Selection::caret(text.len())];
+
+        let projection = project_viewport(&text, &view, 1, 4);
+        let line = &projection.lines[0];
+        assert_eq!(line.text, "👩‍💻x");
+        assert_eq!(line.source.start, 31);
+        assert!(
+            line.source.start == text.len()
+                || text
+                    .grapheme_indices()
+                    .any(|(boundary, _)| boundary == line.source.start)
+        );
+        assert!(
+            line.source.end == text.len()
+                || text
+                    .grapheme_indices()
+                    .any(|(boundary, _)| boundary == line.source.end)
+        );
+
+        let text = "abce\u{301}z";
+        let (_, _, view, _) = editor(text);
+        let projection = project_viewport(text, &view, 1, 4);
+        let line = &projection.lines[0];
+        assert_eq!(line.text, "abce\u{301}");
+        assert_eq!(line.source, 0.."abce\u{301}".len());
+        assert_eq!(
+            line.text.graphemes().collect::<Vec<_>>(),
+            ["a", "b", "c", "e\u{301}"]
+        );
+    }
+
+    #[test]
     fn viewport_projection_bounds_pathological_long_line_and_keeps_caret_visible() {
         let text = "α".repeat(600_000);
         let (_, _, mut view, _) = editor(&text);
@@ -2435,6 +2772,20 @@ mod tests {
         assert_eq!(line.carets, vec![(caret - line.source.start, true)]);
         assert!(text.is_char_boundary(line.source.start));
         assert!(text.is_char_boundary(line.source.end));
+    }
+
+    #[test]
+    fn viewport_projection_drops_an_over_budget_grapheme_instead_of_splitting_it() {
+        let text = format!("e{}", "\u{301}".repeat(20_000));
+        assert!(text.len() > 32 * 1024);
+        assert_eq!(text.graphemes().count(), 1);
+        let (_, _, view, _) = editor(&text);
+
+        let projection = project_viewport(&text, &view, 1, usize::MAX);
+        let line = &projection.lines[0];
+        assert_eq!(line.text, "");
+        assert_eq!(line.source, 0..0);
+        assert!(line.text.len() <= 32 * 1024);
     }
 
     #[test]
@@ -2468,9 +2819,36 @@ mod tests {
         assert!(view.pointer_select(text, "aé🦀".len(), true, 4));
         assert_eq!(view.primary_selection().range(), 1.."aé🦀".len());
 
+        let first_line_end = text.find('\n').unwrap();
+        assert!(view.pointer_select(text, first_line_end, false, 4));
+        assert_eq!(view.primary_selection(), &Selection::caret(first_line_end));
+
         assert!(view.pointer_select(text, usize::MAX, false, 4));
         assert_eq!(view.primary_selection(), &Selection::caret(text.len()));
         assert!(!view.pointer_select(text, text.len(), false, 4));
+    }
+
+    #[test]
+    fn pointer_selection_clamps_to_complete_user_visible_graphemes() {
+        let text = "ae\u{301}👩‍💻z";
+        let (_, _, mut view, _) = editor(text);
+
+        assert!(view.pointer_select(text, "ae".len(), false, 4));
+        assert_eq!(view.primary_selection(), &Selection::caret("a".len()));
+
+        let emoji_start = "ae\u{301}".len();
+        assert!(view.pointer_select(text, emoji_start + "👩".len(), false, 4));
+        assert_eq!(view.primary_selection(), &Selection::caret(emoji_start));
+
+        let crlf = "ab\r\ncd";
+        let (_, _, mut view, _) = editor(crlf);
+        assert!(view.pointer_select(crlf, 3, false, 4));
+        assert_eq!(
+            view.primary_selection(),
+            &Selection::caret(2),
+            "the interior of CRLF retreats to the start of the pair"
+        );
+        assert!(!view.pointer_select(crlf, 2, false, 4));
     }
 
     #[test]
@@ -2677,6 +3055,21 @@ mod tests {
                 reachable: vec!["g  goto-line".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn backward_word_scans_a_long_token_once_and_applies_counts_in_one_pass() {
+        let token = "a".repeat(256 * 1024);
+        let text = format!("{token} one two three");
+        let one = token.len() + 1;
+        let two = one + "one ".len();
+        let three = two + "two ".len();
+
+        assert_eq!(previous_word_boundary(&text, text.len(), 1), three);
+        assert_eq!(previous_word_boundary(&text, text.len(), 2), two);
+        assert_eq!(previous_word_boundary(&text, text.len(), 3), one);
+        assert_eq!(previous_word_boundary(&text, three, 1), two);
+        assert_eq!(previous_word_boundary(&text, text.len(), 4), 0);
     }
 
     #[test]

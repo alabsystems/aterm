@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::tone::Tone;
 use aterm_effects::trail_sound::{
-    BedVariant, CHANNELS, SoundEvent, SoundGesture, SoundKind, TrailSynth,
+    BedVariant, CHANNELS, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth,
 };
 
 /// Output stream rate — the host's canonical rate, shared with
@@ -126,6 +126,7 @@ fn render_candidate(variant: BedVariant, seconds: f32) -> Vec<f32> {
             let (ct, kind, pan, heat) = cues[cue_i];
             synth.push(SoundEvent {
                 style: GlowStyle::Nyan,
+                voice: SoundVoice::Style,
                 kind: SoundGesture::Trail(kind),
                 pan,
                 heat,

@@ -12,11 +12,13 @@
 //! * **macOS** — the system **Keychain** (generic password, service
 //!   [`KEYCHAIN_SERVICE`], account = the connection name). The best-experience
 //!   default; provisioned with [`store_token`], read with [`resolve_token`].
-//! * **Linux** — a referenced **0600 `token_file`** (SSH-key style);
+//! * **Linux** — an explicit **0600 `token_file`**, or the conventional
+//!   `~/.config/aterm/net/<name>.token` written by [`store_token`].
 //!   [`resolve_token`] refuses a group/world-accessible file.
-//! * **Windows** — a `token_file` too, but there are no POSIX mode bits: the
-//!   file is exclusive-created and inherits its directory's ACL (0600 is NOT
-//!   enforced), and reads refuse symlinks/junctions and non-regular files.
+//! * **Windows** — the explicit/conventional token file too, but there are no
+//!   POSIX mode bits: the file is exclusive-created and inherits its
+//!   directory's ACL (0600 is NOT enforced), and reads refuse
+//!   symlinks/junctions and non-regular files.
 //!
 //! Connections are re-read from disk on each [`resolve`], so edits take effect
 //! without a restart.
@@ -47,25 +49,59 @@ pub(crate) fn resolve(name: &str) -> Option<Connection> {
 pub(crate) fn names() -> Vec<String> {
     crate::app_config::load_config()
         .net
-        .map(|n| {
-            n.connections
-                .into_iter()
-                .map(|c| c.name)
-                .filter(|name| valid_connection_name(name))
-                .collect()
-        })
+        .map(|net| dialable_names(net.connections))
         .unwrap_or_default()
+}
+
+fn dialable_names(connections: Vec<Connection>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    connections
+        .into_iter()
+        .map(|connection| connection.name)
+        .filter(|name| valid_connection_name(name) && seen.insert(name.clone()))
+        .collect()
 }
 
 /// A connection name indexes the macOS Keychain account AND (off-macOS) a
 /// `<name>.token` file path, so it is restricted to a safe alphabet: a non-empty
 /// run of `[A-Za-z0-9_-]`. This rejects whitespace (so `dial-list` and `dial`
 /// agree) and any `.`/`..`/`/` that could traverse out of `~/.config/aterm/net`.
-fn valid_connection_name(name: &str) -> bool {
+pub(crate) fn valid_connection_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Pure syntax check for the outbound endpoint accepted by the dial path. DNS
+/// names remain valid without resolving them in Manual's background analysis;
+/// malformed/missing ports, raw unbracketed IPv6, whitespace, and impossible
+/// port zero are rejected before a user waits for a network attempt.
+pub(crate) fn valid_dial_endpoint(endpoint: &str) -> bool {
+    if endpoint.is_empty() || endpoint != endpoint.trim() {
+        return false;
+    }
+    if let Ok(address) = endpoint.parse::<std::net::SocketAddr>() {
+        return address.port() != 0;
+    }
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        return false;
+    };
+    if host.is_empty()
+        || host.len() > 253
+        || host.contains(':')
+        || host.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '/' | '\\' | '[' | ']')
+        })
+    {
+        return false;
+    }
+    let Ok(port) = port.parse::<u16>() else {
+        return false;
+    };
+    port != 0
 }
 
 /// Parse the configured cert `fingerprint` (64-char SHA-256 hex, optionally
@@ -147,13 +183,33 @@ pub(crate) fn resolve_token(conn: &Connection) -> Result<EdgeToken, String> {
     if let Some(path) = &conn.token_file {
         return token_from_file(path);
     }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(directory) = config_net_dir() {
+        return resolve_conventional_file_token(conn, &directory);
+    }
     Err(provision_hint(&conn.name))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn resolve_conventional_file_token(
+    conn: &Connection,
+    directory: &std::path::Path,
+) -> Result<EdgeToken, String> {
+    token_from_path(
+        &directory.join(format!("{}.token", conn.name)),
+        &format!("stored token for '{}'", conn.name),
+    )
+    .map_err(|error| format!("{error}; {}", provision_hint(&conn.name)))
+}
+
 fn token_from_file(path: &str) -> Result<EdgeToken, String> {
-    let hex = read_token_file(&expand_tilde(path), path)?;
+    token_from_path(&expand_tilde(path), path)
+}
+
+fn token_from_path(path: &std::path::Path, label: &str) -> Result<EdgeToken, String> {
+    let hex = read_token_file(path, label)?;
     EdgeToken::from_hex(hex.trim())
-        .ok_or_else(|| format!("token_file {path} does not contain 64-char hex"))
+        .ok_or_else(|| format!("token_file {label} does not contain 64-char hex"))
 }
 
 /// Upper bound on a `token_file` read. A legit token file is one 64-char hex line
@@ -161,7 +217,6 @@ fn token_from_file(path: &str) -> Result<EdgeToken, String> {
 /// FIFO, a device, a runaway file — fail fast instead of growing memory without
 /// bound. Read via `take(TOKEN_FILE_MAX + 1)` so hitting the cap is
 /// distinguishable from a file of exactly the cap size.
-#[cfg_attr(not(any(unix, windows)), allow(dead_code))] // the fallback reader is an uncapped stub
 const TOKEN_FILE_MAX: u64 = 4096;
 
 /// Read a 0600 token file's contents. On Unix: open ONCE with `O_NOFOLLOW` (reject
@@ -249,7 +304,8 @@ fn read_token_file(p: &std::path::Path, path: &str) -> Result<String, String> {
 
 #[cfg(not(any(unix, windows)))]
 fn read_token_file(p: &std::path::Path, path: &str) -> Result<String, String> {
-    std::fs::read_to_string(p).map_err(|e| format!("token_file {path}: {e}"))
+    aterm_effects::file_feed::read_bounded_regular_utf8(p, TOKEN_FILE_MAX as usize)
+        .map_err(|e| format!("token_file {path}: {e}"))
 }
 
 /// Provision a connection's drive token: into the macOS Keychain, else a 0600
@@ -447,6 +503,77 @@ mod tests {
             parse_fingerprint(&"zz".repeat(32)).is_none(),
             "non-hex rejected"
         );
+    }
+
+    #[test]
+    fn dial_endpoint_syntax_and_name_catalog_are_bounded_and_unambiguous() {
+        for valid in [
+            "work.example:7100",
+            "localhost:1",
+            "127.0.0.1:7100",
+            "[::1]:7100",
+        ] {
+            assert!(valid_dial_endpoint(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "work.example",
+            ":7100",
+            "work.example:0",
+            "work.example:not-a-port",
+            "::1:7100",
+            " work.example:7100",
+            "work/example:7100",
+        ] {
+            assert!(!valid_dial_endpoint(invalid), "{invalid}");
+        }
+
+        let connection = |name: &str| Connection {
+            name: name.to_string(),
+            host: "127.0.0.1:7100".to_string(),
+            fingerprint: "00".repeat(32),
+            token_file: None,
+            sid: None,
+            expect_nonce: None,
+        };
+        assert_eq!(
+            dialable_names(vec![
+                connection("work"),
+                connection("bad name"),
+                connection("work"),
+                connection("home"),
+            ]),
+            ["work", "home"],
+            "first configured name wins and output order remains stable"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn conventional_dial_token_file_roundtrips_without_an_explicit_token_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-conventional-dial-token-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = "5a".repeat(32);
+        write_0600(&dir.join("work-box.token"), &token).unwrap();
+        let connection = Connection {
+            name: "work-box".to_string(),
+            host: "127.0.0.1:7100".to_string(),
+            fingerprint: "00".repeat(32),
+            token_file: None,
+            sid: None,
+            expect_nonce: None,
+        };
+        assert_eq!(
+            resolve_conventional_file_token(&connection, &dir)
+                .unwrap()
+                .to_hex(),
+            token
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

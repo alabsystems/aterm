@@ -172,9 +172,8 @@ pub enum MenuAction {
     /// "click-upgrade" ask); with nothing actually staged it falls back to the Software
     /// Update route (honest details, never a silent dead click or a blind restart).
     ApplyUpdate,
-    /// Open aterm.toml — open `~/.config/aterm/aterm.toml` in the default editor,
-    /// creating a documented starter file if absent (`open_config_file`). The
-    /// escape hatch for keys the Settings app does not surface.
+    /// Open aterm.toml — open the canonical config in Settings ▸ Manual's native,
+    /// assisted editor. This is cross-platform and shares the exact document/save host.
     Preferences,
     /// Quit aterm.
     Quit,
@@ -239,15 +238,6 @@ pub enum MenuAction {
     /// every audible and decorative effect without overwriting the underlying
     /// preferences; disabling it restores those requested settings exactly.
     ToggleSeriousMode,
-    /// Toggle the WHOLE bottom HUD band — the master `show_hud` switch over every
-    /// panel (`App::toggle_hud_master`); per-panel keys are preserved for re-enable.
-    ShowHud,
-    /// Toggle the Resources HUD widget (system vs session).
-    ShowResourcesHud,
-    /// Toggle the aterm Engine HUD widget (render speed / memory).
-    ShowEngineHud,
-    /// Open the Performance control panel (all HUD toggles in one window).
-    ShowPerformancePanel,
     /// Focus or create the process-singleton Settings tab. The app-menu Settings…
     /// item — ⌘, — uses the standard macOS settings chord.
     ToggleSettings,
@@ -315,10 +305,7 @@ impl MenuAction {
             MenuAction::SplitHorizontal => 25,
             MenuAction::NextTab => 26,
             MenuAction::PrevTab => 27,
-            MenuAction::ShowResourcesHud => 28,
-            MenuAction::ShowEngineHud => 29,
-            MenuAction::ShowHud => 33,
-            MenuAction::ShowPerformancePanel => 32,
+            // 28, 29, 32, and 33 were bottom-HUD commands. Keep them reserved.
             MenuAction::ToggleSettings => 30,
             MenuAction::OpenPalette => 31,
             // 34 was "Check for Updates…" (a separate NSAlert check) — folded into
@@ -370,10 +357,7 @@ impl MenuAction {
             25 => MenuAction::SplitHorizontal,
             26 => MenuAction::NextTab,
             27 => MenuAction::PrevTab,
-            28 => MenuAction::ShowResourcesHud,
-            29 => MenuAction::ShowEngineHud,
-            33 => MenuAction::ShowHud,
-            32 => MenuAction::ShowPerformancePanel,
+            // 28, 29, 32, and 33 are retired bottom-HUD tags.
             30 => MenuAction::ToggleSettings,
             31 => MenuAction::OpenPalette,
             // 34 retired (was CheckForUpdates) — see `tag`.
@@ -438,9 +422,9 @@ pub(crate) enum InvokeAuthority {
     /// Benign: the `invoke` verb's base `WriteInput` gate suffices (view/window/tab/
     /// navigation state, runtime-only font zoom — nothing durable or exfiltrating).
     WriteInput,
-    /// Rewrites DURABLE `aterm.toml` on invoke (the persisted `show_*_hud` toggles) or
-    /// raises the durable-config surface (`Preferences` opens `aterm.toml`;
-    /// `ToggleSettings` raises the security-knob overlay) — the `ConfigWrite` fine op.
+    /// Rewrites durable `aterm.toml` on invoke or raises the durable-config surface
+    /// (`Preferences` opens Settings ▸ Manual;
+    /// `ToggleSettings` raises Top Settings) — the `ConfigWrite` fine op.
     ConfigWrite,
     /// Moves the selection onto / reads it off the OS pasteboard — the same exfil/inject
     /// boundary as the `copy` verb, the `ClipboardWrite` fine op.
@@ -476,19 +460,14 @@ impl MenuAction {
             // Durable `aterm.toml` writes / the security-knob config surface.
             MenuAction::Preferences
             | MenuAction::ToggleSettings
-            | MenuAction::ToggleSeriousMode
-            | MenuAction::ShowHud
-            | MenuAction::ShowResourcesHud
-            | MenuAction::ShowEngineHud => ConfigWrite,
+            | MenuAction::ToggleSeriousMode => ConfigWrite,
             // Gateway to every action + the staged-update re-exec twins.
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
             // Benign runtime/view/window/tab state. Font zoom is runtime-only
             // (`set_font_px` pins `font_px`; it does NOT persist to `aterm.toml`), so it
-            // stays `WriteInput`. `ShowPerformancePanel` only OPENS the panel (its
-            // checkboxes persist through their own `ConfigWrite`-gated path, not by
-            // opening). `Quit` is a denial of service, not a capability escalation, so it
+            // stays `WriteInput`. `Quit` is a denial of service, not a capability escalation, so it
             // is left with the base gate rather than over-reaching to Owner-only.
             MenuAction::About
             | MenuAction::Version
@@ -512,10 +491,8 @@ impl MenuAction {
             | MenuAction::FontActualSize
             | MenuAction::SplitVertical
             | MenuAction::SplitHorizontal
-            // Runtime-only per-session visual toggle: nothing durable is
-            // written (unlike the ShowHud family), nothing leaves the process.
+            // Runtime-only per-session visual toggle: nothing durable is written.
             | MenuAction::ToggleMatrixRain
-            | MenuAction::ShowPerformancePanel
             | MenuAction::Minimize
             | MenuAction::Zoom
             | MenuAction::NextTab
@@ -563,10 +540,6 @@ impl MenuAction {
             "SplitHorizontal" => Some(MenuAction::SplitHorizontal),
             "ToggleMatrixRain" => Some(MenuAction::ToggleMatrixRain),
             "ToggleSeriousMode" => Some(MenuAction::ToggleSeriousMode),
-            "ShowHud" => Some(MenuAction::ShowHud),
-            "ShowResourcesHud" => Some(MenuAction::ShowResourcesHud),
-            "ShowEngineHud" => Some(MenuAction::ShowEngineHud),
-            "ShowPerformancePanel" => Some(MenuAction::ShowPerformancePanel),
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
             "OpenPalette" => Some(MenuAction::OpenPalette),
             "Minimize" => Some(MenuAction::Minimize),
@@ -636,8 +609,8 @@ const APP_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Separator,
-    // ⌘, focuses or creates the native Settings tab. "Open aterm.toml" stays as
-    // the escape hatch for keys the Settings app does not surface.
+    // ⌘, focuses or creates the native Settings tab. "Open aterm.toml" opens
+    // or reuses the separate native config Editor tab used by Manual.
     Item {
         label: "Settings…",
         action: MenuAction::ToggleSettings,
@@ -819,32 +792,6 @@ const VIEW_MENU: &[MenuEntry] = &[
     },
     Separator,
     Item {
-        label: "Show Bottom HUD",
-        action: MenuAction::ShowHud,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "HUD: Resources (system vs session)",
-        action: MenuAction::ShowResourcesHud,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "HUD: aterm Engine (render / memory)",
-        action: MenuAction::ShowEngineHud,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Separator,
-    Item {
-        label: "Performance Panel…",
-        action: MenuAction::ShowPerformancePanel,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Separator,
-    Item {
         label: "Command Palette…",
         action: MenuAction::OpenPalette,
         key: "p",
@@ -1018,7 +965,7 @@ pub fn menu_chrome_lines() -> Vec<String> {
 #[cfg(target_os = "macos")]
 pub use macos::{
     MenuHandle, choose_local_file, confirm, defer_quit_for_terminate, install, notify,
-    open_config_file, open_help_url, update_version_menu,
+    open_help_url, update_version_menu,
 };
 
 /// Non-macOS no-op handle: there is no platform menu off macOS. Held by `App` in
@@ -1045,10 +992,6 @@ pub fn update_version_menu(_handle: &MenuHandle, _staged: Option<(u64, &str)>, _
 pub fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
     None
 }
-
-/// Non-macOS stub: opening the config file in a GUI editor is macOS-only here.
-#[cfg(not(target_os = "macos"))]
-pub fn open_config_file() {}
 
 /// Non-macOS stub: no native alert; the "Check for Updates" result is logged instead.
 #[cfg(not(target_os = "macos"))]
@@ -1246,7 +1189,7 @@ mod macos {
     }
 
     /// Build the App menu (titled with the app name by convention): About,
-    /// Settings (⌘, — the overlay), Open aterm.toml, Quit. Items and separators
+    /// Settings (⌘, — the native tab), Open aterm.toml in Manual, Quit. Items and separators
     /// preserved verbatim from [`install`].
     fn build_app_menu(mtm: MainThreadMarker, target: &MenuTarget) -> Retained<NSMenu> {
         let app_menu = NSMenu::new(mtm);
@@ -1271,8 +1214,8 @@ mod macos {
             false,
         );
         add_separator(mtm, &app_menu);
-        // ⌘, — the standard macOS settings chord — opens the own-rendered Settings
-        // overlay (the native Preferences NSWindow is retired). The menu key
+        // ⌘, — the standard macOS settings chord — focuses the own-rendered native
+        // Settings tab (the separate Preferences NSWindow is retired). The menu key
         // equivalent IS the shortcut: AppKit's performKeyEquivalent dispatches it
         // into the Wake::MenuAction relay before keyDown reaches on_key.
         add_item(
@@ -1599,46 +1542,6 @@ mod macos {
             false,
         );
         add_separator(mtm, &view);
-        // Streaming bottom HUD widgets — the master switch for the whole band, then
-        // one toggle per panel (no key-equivalents).
-        add_item(
-            mtm,
-            &view,
-            target,
-            "Show Bottom HUD",
-            MenuAction::ShowHud,
-            "",
-            false,
-        );
-        add_item(
-            mtm,
-            &view,
-            target,
-            "HUD: Resources (system vs session)",
-            MenuAction::ShowResourcesHud,
-            "",
-            false,
-        );
-        add_item(
-            mtm,
-            &view,
-            target,
-            "HUD: aterm Engine (render / memory)",
-            MenuAction::ShowEngineHud,
-            "",
-            false,
-        );
-        add_separator(mtm, &view);
-        // The dedicated Performance control panel — every HUD toggle in one window.
-        add_item(
-            mtm,
-            &view,
-            target,
-            "Performance Panel…",
-            MenuAction::ShowPerformancePanel,
-            "",
-            false,
-        );
         add_separator(mtm, &view);
         // The own-rendered, cross-platform command palette (⇧⌘P). A real menu key
         // equivalent, so AppKit's performKeyEquivalent dispatches it into the SAME
@@ -1940,102 +1843,6 @@ mod macos {
         }
     }
 
-    /// A documented starter config written to `~/.config/aterm/aterm.toml` the first
-    /// time the user opens "Open aterm.toml" on a machine with no config yet. Every key
-    /// is commented out (defaults apply), so writing it changes nothing — it just
-    /// makes the (real, hot-reloading) settings surface DISCOVERABLE.
-    const DEFAULT_CONFIG_TEMPLATE: &str = "\
-# aterm configuration — ~/.config/aterm/aterm.toml
-# Every setting is optional; uncomment to override. Edits hot-reload on save.
-# Environment variables (ATERM_*) take precedence over this file.
-
-# --- appearance ---------------------------------------------------------------
-# font_family = \"SF Mono\"      # any installed monospace family (default: SF Mono on macOS)
-# font_px = 24                   # PHYSICAL px; an explicit value disables the Retina
-#                                # auto-scale (only the built-in default scales), so on a
-#                                # 2x display use 2x the point size you want (24 = 12 pt)
-# theme = \"Default\"            # a built-in scheme (Dracula, Nord, One Dark, …)
-# cursor_style = \"block\"       # block | bar | underline
-# cursor_blink = true
-# scrollback_lines = 10000
-# selection_color = \"#33415E\"  # highlight behind selected text
-
-# --- motion / cursor aurora (the \"LUMEN WAKE\" streaming trailer) -------------
-# motion = \"auto\"                # auto (follow OS Reduce Motion) | full | reduced
-# cursor_trail = true            # master on/off (default ON)
-# cursor_trail_style = \"phaser\"  # phaser | comet | lumen | nyan rainbow | sparkle | fire | laser | water | beam | off
-#                                #   phaser  = full-spectrum additive hue sweep (DEFAULT)
-#                                #   comet   = cadence-comet trail (directional fading comet
-#                                #             that ignites with fast typing) + the light crown
-#                                #   lumen   = additive light comet + bloom + landing ping (crown only)
-#                                #   nyan rainbow = momentum-driven banded rainbow ribbon (a
-#                                #             blinking block twinkles like a little star)
-#                                #   sparkle = phaser comet + spark particles
-#                                #   fire    = rising warm embers
-#                                #   laser   = monochrome beam + tight same-hue bloom
-#                                #   water   = ocean comet + droplet splash
-#                                #   beam    = bloom-free beam-only crown (no trail body)
-# cursor_trail_color = \"#50FA7B\" # base colour (default: the cursor colour)
-# cursor_trail_accent = \"#7AA2F7\"# comet-tail / ring colour (default: brightened cursor)
-# cursor_trail_ms = 260          # fade duration in ms (30..2000)
-# cursor_trail_length = 24       # max comet length in cells (1..512)
-# cursor_trail_intensity = 0.7   # aurora brightness 0.0..1.0
-# cursor_trail_radius = 0.6      # bloom-crown radius in cells (0 = no bloom)
-# cursor_trail_ring = true       # expanding \"ping\" ring on a jump
-# cursor_trail_bloom = true      # GPU-only soft halo around the comet (default ON)
-# cursor_trail_bloom_strength = 0.85  # halo intensity 0.0..3.0
-# cursor_trail_bloom_radius = 2.2     # half-res blur texels 0.5..8.0
-
-# --- behavior -----------------------------------------------------------------
-# gpu = false                    # GPU/Metal rendering (env ATERM_GPU=1 overrides)
-# copy_on_select = true          # auto-copy mouse selection to clipboard — DEFAULT ON
-# show_build_badge = false        # OPTIONAL floating top-right v<version> pill — DEFAULT OFF.
-                                  # The version now lives in the menu bar (the v<version>
-                                  # menu opens About); this pill is an opt-in extra
-                                  # (Settings toggle: Show floating version pill)
-# show_hud = true                # MASTER switch for the whole bottom HUD band (default OFF);
-                                  # true shows it, then per-panel keys select which panels
-# show_resources_hud = true      # bottom HUD: total system vs this session (CPU/mem/GPU/
-                                  # disk/net) — DEFAULT ON
-# show_engine_hud = true          # bottom HUD: aterm's own render speed / memory / app-fed
-                                  # metrics (`aterm-ctl metric <name> <value>`) — DEFAULT ON.
-                                  # Toggle via these keys or View ▸ Performance Panel… on
-                                  # macOS. (Resource meters read /proc on Linux — real
-                                  # numbers, not n/a; GPU/disk system meters are macOS-only.)
-
-# Glyph weight: text_blending = \"linear-corrected\" (default) matches native
-# macOS text weight (\"linear\" = the physical blend); font_thicken = true adds
-# CoreText smoothing (macOS); stem_gamma = 0.9 thickens stems (>1 thins,
-# 1 = off; the ATERM_STEM_GAMMA env var aliases it and wins).
-
-# --- security opt-ins (all default OFF) ---------------------------------------
-# allow_osc52_query = false
-# allow_window_ops = false
-# allow_notifications = false
-# allow_palette_reconfigure = false
-#
-# --- input policy: map a chord to RAW BYTES (overrides the default key encoding) ---
-# [key_sequences]
-# \"shift+enter\" = \"\\n\"        # send a literal newline (LF)
-# 'f5' = '\\e[15~'              # use a TOML literal '...' string so \\e is ESC
-";
-
-    /// App menu ▸ Open aterm.toml: open the user config file in the default editor,
-    /// creating a documented starter file if it does not exist yet — the escape hatch
-    /// for keys the Settings overlay (⌘,) does not surface. Best-effort.
-    pub fn open_config_file() {
-        let Some(path) = crate::app_config::config_path() else {
-            return;
-        };
-        if !path.exists() {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&path, DEFAULT_CONFIG_TEMPLATE);
-        }
-        open_in_workspace(&path.to_string_lossy(), true);
-    }
-
     /// Help ▸ aterm Help: open the bundled, offline features guide
     /// (`Contents/Resources/Help.html`, bundled by the ship tool — aterm-release
     /// `bundle.rs`) in the default browser. Falls back to the project page when
@@ -2121,10 +1928,6 @@ mod tests {
         MenuAction::PrevTab,
         MenuAction::ToggleSeriousMode,
         MenuAction::ToggleMatrixRain,
-        MenuAction::ShowHud,
-        MenuAction::ShowResourcesHud,
-        MenuAction::ShowEngineHud,
-        MenuAction::ShowPerformancePanel,
         MenuAction::ToggleSettings,
         MenuAction::OpenPalette,
         MenuAction::Help,
@@ -2347,11 +2150,6 @@ mod tests {
             !titles[0].contains("Hide aterm"),
             "the Hide item is removed from the app menu: {:?}",
             titles[0]
-        );
-        assert!(
-            titles[3].contains("Show Bottom HUD"),
-            "View lists the master HUD toggle: {:?}",
-            titles[3]
         );
         // No separator artifacts (a stray ", ," from an unfiltered Separator).
         assert!(

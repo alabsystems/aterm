@@ -28,7 +28,7 @@ fn real_template() -> String {
 fn stamp_real(icon: Option<&str>) -> String {
     bundle::stamp_info_plist(
         &real_template(),
-        "0.26",
+        "0.2.0",
         1_783_918_101,
         "com.aterm.aterm",
         "aed5a06c1f00",
@@ -44,7 +44,7 @@ fn stamps_the_three_versioned_keys_in_the_real_template() {
     let out = stamp_real(Some("aterm"));
     // Replaced values, in the template's own tab-indented shape.
     assert!(
-        out.contains("<key>CFBundleShortVersionString</key>\n\t<string>0.26</string>"),
+        out.contains("<key>CFBundleShortVersionString</key>\n\t<string>0.2.0</string>"),
         "{out}"
     );
     assert!(
@@ -55,10 +55,16 @@ fn stamps_the_three_versioned_keys_in_the_real_template() {
         out.contains("<key>CFBundleIdentifier</key>\n\t<string>com.aterm.aterm</string>"),
         "{out}"
     );
-    // The committed baseline values must be gone.
+    // The committed baseline sentinels must be gone. These are the REAL values in
+    // apps/aterm-mac/Info.plist (`0.0.0` short version, integer `0` build number);
+    // asserting a value the template never contained would be vacuous.
     assert!(
-        !out.contains("<string>0.1.0</string>"),
-        "baseline version left behind: {out}"
+        !out.contains("<key>CFBundleShortVersionString</key>\n\t<string>0.0.0</string>"),
+        "baseline short version left behind: {out}"
+    );
+    assert!(
+        !out.contains("<key>CFBundleVersion</key>\n\t<string>0</string>"),
+        "baseline build number left behind: {out}"
     );
 }
 
@@ -111,7 +117,7 @@ fn stamping_twice_replaces_instead_of_duplicating() {
     let once = stamp_real(Some("aterm"));
     let twice = bundle::stamp_info_plist(
         &once,
-        "0.27",
+        "0.3.0",
         1_783_918_102,
         "com.example.aterm",
         "bbbbbbbbbbbb-dirty",
@@ -140,7 +146,7 @@ fn non_string_key_is_refused_not_misstamped() {
                     \t<key>Other</key>\n\
                     \t<string>x</string>\n\
                     </dict>";
-    let err = bundle::stamp_info_plist(template, "0.26", 1, "id", "c", None).unwrap_err();
+    let err = bundle::stamp_info_plist(template, "0.2.0", 1, "id", "c", None).unwrap_err();
     assert!(err.contains("CFBundleVersion"), "{err}");
 }
 
@@ -148,7 +154,7 @@ fn non_string_key_is_refused_not_misstamped() {
 fn stamped_values_are_xml_escaped() {
     let template = "<dict>\n\t<key>CFBundleVersion</key>\n\t<string>0</string>\n</dict>";
     let out =
-        bundle::stamp_info_plist(template, "0.26", 1, "a&b<c>", "commit", None).expect("stamp");
+        bundle::stamp_info_plist(template, "0.2.0", 1, "a&b<c>", "commit", None).expect("stamp");
     assert!(out.contains("<string>a&amp;b&lt;c&gt;</string>"), "{out}");
 }
 

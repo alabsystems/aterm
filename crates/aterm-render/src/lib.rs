@@ -33,6 +33,11 @@ pub mod chrome_metrics;
 mod colr;
 pub mod deco;
 pub mod fire_field;
+pub mod font_catalog;
+/// The glyph-resolution CHAIN as one pure, exhaustively-verifiable policy —
+/// the module the U+276F tofu bug proved was missing (see its docs).
+pub mod font_chain;
+pub mod font_file;
 pub mod hdr;
 pub mod ligature_shaping;
 pub mod procedural;
@@ -264,6 +269,13 @@ pub enum FaceId {
     /// STIX/Apple Symbols): it guarantees a visible, theme-coloured glyph instead
     /// of `.notdef` tofu, while still never rendering in colour.
     ColorEmojiMono,
+    /// One of the EXTRA bundled game-title faces of an active `game:` MIX
+    /// (`game:minecraft+zelda`): a character whose deterministic pick
+    /// ([`game_mix_face_index`]) lands on a non-primary mix face routes here
+    /// and rasterizes through the metric-normalized fallback pipeline. The
+    /// pick is a pure function of the code point, so cache keys stay stable
+    /// without carrying an index.
+    GameMix,
     /// A RUNTIME-DISCOVERED fallback face (M3 FONT-DISCOVERY): a system font found
     /// at query time to cover a code point that NONE of the configured faces
     /// (primary / broad / symbol / colour) carry. On macOS the cover is resolved
@@ -726,6 +738,73 @@ impl<V> TwoGenTextCache<V> {
 /// Shared (`Arc`) so the raster closures clone a handle, never the list.
 type VarCoords = Option<std::sync::Arc<[(u32, f32)]>>;
 
+/// One immutable font blob retained by a prepared native font generation.
+///
+/// Renderer internals historically use both `Arc<[u8]>` (primary/styled faces)
+/// and `Arc<Vec<u8>>` (large interned fallback/emoji faces).  Keeping both forms
+/// here avoids copying a multi-hundred-megabyte fallback merely to compare two
+/// generations.  Equality is deliberately byte-exact across the two storage
+/// forms; no hash or pathname identity can make a changed face look equal.
+#[derive(Clone)]
+enum AdmittedFontBlob {
+    Slice(std::sync::Arc<[u8]>),
+    Vec(std::sync::Arc<Vec<u8>>),
+}
+
+impl AdmittedFontBlob {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Slice(bytes) => bytes,
+            Self::Vec(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+impl PartialEq for AdmittedFontBlob {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for AdmittedFontBlob {}
+
+impl std::fmt::Debug for AdmittedFontBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmittedFontBlob")
+            .field("bytes", &self.bytes().len())
+            .finish()
+    }
+}
+
+/// Exact immutable identity of one admitted face, including its collection
+/// index.  The index is part of the source: two faces in one TTC share bytes but
+/// are not interchangeable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdmittedFaceSource {
+    bytes: AdmittedFontBlob,
+    index: u32,
+}
+
+/// Collision-free snapshot of every face in one prepared font generation.
+///
+/// This value owns only `Arc` handles. Cloning it is constant-time per face and
+/// comparing it performs exact byte equality without opening a path. Hosts use
+/// it to suppress a renderer rebuild when an unrelated config edit prepared the
+/// same primary/style/fallback/symbol/emoji generation.
+///
+/// Runtime per-codepoint discoveries are intentionally excluded: they are a
+/// cache of text already displayed, not an input to the configured generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmittedFontSources {
+    sealed: bool,
+    primary: Option<AdmittedFaceSource>,
+    injected_bold: Option<AdmittedFaceSource>,
+    styled: [Option<AdmittedFaceSource>; 3],
+    fallback: Vec<AdmittedFaceSource>,
+    symbol: Option<AdmittedFaceSource>,
+    emoji: Option<AdmittedFaceSource>,
+}
+
 /// Monospace CPU rasterizer.
 ///
 /// `font` is the primary monospace face used for Latin/box-drawing. `fallback`
@@ -859,6 +938,10 @@ pub struct Renderer {
     /// so [`FaceId::Fallback`] tries each chain entry IN ORDER and the first that
     /// has the glyph wins — the per-char winner is memoized in [`Self::fallback_pick`].
     fallback_chain: Vec<FallbackFace>,
+    /// The EXTRA faces of an active game-font MIX (`game:<id>+<id>[+<id>]`),
+    /// in toggle order; the mix's FIRST face is the ordinary primary. Empty =
+    /// no mix. See [`Renderer::set_game_mix_faces`] / [`FaceId::GameMix`].
+    game_mix: Vec<FallbackFace>,
     /// Per-char index into [`Self::fallback_chain`] for the entry that covered the
     /// char, recorded by [`Self::fallback_has`] so the rasterizer (which sees only
     /// a [`GlyphKey`]'s code point) recovers WHICH chain face to draw from — exactly
@@ -941,6 +1024,11 @@ pub struct Renderer {
     primary_path: Option<String>,
     /// Whether [`ensure_styled_faces`] has run (it tries the disk read exactly once).
     styled_loaded: bool,
+    /// A worker has settled every path-backed primary/style/fallback/symbol/emoji
+    /// source and closed runtime system discovery.  Only such a generation may
+    /// be reconstructed by [`Self::rebuild_from_admitted`]; otherwise a zoom
+    /// could silently discard an unresolved lazy face.
+    admitted_sources_sealed: bool,
     /// Reused per-row "is this column shapeable" scratch for [`row_glyph_plan`],
     /// cleared+resized each call instead of a fresh `vec![false; cols]` per row per
     /// frame (pure allocator-churn avoidance on the render hot path).
@@ -1232,6 +1320,27 @@ pub enum DamageOutcome {
     /// via the `default_bg` clause of `compute_dirty_rows`) is byte-identical
     /// to the previous frame.
     Rows,
+    /// E7 WHOLE-ROW SCROLL BLIT. A rigid history scroll: the retained grid rows
+    /// were BLITTED (shifted by `delta_rows` whole cell rows —
+    /// [`scroll_translate::translate_grid_band_in_place`] at a whole-cell
+    /// multiple) inside the cached framebuffer, and ONLY the newly-exposed
+    /// strip (plus any cursor rows, flagged in [`WindowCpu::dirty_rows`]) was
+    /// re-rasterized. Every other grid pixel is last frame's SAME pixels moved
+    /// by `delta_rows·cell_h` device px (positive = up, matching the translate
+    /// sign); padding is untouched (a bg change forces `Full`). A CPU presenter
+    /// must move its own retained surface rows by the same `delta_rows·cell_h`
+    /// before repainting the flagged bands, else treat the frame as `Full`
+    /// (the cache already holds the correct full frame — a full copy is always
+    /// safe). The rendered pixels are byte-identical to a full repaint; only
+    /// the WORK differs (retained rows blitted, not re-rastered).
+    Scroll {
+        /// Signed whole-row shift applied to the retained rows: viewport row `r`
+        /// now shows the pixels that were at row `r + delta_rows` last frame
+        /// (positive shifts content UP, exposing a bottom strip; negative shifts
+        /// DOWN, exposing a top strip — the [`scroll_translate`] convention with
+        /// `frac_px = delta_rows · cell_h`, `dst[r] ← src[r + delta_rows]`).
+        delta_rows: i32,
+    },
 }
 
 /// Per-window CPU damage-cache state — the analog of the GPU's `WindowGpu` (S5).
@@ -1293,6 +1402,16 @@ pub struct WindowCpu {
     /// must commit one real frame (the epoch-bumped repaint) past its own
     /// coarse screen-level early-out.
     pub(crate) fallback_pending_prev: bool,
+    /// E7 SCROLL-BLIT overshoot-apron scratch, resident across frames so a scroll
+    /// notch pays no per-frame allocation. `scroll_apron_saved` holds the
+    /// concatenated cell-height pixel bands the UPPER apron snapshots (a
+    /// re-rastered retained row's upward glyph overshoot would otherwise
+    /// double-composite over the blitted-correct row above it), `scroll_apron_rows`
+    /// names their rows, and `scroll_apron_tmp` is the one-band buffer the LOWER
+    /// apron's clipped overshoot redraw uses to protect its retained source row.
+    pub(crate) scroll_apron_saved: Vec<u32>,
+    pub(crate) scroll_apron_rows: Vec<usize>,
+    pub(crate) scroll_apron_tmp: Vec<u32>,
 }
 
 impl WindowCpu {
@@ -1570,6 +1689,15 @@ fn primary_candidate_paths() -> Vec<String> {
     paths
 }
 
+/// Ordered fixed-path candidates used when no configured primary family is
+/// active. Hosts preparing a font generation off-thread use this exact list so
+/// clearing `font_family` restores the same face as [`Renderer::from_system`]
+/// without asking the event loop to rediscover or read it.
+#[must_use]
+pub fn primary_font_candidate_paths() -> Vec<String> {
+    primary_candidate_paths()
+}
+
 /// The bundled last-resort monospace face (FONT-EMBED): DejaVu Sans Mono, under the
 /// Bitstream Vera + DejaVu licenses (`assets/DejaVuSansMono.LICENSE.txt`). Used only
 /// when every system/configured candidate is absent, so a host with no usable font
@@ -1577,6 +1705,116 @@ fn primary_candidate_paths() -> Vec<String> {
 #[cfg(feature = "embedded-font")]
 pub fn embedded_font() -> &'static [u8] {
     include_bytes!("../assets/DejaVuSansMono.ttf")
+}
+
+/// One bundled game-title face: the `game:<id>` virtual-family target. These are
+/// open-licensed LOOKALIKE faces evoking each game's title-screen lettering —
+/// never the games' own proprietary fonts. Each ships with its license text
+/// beside it in `assets/game/`.
+pub struct GameFont {
+    /// The stable selector after the `game:` scheme (config `game_font` value).
+    pub id: &'static str,
+    /// The game whose title screen the face evokes (display label).
+    pub game: &'static str,
+    /// The actual open font's name + license, for honest attribution in UI.
+    pub face: &'static str,
+    bytes: &'static [u8],
+}
+
+/// The virtual-family scheme for bundled game faces: a request of `game:<id>`
+/// (e.g. `game:minecraft`) resolves to embedded bytes in BOTH resolution paths
+/// (startup [`Renderer::from_system_with_family`] and the off-thread
+/// [`font_catalog::resolve_and_admit`]), never the filesystem.
+pub const GAME_FONT_SCHEME: &str = "game:";
+
+/// The bundled game-title faces (FONT-GAME), in display order. One table drives
+/// the resolver, the settings toggles, and the attribution strings.
+pub const GAME_FONTS: &[GameFont] = &[
+    GameFont {
+        id: "roblox",
+        game: "Roblox",
+        face: "Luckiest Guy (Astigmatic, Apache-2.0)",
+        bytes: include_bytes!("../assets/game/LuckiestGuy-Regular.ttf"),
+    },
+    GameFont {
+        id: "minecraft",
+        game: "Minecraft",
+        face: "Monocraft (Idrees Hassan, OFL-1.1)",
+        bytes: include_bytes!("../assets/game/Monocraft.ttf"),
+    },
+    GameFont {
+        id: "zelda",
+        game: "The Legend of Zelda: Breath of the Wild",
+        face: "Cinzel (NDISCOVER, OFL-1.1)",
+        bytes: include_bytes!("../assets/game/Cinzel-var.ttf"),
+    },
+    GameFont {
+        id: "mariokart",
+        game: "Mario Kart",
+        face: "Titan One (Rodrigo Fuenzalida, OFL-1.1)",
+        bytes: include_bytes!("../assets/game/TitanOne-Regular.ttf"),
+    },
+    GameFont {
+        id: "animal-crossing",
+        game: "Animal Crossing",
+        face: "Chewy (Sideshow, Apache-2.0)",
+        bytes: include_bytes!("../assets/game/Chewy-Regular.ttf"),
+    },
+];
+
+/// The embedded face bytes for a `game_font` id (`"minecraft"`, …), or `None`
+/// for an unknown id — the caller falls back to normal family resolution.
+#[must_use]
+pub fn game_font_bytes(id: &str) -> Option<&'static [u8]> {
+    GAME_FONTS
+        .iter()
+        .find(|font| font.id == id)
+        .map(|font| font.bytes)
+}
+
+/// Resolve a FAMILY REQUEST under the `game:` scheme: `Some(bytes)` only for
+/// `game:<known-id>`. Any other shape (including a bare id without the scheme)
+/// is `None`, so real families named like a game are never shadowed.
+#[must_use]
+pub fn game_font_for_family(family: &str) -> Option<&'static [u8]> {
+    game_font_mix_for_family(family).map(|faces| faces[0])
+}
+
+/// The maximum number of faces one game-font MIX may combine.
+pub const GAME_FONT_MIX_MAX: usize = 3;
+
+/// Resolve a FAMILY REQUEST under the `game:` scheme to its full face list:
+/// `game:<id>` yields one face, `game:<id>+<id>[+<id>]` up to
+/// [`GAME_FONT_MIX_MAX`]. `None` for any unknown/duplicate id, an empty list,
+/// or more than the cap — the whole request is rejected rather than silently
+/// dropping a face the user asked for.
+#[must_use]
+pub fn game_font_mix_for_family(family: &str) -> Option<Vec<&'static [u8]>> {
+    let ids = family.strip_prefix(GAME_FONT_SCHEME)?;
+    let mut seen: Vec<&str> = Vec::new();
+    let mut faces = Vec::new();
+    for id in ids.split('+') {
+        let id = id.trim();
+        if seen.contains(&id) || faces.len() == GAME_FONT_MIX_MAX {
+            return None;
+        }
+        faces.push(game_font_bytes(id)?);
+        seen.push(id);
+    }
+    (!faces.is_empty()).then_some(faces)
+}
+
+/// The deterministic per-character mix pick: which face of a `total`-face mix
+/// (primary = 0, extras = 1..) a code point renders in. A pure multiplicative
+/// hash of the scalar value, so the SAME character always lands on the SAME
+/// face — across frames, resizes, and reloads — and adjacent letters spread
+/// across the mix (the ransom-note look) instead of clustering.
+#[must_use]
+pub fn game_mix_face_index(ch: char, total: usize) -> usize {
+    if total <= 1 {
+        return 0;
+    }
+    ((ch as u32).wrapping_mul(2_654_435_761) >> 16) as usize % total
 }
 
 /// The bundled Symbols Nerd Font (FONT-2b): a monospace icon face carrying the full
@@ -1988,6 +2226,12 @@ struct RuntimeFallback {
     /// working set of fallback code points is tiny). Only ACCEPTED face indices
     /// are ever stored, so [`Self::face_for`] can never hand out a declining face.
     decisions: FxHashMap<char, Option<usize>>,
+    /// Decision cache for [`Self::resolve_embedded_only`] — the SEALED path,
+    /// which consults only the bundled (I/O-free) symbol face. Kept apart from
+    /// [`Self::decisions`] because an embedded-only `None` means "the bundled
+    /// face lacks it", not the stronger "no font on this system has it".
+    /// Same [`Self::MAX_DECISIONS`] coarse bound.
+    embedded_decisions: FxHashMap<char, Option<usize>>,
 }
 
 /// One runtime-DISCOVERED fallback face (W8): raw bytes + the chosen collection
@@ -2076,7 +2320,7 @@ impl RuntimeFallback {
             if self.failed_paths.contains(&path) {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&path)) else {
                 self.failed_paths.insert(path);
                 continue;
             };
@@ -2123,15 +2367,31 @@ impl RuntimeFallback {
             }
         }
         // FONT-2b guaranteed icon backstop: the bundled Symbols Nerd Font, tried LAST (any
-        // installed/configured face already won above). Loaded ONCE into a dedicated slot
-        // keyed by a synthetic path — deliberately NOT via the candidate-path list, so the
-        // per-path `failed_paths` gate can never poison it (a non-icon code point that this
-        // face lacks must not permanently disable it for the PUA icons it DOES cover). Then
-        // probed per code point like any other runtime face.
+        // installed/configured face already won above).
+        self.try_embedded_symbols(ch, ctx)
+    }
+
+    /// The synthetic reuse key of the bundled-symbols slot in [`Self::faces`].
+    /// Deliberately NOT a real path: it must never enter the candidate-path list,
+    /// so the per-path `failed_paths` gate can never poison it (a non-icon code
+    /// point this face lacks must not permanently disable it for the ones it covers).
+    #[cfg(feature = "embedded-symbols")]
+    const EMBEDDED_SYMBOLS_PATH: &'static str = "<embedded-symbols-nerd-font>";
+
+    /// FONT-2b: resolve `ch` against the BUNDLED Symbols Nerd Font alone.
+    ///
+    /// Loaded ONCE into a dedicated slot, then probed per code point like any
+    /// other runtime face. Crucially this performs **no filesystem I/O and no
+    /// host font query** — the bytes are `include_bytes!`'d into the binary — so
+    /// it is the one runtime-fallback tier a SEALED font generation may still
+    /// consult (see [`Renderer::seal_admitted_font_sources`], which closes
+    /// pathname discovery but not this).
+    #[cfg_attr(not(feature = "embedded-symbols"), allow(unused_variables))]
+    fn try_embedded_symbols(&mut self, ch: char, ctx: FallbackProbeCtx) -> Option<usize> {
         #[cfg(feature = "embedded-symbols")]
         {
-            const EMBEDDED: &str = "<embedded-symbols-nerd-font>";
-            if !self.faces.iter().any(|f| f.path == EMBEDDED) {
+            let key = Self::EMBEDDED_SYMBOLS_PATH;
+            if !self.faces.iter().any(|f| f.path == key) {
                 let bytes = embedded_symbols_font().to_vec();
                 let font =
                     fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
@@ -2142,17 +2402,47 @@ impl RuntimeFallback {
                     font,
                     bytes: intern_font_bytes(bytes),
                     index: 0,
-                    path: EMBEDDED.to_string(),
+                    path: key.to_string(),
                     norm,
                 });
             }
-            if let Some(i) = self.faces.iter().position(|f| f.path == EMBEDDED)
+            if let Some(i) = self.faces.iter().position(|f| f.path == key)
                 && runtime_face_can_render(&self.faces[i], ch, ctx.use_ct)
             {
                 return Some(i);
             }
         }
         None
+    }
+
+    /// Resolve `ch` against the BUNDLED symbol face only, memoized — the sealed
+    /// generation's analog of [`Self::resolve`].
+    ///
+    /// SEALING CLOSES PATHNAME DISCOVERY, NOT THE BUNDLED BACKSTOP. Before this
+    /// existed, [`Renderer::seal_admitted_font_sources`] switched the whole
+    /// give-up path off, which made the compiled-in Symbols Nerd Font
+    /// structurally unreachable in the GUI (every window seals its backend) — so
+    /// a code point no configured face covered rendered `.notdef` FOREVER even
+    /// though a loaded face covered it. That is the U+276F `❯` tofu the owner
+    /// reported on 2026-07-24: Monaco, SFNSMono, Arial Unicode, Apple Symbols,
+    /// STIX Two Math and Hiragino all miss it; the bundled face has it.
+    ///
+    /// Decisions live in their OWN map, never [`Self::decisions`]: an
+    /// embedded-only `None` is a WEAKER fact than a full-discovery `None`, and
+    /// must never be mistaken for one if the generation is later unsealed
+    /// ([`Renderer::set_runtime_font_discovery`] clears the seal).
+    fn resolve_embedded_only(&mut self, ch: char, ctx: FallbackProbeCtx) -> Option<usize> {
+        if let Some(&decision) = self.embedded_decisions.get(&ch) {
+            return decision;
+        }
+        let decision = self.try_embedded_symbols(ch, ctx);
+        // Same coarse bound as `resolve`: clear wholesale once full, then insert,
+        // so the just-requested code point stays cached.
+        if self.embedded_decisions.len() >= Self::MAX_DECISIONS {
+            self.embedded_decisions.clear();
+        }
+        self.embedded_decisions.insert(ch, decision);
+        decision
     }
 
     /// The discovered face's raster PARTS for code point `ch`, if a decision is
@@ -2171,11 +2461,75 @@ impl RuntimeFallback {
         u32,
         FaceNorm,
     )> {
-        let &Some(i) = self.decisions.get(&ch)? else {
+        // Either cache may hold the decision: `decisions` on the discovering
+        // path, `embedded_decisions` on the SEALED (bundled-face-only) path.
+        // Both index the SAME `faces` vec, so the recovery is uniform. Missing
+        // this fall-through renders a key whose `source` says RuntimeFallback
+        // as `.notdef` — a silent tofu that looks exactly like the bug this
+        // path exists to prevent.
+        let &Some(i) = self
+            .decisions
+            .get(&ch)
+            .or_else(|| self.embedded_decisions.get(&ch))?
+        else {
             return None;
         };
         let f = self.faces.get(i)?;
         Some((f.font.clone(), f.bytes.clone(), f.index, f.norm))
+    }
+}
+
+/// The renderer's LAZY implementation of the pure chain's coverage oracle
+/// ([`font_chain::ChainProbe`]). Each arm performs exactly the probe that tier
+/// owns — loading its face on first use — and `resolve_chain` guarantees each is
+/// asked at most once, in declared order.
+struct RendererProbe<'a, 'g> {
+    r: &'a mut Renderer,
+    ch: char,
+    /// The primary face's Unicode glyph id, captured when that tier is probed so
+    /// the key can be addressed BY ID.
+    primary_gid: &'g mut Option<u16>,
+}
+
+impl font_chain::ChainProbe for RendererProbe<'_, '_> {
+    fn covers(&mut self, tier: font_chain::Tier) -> bool {
+        match tier {
+            // Procedural box-drawing/block/braille interception stays FIRST:
+            // those cells must be cell-exact and seam-free, which no font
+            // guarantees ($ATERM_NO_PROCEDURAL_GLYPHS opts back into fonts).
+            font_chain::Tier::Procedural => self.r.procedural && procedural::covers(self.ch),
+            // Coverage + glyph id from the UNICODE cmap (ttf-parser), NOT
+            // fontdue's char lookup, which mis-selects a Mac Roman subtable on
+            // Apple `.ttc` fonts (see `primary_unicode_gid`).
+            font_chain::Tier::Primary => {
+                *self.primary_gid = self.r.primary_unicode_gid(self.ch);
+                self.primary_gid.is_some()
+            }
+            // Records WHICH chain entry covered `ch` (in `fallback_pick`) so the
+            // rasterizer recovers it later.
+            font_chain::Tier::Fallback => self.r.fallback_has(self.ch),
+            font_chain::Tier::Symbol => self.r.symbol_fallback_has(self.ch),
+            font_chain::Tier::Color => self.r.color_font_has(self.ch),
+            font_chain::Tier::RuntimeDecisions => {
+                let ctx = self.r.runtime_probe_ctx();
+                self.r.runtime_fallback.resolve(self.ch, ctx).is_some()
+            }
+            font_chain::Tier::RuntimeEmbedded => {
+                let ctx = self.r.runtime_probe_ctx();
+                self.r
+                    .runtime_fallback
+                    .resolve_embedded_only(self.ch, ctx)
+                    .is_some()
+            }
+        }
+    }
+
+    fn parse_pending(&mut self, tier: font_chain::Tier) -> bool {
+        match tier {
+            font_chain::Tier::Fallback => self.r.fallback_parse_rx.is_some(),
+            font_chain::Tier::Symbol => self.r.symbol_parse_rx.is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -2388,7 +2742,7 @@ pub fn warm_font_coverage_index() {
 /// parsed-face intern.
 fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
     paths.iter().find_map(|p| {
-        let bytes = std::fs::read(p).ok()?;
+        let bytes = font_file::read_font_file(std::path::Path::new(p)).ok()?;
         FallbackFace::from_bytes(&bytes, Some(p.clone())).ok()
     })
 }
@@ -2405,7 +2759,7 @@ fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
 fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
     let mut chain = Vec::new();
     for p in paths {
-        let Ok(bytes) = std::fs::read(p) else {
+        let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
             continue;
         };
         let is_native_tier = CJK_NATIVE_FALLBACK_CANDIDATES.contains(&p.as_str());
@@ -2439,7 +2793,7 @@ fn font_coverage_index() -> &'static [FontCoverage] {
             if path_is_last_resort(&p) {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok(bytes) = font_file::read_font_file(&path) else {
                 continue;
             };
             let (weight, italic) = ttf_parser::Face::parse(&bytes, 0)
@@ -3701,8 +4055,10 @@ pub fn resolve_font_family(family: &str) -> Option<String> {
     }
     // Either separator marks a path: `\` so a Windows `C:\…\x.ttf` value works
     // (no real font FAMILY name contains a separator on any platform).
-    if trimmed.contains(['/', '\\']) && std::path::Path::new(trimmed).is_file() {
-        return Some(trimmed.to_string());
+    if trimmed.contains(['/', '\\']) {
+        return font_file::validate_font_file(std::path::Path::new(trimmed))
+            .is_ok()
+            .then(|| trimmed.to_string());
     }
     let want = normalize_family(trimmed);
     if want.is_empty() {
@@ -3736,6 +4092,43 @@ pub fn resolve_font_family(family: &str) -> Option<String> {
         return Some(p);
     }
     prefix_hit
+}
+
+/// Resolve one config-authored family-or-path and validate the resulting file
+/// under the explicit-font admission policy.
+///
+/// Unlike [`resolve_font_family`], this preserves the reason an explicit path
+/// was rejected (missing, special/link target, or over the byte budget) so
+/// Settings/Manual can underline the exact key instead of reducing every error
+/// to “family not found”. The returned path has been validated, but callers that
+/// later consume bytes must still use [`font_file::read_font_file`]: a pathname
+/// may legitimately change between validation and application.
+pub fn resolve_config_font(family: &str) -> Result<String, String> {
+    let trimmed = family.trim();
+    if trimmed.is_empty() {
+        return Err("empty font name or path".to_string());
+    }
+    // The `game:` scheme names embedded bytes, not a file: admissible by
+    // construction, and the virtual name IS its resolved identity. An unknown
+    // game id falls through to normal resolution (and its honest error).
+    if game_font_for_family(trimmed).is_some() {
+        return Ok(trimmed.to_string());
+    }
+    let explicit_path = trimmed.contains(['/', '\\']);
+    let path = if explicit_path {
+        trimmed.to_string()
+    } else {
+        resolve_font_family(trimmed)
+            .ok_or_else(|| format!("{trimmed:?} does not resolve to a font file"))?
+    };
+    font_file::validate_font_file(std::path::Path::new(&path)).map_err(|error| {
+        if explicit_path {
+            format!("font path {path:?} is not admissible ({error})")
+        } else {
+            format!("resolved font {path:?} is not admissible ({error})")
+        }
+    })?;
+    Ok(path)
 }
 
 /// Upper bound on a font file the name-table pass will read. A terminal FAMILY is never
@@ -3774,10 +4167,8 @@ fn font_name_table_matches(bytes: &[u8], want: &str) -> bool {
 #[must_use]
 fn resolve_by_name_table(want: &str) -> Option<String> {
     for path in font_files() {
-        if std::fs::metadata(&path).map_or(u64::MAX, |m| m.len()) > NAME_SCAN_MAX_BYTES {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = font_file::read_bounded_font_file(&path, NAME_SCAN_MAX_BYTES as usize)
+        else {
             continue;
         };
         if font_name_table_matches(&bytes, want) {
@@ -3828,45 +4219,7 @@ const FONT_SCAN_MAX_DEPTH: usize = 8;
 /// all consume it, so Linux's nested tree and macOS's flat one are handled
 /// uniformly — depth-0 files (the macOS layout) are still found first.
 fn font_files() -> Vec<std::path::PathBuf> {
-    fn is_font(p: &std::path::Path) -> bool {
-        p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| FONT_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
-    }
-    fn walk(dir: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        let mut entries: Vec<std::fs::DirEntry> = entries.flatten().collect();
-        entries.sort_by_key(std::fs::DirEntry::path);
-        for entry in entries {
-            let p = entry.path();
-            // `file_type()` reports the entry WITHOUT following a final symlink. We
-            // descend ONLY real directories — a symlinked directory is never followed,
-            // so a self/loop symlink (e.g. in ~/.fonts) cannot blow the walk up
-            // (real dirs form an acyclic tree). A symlink that points at a font FILE is
-            // still honoured (font trees legitimately symlink faces).
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
-                if depth < FONT_SCAN_MAX_DEPTH {
-                    walk(&p, depth + 1, out);
-                }
-            } else if ft.is_symlink() {
-                // Resolve the link target's kind once; follow file targets, skip dir
-                // targets (loop-safe). `is_file()` traverses the link.
-                if p.is_file() && is_font(&p) {
-                    out.push(p);
-                }
-            } else if is_font(&p) {
-                out.push(p);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    for dir in font_search_dirs() {
-        walk(&dir, 0, &mut out);
-    }
-    out
+    font_catalog::system_font_files()
 }
 
 /// Normalize a family name / file stem for comparison: lowercase, with ASCII
@@ -4027,7 +4380,7 @@ fn deco_tables(bytes: &[u8]) -> Option<deco::DecoTables> {
 #[must_use]
 pub fn face_info(family: &str) -> Option<FaceInfo> {
     let path = resolve_font_family(family)?;
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = font_file::read_font_file(std::path::Path::new(&path)).ok()?;
     let font =
         fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default()).ok()?;
     let lm = font.horizontal_line_metrics(FaceInfo::PROBE_PX)?;
@@ -4131,6 +4484,7 @@ impl Renderer {
             resolved_features: ligature_shaping::build_feature_list(&[], true),
             shaped_runs: ShapedRunCache::default(),
             fallback_chain: Vec::new(),
+            game_mix: Vec::new(),
             fallback_pick: FxHashMap::default(),
             fallback_paths: Vec::new(),
             cfg_fallback_fonts: Vec::new(),
@@ -4150,6 +4504,7 @@ impl Renderer {
             ct_cache: FxHashMap::default(),
             primary_path: None,
             styled_loaded: false,
+            admitted_sources_sealed: false,
             shapeable_scratch: Vec::new(),
             break_mask_scratch: Vec::new(),
             glyph_plan_scratch: Vec::new(),
@@ -4218,6 +4573,24 @@ impl Renderer {
     /// instead of going blank. Prefer the lazy path (`from_system`) unless you have
     /// a reason to pay the parse cost upfront. To add MORE fallbacks for scripts one
     /// face misses, follow with [`add_fallback_bytes`](Self::add_fallback_bytes).
+    /// Install the EXTRA faces of a game-font MIX (the mix's first face is the
+    /// ordinary primary this renderer was built from). Every character then
+    /// deterministically picks one face of the whole mix
+    /// ([`game_mix_face_index`]); picks landing on an extra face rasterize
+    /// through the metric-normalized fallback pipeline, so differently-metriced
+    /// title faces still fill the same cell grid. An empty slice clears the mix.
+    pub fn set_game_mix_faces(&mut self, faces: &[&[u8]]) -> Result<(), String> {
+        let mut mix = Vec::with_capacity(faces.len());
+        for bytes in faces {
+            mix.push(FallbackFace::from_bytes(bytes, None)?);
+        }
+        self.game_mix = mix;
+        // Per-char routing + rasters were keyed to the OLD mix; re-resolve.
+        self.keys.clear();
+        self.glyphs.clear();
+        Ok(())
+    }
+
     pub fn set_fallback_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
         // Interned: a ~370MB parsed broad fallback is shared across panes injecting
         // the same bytes (every terminal pane injects the same OS fallback).
@@ -4415,6 +4788,7 @@ impl Renderer {
         }
         self.cfg_fallback_fonts = paths.to_vec();
         self.fallback_paths = fallback_candidate_paths(paths);
+        self.admitted_sources_sealed = false;
         self.fallback_chain.clear();
         self.fallback_pick.clear();
         // Per-char keys + bitmaps resolved against the OLD chain; drop both so a
@@ -4436,6 +4810,7 @@ impl Renderer {
         let config: Vec<String> = path.map(str::to_string).into_iter().collect();
         self.symbol_fallback = None;
         self.symbol_fallback_paths = symbol_fallback_candidate_paths(&config);
+        self.admitted_sources_sealed = false;
         self.keys.clear();
         self.glyphs.clear();
         true
@@ -4452,6 +4827,7 @@ impl Renderer {
         let config: Vec<String> = path.map(str::to_string).into_iter().collect();
         self.color_font = None;
         self.color_font_paths = color_emoji_candidate_paths(&config);
+        self.admitted_sources_sealed = false;
         // Same three memos `set_color_font_bytes` documents: keys (select_face
         // consulted colour coverage), per-char emoji keys, shaped-cluster gids —
         // plus the rasterized bitmaps.
@@ -4574,6 +4950,7 @@ impl Renderer {
         self.styled_faces = [None, None, None];
         self.styled_loaded = false;
         self.primary_path = None;
+        self.admitted_sources_sealed = false;
         // Everything was rasterized / id-resolved against the OLD primary; drop it
         // all so the new face takes over (same discipline as `set_px`).
         self.glyphs.clear();
@@ -4611,6 +4988,7 @@ impl Renderer {
         let path = path.into();
         self.set_primary_font(bytes)?;
         self.primary_path = Some(path);
+        self.admitted_sources_sealed = false;
         Ok(())
     }
 
@@ -4621,25 +4999,76 @@ impl Renderer {
         Self::from_system_with_family(None, px, theme)
     }
 
+    /// Build from one already-resolved font file's admitted bytes.
+    ///
+    /// This is the no-filesystem half of the configured-primary path. Hosts use
+    /// it to preserve the current working face when a later pathname admission
+    /// fails, while retaining the real path for styled-sibling discovery.
+    pub fn from_resolved_font_file(
+        path: impl Into<String>,
+        bytes: &[u8],
+        px: f32,
+        theme: Theme,
+    ) -> Result<Self, String> {
+        let mut renderer = Self::from_bytes(bytes, px, theme)?;
+        renderer.primary_path = Some(path.into());
+        renderer.fallback_paths = fallback_candidate_paths(&[]);
+        renderer.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
+        renderer.color_font_paths = color_emoji_candidate_paths(&[]);
+        Ok(renderer)
+    }
+
+    /// Strict configured-primary constructor.
+    ///
+    /// Unlike [`Self::from_system_with_family`], this never falls through to a
+    /// different face after a configured family/path resolves but fails bounded
+    /// admission or parsing. That distinction is required by live reload: a bad
+    /// edit must leave the current working font on glass, not silently replace it
+    /// with a built-in candidate.
+    pub fn from_configured_font_family(
+        family: &str,
+        px: f32,
+        theme: Theme,
+    ) -> Result<Self, String> {
+        if let Some(mix) = game_font_mix_for_family(family.trim()) {
+            let mut renderer = Self::from_resolved_font_file(family.trim(), mix[0], px, theme)?;
+            renderer.set_game_mix_faces(&mix[1..])?;
+            return Ok(renderer);
+        }
+        let path = resolve_config_font(family)?;
+        let bytes = font_file::read_font_file(std::path::Path::new(&path))
+            .map_err(|error| format!("font {path:?} failed bounded admission ({error})"))?;
+        Self::from_resolved_font_file(path, &bytes, px, theme)
+    }
+
     /// Like [`Renderer::from_system`], but tries a configured font FAMILY name
     /// FIRST. The candidate order is: the resolved family file (if `family` names
     /// one that exists), then `$ATERM_FONT`, then the built-in [`FONT_CANDIDATES`].
     /// A `None` family — or a family that resolves to nothing — reduces EXACTLY to
     /// `from_system`, so the default (and a typo'd family) is byte-identical.
     pub fn from_system_with_family(family: Option<&str>, px: f32, theme: Theme) -> Option<Self> {
+        // The `game:` scheme resolves to embedded bytes, never the filesystem —
+        // the same interception `font_catalog::resolve_and_admit` performs, so
+        // startup and live reload can never disagree about a game face.
+        if let Some(requested) = family
+            && let Some(mix) = game_font_mix_for_family(requested)
+            && let Ok(mut renderer) = Self::from_resolved_font_file(requested, mix[0], px, theme)
+        {
+            if renderer.set_game_mix_faces(&mix[1..]).is_err() {
+                // A bundled face that parses standalone always parses here;
+                // fail open to the first face alone rather than no font.
+            }
+            return Some(renderer);
+        }
         let mut paths: Vec<String> = Vec::new();
         if let Some(p) = family.and_then(resolve_font_family) {
             paths.push(p);
         }
         paths.extend(primary_candidate_paths());
         for p in paths {
-            if let Ok(bytes) = std::fs::read(&p)
-                && let Ok(mut r) = Self::from_bytes(&bytes, px, theme)
+            if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p))
+                && let Ok(r) = Self::from_resolved_font_file(p.clone(), &bytes, px, theme)
             {
-                r.primary_path = Some(p.clone());
-                r.fallback_paths = fallback_candidate_paths(&[]);
-                r.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
-                r.color_font_paths = color_emoji_candidate_paths(&[]);
                 return Some(r);
             }
         }
@@ -4783,7 +5212,27 @@ impl Renderer {
     /// it off: discovery can never succeed there, and a real miss should reach
     /// [`Self::take_missing_font_classes`] without per-char fs attempts.
     pub fn set_runtime_font_discovery(&mut self, enabled: bool) {
+        let widened = enabled && (!self.runtime_discovery || self.admitted_sources_sealed);
         self.runtime_discovery = enabled;
+        if enabled {
+            self.admitted_sources_sealed = false;
+        }
+        if widened {
+            // SEAL MONOTONICITY in the MEMO layer — a hole the `font_chain`
+            // P4 proof exposed. This is the one chain-WIDENING mutator that did
+            // not drop the per-code-point memos; every other one does
+            // (`set_config_fallback_fonts`, `set_config_symbol_font`,
+            // `set_config_emoji_font`, `set_color_font_bytes`,
+            // `seal_admitted_font_sources`). Re-enabling discovery BOTH opens
+            // the runtime tier AND clears the seal, so a `.notdef` decided
+            // against the narrower chain would otherwise survive the widening
+            // and stay tofu forever — the exact shape of the U+276F bug, one
+            // layer up. Latent today (every in-tree caller passes `false`),
+            // which is precisely when it is cheap to close.
+            self.keys.clear();
+            self.glyphs.clear();
+            self.font_epoch += 1;
+        }
     }
 
     fn block_on_lazy_fallbacks(&mut self) {
@@ -5070,7 +5519,7 @@ impl Renderer {
                 if self.styled_faces[slot].is_some() {
                     break;
                 }
-                if let Ok(bytes) = std::fs::read(&p)
+                if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p))
                     && let Ok(font) = fontdue::Font::from_bytes(
                         bytes.as_slice(),
                         fontdue::FontSettings::default(),
@@ -5114,6 +5563,179 @@ impl Renderer {
         self.rb_primary_bytes.clone().map(|b| (b, 0))
     }
 
+    /// The admitted path that supplied the primary face, when it came from a
+    /// native file. This is immutable generation metadata only: callers must
+    /// never reopen it on an event-loop apply path.
+    #[must_use]
+    pub fn primary_source_path(&self) -> Option<&str> {
+        self.primary_path.as_deref()
+    }
+
+    /// Return the exact retained face sources for this renderer without path
+    /// resolution, filesystem access, or hashing.
+    #[must_use]
+    pub fn admitted_font_sources(&self) -> AdmittedFontSources {
+        let slice = |bytes: &std::sync::Arc<[u8]>, index| AdmittedFaceSource {
+            bytes: AdmittedFontBlob::Slice(std::sync::Arc::clone(bytes)),
+            index,
+        };
+        let vec = |bytes: &std::sync::Arc<Vec<u8>>, index| AdmittedFaceSource {
+            bytes: AdmittedFontBlob::Vec(std::sync::Arc::clone(bytes)),
+            index,
+        };
+        AdmittedFontSources {
+            sealed: self.admitted_sources_sealed,
+            primary: self.rb_primary_bytes.as_ref().map(|bytes| slice(bytes, 0)),
+            injected_bold: self.bold_font_bytes.as_ref().map(|bytes| slice(bytes, 0)),
+            styled: std::array::from_fn(|slot| {
+                self.styled_faces[slot]
+                    .as_ref()
+                    .map(|face| slice(&face.bytes, face.index))
+            }),
+            fallback: self
+                .fallback_chain
+                .iter()
+                .map(|face| vec(&face.bytes, face.index))
+                .collect(),
+            symbol: self
+                .symbol_fallback
+                .as_ref()
+                .map(|face| vec(&face.bytes, face.index)),
+            emoji: self.color_font.as_ref().map(|bytes| vec(bytes, 0)),
+        }
+    }
+
+    /// Settle and close one complete path-backed font generation.
+    ///
+    /// This is intentionally worker-only work: it may read and parse the
+    /// generation's already-bounded styled sibling, broad fallback, symbol, and
+    /// emoji candidates. On return all such candidates have become retained
+    /// immutable faces (or a final absence), every candidate path is gone, and
+    /// runtime system discovery is disabled. Publication, zoom, semantic forks,
+    /// and device-loss recovery can therefore use only resident bytes.
+    pub fn seal_admitted_font_sources(&mut self) -> AdmittedFontSources {
+        self.ensure_styled_faces();
+        self.block_on_lazy_fallbacks();
+        self.ensure_color_font();
+
+        // `ensure_*` consumes these already, but clear explicitly so this method
+        // remains a hard boundary if their implementation later changes.
+        self.fallback_paths.clear();
+        self.symbol_fallback_paths.clear();
+        self.color_font_paths.clear();
+        self.fallback_parse_rx = None;
+        self.symbol_parse_rx = None;
+
+        // Runtime per-codepoint discovery is the final synchronous PATHNAME
+        // seam. A sealed configured generation uses its admitted broad/symbol/
+        // emoji cascade and reports a real miss instead of reopening the host.
+        //
+        // The seal closes FILESYSTEM/host discovery — NOT the bundled Symbols
+        // Nerd Font, whose bytes are compiled in. `admitted_sources_sealed`
+        // (set at the end of this method) is what narrows the give-up path to
+        // `RuntimeFallback::resolve_embedded_only`, which performs no I/O and
+        // so cannot violate the no-font-I/O seal.
+        //
+        // This deliberately does NOT touch `runtime_discovery`. That flag is
+        // the E1 host switch meaning "no runtime fallback AT ALL" (web/wasm
+        // hosts turn it off so a real miss reaches `take_missing_font_classes`
+        // and they can inject the face themselves). Conflating the two is what
+        // produced the U+276F `❯` tofu: every GUI backend seals, sealing set
+        // `runtime_discovery = false`, and the compiled-in backstop became
+        // structurally unreachable — so a code point a LOADED face covered
+        // still rendered `.notdef`, permanently.
+        self.runtime_fallback = RuntimeFallback::default();
+        self.missing_font_classes = 0;
+        // A worker normally seals before any terminal glyph is planned. Clear
+        // the routing caches as a defensive guarantee if a caller seals later:
+        // no key may retain a now-discarded runtime face decision.
+        self.keys.clear();
+        self.styled_keys.clear();
+        self.glyphs.clear();
+        self.emoji_keys.clear();
+        self.cluster_gids.clear();
+        self.shaped_runs.clear();
+        self.admitted_sources_sealed = true;
+        self.admitted_font_sources()
+    }
+
+    /// Rebuild this complete font generation at `px`/`theme` from retained
+    /// bytes and parsed immutable faces only.
+    ///
+    /// An unsealed renderer is rejected rather than silently losing a lazy
+    /// candidate or falling back to pathname discovery. The returned renderer
+    /// has fresh glyph/layout caches but preserves the exact configured cascade,
+    /// collection indices, shaping/variation/style policy, and font appearance
+    /// knobs. It contains no candidate paths and cannot perform font I/O.
+    pub fn rebuild_from_admitted(&self, px: f32, theme: Theme) -> Result<Self, String> {
+        if !self.admitted_sources_sealed {
+            return Err(
+                "font generation is not sealed; prepare it on the font worker first".into(),
+            );
+        }
+        let primary = self
+            .rb_primary_bytes
+            .as_deref()
+            .ok_or("font generation has no retained primary bytes")?;
+        let mut rebuilt = Self::from_bytes(primary, px, theme)?;
+
+        // Exact admitted faces. Parsed broad/styled faces are Arc-backed and can
+        // be shared across sizes; only glyph rasters depend on `px`.
+        if let Some(bytes) = self.bold_font_bytes.as_deref() {
+            rebuilt.set_bold_font(bytes)?;
+        }
+        rebuilt.styled_faces = self.styled_faces.clone();
+        rebuilt.styled_loaded = true;
+        rebuilt.primary_path = self.primary_path.clone(); // diagnostics only
+        rebuilt.fallback_chain = self.fallback_chain.clone();
+        rebuilt.game_mix = self.game_mix.clone();
+        rebuilt.fallback_paths.clear();
+        rebuilt
+            .cfg_fallback_fonts
+            .clone_from(&self.cfg_fallback_fonts);
+        rebuilt.symbol_fallback = self.symbol_fallback.clone();
+        rebuilt.symbol_fallback_paths.clear();
+        rebuilt.cfg_symbol_font.clone_from(&self.cfg_symbol_font);
+        rebuilt.color_font = self.color_font.clone();
+        rebuilt.color_font_paths.clear();
+        rebuilt.cfg_emoji_font.clone_from(&self.cfg_emoji_font);
+        rebuilt.fallback_parse_rx = None;
+        rebuilt.symbol_parse_rx = None;
+        rebuilt.runtime_fallback = self.runtime_fallback.clone();
+        // INHERIT the E1 host switch rather than forcing it off: a rebuild is a
+        // zoom/theme flip of the SAME generation, not a policy change. What bars
+        // pathname discovery here is `admitted_sources_sealed`, which also keeps
+        // the I/O-free bundled backstop reachable (see `glyph_key_inner`).
+        // Forcing this to `false` is what carried the U+276F tofu across zooms.
+        rebuilt.runtime_discovery = self.runtime_discovery;
+        rebuilt.admitted_sources_sealed = true;
+
+        // Font policy and geometry. Apply variations before line-height so all
+        // metrics are derived from the requested instance at the new size.
+        rebuilt.synthetic_styles = self.synthetic_styles;
+        rebuilt.set_text_shaping(self.shaping.clone());
+        let _ = rebuilt.set_font_variations(&self.cfg_font_variations, self.font_weight_dark_nudge);
+        rebuilt.set_line_height(self.line_height_scale);
+        rebuilt.set_adjust_baseline(self.baseline_adjust);
+        rebuilt.set_adjust_underline(self.underline_adjust_pos, self.underline_adjust_thick);
+        rebuilt.set_underline_skip_descenders(self.underline_skip_descenders);
+        rebuilt.set_stem_gamma(self.stem_gamma);
+        rebuilt.set_text_blending(self.text_blending);
+        rebuilt.set_font_thicken(self.font_thicken);
+        rebuilt.set_selection_fg(self.selection_fg);
+        rebuilt.set_minimum_contrast(self.min_contrast);
+        rebuilt.set_background_opacity(self.bg_opacity);
+        rebuilt.set_cursor_opacity(self.cursor_opacity);
+        rebuilt.set_selection_inactive(self.selection_inactive);
+        rebuilt.set_selection_inactive_bg(self.selection_inactive_bg);
+        rebuilt.procedural = self.procedural;
+        #[cfg(target_os = "macos")]
+        {
+            rebuilt.rasterizer = self.rasterizer;
+        }
+        Ok(rebuilt)
+    }
+
     /// The real BOLD weight of the primary family for the GUI chrome —
     /// `(bytes, collection index)` — preferring a host-injected bold face
     /// ([`Self::set_bold_font`]) and otherwise the lazily-discovered `-Bold`
@@ -5152,12 +5774,20 @@ impl Renderer {
     /// shared `Arc` data without a second resident copy.
     #[must_use]
     pub fn fork_semantic_surface(&self, px: f32, theme: Theme) -> Option<Self> {
+        // A published native generation is closed over exact admitted bytes.
+        // Rebuilding it through the historical fork below would recreate lazy
+        // fallback/symbol/emoji candidate paths and reopen the filesystem from a
+        // later semantic warmup. Keep sealed generations sealed end-to-end.
+        if self.admitted_sources_sealed {
+            return self.rebuild_from_admitted(px, theme).ok();
+        }
         let primary = self.rb_primary_bytes.as_deref()?;
         let mut fork = Self::from_bytes(primary, px, theme).ok()?;
 
         // Font routing assets. Loaded faces are immutable Arc-backed values;
         // per-character decisions/caches remain private to the fork.
         fork.fallback_chain = self.fallback_chain.clone();
+        fork.game_mix = self.game_mix.clone();
         fork.cfg_fallback_fonts = self.cfg_fallback_fonts.clone();
         fork.fallback_paths = if fork.fallback_chain.is_empty() {
             fallback_candidate_paths(&fork.cfg_fallback_fonts)
@@ -5359,6 +5989,12 @@ impl Renderer {
             // key was built, so `parts_for` recovers the exact face. `None` if
             // the decision is somehow absent (it never is on the real path).
             FaceId::RuntimeFallback => self.runtime_fallback.parts_for(ch),
+            // The mix pick is a pure function of the code point — recompute it
+            // (no per-char memo to recover). Fail safe to the primary below.
+            FaceId::GameMix => game_mix_face_index(ch, self.game_mix.len() + 1)
+                .checked_sub(1)
+                .and_then(|i| self.game_mix.get(i))
+                .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm)),
             _ => None,
         };
         // `bytes`/`index` feed the CoreText-native raster below — macOS-only.
@@ -5553,7 +6189,7 @@ impl Renderer {
         }
         let paths = std::mem::take(&mut self.color_font_paths);
         for p in paths {
-            if let Ok(bytes) = std::fs::read(&p) {
+            if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p)) {
                 // Validate it parses as a colour (sbix) face before keeping it.
                 if ttf_parser::Face::parse(&bytes, 0).is_ok() {
                     self.color_font = Some(intern_font_bytes(bytes));
@@ -6503,104 +7139,82 @@ impl Renderer {
     /// fallback parse is in flight and `ch` was routed to `.notdef` for THIS
     /// frame only — the decision was NOT memoized (here nor by any caller), so
     /// it re-resolves once the parse lands and the epoch-forced repaint runs.
+    ///
+    /// The POLICY — tier order, the two independent narrowing switches, the
+    /// provisional gates, the give-up — lives in the pure, exhaustively-verified
+    /// [`font_chain::resolve_chain`]. This function supplies only the LAZY
+    /// probes: each coverage fact is computed when, and only when, every
+    /// higher-priority tier has already missed, so the heavy fallback / symbol /
+    /// colour faces are never loaded for a char the primary face covers.
     fn glyph_key_inner(&mut self, ch: char) -> (GlyphKey, bool) {
         if let Some(&key) = self.keys.get(&ch) {
             return (key, false);
         }
-        // Probe coverage lazily, in priority order — each fact is computed only
-        // when every higher-priority face has already missed, so the heavy
-        // fallback / symbol / colour faces are never loaded for a char the
-        // primary face covers. Procedural box-drawing/block/braille interception
-        // stays FIRST: those cells must be cell-exact and seam-free, which no
-        // font guarantees ($ATERM_NO_PROCEDURAL_GLYPHS opts back into fonts).
-        let procedural = self.procedural && procedural::covers(ch);
-        // Primary coverage + glyph id come from the UNICODE cmap (ttf-parser), NOT
-        // fontdue's char lookup, which mis-selects a Mac Roman subtable on Apple
-        // `.ttc` fonts (see `primary_unicode_gid`). The id is carried on the key so
-        // the glyph is rasterized BY ID, faithful to the cell's Unicode scalar.
-        let primary_gid = if procedural {
-            None
-        } else {
-            self.primary_unicode_gid(ch)
-        };
-        let primary_has = primary_gid.is_some();
-        // The fallback CHAIN is tried in order; `fallback_has` records WHICH entry
-        // covered `ch` (in `fallback_pick`) so the rasterizer recovers it later.
-        let fallback_has = !procedural && !primary_has && self.fallback_has(ch);
-        // While the lazy broad-fallback face parses on the background thread, an
-        // uncovered char's routing is PROVISIONAL: render `.notdef` this frame
-        // WITHOUT memoizing the decision and WITHOUT cascading into the
-        // lower-priority loaders (the runtime resolver would synchronously
-        // read+parse a covering system font — the very stall the background
-        // parse exists to avoid). The epoch bump on landing forces the repaint
-        // that re-resolves it.
-        if !procedural && !primary_has && !fallback_has && self.fallback_parse_rx.is_some() {
-            return (
-                GlyphKey::mono_char(FaceId::Primary, ch, StyleBits::REGULAR, self.px_q),
-                true,
-            );
-        }
-        let symbol_has =
-            !procedural && !primary_has && !fallback_has && self.symbol_fallback_has(ch);
-        // Same provisional treatment while the SYMBOL face parses.
-        if !procedural
-            && !primary_has
-            && !fallback_has
-            && !symbol_has
-            && self.symbol_parse_rx.is_some()
-        {
-            return (
-                GlyphKey::mono_char(FaceId::Primary, ch, StyleBits::REGULAR, self.px_q),
-                true,
-            );
-        }
-        // Colour coverage is probed when every mono face missed. Whether it
-        // produces a colour glyph or a monochromatized one is decided by
-        // `select_face` from `wants_emoji` (the Unicode `Emoji_Presentation`
-        // property) — so a default-text symbol (⏺) the colour font covers never
-        // resolves to the colour face. The POLICY lives in the pure,
-        // exhaustively-verified `select_face`: ONE provable colour-vs-text place.
-        let wants_emoji = aterm_grapheme::is_emoji_presentation(ch);
-        let color_has =
-            !procedural && !primary_has && !fallback_has && !symbol_has && self.color_font_has(ch);
-        let face = select_face(
-            procedural,
-            primary_has,
-            fallback_has,
-            symbol_has,
-            color_has,
-            wants_emoji,
-        );
-        // M3 FONT-DISCOVERY: `select_face` returns `FaceId::Primary` for the
-        // genuinely-covered primary glyph AND for the give-up `.notdef` case (no
-        // configured face covers the char). Distinguish them: it is a give-up
-        // ONLY when the char isn't procedural and the primary truly lacks it.
-        // In that give-up case — and ONLY then — try the runtime resolver before
-        // settling for `.notdef`. The common path (any face covered it) never
-        // reaches this, so behaviour/perf for ordinary text is unchanged.
-        let face = if face == FaceId::Primary && !procedural && !primary_has {
-            let resolved = if self.runtime_discovery {
-                let ctx = self.runtime_probe_ctx();
-                self.runtime_fallback.resolve(ch, ctx)
-            } else {
-                None
-            };
-            match resolved {
-                Some(_) => FaceId::RuntimeFallback,
-                None => {
-                    // A real miss — render `.notdef`, and record WHICH injectable
-                    // face class would have served the char so a poll-based host
-                    // can lazily inject it (E1 lazy web fonts).
-                    self.missing_font_classes |= if wants_emoji {
-                        MISSING_FONT_CLASS_EMOJI
-                    } else {
-                        MISSING_FONT_CLASS_TEXT
-                    };
-                    FaceId::Primary
-                }
+        // FONT-GAME MIX: with extra game faces installed, every character
+        // deterministically picks one face of the mix — pick 0 continues on the
+        // ordinary cascade below; a covered pick on an extra face routes to
+        // [`FaceId::GameMix`] (rasterized metric-normalized, like a fallback
+        // face). Procedural cells stay procedural: box drawing must be
+        // cell-exact and seam-free whatever the mix, so the mix defers to what
+        // is also the chain's first tier.
+        //
+        // This interception sits OUTSIDE the verified chain deliberately. It is
+        // a cosmetic pre-emption, not a coverage tier: it routes ONLY to a face
+        // that already covers `ch` and otherwise falls through untouched, so it
+        // cannot manufacture tofu and cannot perturb the tier order that
+        // `font_chain`'s proofs pin.
+        if !self.game_mix.is_empty() && !(self.procedural && procedural::covers(ch)) {
+            let pick = game_mix_face_index(ch, self.game_mix.len() + 1);
+            if let Some(face) = pick.checked_sub(1).and_then(|i| self.game_mix.get(i))
+                && face.font.lookup_glyph_index(ch) != 0
+            {
+                let key = GlyphKey::mono_char(FaceId::GameMix, ch, StyleBits::REGULAR, self.px_q);
+                self.keys.insert(ch, key);
+                return (key, false);
             }
-        } else {
-            face
+        }
+        let policy = font_chain::ChainPolicy {
+            // The E1 host switch: no runtime fallback at all, so the miss reaches
+            // `missing_font_classes` and a web/wasm host can inject the face.
+            runtime_discovery: self.runtime_discovery,
+            // The font worker settled this generation: no PATHNAME discovery (it
+            // would reopen the host on the render thread). The BUNDLED symbol
+            // face is `include_bytes!`'d — no I/O, no host query — so it stays
+            // reachable. Conflating these two gates is what tofu'd U+276F.
+            sealed: self.admitted_sources_sealed,
+            wants_emoji: aterm_grapheme::is_emoji_presentation(ch),
+        };
+        let mut primary_gid: Option<u16> = None;
+        let mut probe = RendererProbe {
+            r: self,
+            ch,
+            primary_gid: &mut primary_gid,
+        };
+        let resolved = font_chain::resolve_chain(&mut probe, policy);
+        let face = match resolved {
+            font_chain::Resolution::Provisional => {
+                debug_assert!(
+                    !self.keys.contains_key(&ch),
+                    "a provisional `.notdef` must never be memoized — it strands the tofu",
+                );
+                return (
+                    GlyphKey::mono_char(FaceId::Primary, ch, StyleBits::REGULAR, self.px_q),
+                    true,
+                );
+            }
+            font_chain::Resolution::Notdef => {
+                // A real miss — record WHICH injectable face class would have
+                // served the char so a poll-based host can lazily inject it
+                // (E1 lazy web fonts).
+                self.missing_font_classes |= if policy.wants_emoji {
+                    MISSING_FONT_CLASS_EMOJI
+                } else {
+                    MISSING_FONT_CLASS_TEXT
+                };
+                FaceId::Primary
+            }
+            font_chain::Resolution::Runtime(_) => FaceId::RuntimeFallback,
+            font_chain::Resolution::Face(f) => f,
         };
         let key = match face {
             // The colour face carries a 32-bit RGBA sbix bitmap (🚀 😀); every
@@ -6617,6 +7231,15 @@ impl Renderer {
             }
             source => GlyphKey::mono_char(source, ch, StyleBits::REGULAR, self.px_q),
         };
+        // P3 KEY/RASTER AGREEMENT: the record this resolution WROTE must be the
+        // record `fallback_mono_raster` READS back from the key's face. Breaking
+        // it is a silent tofu — the `.notdef` raster wearing a fallback face id.
+        debug_assert!(
+            resolved
+                .recovery_slot()
+                .is_none_or(|slot| font_chain::slot_for_source(key.source) == Some(slot)),
+            "glyph key {key:?} cannot recover the face that {resolved:?} resolved",
+        );
         self.keys.insert(ch, key);
         (key, false)
     }
@@ -7442,7 +8065,10 @@ impl Renderer {
                     t
                 } else if matches!(
                     key.source,
-                    FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
+                    FaceId::Fallback
+                        | FaceId::SymbolFallback
+                        | FaceId::RuntimeFallback
+                        | FaceId::GameMix
                 ) {
                     // W8 (fallback harmony): fallback faces rasterize through
                     // their own pipeline — CoreText-native on macOS, metric-
@@ -7467,7 +8093,8 @@ impl Renderer {
                         | FaceId::ColorEmojiMono
                         | FaceId::Fallback
                         | FaceId::SymbolFallback
-                        | FaceId::RuntimeFallback => &self.font,
+                        | FaceId::RuntimeFallback
+                        | FaceId::GameMix => &self.font,
                         // BoldPrimary keys are always built as MonoGid (handled in the
                         // MonoGid arm); this Mono-class case is unreachable on the real
                         // path, so fail safe to the bold face (then the primary).
@@ -7986,6 +8613,11 @@ impl Renderer {
         // below can borrow `self` mutably for rasterization. It is restored into
         // `wc.dirty_scratch` before every return (capacity retained for reuse).
         let mut dirty = std::mem::take(&mut wc.dirty_scratch);
+        // E7: a rigid whole-row history scroll that `compute_dirty_rows` rejects
+        // (offset AND anchor both shifted → FullRepaint) is rescued into a BLIT —
+        // shift the retained rows, re-rasterize only the exposed strip. `Some`
+        // delta ⇒ `dirty` holds exactly the exposed/cursor rows to repaint.
+        let mut scroll_delta: Option<i32> = None;
         let decision = match &wc.cache {
             // The cached pixel dims must also match `(w, h)`. `compute_dirty_rows`
             // already requires equal rows/cols (which fix the dims under the fixed
@@ -7999,7 +8631,7 @@ impl Renderer {
                     && c.grid_top == self.grid_top()
                     && c.font_epoch == self.font_epoch =>
             {
-                compute_dirty_rows(
+                let d = compute_dirty_rows(
                     &c.input,
                     input,
                     c.cursor_blink_phase,
@@ -8008,17 +8640,34 @@ impl Renderer {
                     self.cursor_style_override,
                     self.cell_h,
                     &mut dirty,
-                )
+                );
+                if matches!(d, DirtyDecision::FullRepaint) {
+                    scroll_delta = scroll_blit_plan(
+                        &c.input,
+                        input,
+                        c.cursor_blink_phase,
+                        c.cursor_style_override,
+                        self.cursor_blink_phase,
+                        self.cursor_style_override,
+                        self.cell_h,
+                        &mut dirty,
+                    );
+                }
+                d
             }
             _ => DirtyDecision::FullRepaint,
         };
         let dirty_rows = match decision {
-            DirtyDecision::FullRepaint => {
+            // A true full repaint (no scroll-blit rescue): rebuild every row.
+            DirtyDecision::FullRepaint if scroll_delta.is_none() => {
                 wc.dirty_scratch = dirty;
                 wc.last_damage = DamageOutcome::Full;
                 self.full_render(wc, input, w, h);
                 return (w, h);
             }
+            // Rescued scroll blit: the exposed/cursor rows in `dirty` drive the
+            // SAME damaged tail as ordinary row damage (pixels pre-shifted below).
+            DirtyDecision::FullRepaint => DirtyRows::rows_only(),
             DirtyDecision::Rows(d) => d,
         };
 
@@ -8029,6 +8678,45 @@ impl Renderer {
         // `wc.dirty_scratch` before return).
         let mut cache = wc.cache.take().expect("reusable implies Some");
         debug_assert_eq!(cache.pixels.len(), w * h);
+
+        // E7 SCROLL BLIT: shift the retained grid rows by `delta·cell_h` device px
+        // inside the cached framebuffer (whole-cell multiple — an integer memmove
+        // of already-rasterized rows), so the damaged tail below re-rasterizes ONLY
+        // the exposed strip + cursor rows flagged in `dirty`. The shift confines to
+        // the grid pixel band `[grid_top, grid_top + rows·cell_h)`; padding is
+        // invariant (a bg change forces the full path). Byte-identical to a full
+        // repaint because a retained row's content was proven unchanged and row
+        // rasterization is a pure Y-translation.
+        // E7 overshoot-apron scratch, resident on `wc` (taken out so the per-row
+        // helpers below can hold `&mut wc.image_cache` alongside them). Restored on
+        // every return.
+        let mut apron_rows = std::mem::take(&mut wc.scroll_apron_rows);
+        let mut apron_saved = std::mem::take(&mut wc.scroll_apron_saved);
+        let mut apron_tmp = std::mem::take(&mut wc.scroll_apron_tmp);
+        if let Some(delta) = scroll_delta {
+            let y0 = self.grid_top().min(h);
+            let y1 = (self.grid_top() + rows.saturating_mul(self.cell_h)).min(h);
+            scroll_translate::translate_grid_band_in_place(
+                &mut cache.pixels,
+                w,
+                y0,
+                y1,
+                i64::from(delta) * self.cell_h as i64,
+            );
+            // UPPER APRON (BUG 1/2 overshoot, step 1): snapshot the blitted-correct
+            // band directly above every re-rastered RETAINED row (shade-parity or
+            // cursor row), so `composite_free`'s upward glyph overshoot can't
+            // double-composite over it — restored byte-exact after the re-raster.
+            self.scroll_snapshot_upper_aprons(
+                &cache.pixels,
+                w,
+                h,
+                &dirty,
+                delta,
+                &mut apron_rows,
+                &mut apron_saved,
+            );
+        }
 
         // DIRTY-GATE: nothing to draw — no dirty rows, the cursor is in the same
         // place/state, the blink/override is unchanged, AND no overlay (LUMEN
@@ -8055,6 +8743,9 @@ impl Renderer {
         if gate_hit {
             wc.cache = Some(cache);
             wc.dirty_scratch = dirty;
+            wc.scroll_apron_rows = apron_rows;
+            wc.scroll_apron_saved = apron_saved;
+            wc.scroll_apron_tmp = apron_tmp;
             wc.last_damage = DamageOutcome::GateHit;
             return (w, h);
         }
@@ -8082,12 +8773,6 @@ impl Renderer {
             Some(band_bg),
             Some(&dirty),
         );
-        // SCENE additive light ONLY (post-pass, over the text — the GPU's
-        // additive-pass placement); the `scene_over` world sprites now stamp
-        // INSIDE `render_row` (pass 1c, under the text) so the CPU matches the
-        // GPU's `emit_base_pre` z-order — the scene z-order fix. Damaged path →
-        // dirty rows (pass 1c already re-stamped over-quads on each dirty row).
-        self.draw_scene_add(&mut cache.pixels, w, h, input, Some(&dirty));
         // (The comet ember bed now draws INSIDE `composite_free` — phase B2b,
         // under the glyph ink — not as a post-pass here.)
         // LUMEN aurora (additive light) UNDER the cursor; damaged path → dirty rows.
@@ -8116,6 +8801,35 @@ impl Renderer {
                 .filter_map(|(r, &d)| d.then_some(r)),
             FreeZ::OverText,
         );
+        // E7 overshoot aprons (BUG 1/2), steps 2 & 3 — a no-op on a non-scroll
+        // frame (`apron_rows` empty, no lower boundary flagged) and on scroll
+        // content with no glyph overshoot. Run BEFORE `draw_cursor` so a static
+        // cursor lands over the finished text, exactly as the full path orders it.
+        if scroll_delta.is_some() {
+            // Step 2: undo `composite_free`'s upward overshoot spill over the
+            // retained rows above each re-rastered retained row.
+            self.scroll_restore_upper_aprons(&mut cache.pixels, w, h, &apron_rows, &apron_saved);
+            // Step 3: composite the RETAINED row-below's upward overshoot into each
+            // re-rastered band whose lower neighbour was blitted (the top exposed
+            // strip's inner edge, and any interior shade-parity row) — the overshoot
+            // the blit could not carry because that band was rebuilt from scratch.
+            for r in 0..rows {
+                if dirty[r] && r + 1 < rows && !dirty[r + 1] {
+                    self.scroll_draw_lower_apron(
+                        &mut wc.image_cache,
+                        &mut cache.pixels,
+                        w,
+                        h,
+                        input,
+                        r,
+                        &mut apron_tmp,
+                    );
+                }
+            }
+        }
+        wc.scroll_apron_rows = apron_rows;
+        wc.scroll_apron_saved = apron_saved;
+        wc.scroll_apron_tmp = apron_tmp;
         // Cursor overlay — the EXACT same code the full path runs.
         self.draw_cursor(&mut cache.pixels, w, h, input);
 
@@ -8134,7 +8848,13 @@ impl Renderer {
         // `.notdef` keys).
         wc.cache = Some(cache);
         wc.dirty_scratch = dirty;
-        wc.last_damage = DamageOutcome::Rows;
+        // A rescued scroll blit reports the whole-row shift so a CPU presenter can
+        // move its own retained surface rows in lockstep before repainting the
+        // flagged bands; ordinary row damage reports `Rows`.
+        wc.last_damage = match scroll_delta {
+            Some(delta_rows) => DamageOutcome::Scroll { delta_rows },
+            None => DamageOutcome::Rows,
+        };
         (w, h)
     }
 
@@ -8316,11 +9036,6 @@ impl Renderer {
         // phase runner (FREE_OVERLAY_LAYER_DESIGN §3.2.2) therefore needs no
         // per-band clear pre-step on this path (`band_bg: None`).
         self.composite_free(&mut ic, &mut pixels, w, h, input, 0..rows, None, None);
-        // SCENE additive light ONLY (post-pass, over the text); the `scene_over`
-        // world sprites drew UNDER the text inside `render_row` (pass 1c) — the
-        // scene z-order fix, matching the GPU's `emit_base_pre`. Full path →
-        // every row.
-        self.draw_scene_add(&mut pixels, w, h, input, None);
         // (The comet ember bed now draws INSIDE `composite_free` — phase B2b,
         // under the glyph ink — not as a post-pass here.)
         self.draw_glow(&mut pixels, w, h, input, None);
@@ -8385,6 +9100,116 @@ impl Renderer {
         pixels[y0 * w..y1 * w].fill(bg);
     }
 
+    /// The `[y0, y1)` device-pixel span of grid row `r`'s band (`grid_top +
+    /// r·cell_h` down, one cell tall), clamped to the frame height `h`.
+    fn row_band_px(&self, r: usize, h: usize) -> (usize, usize) {
+        let y0 = (self.grid_top() + r * self.cell_h).min(h);
+        let y1 = (self.grid_top() + (r + 1) * self.cell_h).min(h);
+        (y0, y1)
+    }
+
+    /// E7 UPPER APRON (step 1). Snapshot the band directly ABOVE every re-rastered
+    /// RETAINED row so [`Self::scroll_restore_upper_aprons`] can restore it after
+    /// `composite_free`. A re-rastered retained row (a shade-parity or cursor row,
+    /// whose CONTENT is unchanged, so the row above already holds its correct
+    /// upward glyph overshoot from the blit) would otherwise have that overshoot
+    /// drawn a SECOND time by `composite_free`'s fg pass — a double-composite over
+    /// the blitted-correct pixels. An EXPOSED row is deliberately skipped: the row
+    /// above it legitimately needs the fresh overshoot (its blitted copy predates
+    /// the exposed content), so `composite_free`'s spill there is the correct fill.
+    /// Called AFTER the blit, so the snapshot captures the shifted pixels.
+    #[allow(clippy::too_many_arguments)]
+    fn scroll_snapshot_upper_aprons(
+        &self,
+        pixels: &[u32],
+        w: usize,
+        h: usize,
+        dirty: &[bool],
+        da: i32,
+        rows_out: &mut Vec<usize>,
+        saved: &mut Vec<u32>,
+    ) {
+        rows_out.clear();
+        saved.clear();
+        let rows = dirty.len();
+        for r in 0..rows {
+            // Only a re-rastered RETAINED row (source in range) with a NON-dirty
+            // (blitted) row above it can double-composite.
+            let retained = (0..rows as i64).contains(&(r as i64 + i64::from(da)));
+            if !dirty[r] || !retained || r == 0 || dirty[r - 1] {
+                continue;
+            }
+            let (y0, y1) = self.row_band_px(r - 1, h);
+            if y0 >= y1 {
+                continue;
+            }
+            rows_out.push(r - 1);
+            saved.extend_from_slice(&pixels[y0 * w..y1 * w]);
+        }
+    }
+
+    /// E7 UPPER APRON (step 2). Restore the bands snapshotted by
+    /// [`Self::scroll_snapshot_upper_aprons`], undoing `composite_free`'s
+    /// double-composited overshoot spill so each blitted row above a re-rastered
+    /// retained row is byte-exact again.
+    fn scroll_restore_upper_aprons(
+        &self,
+        pixels: &mut [u32],
+        w: usize,
+        h: usize,
+        rows_in: &[usize],
+        saved: &[u32],
+    ) {
+        let mut off = 0;
+        for &above in rows_in {
+            let (y0, y1) = self.row_band_px(above, h);
+            let n = (y1 - y0) * w;
+            if off + n > saved.len() {
+                break;
+            }
+            pixels[y0 * w..y1 * w].copy_from_slice(&saved[off..off + n]);
+            off += n;
+        }
+    }
+
+    /// E7 LOWER APRON (step 3). Composite the RETAINED row `r+1`'s UPWARD glyph
+    /// overshoot into the freshly re-rastered band `r`. Band `r` (an exposed strip
+    /// row or a shade-parity row) was rebuilt from scratch by `composite_free`,
+    /// which drew only its own rows' glyphs — so the overshoot the row below
+    /// (`r+1`, blitted, never redrawn) bleeds up into band `r` is missing. Draw
+    /// exactly that overshoot: row `r+1`'s foreground CLIPPED to band `r`
+    /// (`[clip_y0, clip_y1) = [top(r), top(r+1))`), which keeps only the pixels
+    /// that land above the source row's own band, i.e. its upward overshoot. The
+    /// retained source band `r+1` is snapshotted and restored so a clip-agnostic
+    /// image / decoration draw inside it cannot perturb the blitted pixels.
+    #[allow(clippy::too_many_arguments)]
+    fn scroll_draw_lower_apron(
+        &mut self,
+        ic: &mut ImageCache,
+        pixels: &mut [u32],
+        w: usize,
+        h: usize,
+        input: &RenderInput,
+        r: usize,
+        tmp: &mut Vec<u32>,
+    ) {
+        let src = r + 1; // the blitted row whose overshoot bleeds up into band `r`
+        let (sy0, sy1) = self.row_band_px(src, h);
+        let (by0, _) = self.row_band_px(r, h);
+        if sy0 >= sy1 || by0 >= sy0 {
+            return;
+        }
+        // Protect the retained source band from any clip-agnostic in-band draw.
+        tmp.clear();
+        tmp.extend_from_slice(&pixels[sy0 * w..sy1 * w]);
+        let mut ctx = self.row_ctx(input, src);
+        // Restrict the draw to band `r`: at/above `by0`, strictly above `sy0`.
+        ctx.scale.clip_y0 = by0 as i32;
+        ctx.scale.clip_y1 = sy0 as i32;
+        self.render_row_fg(ic, pixels, w, h, input, src, &ctx);
+        pixels[sy0 * w..sy1 * w].copy_from_slice(tmp);
+    }
+
     /// The SHARED per-frame phase runner (FREE_OVERLAY_LAYER_DESIGN §3.2.2),
     /// called by BOTH `render_core` (the damaged path, passing the dirty rows)
     /// and `full_render` (passing `0..rows`) IN PLACE OF their per-row
@@ -8396,8 +9221,8 @@ impl Renderer {
     ///   reset at the grid edges — the CPU twin of the GPU's band-edge strip
     ///   quads), then [`Self::render_row_bg`]. The full path passes `None`: its
     ///   once-over bg fill already covers band and pads.
-    /// * **B1 — legacy per-row sprites.** [`Self::draw_sprites_for_row`]
-    ///   (`scene_over` + `cat_quads` pass 1c), each in its own band.
+    /// * **B1 — per-row sprites.** [`Self::draw_sprites_for_row`] stamps rain
+    ///   and cat quads, each in its own band.
     /// * **B2 — under-text FREE sprites.** Row-spanning rects stamped over the
     ///   assembled bg (B1-then-B2 mirrors the GPU: `FreeUnder` after `cat_over`,
     ///   under glyphs). Not clobbered: Phase A already laid every band's bg.
@@ -9812,29 +10637,21 @@ impl Renderer {
     }
 
     /// Pass 1c (called from [`Self::render_row`], between the pass-1 bg fill and
-    /// the pass-1b inline images): stamp every SCENE `scene_over` sprite and every
-    /// peeking-CAT sprite whose row band is `r`, UNDER this row's images / glyphs /
-    /// line decorations. Two sampling regimes, deliberately different contracts:
+    /// the pass-1b inline images): stamp rain and peeking-CAT sprites whose row
+    /// band is `r`, UNDER this row's images / glyphs / line decorations.
     ///
-    ///   * `scene_over` keeps the existing BILINEAR sample (the `draw_scene` code,
-    ///     moved here verbatim) — `SpriteQuad` supports scaled dests and the GPU
-    ///     binds the LINEAR `scene_sampler`, so the scene stays a tolerance-parity
-    ///     layer. Folding scenes into the NEAREST stamp would silently change CPU
-    ///     scene pixels (bilinear at 1:1 is not identity at sprite edges) and
-    ///     re-break the very parity this pass restores.
-    ///   * `rain_quads` (PHOSPHOR digital rain) reuse the SAME NEAREST stamp with
+    ///   * `rain_quads` (PHOSPHOR digital rain) use the NEAREST stamp with
     ///     their own atlas — rain glyph tiles are baked at exact destination size
     ///     (the 1:1 parity contract), so the cat regime applies verbatim.
     ///   * `cat_quads` use a NEAREST 1:1 integer-stepped stamp — cats are baked at
     ///     exact destination size and the GPU cat stream binds the NEAREST
     ///     sampler, so no filtering happens on either side.
     ///
-    /// Z-order within the pass: `scene_over` → rain → cats (cats walk ON the
-    /// rain; both draw UNDER the row's glyphs, matching the GPU's
-    /// `bg → scene_over → RainUnder → cat_over → glyphs` stream order).
+    /// Z-order within the pass: rain → cats (cats walk ON the rain; both draw
+    /// UNDER the row's glyphs, matching the GPU stream order).
     ///
     /// All composite via the shared linear-light [`blend`]. Empty vecs / absent
-    /// atlases are a no-op — byte-identical to the pre-scene/pre-cat/pre-rain path.
+    /// atlases are a no-op — byte-identical to the pre-cat/pre-rain path.
     /// Rebuild the per-frame RAIN row-bucket CSR (`rain_row_starts` +
     /// `rain_row_idx`) from `input.rain_quads`, so pass 1c can index a row's
     /// quads directly instead of re-scanning the whole vec once per row
@@ -9923,16 +10740,6 @@ impl Renderer {
         rain_white: bool,
     ) {
         let (pad_x, pad_y) = (self.pad, self.grid_top());
-        if !input.scene_over.is_empty()
-            && let Some(atlas) = input.scene_atlas.as_deref()
-            && atlas_texels_valid(atlas)
-        {
-            for q in &input.scene_over {
-                if q.row as usize == r {
-                    stamp_scene_quad(pixels, w, h, pad_x, pad_y, atlas, q, false);
-                }
-            }
-        }
         if !rain_row.is_empty()
             && let Some(atlas) = input.rain_atlas.as_deref()
             && atlas_texels_valid(atlas)
@@ -9977,46 +10784,6 @@ impl Renderer {
                     stamp_cat_quad::<false>(pixels, w, h, pad_x, pad_y, atlas, q);
                 }
             }
-        }
-    }
-
-    /// Composite the SCENE additive light (`scene_add`: sun, fireflies, comet
-    /// trails) — premultiplied saturating-add, like the LUMEN glow — sampled
-    /// BILINEARLY from `input.scene_atlas`. Drawn as a POST-pass (over the text,
-    /// the GPU's additive-pass placement) and dirty-gated per row exactly like
-    /// [`Self::draw_glow`]. The `scene_over` world sprites do NOT draw here any
-    /// more: they moved into pass 1c ([`Self::draw_sprites_for_row`]) so the CPU
-    /// matches the GPU's documented under-text slot — the scene z-order fix. An
-    /// empty `scene_add` / absent atlas is a no-op (byte-identical).
-    fn draw_scene_add(
-        &self,
-        pixels: &mut [u32],
-        w: usize,
-        h: usize,
-        input: &RenderInput,
-        dirty: Option<&[bool]>,
-    ) {
-        if input.scene_add.is_empty() {
-            return;
-        }
-        let Some(atlas) = input.scene_atlas.as_deref() else {
-            return;
-        };
-        if !atlas_texels_valid(atlas) {
-            return;
-        }
-        let (pad_x, pad_y) = (self.pad, self.grid_top());
-        let rows = input.rows;
-        for q in &input.scene_add {
-            if q.row as usize >= rows {
-                continue;
-            }
-            if let Some(dd) = dirty
-                && !dd.get(q.row as usize).copied().unwrap_or(false)
-            {
-                continue;
-            }
-            stamp_scene_quad(pixels, w, h, pad_x, pad_y, atlas, q, true);
         }
     }
 
@@ -11358,11 +12125,23 @@ fn any_double_height(line_sizes: &[LineSize]) -> bool {
 /// would skip repainting it. The common ASCII row carries an empty `images[r]`,
 /// so this is a cheap `Vec::is_empty`-fast `==` there (no allocation, no scan).
 fn row_differs(a: &RenderInput, b: &RenderInput, r: usize) -> bool {
-    a.cells[r] != b.cells[r]
-        || a.clusters[r] != b.clusters[r]
-        || a.combining[r] != b.combining[r]
-        || a.line_sizes[r] != b.line_sizes[r]
-        || a.images[r] != b.images[r]
+    row_differs_shifted(a, r, b, r)
+}
+
+/// Whether row `ra` of `a` differs from row `rb` of `b` in any render-relevant
+/// channel — the SHIFTED twin of [`row_differs`] (same exact per-channel
+/// comparison, but at independent row indices). The E7 whole-row scroll-blit
+/// uses it to prove a retained row survives a rigid shift: `a`'s viewport row
+/// `ra` equals `b`'s viewport row `rb` in cells / clusters / combining / DEC
+/// line size / inline images, and since row rasterization is a pure translation
+/// in Y (the same invariant the M1b band translate relies on) EQUAL content at
+/// two rows rasterizes to byte-identical pixels once shifted by the row delta.
+fn row_differs_shifted(a: &RenderInput, ra: usize, b: &RenderInput, rb: usize) -> bool {
+    a.cells[ra] != b.cells[rb]
+        || a.clusters[ra] != b.clusters[rb]
+        || a.combining[ra] != b.combining[rb]
+        || a.line_sizes[ra] != b.line_sizes[rb]
+        || a.images[ra] != b.images[rb]
 }
 
 /// Mark row `r` dirty if it is in range (a no-op for an out-of-range cursor row).
@@ -11541,13 +12320,8 @@ pub struct DirtyRows {
     /// row restores its un-ringed glyphs. SETTLED strengths — non-empty but
     /// EQUAL vecs — leave this false and gate-hit.
     pub fire_halo_changed: bool,
-    /// Whether the SCENE quads (`scene_over`/`scene_add`) or the atlas version differ
-    /// from the prior frame. Same overlay role as `glow_changed`: when set, every
-    /// prev/cur scene-quad row is marked dirty so the sprites/light are recomposited
-    /// over a freshly-rebuilt row, and the gate must NOT fire.
-    pub scene_changed: bool,
     /// Whether the peeking-CAT sprites (`cat_quads`) or the cat-atlas version
-    /// differ from the prior frame. Same overlay role as `scene_changed`: when
+    /// differ from the prior frame. When
     /// set, every prev/cur cat-quad row is marked dirty (rows ONLY — every cat
     /// quad lies in exactly one row band; the chin slice is its own row-`r`
     /// quad) and the gate must NOT fire. SETTLED cats — non-empty but EQUAL
@@ -11593,6 +12367,35 @@ pub struct DirtyRows {
 }
 
 impl DirtyRows {
+    /// A verdict carrying ONLY per-row content damage (the flags live in the
+    /// caller-owned `dirty` scratch): every overlay/cursor/blink flag is clear.
+    /// Used by the E7 scroll-blit, whose eligibility gate already proved there is
+    /// no overlay, no selection, and a static cursor — so the shifted frame's only
+    /// re-rasterized work is the flagged (exposed + cursor) rows. `any_dirty` is
+    /// `true` because a scroll always exposes at least one row (`|delta| < rows`).
+    #[must_use]
+    pub(crate) fn rows_only() -> Self {
+        Self {
+            any_dirty: true,
+            cursor_changed: false,
+            blink_or_override_changed: false,
+            glow_changed: false,
+            glow_halo_changed: false,
+            glow_under_changed: false,
+            fire_patch_changed: false,
+            trail_changed: false,
+            deco_changed: false,
+            ink_changed: false,
+            char_fg_changed: false,
+            fire_halo_changed: false,
+            cat_changed: false,
+            free_changed: false,
+            nova_changed: false,
+            rain_changed: false,
+            rain_add_changed: false,
+        }
+    }
+
     /// True iff the frame is pixel-identical to the prior one: no dirty row, no
     /// cursor change, the same blink/override state, and unchanged overlays. This
     /// is exactly the CPU/GPU gate-hit condition.
@@ -11610,13 +12413,238 @@ impl DirtyRows {
             && !self.ink_changed
             && !self.char_fg_changed
             && !self.fire_halo_changed
-            && !self.scene_changed
             && !self.cat_changed
             && !self.free_changed
             && !self.nova_changed
             && !self.rain_changed
             && !self.rain_add_changed
     }
+}
+
+/// Whether the cursor is actually painted for `input` at the given blink phase /
+/// style override — the SAME shown-test [`compute_dirty_rows`] and `draw_cursor`
+/// use (effective style = override ?? DECSCUSR, gated by DECTCEM + blink phase +
+/// in-range position).
+fn cursor_shown_in(
+    input: &RenderInput,
+    blink_phase: bool,
+    cursor_style_override: Option<CursorStyle>,
+) -> bool {
+    let style = cursor_style_override.unwrap_or(input.cursor_style);
+    input.cursor_row < input.rows
+        && input.cursor_col < input.cols
+        && input.cursor_visible
+        && cursor_shown(style, blink_phase)
+}
+
+/// Whether a frame is a PURE-GRID frame the E7 whole-row scroll-blit can shift
+/// rigidly: no position-keyed overlay stream (which the blit does not relocate)
+/// and no active selection (a per-row span the blit would strand). The cursor is
+/// handled separately (it is a single relocatable overlay). Every stream is
+/// empty in the common history-scroll case, so this is a cheap `is_empty` fan.
+fn scroll_blittable_content(input: &RenderInput) -> bool {
+    input.cursor_trail.is_empty()
+        && input.cursor_glow_add.is_empty()
+        && input.glow_halo.is_empty()
+        && input.glow_under.is_empty()
+        && input.fire_patch.is_empty()
+        && input.word_decorations.is_empty()
+        && input.ink.is_empty()
+        && input.char_fg.is_empty()
+        && input.fire_halo.is_empty()
+        && input.cat_quads.is_empty()
+        && input.free_sprites.is_empty()
+        && input.nova_add.is_empty()
+        && input.rain_quads.is_empty()
+        && input.rain_add.is_empty()
+        && !input.selection.has_selection()
+}
+
+/// E7 overshoot-apron reconciliation depth: how many RETAINED rows directly above
+/// a bottom-exposed strip the scroll blit re-rasters so the upward-overshoot seam
+/// (a re-rastered row's fresh ink over the blitted row above it) is reconciled
+/// rather than left to DRIFT upward a row per notch. Two — the ≤1-cell upward
+/// overshoot reaches the first retained row, and re-rastering that row makes its
+/// own overshoot into the second stale relative to the rigidly-blitted copy; the
+/// third boundary is between two rigidly-moved rows and is blit-consistent. See
+/// `scroll_blit_plan`'s overshoot-invariant loop; proven geometry-independent by
+/// the `tests/scroll_blit.rs` px×direction×glyph sweep.
+const OVERSHOOT_APRON_ROWS: usize = 2;
+
+/// E7 SCROLL-BLIT PLANNER. Decides whether `input` is a RIGID whole-row history
+/// scroll of the frame cached as `prev` — the case [`compute_dirty_rows`] returns
+/// [`DirtyDecision::FullRepaint`] for (offset AND anchor both shifted) even though
+/// the grid merely slid by a known integer row delta and those rows were already
+/// rasterized last frame.
+///
+/// Returns `Some(delta_rows)` when the frame can be presented by BLITTING the
+/// retained rows (a whole-cell-multiple [`scroll_translate::translate_grid_band_in_place`]
+/// on the cached pixels) and re-rasterizing ONLY the newly-exposed strip (plus
+/// the cursor's old/new rows). On success `dirty` is filled with exactly those
+/// rows. `None` (leaving the caller on the always-correct full-repaint path)
+/// whenever the frame is anything richer than a rigid scroll: geometry / default
+/// bg changed, a double-height row, any overlay/selection stream present, a
+/// moving/appearing cursor, a retained row whose content changed (streaming while
+/// scrolled), a zero shift, or a shift `>= rows` (nothing retained → full is as
+/// cheap).
+///
+/// SOUNDNESS: row rasterization is a pure translation in Y (the invariant the M1b
+/// band translate already relies on), so a retained row whose content is
+/// byte-identical to last frame's source row (checked via [`row_differs_shifted`])
+/// rasterizes to byte-identical pixels once shifted by the row delta; the exposed
+/// strip is re-rasterized fresh by the same per-row passes the full path runs. The
+/// presented frame is therefore byte-identical to a full repaint.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scroll_blit_plan(
+    prev: &RenderInput,
+    input: &RenderInput,
+    prev_blink_phase: bool,
+    prev_cursor_style_override: Option<CursorStyle>,
+    cur_blink_phase: bool,
+    cur_cursor_style_override: Option<CursorStyle>,
+    cell_h: usize,
+    dirty: &mut Vec<bool>,
+) -> Option<i32> {
+    let rows = input.rows;
+    // Geometry / default-bg change, or a double-height row, is a genuine full
+    // repaint (dims fix the pixel band; DECDHL spans two bands so a per-row shift
+    // would seam).
+    if prev.rows != rows
+        || prev.cols != input.cols
+        || prev.default_bg != input.default_bg
+        || any_double_height(&prev.line_sizes)
+        || any_double_height(&input.line_sizes)
+    {
+        return None;
+    }
+    // Overlays / selection are position-keyed and not relocated by the rigid blit.
+    if !scroll_blittable_content(prev) || !scroll_blittable_content(input) {
+        return None;
+    }
+    // The per-frame ANCHOR delta IS the integer row shift: viewport row r shows
+    // absolute row (base_y − display_offset) + r, so `dst[r] ← src[r + da]`.
+    let da = (input.base_y - i64::from(input.display_offset))
+        - (prev.base_y - i64::from(prev.display_offset));
+    if da == 0 || da.unsigned_abs() as usize >= rows {
+        return None;
+    }
+    let da = da as i32; // |da| < rows, and rows is small
+    // Every RETAINED row must survive the shift byte-identically: new row r maps
+    // to prev row r + da when in range.
+    for r in 0..rows {
+        let src = r as i64 + i64::from(da);
+        if (0..rows as i64).contains(&src) && row_differs_shifted(input, r, prev, src as usize) {
+            return None;
+        }
+    }
+    // Cursor: the blit relocates the OLD cursor's pixels, so only a static,
+    // identically-drawn cursor (or none) is handled here.
+    let prev_shown = cursor_shown_in(prev, prev_blink_phase, prev_cursor_style_override);
+    let cur_shown = cursor_shown_in(input, cur_blink_phase, cur_cursor_style_override);
+    if prev_shown != cur_shown {
+        return None;
+    }
+    if cur_shown
+        && !(prev.cursor_row == input.cursor_row
+            && prev.cursor_col == input.cursor_col
+            && prev.cursor_style == input.cursor_style
+            && prev.cursor_color == input.cursor_color
+            && prev.cursor_fill_override == input.cursor_fill_override
+            && prev_blink_phase == cur_blink_phase
+            && prev_cursor_style_override == cur_cursor_style_override)
+    {
+        return None;
+    }
+    // Eligible. Flag the exposed strip (rows with no in-range source) + the
+    // cursor's re-stamp row and its blitted-ghost row (so the damaged tail erases
+    // the moved cursor pixels and re-stamps the crisp cursor).
+    dirty.clear();
+    dirty.resize(rows, false);
+    for (r, slot) in dirty.iter_mut().enumerate() {
+        let src = r as i64 + i64::from(da);
+        if !(0..rows as i64).contains(&src) {
+            *slot = true; // no in-range source ⇒ newly exposed
+        }
+    }
+    if cur_shown {
+        mark(dirty, input.cursor_row);
+        let ghost = i64::from(input.cursor_row as i32 - da);
+        if (0..rows as i64).contains(&ghost) {
+            dirty[ghost as usize] = true;
+        }
+    }
+    // SHADE-PHASE PARITY (BUG 1). The blit memmoves each retained row's already-
+    // rasterized pixels by `da·cell_h` device px. A procedural shade dither
+    // (U+2591–2593) is a function of ABSOLUTE framebuffer Y-parity ([`shade`] via
+    // [`shade_phase_key`]), so when that shift is ODD it lands at the OPPOSITE
+    // phase — a stale-phase seam that doubles the dither line. Re-raster (rather
+    // than blit) exactly the retained rows that carry a phase-sensitive cell; when
+    // the shift is EVEN the phase is preserved and every retained row still blits,
+    // so the common-case win is untouched. Most scroll frames carry no such cell,
+    // so this marks nothing.
+    if (i64::from(da) * cell_h as i64) & 1 != 0 {
+        for r in 0..rows {
+            let src = r as i64 + i64::from(da);
+            if (0..rows as i64).contains(&src) && row_has_y_phase_cell(input, r) {
+                mark(dirty, r);
+            }
+        }
+    }
+    // UPWARD-OVERSHOOT INVARIANT (the general rule; subsumes the ad-hoc bug-2
+    // top-strip apron and closes the bug-3 bottom-strip seam for both directions).
+    // A single-width row keeps UPWARD glyph overshoot into the row above
+    // (Scale::NORMAL.clip_y0 = i32::MIN), so a rendered row's band composites its
+    // BELOW-neighbour's overshoot over its own ink. A blitted row stays
+    // byte-correct only while its below-neighbour also moved rigidly with it: at
+    // the boundary where the re-rastered EXPOSED strip meets the blitted region,
+    // the blitted row directly above carries a STALE overshoot — the re-rastered
+    // row's fresh ink no longer matches the copy the shift blitted in. Re-rastering
+    // that one row just moves the boundary up a row, re-exposing the SAME seam
+    // (verified: a one-row apron leaves a seam that DRIFTS upward a row per notch
+    // and accumulates). The seam only goes clean two rows above the exposed strip,
+    // where the boundary lies between two rows that BOTH moved rigidly (their
+    // overshoot relationship is preserved byte-for-byte by the shift). So re-raster
+    // the exposed strip PLUS the `OVERSHOOT_APRON_ROWS` retained rows directly
+    // above it — the reconciliation depth for the ≤1-cell upward overshoot of the
+    // supported glyphs (proven geometry-independent by the tests/scroll_blit.rs
+    // sweep). Only fires toward the bottom (`da > 0`): into history the exposed
+    // strip is at the TOP and the retained region below moved as one rigid block,
+    // so no retained row sits above an exposed row and this marks nothing.
+    // composite_free draws each exposed / apron row's fresh overshoot into the
+    // re-rastered band above it; the UPPER apron protects the topmost still-blitted
+    // neighbour from the double-composite. Keyed off the EXPOSED set (source out of
+    // range), never `dirty`, so a shade/cursor re-raster is never taken for exposed
+    // content.
+    for r in 0..rows {
+        let below_exposed = !(0..rows as i64).contains(&((r + 1) as i64 + i64::from(da)));
+        if below_exposed {
+            for k in 0..OVERSHOOT_APRON_ROWS as i64 {
+                let rr = r as i64 - k;
+                if rr >= 0 && (0..rows as i64).contains(&(rr + i64::from(da))) {
+                    mark(dirty, rr as usize);
+                }
+            }
+        }
+    }
+    Some(da)
+}
+
+/// A grid cell whose rasterized bitmap depends on the ABSOLUTE framebuffer
+/// Y-parity: today exactly the procedural shade dithers U+2591–2593, whose
+/// pattern [`shade_phase_key`] folds from the cell's absolute pixel row. A rigid
+/// scroll blit that shifts by an ODD pixel count carries such a cell to the wrong
+/// dither phase, so its row must be re-rasterized rather than memmoved.
+fn cell_is_y_phase_sensitive(ch: char) -> bool {
+    matches!(ch as u32, 0x2591..=0x2593)
+}
+
+/// Whether viewport row `r` of `input` carries any [`cell_is_y_phase_sensitive`]
+/// cell (a shade dither), i.e. cannot be blitted across an odd-pixel scroll.
+fn row_has_y_phase_cell(input: &RenderInput, r: usize) -> bool {
+    input
+        .cells
+        .get(r)
+        .is_some_and(|row| row.iter().any(|c| cell_is_y_phase_sensitive(c.ch)))
 }
 
 /// THE shared dirty-row computation. Decides whether `input` (to be drawn at
@@ -11665,22 +12693,40 @@ pub fn compute_dirty_rows(
 
     // REUSABLE precheck — IDENTICAL to `render_input_cached`'s `reusable` and to
     // `is_unchanged_frame`'s clause 1: same geometry (rows/cols fix the pixel
-    // dims), same scrollback offset, and NO double-HEIGHT row in either frame. A
-    // double-height (DECDHL) glyph clips a 2× glyph across two row bands, so a
-    // single dirty row can't be repainted in isolation without risking a seam —
-    // any double-height row forces the full path. (DECDWL double-WIDTH is safe:
-    // it stays within one row band, so it rides the normal per-row path.)
+    // dims), same VIEWPORT PLACEMENT (equal offsets OR equal absolute anchors,
+    // below), and NO double-HEIGHT row in either frame. A double-height
+    // (DECDHL) glyph clips a 2× glyph across two row bands, so a single dirty
+    // row can't be repainted in isolation without risking a seam — any
+    // double-height row forces the full path. (DECDWL double-WIDTH is safe: it
+    // stays within one row band, so it rides the normal per-row path.)
+    //
+    // ANCHOR OR OFFSET (audit E5 + Wave-3 reuse-narrowing fix): viewport row 0
+    // shows absolute row `base_y − display_offset`. Requiring equal OFFSETS
+    // alone forced a FullRepaint on every reading-history-while-streaming
+    // frame — output advances `base_y` while the scrolled viewport is
+    // re-pinned by advancing `display_offset` in lockstep, leaving every
+    // viewport row's CONTENT identical; the equal-ANCHOR arm admits those
+    // pixel-identical frames as ordinary row-diff frames (usually a gate hit).
+    // Requiring equal ANCHORS alone re-narrowed the other direction: a
+    // bottom-pinned flood keeps `display_offset == 0` while `base_y` advances,
+    // so a UNIFORM flood (every viewport row byte-identical frame-over-frame)
+    // full-repainted instead of gate-hitting — forfeiting the E3 zero-band
+    // present. Accept EITHER arm: both are row-diff-safe because every
+    // per-row comparison below is per-frame-viewport-relative: cells/clusters/
+    // combining/line_sizes/images are extracted per frame in viewport space;
+    // the cursor is compared in its own per-frame coordinates; and the
+    // selection span diff maps each frame through its OWN offset (below).
     // A LIVE default-background change (OSC 11 / OSC 111 reset / DECSCNM) recolours
     // the window PADDING band AND every default-bg cell; the padding strips are not a
     // "row" the per-row diff below can mark, so force a full repaint to re-clear them.
     // Unchanged in the common case (default_bg steady), so byte-identical to before.
     // A SELECTION change does NOT force the full path: it is diffed per row below
     // (a mouse-drag selection moves the span of 1-2 rows per frame, not the screen).
-    // The offset clause stays load-bearing for that diff: selection rows are
-    // live-screen coords, so equal offsets make the per-row span mapping exact.
+    let anchor_eq = prev_input.base_y - i64::from(prev_input.display_offset)
+        == input.base_y - i64::from(input.display_offset);
     let reusable = prev_input.rows == rows
         && prev_input.cols == cols
-        && prev_input.display_offset == input.display_offset
+        && (prev_input.display_offset == input.display_offset || anchor_eq)
         && prev_input.default_bg == input.default_bg
         && !any_double_height(&prev_input.line_sizes)
         && !any_double_height(&input.line_sizes);
@@ -11714,11 +12760,16 @@ pub fn compute_dirty_rows(
     // by `row_differs` above; so equal spans render byte-identically and only the
     // span-changed rows (typically the 1-2 rows at a drag's endpoint) repaint,
     // instead of the whole screen per pointer move.
-    if prev_input.selection != input.selection {
+    //
+    // Selection rows are LIVE-SCREEN coords, so each frame maps through its
+    // OWN offset (audit E5: the anchor precheck admits offset-shifted frames;
+    // an offset shift moves the live↔viewport mapping even when the selection
+    // bytes are equal, so it re-runs this diff too).
+    if prev_input.selection != input.selection || prev_input.display_offset != input.display_offset
+    {
         for (r, d) in dirty.iter_mut().enumerate() {
-            let sel_row = r as i32 - input.display_offset;
-            if selection_row_span(&prev_input.selection, sel_row)
-                != selection_row_span(&input.selection, sel_row)
+            if selection_row_span(&prev_input.selection, r as i32 - prev_input.display_offset)
+                != selection_row_span(&input.selection, r as i32 - input.display_offset)
             {
                 *d = true;
                 any_dirty = true;
@@ -11900,26 +12951,6 @@ pub fn compute_dirty_rows(
         }
     }
 
-    // SCENE quads (Living Panels): src-over sprites + additive light, both overlays the
-    // row-content diff cannot see. Atlas-version change also counts (a skin/theme rebake
-    // changes every sampled texel). Mark prev∪cur rows so an animating scene repaints
-    // its band fresh each frame; idle (both empty, same atlas) marks nothing.
-    let scene_changed = prev_input.scene_over != input.scene_over
-        || prev_input.scene_add != input.scene_add
-        || prev_input.scene_atlas.as_ref().map(|a| a.version)
-            != input.scene_atlas.as_ref().map(|a| a.version);
-    if scene_changed {
-        for q in prev_input
-            .scene_over
-            .iter()
-            .chain(&prev_input.scene_add)
-            .chain(&input.scene_over)
-            .chain(&input.scene_add)
-        {
-            mark(dirty, q.row as usize);
-        }
-    }
-
     // Peeking-CAT sprites (Sparkle Words v2): the same overlay pattern as the
     // scene quads. The cat-atlas VERSION counts too (a rebake — blink frame,
     // cell-metric change — changes every sampled texel, so the quad rows must
@@ -11927,9 +12958,15 @@ pub fn compute_dirty_rows(
     // lies in exactly one row band (the SpriteQuad invariant — a two-row cat is
     // a head quad in row r-1 plus a chin quad in row r, each marked by its own
     // row). SETTLED cats (equal quads, same version) mark nothing and gate-hit.
+    // Atlas change is detected by SNAPSHOT IDENTITY (`Arc::as_ptr`), not the
+    // `version` counter: every rebake publishes a fresh `Arc`, while versions
+    // are deterministic per engine INSTANCE and replay across a rebuilt
+    // engine — a version compare would read a rebuilt engine's different
+    // texels as "settled" (split-pane audit; same law as the GPU texture
+    // cache's `Arc::ptr_eq` skip).
     let cat_changed = prev_input.cat_quads != input.cat_quads
-        || prev_input.cat_atlas.as_ref().map(|a| a.version)
-            != input.cat_atlas.as_ref().map(|a| a.version);
+        || prev_input.cat_atlas.as_ref().map(std::sync::Arc::as_ptr)
+            != input.cat_atlas.as_ref().map(std::sync::Arc::as_ptr);
     if cat_changed {
         for q in prev_input.cat_quads.iter().chain(&input.cat_quads) {
             mark(dirty, q.row as usize);
@@ -11943,12 +12980,12 @@ pub fn compute_dirty_rows(
     // (r+1)·cell_h)`, so the mapping is pad-free; `div_euclid` keeps a negative
     // (off-grid) origin's band arithmetic exact. A rect spilling into the
     // top/bottom pad strip force-marks the edge row so the edge scissor — which
-    // already extends over the pad — draws it. Atlas-version change counts too
-    // (a rebake changes every sampled texel). Settled sprites (equal, same
-    // version) mark nothing and gate-hit.
+    // already extends over the pad — draws it. An atlas snapshot change counts
+    // too (a rebake publishes a fresh Arc and changes every sampled texel).
+    // Settled sprites (equal, same Arc) mark nothing and gate-hit.
     let free_changed = prev_input.free_sprites != input.free_sprites
-        || prev_input.free_atlas.as_ref().map(|a| a.version)
-            != input.free_atlas.as_ref().map(|a| a.version);
+        || prev_input.free_atlas.as_ref().map(std::sync::Arc::as_ptr)
+            != input.free_atlas.as_ref().map(std::sync::Arc::as_ptr);
     if free_changed {
         let ch = cell_h.max(1);
         let last_row = rows.saturating_sub(1) as i32;
@@ -11991,15 +13028,18 @@ pub fn compute_dirty_rows(
     // tick most columns' rows are byte-equal and stay clean, so a downpour does
     // not repaint the whole band every frame. Rows only: every rain quad lies
     // in exactly one row band (the SpriteQuad invariant). The FLAG is the plain
-    // vec/version inequality (identical to the other arms — and to RenderInput's
-    // PartialEq, which the gate debug_assert pins), so an unsorted host vec can
-    // at worst over/under-mark inside a changed frame, never corrupt the gate.
-    // An atlas-version bump (rebake: cell-metric / ramp change) invalidates
-    // every sampled texel, so it marks ALL prev∪cur quad rows regardless of
-    // quad equality. SETTLED rain (equal quads, same version) marks nothing and
-    // gate-hits — the drained steady state is free.
-    let rain_atlas_bumped = prev_input.rain_atlas.as_ref().map(|a| a.version)
-        != input.rain_atlas.as_ref().map(|a| a.version);
+    // vec inequality plus the atlas-IDENTITY compare below (the same
+    // identity law RenderInput's PartialEq now applies), so an unsorted host
+    // vec can at worst over/under-mark inside a changed frame, never corrupt
+    // the gate. A fresh atlas publish (rebake: cell-metric / ramp change —
+    // every rebake publishes a new Arc) invalidates every sampled texel, so
+    // it marks ALL prev∪cur quad rows regardless of quad equality. SETTLED
+    // rain (equal quads, same Arc) marks nothing and gate-hits — the drained
+    // steady state is free.
+    // Identity, not `version` — a rebuilt engine replays version numbers with
+    // different texels (see the cat arm's comment; split-pane audit).
+    let rain_atlas_bumped = prev_input.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
+        != input.rain_atlas.as_ref().map(std::sync::Arc::as_ptr);
     let rain_changed = rain_atlas_bumped || prev_input.rain_quads != input.rain_quads;
     if rain_atlas_bumped {
         for q in prev_input.rain_quads.iter().chain(&input.rain_quads) {
@@ -12049,14 +13089,14 @@ pub fn compute_dirty_rows(
     }
 
     // UNCONDITIONAL-OVERLAY scissor-band fill (runs LAST — it reads the band
-    // the arms above produced). The GPU builds the scene/cat/rain/free sprite
+    // the arms above produced). The GPU builds the cat/rain/free sprite
     // streams UNGATED by row (a free sprite has no row tag; a settled cat's
     // instances are rebuilt bytes-equal every frame) and clips them with ONE
     // scissor over the dirty rows' BOUNDING band. A SETTLED sprite whose rows
     // fall INSIDE that band (unrelated dirt above and below it) would be
     // Load-preserved by the base pass yet redrawn by the sprite stream — a
-    // translucent texel re-blends over its own cached pixels (and scene_add
-    // light re-adds) every damaged frame. Mark every band row a CURRENT-frame
+    // translucent texel re-blends over its own cached pixels every damaged
+    // frame. Mark every band row a CURRENT-frame
     // sprite overlaps as dirty, so every overlay pixel inside the scissor
     // lands on a fully rebuilt row. Marks stay INSIDE [first, last], so the
     // band (and scissor rect) is unchanged; a changed overlay already marked
@@ -12087,13 +13127,7 @@ pub fn compute_dirty_rows(
                     mark(dirty, r);
                 }
             }
-            for q in input
-                .scene_over
-                .iter()
-                .chain(&input.scene_add)
-                .chain(&input.cat_quads)
-                .chain(&input.rain_quads)
-            {
+            for q in input.cat_quads.iter().chain(&input.rain_quads) {
                 let r = q.row as usize;
                 if (first..=last).contains(&r) {
                     mark(dirty, r);
@@ -12160,7 +13194,6 @@ pub fn compute_dirty_rows(
         ink_changed,
         char_fg_changed,
         fire_halo_changed,
-        scene_changed,
         cat_changed,
         free_changed,
         nova_changed,
@@ -12179,9 +13212,10 @@ pub fn compute_dirty_rows(
 /// It encodes EXACTLY the conditions under which `render_input_cached` returns
 /// the cached frame untouched:
 ///
-/// 1. REUSABLE — same geometry (rows/cols, hence pixel dims), same scrollback
-///    offset, and NO double-HEIGHT row in either frame (a DECDHL glyph spans two
-///    row bands, so per-row reuse is unsafe).
+/// 1. REUSABLE — same geometry (rows/cols, hence pixel dims), same viewport
+///    placement (equal `display_offset`s OR equal absolute anchors — audit E5 +
+///    Wave-3 widening), and NO double-HEIGHT row in either frame (a DECDHL
+///    glyph spans two row bands, so per-row reuse is unsafe).
 /// 2. NO DIRTY ROW — every row's render-relevant inputs ([`row_differs`]) match
 ///    AND every row's selected-column span is unchanged (a selection change that
 ///    projects to identical per-row spans is pixel-identical, so it may gate-hit).
@@ -13308,7 +14342,7 @@ impl<'a> FireHaloWalk<'a> {
     }
 }
 
-/// Whether a scene/cat atlas is structurally sound to sample from: non-zero
+/// Whether a sprite atlas is structurally sound to sample from: non-zero
 /// dims and a pixel buffer long enough for `width*height` RGBA8 texels. A
 /// malformed atlas (a host bug) makes every sprite a silent no-op instead of a
 /// panic deep in the rasterizer — matching the GPU, which refuses the upload.
@@ -13320,118 +14354,13 @@ fn atlas_texels_valid(atlas: &SceneAtlas) -> bool {
     atlas.width != 0 && atlas.height != 0 && atlas.rgba.len() >= need
 }
 
-/// BILINEAR sample of a scene atlas inside a sprite's texel rect at normalized
-/// `(u, v)` — the `draw_scene` sampling code, moved here verbatim when the
-/// `scene_over` quads moved into pass 1c (the scene z-order fix). The scene
-/// stays a bilinear, tolerance-parity regime (GPU: LINEAR `scene_sampler`);
-/// only the CAT stamp is NEAREST.
-fn scene_sample(
-    atlas: &SceneAtlas,
-    ax: u16,
-    ay: u16,
-    aw: u16,
-    ah: u16,
-    u: f32,
-    v: f32,
-) -> [f32; 4] {
-    let u = u.clamp(0.0, 1.0);
-    let v = v.clamp(0.0, 1.0);
-    let fx = u * (aw as f32 - 1.0);
-    let fy = v * (ah as f32 - 1.0);
-    let x0 = fx.floor() as u32;
-    let y0 = fy.floor() as u32;
-    let x1 = (x0 + 1).min(aw as u32 - 1);
-    let y1 = (y0 + 1).min(ah as u32 - 1);
-    let tx = fx - x0 as f32;
-    let ty = fy - y0 as f32;
-    let texel = |lx: u32, ly: u32| -> [f32; 4] {
-        let i = (((ay as u32 + ly) * atlas.width + (ax as u32 + lx)) * 4) as usize;
-        [
-            atlas.rgba[i] as f32 / 255.0,
-            atlas.rgba[i + 1] as f32 / 255.0,
-            atlas.rgba[i + 2] as f32 / 255.0,
-            atlas.rgba[i + 3] as f32 / 255.0,
-        ]
-    };
-    let a = texel(x0, y0);
-    let b = texel(x1, y0);
-    let c = texel(x0, y1);
-    let d = texel(x1, y1);
-    let mut out = [0.0f32; 4];
-    for k in 0..4 {
-        let top = a[k] + (b[k] - a[k]) * tx;
-        let bot = c[k] + (d[k] - c[k]) * tx;
-        out[k] = top + (bot - top) * ty;
-    }
-    out
-}
-
-/// Stamp ONE scene sprite quad — bilinear sample × multiply tint × opacity,
-/// composited src-over (`additive == false`, via the shared linear-light
-/// [`blend`]) or premultiplied-saturating-add (`additive == true`, [`add_sat`]).
-/// The per-pixel loop of the retired `draw_scene`, moved verbatim; callers own
-/// the row/dirty gating (pass 1c stamps over-quads per row inside `render_row`;
-/// [`Renderer::draw_scene_add`] gates the additive post-pass).
-#[allow(clippy::too_many_arguments)] // the split (pad_x, pad_y) grid origin crossed the arity line
-fn stamp_scene_quad(
-    pixels: &mut [u32],
-    w: usize,
-    h: usize,
-    pad_x: usize,
-    pad_y: usize,
-    atlas: &SceneAtlas,
-    q: &SpriteQuad,
-    additive: bool,
-) {
-    if q.w == 0 || q.h == 0 || q.aw == 0 || q.ah == 0 {
-        return;
-    }
-    let x0 = pad_x + q.x as usize;
-    let y0 = pad_y + q.y as usize;
-    let xend = (x0 + q.w as usize).min(w);
-    let yend = (y0 + q.h as usize).min(h);
-    if x0 >= xend || y0 >= yend {
-        return;
-    }
-    let tr = ((q.tint >> 16) & 0xff) as f32 / 255.0;
-    let tg = ((q.tint >> 8) & 0xff) as f32 / 255.0;
-    let tb = (q.tint & 0xff) as f32 / 255.0;
-    let qa = q.alpha as f32 / 255.0;
-    for py in y0..yend {
-        let v = ((py - y0) as f32 + 0.5) / q.h as f32;
-        let base = py * w;
-        for px in x0..xend {
-            let mut u = ((px - x0) as f32 + 0.5) / q.w as f32;
-            if q.flip_x {
-                u = 1.0 - u;
-            }
-            let t = scene_sample(atlas, q.ax, q.ay, q.aw, q.ah, u, v);
-            let a8 = ((t[3] * qa) * 255.0 + 0.5) as u32;
-            if a8 == 0 {
-                continue;
-            }
-            let a8 = a8.min(255) as u8;
-            let cr = (t[0] * tr * 255.0 + 0.5) as u32 & 0xff;
-            let cg = (t[1] * tg * 255.0 + 0.5) as u32 & 0xff;
-            let cb = (t[2] * tb * 255.0 + 0.5) as u32 & 0xff;
-            let color = (cr << 16) | (cg << 8) | cb;
-            let idx = base + px;
-            pixels[idx] = if additive {
-                add_sat(pixels[idx], premul_rgb(color, a8))
-            } else {
-                blend(pixels[idx], color, a8)
-            };
-        }
-    }
-}
-
 /// Stamp ONE peeking-cat sprite quad with NEAREST, INTEGER-STEPPED sampling —
 /// no filtering, no float texel math. Cats are baked at exact destination size
 /// (bake == dest, 1:1: the source index reduces to the dest offset exactly),
 /// and the GPU cat stream binds the NEAREST sampler over the same RGBA texels,
 /// so both backends read the identical texel per pixel; the only per-pixel math
-/// is the multiply tint/opacity and the shared linear-light [`blend`] (the same
-/// src-over the scene stamp uses). The pixel-center step (`(2·d + 1)·src /
+/// is the multiply tint/opacity and the shared linear-light [`blend`]. The
+/// pixel-center step (`(2·d + 1)·src /
 /// (2·dest)`) matches the GPU's NEAREST semantics at ANY scale, defensively —
 /// the contract (and the parity pin) is 1:1.
 fn stamp_cat_quad<const WHITE_RGB: bool>(
@@ -19263,6 +20192,93 @@ mod tests {
         assert!(
             !std::sync::Arc::ptr_eq(&a1, &b),
             "different font bytes must not be aliased"
+        );
+    }
+
+    /// A published font generation is self-contained: deleting its sole source
+    /// pathname cannot change or prevent a later zoom rebuild, and every face
+    /// role survives by exact bytes. The unsealed negative control proves the
+    /// test would catch a caller trying to rebuild the historical lazy/path
+    /// generation.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn sealed_generation_rebuilds_after_all_source_paths_disappear() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-admitted-font-rebuild-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create font fixture directory");
+        let path = dir.join("PreparedMono-Regular.ttf");
+        std::fs::write(&path, embedded_font()).expect("write admitted primary fixture");
+
+        let theme = Theme::default();
+        let mut renderer = Renderer::from_resolved_font_file(
+            path.to_string_lossy().into_owned(),
+            embedded_font(),
+            16.0,
+            theme,
+        )
+        .expect("primary fixture parses");
+        // Exercise every retained role without depending on the host's installed
+        // fonts. A normal TTF is parseable by the emoji byte holder; colour
+        // coverage is irrelevant to this source-retention regression.
+        for slot in 0..3 {
+            renderer
+                .set_styled_font_bytes(slot, embedded_font())
+                .expect("styled fixture parses");
+        }
+        renderer
+            .set_bold_font(embedded_font())
+            .expect("injected bold fixture parses");
+        renderer
+            .set_fallback_bytes(embedded_font())
+            .expect("fallback fixture parses");
+        renderer
+            .set_symbol_fallback_bytes(embedded_font())
+            .expect("symbol fixture parses");
+        renderer
+            .set_color_font_arc(intern_font_bytes(embedded_font().to_vec()))
+            .expect("emoji fixture parses");
+
+        assert!(
+            renderer.rebuild_from_admitted(20.0, theme).is_err(),
+            "negative control: a generation must be sealed before reconstruction"
+        );
+        let before = renderer.seal_admitted_font_sources();
+        assert!(
+            before.sealed,
+            "worker seal is represented in the exact snapshot"
+        );
+        assert!(before.primary.is_some());
+        assert!(before.injected_bold.is_some());
+        assert!(before.styled.iter().all(Option::is_some));
+        assert_eq!(before.fallback.len(), 1);
+        assert!(before.symbol.is_some());
+        assert!(before.emoji.is_some());
+
+        std::fs::remove_dir_all(&dir).expect("remove every source pathname");
+        let rebuilt = renderer
+            .rebuild_from_admitted(24.0, theme)
+            .expect("sealed rebuild uses retained bytes only");
+        assert_eq!(
+            rebuilt.admitted_font_sources(),
+            before,
+            "zoom rebuild must preserve the exact complete source generation"
+        );
+        assert_eq!(
+            rebuilt.cell_geometry(24.0),
+            rebuilt.cell_geometry(rebuilt.px)
+        );
+
+        let semantic = renderer
+            .fork_semantic_surface(14.0, theme)
+            .expect("sealed semantic fork uses retained bytes only");
+        assert_eq!(
+            semantic.admitted_font_sources(),
+            before,
+            "semantic fork must not resurrect any lazy candidate path"
         );
     }
 }

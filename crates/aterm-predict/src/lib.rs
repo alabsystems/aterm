@@ -21,7 +21,8 @@
 //! `std::time::Instant` (byte-identical to the pre-extraction `aterm-gui` build);
 //! on wasm32 it is `web_time::Instant`, so a web host can sample its real
 //! monotonic clock. The host wires four seams:
-//!   1. [`Predictor::predict_char`] / [`Predictor::predict_backspace`] on a keypress,
+//!   1. [`Predictor::predict_char_in_grid`] (or the height-blind
+//!      [`Predictor::predict_char`]) / [`Predictor::predict_backspace`] on a keypress,
 //!   2. [`Predictor::reconcile`] after child output is applied to the grid,
 //!   3. [`Predictor::overlay`] when composing a frame (the glyphs to paint), and
 //!   4. [`Predictor::reset`] when the coordinate space changes (resize / pane swap).
@@ -30,24 +31,29 @@
 //! * **Adaptive display.** Predictions are always *tracked* (to measure echo RTT),
 //!   but in the default `Adaptive` mode they are only *shown* after consecutive slow
 //!   confirmations establish a stable high-latency link AND at least one prediction
-//!   has been confirmed this epoch. One delayed scheduler turn cannot enable pixels,
-//!   and one fast confirmation closes the gate again. On a local shell the real echo
-//!   is already effectively instant, so speculative pixels add visual risk without a
-//!   perceptible latency win.
+//!   has been confirmed this epoch. One delayed scheduler turn cannot enable pixels.
+//!   The gate is HYSTERETIC (open at `DISPLAY_OPEN_MS`, close only after
+//!   `FAST_SAMPLES_TO_HIDE` decisive fast samples with a fast *smoothed* RTT and an
+//!   empty pending set): a symmetric single-sample gate flaps under ordinary jitter,
+//!   and every flap erases a ghost that is already on glass (a dim→blank→solid blink
+//!   that reads as a rendering fault, not as a latency win).
 //! * **Alt-screen gate.** In the alternate screen (vim/less/htop) the app owns the
 //!   cursor and does not line-echo; [`Predictor::reconcile`] flushes and predicting
 //!   is refused.
 //! * **No unechoed flash (Adaptive).** Adaptive display requires a *confirmed* echo
 //!   in the CURRENT line's epoch, so a password prompt (a line that never echoes)
-//!   never displays a predicted character. The epoch is reset at the SUBMIT boundary
+//!   never displays a predicted character. The epoch is ended at the SUBMIT boundary
 //!   ([`Predictor::note_line_submit`], on Enter) — not merely on a physical-row change,
 //!   which the cursor does NOT undergo across logical lines on a terminal scrolled to
 //!   the bottom — so a prompt inheriting a prior command's confirmation on the same
-//!   bottom row cannot flash the secret. `Always` is the explicit power-user opt-in and
-//!   does NOT carry this guarantee: it can briefly show an unechoed glyph until the
-//!   `GLITCH_MS` flush, so it is unsuitable at a password prompt.
-//! * **Self-healing.** Any prediction unconfirmed for `GLITCH_MS` is flushed, and
-//!   any divergence (the app drew a different glyph, or the cursor jumped) flushes
+//!   bottom row cannot flash the secret. Guesses carry the epoch they were armed in, so
+//!   a pre-submit guess retiring AFTER the boundary cannot re-arm the new line's gate.
+//!   `Always` is the explicit power-user opt-in and does NOT carry this guarantee: it
+//!   can briefly show an unechoed glyph until the glitch-window expiry, so it is
+//!   unsuitable at a password prompt.
+//! * **Self-healing.** Any prediction unconfirmed for the glitch window
+//!   (RTT-relative — floor 250 ms, ceiling 2 s) expires,
+//!   and any divergence (the app drew a different glyph, or the cursor jumped) flushes
 //!   the whole set — so a wrong guess is corrected within one output burst.
 
 use std::time::Duration;
@@ -92,8 +98,13 @@ pub struct Prediction {
     pub col: u16,
     /// The predicted glyph.
     pub ch: char,
-    /// When predicted — drives the unconfirmed-glitch timeout (`GLITCH_MS`).
+    /// When predicted — drives the unconfirmed-glitch timeout (the glitch window).
     born: Instant,
+    /// The confirmation epoch (see `Predictor::epoch`) this guess was armed in. A
+    /// guess armed BEFORE an Enter must never arm the NEXT line's display gate when
+    /// its echo finally lands, or a password prompt inherits the submitted command's
+    /// confirmation — the exact leak `note_line_submit` exists to prevent.
+    epoch: u64,
 }
 
 impl Prediction {
@@ -107,21 +118,47 @@ impl Prediction {
             col,
             ch,
             born: Instant::now(),
+            epoch: 0,
         }
     }
 }
 
-/// Flush a prediction that the program has not echoed within this window — the app
-/// is not line-echoing as we assumed (raw-mode key, password, swallowed input).
-const GLITCH_MS: u64 = 250;
-/// `Adaptive` classifies a confirmed echo as slow at or above this latency.
-/// Below it the real echo is effectively instant, so a rare >250 ms scheduler tail
-/// can expire invisibly instead of painting and later erasing a speculative glyph.
-const DISPLAY_SRTT_MS: f32 = 6.0;
+/// Floor of the unconfirmed-guess expiry window: below this a normal output burst has
+/// not necessarily arrived yet even on a local link.
+const GLITCH_FLOOR_MS: u64 = 250;
+/// Ceiling of the expiry window. The window is RTT-relative (see
+/// [`Predictor::glitch_window`]) so a slow link can actually keep a guess alive long
+/// enough to be confirmed; this bounds how long a *wrong* guess (raw-mode key,
+/// swallowed input) can sit on glass before it self-heals.
+const GLITCH_CEILING_MS: u64 = 2000;
+/// The expiry window as a multiple of the smoothed RTT. A fixed 250 ms window is
+/// SHORTER than the echo it is waiting for on every link the feature targets: the
+/// expiry then always beats the echo, nothing is ever confirmed, no RTT sample is ever
+/// recorded, and the adaptive latch can never open — the feature is dead in exactly
+/// its target regime. Three RTTs leaves room for one retransmit-scale outlier.
+const GLITCH_SRTT_MULT: f32 = 3.0;
+/// How many times consecutive timeouts may DOUBLE the glitch floor while probing a
+/// cold link (250 → 500 → 1000 → 2000 ms). Bounded so an endlessly non-echoing
+/// context — a password prompt, a raw-mode key — cannot walk the window upward
+/// without limit, and reset by the first real confirmation ([`Predictor::record_rtt`]).
+const EXPIRY_BACKOFF_MAX: u8 = 3;
+/// `Adaptive` OPENS the display gate on samples at or above this latency. Well clear
+/// of aterm's own local-echo distribution (single-digit ms), so ordinary scheduler
+/// noise cannot be mistaken for a link that speculation can help.
+const DISPLAY_OPEN_MS: f32 = 20.0;
+/// `Adaptive` may CLOSE the display gate only on samples below this latency. The gap
+/// to [`DISPLAY_OPEN_MS`] is the hysteresis band: samples inside it are evidence for
+/// neither regime and leave the latch (and both streaks) untouched, so a link jittering
+/// across one threshold cannot flap the gate — and every flap erases a ghost that is
+/// already on glass.
+const DISPLAY_CLOSE_MS: f32 = 8.0;
 /// A single delayed event-loop turn is not evidence of a slow link. Require two
-/// consecutive slow confirmations before Adaptive may paint; a fast confirmation
-/// closes the latch immediately.
-const SLOW_CONFIRMATIONS_TO_DISPLAY: u8 = 2;
+/// consecutive slow samples before Adaptive may paint.
+const SLOW_SAMPLES_TO_DISPLAY: u8 = 2;
+/// …and symmetric-but-stricter evidence to stop painting: three consecutive decisive
+/// fast samples. Closing is the destructive direction (it erases in-flight pixels), so
+/// it also requires the smoothed RTT to agree and the pending set to be empty.
+const FAST_SAMPLES_TO_HIDE: u8 = 3;
 /// EWMA weight for a freshly-confirmed echo sample into the smoothed RTT.
 const SRTT_ALPHA: f32 = 0.3;
 
@@ -129,21 +166,34 @@ const SRTT_ALPHA: f32 = 0.3;
 #[derive(Default)]
 pub struct Predictor {
     mode: PredictMode,
-    /// Pending predictions in type order (oldest = `first`); each on the row it was
-    /// typed. A wrap or row change flushes them (the same-row model bows out).
+    /// Pending predictions in type order (oldest = `first`). A guess at the right
+    /// margin continues at column 0 of the NEXT row when the host supplies the grid
+    /// height ([`Predictor::predict_char_in_grid`]); an unexpected row change still
+    /// flushes them.
     preds: Vec<Prediction>,
     /// Smoothed echo round-trip estimate in ms (EWMA of confirmed predictions). The
     /// link property `Adaptive` consults. Coordinate-only [`reset`](Self::reset)
     /// preserves it; [`reset_session`](Self::reset_session) clears it so a slow
     /// remote pane can never make a newly focused local pane speculate visibly.
     srtt: Option<f32>,
-    /// Consecutive raw echo samples at or above [`DISPLAY_SRTT_MS`]. This filters
+    /// Consecutive expiry turns with no confirmation, doubling the glitch floor as a
+    /// COLD-LINK probe (see [`Predictor::glitch_window`]). Deliberately NOT an input to
+    /// `srtt` or to the display regime: a timeout is the absence of an echo, not a slow
+    /// echo, and treating it as evidence both diverged the RTT estimate and latched
+    /// speculation ON at non-echoing prompts. Reset by the first real confirmation.
+    expiry_backoff: u8,
+    /// Consecutive raw echo samples at or above [`DISPLAY_OPEN_MS`]. This filters
     /// isolated scheduler tails that would otherwise seed the EWMA above the visual
     /// threshold after one sample.
-    slow_confirmations: u8,
-    /// Stable Adaptive display classification. Two consecutive slow confirmations
-    /// open it; the first fast confirmation closes it, so returning from a remote
-    /// foreground process to a local shell cannot inherit a long EWMA tail.
+    slow_samples: u8,
+    /// Consecutive raw echo samples below [`DISPLAY_CLOSE_MS`] — the closing streak.
+    /// Separate from `slow_samples` because the two thresholds differ (hysteresis):
+    /// a sample inside the band advances neither.
+    fast_samples: u8,
+    /// Stable Adaptive display classification. Consecutive slow samples open it;
+    /// closing needs a sustained fast streak, a fast smoothed RTT, and nothing in
+    /// flight — so returning from a remote foreground process to a local shell still
+    /// closes it promptly, but ordinary jitter cannot blink a ghost off the glass.
     adaptive_slow: bool,
     /// Have we confirmed ≥1 prediction on the CURRENT line (epoch)? Gates display so an
     /// unechoed context never shows a guess. Reset when typing starts on a new row.
@@ -153,6 +203,29 @@ pub struct Predictor {
     /// `confirmed_epoch = false`, so a no-echo line never inherits a prior line's
     /// confirmation and displays an unechoed secret.
     epoch_row: Option<u16>,
+    /// Monotonic id of the CURRENT confirmation epoch, bumped by
+    /// [`note_line_submit`](Self::note_line_submit). Guesses are tagged with it so the
+    /// submit boundary can end the epoch for FUTURE guesses without discarding the
+    /// pixels of in-flight ones: a stale guess still reconciles (and still feeds the
+    /// RTT estimate) but can neither anchor a new guess nor arm the new line's gate.
+    epoch: u64,
+    /// The most recent grid width seen by `predict_char*`. Only the wrap-consistency
+    /// check in [`reconcile`](Self::reconcile) reads it: a guess that continues at
+    /// column 0 of the next row is confirmed against a real cursor parked in the
+    /// DEFERRED-WRAP slot (last column of the previous row), which is where a terminal
+    /// leaves it after echoing the final column.
+    grid_cols: u16,
+    /// A character we could not model was declined while guesses were pending. Those
+    /// guesses are anchored to its LEFT and remain valid, but everything typed after it
+    /// would be predicted one or more columns too far left (the real echo will insert
+    /// the declined glyph). So we stop extending until the set drains and the live
+    /// cursor — which the real echo moves correctly — can re-anchor us.
+    anchor_lost: bool,
+    /// The epoch whose still-pending guesses keep displaying after their line was
+    /// submitted. Set at [`note_line_submit`](Self::note_line_submit) only when that
+    /// epoch had CONFIRMED an echo, so the carried pixels are always characters the
+    /// user has already watched that line echo back — never a secret.
+    grandfathered_epoch: Option<u64>,
 }
 
 impl Predictor {
@@ -174,43 +247,97 @@ impl Predictor {
     }
 
     /// Register a printable character the user just typed (and that the host wrote to
-    /// the PTY). `cursor` is the live real cursor (the anchor when nothing is pending);
-    /// while typing ahead, each new glyph extends from the previous prediction. `cols`
-    /// is the grid width, so we never predict past a wrap (a wrap moves rows — outside
-    /// the same-row model, so we decline + flush). Returns `true` if a guess was added.
+    /// the PTY), on a host that does not know its grid HEIGHT. Identical to
+    /// [`predict_char_in_grid`](Self::predict_char_in_grid) with no wrap lane: a guess
+    /// that would cross the right margin is declined. Prefer the grid-aware entry
+    /// point — a long command line is exactly where an ssh user wants type-ahead most,
+    /// and the wrap is where it used to stop.
     pub fn predict_char(&mut self, ch: char, cursor: (u16, u16), cols: u16, now: Instant) -> bool {
+        // `rows = 0` ⇒ no row is available to wrap INTO, so the margin declines.
+        self.predict_char_in_grid(ch, cursor, (cols, 0), now)
+    }
+
+    /// Register a printable character the user just typed. `cursor` is the live real
+    /// cursor (the anchor when nothing is pending); while typing ahead, each new glyph
+    /// extends from the previous prediction. `grid` is `(cols, rows)`: at the right
+    /// margin the guess continues at column 0 of the next row, and only a guess that
+    /// would fall off the BOTTOM of the grid is declined. Returns `true` if a guess was
+    /// added.
+    ///
+    /// A refusal never flushes. A character we cannot model does not invalidate the
+    /// guesses anchored to its LEFT — those are still exactly what the program will
+    /// echo — and flushing them erased the whole word on every accented keystroke of a
+    /// French/German/Spanish/UK layout. It does however cost us the anchor for
+    /// everything typed AFTER it (see `anchor_lost`).
+    pub fn predict_char_in_grid(
+        &mut self,
+        ch: char,
+        cursor: (u16, u16),
+        grid: (u16, u16),
+        now: Instant,
+    ) -> bool {
         if self.mode == PredictMode::Off {
             return false;
         }
-        // Only single-width, self-echoing printables. Control/combining/wide glyphs
-        // (CJK, emoji, ESC sequences) have ambiguous echo geometry → let the real
-        // output handle them, and resync from the next reconcile.
-        if !(ch == ' ' || ch.is_ascii_graphic()) {
-            self.flush();
+        let (cols, rows) = grid;
+        if cols == 0 {
+            return false; // degenerate geometry: no cell can hold a guess
+        }
+        self.grid_cols = cols;
+        // A drained set re-anchors on the live cursor, which the real echo has moved
+        // past whatever we declined, so the block on extending lifts here.
+        if self.preds.is_empty() {
+            self.anchor_lost = false;
+        }
+        // Only single-width, self-echoing printables — width is the criterion, not
+        // ASCII-ness: `é`/`ü`/`ñ` occupy exactly one cell and echo like any other
+        // letter, while control (ESC sequences), zero-width (combining marks, which
+        // modify the cell to their LEFT) and wide (CJK, emoji) glyphs have echo
+        // geometry we cannot place. Refused glyphs are left to the real output.
+        if ch.is_control() || aterm_grapheme::char_width(ch) != 1 {
+            self.anchor_lost = true;
             return false;
         }
+        if self.anchor_lost {
+            return false;
+        }
+        // Anchor: extend the last pending guess OF THIS EPOCH, else the live cursor.
+        // A pre-submit guess still in flight belongs to the previous logical line and
+        // must not anchor the new one.
+        let anchor = self.preds.iter().rev().find(|p| p.epoch == self.epoch);
         // A new line is a fresh confirmation epoch: a guess only displays (Adaptive)
         // after an echo is confirmed ON THIS LINE. So a no-echo prompt on a new row
         // (a password prompt after a command) never inherits the prior line's
         // confirmation and never shows an unechoed glyph.
-        if self.preds.is_empty() && self.epoch_row != Some(cursor.0) {
+        if anchor.is_none() && self.epoch_row != Some(cursor.0) {
             self.confirmed_epoch = false;
             self.epoch_row = Some(cursor.0);
         }
-        // Anchor: extend the last pending guess, else the live cursor.
-        let (row, col) = match self.preds.last() {
+        let (row, col) = match anchor {
             Some(p) => (p.row, p.col.saturating_add(1)),
             None => cursor,
         };
-        if col >= cols {
-            self.flush(); // would wrap to a new row — outside the same-row model
-            return false;
-        }
+        let (row, col) = if col >= cols {
+            // The line wraps. The next glyph lands at column 0 of the following row —
+            // that is what the program will echo, so predicting it is no more
+            // speculative than any other guess. Only the bottom edge is unmodellable
+            // (the grid scrolls, moving every pending guess), and there we decline
+            // WITHOUT flushing: the guesses to the left are still correct.
+            let next = row.saturating_add(1);
+            if next >= rows {
+                self.anchor_lost = true;
+                return false;
+            }
+            (next, 0)
+        } else {
+            (row, col)
+        };
         self.preds.push(Prediction {
             row,
             col,
             ch,
             born: now,
+            epoch: self.epoch,
         });
         true
     }
@@ -222,7 +349,13 @@ impl Predictor {
         if self.mode == PredictMode::Off {
             return false;
         }
-        self.preds.pop().is_some()
+        // Only OUR trailing guess on the CURRENT line: a guess left in flight by the
+        // previous line's submit is not what this Backspace erases.
+        if self.preds.last().is_some_and(|p| p.epoch == self.epoch) {
+            self.preds.pop();
+            return true;
+        }
+        false
     }
 
     /// The user SUBMITTED the line (a plain Enter). End the confirmation epoch: the
@@ -237,9 +370,27 @@ impl Predictor {
     /// boundary makes the epoch track logical INPUT lines, not physical rows — so
     /// `sudo`/`ssh`/`git push` password prompts show nothing until they prove they
     /// echo (which a password prompt never does). Cheap no-op when nothing is pending.
+    ///
+    /// It ends the epoch for FUTURE guesses ONLY; guesses already in flight keep their
+    /// pixels. Flushing them here erased the last few typed characters at the exact
+    /// instant of commit — on a slow link the tail of the command line blinked out and
+    /// reappeared one RTT later, at the most attention-grabbing moment of the whole
+    /// interaction, which felt LAGGIER than not predicting at all. They retire normally
+    /// through [`reconcile`](Self::reconcile) (the echo lands, or the cursor jumps to
+    /// the next row and the consistency check flushes) or expire at the glitch window.
+    /// The password guarantee is untouched: it concerns guesses armed AFTER this
+    /// boundary, and those carry the NEW epoch, which starts unconfirmed — a stale
+    /// guess confirming later cannot arm it (see `Prediction::epoch`).
     pub fn note_line_submit(&mut self) {
-        self.flush(); // drops pending guesses AND clears confirmed_epoch
+        // Ending the epoch closes the Adaptive gate, which would blank the in-flight
+        // guesses just as surely as flushing them. Guesses from an epoch that PROVED it
+        // echoes keep their pixels until they retire or expire — the user has already
+        // watched that line echo, so nothing unechoed is exposed by carrying them.
+        self.grandfathered_epoch = self.confirmed_epoch.then_some(self.epoch);
+        self.epoch = self.epoch.wrapping_add(1);
+        self.confirmed_epoch = false;
         self.epoch_row = None; // the next predict_char (re)starts a fresh epoch
+        self.anchor_lost = false; // the new line re-anchors on the live cursor
     }
 
     /// Reconcile pending predictions against fresh grid state after child output was
@@ -264,10 +415,16 @@ impl Predictor {
         // Classify latency once per independent output/reconcile TURN, not once per
         // character. One delayed scheduler callback can retire a whole type-ahead
         // burst; counting every retired glyph as separate slow evidence would let
-        // that single tail satisfy the two-confirmation latch by itself. The fastest
-        // confirmed glyph is the conservative current-link sample: if output caught
-        // up to any newly typed glyph quickly, speculative pixels provide no benefit.
-        let mut fastest_confirmed = None;
+        // that single tail satisfy the two-confirmation latch by itself.
+        //
+        // The turn's sample is the OLDEST retired guess — the latency the user
+        // actually waited to see their first unechoed glyph. `preds` is in type order,
+        // so the LAST retired guess is always the most recently typed and therefore
+        // always the smallest sample: taking the minimum meant a 5-character burst
+        // echoed in one 45 ms turn reported 5 ms, and the faster the user typed the
+        // more certain the shutoff — the display gate closed hardest exactly when
+        // type-ahead was carrying the most text.
+        let mut oldest_confirmed: Option<Duration> = None;
 
         // Retire confirmed leading predictions; a different glyph at the head ⇒ the
         // program diverged from our guess ⇒ flush. A still-blank head ⇒ not echoed
@@ -277,10 +434,10 @@ impl Predictor {
                 Some(c) if c == p.ch => {
                     let sample = now.saturating_duration_since(p.born);
                     self.record_rtt(sample);
-                    fastest_confirmed = Some(
-                        fastest_confirmed.map_or(sample, |current: Duration| current.min(sample)),
-                    );
-                    self.confirmed_epoch = true;
+                    oldest_confirmed.get_or_insert(sample);
+                    // A guess from BEFORE the last submit measures the link, but must
+                    // not arm the new line's display gate (password safety).
+                    self.confirmed_epoch |= p.epoch == self.epoch;
                     self.preds.remove(0);
                 }
                 Some(_) => {
@@ -297,11 +454,8 @@ impl Predictor {
                     {
                         let sample = now.saturating_duration_since(p.born);
                         self.record_rtt(sample);
-                        fastest_confirmed = Some(
-                            fastest_confirmed
-                                .map_or(sample, |current: Duration| current.min(sample)),
-                        );
-                        self.confirmed_epoch = true;
+                        oldest_confirmed.get_or_insert(sample);
+                        self.confirmed_epoch |= p.epoch == self.epoch;
                         self.preds.remove(0);
                     } else {
                         break;
@@ -309,7 +463,7 @@ impl Predictor {
                 }
             }
         }
-        if let Some(sample) = fastest_confirmed {
+        if let Some(sample) = oldest_confirmed {
             self.record_echo_regime(sample);
         }
 
@@ -319,33 +473,129 @@ impl Predictor {
         if let Some(&p) = self.preds.first() {
             match real_cursor {
                 Some(rc) if rc == (p.row, p.col) => {}
+                // A guess that continued past the right margin is legitimately AHEAD of
+                // the real cursor: a terminal defers the wrap, so after echoing the
+                // final column the cursor is parked THERE (last column, previous row)
+                // and only moves to (row, 0) when the next glyph arrives. Treating that
+                // as a divergence flushed every wrapped type-ahead one burst after it
+                // was armed — the long command lines the feature exists for.
+                Some((rr, rc))
+                    if p.col == 0
+                        && self.grid_cols > 0
+                        && rr.saturating_add(1) == p.row
+                        && rc.saturating_add(1) == self.grid_cols => {}
                 _ => self.flush(),
             }
         }
     }
 
     /// The predictions to OVERLAY this frame. Expires stale unconfirmed guesses first
-    /// (self-healing), then applies the display gate: `Off` ⇒ none; `Always` ⇒ all
-    /// pending; `Adaptive` ⇒ all pending iff an echo is confirmed this epoch and
-    /// consecutive slow samples established a stable high-latency link.
+    /// (self-healing), then applies the display gate — see
+    /// [`visible_count`](Self::visible_count) — which yields the leading run of guesses
+    /// this frame may paint: `Off` ⇒ none; `Always` ⇒ all pending; `Adaptive` ⇒ all
+    /// pending once an echo is confirmed this epoch and consecutive slow samples
+    /// established a stable high-latency link (plus any guess carried across a submit
+    /// by a line that had already confirmed).
     pub fn overlay(&mut self, now: Instant) -> &[Prediction] {
-        if let Some(oldest) = self.preds.first()
-            && now.saturating_duration_since(oldest.born) > Duration::from_millis(GLITCH_MS)
-        {
-            self.flush();
-        }
-        if self.show_gate() { &self.preds } else { &[] }
+        self.expire(now);
+        &self.preds[..self.visible_count()]
     }
 
-    /// The display gate shared by [`overlay`](Self::overlay) and
-    /// [`is_displaying`](Self::is_displaying): `Off` ⇒ never; `Always` ⇒ always;
-    /// `Adaptive` ⇒ once an echo is confirmed this epoch and consecutive slow echo
-    /// samples established that prediction can help.
-    fn show_gate(&self) -> bool {
+    /// Retire guesses the program has not echoed within the glitch window.
+    ///
+    /// Only the EXPIRED head(s) go. The old code flushed the entire set, which on a
+    /// link slower than the (then fixed) window destroyed the whole mechanism: the
+    /// flush also cleared `confirmed_epoch`, so the echo always arrived to an empty
+    /// `preds`, nothing was ever confirmed, no RTT sample was ever taken, and the
+    /// adaptive latch could never open. The tail is younger than the head and has not
+    /// earned its timeout yet.
+    ///
+    /// A timeout is itself evidence: it proves the echo took AT LEAST one window. That
+    /// lower bound is fed to the estimator so a cold slow link can bootstrap — without
+    /// it the window can only grow from confirmations, and on a link where the first
+    /// window always expires first there are none. The sample is the WINDOW, not the
+    /// guess's true age: `overlay` is frame-driven, and a backgrounded/stalled host can
+    /// call it seconds late, which would otherwise blow the estimate (and with it every
+    /// guess's lifetime) up to the ceiling on one dropped frame.
+    fn expire(&mut self, now: Instant) {
+        let window = self.glitch_window();
+        let mut timed_out = false;
+        while let Some(oldest) = self.preds.first() {
+            if now.saturating_duration_since(oldest.born) <= window {
+                break;
+            }
+            self.preds.remove(0);
+            timed_out = true;
+        }
+        if timed_out {
+            // A timeout WIDENS the probe window and NOTHING else. It must not reach
+            // `record_rtt` or `record_echo_regime`, both of which an earlier version of
+            // this fix called with `window` — two separate defects:
+            //
+            // (a) DIVERGENCE. `window` is itself `GLITCH_SRTT_MULT * srtt`, so feeding
+            //     it back gives `srtt' = 0.7*srtt + 0.3*(3*srtt) = 1.6*srtt` — no fixed
+            //     point below the ceiling. Successive unechoed keystrokes on a 1 ms LAN
+            //     walked the window 250 → 383 → 613 → 981 → 1569 → 2000 ms, leaving a
+            //     wrong guess on glass for two full seconds.
+            //
+            // (b) SAFETY. `window >= GLITCH_FLOOR_MS` is always >= `DISPLAY_OPEN_MS`, so
+            //     every timeout voted "slow" and two of them latched `adaptive_slow` —
+            //     ON A LOCAL LINK. The most reachable trigger is the password prompt
+            //     this crate's safety docs are built around: nothing echoes, the real
+            //     cursor never moves, so `reconcile` never flushes and every guess
+            //     reaches here. Typing a 2-character password put a ghost on screen.
+            //
+            // A timeout means NO echo arrived — which is not the same observation as a
+            // slow echo, and is the signature of a context where predicting is useless.
+            // So the backoff is an independent probe: it only lengthens how long the
+            // NEXT guess is willing to wait, and any real confirmation resets it. A
+            // cold link slower than the floor still bootstraps (the window widens until
+            // an echo fits inside it, and THAT confirmation is the real evidence that
+            // opens the gate), but no amount of silence can ever open the gate itself.
+            self.expiry_backoff = self.expiry_backoff.saturating_add(1).min(EXPIRY_BACKOFF_MAX);
+        }
+    }
+
+    /// How long an unconfirmed guess may live. RTT-relative, because a fixed window is
+    /// the wrong unit: 250 ms is generous on a 2 ms LAN link and shorter than a single
+    /// echo on the 300 ms satellite/transpacific links this feature is FOR. Floor and
+    /// ceiling bound the two failure modes (expiring inside one local output burst; a
+    /// wrong guess sitting on glass).
+    /// The `expiry_backoff` term is the COLD-LINK probe: with no confirmation yet
+    /// there is no `srtt`, so a link slower than the floor could never get an echo in
+    /// under the window and could never learn anything. Doubling the floor per
+    /// consecutive timeout walks it 250 → 500 → 1000 → 2000 ms until an echo fits;
+    /// any confirmation resets it (see [`Self::record_rtt`]). It is bounded, and
+    /// unlike feeding timeouts into `srtt` it cannot diverge or vote on the regime.
+    fn glitch_window(&self) -> Duration {
+        let probe = (GLITCH_FLOOR_MS << self.expiry_backoff.min(EXPIRY_BACKOFF_MAX)) as f32;
+        let floor = probe.min(GLITCH_CEILING_MS as f32);
+        let ms = self.srtt.map_or(floor, |s| {
+            (s * GLITCH_SRTT_MULT).clamp(floor, GLITCH_CEILING_MS as f32)
+        });
+        Duration::from_millis(ms as u64)
+    }
+
+    /// How many LEADING pending guesses pass the display gate — shared by
+    /// [`overlay`](Self::overlay) and [`is_displaying`](Self::is_displaying). `Off` ⇒
+    /// none; `Always` ⇒ all; `Adaptive` ⇒ all once an echo is confirmed this epoch and
+    /// consecutive slow echo samples established that prediction can help.
+    ///
+    /// A COUNT rather than a bool because the submit boundary can leave guesses from a
+    /// confirmed line in flight while the new epoch is still unconfirmed. Those keep
+    /// their pixels (they are always at the FRONT, being older) while the new line's
+    /// guesses stay dark — the password guarantee applies per guess, not per frame.
+    fn visible_count(&self) -> usize {
         match self.mode {
-            PredictMode::Off => false,
-            PredictMode::Always => true,
-            PredictMode::Adaptive => self.confirmed_epoch && self.adaptive_slow,
+            PredictMode::Off => 0,
+            PredictMode::Always => self.preds.len(),
+            PredictMode::Adaptive if !self.adaptive_slow => 0,
+            PredictMode::Adaptive if self.confirmed_epoch => self.preds.len(),
+            PredictMode::Adaptive => self
+                .preds
+                .iter()
+                .take_while(|p| Some(p.epoch) == self.grandfathered_epoch)
+                .count(),
         }
     }
 
@@ -378,9 +628,12 @@ impl Predictor {
     pub fn is_displaying(&self, now: Instant) -> bool {
         match self.preds.first() {
             None => false,
+            // The same window `expire` uses: these two disagreeing would either strand
+            // an erase (host thinks nothing changed) or burn a frame per repaint while
+            // the guess is still legitimately in flight.
             Some(oldest) => {
-                now.saturating_duration_since(oldest.born) > Duration::from_millis(GLITCH_MS)
-                    || self.show_gate()
+                now.saturating_duration_since(oldest.born) > self.glitch_window()
+                    || self.visible_count() > 0
             }
         }
     }
@@ -390,9 +643,8 @@ impl Predictor {
     /// visible, repainted away) via [`overlay`](Self::overlay)'s expiry flush even when
     /// no further input or output arrives.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.preds
-            .first()
-            .map(|p| p.born + Duration::from_millis(GLITCH_MS))
+        let window = self.glitch_window();
+        self.preds.first().map(|p| p.born + window)
     }
 
     /// Drop all in-flight predictions (coordinate space changed: resize, font zoom,
@@ -410,7 +662,8 @@ impl Predictor {
     pub fn reset_session(&mut self) {
         self.reset();
         self.srtt = None;
-        self.slow_confirmations = 0;
+        self.slow_samples = 0;
+        self.fast_samples = 0;
         self.adaptive_slow = false;
     }
 
@@ -419,6 +672,8 @@ impl Predictor {
     fn flush(&mut self) {
         self.preds.clear();
         self.confirmed_epoch = false;
+        self.anchor_lost = false; // nothing left to be anchored to
+        self.grandfathered_epoch = None; // …and nothing left to carry pixels for
     }
 
     /// Fold a confirmed echo latency into the smoothed RTT estimate.
@@ -428,25 +683,52 @@ impl Predictor {
             None => ms,
             Some(s) => s * (1.0 - SRTT_ALPHA) + ms * SRTT_ALPHA,
         });
+        // A real echo landed, so the cold-link probe has served its purpose: retire the
+        // backoff and let `srtt` alone size the window from here. Resetting here rather
+        // than in `expire` is what makes the probe converge — silence widens it, and
+        // exactly one confirmation collapses it.
+        self.expiry_backoff = 0;
     }
 
     /// Fold one independent output turn into the stable visual classification.
+    ///
+    /// A LATCH, not a comparator. The thresholds are deliberately asymmetric and
+    /// separated by a dead band: the old single 6 ms line sat inside aterm's own local
+    /// echo distribution and closed on ONE fast sample, so on a jittery link the steady
+    /// state was "off, with occasional flashes" — and because each flip erases whatever
+    /// is mid-flight, the user saw the text they had just typed blink out and come back.
+    /// Stability is worth more here than reaction speed in either direction.
     fn record_echo_regime(&mut self, rtt: Duration) {
         let ms = rtt.as_secs_f32() * 1000.0;
-        if ms >= DISPLAY_SRTT_MS {
-            self.slow_confirmations = self
-                .slow_confirmations
+        if ms >= DISPLAY_OPEN_MS {
+            self.fast_samples = 0;
+            self.slow_samples = self
+                .slow_samples
                 .saturating_add(1)
-                .min(SLOW_CONFIRMATIONS_TO_DISPLAY);
-            if self.slow_confirmations >= SLOW_CONFIRMATIONS_TO_DISPLAY {
+                .min(SLOW_SAMPLES_TO_DISPLAY);
+            if self.slow_samples >= SLOW_SAMPLES_TO_DISPLAY {
                 self.adaptive_slow = true;
             }
-        } else {
-            // Fast evidence is decisive: speculative pixels provide no benefit on
-            // the live path even if an old remote EWMA takes many samples to decay.
-            self.slow_confirmations = 0;
-            self.adaptive_slow = false;
+        } else if ms < DISPLAY_CLOSE_MS {
+            self.slow_samples = 0;
+            self.fast_samples = self
+                .fast_samples
+                .saturating_add(1)
+                .min(FAST_SAMPLES_TO_HIDE);
+            // Three conditions, all required, because closing is the destructive
+            // direction: a sustained streak (not one lucky turn), agreement from the
+            // SMOOTHED estimate (a single raw sample is exactly the jitter we are
+            // filtering), and an EMPTY pending set — a gate flip with guesses in flight
+            // erases pixels that are already on glass, which is the blink itself.
+            let smoothed_fast = self.srtt.is_none_or(|s| s < DISPLAY_CLOSE_MS);
+            if self.fast_samples >= FAST_SAMPLES_TO_HIDE && smoothed_fast && self.preds.is_empty() {
+                self.adaptive_slow = false;
+            }
         }
+        // Samples inside [DISPLAY_CLOSE_MS, DISPLAY_OPEN_MS) are evidence for neither
+        // regime: they leave the latch AND both streaks alone, so "consecutive" counts
+        // decisive turns rather than being reset by every ambiguous one (a link
+        // oscillating around one threshold would otherwise never reach either latch).
     }
 }
 
@@ -465,6 +747,16 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    /// One complete type→echo turn on row 0: arm `ch` at `col` at `at`, then confirm it
+    /// `rtt` later with the cursor advanced. Returns the confirmation instant. Only
+    /// valid with an empty pending set (it anchors on the passed cursor).
+    fn echo_turn(p: &mut Predictor, ch: char, col: u16, at: Instant, rtt: Duration) -> Instant {
+        assert!(p.predict_char(ch, (0, col), 80, at));
+        let done = at + rtt;
+        p.reconcile(Some((0, col + 1)), false, done, cell(&[((0, col), ch)]));
+        done
     }
 
     #[test]
@@ -564,29 +856,139 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_slow_to_fast_closes_on_first_local_confirmation() {
+    fn adaptive_slow_to_fast_closes_only_after_a_sustained_fast_streak() {
+        // Leaving ssh for a local foreground process must still stop painting — but
+        // NOT on one fast sample. A single-sample close makes the steady state on any
+        // jittery link "off with occasional flashes", and each flip erases whatever is
+        // mid-flight, so the user watches their own typing blink out and return.
         let mut p = Predictor::new(PredictMode::Adaptive);
         let now = t0();
+        let slow = Duration::from_millis(60);
+        let fast = Duration::from_millis(1);
 
-        assert!(p.predict_char('a', (0, 0), 80, now));
-        let slow1 = now + Duration::from_millis(60);
-        p.reconcile(Some((0, 1)), false, slow1, cell(&[((0, 0), 'a')]));
-        assert!(p.predict_char('b', (0, 1), 80, slow1));
-        let slow2 = slow1 + Duration::from_millis(60);
-        p.reconcile(Some((0, 2)), false, slow2, cell(&[((0, 1), 'b')]));
-        assert!(p.predict_char('c', (0, 2), 80, slow2));
-        assert_eq!(p.overlay(slow2).len(), 1, "sustained remote latency opens");
+        let mut at = echo_turn(&mut p, 'a', 0, now, slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.predict_char('c', (0, 2), 80, at));
+        assert_eq!(p.overlay(at).len(), 1, "sustained remote latency opens");
+        p.reconcile(Some((0, 3)), false, at + fast, cell(&[((0, 2), 'c')]));
+        at += fast;
 
-        // The EWMA is still far above 6 ms here, but current fast evidence wins:
-        // returning from ssh to a local foreground must close after one echo.
-        let local = slow2 + Duration::from_millis(1);
-        p.reconcile(Some((0, 3)), false, local, cell(&[((0, 2), 'c')]));
-        assert!(p.srtt.is_some_and(|sample| sample >= DISPLAY_SRTT_MS));
-        assert!(p.predict_char('d', (0, 3), 80, local));
+        // Two more fast turns: the raw streak is now long enough, but the SMOOTHED
+        // estimate is still remote-sized, so the latch holds.
+        at = echo_turn(&mut p, 'd', 3, at, fast);
+        at = echo_turn(&mut p, 'e', 4, at, fast);
+        assert!(p.srtt.is_some_and(|s| s >= DISPLAY_CLOSE_MS));
         assert!(
-            p.overlay(local).is_empty(),
-            "one fast confirmation closes despite the stale remote EWMA"
+            p.adaptive_slow,
+            "a raw streak alone must not close the gate"
         );
+
+        // Keep echoing locally: once the EWMA itself agrees, the gate closes.
+        for col in 5..14 {
+            at = echo_turn(&mut p, 'x', col, at, fast);
+        }
+        assert!(!p.adaptive_slow, "a settled local link stops painting");
+        assert!(p.predict_char('z', (0, 14), 80, at));
+        assert!(p.overlay(at).is_empty());
+    }
+
+    #[test]
+    fn adaptive_gate_does_not_flap_across_a_single_fast_sample() {
+        // REGRESSION (P2): the old classifier opened on two samples ≥ 6 ms and closed
+        // on ONE below it — thresholds inside aterm's own local-echo distribution. A
+        // link alternating 30 ms / 5 ms therefore spent most frames dark and erased a
+        // ghost on every dip. Hysteresis: one fast dip in a slow link changes nothing.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let slow = Duration::from_millis(30);
+
+        let mut at = echo_turn(&mut p, 'a', 0, now, slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.adaptive_slow, "control: the slow link opened the gate");
+
+        at = echo_turn(&mut p, 'c', 2, at, Duration::from_millis(5)); // one jitter dip
+        assert!(p.adaptive_slow, "one fast dip must not blank the overlay");
+        at = echo_turn(&mut p, 'd', 3, at, slow);
+        assert!(p.predict_char('e', (0, 4), 80, at));
+        assert_eq!(
+            p.overlay(at).len(),
+            1,
+            "the slow link keeps painting across its own jitter"
+        );
+    }
+
+    #[test]
+    fn adaptive_gate_never_closes_while_a_guess_is_in_flight() {
+        // Closing is the destructive direction: it un-paints pixels that are already on
+        // glass. Even a fully-settled fast streak must wait for the pending set to
+        // drain, or the very turn that decides "prediction is not needed" is the turn
+        // that blinks out the guess the user is currently looking at.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let slow = Duration::from_millis(60);
+        let fast = Duration::from_millis(1);
+
+        let mut at = echo_turn(&mut p, 'a', 0, now, slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.adaptive_slow);
+
+        // Every turn confirms one guess while the user is one glyph ahead, so the
+        // pending set is never empty at classification time.
+        let mut col = 2u16;
+        for _ in 0..14 {
+            assert!(p.predict_char('x', (0, col), 80, at));
+            assert!(p.predict_char('y', (0, col + 1), 80, at));
+            at += fast;
+            p.reconcile(Some((0, col + 1)), false, at, cell(&[((0, col), 'x')]));
+            assert!(p.predict_backspace(at), "retire the type-ahead glyph");
+            col += 1;
+        }
+        assert!(
+            p.srtt.is_some_and(|s| s < DISPLAY_CLOSE_MS),
+            "control: the smoothed estimate is now unambiguously local"
+        );
+        assert!(
+            p.adaptive_slow,
+            "a gate flip with pixels in flight is exactly the visible blink"
+        );
+
+        // Drained: the same evidence now closes it.
+        let _ = echo_turn(&mut p, 'q', col, at, fast);
+        assert!(!p.adaptive_slow);
+    }
+
+    #[test]
+    fn burst_is_classified_by_the_oldest_retired_guess() {
+        // REGRESSION (P3): `preds` is in type order, so the LAST guess retired in a
+        // turn is the newest and always the smallest sample. Classifying by the minimum
+        // meant a five-glyph burst echoed in one 45 ms turn reported 5 ms — the faster
+        // the user typed, the more certain the shutoff. The user waited 45 ms for the
+        // FIRST unechoed glyph; that is the latency prediction exists to hide.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let burst = |p: &mut Predictor, start: Instant, base: u16| -> Instant {
+            for i in 0..5u16 {
+                assert!(p.predict_char(
+                    'a',
+                    (0, base + i),
+                    80,
+                    start + Duration::from_millis(u64::from(i) * 10)
+                ));
+            }
+            let echoed: Vec<((u16, u16), char)> = (0..5u16).map(|i| ((0, base + i), 'a')).collect();
+            let done = start + Duration::from_millis(45);
+            p.reconcile(Some((0, base + 5)), false, done, cell(&echoed));
+            done
+        };
+
+        let after = burst(&mut p, now, 0);
+        let after = burst(&mut p, after, 5);
+        assert!(
+            p.adaptive_slow,
+            "two 45 ms turns are a slow link no matter how fast the user types"
+        );
+        assert!(p.predict_char('z', (0, 10), 80, after));
+        assert_eq!(p.overlay(after).len(), 1);
     }
 
     #[test]
@@ -608,7 +1010,7 @@ mod tests {
             "no speculative pixel was painted"
         );
 
-        let after_deadline = fast + Duration::from_millis(GLITCH_MS + 1);
+        let after_deadline = fast + Duration::from_millis(GLITCH_FLOOR_MS + 1);
         // `is_displaying` deliberately returns true for one cleanup frame once any
         // pending guess expires, even if the display gate stayed closed. The visual
         // contract is the overlay trace: empty before the deadline and still empty
@@ -660,7 +1062,7 @@ mod tests {
         p.predict_char('a', (0, 0), 80, now);
         assert_eq!(p.overlay(now).len(), 1);
         // No echo ever arrives; after the glitch window the guess is dropped.
-        let late = now + Duration::from_millis(GLITCH_MS + 50);
+        let late = now + Duration::from_millis(GLITCH_FLOOR_MS + 50);
         assert!(p.overlay(late).is_empty());
         assert!(!p.is_active());
     }
@@ -680,7 +1082,7 @@ mod tests {
             p.next_deadline().is_some(),
             "a pending guess arms a deadline"
         );
-        let late = now + Duration::from_millis(GLITCH_MS + 50);
+        let late = now + Duration::from_millis(GLITCH_FLOOR_MS + 50);
         let _ = p.overlay(late); // the same flush the scrolled-back branch now runs
         assert!(!p.is_active(), "stale guess flushed past the glitch window");
         assert!(
@@ -702,27 +1104,126 @@ mod tests {
     }
 
     #[test]
-    fn does_not_predict_past_the_right_margin() {
+    fn height_blind_hosts_decline_at_the_margin_without_flushing() {
+        // The legacy 4-argument seam has no grid HEIGHT, so it cannot know whether a
+        // wrap lands on a real row; it still declines. What it must not do is flush:
+        // the guesses to the LEFT of the margin are exactly what the program will echo.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
         assert!(p.predict_char('a', (0, 78), 80, now)); // col 78 ok
         assert!(p.predict_char('b', (0, 78), 80, now)); // extends to col 79 (last column)
         assert!(
             !p.predict_char('c', (0, 78), 80, now),
-            "col 80 would wrap → declined"
+            "col 80 would wrap and no row height was supplied → declined"
         );
-        assert!(!p.is_active(), "the wrap attempt flushed pending guesses");
+        assert_eq!(
+            p.overlay(now).len(),
+            2,
+            "declining the wrap must not erase the two glyphs already on glass"
+        );
     }
 
     #[test]
-    fn non_ascii_is_not_predicted() {
+    fn wraps_to_the_next_row_instead_of_flushing() {
+        // REGRESSION (P6): prediction used to stop at the right margin — on long
+        // command lines, which is where an ssh user wants type-ahead MOST. The program
+        // will echo the next glyph at column 0 of the following row; guessing that is
+        // no more speculative than any other guess.
         let mut p = Predictor::new(PredictMode::Always);
         let now = t0();
+        assert!(p.predict_char_in_grid('a', (0, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now));
+        let shown = p.overlay(now);
+        assert_eq!(shown.len(), 2);
+        assert_eq!((shown[0].row, shown[0].col), (0, 79));
+        assert_eq!(
+            (shown[1].row, shown[1].col, shown[1].ch),
+            (1, 0, 'b'),
+            "the wrapped glyph continues on the next row"
+        );
+    }
+
+    #[test]
+    fn wrapped_guess_survives_the_deferred_wrap_cursor() {
+        // A terminal DEFERS the wrap: after echoing the final column the cursor is
+        // still parked there and only moves to (row+1, 0) when the next glyph arrives.
+        // The strict cursor-consistency check read that as a divergence and flushed
+        // every wrapped guess one output burst after it was armed.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char_in_grid('a', (0, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now));
+        // The echo of 'a' lands; the cursor stays in the deferred-wrap slot (0,79).
+        p.reconcile(Some((0, 79)), false, now, cell(&[((0, 79), 'a')]));
+        let shown = p.overlay(now);
+        assert_eq!(shown.len(), 1, "'a' retires, the wrapped 'b' survives");
+        assert_eq!((shown[0].row, shown[0].col, shown[0].ch), (1, 0, 'b'));
+    }
+
+    #[test]
+    fn bottom_row_declines_without_flushing() {
+        // The bottom edge is genuinely unmodellable — the grid SCROLLS, moving every
+        // pending guess — so we decline there. The pending set stays: those cells are
+        // above the wrap and unaffected.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char_in_grid('a', (23, 79), (80, 24), now));
+        assert!(
+            !p.predict_char_in_grid('b', (23, 79), (80, 24), now),
+            "there is no row 24 to wrap into"
+        );
+        assert_eq!(p.overlay(now).len(), 1, "the armed glyph keeps its pixels");
+    }
+
+    #[test]
+    fn wide_glyphs_are_declined_but_narrow_accents_are_predicted() {
+        // Width, not ASCII-ness, is the criterion. `é` occupies one cell and echoes
+        // like any letter; CJK/emoji take two and combining marks alter the cell to
+        // their left, so their echo geometry is not ours to place.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(
+            p.predict_char('é', (0, 0), 80, now),
+            "single-width accented Latin is ordinary self-echoing input"
+        );
+        assert!(p.predict_char('ü', (0, 0), 80, now));
+        assert_eq!(p.overlay(now).len(), 2);
         assert!(
             !p.predict_char('日', (0, 0), 80, now),
             "wide/CJK glyphs are left to real echo"
         );
-        assert!(!p.is_active());
+        assert!(
+            !p.predict_char('\u{0301}', (0, 0), 80, now),
+            "a combining mark modifies the cell to its LEFT — not a new cell"
+        );
+    }
+
+    #[test]
+    fn a_declined_glyph_does_not_erase_the_word_to_its_left() {
+        // REGRESSION (P4): refusal used to flush, so on a French/German/Spanish/UK
+        // layout essentially every word wiped the in-flight set AND the confirmation
+        // epoch. A character we cannot model says nothing about the guesses anchored to
+        // its left — but it does cost us the ANCHOR, so we stop extending until the set
+        // drains and the live cursor (which the real echo moves) re-anchors us.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char('a', (0, 0), 80, now));
+        assert!(!p.predict_char('日', (0, 0), 80, now));
+        assert_eq!(p.overlay(now).len(), 1, "'a' keeps its pixels");
+        assert!(
+            !p.predict_char('b', (0, 0), 80, now),
+            "we cannot place a glyph past a wide echo we did not model"
+        );
+        assert_eq!(
+            p.overlay(now).len(),
+            1,
+            "…and declining that changes nothing"
+        );
+        // The real echo lands and drains the set: the live cursor is authoritative
+        // again, so prediction resumes.
+        p.reconcile(Some((0, 3)), false, now, cell(&[((0, 0), 'a')]));
+        assert!(p.predict_char('c', (0, 3), 80, now));
+        assert_eq!(p.overlay(now)[0].col, 3);
     }
 
     #[test]
@@ -780,19 +1281,202 @@ mod tests {
             1,
             "confirmed slow epoch on row r shows the next keystroke"
         );
-        // Submit (Enter): ends the epoch and flushes the pending guess.
+        // Submit (Enter): ends the epoch for FUTURE guesses. The already-painted 'c'
+        // keeps its pixels (it belongs to a line that proved it echoes), which is the
+        // whole point of not flushing here.
         p.note_line_submit();
-        assert!(
-            p.overlay(confirmed).is_empty(),
-            "submit flushes pending guesses"
+        assert_eq!(
+            p.overlay(confirmed).len(),
+            1,
+            "a guess from the confirmed line keeps its pixels across the submit"
         );
         // Line 2 (password prompt) on the SAME physical row r: never echoes.
         let t1 = confirmed + Duration::from_millis(50);
         assert!(p.predict_char('s', (r, 9), 80, t1)); // predicted (tracked)…
+        let shown = p.overlay(t1);
         assert!(
-            p.overlay(t1).is_empty(),
+            shown.iter().all(|g| g.ch != 's'),
             "after submit, an unechoed char on the SAME physical row must NOT display (no leak)"
         );
+    }
+
+    #[test]
+    fn submit_does_not_blank_the_tail_of_the_command_line() {
+        // REGRESSION (P5): Enter used to flush, so on a slow link the last few typed
+        // characters vanished at the exact instant of commit and reappeared one RTT
+        // later — the most attention-grabbing moment of the interaction, made to feel
+        // laggier than having no prediction at all.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char('l', (0, 0), 80, now));
+        assert!(p.predict_char('s', (0, 0), 80, now));
+        assert_eq!(p.overlay(now).len(), 2);
+        p.note_line_submit();
+        assert_eq!(
+            p.overlay(now).len(),
+            2,
+            "the unechoed tail of the submitted line stays on glass"
+        );
+        assert!(
+            p.next_deadline().is_some(),
+            "…and still self-heals on its own deadline"
+        );
+    }
+
+    #[test]
+    fn a_stale_guess_confirming_after_submit_cannot_arm_the_new_line() {
+        // The password guarantee, pinned against the P5 change: keeping in-flight
+        // guesses across the boundary means one can CONFIRM after it. That confirmation
+        // measures the link (legitimately) but must not arm the new line's display
+        // gate, or the secret typed at the prompt below would show.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let r = 23u16; // bottom row, reused across both logical lines
+        let slow = Duration::from_millis(60);
+        // Establish a slow link on line 1 so the RTT latch is open.
+        assert!(p.predict_char('a', (r, 0), 80, now));
+        let t1 = now + slow;
+        p.reconcile(Some((r, 1)), false, t1, cell(&[((r, 0), 'a')]));
+        assert!(p.predict_char('b', (r, 1), 80, t1));
+        let t2 = t1 + slow;
+        p.reconcile(Some((r, 2)), false, t2, cell(&[((r, 1), 'b')]));
+        assert!(p.adaptive_slow, "control: the link is classified slow");
+
+        // Type one more glyph, hit Enter while it is still unechoed, then let its echo
+        // land AFTER the boundary.
+        assert!(p.predict_char('c', (r, 2), 80, t2));
+        p.note_line_submit();
+        let t3 = t2 + slow;
+        p.reconcile(Some((r, 3)), false, t3, cell(&[((r, 2), 'c')]));
+        assert!(p.idle(), "the stale guess retired normally");
+        assert!(
+            !p.confirmed_epoch,
+            "a pre-submit confirmation must not arm the new line"
+        );
+
+        // The password prompt lands on the SAME physical row and never echoes.
+        assert!(p.predict_char('s', (r, 9), 80, t3));
+        assert!(
+            p.overlay(t3).is_empty(),
+            "an unechoed secret on the new line must never display"
+        );
+    }
+
+    #[test]
+    fn slow_link_expiry_window_grows_until_the_echo_can_confirm() {
+        // REGRESSION (P1): with a FIXED 250 ms expiry, every guess on a link slower
+        // than that was flushed before its echo arrived — and the flush also cleared
+        // `confirmed_epoch`, so `reconcile` always found an empty set, no RTT sample
+        // was ever recorded, and the adaptive latch could never open. The feature was
+        // dead in exactly the regime it exists for. A timeout now WIDENS the probe
+        // window until the echo fits inside it — but is NOT itself evidence about the
+        // link: only real confirmations classify the regime, so opening the gate still
+        // takes `SLOW_SAMPLES_TO_DISPLAY` genuine slow echoes. (Counting timeouts as
+        // slow samples put a ghost on screen after two unechoed keystrokes at a
+        // PASSWORD PROMPT on a 1 ms local link, and fed `3*srtt` back into `srtt` so
+        // the window diverged to the 2 s ceiling.)
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let rtt = Duration::from_millis(400);
+
+        // First keystroke on a cold 400 ms link: nothing confirms it in the floor
+        // window, so it expires — recording a LOWER BOUND on the link's latency.
+        assert!(p.predict_char('a', (0, 0), 80, now));
+        let _ = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 1));
+        assert!(!p.is_active(), "the unconfirmed guess still self-heals");
+        assert!(
+            p.glitch_window() > Duration::from_millis(GLITCH_FLOOR_MS),
+            "a timeout widens the window instead of repeating forever"
+        );
+
+        // Second keystroke: the widened window now outlasts the real 400 ms echo, so
+        // the guess is still in flight when its echo lands and CONFIRMS.
+        let armed = now + Duration::from_millis(500);
+        assert!(p.predict_char('b', (0, 0), 80, armed));
+        let _ = p.overlay(armed + Duration::from_millis(300)); // a frame mid-flight
+        assert!(p.is_active(), "the guess outlives the old fixed window");
+        p.reconcile(Some((0, 1)), false, armed + rtt, cell(&[((0, 0), 'b')]));
+        assert!(p.confirmed_epoch, "the echo finally reaches a live guess");
+        assert!(
+            !p.adaptive_slow,
+            "ONE confirmation is not a regime: silence must never substitute for the \
+             second slow sample (that is what painted a ghost at a password prompt)"
+        );
+        // The confirmation also collapses the probe back to the floor — the estimate is
+        // now doing the sizing, so the backoff must not keep the window inflated.
+        assert_eq!(p.expiry_backoff, 0, "a real echo retires the cold-link probe");
+
+        // A SECOND genuine slow confirmation is what opens the gate.
+        let mut at = armed + rtt;
+        assert!(p.predict_char('c', (0, 1), 80, at));
+        at += rtt;
+        p.reconcile(Some((0, 2)), false, at, cell(&[((0, 1), 'c')]));
+        assert!(
+            p.adaptive_slow,
+            "two real slow echoes classify the link — the honest evidence path"
+        );
+
+        // …and that is the whole point: the next keystroke is painted immediately.
+        assert!(p.predict_char('d', (0, 2), 80, at));
+        assert_eq!(p.overlay(at).len(), 1, "a 400 ms link finally predicts");
+    }
+
+    /// REGRESSION (P1 review): an endlessly non-echoing context — a password prompt,
+    /// a raw-mode key — must never accumulate "slow" evidence. The real cursor does
+    /// not move there, so `reconcile`'s consistency check matches and every guess
+    /// reaches the expiry path; an earlier fix counted each of those as a slow echo
+    /// sample and latched speculation ON after two keystrokes, on a LOCAL link.
+    #[test]
+    fn silence_never_opens_the_gate_or_diverges_the_estimate() {
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let mut now = t0();
+        for _ in 0..12 {
+            assert!(p.predict_char('x', (0, 0), 80, now));
+            now += Duration::from_millis(GLITCH_CEILING_MS + 10);
+            assert!(
+                p.overlay(now).is_empty(),
+                "an unechoed guess is never displayed on a link that never echoed"
+            );
+        }
+        assert!(!p.adaptive_slow, "silence is not evidence of a slow link");
+        assert!(!p.confirmed_epoch, "nothing was ever confirmed");
+        assert_eq!(p.srtt, None, "timeouts must not seed the RTT estimate");
+        assert!(
+            p.glitch_window() <= Duration::from_millis(GLITCH_CEILING_MS),
+            "the probe is bounded, never divergent"
+        );
+    }
+
+    #[test]
+    fn expiry_retires_only_the_oldest_guess_and_keeps_the_epoch() {
+        // The whole set used to go, along with `confirmed_epoch`. The tail is YOUNGER
+        // than the head and has not earned its timeout, and dropping the epoch made the
+        // next line re-prove an echo that this line had already proved.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char('a', (0, 0), 80, now));
+        let later = now + Duration::from_millis(200);
+        assert!(p.predict_char('b', (0, 0), 80, later));
+        let shown = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 10));
+        assert_eq!(shown.len(), 1, "only the expired head is retired");
+        assert_eq!(shown[0].ch, 'b');
+
+        // Adaptive: the confirmation earned on this line survives a later expiry.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let slow = Duration::from_millis(60);
+        let mut at = echo_turn(&mut p, 'a', 0, now, slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.confirmed_epoch && p.adaptive_slow);
+        assert!(p.predict_char('c', (0, 2), 80, at));
+        let expired = at + Duration::from_millis(GLITCH_FLOOR_MS + 10);
+        assert!(p.overlay(expired).is_empty(), "the stale guess expired");
+        assert!(
+            p.confirmed_epoch,
+            "expiry must not make this line re-prove an echo it already proved"
+        );
+        assert!(p.predict_char('d', (0, 2), 80, expired));
+        assert_eq!(p.overlay(expired).len(), 1, "the next guess still paints");
     }
 
     #[test]

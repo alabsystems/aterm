@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The SETTINGS MODEL + non-destructive `aterm.toml` editor behind the own-rendered
-//! Settings overlay ([`crate::settings`]) — the one settings surface (App ▸
-//! Settings…, ⌘,; the native Preferences NSWindow this module once built is retired).
+//! The settings registry and non-destructive `aterm.toml` writer shared by the native
+//! Settings tab and Manual editor (App ▸ Settings…, ⌘,). The separate native
+//! Preferences window this module once built is retired.
 //!
 //! aterm's settings live in `~/.config/aterm/aterm.toml` (hot-reloading — see
 //! [`crate::app_config`]). Everything here is PURE and platform-independent:
-//!   * [`editable_fields`] — the control specs (label/key/kind/seed/placeholder,
-//!     grouped by [`Section`]) the overlay renders and the `controls prefs`
-//!     introspection verb serialises;
+//!   * [`editable_fields`] — the shared config-control registry
+//!     (label/key/kind/seed/placeholder, grouped by [`Section`]) from which the
+//!     curated native tab and Manual schema select their surfaces;
 //!   * [`apply_prefs_edits`] / [`save_prefs_edits`] — write edited values back
 //!     NON-DESTRUCTIVELY (preserving the user's other keys, comments, and formatting
-//!     via `toml_edit`; atomic temp-write + rename). Every committed edit then posts
-//!     the SAME [`Wake::ConfigReload`](crate::Wake) the config-watcher fires, so the
-//!     live hot-reload ([`crate::App::reload_config`]) re-applies the file — no
-//!     parallel reload logic lives here.
+//!     via `toml_edit`; atomic temp-write + rename). The serialized native config
+//!     worker returns the exact committed bytes and post-publication proof for
+//!     direct admission; the watcher remains an independent external-edit source.
 //!
 //! Clearing a field to blank REMOVES that key (reverting it to its built-in default)
 //! rather than writing an empty string. Save is best-effort: a missing config file is
@@ -36,6 +35,10 @@ use crate::app_config::{
 /// followed by a reload round-trips through serde (see [`crate::app_config::Config`]).
 pub(crate) const EDIT_FONT_PX: &str = "font_px";
 pub(crate) const EDIT_FONT_FAMILY: &str = "font_family";
+/// The bundled game-title face selector (`game_font`) — one of
+/// [`GAME_FONT_OPTIONS`], cleared = the normal font selection. Driven by the
+/// Settings "Game Fonts" page's mutually-exclusive toggles.
+pub(crate) const EDIT_GAME_FONT: &str = "game_font";
 // W6 per-style fonts + TOML fallback chain.
 pub(crate) const EDIT_FONT_FAMILY_BOLD: &str = "font_family_bold";
 pub(crate) const EDIT_FONT_FAMILY_ITALIC: &str = "font_family_italic";
@@ -61,6 +64,11 @@ pub(crate) const EDIT_TONE_MELODY: &str = "tone_melody";
 /// texture behind the trail notes; OFF gates the synth's bed mixer entirely
 /// (zero bed samples — the notes, brrrring, bonk and melody are untouched).
 pub(crate) const EDIT_TRAIL_SOUND_BED: &str = "trail_sound_bed";
+/// Typing-sound palette selector (`Config::trail_sound_style`, default
+/// `auto`): `auto` follows the visual trail style's signature palette;
+/// `mechanical` swaps every keystroke to the mechanical-keyboard palette
+/// (switch click + case thock) whatever the trail looks like.
+pub(crate) const EDIT_TRAIL_SOUND_STYLE: &str = "trail_sound_style";
 pub(crate) const EDIT_CURSOR_TRAIL_COLOR: &str = "cursor_trail_color";
 pub(crate) const EDIT_CURSOR_TRAIL_ACCENT: &str = "cursor_trail_accent";
 pub(crate) const EDIT_CURSOR_NYAN_SPRITE: &str = "cursor_nyan_sprite";
@@ -70,6 +78,7 @@ pub(crate) const EDIT_CURSOR_TRAIL_MS: &str = "cursor_trail_ms";
 pub(crate) const EDIT_CURSOR_TRAIL_LENGTH: &str = "cursor_trail_length";
 pub(crate) const EDIT_CURSOR_TRAIL_INTENSITY: &str = "cursor_trail_intensity";
 pub(crate) const EDIT_CURSOR_TRAIL_RADIUS: &str = "cursor_trail_radius";
+pub(crate) const EDIT_CURSOR_TRAIL_WAKE_MS: &str = "cursor_trail_wake_ms";
 pub(crate) const EDIT_CURSOR_TRAIL_RING: &str = "cursor_trail_ring";
 pub(crate) const EDIT_CURSOR_TRAIL_BLOOM: &str = "cursor_trail_bloom";
 pub(crate) const EDIT_CURSOR_TRAIL_BLOOM_STRENGTH: &str = "cursor_trail_bloom_strength";
@@ -115,7 +124,7 @@ pub(crate) const EDIT_SERIOUS_MODE: &str = "serious_mode";
 pub(crate) const EDIT_LOAD_ADAPTIVE_MOTION: &str = "load_adaptive_motion";
 
 /// The hex-colour keys (theme colors plus cursor-trail overrides) — edited as a
-/// `#RGB`/`#RRGGBB`
+/// `RRGGBB`/`#RRGGBB`
 /// hex string ([`EditKind::Color`]). Listed once so `edit_kind` and the
 /// schema rows agree on which keys are colours.
 pub(crate) const COLOR_KEYS: &[&str] = &[
@@ -133,6 +142,25 @@ pub(crate) const EDIT_CONFIRM_MULTILINE_PASTE: &str = "confirm_multiline_paste";
 pub(crate) const EDIT_COLUMNS: &str = "columns";
 pub(crate) const EDIT_LINES: &str = "lines";
 pub(crate) const EDIT_TAB_STRIP_ROWS: &str = "tab_strip_rows";
+/// The selected-tab color override (`active_tab_color`, `#RRGGBB`), cleared =
+/// today's translucent system pill ("Transparent white" on the Tab Color page).
+pub(crate) const EDIT_ACTIVE_TAB_COLOR: &str = "active_tab_color";
+
+/// The `game_font` Enum options: `"off"` (the default font — what clearing the
+/// key also means) followed by the bundled ids in the toggles' display order.
+/// The id tail is pinned against [`aterm_render::GAME_FONTS`] by test so the
+/// registry, the resolver, and the toggles can never disagree about the set;
+/// `"off"` exists so the plain popup control (Compact / search results) can
+/// turn the game font off without a separate reset affordance —
+/// `font_family_request` treats it exactly like an unset key.
+pub(crate) const GAME_FONT_OPTIONS: &[&str] = &[
+    "off",
+    "roblox",
+    "minecraft",
+    "zelda",
+    "mariokart",
+    "animal-crossing",
+];
 /// Smart-title controls. These names deliberately match the public `aterm.toml`
 /// schema exactly; in particular, credentials are represented only by a FILE PATH.
 /// The Settings surface deliberately defines no separate raw-token value.
@@ -175,12 +203,8 @@ pub(crate) const EDIT_ALLOW_WINDOW_OPS: &str = "allow_window_ops";
 pub(crate) const EDIT_ALLOW_NOTIFICATIONS: &str = "allow_notifications";
 pub(crate) const EDIT_ALLOW_PALETTE_RECONFIGURE: &str = "allow_palette_reconfigure";
 pub(crate) const EDIT_ALLOW_KITTY_FILE_TRANSFER: &str = "allow_kitty_file_transfer";
-/// The MASTER bottom-HUD switch (`Config::show_hud`) — one Bool over the whole band;
-/// the per-panel `show_*_hud` keys come from `hud_bar::PanelId::config_key()`.
-pub(crate) const EDIT_SHOW_HUD: &str = "show_hud";
-
 /// The subtle top-right build/version badge switch (`Config::show_build_badge`) — one
-/// Bool, default ON. See [`crate::build_badge`].
+/// Bool, default OFF. See [`crate::build_badge`].
 pub(crate) const EDIT_SHOW_BUILD_BADGE: &str = "show_build_badge";
 
 /// The PHOSPHOR matrix-rain master switch — the `[matrix_rain]` table's `enabled`
@@ -192,15 +216,17 @@ pub(crate) const EDIT_SHOW_BUILD_BADGE: &str = "show_build_badge";
 /// session ends.
 pub(crate) const EDIT_MATRIX_RAIN_ENABLED: &str = "matrix_rain.enabled";
 
-/// The `[packages]` toolchain-manager consent switches, addressed as dotted
-/// keys (the same nested writer as [`EDIT_MATRIX_RAIN_ENABLED`]). Both are
-/// Bools; their DEFAULTS differ deliberately: `auto_update` defaults ON (the
+/// The `[packages]` toolchain-manager maintenance switches, addressed as
+/// dotted keys (the same nested writer as [`EDIT_MATRIX_RAIN_ENABLED`]). All
+/// are Bools. The background-service master and `auto_update` default ON (the
 /// pre-config 6h `atpkg update` cadence), `auto_install` defaults OFF —
 /// installing the multi-GB default toolset needs explicit consent, and this
 /// Settings switch IS the consent click (`docs/TOOLCHAIN-PACKAGE-MANAGER.md`
 /// §11). Housed in the search-only Packages section: the rows render on the
 /// special Settings ▸ Packages page (which no `section()` registry page owns),
 /// while Search and Modified still find them through the ordinary registry.
+pub(crate) const EDIT_PACKAGES_ENABLED: &str = "packages.enabled";
+/// See [`EDIT_PACKAGES_ENABLED`]; default ON.
 pub(crate) const EDIT_PACKAGES_AUTO_UPDATE: &str = "packages.auto_update";
 /// See [`EDIT_PACKAGES_AUTO_UPDATE`]; default OFF (consent-gated).
 pub(crate) const EDIT_PACKAGES_AUTO_INSTALL: &str = "packages.auto_install";
@@ -254,9 +280,8 @@ pub(crate) const PREDICTIVE_ECHO_MODES: &[&str] = &["off", "adaptive", "always"]
 /// spellings `text_blending_or_default` accepts (the `linear_corrected`
 /// underscore alias still parses from a hand-edited file).
 pub(crate) const TEXT_BLENDINGS: &[&str] = &["linear-corrected", "linear"];
-/// Closed domain for the `motion` accessibility policy (W11); `MotionMode::parse`
-/// also accepts aliases (on/off) from a hand-edited file, but the picker writes
-/// only these canonical values.
+/// Closed domain for the `motion` accessibility policy (W11); these are the
+/// exact spellings `MotionMode::parse` accepts and the picker writes.
 pub(crate) const MOTION_MODES: &[&str] = &["auto", "full", "reduced"];
 /// Closed domain for `window_colorspace` (M3 phase A) — the canonical spellings
 /// of [`crate::app_config::WindowColorspace::parse`] (the `displayp3`/`p3`
@@ -276,10 +301,10 @@ pub(crate) const EDIT_PREDICTIVE_ECHO: &str = "predictive_echo";
 pub(crate) const EDIT_FOCUS_BOOST: &str = "focus_boost";
 
 // ---- The FULL-COVERAGE batch (AI-driveability): every remaining `Config` scalar
-// key gets a registry row so `controls prefs` reads it and `settings set|unset`
-// writes it. Each key's TYPE arm in `edit_kind` matters — a missed Bool falls to
+// key gets a registry row so Manual/schema discovery and `settings set|unset`
+// can address it. Each key's TYPE arm in `edit_kind` matters — a missed Bool falls to
 // Text and a Save then writes a TOML string a serde `Option<bool>` rejects on
-// reload (the corruption class the HUD guard documents).
+// reload (the corruption class the schema guard documents).
 
 /// GPU rendering master switch (`Config::gpu`, default ON with CPU fallback).
 /// RESTART-ONLY: the backend is built at launch — `restart_notices` surfaces the
@@ -325,23 +350,54 @@ pub(crate) const EDIT_WINDOW_PADDING: &str = "window_padding";
 /// resolver-clamped to `0..=window_padding` — the renderer's `pad_top <= pad` law).
 pub(crate) const EDIT_WINDOW_PADDING_TOP: &str = "window_padding_top";
 
-/// The LIST-VALUED keys: `Vec<String>` config fields edited as ONE comma-separated
-/// text row (the `fallback_fonts`/`FontList` precedent) whose Save writes a real
-/// TOML ARRAY — these fields deserialize as plain `Vec<String>`, so a comma-joined
-/// STRING (what `fallback_fonts` gets away with via its custom deserializer) would
-/// fail the whole config parse on reload. ROUND-TRIP SAFETY: everything this
-/// control itself writes round-trips exactly (text → split on `,` → array → seed
-/// re-joins `", "`); the one unrepresentable case is a HAND-EDITED entry that
-/// itself contains a literal comma, which would re-split — the exact trade
-/// `fallback_fonts`' comma-string form already ships. Each row's placeholder
-/// documents the separator. `palette` entries are additionally hex-validated at
-/// Save (a malformed colour would be silently ignored at load).
+/// The LIST-VALUED keys accepted by the compatibility `settings set` writer.
+///
+/// Native Settings deliberately does not render these as comma-separated text
+/// controls: a hand-authored member can itself contain a comma (for example a
+/// shell argument), so flattening an existing TOML array would be lossy. Manual
+/// owns their structured editing. The writer still accepts a comma-separated
+/// replacement for legacy control clients and serializes that explicit replacement
+/// as a real TOML array. `palette` entries are additionally hex-validated.
 pub(crate) const LIST_KEYS: &[&str] = &[
     EDIT_PALETTE,
     EDIT_SHELL_ARGS,
     EDIT_CURSOR_TRAIL_PACKS,
     EDIT_FONT_FEATURES,
 ];
+
+/// Collection-shaped values that have no lossless one-line Settings control.
+/// `fallback_fonts` and `font_variation` accept either a string or an array via
+/// `FontList`; the other keys are strict TOML arrays. All remain searchable and
+/// assisted in Manual, and Modified reports their exact authored representation.
+pub(crate) fn manual_collection_key(key: &str) -> bool {
+    LIST_KEYS.contains(&key) || matches!(key, EDIT_FALLBACK_FONTS | EDIT_FONT_VARIATION)
+}
+
+/// Config keys whose value names filesystem-backed assets. Structured Settings
+/// cannot publish these atomically without worker validation, so Manual owns
+/// their editing and the exact-observation worker admits text + decoded assets
+/// as one generation.
+pub(crate) fn config_asset_source_key(key: &str) -> bool {
+    matches!(key, EDIT_CURSOR_NYAN_SPRITE | EDIT_CURSOR_TRAIL_PACKS)
+}
+
+/// Values intentionally edited only in Manual: lossless collections,
+/// host-backed asset sources that require off-thread preparation, and legacy
+/// feline controls that have no honest native choice surface. `style = "paw"`
+/// remains a supported compatibility mode, but it is ink-only in cat-art v4;
+/// the other four feline keys are parsed no-effect compatibility data.
+pub(crate) fn manual_only_key(key: &str) -> bool {
+    manual_collection_key(key)
+        || config_asset_source_key(key)
+        || matches!(
+            key,
+            "sparkle_words.feline.style"
+                | "sparkle_words.feline.idle"
+                | "sparkle_words.feline.gaze"
+                | "sparkle_words.feline.color"
+                | "sparkle_words.feline.intensity"
+        )
+}
 
 /// One SCALAR leaf of a nested config table (`[net]` / `[update]` /
 /// `[sparkle_words]` (+ sub-tables) / `[matrix_rain]`), addressed by its DOTTED
@@ -369,7 +425,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     // [net] — the L3 opt-in TLS drive listener (env vars still override).
     NestedLeaf {
         key: "net.listen",
-        label: "Net: listener bind address",
+        label: "Net: listener numeric IP and port",
         kind: EditKind::Text,
     },
     NestedLeaf {
@@ -422,7 +478,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     // [sparkle_words.profanity]
     NestedLeaf {
         key: "sparkle_words.profanity.enabled",
-        label: "Profanity sparkle",
+        label: "Sparkle words",
         kind: EditKind::Bool,
     },
     NestedLeaf {
@@ -475,24 +531,24 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     // [sparkle_words.feline]
     NestedLeaf {
         key: "sparkle_words.feline.enabled",
-        label: "Feline cat-paw",
+        label: "Keyword kitties",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "sparkle_words.feline.style",
-        label: "Feline style",
+        label: "Feline graphic mode (Manual only)",
         kind: EditKind::Enum {
             options: SPARKLE_FELINE_STYLES,
         },
     },
     NestedLeaf {
         key: "sparkle_words.feline.idle",
-        label: "Feline idle blink/twitch",
+        label: "Retired feline idle animation",
         kind: EditKind::Bool,
     },
     NestedLeaf {
         key: "sparkle_words.feline.gaze",
-        label: "Feline gaze tracking",
+        label: "Retired feline gaze tracking",
         kind: EditKind::Bool,
     },
     NestedLeaf {
@@ -502,12 +558,12 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     },
     NestedLeaf {
         key: "sparkle_words.feline.color",
-        label: "Feline paw tint",
+        label: "Retired feline tint",
         kind: EditKind::Color,
     },
     NestedLeaf {
         key: "sparkle_words.feline.intensity",
-        label: "Feline opacity",
+        label: "Retired feline opacity",
         kind: EditKind::Float,
     },
     NestedLeaf {
@@ -732,6 +788,7 @@ pub(crate) const VISUAL_PREVIEW_KEYS: &[&str] = &[
     EDIT_CURSOR_TRAIL_STYLE,
     EDIT_CURSOR_TRAIL_MS,
     EDIT_CURSOR_TRAIL_LENGTH,
+    EDIT_CURSOR_TRAIL_WAKE_MS,
     EDIT_CURSOR_TRAIL_INTENSITY,
     EDIT_CURSOR_TRAIL_RADIUS,
     EDIT_CURSOR_TRAIL_RING,
@@ -781,10 +838,20 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // A process-wide suppression policy, not a single preview-scene property.
     // Its shipping gates are exercised by the app/render conformance tests.
     EDIT_SERIOUS_MODE,
+    // The game-font toggle re-renders the WHOLE terminal in the chosen face on
+    // save (hot-reload) — the grid itself is the truthful preview; a workbench
+    // specimen projection joins the preview-matrix campaign with the other
+    // font-identity rows.
+    EDIT_GAME_FONT,
+    // A native-toolbar-pill (window chrome) fact like the deferred chrome knobs:
+    // the strip the user is looking at recolors on save; the workbench scene
+    // draws no native toolbar to project it into.
+    EDIT_ACTIVE_TAB_COLOR,
     EDIT_TRAIL_SOUNDS,
     EDIT_TRAIL_SOUND_VOLUME,
     EDIT_TONE_MELODY,
     EDIT_TRAIL_SOUND_BED,
+    EDIT_TRAIL_SOUND_STYLE,
     EDIT_PALETTE,
     EDIT_CURSOR_TRAIL_PACKS,
     EDIT_FONT_FEATURES,
@@ -854,6 +921,18 @@ pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "beam",
     "off",
 ];
+
+/// `trail_sound_style` options — the typing-sound palette selector. Same
+/// single-source-of-truth law as [`CURSOR_TRAIL_STYLES`]: the picker, the
+/// save-time domain validation and the introspection dump all read this.
+/// `auto` = each visual style's signature palette (the default, today's
+/// sound); `mechanical` = the mechanical-keyboard palette (click + thock)
+/// regardless of the trail. Config-file alias spellings (`mech`, `thock`,
+/// `mechanical keyboard`) resolve in `Config::trail_sound_voice`.
+pub(crate) const TRAIL_SOUND_STYLES: &[&str] = &["auto", "mechanical"];
+
+/// Default `trail_sound_style` (the `auto` follow-the-trail identity).
+pub(crate) const DEFAULT_TRAIL_SOUND_STYLE: &str = "auto";
 
 /// The Settings picker's option list for `cursor_trail_style`: the built-in
 /// [`CURSOR_TRAIL_STYLES`] plus one `pack:<id>` entry per LOADED Trail Pack
@@ -944,12 +1023,12 @@ pub(crate) enum EditKind {
     /// advertises `options` so the value domain is machine-readable.
     Enum { options: &'static [&'static str] },
     /// The `theme` key: a colour-scheme NAME picked from the built-in registry
-    /// ([`aterm_types::scheme::builtin_names`], resolved dynamically rather than baked
-    /// into a `&'static` so the picker tracks the registry). Written as a TOML string
-    /// like [`EditKind::Text`] — NOT domain-rejected, because the value can also be the
+    /// plus valid user-installed `<name>.conf` themes, resolved dynamically so
+    /// the picker tracks both. Written as a TOML string like [`EditKind::Text`]
+    /// — NOT domain-rejected, because the value can also be the
     /// `dark:X,light:Y` split form. Cycling it live re-themes the terminal (the preview).
     Theme,
-    /// An `#RGB`/`#RRGGBB` colour string (`foreground`, `cursor_color`, …). Edited via
+    /// An `RRGGBB`/`#RRGGBB` colour string (`foreground`, `cursor_color`, …). Edited via
     /// the in-panel text editor like [`EditKind::Text`], but [`typed_item`] REJECTS a
     /// value that doesn't parse as a hex colour ([`crate::app_config::parse_hex_color`]),
     /// so a malformed colour can't be saved (it would otherwise be ignored at load).
@@ -963,17 +1042,6 @@ pub(crate) enum EditKind {
 /// shared by the window (which builds the controls) and the writer (which types them).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn edit_kind(key: &str) -> EditKind {
-    // HUD toggles (the master show_hud + the per-panel show_*_hud) are Bool. Sourced
-    // from PanelId::config_key() so this can't drift from `editable_fields` — and
-    // CRITICAL: without it these keys fall through to Text and Save would write a TOML
-    // string for a serde `Option<bool>`, silently corrupting the config on reload.
-    if key == EDIT_SHOW_HUD
-        || crate::hud_bar::PanelId::ALL
-            .iter()
-            .any(|p| p.config_key() == key)
-    {
-        return EditKind::Bool;
-    }
     if COLOR_KEYS.contains(&key) {
         return EditKind::Color;
     }
@@ -1021,8 +1089,14 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         },
         // The trail colour overrides are hex like the theme colours but live in
         // the Cursor section, so they get direct Color arms rather than a
-        // COLOR_KEYS entry (whose slice also routes section/group).
-        EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT => EditKind::Color,
+        // COLOR_KEYS entry (whose slice also routes section/group). The
+        // selected-tab override is the same shape in the Window section.
+        EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT | EDIT_ACTIVE_TAB_COLOR => {
+            EditKind::Color
+        }
+        EDIT_GAME_FONT => EditKind::Enum {
+            options: GAME_FONT_OPTIONS,
+        },
         EDIT_TITLE_SUMMARY_PROVIDER => EditKind::Enum {
             options: TITLE_SUMMARY_PROVIDERS,
         },
@@ -1050,6 +1124,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         EDIT_SCROLLBACK
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
+        | EDIT_CURSOR_TRAIL_WAKE_MS
         | EDIT_STREAM_FADE_MS
         | EDIT_COLUMNS
         | EDIT_LINES
@@ -1093,15 +1168,19 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_STREAM_FADE
         | EDIT_RESTORE_SESSION
         | EDIT_TEMPORAL_RECORDING
-        // CRITICAL: the dotted [packages] consent switches must type as Bool —
+        // CRITICAL: the dotted [packages] maintenance switches must type as Bool —
         // falling to Text would write a TOML string for a serde `Option<bool>`,
         // silently corrupting a table the CO-LOCATED atpkg also parses (the
-        // show_hud precedent above; matrix_rain.* leaves are typed by their
-        // NESTED_LEAVES rows before this match is consulted).
+        // matrix_rain.* leaves are typed by their NESTED_LEAVES rows before this
+        // match is consulted).
+        | EDIT_PACKAGES_ENABLED
         | EDIT_PACKAGES_AUTO_UPDATE
         | EDIT_PACKAGES_AUTO_INSTALL => EditKind::Bool,
         EDIT_CURSOR_TRAIL_STYLE => EditKind::Enum {
             options: CURSOR_TRAIL_STYLES,
+        },
+        EDIT_TRAIL_SOUND_STYLE => EditKind::Enum {
+            options: TRAIL_SOUND_STYLES,
         },
         _ => EditKind::Text,
     }
@@ -1573,6 +1652,26 @@ fn typed_item(key: &str, raw: &str) -> Result<toml_edit::Item, PrefsEditError> {
                     .is_some_and(|id| !id.trim().is_empty())
             {
                 Value::from(trimmed)
+            } else if key == EDIT_GAME_FONT && trimmed.contains('+') {
+                // The `game_font` row ALSO accepts a MIX — 2..=3 distinct
+                // bundled ids joined by `+` ("minecraft+zelda"), authored by
+                // the Text & Fonts toggles. Each part must be a real bundled
+                // id (never "off" — an off mix is just a cleared key); the
+                // canonical form is the trimmed parts re-joined in order.
+                let parts: Vec<&str> = trimmed.split('+').map(str::trim).collect();
+                let distinct = parts
+                    .iter()
+                    .all(|part| parts.iter().filter(|other| other == &part).count() == 1);
+                if parts.len() < 2
+                    || parts.len() > aterm_render::GAME_FONT_MIX_MAX
+                    || !distinct
+                    || parts
+                        .iter()
+                        .any(|part| aterm_render::game_font_bytes(part).is_none())
+                {
+                    return Err(bad());
+                }
+                Value::from(parts.join("+"))
             } else {
                 let canon = options
                     .iter()
@@ -1586,7 +1685,7 @@ fn typed_item(key: &str, raw: &str) -> Result<toml_edit::Item, PrefsEditError> {
         // free string) so the `dark:…,light:…` split form survives; the picker only ever
         // supplies a valid built-in name, but a hand-typed split theme is preserved too.
         EditKind::Text | EditKind::Theme => Value::from(trimmed),
-        // A colour must parse as #RGB/#RRGGBB (etc.); reject a malformed value at Save
+        // A colour must parse as RRGGBB/#RRGGBB; reject a malformed value at Save
         // rather than write a string the config loader would silently ignore.
         EditKind::Color => {
             if crate::app_config::parse_hex_color(trimmed).is_none() {
@@ -1598,7 +1697,7 @@ fn typed_item(key: &str, raw: &str) -> Result<toml_edit::Item, PrefsEditError> {
     Ok(Item::Value(value))
 }
 
-/// One editable field of the Settings overlay: a human `label`, the `Config`/TOML
+/// One editable field of Settings: a human `label`, the `Config`/TOML
 /// `key` it edits, its [`EditKind`] (so the overlay builds the right widget and the
 /// writer types the value), the field's CURRENT raw value from the config (`seed`), and
 /// the EFFECTIVE-value `placeholder` shown greyed when the control is blank.
@@ -1668,11 +1767,19 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         "net.listen" => txt(net.and_then(|n| n.listen.as_deref()), "off (no listener)"),
         "net.cert" => txt(net.and_then(|n| n.cert.as_deref()), "none"),
         "net.key" => txt(net.and_then(|n| n.key.as_deref()), "none"),
+        // DERIVED, never a literal: these placeholders show the compiled-in default
+        // update channel, which moved to the public mirror when
+        // `[workspace.metadata.aterm] update_channel` landed. A hard-coded owner here
+        // silently became a lie the moment the channel was repointed, telling the
+        // user their updates come from a repo they are not actually reading.
         "update.owner" => txt(
             upd.and_then(|u| u.owner.as_deref()),
-            "alabsystems (default)",
+            &format!("{} (default)", aterm_update_core::DEFAULT_OWNER),
         ),
-        "update.repo" => txt(upd.and_then(|u| u.repo.as_deref()), "aterm (default)"),
+        "update.repo" => txt(
+            upd.and_then(|u| u.repo.as_deref()),
+            &format!("{} (default)", aterm_update_core::DEFAULT_REPO),
+        ),
         "update.auto_apply" => boolean(upd.and_then(|u| u.auto_apply), true),
         "sparkle_words.enabled" => boolean(sw.and_then(|s| s.enabled), true),
         "sparkle_words.reduced_motion" => boolean(sw.and_then(|s| s.reduced_motion), false),
@@ -1761,7 +1868,7 @@ pub(crate) enum Section {
     Performance,
     Terminal,
     Security,
-    /// The `[packages]` toolchain-manager consent switches. No ordinary
+    /// The `[packages]` toolchain-manager maintenance switches. No ordinary
     /// registry page owns this section (the native Packages route is a SPECIAL
     /// page that renders these rows itself), so it surfaces through Search and
     /// the Modified review only.
@@ -1821,13 +1928,6 @@ pub(crate) fn section_of(key: &str) -> Section {
     if COLOR_KEYS.contains(&key) {
         return Section::Appearance;
     }
-    if key == EDIT_SHOW_HUD
-        || crate::hud_bar::PanelId::ALL
-            .iter()
-            .any(|p| p.config_key() == key)
-    {
-        return Section::Performance;
-    }
     // Nested tables route by PREFIX (one arm per table, not per leaf): the
     // network drive is a remote-access surface (Security, beside the opt-ins);
     // updates are app plumbing (Terminal); the two costume tables are screen
@@ -1853,7 +1953,11 @@ pub(crate) fn section_of(key: &str) -> Section {
         EDIT_PALETTE | EDIT_BACKGROUND_OPACITY | EDIT_BACKGROUND_MATERIAL => Section::Appearance,
         // Window sizing + chrome: the initial grid, the tab strip, the version
         // pill, the interior padding, and what a fresh launch reopens.
-        EDIT_COLUMNS | EDIT_LINES | EDIT_TAB_STRIP_ROWS | EDIT_SHOW_BUILD_BADGE => Section::Window,
+        EDIT_COLUMNS
+        | EDIT_LINES
+        | EDIT_TAB_STRIP_ROWS
+        | EDIT_SHOW_BUILD_BADGE
+        | EDIT_ACTIVE_TAB_COLOR => Section::Window,
         EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP | EDIT_RESTORE_SESSION => Section::Window,
         // Descriptive-title controls live alongside the tab/window chrome they label.
         EDIT_DESCRIPTIVE_TITLES
@@ -1878,10 +1982,12 @@ pub(crate) fn section_of(key: &str) -> Section {
         // Focus-linked QoS is a performance knob, not an input one — as are the
         // launch-time renderer choice and the opt-in replay recorder.
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => Section::Performance,
-        // The [packages] consent switches live on the special Packages page;
+        // The [packages] maintenance switches live on the special Packages page;
         // this section keeps them findable (Search/Modified) without also
         // duplicating them onto an ordinary registry page.
-        EDIT_PACKAGES_AUTO_UPDATE | EDIT_PACKAGES_AUTO_INSTALL => Section::Packages,
+        EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_UPDATE | EDIT_PACKAGES_AUTO_INSTALL => {
+            Section::Packages
+        }
         EDIT_CURSOR_STYLE
         | EDIT_CURSOR_BLINK
         | EDIT_CURSOR_TRAIL
@@ -1889,6 +1995,7 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_TRAIL_SOUNDS
         | EDIT_TONE_MELODY
         | EDIT_TRAIL_SOUND_BED
+        | EDIT_TRAIL_SOUND_STYLE
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
         | EDIT_CURSOR_TRAIL_INTENSITY
@@ -1897,6 +2004,7 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_CURSOR_TRAIL_BLOOM
         | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
         | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
+        | EDIT_CURSOR_TRAIL_WAKE_MS
         | EDIT_CURSOR_FIRE_SHIMMER
         | EDIT_HDR_GLOW
         | EDIT_CURSOR_GLOW_SDR_BOOST
@@ -1915,6 +2023,7 @@ pub(crate) fn section_of(key: &str) -> Section {
         EDIT_SHELL | EDIT_SHELL_ARGS => Section::Terminal,
         EDIT_FONT_PX
         | EDIT_FONT_FAMILY
+        | EDIT_GAME_FONT
         | EDIT_LIGATURES
         | EDIT_LINE_HEIGHT
         | EDIT_ADJUST_BASELINE
@@ -1944,25 +2053,17 @@ pub(crate) fn section_of(key: &str) -> Section {
 /// The GROUP-BOX a control belongs to inside its [`Section`] pane: `(caption, order)`
 /// per the settings-v2 design §3.2 table. The caption is the uppercase group header
 /// drawn above the rounded box; `order` sorts the groups top→bottom within the section
-/// (fields keep their [`editable_fields`] build order within a group). Ungrouped keys
-/// fall into a per-section trailing "General" box rather than vanish — a new key is
-/// visible by default, mis-grouped at worst.
+/// (fields keep their [`editable_fields`] build order within a group). Callers that
+/// include an ungrouped key place it in a trailing per-section "General" box.
 pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     if matches!(key, EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT) {
-        return ("Trail color", 2);
+        return ("Trail color", 3);
     }
     if COLOR_KEYS.contains(&key) {
         return ("Colors", 1);
     }
     if SECURITY_BOOL_KEYS.contains(&key) {
         return ("Permissions", 0);
-    }
-    if key == EDIT_SHOW_HUD
-        || crate::hud_bar::PanelId::ALL
-            .iter()
-            .any(|p| p.config_key() == key)
-    {
-        return ("Bottom HUD", 0);
     }
     // Nested tables group by PREFIX — one box per table, keeping their (many)
     // leaves out of the per-section "General" catch-all.
@@ -1989,7 +2090,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_BOLD_IS_BRIGHT
         | EDIT_FAINT_OPACITY => ("Text & Contrast", 2),
         // M5 window glass (opacity + vibrancy material).
-        EDIT_BACKGROUND_OPACITY | EDIT_BACKGROUND_MATERIAL => ("Glass", 3),
+        EDIT_BACKGROUND_OPACITY | EDIT_BACKGROUND_MATERIAL => ("Transparency", 3),
         EDIT_SERIOUS_MODE => ("Effect policy", 0),
         EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
@@ -1999,30 +2100,32 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_CURSOR_TRAIL_LENGTH
         | EDIT_CURSOR_TRAIL_INTENSITY
         | EDIT_CURSOR_TRAIL_RADIUS
-        | EDIT_CURSOR_TRAIL_RING
-        | EDIT_MOTION
-        | EDIT_LOAD_ADAPTIVE_MOTION => ("Trail effect", 1),
+        | EDIT_CURSOR_TRAIL_WAKE_MS
+        | EDIT_CURSOR_TRAIL_RING => ("Trail effect", 1),
+        EDIT_MOTION | EDIT_LOAD_ADAPTIVE_MOTION => ("Motion", 2),
         // The extended trail surface rides the same box, after the basics
         // (colour identity and the GPU light knobs get their own boxes below).
         EDIT_TRAIL_SOUND_VOLUME
         | EDIT_TONE_MELODY
         | EDIT_TRAIL_SOUND_BED
+        | EDIT_TRAIL_SOUND_STYLE
         | EDIT_CURSOR_TRAIL_PACKS => ("Trail effect", 1),
         // Colour identity: the overrides route via the early COLOR-KEYS return;
         // the custom sprite art rides beside them.
-        EDIT_CURSOR_NYAN_SPRITE => ("Trail color", 2),
+        EDIT_CURSOR_NYAN_SPRITE => ("Trail color", 3),
         EDIT_CURSOR_TRAIL_BLOOM
         | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
         | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
         | EDIT_CURSOR_FIRE_SHIMMER
         | EDIT_HDR_GLOW
-        | EDIT_CURSOR_GLOW_SDR_BOOST => ("Light & GPU", 3),
+        | EDIT_CURSOR_GLOW_SDR_BOOST => ("Light & GPU", 4),
         // M2 stream fade is its own motion pair, not part of the trail.
-        EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => ("Stream fade", 4),
+        EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => ("Stream fade", 5),
         // Typography splits into four scannable boxes (was one 22-row "Font" wall):
         // which faces / how glyphs join / where lines sit / how stems rasterize.
         EDIT_FONT_FAMILY
         | EDIT_FONT_PX
+        | EDIT_GAME_FONT
         | EDIT_FONT_FAMILY_BOLD
         | EDIT_FONT_FAMILY_ITALIC
         | EDIT_FONT_FAMILY_BOLD_ITALIC
@@ -2035,19 +2138,15 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_ADJUST_BASELINE
         | EDIT_ADJUST_UNDERLINE_POSITION
         | EDIT_ADJUST_UNDERLINE_THICKNESS
-        | EDIT_UNDERLINE_SKIP_DESCENDERS => ("Metrics", 2),
+        | EDIT_UNDERLINE_SKIP_DESCENDERS => ("Line layout", 2),
         EDIT_TEXT_BLENDING | EDIT_FONT_THICKEN | EDIT_STEM_GAMMA | EDIT_FONT_WEIGHT
         | EDIT_FONT_VARIATION => ("Rendering", 3),
         // OpenType features join Shaping (they drive the shaper like ligatures);
         // the dark-theme weight nudge is a rasterization knob like `font_weight`.
         EDIT_FONT_FEATURES => ("Shaping", 1),
         EDIT_FONT_WEIGHT_DARK_NUDGE => ("Rendering", 3),
-        // Window › sizing, Smart Titles, chrome, then session.
-        EDIT_COLUMNS
-        | EDIT_LINES
-        | EDIT_TAB_STRIP_ROWS
-        | EDIT_WINDOW_PADDING
-        | EDIT_WINDOW_PADDING_TOP => ("Size", 0),
+        // Window › sizing, Smart Titles, interior padding, chrome, then session.
+        EDIT_COLUMNS | EDIT_LINES | EDIT_TAB_STRIP_ROWS => ("Size", 0),
         EDIT_DESCRIPTIVE_TITLES
         | EDIT_TITLE_SUMMARY_PROVIDER
         | EDIT_TITLE_SUMMARY_MODEL
@@ -2062,18 +2161,21 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_TITLE_SUMMARY_ALLOW_REMOTE
         | EDIT_TAB_TITLE_FORMAT
         | EDIT_WINDOW_TITLE_FORMAT => ("Smart Titles", 1),
-        EDIT_SHOW_BUILD_BADGE => ("Chrome", 2),
-        EDIT_RESTORE_SESSION => ("Session", 3),
+        EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => ("Window padding", 2),
+        EDIT_SHOW_BUILD_BADGE | EDIT_ACTIVE_TAB_COLOR => ("Chrome", 3),
+        EDIT_RESTORE_SESSION => ("Session", 4),
         // Input › clipboard then keyboard.
-        EDIT_COPY_ON_SELECT | EDIT_CONFIRM_MULTILINE_PASTE => ("Clipboard", 0),
+        EDIT_COPY_ON_SELECT => ("Clipboard", 0),
+        EDIT_CONFIRM_MULTILINE_PASTE => ("Paste safety", 0),
         EDIT_OPTION_AS_META | EDIT_PREDICTIVE_ECHO => ("Keyboard", 1),
-        // Performance › the focus-linked QoS knob rides under the HUD box, with
-        // the launch-time renderer choice and the opt-in replay recorder.
+        // Performance › focus-linked QoS, launch-time renderer choice, and replay.
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => ("System", 1),
-        // Packages › the two toolchain-manager consent switches ride together.
-        EDIT_PACKAGES_AUTO_UPDATE | EDIT_PACKAGES_AUTO_INSTALL => ("Toolchain Packages", 0),
+        // Packages › the three toolchain-manager maintenance switches ride together.
+        EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_UPDATE | EDIT_PACKAGES_AUTO_INSTALL => {
+            ("Toolchain Packages", 0)
+        }
         EDIT_SCROLLBACK | EDIT_SEARCH_HISTORY_LINES => ("Scrollback", 0),
-        EDIT_BIDI | EDIT_AMBIGUOUS_WIDTH => ("Text Semantics", 1),
+        EDIT_BIDI | EDIT_AMBIGUOUS_WIDTH => ("Text direction & width", 1),
         // Terminal › which program runs in the pane.
         EDIT_SHELL | EDIT_SHELL_ARGS => ("Shell", 2),
         _ => ("General", u8::MAX),
@@ -2086,29 +2188,149 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
 pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
     Some(match caption {
         "Colors" => "Blank uses the theme's color.",
-        "Text & Contrast" => "Contrast 1.0 leaves colors exactly as programs asked.",
-        "Trail effect" => "The preview above plays the selected effect.",
+        "Text & Contrast" => {
+            "Minimum contrast 1.0 leaves opaque colors unchanged. Translucent backgrounds enforce at least a 4.5:1 ratio."
+        }
+        "Transparency" => {
+            "Opacity requires macOS GPU rendering; other renderers stay solid. Text over translucent backgrounds uses at least 4.5:1 contrast."
+        }
+        "Paste safety" => {
+            "Confirm unbracketed multiline paste. Bracketed paste bypasses it. macOS and Windows prompt; other platforms paste without prompting."
+        }
+        "Motion" => {
+            "Automatic follows system motion when available and reduces effects under load by default. Full allows motion; Reduced limits it. Load adaptation is in Manual."
+        }
+        "Keyboard" => {
+            "Predictive echo waits for confirmed echo and useful latency; passwords are never predicted. Manual's Always mode is unsafe at prompts."
+        }
+        "Scrollback" => {
+            "Scrollback limit 0 is unlimited. Older lines beyond the Cmd-F/socket cap may give partial results. Set Searchable lines to 0 for live-screen-only search."
+        }
+        "Text direction & width" => {
+            "Bidirectional mode reorders right-to-left text. Ambiguous width uses one or two cells and affects new text, not existing cells."
+        }
+        "Stream fade" => {
+            "Fresh live-bottom output fades. It is instant with Reduce Motion, an unfocused window, full-screen apps, scrollback, input, or Serious Mode."
+        }
         "Trail color" => {
             "Blank colors follow the active terminal theme; Nyan uses its built-in sprite."
         }
         "Light & GPU" => {
             "Bloom, shimmer, and HDR gracefully fall back when the display path cannot provide them."
         }
-        "Shaping" => "The preview shows ligature forms live.",
-        "Bottom HUD" => "Panels appear when the HUD is on.",
+        "Rendering" => "Variable weight needs a font with a wght axis; static fonts ignore it.",
         "Matrix rain" => {
-            "Rain follows session activity and drains when idle. \
-             View ▸ Matrix Rain overrides it per session until that session ends."
+            "Rain follows activity and drains when idle. View ▸ Matrix Rain overrides one session. Serious Mode and Reduce Motion disable it."
         }
         "Toolchain Packages" => {
-            "Auto-update keeps installed ALab tools current; turning it on or off takes \
-             effect at the next launch. \
-             Auto-install additionally fetches missing default-set members (multi-GB consent)."
+            "Maintenance controls the background service. It and auto-update apply next launch. Auto-install runs next package operation and may fetch multiple GB."
         }
-        "Permissions" => "All off by default. Programs running in this terminal can request these.",
         "Smart Titles" => {
             "Activity is a generated fallback when a session has no authored Description. Built-in stays on-device. On macOS, aterm auto-starts Ollama only after every file in its bounded runtime code closure passes pinned structural-signature, Apple Developer-ID Team, code-identifier, ownership, permission, and stable-identity checks; it repeats the closure check before terminal context is sent, clears inherited environment, disables cloud integration, and uses direct loopback. A pre-existing localhost service and every custom service remain untrusted network providers and require explicit consent. Other platforms never auto-execute a managed runtime without a platform attestation anchor. Environment proxy honors HTTP(S)_PROXY and NO_PROXY; Direct bypasses them. For HTTPS OpenAI-compatible endpoints, an explicit CA bundle replaces platform roots. Recent terminal text may be sent. Credential filtering is conservative but heuristic and cannot identify every secret; use Built-in or managed local Ollama when terminal context must stay on-device. Credentials and certificates are path-only—never stored here."
         }
+        "Permissions" => {
+            "Off by default. Terminal programs can request access. Notifications work only on macOS and Windows."
+        }
+        "Window padding" => {
+            "Top padding cannot exceed all-edge padding; constrained values show their effective size."
+        }
+        _ => return None,
+    })
+}
+
+/// When an authored value becomes effective. Most preferences are projected
+/// live. Keep this metadata beside the complete preference schema so Advanced,
+/// Modified, and the Manual language service cannot disagree about a saved
+/// value's lifecycle.
+pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
+    match key {
+        EDIT_COLUMNS | EDIT_LINES => Some(
+            "Applies on a fresh launch; an authenticated update handoff preserves the live size",
+        ),
+        EDIT_GPU
+        | EDIT_PACKAGES_ENABLED
+        | EDIT_PACKAGES_AUTO_UPDATE
+        | "net.listen"
+        | "net.cert"
+        | "net.key" => Some("Applies next launch"),
+        EDIT_ALLOW_KITTY_FILE_TRANSFER | EDIT_TEMPORAL_RECORDING | EDIT_SHELL | EDIT_SHELL_ARGS => {
+            Some("Applies to new sessions")
+        }
+        EDIT_HDR_GLOW => Some("Disabling applies now; enabling may require a new window"),
+        EDIT_RESTORE_SESSION => Some("Applies when closing or next launch"),
+        EDIT_PACKAGES_AUTO_INSTALL
+        | "packages.account"
+        | "packages.channel"
+        | "packages.include"
+        | "packages.exclude"
+        | "packages.links" => Some("Applies on the next package operation"),
+        "update.owner" | "update.repo" => {
+            Some("Manual checks use this now; automatic checks use it next launch")
+        }
+        "update.auto_apply" => Some("Applies on the next update transition"),
+        EDIT_MATRIX_RAIN_ENABLED => {
+            Some("Applies live unless this session has a View menu override")
+        }
+        EDIT_AMBIGUOUS_WIDTH => {
+            Some("Applies to newly received text; existing cells keep their current width")
+        }
+        key if key == "net.connections" || key.starts_with("net.connections.") => {
+            Some("Applies on the next dial")
+        }
+        _ => None,
+    }
+}
+
+/// Whether saving this key has any immediate effect in the running app.
+///
+/// Most keys with an [`application_timing`] disclosure are wholly deferred.
+/// Ambiguous-width policy is live for subsequent input while preserving
+/// existing cell geometry; Matrix Rain is live unless a session-local View
+/// override owns that session's effective switch; disabling HDR glow gates the
+/// next present immediately, while enabling may need a new HDR-capable window.
+pub(crate) fn application_has_live_effect(key: &str) -> bool {
+    matches!(
+        key,
+        EDIT_AMBIGUOUS_WIDTH | EDIT_MATRIX_RAIN_ENABLED | EDIT_HDR_GLOW
+    ) || application_timing(key).is_none()
+}
+
+/// Ambient precedence documented beside the schema. Active values are resolved
+/// by `app_config::active_environment_override`; this text also teaches Manual
+/// users why a future launch may not use the TOML value they are editing.
+pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
+    Some(match key {
+        EDIT_COLUMNS => {
+            "$ATERM_COLUMNS / --columns overrides on a fresh launch; an authenticated update handoff preserves the live grid"
+        }
+        EDIT_LINES => {
+            "$ATERM_LINES / --lines overrides on a fresh launch; an authenticated update handoff preserves the live grid"
+        }
+        EDIT_GPU => {
+            "the last --cpu/--gpu flag wins; inherited $ATERM_CPU otherwise wins over $ATERM_GPU; both override this value"
+        }
+        EDIT_FONT_PX => "$ATERM_FONT_PX / --font-px overrides this value",
+        EDIT_FONT_FAMILY => "$ATERM_FONT / --font overrides this value",
+        EDIT_WINDOW_THEME => "on macOS, $ATERM_NO_DARK_CHROME forces Automatic for this launch",
+        EDIT_TAB_STRIP_ROWS => "$ATERM_TAB_STRIP_ROWS overrides this value",
+        EDIT_STEM_GAMMA => "$ATERM_STEM_GAMMA overrides this value",
+        EDIT_SHELL => {
+            "$ATERM_SHELL / --shell overrides this value; -e / --command bypasses the shell"
+        }
+        EDIT_SHELL_ARGS => "a launch -e / --command bypasses shell_args",
+        "net.listen" => "$ATERM_NET_LISTEN overrides this value",
+        "net.cert" => "$ATERM_NET_CERT overrides this value",
+        "net.key" => "$ATERM_NET_KEY overrides this value",
+        "update.owner" => "$ATERM_UPDATE_OWNER overrides this value",
+        "update.repo" => "$ATERM_UPDATE_REPO overrides this value",
+        "update.auto_apply" => "$ATERM_NO_AUTO_APPLY forces this off for the launch",
+        "packages.account" => "$ATPKG_ACCOUNT overrides this value for package operations",
+        EDIT_PACKAGES_AUTO_UPDATE => {
+            "$ATPKG_UPDATE_INTERVAL_SECS controls cadence only (default 21600 seconds; 0 runs once); it never overrides packages.enabled or packages.auto_update"
+        }
+        EDIT_FALLBACK_FONTS => "when unset, deprecated $ATERM_FALLBACK_FONT supplies the fallback",
+        EDIT_SYMBOL_FONT => "when unset, deprecated $ATERM_SYMBOL_FONT supplies the fallback",
+        EDIT_EMOJI_FONT => "when unset, deprecated $ATERM_EMOJI_FONT supplies the fallback",
         _ => return None,
     })
 }
@@ -2116,13 +2338,41 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
 /// Human label for a security opt-in row (keyed by its `SECURITY_BOOL_KEYS` entry).
 fn security_label(key: &str) -> &'static str {
     match key {
-        EDIT_ALLOW_OSC52_QUERY => "Allow clipboard read (OSC 52)",
-        EDIT_ALLOW_WINDOW_OPS => "Allow window ops (XTWINOPS)",
+        EDIT_ALLOW_OSC52_QUERY => "Allow clipboard queries (OSC 52; unanswered by GUI)",
+        EDIT_ALLOW_WINDOW_OPS => "Allow title / text-grid-size queries (XTWINOPS)",
         EDIT_ALLOW_NOTIFICATIONS => "Allow desktop notifications",
-        EDIT_ALLOW_PALETTE_RECONFIGURE => "Allow palette reconfigure (OSC 4/104)",
-        EDIT_ALLOW_KITTY_FILE_TRANSFER => "Allow Kitty file transfer",
+        EDIT_ALLOW_PALETTE_RECONFIGURE => "Allow programs to set indexed colors (OSC 4/21)",
+        EDIT_ALLOW_KITTY_FILE_TRANSFER => "Allow local files for Kitty graphics (new sessions)",
         _ => "Security option",
     }
+}
+
+/// Truthful copy for `motion = "auto"` differs with the shipping platform
+/// seam: macOS observes Reduce Motion live, Windows samples its animations
+/// switch when a window attaches, and other platforms have no OS query yet.
+fn motion_auto_copy(target_os: &str) -> (&'static str, &'static str) {
+    match target_os {
+        "macos" => (
+            "auto (follows live macOS Reduce Motion)",
+            "motion=auto follows macOS Reduce Motion live",
+        ),
+        "windows" => (
+            "auto (samples Windows animations at window attach)",
+            "motion=auto samples Show animations in Windows when a window attaches; preference changes are not observed live",
+        ),
+        _ => (
+            "auto (OS Reduce Motion unavailable; no OS-driven reduction)",
+            "motion=auto cannot query OS Reduce Motion on this platform and does not reduce motion for an OS preference; choose reduced explicitly",
+        ),
+    }
+}
+
+pub(crate) fn motion_auto_placeholder() -> &'static str {
+    motion_auto_copy(std::env::consts::OS).0
+}
+
+pub(crate) fn motion_auto_help() -> &'static str {
+    motion_auto_copy(std::env::consts::OS).1
 }
 
 /// Inclusive numeric bounds + step for a BOUNDED numeric control, so the settings UI
@@ -2141,7 +2391,10 @@ pub(crate) struct Range {
 pub(crate) fn range_of(key: &str) -> Option<Range> {
     let r = |min, max, step| Some(Range { min, max, step });
     match key {
-        EDIT_FONT_PX => r(6.0, 32.0, 1.0),
+        // Full runtime/CLI domain. Keeping only an ergonomic 6..=32 subset here
+        // made valid high-DPI/accessibility values look invalid in Manual and
+        // impossible to author through the native control.
+        EDIT_FONT_PX => r(6.0, 200.0, 1.0),
         // The resolver clamps 30..=2000 (`cursor_trail_ms_or_default`), so the
         // slider floor is 30, not 0 — a 0 the slider could express would silently
         // load as 30 (turning the trail OFF is the style row's `off`, not ms 0).
@@ -2149,6 +2402,10 @@ pub(crate) fn range_of(key: &str) -> Option<Range> {
         // the authored 30/2000 ms endpoints on the slider's exact value grid.
         EDIT_CURSOR_TRAIL_MS => r(30.0, 2000.0, 10.0),
         EDIT_CURSOR_TRAIL_LENGTH => r(1.0, 512.0, 1.0),
+        // The typing wake spans OFF (0) to a long 1.5 s of travel. Unlike the
+        // comet duration above, 0 is a real, reachable setting here — it is
+        // how you keep the rainbow ribbon and drop the plume.
+        EDIT_CURSOR_TRAIL_WAKE_MS => r(0.0, 1500.0, 25.0),
         EDIT_CURSOR_TRAIL_INTENSITY => r(0.0, 1.0, 0.05),
         EDIT_CURSOR_TRAIL_RADIUS => r(0.0, 2.0, 0.05),
         EDIT_CURSOR_TRAIL_BLOOM_STRENGTH => r(0.0, 3.0, 0.05),
@@ -2182,8 +2439,10 @@ pub(crate) fn range_of(key: &str) -> Option<Range> {
         EDIT_ADJUST_UNDERLINE_POSITION | EDIT_ADJUST_UNDERLINE_THICKNESS => r(-32.0, 32.0, 1.0),
         // W2 aesthetic stem gamma — the renderer's clamp domain (<1 thicker, >1 thinner).
         EDIT_STEM_GAMMA => r(0.30, 3.0, 0.05),
-        // W9 primary `wght` — the usable weight-class span (config clamps 1..=1000).
-        EDIT_FONT_WEIGHT => r(100.0, 900.0, 25.0),
+        // W9 primary `wght` — exactly the renderer's 1..=1000 clamp domain.
+        // Unit steps preserve every already-authored integer (including 400)
+        // instead of forcing the slider onto a min-relative 25-unit grid.
+        EDIT_FONT_WEIGHT => r(1.0, 1000.0, 1.0),
         // The trail/aurora numerics — each mirrors its resolver's clamp domain
         // exactly, so the slider can never express a value the load would
         // rewrite (the comet-geometry/bloom/SDR-glow arms are above).
@@ -2240,6 +2499,9 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         | EDIT_CURSOR_TRAIL_INTENSITY
         | EDIT_CURSOR_TRAIL_RADIUS
         | EDIT_CURSOR_TRAIL_RING => &["effect", "motion", "comet", "trail"],
+        EDIT_CURSOR_TRAIL_WAKE_MS => &[
+            "effect", "motion", "trail", "wake", "typing", "nyan", "plume",
+        ],
         EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT => {
             &["effect", "trail", "color", "colour", "aurora", "accent"]
         }
@@ -2248,6 +2510,15 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         }
         EDIT_TONE_MELODY => &["tone", "mood", "melody", "music", "classifier", "sound"],
         EDIT_TRAIL_SOUND_BED => &["bed", "ambient", "drone", "texture", "background", "sound"],
+        EDIT_TRAIL_SOUND_STYLE => &[
+            "mechanical",
+            "keyboard",
+            "thock",
+            "click",
+            "typing",
+            "sound",
+            "audio",
+        ],
         EDIT_CURSOR_NYAN_SPRITE => &["nyan", "cat", "sprite", "image", "png", "trail"],
         EDIT_CURSOR_TRAIL_PACKS => &["trail", "pack", "manifest", "custom", "effect"],
         EDIT_CURSOR_TRAIL_BLOOM
@@ -2289,6 +2560,15 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "effect",
             "screensaver",
             "green",
+        ],
+        EDIT_PACKAGES_ENABLED => &[
+            "packages",
+            "toolchain",
+            "atpkg",
+            "tools",
+            "automatic",
+            "maintenance",
+            "master",
         ],
         EDIT_PACKAGES_AUTO_UPDATE => &["packages", "toolchain", "atpkg", "tools", "alab"],
         EDIT_PACKAGES_AUTO_INSTALL => &[
@@ -2355,7 +2635,6 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         | EDIT_SELECTION_COLOR
         | EDIT_SELECTION_FOREGROUND => &["color", "colour"],
         k if SECURITY_BOOL_KEYS.contains(&k) => &["security", "permission", "allow"],
-        EDIT_SHOW_HUD => &["hud", "performance", "bottom", "bar", "hide"],
         EDIT_SHOW_BUILD_BADGE => &["version", "build", "badge", "chrome"],
         EDIT_DESCRIPTIVE_TITLES => &[
             "smart title",
@@ -2491,12 +2770,6 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "window",
             "activity",
         ],
-        k if crate::hud_bar::PanelId::ALL
-            .iter()
-            .any(|p| p.config_key() == k) =>
-        {
-            &["hud", "performance", "metrics", "monitor"]
-        }
         // Nested tables share one intent vocabulary per table.
         k if k.starts_with("net.") => &["network", "remote", "drive", "listener", "tls"],
         k if k.starts_with("update.") => &["update", "channel", "github", "release"],
@@ -2519,6 +2792,8 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
 /// control still tells the user what is in effect — fixing the all-rows-blank confusion.
 pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
     let font_family = configured_str(cfg.font_family.as_deref());
+    let game_font = configured_str(cfg.game_font.as_deref());
+    let active_tab_color = configured_str(cfg.active_tab_color.as_deref());
     let font_family_bold = configured_str(cfg.font_family_bold.as_deref());
     let font_family_italic = configured_str(cfg.font_family_italic.as_deref());
     let font_family_bold_italic = configured_str(cfg.font_family_bold_italic.as_deref());
@@ -2588,6 +2863,17 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 Some(px) => format!("{px} px"),
                 None => "auto (default)".to_string(),
             },
+        },
+        EditField {
+            label: "Game font",
+            key: EDIT_GAME_FONT,
+            kind: EditKind::Enum {
+                options: GAME_FONT_OPTIONS,
+            },
+            placeholder: game_font
+                .clone()
+                .unwrap_or_else(|| "off (default font)".to_string()),
+            seed: game_font,
         },
         EditField {
             label: "Bold font family",
@@ -2764,7 +3050,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: configured_str(cfg.text_blending.as_deref()),
         },
         EditField {
-            label: "Font thicken (macOS)",
+            label: "Thicken font strokes",
             key: EDIT_FONT_THICKEN,
             kind: EditKind::Bool,
             seed: Some(cfg.font_thicken_or_default().to_string()),
@@ -2781,7 +3067,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Font weight (wght)",
+            label: "Variable font weight",
             key: EDIT_FONT_WEIGHT,
             kind: EditKind::Integer,
             seed: cfg.font_weight.map(|n| n.to_string()),
@@ -2802,7 +3088,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: font_variation,
         },
         EditField {
-            label: "Theme",
+            label: "Color theme",
             key: EDIT_THEME,
             kind: EditKind::Theme,
             placeholder: theme.clone().unwrap_or_else(|| "Default".to_string()),
@@ -2840,7 +3126,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             // ONE popup row over the whole style list (design graft #1) — while its
             // menu is open the preview card's demo lane plays the HIGHLIGHTED look,
             // so browsing the menu live-demos each effect before anything commits.
-            label: "Trail effect",
+            label: "Cursor trail",
             key: EDIT_CURSOR_TRAIL_STYLE,
             kind: EditKind::Enum {
                 options: CURSOR_TRAIL_STYLES,
@@ -2856,7 +3142,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             // trail (droplets, crackle, chimes, the beam's hum...). Default ON;
             // silent whenever the trail's light is (off style, reduced motion,
             // unfocused). `trail_sound_volume` in aterm.toml trims the level.
-            label: "Trail sound effects",
+            label: "Music effects",
             key: EDIT_TRAIL_SOUNDS,
             kind: EditKind::Bool,
             seed: Some(cfg.trail_sounds_or_default().to_string()),
@@ -2888,6 +3174,23 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
+            // WHICH palette the keystrokes speak with: `auto` follows the
+            // visual trail style's signature palette (today's sound);
+            // `mechanical` swaps every key to the mechanical-keyboard
+            // palette — switch click + case thock — whatever the trail
+            // looks like. Volume/on-off/bed gates apply unchanged.
+            label: "Typing sound",
+            key: EDIT_TRAIL_SOUND_STYLE,
+            kind: EditKind::Enum {
+                options: TRAIL_SOUND_STYLES,
+            },
+            seed: cfg.trail_sound_style.clone(),
+            placeholder: cfg
+                .trail_sound_style
+                .clone()
+                .unwrap_or_else(|| format!("{DEFAULT_TRAIL_SOUND_STYLE} (default)")),
+        },
+        EditField {
             label: "Trail duration",
             key: EDIT_CURSOR_TRAIL_MS,
             kind: EditKind::Integer,
@@ -2915,6 +3218,17 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: match cfg.cursor_trail_intensity {
                 Some(v) => v.to_string(),
                 None => "0.7 (default)".to_string(),
+            },
+        },
+        EditField {
+            label: "Typing wake",
+            key: EDIT_CURSOR_TRAIL_WAKE_MS,
+            kind: EditKind::Integer,
+            seed: cfg.cursor_trail_wake_ms.map(|n| n.to_string()),
+            placeholder: match cfg.cursor_trail_wake_ms {
+                Some(0) => "off".to_string(),
+                Some(n) => format!("{n} ms of travel"),
+                None => "300 ms (default)".to_string(),
             },
         },
         EditField {
@@ -3020,13 +3334,13 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "Motion (Reduce Motion)",
+            label: "Motion",
             key: EDIT_MOTION,
             kind: EditKind::Enum {
                 options: MOTION_MODES,
             },
             placeholder: configured_str(cfg.motion.as_deref())
-                .unwrap_or_else(|| "auto (follow OS)".to_string()),
+                .unwrap_or_else(|| motion_auto_placeholder().to_string()),
             seed: configured_str(cfg.motion.as_deref()),
         },
         EditField {
@@ -3055,7 +3369,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             label: "Copy on select",
             key: EDIT_COPY_ON_SELECT,
             kind: EditKind::Bool,
-            // The checkbox always reflects the RESOLVED state (default off), so it
+            // The checkbox always reflects the RESOLVED state (default on), so it
             // starts in the right position; Save writes the explicit bool. The checkbox
             // shows its state directly, so the placeholder is unused (empty).
             seed: Some(cfg.copy_on_select_or_default().to_string()),
@@ -3107,7 +3421,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: selection_foreground,
         },
         EditField {
-            label: "Window theme",
+            label: "System appearance",
             key: EDIT_WINDOW_THEME,
             kind: EditKind::Enum {
                 options: WINDOW_THEMES,
@@ -3115,6 +3429,15 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: configured_str(cfg.window_theme.as_deref())
                 .unwrap_or_else(|| "auto (default)".to_string()),
             seed: configured_str(cfg.window_theme.as_deref()),
+        },
+        EditField {
+            label: "Selected tab color",
+            key: EDIT_ACTIVE_TAB_COLOR,
+            kind: EditKind::Color,
+            placeholder: active_tab_color
+                .clone()
+                .unwrap_or_else(|| "transparent white (default)".to_string()),
+            seed: active_tab_color,
         },
         EditField {
             label: "Show floating version pill",
@@ -3127,7 +3450,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "BiDi mode",
+            label: "Bidirectional text",
             key: EDIT_BIDI,
             kind: EditKind::Enum {
                 options: BIDI_MODES,
@@ -3137,7 +3460,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: configured_str(cfg.bidi.as_deref()),
         },
         EditField {
-            label: "Ambiguous width",
+            label: "Ambiguous-character width",
             key: EDIT_AMBIGUOUS_WIDTH,
             kind: EditKind::Enum {
                 options: AMBIGUOUS_WIDTHS,
@@ -3154,7 +3477,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            label: "Option as Meta (macOS)",
+            label: "Alt/Option as Meta",
             key: EDIT_OPTION_AS_META,
             kind: EditKind::Bool,
             seed: Some(cfg.option_as_meta_or_default().to_string()),
@@ -3167,7 +3490,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.columns.map(|n| n.to_string()),
             placeholder: cfg
                 .columns
-                .map_or_else(|| "auto (fit window)".to_string(), |n| n.to_string()),
+                .map_or_else(|| "80 (default)".to_string(), |n| n.to_string()),
         },
         EditField {
             label: "Initial lines",
@@ -3176,7 +3499,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.lines.map(|n| n.to_string()),
             placeholder: cfg
                 .lines
-                .map_or_else(|| "auto (fit window)".to_string(), |n| n.to_string()),
+                .map_or_else(|| "24 (default)".to_string(), |n| n.to_string()),
         },
         EditField {
             label: "Tab strip rows",
@@ -3340,13 +3663,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: window_title_format,
         },
         EditField {
-            label: "Search history lines",
+            label: "Searchable scrollback lines",
             key: EDIT_SEARCH_HISTORY_LINES,
             kind: EditKind::Integer,
             seed: cfg.search_history_lines.map(|n| n.to_string()),
-            placeholder: cfg
-                .search_history_lines
-                .map_or_else(|| "default".to_string(), |n| n.to_string()),
+            placeholder: cfg.search_history_lines.map_or_else(
+                || format!("{} (default)", aterm_core::search::DEFAULT_MAX_CACHED_LINES),
+                |n| n.to_string(),
+            ),
         },
         EditField {
             label: "Predictive echo",
@@ -3364,6 +3688,15 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_FOCUS_BOOST,
             kind: EditKind::Bool,
             seed: Some(cfg.focus_boost.unwrap_or(true).to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            // `[packages] enabled`: the visible master for the background
+            // updater thread. Explicit Check/Install actions remain available.
+            label: "Automatic package maintenance",
+            key: EDIT_PACKAGES_ENABLED,
+            kind: EditKind::Bool,
+            seed: Some(cfg.packages_enabled().to_string()),
             placeholder: String::new(),
         },
         EditField {
@@ -3390,8 +3723,8 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
         },
     ];
     // ---- FULL-COVERAGE batch: the remaining scalar keys, the list rows, and the
-    // nested-table leaves — so `controls prefs` reads and `settings set` writes
-    // EVERY user setting. Same seeding law as above: configured raw value only
+    // nested-table leaves — so Manual and `settings set` cover EVERY user setting.
+    // Same seeding law as above: configured raw value only
     // (unset = blank), resolved state for Bools, effective default in the
     // placeholder; list rows seed the comma-joined form their Save re-splits.
     let join_list = |v: Option<&Vec<String>>| v.filter(|l| !l.is_empty()).map(|l| l.join(", "));
@@ -3443,7 +3776,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: trail_packs,
         },
         EditField {
-            label: "Stream fade (ink dries)",
+            label: "Fade in new output",
             key: EDIT_STREAM_FADE,
             kind: EditKind::Bool,
             seed: Some(cfg.stream_fade_or_default().to_string()),
@@ -3524,7 +3857,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Background material (macOS)",
+            label: "Background material",
             key: EDIT_BACKGROUND_MATERIAL,
             kind: EditKind::Enum {
                 options: BACKGROUND_MATERIALS,
@@ -3595,27 +3928,6 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         });
     }
-    // Performance: the MASTER bottom-HUD switch first (one Bool hiding the whole
-    // band), then one Bool per HUD panel, so the bottom pane is governed from the
-    // same settings model (Resources + Engine default ON, Scene OFF). Panel rows are
-    // sourced from `PanelId` so the key + label can't drift from the HUD itself;
-    // `edit_kind` classifies all these keys as Bool via the same sources.
-    fields.push(EditField {
-        label: "Show bottom HUD (all panels)",
-        key: EDIT_SHOW_HUD,
-        kind: EditKind::Bool,
-        seed: Some(cfg.show_hud_or_default().to_string()),
-        placeholder: String::new(),
-    });
-    for id in crate::hud_bar::PanelId::ALL {
-        fields.push(EditField {
-            label: id.label(),
-            key: id.config_key(),
-            kind: EditKind::Bool,
-            seed: Some(cfg.hud_enabled(id).to_string()),
-            placeholder: String::new(),
-        });
-    }
     // Group the rows by section LAST (after every push), stably so within-section build
     // order is preserved. This is the single ordering the painter, scroll, and hit-test
     // all see; the overlay renders a header before each section's controls.
@@ -3625,16 +3937,45 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
 
 /// The result of [`save_prefs_edits`], so the window can show visible feedback (a status
 /// line) rather than silently succeeding/failing. `Saved` means the file actually changed
-/// and a reload should follow; `Unchanged` is a true all-no-op Save; `Error` carries a
-/// short human message (also logged) for an unreadable/unwritable/malformed file.
+/// and a reload should follow; `Unchanged` is a true all-no-op Save; `Conflict`
+/// preserves the expected and observed disk generations for a retry UI;
+/// `PublishedUnverified` requires reconciliation before retry; and `Error`
+/// carries a short human message for a pre-publication failure.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SaveOutcome {
     /// The file's content changed and was written; the caller should post a reload.
     Saved,
     /// Nothing actually changed (every edit was a no-op); skip the write + reload.
     Unchanged,
-    /// The save failed; the file is left untouched. Carries a short message for the UI.
+    /// Another disk generation won. The caller must present a conflict rather
+    /// than collapsing it into generic validation or I/O failure.
+    Conflict {
+        expected: crate::native_document_io::ContentFingerprint,
+        observed: crate::native_document_io::ObservedFileVersion,
+        message: String,
+    },
+    /// Replacement may already be visible, but its durability/content proof
+    /// could not be completed. Reload/reconcile before issuing another write.
+    PublishedUnverified {
+        stage: crate::native_document_io::AtomicSaveStage,
+        observed: Option<crate::native_document_io::ObservedFileVersion>,
+        message: String,
+    },
+    /// The save failed before publication. Carries a short message for the UI.
     Error(String),
+}
+
+/// Settings-worker persistence result with the exact generation proof needed
+/// to construct a [`ConfigDiskObservation`](crate::native_config_service::ConfigDiskObservation)
+/// without reopening `aterm.toml` on the event loop.
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigSnapshotSaveResult {
+    pub(crate) outcome: SaveOutcome,
+    /// Present when the save/no-op result itself proves the complete target
+    /// generation. Conflicts and pre-publication failures require a fresh
+    /// bounded worker observation instead.
+    pub(crate) observed: Option<crate::native_document_host::AtomicFileBaseline>,
 }
 
 /// Persist a batch of Preferences edits to `aterm.toml` NON-DESTRUCTIVELY, returning a
@@ -3642,10 +3983,10 @@ pub(crate) enum SaveOutcome {
 /// what happened.
 ///
 /// Best-effort + never panics: a missing file is treated as empty (the keys are
-/// created); a read or write error, or an `apply_prefs_edits` failure (malformed
-/// existing file / bad value) is logged AND returned as [`SaveOutcome::Error`] with the
-/// file left untouched. [`SaveOutcome::Saved`] is returned only when new content was
-/// actually written.
+/// created); validation/I/O failures return [`SaveOutcome::Error`], an OCC loss
+/// returns [`SaveOutcome::Conflict`], and a post-publication proof failure returns
+/// [`SaveOutcome::PublishedUnverified`]. [`SaveOutcome::Saved`] is returned only
+/// when the complete durable proof was produced.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn save_prefs_edits(edits: &[(&str, Option<String>)]) -> SaveOutcome {
     let Some(path) = crate::app_config::config_path() else {
@@ -3653,12 +3994,24 @@ pub(crate) fn save_prefs_edits(edits: &[(&str, Option<String>)]) -> SaveOutcome 
         eprintln!("aterm-gui: prefs save: {msg}; skipping");
         return SaveOutcome::Error(msg);
     };
-    // A missing file is fine — start from empty and create it on write.
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            let msg = format!("{} unreadable ({e})", path.display());
+    // A missing file is fine — start from empty and create it on write. The
+    // returned baseline is the same fingerprint/target binding Manual uses.
+    let contents = match crate::native_document_host::read_config_atomic_file(
+        &path,
+        crate::native_document_host::DEFAULT_DOCUMENT_LIMIT,
+        true,
+    ) {
+        Ok(contents) => contents,
+        Err(error) => {
+            let msg = format!("{} unreadable ({error})", path.display());
+            eprintln!("aterm-gui: prefs save: {msg}; leaving config unchanged");
+            return SaveOutcome::Error(msg);
+        }
+    };
+    let existing = match std::str::from_utf8(&contents.bytes) {
+        Ok(text) => text.to_string(),
+        Err(error) => {
+            let msg = format!("{} is not UTF-8 ({error})", path.display());
             eprintln!("aterm-gui: prefs save: {msg}; leaving config unchanged");
             return SaveOutcome::Error(msg);
         }
@@ -3673,58 +4026,169 @@ pub(crate) fn save_prefs_edits(edits: &[(&str, Option<String>)]) -> SaveOutcome 
     if updated == existing {
         return SaveOutcome::Unchanged; // nothing changed — skip the write + reload
     }
-    // Best-effort create-parent + write; an unwritable file is logged, never a panic.
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        let msg = format!("cannot create {} ({e})", parent.display());
-        eprintln!("aterm-gui: prefs save: {msg}; leaving config unchanged");
-        return SaveOutcome::Error(msg);
-    }
-    // ATOMIC replace: write a sibling temp then rename over the target, so a crash
-    // mid-write can never leave a truncated/partial aterm.toml holding the user's
-    // config (mirrors the fs::rename idiom in control_auth.rs). The temp sits in the
-    // same dir, so the rename stays on one filesystem (atomic).
-    let tmp = path.with_extension("toml.tmp");
-    match std::fs::write(&tmp, &updated).and_then(|()| std::fs::rename(&tmp, &path)) {
-        Ok(()) => SaveOutcome::Saved,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp); // best-effort: don't leave a stray temp
-            let msg = format!("{} unwritable ({e})", path.display());
-            eprintln!("aterm-gui: prefs save: {msg}; config unchanged");
-            SaveOutcome::Error(msg)
-        }
-    }
+    commit_prefs_bytes(&path, &contents.baseline, updated.as_bytes())
 }
 
 /// Atomically persist a complete snapshot already produced by the versioned
 /// native-config service. The service, not this function, performs semantic
 /// edits and OCC; this seam only commits its non-destructive TOML projection.
-pub(crate) fn save_prefs_snapshot(updated: &str) -> SaveOutcome {
-    let Some(path) = crate::app_config::config_path() else {
-        return SaveOutcome::Error("no config path (HOME/XDG unset)".to_string());
-    };
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return SaveOutcome::Error(format!("{} unreadable ({error})", path.display()));
+#[cfg(test)]
+pub(crate) fn save_prefs_snapshot(
+    plan: &crate::native_config_service::ConfigPersistencePlan,
+) -> SaveOutcome {
+    save_prefs_snapshot_observed(plan).outcome
+}
+
+/// Worker-facing form of [`save_prefs_snapshot`] that retains the committed
+/// proof. Callers can hand exact bytes + this baseline to the event loop; no
+/// completion-side pathname read is needed.
+pub(crate) fn save_prefs_snapshot_observed(
+    plan: &crate::native_config_service::ConfigPersistencePlan,
+) -> ConfigSnapshotSaveResult {
+    if plan.expected_text == plan.snapshot.text {
+        return ConfigSnapshotSaveResult {
+            outcome: SaveOutcome::Unchanged,
+            observed: plan.baseline.clone(),
+        };
+    }
+    let (path, baseline) = if let Some(baseline) = plan.baseline.clone() {
+        (baseline.target.logical_path().to_path_buf(), baseline)
+    } else {
+        let Some(path) = plan
+            .logical_path
+            .clone()
+            .or_else(crate::app_config::config_path)
+        else {
+            return ConfigSnapshotSaveResult {
+                outcome: SaveOutcome::Error("no config path (HOME/XDG unset)".to_string()),
+                observed: None,
+            };
+        };
+        let contents = match crate::native_document_host::read_config_atomic_file(
+            &path,
+            crate::native_document_host::DEFAULT_DOCUMENT_LIMIT,
+            true,
+        ) {
+            Ok(contents) => contents,
+            Err(error) => {
+                return ConfigSnapshotSaveResult {
+                    outcome: SaveOutcome::Error(format!("{} unreadable ({error})", path.display())),
+                    observed: None,
+                };
+            }
+        };
+        if contents.bytes.as_slice() != plan.expected_text.as_bytes() {
+            return ConfigSnapshotSaveResult {
+                outcome: SaveOutcome::Conflict {
+                    expected: crate::native_document_io::ContentFingerprint::of(
+                        plan.expected_text.as_bytes(),
+                    ),
+                    observed: contents.baseline.observed,
+                    message: "config changed on disk before the Settings transaction began"
+                        .to_string(),
+                },
+                observed: None,
+            };
         }
+        (path, contents.baseline)
     };
-    if existing == updated {
-        return SaveOutcome::Unchanged;
-    }
-    if let Some(parent) = path.parent()
-        && let Err(error) = std::fs::create_dir_all(parent)
+    match crate::native_document_host::commit_atomic_bytes(&baseline, plan.snapshot.text.as_bytes())
     {
-        return SaveOutcome::Error(format!("cannot create {} ({error})", parent.display()));
+        crate::native_document_host::AtomicCommitResult::Committed(proof) => {
+            ConfigSnapshotSaveResult {
+                outcome: SaveOutcome::Saved,
+                observed: Some(crate::native_document_host::AtomicFileBaseline {
+                    target: baseline.target,
+                    observed: proof.observed,
+                }),
+            }
+        }
+        crate::native_document_host::AtomicCommitResult::Conflict { observed, message } => {
+            let message = format!(
+                "{} changed while saving ({message}); review the latest file and retry",
+                path.display()
+            );
+            eprintln!("aterm-gui: prefs save: {message}; config unchanged");
+            ConfigSnapshotSaveResult {
+                outcome: SaveOutcome::Conflict {
+                    expected: baseline.observed.content,
+                    observed,
+                    message,
+                },
+                observed: None,
+            }
+        }
+        crate::native_document_host::AtomicCommitResult::Failed { stage, message } => {
+            let message = format!("{} save failed at {stage:?} ({message})", path.display());
+            eprintln!("aterm-gui: prefs save: {message}; config unchanged");
+            ConfigSnapshotSaveResult {
+                outcome: SaveOutcome::Error(message),
+                observed: None,
+            }
+        }
+        crate::native_document_host::AtomicCommitResult::PublishedUnverified {
+            stage,
+            observed,
+            message,
+        } => {
+            let message = format!(
+                "{} may already contain the requested bytes; reload and reconcile before retrying \
+                 ({stage:?}: {message})",
+                path.display()
+            );
+            eprintln!("aterm-gui: prefs save: {message}");
+            ConfigSnapshotSaveResult {
+                outcome: SaveOutcome::PublishedUnverified {
+                    stage,
+                    observed,
+                    message,
+                },
+                observed: None,
+            }
+        }
     }
-    let temporary = path.with_extension("toml.tmp");
-    match std::fs::write(&temporary, updated).and_then(|()| std::fs::rename(&temporary, &path)) {
-        Ok(()) => SaveOutcome::Saved,
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            SaveOutcome::Error(format!("{} unwritable ({error})", path.display()))
+}
+
+fn commit_prefs_bytes(
+    path: &std::path::Path,
+    baseline: &crate::native_document_host::AtomicFileBaseline,
+    updated: &[u8],
+) -> SaveOutcome {
+    match crate::native_document_host::commit_atomic_bytes(baseline, updated) {
+        crate::native_document_host::AtomicCommitResult::Committed(_) => SaveOutcome::Saved,
+        crate::native_document_host::AtomicCommitResult::Conflict { observed, message } => {
+            let message = format!(
+                "{} changed while saving ({message}); review the latest file and retry",
+                path.display()
+            );
+            eprintln!("aterm-gui: prefs save: {message}; config unchanged");
+            SaveOutcome::Conflict {
+                expected: baseline.observed.content,
+                observed,
+                message,
+            }
+        }
+        crate::native_document_host::AtomicCommitResult::Failed { stage, message } => {
+            let message = format!("{} save failed at {stage:?} ({message})", path.display());
+            eprintln!("aterm-gui: prefs save: {message}; config unchanged");
+            SaveOutcome::Error(message)
+        }
+        crate::native_document_host::AtomicCommitResult::PublishedUnverified {
+            stage,
+            observed,
+            message,
+        } => {
+            let message = format!(
+                "{} may already contain the requested bytes; reload and reconcile before retrying \
+                 ({stage:?}: {message})",
+                path.display()
+            );
+            eprintln!("aterm-gui: prefs save: {message}");
+            SaveOutcome::PublishedUnverified {
+                stage,
+                observed,
+                message,
+            }
         }
     }
 }
@@ -3831,15 +4295,88 @@ mod edit_tests {
     use super::{
         Config, EDIT_ALLOW_WINDOW_OPS, EDIT_BACKGROUND, EDIT_COLUMNS, EDIT_COPY_ON_SELECT,
         EDIT_CURSOR_COLOR, EDIT_CURSOR_STYLE, EDIT_CURSOR_TRAIL, EDIT_CURSOR_TRAIL_STYLE,
-        EDIT_FONT_FAMILY, EDIT_FONT_PX, EDIT_FOREGROUND, EDIT_LIGATURES, EDIT_LINES,
+        EDIT_FONT_FAMILY, EDIT_FONT_PX, EDIT_FOREGROUND, EDIT_LIGATURES, EDIT_LINES, EDIT_MOTION,
         EDIT_SCROLLBACK, EDIT_SEARCH_HISTORY_LINES, EDIT_SELECTION_COLOR, EDIT_THEME,
-        EDIT_WINDOW_THEME, EditKind, PrefsEditError, apply_prefs_edits, editable_fields,
-        keywords_of, range_of,
+        EDIT_WINDOW_THEME, EditKind, PrefsEditError, SaveOutcome, apply_prefs_edits,
+        editable_fields, keywords_of, range_of,
     };
 
     /// `Some(v)` helper to keep the edit lists terse.
     fn set(v: &str) -> Option<String> {
         Some(v.to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_save_preserves_a_bound_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock follows the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "aterm-prefs-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create isolated test directory");
+        let target = directory.join("managed.toml");
+        let link = directory.join("aterm.toml");
+        std::fs::write(&target, "font_px = 12\n").expect("seed managed config");
+        symlink(&target, &link).expect("create config symlink");
+
+        let baseline = crate::native_document_host::read_config_atomic_file(&link, 4096, false)
+            .expect("config authority admits a bound final symlink")
+            .baseline;
+        assert!(matches!(
+            super::commit_prefs_bytes(&link, &baseline, b"font_px = 14\n"),
+            SaveOutcome::Saved
+        ));
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read updated target"),
+            "font_px = 14\n"
+        );
+        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
+    }
+
+    #[test]
+    fn atomic_config_occ_preserves_structured_conflict_context() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "aterm-prefs-conflict-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("aterm.toml");
+        std::fs::write(&path, "font_px = 12\n").unwrap();
+        let baseline = crate::native_document_host::read_atomic_file(&path, 4096, false)
+            .unwrap()
+            .baseline;
+        std::fs::write(&path, "font_px = 14\n").unwrap();
+
+        assert!(matches!(
+            super::commit_prefs_bytes(&path, &baseline, b"font_px = 16\n"),
+            SaveOutcome::Conflict {
+                expected,
+                observed,
+                message,
+            } if expected == baseline.observed.content
+                && observed.content
+                    == crate::native_document_io::ContentFingerprint::of(b"font_px = 14\n")
+                && message.contains("review the latest file")
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "font_px = 14\n");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3855,7 +4392,7 @@ mod edit_tests {
             super::VISUAL_PREVIEW_KEYS.len(),
             "duplicate preview key"
         );
-        assert_eq!(registry.len(), 57, "the explicit visual contract changed");
+        assert_eq!(registry.len(), 58, "the explicit visual contract changed");
 
         let fields = super::editable_fields(&Config::default());
         let expected = fields
@@ -3902,7 +4439,7 @@ mod edit_tests {
         for (section, count) in [
             (super::Section::Appearance, 11),
             (super::Section::Typography, 22),
-            (super::Section::Cursor, 20),
+            (super::Section::Cursor, 21),
             (super::Section::Window, 4),
         ] {
             assert_eq!(
@@ -4085,13 +4622,14 @@ mod edit_tests {
         assert_eq!(row_on.seed.as_deref(), Some("true"), "resolved ON");
     }
 
-    /// The `[packages]` consent switches: Bool-typed dotted keys, sectioned in
+    /// The `[packages]` maintenance switches: Bool-typed dotted keys, sectioned in
     /// the search-only Packages section (which NO ordinary route owns — the
     /// special page renders them), grouped and searchable, seeded with the
     /// DIFFERING resolved defaults (auto_update ON, auto_install OFF).
     #[test]
     fn packages_consent_rows_surface_in_the_settings_model() {
         for key in [
+            super::EDIT_PACKAGES_ENABLED,
             super::EDIT_PACKAGES_AUTO_UPDATE,
             super::EDIT_PACKAGES_AUTO_INSTALL,
         ] {
@@ -4107,6 +4645,11 @@ mod edit_tests {
         assert!(super::group_footnote("Toolchain Packages").is_some());
 
         let fields = editable_fields(&Config::default());
+        let enabled = fields
+            .iter()
+            .find(|f| f.key == super::EDIT_PACKAGES_ENABLED)
+            .expect("background-service master row exists");
+        assert_eq!(enabled.seed.as_deref(), Some("true"), "master defaults ON");
         let auto_update = fields
             .iter()
             .find(|f| f.key == super::EDIT_PACKAGES_AUTO_UPDATE)
@@ -4122,9 +4665,20 @@ mod edit_tests {
             "consent-gated default OFF"
         );
 
-        let configured: Config =
-            toml::from_str("[packages]\nauto_update = false\nauto_install = true\n").unwrap();
+        let configured: Config = toml::from_str(
+            "[packages]\nenabled = false\nauto_update = false\nauto_install = true\n",
+        )
+        .unwrap();
         let fields = editable_fields(&configured);
+        assert_eq!(
+            fields
+                .iter()
+                .find(|f| f.key == super::EDIT_PACKAGES_ENABLED)
+                .unwrap()
+                .seed
+                .as_deref(),
+            Some("false")
+        );
         assert_eq!(
             fields
                 .iter()
@@ -4622,6 +5176,34 @@ listen = \"127.0.0.1:7777\" # local only
         assert!(matches!(err, PrefsEditError::BadValue { .. }));
     }
 
+    #[test]
+    fn initial_grid_placeholders_match_fixed_runtime_defaults() {
+        let fields = editable_fields(&Config::default());
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|field| field.key == key)
+                .unwrap_or_else(|| panic!("missing field {key}"))
+        };
+        assert_eq!(field(EDIT_COLUMNS).seed, None);
+        assert_eq!(field(EDIT_COLUMNS).placeholder, "80 (default)");
+        assert_eq!(field(EDIT_LINES).seed, None);
+        assert_eq!(field(EDIT_LINES).placeholder, "24 (default)");
+
+        let configured: Config = toml::from_str("columns = 132\nlines = 50\n").unwrap();
+        let fields = editable_fields(&configured);
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|field| field.key == key)
+                .unwrap_or_else(|| panic!("missing field {key}"))
+        };
+        assert_eq!(field(EDIT_COLUMNS).seed.as_deref(), Some("132"));
+        assert_eq!(field(EDIT_COLUMNS).placeholder, "132");
+        assert_eq!(field(EDIT_LINES).seed.as_deref(), Some("50"));
+        assert_eq!(field(EDIT_LINES).placeholder, "50");
+    }
+
     /// The cursor-trail rows are present: the master toggle seeds its RESOLVED state (ON
     /// by default — the owner's batteries-on delight call) and the style enum seeds blank
     /// on an unset config but advertises its effective default in the placeholder.
@@ -4694,74 +5276,6 @@ listen = \"127.0.0.1:7777\" # local only
         }
     }
 
-    /// P1.2: the HUD/perf-pane toggles — the master `show_hud` plus one per panel —
-    /// are present as Bool controls, seeded from their defaults (master OFF per
-    /// 6272bd7a, Resources ON, Engine ON, Scene OFF), and `edit_kind` agrees they are Bool — the
-    /// load-bearing guard against string-vs-bool config corruption on Save.
-    #[test]
-    fn editable_fields_includes_hud_toggles_as_bool() {
-        let fields = editable_fields(&Config::default());
-        let hud_keys = std::iter::once(super::EDIT_SHOW_HUD).chain(
-            crate::hud_bar::PanelId::ALL
-                .iter()
-                .map(|id| id.config_key()),
-        );
-        for key in hud_keys {
-            let row = fields
-                .iter()
-                .find(|f| f.key == key)
-                .unwrap_or_else(|| panic!("HUD row {key} present"));
-            assert!(
-                matches!(row.kind, super::EditKind::Bool),
-                "{key} row is Bool"
-            );
-            assert!(
-                matches!(super::edit_kind(key), super::EditKind::Bool),
-                "edit_kind({key}) is Bool (else Save writes a string for a serde bool)"
-            );
-        }
-        let seed = |k: &str| {
-            fields
-                .iter()
-                .find(|f| f.key == k)
-                .and_then(|f| f.seed.clone())
-        };
-        assert_eq!(seed(super::EDIT_SHOW_HUD).as_deref(), Some("false")); // master OFF (6272bd7a)
-        assert_eq!(seed("show_resources_hud").as_deref(), Some("true")); // default ON
-        assert_eq!(seed("show_engine_hud").as_deref(), Some("true")); // default ON
-        // The master row must sort BEFORE the per-panel rows inside Performance, so
-        // the band-wide switch is the first thing a user sees in the section.
-        let pos = |k: &str| fields.iter().position(|f| f.key == k).expect("row");
-        assert!(pos(super::EDIT_SHOW_HUD) < pos("show_resources_hud"));
-    }
-
-    /// The master `show_hud` switch round-trips as a TOML BOOL through a Save +
-    /// serde re-parse, and `false` resolves to hiding the band while the per-panel
-    /// keys keep their own values (the master never rewrites them).
-    #[test]
-    fn show_hud_master_round_trips_and_gates_nothing_else() {
-        let out = apply_prefs_edits("", &[(super::EDIT_SHOW_HUD, set("false"))]).unwrap();
-        let cfg: Config = toml::from_str(&out).expect("re-parses");
-        assert_eq!(cfg.show_hud, Some(false));
-        assert!(!cfg.show_hud_or_default());
-        // Per-panel resolution is deliberately unaffected by the master.
-        assert!(cfg.show_resources_hud_or_default());
-        assert!(cfg.hud_enabled(crate::hud_bar::PanelId::Resources));
-    }
-
-    /// A HUD toggle Save writes a TOML BOOL (not a string) and re-parses through serde —
-    /// the round-trip the `edit_kind` guard protects.
-    #[test]
-    fn hud_toggle_round_trips_as_bool() {
-        let out = apply_prefs_edits("", &[("show_engine_hud", set("true"))]).unwrap();
-        assert!(
-            out.contains("show_engine_hud = true"),
-            "written as a TOML bool, not a quoted string: {out}"
-        );
-        let c: Config = toml::from_str(&out).unwrap();
-        assert_eq!(c.show_engine_hud, Some(true));
-    }
-
     /// A colour control validates as hex on Save: a good `#RRGGBB` round-trips as a
     /// string, a malformed colour is rejected (BadValue) rather than written.
     #[test]
@@ -4826,6 +5340,160 @@ listen = \"127.0.0.1:7777\" # local only
         let c: Config = toml::from_str(&out).unwrap();
         assert_eq!(c.allow_osc52_query, Some(true)); // TOML bool, not a string
         assert_eq!(c.columns, Some(100)); // TOML int, not a string
+    }
+
+    #[test]
+    fn launch_only_timing_metadata_is_exact_and_shared() {
+        for key in [super::EDIT_COLUMNS, super::EDIT_LINES] {
+            assert_eq!(
+                super::application_timing(key),
+                Some(
+                    "Applies on a fresh launch; an authenticated update handoff preserves the live size"
+                )
+            );
+        }
+        for key in [
+            super::EDIT_GPU,
+            super::EDIT_PACKAGES_AUTO_UPDATE,
+            super::EDIT_PACKAGES_ENABLED,
+            "net.listen",
+            "net.cert",
+            "net.key",
+        ] {
+            assert_eq!(super::application_timing(key), Some("Applies next launch"));
+        }
+        for key in [
+            super::EDIT_ALLOW_KITTY_FILE_TRANSFER,
+            super::EDIT_TEMPORAL_RECORDING,
+            super::EDIT_SHELL,
+            super::EDIT_SHELL_ARGS,
+        ] {
+            assert_eq!(
+                super::application_timing(key),
+                Some("Applies to new sessions")
+            );
+        }
+        assert_eq!(
+            super::application_timing(super::EDIT_HDR_GLOW),
+            Some("Disabling applies now; enabling may require a new window")
+        );
+        assert_eq!(
+            super::application_timing(super::EDIT_RESTORE_SESSION),
+            Some("Applies when closing or next launch")
+        );
+        for key in [
+            super::EDIT_PACKAGES_AUTO_INSTALL,
+            "packages.account",
+            "packages.channel",
+            "packages.include",
+            "packages.exclude",
+            "packages.links",
+        ] {
+            assert_eq!(
+                super::application_timing(key),
+                Some("Applies on the next package operation"),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            super::application_timing("net.connections.host"),
+            Some("Applies on the next dial")
+        );
+        assert_eq!(
+            super::application_timing("update.owner"),
+            Some("Manual checks use this now; automatic checks use it next launch")
+        );
+        assert_eq!(
+            super::application_timing("update.auto_apply"),
+            Some("Applies on the next update transition")
+        );
+        assert_eq!(
+            super::application_timing(super::EDIT_AMBIGUOUS_WIDTH),
+            Some("Applies to newly received text; existing cells keep their current width")
+        );
+        assert!(
+            super::application_has_live_effect(super::EDIT_AMBIGUOUS_WIDTH),
+            "the width policy is consumed immediately for subsequent input"
+        );
+        assert_eq!(
+            super::application_timing(super::EDIT_MATRIX_RAIN_ENABLED),
+            Some("Applies live unless this session has a View menu override")
+        );
+        assert!(
+            super::application_has_live_effect(super::EDIT_MATRIX_RAIN_ENABLED),
+            "the config switch is live whenever no session-local override owns the effect"
+        );
+        assert!(
+            super::application_has_live_effect(super::EDIT_HDR_GLOW),
+            "disabling HDR glow gates the next present in an existing GPU window"
+        );
+        for key in [super::EDIT_GPU, super::EDIT_SHELL, "net.connections.host"] {
+            assert!(
+                !super::application_has_live_effect(key),
+                "{key} is wholly deferred"
+            );
+        }
+        for key in [
+            super::EDIT_THEME,
+            super::EDIT_FONT_PX,
+            super::EDIT_CURSOR_BLINK,
+            super::EDIT_TAB_STRIP_ROWS,
+        ] {
+            assert_eq!(super::application_timing(key), None, "{key} applies live");
+            assert!(
+                super::application_has_live_effect(key),
+                "{key} applies live"
+            );
+        }
+    }
+
+    #[test]
+    fn audited_advanced_labels_defaults_and_consequence_notes_are_plain_and_exact() {
+        let fields = editable_fields(&Config::default());
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|field| field.key == key)
+                .unwrap_or_else(|| panic!("missing field {key}"))
+        };
+        assert_eq!(field(super::EDIT_BIDI).label, "Bidirectional text");
+        assert_eq!(
+            field(super::EDIT_AMBIGUOUS_WIDTH).label,
+            "Ambiguous-character width"
+        );
+        assert_eq!(field(super::EDIT_FONT_WEIGHT).label, "Variable font weight");
+        let search = field(super::EDIT_SEARCH_HISTORY_LINES);
+        assert_eq!(search.label, "Searchable scrollback lines");
+        assert_eq!(
+            search.placeholder,
+            format!("{} (default)", aterm_core::search::DEFAULT_MAX_CACHED_LINES)
+        );
+
+        let keyboard = super::group_footnote("Keyboard").unwrap();
+        assert!(keyboard.contains("confirmed echo"));
+        assert!(keyboard.contains("passwords"));
+        assert!(keyboard.contains("Manual's Always mode is unsafe"));
+        let paste = super::group_footnote("Paste safety").unwrap();
+        assert!(paste.contains("unbracketed multiline paste"));
+        assert!(paste.contains("Bracketed paste bypasses it"));
+        let scrollback = super::group_footnote("Scrollback").unwrap();
+        assert!(scrollback.contains("Cmd-F/socket cap"));
+        assert!(scrollback.contains("partial results"));
+        assert!(scrollback.contains("Set Searchable lines to 0 for live-screen-only search"));
+        let semantics = super::group_footnote("Text direction & width").unwrap();
+        assert!(semantics.contains("reorders right-to-left text"));
+        assert!(semantics.contains("one or two cells"));
+        assert!(semantics.contains("not existing cells"));
+        let rendering = super::group_footnote("Rendering").unwrap();
+        assert!(rendering.contains("needs a font with a wght axis"));
+        assert!(rendering.contains("static fonts ignore it"));
+        assert_eq!(
+            field(super::EDIT_ALLOW_PALETTE_RECONFIGURE).label,
+            "Allow programs to set indexed colors (OSC 4/21)"
+        );
+        let packages = super::group_footnote("Toolchain Packages").unwrap();
+        assert!(packages.contains("auto-update apply next launch"));
+        assert!(packages.contains("Auto-install runs next package operation"));
     }
 
     /// P1.4c enum-domain keys: cursor_style/window_theme/bidi/ambiguous_width classify as
@@ -5248,8 +5916,16 @@ listen = \"127.0.0.1:7777\" # local only
             "https://127.1:9443/v1/chat",
             "https://2130706433:9443/v1/chat",
             "https://0x7f000001:9443/v1/chat",
-            concat!("https://models.example.test/v1/", "sk-", "proj-abcdefghijklmnopqrstuvwxyz012345/chat"),
-            concat!("https://", "sk-", "proj-abcdefghijklmnopqrstuvwxyz012345.models.example/v1/chat"),
+            concat!(
+                "https://models.example.test/v1/",
+                "sk-",
+                "proj-abcdefghijklmnopqrstuvwxyz012345/chat"
+            ),
+            concat!(
+                "https://",
+                "sk-",
+                "proj-abcdefghijklmnopqrstuvwxyz012345.models.example/v1/chat"
+            ),
             "https://models.example.test/v1/%2Fchat",
             "https://models.example.test/v1/%ZZ/chat",
             "https://models.example.test\\v1\\chat",
@@ -5385,14 +6061,12 @@ listen = \"127.0.0.1:7777\" # local only
             );
             last_section = idx;
         }
-        // The colour rows + HUD toggles are present somewhere in the list.
+        // The colour rows are present somewhere in the list.
         for k in [
             EDIT_FOREGROUND,
             EDIT_BACKGROUND,
             EDIT_CURSOR_COLOR,
             EDIT_SELECTION_COLOR,
-            crate::hud_bar::PanelId::Resources.config_key(),
-            crate::hud_bar::PanelId::Engine.config_key(),
         ] {
             assert!(keys.contains(&k), "missing key {k}");
         }
@@ -5521,6 +6195,10 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(placeholder(&fields, EDIT_THEME), "Default");
         assert_eq!(placeholder(&fields, EDIT_CURSOR_STYLE), "block (default)");
         assert_eq!(placeholder(&fields, EDIT_SCROLLBACK), "100000 (default)");
+        assert_eq!(
+            placeholder(&fields, EDIT_MOTION),
+            super::motion_auto_placeholder()
+        );
         // None of the text-row placeholders are blank.
         for k in [
             EDIT_FONT_PX,
@@ -5530,6 +6208,24 @@ listen = \"127.0.0.1:7777\" # local only
             EDIT_SCROLLBACK,
         ] {
             assert!(!placeholder(&fields, k).is_empty(), "{k} placeholder blank");
+        }
+    }
+
+    #[test]
+    fn motion_auto_copy_is_truthful_for_each_platform_capability() {
+        let (mac_placeholder, mac_help) = super::motion_auto_copy("macos");
+        assert!(mac_placeholder.contains("live macOS"));
+        assert!(mac_help.contains("live"));
+
+        let (windows_placeholder, windows_help) = super::motion_auto_copy("windows");
+        assert!(windows_placeholder.contains("window attach"));
+        assert!(windows_help.contains("not observed live"));
+
+        for target in ["linux", "freebsd"] {
+            let (placeholder, help) = super::motion_auto_copy(target);
+            assert!(placeholder.contains("unavailable"));
+            assert!(help.contains("choose reduced explicitly"));
+            assert!(!placeholder.contains("follow OS"));
         }
     }
 
@@ -5551,9 +6247,9 @@ listen = \"127.0.0.1:7777\" # local only
 }
 
 /// FULL-COVERAGE conformance: the proofs that the settings registry spans the
-/// ENTIRE `Config` surface (the AI-driveability contract behind `controls prefs`
-/// + `settings set|unset`) — an exhaustiveness gate over the serde fields, the
-///   dotted-key nested-table writer, and the list-row round-trips.
+/// ENTIRE `Config` surface (the AI-driveability contract behind Manual and
+/// `settings set|unset`) — an exhaustiveness gate over the serde fields, the
+/// dotted-key nested-table writer, and the list-row round-trips.
 #[cfg(test)]
 mod registry_conformance_tests {
     use super::{
@@ -5994,5 +6690,83 @@ enabled = true
         assert!(range_of(super::EDIT_TRAIL_SOUND_VOLUME).is_some());
         assert!(range_of(super::EDIT_WINDOW_PADDING).is_some());
         assert!(range_of(super::EDIT_WINDOW_PADDING_TOP).is_some());
+    }
+
+    /// FONT-GAME: the registry's `game_font` option list is EXACTLY the bundled
+    /// face registry (ids and order), so the settings toggles, the Enum
+    /// validation, and the `game:` resolver can never disagree; and the two new
+    /// keys round-trip through the real TOML writer with their typed validation
+    /// (a bad game id / a non-hex tab color is rejected, never written).
+    #[test]
+    fn game_font_and_tab_color_registry_rows_are_wired() {
+        let bundled: Vec<&str> = aterm_render::GAME_FONTS.iter().map(|f| f.id).collect();
+        assert_eq!(
+            super::GAME_FONT_OPTIONS.first(),
+            Some(&"off"),
+            "the popup's explicit off state leads the option list"
+        );
+        assert_eq!(
+            &super::GAME_FONT_OPTIONS[1..],
+            bundled.as_slice(),
+            "GAME_FONT_OPTIONS' id tail must mirror aterm_render::GAME_FONTS"
+        );
+        // "off" behaves exactly like an unset key in the resolver.
+        let off = Config {
+            game_font: Some("off".to_string()),
+            font_family: Some("Menlo".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(off.font_family_request().as_deref(), Some("Menlo"));
+        let set = |v: &str| Some(v.to_string());
+        let out = apply_prefs_edits(
+            "",
+            &[
+                (super::EDIT_GAME_FONT, set("minecraft")),
+                (super::EDIT_ACTIVE_TAB_COLOR, set("#FF00AA")),
+            ],
+        )
+        .unwrap();
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(c.game_font.as_deref(), Some("minecraft"));
+        assert_eq!(c.active_tab_color.as_deref(), Some("#FF00AA"));
+        assert_eq!(c.active_tab_color_rgb(), Some([0xFF, 0x00, 0xAA]));
+        assert_eq!(c.font_family_request().as_deref(), Some("game:minecraft"));
+        // A MIX round-trips through the writer in canonical joined form, and
+        // the resolver canonicalizes it into the `game:` mix family.
+        let out =
+            apply_prefs_edits("", &[(super::EDIT_GAME_FONT, set(" minecraft + zelda "))]).unwrap();
+        let mixed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(mixed.game_font.as_deref(), Some("minecraft+zelda"));
+        assert_eq!(
+            mixed.font_family_request().as_deref(),
+            Some("game:minecraft+zelda")
+        );
+        // Unknown game id / bad mixes / non-hex color: rejected by the writer.
+        for bad in [
+            "doom",
+            "minecraft+doom",
+            "zelda+zelda",
+            "roblox+minecraft+zelda+mariokart",
+        ] {
+            assert!(
+                matches!(
+                    apply_prefs_edits("", &[(super::EDIT_GAME_FONT, set(bad))]).unwrap_err(),
+                    PrefsEditError::BadValue { .. }
+                ),
+                "{bad} must be rejected"
+            );
+        }
+        assert!(matches!(
+            apply_prefs_edits("", &[(super::EDIT_ACTIVE_TAB_COLOR, set("pink"))]).unwrap_err(),
+            PrefsEditError::BadValue { .. }
+        ));
+        // Clearing the game font restores the plain family passthrough.
+        let mut cleared = c.clone();
+        cleared.game_font = None;
+        assert_eq!(cleared.font_family_request(), cleared.font_family);
+        // A typo'd id that somehow reaches config falls back fail-open.
+        let mut typo = c;
+        typo.game_font = Some("dooom".to_string());
+        assert_eq!(typo.font_family_request(), typo.font_family);
     }
 }

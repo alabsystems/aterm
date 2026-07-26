@@ -59,13 +59,17 @@ pub fn run_with(
         "doctor: index source github.com/{}",
         crate::resolve_account(cfg_account).slug()
     );
-    if crate::enabled() {
-        println!(
-            "doctor: ok — root key pinned (fingerprint {})",
-            crate::root_key_fingerprint()
-        );
+    if crate::manager_enabled() {
+        if std::env::var("ATPKG_ROOTKEY_OVERRIDE").is_ok_and(|key| !key.is_empty()) {
+            println!("doctor: ok — root key via ATPKG_ROOTKEY_OVERRIDE");
+        } else {
+            println!(
+                "doctor: ok — root key pinned (fingerprint {})",
+                crate::root_key_fingerprint()
+            );
+        }
     } else {
-        println!("doctor: warn — disabled/inert (no root key pinned at build time)");
+        println!("doctor: warn — disabled/inert (no root key available or ATPKG_DISABLE set)");
     }
     // Loud token provenance (never the token itself): which source of the
     // `$ATPKG_TOKEN` → aterm-update-core chain (env → keychain → 0600 file →

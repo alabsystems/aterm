@@ -176,6 +176,16 @@ impl Grid {
             self.drain_lazy_buffer();
         }
 
+        // That drain just recycled up to a poolful of OLD-WIDTH cell bodies.
+        // Their capacities are sized for `old_cols`, so keeping them across a
+        // width change is either dead memory (width shrank) or a guaranteed
+        // realloc on first refill (width grew). Contents cannot go stale — the
+        // body is cleared and refilled from the row slice — so this is purely a
+        // footprint/realloc guard, and the pool refills within one drain batch.
+        if new_cols != old_cols {
+            self.storage.lazy_buffer.clear_pool();
+        }
+
         let cursor_row = self.storage.cursor.row as usize;
         let cursor_col = self.storage.cursor.col;
 
@@ -319,8 +329,6 @@ impl Grid {
     /// screen. The caller owes the cursor a downward shift by exactly this
     /// count — the cursor's content moved that many rows down the viewport.
     fn adjust_row_count(&mut self, target_rows: u16, new_cols: u16) -> usize {
-        use super::scroll_convert::DeferredLine;
-
         let target = target_rows as usize;
         let old_visible = usize::from(self.storage.visible_rows);
 
@@ -380,8 +388,7 @@ impl Grid {
                             u16::MAX,
                             self.styles(),
                         );
-                        let deferred = DeferredLine::new(row, extracted);
-                        self.storage.lazy_buffer.push(deferred);
+                        self.storage.lazy_buffer.push_row(row, extracted);
                     }
                 } else {
                     drop(self.storage.rows.drain(..from_front));
@@ -415,8 +422,7 @@ impl Grid {
                             external_row,
                             self.styles(),
                         );
-                        let deferred = DeferredLine::new(row, extracted);
-                        self.storage.lazy_buffer.push(deferred);
+                        self.storage.lazy_buffer.push_row(row, extracted);
                     }
                 } else {
                     for _ in 0..from_back {
@@ -600,8 +606,6 @@ impl Grid {
         // If the cursor overflows the visible area, push excess top rows to
         // scrollback instead of silently discarding them (#7410).
         if result.rows.len() > target_rows && result.cursor_row >= target_rows {
-            use super::scroll_convert::DeferredLine;
-
             let rows_to_push = result.rows.len() - target_rows;
             // Push the minimum needed to bring cursor into the visible window.
             // This is the number of rows we need to remove from the top.
@@ -615,8 +619,7 @@ impl Grid {
                 let row_idx = u16::try_from(i).unwrap_or(u16::MAX);
                 let extracted =
                     Self::extract_row_extras(row, &result.extras, row_idx, self.styles());
-                let deferred = DeferredLine::new(row, extracted);
-                self.storage.lazy_buffer.push(deferred);
+                self.storage.lazy_buffer.push_row(row, extracted);
             }
 
             // Shift extras row indices to match the row removal.

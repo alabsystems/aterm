@@ -3034,21 +3034,28 @@ mod tests {
 
     #[test]
     fn file_advisory_locks_are_categorized_on_this_tree() {
-        // The two real OS file-advisory sites (kitty_log's sibling-lock flock;
-        // the updater's install-ledger lock in aterm-update-core, picked up by
-        // the 2026-07-13 crate-set widening) must be classified by File
-        // EVIDENCE, listed with their binding spans, and excluded from the
-        // mutex graph — existence-checked here so the classification cannot
-        // silently rot into UNKNOWN (or vanish).
+        // The two real OS file-advisory sites (`restore::with_restore_lock`'s
+        // sibling-lock flock over the restore manifest; the updater's
+        // install-ledger lock in aterm-update-core, picked up by the 2026-07-13
+        // crate-set widening) must be classified by File EVIDENCE, listed with
+        // their binding spans, and excluded from the mutex graph —
+        // existence-checked here so the classification cannot silently rot into
+        // UNKNOWN (or vanish).
+        //
+        // NOTE (2026-07-24): this named `crates/aterm-gui/src/kitty_log.rs` for
+        // the first site long after that flock moved to `restore.rs` — kitty_log
+        // has carried ZERO `.lock()` calls since. The assertion had been failing
+        // on `main` for an unknown span, i.e. this gate was dark. Naming the
+        // ACTUAL site restores its teeth.
         let out = run_lock_order_census(&repo_root());
         assert!(
             out.log.contains("2 OS file-advisory"),
-            "expected exactly the kitty_log + update-core flocks in the advisory \
-             category:\n{}",
+            "expected exactly the restore-manifest + update-core flocks in the \
+             advisory category:\n{}",
             out.log
         );
         assert!(
-            out.log.contains("crates/aterm-gui/src/kitty_log.rs")
+            out.log.contains("crates/aterm-gui/src/restore.rs")
                 && out.log.contains("crates/aterm-update-core/src/sys.rs")
                 && out.log.contains("proven std::fs::File by its binding at"),
             "each advisory listing must carry its audit evidence:\n{}",

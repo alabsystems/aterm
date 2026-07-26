@@ -40,6 +40,10 @@ aterm-spec = { workspace = true, optional = true }
 # unit-test build, and the Tier-1 lockstep (tests/conformance_streaming.rs)
 # drives the derived StreamingSearch model + tiered transition validation.
 aterm-spec = { workspace = true }
+# E4 differential equivalence oracle: property-tests the verified search path
+# (which reads the per-line String cache via str::find) against a brute-force
+# substring reference, so the String-drop refactor stays byte-identical.
+proptest = { workspace = true }
 
 [build-dependencies]
 # COMPILE-TIME temporal gate (build.rs): the derived StreamingSearch model is

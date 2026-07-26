@@ -167,7 +167,7 @@ struct SemanticStamp {
     cwd_hash: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum ActivityState {
     Unknown,
     Prompt,
@@ -305,7 +305,15 @@ struct Entry {
     next_refresh: Option<Instant>,
     backoff_until: Option<Instant>,
     failure_count: u32,
+    /// Forces the next admissible request past the identical-snapshot dedup.
+    /// Set at semantic boundaries, provider failures, managed-runtime exits, and
+    /// authority transitions — every state where re-running inference over
+    /// unchanged content is still meaningful; cleared when a request is queued.
     dirty: bool,
+    /// [`snapshot_content_hash`] of the last queued request's snapshot. A timer
+    /// refresh whose snapshot hashes identically (and whose entry is not
+    /// `dirty`) would send a byte-identical prompt, so it is skipped.
+    last_dispatched_snapshot: Option<u64>,
     last_error: Option<String>,
 }
 
@@ -393,6 +401,25 @@ pub(crate) struct Coordinator {
     /// Ollama leaves configured authority untouched and publishes this only after
     /// its per-process ephemeral listener has been selected.
     runtime_endpoint: Option<String>,
+    /// Composed chrome labels keyed by `(session, format/separator flavor)`.
+    /// The tab strip and the window titlebar both re-compose on every redraw;
+    /// this cache turns an unchanged (title, description) frame into one hash
+    /// pass plus a `clone_from`. A `Mutex` (uncontended: the cache is only
+    /// touched from the UI thread) because every render path holds `&App`.
+    compose_cache: Mutex<HashMap<(u64, u64), ComposedLabel>>,
+    /// Count of full label compositions actually performed, so tests can pin
+    /// that steady frames are served from the cache or the clean-title fast path.
+    #[cfg(test)]
+    compose_runs: AtomicU64,
+}
+
+/// One cached composed chrome label plus the hash of the exact pure-composition
+/// inputs (raw title + resolved description) that produced it. The hash IS the
+/// full input key — format and separator live in the map key — so a stale hit
+/// is impossible and no invalidation hook is needed beyond session retirement.
+struct ComposedLabel {
+    input_hash: u64,
+    composed: String,
 }
 
 struct Worker {
@@ -466,6 +493,9 @@ impl Coordinator {
             model_ready: false,
             last_runtime_error: None,
             runtime_endpoint: None,
+            compose_cache: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            compose_runs: AtomicU64::new(0),
         }
     }
 
@@ -560,6 +590,7 @@ impl Coordinator {
             backoff_until: None,
             failure_count: 0,
             dirty: true,
+            last_dispatched_snapshot: None,
             last_error: None,
         });
         if boundary {
@@ -593,26 +624,37 @@ impl Coordinator {
                 if include_output {
                     snapshot.capture_recent_output(term, context_lines);
                 }
-                // A semantic boundary already advanced the generation above. A
-                // timer refresh has no boundary of its own, so it advances here
-                // to supersede the previous periodic request.
-                if !boundary {
-                    entry.generation = entry.generation.saturating_add(1);
+                let content = snapshot_content_hash(&snapshot);
+                if !boundary && !entry.dirty && entry.last_dispatched_snapshot == Some(content) {
+                    // An idle terminal reproduces byte-identical prompt content
+                    // every interval, and an identical prompt can only re-derive
+                    // the answer already on screen. Skip the redundant inference
+                    // and re-arm the periodic check; `dirty` marks the entries
+                    // whose next admissible wake must dispatch regardless.
+                    entry.next_refresh = Some(now + interval);
+                } else {
+                    // A semantic boundary already advanced the generation above. A
+                    // timer refresh has no boundary of its own, so it advances here
+                    // to supersede the previous periodic request.
+                    if !boundary {
+                        entry.generation = entry.generation.saturating_add(1);
+                    }
+                    entry.last_request = Some(now);
+                    entry.next_refresh = Some(now + interval);
+                    entry.backoff_until = None;
+                    entry.dirty = false;
+                    entry.last_dispatched_snapshot = Some(content);
+                    queued = Some(Job {
+                        session,
+                        session_epoch,
+                        session_authority,
+                        generation: entry.generation,
+                        authority_epoch: self.authority_epoch,
+                        config_fingerprint: fingerprint,
+                        settings,
+                        snapshot,
+                    });
                 }
-                entry.last_request = Some(now);
-                entry.next_refresh = Some(now + interval);
-                entry.backoff_until = None;
-                entry.dirty = false;
-                queued = Some(Job {
-                    session,
-                    session_epoch,
-                    session_authority,
-                    generation: entry.generation,
-                    authority_epoch: self.authority_epoch,
-                    config_fingerprint: fingerprint,
-                    settings,
-                    snapshot,
-                });
             } else {
                 let error = "smart-title endpoint is not configured".to_string();
                 entry.last_error = Some(error.clone());
@@ -623,11 +665,22 @@ impl Coordinator {
                 self.runtime_state = TitleSummaryRuntimeState::Error;
                 self.last_runtime_error = Some(error);
             }
-        } else if model_provider && boundary {
+        } else if model_provider {
+            // A due wake gated by the minimum interval or an active backoff must
+            // re-arm `next_refresh` to the next ADMISSIBLE instant — for the timer
+            // case as much as for a boundary. Leaving an elapsed deadline behind
+            // makes `next_retry()` feed the past instant into `about_to_wait`'s
+            // `WaitUntil`, which fires immediately: the event loop busy-spins
+            // through full snapshots until the gate finally opens.
             let interval_deadline = entry.last_request.map_or(now, |last| last + interval);
             let deadline = entry
                 .backoff_until
                 .map_or(interval_deadline, |backoff| backoff.max(interval_deadline));
+            debug_assert!(
+                deadline > now,
+                "a gated refresh implies a closed interval/backoff gate, whose \
+                 deadline lies strictly in the future"
+            );
             entry.next_refresh = Some(deadline);
         }
         if let Some(job) = queued {
@@ -831,6 +884,10 @@ impl Coordinator {
 
     pub(crate) fn retire(&mut self, session: u64) {
         self.entries.remove(&session);
+        self.compose_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(owner, _), _| *owner != session);
         self.due_observation_queue
             .retain(|queued| *queued != session);
         if !retry_pending_after(ObservationRetryTransition::Retired) {
@@ -1019,6 +1076,10 @@ impl Coordinator {
         if let Some(worker) = self.worker.take() {
             worker.shutdown();
         }
+        self.compose_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         // A cold process replacement can fail and return to this App. Clearing the
         // resolved key makes the ordinary reconfigure path recreate a fresh worker
         // and exact authority instead of leaving shutdown state permanently inert.
@@ -1029,6 +1090,9 @@ impl Coordinator {
         self.runtime_endpoint = None;
     }
 
+    /// Compose the presented label as a fresh `String`. Same cache and fast path
+    /// as [`Self::compose_label_into`]; per-frame paths that own a reusable slot
+    /// should prefer that method to avoid the return-value allocation.
     #[must_use]
     pub(crate) fn compose(
         &self,
@@ -1039,6 +1103,40 @@ impl Coordinator {
         config: &Config,
         separator: &str,
     ) -> String {
+        let mut label = raw_title.to_string();
+        self.compose_label_into(
+            session,
+            authored_description,
+            format,
+            config,
+            separator,
+            &mut label,
+        );
+        label
+    }
+
+    /// Compose the presented label IN PLACE: `slot` arrives holding the raw
+    /// title and leaves holding the composed label.
+    ///
+    /// Per-frame contract (the tab strip re-labels every tab on every redraw):
+    /// - CLEAN FAST PATH: with no description to merge and a title the chrome
+    ///   sanitizer would pass through unchanged, the raw title IS the label —
+    ///   no sanitize/grapheme pass, no allocation, no cache traffic.
+    /// - CACHE HIT: an unchanged (title, description) pair for this session and
+    ///   format/separator flavor reuses the stored `String` via `clone_from`
+    ///   into the resident slot — no fresh allocation after warmup.
+    /// - CACHE MISS: sanitize + grapheme-cap + compose once, then store. Tab
+    ///   (`" · "`) and window (`" — "`) flavors occupy separate keys so the two
+    ///   per-frame callers cannot evict each other.
+    pub(crate) fn compose_label_into(
+        &self,
+        session: Option<u64>,
+        authored_description: Option<&str>,
+        format: TitleFormat,
+        config: &Config,
+        separator: &str,
+        slot: &mut String,
+    ) {
         let activity = session
             .and_then(|id| self.activity(id, config))
             .unwrap_or_default();
@@ -1046,12 +1144,54 @@ impl Coordinator {
             .map(str::trim)
             .filter(|description| !description.is_empty())
             .unwrap_or(activity);
-        // Durable OSC/session metadata remains complete in its owner. Only the
-        // native chrome projection is sanitized and grapheme-capped, preventing a
-        // 1024-byte authored field from becoming an enormous tab/window title.
-        let title = chrome_presentation_text(raw_title, MAX_CHROME_TITLE_GRAPHEMES);
-        let description = chrome_presentation_text(description, MAX_CHROME_DESCRIPTION_GRAPHEMES);
-        compose_parts(&title, &description, format, separator)
+        if description.is_empty() && !slot.is_empty() && title_is_presentation_clean(slot) {
+            return;
+        }
+        let Some(session) = session else {
+            // Session-less chrome (native surfaces, tests) has no stable cache
+            // identity; compose directly.
+            let composed = compose_presentation(slot, description, format, separator);
+            #[cfg(test)]
+            self.compose_runs.fetch_add(1, Ordering::Relaxed);
+            slot.clone_from(&composed);
+            return;
+        };
+        let mut input = std::collections::hash_map::DefaultHasher::new();
+        slot.hash(&mut input);
+        description.hash(&mut input);
+        let input_hash = input.finish();
+        let mut flavor = std::collections::hash_map::DefaultHasher::new();
+        format.as_str().hash(&mut flavor);
+        separator.hash(&mut flavor);
+        let key = (session, flavor.finish());
+        let mut cache = self
+            .compose_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.get(&key)
+            && cached.input_hash == input_hash
+        {
+            slot.clone_from(&cached.composed);
+            return;
+        }
+        #[cfg(test)]
+        self.compose_runs.fetch_add(1, Ordering::Relaxed);
+        let composed = compose_presentation(slot, description, format, separator);
+        slot.clone_from(&composed);
+        cache.insert(
+            key,
+            ComposedLabel {
+                input_hash,
+                composed,
+            },
+        );
+    }
+
+    /// Number of full label compositions performed so far (cache misses plus
+    /// session-less composes). Frame-path tests pin cache hits with this.
+    #[cfg(test)]
+    pub(crate) fn compose_runs(&self) -> u64 {
+        self.compose_runs.load(Ordering::Relaxed)
     }
 
     fn dispatch_next(&mut self) {
@@ -1612,6 +1752,20 @@ fn semantic_stamp(term: &Terminal) -> SemanticStamp {
     }
 }
 
+/// Content hash over exactly the [`Snapshot`] fields that reach the provider
+/// prompt (see [`snapshot_prompt`]). Two snapshots hashing equal produce
+/// byte-identical prompts, which is what makes the timer-refresh dedup sound.
+fn snapshot_content_hash(snapshot: &Snapshot) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    snapshot.title.hash(&mut hash);
+    snapshot.cwd.hash(&mut hash);
+    snapshot.command.hash(&mut hash);
+    snapshot.state.hash(&mut hash);
+    snapshot.exit_code.hash(&mut hash);
+    snapshot.recent_output.hash(&mut hash);
+    hash.finish()
+}
+
 fn hash_semantic_prefix(value: &str) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     for ch in value
@@ -1938,6 +2092,36 @@ fn uppercase_first(value: &str) -> String {
         return String::new();
     };
     first.to_uppercase().chain(chars).collect()
+}
+
+/// The uncached full composition. Durable OSC/session metadata remains complete
+/// in its owner; only this native chrome projection is sanitized and
+/// grapheme-capped, preventing a 1024-byte authored field from becoming an
+/// enormous tab/window title.
+fn compose_presentation(
+    raw_title: &str,
+    description: &str,
+    format: TitleFormat,
+    separator: &str,
+) -> String {
+    let title = chrome_presentation_text(raw_title, MAX_CHROME_TITLE_GRAPHEMES);
+    let description = chrome_presentation_text(description, MAX_CHROME_DESCRIPTION_GRAPHEMES);
+    compose_parts(&title, &description, format, separator)
+}
+
+/// True when the chrome sanitizer and grapheme cap pass `title` through
+/// byte-identical, so a composition WITHOUT a description may keep it as-is.
+/// Printable ASCII with single interior spaces and no edge spaces is exactly
+/// identity under `canonical_single_line` (nothing filtered, collapsed, or
+/// trimmed), and each such byte is one grapheme, so the cap reduces to `len()`.
+/// `compose_parts` then returns the (already-trimmed, non-empty) title verbatim
+/// for every format when the description side is empty.
+fn title_is_presentation_clean(title: &str) -> bool {
+    title.len() <= MAX_CHROME_TITLE_GRAPHEMES
+        && !title.starts_with(' ')
+        && !title.ends_with(' ')
+        && !title.contains("  ")
+        && title.bytes().all(|byte| (b' '..=b'~').contains(&byte))
 }
 
 fn compose_parts(title: &str, description: &str, format: TitleFormat, separator: &str) -> String {
@@ -5333,6 +5517,22 @@ mod tests {
         (request_rx, result_tx)
     }
 
+    /// A successful managed-local completion carrying `job`'s exact freshness
+    /// stamps, so `poll` applies it.
+    fn ok_result_for(job: &Job, text: &str, endpoint: &str) -> WorkerMessage {
+        WorkerMessage::Result(WorkerResult {
+            session: job.session,
+            session_epoch: job.session_epoch,
+            generation: job.generation,
+            authority_epoch: job.authority_epoch,
+            config_fingerprint: job.config_fingerprint,
+            result: Ok(text.to_string()),
+            locality: TitleSummaryLocality::ManagedLocal,
+            effective_endpoint: Some(endpoint.to_string()),
+            managed_install_present: true,
+        })
+    }
+
     #[cfg(unix)]
     fn spawn_dedicated_test_child() -> std::process::Child {
         let mut command = std::process::Command::new("sleep");
@@ -6186,7 +6386,7 @@ mod tests {
             title_summary_interval_seconds: Some(5),
             ..Config::default()
         };
-        let term = Terminal::new(2, 20);
+        let mut term = Terminal::new(2, 20);
         let start = Instant::now();
         coordinator.observe(7, &term, &config, true, start);
         assert_eq!(coordinator.entries[&7].generation, 1);
@@ -6203,6 +6403,9 @@ mod tests {
                 .due_observations(start + Duration::from_secs(5), Some(7))
                 .contains(&7)
         );
+        // New output within the same command changes prompt content without a
+        // semantic boundary; the due periodic refresh must admit a replacement.
+        term.process(b"progress line\r\n");
         coordinator.observe(7, &term, &config, true, start + Duration::from_secs(5));
         assert_eq!(coordinator.entries[&7].generation, 2);
         let health = coordinator.health(start + Duration::from_secs(5), &config);
@@ -6360,6 +6563,348 @@ mod tests {
         assert_eq!(crashed["endpoint1"], 0);
         assert_eq!(crashed["health_endpoint1"], 0);
         assert!(model.check_invariant("RevokedHealthIsClear", &crashed));
+    }
+
+    /// Regression: a managed-runtime exit re-arms every session at `now`, so the
+    /// next timer wake usually lands inside the minimum interval. That gated
+    /// wake must move `next_refresh` to the next admissible instant — the old
+    /// code re-armed only at semantic boundaries, so the elapsed deadline made
+    /// `next_retry()` keep returning a past instant, `about_to_wait`'s
+    /// `WaitUntil` fired immediately, and the event loop busy-spun through full
+    /// snapshots (including the sensitive-text scan) for up to a whole interval.
+    #[test]
+    fn gated_wake_after_managed_runtime_exit_rearms_into_the_future() {
+        let mut coordinator = Coordinator::new(None);
+        let config = Config {
+            title_summary_provider: Some(TitleSummaryProvider::Ollama),
+            title_summary_interval_seconds: Some(300),
+            ..Config::default()
+        };
+        assert!(coordinator.reconfigure(&config));
+        let (request_rx, result_tx) = install_test_worker(&mut coordinator);
+        let mut term = Terminal::new(2, 20);
+        let start = Instant::now();
+        coordinator.observe(7, &term, &config, true, start);
+        let job = request_rx
+            .try_recv()
+            .expect("the first observation dispatches");
+        let endpoint = "http://127.0.0.1:32123/api/chat";
+        result_tx
+            .send(ok_result_for(&job, "Running tests", endpoint))
+            .unwrap();
+        assert_eq!(coordinator.poll(&config), vec![7]);
+
+        result_tx
+            .send(WorkerMessage::ManagedRuntimeExited(ManagedRuntimeExit {
+                endpoint: endpoint.to_string(),
+                authority_epoch: job.authority_epoch,
+            }))
+            .unwrap();
+        assert!(coordinator.poll(&config).is_empty());
+        let woke = Instant::now();
+        assert!(
+            coordinator
+                .next_retry()
+                .is_some_and(|deadline| deadline <= woke),
+            "the exit makes every session due for one immediate observation"
+        );
+
+        // The wake lands inside the 300 s minimum: timer-due but inadmissible.
+        // It must not queue work and must leave no elapsed deadline behind.
+        coordinator.observe(7, &term, &config, true, woke);
+        assert!(coordinator.pending.is_empty());
+        assert!(request_rx.try_recv().is_err());
+        let rearmed = coordinator
+            .next_retry()
+            .expect("the session stays scheduled");
+        assert!(
+            rearmed > woke,
+            "a gated wake must re-arm strictly into the future"
+        );
+        assert_eq!(
+            coordinator.entries[&7].next_refresh,
+            Some(start + Duration::from_secs(300)),
+            "the re-arm is the next admissible instant"
+        );
+
+        // A due-and-admissible refresh still fires: past the minimum, the same
+        // session queues exactly one replacement request.
+        term.process(b"fresh output after the crash\r\n");
+        coordinator.observe(7, &term, &config, true, start + Duration::from_secs(300));
+        let refreshed = request_rx
+            .try_recv()
+            .expect("an admissible refresh dispatches");
+        assert_eq!(refreshed.session, 7);
+    }
+
+    /// An idle session's timer refresh re-captures a byte-identical snapshot,
+    /// and an identical prompt can only reproduce the label already shown. The
+    /// refresh is skipped and re-armed; real new output re-admits.
+    #[test]
+    fn idle_timer_refreshes_skip_identical_snapshots_until_content_changes() {
+        let mut coordinator = Coordinator::new(None);
+        let config = Config {
+            title_summary_provider: Some(TitleSummaryProvider::Ollama),
+            title_summary_interval_seconds: Some(5),
+            ..Config::default()
+        };
+        assert!(coordinator.reconfigure(&config));
+        let (request_rx, result_tx) = install_test_worker(&mut coordinator);
+        let mut term = Terminal::new(2, 20);
+        let start = Instant::now();
+        coordinator.observe(7, &term, &config, true, start);
+        let job = request_rx
+            .try_recv()
+            .expect("the first observation dispatches");
+        result_tx
+            .send(ok_result_for(
+                &job,
+                "Quiet shell",
+                "http://127.0.0.1:32123/api/chat",
+            ))
+            .unwrap();
+        assert_eq!(coordinator.poll(&config), vec![7]);
+
+        // Two timer refreshes over the unchanged terminal: neither may enqueue,
+        // each re-arms the next periodic check, and the applied result's
+        // generation survives (a skip must not revoke it).
+        coordinator.observe(7, &term, &config, true, start + Duration::from_secs(5));
+        assert!(request_rx.try_recv().is_err());
+        assert!(coordinator.pending.is_empty());
+        assert_eq!(coordinator.entries[&7].generation, 1);
+        assert_eq!(
+            coordinator.entries[&7].next_refresh,
+            Some(start + Duration::from_secs(10))
+        );
+        coordinator.observe(7, &term, &config, true, start + Duration::from_secs(10));
+        assert!(request_rx.try_recv().is_err());
+        assert!(coordinator.pending.is_empty());
+        assert_eq!(coordinator.activity(7, &config), Some("Quiet shell"));
+
+        // New output changes prompt content without a semantic boundary: the
+        // next due refresh admits exactly one superseding request.
+        term.process(b"compiling aterm-gui\r\n");
+        coordinator.observe(7, &term, &config, true, start + Duration::from_secs(15));
+        let refreshed = request_rx.try_recv().expect("changed content re-admits");
+        assert_eq!(refreshed.session, 7);
+        assert_eq!(
+            coordinator.entries[&7].generation, 2,
+            "a real periodic request supersedes the applied result"
+        );
+    }
+
+    /// The dedup must never absorb an error retry: a failed request sets
+    /// `dirty`, so the post-backoff refresh re-dispatches even though snapshot
+    /// content is unchanged (the failure was transport, not content).
+    #[test]
+    fn failure_retry_dispatches_over_an_unchanged_snapshot() {
+        let mut coordinator = Coordinator::new(None);
+        let config = Config {
+            title_summary_provider: Some(TitleSummaryProvider::Ollama),
+            title_summary_interval_seconds: Some(5),
+            ..Config::default()
+        };
+        assert!(coordinator.reconfigure(&config));
+        let (request_rx, result_tx) = install_test_worker(&mut coordinator);
+        let term = Terminal::new(2, 20);
+        let start = Instant::now();
+        coordinator.observe(7, &term, &config, true, start);
+        let job = request_rx
+            .try_recv()
+            .expect("the first observation dispatches");
+        result_tx
+            .send(WorkerMessage::Result(WorkerResult {
+                session: job.session,
+                session_epoch: job.session_epoch,
+                generation: job.generation,
+                authority_epoch: job.authority_epoch,
+                config_fingerprint: job.config_fingerprint,
+                result: Err("connection refused".to_string()),
+                locality: TitleSummaryLocality::ManagedLocal,
+                effective_endpoint: None,
+                managed_install_present: true,
+            }))
+            .unwrap();
+        assert!(coordinator.poll(&config).is_empty());
+        assert!(
+            coordinator.entries[&7].dirty,
+            "a failure marks the entry for a real retry"
+        );
+        let retry_at = coordinator.entries[&7]
+            .backoff_until
+            .expect("a failure arms a backoff");
+
+        coordinator.observe(7, &term, &config, true, retry_at + Duration::from_secs(5));
+        let retried = request_rx
+            .try_recv()
+            .expect("the backoff retry must reach the provider");
+        assert_eq!(retried.session, 7);
+        assert_eq!(retried.generation, 2);
+    }
+
+    /// Tab and window chrome recompose labels every frame. Unchanged inputs
+    /// must be served from the per-session compose cache rather than re-running
+    /// sanitize/grapheme passes and allocations each frame.
+    #[test]
+    fn composed_labels_cache_per_session_until_title_or_description_changes() {
+        let mut coordinator = Coordinator::new(None);
+        let config = Config {
+            title_summary_provider: Some(TitleSummaryProvider::Ollama),
+            ..Config::default()
+        };
+        assert!(coordinator.reconfigure(&config));
+        // Hold the lane synthetically: no worker, no provider I/O.
+        coordinator.in_flight = Some((99, 99, 99, 99, 99));
+        let term = Terminal::new(2, 20);
+        coordinator.observe(7, &term, &config, true, Instant::now());
+        coordinator.set_test_activity(7, "Compiling the release build");
+
+        let first = coordinator.compose(
+            Some(7),
+            "make",
+            None,
+            TitleFormat::TitleDescription,
+            &config,
+            " · ",
+        );
+        assert_eq!(first, "make · Compiling the release build");
+        let runs = coordinator.compose_runs();
+        assert!(runs >= 1);
+        let second = coordinator.compose(
+            Some(7),
+            "make",
+            None,
+            TitleFormat::TitleDescription,
+            &config,
+            " · ",
+        );
+        assert_eq!(second, first);
+        assert_eq!(
+            coordinator.compose_runs(),
+            runs,
+            "unchanged inputs reuse the cached label"
+        );
+
+        // The window flavor occupies its own slot: the two per-frame callers
+        // alternate every frame and must not evict each other.
+        let window_first = coordinator.compose(
+            Some(7),
+            "make",
+            None,
+            TitleFormat::TitleDescription,
+            &config,
+            " — ",
+        );
+        assert_eq!(window_first, "make — Compiling the release build");
+        let warm = coordinator.compose_runs();
+        let tab_again = coordinator.compose(
+            Some(7),
+            "make",
+            None,
+            TitleFormat::TitleDescription,
+            &config,
+            " · ",
+        );
+        let window_again = coordinator.compose(
+            Some(7),
+            "make",
+            None,
+            TitleFormat::TitleDescription,
+            &config,
+            " — ",
+        );
+        assert_eq!(tab_again, first);
+        assert_eq!(window_again, window_first);
+        assert_eq!(
+            coordinator.compose_runs(),
+            warm,
+            "flavors are cached independently"
+        );
+
+        // A title change recomposes once; a description change recomposes once.
+        let retitled = coordinator.compose(
+            Some(7),
+            "make check",
+            None,
+            TitleFormat::TitleDescription,
+            &config,
+            " · ",
+        );
+        assert_eq!(retitled, "make check · Compiling the release build");
+        assert_eq!(coordinator.compose_runs(), warm + 1);
+        coordinator.set_test_activity(7, "Linking objects");
+        let redescribed = coordinator.compose(
+            Some(7),
+            "make check",
+            None,
+            TitleFormat::TitleDescription,
+            &config,
+            " · ",
+        );
+        assert_eq!(redescribed, "make check · Linking objects");
+        assert_eq!(coordinator.compose_runs(), warm + 2);
+
+        // Retirement drops the session's cache slots with the session.
+        coordinator.retire(7);
+        assert!(
+            coordinator
+                .compose_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    /// The clean-title fast path must be indistinguishable from the full
+    /// sanitize/grapheme composition, and must reject every title the
+    /// sanitizer would actually rewrite.
+    #[test]
+    fn clean_title_fast_path_matches_full_composition() {
+        let coordinator = Coordinator::new(None);
+        let config = Config::default();
+        let long_clean = "x".repeat(MAX_CHROME_TITLE_GRAPHEMES);
+        let clean = ["vim", "cargo build --release", "a b c", long_clean.as_str()];
+        for title in clean {
+            assert!(title_is_presentation_clean(title), "{title:?}");
+        }
+        let over_cap = "y".repeat(MAX_CHROME_TITLE_GRAPHEMES + 1);
+        let dirty = [
+            " padded ",
+            "two  spaces",
+            "tab\there",
+            "combining e\u{301}",
+            "bidi \u{202e}spoof",
+            over_cap.as_str(),
+        ];
+        for title in dirty {
+            assert!(!title_is_presentation_clean(title), "{title:?}");
+        }
+        for title in clean.iter().copied().chain(dirty.iter().copied()) {
+            let composed = coordinator.compose(
+                None,
+                title,
+                None,
+                TitleFormat::TitleDescription,
+                &config,
+                " · ",
+            );
+            let expected = compose_parts(
+                &chrome_presentation_text(title, MAX_CHROME_TITLE_GRAPHEMES),
+                "",
+                TitleFormat::TitleDescription,
+                " · ",
+            );
+            assert_eq!(composed, expected, "{title:?}");
+        }
+        let empty = coordinator.compose(
+            None,
+            "",
+            None,
+            TitleFormat::TitleDescription,
+            &config,
+            " · ",
+        );
+        assert_eq!(empty, "aterm", "an empty title still resolves the fallback");
     }
 
     #[test]

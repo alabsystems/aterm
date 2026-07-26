@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! P2 — the cross-platform accessibility tree for the Settings overlay, built from the
-//! SAME [`crate::settings::SettingsState`] model the pixels and the `controls settings`
-//! verb use. One model, three consumers: the drawn cells, the introspection serializer,
-//! and (here) an [`accesskit::TreeUpdate`] that `accesskit_winit` fans out to the OS
+//! P2 — the retired overlay model's cross-platform accessibility prototype. Production
+//! Settings accessibility and `controls settings` both consume the native compiled
+//! semantic tree; this feature-gated module remains only for legacy model coverage. It
+//! maps [`crate::settings::SettingsState`] into an [`accesskit::TreeUpdate`] that
+//! `accesskit_winit` fans out to the OS
 //! accessibility APIs (UIA on Windows, AT-SPI on Linux, NSAccessibility on macOS) — so a
 //! screen reader, an AI, and the on-glass view can never disagree.
 //!

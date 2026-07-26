@@ -276,7 +276,7 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
          frame_w={} frame_h={} surface_w={} surface_h={} offset_x={} offset_y={} \
          band_left={} band_right={} band_top={} band_bottom={} crop_left={} \
          crop_right={} crop_top={} crop_bottom={} pad={} pad_top={} pad_bottom={} head={} \
-         tab_rows={} hud_rows={} viewers={} visible_viewers={} geometry={} \
+         tab_rows={} viewers={} visible_viewers={} geometry={} \
          present_retry_state={} present_retry_count={} present_retry_remaining={} \
          present_retry_in_ms={}\n",
         snapshot.rows,
@@ -312,7 +312,6 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
         snapshot.pad_bottom,
         snapshot.head,
         snapshot.tab_rows,
-        snapshot.hud_rows,
         snapshot.viewers,
         snapshot.visible_viewers,
         snapshot.geometry,
@@ -389,6 +388,10 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         let (input, present, render) = crate::metrics::distributions();
         let key_write = crate::metrics::key_write_distribution();
         let pre_present = crate::metrics::pre_present_distribution();
+        // The drawable-park slice. Until this existed the largest known macOS typing
+        // stall could only be estimated as `redraw_total - compose - render`, mixed
+        // with the post-present tail — so a regression in it moved no published number.
+        let acquire = crate::metrics::acquire_wait_distribution();
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
         return format!(
             "OK n_input={} input_p50_ms={:.2} input_p95_ms={:.2} input_p99_ms={:.2} \
@@ -396,7 +399,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              n_render={} render_p50_ms={:.2} render_p95_ms={:.2} render_p99_ms={:.2} \
              n_key_write={} key_write_p50_ms={:.2} key_write_p95_ms={:.2} \
              key_write_p99_ms={:.2} n_pre_present={} pre_present_p50_ms={:.2} \
-             pre_present_p95_ms={:.2} pre_present_p99_ms={:.2}\n",
+             pre_present_p95_ms={:.2} pre_present_p99_ms={:.2} \
+             n_acquire={} acquire_p50_ms={:.2} acquire_p95_ms={:.2} acquire_p99_ms={:.2}\n",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -417,6 +421,10 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             p(pre_present, 0.50),
             p(pre_present, 0.95),
             p(pre_present, 0.99),
+            acquire.count(),
+            p(acquire, 0.50),
+            p(acquire, 0.95),
+            p(acquire, 0.99),
         );
     }
     if rest.trim() == "reset" {
@@ -608,103 +616,6 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.max_frame_gap_ns),
         ms(m.first_present_ns),
     ))
-}
-
-/// `widgets [json]` -> the UNIFIED system-metrics snapshot the widget tray renders:
-/// system CPU/mem/GPU capacity+usage, THIS tab's CPU/RSS, disk, and network health —
-/// read straight from the one metrics-service snapshot (never re-collected here).
-/// Honesty is preserved on the wire: an unavailable figure is `na` (text) / `null`
-/// (json); an approximate one is `approx:<v>`; per-tab GPU is `unobtainable`.
-/// `widgets --json` / `widgets json` -> the live HUD panel figures as one JSON
-/// object on the `OK` line (Status-framed: single line, so no framing flip).
-/// Factored out of [`cmd_widgets`] so the inline sub-form and the central
-/// `--json` dispatch share ONE emitter — an explicit json request is never
-/// answered with the text shape.
-pub(crate) fn cmd_widgets_json() -> String {
-    use crate::metrics_service::{Avail, NetHealth, global_snapshot};
-    let Some(s) = global_snapshot() else {
-        return "ERR metrics service not ready\n".to_string();
-    };
-    let net = match s.net_health {
-        NetHealth::Offline => "offline",
-        NetHealth::Online => "online",
-        NetHealth::Slow => "slow",
-        NetHealth::Unknown => "unknown",
-    };
-    let jf = |a: Avail<f64>| a.value().map_or("null".to_string(), |v| format!("{v:.4}"));
-    let ju = |a: Avail<u64>| a.value().map_or("null".to_string(), |v| v.to_string());
-    format!(
-        "OK {{\"cpu_cap\":{},\"cpu_sys\":{},\"cpu_tab\":{},\"mem_total\":{},\
-         \"mem_sys\":{},\"mem_tab\":{},\"mem_self\":{},\"gpu_sys\":{},\"gpu_tab\":null,\
-         \"vram_budget\":{},\"vram_used\":{},\"disk_free\":{},\"disk_total\":{},\
-         \"net\":\"{}\",\"rx_bps\":{},\"tx_bps\":{},\"link_baud\":{}}}\n",
-        s.cpu_cores,
-        jf(s.cpu_system),
-        jf(s.tab_cpu),
-        s.mem_total,
-        jf(s.mem_system),
-        ju(s.tab_rss),
-        ju(s.mem_self),
-        jf(s.gpu_system),
-        ju(s.gpu_vram_budget),
-        ju(s.gpu_vram_used),
-        ju(s.disk_free),
-        ju(s.disk_total),
-        net,
-        jf(s.net_rx_bps),
-        jf(s.net_tx_bps),
-        ju(s.net_link_baud),
-    )
-}
-
-pub(crate) fn cmd_widgets(rest: &str) -> String {
-    use crate::metrics_service::{Avail, NetHealth, global_snapshot};
-    let Some(s) = global_snapshot() else {
-        return "ERR metrics service not ready\n".to_string();
-    };
-    let net = match s.net_health {
-        NetHealth::Offline => "offline",
-        NetHealth::Online => "online",
-        NetHealth::Slow => "slow",
-        NetHealth::Unknown => "unknown",
-    };
-    // Both the inline `widgets json` sub-form and the central `widgets --json`
-    // dispatch route here, so an EXPLICIT json request can never silently fall
-    // back to the text shape (the F24 class the audit closed for other verbs).
-    if rest.trim() == "json" {
-        return cmd_widgets_json();
-    }
-    let f = |a: Avail<f64>| match a {
-        Avail::Ok(v) => format!("{v:.3}"),
-        Avail::BestEffort(v) => format!("approx:{v:.3}"),
-        Avail::Unavailable => "na".to_string(),
-    };
-    let u = |a: Avail<u64>| match a {
-        Avail::Ok(v) => v.to_string(),
-        Avail::BestEffort(v) => format!("approx:{v}"),
-        Avail::Unavailable => "na".to_string(),
-    };
-    format!(
-        "OK cpu_cap={} cpu_sys={} cpu_tab={} mem_total={} mem_sys={} mem_tab={} mem_self={} \
-         gpu_sys={} gpu_tab=unobtainable vram_budget={} vram_used={} \
-         disk_free={} disk_total={} net={} rx_bps={} tx_bps={} link_baud={}\n",
-        s.cpu_cores,
-        f(s.cpu_system),
-        f(s.tab_cpu),
-        s.mem_total,
-        f(s.mem_system),
-        u(s.tab_rss),
-        u(s.mem_self),
-        f(s.gpu_system),
-        u(s.gpu_vram_budget),
-        u(s.gpu_vram_used),
-        u(s.disk_free),
-        u(s.disk_total),
-        net,
-        f(s.net_rx_bps),
-        f(s.net_tx_bps),
-        u(s.net_link_baud),
-    )
 }
 
 /// `lines` -> `OK <total_scrollback_lines>\n` — how many lines of history
@@ -1635,58 +1546,108 @@ fn underline_style_name(u: UnderlineStyle) -> &'static str {
 ///
 /// Serializes from a [`StyledCellSnap`] gathered under the terminal lock, so the
 /// per-cell `format!` — the bulk of the frame cost — runs with the lock released.
-fn styled_cell_json(snap: &StyledCellSnap) -> String {
+/// Lowercase two-hex-digit bytes for one RGB triple, table-driven.
+///
+/// `write!("{:02x}")` routes through `core::fmt`'s dynamic machinery — trait
+/// objects, a width/fill state machine — for what is ultimately two array
+/// lookups. The lossless frame writes SIX of these per cell (fg, bg, and the
+/// optional underline colour), so on a large window that is ~90 000 formatter
+/// invocations per snapshot. Same bytes, none of the machinery.
+fn push_hex_rgb(out: &mut String, rgb: [u8; 3]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for b in rgb {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+}
+
+/// A JSON boolean without the formatter (four per cell).
+fn push_bool(out: &mut String, v: bool) {
+    out.push_str(if v { "true" } else { "false" });
+}
+
+/// One lossless cell, APPENDED to `out` — byte-identical to the allocating twin
+/// above, with none of its allocations.
+///
+/// This is the hot loop of the whole introspection surface: `screen` and every
+/// `subscribe … cells` push run it once per cell, up to ~15 000 per snapshot on
+/// a large window, on every change, for every subscriber. The retired version
+/// spent ~6 heap allocations per cell before it wrote a byte — three of them
+/// (`underline_color`, `hyperlink`, `hyperlink_id`) existing only to spell the
+/// literal `null`, plus a `Vec<&str>` of attribute names, a `String` per
+/// attribute, and a `String` for the escaped glyph — then the result was copied
+/// into a per-row `String` and again into the frame. Writing straight into the
+/// destination removes all of it; the bytes are unchanged.
+fn write_styled_cell_json(out: &mut String, snap: &StyledCellSnap) {
     let cell = &snap.cell;
-    let mut attrs: Vec<&str> = Vec::new();
+    out.push_str("{\"glyph\":\"");
+    crate::control::json_escape_into(out, &snap.glyph);
+    out.push_str("\",\"fg\":\"");
+    push_hex_rgb(out, cell.fg);
+    out.push_str("\",\"bg\":\"");
+    push_hex_rgb(out, cell.bg);
+    out.push_str("\",\"attrs\":[");
+    // The attribute list, comma-joined in place (no Vec, no per-name String).
+    let mut first = true;
+    let mut attr = |out: &mut String, name: &str| {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push('"');
+        out.push_str(name);
+        out.push('"');
+    };
     if cell.bold {
-        attrs.push("bold");
+        attr(out, "bold");
     }
     if cell.italic {
-        attrs.push("italic");
+        attr(out, "italic");
     }
     if cell.underline != UnderlineStyle::None {
-        attrs.push("underline");
+        attr(out, "underline");
     }
     if cell.strikethrough {
-        attrs.push("strike");
+        attr(out, "strike");
     }
-    let attrs_json = attrs
-        .iter()
-        .map(|a| format!("\"{a}\""))
-        .collect::<Vec<_>>()
-        .join(",");
-    let glyph: &str = &snap.glyph;
-    let underline_color = cell.underline_color.map_or_else(
-        || "null".to_string(),
-        |[r, g, b]| format!("\"{r:02x}{g:02x}{b:02x}\""),
-    );
-    let hyperlink = snap
-        .hyperlink
-        .as_deref()
-        .map_or_else(|| "null".to_string(), |u| format!("\"{}\"", json_escape(u)));
-    let hyperlink_id = snap
-        .hyperlink_id
-        .as_deref()
-        .map_or_else(|| "null".to_string(), |i| format!("\"{}\"", json_escape(i)));
-    let wide_lead = snap.wide_lead;
-    format!(
-        "{{\"glyph\":\"{}\",\"fg\":\"{:02x}{:02x}{:02x}\",\"bg\":\"{:02x}{:02x}{:02x}\",\
-         \"attrs\":[{attrs_json}],\"underline_style\":\"{}\",\"overline\":{},\
-         \"underline_color\":{underline_color},\"emoji_presentation\":{},\
-         \"wide\":{},\"wide_lead\":{wide_lead},\"hyperlink\":{hyperlink},\
-         \"hyperlink_id\":{hyperlink_id}}}",
-        json_escape(glyph),
-        cell.fg[0],
-        cell.fg[1],
-        cell.fg[2],
-        cell.bg[0],
-        cell.bg[1],
-        cell.bg[2],
-        underline_style_name(cell.underline),
-        cell.overline,
-        cell.emoji_presentation,
-        cell.wide,
-    )
+    out.push_str("],\"underline_style\":\"");
+    out.push_str(underline_style_name(cell.underline));
+    out.push_str("\",\"overline\":");
+    push_bool(out, cell.overline);
+    out.push_str(",\"underline_color\":");
+    match cell.underline_color {
+        Some(rgb) => {
+            out.push('"');
+            push_hex_rgb(out, rgb);
+            out.push('"');
+        }
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"emoji_presentation\":");
+    push_bool(out, cell.emoji_presentation);
+    out.push_str(",\"wide\":");
+    push_bool(out, cell.wide);
+    out.push_str(",\"wide_lead\":");
+    push_bool(out, snap.wide_lead);
+    out.push_str(",\"hyperlink\":");
+    match snap.hyperlink.as_deref() {
+        Some(u) => {
+            out.push('"');
+            crate::control::json_escape_into(out, u);
+            out.push('"');
+        }
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"hyperlink_id\":");
+    match snap.hyperlink_id.as_deref() {
+        Some(i) => {
+            out.push('"');
+            crate::control::json_escape_into(out, i);
+            out.push('"');
+        }
+        None => out.push_str("null"),
+    }
+    out.push('}');
 }
 
 /// The wire name of a DEC [`LineSize`](aterm_core::grid::LineSize): the renderer
@@ -1863,11 +1824,30 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
 /// Lock-free by construction (the snapshot owns everything it reads); the wire
 /// format is byte-identical to the historical under-lock serializer.
 pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
-    let mut row_items: Vec<String> = Vec::with_capacity(snap.rows);
-    for row_cells in &snap.cells {
-        let cells: Vec<String> = row_cells.iter().map(styled_cell_json).collect();
-        row_items.push(format!("[{}]", cells.join(",")));
+    use std::fmt::Write as _;
+    // ONE buffer for the whole frame. The retired shape built a `String` per
+    // cell, joined those into a `String` per row, then joined the rows into the
+    // frame — three full copies of a payload that reaches megabytes on a large
+    // window, on top of the per-cell allocations. Reserving up front and writing
+    // straight through removes all of it. ~180 bytes/cell is the measured shape
+    // of an ordinary cell; a short read is just one realloc, never wrong.
+    let cell_count = snap.cells.iter().map(Vec::len).sum::<usize>();
+    let mut out = String::with_capacity(256 + cell_count * 180);
+    let mut rows_json = String::with_capacity(cell_count * 180);
+    for (r, row_cells) in snap.cells.iter().enumerate() {
+        if r > 0 {
+            rows_json.push(',');
+        }
+        rows_json.push('[');
+        for (c, cell) in row_cells.iter().enumerate() {
+            if c > 0 {
+                rows_json.push(',');
+            }
+            write_styled_cell_json(&mut rows_json, cell);
+        }
+        rows_json.push(']');
     }
+    let _ = &mut out;
     let line_sizes_json = snap
         .line_sizes
         .iter()
@@ -1883,10 +1863,11 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
         .map(|(ar, ac, img)| styled_image_json(*ar, *ac, img))
         .collect::<Vec<_>>()
         .join(",");
-    format!(
+    let _ = write!(
+        out,
         "{{\"seq\":{},\"dims\":{{\"rows\":{},\"cols\":{}}},\
          \"cursor\":{{\"row\":{},\"col\":{},\"visible\":{},{}}},\
-         \"rows\":[{}],\"line_sizes\":[{line_sizes_json}],\"selection\":{},\
+         \"rows\":[{rows_json}],\"line_sizes\":[{line_sizes_json}],\"selection\":{},\
          \"images\":[{images_json}]}}",
         snap.seq,
         snap.rows,
@@ -1895,9 +1876,9 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
         snap.cursor_col,
         snap.cursor_visible,
         json_str_field("style", snap.cursor_style),
-        row_items.join(","),
         snap.selection_json,
-    )
+    );
+    out
 }
 
 /// Build the whole styled-screen frame as a single-line JSON object:
@@ -1938,9 +1919,6 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         glow_under: _, // OMITTED: host-owned EMBERFORGE under-glyph flame-body light quads, not engine cell content
         fire_patch: _, // OMITTED: host-owned EMBERFORGE per-pixel fire-field patches (render bling), not engine cell content
         cursor_fill_override: _, // OMITTED: host-owned rainbow-cursor block fill, not engine cell content
-        scene_over: _, // OMITTED: host-owned Scene sprite quads (Living Panels), not engine cell content
-        scene_add: _,  // OMITTED: host-owned Scene additive-light quads, not engine cell content
-        scene_atlas: _, // OMITTED: host-owned Scene sprite atlas (texture), not engine cell content
         word_decorations: _, // OMITTED: host-owned sparkle-word decorations, not engine cell content
         ink: _, // OMITTED: host-owned animated-ink fg overrides (render bling), not engine cell content
         char_fg: _, // OMITTED: host-owned EMBERFORGE charred glyph-ink fg overrides (render bling), not engine cell content
@@ -1959,11 +1937,12 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         scroll_frac_px: _, // OMITTED: M1b sub-row present translate, display-only (not cell content)
         grid_top_row: _,   // OMITTED: M1b grid/chrome partition, display-only
         grid_bot_row: _,   // OMITTED: M1b grid/chrome partition, display-only
-        selection: _,      // frame "selection" (F3)
-        clusters: _,       // folded into per-cell "glyph" (cell_grapheme)
-        combining: _,      // folded into per-cell "glyph" (cell_grapheme)
-        line_sizes: _,     // frame "line_sizes" (F2)
-        images: _,         // frame "images" (F1)
+        fx_clip: _, // OMITTED: focused-pane present-time post-fx clip box (split-pane audit), display-only
+        selection: _, // frame "selection" (F3)
+        clusters: _, // folded into per-cell "glyph" (cell_grapheme)
+        combining: _, // folded into per-cell "glyph" (cell_grapheme)
+        line_sizes: _, // frame "line_sizes" (F2)
+        images: _,  // frame "images" (F1)
         default_bg: _, // OMITTED: host-resolved live default-bg for the padding band, not per-cell content (cells carry their own bg)
         cursor_color: _, // OMITTED: host-resolved live cursor colour, host-owned
         snapshot_seq: _, // frame "seq" (the engine content version stamp)
@@ -2004,7 +1983,7 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
          \"surface_w\":{},\"surface_h\":{},\"offset_x\":{},\"offset_y\":{},\
          \"band_left\":{},\"band_right\":{},\"band_top\":{},\"band_bottom\":{},\
          \"crop_left\":{},\"crop_right\":{},\"crop_top\":{},\"crop_bottom\":{},\
-         \"pad\":{},\"pad_top\":{},\"pad_bottom\":{},\"head\":{},\"tab_rows\":{},\"hud_rows\":{},\
+         \"pad\":{},\"pad_top\":{},\"pad_bottom\":{},\"head\":{},\"tab_rows\":{},\
          \"viewers\":{},\"visible_viewers\":{},\"geometry\":\"{}\",\
          \"present_retry_state\":\"{}\",\"present_retry_count\":{},\
          \"present_retry_remaining\":{},\"present_retry_in_ms\":{}}}",
@@ -2041,7 +2020,6 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
         snapshot.pad_bottom,
         snapshot.head,
         snapshot.tab_rows,
-        snapshot.hud_rows,
         snapshot.viewers,
         snapshot.visible_viewers,
         snapshot.geometry,
@@ -2397,76 +2375,6 @@ mod tests {
             raced.content_seq,
             term_lock(&term).content_seq(),
             "the result retains its original coordinate-generation stamp"
-        );
-    }
-
-    /// Golden wire-grammar for the `widgets` verb: the KEY SKELETON (names + order) of
-    /// both the text and json forms is pinned, so a field can never silently drift,
-    /// appear, or reorder as the producers grow. Content (values) is honesty-dependent
-    /// and not asserted here — the honesty STATES are covered in `metrics_service`. Per-
-    /// tab GPU is a hard literal (`gpu_tab=unobtainable` / `"gpu_tab":null`): macOS has
-    /// no per-process GPU counter, so there is no field to fabricate.
-    #[test]
-    fn widgets_wire_grammar_is_golden() {
-        use crate::metrics_service::MetricsService;
-        // Ensure a snapshot is published (first MetricsService wins the process-global
-        // slot; if another test already published one, global_snapshot still returns it).
-        let t0 = std::time::Instant::now();
-        let mut svc = MetricsService::new(t0);
-        svc.sample(None, Some("/"), t0);
-
-        const KEYS: &[&str] = &[
-            "cpu_cap",
-            "cpu_sys",
-            "cpu_tab",
-            "mem_total",
-            "mem_sys",
-            "mem_tab",
-            "mem_self",
-            "gpu_sys",
-            "gpu_tab",
-            "vram_budget",
-            "vram_used",
-            "disk_free",
-            "disk_total",
-            "net",
-            "rx_bps",
-            "tx_bps",
-            "link_baud",
-        ];
-
-        // Text form: "OK k1=v1 k2=v2 ...\n" — split on whitespace, take the key before '='.
-        let text = super::cmd_widgets("");
-        assert!(text.starts_with("OK "), "text form is OK-prefixed: {text}");
-        assert!(text.ends_with('\n'));
-        let text_keys: Vec<&str> = text
-            .trim_start_matches("OK ")
-            .split_whitespace()
-            .map(|tok| tok.split('=').next().unwrap())
-            .collect();
-        assert_eq!(text_keys, KEYS, "text `widgets` key skeleton drifted");
-        assert!(
-            text.contains(" gpu_tab=unobtainable "),
-            "per-tab GPU stays unobtainable: {text}"
-        );
-
-        // Json form: `OK { "k1":v1, ... }` — the `"key":` markers appear in order.
-        let json = super::cmd_widgets("json");
-        assert!(
-            json.starts_with("OK {") && json.trim_end().ends_with('}'),
-            "json form: {json}"
-        );
-        let mut cursor = 0usize;
-        for k in KEYS {
-            let marker = format!("\"{k}\":");
-            let at = json[cursor..]
-                .find(&marker)
-                .unwrap_or_else(|| panic!("json key `{k}` missing or out of order in: {json}"));
-            cursor += at + marker.len();
-        }
-        assert!(
-            json.contains("\"gpu_tab\":null"),
-            "per-tab GPU stays null in json: {json}"
         );
     }
 

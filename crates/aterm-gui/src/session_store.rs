@@ -65,8 +65,9 @@ impl SessionState {
 
     /// Inverse of [`Self::as_str`] for the handoff manifest round-trip; unknown ⇒
     /// `Spawning` (fail-safe: a restored session is addressable + input-safe).
-    // retained scaffolding: only exercised by the handoff round-trip (spec-proven +
-    // tested) which is not yet wired into the live GUI exec path.
+    // LOAD-BEARING WIRE FORMAT — see `SessionHandoff` below. Currently reached
+    // only from tests because `take_incoming` re-derives live state rather than
+    // trusting the carried string, but these spellings ARE the wire.
     #[allow(dead_code)]
     #[must_use]
     pub fn from_str(s: &str) -> Self {
@@ -169,9 +170,22 @@ pub struct SessionHandoff {
     pub window: Option<WindowCarry>,
 }
 
-// retained scaffolding: the seamless re-exec handoff manifest is spec-proven
-// (`handoff_roundtrip_model`) + unit-tested, but not yet wired into the live GUI
-// exec path; origin/main keeps evolving it, so annotate rather than delete.
+// ⚠ LOAD-BEARING WIRE FORMAT — DO NOT "CLEAN UP" THIS SERIALIZATION.
+//
+// (The comment that used to sit here said this was "retained scaffolding … not
+// yet wired into the live GUI exec path". That was false and dangerous: this
+// type IS the shipping seamless update. `seamless::write_outgoing` writes it,
+// `seamless::take_incoming` parses it, and `app_input`'s handoff worker sets it
+// as the child's `ATERM_SEAMLESS_MANIFEST`.)
+//
+// The bytes this emits are hashed by the OUTGOING binary and read back by the
+// INCOMING one, which is a DIFFERENT VERSION by definition. Changing the field
+// set, the field order, the TOML spelling, or `ScreenCarry`'s JSON meta changes
+// what the new binary sees. The adoption proof survives that only because both
+// sides now hash the WIRE BYTES rather than a re-serialization
+// (`seamless::layout_wire_digest` / `seamless::screen_wire_digest`) — keep it
+// that way. Additive `#[serde(default, skip_serializing_if = "…")]` fields are
+// the safe shape; anything else needs a protocol-shape bump.
 #[allow(dead_code)]
 impl SessionHandoff {
     /// Current schema of the handoff manifest.
@@ -249,9 +263,9 @@ impl SessionHandoff {
 /// Wire form: `"<local_id>=<fd>:<pid>,..."` (e.g. `"0=6:12345,1=7:12346"`). Encode/parse
 /// are total + fail-safe: an unparseable entry is skipped (that tab cold-restarts) so a
 /// corrupt/spoofed value can never fabricate a session — it can only fail closed.
-// retained scaffolding: the volatile fd/pid re-exec channel (RFC Rung 1b) is
-// unit-tested but not yet wired into the live GUI exec path; origin/main keeps
-// evolving it, so annotate rather than delete.
+// LOAD-BEARING: this is the LIVE `ATERM_SEAMLESS_FDS` channel. The handoff
+// worker builds it (`app_input`), `seamless::write_outgoing` encodes it, and
+// `seamless::take_incoming` decodes and joins it to the manifest on `local_id`.
 #[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HandoffFds {

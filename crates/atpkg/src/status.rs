@@ -18,6 +18,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::Layout;
 
+/// Maximum serialized size of the operator-readable status record.
+///
+/// A normal record is a few KiB. Two MiB leaves room for a large managed fleet
+/// while making Settings/doctor/verify parsing and allocation strictly finite.
+pub const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum number of per-program rows admitted from one status snapshot.
+pub const MAX_STATUS_PROGRAMS: usize = 2048;
+
 /// One program's last-known state, for `status.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgramStatus {
@@ -76,9 +85,24 @@ impl Status {
 /// Atomically write `status` to `layout.status()` (temp + rename). Best-effort: a failure
 /// is returned but is never fatal to an apply (status is diagnostics).
 pub fn write(layout: &Layout, status: &Status) -> io::Result<()> {
+    if status.programs.len() > MAX_STATUS_PROGRAMS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "status.toml has {} programs; limit is {MAX_STATUS_PROGRAMS}",
+                status.programs.len()
+            ),
+        ));
+    }
     let text = status
         .to_toml()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if text.len() > MAX_STATUS_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("status.toml exceeds the {MAX_STATUS_BYTES}-byte limit"),
+        ));
+    }
     let dest = layout.status();
     // Manual rendering of the previous
     // `format!("status.toml.tmp-{}", std::process::id())` — byte-identical: the
@@ -95,12 +119,41 @@ pub fn write(layout: &Layout, status: &Status) -> io::Result<()> {
     std::fs::rename(&tmp, &dest)
 }
 
-/// Read + parse `status.toml`, or `None` if absent/unparseable (a corrupt diagnostics file
-/// is never load-bearing).
+/// Read + parse `status.toml` with explicit admission/parse diagnostics.
+///
+/// Missing is a normal `Ok(None)`. Existing paths must be bounded regular
+/// non-link files containing valid UTF-8 TOML and no more than
+/// [`MAX_STATUS_PROGRAMS`] rows.
+pub fn read_checked(layout: &Layout) -> io::Result<Option<Status>> {
+    let path = layout.status();
+    let text = match crate::metadata_io::read_bounded_regular_utf8(&path, MAX_STATUS_BYTES) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let status: Status = toml::from_str(&text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("status.toml is invalid: {error}"),
+        )
+    })?;
+    if status.programs.len() > MAX_STATUS_PROGRAMS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "status.toml has {} programs; limit is {MAX_STATUS_PROGRAMS}",
+                status.programs.len()
+            ),
+        ));
+    }
+    Ok(Some(status))
+}
+
+/// Compatibility projection: absent or malformed diagnostics yield `None`.
+/// Interactive surfaces which can show an error should use [`read_checked`].
 #[must_use]
 pub fn read(layout: &Layout) -> Option<Status> {
-    let text = std::fs::read_to_string(layout.status()).ok()?;
-    toml::from_str(&text).ok()
+    read_checked(layout).ok().flatten()
 }
 
 #[cfg(test)]
@@ -185,8 +238,37 @@ mod tests {
     fn read_absent_or_corrupt_is_none() {
         let l = layout("absent");
         assert!(read(&l).is_none(), "absent status reads as None");
+        assert_eq!(read_checked(&l).unwrap(), None);
         std::fs::write(l.status(), "this is not valid toml {{{").unwrap();
         assert!(read(&l).is_none(), "corrupt status is never load-bearing");
+        let error = read_checked(&l).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("status.toml is invalid"));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[test]
+    fn status_program_count_is_bounded_on_read_and_write() {
+        let l = layout("program-cap");
+        let mut programs = BTreeMap::new();
+        for index in 0..=MAX_STATUS_PROGRAMS {
+            programs.insert(format!("p{index}"), ProgramStatus::default());
+        }
+        let status = Status {
+            schema: 1,
+            programs,
+            ..Default::default()
+        };
+        let write_error = write(&l, &status).unwrap_err();
+        assert_eq!(write_error.kind(), io::ErrorKind::InvalidData);
+        assert!(write_error.to_string().contains("limit is"));
+
+        // Bypass the writer to prove a hostile otherwise-valid on-disk record
+        // is rejected by the independent read-side count gate too.
+        std::fs::write(l.status(), status.to_toml().unwrap()).unwrap();
+        let read_error = read_checked(&l).unwrap_err();
+        assert_eq!(read_error.kind(), io::ErrorKind::InvalidData);
+        assert!(read_error.to_string().contains("limit is"));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 }

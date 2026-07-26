@@ -818,6 +818,37 @@ impl MatrixRain {
         self.last_emit_nonempty = false;
     }
 
+    /// The host swapped WHICH grid this engine watches (front-session change
+    /// on a retained engine: a tab switch, a pane-focus move in a split, a
+    /// session migration). `needs_rescan` alone cannot see this — it compares
+    /// per-terminal damage epochs, and two unrelated terminals' monotonic
+    /// counters can collide, silently keeping the OLD grid's occupancy (rain
+    /// falling through the new tab's text) and its sampled material alphabet.
+    /// Rebaseline everything grid-derived:
+    /// - occupancy: force the next Tier-A rescan regardless of epoch equality;
+    /// - material bank: drop the old grid's literal glyphs and resample from
+    ///   the new one (stale output characters must not rain over another
+    ///   session);
+    /// - activity: the next `note_activity` observation is a baseline, never
+    ///   a manufactured burst off an unrelated `content_seq`.
+    /// - composer provenance: the `material_editing` latch belongs to the OLD
+    ///   grid's unsent draft (set per keystroke, released at TurnStart).
+    ///   Carrying it across the swap deadlocked literal mode: this clear +
+    ///   a latched Editing meant `sample_material` refused every refill, so
+    ///   rain went DARK on the new grid until its next Enter (post-merge
+    ///   re-audit, HIGH). The NEW grid's composing line is still protected by
+    ///   the cursor-band / hidden-band exclusions the sampler always applies.
+    ///
+    /// Weather/clock state deliberately survives — the swap is a viewpoint
+    /// change, not a restart.
+    pub fn note_grid_replaced(&mut self) {
+        self.have_scanned = false;
+        self.clear_material_bank();
+        self.material_sample_needed = self.cfg.output_material;
+        self.material_editing = false;
+        self.last_seq = None;
+    }
+
     /// Whether an input note could actually animate this engine — the host's
     /// "is a wake-up redraw worth requesting" probe: false when disabled or
     /// under reduced motion (emit would return 0 immediately), so key
@@ -1333,6 +1364,40 @@ impl MatrixRain {
     #[must_use]
     pub fn atlas_version(&self) -> u64 {
         self.baker.version()
+    }
+
+    /// One-line diagnostic snapshot for host introspection (`aterm-ctl rain
+    /// status` — split-pane audit): the EFFECTIVE weather word, the live
+    /// density staircase byte, the engine tick, whether a Tier-A scan is
+    /// resident, the literal-material alphabet size, and whether the last
+    /// emit produced light. Pure read; the exact set an operator needs to
+    /// answer "why isn't it raining" without a debugger.
+    #[must_use]
+    pub fn diag_line(&self) -> String {
+        let weather = match self.eff_weather() {
+            RainWeather::Working => "working",
+            RainWeather::Calm => "calm",
+            RainWeather::Sleep => "sleep",
+        };
+        let vis = match self.visibility {
+            RainVisibility::Focused => "focused",
+            RainVisibility::VisibleUnfocused => "visible",
+            RainVisibility::Hidden => "hidden",
+        };
+        format!(
+            "weather={} density={} tick={} scanned={} material={} emitting={} vis={} drain={} \
+             seq={} streak={}",
+            weather,
+            self.density_byte,
+            self.tick,
+            self.have_scanned,
+            self.material_chars.len(),
+            self.last_emit_nonempty,
+            vis,
+            self.drain_ticks,
+            self.last_seq.map_or_else(|| "none".into(), |s| s.to_string()),
+            self.content_streak,
+        )
     }
 
     #[cfg(test)]
@@ -4194,6 +4259,96 @@ mod tests {
         scan_empty(&mut e, 10, 10);
         assert!(!e.needs_rescan(1));
         assert!(e.needs_rescan(2), "epoch change re-arms the rescan");
+    }
+
+    /// SPLIT-PANE AUDIT: a retained engine whose FRONT GRID was swapped
+    /// (tab switch / pane-focus move) must rescan even when the two
+    /// terminals' unrelated damage-epoch counters happen to collide —
+    /// `note_grid_replaced` rebaselines occupancy, material, and activity.
+    #[test]
+    fn note_grid_replaced_forces_rescan_despite_epoch_collision() {
+        let mut e = MatrixRain::new(cfg_on());
+        scan_empty(&mut e, 10, 10);
+        assert!(
+            !e.needs_rescan(1),
+            "scanned engine holds on an equal epoch (the collision)"
+        );
+        e.note_grid_replaced();
+        assert!(
+            e.needs_rescan(1),
+            "grid replacement re-arms the rescan at the SAME epoch"
+        );
+    }
+
+    /// TINY PANES (split-pane audit): a 1–2-row viewport — a heavily
+    /// subdivided split pane — must emit (or honestly emit nothing) without
+    /// panicking. The old `col_params` floored `rows` at 1 and then hit
+    /// `.clamp(3, rows)` (min > max ⇒ panic) on the first ungated emit.
+    /// Every emitted quad stays inside the real geometry.
+    #[test]
+    fn tiny_pane_emits_without_panicking() {
+        for rows in [1u16, 2] {
+            let mut e = MatrixRain::new(cfg_on());
+            scan_empty(&mut e, usize::from(rows), 20);
+            pour(&mut e);
+            let g = geom(rows, 20, 8, 16);
+            let (mut q, mut a) = (Vec::new(), Vec::new());
+            for _ in 0..120 {
+                e.note_keystroke();
+                e.advance_ms(83);
+                e.emit(g, &idle(), &mut q, &mut a);
+                for quad in &q {
+                    assert!(quad.row < rows, "emission stays inside the real rows");
+                }
+            }
+        }
+    }
+
+    /// A latched composer-provenance guard must not survive a grid swap:
+    /// with `material_editing` still true, the cleared bank could never
+    /// refill (`sample_material` refuses while Editing), so literal-mode
+    /// rain stayed DARK on the new grid until its next Enter (post-merge
+    /// re-audit, HIGH).
+    #[test]
+    fn note_grid_replaced_releases_the_editing_latch() {
+        let mut e = MatrixRain::new(literal_cfg_on());
+        e.note_keystroke();
+        assert!(e.material_editing_for_test(), "keystroke latches Editing");
+        e.note_grid_replaced();
+        assert!(
+            !e.material_editing_for_test(),
+            "the latch belongs to the OLD grid's draft — the swap releases it"
+        );
+        // And the released latch actually lets the new grid sample.
+        let mut cells = vec![vec![space_cell(bg3()); 10]; 10];
+        for (i, ch) in "0f3a".chars().enumerate() {
+            cells[0][i].ch = ch;
+        }
+        e.sample_material(&cells, 10, None, &[]);
+        assert!(
+            !e.literal_material_chars_for_test().is_empty(),
+            "the new grid's output refills the alphabet immediately"
+        );
+    }
+
+    /// The material alphabet is grid-derived state: swapping grids drops the
+    /// old session's sampled characters and re-arms a fresh literal sample.
+    #[test]
+    fn note_grid_replaced_clears_the_material_bank() {
+        let mut e = MatrixRain::new(literal_cfg_on());
+        scan_empty(&mut e, 10, 10);
+        let mut cells = vec![vec![space_cell(bg3()); 10]; 10];
+        for (i, ch) in "0f3a".chars().enumerate() {
+            cells[0][i].ch = ch;
+        }
+        e.sample_material(&cells, 10, None, &[]);
+        assert!(!e.literal_material_chars_for_test().is_empty());
+        e.note_grid_replaced();
+        assert!(
+            e.literal_material_chars_for_test().is_empty(),
+            "old grid's literal alphabet must not rain over the new session"
+        );
+        assert!(e.needs_material_sample(), "fresh sample re-armed");
     }
 
     // ---- ROM / baker via the engine -------------------------------------------

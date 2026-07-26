@@ -308,7 +308,9 @@ fn assert_proves_and_catches_in_trust(ty: &PathBuf, m: &Model) {
 #[test]
 fn edge_gate_spec_model_checked_in_trust() {
     // TIERED (VERIFY-1): external-tool obligation; runs only with the toolchain.
-    let Some(ty) = ty_escalation("edge_gate fail-closed spec") else { return };
+    let Some(ty) = ty_escalation("edge_gate fail-closed spec") else {
+        return;
+    };
     assert_proves_and_catches_in_trust(&ty, &edge_gate_model());
 }
 
@@ -317,6 +319,8 @@ fn edge_gate_spec_model_checked_in_trust() {
 #[test]
 fn sink_no_loss_spec_model_checked_in_trust() {
     // TIERED (VERIFY-1): external-tool obligation; runs only with the toolchain.
-    let Some(ty) = ty_escalation("sink no-loss spec") else { return };
+    let Some(ty) = ty_escalation("sink no-loss spec") else {
+        return;
+    };
     assert_proves_and_catches_in_trust(&ty, &sink_no_loss_model());
 }

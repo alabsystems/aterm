@@ -15,6 +15,8 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
+use aterm_grapheme::GraphemeClusters;
+
 pub(crate) use crate::tab_model::{AppInstanceId, ViewId};
 
 use crate::document_store::DocumentId;
@@ -129,7 +131,7 @@ impl Default for CommonViewState {
 pub(crate) enum AppViewState {
     Settings(Box<crate::native_settings::SettingsViewState>),
     Markdown(MarkdownViewState),
-    Editor(EditorViewState),
+    Editor(Box<EditorViewState>),
     Recovery(RecoveryViewState),
 }
 
@@ -211,6 +213,26 @@ pub(crate) struct EditorViewState {
     pub(crate) buffer: Option<crate::native_editor::EditorBufferView>,
     pub(crate) preedit: String,
     pub(crate) status: Option<String>,
+    /// Persistent host-watcher warning for the canonical config/theme inputs.
+    /// Kept separate from command feedback and diagnostics so either can change
+    /// without erasing the other; a typed recovery edge alone clears it.
+    pub(crate) config_watch_status: Option<String>,
+    /// Selected contextual aterm.toml completion. The visible window is
+    /// derived from this index and the exact responsive row capacity.
+    pub(crate) config_completion_selected: usize,
+    /// Exact assist context whose completion row owns keyboard navigation.
+    /// Merely showing suggestions must never steal Enter or the arrow keys
+    /// from ordinary editing.
+    pub(crate) config_completion_interaction:
+        Option<crate::native_config_language::ConfigCompletionContext>,
+    /// Escape dismisses contextual assistance only for the immutable document
+    /// sequence + caret that produced it. Any edit or caret move naturally
+    /// creates a new context and may offer assistance again.
+    pub(crate) config_completion_dismissed:
+        Option<crate::native_config_language::ConfigCompletionContext>,
+    /// Retained Manual diagnostics are navigable without moving the document
+    /// caret. The semantic modeline announces the complete selected message.
+    pub(crate) config_diagnostic_selected: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -219,6 +241,58 @@ pub(crate) struct RecoveryViewState {
     pub(crate) page: usize,
     pub(crate) notice: Option<String>,
     pub(crate) pending: Option<RecoveryPending>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigCompletionNavigation {
+    Previous,
+    Next,
+    Page(usize),
+}
+
+#[must_use]
+pub(crate) fn config_completion_selection_transition(
+    current: usize,
+    candidates: usize,
+    navigation: ConfigCompletionNavigation,
+) -> usize {
+    let last = candidates.saturating_sub(1);
+    if candidates == 0 {
+        return 0;
+    }
+    match navigation {
+        ConfigCompletionNavigation::Previous => current.min(last).saturating_sub(1),
+        ConfigCompletionNavigation::Next => current.min(last).saturating_add(1).min(last),
+        ConfigCompletionNavigation::Page(index) => index.min(last),
+    }
+}
+
+#[must_use]
+pub(crate) fn config_completion_window(
+    selected: usize,
+    candidates: usize,
+    capacity: usize,
+) -> std::ops::Range<usize> {
+    if candidates == 0 || capacity == 0 {
+        return 0..0;
+    }
+    let selected = selected.min(candidates - 1);
+    let capacity = capacity.min(candidates);
+    let start = (selected / capacity) * capacity;
+    start..start.saturating_add(capacity).min(candidates)
+}
+
+#[must_use]
+pub(crate) fn config_diagnostic_selection_transition(
+    current: usize,
+    diagnostics: usize,
+    previous: bool,
+) -> usize {
+    match diagnostics {
+        0 | 1 => 0,
+        _ if previous => (current.min(diagnostics - 1) + diagnostics - 1) % diagnostics,
+        _ => (current.min(diagnostics - 1) + 1) % diagnostics,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,8 +310,17 @@ pub(crate) struct RecoveryPending {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryCapability {
-    Settings { route: String },
-    Document { kind: AppKind, uri: String },
+    Settings {
+        route: String,
+    },
+    Document {
+        kind: AppKind,
+        uri: String,
+        /// Preserve the privileged config-editor reducer on Retry. Treating
+        /// this document as an ordinary Editor would bypass schema diagnostics
+        /// and the versioned config save lane after a failed restore.
+        config_editor: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -924,7 +1007,15 @@ impl NativeAppModel for RecoveryApp {
                         ),
                         ..ControlState::default()
                     })
-                    .style(StyleRef::Secondary),
+                    // Retry is the page's DEFAULT while it is actionable: the
+                    // highlighted Primary a bare Return activates (see
+                    // `CompiledUi::default_action`). With no retained
+                    // capability nothing is highlighted and Return stays inert.
+                    .style(if key == "recovery/retry" && enabled {
+                        StyleRef::Primary
+                    } else {
+                        StyleRef::Secondary
+                    }),
                 ),
             )
             .layout(Layout::default().width(Length::Fill).height(Length::Fill))
@@ -1164,8 +1255,15 @@ impl RecoveryApp {
     fn diagnostics_text(&self) -> String {
         let capability = match &self.capability {
             Some(RecoveryCapability::Settings { route }) => format!("settings-route={route}"),
-            Some(RecoveryCapability::Document { kind, uri }) => {
-                format!("document-kind={}\noriginal={uri}", kind.as_str())
+            Some(RecoveryCapability::Document {
+                kind,
+                uri,
+                config_editor,
+            }) => {
+                format!(
+                    "document-kind={}\noriginal={uri}\nconfig-editor={config_editor}",
+                    kind.as_str()
+                )
             }
             None => "capability=none".to_string(),
         };
@@ -1249,6 +1347,7 @@ mod recovery_tests {
         let app = recovery(Some(RecoveryCapability::Document {
             kind: AppKind::Markdown,
             uri: "file:///tmp/Guide.md".to_string(),
+            config_editor: false,
         }));
         for (width, height, scale) in [
             (320.0, 568.0, 0.85),
@@ -1328,6 +1427,7 @@ mod recovery_tests {
         let app = recovery(Some(RecoveryCapability::Document {
             kind: AppKind::Markdown,
             uri: "file:///tmp/Guide.md".to_string(),
+            config_editor: false,
         }));
         for (width, height) in [(320.0, 568.0), (800.0, 320.0), (1_200.0, 400.0)] {
             let viewport = LogicalRect::new(0.0, 0.0, width, height);
@@ -1386,6 +1486,7 @@ mod recovery_tests {
         let app = recovery(Some(RecoveryCapability::Document {
             kind: AppKind::Markdown,
             uri: "file:///tmp/Guide.md".to_string(),
+            config_editor: false,
         }));
         let mut runtime = NativeRuntime::new();
         let instance = runtime.insert_instance(NativeApp::Recovery(app)).unwrap();
@@ -1417,6 +1518,7 @@ mod recovery_tests {
             RecoveryRequest::Retry(RecoveryCapability::Document {
                 kind: AppKind::Markdown,
                 ref uri,
+                config_editor: false,
             }) if uri == "file:///tmp/Guide.md"
         ));
         runtime
@@ -1457,6 +1559,7 @@ mod recovery_tests {
         let app = recovery(Some(RecoveryCapability::Document {
             kind: AppKind::Markdown,
             uri: "file:///tmp/Guide.md".to_string(),
+            config_editor: false,
         }));
         let mut runtime = NativeRuntime::new();
         let instance = runtime.insert_instance(NativeApp::Recovery(app)).unwrap();
@@ -1610,6 +1713,25 @@ pub(crate) enum AppEvent {
     EditorChord(crate::native_editor::KeyChord),
     EditorCommand(crate::native_editor::EditorCommand),
     EditorCompletion(crate::native_editor::EditorCompletionAction),
+    EditorConfigCompletion(crate::native_config_language::ConfigCompletionEdit),
+    EditorConfigCompletionRejected,
+    EditorConfigNavigate {
+        navigation: ConfigCompletionNavigation,
+        candidates: usize,
+        context: crate::native_config_language::ConfigCompletionContext,
+    },
+    EditorConfigDismiss {
+        context: crate::native_config_language::ConfigCompletionContext,
+    },
+    EditorConfigDiagnosticNavigate {
+        previous: bool,
+    },
+    /// Accessibility-owned source-byte selection for the editable text viewport.
+    /// The document workspace validates UTF-8 boundaries before installing it.
+    EditorSetSelection {
+        anchor: usize,
+        head: usize,
+    },
     /// Host-owned semantic viewport capacity, derived from the exact editor
     /// rect and active text scale before an editor reducer transition.
     EditorViewportChanged {
@@ -1652,6 +1774,10 @@ pub(crate) enum AppEvent {
     /// reader instead of leaving its transient "Opening editor…" status behind.
     DocumentEditorOpened {
         document: DocumentId,
+    },
+    ConfigEditorFinished {
+        operation: OperationId,
+        outcome: ConfigEditorOutcome,
     },
     ConfigPatchFinished {
         operation: OperationId,
@@ -1705,6 +1831,13 @@ pub(crate) enum TextInputEvent {
     KillToStart,
     /// Delete the word before the caret (readline Ctrl-W).
     DeleteWordBackward,
+    /// Caret one WORD left/right (⌥←/⌥→, ⌥B/⌥F) in a Settings text field.
+    WordLeft {
+        extend: bool,
+    },
+    WordRight {
+        extend: bool,
+    },
     SelectAll,
     Undo,
     Redo,
@@ -1803,9 +1936,22 @@ pub(crate) struct ConfigPatch {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigPatchOutcome {
-    Applied { revision: u64, undo: Option<u64> },
-    Conflict { revision: u64 },
-    Rejected { message: String },
+    Applied {
+        revision: u64,
+        undo: Option<u64>,
+    },
+    Conflict {
+        revision: u64,
+    },
+    /// Replacement may be visible, but the atomic writer could not prove its
+    /// final bytes/durability. Callers must reconcile before claiming success
+    /// or issuing a blind follow-up.
+    Indeterminate {
+        message: String,
+    },
+    Rejected {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1819,6 +1965,21 @@ pub(crate) enum ExternalOpenOutcome {
     Opened,
     Denied { message: String },
     Failed { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigEditorOutcome {
+    Opened { canonical_uri: String },
+    Failed { message: String },
+}
+
+/// Path-authority-free intent carried from Settings to the canonical Manual
+/// editor. The host resolves only its own aterm.toml capability; this value can
+/// choose text inside that document but can never redirect the filesystem open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigEditorTarget {
+    Key(String),
+    Search(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1963,6 +2124,12 @@ pub(crate) enum AppEffect {
         request: ExternalOpenRequest,
         reply: ReplyToken<ExternalOpenOutcome>,
     },
+    /// Resolve, ensure, and open the process's canonical `aterm.toml` through
+    /// the native editor host. The reducer receives no ambient path authority.
+    OpenConfigEditor {
+        target: Option<ConfigEditorTarget>,
+        reply: ReplyToken<ConfigEditorOutcome>,
+    },
     Update {
         request: UpdateRequest,
         reply: ReplyToken<UpdateOutcome>,
@@ -1994,6 +2161,9 @@ pub(crate) struct ViewMotionCx {
     pub(crate) system_reduced: bool,
     pub(crate) focused: bool,
     pub(crate) performance_reduced: bool,
+    /// Live OS light/dark appearance. This is a host fact, not terminal palette
+    /// state: Settings uses it to resolve `window_theme = "auto"` previews.
+    pub(crate) system_dark: bool,
     /// The process-wide serious-mode override. Unlike Reduce Motion, this also
     /// suppresses static cursor trails and post-processing in authored previews.
     pub(crate) serious: bool,
@@ -2005,6 +2175,7 @@ impl Default for ViewMotionCx {
             system_reduced: false,
             focused: true,
             performance_reduced: false,
+            system_dark: false,
             serious: false,
         }
     }
@@ -2047,6 +2218,10 @@ pub(crate) struct UpdateCx<'a> {
 }
 
 impl UpdateCx<'_> {
+    pub(crate) const fn view_id(&self) -> ViewId {
+        self.view
+    }
+
     fn operation(&mut self) -> OperationId {
         let raw = (*self.next_operation).max(1);
         *self.next_operation = raw.saturating_add(1);
@@ -2126,6 +2301,21 @@ impl UpdateCx<'_> {
         operation
     }
 
+    pub(crate) fn open_config_editor(&mut self) -> OperationId {
+        self.open_config_editor_at(None)
+    }
+
+    pub(crate) fn open_config_editor_at(
+        &mut self,
+        target: Option<ConfigEditorTarget>,
+    ) -> OperationId {
+        let reply = self.view_reply();
+        let operation = reply.operation;
+        self.effects
+            .push(AppEffect::OpenConfigEditor { target, reply });
+        operation
+    }
+
     pub(crate) fn open_document_editor(&mut self, document: DocumentId) {
         self.effects
             .push(AppEffect::OpenDocumentEditor { document });
@@ -2187,6 +2377,9 @@ pub(crate) struct NativeRuntime {
     view_lifecycles: BTreeMap<ViewId, crate::front_content::ViewLifecycle>,
     document_generations: BTreeMap<DocumentId, u64>,
     service_generations: BTreeMap<ServiceId, u64>,
+    /// Process-global failure/recovery projection for the config and theme
+    /// watcher. New Settings/Manual views inherit this state at attach time.
+    config_watch_status: crate::config_watcher::WatchStatusState,
     next_operation: u64,
 }
 
@@ -2201,6 +2394,7 @@ impl Default for NativeRuntime {
             view_lifecycles: BTreeMap::new(),
             document_generations: BTreeMap::new(),
             service_generations: BTreeMap::new(),
+            config_watch_status: crate::config_watcher::WatchStatusState::default(),
             next_operation: 1,
         }
     }
@@ -2233,7 +2427,7 @@ impl NativeRuntime {
         &mut self,
         view: ViewId,
         instance: AppInstanceId,
-        state: AppViewState,
+        mut state: AppViewState,
     ) -> Result<(), RuntimeError> {
         let Some(app) = self.instances.get(&instance) else {
             return Err(RuntimeError::UnknownInstance(instance));
@@ -2246,6 +2440,17 @@ impl NativeRuntime {
         }
         if self.views.contains_key(&view) {
             return Err(RuntimeError::DuplicateView(view));
+        }
+        let watch_status = self.config_watch_status.message();
+        match &mut state {
+            AppViewState::Settings(settings) => {
+                settings.config_watch_status.clone_from(&watch_status);
+            }
+            AppViewState::Editor(editor) if matches!(app, NativeApp::Editor(app) if app.config_editor) =>
+            {
+                editor.config_watch_status.clone_from(&watch_status);
+            }
+            AppViewState::Markdown(_) | AppViewState::Editor(_) | AppViewState::Recovery(_) => {}
         }
         self.views.insert(view, state);
         self.view_generations.insert(view, 1);
@@ -2342,7 +2547,13 @@ impl NativeRuntime {
 
     /// Refresh every controller derived from one canonical document. The source
     /// remains owned by `DocumentStore`; Markdown retains only its parsed projection.
-    pub(crate) fn publish_document(&mut self, document: DocumentId, source: &str, dirty: bool) {
+    pub(crate) fn publish_document(
+        &mut self,
+        document: DocumentId,
+        source: &str,
+        revision: u64,
+        dirty: bool,
+    ) {
         for app in self.instances.values_mut() {
             match app {
                 NativeApp::Markdown(markdown) if markdown.document == document => {
@@ -2351,10 +2562,328 @@ impl NativeRuntime {
                 }
                 NativeApp::Editor(editor) if editor.document == document => {
                     editor.dirty = dirty;
+                    if editor.config_editor && editor.config_analysis_revision != revision {
+                        // Pure TOML/schema analysis is worker-owned. Publishing
+                        // new bytes only invalidates the old projection and
+                        // closes Save until that exact revision completes.
+                        editor.config_analysis = None;
+                        editor.config_analysis_revision = revision;
+                        editor.config_host_requested_revision = None;
+                        editor.config_assist_cache.borrow_mut().clear();
+                    }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Mark one already-granted canonical document as the real aterm config.
+    /// The host resolves that identity; the editor model receives only immutable
+    /// bytes and a document revision, never a path or filesystem capability.
+    pub(crate) fn enable_config_editor(
+        &mut self,
+        document: DocumentId,
+        _source: &str,
+        revision: u64,
+    ) -> bool {
+        let mut enabled = false;
+        for app in self.instances.values_mut() {
+            if let NativeApp::Editor(editor) = app
+                && editor.document == document
+            {
+                editor.config_editor = true;
+                editor.config_analysis = None;
+                editor.config_analysis_revision = revision;
+                editor.config_host_requested_revision = None;
+                editor.config_assist_cache.borrow_mut().clear();
+                enabled = true;
+            }
+        }
+        if enabled {
+            self.synchronize_config_watch_status_views();
+        }
+        enabled
+    }
+
+    /// Apply a de-duplicated watcher edge and fan the resulting persistent
+    /// status to every live Settings and config-editor view. Returns whether the
+    /// process-global projection changed; callers then schedule one redraw.
+    pub(crate) fn apply_config_watch_status(
+        &mut self,
+        event: crate::config_watcher::WatchStatusEvent,
+    ) -> bool {
+        if !self.config_watch_status.reduce(event) {
+            return false;
+        }
+        self.synchronize_config_watch_status_views();
+        true
+    }
+
+    pub(crate) fn note_config_watch_candidate(
+        &mut self,
+        baseline: crate::native_document_host::AtomicFileBaseline,
+    ) {
+        self.config_watch_status.note_config_candidate(baseline);
+    }
+
+    #[must_use]
+    pub(crate) fn has_config_watch_candidate(&self) -> bool {
+        self.config_watch_status.has_config_candidate()
+    }
+
+    pub(crate) fn acknowledge_config_watch_candidate(
+        &mut self,
+        baseline: &crate::native_document_host::AtomicFileBaseline,
+    ) -> bool {
+        if !self
+            .config_watch_status
+            .acknowledge_config_candidate(baseline)
+        {
+            return false;
+        }
+        self.synchronize_config_watch_status_views();
+        true
+    }
+
+    pub(crate) fn reject_config_watch_candidate(
+        &mut self,
+        baseline: &crate::native_document_host::AtomicFileBaseline,
+        kind: crate::config_watcher::WatchFailureKind,
+    ) -> bool {
+        if !self
+            .config_watch_status
+            .reject_config_candidate(baseline, kind)
+        {
+            return false;
+        }
+        self.synchronize_config_watch_status_views();
+        true
+    }
+
+    fn synchronize_config_watch_status_views(&mut self) {
+        let message = self.config_watch_status.message();
+        let config_documents = self
+            .instances
+            .values()
+            .filter_map(|app| match app {
+                NativeApp::Editor(editor) if editor.config_editor => Some(editor.document),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for state in self.views.values_mut() {
+            let status = match state {
+                AppViewState::Settings(settings) => &mut settings.config_watch_status,
+                AppViewState::Editor(editor)
+                    if editor
+                        .buffer
+                        .as_ref()
+                        .is_some_and(|buffer| config_documents.contains(&buffer.document)) =>
+                {
+                    &mut editor.config_watch_status
+                }
+                AppViewState::Markdown(_) | AppViewState::Editor(_) | AppViewState::Recovery(_) => {
+                    continue;
+                }
+            };
+            if *status == message {
+                continue;
+            }
+            status.clone_from(&message);
+            match state {
+                AppViewState::Settings(settings) => {
+                    settings.common.presentation_revision =
+                        settings.common.presentation_revision.saturating_add(1);
+                }
+                AppViewState::Editor(editor) => {
+                    editor.common.presentation_revision =
+                        editor.common.presentation_revision.saturating_add(1);
+                }
+                AppViewState::Markdown(_) | AppViewState::Recovery(_) => {}
+            }
+        }
+    }
+
+    /// Latch one complete Manual analysis request for an exact source and host
+    /// environment generation. The worker runs pure parsing first and probes
+    /// filesystem-backed semantics only when that parse is admissible.
+    pub(crate) fn begin_config_host_analysis(
+        &mut self,
+        document: DocumentId,
+        revision: u64,
+        analysis_generation: u64,
+    ) -> bool {
+        let mut requested = false;
+        for app in self.instances.values_mut() {
+            let NativeApp::Editor(editor) = app else {
+                continue;
+            };
+            let request = (revision, analysis_generation);
+            if !editor.config_editor
+                || editor.document != document
+                || editor.config_analysis_revision != revision
+                || editor.config_host_requested_revision == Some(request)
+            {
+                continue;
+            }
+            // A byte-identical environment refresh can invalidate host-backed
+            // asset/font diagnostics without changing the document revision.
+            // Retaining the previous generation here would leave every Save
+            // face enabled during the worker gap, so make validation pending
+            // until this exact `(revision, generation)` completes.
+            editor.config_analysis = None;
+            editor.config_assist_cache.borrow_mut().clear();
+            editor.config_host_requested_revision = Some(request);
+            requested = true;
+        }
+        requested
+    }
+
+    /// Merge a host completion only into the exact Manual source revision that
+    /// requested it. A completion from older text is presentation-inert.
+    pub(crate) fn finish_config_host_analysis(
+        &mut self,
+        document: DocumentId,
+        revision: u64,
+        analysis_generation: u64,
+        analysis: crate::native_config_language::ConfigAnalysis,
+    ) -> bool {
+        let mut changed = false;
+        let mut accepted = false;
+        for app in self.instances.values_mut() {
+            let NativeApp::Editor(editor) = app else {
+                continue;
+            };
+            if !editor.config_editor
+                || editor.document != document
+                || editor.config_analysis_revision != revision
+                || editor.config_host_requested_revision != Some((revision, analysis_generation))
+            {
+                continue;
+            }
+            accepted = true;
+            changed |= editor.config_analysis.as_ref() != Some(&analysis);
+            editor.config_analysis = Some(analysis.clone());
+        }
+        if accepted {
+            for state in self.views.values_mut() {
+                let AppViewState::Editor(state) = state else {
+                    continue;
+                };
+                if state
+                    .buffer
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.document == document)
+                    && state
+                        .status
+                        .as_deref()
+                        .is_some_and(|status| status.starts_with("Save blocked"))
+                {
+                    state.status = None;
+                    state.common.presentation_revision =
+                        state.common.presentation_revision.saturating_add(1);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn config_editor_enabled(&self, instance: AppInstanceId) -> bool {
+        matches!(
+            self.instances.get(&instance),
+            Some(NativeApp::Editor(editor)) if editor.config_editor
+        )
+    }
+
+    pub(crate) fn config_editor_analysis(
+        &self,
+        instance: AppInstanceId,
+    ) -> Option<&crate::native_config_language::ConfigAnalysis> {
+        match self.instances.get(&instance)? {
+            NativeApp::Editor(editor) if editor.config_editor => editor.config_analysis.as_ref(),
+            NativeApp::Settings(_)
+            | NativeApp::Markdown(_)
+            | NativeApp::Editor(_)
+            | NativeApp::Recovery(_) => None,
+        }
+    }
+
+    /// Resolve and retain assistance for one exact document sequence + caret.
+    /// Both paint and keyboard input cross this seam, so activation never
+    /// depends on a prior `EditorApp::view` pass having happened to fill the
+    /// cache. The analysis-owned lexical index keeps a cache miss bounded to
+    /// one line lookup and the size-capped current line.
+    pub(crate) fn config_editor_assist(
+        &self,
+        instance: AppInstanceId,
+        snapshot: &crate::document_store::DocumentSnapshot,
+        caret: usize,
+    ) -> Option<(
+        crate::native_config_language::ConfigCompletionContext,
+        crate::native_config_language::ConfigAssist,
+    )> {
+        match self.instances.get(&instance)? {
+            NativeApp::Editor(editor) => editor.config_assist(snapshot, caret),
+            NativeApp::Settings(_) | NativeApp::Markdown(_) | NativeApp::Recovery(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_config_assist_cache(&self, instance: AppInstanceId) {
+        if let Some(NativeApp::Editor(editor)) = self.instances.get(&instance) {
+            editor.config_assist_cache.borrow_mut().clear();
+        }
+    }
+
+    pub(crate) fn cached_config_completion_count(
+        &self,
+        instance: AppInstanceId,
+        context: crate::native_config_language::ConfigCompletionContext,
+    ) -> usize {
+        match self.instances.get(&instance) {
+            Some(NativeApp::Editor(editor)) if editor.config_editor => editor
+                .config_assist_cache
+                .borrow()
+                .iter()
+                .find(|(cached, _)| *cached == context)
+                .map_or(0, |(_, assist)| assist.completions.len()),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn cached_config_assist_present(
+        &self,
+        instance: AppInstanceId,
+        context: crate::native_config_language::ConfigCompletionContext,
+    ) -> bool {
+        match self.instances.get(&instance) {
+            Some(NativeApp::Editor(editor)) if editor.config_editor => editor
+                .config_assist_cache
+                .borrow()
+                .iter()
+                .find(|(cached, _)| *cached == context)
+                .is_some_and(|(_, assist)| assist.help.is_some() || !assist.completions.is_empty()),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn config_editor_document(&self) -> Option<DocumentId> {
+        self.instances.values().find_map(|app| match app {
+            NativeApp::Editor(editor) if editor.config_editor => Some(editor.document),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn config_editor_save_error(&self, document: DocumentId) -> Option<String> {
+        self.instances.values().find_map(|app| match app {
+            NativeApp::Editor(editor) if editor.document == document && editor.config_editor => {
+                editor.config_analysis.as_ref().map_or_else(
+                    || Some("Config validation is still in progress".to_string()),
+                    |analysis| analysis.has_errors().then(|| analysis.summary()).flatten(),
+                )
+            }
+            _ => None,
+        })
     }
 
     pub(crate) fn set_document_saving(&mut self, document: DocumentId, saving: bool) {
@@ -2363,6 +2892,16 @@ impl NativeRuntime {
                 && editor.document == document
             {
                 editor.checkpoint_pending = saving;
+            }
+        }
+    }
+
+    pub(crate) fn set_document_disk_conflict(&mut self, document: DocumentId, disk_conflict: bool) {
+        for app in self.instances.values_mut() {
+            if let NativeApp::Editor(editor) = app
+                && editor.document == document
+            {
+                editor.disk_conflict = disk_conflict;
             }
         }
     }
@@ -4593,7 +5132,7 @@ fn bounded_markdown_label(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
-    let Some((end, _)) = text.char_indices().nth(max_chars) else {
+    let Some((end, _)) = text.grapheme_indices().nth(max_chars) else {
         return text.to_string();
     };
     let mut output = text[..end].to_string();
@@ -4620,13 +5159,13 @@ fn markdown_toolbar_label_width(label: &str, minimum: f32, text_scale: f32) -> f
 /// should retain its extension and distinguishing prefix instead of relying on a
 /// parent clip that can also cover the cursor/save indicators beside it.
 fn bounded_middle_label(text: &str, max_chars: usize) -> String {
-    bounded_middle_label_from_chars(&text.chars().collect::<Vec<_>>(), max_chars)
+    bounded_middle_label_from_graphemes(&text.graphemes().collect::<Vec<_>>(), max_chars)
 }
 
-fn bounded_middle_label_from_chars(chars: &[char], max_chars: usize) -> String {
-    let count = chars.len();
+fn bounded_middle_label_from_graphemes(graphemes: &[&str], max_chars: usize) -> String {
+    let count = graphemes.len();
     if count <= max_chars {
-        return chars.iter().collect();
+        return graphemes.concat();
     }
     if max_chars == 0 {
         return String::new();
@@ -4636,8 +5175,8 @@ fn bounded_middle_label_from_chars(chars: &[char], max_chars: usize) -> String {
     }
     let head = (max_chars - 1).div_ceil(2);
     let tail = max_chars - 1 - head;
-    let prefix = chars[..head].iter().collect::<String>();
-    let suffix = chars[count - tail..].iter().collect::<String>();
+    let prefix = graphemes[..head].concat();
+    let suffix = graphemes[count - tail..].concat();
     format!("{prefix}…{suffix}")
 }
 
@@ -4646,9 +5185,19 @@ fn bounded_middle_label_from_chars(chars: &[char], max_chars: usize) -> String {
 /// deliberately capped because filesystem titles are short while app-provided
 /// titles are not required to be.
 fn bounded_middle_label_to_width(text: &str, max_width: f32, px: f32) -> String {
+    bounded_middle_label_to_width_for_face(text, max_width, px, crate::widget::TextFace::UiBold)
+}
+
+fn bounded_middle_label_to_width_for_face(
+    text: &str,
+    max_width: f32,
+    px: f32,
+    face: crate::widget::TextFace,
+) -> String {
     use crate::widget::TextFace;
 
-    let measure = |label: &str| crate::tray_raster::ui_text_width_for(TextFace::UiBold, label, px);
+    debug_assert!(matches!(face, TextFace::Ui | TextFace::UiBold));
+    let measure = |label: &str| crate::tray_raster::ui_text_width_for(face, label, px);
     if max_width <= 0.0 || !max_width.is_finite() || px <= 0.0 || !px.is_finite() {
         return String::new();
     }
@@ -4656,13 +5205,13 @@ fn bounded_middle_label_to_width(text: &str, max_width: f32, px: f32) -> String 
         return text.to_string();
     }
 
-    // 256 displayed scalars is already far beyond any title that can fit in
+    // 256 displayed graphemes is already far beyond any title that can fit in
     // native app chrome. Capping also prevents adversarial service titles from
     // turning a layout pass into an unbounded quadratic search.
-    let chars = text.chars().collect::<Vec<_>>();
-    let count = chars.len().min(256);
+    let graphemes = text.graphemes().collect::<Vec<_>>();
+    let count = graphemes.len().min(256);
     for max_chars in (2..=count).rev() {
-        let candidate = bounded_middle_label_from_chars(&chars, max_chars);
+        let candidate = bounded_middle_label_from_graphemes(&graphemes, max_chars);
         if measure(&candidate) <= max_width {
             return candidate;
         }
@@ -4672,6 +5221,29 @@ fn bounded_middle_label_to_width(text: &str, max_width: f32, px: f32) -> String 
     } else {
         String::new()
     }
+}
+
+/// Preserve the complete metadata-derived help in accessibility/status
+/// semantics while expressing verbose platform constraints compactly in the
+/// one-line visual strip. Every operational distinction remains visible.
+fn config_visual_help(help: &str) -> String {
+    help.replace(
+        "GPU rendering (restart) · gpu · true / false · Applies next launch · ",
+        "GPU rendering · ",
+    )
+    .replace("default 1.0 (solid)", "default 1.0")
+    .replace(
+        "macOS GPU window path only; CPU and non-macOS GPU grids stay solid",
+        "macOS GPU; CPU/other GPU solid",
+    )
+    .replace(
+        "translucent backgrounds enforce at least 4.5:1 text contrast",
+        "translucency ≥4.5:1 contrast",
+    )
+    .replace(
+        "the last --cpu/--gpu flag wins; inherited $ATERM_CPU otherwise wins over $ATERM_GPU; both override this value",
+        "last --cpu/--gpu > $ATERM_CPU > $ATERM_GPU > config",
+    )
 }
 
 /// Compact editor controller seam. The editor module owns commands/edit
@@ -4685,9 +5257,26 @@ pub(crate) struct EditorApp {
     pub(crate) canonical_uri: String,
     pub(crate) dirty: bool,
     pub(crate) checkpoint_pending: bool,
+    /// The saver baseline no longer matches disk. Save stays unavailable until
+    /// the host installs an explicitly reconciled observation.
+    pub(crate) disk_conflict: bool,
     pub(crate) recovery_status: Option<String>,
     pub(crate) can_undo: bool,
     pub(crate) can_redo: bool,
+    config_editor: bool,
+    config_analysis: Option<crate::native_config_language::ConfigAnalysis>,
+    config_analysis_revision: u64,
+    /// Exact source/environment generation admitted to the off-thread config
+    /// analysis lane.
+    /// Keeping the latch beside the pure analysis makes repeat presentation
+    /// refreshes idempotent and rejects stale worker completions by construction.
+    config_host_requested_revision: Option<(u64, u64)>,
+    config_assist_cache: std::cell::RefCell<
+        Vec<(
+            crate::native_config_language::ConfigCompletionContext,
+            crate::native_config_language::ConfigAssist,
+        )>,
+    >,
 }
 
 impl EditorApp {
@@ -4707,10 +5296,55 @@ impl EditorApp {
             canonical_uri,
             dirty: false,
             checkpoint_pending: false,
+            disk_conflict: false,
             recovery_status: None,
             can_undo: false,
             can_redo: false,
+            config_editor: false,
+            config_analysis: None,
+            config_analysis_revision: 0,
+            config_host_requested_revision: None,
+            config_assist_cache: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    fn config_assist(
+        &self,
+        snapshot: &crate::document_store::DocumentSnapshot,
+        caret: usize,
+    ) -> Option<(
+        crate::native_config_language::ConfigCompletionContext,
+        crate::native_config_language::ConfigAssist,
+    )> {
+        if !self.config_editor
+            || self.document != snapshot.id
+            || self.config_analysis_revision != snapshot.seq.0
+        {
+            return None;
+        }
+        let analysis = self.config_analysis.as_ref()?;
+        let context = crate::native_config_language::ConfigCompletionContext::new(
+            snapshot.id.get(),
+            snapshot.seq.0,
+            caret,
+        );
+        if let Some(assist) = self
+            .config_assist_cache
+            .borrow()
+            .iter()
+            .find(|(cached, _)| *cached == context)
+            .map(|(_, assist)| assist.clone())
+        {
+            return Some((context, assist));
+        }
+        let assist =
+            crate::native_config_language::assist_with_analysis(&snapshot.text, caret, analysis);
+        let mut cache = self.config_assist_cache.borrow_mut();
+        if cache.len() >= 16 {
+            cache.remove(0);
+        }
+        cache.push((context, assist.clone()));
+        Some((context, assist))
     }
 }
 
@@ -4738,6 +5372,61 @@ impl NativeAppModel for EditorApp {
                 EventResult::Handled
             }
             AppEvent::DocumentChanged { document, .. } if document == self.document => {
+                if view
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("Save blocked"))
+                {
+                    view.status = None;
+                }
+                view.config_completion_selected = 0;
+                view.config_completion_interaction = None;
+                view.config_completion_dismissed = None;
+                view.config_diagnostic_selected = 0;
+                view.common.presentation_revision =
+                    view.common.presentation_revision.saturating_add(1);
+                EventResult::Handled
+            }
+            AppEvent::EditorConfigNavigate {
+                navigation,
+                candidates,
+                context,
+            } if self.config_editor => {
+                view.config_completion_selected = config_completion_selection_transition(
+                    view.config_completion_selected,
+                    candidates,
+                    navigation,
+                );
+                view.config_completion_interaction = Some(context);
+                view.config_completion_dismissed = None;
+                view.common.last_focus = (candidates > 0).then(|| {
+                    UiKey::new(format!(
+                        "editor/config-completion/{}",
+                        view.config_completion_selected
+                    ))
+                });
+                view.common.presentation_revision =
+                    view.common.presentation_revision.saturating_add(1);
+                EventResult::Handled
+            }
+            AppEvent::EditorConfigDismiss { context } if self.config_editor => {
+                view.config_completion_dismissed = Some(context);
+                view.config_completion_interaction = None;
+                view.common.last_focus = Some(UiKey::new("editor/buffer"));
+                view.common.presentation_revision =
+                    view.common.presentation_revision.saturating_add(1);
+                EventResult::Handled
+            }
+            AppEvent::EditorConfigDiagnosticNavigate { previous } if self.config_editor => {
+                let count = self.config_analysis.as_ref().map_or(
+                    0,
+                    crate::native_config_language::ConfigAnalysis::diagnostic_count,
+                );
+                view.config_diagnostic_selected = config_diagnostic_selection_transition(
+                    view.config_diagnostic_selected,
+                    count,
+                    previous,
+                );
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
                 EventResult::Handled
@@ -4765,12 +5454,36 @@ impl NativeAppModel for EditorApp {
                 *selected,
             ))
         });
-        let completion_count = command_completion
+        let minibuffer_active = view
+            .buffer
             .as_ref()
-            .map_or(0, |(_, candidates, _)| candidates.len().max(1));
+            .is_some_and(crate::native_editor::EditorBufferView::minibuffer_active);
+        let config_assist = (!minibuffer_active
+            && view
+                .buffer
+                .as_ref()
+                .is_some_and(|buffer| !buffer.chord_pending()))
+        .then(|| {
+            let snapshot = cx.document?;
+            let caret = view.buffer.as_ref()?.primary_selection().head;
+            self.config_assist(snapshot, caret)
+        })
+        .flatten()
+        .filter(|(context, _)| view.config_completion_dismissed != Some(*context))
+        .filter(|(_, assist)| assist.help.is_some() || !assist.completions.is_empty());
+        let completion_count = command_completion.as_ref().map_or_else(
+            || {
+                config_assist
+                    .as_ref()
+                    .map_or(0, |(_, assist)| assist.completions.len().max(1))
+            },
+            |(_, candidates, _)| candidates.len().max(1),
+        );
         let shell = crate::native_ui::editor_shell_metrics(cx.viewport, completion_count);
         let outer_padding = shell.outer_padding;
         let compact_commands = shell.compact_commands;
+        let narrow_problem_commands =
+            cx.viewport.width < 900.0 * crate::native_appearance::text_scale().min(1.4);
         let command_gap = shell.command_gap;
         let command_bar_height = shell.command_bar_height;
         let editor_gap = shell.content_gap;
@@ -4788,7 +5501,7 @@ impl NativeAppModel for EditorApp {
         let column_capacity = ((editor_rect.right() - editor_geometry.text_x).max(1.0)
             / editor_geometry.cell_w)
             .floor() as usize;
-        let projection = cx.document.and_then(|snapshot| {
+        let mut projection = cx.document.and_then(|snapshot| {
             view.buffer.as_ref().map(|buffer| {
                 // Runtime-only renderers do not have a host resize event. Use a
                 // reconciled view clone so direct semantic/introspection renders
@@ -4804,6 +5517,11 @@ impl NativeAppModel for EditorApp {
                 )
             })
         });
+        if let (Some(projection), Some(analysis)) =
+            (projection.as_mut(), self.config_analysis.as_ref())
+        {
+            crate::native_config_language::decorate_projection(projection, analysis);
+        }
         let cursor_label = cx.document.and_then(|snapshot| {
             view.buffer
                 .as_ref()
@@ -4815,13 +5533,15 @@ impl NativeAppModel for EditorApp {
             .buffer
             .as_ref()
             .and_then(|buffer| editor_minibuffer_label(buffer, &view.preedit, footer_chars));
-        let status = editor_status_label(
+        let semantic_status = editor_status_message(
             self,
             view,
             projection.as_ref(),
             cx.document.is_some_and(|snapshot| snapshot.text.is_empty()),
-            footer_chars,
         );
+        let status = semantic_status
+            .as_deref()
+            .map(|label| bounded_markdown_label(label, footer_chars));
         let document_preedit = if view
             .buffer
             .as_ref()
@@ -4845,6 +5565,19 @@ impl NativeAppModel for EditorApp {
         let focused = view.common.focus_visible
             && view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
         let buffer_ready = view.buffer.is_some();
+        let config_valid = !self.config_editor
+            || self
+                .config_analysis
+                .as_ref()
+                .is_some_and(|analysis| !analysis.has_errors());
+        let config_diagnostic_count = if self.config_editor {
+            self.config_analysis.as_ref().map_or(
+                0,
+                crate::native_config_language::ConfigAnalysis::diagnostic_count,
+            )
+        } else {
+            0
+        };
         let command_button = |key: &'static str,
                               visual_label: &'static str,
                               label: &'static str,
@@ -4873,7 +5606,7 @@ impl NativeAppModel for EditorApp {
                 "Save",
                 "Save buffer (Cmd-S or C-x C-s)",
                 "editor/save",
-                self.dirty && !self.checkpoint_pending,
+                self.dirty && !self.checkpoint_pending && !self.disk_conflict && config_valid,
             )
         };
         let undo = || {
@@ -4921,7 +5654,54 @@ impl NativeAppModel for EditorApp {
                 buffer_ready,
             )
         };
+        let recovery_or_commands = || {
+            if self.disk_conflict && self.dirty {
+                command_button(
+                    "editor/revert-button",
+                    "Reload",
+                    "Discard Changes and Reload from Disk",
+                    "editor/revert",
+                    buffer_ready && !self.checkpoint_pending,
+                )
+            } else {
+                commands()
+            }
+        };
+        let previous_problem = || {
+            command_button(
+                "editor/config-problem-previous-button",
+                if compact_commands {
+                    "‹!"
+                } else if narrow_problem_commands {
+                    "Prev"
+                } else {
+                    "Prev Issue"
+                },
+                "Previous config problem (Shift-F8)",
+                "editor/config-problem-previous",
+                config_diagnostic_count > 0,
+            )
+        };
+        let next_problem = || {
+            command_button(
+                "editor/config-problem-next-button",
+                if compact_commands {
+                    "!›"
+                } else if narrow_problem_commands {
+                    "Next"
+                } else {
+                    "Next Issue"
+                },
+                "Next config problem (F8)",
+                "editor/config-problem-next",
+                config_diagnostic_count > 0,
+            )
+        };
         let command_bar = if compact_commands {
+            let mut navigation_commands = vec![find(), goto_line(), recovery_or_commands()];
+            if config_diagnostic_count > 0 {
+                navigation_commands.extend([previous_problem(), next_problem()]);
+            }
             UiNode::new(
                 "editor/command-bar",
                 UiContent::Group(GroupSpec::new("Editor commands")),
@@ -4954,9 +5734,20 @@ impl NativeAppModel for EditorApp {
                         .width(Length::Fill)
                         .height(Length::Fill),
                 )
-                .children(vec![find(), goto_line(), commands()]),
+                .children(navigation_commands),
             ])
         } else {
+            let mut commands = vec![
+                save(),
+                undo(),
+                redo(),
+                find(),
+                goto_line(),
+                recovery_or_commands(),
+            ];
+            if config_diagnostic_count > 0 {
+                commands.extend([previous_problem(), next_problem()]);
+            }
             UiNode::new(
                 "editor/command-bar",
                 UiContent::Group(GroupSpec::new("Editor commands")),
@@ -4967,14 +5758,7 @@ impl NativeAppModel for EditorApp {
                     .width(Length::Fill)
                     .height(Length::Fixed(command_bar_height)),
             )
-            .children(vec![
-                save(),
-                undo(),
-                redo(),
-                find(),
-                goto_line(),
-                commands(),
-            ])
+            .children(commands)
         };
         let command_palette = command_completion.as_ref().and_then(
             |(query, candidates, selected)| {
@@ -5007,18 +5791,7 @@ impl NativeAppModel for EditorApp {
                     UiNode::new(
                         "editor/completion-status",
                         UiContent::Text(crate::native_ui::TextSpec {
-                            text: if compact_label {
-                                if candidates.is_empty() {
-                                    "M-x · no matches".to_string()
-                                } else {
-                                    format!("M-x · {} matches", candidates.len())
-                                }
-                            } else {
-                                format!(
-                                    "M-x · {} matches · ↑/↓ choose · Tab complete · Enter run · Esc close",
-                                    candidates.len()
-                                )
-                            },
+                            text: command_palette_status(candidates.len(), compact_label),
                             role: SemanticRole::Status,
                             style: StyleRef::Quiet,
                         }),
@@ -5117,9 +5890,258 @@ impl NativeAppModel for EditorApp {
                 )
             },
         );
+        let config_palette = config_assist.as_ref().and_then(|(context, assist)| {
+            if shell.palette_visible_rows == 0 {
+                return None;
+            }
+            let text_scale = crate::native_appearance::text_scale();
+            let available_width = (cx.viewport.width
+                - shell.outer_padding * 2.0
+                - shell.palette_padding * 2.0
+                // TextSpec's visual status treatment owns additional optical
+                // inset beyond the palette's structural padding. Keep the
+                // width-bound copy inside that painted measure as well.
+                - 72.0)
+                .max(0.0);
+            let help = assist
+                .help
+                .as_deref()
+                .unwrap_or("Type a setting name for metadata-derived completions");
+            let capacity = shell
+                .palette_visible_rows
+                .min(assist.completions.len().max(1));
+            let total = assist.completions.len();
+            let selected_for_context = if view.config_completion_interaction == Some(*context) {
+                view.config_completion_selected
+            } else {
+                0
+            };
+            let selected = config_completion_selection_transition(
+                selected_for_context,
+                total,
+                ConfigCompletionNavigation::Page(selected_for_context),
+            );
+            let window = config_completion_window(selected, total, capacity);
+            let start = window.start;
+            let end = window.end;
+            let help_status = if total > capacity {
+                format!(
+                    "{help} · {}–{end} of {total} · Tab or Ctrl-Space choose · ↑/↓ move · Enter/Tab insert",
+                    start + 1
+                )
+            } else if total > 0 {
+                format!("{help} · Tab or Ctrl-Space choose · ↑/↓ move · Enter/Tab insert")
+            } else {
+                help.to_string()
+            };
+            // Keep the complete help in the status semantics, while the
+            // visible one-line LSP strip uses compact, still-actionable key
+            // guidance. Measure it with the exact regular/caption typography
+            // that TextSpec paints; the title-oriented semibold helper can
+            // disagree materially with the proportional regular face.
+            let concise_help = config_visual_help(help);
+            let visual_status = if total > capacity {
+                format!(
+                    "{concise_help} · {}–{end}/{total} · Ctrl-Space · ↑↓ select · Enter/Tab insert",
+                    start + 1
+                )
+            } else if total > 0 {
+                format!("{concise_help} · Ctrl-Space · ↑↓ select · Enter/Tab insert")
+            } else {
+                concise_help
+            };
+            let visual_help = bounded_middle_label_to_width_for_face(
+                &visual_status,
+                available_width,
+                13.0 * text_scale,
+                crate::widget::TextFace::Ui,
+            );
+            let mut children = vec![
+                UiNode::new(
+                    "editor/config-help",
+                    UiContent::Group(GroupSpec {
+                        label: Some(help_status),
+                        role: SemanticRole::Status,
+                        style: StyleRef::Quiet,
+                    }),
+                )
+                .layout(
+                    Layout::default()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(shell.palette_header_height)),
+                )
+                .children(vec![
+                    UiNode::new(
+                        "editor/config-help/visual",
+                        UiContent::Text(crate::native_ui::TextSpec {
+                            text: visual_help,
+                            role: SemanticRole::Text,
+                            style: StyleRef::Quiet,
+                        }),
+                    )
+                    .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+                    .paint_only(),
+                ]),
+            ];
+            if assist.completions.is_empty() {
+                children.push(
+                    UiNode::new(
+                        "editor/config-completion-empty",
+                        UiContent::Text(crate::native_ui::TextSpec {
+                            text: "Context help · no value completion at this caret".to_string(),
+                            role: SemanticRole::Status,
+                            style: StyleRef::Plain,
+                        }),
+                    )
+                    .layout(
+                        Layout::default()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(shell.palette_row_height)),
+                    ),
+                );
+            } else {
+                let overflow = total > capacity;
+                let navigation_width = shell.palette_row_height.max(34.0);
+                let completion_width = (available_width
+                    - if overflow {
+                        navigation_width * 2.0 + shell.palette_row_gap * 2.0
+                    } else {
+                        0.0
+                    })
+                .max(0.0);
+                for (visible_index, completion) in assist.completions[start..end].iter().enumerate()
+                {
+                    let index = start + visible_index;
+                    let is_selected = index == selected;
+                    let visual = bounded_middle_label_to_width(
+                        &completion.display,
+                        completion_width,
+                        13.0 * text_scale,
+                    );
+                    let completion_node = UiNode::new(
+                        format!("editor/config-completion/{index}"),
+                        UiContent::Button(
+                            Control::new(
+                                ButtonSpec::new(format!(
+                                    "Insert {}, result {} of {}{}. {}",
+                                    completion.display,
+                                    index + 1,
+                                    total,
+                                    if is_selected { ", selected" } else { "" },
+                                    completion.help
+                                ))
+                                .visual_label(visual),
+                                ActionId::new(
+                                    crate::native_config_language::config_completion_action(
+                                        *context, index, completion,
+                                    ),
+                                ),
+                            )
+                            .state(ControlState {
+                                selected: is_selected,
+                                ..ControlState::default()
+                            })
+                            .style(if is_selected {
+                                StyleRef::Accent
+                            } else {
+                                StyleRef::Secondary
+                            }),
+                        ),
+                    )
+                    .layout(
+                        Layout::default()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(shell.palette_row_height)),
+                    );
+                    if overflow && visible_index == 0 {
+                        let page_button =
+                            |key: &'static str,
+                             label: &'static str,
+                             visual: &'static str,
+                             target: usize,
+                             enabled: bool| {
+                                UiNode::new(
+                                    key,
+                                    UiContent::Button(
+                                        Control::new(
+                                            ButtonSpec::new(label).visual_label(visual),
+                                            ActionId::new(format!(
+                                                "editor/config-page/{target}/{total}"
+                                            )),
+                                        )
+                                        .state(ControlState {
+                                            enabled,
+                                            ..ControlState::default()
+                                        })
+                                        .style(StyleRef::Quiet),
+                                    ),
+                                )
+                                .layout(
+                                    Layout::default()
+                                        .width(Length::Fixed(navigation_width))
+                                        .height(Length::Fixed(shell.palette_row_height)),
+                                )
+                            };
+                        children.push(
+                            UiNode::new(
+                                "editor/config-completion-window",
+                                UiContent::Group(GroupSpec::new(format!(
+                                    "Config completions {} through {end} of {total}",
+                                    start + 1
+                                ))),
+                            )
+                            .layout(
+                                Layout::row()
+                                    .height(Length::Fixed(shell.palette_row_height))
+                                    .gap(shell.palette_row_gap),
+                            )
+                            .children(vec![
+                                page_button(
+                                    "editor/config-page-previous",
+                                    "Previous config completions",
+                                    "‹",
+                                    start.saturating_sub(capacity),
+                                    start > 0,
+                                ),
+                                completion_node,
+                                page_button(
+                                    "editor/config-page-next",
+                                    "Next config completions",
+                                    "›",
+                                    end.min(total.saturating_sub(1)),
+                                    end < total,
+                                ),
+                            ]),
+                        );
+                    } else {
+                        children.push(completion_node);
+                    }
+                }
+            }
+            Some(
+                UiNode::new(
+                    "editor/config-assist",
+                    UiContent::Group(
+                        GroupSpec::new("aterm.toml contextual help and completions")
+                            .style(StyleRef::Secondary),
+                    ),
+                )
+                .layout(
+                    Layout::column()
+                        .padding(Insets::all(shell.palette_padding))
+                        .gap(shell.palette_row_gap)
+                        .width(Length::Fill)
+                        .height(Length::Fixed(shell.palette_height))
+                        .clipped(),
+                )
+                .children(children),
+            )
+        });
         let mut children = vec![command_bar];
         if let Some(command_palette) = command_palette {
             children.push(command_palette);
+        } else if let Some(config_palette) = config_palette {
+            children.push(config_palette);
         }
         children.push(
             UiNode::new(
@@ -5131,6 +6153,7 @@ impl NativeAppModel for EditorApp {
                     projection,
                     preedit: document_preedit,
                     status,
+                    semantic_status,
                     minibuffer,
                     cursor_label,
                     dirty: self.dirty,
@@ -5158,12 +6181,20 @@ impl NativeAppModel for EditorApp {
 
     fn commands(&self, view: &Self::ViewState, out: &mut Vec<Command>) {
         let buffer_ready = view.buffer.is_some();
+        let config_valid = !self.config_editor
+            || self
+                .config_analysis
+                .as_ref()
+                .is_some_and(|analysis| !analysis.has_errors());
         out.extend([
             Command {
                 id: ActionId::new("editor/save"),
                 title: "Save Buffer".to_string(),
                 shortcut: Some("Cmd-S · C-x C-s".to_string()),
-                enabled: self.dirty && !self.checkpoint_pending,
+                enabled: self.dirty
+                    && !self.checkpoint_pending
+                    && !self.disk_conflict
+                    && config_valid,
             },
             Command {
                 id: ActionId::new("editor/undo"),
@@ -5202,6 +6233,26 @@ impl NativeAppModel for EditorApp {
                 enabled: self.dirty && !self.checkpoint_pending,
             },
         ]);
+        let diagnostic_count = self.config_analysis.as_ref().map_or(
+            0,
+            crate::native_config_language::ConfigAnalysis::diagnostic_count,
+        );
+        if self.config_editor && diagnostic_count > 0 {
+            out.extend([
+                Command {
+                    id: ActionId::new("editor/config-problem-next"),
+                    title: "Config: Next Problem".to_string(),
+                    shortcut: Some("F8".to_string()),
+                    enabled: diagnostic_count > 0,
+                },
+                Command {
+                    id: ActionId::new("editor/config-problem-previous"),
+                    title: "Config: Previous Problem".to_string(),
+                    shortcut: Some("Shift-F8".to_string()),
+                    enabled: diagnostic_count > 0,
+                },
+            ]);
+        }
     }
 
     fn presentation(&self, _view: &Self::ViewState) -> AppPresentation {
@@ -5269,8 +6320,9 @@ fn editor_minibuffer_label(
 
 fn editor_prompt_label(prefix: &str, query: &str, preedit: &str, max_chars: usize) -> String {
     let body = format!("{query}{preedit}").replace(['\r', '\n'], " ");
-    let prefix_chars = prefix.chars().count();
-    let body_chars = body.chars().count();
+    let prefix_chars = prefix.graphemes().count();
+    let body_graphemes = body.graphemes().collect::<Vec<_>>();
+    let body_chars = body_graphemes.len();
     if prefix_chars.saturating_add(body_chars) <= max_chars {
         return format!("{prefix}{body}");
     }
@@ -5278,41 +6330,75 @@ fn editor_prompt_label(prefix: &str, query: &str, preedit: &str, max_chars: usiz
     if tail_chars == 0 {
         return bounded_markdown_label(prefix, max_chars);
     }
-    let tail = body
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
+    let tail = body_graphemes[body_chars - tail_chars..].concat();
     format!("{prefix}…{tail}")
 }
 
-fn editor_status_label(
+fn editor_status_message(
     app: &EditorApp,
     view: &EditorViewState,
     projection: Option<&crate::native_editor::EditorViewportProjection>,
     empty: bool,
-    max_chars: usize,
 ) -> Option<String> {
     let lines = projection.map_or(1, |projection| projection.total_lines.max(1));
-    let label = if let Some(recovery) = app.recovery_status.as_deref() {
+    let line_noun = if lines == 1 { "line" } else { "lines" };
+    let label = if app.disk_conflict {
+        let recovery = app
+            .recovery_status
+            .as_deref()
+            .filter(|status| status.contains("Save is blocked"))
+            .unwrap_or(
+                "File changed on disk; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’",
+            );
+        format!("Recovery · {recovery}")
+    } else if let Some(recovery) = app.recovery_status.as_deref() {
         format!("Recovery · {recovery}")
     } else if app.checkpoint_pending {
         "Saving checkpoint...".to_string()
+    } else if app.config_editor && app.config_analysis.is_none() {
+        "Validating aterm.toml…".to_string()
+    } else if let Some(blocked) = view
+        .status
+        .as_deref()
+        .filter(|status| status.starts_with("Save blocked"))
+    {
+        blocked.to_string()
+    } else if let Some(summary) = app
+        .config_analysis
+        .as_ref()
+        .and_then(|analysis| analysis.summary_at(view.config_diagnostic_selected))
+    {
+        summary
     } else if let Some(status) = view.status.as_deref().filter(|status| !status.is_empty()) {
         status.to_string()
     } else if app.dirty {
-        format!("Modified · Cmd-S to save · {lines} lines")
+        format!("Modified · Cmd-S to save · {lines} {line_noun}")
     } else if empty {
         "Empty buffer · Ready".to_string()
-    } else if lines == 1 {
-        "1 line · Ready".to_string()
     } else {
-        format!("{lines} lines · Ready")
+        format!("{lines} {line_noun} · Ready")
     };
-    Some(bounded_markdown_label(&label, max_chars))
+    let watcher = app
+        .config_editor
+        .then_some(view.config_watch_status.as_deref())
+        .flatten()
+        .filter(|status| !status.is_empty());
+    Some(match watcher {
+        Some(watcher) => format!("{label} · Reload warning · {watcher}"),
+        None => label,
+    })
+}
+
+fn command_palette_status(matches: usize, compact: bool) -> String {
+    if compact && matches == 0 {
+        return "M-x · no matches".to_string();
+    }
+    let noun = if matches == 1 { "match" } else { "matches" };
+    if compact {
+        format!("M-x · {matches} {noun}")
+    } else {
+        format!("M-x · {matches} {noun} · ↑/↓ choose · Tab complete · Enter run · Esc close")
+    }
 }
 
 fn editor_cursor_label(text: &str, view: &crate::native_editor::EditorBufferView) -> String {
@@ -5323,12 +6409,21 @@ fn editor_cursor_label(text: &str, view: &crate::native_editor::EditorBufferView
         .unwrap_or(0);
     let before = &text[..caret];
     let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let column = before
-        .rsplit_once('\n')
-        .map_or(before, |(_, tail)| tail)
-        .chars()
-        .count()
-        + 1;
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    // Give the shared editor geometry the complete logical line. A defensive
+    // selection can arrive on a UTF-8 character boundary inside a combining
+    // or ZWJ cluster; slicing at the caret would make that partial cluster
+    // look complete and overstate the column. The canonical helper instead
+    // stops before the enclosing grapheme and applies the same tab/CJK/emoji
+    // widths used by projection, paint, pointer hit testing, and motion.
+    let line_end = text[caret..]
+        .find('\n')
+        .map_or(text.len(), |relative| caret + relative);
+    let column = crate::native_editor::editor_display_column(
+        &text[line_start..line_end],
+        caret - line_start,
+        0,
+    ) + 1;
     format!("Ln {line}, Col {column}")
 }
 
@@ -5345,6 +6440,135 @@ mod markdown_reader_tests {
             .iter()
             .find(|command| command.id.as_str() == id)
             .unwrap_or_else(|| panic!("missing command {id}"))
+    }
+
+    #[test]
+    fn manual_host_diagnostics_are_exact_revision_latest_and_idempotent() {
+        let mut documents = crate::document_store::DocumentStore::new();
+        let document = documents.open(
+            "file:///tmp/aterm.toml".to_string(),
+            "theme = \"Default\"\n".to_string(),
+        );
+        let mut runtime = NativeRuntime::new();
+        let instance = runtime
+            .insert_instance(NativeApp::Editor(EditorApp::new(
+                document,
+                "aterm.toml".to_string(),
+            )))
+            .unwrap();
+        let view = ViewId::from_stored(7);
+        runtime
+            .attach_view(view, instance, AppViewState::Editor(Box::default()))
+            .unwrap();
+        assert!(runtime.enable_config_editor(document, "theme = \"Default\"\n", 7));
+        assert!(runtime.begin_config_host_analysis(document, 7, 3));
+        assert!(!runtime.begin_config_host_analysis(document, 7, 3));
+
+        let warning = crate::native_config_language::ConfigDiagnostic {
+            bytes: 8..17,
+            line: 1,
+            column: 9,
+            severity: crate::native_config_language::ConfigDiagnosticSeverity::Warning,
+            message: "configured theme is unavailable".to_string(),
+        };
+        let mut analysis = crate::native_config_language::analyze("theme = \"Default\"\n");
+        assert!(analysis.merge_host_diagnostics(vec![warning.clone()]));
+        assert!(
+            !runtime.finish_config_host_analysis(document, 6, 3, analysis.clone()),
+            "an older worker completion must not alter current editor assistance"
+        );
+        assert!(runtime.finish_config_host_analysis(document, 7, 3, analysis.clone()));
+        assert!(
+            !runtime.finish_config_host_analysis(document, 7, 3, analysis),
+            "a replayed exact completion must not duplicate diagnostics"
+        );
+
+        runtime.publish_document(document, "theme = \"Nord\"\n", 8, true);
+        assert!(runtime.begin_config_host_analysis(document, 8, 3));
+        let valid = crate::native_config_language::analyze("theme = \"Nord\"\n");
+        assert!(runtime.finish_config_host_analysis(document, 8, 3, valid.clone()));
+        assert!(runtime.config_editor_save_error(document).is_none());
+        assert!(
+            runtime.begin_config_host_analysis(document, 8, 4),
+            "same source revision is rechecked after the host environment advances"
+        );
+        assert!(
+            runtime
+                .config_editor_save_error(document)
+                .is_some_and(|message| message.contains("still in progress")),
+            "the previous host generation cannot authorize Save during revalidation"
+        );
+        assert!(
+            !command(&runtime.commands(instance, view).unwrap(), "editor/save").enabled,
+            "the visible command face must agree with the fail-closed host gate"
+        );
+        assert!(
+            !runtime.finish_config_host_analysis(document, 8, 3, valid.clone()),
+            "the old generation remains stale even though the document revision matches"
+        );
+        assert!(runtime.config_editor_save_error(document).is_some());
+        assert!(runtime.finish_config_host_analysis(document, 8, 4, valid));
+        assert!(runtime.config_editor_save_error(document).is_none());
+        assert!(command(&runtime.commands(instance, view).unwrap(), "editor/save").enabled);
+        assert!(runtime.enable_config_editor(document, "theme = \"Nord\n", 9));
+        assert!(runtime.begin_config_host_analysis(document, 9, 4));
+        let invalid = crate::native_config_language::analyze("theme = \"Nord\n");
+        assert!(invalid.has_errors());
+        assert!(runtime.finish_config_host_analysis(document, 9, 4, invalid));
+    }
+
+    #[test]
+    fn manual_host_diagnostic_replacement_at_capacity_reports_presentation_damage() {
+        let mut documents = crate::document_store::DocumentStore::new();
+        let document = documents.open(
+            "file:///tmp/aterm-capped.toml".to_string(),
+            "theme = \"Default\"\n".to_string(),
+        );
+        let mut runtime = NativeRuntime::new();
+        let instance = runtime
+            .insert_instance(NativeApp::Editor(EditorApp::new(
+                document,
+                "aterm.toml".to_string(),
+            )))
+            .unwrap();
+        assert!(runtime.enable_config_editor(document, "theme = \"Default\"\n", 11));
+        let mut analysis = crate::native_config_language::analyze("theme = \"Default\"\n");
+        analysis.diagnostics = (0..32)
+            .map(|index| crate::native_config_language::ConfigDiagnostic {
+                bytes: 0..1,
+                line: 1,
+                column: 1,
+                severity: crate::native_config_language::ConfigDiagnosticSeverity::Warning,
+                message: format!("pure warning {index}"),
+            })
+            .collect();
+        assert_eq!(analysis.diagnostics.len(), 32);
+        assert!(runtime.begin_config_host_analysis(document, 11, 1));
+        assert!(runtime.finish_config_host_analysis(document, 11, 1, analysis.clone()));
+        let host = crate::native_config_language::ConfigDiagnostic {
+            bytes: 8..17,
+            line: 1,
+            column: 9,
+            severity: crate::native_config_language::ConfigDiagnosticSeverity::Error,
+            message: "configured theme asset is invalid".to_string(),
+        };
+        assert!(analysis.merge_host_diagnostics(vec![host.clone()]));
+        assert!(runtime.begin_config_host_analysis(document, 11, 2));
+
+        assert!(
+            runtime.finish_config_host_analysis(document, 11, 2, analysis.clone()),
+            "a late host error must evict one capped warning and invalidate presentation"
+        );
+        let NativeApp::Editor(editor) = runtime.instances.get(&instance).unwrap() else {
+            panic!("Manual editor instance");
+        };
+        let diagnostics = &editor.config_analysis.as_ref().unwrap().diagnostics;
+        assert_eq!(diagnostics.len(), 32);
+        assert!(diagnostics.contains(&host));
+        assert!(
+            !runtime.finish_config_host_analysis(document, 11, 2, analysis),
+            "replayed completion remains presentation-inert"
+        );
     }
 
     #[test]
@@ -5385,7 +6609,7 @@ mod markdown_reader_tests {
         for (view, instance, kind) in views {
             let state = match kind {
                 AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
-                AppKind::Editor => AppViewState::Editor(EditorViewState::default()),
+                AppKind::Editor => AppViewState::Editor(Box::default()),
                 AppKind::Settings | AppKind::Recovery => unreachable!(),
             };
             runtime.attach_view(view, instance, state).unwrap();
@@ -6541,6 +7765,30 @@ mod markdown_reader_tests {
     }
 
     #[test]
+    fn manual_watcher_warning_does_not_destroy_editor_feedback_and_recovery_clears_it() {
+        let source = "font_px = \"huge\"\n";
+        let (mut app, mut view, _snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        view.status = Some("Saved".to_string());
+        view.config_watch_status =
+            Some("aterm.toml reload rejected: the file is not valid UTF-8.".to_string());
+
+        let warning = editor_status_message(&app, &view, None, false).unwrap();
+        assert!(warning.contains("Reload warning"));
+        assert!(warning.contains("not valid UTF-8"));
+        assert!(warning.contains("Ln 1, Col"));
+        assert!(warning.contains("font_px"));
+        assert_eq!(view.status.as_deref(), Some("Saved"));
+
+        view.config_watch_status = None;
+        let recovered = editor_status_message(&app, &view, None, false).unwrap();
+        assert!(recovered.contains("Ln 1, Col"));
+        assert!(!recovered.contains("Reload warning"));
+        assert_eq!(view.status.as_deref(), Some("Saved"));
+    }
+
+    #[test]
     fn editor_view_is_responsive_bounded_and_reports_real_buffer_state() {
         let text = (1..=80)
             .map(|line| format!("line {line}\n"))
@@ -6591,6 +7839,325 @@ mod markdown_reader_tests {
             }));
             compiled.validate_parity().unwrap();
         }
+    }
+
+    #[test]
+    fn manual_config_completions_page_every_candidate_and_keep_full_live_help() {
+        let source = "";
+        let (mut app, mut view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.config_analysis_revision = 1;
+        let assist = crate::native_config_language::assist(source, 0);
+        assert_eq!(assist.completions.len(), 8);
+        view.config_completion_interaction =
+            Some(crate::native_config_language::ConfigCompletionContext::new(
+                snapshot.id.get(),
+                snapshot.seq.0,
+                0,
+            ));
+        let viewport = LogicalRect::new(0.0, 0.0, 320.0, 300.0);
+        let capacity = crate::native_ui::editor_shell_metrics(viewport, 8).palette_visible_rows;
+        assert!(capacity > 0 && capacity < assist.completions.len());
+        let mut reachable = std::collections::BTreeSet::new();
+
+        for selected in 0..assist.completions.len() {
+            view.config_completion_selected = selected;
+            let compiled = app
+                .view(
+                    &view,
+                    &ViewCx {
+                        viewport,
+                        config_revision: 1,
+                        update_revision: 1,
+                        animation_phase_ms: 720,
+                        motion: ViewMotionCx::default(),
+                        terminal_font_px: 12.0,
+                        terminal_theme: aterm_render::Theme::default(),
+                        semantic_font: None,
+                        document: Some(&snapshot),
+                    },
+                )
+                .compile(viewport)
+                .unwrap();
+            let visible = compiled
+                .semantics
+                .iter()
+                .filter_map(|node| {
+                    node.key
+                        .as_str()
+                        .strip_prefix("editor/config-completion/")?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .collect::<Vec<_>>();
+            assert!(visible.contains(&selected));
+            assert!(visible.len() <= capacity);
+            reachable.extend(visible);
+
+            let help = compiled
+                .semantic(&UiKey::new("editor/config-help"))
+                .unwrap();
+            assert_eq!(help.role, crate::native_ui::SemanticRole::Status);
+            assert!(help.label.contains("Tab or Ctrl-Space choose"));
+            assert!(help.label.contains(assist.help.as_deref().unwrap()));
+            assert!(
+                compiled
+                    .semantic(&UiKey::new("editor/config-help/visual"))
+                    .is_none(),
+                "bounded visual copy must not duplicate the live status"
+            );
+            let visual = compiled
+                .paint
+                .iter()
+                .find(|node| node.key == UiKey::new("editor/config-help/visual"))
+                .and_then(|node| match &node.content {
+                    UiContent::Text(spec) => Some(spec.text.as_str()),
+                    _ => None,
+                })
+                .expect("painted config help");
+            assert!(visual.chars().count() < help.label.chars().count());
+
+            for key in ["editor/config-page-previous", "editor/config-page-next"] {
+                let action = compiled
+                    .semantic(&UiKey::new(key))
+                    .and_then(|node| node.action.as_ref());
+                assert!(action.is_some());
+                assert!(
+                    crate::command_registry::native_document_action(action.unwrap().as_str())
+                        .is_some()
+                );
+            }
+            compiled.validate_parity().unwrap();
+        }
+        assert_eq!(
+            reachable,
+            (0..assist.completions.len()).collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn manual_gpu_help_fits_a_wide_editor_without_eliding_lsp_guidance() {
+        let source = "background_opacity = \n";
+        let (mut app, mut view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.config_analysis_revision = snapshot.seq.0;
+        let caret = source.find('\n').expect("one-line config");
+        let buffer = view.buffer.as_mut().expect("editor buffer");
+        buffer.selections = vec![crate::native_editor::Selection::caret(caret)];
+        buffer.primary = 0;
+
+        let viewport = LogicalRect::new(0.0, 0.0, 1_200.0, 822.0);
+        let compiled = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    config_revision: 1,
+                    update_revision: 1,
+                    animation_phase_ms: 720,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 12.0,
+                    terminal_theme: aterm_render::Theme::default(),
+                    semantic_font: None,
+                    document: Some(&snapshot),
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+        let semantic = compiled
+            .semantic(&UiKey::new("editor/config-help"))
+            .expect("complete config help semantics");
+        assert!(
+            compiled
+                .semantic(&UiKey::new("editor/config-help/visual"))
+                .is_none()
+        );
+        let visual = compiled
+            .paint
+            .iter()
+            .find(|node| node.key == UiKey::new("editor/config-help/visual"))
+            .and_then(|node| match &node.content {
+                UiContent::Text(spec) => Some(spec.text.as_str()),
+                _ => None,
+            })
+            .expect("visible config help");
+
+        for expected in [
+            "background_opacity",
+            "number",
+            "default 1.0",
+            "range 0–1",
+            "macOS GPU",
+            "CPU",
+            "4.5:1",
+        ] {
+            assert!(semantic.label.contains(expected), "{}", semantic.label);
+            assert!(visual.contains(expected), "{visual}");
+        }
+        assert!(!visual.contains('…'), "{visual}");
+        let audit = compiled.paint_audit_lines();
+        assert!(
+            audit.iter().any(|line| {
+                line.contains("key=\"editor/config-help/visual\"")
+                    && line.contains("overflow=false")
+            }),
+            "{audit:#?}"
+        );
+        compiled.validate_parity().unwrap();
+    }
+
+    #[test]
+    fn manual_gpu_completion_help_fits_the_live_wide_editor_path() {
+        let source = "";
+        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.config_analysis_revision = snapshot.seq.0;
+        let viewport = LogicalRect::new(0.0, 0.0, 1_200.0, 822.0);
+        let compiled = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    config_revision: 1,
+                    update_revision: 1,
+                    animation_phase_ms: 720,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 12.0,
+                    terminal_theme: aterm_render::Theme::default(),
+                    semantic_font: None,
+                    document: Some(&snapshot),
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+        let semantic = compiled
+            .semantic(&UiKey::new("editor/config-help"))
+            .expect("complete completion help semantics");
+        assert!(
+            compiled
+                .semantic(&UiKey::new("editor/config-help/visual"))
+                .is_none()
+        );
+        let visual = compiled
+            .paint
+            .iter()
+            .find(|node| node.key == UiKey::new("editor/config-help/visual"))
+            .and_then(|node| match &node.content {
+                UiContent::Text(spec) => Some(spec.text.as_str()),
+                _ => None,
+            })
+            .expect("visible completion help");
+
+        assert!(semantic.label.contains("inherited $ATERM_CPU"));
+        for expected in [
+            "GPU rendering",
+            "last --cpu/--gpu",
+            "$ATERM_CPU",
+            "$ATERM_GPU",
+            "Ctrl-Space",
+            "↑↓ select",
+            "Enter/Tab insert",
+        ] {
+            assert!(visual.contains(expected), "{visual}");
+        }
+        assert!(!visual.contains('…'), "{visual}");
+        assert!(compiled.paint_audit_lines().iter().any(|line| {
+            line.contains("key=\"editor/config-help/visual\"") && line.contains("overflow=false")
+        }));
+        compiled.validate_parity().unwrap();
+    }
+
+    #[test]
+    fn manual_editor_chrome_elision_preserves_complete_grapheme_clusters() {
+        for (source, expected) in [
+            ("A👩‍💻WWWW", "A👩‍💻…"),
+            ("Ae\u{301}WWWW", "Ae\u{301}…"),
+            ("A🇺🇳WWWW", "A🇺🇳…"),
+        ] {
+            assert_eq!(bounded_markdown_label(source, 2), expected);
+        }
+
+        let prompt = editor_prompt_label("I-search: ", "discarded👩‍💻🇺🇳", "e\u{301}", 14);
+        assert_eq!(prompt, "I-search: …👩‍💻🇺🇳e\u{301}");
+        assert_eq!(prompt.graphemes().count(), 14);
+    }
+
+    #[test]
+    fn manual_editor_cursor_label_uses_shared_grapheme_cell_geometry() {
+        let text = "first\n\te\u{301}中👩‍💻🇺🇳Z\n";
+        let (_app, mut view, _snapshot) = editor_fixture(text, "aterm.toml");
+        let buffer = view.buffer.as_mut().expect("editor buffer");
+        let line_start = text.find('\n').unwrap() + 1;
+        let after_tab = line_start + '\t'.len_utf8();
+        let after_combining = after_tab + "e\u{301}".len();
+        let after_cjk = after_combining + "中".len();
+        let after_emoji = after_cjk + "👩‍💻".len();
+        let after_flag = after_emoji + "🇺🇳".len();
+
+        for (caret, expected) in [
+            (after_tab, "Ln 2, Col 5"),
+            (after_combining, "Ln 2, Col 6"),
+            (after_cjk, "Ln 2, Col 8"),
+            (after_emoji, "Ln 2, Col 10"),
+            (after_flag, "Ln 2, Col 12"),
+            (after_flag + 1, "Ln 2, Col 13"),
+            // Defensive selections on character boundaries inside a cluster
+            // resolve to the cluster's leading edge, never a phantom cell.
+            (after_tab + 'e'.len_utf8(), "Ln 2, Col 5"),
+            (after_cjk + '👩'.len_utf8(), "Ln 2, Col 8"),
+        ] {
+            buffer.selections = vec![crate::native_editor::Selection::caret(caret)];
+            assert_eq!(editor_cursor_label(text, buffer), expected, "caret={caret}");
+        }
+    }
+
+    #[test]
+    fn manual_config_footer_bounds_paint_but_retains_full_unicode_diagnostic() {
+        let source = "future = true\n";
+        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        let unknown_key = "future.👩‍💻.e\u{301}.🇺🇳.a-deliberately-long-forward-compatible-key";
+        let mut analysis = crate::native_config_language::analyze(source);
+        analysis.diagnostics = vec![crate::native_config_language::ConfigDiagnostic {
+            bytes: 0..6,
+            line: 1,
+            column: 1,
+            severity: crate::native_config_language::ConfigDiagnosticSeverity::Warning,
+            message: format!("unknown configuration key {unknown_key}"),
+        }];
+        app.config_analysis = Some(analysis);
+        app.config_analysis_revision = snapshot.seq.0;
+        let viewport = LogicalRect::new(0.0, 0.0, 286.5, 558.0);
+        let compiled = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    config_revision: 1,
+                    update_revision: 1,
+                    animation_phase_ms: 720,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 12.0,
+                    terminal_theme: aterm_render::Theme::default(),
+                    semantic_font: None,
+                    document: Some(&snapshot),
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+        let spec = editor_spec(&compiled);
+        let semantic = spec
+            .semantic_status
+            .as_deref()
+            .expect("complete diagnostic status");
+        let visual = spec.status.as_deref().expect("bounded diagnostic footer");
+        assert!(semantic.contains(unknown_key), "{semantic}");
+        assert_ne!(visual, semantic);
+        assert!(visual.ends_with('…'), "{visual}");
+        compiled.validate_parity().unwrap();
     }
 
     #[test]
@@ -6663,6 +8230,131 @@ mod markdown_reader_tests {
             } else {
                 assert!(primary.is_none());
                 assert!(navigation.is_none());
+            }
+            compiled.validate_parity().unwrap();
+        }
+
+        app.disk_conflict = true;
+        let mut commands = Vec::new();
+        app.commands(&view, &mut commands);
+        assert!(
+            !command(&commands, "editor/save").enabled,
+            "shortcut/controller Save must share the conflict gate"
+        );
+        let viewport = LogicalRect::new(0.0, 0.0, 474.0, 468.0);
+        let compiled = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    config_revision: 1,
+                    update_revision: 1,
+                    animation_phase_ms: 720,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 12.0,
+                    terminal_theme: aterm_render::Theme::default(),
+                    semantic_font: None,
+                    document: Some(&snapshot),
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+        assert!(
+            compiled
+                .semantic(&UiKey::new("editor/save-button"))
+                .and_then(|node| node.state)
+                .is_some_and(|state| !state.enabled),
+            "the painted/semantic Save button must be disabled during conflict"
+        );
+        let reload = compiled
+            .semantic(&UiKey::new("editor/revert-button"))
+            .expect("conflict recovery is visible without opening the command palette");
+        assert_eq!(
+            reload.action.as_ref().map(ActionId::as_str),
+            Some("editor/revert")
+        );
+        assert!(reload.state.is_some_and(|state| state.enabled));
+        assert!(
+            reload
+                .label
+                .contains("Discard Changes and Reload from Disk")
+        );
+        assert!(
+            editor_spec(&compiled)
+                .semantic_status
+                .as_deref()
+                .is_some_and(|status| {
+                    status.contains("Save is blocked")
+                        && status.contains("Discard Changes and Reload from Disk")
+                }),
+            "conflict recovery stays actionable even if no generic recovery notice exists"
+        );
+    }
+
+    #[test]
+    fn manual_problem_navigation_is_visible_actionable_and_responsive() {
+        let source = "future_first_setting = 1\nfuture_second_setting = 2\n";
+        let (mut app, view, snapshot) = editor_fixture(source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(source));
+        app.config_analysis_revision = snapshot.seq.0;
+        assert_eq!(
+            app.config_analysis.as_ref().map_or(
+                0,
+                crate::native_config_language::ConfigAnalysis::diagnostic_count
+            ),
+            2
+        );
+
+        for (width, height) in [(804.0, 582.0), (286.5, 558.0)] {
+            let viewport = LogicalRect::new(0.0, 0.0, width, height);
+            let compiled = app
+                .view(
+                    &view,
+                    &ViewCx {
+                        viewport,
+                        config_revision: 1,
+                        update_revision: 1,
+                        animation_phase_ms: 720,
+                        motion: ViewMotionCx::default(),
+                        terminal_font_px: 12.0,
+                        terminal_theme: aterm_render::Theme::default(),
+                        semantic_font: None,
+                        document: Some(&snapshot),
+                    },
+                )
+                .compile(viewport)
+                .unwrap();
+
+            for (key, action, label) in [
+                (
+                    "editor/config-problem-previous-button",
+                    "editor/config-problem-previous",
+                    "Previous config problem (Shift-F8)",
+                ),
+                (
+                    "editor/config-problem-next-button",
+                    "editor/config-problem-next",
+                    "Next config problem (F8)",
+                ),
+            ] {
+                let semantic = compiled.semantic(&UiKey::new(key)).expect(key);
+                assert_eq!(semantic.action.as_ref().map(ActionId::as_str), Some(action));
+                assert_eq!(semantic.label, label);
+                assert!(semantic.state.is_some_and(|state| state.enabled));
+                assert!(
+                    compiled
+                        .hits
+                        .iter()
+                        .any(|hit| { hit.key.as_str() == key && hit.action.as_str() == action })
+                );
+                let audit = compiled.paint_audit_lines();
+                assert!(
+                    audit.iter().any(|line| {
+                        line.contains(&format!("key={key:?}")) && line.contains("overflow=false")
+                    }),
+                    "{key} at {width}×{height}: {audit:#?}"
+                );
             }
             compiled.validate_parity().unwrap();
         }
@@ -6739,6 +8431,25 @@ mod markdown_reader_tests {
     }
 
     #[test]
+    fn command_palette_count_copy_uses_match_and_matches() {
+        assert_eq!(command_palette_status(0, true), "M-x · no matches");
+        assert_eq!(command_palette_status(1, true), "M-x · 1 match");
+        assert_eq!(command_palette_status(2, true), "M-x · 2 matches");
+        assert_eq!(
+            command_palette_status(0, false),
+            "M-x · 0 matches · ↑/↓ choose · Tab complete · Enter run · Esc close"
+        );
+        assert_eq!(
+            command_palette_status(1, false),
+            "M-x · 1 match · ↑/↓ choose · Tab complete · Enter run · Esc close"
+        );
+        assert_eq!(
+            command_palette_status(2, false),
+            "M-x · 2 matches · ↑/↓ choose · Tab complete · Enter run · Esc close"
+        );
+    }
+
+    #[test]
     fn editor_recovery_wins_and_long_minibuffer_keeps_the_live_tail() {
         let (mut app, mut view, snapshot) = editor_fixture("", "empty.md");
         let viewport = LogicalRect::new(0.0, 0.0, 474.0, 468.0);
@@ -6792,7 +8503,16 @@ mod markdown_reader_tests {
             .unwrap();
         assert_eq!(
             editor_spec(&dirty).status.as_deref(),
-            Some("Modified · Cmd-S to save · 1 lines")
+            Some("Modified · Cmd-S to save · 1 line")
+        );
+        let two_line_projection = crate::native_editor::EditorViewportProjection {
+            first_line: 0,
+            total_lines: 2,
+            lines: Vec::new(),
+        };
+        assert_eq!(
+            editor_status_message(&app, &view, Some(&two_line_projection), false).as_deref(),
+            Some("Modified · Cmd-S to save · 2 lines")
         );
         let dirty_pixels = crate::tray_raster::rasterize_tray(
             &dirty.tray(aterm_render::Theme::default(), 13.0).prims,
@@ -6853,9 +8573,12 @@ mod markdown_reader_tests {
         let label = bounded_middle_label("prefix-🦀-a-very-long-document.md", 18);
         assert!(label.starts_with("prefix-🦀"));
         assert!(label.ends_with("ument.md"));
-        assert_eq!(label.chars().count(), 18);
+        assert_eq!(label.graphemes().count(), 18);
         assert_eq!(bounded_middle_label("abc", 1), "…");
         assert_eq!(bounded_middle_label("abc", 0), "");
+        assert_eq!(bounded_middle_label("A👩‍💻BCDE", 4), "A👩‍💻…E");
+        assert_eq!(bounded_middle_label("ABCDEé", 3), "A…é");
+        assert_eq!(bounded_middle_label("ABCDE🇺🇳", 3), "A…🇺🇳");
     }
 
     #[test]
@@ -6898,47 +8621,49 @@ mod markdown_reader_tests {
         let view = MarkdownViewState::default();
         let px = 20.0 * crate::native_appearance::text_scale();
 
-        let viewport = LogicalRect::new(0.0, 0.0, 928.0, 620.0);
-        let compiled = app
-            .view(
-                &view,
-                &ViewCx {
-                    viewport,
-                    config_revision: 1,
-                    update_revision: 1,
-                    animation_phase_ms: 720,
-                    motion: ViewMotionCx::default(),
-                    terminal_font_px: 12.0,
-                    terminal_theme: aterm_render::Theme::default(),
-                    semantic_font: None,
-                    document: None,
-                },
-            )
-            .compile(viewport)
-            .unwrap();
-        let visual = compiled.semantic(&UiKey::new("markdown/title")).unwrap();
-        assert!(
-            crate::tray_raster::ui_text_width_for(TextFace::UiBold, &visual.label, px)
-                <= visual.rect.width - 4.0 + 0.01,
-            "{}px title paints inside its exact flexible rect",
-            viewport.width,
-        );
-        assert!(
-            visual.label.starts_with("at"),
-            "{}px title lost its identity-bearing prefix: {}",
-            viewport.width,
-            visual.label,
-        );
-        assert!(visual.label.ends_with(".md"));
-        assert_eq!(
-            compiled
-                .semantic(&UiKey::new("markdown/header"))
-                .unwrap()
-                .label,
-            format!("Markdown reader: {title}"),
-            "visual elision never truncates the semantic document identity",
-        );
-        compiled.validate_parity().unwrap();
+        {
+            let viewport = LogicalRect::new(0.0, 0.0, 928.0, 620.0);
+            let compiled = app
+                .view(
+                    &view,
+                    &ViewCx {
+                        viewport,
+                        config_revision: 1,
+                        update_revision: 1,
+                        animation_phase_ms: 720,
+                        motion: ViewMotionCx::default(),
+                        terminal_font_px: 12.0,
+                        terminal_theme: aterm_render::Theme::default(),
+                        semantic_font: None,
+                        document: None,
+                    },
+                )
+                .compile(viewport)
+                .unwrap();
+            let visual = compiled.semantic(&UiKey::new("markdown/title")).unwrap();
+            assert!(
+                crate::tray_raster::ui_text_width_for(TextFace::UiBold, &visual.label, px)
+                    <= visual.rect.width - 4.0 + 0.01,
+                "{}px title paints inside its exact flexible rect",
+                viewport.width,
+            );
+            assert!(
+                visual.label.starts_with("at"),
+                "{}px title lost its identity-bearing prefix: {}",
+                viewport.width,
+                visual.label,
+            );
+            assert!(visual.label.ends_with(".md"));
+            assert_eq!(
+                compiled
+                    .semantic(&UiKey::new("markdown/header"))
+                    .unwrap()
+                    .label,
+                format!("Markdown reader: {title}"),
+                "visual elision never truncates the semantic document identity",
+            );
+            compiled.validate_parity().unwrap();
+        }
 
         for viewport in [
             LogicalRect::new(0.0, 0.0, 474.0, 468.0),

@@ -97,9 +97,11 @@ impl Terminal {
     /// Applied to the PRIMARY-content grid — the active grid, or the saved
     /// primary while the alt screen is up — because scrollback belongs to
     /// primary content: the alt buffer has none by xterm spec (its ring cap
-    /// is 0 and must stay 0). Tiered grids apply the limit to the store;
-    /// ring-only grids (the wasm engines) re-cap the ring itself, evicting
-    /// the oldest lines on shrink (see [`Grid::set_scrollback_line_limit`]).
+    /// is 0 and must stay 0). The limit is ONE TOTAL retention count (audit
+    /// E1): on tiered grids it caps ring + staged + store together (the store
+    /// takes the remainder after the ring's share); ring-only grids re-cap
+    /// the ring itself, evicting the oldest lines on shrink (see
+    /// [`Grid::set_scrollback_line_limit`]).
     ///
     /// [`Grid::set_scrollback_line_limit`]: crate::grid::Grid::set_scrollback_line_limit
     pub fn set_scrollback_line_limit(&mut self, limit: Option<usize>) {
@@ -125,19 +127,49 @@ impl Terminal {
         self.main_grid().scrollback_line_limit()
     }
 
-    /// Highest scrollback watermark pressure across the main and alternate grids.
+    /// Highest scrollback watermark pressure across the main and alternate
+    /// grids — the tiered stores' budget watermarks, plus the advisory RING
+    /// byte watermark (audit E10a) when one is configured via
+    /// [`set_ring_byte_watermark`](Self::set_ring_byte_watermark), so a
+    /// ring-only "unlimited" terminal still reports memory pressure.
     #[must_use]
     pub fn scrollback_pressure_level(&self) -> crate::scrollback::WatermarkLevel {
         let mut level = self.grid.scrollback().map_or(
             crate::scrollback::WatermarkLevel::Green,
             aterm_scrollback::ScrollbackStorage::watermark_level,
         );
+        level = level.max(self.grid.ring_watermark_level());
         if let Some(ref alt) = self.alt_grid {
             if let Some(scrollback) = alt.scrollback() {
                 level = level.max(scrollback.watermark_level());
             }
         }
         level
+    }
+
+    /// Set the advisory RING byte watermark budget on the primary-content
+    /// grid (audit E10a): with no tiered store and no line limit, retention
+    /// is otherwise unbounded and silent — a configured budget makes
+    /// [`scrollback_pressure_level`](Self::scrollback_pressure_level) report
+    /// Yellow/Red as ring memory approaches it. Advisory only (no eviction).
+    /// `None` (default) disables it.
+    pub fn set_ring_byte_watermark(&mut self, budget: Option<usize>) {
+        self.grid.set_ring_byte_watermark(budget);
+    }
+
+    /// Monotonic count of history lines LOST to non-user-requested truncation
+    /// across the main and alternate grids (audit E10a): flood-backpressure
+    /// staged-line drops, detached-reflow-window cap drops, and
+    /// memory-pressure store evictions. The OUT-OF-BAND truncation signal —
+    /// content never carries a sentinel line; hosts poll this and surface the
+    /// loss in their own UI chrome.
+    #[must_use]
+    pub fn scrollback_truncated_lines(&self) -> u64 {
+        let mut total = self.grid.truncated_lines();
+        if let Some(ref alt) = self.alt_grid {
+            total += alt.truncated_lines();
+        }
+        total
     }
 
     /// Clear all scrollback history (main and alt grids).
@@ -404,6 +436,41 @@ mod tests {
         t.process(b"\x1b[?1049l"); // back to primary
         assert_eq!(t.grid().scrollback_lines(), 50);
         assert_eq!(t.scrollback_line_limit(), Some(50));
+    }
+
+    /// E10a: the advisory ring byte watermark folds into the ONE pressure
+    /// query, and the out-of-band truncation counter aggregates grid + store
+    /// loss — with nothing counted for user-requested limits.
+    #[test]
+    fn ring_watermark_and_truncation_counter_are_out_of_band() {
+        use crate::scrollback::WatermarkLevel;
+        let mut t = Terminal::new(5, 20);
+        write_lines(&mut t, 0, 500);
+        assert_eq!(
+            t.scrollback_pressure_level(),
+            WatermarkLevel::Green,
+            "no store, no configured ring watermark → Green"
+        );
+        assert_eq!(t.scrollback_truncated_lines(), 0);
+
+        // Configure a budget the ring already exceeds: pressure surfaces
+        // through the SAME query hosts already poll.
+        t.set_ring_byte_watermark(Some(1));
+        assert_eq!(
+            t.scrollback_pressure_level(),
+            WatermarkLevel::Red,
+            "ring bytes past the advisory budget read Red"
+        );
+        t.set_ring_byte_watermark(None);
+        assert_eq!(t.scrollback_pressure_level(), WatermarkLevel::Green);
+
+        // A user limit shrink evicts intentionally — never counted as loss.
+        t.set_scrollback_line_limit(Some(10));
+        assert_eq!(
+            t.scrollback_truncated_lines(),
+            0,
+            "requested truncation is not loss"
+        );
     }
 
     /// The whole point of the bracket guard: a paste planted with ESC[201~

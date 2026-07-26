@@ -33,6 +33,7 @@ use web_time::Instant;
 
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::{RenderCell, Terminal};
+use aterm_hash::FxHashMap;
 use aterm_lexicon::{Class, FormId, LangSet, Lexicon, Match, ScanOptions, ScanScratch};
 use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, InkCell, WordDecoration};
 use aterm_scene::vector::FIXED_ONE;
@@ -116,6 +117,12 @@ const REKEY_MAX_LINEAR_ROWS: u32 = 2;
 const ALIGN_DECISION_CELLS: usize = (PERSIST_CAP + 1) * (MAX_OCCURRENCES + 1);
 /// §3.6 ordinal mix constant: `ident = mix(seed ^ ordinal · THIS)`.
 const ORDINAL_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Floor / ceiling for one generation of the [`ScanMemo`]; the live cap is the
+/// viewport's row count clamped into this band (see `ScanMemo::fit`), so the
+/// memo's footprint tracks the grid it is memoizing (≈ `2 · rows · cols` bytes)
+/// instead of a fixed worst case sized for the widest terminal anyone might open.
+const SCAN_MEMO_MIN_GEN: usize = 32;
+const SCAN_MEMO_MAX_GEN: usize = 4096;
 /// §5.2 hard cap on peeking cats per frame: row-major deterministic truncation;
 /// occurrences past the cap fall back to the v1 paw + ink.
 const MAX_CATS: usize = 8;
@@ -188,19 +195,19 @@ const ORCA_PALETTE: [u32; 4] = [0x0020_6CC8, 0x0029_A0E0, 0x0055_D6F0, 0x00E8_FB
 /// App-cached resolved sparkle state: the resolved [`DecoConfig`] plus the
 /// compiled lexicon. Rebuilt only on config reload / toggle (NOT per frame), so
 /// the per-frame path neither re-resolves config nor rebuilds the lexicon.
+#[derive(Clone)]
 pub struct Resolved {
     pub cfg: DecoConfig,
     pub lexicon: std::sync::Arc<Lexicon>,
 }
 
-/// `[sparkle_words.feline] style` (§10): the v2 peeking cat, or the exact v1
-/// steady paw (v2 is independently revertible per class).
+/// `[sparkle_words.feline] style`: the v4 peeking cat, or the retained legacy
+/// ink-only mode. Paw graphics were retired in cat-art v4.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FelineStyle {
-    /// `style = "cat"` (the default): the §5 peeking cat, with the documented
-    /// auto-floors falling back to the paw where a cat cannot render.
+    /// `style = "cat"` (the default): the authored peeking-cat graphic.
     Cat,
-    /// `style = "paw"`: exactly the v1 path.
+    /// `style = "paw"`: legacy ink-only compatibility mode; no paw graphic.
     Paw,
 }
 
@@ -320,9 +327,10 @@ pub struct DecoConfig {
     /// Orca / cetacean family → the randomized water-droplet "splash".
     pub orca: bool,
     /// Emphasis / hype words (user `extra_words` only; the builtin lexicon
-    /// ships no emphasis forms) — the ink-only class. Already
-    /// ANDed with `ink_enabled` by the resolver (an emphasis match with ink off
-    /// would render nothing, so it must not consume occurrence slots).
+    /// ships no emphasis forms) — the ink-only class. This gates only the
+    /// class-default path. A custom override is resolved before class gates
+    /// and intentionally bypasses this value, even though custom surfaces are
+    /// indexed under the emphasis class.
     pub emphasis: bool,
     /// Animated glyph-ink shimmer over ink-bearing classes (emphasis + profanity
     /// + feline; orca untouched in v2). `false` ⇒ zero [`InkCell`]s emitted.
@@ -346,19 +354,8 @@ pub struct DecoConfig {
     pub allow_bare_cat: bool,
     /// Decorate a lone CJK cat ideograph (opt-in).
     pub cjk_single_char: bool,
-    /// Feline paw tint `0x00RRGGBB`.
-    pub feline_color: u32,
-    /// Feline paw opacity `0.0..=1.0`.
-    pub feline_intensity: f32,
-    /// `[sparkle_words.feline] style` (§10): peeking cat vs the exact v1 paw.
+    /// Feline graphic mode: authored cat versus legacy ink-only `paw`.
     pub feline_style: FelineStyle,
-    /// `[sparkle_words.feline] idle` (§10): blink/ear-twitch one-shots (≤ 1/s,
-    /// focus-gated). `false` ⇒ exact 0% between damage (no deadline ever arms).
-    pub feline_idle: bool,
-    /// `[sparkle_words.feline] gaze` (§10): pupils track the cursor (present-
-    /// driven, zero new wakes, §5.8). `false` (like `reduced_motion`) ⇒
-    /// centered pupils, no tracking.
-    pub feline_gaze: bool,
     /// `[sparkle_words.feline] magic` (§10): Fortune (1/512) / Nebula (1/1024)
     /// rare cats. `false` ⇒ every cat takes the ordinary build.
     pub feline_magic: bool,
@@ -368,6 +365,13 @@ pub struct DecoConfig {
     /// `[sparkle_words.profanity] magic` (§10): Quasar (1/512) / Singularity
     /// (1/1024) rare novas. `false` ⇒ every nova takes the ordinary build.
     pub profanity_magic: bool,
+    /// FREQUENCY, 2026-07-24 (owner: "more common f-bomb explosions"): the
+    /// default rose 10 -> 30, so roughly one f-bomb in three detonates instead
+    /// of one in ten. The screen is still bounded by machinery this knob cannot
+    /// defeat — `MAX_ACTIVE_SUPERNOVAE = 1` plus the ignition limiter
+    /// (`IGNITION_WINDOW` / `MAX_RECENT_IGNITIONS`), which QUEUE rather than
+    /// cancel — so raising the roll cannot exceed the flash budget.
+    ///
     /// v3 §3.2 `[sparkle_words.profanity] supernova_chance` (`0..=100`, 0
     /// disables): the per-appearance FUCK SUPER NOVA escalation chance.
     /// Consulted only under [`ProfanityStyle::Rainbow`] (documented — the
@@ -504,15 +508,11 @@ impl Default for DecoConfig {
             suppress_in_alt_screen: false,
             allow_bare_cat: true,
             cjk_single_char: false,
-            feline_color: 0x00F7_A8B8,
-            feline_intensity: 0.7,
             feline_style: FelineStyle::Cat,
-            feline_idle: true,
-            feline_gaze: true,
             feline_magic: true,
             profanity_style: ProfanityStyle::Rainbow,
             profanity_magic: true,
-            supernova_chance: 10,
+            supernova_chance: 30,
             spec_table: SpecTable::default(),
             palette: Vec::new(),
             density: 3,
@@ -652,6 +652,12 @@ struct Episode {
     /// firing) and stored so the decision transfers with row alignment.
     /// Always `false` for born-done/born-settled episodes.
     burst_roll: bool,
+    /// WHICH of the three detonation degrees this episode drew, decoded from
+    /// the HIGH half of the same birth draw that set [`Self::burst_roll`] (see
+    /// [`supernova::tier_of`]). Stored, like the roll itself, so the decision
+    /// transfers with row alignment instead of being re-drawn on every scan.
+    /// Meaningless unless `burst_roll` and a `SuperNova` burst kind.
+    burst_tier: supernova::SuperTier,
     /// v3 §6: the burst axis kind at birth (`None` = no burst axis). The §3.2
     /// burst mutex reads it to tell a live CLASSIC nova's genome-derived
     /// window from a supernova's without the occurrence in scope.
@@ -699,6 +705,7 @@ impl Episode {
             peek_pause: None,
             peek_total: 0,
             burst_roll: false,
+            burst_tier: supernova::SuperTier::Nova,
             burst_kind: None,
             bonk_pending: false,
         }
@@ -1303,6 +1310,170 @@ pub enum NyanSpriteSource {
     },
 }
 
+/// Exact memo of `visible row text -> lexicon matches`, the rescan's dominant
+/// cost.
+///
+/// LATENCY MECHANISM. The rescan is triggered by the DAMAGE EPOCH but is not
+/// damage-limited: any PTY byte advances the epoch, so every presented frame
+/// under output re-tokenises the WHOLE viewport — and it does so on the main
+/// thread, inside the very present that carries the user's keystroke echo
+/// (`cell_frame_into` + `take_damage` sit one branch above it). Measured on a
+/// full 60x200 grid of English prose that is ~99 µs/frame, of which ~86 µs is
+/// `Lexicon::scan_into_with_scratch` alone: per token it folds the surface,
+/// probes the spaced map, and retries possessive/clitic candidates. Those
+/// microseconds are pure echo latency, and they also feed `render_ns`, so a
+/// busy screen can push the load-shed latch into `perf_reduced` and fade out
+/// every cursor effect exactly while the user is typing fastest.
+///
+/// The scanner is a PURE function of `(row text, ScanOptions, Lexicon)`: it
+/// reads no column map, no colors, no row index, and no clock. So a row whose
+/// character stream is unchanged since any recent frame cannot produce
+/// different matches, and the whole tokenise+lookup pass can be replaced by one
+/// hash lookup. Everything downstream of the match list — ordinals, identity,
+/// the persist fast path, SimHash births, ink capture, alignment — still runs
+/// verbatim on every row, every frame, so the presented decoration set is
+/// unchanged by construction.
+///
+/// Keyed by the row TEXT rather than the row INDEX on purpose: under scrolling
+/// output (the case the memo exists for) row `r` this frame holds what row
+/// `r + k` held last frame, so an index-keyed memo would miss on every row of
+/// every scrolled frame — precisely the heavy-output case. Text keys hit for
+/// every line that merely moved, leaving only genuinely new lines to scan.
+///
+/// Capacity is two generations of `fit`: a full hot generation is demoted to
+/// cold wholesale (dropping the previous cold), so retention is at least one
+/// screenful — enough for the scroll hit — and never grows without bound as a
+/// build log streams distinct lines through it. `String`/`Vec` keys are exact,
+/// so no hash-collision argument is needed for correctness.
+#[derive(Default)]
+struct ScanMemo {
+    hot: FxHashMap<String, Vec<Match>>,
+    cold: FxHashMap<String, Vec<Match>>,
+    /// Live per-generation entry cap (from the viewport row count).
+    gen_cap: usize,
+    /// Fingerprint of the [`ScanOptions`] the resident entries were produced
+    /// under. Lexicon rebuilds and `[sparkle_words]` edits already route
+    /// through `hard_reset` (which clears the memo outright); this is the
+    /// standing guard for any caller that changes the gates WITHOUT one — a
+    /// stale `allow_bare_cat`/`ignore` entry would keep decorating a word the
+    /// user just denied, on a byte-idle grid, until the text next changed.
+    opts_fp: u64,
+    /// Test-only: force every probe to miss so the equivalence battery can
+    /// drive a second engine down the always-re-lex path.
+    #[cfg(test)]
+    bypass: bool,
+    #[cfg(test)]
+    hits: u64,
+    #[cfg(test)]
+    misses: u64,
+}
+
+impl ScanMemo {
+    fn clear(&mut self) {
+        self.hot.clear();
+        self.cold.clear();
+    }
+
+    /// Per-rescan prologue: retire everything if the scan gates moved, and size
+    /// the generations to the viewport. Called once per rescan, not per row.
+    fn fit(&mut self, rows: usize, opts_fp: u64) {
+        if self.opts_fp != opts_fp {
+            self.clear();
+            self.opts_fp = opts_fp;
+        }
+        // TWO screenfuls per generation, not one: at exactly one screenful a
+        // single new line would rotate the generation every frame, so the next
+        // frame's rows would all miss hot and pay a promotion — hit rate holds
+        // but the memo churns for nothing. Two screenfuls amortize the rotation
+        // over a screenful of genuinely new lines.
+        self.gen_cap = rows
+            .saturating_mul(2)
+            .clamp(SCAN_MEMO_MIN_GEN, SCAN_MEMO_MAX_GEN);
+    }
+
+    /// Probe for `text`, promoting a cold-generation hit into hot. `true` means
+    /// [`matches`](Self::matches) will serve this row without a lexicon pass.
+    fn touch(&mut self, text: &str) -> bool {
+        #[cfg(test)]
+        if self.bypass {
+            self.misses += 1;
+            return false;
+        }
+        if self.hot.contains_key(text) {
+            #[cfg(test)]
+            {
+                self.hits += 1;
+            }
+            return true;
+        }
+        let Some((key, value)) = self.cold.remove_entry(text) else {
+            #[cfg(test)]
+            {
+                self.misses += 1;
+            }
+            return false;
+        };
+        #[cfg(test)]
+        {
+            self.hits += 1;
+        }
+        self.install(key, value);
+        true
+    }
+
+    /// The memoized match list for a row [`touch`](Self::touch) just reported
+    /// resident. A miss here would silently drop the row's decorations rather
+    /// than merely slow the frame, so it is a debug hard error; release falls
+    /// back to "no matches" instead of panicking inside a present.
+    fn matches(&self, text: &str) -> &[Match] {
+        debug_assert!(self.hot.contains_key(text), "touch() proved residency");
+        self.hot.get(text).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Record a freshly scanned row.
+    fn remember(&mut self, text: &str, matches: &[Match]) {
+        self.install(text.to_owned(), matches.to_vec());
+    }
+
+    fn install(&mut self, key: String, value: Vec<Match>) {
+        if self.hot.len() >= self.gen_cap.max(1) {
+            // Generation rotation, not eviction: the screenful that just went
+            // cold still answers next frame's scroll, and the generation before
+            // it is dropped in one free instead of a per-entry LRU walk on the
+            // typing path.
+            self.cold.clear();
+            std::mem::swap(&mut self.hot, &mut self.cold);
+        }
+        self.hot.insert(key, value);
+    }
+}
+
+/// Fold every input that can change what [`Lexicon::scan_into_with_scratch`]
+/// returns for a fixed row text into one key. Computed ONCE per rescan (the
+/// `ignore` walk is O(|deny list|), not O(rows · |deny list|)).
+fn scan_opts_fp(opts: &ScanOptions<'_>) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let fold = |acc: u64, byte: u8| (acc ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+    let mut fp = fold(FNV_OFFSET, u8::from(opts.allow_bare_cat));
+    fp = fold(fp, u8::from(opts.cjk_single_char));
+    if let Some(ignore) = opts.ignore {
+        // XOR-folded per-word hashes: `HashSet` iteration order is not stable
+        // across rebuilds, so an order-SENSITIVE fold would spuriously retire
+        // the memo (a pure slowdown, but every frame). Length is mixed in so
+        // adding a word that XORs to zero against an existing one still moves
+        // the key.
+        let mut set = 0u64;
+        for word in ignore {
+            set ^= word.bytes().fold(FNV_OFFSET, fold);
+        }
+        fp ^= set;
+        fp = fold(fp, 0xff);
+        fp ^= ignore.len() as u64;
+    }
+    fp
+}
+
 #[derive(Default)]
 pub struct WordDecorations {
     occ: Vec<Occurrence>,
@@ -1319,6 +1490,9 @@ pub struct WordDecorations {
     scan_cells: Vec<RenderCell>,
     scan_chars: Vec<char>,
     scan_matches: Vec<Match>,
+    /// The rescan's tokenise+lexicon-lookup memo — see [`ScanMemo`]. Holds the
+    /// only per-row work that is a pure function of the row's text.
+    scan_memo: ScanMemo,
     /// Lexicon token/fold/CJK workspace, resident so typing-damage rescans
     /// allocate nothing after the scanner reaches its high-water capacities.
     scan_scratch: ScanScratch,
@@ -1376,6 +1550,12 @@ pub struct WordDecorations {
     /// [`crate::nyan_sing::NoteKind`]. Re-painted only when the host id (kind +
     /// cell-metric-derived size) changes.
     note_cache: [Option<NotePaintCache>; 2],
+    /// The NUKE CLOUD's resident paints, one per [`crate::nuke::NukePart`].
+    /// Same discipline as [`Self::note_cache`]: the art is a pure function of
+    /// `(part, w, h)`, so a cloud that is rising, blooming and rolling out for
+    /// 3.6 s bakes each part ONCE and animates by dest-rect transform alone —
+    /// it never spends the shared per-frame bake budget after warmup.
+    nuke_cache: [Option<NotePaintCache>; 3],
     /// v3 §1.1 fix #2: session-scoped LRU set of finished one-shots, keyed
     /// `ident ^ ctx_fp` → last-touch sequence (touch-on-hit). Cap
     /// [`DONE_MARKS_CAP`]; eviction removes the oldest-touched key. Survives
@@ -1568,6 +1748,15 @@ impl WordDecorations {
         self.have_scanned = false;
         self.last_epoch = 0;
         self.active_until = None;
+        // The tokenise memo is only valid against the lexicon + scan gates that
+        // produced it, and `hard_reset` is exactly the "config reload / lexicon
+        // rebuild / knob setter" hook (§1.1 reset table). Retiring it here is
+        // what keeps a reloaded deny-list or a swapped language set from being
+        // ignored on rows whose TEXT never changed — the memo would otherwise
+        // keep answering with the old lexicon's matches forever on an idle
+        // grid. `reset()` (pane-space change) drops it too: a cold memo is only
+        // a warm-up cost, never a wrong frame.
+        self.scan_memo.clear();
         self.ink_base_fg.clear();
         self.ink_cols.clear();
         self.persist.clear();
@@ -2158,6 +2347,7 @@ impl WordDecorations {
             return;
         }
         let opts = cfg.scan_opts();
+        self.scan_memo.fit(rows, scan_opts_fp(&opts));
         // A language-gated collision at the editing caret is provisional: the
         // user may still be typing a longer ordinary word (`fut` -> `future`).
         // Scrolled-back content has no live input cursor, so it is settled.
@@ -2330,6 +2520,7 @@ impl WordDecorations {
             return;
         }
         let opts = cfg.scan_opts();
+        self.scan_memo.fit(rows, scan_opts_fp(&opts));
         let mut out = self.rescan_begin();
         let mut ink_full = false;
         let mut start_row = 0usize;
@@ -2465,14 +2656,28 @@ impl WordDecorations {
             if !occupied || cutoff > 0 {
                 continue; // above the cutoff only occupancy is recorded
             }
-            lexicon.scan_into_with_scratch(
-                &self.scan_text,
-                opts,
-                &mut self.scan_chars,
-                &mut self.scan_matches,
-                &mut self.scan_scratch,
-            );
-            let est = self.scan_matches.len();
+            // Same `(text, opts, lexicon)` scan `scan_row` makes — the row text
+            // is built here from the identical non-wide `cell.ch` stream — so it
+            // shares the memo. That matters here precisely BECAUSE this pass is
+            // the pathological one: a match-saturated screen otherwise pays
+            // three full-grid tokenise passes in one frame (the aborted
+            // top-down scan, this bottom-up estimate, and the restarted scan).
+            // Only the match COUNT is read; `scan_chars`/`scan_matches` are left
+            // as scratch either way, and the restarted `scan_row` rebuilds
+            // whatever it needs.
+            let est = if self.scan_memo.touch(&self.scan_text) {
+                self.scan_memo.matches(&self.scan_text).len()
+            } else {
+                lexicon.scan_into_with_scratch(
+                    &self.scan_text,
+                    opts,
+                    &mut self.scan_chars,
+                    &mut self.scan_matches,
+                    &mut self.scan_scratch,
+                );
+                self.scan_memo.remember(&self.scan_text, &self.scan_matches);
+                self.scan_matches.len()
+            };
             if est > budget {
                 cutoff = r + 1;
             } else {
@@ -2550,14 +2755,45 @@ impl WordDecorations {
         if !occupied {
             return true;
         }
-        lexicon.scan_into_with_scratch(
-            &self.scan_text,
-            opts,
-            &mut self.scan_chars,
-            &mut self.scan_matches,
-            &mut self.scan_scratch,
-        );
-        for &m in &self.scan_matches {
+        // TOKENISE + LEXICON LOOKUP — ~86 % of the rescan, and the rescan runs
+        // inside the present carrying the keystroke echo. Served from the
+        // [`ScanMemo`] whenever this exact row text was scanned recently: the
+        // scanner reads nothing but `(text, opts, lexicon)`, and the memo is
+        // retired on an `opts` change (`fit`) or a lexicon rebuild
+        // (`hard_reset` -> `reset_transient_state`), so a hit returns exactly
+        // what the call below would have. Under typing only the edited row(s)
+        // miss; under scrolling output only the genuinely new lines do.
+        let hit = self.scan_memo.touch(&self.scan_text);
+        if !hit {
+            lexicon.scan_into_with_scratch(
+                &self.scan_text,
+                opts,
+                &mut self.scan_chars,
+                &mut self.scan_matches,
+                &mut self.scan_scratch,
+            );
+            self.scan_memo.remember(&self.scan_text, &self.scan_matches);
+        }
+        // Disjoint field borrows: `matches` pins `scan_memo`/`scan_matches`
+        // while the loop below mutates only the accumulators.
+        let matches: &[Match] = if hit {
+            self.scan_memo.matches(&self.scan_text)
+        } else {
+            &self.scan_matches
+        };
+        if hit && !matches.is_empty() {
+            // A hit skipped the scanner, so `scan_chars` still holds the
+            // PREVIOUS row's stream — and the deferred-birth SimHash below
+            // indexes it with THIS row's `m.start`/`m.end`, which would fold a
+            // neighbouring row's context into the genome (a different magic
+            // roll, i.e. visibly different art). Rebuild it exactly as
+            // `scan_into_with_scratch` opens: `clear()` + `extend(chars())`.
+            // Only the deferred path reads it, so a match-free row (the common
+            // case) skips even this.
+            self.scan_chars.clear();
+            self.scan_chars.extend(self.scan_text.chars());
+        }
+        for &m in matches {
             let start_col = self.scan_colmap.get(m.start).copied().unwrap_or(0);
             let end_lead = self
                 .scan_colmap
@@ -3115,9 +3351,16 @@ impl WordDecorations {
                         && let Some(b) = occ.spec.burst
                         && b.chance_pct > 0
                     {
-                        ep.burst_roll =
-                            mix(occ.genome.gkey ^ self.birth_seq ^ supernova::SUPERNOVA_SALT) % 100
-                                < u64::from(b.chance_pct);
+                        // ONE draw, TWO decodes. `mix` is the splitmix64
+                        // finalizer, so its halves are independent: the LOW
+                        // half decides whether to detonate, the HIGH half which
+                        // of the three degrees. No new RNG, no new state, and
+                        // the tier inherits the roll's determinism and its
+                        // row-alignment transfer for free.
+                        let draw =
+                            mix(occ.genome.gkey ^ self.birth_seq ^ supernova::SUPERNOVA_SALT);
+                        ep.burst_roll = draw % 100 < u64::from(b.chance_pct);
+                        ep.burst_tier = supernova::tier_of(draw);
                     }
                     // Curse-BONK typed witness, latched at the ONLY fresh-
                     // birth site: a Profanity episode born with the caret
@@ -3262,6 +3505,11 @@ impl WordDecorations {
         let anim = Duration::from_millis(cfg.anim_ms);
         let mut fp: u64 = 0xcbf2_9ce4_8422_2325;
         let mut active_until: Option<Instant> = None;
+        // The nuke cloud's `(t_ms, cx, cy)`, recorded inside the occurrence
+        // loop and emitted after it — baking borrows `self.cat_baker`, which
+        // that loop already holds mutably. `MAX_ACTIVE_SUPERNOVAE = 1` makes
+        // one slot sufficient by construction.
+        let mut nuke_pending: Option<(u64, i32, i32)> = None;
         // v3 §3.2 supernova prepass FIRST: it owns the GLOBAL BURST MUTEX
         // (`super_until`) that the classic nova prepass defers new grants
         // behind — published from its persist-wide busy scan, so a live
@@ -3616,7 +3864,15 @@ impl WordDecorations {
                         .copied()
                     {
                         let t = now.saturating_duration_since(sv.start).as_millis() as u64;
-                        let until = sv.start + Duration::from_millis(supernova::SUPER_TOTAL_MS);
+                        // PER-TIER window: a Flash is over in ~1.1 s, a Nova
+                        // keeps the historical 2.4 s, a Nuke runs 3.6 s while
+                        // the cloud rises, blooms and rolls out.
+                        let tier = self
+                            .persist
+                            .get(&occ.ident)
+                            .map_or(supernova::SuperTier::Nova, |e| e.burst_tier);
+                        let until =
+                            sv.start + Duration::from_millis(supernova::total_ms(tier));
                         active_until = Some(active_until.map_or(until, |d: Instant| d.max(until)));
                         fp = fold_u64(fp, frame.wrapping_mul(0x9E37_79B1));
                         // §3.2 theme branch, per occurrence: additive white is
@@ -3649,6 +3905,14 @@ impl WordDecorations {
                             .min(nova::MAX_NOVA_QUADS.saturating_sub(nova.len()));
                         let n0 = nova.len();
                         supernova::emit_super(t, &env, budget, nova);
+                        // THE NUKE CLOUD — the rarest degree. Recorded here
+                        // and emitted AFTER the occurrence loop: baking needs
+                        // `&mut self.cat_baker`, which this loop already holds.
+                        // At most one cloud can exist (`MAX_ACTIVE_SUPERNOVAE`
+                        // = 1), so this is one Option, not a queue.
+                        if tier == supernova::SuperTier::Nuke && !cfg.reduced_motion {
+                            nuke_pending = Some((t, env.cx, env.cy));
+                        }
                         // §3.2 selection × wash: SPLIT row quads around the
                         // selected span (the center-cell drop predicate is
                         // degenerate for full-width wash quads). Host-side, so
@@ -3697,7 +3961,8 @@ impl WordDecorations {
                         // Afterglow: the ink settled to the static rainbow;
                         // the ember star fades ≤ 2 s after the window (§3.2),
                         // then zero decos forever.
-                        let end = s + Duration::from_millis(supernova::SUPER_TOTAL_MS);
+                        // The ember starts when THIS TIER's window ends.
+                        let end = s + Duration::from_millis(supernova::total_ms(ep.burst_tier));
                         if now >= end {
                             let t = now.saturating_duration_since(end).as_millis() as u64;
                             if t < RESIDUAL_FADE_MS {
@@ -3846,6 +4111,70 @@ impl WordDecorations {
                         }
                     }
                 }
+            }
+        }
+        // THE NUKE CLOUD, emitted post-loop (see `nuke_pending`). Three baked
+        // tiles — base surge, column, head — each resolved by `nuke_draw` into
+        // a dest-rect transform, alpha and tint. They ride the FreeSprite lane
+        // (the cat's and the sing-along notes'), because the cloud is ART, not
+        // light: it must not be additively blended over the text it floats on.
+        //
+        // Back-to-front, so the head occludes the column it sits on.
+        if let Some((t, cx, cy)) = nuke_pending {
+            for (slot, part) in [
+                crate::nuke::NukePart::Skirt,
+                crate::nuke::NukePart::Stem,
+                crate::nuke::NukePart::Cap,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let Some(d) = crate::nuke::nuke_draw(t, part) else {
+                    continue;
+                };
+                let (nw, nh) = crate::nuke::nuke_nat_size(part, geom.cell_w, geom.cell_h);
+                let host = crate::nuke::nuke_host_id(part, nw, nh);
+                if self.nuke_cache[slot].as_ref().map(|c| c.host) != Some(host) {
+                    self.nuke_cache[slot] = Some(NotePaintCache {
+                        host,
+                        rgba: crate::nuke::bake_nuke(nw, nh, part).pixels().to_vec(),
+                    });
+                }
+                let paint = &self.nuke_cache[slot].as_ref().expect("filled above").rgba;
+                let Some(tile) = self.cat_baker.host_tile(host, nw, nh, paint) else {
+                    continue; // bake budget spent; this part lands next frame
+                };
+                let dest_w = ((f32::from(nw) * d.sx).round() as i32).max(1);
+                let dest_h = ((f32::from(nh) * d.sy).round() as i32).max(1);
+                let grid_w = i32::from(geom.cols) * i32::from(geom.cell_w);
+                if dest_w > grid_w {
+                    continue; // a grid narrower than the cloud stays clear
+                }
+                // Anchored on the blast, standing ON the word's row and
+                // growing UPWARD from it.
+                let base_y = cy + i32::from(geom.cell_h) / 2;
+                let dy = (d.dy_cells * f32::from(geom.cell_h)).round() as i32;
+                let alpha = (d.alpha * f32::from(u8::MAX)) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                // BOUND: three sprites at most, and `MAX_ACTIVE_SUPERNOVAE = 1`
+                // means one cloud at a time — a constant cost, not a cap.
+                free.push(FreeSprite {
+                    x: (cx - dest_w / 2).clamp(0, (grid_w - dest_w).max(0)),
+                    y: base_y - dest_h + dy,
+                    w: dest_w as u16,
+                    h: dest_h as u16,
+                    ax: tile.ax,
+                    ay: tile.ay,
+                    aw: nw,
+                    ah: nh,
+                    tint: d.tint,
+                    alpha,
+                    flip_x: false,
+                    z: FreeZ::OverText,
+                    sampler: FreeSampler::Nearest,
+                });
             }
         }
         // §F4.2 post-loop: mark exactly the successfully QUEUED sightings
@@ -5121,7 +5450,7 @@ struct PeekView {
 /// Rise (450 ms, ease_out_back, genome overshoot,
 ///       eyes closed → open at p ≥ 0.85)
 /// → Dwell (genome 2200..3598 ms − mix(ident) % 300; +500 ms magic/accessory,
-///          cap 3750; pure-time blink/ear-twitch/knead/gaze/flutter)
+///          cap 3750; authored pose/accessory variation)
 /// → Descend (320 ms easeInOutCubic; optional 60 ms anticipation lift on
 ///            ~50% of genomes; eyes Closed-happy at the near-stationary top)
 /// → Done (zero quads, forever for this episode)
@@ -6197,17 +6526,13 @@ mod tests {
             suppress_in_alt_screen: false,
             allow_bare_cat: true,
             cjk_single_char: false,
-            feline_color: 0x00F7_A8B8,
-            feline_intensity: 0.7,
             feline_style: FelineStyle::Cat,
-            feline_idle: true,
-            feline_gaze: true,
             feline_magic: true,
             // The v1 batteries pin exact v1 sparkle behavior; the nova
             // battery flips this to `Nova` explicitly.
             profanity_style: ProfanityStyle::Sparkle,
             profanity_magic: true,
-            supernova_chance: 10,
+            supernova_chance: 30,
             spec_table: SpecTable::default(),
             palette: vec![0x00FF_D447, 0x00FF_7CE5],
             density: 3,
@@ -6246,8 +6571,8 @@ mod tests {
     }
 
     /// `tick` with a throwaway ink + sprite scratch and NO geometry (the
-    /// all-zero [`EffectGeom`] trips the §5.7 floor, so feline words take the
-    /// exact v1 paw path), for the pre-cat deco tests.
+    /// all-zero [`EffectGeom`] trips the cat eligibility floor, so feline words
+    /// emit ink but no graphic), for the pre-cat decoration tests.
     fn tick_deco(
         wd: &mut WordDecorations,
         now: Instant,
@@ -6514,6 +6839,14 @@ mod tests {
         let lex = Lexicon::with_languages(&["all"]);
         let mut c = cfg();
         c.profanity_style = ProfanityStyle::Rainbow;
+        // This test pins the COMPLETION contract (`fuc` is ordinary, `fuck`
+        // cues exactly once), not the detonation frequency — so pin the roll
+        // OFF rather than inheriting whatever `supernova_chance` currently
+        // defaults to. It silently rode the old 10% default and started
+        // counting two cues when that rose to 30% (2026-07-24): at 30% this
+        // occurrence's genome now wins the roll and the escalation adds its
+        // own cue, which says nothing about completion.
+        c.supernova_chance = 0;
         let t0 = Instant::now();
         let model = aterm_spec::derive::exact_profanity_completion_model();
         let mut state = model.init_state();
@@ -7172,6 +7505,197 @@ mod tests {
         assert_eq!(
             wd_term.ink_cols, wd_cells.ink_cols,
             "captured ink columns must match"
+        );
+    }
+
+    /// Every field of the decoration set the renderer reads, plus the resident
+    /// ink buffers those fields index into — the full equivalence surface for
+    /// the [`ScanMemo`] battery below.
+    fn deco_state(wd: &WordDecorations) -> (Vec<String>, Vec<[u8; 3]>, Vec<u16>, Vec<u64>) {
+        let occ = wd
+            .occ
+            .iter()
+            .map(|o| {
+                // Two groups: `Debug` is only implemented for tuples up to 12.
+                format!(
+                    "{:?}{:?}",
+                    (
+                        o.row,
+                        o.start_col,
+                        o.end_col,
+                        o.class,
+                        o.form_id,
+                        o.seed,
+                        o.ident,
+                        o.appeared,
+                        o.genome,
+                    ),
+                    (
+                        o.ink_base,
+                        o.ink_cells,
+                        o.ink_bg,
+                        o.cat_colors,
+                        o.cat_text_clear,
+                        o.dec_line,
+                        o.inert,
+                        o.custom,
+                    )
+                )
+            })
+            .collect();
+        // Episode identities too: a memo that returned a stale match list would
+        // show up here (as a different persist population) even on a frame
+        // whose visible occurrences happened to coincide.
+        let mut idents: Vec<u64> = wd.persist.keys().copied().collect();
+        idents.sort_unstable();
+        (occ, wd.ink_base_fg.clone(), wd.ink_cols.clone(), idents)
+    }
+
+    /// The tokenise memo is a PURE-FUNCTION cache, so a memoized engine and an
+    /// always-re-lex engine driven through the SAME frame sequence must agree
+    /// on every rescan — not merely on the final one.
+    ///
+    /// The sequence deliberately covers what makes an incremental scan hard:
+    /// a partially typed word under the live caret (the `ambiguous` gate is
+    /// cursor-dependent, so a row's admitted matches can change with NO text
+    /// change on that row), soft-wrapped words, wide CJK leads (which shift the
+    /// char->column map away from the memo's char-indexed matches), DECDWL
+    /// rows, scrolling (every row's text moves to a different row INDEX — the
+    /// reason the memo is keyed by text), repeated identical lines, and a
+    /// screen clear.
+    #[test]
+    fn scan_memo_frames_are_identical_to_an_always_rescanning_engine() {
+        let (rows, cols) = (14usize, 44usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let lex = Lexicon::with_languages(&["en"]);
+        let c = cfg();
+        let geom = EffectGeom {
+            cell_w: 8,
+            cell_h: 16,
+            rows: rows as u16,
+            cols: cols as u16,
+        };
+        let mut memoized = WordDecorations::default();
+        let mut control = WordDecorations::default();
+        control.scan_memo.bypass = true;
+        let t0 = Instant::now();
+
+        // Each step is one PTY write; the rescan runs after every one, exactly
+        // as the per-frame render path does under streaming output.
+        let steps: &[&[u8]] = &[
+            b"I love cats and say fuck sometimes\r\n",
+            b"a kitty naps here\r\n",
+            b"plain build output, nothing to match\r\n",
+            "\u{5BBD}\u{5BBD} kitty ultrathink\r\n".as_bytes(),
+            b"\x1b#6cat nap\r\n",
+            // Incremental typing at a prompt: only the caret row's text moves,
+            // and `fu`/`fuc` sit under the caret (the provisional-collision
+            // gate) before `fuck` settles.
+            b"$ fu",
+            b"c",
+            b"k",
+            b" ",
+            b"and a cat",
+            b"\r\n",
+            // Repeated identical lines: the memo answers every one of them.
+            b"the cat sat on the mat\r\n",
+            b"the cat sat on the mat\r\n",
+            b"the cat sat on the mat\r\n",
+            // Overflow the viewport so the whole screen scrolls: every row's
+            // text survives at a NEW row index.
+            b"scroll me one\r\nscroll me two\r\nfuck this build\r\nkitty again\r\n",
+            b"more cats\r\nmore kittens\r\nmore fuck\r\n",
+            // Clear + redraw: the grace/alignment machinery, on a memo that
+            // still holds every one of the cleared lines.
+            b"\x1b[2J\x1b[H",
+            b"kitty again\r\n",
+        ];
+
+        let mut snap = aterm_core::render::RenderInput::default();
+        for (i, step) in steps.iter().enumerate() {
+            term.process(step);
+            term.cell_frame_into(&mut snap, rows, cols);
+            let now = t0 + Duration::from_millis(16 * (i as u64 + 1));
+            let cursor = (term.grid().display_offset() == 0).then(|| {
+                let cur = term.cursor();
+                (cur.row, cur.col)
+            });
+            let epoch = term.damage_epoch();
+            for wd in [&mut memoized, &mut control] {
+                wd.rescan_from_cells_with_geom_at_cursor(
+                    &snap.cells,
+                    &snap.line_sizes,
+                    rows,
+                    cols,
+                    &lex,
+                    &c,
+                    epoch,
+                    now,
+                    geom,
+                    0x0011_1111,
+                    cursor,
+                );
+            }
+            assert_eq!(
+                deco_state(&memoized),
+                deco_state(&control),
+                "frame {i}: the memoized rescan diverged from the full rescan"
+            );
+        }
+        assert!(
+            !memoized.occ.is_empty(),
+            "the fixture must end with live decorations"
+        );
+        // Non-vacuity: the battery must actually have been SERVED from the
+        // memo, or the equality above proves nothing about it.
+        assert!(
+            memoized.scan_memo.hits > u64::try_from(steps.len()).expect("small") * 4,
+            "the memo must serve the bulk of the rows (hits: {}, misses: {})",
+            memoized.scan_memo.hits,
+            memoized.scan_memo.misses
+        );
+        assert_eq!(
+            control.scan_memo.hits, 0,
+            "the control engine must never be served from the memo"
+        );
+    }
+
+    /// The memo caches a function of `(row text, ScanOptions, Lexicon)`, and the
+    /// rescan only fires on a DAMAGE EPOCH change — so a deny-list edit on a
+    /// byte-idle grid has no text change to force a re-lex. `ScanMemo::fit`'s
+    /// options fingerprint is what retires the stale entries; without it the
+    /// user's newly ignored word would keep sparkling until it was retyped.
+    #[test]
+    fn scan_memo_retires_when_the_scan_gates_change() {
+        let (rows, cols) = (3usize, 32usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"the kitty is here\r\n");
+        let lex = Lexicon::with_languages(&["en"]);
+        let mut c = cfg();
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let now = Instant::now();
+        let mut wd = WordDecorations::default();
+        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 1, now);
+        assert!(
+            wd.occ.iter().any(|o| o.class == Class::Feline),
+            "the fixture must decorate the feline word first"
+        );
+
+        // Same cells, same epoch-advance, ONLY the deny list changed.
+        c.ignore.insert("kitty".to_string());
+        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 2, now);
+        assert!(
+            !wd.occ.iter().any(|o| o.class == Class::Feline),
+            "a denied surface must stop decorating without needing a text change"
+        );
+
+        // ...and back: the fingerprint must be a two-way gate, not a latch.
+        c.ignore.clear();
+        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 3, now);
+        assert!(
+            wd.occ.iter().any(|o| o.class == Class::Feline),
+            "clearing the deny list must restore the decoration"
         );
     }
 
@@ -7942,6 +8466,13 @@ mod tests {
                 wd.ctx_folded.capacity(),
                 wd.pending.capacity(),
                 wd.align_old.capacity(),
+                // The tokenise memo is resident scratch under the same rule:
+                // once every visible row's text is memoized, a rescan neither
+                // inserts nor rotates, so a growing capacity here would mean
+                // the memo is missing every frame (a silent regression to the
+                // full re-tokenise it exists to remove).
+                wd.scan_memo.hot.capacity(),
+                wd.scan_memo.cold.capacity(),
             ]
         };
         let mut out = Vec::new();
@@ -14361,5 +14892,135 @@ mod tests {
             0,
             "reset() must drop pending cues with the state"
         );
+    }
+}
+
+/// The measurement behind the [`ScanMemo`]: how much of a rescan the per-row
+/// tokenise+lexicon pass actually is, on the two shapes that matter — a full
+/// screen the user is typing into, and a screen scrolling under output.
+///
+/// Not a correctness test (it prints, it does not assert timings — a shared CI
+/// box has no stable clock), so it is `#[ignore]`d. Reproduce with:
+/// `cargo test -p aterm-effects --release --lib -- --ignored --nocapture scan_memo_cost`
+#[cfg(test)]
+mod scan_memo_bench {
+    use super::*;
+    use aterm_core::terminal::Terminal;
+    use aterm_lexicon::Lexicon;
+
+    /// A dense line of ordinary prose carrying one match of each live class —
+    /// the realistic worst case for the scanner (every token is a spaced-script
+    /// token that must be folded and probed, none are suppressed as code/paths).
+    const PROSE: &str = "the quick brown fox jumps over the lazy dog while a cat naps and someone says fuck about the build system output that keeps scrolling past here forever\r\n";
+
+    fn bench_cfg() -> DecoConfig {
+        DecoConfig {
+            profanity: true,
+            feline: true,
+            orca: true,
+            emphasis: true,
+            ink_enabled: true,
+            ..DecoConfig::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "timing probe, not an assertion; see the module doc"]
+    fn scan_memo_cost() {
+        let (rows, cols) = (60usize, 200usize);
+        let lex = Lexicon::with_languages(&["en"]);
+        let cfg = bench_cfg();
+        let geom = EffectGeom {
+            cell_w: 8,
+            cell_h: 16,
+            rows: rows as u16,
+            cols: cols as u16,
+        };
+        let now = Instant::now();
+        let frames = 200u64;
+
+        // (1) STATIC full screen, rescanned every frame — the shape a user
+        // typing at a prompt on a full screen presents: one row's text changes,
+        // the damage epoch advances, and the rescan re-tokenises everything.
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        for _ in 0..rows {
+            term.process(PROSE.as_bytes());
+        }
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        for bypass in [true, false] {
+            let mut wd = WordDecorations::default();
+            wd.scan_memo.bypass = bypass;
+            for e in 0..5u64 {
+                wd.rescan_from_cells_with_geom(
+                    &snap.cells,
+                    &snap.line_sizes,
+                    rows,
+                    cols,
+                    &lex,
+                    &cfg,
+                    e,
+                    now,
+                    geom,
+                    0,
+                );
+            }
+            let started = Instant::now();
+            for e in 10..10 + frames {
+                wd.rescan_from_cells_with_geom(
+                    &snap.cells,
+                    &snap.line_sizes,
+                    rows,
+                    cols,
+                    &lex,
+                    &cfg,
+                    e,
+                    now,
+                    geom,
+                    0,
+                );
+            }
+            println!(
+                "STATIC screen  memo={:5}: {:?}/frame  occ={}",
+                !bypass,
+                started.elapsed() / u32::try_from(frames).expect("small"),
+                wd.occ.len()
+            );
+        }
+
+        // (2) SCROLLING output: one new line per frame, so every surviving row
+        // keeps its TEXT and changes its INDEX. This is what makes the memo
+        // text-keyed rather than row-keyed.
+        for bypass in [true, false] {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            for _ in 0..rows {
+                term.process(PROSE.as_bytes());
+            }
+            let mut wd = WordDecorations::default();
+            wd.scan_memo.bypass = bypass;
+            let mut snap = aterm_core::render::RenderInput::default();
+            let started = Instant::now();
+            for e in 0..frames {
+                term.process(PROSE.as_bytes());
+                term.cell_frame_into(&mut snap, rows, cols);
+                wd.rescan_from_cells_with_geom(
+                    &snap.cells,
+                    &snap.line_sizes,
+                    rows,
+                    cols,
+                    &lex,
+                    &cfg,
+                    e,
+                    now,
+                    geom,
+                    0,
+                );
+            }
+            println!(
+                "SCROLL 1 line  memo={:5}: {:?}/frame (includes cell_frame_into)",
+                !bypass,
+                started.elapsed() / u32::try_from(frames).expect("small")
+            );
+        }
     }
 }

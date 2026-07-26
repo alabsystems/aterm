@@ -705,6 +705,41 @@ impl Lexicon {
         self.cjk_forms.iter().map(|(k, v)| (k.as_str(), v.class))
     }
 
+    /// Whether at least one compiled surface in `class` can pass the scanner's
+    /// static policy gates and is not claimed by an overriding runtime table.
+    /// This is a cold-path capability projection for hosts; it follows the same
+    /// folded keys, ignore policy, short-word rules, CJK exceptions, and
+    /// single-character opt-in as [`Self::scan`], without synthesizing text or
+    /// allocating one scan per surface.
+    pub fn has_scannable_class_surface(
+        &self,
+        class: Class,
+        opts: &ScanOptions<'_>,
+        mut overridden: impl FnMut(u64) -> bool,
+    ) -> bool {
+        let spaced = self.spaced.iter().any(|(surface, hit)| {
+            hit.class == class
+                && opts
+                    .ignore
+                    .is_none_or(|ignore| !ignore.contains(surface.as_str()))
+                && !(class == Class::Feline && !opts.allow_bare_cat && surface.chars().count() <= 3)
+                && !(class == Class::Emphasis
+                    && surface.chars().count() <= 3
+                    && !self.user_surfaces.contains(surface.as_str()))
+                && !overridden(fnv1a64(surface))
+        });
+        spaced
+            || self.cjk_forms.iter().any(|(surface, hit)| {
+                hit.class == class
+                    && !self.cjk_exceptions.contains(surface.as_str())
+                    && (surface.chars().count() != 1 || opts.cjk_single_char)
+                    && opts
+                        .ignore
+                        .is_none_or(|ignore| !ignore.contains(surface.as_str()))
+                    && !overridden(fnv1a64(surface))
+            })
+    }
+
     /// Classify an already-isolated whole token (no surrounding context). Applies
     /// possessive and clitic stripping but **not** the bare-`cat` / code-context
     /// policy guards (those are [`Lexicon::scan`]'s job). Returns the family if

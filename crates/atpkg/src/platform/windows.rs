@@ -150,7 +150,13 @@ fn backslashed(p: &Path) -> std::ffi::OsString {
     let wide: Vec<u16> = p
         .as_os_str()
         .encode_wide()
-        .map(|c| if c == u16::from(b'/') { u16::from(b'\\') } else { c })
+        .map(|c| {
+            if c == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                c
+            }
+        })
         .collect();
     std::ffi::OsString::from_wide(&wide)
 }
@@ -231,8 +237,7 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
 /// A tombstone `.cmd` (no forward target) yields `None`.
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
-    let content = fs::read_to_string(shim).ok()?;
-    super::parse_cmd_shim_target(&content)
+    super::read_cmd_shim_target(shim)
 }
 
 /// Run `command` to completion, then `exit` with its code (Windows has no `execve`, so

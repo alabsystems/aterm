@@ -60,7 +60,8 @@ use aterm_core::terminal::{RenderCell, UnderlineStyle};
 /// total function of the five facts the redraw has in hand. Every bypass is a
 /// bypass TO INSTANT (exact bytes), never to a different animation.
 ///
-/// * `enabled` — config `stream_fade` (default on).
+/// * `enabled` — config `stream_fade` (absent-config default off; the generated
+///   starter file opts in explicitly).
 /// * `input_hot` — a keystroke egress awaits its echo: typed characters must
 ///   land instantly (fading the echo would read as added latency).
 /// * `alt_screen` — full-screen programs (vim/less/htop) repaint in place;

@@ -5,7 +5,7 @@
 //! §F4): the ONE CI-pinnable source shared by the recorder
 //! (`word_decorations`), the persistent store's TOML keys (aterm-gui
 //! `kitty_log`), the settings-page labels, and the genome decode — the
-//! `hud_bar::PanelId` idiom (`ALL` + `config_key()` + `label()`).
+//! the shared registry idiom (`ALL` + `config_key()` + `label()`).
 //!
 //! Aggregation key = `(KittyType, KittyMagic, primary LangId)` — never raw
 //! `Genome.magic` (raw magic would grow the log file without bound). The
@@ -251,11 +251,11 @@ impl KittyMagic {
 pub enum KittyShownAs {
     /// The real §5 cat (any [`KittyType`] except `PawClassic`).
     Cat,
-    /// v1 paw because the cell floors / DEC row suppressed the cat (§5.7).
+    /// No graphic because cell floors / text clearance suppressed the cat.
     PawFallbackFloor,
-    /// v1 paw because the occurrence fell past `MAX_CATS` (§5.2 truncation).
+    /// No graphic because the occurrence fell past `MAX_CATS`.
     PawFallbackOverflow,
-    /// v1 paw because `[sparkle_words.feline] style = "paw"` (§10).
+    /// No graphic because legacy `style = "paw"` selects ink-only rendering.
     PawStyle,
 }
 
@@ -282,9 +282,9 @@ impl KittyShownAs {
     pub fn label(self) -> &'static str {
         match self {
             KittyShownAs::Cat => "Cat",
-            KittyShownAs::PawFallbackFloor => "Paw (small cells)",
-            KittyShownAs::PawFallbackOverflow => "Paw (too many cats)",
-            KittyShownAs::PawStyle => "Paw (style)",
+            KittyShownAs::PawFallbackFloor => "No graphic (ineligible cat)",
+            KittyShownAs::PawFallbackOverflow => "No graphic (cat limit)",
+            KittyShownAs::PawStyle => "No graphic (legacy paw mode)",
         }
     }
 }

@@ -714,9 +714,9 @@ pub(crate) fn cmd_mouse(proxy: &EventLoopProxy<Wake>, scope: super::Scope, rest:
 /// PURE control-authority decision: whether a `mouse`-verb gesture from `scope`
 /// must have its copy-on-select CLIPBOARD side-effect suppressed. Only a NON-OWNER
 /// (scoped-edge) gesture is suppressed; the Owner god token (in-session / owner
-/// automation) is exempt, matching the [`overlay_drive_refusal`](super) Owner
+/// automation) is exempt, matching the `front_drive_escalation` Owner
 /// carve-out. Split out pure so the policy is unit-testable without an event loop
-/// (mirrors `update_is_owner_only_subcmd` / `overlay_drive_refusal`).
+/// (mirrors `update_is_owner_only_subcmd` / `front_drive_escalation`).
 pub(crate) fn scope_suppresses_copy_on_select(scope: super::Scope) -> bool {
     !matches!(scope, super::Scope::Owner)
 }

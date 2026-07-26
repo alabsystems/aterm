@@ -48,8 +48,23 @@ pub struct Manifest {
     /// Manifest format version (the publisher emits `schema = 1`). Absent ⇒ 0.
     #[serde(default)]
     pub schema: u32,
-    /// Human display version, e.g. `"0.26"`. Non-load-bearing — `build_number`
-    /// gates everything; this string only feeds log lines and UI.
+    /// The release version — the workspace `MAJOR.MINOR.0` version with any nonzero patch
+    /// reset to 0, e.g. `"0.2.0"` —
+    /// **load-bearing, an identity bind on both sides.** The client derives the
+    /// expected value from the release's canonical `vMAJOR.MINOR.PATCH` tag and
+    /// refuses any manifest whose `version` differs, then requires the DMG asset
+    /// to be exactly `aterm-<version>.dmg` (`aterm-update/src/github.rs`,
+    /// `fetch_authoritative_release` / `authoritative_dmg_index`). The publisher
+    /// self-checks the same triple at cut time (`aterm-release/src/verify.rs`).
+    ///
+    /// It is NOT the ordering key and never was: release *selection* orders by
+    /// the numeric tag and [`build_number`](Self::build_number) is the *apply*
+    /// gate. Do not treat this string as display-only — a scheme change that
+    /// alters the tag shape must change this field in lockstep. There is exactly
+    /// ONE version lineage: this string, the tag, the DMG name and the source
+    /// snapshot are all the same number (see `VERSIONING.md`). Retired
+    /// two-component releases (`"0.25"`..`"0.61"`) stay published as archive
+    /// history and are skipped by every client.
     pub version: String,
     /// Monotonic build number — THE downgrade gate. Claimed from the append-only
     /// `RELEASES.ledger` (`n = max(tail + 1, unix_now)`, epoch-scale) and stamped

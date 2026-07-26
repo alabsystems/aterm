@@ -2175,3 +2175,40 @@ fn max_cached_for_retained_protects_the_newest_lines() {
         "the oldest of the newest-8 lines survives eviction and stays searchable"
     );
 }
+
+/// Prescription (b): the regex-mode oracle battery (`streaming::regex_tests`
+/// plus the `SearchIndex` regex path) is gated on `feature = "regex"` and
+/// compiles to ZERO cases without it. This tripwire is ALWAYS compiled, so a
+/// silently dropped feature flag on the regex lane becomes a hard failure
+/// instead of an invisible loss of coverage.
+///
+/// - feature ON: a canary drives the real regex search path and REQUIRES a hit,
+///   proving regex cases actually execute (not merely that the module compiled).
+/// - feature OFF + `ATERM_SEARCH_REGEX_LANE=1` (the lane marker `verify.sh` sets):
+///   fail — the lane intended regex coverage but built without the feature.
+/// - feature OFF, no marker: pass — a legitimate default (regex-less) build.
+#[test]
+fn regex_lane_tripwire() {
+    #[cfg(feature = "regex")]
+    {
+        let mut index = SearchIndex::new();
+        index.index_line(0, "order 4567 shipped");
+        let hits = index
+            .search_with_positions_opts("[0-9]+", true, true)
+            .expect("regex feature is compiled in, so a valid pattern must compile");
+        assert!(
+            !hits.is_empty(),
+            "regex feature compiled in but the canary pattern matched nothing — \
+             the regex search path is wired to nothing"
+        );
+    }
+    #[cfg(not(feature = "regex"))]
+    {
+        assert!(
+            std::env::var_os("ATERM_SEARCH_REGEX_LANE").is_none(),
+            "ATERM_SEARCH_REGEX_LANE=1 but aterm-search was built WITHOUT --features \
+             regex: the regex oracle battery compiled out to 0 cases (silent coverage \
+             loss). Run the lane with `--features regex`."
+        );
+    }
+}

@@ -16,9 +16,9 @@
 //! search index cap, `bad regex` on a malformed pattern — never a bare, misleading
 //! "no matches".
 //!
-//! Pure + themed like the HUD/config-notice bands (it reuses
+//! Pure + themed like the config-notice bands (it reuses
 //! [`crate::settings::blank_row`]/[`crate::settings::write_str`] +
-//! [`crate::hud_bar::hud_colors`]), so the row builder unit-tests with no window and
+//! [`crate::chrome_band::band_colors`]), so the row builder unit-tests with no window and
 //! is drawn by `App::splice_find_bar` (app_render.rs), which OVERWRITES one grid row in
 //! place — the top row normally, or the BOTTOM row when the current match would
 //! otherwise sit under the top bar (adaptive placement, so the match is never hidden).
@@ -28,14 +28,14 @@ use std::ops::Range;
 use aterm_core::terminal::RenderCell;
 use aterm_render::Theme;
 
-use crate::hud_bar::{self, HudColors};
+use crate::chrome_band::{self, BandColors};
 use crate::settings::{blank_row, write_str};
 
 /// The caret drawn immediately after the query — a thin vertical bar, so the bar
 /// reads as an editable text field even though the terminal cursor stays on the shell.
 const CARET: char = '▏';
 
-/// Left indent of the `Find:` prompt (one blank cell, like the HUD/notice bands).
+/// Left indent of the `Find:` prompt (one blank cell, like the notice bands).
 const LEFT_PAD: usize = 1;
 
 /// The `Find: ` prompt drawn ahead of the live query. Its width fixes where the query
@@ -87,7 +87,7 @@ fn write_segs(row: &mut [RenderCell], cols: usize, mut col: usize, segs: &[Seg],
 
 /// The status run: bad-regex / match position / (truncation-honest) no-match, or
 /// `None` when the query is empty (bar just opened — nothing to report yet).
-fn status_seg(v: &FindBarView, c: &HudColors) -> Option<Seg> {
+fn status_seg(v: &FindBarView, c: &BandColors) -> Option<Seg> {
     if v.query.is_empty() {
         return None;
     }
@@ -114,7 +114,7 @@ fn status_seg(v: &FindBarView, c: &HudColors) -> Option<Seg> {
 /// active), the status, and — when `include_hint` — the key-hint tail (which teaches
 /// the full emacs-isearch keymap while the query is still empty). The indicators
 /// ALWAYS show, so the user can see the feature exists and its current state.
-fn right_segs(v: &FindBarView, c: &HudColors, include_hint: bool) -> Vec<Seg> {
+fn right_segs(v: &FindBarView, c: &BandColors, include_hint: bool) -> Vec<Seg> {
     let mut segs = vec![
         seg(
             "Aa",
@@ -154,7 +154,7 @@ fn right_segs(v: &FindBarView, c: &HudColors, include_hint: bool) -> Vec<Seg> {
 /// normal placement), or an OVERLINE (true) when adaptive placement floats it to the
 /// BOTTOM row (content above — see `App::splice_find_bar`, which flips placement so
 /// the current match is never hidden). The rule rides the blank cells only, exactly
-/// like the HUD/notice bands.
+/// like the notice bands.
 #[cfg(test)]
 pub(crate) fn find_bar_row(
     v: &FindBarView,
@@ -174,7 +174,7 @@ pub(crate) fn find_bar_row_with_indicators(
     theme: Theme,
     seam_at_top: bool,
 ) -> (Vec<RenderCell>, Option<Range<usize>>, Option<Range<usize>>) {
-    let c = hud_bar::hud_colors(theme);
+    let c = chrome_band::band_colors(theme);
     // The seam marks the bar's content-facing edge: an overline (bar at the bottom) or,
     // when floated to the top, an underline on the bottom edge instead.
     let mut row = blank_row(cols, c.label, c.bar_bg, seam_at_top);
@@ -225,7 +225,7 @@ fn caret_col(v: &FindBarView) -> usize {
 /// geometry — both [`find_bar_row`] and [`indicator_cols`] call it, so the click
 /// hit-test can never drift from the paint. Segment WIDTHS depend only on `v`, not the
 /// theme colours, so the placement is colour-independent.
-fn right_side_placement(v: &FindBarView, c: &HudColors, cols: usize) -> Option<(usize, Vec<Seg>)> {
+fn right_side_placement(v: &FindBarView, c: &BandColors, cols: usize) -> Option<(usize, Vec<Seg>)> {
     let caret = caret_col(v);
     for segs in [right_segs(v, c, true), right_segs(v, c, false)] {
         let w = segs_width(&segs);
@@ -249,7 +249,7 @@ pub(crate) fn indicator_cols(
     v: &FindBarView,
     cols: usize,
 ) -> (Option<Range<usize>>, Option<Range<usize>>) {
-    match right_side_placement(v, &hud_bar::hud_colors(Theme::default()), cols) {
+    match right_side_placement(v, &chrome_band::band_colors(Theme::default()), cols) {
         Some((start, _)) => (Some(start..start + 2), Some(start + 3..start + 5)),
         None => (None, None),
     }
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn active_toggle_uses_bright_tone() {
         let cols = 90;
-        let c = hud_bar::hud_colors(Theme::default());
+        let c = chrome_band::band_colors(Theme::default());
         // The `A` cell of the `Aa` indicator — searched by cell (not byte offset: the
         // multi-byte caret before it would desync a String::find byte index).
         let fg_at = |row: &[RenderCell], ch: char| -> [u8; 3] {

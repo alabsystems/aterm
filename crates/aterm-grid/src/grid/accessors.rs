@@ -544,24 +544,59 @@ impl Grid {
 
     /// Set the retained scrollback line limit (`None` = unlimited).
     ///
-    /// Tiered grids: the limit governs the store (truncating immediately);
-    /// the ring stays the fixed-size hot tier. Ring-only grids (no store —
-    /// the wasm engines) have no other retention, so the limit re-caps the
-    /// ring itself: growth stays lazy (rows allocate only as lines scroll
-    /// off) and a shrink evicts the OLDEST lines immediately, mirroring the
-    /// store's `set_line_limit` truncation semantics.
+    /// The limit is ONE TOTAL retention count (audit E1, Codex-required
+    /// unification): on a tiered grid it caps ring + lazy + store TOGETHER,
+    /// not the store alone — previously a limit of `L` retained `L` store
+    /// lines PLUS the full ring, silently doubling retention. Split rule:
+    /// the ring keeps its role as the fixed fast tier, so
+    ///   * `limit >= ring cap`: store limit = `limit - ring cap` (the ring's
+    ///     share is its cap — the steady-state ring occupancy);
+    ///   * `limit < ring cap`: the ring itself is re-capped to `limit`
+    ///     (evicting its oldest lines) and the store drops to zero. The ring
+    ///     cap does NOT grow back on a later raise — the hot-tier size is a
+    ///     construction decision; the raise widens only the store share.
+    ///
+    /// Lines staged in the lazy buffer count against the store share (they
+    /// are drained into the store here, and every steady-state drain point
+    /// re-truncates), so `scrollback_lines() <= limit` at every quiescent
+    /// point; mid-batch the transient overshoot is bounded by the lazy-drain
+    /// threshold.
+    ///
+    /// Ring-only grids (no store) have no other retention, so the limit
+    /// re-caps the ring itself: growth stays lazy (rows allocate only as
+    /// lines scroll off) and a shrink evicts the OLDEST lines immediately,
+    /// mirroring the store's `set_line_limit` truncation semantics.
     pub fn set_scrollback_line_limit(&mut self, limit: Option<usize>) {
         if self.storage.scrollback.is_some() || self.storage.scrollback_detached_for_reflow {
             // Retained-set size before the truncation (the lazy-buffer drain
             // below only MOVES staged lines into the store, so a change here
             // means lines were really evicted).
             let before = self.scrollback_lines();
+            // Unified split: the store's share is what remains after the
+            // ring's share (its cap). Computed BEFORE any ring re-cap so the
+            // `limit < ring cap` arm sees the original cap.
+            let ring_cap = self.storage.max_scrollback;
+            let store_limit = limit.map(|l| l.saturating_sub(ring_cap));
             // Drain staged lazy lines first (via scrollback_mut) so the store's
             // truncation sees the full history — the historical Terminal path.
             // While the store is out for an off-thread reflow this is a no-op
             // (the pre-existing behavior); the ring must NOT be re-capped then.
             if let Some(sb) = self.scrollback_mut() {
-                sb.set_line_limit(limit);
+                sb.set_line_limit(store_limit);
+            }
+            // `limit < ring cap`: the ring alone must not retain more than the
+            // total — re-cap it (skipped while detached for reflow: the ring
+            // is holding the only live copy of recent history then).
+            if let Some(l) = limit
+                && l < ring_cap
+                && !(self.storage.scrollback_detached_for_reflow
+                    && self.storage.scrollback.is_none())
+            {
+                self.storage.max_scrollback = l;
+                let excess = self.storage.ring_buffer_scrollback().saturating_sub(l);
+                if excess > 0 {
+                    self.evict_oldest_ring_scrollback(excess);
+                }
             }
             // A shrink that evicted lines changed the retained/indexed set:
             // re-clamp a scrolled-back viewport and invalidate content-keyed
@@ -581,6 +616,56 @@ impl Grid {
             .saturating_sub(self.storage.max_scrollback);
         if excess > 0 {
             self.evict_oldest_ring_scrollback(excess);
+        }
+    }
+
+    /// Monotonic count of history lines LOST to non-user-requested truncation
+    /// (audit E10a, out-of-band — no sentinel is ever injected into content):
+    /// flood-backpressure staged-line drops + detached-reflow-window cap drops
+    /// (this grid) + memory-pressure store evictions (the attached tiered
+    /// store). User-requested limit shrinks are intentional and not counted.
+    #[must_use]
+    pub fn truncated_lines(&self) -> u64 {
+        self.storage.flood_truncated_lines
+            + self.storage.scrollback.as_ref().map_or(
+                0,
+                aterm_scrollback::ScrollbackStorage::pressure_evicted_lines,
+            )
+    }
+
+    /// Set the RING byte watermark budget (audit E10a): ring-only grids with
+    /// an unlimited line limit have no other memory signal — with a budget
+    /// set, [`ring_watermark_level`](Self::ring_watermark_level) reports
+    /// Yellow at 80% and Red at 95% of it. `None` (default) disables the
+    /// watermark (level reads Green). Advisory only: nothing is evicted.
+    pub fn set_ring_byte_watermark(&mut self, budget: Option<usize>) {
+        self.storage.ring_byte_watermark = budget;
+    }
+
+    /// Ring-byte watermark level against the configured budget
+    /// ([`set_ring_byte_watermark`](Self::set_ring_byte_watermark)), computed
+    /// from [`memory_used`](Self::memory_used) at query time — which counts
+    /// staged lazy-buffer lines too (Wave-3 review: flood backpressure parks
+    /// raw rows there before the store absorbs them), so the signal rises
+    /// DURING a flood, not only after the drain. A PURE
+    /// threshold compare (the poll-driven advisory signal does not carry the
+    /// store watermark's hysteresis latch): Green below 80%, Yellow from 80%,
+    /// Red from 95%. Green when no budget is configured.
+    #[must_use]
+    pub fn ring_watermark_level(&self) -> aterm_scrollback::WatermarkLevel {
+        use aterm_scrollback::WatermarkLevel;
+        let Some(budget) = self.storage.ring_byte_watermark else {
+            return WatermarkLevel::Green;
+        };
+        let used = self.memory_used();
+        // Same 80/95 thresholds as the tiered store's defaults; u128 products
+        // cannot overflow for real byte counts.
+        if used as u128 * 100 >= budget as u128 * 95 {
+            WatermarkLevel::Red
+        } else if used as u128 * 100 >= budget as u128 * 80 {
+            WatermarkLevel::Yellow
+        } else {
+            WatermarkLevel::Green
         }
     }
 

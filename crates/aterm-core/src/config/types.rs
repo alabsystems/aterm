@@ -233,11 +233,11 @@ pub struct TerminalConfig {
     /// does not invoke the clipboard callback or emit a response.
     pub allow_osc52_query: bool,
 
-    /// Allow CSI t window manipulation operations (#7139).
+    /// Allow CSI t window operations 1 through 21 (#7139).
     ///
-    /// When disabled (default), dangerous CSI t operations (move, resize,
-    /// iconify, maximize, fullscreen) are silently ignored. Safe operations
-    /// (queries, title stack, refresh) always pass through.
+    /// When disabled (default), the gated manipulation and report operations
+    /// are silently ignored. Title-stack operations 22 and 23 remain available;
+    /// hosts still need a window callback for operations that require the OS.
     pub allow_window_ops: bool,
 
     /// Allow desktop notification OSC sequences (#7878 CF-009, #7918).
@@ -434,6 +434,9 @@ impl TerminalConfig {
         }
         if self.bidi != other.bidi {
             changes.push(ConfigChange::BiDi);
+        }
+        if self.ambiguous_width_double != other.ambiguous_width_double {
+            changes.push(ConfigChange::AmbiguousWidth);
         }
         if self.bold_is_bright != other.bold_is_bright
             || (self.faint_opacity - other.faint_opacity).abs() > f32::EPSILON

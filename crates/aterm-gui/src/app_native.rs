@@ -8,9 +8,9 @@
 //! tab presentation invalidation, and redraws.
 
 use crate::native_app::{
-    AppEffect, AppEvent, ClipboardOutcome, ClipboardRequest, ConfigPatchOutcome, DamageRegion,
-    EventResult, ExpectedConfigValue, ExternalOpenOutcome, PackagesOutcome, PackagesRequest,
-    TextInputEvent, UpdateOutcome, UpdateRequest, ViewCx,
+    AppEffect, AppEvent, ClipboardOutcome, ClipboardRequest, ConfigEditorOutcome,
+    ConfigPatchOutcome, DamageRegion, EventResult, ExpectedConfigValue, ExternalOpenOutcome,
+    PackagesOutcome, PackagesRequest, TextInputEvent, UpdateOutcome, UpdateRequest, ViewCx,
 };
 use crate::native_config_service::{
     ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ExpectedValue,
@@ -21,8 +21,79 @@ use crate::native_updater_service::{
     DurableStageDisposition, DurableUpdateStatus, InstalledUpdate, NativeUpdaterService,
     ReturnedApplyDisposition, ReturnedApplyFacts, UpdaterPhase, UpdaterWorkTicket,
 };
-use crate::packages_screen::PackagesBusy;
+use crate::packages_screen::{PackagesBusy, PackagesCommandOutcome, PackagesWorkerCompletion};
 use crate::{App, Wake, WindowId};
+
+static NEXT_CONTROL_SETTINGS_REQUEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_control_settings_request() -> u64 {
+    NEXT_CONTROL_SETTINGS_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn control_serious_mode_intent(key: &str, value: Option<&str>) -> Option<bool> {
+    if key != crate::prefs::EDIT_SERIOUS_MODE {
+        return None;
+    }
+    match value {
+        // Removing the authored field restores Config's documented default.
+        None => Some(false),
+        Some(value) => value.trim().parse::<bool>().ok(),
+    }
+}
+
+fn control_settings_completion_reply(
+    key: &str,
+    value: Option<&str>,
+    outcome: &ConfigPatchOutcome,
+    synchronization_error: Option<&str>,
+) -> Result<String, String> {
+    match outcome {
+        ConfigPatchOutcome::Applied { undo, .. } => {
+            let mut status = if undo.is_some() {
+                format!("saved: {key} = {}", value.unwrap_or(""))
+            } else {
+                format!("{key}: unchanged")
+            };
+            if let Some(error) = synchronization_error {
+                // The worker produced a durable proof, so this remains a successful
+                // save; the service gate is nevertheless closed until a later stable
+                // observation. State that explicitly instead of hiding reconciliation.
+                status.push_str("; reconciliation required: ");
+                status.push_str(error);
+            }
+            Ok(status)
+        }
+        ConfigPatchOutcome::Conflict { revision } => {
+            let mut error = format!(
+                "save conflict for {key} at config revision {revision}; current aterm.toml was kept"
+            );
+            if let Some(reconcile) = synchronization_error {
+                error.push_str("; reconciliation required: ");
+                error.push_str(reconcile);
+            }
+            Err(error)
+        }
+        ConfigPatchOutcome::Indeterminate { message } => {
+            let mut error = format!(
+                "publication unverified for {key}: {message}; reload aterm.toml before retrying"
+            );
+            if let Some(reconcile) = synchronization_error {
+                error.push_str("; reconciliation required: ");
+                error.push_str(reconcile);
+            }
+            Err(error)
+        }
+        ConfigPatchOutcome::Rejected { message } => {
+            let mut error = format!("save failed: {message}");
+            if let Some(reconcile) = synchronization_error {
+                error.push_str("; reconciliation required: ");
+                error.push_str(reconcile);
+            }
+            Err(error)
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -271,6 +342,16 @@ pub(crate) fn collect_native_update_reconcile_facts(
 
 const MAX_AUTOMATIC_UPDATE_CYCLES: u8 = 3;
 
+/// Activity revocation gets a much larger budget than a preflight block, and a
+/// long-tailed schedule. Rationale from the field: on the machine this feature
+/// exists for — a daily driver with an agent streaming shell output into it —
+/// revocation is the NORMAL outcome of any single attempt, not evidence of a
+/// problem. Three tries then permanent manual-only guaranteed the staged build
+/// sat unapplied until the next relaunch, which is exactly what happened.
+/// Every attempt is a lossless park/spawn/paint round trip, so the cost of
+/// being wrong is bounded and the backoff below keeps it from thrashing.
+const MAX_ACTIVITY_REVOKED_CYCLES: u8 = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutomaticRetryKind {
     PreflightBlocked,
@@ -293,18 +374,28 @@ fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::ti
     if kind == AutomaticRetryKind::PhysicalFailure {
         return None;
     }
-    if cycles >= MAX_AUTOMATIC_UPDATE_CYCLES {
+    let budget = match kind {
+        AutomaticRetryKind::ActivityRevoked => MAX_ACTIVITY_REVOKED_CYCLES,
+        _ => MAX_AUTOMATIC_UPDATE_CYCLES,
+    };
+    if cycles >= budget {
         return None;
     }
     let seconds = match (kind, cycles) {
         (AutomaticRetryKind::PreflightBlocked, 0 | 1) => 5,
         (AutomaticRetryKind::PreflightBlocked, _) => 15,
-        // Exponential spacing: each revoked attempt costs a park/spawn/paint
-        // round trip, so back off hard while the terminal stays busy. The
-        // ≥500 ms quiet-epoch admission still gates every re-attempt.
+        // Exponential spacing capped at 15 min: each revoked attempt costs a
+        // park/spawn/paint round trip, so back off hard while the terminal
+        // stays busy. The ≥500 ms quiet-epoch admission still gates every
+        // re-attempt, and the budget replenishes after a long idle gap.
         (AutomaticRetryKind::ActivityRevoked, 0) => 2,
         (AutomaticRetryKind::ActivityRevoked, 1) => 8,
-        (AutomaticRetryKind::ActivityRevoked, _) => 30,
+        (AutomaticRetryKind::ActivityRevoked, 2) => 30,
+        (AutomaticRetryKind::ActivityRevoked, 3) => 60,
+        (AutomaticRetryKind::ActivityRevoked, 4) => 120,
+        (AutomaticRetryKind::ActivityRevoked, 5) => 300,
+        (AutomaticRetryKind::ActivityRevoked, 6) => 600,
+        (AutomaticRetryKind::ActivityRevoked, _) => 900,
         // Kept explicit so this helper stays fail-closed if the early return above is
         // ever refactored. A physical handoff failure must never mint a timer retry.
         (AutomaticRetryKind::PhysicalFailure, _) => return None,
@@ -443,15 +534,17 @@ fn native_appearance_revision(preferences: crate::native_appearance::AppearanceP
 
 /// Paint identity for the host-owned motion facts supplied to every native app.
 /// These facts are intentionally not reducer state: focus, OS Reduce Motion,
-/// recording-watch focus, load shedding, and the process-wide serious override can
-/// all change while the native view generation remains stable. They must nevertheless
-/// invalidate retained pixels because Settings previews resolve animation, static
-/// effect output, and their static/live badge from this exact context.
+/// recording-watch focus, load shedding, OS appearance, and the process-wide
+/// serious override can all change while the native view generation remains stable.
+/// They must nevertheless invalidate retained pixels because Settings previews
+/// resolve animation, automatic window appearance, static effect output, and their
+/// static/live badge from this exact context.
 fn native_motion_revision(motion: crate::native_app::ViewMotionCx) -> u8 {
     (motion.system_reduced as u8)
         | ((motion.focused as u8) << 1)
         | ((motion.performance_reduced as u8) << 2)
         | ((motion.serious as u8) << 3)
+        | ((motion.system_dark as u8) << 4)
 }
 
 impl NativeUiCompileStamp {
@@ -521,25 +614,117 @@ pub(crate) struct RetainedNativeLeafArtifact<'a> {
     pub(crate) scale: f64,
 }
 
-struct NativeConfigJob {
-    snapshot: crate::native_config_service::ConfigSnapshot,
+struct NativeConfigPersistenceJob {
+    plan: crate::native_config_service::ConfigPersistencePlan,
     undo: Option<u64>,
-    instance: crate::tab_model::AppInstanceId,
-    view: crate::tab_model::ViewId,
-    reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
+    origin: NativeConfigOrigin,
     proxy: winit::event_loop::EventLoopProxy<Wake>,
+}
+
+struct NativeConfigReconciliationJob {
+    path: std::path::PathBuf,
+    themes: std::sync::Arc<crate::app_config::ThemeCatalog>,
+    pending_sequence: u64,
+    proxy: winit::event_loop::EventLoopProxy<Wake>,
+}
+
+struct NativeConfigExternalPreparationJob {
+    observation: crate::native_config_service::ConfigDiskObservation,
+    themes: std::sync::Arc<crate::app_config::ThemeCatalog>,
+    proxy: winit::event_loop::EventLoopProxy<Wake>,
+}
+
+enum NativeConfigJob {
+    Persist(NativeConfigPersistenceJob),
+    Reconcile(NativeConfigReconciliationJob),
+    PrepareExternal(NativeConfigExternalPreparationJob),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeConfigPersistenceCompletion {
+    pub(crate) outcome: ConfigPatchOutcome,
+    pub(crate) observation: Result<crate::native_config_service::PreparedConfigObservation, String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeConfigReconciliationCompletion {
+    pub(crate) pending_sequence: u64,
+    pub(crate) observation: Result<crate::native_config_service::PreparedConfigObservation, String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeConfigExternalPreparationCompletion {
+    pub(crate) observation: crate::native_config_service::ConfigDiskObservation,
+    pub(crate) result: Result<crate::native_config_service::PreparedConfigObservation, String>,
 }
 
 pub(crate) enum NativeConfigWork {
     Patch(crate::native_app::ConfigPatch),
     Undo(u64),
+    /// A process command is a semantic intent until it reaches the head of the
+    /// serialized config lane.  Materializing its OCC patch any earlier would
+    /// give several rapid toggles the same base revision/expected value, so the
+    /// third click could conflict with the second one's durable completion.
+    SeriousMode(bool),
+    /// Legacy control-protocol `settings set|unset` is an absolute semantic
+    /// intent, materialized against the newest service revision only when it
+    /// reaches the serialized lane head.  It must never run the old standalone
+    /// read/edit/write helper beside native Settings.
+    ControlField {
+        key: String,
+        value: Option<String>,
+    },
+}
+
+/// Completion authority for the one serialized config lane. Native Settings
+/// patches return to their typed reducer; process commands have no fabricated
+/// view identity and complete through their own App-owned policy transition.
+#[derive(Debug)]
+pub(crate) enum NativeConfigOrigin {
+    View {
+        instance: crate::tab_model::AppInstanceId,
+        view: crate::tab_model::ViewId,
+        reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
+    },
+    SeriousMode {
+        desired: bool,
+    },
+    /// Completion sink for the stable `settings set|unset` wire command. The
+    /// control thread remains blocked on this one-shot while the main loop stays
+    /// free to receive the worker completion. Non-success outcomes are returned
+    /// as `Err`, so the wire formatter cannot accidentally prefix them with OK.
+    Control {
+        request_id: u64,
+        key: String,
+        value: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
 }
 
 pub(crate) struct NativeConfigRequest {
-    instance: crate::tab_model::AppInstanceId,
-    view: crate::tab_model::ViewId,
-    reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
+    origin: NativeConfigOrigin,
     work: NativeConfigWork,
+}
+
+pub(crate) enum DeferredNativeConfigGeneration {
+    Prepared(Box<crate::native_font_catalog::PreparedConfigGeneration>),
+    Observation(Box<crate::native_config_service::PreparedConfigObservation>),
+}
+
+impl DeferredNativeConfigGeneration {
+    fn baseline(&self) -> &crate::native_document_host::AtomicFileBaseline {
+        match self {
+            Self::Prepared(generation) => &generation.observation.baseline,
+            Self::Observation(prepared) => &prepared.observation.baseline,
+        }
+    }
+
+    fn themes(&self) -> &std::sync::Arc<crate::app_config::ThemeCatalog> {
+        match self {
+            Self::Prepared(generation) => &generation.assets.themes,
+            Self::Observation(prepared) => &prepared.assets.themes,
+        }
+    }
 }
 
 fn native_config_queue() -> Result<&'static std::sync::mpsc::Sender<NativeConfigJob>, String> {
@@ -552,25 +737,42 @@ fn native_config_queue() -> Result<&'static std::sync::mpsc::Sender<NativeConfig
                 .name("aterm-native-config".to_string())
                 .spawn(move || {
                     while let Ok(job) = receiver.recv() {
-                        let outcome =
-                            match crate::prefs::save_prefs_snapshot(job.snapshot.text.as_ref()) {
-                                crate::prefs::SaveOutcome::Saved
-                                | crate::prefs::SaveOutcome::Unchanged => {
-                                    ConfigPatchOutcome::Applied {
-                                        revision: job.snapshot.revision,
-                                        undo: job.undo,
-                                    }
-                                }
-                                crate::prefs::SaveOutcome::Error(message) => {
-                                    ConfigPatchOutcome::Rejected { message }
-                                }
-                            };
-                        let _ = job.proxy.send_event(Wake::NativeConfigFinished {
-                            instance: job.instance,
-                            view: job.view,
-                            reply: job.reply,
-                            outcome,
-                        });
+                        match job {
+                            NativeConfigJob::Persist(job) => {
+                                let completion =
+                                    execute_native_config_persistence(&job.plan, job.undo);
+                                let _ = job.proxy.send_event(Wake::NativeConfigFinished {
+                                    origin: job.origin,
+                                    completion,
+                                });
+                            }
+                            NativeConfigJob::Reconcile(job) => {
+                                let completion = NativeConfigReconciliationCompletion {
+                                    pending_sequence: job.pending_sequence,
+                                    observation: observe_and_prepare_native_config(
+                                        &job.path, job.themes,
+                                    ),
+                                };
+                                let _ = job
+                                    .proxy
+                                    .send_event(Wake::NativeConfigReconciled { completion });
+                            }
+                            NativeConfigJob::PrepareExternal(job) => {
+                                let observation = job.observation;
+                                let result =
+                                    crate::native_config_service::VersionedConfigService::prepare_observation(
+                                        observation.clone(),
+                                        job.themes,
+                                    );
+                                let completion = NativeConfigExternalPreparationCompletion {
+                                    observation,
+                                    result,
+                                };
+                                let _ = job.proxy.send_event(
+                                    Wake::NativeConfigExternalPrepared { completion },
+                                );
+                            }
+                        }
                     }
                 })
                 .map_err(|error| format!("could not start config worker: {error}"))?;
@@ -580,7 +782,99 @@ fn native_config_queue() -> Result<&'static std::sync::mpsc::Sender<NativeConfig
         .map_err(Clone::clone)
 }
 
+fn observe_and_prepare_native_config(
+    path: &std::path::Path,
+    themes: std::sync::Arc<crate::app_config::ThemeCatalog>,
+) -> Result<crate::native_config_service::PreparedConfigObservation, String> {
+    let observation =
+        crate::native_config_service::VersionedConfigService::observe_path(path, true)?;
+    crate::native_config_service::VersionedConfigService::prepare_observation(observation, themes)
+}
+
+pub(crate) fn execute_native_config_persistence(
+    plan: &crate::native_config_service::ConfigPersistencePlan,
+    undo: Option<u64>,
+) -> NativeConfigPersistenceCompletion {
+    let saved = crate::prefs::save_prefs_snapshot_observed(plan);
+    let outcome = match &saved.outcome {
+        crate::prefs::SaveOutcome::Saved | crate::prefs::SaveOutcome::Unchanged => {
+            ConfigPatchOutcome::Applied {
+                revision: plan.snapshot.revision,
+                undo,
+            }
+        }
+        crate::prefs::SaveOutcome::Conflict { .. } => ConfigPatchOutcome::Conflict {
+            revision: plan.snapshot.revision,
+        },
+        crate::prefs::SaveOutcome::PublishedUnverified { stage, message, .. } => {
+            ConfigPatchOutcome::Indeterminate {
+                message: format!(
+                    "config publication at {stage:?} could not be verified: {message}; reload before retrying"
+                ),
+            }
+        }
+        crate::prefs::SaveOutcome::Error(message) => ConfigPatchOutcome::Rejected {
+            message: message.clone(),
+        },
+    };
+    let observation = if let Some(baseline) = saved.observed {
+        Ok(crate::native_config_service::ConfigDiskObservation {
+            text: plan.snapshot.text.to_string(),
+            baseline,
+        })
+    } else {
+        plan.baseline
+            .as_ref()
+            .map(|baseline| baseline.target.logical_path().to_path_buf())
+            .or_else(|| plan.logical_path.clone())
+            .or_else(crate::app_config::config_path)
+            .ok_or_else(|| "no config path (HOME/XDG unset)".to_string())
+            .and_then(|path| {
+                crate::native_config_service::VersionedConfigService::observe_path(&path, true)
+            })
+    }
+    .and_then(|observation| {
+        crate::native_config_service::VersionedConfigService::prepare_observation(
+            observation,
+            std::sync::Arc::clone(&plan.snapshot.assets.themes),
+        )
+    });
+    NativeConfigPersistenceCompletion {
+        outcome,
+        observation,
+    }
+}
+
 impl App {
+    /// Main-thread projection consumed by the control socket's front-input
+    /// authorization fence. Overlay identity wins because it is the immediate
+    /// event consumer; otherwise native Settings is distinguished from every
+    /// other native app instead of being collapsed into "no overlay".
+    pub(crate) fn front_control_surface(&self) -> crate::control::FrontControlSurface {
+        if let Some(kind) = self
+            .front()
+            .and_then(|window| window.overlay())
+            .map(|overlay| overlay.kind())
+        {
+            return crate::control::FrontControlSurface::Overlay(kind);
+        }
+        let Some(wid) = self.frontmost_window else {
+            return crate::control::FrontControlSurface::None;
+        };
+        let Some((instance, _)) = self.active_native_view(wid) else {
+            return crate::control::FrontControlSurface::None;
+        };
+        if self
+            .native_runtime
+            .app(instance)
+            .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
+        {
+            crate::control::FrontControlSurface::NativeSettings
+        } else {
+            crate::control::FrontControlSurface::OtherNative
+        }
+    }
+
     fn ensure_native_update_reconcile_worker(&mut self) -> Option<NativeUpdateReconcileSender> {
         if let Some(worker) = self.native_update_reconcile_worker.clone() {
             return Some(worker);
@@ -891,25 +1185,7 @@ impl App {
         }
     }
 
-    /// Return the active Settings view only while its compact/desktop semantic
-    /// route is Diagnostics. The event-loop cadence uses this exact route fact;
-    /// hidden tabs and every other native app remain timer-free.
-    pub(crate) fn active_native_diagnostics_view(
-        &self,
-        wid: WindowId,
-    ) -> Option<crate::tab_model::ViewId> {
-        let (_, view) = self.windows.get(&wid)?.front_content?.native()?;
-        match self.native_runtime.view_state(view) {
-            Some(crate::native_app::AppViewState::Settings(state))
-                if state.route == crate::native_settings::SettingsRoute::Diagnostics =>
-            {
-                Some(view)
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn native_ui_viewport(
+    fn native_ui_full_viewport(
         &self,
         wid: WindowId,
     ) -> Result<crate::native_ui::LogicalRect, String> {
@@ -918,24 +1194,7 @@ impl App {
         };
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid);
-        let trailing_pad = if self.hud_rows.min(ws.hud_cap) == 0 {
-            pad
-        } else {
-            0
-        };
         let scale = ws.scale.max(f64::EPSILON) as f32;
-        if let Some((_, view)) = self.active_native_view(wid)
-            && let Some(plan) = self.active_visible_leaf_plan(wid)
-            && plan.leaves.len() > 1
-            && let Some(leaf) = plan.leaf(view)
-        {
-            return Ok(crate::native_ui::LogicalRect::new(
-                0.0,
-                0.0,
-                leaf.rect.size.width * cw as f32 / scale,
-                leaf.rect.size.height * ch as f32 / scale,
-            ));
-        }
         Ok(crate::native_ui::LogicalRect::new(
             0.0,
             0.0,
@@ -943,14 +1202,69 @@ impl App {
                 .saturating_mul(cw)
                 .saturating_add(pad.saturating_mul(2)) as f32
                 / scale,
-            usize::from(ws.rows)
-                .saturating_mul(ch)
-                // With no HUD, native content extends through the outer base-bottom
-                // pad. With a HUD below it, that pad belongs after the HUD instead,
-                // so the card stops at the native row boundary.
-                .saturating_add(trailing_pad) as f32
-                / scale,
+            usize::from(ws.rows).saturating_mul(ch).saturating_add(pad) as f32 / scale,
         ))
+    }
+
+    /// Resolve the logical viewport for one exact native presentation, even
+    /// when another leaf is focused or its containing tab is inactive. This is
+    /// the geometry counterpart of stable view addressing used by semantic
+    /// inspection; it must never borrow the focused leaf's rectangle.
+    pub(crate) fn native_ui_viewport_for(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+    ) -> Result<crate::native_ui::LogicalRect, String> {
+        if !matches!(
+            self.view_store.get(view),
+            Some(crate::tab_model::View::Native(_))
+        ) {
+            return Err("view is not a native presentation".to_string());
+        }
+        let Some(window) = self.windows.get(&wid) else {
+            return Err("unknown window".to_string());
+        };
+        let Some(tab) = window
+            .tab_set
+            .tabs()
+            .iter()
+            .find(|tab| tab.root.contains(view))
+        else {
+            return Err("native view is not in this window".to_string());
+        };
+        if tab.root.len() <= 1 {
+            return self.native_ui_full_viewport(wid);
+        }
+        let plan = self
+            .visible_leaf_plan_for_tab(wid, tab.id)
+            .ok_or_else(|| "native view tab has no layout".to_string())?;
+        let leaf = plan
+            .leaf(view)
+            .ok_or_else(|| "native view is hidden by pane zoom".to_string())?;
+        // Zoom presents one leaf as the whole native content surface. Preserve
+        // the full viewport's padding exactly as the ordinary single-leaf path.
+        if plan.leaves.len() <= 1 {
+            return self.native_ui_full_viewport(wid);
+        }
+        let (cw, ch) = self.win_cell_size(wid);
+        let scale = window.scale.max(f64::EPSILON) as f32;
+        Ok(crate::native_ui::LogicalRect::new(
+            0.0,
+            0.0,
+            leaf.rect.size.width * cw as f32 / scale,
+            leaf.rect.size.height * ch as f32 / scale,
+        ))
+    }
+
+    pub(crate) fn native_ui_viewport(
+        &self,
+        wid: WindowId,
+    ) -> Result<crate::native_ui::LogicalRect, String> {
+        if let Some((_, view)) = self.active_native_view(wid) {
+            self.native_ui_viewport_for(wid, view)
+        } else {
+            self.native_ui_full_viewport(wid)
+        }
     }
 
     /// Device-pixel Y where native content begins: effective top pad + OS head band +
@@ -1180,6 +1494,7 @@ impl App {
             system_reduced: self.system_reduce_motion,
             focused: self.motion_focus(wid, focused_leaf && focused_window),
             performance_reduced: self.perf_reduced,
+            system_dark: self.os_appearance == aterm_types::Appearance::Dark,
             serious: self.serious_mode_enabled(),
         }
     }
@@ -1462,6 +1777,43 @@ impl App {
                             )
                         })
                         .unwrap_or_else(|| event.clone()),
+                    action if action.starts_with("editor/config-page/") => action
+                        .strip_prefix("editor/config-page/")
+                        .and_then(|suffix| suffix.split_once('/'))
+                        .and_then(|(target, candidates)| {
+                            Some((
+                                target.parse::<usize>().ok()?,
+                                candidates.parse::<usize>().ok()?,
+                            ))
+                        })
+                        .and_then(|(target, candidates)| {
+                            self.editor_config_completion_context(instance, view)
+                                .map(|context| AppEvent::EditorConfigNavigate {
+                                    navigation: crate::native_app::ConfigCompletionNavigation::Page(
+                                        target,
+                                    ),
+                                    candidates,
+                                    context,
+                                })
+                        })
+                        .unwrap_or_else(|| event.clone()),
+                    "editor/config-problem-next" => {
+                        AppEvent::EditorConfigDiagnosticNavigate { previous: false }
+                    }
+                    "editor/config-problem-previous" => {
+                        AppEvent::EditorConfigDiagnosticNavigate { previous: true }
+                    }
+                    action
+                        if action.starts_with(
+                            crate::native_config_language::CONFIG_COMPLETION_ACTION_PREFIX,
+                        ) =>
+                    {
+                        self.editor_config_completion(instance, view, action)
+                            .map_or(
+                                AppEvent::EditorConfigCompletionRejected,
+                                AppEvent::EditorConfigCompletion,
+                            )
+                    }
                     _ => event,
                 },
                 _ => event,
@@ -1554,6 +1906,56 @@ impl App {
                         )
                     })
             );
+        let editor_minibuffer_active = editor_active
+            && matches!(
+                self.native_runtime.view_state(active_view),
+                Some(crate::native_app::AppViewState::Editor(state))
+                    if state
+                        .buffer
+                        .as_ref()
+                        .is_some_and(crate::native_editor::EditorBufferView::minibuffer_active)
+            );
+        let (
+            editor_config_completion_count,
+            editor_config_completion_selected,
+            editor_config_completion_context,
+            editor_config_completion_interacting,
+            editor_config_assist_present,
+            editor_config_assist_dismissed,
+        ) = if editor_active && !editor_minibuffer_active && !editor_chord_pending {
+            self.editor_config_assist(instance, active_view)
+                .and_then(|(context, assist)| {
+                    let crate::native_app::AppViewState::Editor(state) =
+                        self.native_runtime.view_state(active_view)?
+                    else {
+                        return None;
+                    };
+                    let dismissed = state.config_completion_dismissed == Some(context);
+                    let interacting = state.config_completion_interaction == Some(context);
+                    let selected = if interacting {
+                        state.config_completion_selected
+                    } else {
+                        0
+                    };
+                    let count = assist.completions.len();
+                    let present = assist.help.is_some() || count > 0;
+                    Some((
+                        count,
+                        selected,
+                        Some(context),
+                        interacting,
+                        present,
+                        dismissed,
+                    ))
+                })
+                .unwrap_or((0, 0, None, false, false, false))
+        } else {
+            (0, 0, None, false, false, false)
+        };
+        let editor_config_completion_active =
+            !editor_config_assist_dismissed && editor_config_completion_count > 0;
+        let editor_config_assist_visible =
+            !editor_config_assist_dismissed && editor_config_assist_present;
         let settings_active = self
             .native_runtime
             .app(instance)
@@ -1563,12 +1965,45 @@ impl App {
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Markdown);
 
-        if let InputEvent::Key {
-            key: Key::Named(NamedKey::Tab),
-            mods,
-            event_type: KeyEventType::Press,
-            ..
-        } = event
+        if editor_config_assist_present
+            && (!editor_config_completion_interacting || editor_config_assist_dismissed)
+            && !editor_chord_pending
+            && let InputEvent::Key {
+                key: Key::Named(NamedKey::Space),
+                mods,
+                event_type: KeyEventType::Press,
+                ..
+            } = event
+            && mods.contains(Modifiers::CTRL)
+            && !mods.intersects(
+                Modifiers::ALT
+                    | Modifiers::SUPER
+                    | Modifiers::HYPER
+                    | Modifiers::META
+                    | Modifiers::SHIFT,
+            )
+            && let Some(context) = editor_config_completion_context
+        {
+            let _ = self.dispatch_native_event(
+                wid,
+                AppEvent::EditorConfigNavigate {
+                    navigation: crate::native_app::ConfigCompletionNavigation::Page(
+                        editor_config_completion_selected,
+                    ),
+                    candidates: editor_config_completion_count,
+                    context,
+                },
+            );
+            return true;
+        }
+
+        if !editor_chord_pending
+            && let InputEvent::Key {
+                key: Key::Named(NamedKey::Tab),
+                mods,
+                event_type: KeyEventType::Press,
+                ..
+            } = event
         {
             if editor_command_palette_active {
                 let _ = self.dispatch_native_event(
@@ -1579,19 +2014,131 @@ impl App {
                 );
                 return true;
             }
+            if editor_config_completion_active && !mods.contains(Modifiers::SHIFT) {
+                let Some(context) = editor_config_completion_context else {
+                    return true;
+                };
+                let _ = self.dispatch_native_event(
+                    wid,
+                    AppEvent::EditorConfigNavigate {
+                        navigation: crate::native_app::ConfigCompletionNavigation::Page(
+                            editor_config_completion_selected,
+                        ),
+                        candidates: editor_config_completion_count,
+                        context,
+                    },
+                );
+                if editor_config_completion_interacting
+                    && self.activate_native_focus(wid).unwrap_or(false)
+                {
+                    return true;
+                }
+                // First Tab explicitly enters the completion list without
+                // mutating the document. Arrows can now choose any candidate;
+                // Enter or a second Tab accepts it.
+                return true;
+            }
             let _ = self.move_native_focus(wid, mods.contains(Modifiers::SHIFT));
             return true;
         }
-        if !editor_active
-            && !self.native_text_field_has_focus(wid)
+        let editor_config_completion_focused = editor_config_completion_interacting
+            && editor_active
+            && self
+                .native_runtime
+                .view_state(active_view)
+                .and_then(|state| state.common().last_focus.as_ref())
+                .is_some_and(|key| key.as_str().starts_with("editor/config-completion/"));
+        if editor_config_assist_visible
+            && !editor_chord_pending
             && let InputEvent::Key {
-                key: Key::Named(NamedKey::Enter | NamedKey::Space),
+                key: Key::Named(NamedKey::Escape),
+                event_type: KeyEventType::Press,
+                ..
+            } = event
+            && let Some(context) = editor_config_completion_context
+        {
+            let _ = self.dispatch_native_event(wid, AppEvent::EditorConfigDismiss { context });
+            return true;
+        }
+        if editor_config_completion_active
+            && editor_config_completion_focused
+            && let InputEvent::Key {
+                key: Key::Named(NamedKey::Enter),
+                event_type: KeyEventType::Press,
+                ..
+            } = event
+        {
+            let Some(context) = editor_config_completion_context else {
+                return true;
+            };
+            let _ = self.dispatch_native_event(
+                wid,
+                AppEvent::EditorConfigNavigate {
+                    navigation: crate::native_app::ConfigCompletionNavigation::Page(
+                        editor_config_completion_selected,
+                    ),
+                    candidates: editor_config_completion_count,
+                    context,
+                },
+            );
+            if self.activate_native_focus(wid).unwrap_or(false) {
+                return true;
+            }
+        }
+        if editor_config_completion_focused
+            && let InputEvent::Key {
+                key: Key::Named(NamedKey::Space),
                 event_type: KeyEventType::Press,
                 ..
             } = event
             && self.activate_native_focus(wid).unwrap_or(false)
         {
             return true;
+        }
+        let editor_config_diagnostic_count =
+            self.native_runtime.config_editor_analysis(instance).map_or(
+                0,
+                crate::native_config_language::ConfigAnalysis::diagnostic_count,
+            );
+        if editor_active
+            && editor_config_diagnostic_count > 0
+            && let InputEvent::Key {
+                key: Key::Named(NamedKey::F8),
+                mods,
+                event_type: KeyEventType::Press,
+                ..
+            } = event
+        {
+            let _ = self.dispatch_native_event(
+                wid,
+                AppEvent::EditorConfigDiagnosticNavigate {
+                    previous: mods.contains(Modifiers::SHIFT),
+                },
+            );
+            return true;
+        }
+        if !editor_active
+            && !self.native_text_field_has_focus(wid)
+            && let InputEvent::Key {
+                key: Key::Named(key @ (NamedKey::Enter | NamedKey::NumpadEnter | NamedKey::Space)),
+                event_type: KeyEventType::Press,
+                ..
+            } = event
+        {
+            if self.activate_native_focus(wid).unwrap_or(false) {
+                return true;
+            }
+            // Nothing holds keyboard focus: Return falls back to the page's
+            // DEFAULT button (the highlighted Primary — "Install & Relaunch",
+            // "Copy Build Information"), the native default-button convention.
+            // Space never does; on macOS it only activates the focused control.
+            // NumpadEnter only ever arrives from a controller (`key kpenter`);
+            // winit folds the physical keypad key to Enter before this seam.
+            if matches!(key, NamedKey::Enter | NamedKey::NumpadEnter)
+                && self.activate_native_default(wid).unwrap_or(false)
+            {
+                return true;
+            }
         }
 
         let app_event = match event {
@@ -1654,6 +2201,15 @@ impl App {
                         Key::Named(NamedKey::Delete) => Some("delete".to_string()),
                         Key::Named(NamedKey::Enter) => Some("enter".to_string()),
                         Key::Named(NamedKey::Escape) => Some("escape".to_string()),
+                        Key::Named(NamedKey::Tab) => Some("tab".to_string()),
+                        // WORD MOTION on the arrows (2026-07-24). These fell to
+                        // `_ => None` and the event was DROPPED, so in the
+                        // native editor ⌥← / ⌥→ were dead keys while `M-b` /
+                        // `M-f` worked — the same command, reachable only by
+                        // the emacs spelling. Plain arrows are unaffected: this
+                        // arm is only entered when a modifier is held.
+                        Key::Named(NamedKey::ArrowLeft) => Some("left".to_string()),
+                        Key::Named(NamedKey::ArrowRight) => Some("right".to_string()),
                         _ => None,
                     };
                     key.map(|key| {
@@ -1678,6 +2234,10 @@ impl App {
                         && !mods.intersects(
                             Modifiers::SUPER | Modifiers::ALT | Modifiers::HYPER | Modifiers::META,
                         );
+                    // The ⌥ twin of `readline`, for word motion only.
+                    let alt_word = settings_active
+                        && mods.intersects(Modifiers::ALT | Modifiers::META)
+                        && !mods.intersects(Modifiers::CTRL | Modifiers::SUPER | Modifiers::HYPER);
                     match key {
                         Key::Character('a' | 'A') if readline => {
                             Some(AppEvent::TextInput(TextInputEvent::Home { extend }))
@@ -1702,6 +2262,24 @@ impl App {
                         }
                         Key::Character('w' | 'W') if readline => {
                             Some(AppEvent::TextInput(TextInputEvent::DeleteWordBackward))
+                        }
+                        // WORD MOTION in Settings fields (2026-07-24 audit:
+                        // they had none at all). ⌥←/⌥→ is what a Mac user
+                        // reaches for; ⌥B/⌥F is the emacs spelling of the same
+                        // pair, matching the terminal's own ESC-b/ESC-f. ⌥-only
+                        // so ⌘← (line start) and the CTRL readline set above
+                        // are untouched.
+                        Key::Named(NamedKey::ArrowLeft) if alt_word => {
+                            Some(AppEvent::TextInput(TextInputEvent::WordLeft { extend }))
+                        }
+                        Key::Named(NamedKey::ArrowRight) if alt_word => {
+                            Some(AppEvent::TextInput(TextInputEvent::WordRight { extend }))
+                        }
+                        Key::Character('b' | 'B') if alt_word => {
+                            Some(AppEvent::TextInput(TextInputEvent::WordLeft { extend }))
+                        }
+                        Key::Character('f' | 'F') if alt_word => {
+                            Some(AppEvent::TextInput(TextInputEvent::WordRight { extend }))
                         }
                         Key::Character('a' | 'A') if command => {
                             Some(AppEvent::TextInput(TextInputEvent::SelectAll))
@@ -1756,6 +2334,17 @@ impl App {
                                 Some(AppEvent::EditorCompletion(
                                     crate::native_editor::EditorCompletionAction::Previous,
                                 ))
+                            } else if editor_config_completion_active
+                                && editor_config_completion_focused
+                            {
+                                editor_config_completion_context.map(|context| {
+                                    AppEvent::EditorConfigNavigate {
+                                        navigation:
+                                            crate::native_app::ConfigCompletionNavigation::Previous,
+                                        candidates: editor_config_completion_count,
+                                        context,
+                                    }
+                                })
                             } else {
                                 Some(AppEvent::EditorCommand(
                                     crate::native_editor::EditorCommand::MoveLineUp,
@@ -1767,6 +2356,17 @@ impl App {
                                 Some(AppEvent::EditorCompletion(
                                     crate::native_editor::EditorCompletionAction::Next,
                                 ))
+                            } else if editor_config_completion_active
+                                && editor_config_completion_focused
+                            {
+                                editor_config_completion_context.map(|context| {
+                                    AppEvent::EditorConfigNavigate {
+                                        navigation:
+                                            crate::native_app::ConfigCompletionNavigation::Next,
+                                        candidates: editor_config_completion_count,
+                                        context,
+                                    }
+                                })
                             } else {
                                 Some(AppEvent::EditorCommand(
                                     crate::native_editor::EditorCommand::MoveLineDown,
@@ -1783,7 +2383,7 @@ impl App {
                                 crate::native_editor::EditorCommand::MoveLineEnd,
                             ))
                         }
-                        Key::Named(NamedKey::Enter) => {
+                        Key::Named(NamedKey::Enter | NamedKey::NumpadEnter) => {
                             Some(AppEvent::TextInput(TextInputEvent::Submit))
                         }
                         Key::Named(NamedKey::Escape) => {
@@ -1962,6 +2562,25 @@ impl App {
         Ok(true)
     }
 
+    /// Activate the page's DEFAULT button (`CompiledUi::default_action`) — the
+    /// bare-Return fallback when no control holds keyboard focus. `false` when
+    /// the page declares no enabled Primary button; the key then flows on to
+    /// the text-input lowering exactly as before.
+    fn activate_native_default(&mut self, wid: WindowId) -> Result<bool, String> {
+        let compiled = self.compiled_native_ui(wid)?;
+        let Some((_, action)) = compiled.default_action else {
+            return Ok(false);
+        };
+        self.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: action,
+                value: None,
+            }),
+        )?;
+        Ok(true)
+    }
+
     fn execute_native_effect(
         &mut self,
         wid: WindowId,
@@ -1972,18 +2591,22 @@ impl App {
         match effect {
             AppEffect::ConfigPatch { patch, reply } => {
                 self.native_config_pending.push_back(NativeConfigRequest {
-                    instance,
-                    view,
-                    reply,
+                    origin: NativeConfigOrigin::View {
+                        instance,
+                        view,
+                        reply,
+                    },
                     work: NativeConfigWork::Patch(patch),
                 });
                 self.pump_native_config()?;
             }
             AppEffect::ConfigUndo { token, reply } => {
                 self.native_config_pending.push_back(NativeConfigRequest {
-                    instance,
-                    view,
-                    reply,
+                    origin: NativeConfigOrigin::View {
+                        instance,
+                        view,
+                        reply,
+                    },
                     work: NativeConfigWork::Undo(token),
                 });
                 self.pump_native_config()?;
@@ -2008,6 +2631,24 @@ impl App {
                         instance,
                         view,
                         AppEvent::ExternalOpenFinished {
+                            operation: reply.operation,
+                            outcome,
+                        },
+                    )?;
+                }
+            }
+            AppEffect::OpenConfigEditor { target, reply } => {
+                let outcome =
+                    match self.ensure_and_open_config_editor_at_in_window(wid, target.as_ref()) {
+                        Ok(canonical_uri) => ConfigEditorOutcome::Opened { canonical_uri },
+                        Err(message) => ConfigEditorOutcome::Failed { message },
+                    };
+                if self.native_runtime.completion_is_current(&reply) {
+                    self.dispatch_native_completion(
+                        wid,
+                        instance,
+                        view,
+                        AppEvent::ConfigEditorFinished {
                             operation: reply.operation,
                             outcome,
                         },
@@ -2129,8 +2770,263 @@ impl App {
         Ok(())
     }
 
-    fn pump_native_config(&mut self) -> Result<(), String> {
+    /// Enqueue one stable-protocol `settings set|unset` command into the exact
+    /// serialized/versioned persistence lane used by native Settings.  Validation,
+    /// reconciliation, OCC, atomic publication, and follow-up observation therefore
+    /// have one owner.  The main loop never blocks on the disk worker: completion
+    /// carries the socket's one-shot reply back through [`NativeConfigOrigin::Control`].
+    pub(crate) fn queue_control_settings_field(
+        &mut self,
+        key: String,
+        value: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    ) {
+        let Some(canonical_key) = crate::prefs::editable_fields(&self.config)
+            .into_iter()
+            .find(|field| field.key == key)
+            .map(|field| field.key.to_string())
+        else {
+            let _ = reply.send(Err(format!(
+                "unknown key {key:?} (search Settings or use Manual for the complete schema)"
+            )));
+            return;
+        };
+        if self.proxy.is_none() {
+            let _ = reply.send(Err(
+                "save failed: config persistence needs an event-loop proxy".to_string(),
+            ));
+            return;
+        }
+        if let Err(error) = native_config_queue() {
+            let _ = reply.send(Err(format!("save failed: {error}")));
+            return;
+        }
+
+        let request_id = self.enqueue_control_settings_field_intent(canonical_key, value, reply);
+        if let Err(error) = self.pump_native_config()
+            && let Some(position) = self.native_config_pending.iter().position(|request| {
+                matches!(
+                    &request.origin,
+                    NativeConfigOrigin::Control {
+                        request_id: queued,
+                        ..
+                    } if *queued == request_id
+                )
+            })
+            && let Some(NativeConfigRequest {
+                origin: NativeConfigOrigin::Control { reply, .. },
+                ..
+            }) = self.native_config_pending.remove(position)
+        {
+            // Reconciliation/capability failure happened before this request was
+            // reduced. Remove only this caller's uniquely-tagged request so the
+            // control thread receives a bounded ERR instead of waiting forever;
+            // older UI intents remain queued for the normal reconciliation retry.
+            let _ = reply.send(Err(format!("save failed: {error}")));
+            self.refresh_serious_mode_queued_projection();
+        }
+    }
+
+    fn enqueue_control_settings_field_intent(
+        &mut self,
+        canonical_key: String,
+        value: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    ) -> u64 {
+        let request_id = next_control_settings_request();
+        let serious_mode_intent = control_serious_mode_intent(&canonical_key, value.as_deref());
+        self.native_config_pending.push_back(NativeConfigRequest {
+            origin: NativeConfigOrigin::Control {
+                request_id,
+                key: canonical_key.clone(),
+                value: value.clone(),
+                reply,
+            },
+            work: NativeConfigWork::ControlField {
+                key: canonical_key,
+                value,
+            },
+        });
+        // This legacy command shares the same semantic queue as the native
+        // Serious Mode command. Project a valid absolute control intent before
+        // pumping so a rapid following toggle composes against the value that
+        // will precede it, not the still-live durable value. Invalid bool text
+        // deliberately has no projection: reduction will reject it without
+        // changing the service.
+        if let Some(desired) = serious_mode_intent {
+            self.serious_mode_queued_projection = Some(desired);
+        }
+        request_id
+    }
+
+    /// Enqueue the menu/keybinding/palette Serious Mode command in the same
+    /// versioned transaction lane used by native Settings. Capability preflight
+    /// happens before the request becomes visible. The semantic desired value
+    /// is materialized as an exact OCC patch only when it reaches the head of
+    /// that lane, against the last completed/optimistic service revision. The
+    /// live policy is left untouched until durable completion returns.
+    pub(crate) fn queue_serious_mode_toggle(&mut self) -> Result<(), String> {
+        self.proxy
+            .as_ref()
+            .ok_or_else(|| "config persistence needs an event-loop proxy".to_string())?;
+        let _ = native_config_queue()?;
+        self.enqueue_serious_mode_intent()?;
+        let result = self.pump_native_config();
+        if result.is_err() {
+            self.refresh_serious_mode_queued_projection();
+        }
+        result
+    }
+
+    /// Compose a new click against the newest queued intent, not just the live
+    /// durable policy. Kept as one shipping seam so any rapid toggle sequence
+    /// retains its parity while earlier completions are in flight.
+    fn enqueue_serious_mode_intent(&mut self) -> Result<(), String> {
+        let desired = !self
+            .serious_mode_queued_projection
+            .unwrap_or_else(|| self.serious_mode_enabled());
+        self.native_config_pending.push_back(NativeConfigRequest {
+            origin: NativeConfigOrigin::SeriousMode { desired },
+            work: NativeConfigWork::SeriousMode(desired),
+        });
+        self.serious_mode_queued_projection = Some(desired);
+        Ok(())
+    }
+
+    /// Recompute the semantic projection after a completion or a failed queue
+    /// admission. The newest valid intent wins; malformed legacy bool text is
+    /// ignored because its reduction is guaranteed to reject without a write.
+    fn refresh_serious_mode_queued_projection(&mut self) {
+        self.serious_mode_queued_projection =
+            self.native_config_pending
+                .iter()
+                .rev()
+                .find_map(|request| match &request.origin {
+                    NativeConfigOrigin::SeriousMode { desired } => Some(*desired),
+                    NativeConfigOrigin::Control { key, value, .. } => {
+                        control_serious_mode_intent(key, value.as_deref())
+                    }
+                    NativeConfigOrigin::View { .. } => None,
+                });
+    }
+
+    /// Build the exact compare-and-swap request for a Serious Mode intent at
+    /// dequeue time. Every earlier request has already reduced into the
+    /// service, so both the base revision and expected value are current.
+    fn serious_mode_patch_request(
+        &self,
+        desired: bool,
+    ) -> Result<crate::native_app::ConfigPatch, String> {
+        let snapshot = self.native_config_service.snapshot();
+        let expected = snapshot.values()?.remove(crate::prefs::EDIT_SERIOUS_MODE);
+        Ok(crate::native_app::ConfigPatch {
+            base_revision: snapshot.revision,
+            edits: vec![crate::native_app::ConfigEdit {
+                key: crate::prefs::EDIT_SERIOUS_MODE.to_string(),
+                expected: ExpectedConfigValue::Exact(expected),
+                value: Some(desired.to_string()),
+            }],
+        })
+    }
+
+    fn control_field_patch_request(
+        &self,
+        key: String,
+        value: Option<String>,
+    ) -> Result<crate::native_app::ConfigPatch, String> {
+        let snapshot = self.native_config_service.snapshot();
+        let expected = snapshot.values()?.remove(&key);
+        Ok(crate::native_app::ConfigPatch {
+            base_revision: snapshot.revision,
+            edits: vec![crate::native_app::ConfigEdit {
+                key,
+                expected: ExpectedConfigValue::Exact(expected),
+                value,
+            }],
+        })
+    }
+
+    fn reduce_native_config_work(
+        &mut self,
+        work: NativeConfigWork,
+    ) -> Result<ConfigPatchResult, String> {
+        let work = match work {
+            NativeConfigWork::SeriousMode(desired) => {
+                NativeConfigWork::Patch(self.serious_mode_patch_request(desired)?)
+            }
+            NativeConfigWork::ControlField { key, value } => {
+                NativeConfigWork::Patch(self.control_field_patch_request(key, value)?)
+            }
+            work => work,
+        };
+        Ok(match work {
+            NativeConfigWork::Patch(patch) => {
+                self.native_config_service.patch(ConfigPatchRequest {
+                    base_revision: patch.base_revision,
+                    edits: patch
+                        .edits
+                        .into_iter()
+                        .map(|edit| ConfigKeyEdit {
+                            key: edit.key,
+                            expected: match edit.expected {
+                                ExpectedConfigValue::Any => ExpectedValue::Any,
+                                ExpectedConfigValue::Exact(value) => ExpectedValue::Exact(value),
+                            },
+                            value: edit.value,
+                        })
+                        .collect(),
+                })
+            }
+            NativeConfigWork::Undo(token) => self
+                .native_config_service
+                .undo(crate::native_config_service::UndoToken::from_stored(token)),
+            NativeConfigWork::SeriousMode(_) | NativeConfigWork::ControlField { .. } => {
+                unreachable!("semantic config work is materialized above")
+            }
+        })
+    }
+
+    pub(crate) fn pump_native_config(&mut self) -> Result<(), String> {
         while !self.native_config_inflight {
+            // A watcher candidate owns file authority from receipt through
+            // parse/assets/font preparation. Hold semantic writes until that
+            // exact baseline is either admitted or rejected. Once a complete
+            // generation is retained, reconciliation may run to order it
+            // against a concurrent durable write.
+            if self.config_watch_admission_pending()
+                && self.native_config_external_pending.is_none()
+            {
+                return Ok(());
+            }
+            // A conflict or post-publication proof failure invalidates the
+            // previous disk baseline. Dispatch a bounded worker observation
+            // before even popping the next semantic request; the event loop
+            // never opens the pathname or resolves referenced assets.
+            if self.native_config_service.reconciliation_required() {
+                let proxy = self.proxy.clone().ok_or_else(|| {
+                    "native config reconciliation needs an event-loop proxy".to_string()
+                })?;
+                let queue = native_config_queue()?;
+                let path = self
+                    .native_config_service
+                    .bound_logical_path()
+                    .map(std::path::Path::to_path_buf)
+                    .or_else(crate::app_config::config_path)
+                    .ok_or_else(|| "no config path (HOME/XDG unset)".to_string())?;
+                let job = NativeConfigJob::Reconcile(NativeConfigReconciliationJob {
+                    path,
+                    themes: std::sync::Arc::clone(
+                        &self.native_config_service.snapshot().assets.themes,
+                    ),
+                    pending_sequence: self.native_config_external_sequence,
+                    proxy,
+                });
+                queue.send(job).map_err(|_| {
+                    "native config worker stopped during reconciliation".to_string()
+                })?;
+                self.native_config_inflight = true;
+                return Ok(());
+            }
             if self.native_config_pending.is_empty() {
                 return Ok(());
             }
@@ -2146,72 +3042,94 @@ impl App {
                 .native_config_pending
                 .pop_front()
                 .expect("queue was checked before capability acquisition");
-            let result = match request.work {
-                NativeConfigWork::Patch(patch) => {
-                    self.native_config_service.patch(ConfigPatchRequest {
-                        base_revision: patch.base_revision,
-                        edits: patch
-                            .edits
-                            .into_iter()
-                            .map(|edit| ConfigKeyEdit {
-                                key: edit.key,
-                                expected: match edit.expected {
-                                    ExpectedConfigValue::Any => ExpectedValue::Any,
-                                    ExpectedConfigValue::Exact(value) => {
-                                        ExpectedValue::Exact(value)
-                                    }
-                                },
-                                value: edit.value,
-                            })
-                            .collect(),
-                    })
+            let NativeConfigRequest { origin, work } = request;
+            let result = match self.reduce_native_config_work(work) {
+                Ok(result) => result,
+                Err(message) => {
+                    let authoritative = self.native_config_service.snapshot();
+                    self.publish_native_config_origin(
+                        origin,
+                        ConfigPatchOutcome::Rejected { message },
+                        Some(authoritative),
+                        false,
+                        None,
+                    );
+                    continue;
                 }
-                NativeConfigWork::Undo(token) => self
-                    .native_config_service
-                    .undo(crate::native_config_service::UndoToken::from_stored(token)),
             };
             match result {
                 ConfigPatchResult::Applied { snapshot, undo } => {
-                    queue
-                        .send(NativeConfigJob {
-                            snapshot,
-                            undo: Some(undo.get()),
-                            instance: request.instance,
-                            view: request.view,
-                            reply: request.reply,
-                            proxy,
-                        })
-                        .map_err(|_| "native config worker stopped".to_string())?;
+                    let plan = self.native_config_service.persistence_plan(snapshot);
+                    let job = NativeConfigJob::Persist(NativeConfigPersistenceJob {
+                        plan,
+                        undo: Some(undo.get()),
+                        origin,
+                        proxy,
+                    });
+                    if let Err(error) = queue.send(job) {
+                        // The reducer has advanced but no worker owns the candidate.
+                        // Restore from durable authority before completing the
+                        // initiating request; a control-origin request owns a blocked
+                        // socket reply and must not be silently dropped here.
+                        let NativeConfigJob::Persist(job) = error.0 else {
+                            unreachable!("persistence send returned a reconciliation job")
+                        };
+                        let restored = self.native_config_service.restore_durable_snapshot();
+                        let (authoritative, message) = match restored {
+                            Ok(snapshot) => {
+                                (Some(snapshot), "native config worker stopped".to_string())
+                            }
+                            Err(error) => (
+                                None,
+                                format!(
+                                    "native config worker stopped; in-memory durable rollback failed: {error}"
+                                ),
+                            ),
+                        };
+                        self.publish_native_config_origin(
+                            job.origin,
+                            ConfigPatchOutcome::Rejected {
+                                message: message.clone(),
+                            },
+                            authoritative,
+                            true,
+                            Some(message),
+                        );
+                        continue;
+                    }
                     self.native_config_inflight = true;
                     return Ok(());
                 }
                 ConfigPatchResult::Unchanged { snapshot } => {
-                    self.publish_native_config_completion(
-                        request.instance,
-                        request.view,
-                        request.reply,
+                    self.publish_native_config_origin(
+                        origin,
                         ConfigPatchOutcome::Applied {
                             revision: snapshot.revision,
                             undo: None,
                         },
+                        Some(snapshot),
+                        false,
+                        None,
                     );
                 }
                 ConfigPatchResult::Conflict { snapshot, .. } => {
-                    self.publish_native_config_completion(
-                        request.instance,
-                        request.view,
-                        request.reply,
+                    self.publish_native_config_origin(
+                        origin,
                         ConfigPatchOutcome::Conflict {
                             revision: snapshot.revision,
                         },
+                        Some(snapshot),
+                        false,
+                        None,
                     );
                 }
-                ConfigPatchResult::Rejected { message, .. } => {
-                    self.publish_native_config_completion(
-                        request.instance,
-                        request.view,
-                        request.reply,
+                ConfigPatchResult::Rejected { snapshot, message } => {
+                    self.publish_native_config_origin(
+                        origin,
                         ConfigPatchOutcome::Rejected { message },
+                        Some(snapshot),
+                        false,
+                        None,
                     );
                 }
             }
@@ -2224,30 +3142,392 @@ impl App {
     /// publication fans out to every currently live Settings view.
     pub(crate) fn finish_native_config_write(
         &mut self,
-        instance: crate::tab_model::AppInstanceId,
-        view: crate::tab_model::ViewId,
-        reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
-        outcome: ConfigPatchOutcome,
+        origin: NativeConfigOrigin,
+        completion: NativeConfigPersistenceCompletion,
     ) {
         self.native_config_inflight = false;
-        if matches!(outcome, ConfigPatchOutcome::Rejected { .. })
-            && let Ok(current) =
-                crate::native_config_service::VersionedConfigService::load_current()
-        {
-            self.native_config_service = current;
+        let NativeConfigPersistenceCompletion {
+            outcome,
+            observation,
+        } = completion;
+        if matches!(
+            &outcome,
+            ConfigPatchOutcome::Conflict { .. } | ConfigPatchOutcome::Indeterminate { .. }
+        ) {
+            self.native_config_service.mark_reconciliation_required();
         }
-        self.publish_native_config_completion(instance, view, reply, outcome);
-        if let Some(text) = self.native_config_external_pending.take()
-            && self
-                .sync_native_config_external(text)
-                .ok()
-                .flatten()
-                .is_some()
-            && let Some(proxy) = self.proxy.as_ref()
-        {
-            let _ = proxy.send_event(Wake::ConfigReload);
+        let before_revision = self.native_config_service.snapshot().revision;
+        let mut runtime_observation = None;
+        let (authoritative, synchronization_error) = match observation {
+            Ok(prepared) => {
+                let prepared = self.rebase_prepared_config_themes(prepared);
+                match self
+                    .native_config_service
+                    .synchronize_prepared_observation(prepared.clone())
+                {
+                    Ok(snapshot) => {
+                        runtime_observation = Some(prepared);
+                        (Some(snapshot), None)
+                    }
+                    Err(error) => {
+                        self.native_config_service.mark_reconciliation_required();
+                        let restored = if matches!(&outcome, ConfigPatchOutcome::Applied { .. }) {
+                            None
+                        } else {
+                            self.native_config_service.restore_durable_snapshot().ok()
+                        };
+                        (restored, Some(error))
+                    }
+                }
+            }
+            Err(error) => {
+                self.native_config_service.mark_reconciliation_required();
+                let restored = if matches!(&outcome, ConfigPatchOutcome::Applied { .. }) {
+                    None
+                } else {
+                    self.native_config_service.restore_durable_snapshot().ok()
+                };
+                (restored, Some(error))
+            }
+        };
+        let reconciled_changed = authoritative
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.revision != before_revision);
+        self.publish_native_config_origin(
+            origin,
+            outcome,
+            authoritative,
+            reconciled_changed,
+            synchronization_error.clone(),
+        );
+        if let Some(error) = synchronization_error {
+            self.surface_native_config_lane_error(format!(
+                "Config was saved, but its exact disk generation could not be admitted: {error}"
+            ));
         }
-        let _ = self.pump_native_config();
+        if self.config_watch_admission_pending() || self.native_config_external_pending.is_some() {
+            // A watcher candidate was observed while persistence owned the
+            // lane. It may still be in raw parse/assets/font preparation, so
+            // its relative order is ambiguous until a worker samples the path
+            // after this point. Fence queued semantic writes immediately.
+            self.native_config_service.mark_reconciliation_required();
+            runtime_observation = None;
+        }
+        if let Some(prepared) = runtime_observation {
+            self.reload_prepared_config_observation(prepared);
+        }
+        if let Err(error) = self.pump_native_config() {
+            self.surface_native_config_lane_error(error);
+        }
+    }
+
+    pub(crate) fn finish_native_config_reconciliation(
+        &mut self,
+        completion: NativeConfigReconciliationCompletion,
+    ) {
+        self.native_config_inflight = false;
+        let prepared = match completion.observation {
+            Ok(prepared) => self.rebase_prepared_config_themes(prepared),
+            Err(error) => {
+                self.native_config_service.mark_reconciliation_required();
+                self.surface_native_config_lane_error(format!(
+                    "Config reconciliation failed; queued changes remain pending: {error}"
+                ));
+                return;
+            }
+        };
+
+        if self.native_config_external_sequence > completion.pending_sequence {
+            // A watcher completion arrived after this worker sampled the path.
+            // Admit the sample as an exact intermediate generation, retain the
+            // newer watcher payload, and sample once more before any write.
+            if let Err(error) = self
+                .native_config_service
+                .synchronize_prepared_observation(prepared)
+            {
+                self.native_config_service.mark_reconciliation_required();
+                self.surface_native_config_lane_error(error);
+                return;
+            }
+            self.native_config_service.mark_reconciliation_required();
+            if let Err(error) = self.pump_native_config() {
+                self.surface_native_config_lane_error(error);
+            }
+            return;
+        }
+
+        let pending_matches = self
+            .native_config_external_pending
+            .as_ref()
+            .is_some_and(|pending| pending.baseline() == &prepared.observation.baseline);
+        let pending_theme_is_current =
+            self.native_config_external_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    std::sync::Arc::ptr_eq(
+                        pending.themes(),
+                        &self.native_config_service.snapshot().assets.themes,
+                    )
+                });
+        if pending_matches && pending_theme_is_current {
+            self.drain_reconciled_deferred_config_generation();
+            return;
+        }
+
+        if let Some(superseded) = self.native_config_external_pending.take() {
+            aterm_log::debug!(
+                "validated deferred config generation as superseded: {}",
+                superseded.baseline().target.logical_path().display()
+            );
+        }
+        let runtime = prepared.clone();
+        let snapshot = match self
+            .native_config_service
+            .synchronize_prepared_observation(prepared)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.native_config_service.mark_reconciliation_required();
+                self.surface_native_config_lane_error(error);
+                return;
+            }
+        };
+        self.publish_native_config_snapshot(&snapshot);
+        self.reload_prepared_config_observation(runtime);
+        if let Err(error) = self.pump_native_config() {
+            self.surface_native_config_lane_error(error);
+        }
+    }
+
+    fn rebase_prepared_config_themes(
+        &self,
+        mut prepared: crate::native_config_service::PreparedConfigObservation,
+    ) -> crate::native_config_service::PreparedConfigObservation {
+        let current = &self.native_config_service.snapshot().assets.themes;
+        if !std::sync::Arc::ptr_eq(&prepared.assets.themes, current) {
+            prepared.assets = std::sync::Arc::new(crate::app_config::ConfigAssetCatalog {
+                trail_packs: std::sync::Arc::clone(&prepared.assets.trail_packs),
+                nyan_sprite: prepared.assets.nyan_sprite.clone(),
+                themes: std::sync::Arc::clone(current),
+                sparkle_spec_consumers: prepared.assets.sparkle_spec_consumers.clone(),
+            });
+        }
+        prepared
+    }
+
+    pub(crate) fn defer_prepared_config_generation(
+        &mut self,
+        generation: crate::native_font_catalog::PreparedConfigGeneration,
+    ) {
+        self.native_config_external_sequence = self
+            .native_config_external_sequence
+            .saturating_add(1)
+            .max(1);
+        self.native_config_external_pending = Some(DeferredNativeConfigGeneration::Prepared(
+            Box::new(generation),
+        ));
+    }
+
+    /// Consume the exact deferred generation whose config baseline a
+    /// reconciliation worker just observed. Prepared runtime generations must
+    /// bypass the still-closed reconciliation gate exactly once; their own
+    /// service admission clears it atomically with the matching bytes/assets.
+    fn drain_reconciled_deferred_config_generation(&mut self) {
+        if let Some(generation) = self.native_config_external_pending.take() {
+            match generation {
+                DeferredNativeConfigGeneration::Prepared(generation) => {
+                    self.apply_reconciled_prepared_config_generation(*generation);
+                }
+                DeferredNativeConfigGeneration::Observation(prepared) => {
+                    self.admit_manual_config_observation(*prepared);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn admit_manual_config_observation(
+        &mut self,
+        prepared: crate::native_config_service::PreparedConfigObservation,
+    ) {
+        if self.native_config_inflight {
+            self.native_config_external_sequence = self
+                .native_config_external_sequence
+                .saturating_add(1)
+                .max(1);
+            self.native_config_external_pending = Some(
+                DeferredNativeConfigGeneration::Observation(Box::new(prepared)),
+            );
+            return;
+        }
+        let prepared = self.rebase_prepared_config_themes(prepared);
+        let runtime = prepared.clone();
+        let admitted_baseline = prepared.observation.baseline.clone();
+        match self
+            .native_config_service
+            .synchronize_prepared_observation(prepared)
+        {
+            Ok(snapshot) => {
+                self.publish_native_config_snapshot(&snapshot);
+                self.reload_prepared_config_observation(runtime);
+                self.finish_native_config_external_admission(&admitted_baseline);
+            }
+            Err(error) => {
+                self.native_config_service.mark_reconciliation_required();
+                self.surface_native_config_lane_error(format!(
+                    "Manual saved aterm.toml, but its exact generation could not be admitted: {error}"
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn finish_native_config_external_admission(
+        &mut self,
+        baseline: &crate::native_document_host::AtomicFileBaseline,
+    ) {
+        // Clear only the payload this admission actually proves. A slower
+        // generation A must not discard a newer retained generation B.
+        if self
+            .native_config_external_pending
+            .as_ref()
+            .is_some_and(|pending| pending.baseline() == baseline)
+        {
+            self.native_config_external_pending = None;
+        }
+        self.acknowledge_config_watch_admission(baseline);
+        if let Err(error) = self.pump_native_config() {
+            self.surface_native_config_lane_error(error);
+        }
+    }
+
+    pub(crate) fn prepare_native_config_external_observation(
+        &mut self,
+        observation: crate::native_config_service::ConfigDiskObservation,
+    ) {
+        let baseline = observation.baseline.clone();
+        let Some(proxy) = self.proxy.clone() else {
+            let result = crate::native_config_service::VersionedConfigService::prepare_observation(
+                observation.clone(),
+                std::sync::Arc::clone(&self.native_config_service.snapshot().assets.themes),
+            );
+            self.finish_native_config_external_preparation(
+                NativeConfigExternalPreparationCompletion {
+                    observation,
+                    result,
+                },
+            );
+            return;
+        };
+        let job = NativeConfigJob::PrepareExternal(NativeConfigExternalPreparationJob {
+            observation,
+            themes: std::sync::Arc::clone(&self.native_config_service.snapshot().assets.themes),
+            proxy,
+        });
+        let result = native_config_queue().and_then(|queue| {
+            queue
+                .send(job)
+                .map_err(|_| "native config worker stopped during external preparation".to_string())
+        });
+        if let Err(error) = result {
+            self.native_config_service.mark_reconciliation_required();
+            self.reject_config_watch_admission_for(
+                &baseline,
+                crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
+            );
+            self.surface_native_config_lane_error(error);
+        }
+    }
+
+    pub(crate) fn finish_native_config_external_preparation(
+        &mut self,
+        completion: NativeConfigExternalPreparationCompletion,
+    ) {
+        match completion.result {
+            Ok(prepared) => self.reload_prepared_config_observation(prepared),
+            Err(error) => {
+                // Invalid TOML is still valid UTF-8 editor content. Manual must
+                // receive the exact watcher bytes so its LSP-style diagnostics
+                // can help repair them, while live Config remains unchanged.
+                if let Err(refresh_error) =
+                    self.refresh_open_config_editor_observation(&completion.observation)
+                {
+                    aterm_log::warn!(
+                        "config reload: Manual refresh needs attention ({refresh_error})"
+                    );
+                }
+                self.native_config_service.mark_reconciliation_required();
+                self.reject_config_watch_admission_for(
+                    &completion.observation.baseline,
+                    crate::config_watcher::WatchFailureKind::ConfigInvalidToml,
+                );
+                self.surface_native_config_lane_error(format!(
+                    "Config observation was not valid TOML: {error}"
+                ));
+                if let Err(error) = self.pump_native_config() {
+                    self.surface_native_config_lane_error(error);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn surface_native_config_lane_error(&mut self, message: String) {
+        aterm_log::warn!("native config: {message}");
+        self.config_notice =
+            crate::config_notice::ConfigNotice::new(vec![message], std::time::Instant::now());
+        self.request_redraw_all_windows();
+    }
+
+    fn publish_native_config_origin(
+        &mut self,
+        origin: NativeConfigOrigin,
+        outcome: ConfigPatchOutcome,
+        authoritative: Option<crate::native_config_service::ConfigSnapshot>,
+        reconciled_changed: bool,
+        synchronization_error: Option<String>,
+    ) {
+        if let Some(snapshot) = authoritative.as_ref() {
+            self.publish_native_config_snapshot(snapshot);
+        }
+        match origin {
+            NativeConfigOrigin::View {
+                instance,
+                view,
+                reply,
+            } => self.publish_native_config_completion(
+                instance,
+                view,
+                reply,
+                outcome,
+                reconciled_changed,
+            ),
+            NativeConfigOrigin::SeriousMode { desired } => self.publish_serious_mode_completion(
+                desired,
+                outcome,
+                authoritative,
+                synchronization_error,
+            ),
+            NativeConfigOrigin::Control {
+                key, value, reply, ..
+            } => {
+                let serious_mode = key == crate::prefs::EDIT_SERIOUS_MODE;
+                if serious_mode && let Some(snapshot) = authoritative.as_ref() {
+                    self.apply_serious_mode_config_snapshot(snapshot);
+                }
+                let response = control_settings_completion_reply(
+                    &key,
+                    value.as_deref(),
+                    &outcome,
+                    synchronization_error.as_deref(),
+                );
+                self.refresh_serious_mode_queued_projection();
+                let _ = reply.send(response);
+                if matches!(&outcome, ConfigPatchOutcome::Applied { undo: Some(_), .. })
+                    || reconciled_changed
+                    || (serious_mode && authoritative.is_some())
+                {
+                    self.request_redraw_all_windows();
+                }
+            }
+        }
     }
 
     fn publish_native_config_completion(
@@ -2256,11 +3536,12 @@ impl App {
         view: crate::tab_model::ViewId,
         reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
         outcome: ConfigPatchOutcome,
+        reconciled_changed: bool,
     ) {
         let revision = match &outcome {
             ConfigPatchOutcome::Applied { revision, .. }
             | ConfigPatchOutcome::Conflict { revision } => Some(*revision),
-            ConfigPatchOutcome::Rejected { .. } => None,
+            ConfigPatchOutcome::Indeterminate { .. } | ConfigPatchOutcome::Rejected { .. } => None,
         };
         if self.native_runtime.completion_is_current(&reply)
             && self.native_runtime.view_state(view).is_some()
@@ -2284,34 +3565,115 @@ impl App {
             );
         }
 
-        if revision.is_some() {
-            // The durable snapshot is fanned out by `reload_config` only after
-            // the live App has installed the same parsed Config + catalog Arc.
-            if let Some(proxy) = self.proxy.as_ref() {
-                let _ = proxy.send_event(Wake::ConfigReload);
-            }
+        if revision.is_some() || reconciled_changed {
             self.request_redraw_all_windows();
         }
     }
 
-    /// Feed watcher snapshots into the same serialized config lane. An external
-    /// edit observed while a durable write is in flight waits behind that write;
-    /// queued UI requests are reduced only after its changed-key stamps land.
-    pub(crate) fn sync_native_config_external(
+    fn publish_serious_mode_completion(
         &mut self,
-        text: String,
+        desired: bool,
+        outcome: ConfigPatchOutcome,
+        authoritative: Option<crate::native_config_service::ConfigSnapshot>,
+        synchronization_error: Option<String>,
+    ) {
+        let applied = authoritative
+            .as_ref()
+            .map(|snapshot| self.apply_serious_mode_config_snapshot(snapshot));
+
+        let feedback = match (&outcome, &applied) {
+            (ConfigPatchOutcome::Applied { .. }, Some(actual)) if *actual == desired => {
+                synchronization_error.as_deref().map(|error| {
+                    format!(
+                        "Serious Mode was saved, but later config edits could not be verified: {error}"
+                    )
+                })
+            }
+            (ConfigPatchOutcome::Applied { .. }, Some(_)) => Some(
+                "Serious Mode was saved, but a newer aterm.toml edit now controls it.".to_string(),
+            ),
+            (ConfigPatchOutcome::Applied { .. }, None) => Some(format!(
+                "Serious Mode was saved but could not be applied: {}",
+                synchronization_error
+                    .as_deref()
+                    .unwrap_or("no authoritative config snapshot")
+            )),
+            (ConfigPatchOutcome::Conflict { .. }, _) => Some(
+                "Serious Mode was not changed because aterm.toml changed first; its current value was kept."
+                    .to_string(),
+            ),
+            (ConfigPatchOutcome::Indeterminate { message }, _) => Some(format!(
+                "Serious Mode may have been written but could not be verified; reload before retrying: {message}"
+            )),
+            (ConfigPatchOutcome::Rejected { message }, _) => Some(
+                synchronization_error.as_deref().map_or_else(
+                    || format!("Serious Mode was not changed: {message}"),
+                    |error| {
+                        format!(
+                            "Serious Mode was not changed: {message}; current aterm.toml could not be admitted: {error}"
+                        )
+                    },
+                ),
+            ),
+        };
+        if let Some(message) = feedback {
+            self.config_notice =
+                crate::config_notice::ConfigNotice::new(vec![message], std::time::Instant::now());
+        }
+
+        // Settings already received the exact snapshot synchronously above;
+        // the worker-prepared runtime generation is scheduled by the caller.
+        self.refresh_serious_mode_queued_projection();
+        self.request_redraw_all_windows();
+    }
+
+    /// Install only the process-global projection owned by this command from
+    /// the worker-validated typed snapshot, without reparsing TOML on the event
+    /// loop, then fan the same generation out to Settings immediately.
+    fn apply_serious_mode_config_snapshot(
+        &mut self,
+        snapshot: &crate::native_config_service::ConfigSnapshot,
+    ) -> bool {
+        self.config.serious_mode = snapshot.config.serious_mode;
+        let enabled = self.apply_serious_mode(snapshot.config.serious_mode_or_default());
+        self.publish_native_config_snapshot(snapshot);
+        enabled
+    }
+
+    /// Feed one exact stable file observation through the serialized config
+    /// lane. If a Settings commit is in flight, retain the complete bytes + disk
+    /// generation; completion later rejects it if that generation is no longer
+    /// current instead of rereading or replaying stale text.
+    #[cfg(test)]
+    pub(crate) fn sync_native_config_external_observation(
+        &mut self,
+        observation: crate::native_config_service::ConfigDiskObservation,
     ) -> Result<Option<crate::native_config_service::ConfigSnapshot>, String> {
+        let prepared = crate::native_config_service::VersionedConfigService::prepare_observation(
+            observation,
+            std::sync::Arc::clone(&self.native_config_service.snapshot().assets.themes),
+        )?;
         if self.native_config_inflight {
-            self.native_config_external_pending = Some(text);
+            self.native_config_external_sequence = self
+                .native_config_external_sequence
+                .saturating_add(1)
+                .max(1);
+            self.native_config_external_pending = Some(
+                DeferredNativeConfigGeneration::Observation(Box::new(prepared)),
+            );
             return Ok(None);
         }
-        let snapshot = self.native_config_service.replace_external(text)?;
+        let snapshot = self
+            .native_config_service
+            .synchronize_prepared_observation(prepared)?;
         Ok(Some(snapshot))
     }
 
-    /// Publish one already-installed App config generation to every live
-    /// Settings presentation. Call only after `App.config` and
-    /// `App.config_assets` have been replaced with this snapshot's data.
+    /// Publish one admitted config generation to every live Settings
+    /// presentation. Full reload callers install `App.config` and assets first;
+    /// a narrow process command may first install only the live projection it
+    /// owns, then publish the complete durable Settings snapshot while the
+    /// ordinary reload applies unrelated fields.
     pub(crate) fn publish_native_config_snapshot(
         &mut self,
         snapshot: &crate::native_config_service::ConfigSnapshot,
@@ -2336,6 +3698,13 @@ impl App {
                 view,
                 AppEvent::ConfigChanged(snapshot.clone()),
             );
+        }
+        // Stable config observations also refresh host semantics for an open
+        // Manual buffer. `analysis_generation` advances on byte-identical
+        // observations, so referenced assets/fonts cannot leave diagnostics
+        // stale merely because the TOML text did not change.
+        if let Some(document) = self.native_runtime.config_editor_document() {
+            self.request_config_host_diagnostics(document);
         }
     }
 
@@ -2410,11 +3779,12 @@ impl App {
                 message: "no co-located atpkg binary beside this executable".to_string(),
             };
         };
-        if !atpkg::enabled() {
+        if !atpkg::manager_enabled() {
             // Same trust posture the binary itself enforces; refusing here is
             // honesty, not authority — atpkg would refuse loudly anyway.
             return PackagesOutcome::Blocked {
-                message: "the package manager is inert (no root key pinned)".to_string(),
+                message: "the package manager is inert (no effective root key is available, or ATPKG_DISABLE is set)"
+                    .to_string(),
             };
         }
         if self.native_packages_service.busy().is_some() {
@@ -2445,15 +3815,34 @@ impl App {
         let spawn = std::thread::Builder::new()
             .name("aterm-packages-verb".into())
             .spawn(move || {
-                // Output is discarded on purpose: atpkg records its own
-                // status.toml, which the collection below reads back.
-                let _ = std::process::Command::new(&atpkg)
+                // atpkg records detailed durable status in status.toml. Keep
+                // the process result separately: the old status may predate a
+                // failed launch/non-zero exit and must never be presented as
+                // the result of this attempt.
+                let result = std::process::Command::new(&atpkg)
                     .args(&verb)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
+                let command = match result {
+                    Ok(status) if status.success() => {
+                        PackagesCommandOutcome::Succeeded { operation: busy }
+                    }
+                    Ok(status) => PackagesCommandOutcome::Failed {
+                        operation: busy,
+                        message: format!("atpkg {} exited with {status}", verb.join(" ")),
+                    },
+                    Err(error) => PackagesCommandOutcome::Failed {
+                        operation: busy,
+                        message: format!("could not launch atpkg {}: {error}", verb.join(" ")),
+                    },
+                };
                 let report = crate::packages_screen::collect_packages_status(true);
-                let _ = proxy.send_event(Wake::NativePackagesFinished { sequence, report });
+                let completion = PackagesWorkerCompletion::command(report, command);
+                let _ = proxy.send_event(Wake::NativePackagesFinished {
+                    sequence,
+                    completion,
+                });
             });
         match spawn {
             Ok(_) => PackagesOutcome::Accepted,
@@ -2487,7 +3876,11 @@ impl App {
             .name("aterm-packages-status".into())
             .spawn(move || {
                 let report = crate::packages_screen::collect_packages_status(available);
-                let _ = proxy.send_event(Wake::NativePackagesFinished { sequence, report });
+                let completion = PackagesWorkerCompletion::refresh(report);
+                let _ = proxy.send_event(Wake::NativePackagesFinished {
+                    sequence,
+                    completion,
+                });
             });
         if spawn.is_err() {
             // Release the reservation via abort (never a fabricated report):
@@ -2503,9 +3896,9 @@ impl App {
     pub(crate) fn finish_native_packages(
         &mut self,
         sequence: u64,
-        report: crate::packages_screen::PackagesStatusReport,
+        completion: crate::packages_screen::PackagesWorkerCompletion,
     ) {
-        if !self.native_packages_service.finish(sequence, report) {
+        if !self.native_packages_service.finish(sequence, completion) {
             return;
         }
         self.publish_native_packages_state();
@@ -2518,8 +3911,10 @@ impl App {
         let revision = self.native_packages_service.revision();
         let state = self.native_packages_service.state(
             self.config.packages_update_loop_enabled(),
+            self.config.packages_enabled(),
             self.config.packages_auto_update(),
             self.config.packages_auto_install(),
+            self.package_update_loop_running,
         );
         if !self
             .native_runtime
@@ -2577,7 +3972,7 @@ impl App {
         }
     }
 
-    fn execute_recovery_request(
+    pub(crate) fn execute_recovery_request(
         &mut self,
         wid: WindowId,
         request: crate::native_app::RecoveryRequest,
@@ -2626,8 +4021,21 @@ impl App {
                     }
                 }
             }
-            RecoveryRequest::Retry(RecoveryCapability::Document { kind, uri }) => {
-                open_document(self, kind, uri)
+            RecoveryRequest::Retry(RecoveryCapability::Document {
+                kind,
+                uri,
+                config_editor,
+            }) => {
+                if config_editor {
+                    match self.ensure_and_open_config_editor_in_window(wid) {
+                        Ok(_) => RecoveryOutcome::Opened {
+                            message: "Reopened aterm.toml in Manual configuration mode".to_string(),
+                        },
+                        Err(message) => RecoveryOutcome::Failed { message },
+                    }
+                } else {
+                    open_document(self, kind, uri)
+                }
             }
             RecoveryRequest::OpenOriginal { uri } => {
                 open_document(self, crate::native_app::AppKind::Editor, uri)
@@ -2678,13 +4086,12 @@ impl App {
                     .unwrap_or((None, None));
                 let snapshot = self.native_updater_service.snapshot();
                 let build = snapshot.current_build;
-                let version = snapshot.current_version.clone();
                 let spawn = std::thread::Builder::new()
                     .name("aterm-native-update-check".into())
                     .spawn(move || {
                         let source =
                             aterm_update::Source::resolve(owner.as_deref(), repo.as_deref());
-                        let status = aterm_update::check_now(build, &version, &source);
+                        let status = aterm_update::check_now(build, &source);
                         let _ = proxy.send_event(Wake::NativeUpdateFinished {
                             ticket,
                             status: durable_update_status(status),
@@ -2744,9 +4151,112 @@ impl App {
 
     /// Retain automatic apply intent for one exact (or superseding) staged build.
     /// Returns true only when this call armed a new intent.
+    /// Let an ACTIVITY-shaped manual-only latch lapse once its deadline passes,
+    /// restoring both automatic apply and a fresh retry budget for that
+    /// artifact. Genuine-failure latches carry no deadline and never lapse.
+    /// Returns true when a latch was actually released.
+    pub(crate) fn lapse_expired_auto_apply_manual_only(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let lapsed = self
+            .auto_apply_manual_only
+            .is_some_and(|manual| manual.retry_at.is_some_and(|at| now >= at));
+        if lapsed {
+            aterm_log::info!(
+                "update apply: the activity-revoked manual-only latch lapsed; \
+                 automatic apply is eligible again"
+            );
+            self.auto_apply_manual_only = None;
+            self.auto_overlap_retry = None;
+        }
+        lapsed
+    }
+
+    /// Authenticate the staged candidate OFF the GUI thread and OUTSIDE the
+    /// parked window, caching the verdict for the next handoff attempt.
+    ///
+    /// Idempotent and cheap to call: a fresh verdict for the same
+    /// `(build, commit)` short-circuits. A failure is cached too — a doomed
+    /// candidate then fails preparation immediately rather than after parking
+    /// every reader and spending a third of a second on `codesign`.
+    fn spawn_staged_handoff_preverification(&mut self, build: u64) {
+        let snapshot = self.native_updater_service.snapshot();
+        let current_build = snapshot.current_build;
+        let commit = snapshot
+            .staged
+            .as_ref()
+            .filter(|staged| staged.build == build)
+            .and_then(|staged| staged.commit.clone());
+        // Without a pinned commit the worker's own call would be a different
+        // (weaker) query, so do not cache a verdict that would not match it.
+        let Some(commit) = commit else {
+            return;
+        };
+        {
+            let cached = self
+                .handoff_preverified
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cached.as_ref().is_some_and(|entry| {
+                entry.build == build
+                    && entry.commit == commit
+                    && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
+            }) {
+                return;
+            }
+        }
+        let slot = std::sync::Arc::clone(&self.handoff_preverified);
+        let spawned = std::thread::Builder::new()
+            .name("aterm-update-preverify".to_string())
+            .spawn(move || {
+                let passed = aterm_update::preverify_staged_for_handoff(
+                    current_build,
+                    Some(build),
+                    Some(&commit),
+                );
+                if let Err(error) = passed.as_ref() {
+                    aterm_log::warn!(
+                        "update apply: staged build {build} failed pre-park verification: {error}"
+                    );
+                }
+                *slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(crate::HandoffPreverification {
+                        build,
+                        commit,
+                        at: std::time::Instant::now(),
+                        passed: passed.is_ok(),
+                    });
+            });
+        if spawned.is_err() {
+            // No thread: the worker simply verifies in-line as it always did.
+            aterm_log::warn!("update apply: pre-park verification thread unavailable");
+        }
+    }
+
+    /// Re-arm automatic apply for whatever is still staged, after a latch
+    /// lapsed. Reads the SERVICE snapshot (in-memory authority), performs no
+    /// disk or network work, and is a no-op when nothing is staged.
+    pub(crate) fn rearm_native_auto_apply_after_lapse(&mut self) {
+        if self.native_updater_service.snapshot().phase == UpdaterPhase::Applying {
+            return;
+        }
+        let Some((build, digest)) = self
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map(|staged| (staged.build, staged.dmg_sha256.clone()))
+        else {
+            return;
+        };
+        self.arm_native_auto_apply(build, &digest);
+    }
+
     pub(crate) fn arm_native_auto_apply(&mut self, build: u64, digest: &str) -> bool {
         use crate::native_update_auto_intent::{ArmDecision, ArmFacts};
 
+        self.lapse_expired_auto_apply_manual_only();
         let enabled = crate::app_config::update_auto_apply(&self.config)
             && std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_none();
         let Some(dmg_sha256) = decode_dmg_sha256(digest) else {
@@ -2778,6 +4288,11 @@ impl App {
             }
             ArmDecision::Keep => false,
             ArmDecision::Set(build) => {
+                // SEAM 1, HOISTED OUT OF THE PARKED WINDOW: authenticate the
+                // staged bundle NOW, while every reader is still live and a
+                // cancel costs nothing, instead of as the handoff worker's first
+                // action with the whole terminal parked behind it.
+                self.spawn_staged_handoff_preverification(build);
                 // A different artifact at the same build, or a newer build, owns a
                 // distinct budget. Older wakes were suppressed by `arm` above.
                 self.auto_apply_manual_only = None;
@@ -2921,6 +4436,7 @@ impl App {
                     self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                         build: intent.build,
                         dmg_sha256: intent.dmg_sha256,
+                        retry_at: None,
                     });
                 }
                 if announce && intent.attempts == 1 {
@@ -2954,6 +4470,7 @@ impl App {
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                     build: intent.build,
                     dmg_sha256: intent.dmg_sha256,
+                    retry_at: None,
                 });
                 debug_assert_eq!(
                     automatic_retry_delay(intent.attempts, AutomaticRetryKind::PhysicalFailure),
@@ -2972,6 +4489,7 @@ impl App {
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                     build: intent.build,
                     dmg_sha256: intent.dmg_sha256,
+                    retry_at: None,
                 });
                 aterm_log::warn!(
                     "automatic update policy mismatch; clearing timer and requiring manual retry"
@@ -3198,7 +4716,17 @@ impl App {
                 };
             }
         };
-        let (readiness, safety_token) = self.native_update_close_preflight();
+        let (readiness, safety_token) =
+            match self.prepare_all_native_shutdown(crate::native_app::CloseScope::Relaunch) {
+                Ok(true) => self.native_update_close_preflight(),
+                Ok(false) => (
+                    ClosePreflight::Blocked(vec![
+                        "Review or discard unsaved native-app work before relaunching".to_string(),
+                    ]),
+                    None,
+                ),
+                Err(message) => (ClosePreflight::Blocked(vec![message]), None),
+            };
         match self
             .native_updater_service
             .finish_apply_preflight(ticket, readiness)
@@ -3277,15 +4805,24 @@ impl App {
     ) -> Option<std::time::Duration> {
         let dmg_sha256 = decode_dmg_sha256(attempt.target_dmg_sha256())?;
         let build = attempt.target_build();
+        let now = std::time::Instant::now();
         let cycles = self
             .auto_overlap_retry
-            .filter(|retry| retry.build == build && retry.dmg_sha256 == dmg_sha256)
+            .filter(|retry| {
+                // REPLENISHING BUDGET: a busy stretch must not permanently
+                // retire an artifact. Once the terminal has gone long enough
+                // without a revoked attempt, start the schedule over.
+                retry.build == build
+                    && retry.dmg_sha256 == dmg_sha256
+                    && now.duration_since(retry.last_attempt) < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
+            })
             .map_or(0, |retry| retry.cycles);
         let delay = automatic_retry_delay(cycles, AutomaticRetryKind::ActivityRevoked)?;
         self.auto_overlap_retry = Some(crate::AutoOverlapRetry {
             build,
             dmg_sha256,
             cycles: cycles.saturating_add(1),
+            last_attempt: now,
         });
         self.auto_apply_manual_only = None;
         self.auto_apply_intent = Some(crate::AutoApplyIntent {
@@ -3328,6 +4865,7 @@ impl App {
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                     build: attempt.target_build(),
                     dmg_sha256,
+                    retry_at: None,
                 });
             }
             self.auto_apply_intent = None;
@@ -3390,9 +4928,14 @@ impl App {
                     return Some(UpdateOutcome::Deferred { reason: message });
                 }
                 if let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256()) {
+                    // RECOVERABLE when the cause was activity: the artifact is
+                    // fine, the terminal was just busy, so the latch lapses
+                    // instead of retiring automatic apply until a relaunch.
                     self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                         build: attempt.target_build(),
                         dmg_sha256,
+                        retry_at: activity_revoked
+                            .then(|| std::time::Instant::now() + crate::ACTIVITY_MANUAL_ONLY_LAPSE),
                     });
                 }
                 self.auto_apply_intent = None;
@@ -3474,8 +5017,31 @@ impl App {
                 )
             })
             .count();
+        let settings_drafts = self
+            .view_store
+            .iter()
+            .filter(|(view, link)| {
+                let crate::tab_model::View::Native(native) = link else {
+                    return false;
+                };
+                self.native_runtime
+                    .app(native.instance)
+                    .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
+                    && self
+                        .native_runtime
+                        .presentation(native.instance, *view)
+                        .is_ok_and(|presentation| {
+                            presentation.indicators.dirty && !presentation.closable
+                        })
+            })
+            .count();
 
         let mut blockers = Vec::new();
+        if settings_drafts > 0 {
+            blockers.push(format!(
+                "Review Settings Drafts: {settings_drafts} Settings view(s) have unsaved text"
+            ));
+        }
         if dirty_documents > 0 {
             blockers.push(format!(
                 "Checkpoint Drafts: {dirty_documents} document(s) have uncheckpointed edits"
@@ -3523,6 +5089,17 @@ impl App {
     /// This keeps `ATERM_DEBUG_SEAMLESS_REEXEC` useful without granting it a bypass
     /// around dirty documents, checkpoint work, or restore/adoption state.
     pub(crate) fn apply_debug_seamless_update(&mut self) -> UpdateOutcome {
+        match self.prepare_all_native_shutdown(crate::native_app::CloseScope::Relaunch) {
+            Ok(true) => {}
+            Ok(false) => {
+                return UpdateOutcome::Blocked {
+                    reasons: vec![
+                        "Review or discard unsaved native-app work before relaunching".to_string(),
+                    ],
+                };
+            }
+            Err(message) => return UpdateOutcome::Failed { message },
+        }
         let (readiness, safety_token) = self.native_update_close_preflight();
         match readiness {
             ClosePreflight::Blocked(reasons) => UpdateOutcome::Blocked { reasons },
@@ -3670,6 +5247,812 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serious_mode_dequeue_builds_exact_authored_value_without_mutating_runtime() {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "serious_mode = true\n".to_string(),
+        )
+        .unwrap();
+        assert!(app.set_serious_mode(true));
+        let revision = app.native_config_service.snapshot().revision;
+
+        let patch = app.serious_mode_patch_request(false).unwrap();
+        assert_eq!(patch.base_revision, revision);
+        assert_eq!(patch.edits.len(), 1);
+        assert_eq!(patch.edits[0].key, crate::prefs::EDIT_SERIOUS_MODE);
+        assert_eq!(
+            patch.edits[0].expected,
+            ExpectedConfigValue::Exact(Some("true".to_string()))
+        );
+        assert_eq!(patch.edits[0].value.as_deref(), Some("false"));
+        assert!(
+            app.serious_mode_enabled(),
+            "building/enqueuing intent cannot advance the live policy"
+        );
+    }
+
+    #[test]
+    fn rapid_serious_mode_intents_compose_against_the_queued_projection() {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "serious_mode = false\n".to_string(),
+        )
+        .unwrap();
+        assert!(!app.serious_mode_enabled());
+
+        app.enqueue_serious_mode_intent().unwrap();
+        app.enqueue_serious_mode_intent().unwrap();
+        app.enqueue_serious_mode_intent().unwrap();
+
+        let desired = app
+            .native_config_pending
+            .iter()
+            .map(|request| match &request.origin {
+                NativeConfigOrigin::SeriousMode { desired } => *desired,
+                NativeConfigOrigin::View { .. } | NativeConfigOrigin::Control { .. } => {
+                    panic!("unexpected non-Serious-Mode request")
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(desired, vec![true, false, true]);
+        assert!(
+            app.native_config_pending
+                .iter()
+                .all(|request| { matches!(&request.work, NativeConfigWork::SeriousMode(_)) })
+        );
+        assert_eq!(app.serious_mode_queued_projection, Some(true));
+        assert!(
+            !app.serious_mode_enabled(),
+            "queued intents cannot mutate the live policy before durability"
+        );
+    }
+
+    #[test]
+    fn legacy_serious_mode_set_and_native_toggle_share_one_semantic_projection() {
+        let model = aterm_spec::derive::serious_mode_intent_queue_model();
+        let mut model_state = model.init_state();
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "serious_mode = false\n".to_string(),
+        )
+        .unwrap();
+        assert!(!app.serious_mode_enabled());
+
+        let (reply, completion) = std::sync::mpsc::channel();
+        app.enqueue_control_settings_field_intent(
+            crate::prefs::EDIT_SERIOUS_MODE.to_string(),
+            Some(" true ".to_string()),
+            reply,
+        );
+        assert_eq!(app.serious_mode_queued_projection, Some(true));
+
+        // The native command arrives before the control write completes. It
+        // must toggle the queued true intent to false, not the still-live false
+        // policy to true.
+        app.enqueue_serious_mode_intent().unwrap();
+        assert_eq!(app.serious_mode_queued_projection, Some(false));
+        assert!(matches!(
+            app.native_config_pending
+                .get(1)
+                .map(|request| &request.work),
+            Some(NativeConfigWork::SeriousMode(false))
+        ));
+        for action in ["StartSetOn", "QueueToggle"] {
+            let before = model_state.clone();
+            assert!(model.fire(action, &mut model_state));
+            assert_eq!(
+                aterm_spec::interp::admits(&model, &before, &model_state),
+                Some(action)
+            );
+        }
+
+        let NativeConfigRequest { origin, work } = app.native_config_pending.pop_front().unwrap();
+        let (outcome, snapshot) = match app.reduce_native_config_work(work).unwrap() {
+            ConfigPatchResult::Applied { snapshot, undo } => (
+                ConfigPatchOutcome::Applied {
+                    revision: snapshot.revision,
+                    undo: Some(undo.get()),
+                },
+                snapshot,
+            ),
+            other => panic!("control Serious Mode intent must apply: {other:?}"),
+        };
+        assert_eq!(
+            app.native_config_service
+                .value(crate::prefs::EDIT_SERIOUS_MODE)
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(model_state["service"], 1);
+        assert_eq!(model_state["live"], 0);
+        assert_eq!(model_state["projection"], 0);
+        assert_eq!(model_state["queue_count"], 1);
+        app.publish_native_config_origin(origin, outcome, Some(snapshot), false, None);
+        assert!(app.serious_mode_enabled());
+        assert_eq!(app.serious_mode_queued_projection, Some(false));
+        assert!(completion.recv().unwrap().unwrap().starts_with("saved:"));
+
+        let NativeConfigRequest { origin, work } = app.native_config_pending.pop_front().unwrap();
+        let (outcome, snapshot) = match app.reduce_native_config_work(work).unwrap() {
+            ConfigPatchResult::Applied { snapshot, undo } => (
+                ConfigPatchOutcome::Applied {
+                    revision: snapshot.revision,
+                    undo: Some(undo.get()),
+                },
+                snapshot,
+            ),
+            other => panic!("following native toggle must apply: {other:?}"),
+        };
+        let before = model_state.clone();
+        assert!(model.fire("Complete", &mut model_state));
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &before, &model_state),
+            Some("Complete")
+        );
+        assert_eq!(model_state["live"], 1);
+        assert_eq!(model_state["service"], 0);
+        assert_eq!(model_state["inflight"], 1);
+        assert!(app.serious_mode_enabled());
+        assert_eq!(
+            app.native_config_service
+                .value(crate::prefs::EDIT_SERIOUS_MODE)
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+        app.publish_native_config_origin(origin, outcome, Some(snapshot), false, None);
+        let before = model_state.clone();
+        assert!(model.fire("Complete", &mut model_state));
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &before, &model_state),
+            Some("Complete")
+        );
+        assert!(!app.serious_mode_enabled());
+        assert_eq!(app.serious_mode_queued_projection, None);
+        assert_eq!(model_state["live"], 0);
+        assert_eq!(model_state["service"], 0);
+        assert!(model.check_invariant("IdleIsAuthoritative", &model_state));
+    }
+
+    #[test]
+    fn malformed_legacy_serious_mode_value_cannot_poison_toggle_projection() {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "serious_mode = false\n".to_string(),
+        )
+        .unwrap();
+        let (reply, _completion) = std::sync::mpsc::channel();
+        app.enqueue_control_settings_field_intent(
+            crate::prefs::EDIT_SERIOUS_MODE.to_string(),
+            Some("TRUE".to_string()),
+            reply,
+        );
+        assert_eq!(app.serious_mode_queued_projection, None);
+
+        app.enqueue_serious_mode_intent().unwrap();
+        assert_eq!(app.serious_mode_queued_projection, Some(true));
+        assert!(matches!(
+            app.native_config_pending
+                .back()
+                .map(|request| &request.work),
+            Some(NativeConfigWork::SeriousMode(true))
+        ));
+    }
+
+    #[test]
+    fn config_pump_preserves_queued_work_when_reconciliation_worker_is_unavailable() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-native-config-pump-reconcile-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, "serious_mode = false\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
+        app.native_config_service.mark_reconciliation_required();
+        app.enqueue_serious_mode_intent().unwrap();
+        let queued_revision = app.native_config_service.snapshot().revision;
+
+        std::fs::write(&path, "serious_mode = [\n").unwrap();
+        let error = app.pump_native_config().unwrap_err();
+        assert!(error.contains("event-loop proxy"), "{error}");
+        assert_eq!(app.native_config_pending.len(), 1);
+        assert!(app.native_config_service.reconciliation_required());
+        assert_eq!(
+            app.native_config_service.snapshot().revision,
+            queued_revision
+        );
+
+        std::fs::write(&path, "serious_mode = true\n").unwrap();
+        let error = app.pump_native_config().unwrap_err();
+        assert!(error.contains("event-loop proxy"), "{error}");
+        assert!(
+            app.native_config_service.reconciliation_required(),
+            "the event loop must not reopen even a now-valid pathname without its worker"
+        );
+        assert_eq!(
+            app.native_config_pending.len(),
+            1,
+            "proxy failure occurs before the reconciled request is popped"
+        );
+        assert_eq!(
+            app.native_config_service
+                .value(crate::prefs::EDIT_SERIOUS_MODE)
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_control_completion_never_translates_conflict_or_unverified_publication_to_ok() {
+        let conflict = control_settings_completion_reply(
+            crate::prefs::EDIT_COPY_ON_SELECT,
+            Some("true"),
+            &ConfigPatchOutcome::Conflict { revision: 9 },
+            None,
+        )
+        .unwrap_err();
+        assert!(conflict.starts_with("save conflict"), "{conflict}");
+
+        let unverified = control_settings_completion_reply(
+            crate::prefs::EDIT_COPY_ON_SELECT,
+            Some("true"),
+            &ConfigPatchOutcome::Indeterminate {
+                message: "post-rename observation failed".to_string(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            unverified.starts_with("publication unverified"),
+            "{unverified}"
+        );
+        assert!(unverified.contains("reload aterm.toml"), "{unverified}");
+
+        assert_eq!(
+            control_settings_completion_reply(
+                crate::prefs::EDIT_COPY_ON_SELECT,
+                Some("true"),
+                &ConfigPatchOutcome::Applied {
+                    revision: 2,
+                    undo: Some(1),
+                },
+                None,
+            )
+            .unwrap(),
+            format!("saved: {} = true", crate::prefs::EDIT_COPY_ON_SELECT),
+        );
+    }
+
+    #[test]
+    fn legacy_control_field_is_materialized_at_the_versioned_lane_head() {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "copy_on_select = false\nfont_px = 14.0\n".to_string(),
+        )
+        .unwrap();
+
+        // Advance the service before reducing the legacy absolute intent. The
+        // control work must bind to this newest revision/value, not a standalone
+        // file read or an enqueue-time baseline.
+        let snapshot = app.native_config_service.snapshot();
+        let base = snapshot.revision;
+        let expected_font = snapshot
+            .values()
+            .unwrap()
+            .remove(crate::prefs::EDIT_FONT_PX);
+        assert!(matches!(
+            app.native_config_service.patch(ConfigPatchRequest {
+                base_revision: base,
+                edits: vec![ConfigKeyEdit {
+                    key: crate::prefs::EDIT_FONT_PX.to_string(),
+                    expected: ExpectedValue::Exact(expected_font),
+                    value: Some("16.0".to_string()),
+                }],
+            }),
+            ConfigPatchResult::Applied { .. }
+        ));
+
+        let reduced = app
+            .reduce_native_config_work(NativeConfigWork::ControlField {
+                key: crate::prefs::EDIT_COPY_ON_SELECT.to_string(),
+                value: Some("true".to_string()),
+            })
+            .unwrap();
+        assert!(matches!(reduced, ConfigPatchResult::Applied { .. }));
+        assert_eq!(
+            app.native_config_service
+                .value(crate::prefs::EDIT_COPY_ON_SELECT)
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            app.native_config_service
+                .value(crate::prefs::EDIT_FONT_PX)
+                .unwrap()
+                .as_deref(),
+            Some("16"),
+            "the serialized legacy edit preserves earlier lane work"
+        );
+    }
+
+    #[test]
+    fn legacy_unverified_completion_replies_err_and_keeps_reconciliation_gate_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-native-config-control-unverified-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, "copy_on_select = false\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
+        app.native_config_inflight = true;
+        let (reply, completion) = std::sync::mpsc::channel();
+
+        // Make the bound logical path unobservable so the mandatory completion
+        // reconciliation fails. A later write must remain fenced.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.finish_native_config_write(
+            NativeConfigOrigin::Control {
+                request_id: 7,
+                key: crate::prefs::EDIT_COPY_ON_SELECT.to_string(),
+                value: Some("true".to_string()),
+                reply,
+            },
+            NativeConfigPersistenceCompletion {
+                outcome: ConfigPatchOutcome::Indeterminate {
+                    message: "post-publication proof failed".to_string(),
+                },
+                observation: Err("exact post-publication observation failed".to_string()),
+            },
+        );
+
+        let response = completion.recv().expect("control completion delivered");
+        let error = response.expect_err("unverified publication is never an OK reply");
+        assert!(error.starts_with("publication unverified"), "{error}");
+        assert!(error.contains("reconciliation required"), "{error}");
+        assert!(
+            app.native_config_service.reconciliation_required(),
+            "a failed stable observation must keep the next-write gate closed"
+        );
+        assert!(!app.native_config_inflight);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_control_enqueue_reports_preflight_errors_without_stranding_a_reply() {
+        let mut app = App::headless_for_test();
+        let (unknown_reply, unknown_completion) = std::sync::mpsc::channel();
+        app.queue_control_settings_field(
+            "not_a_real_setting".to_string(),
+            Some("true".to_string()),
+            unknown_reply,
+        );
+        assert!(
+            unknown_completion
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("unknown key")
+        );
+
+        let (reply, completion) = std::sync::mpsc::channel();
+        app.queue_control_settings_field(
+            crate::prefs::EDIT_COPY_ON_SELECT.to_string(),
+            Some("true".to_string()),
+            reply,
+        );
+        let error = completion.recv().unwrap().unwrap_err();
+        assert!(error.contains("event-loop proxy"), "{error}");
+        assert!(app.native_config_pending.is_empty());
+    }
+
+    #[test]
+    fn applied_completion_observation_failure_closes_gate_before_pumping_next_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-native-config-applied-reconcile-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, "serious_mode = false\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
+        let base_revision = app.native_config_service.snapshot().revision;
+        let ConfigPatchResult::Applied { snapshot, undo } =
+            app.native_config_service.patch(ConfigPatchRequest {
+                base_revision,
+                edits: vec![ConfigKeyEdit {
+                    key: crate::prefs::EDIT_SERIOUS_MODE.to_string(),
+                    expected: ExpectedValue::Exact(Some("false".to_string())),
+                    value: Some("true".to_string()),
+                }],
+            })
+        else {
+            panic!("test candidate must reduce");
+        };
+        std::fs::write(&path, snapshot.text.as_bytes()).unwrap();
+        app.native_config_inflight = true;
+        app.native_config_pending.push_back(NativeConfigRequest {
+            origin: NativeConfigOrigin::SeriousMode { desired: false },
+            work: NativeConfigWork::SeriousMode(false),
+        });
+
+        // The worker proved its candidate, then a non-cooperating writer made
+        // the path unobservable before completion reconciliation.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.finish_native_config_write(
+            NativeConfigOrigin::SeriousMode { desired: true },
+            NativeConfigPersistenceCompletion {
+                outcome: ConfigPatchOutcome::Applied {
+                    revision: snapshot.revision,
+                    undo: Some(undo.get()),
+                },
+                observation: Err("exact committed observation was lost".to_string()),
+            },
+        );
+
+        assert!(app.native_config_service.reconciliation_required());
+        assert_eq!(
+            app.native_config_pending.len(),
+            1,
+            "queued work cannot be consumed against the pre-write baseline"
+        );
+        assert!(!app.native_config_inflight);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
+        struct PendingCompletion {
+            desired: bool,
+            outcome: ConfigPatchOutcome,
+            snapshot: crate::native_config_service::ConfigSnapshot,
+        }
+
+        fn start_next(app: &mut App) -> PendingCompletion {
+            let NativeConfigRequest { origin, work } = app
+                .native_config_pending
+                .pop_front()
+                .expect("queued Serious Mode intent");
+            let desired = match origin {
+                NativeConfigOrigin::SeriousMode { desired } => desired,
+                NativeConfigOrigin::View { .. } | NativeConfigOrigin::Control { .. } => {
+                    panic!("unexpected non-Serious-Mode request")
+                }
+            };
+            assert!(matches!(
+                &work,
+                NativeConfigWork::SeriousMode(value) if *value == desired
+            ));
+            let (outcome, snapshot) = match app.reduce_native_config_work(work).unwrap() {
+                ConfigPatchResult::Applied { snapshot, undo } => (
+                    ConfigPatchOutcome::Applied {
+                        revision: snapshot.revision,
+                        undo: Some(undo.get()),
+                    },
+                    snapshot,
+                ),
+                ConfigPatchResult::Unchanged { snapshot } => (
+                    ConfigPatchOutcome::Applied {
+                        revision: snapshot.revision,
+                        undo: None,
+                    },
+                    snapshot,
+                ),
+                result => panic!("serialized semantic intent must apply: {result:?}"),
+            };
+            PendingCompletion {
+                desired,
+                outcome,
+                snapshot,
+            }
+        }
+
+        fn complete(app: &mut App, completion: PendingCompletion) {
+            app.publish_native_config_origin(
+                NativeConfigOrigin::SeriousMode {
+                    desired: completion.desired,
+                },
+                completion.outcome,
+                Some(completion.snapshot),
+                false,
+                None,
+            );
+            assert_eq!(app.serious_mode_enabled(), completion.desired);
+        }
+
+        fn project(
+            model: &aterm_spec::derive::Model,
+            app: &App,
+            current: Option<bool>,
+            queued_expected: &std::collections::VecDeque<bool>,
+            issued: i64,
+            completed: i64,
+        ) -> aterm_spec::interp::State {
+            let mut state = model.init_state();
+            let live = app.serious_mode_enabled();
+            let service = app
+                .native_config_service
+                .value(crate::prefs::EDIT_SERIOUS_MODE)
+                .unwrap()
+                .as_deref()
+                == Some("true");
+            let queued = app
+                .native_config_pending
+                .iter()
+                .map(|request| match request.origin {
+                    NativeConfigOrigin::SeriousMode { desired } => desired,
+                    NativeConfigOrigin::View { .. } | NativeConfigOrigin::Control { .. } => {
+                        panic!("unexpected non-Serious-Mode request")
+                    }
+                })
+                .collect::<Vec<_>>();
+            state.insert("live", i64::from(live));
+            state.insert("service", i64::from(service));
+            state.insert(
+                "projection",
+                i64::from(app.serious_mode_queued_projection.unwrap_or(live)),
+            );
+            state.insert("inflight", i64::from(current.is_some()));
+            state.insert("current_desired", i64::from(current.unwrap_or(live)));
+            state.insert("queue_count", queued.len() as i64);
+            state.insert("q1", i64::from(queued.first().copied().unwrap_or(false)));
+            state.insert("q2", i64::from(queued.get(1).copied().unwrap_or(false)));
+            state.insert(
+                "q1_expected",
+                i64::from(queued_expected.front().copied().unwrap_or(false)),
+            );
+            state.insert(
+                "q2_expected",
+                i64::from(queued_expected.get(1).copied().unwrap_or(false)),
+            );
+            state.insert("issued", issued);
+            state.insert("completed", completed);
+            state.insert("conflict", 0);
+            state.insert(
+                "last_desired",
+                i64::from(app.serious_mode_queued_projection.unwrap_or(live)),
+            );
+            state.insert("intent_kind", i64::from(issued > 0));
+            state
+        }
+
+        fn assert_action(
+            model: &aterm_spec::derive::Model,
+            before: &aterm_spec::interp::State,
+            after: &aterm_spec::interp::State,
+            action: &'static str,
+        ) {
+            assert_eq!(
+                model.successors(action, before).as_slice(),
+                std::slice::from_ref(after),
+                "shipping queue transition must refine {action}"
+            );
+            assert_eq!(
+                aterm_spec::interp::admits(model, before, after),
+                Some(action)
+            );
+            for invariant in &model.invariants {
+                assert!(
+                    model.check_invariant(invariant.name, after),
+                    "post-state violates {}::{}: {after:?}",
+                    model.name,
+                    invariant.name
+                );
+            }
+        }
+
+        let model = aterm_spec::derive::serious_mode_intent_queue_model();
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "serious_mode = false\n".to_string(),
+        )
+        .unwrap();
+        assert!(!app.set_serious_mode(false));
+        let baseline_revision = app.native_config_service.snapshot().revision;
+        let mut issued = 0;
+        let mut completed = 0;
+        let mut queued_expected = std::collections::VecDeque::new();
+        let mut state = project(&model, &app, None, &queued_expected, issued, completed);
+        assert_eq!(state, model.init_state());
+
+        app.enqueue_serious_mode_intent().unwrap();
+        let mut current = start_next(&mut app);
+        issued += 1;
+        let after = project(
+            &model,
+            &app,
+            Some(current.desired),
+            &queued_expected,
+            issued,
+            completed,
+        );
+        assert_action(&model, &state, &after, "StartToggle");
+        state = after;
+
+        queued_expected.push_back(true);
+        app.enqueue_serious_mode_intent().unwrap();
+        issued += 1;
+        let after = project(
+            &model,
+            &app,
+            Some(current.desired),
+            &queued_expected,
+            issued,
+            completed,
+        );
+        assert_action(&model, &state, &after, "QueueToggle");
+        state = after;
+
+        queued_expected.push_back(true);
+        app.enqueue_serious_mode_intent().unwrap();
+        issued += 1;
+        let after = project(
+            &model,
+            &app,
+            Some(current.desired),
+            &queued_expected,
+            issued,
+            completed,
+        );
+        assert_action(&model, &state, &after, "QueueToggle");
+        state = after;
+
+        complete(&mut app, current);
+        queued_expected.pop_front();
+        current = start_next(&mut app);
+        completed += 1;
+        let after = project(
+            &model,
+            &app,
+            Some(current.desired),
+            &queued_expected,
+            issued,
+            completed,
+        );
+        assert_action(&model, &state, &after, "Complete");
+        state = after;
+
+        // Negative control: the old enqueue-time expected value conflicts the
+        // third intent here and is not an admitted transition of the shipping
+        // (Buggy=0) model.
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let stale_third = buggy.successors("Complete", &state)[0].clone();
+        assert_eq!(stale_third["conflict"], 1);
+        assert_eq!(
+            aterm_spec::interp::admits(&model, &state, &stale_third),
+            None
+        );
+        assert!(!buggy.check_invariant("NoSerializedConflict", &stale_third));
+
+        complete(&mut app, current);
+        queued_expected.pop_front();
+        current = start_next(&mut app);
+        completed += 1;
+        let after = project(
+            &model,
+            &app,
+            Some(current.desired),
+            &queued_expected,
+            issued,
+            completed,
+        );
+        assert_action(&model, &state, &after, "Complete");
+        state = after;
+
+        complete(&mut app, current);
+        completed += 1;
+        let after = project(&model, &app, None, &queued_expected, issued, completed);
+        assert_action(&model, &state, &after, "Complete");
+        assert!(app.native_config_pending.is_empty());
+        assert_eq!(app.serious_mode_queued_projection, None);
+        assert_eq!(
+            app.native_config_service.snapshot().revision,
+            baseline_revision + 3
+        );
+        assert_eq!(
+            app.native_config_service
+                .value(crate::prefs::EDIT_SERIOUS_MODE)
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn durable_serious_mode_snapshot_updates_runtime_and_open_settings_immediately() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let before_presentation = app
+            .native_runtime
+            .view_state(view)
+            .unwrap()
+            .common()
+            .presentation_revision;
+        let mut service =
+            crate::native_config_service::VersionedConfigService::new(String::new()).unwrap();
+        let snapshot = match service.patch(crate::native_config_service::ConfigPatchRequest {
+            base_revision: 1,
+            edits: vec![crate::native_config_service::ConfigKeyEdit {
+                key: crate::prefs::EDIT_SERIOUS_MODE.to_string(),
+                expected: crate::native_config_service::ExpectedValue::Exact(None),
+                value: Some("true".to_string()),
+            }],
+        }) {
+            crate::native_config_service::ConfigPatchResult::Applied { snapshot, .. } => snapshot,
+            other => panic!("serious-mode fixture patch failed: {other:?}"),
+        };
+
+        assert!(app.apply_serious_mode_config_snapshot(&snapshot));
+
+        assert!(app.serious_mode_enabled());
+        assert_eq!(app.config.serious_mode, Some(true));
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("Settings view");
+        };
+        assert!(state.common.presentation_revision > before_presentation);
+        let field = state
+            .legacy
+            .fields
+            .iter()
+            .find(|field| field.key == crate::prefs::EDIT_SERIOUS_MODE)
+            .unwrap();
+        assert_eq!(crate::settings::SettingsState::display_value(field), "true");
+    }
+
+    #[test]
+    fn serious_mode_conflict_keeps_disk_authority_and_surfaces_feedback() {
+        let mut app = App::headless_for_test();
+        assert!(app.set_serious_mode(true));
+        let authoritative = crate::native_config_service::VersionedConfigService::new(
+            "serious_mode = false\n".to_string(),
+        )
+        .unwrap()
+        .snapshot();
+
+        app.publish_serious_mode_completion(
+            true,
+            ConfigPatchOutcome::Conflict {
+                revision: authoritative.revision,
+            },
+            Some(authoritative),
+            None,
+        );
+
+        assert!(!app.serious_mode_enabled());
+        assert_eq!(app.config.serious_mode, Some(false));
+        assert!(app.config_notice.as_ref().is_some_and(|notice| {
+            notice
+                .lines
+                .iter()
+                .any(|line| line.contains("aterm.toml changed first"))
+        }));
+    }
 
     #[test]
     fn sole_worker_stamps_fifo_read_order_not_request_order() {
@@ -4175,6 +6558,10 @@ mod tests {
                 serious: true,
                 ..base
             },
+            crate::native_app::ViewMotionCx {
+                system_dark: true,
+                ..base
+            },
         ] {
             assert_ne!(native_motion_revision(motion), revision);
         }
@@ -4206,6 +6593,30 @@ mod tests {
         app.set_serious_mode(true);
         let serious = app.native_ui_compile_stamp(wid).unwrap();
         assert_ne!(serious.paint_revision, base.paint_revision);
+    }
+
+    #[test]
+    fn plain_terminal_theme_os_flip_invalidates_auto_window_preview() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+        let theme = app.theme;
+        app.os_appearance = aterm_types::Appearance::Light;
+        let light = app.native_ui_compile_stamp(wid).unwrap();
+        app.os_appearance = aterm_types::Appearance::Dark;
+        assert_eq!(
+            app.theme.fg, theme.fg,
+            "plain terminal foreground stays unchanged"
+        );
+        assert_eq!(
+            app.theme.bg, theme.bg,
+            "plain terminal background stays unchanged"
+        );
+        let dark = app.native_ui_compile_stamp(wid).unwrap();
+        assert_ne!(
+            light.paint_revision, dark.paint_revision,
+            "live OS appearance participates in retained native paint identity"
+        );
     }
 
     #[test]
@@ -4261,8 +6672,8 @@ mod tests {
         let second_compiled = app
             .compiled_native_ui_for(second, second_instance, second_view, second_viewport)
             .unwrap();
-        assert!(preview_value(&first_compiled).contains("12 px monospace"));
-        assert!(preview_value(&second_compiled).contains("24 px monospace"));
+        assert!(preview_value(&first_compiled).contains("at 12 pixels"));
+        assert!(preview_value(&second_compiled).contains("at 24 pixels"));
 
         // Moving the process-global renderer activation must not perturb either
         // window's native stamp; their MetricsView records remain authoritative.
@@ -4551,7 +6962,9 @@ mod tests {
     fn old_hidden_output_without_present_ages_to_automatic_attempt() {
         let mut app = App::headless_for_test();
         app.config.cursor_blink = Some(false);
-        app.sparkle_force_off = true;
+        app.serious_mode = true;
+        // Serious Mode suppresses word decorations without an invisible
+        // runtime override that could contradict the saved Top Settings toys.
         // Matrix rain needs no kill here: the config default is OFF and no
         // session override exists, so no engine (hence no effect redraw) can
         // arise (the old app-global `rain_force_off` latch is retired).
@@ -4630,32 +7043,46 @@ mod tests {
     }
 
     /// Seamless seam 4 (retry budget): an activity-revoked overlap schedules
-    /// bounded, exponentially spaced automatic re-attempts — 2 s, 8 s, 30 s —
-    /// then exhausts to `None` so the caller latches manual-only. Genuine
-    /// physical failures never mint a timer retry at any cycle count.
+    /// bounded, exponentially spaced automatic re-attempts capped at 15 min,
+    /// then exhausts to `None` so the caller latches a LAPSING manual-only
+    /// state. Genuine physical failures never mint a timer retry at any cycle
+    /// count, and a preflight block keeps its own much smaller budget.
     #[test]
     fn activity_revoked_retry_budget_spaces_exponentially_then_exhausts() {
         use std::time::Duration;
+        let schedule = [2, 8, 30, 60, 120, 300, 600, 900];
         assert_eq!(
-            automatic_retry_delay(0, AutomaticRetryKind::ActivityRevoked),
-            Some(Duration::from_secs(2))
+            schedule.len(),
+            usize::from(MAX_ACTIVITY_REVOKED_CYCLES),
+            "the schedule must cover exactly the budget"
         );
-        assert_eq!(
-            automatic_retry_delay(1, AutomaticRetryKind::ActivityRevoked),
-            Some(Duration::from_secs(8))
-        );
-        assert_eq!(
-            automatic_retry_delay(2, AutomaticRetryKind::ActivityRevoked),
-            Some(Duration::from_secs(30))
-        );
+        for (cycles, seconds) in schedule.into_iter().enumerate() {
+            assert_eq!(
+                automatic_retry_delay(
+                    u8::try_from(cycles).expect("small"),
+                    AutomaticRetryKind::ActivityRevoked
+                ),
+                Some(Duration::from_secs(seconds)),
+                "cycle {cycles}"
+            );
+        }
         assert_eq!(
             automatic_retry_delay(
-                MAX_AUTOMATIC_UPDATE_CYCLES,
+                MAX_ACTIVITY_REVOKED_CYCLES,
                 AutomaticRetryKind::ActivityRevoked
             ),
             None
         );
-        for cycles in 0..=MAX_AUTOMATIC_UPDATE_CYCLES {
+        // The preflight budget is deliberately NOT widened: a blocked preflight
+        // is a real ordering fault, not "the terminal was busy".
+        assert_eq!(
+            automatic_retry_delay(
+                MAX_AUTOMATIC_UPDATE_CYCLES,
+                AutomaticRetryKind::PreflightBlocked
+            ),
+            None
+        );
+        for cycles in 0..=MAX_ACTIVITY_REVOKED_CYCLES {
             assert_eq!(
                 automatic_retry_delay(cycles, AutomaticRetryKind::PhysicalFailure),
                 None,
@@ -4681,11 +7108,17 @@ mod tests {
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
             build: 77,
             dmg_sha256: [0xab; 32],
+            retry_at: None,
         });
         let expected = [
             Some(std::time::Duration::from_secs(2)),
             Some(std::time::Duration::from_secs(8)),
             Some(std::time::Duration::from_secs(30)),
+            Some(std::time::Duration::from_secs(60)),
+            Some(std::time::Duration::from_secs(120)),
+            Some(std::time::Duration::from_secs(300)),
+            Some(std::time::Duration::from_secs(600)),
+            Some(std::time::Duration::from_secs(900)),
             None,
         ];
         for (cycle, want) in expected.into_iter().enumerate() {
@@ -4703,7 +7136,7 @@ mod tests {
         }
         assert_eq!(
             app.auto_overlap_retry.map(|retry| retry.cycles),
-            Some(MAX_AUTOMATIC_UPDATE_CYCLES),
+            Some(MAX_ACTIVITY_REVOKED_CYCLES),
             "duplicate completions cannot mint fresh budget"
         );
 
@@ -4719,6 +7152,92 @@ mod tests {
         );
     }
 
+    /// Seamless seam 5 (recoverable degradation). A latch set because the
+    /// TERMINAL WAS BUSY must LAPSE; a latch set because the artifact or the
+    /// physical handoff genuinely failed must not. Before this, three unlucky
+    /// moments retired automatic apply until the next relaunch — which is
+    /// precisely the "staged, applies on next launch" state seen in the field.
+    #[test]
+    fn an_activity_shaped_manual_only_latch_lapses_but_a_genuine_one_does_not() {
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+
+        // GENUINE failure: no deadline, never lapses, budget untouched.
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: None,
+        });
+        assert!(!app.lapse_expired_auto_apply_manual_only());
+        assert!(app.auto_apply_manual_only.is_some());
+
+        // ACTIVITY-shaped, still within its window: holds.
+        app.auto_overlap_retry = Some(crate::AutoOverlapRetry {
+            build,
+            dmg_sha256: [0xab; 32],
+            cycles: MAX_ACTIVITY_REVOKED_CYCLES,
+            last_attempt: std::time::Instant::now(),
+        });
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)),
+        });
+        assert!(!app.lapse_expired_auto_apply_manual_only());
+        assert!(app.auto_apply_manual_only.is_some());
+
+        // ACTIVITY-shaped, deadline passed: lapses, AND the artifact's retry
+        // budget starts over so the next attempt is not instantly exhausted.
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        });
+        assert!(app.lapse_expired_auto_apply_manual_only());
+        assert!(app.auto_apply_manual_only.is_none());
+        assert!(
+            app.auto_overlap_retry.is_none(),
+            "a lapsed latch replenishes the activity retry budget"
+        );
+        // …and automatic apply is armable again for the same artifact.
+        assert!(app.arm_native_auto_apply(build, &"ab".repeat(32)));
+    }
+
+    /// The retry budget REPLENISHES after a long idle gap: a busy hour must not
+    /// permanently spend an artifact's automatic attempts.
+    #[test]
+    fn an_idle_gap_replenishes_the_activity_revoked_retry_budget() {
+        let mut app = App::headless_for_test();
+        let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            77,
+            "0123456789abcdef0123456789abcdef01234567",
+            &"ab".repeat(32),
+        );
+        app.auto_overlap_retry = Some(crate::AutoOverlapRetry {
+            build: 77,
+            dmg_sha256: [0xab; 32],
+            cycles: MAX_ACTIVITY_REVOKED_CYCLES,
+            last_attempt: std::time::Instant::now(),
+        });
+        assert_eq!(
+            app.arm_activity_revoked_overlap_retry(&ticket),
+            None,
+            "a freshly exhausted budget stays exhausted"
+        );
+        app.auto_overlap_retry = Some(crate::AutoOverlapRetry {
+            build: 77,
+            dmg_sha256: [0xab; 32],
+            cycles: MAX_ACTIVITY_REVOKED_CYCLES,
+            last_attempt: std::time::Instant::now() - crate::ACTIVITY_RETRY_BUDGET_REPLENISH
+                - std::time::Duration::from_secs(1),
+        });
+        assert_eq!(
+            app.arm_activity_revoked_overlap_retry(&ticket),
+            Some(std::time::Duration::from_secs(2)),
+            "after a long idle gap the schedule starts over"
+        );
+    }
+
     #[test]
     fn manual_only_latch_survives_duplicate_wakes_and_exactly_new_bytes_rearm() {
         let mut app = App::headless_for_test();
@@ -4726,6 +7245,7 @@ mod tests {
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
             build,
             dmg_sha256: [0xab; 32],
+            retry_at: None,
         });
 
         for _ in 0..3 {
@@ -4736,6 +7256,7 @@ mod tests {
                 Some(crate::AutoApplyManualOnly {
                     build,
                     dmg_sha256: [0xab; 32],
+                    retry_at: None,
                 })
             );
         }
@@ -5036,6 +7557,65 @@ mod tests {
     }
 
     #[test]
+    fn bare_return_activates_the_pages_primary_default_button() {
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+        // About route: `navigate()` anchors keyboard focus on the page
+        // CONTAINER (a non-actionable Group, its scroll/a11y anchor), so a
+        // fresh page has no activatable focus and "Copy Build Information" is
+        // its Primary. A bare Return must fire it (the native default-button
+        // convention); before, the key fell through to a text Submit that
+        // no-ops outside an edit. Space must NOT fall back — on macOS Space
+        // only ever activates the focused control.
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // A REGULAR-width viewport: the default headless grid classifies as
+        // Compact, where the paginated About page does not author its action
+        // row (and so genuinely has no default to fire).
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.cols = 220;
+            ws.rows = 60;
+        }
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (_, view) = app.active_native_view(wid).unwrap();
+        assert!(
+            !app.activate_native_focus(wid).unwrap_or(false),
+            "fresh page must hold no ACTIVATABLE focus for this test to exercise the fallback"
+        );
+
+        let press = |key| crate::input::InputEvent::Key {
+            key: Key::Named(key),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        assert!(app.native_input_event(wid, &press(NamedKey::Space)));
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("Settings view");
+        };
+        assert_eq!(
+            state.feedback, None,
+            "unfocused Space must not trigger the default button"
+        );
+
+        assert!(app.native_input_event(wid, &press(NamedKey::Enter)));
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("Settings view");
+        };
+        // The headless clipboard executor completes inline, so the feedback has
+        // already advanced past "Copying build information…" to the done state.
+        assert_eq!(
+            state.feedback.as_deref(),
+            Some("Build information copied"),
+            "unfocused Return must fire the page's Primary (default) button"
+        );
+    }
+
+    #[test]
     fn settings_search_field_honors_readline_control_keys() {
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 
@@ -5101,85 +7681,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_font_headless_native_card_and_hud_cover_the_exact_composed_frame() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-
-        // Reproduce the failing renderer configuration: `$ATERM_FONT_PX=16` builds
-        // a 16 px backend. Production startup passes these exact values into the
-        // WindowState constructor; no constructor-owned automatic seed exists.
-        app.backend.activate_px(16.0);
-        app.font_px = 16.0;
-        app.backend.set_pad(crate::pad_for_scale(1.0));
-        app.backend.set_pad_top(crate::pad_top_for_scale(1.0));
-        app.backend.set_head(0);
-        let metrics = app.unattached_window_metrics();
-        app.windows.get_mut(&wid).unwrap().metrics = metrics;
-        assert_eq!(app.win_cell_size(wid), app.cell_size());
-        assert_eq!(app.win_pad(wid), app.backend.pad());
-        assert_eq!(app.win_pad_top(wid), app.backend.pad_top());
-        assert_eq!(app.win_head(wid), app.backend.head());
-
-        app.tab_strip_rows = 1;
-        app.set_panel(crate::hud_bar::PanelId::Resources, true);
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
-        assert!(app.prepare_native_input_scratch(wid));
-
-        let ws = &app.windows[&wid];
-        let card = ws.settings_card.as_ref().expect("native card raster");
-        let composed_rows = u16::try_from(ws.input_scratch.cells.len()).unwrap();
-        let frame = app.frame_px(composed_rows, ws.cols);
-        assert_eq!(card.dx, 0);
-        assert_eq!(card.dx + card.pw, frame.width, "no uncovered right band");
-        let hud_rows = usize::from(app.hud_rows.min(ws.hud_cap));
-        assert!(
-            hud_rows > 0,
-            "fixture must exercise native + HUD composition"
-        );
-        assert_eq!(
-            card.dy as usize
-                + card.ph as usize
-                + hud_rows * app.win_cell_size(wid).1
-                + app.win_pad(wid),
-            frame.height as usize,
-            "native card and HUD exactly cover the visible frame through its base bottom pad",
-        );
-        assert_eq!(
-            card.dy as usize,
-            app.win_pad_top(wid) + app.win_head(wid) + app.win_cell_size(wid).1,
-            "native content begins below the padded one-row tab strip"
-        );
-        assert_eq!(
-            card.ph as usize,
-            usize::from(ws.rows) * app.win_cell_size(wid).1,
-            "HUD owns the rows below native content; the base bottom pad follows the HUD",
-        );
-        assert_eq!(
-            frame.height as usize
-                - usize::from(composed_rows) * app.win_cell_size(wid).1
-                - app.win_pad_top(wid),
-            app.win_pad(wid),
-            "visible native frame has explicit configured top and base bottom",
-        );
-        assert_ne!(
-            card.ph as usize,
-            usize::from(ws.rows) * app.win_cell_size(wid).1 + 2 * app.win_pad(wid)
-                - app.win_pad_top(wid),
-            "negative control: native viewport must not conserve 2*pad",
-        );
-        assert_eq!(
-            card.rgba.len(),
-            usize::try_from(card.pw).unwrap() * usize::try_from(card.ph).unwrap() * 4,
-            "the retained card owns every pixel in its declared extent"
-        );
-        assert_ne!(
-            card.rgba.last().copied(),
-            Some(0),
-            "the native root paints the bottom-right content pixel"
-        );
-    }
-
-    #[test]
     fn explicit_font_metrics_seed_initial_and_additional_headless_windows() {
         let mut app = App::headless_for_test();
         app.backend.activate_px(16.0);
@@ -5206,5 +7707,216 @@ mod tests {
         assert_eq!(app.windows[&additional].metrics, expected);
         assert_eq!(app.win_cell_size(additional), app.cell_size());
         assert_eq!(app.win_pad(additional), app.backend.pad());
+    }
+
+    /// Tier-1 conformance for the shipping exact-observation handoff. A failed
+    /// reconciliation must retain both the deferred external bytes and a queued
+    /// semantic write; retry admits that exact generation before the write can
+    /// leave the queue. The negative control proves the model rejects the lost
+    /// candidate state this test is intended to exclude.
+    #[test]
+    fn exact_observation_handoff_conforms_and_preserves_failed_reconciliation() {
+        fn project(
+            model: &aterm_spec::derive::Model,
+            app: &App,
+            phase: i64,
+            sampled: i64,
+            admitted: i64,
+            reconciliation_failed: bool,
+        ) -> aterm_spec::interp::State {
+            let pending = i64::from(app.native_config_external_pending.is_some());
+            let mut state = model.init_state();
+            state.insert("phase", phase);
+            state.insert("pending", pending);
+            state.insert("sampled", sampled);
+            state.insert(
+                "gate",
+                i64::from(app.native_config_service.reconciliation_required() || pending == 1),
+            );
+            state.insert("queued", i64::from(!app.native_config_pending.is_empty()));
+            state.insert("admitted", admitted);
+            state.insert("reconciliation_failed", i64::from(reconciliation_failed));
+            state
+        }
+
+        fn assert_step(
+            model: &aterm_spec::derive::Model,
+            before: &aterm_spec::interp::State,
+            after: &aterm_spec::interp::State,
+            action: &str,
+        ) {
+            assert_eq!(
+                model.successors(action, before).as_slice(),
+                std::slice::from_ref(after),
+                "shipping transition must refine {action}"
+            );
+            for invariant in &model.invariants {
+                assert!(
+                    model.check_invariant(invariant.name, after),
+                    "post-state violates {}::{}: {after:?}",
+                    model.name,
+                    invariant.name
+                );
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "aterm-config-observation-handoff-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("aterm.toml");
+        std::fs::write(&path, "serious_mode = false\n").unwrap();
+
+        let model = aterm_spec::derive::native_config_observation_handoff_model();
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
+        let mut state = project(&model, &app, 0, 0, 0, false);
+        assert_eq!(state, model.init_state());
+
+        app.native_config_inflight = true;
+        let after = project(&model, &app, 1, 0, 0, false);
+        assert_step(&model, &state, &after, "BeginWrite");
+        state = after;
+
+        app.enqueue_serious_mode_intent().unwrap();
+        let after = project(&model, &app, 1, 0, 0, false);
+        assert_step(&model, &state, &after, "QueueWrite");
+        state = after;
+
+        std::fs::write(&path, "serious_mode = true\n").unwrap();
+        let observation =
+            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                .unwrap();
+        assert!(
+            app.sync_native_config_external_observation(observation.clone())
+                .unwrap()
+                .is_none()
+        );
+        let after = project(&model, &app, 1, 0, 0, false);
+        assert_step(&model, &state, &after, "ObserveFirst");
+        state = after;
+
+        app.finish_native_config_write(
+            NativeConfigOrigin::SeriousMode { desired: false },
+            NativeConfigPersistenceCompletion {
+                outcome: ConfigPatchOutcome::Conflict {
+                    revision: app.native_config_service.snapshot().revision,
+                },
+                observation: Err("publication was overtaken".to_string()),
+            },
+        );
+        let after = project(&model, &app, 0, 0, 0, false);
+        assert_step(&model, &state, &after, "FinishWrite");
+        state = after;
+        assert_eq!(app.native_config_pending.len(), 1);
+        assert!(app.native_config_external_pending.is_some());
+
+        app.native_config_inflight = true;
+        let after = project(&model, &app, 2, 1, 0, false);
+        assert_step(&model, &state, &after, "StartReconcile");
+        state = after;
+        app.finish_native_config_reconciliation(NativeConfigReconciliationCompletion {
+            pending_sequence: app.native_config_external_sequence,
+            observation: Err("transient stable-read failure".to_string()),
+        });
+        let after = project(&model, &app, 0, 0, 0, true);
+        assert_step(&model, &state, &after, "FailReconcile");
+        state = after;
+        assert_eq!(app.native_config_pending.len(), 1);
+        assert!(app.native_config_external_pending.is_some());
+
+        let themes = std::sync::Arc::clone(&app.native_config_service.snapshot().assets.themes);
+        let reconciled = crate::native_config_service::VersionedConfigService::prepare_observation(
+            observation,
+            themes,
+        )
+        .unwrap();
+        app.native_config_inflight = true;
+        let after = project(&model, &app, 2, 1, 0, false);
+        assert_step(&model, &state, &after, "RetryReconcile");
+        state = after;
+        app.finish_native_config_reconciliation(NativeConfigReconciliationCompletion {
+            pending_sequence: app.native_config_external_sequence,
+            observation: Ok(reconciled),
+        });
+        let after = project(&model, &app, 0, 0, 1, false);
+        assert_step(&model, &state, &after, "AdmitExact");
+        assert_eq!(
+            app.native_config_service.snapshot().text.as_ref(),
+            "serious_mode = true\n"
+        );
+        assert!(app.native_config_external_pending.is_none());
+        assert_eq!(app.native_config_pending.len(), 1);
+
+        let mut lost = after;
+        lost.insert("dropped_candidate", 1);
+        assert!(
+            !model.check_invariant("DeferredGenerationNeverLost", &lost),
+            "negative control: dropping the failed observation must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matching_prepared_generation_reconciliation_admits_without_requeue() {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-config-prepared-reconcile-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("aterm.toml");
+        std::fs::write(&path, "serious_mode = false\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
+        std::fs::write(&path, "serious_mode = true\n").unwrap();
+        let observation =
+            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                .unwrap();
+        let themes = std::sync::Arc::clone(&app.native_config_service.snapshot().assets.themes);
+        let prepared = crate::native_config_service::VersionedConfigService::prepare_observation(
+            observation,
+            themes,
+        )
+        .unwrap();
+        let expected_assets = std::sync::Arc::clone(&prepared.assets);
+        let generation = crate::native_font_catalog::PreparedConfigGeneration {
+            observation: prepared.observation.clone(),
+            config: prepared.config.clone(),
+            values: prepared.values.clone(),
+            assets: std::sync::Arc::clone(&prepared.assets),
+            path_feed_fps: prepared.config.path_feed_fingerprints(),
+            sparkle: prepared.config.prepare_sparkle_runtime(),
+            fonts: None,
+            warnings: Vec::new(),
+        };
+
+        app.native_config_service.mark_reconciliation_required();
+        app.defer_prepared_config_generation(generation);
+        let deferred_sequence = app.native_config_external_sequence;
+        assert!(app.native_config_external_pending.is_some());
+        app.native_config_inflight = true;
+
+        app.finish_native_config_reconciliation(NativeConfigReconciliationCompletion {
+            pending_sequence: deferred_sequence,
+            observation: Ok(prepared),
+        });
+
+        assert!(!app.native_config_inflight);
+        assert!(!app.native_config_service.reconciliation_required());
+        assert!(app.native_config_external_pending.is_none());
+        assert_eq!(app.native_config_external_sequence, deferred_sequence);
+        let snapshot = app.native_config_service.snapshot();
+        assert_eq!(snapshot.text.as_ref(), "serious_mode = true\n");
+        assert!(std::sync::Arc::ptr_eq(&snapshot.assets, &expected_assets));
+        assert!(app.config.serious_mode_or_default());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -42,6 +42,15 @@ use std::time::Instant;
 static FRAMES_PRESENTED: AtomicU64 = AtomicU64::new(0);
 static LAST_PRESENT_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME_RENDER_NS: AtomicU64 = AtomicU64::new(0);
+// OFFSCREEN rasterizations (introspection `image`/`window`/`snapshot`): counted
+// separately from real presents so a screenshot can never move the on-glass
+// ledger. See `record_offscreen_raster`.
+// Swapchain-acquire wait: the drawable-park slice. See `note_acquire_wait`.
+static LAST_ACQUIRE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_ACQUIRE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static OFFSCREEN_RASTERS: AtomicU64 = AtomicU64::new(0);
+static LAST_OFFSCREEN_RASTER_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_OFFSCREEN_RASTER_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_PRESENT_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_FRAME_RENDER_NS: AtomicU64 = AtomicU64::new(0);
 static SLOW_FRAMES: AtomicU64 = AtomicU64::new(0);
@@ -81,6 +90,22 @@ static SHED_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
 static INPUT_STAMP_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_INPUT_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_INPUT_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+
+// THRU-2 SCHEDULING signal, split from the metric stamp above (touch-to-glass
+// audit round 2). `INPUT_STAMP_NS` does double duty badly: it is consumed by the
+// next CONTENT present, which under concurrent streaming output is a log-line
+// frame, not the keystroke's echo — so the reader's fine 8 KiB slicing disarmed
+// within one frame of each key and spent ~85% of a typing burst back on
+// whole-64-KiB term-lock holds, exactly the starvation the slicing exists to
+// prevent. This deadline is armed at HARDWARE key arrival (before any press-path
+// term_lock) and decays `TYPING_HOT_TAIL_NS` after the LAST key, so it spans a
+// whole typing burst and is immune to what the present path does.
+static TYPING_HOT_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+/// How long after a keystroke the reader keeps its term-lock holds fine. Longer
+/// than a fast typist's inter-key gap (~125 ms at 100 wpm) so a burst never
+/// disarms mid-word, short enough that a pure output flood pays the 8x lock
+/// round-trip cost only while a human is actually at the keyboard.
+const TYPING_HOT_TAIL_NS: u64 = 250_000_000;
 
 // Lost-wake heals (the self-expiring `gated_output_wake` latch re-armed after a
 // `Wake::Output` was consumed without a handler pass). ANY non-zero value means
@@ -171,12 +196,16 @@ pub(crate) enum DeadlineOwner {
     ResizeSettle = 8,
     PresentRetry = 9,
     FrameCap = 10,
-    Hud = 11,
+    /// Retired bottom-HUD deadline slot. The numeric tombstone is retained because
+    /// deadline-owner discriminants are an append-only diagnostics wire contract.
+    Retired11 = 11,
     CursorEffect = 12,
     Rain = 13,
     SettingsDemo = 14,
     NativePreview = 15,
-    NativeDiagnostics = 16,
+    /// Retired native Settings Diagnostics refresh slot. Preserve both the
+    /// numeric value and legacy wire label for recorded-metrics compatibility.
+    RetiredNativeDiagnostics16 = 16,
     Predictor = 17,
     ScrollGlide = 18,
     Overscroll = 19,
@@ -208,12 +237,12 @@ impl DeadlineOwner {
             8 => Self::ResizeSettle,
             9 => Self::PresentRetry,
             10 => Self::FrameCap,
-            11 => Self::Hud,
+            11 => Self::Retired11,
             12 => Self::CursorEffect,
             13 => Self::Rain,
             14 => Self::SettingsDemo,
             15 => Self::NativePreview,
-            16 => Self::NativeDiagnostics,
+            16 => Self::RetiredNativeDiagnostics16,
             17 => Self::Predictor,
             18 => Self::ScrollGlide,
             19 => Self::Overscroll,
@@ -248,12 +277,12 @@ impl DeadlineOwner {
             Self::ResizeSettle => "resize_settle",
             Self::PresentRetry => "present_retry",
             Self::FrameCap => "frame_cap",
-            Self::Hud => "hud",
+            Self::Retired11 => "retired-11",
             Self::CursorEffect => "cursor_effect",
             Self::Rain => "rain",
             Self::SettingsDemo => "settings_demo",
             Self::NativePreview => "native_preview",
-            Self::NativeDiagnostics => "native_diagnostics",
+            Self::RetiredNativeDiagnostics16 => "native_diagnostics",
             Self::Predictor => "predictor",
             Self::ScrollGlide => "scroll_glide",
             Self::Overscroll => "overscroll",
@@ -492,6 +521,7 @@ static H_PRESENT_LATENCY: Histogram = Histogram::new();
 static H_FRAME_RENDER: Histogram = Histogram::new();
 static H_KEY_WRITE: Histogram = Histogram::new();
 static H_PRE_PRESENT: Histogram = Histogram::new();
+static H_ACQUIRE_WAIT: Histogram = Histogram::new();
 
 /// The three live distributions, for the `metrics percentiles` verb:
 /// input→present (what typing feels like), output→present (the
@@ -515,6 +545,30 @@ pub fn key_write_distribution() -> &'static Histogram {
 #[must_use]
 pub fn pre_present_distribution() -> &'static Histogram {
     &H_PRE_PRESENT
+}
+
+/// Swapchain-acquire (`nextDrawable`) WAIT distribution — pure blocking on the
+/// compositor, not work.
+///
+/// This slice previously had no instrument at all: it fell between
+/// `note_pre_present` (which ends before the acquire) and the renderer's
+/// `last_present_work_ns` (which starts after it), so it was inferable only as
+/// `redraw_total - compose - raster_submit`, contaminated by the whole
+/// post-present tail. That is the single largest known typing-stall mechanism on
+/// macOS — a blocked acquire parks the winit main thread and queues keyDowns in
+/// the OS event queue (measured at up to ~84 ms) — so the system was blind to its
+/// own worst stall. Now it has a p50/p95/p99 of its own.
+#[must_use]
+pub fn acquire_wait_distribution() -> &'static Histogram {
+    &H_ACQUIRE_WAIT
+}
+
+/// Record one present's swapchain-acquire wait. Cheap (one histogram bucket
+/// increment); called on every successful present.
+pub fn note_acquire_wait(ns: u64) {
+    H_ACQUIRE_WAIT.record(ns);
+    LAST_ACQUIRE_WAIT_NS.store(ns, Ordering::Relaxed);
+    MAX_ACQUIRE_WAIT_NS.fetch_max(ns, Ordering::Relaxed);
 }
 
 /// A frame whose causal compose+raster/encode-submit CPU work exceeds a ~30 fps
@@ -571,6 +625,29 @@ pub fn record_present(latency_ns: u64, render_ns: u64) {
     }
 }
 
+/// An OFFSCREEN rasterization (`image` / `window` / `snapshot` introspection) —
+/// pixels built into a buffer that never reach glass.
+///
+/// These used to call [`record_present`] with a zero latency, which bumped
+/// `frames`, `last_/max_frame_render_ns`, `slow_frames` and the present-gap clock
+/// with work no real present ever did. A full-frame `image` rasterization is far
+/// more expensive than a scissored dirty-row on-glass frame and happens at an
+/// arbitrary time relative to real presents, so the natural measurement protocol
+/// (`metrics reset` → drive → `image` → `metrics`) silently corrupted the exact
+/// counters it was reading: `max_frame_render_ms` took a value nothing on the
+/// present path produced, `slow_frames` could go 0 → 1 on a healthy run, and
+/// `max_frame_gap_ms` was skewed in BOTH directions (an `image` between two
+/// presents shrinks a real hitch out of existence; one taken long after the last
+/// present books a multi-second phantom gap).
+///
+/// Its own counters keep headless/introspection runs observable — the reason the
+/// original calls existed — without contaminating the on-glass ledger.
+pub fn record_offscreen_raster(render_ns: u64) {
+    OFFSCREEN_RASTERS.fetch_add(1, Ordering::Relaxed);
+    LAST_OFFSCREEN_RASTER_NS.store(render_ns, Ordering::Relaxed);
+    MAX_OFFSCREEN_RASTER_NS.fetch_max(render_ns, Ordering::Relaxed);
+}
+
 /// Stamp the arrival of user input bound for the PTY (a keystroke or a control
 /// `send`/`key`). Keeps the OLDEST unpresented arrival — the worst case is the
 /// honest one — so a burst does not shrink the measured slice.
@@ -591,20 +668,42 @@ pub fn note_input() {
         now
     };
     let _ = INPUT_STAMP_NS.compare_exchange(0, stamp, Ordering::Relaxed, Ordering::Relaxed);
+    note_typing_hot();
 }
 
-/// Whether a keystroke is currently waiting to echo (stamped by [`note_input`],
-/// cleared by the next content present). THRU-2's ingest signal: the PTY reader
-/// keeps its term-lock holds FINE (8 KiB slices) only inside this key→echo
-/// window and takes whole-burst holds otherwise — so the interactivity bound
-/// the chunking exists for is enforced exactly when a human is waiting on it,
-/// and a pure output flood pays 8x fewer lock round-trips. Read-only,
-/// lock-free, Relaxed (a stale read for one hold is harmless: the next hold
-/// re-reads, and a mid-hold arrival waits at most one whole-burst process —
-/// sub-frame).
+/// Arm the THRU-2 interactivity window: a human just pressed a key, so the PTY
+/// reader must keep its term-lock holds FINE until `TYPING_HOT_TAIL_NS` after the
+/// LAST key.
+///
+/// Called at the TRUE hardware arrival (the `WindowEvent::KeyboardInput` arm),
+/// BEFORE any press-path `term_lock` — that ordering is the whole point. The
+/// previous design armed the signal from `note_input` deep inside
+/// `input_to_session`, i.e. AFTER three-to-four terminal-mutex acquisitions had
+/// already queued behind whole-64-KiB reader holds; only the final `seam_egress`
+/// acquisition benefited from the signal the keystroke itself had set.
+///
+/// Deliberately NOT tied to `INPUT_STAMP_NS`: that stamp is the latency METRIC and
+/// is consumed by the next content present (a flood frame, not necessarily this
+/// key's echo), which silently disarmed the scheduling hint mid-burst.
+pub fn note_typing_hot() {
+    TYPING_HOT_UNTIL_NS.store(
+        now_ns().saturating_add(TYPING_HOT_TAIL_NS),
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether a human is actively typing (armed by [`note_typing_hot`] at hardware
+/// key arrival, decaying `TYPING_HOT_TAIL_NS` after the last key). THRU-2's ingest
+/// signal: the PTY reader keeps its term-lock holds FINE (8 KiB slices) inside
+/// this window and takes wider holds otherwise — so the interactivity bound the
+/// chunking exists for is enforced exactly when a human is waiting on it, and a
+/// pure output flood pays far fewer lock round-trips. Read-only, lock-free,
+/// Relaxed (a stale read for one hold is harmless: the next hold re-reads, and a
+/// mid-hold arrival waits at most one capped process — sub-frame).
 #[must_use]
 pub fn input_pending() -> bool {
-    INPUT_STAMP_NS.load(Ordering::Relaxed) != 0
+    let until = TYPING_HOT_UNTIL_NS.load(Ordering::Relaxed);
+    until != 0 && now_ns() < until
 }
 
 // ---- ATERM_LATENCY_TRACE: isolate the UI-thread key->write component ---------
@@ -883,6 +982,24 @@ pub fn reset() {
     LAST_PRESENT_STAMP_NS.store(0, Ordering::Relaxed);
     // A stale no-echo stamp must not leak a bogus slice into the fresh window.
     INPUT_STAMP_NS.store(0, Ordering::Relaxed);
+    // MEASUREMENT-WINDOW HONESTY (touch-to-glass audit): every `last_*` that is an
+    // OBSERVATION of the window clears with it, so a `0.00` unambiguously means "no
+    // sample in this window" instead of silently reprinting the PREVIOUS run's
+    // number. Without this, the documented `reset` → drive → read protocol turns a
+    // zero-sample run into a passing regression test. True GAUGES (`SYNC_HOLDING`,
+    // `PERF_REDUCED`, `BACKEND_GPU`) and the startup fact (`FIRST_PRESENT_NS`) are
+    // state, not observations, and deliberately survive.
+    OFFSCREEN_RASTERS.store(0, Ordering::Relaxed);
+    LAST_OFFSCREEN_RASTER_NS.store(0, Ordering::Relaxed);
+    MAX_OFFSCREEN_RASTER_NS.store(0, Ordering::Relaxed);
+    LAST_ACQUIRE_WAIT_NS.store(0, Ordering::Relaxed);
+    MAX_ACQUIRE_WAIT_NS.store(0, Ordering::Relaxed);
+    H_ACQUIRE_WAIT.reset();
+    LAST_INPUT_PRESENT_NS.store(0, Ordering::Relaxed);
+    LAST_KEY_WRITE_NS.store(0, Ordering::Relaxed);
+    LAST_PRESENT_LATENCY_NS.store(0, Ordering::Relaxed);
+    LAST_FRAME_RENDER_NS.store(0, Ordering::Relaxed);
+    LAST_REDRAW_TOTAL_NS.store(0, Ordering::Relaxed);
     // The distributions are window stats like the maxima they generalize.
     H_INPUT_PRESENT.reset();
     H_PRESENT_LATENCY.reset();

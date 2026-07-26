@@ -69,27 +69,26 @@
 //!   `OK <w> <h> <path>`. `<target>` selects which window: omitted/`front` = the
 //!   front terminal window (native OS chrome — titlebar, traffic lights, unified
 //!   toolbar, full-width tab strip — AND the terminal content); `prefs`/`settings`
-//!   = the Settings overlay (composited into the front window, so this is the
-//!   front capture with the overlay up); `perf`/`performance` = the Performance
-//!   control panel. Unlike `image` (terminal content framebuffer only), this photographs
+//!   = the native Settings tab in that same window. Unlike `image` (terminal content
+//!   framebuffer only), this photographs
 //!   the real composited on-screen pixels via CoreGraphics, so an AI can SEE the
 //!   whole window or any GUI screen. A first token that is a known target keyword
 //!   always selects that window — to write to a file literally named
-//!   `prefs`/`perf`/`front`, give a target first (e.g. `window front prefs`). macOS
+//!   `prefs`/`front`, give a target first (e.g. `window front prefs`). macOS
 //!   only; needs Screen Recording permission (a clear `ERR` explains how to grant it
-//!   if missing); a not-open aux window or headless / off-macOS gets a clear `ERR`.
-//! * `controls <target>` — dump an auxiliary GUI window's controls as text:
-//!   `prefs`/`settings` lists each setting (`field key=… label=… value=…
-//!   effective=…`), `perf`/`performance` lists the HUD toggles (`toggle key=…
-//!   label=… enabled=…`). The analogue of `chrome` for the settings/perf GUIs —
-//!   works HEADLESS (built from the live config/panel model, no screenshot or
-//!   Screen Recording grant needed). `"OK <n>\n"` + `<n>` lines.
-//! * `open <target>`   — bring an auxiliary GUI screen UP: `prefs`/`settings` opens
-//!   the Settings overlay on the front window, `perf`/`performance` the Performance
-//!   control panel. The piece that lets a driver introspect a CLOSED screen: `open
-//!   prefs` then `window prefs` / `controls prefs`. Overlay targets (prefs / about /
-//!   menu) work HEADLESS too (they composite into the virtual frame `image` reads);
-//!   `perf` is a real `NSWindow` — windowed macOS only (headless gets `ERR`).
+//!   if missing); a missing target or headless / off-macOS gets a clear `ERR`.
+//! * `controls <target>` — dump a GUI surface's controls as text. For
+//!   `prefs`/`settings`, compatibility `field key=… label=… value=… effective=…`
+//!   rows describe only setting controls on the current native route; the following
+//!   canonical `ui …` rows serialize that route's full compiled semantic tree. A
+//!   closed Settings tab reports zero controls instead of fabricating an off-screen
+//!   catalog. This is the analogue of `chrome` for app surfaces and works HEADLESS
+//!   (built from the live model, with no screenshot or Screen Recording grant needed).
+//!   `"OK <n>\n"` + `<n>` lines.
+//! * `open <target>`   — open an own-rendered surface; `prefs`/`settings` opens the
+//!   native Settings tab. This lets a driver introspect a closed surface: `open prefs`
+//!   then `window prefs` / `controls prefs`. These targets work HEADLESS too because
+//!   their native tab-app trees compile into the virtual frame `image` reads.
 //! * `resize <r> <c>`  — resize the engine + PTY (each dimension 1..=4096;
 //!   out-of-range requests get `ERR out of range`).
 //! * `select <r1> <c1> <r2> <c2>` — select from cell `(r1,c1)` to `(r2,c2)`,
@@ -738,7 +737,10 @@ const EXIT_TIMEOUT: u8 = 124;
 /// `TimedOut` (Windows), NOT as a generic failure — so it maps to [`EXIT_TIMEOUT`]
 /// and a wedged server is distinguishable from an `ERR`/usage/connect failure.
 fn is_timeout_error(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 /// The whole client as a callable: `argv[1..]` in, process exit code out.
@@ -865,8 +867,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
             out.write_all(help.as_bytes())?;
             return Ok(ExitCode::SUCCESS);
         } else if arg == "-V" || arg == "--version" {
-            // Compile-time concatenation: no runtime formatting needed.
-            print_stdout_line(concat!("aterm-ctl ", env!("CARGO_PKG_VERSION")))?;
+            print_stdout_line(&format!("aterm-ctl {}", aterm_types::version::APP_VERSION))?;
             return Ok(ExitCode::SUCCESS);
         } else if arg == "--completions" {
             // Hidden pre-verb flag (kept OUT of `--help`): print the shell
@@ -1862,7 +1863,10 @@ mod tests {
     #[test]
     fn dial_frames_response_by_forwarded_verb_not_dial() {
         let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
-        assert_eq!(forwarded_verb(&p("dial myhost text")).as_deref(), Some("text"));
+        assert_eq!(
+            forwarded_verb(&p("dial myhost text")).as_deref(),
+            Some("text")
+        );
         assert_eq!(
             forwarded_verb(&p("dial myhost cursor")).as_deref(),
             Some("cursor")
@@ -1991,7 +1995,10 @@ mod tests {
         let ok = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("dial exchange must not block indefinitely");
-        assert!(ok, "dial myhost text should complete the exchange (OK reply)");
+        assert!(
+            ok,
+            "dial myhost text should complete the exchange (OK reply)"
+        );
         cli.join().expect("client thread");
         let relayed = srv.join().expect("server thread");
         assert_eq!(
@@ -2089,6 +2096,7 @@ mod tests {
             "blocks",
             "blocktext",
             "chrome",
+            "panes",
             "sessions",
             "family",
             "who",
@@ -2213,8 +2221,7 @@ mod tests {
         // The exact generated catalog line for a representative verb is present
         // verbatim — proof the section is the table's own rendering, not prose.
         assert!(
-            aterm_types::control_verbs::catalog_lines()
-                .all(|line| help.contains(&line)),
+            aterm_types::control_verbs::catalog_lines().all(|line| help.contains(&line)),
             "every generated catalog line must appear in --help"
         );
         // The hand-written prose sections survive.
@@ -2297,9 +2304,9 @@ mod tests {
     fn version_line_is_well_formed() {
         // Mirror what the --version branch prints; guard against a blank or
         // mis-prefixed version line.
-        let line = format!("aterm-ctl {}", env!("CARGO_PKG_VERSION"));
+        let line = format!("aterm-ctl {}", aterm_types::version::APP_VERSION);
         assert!(line.starts_with("aterm-ctl "));
-        assert!(!env!("CARGO_PKG_VERSION").is_empty());
+        assert!(!aterm_types::version::APP_VERSION.is_empty());
     }
 
     /// `--timeout` parses SECONDS into the per-op deadline: `0` disables it
@@ -2315,7 +2322,11 @@ mod tests {
         assert_eq!(parse_timeout("900").unwrap(), Some(EXCHANGE_DEADLINE));
         for bad in ["", "-1", "abc", "1.5", "  "] {
             let e = parse_timeout(bad).unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?} should error");
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidInput,
+                "{bad:?} should error"
+            );
         }
     }
 
@@ -2325,7 +2336,9 @@ mod tests {
     #[test]
     fn timeout_exit_code_is_124_and_client_kinds_map_to_it() {
         assert_eq!(EXIT_TIMEOUT, 124);
-        assert!(is_timeout_error(&io::Error::from(io::ErrorKind::WouldBlock)));
+        assert!(is_timeout_error(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        )));
         assert!(is_timeout_error(&io::Error::from(io::ErrorKind::TimedOut)));
         assert!(!is_timeout_error(&io::Error::from(
             io::ErrorKind::ConnectionRefused
@@ -2339,7 +2352,9 @@ mod tests {
     #[test]
     fn reply_is_timeout_detects_await_and_turn_forms() {
         assert!(reply_is_timeout("OK timeout"));
-        assert!(reply_is_timeout("OK 24 turn submitted=1 status=timeout seq=9"));
+        assert!(reply_is_timeout(
+            "OK 24 turn submitted=1 status=timeout seq=9"
+        ));
         assert!(!reply_is_timeout(
             "OK 24 turn submitted=1 status=settled seq=9"
         ));
@@ -2437,7 +2452,10 @@ mod tests {
             "screen".to_string(),
         ];
         expand_self_selector(&mut p, Some("s-x".into())).unwrap();
-        assert_eq!(p[1], "@s-x,@1,@s-x", "each self element in the list expands");
+        assert_eq!(
+            p[1], "@s-x,@1,@s-x",
+            "each self element in the list expands"
+        );
         // `subscribe` with a concrete selector is untouched; unset env still errors
         // when the subscribe selector needs it.
         let mut p = vec![
@@ -2509,7 +2527,10 @@ mod tests {
         ] {
             let script = completion_script(shell).expect("known shell yields a script");
             assert!(!script.is_empty(), "{shell} script is non-empty");
-            assert!(script.contains(wiring), "{shell} script has its shell wiring");
+            assert!(
+                script.contains(wiring),
+                "{shell} script has its shell wiring"
+            );
             // Representative verbs called out by the audit finding.
             for verb in ["text", "turn", "subscribe"] {
                 assert!(script.contains(verb), "{shell} completes `{verb}`");

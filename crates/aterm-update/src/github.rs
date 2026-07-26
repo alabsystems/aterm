@@ -4,24 +4,231 @@
 //! The DMG/.app-specific orchestration of a background update check: find the
 //! newest release carrying an `aterm-appcast.toml`, and — if it is strictly newer
 //! than the running build — download + verify its DMG and stage it. The portable
-//! GitHub plumbing it drives (authenticated `curl` GET/download, the per-machine
-//! token chain) lives in `aterm-update-core` (`api_get`/`download_bytes`/
+//! GitHub plumbing it drives (token-optional `curl` GET/download, the per-machine
+//! token chain) lives in `aterm-update-core` (`api_get_classified`/`download_bytes`/
 //! `download_to`, [`aterm_update_core::token`]).
 //!
-//! Private repos require the API (the `releases/latest/download/…` browser
-//! shortcut needs web auth), so every request is authenticated with the per-machine
-//! token and asset bytes are downloaded via the asset API URL with
-//! `Accept: application/octet-stream` (curl `-L` follows the 302 to storage and
-//! drops the `Authorization` header on the cross-host redirect by default). The
-//! token is fed to curl through STDIN (`curl --config -`), never on argv, so it is
-//! not exposed to same-user processes via `ps`.
+//! Requests go through the API (the `releases/latest/download/…` browser shortcut
+//! needs web auth even on a public repo) and asset bytes are downloaded via the asset
+//! API URL with `Accept: application/octet-stream` (curl `-L` follows the 302 to
+//! storage and drops the `Authorization` header on the cross-host redirect by
+//! default). When a token IS available it is fed to curl through STDIN
+//! (`curl --config -`), never on argv, so it is not exposed to same-user processes
+//! via `ps`.
+//!
+//! # The credential ladder (token-first, anonymous fallback)
+//!
+//! This module used to GATE on the token: no token → record "idle", return before any
+//! network call. That was correct only while the release channel was private. It is
+//! now public, and the gate meant a freshly installed Mac — which has no token and no
+//! reason to acquire one — never even asked whether an update existed.
+//!
+//! So the token is RESOLVED, never gated on, and the first releases-LIST response is
+//! the sole classifier, because a network answer is the only real evidence about
+//! whether this machine can read the channel:
+//!
+//! * a token resolved → use it (5000 requests/hour instead of the shared ~60/hour
+//!   per-IP anonymous budget, and a private channel keeps working exactly as before);
+//! * no token → ask anonymously anyway;
+//! * 401/403 WITH a token → retry once anonymously, so a stale ambient `gh auth
+//!   token` cannot brick a machine whose channel is public;
+//! * 401/403/404 WITHOUT a token → [`unreadable_explanation`]: loud, actionable, and
+//!   never a silent idle;
+//! * 429 / rate-limited 403 → back off; not a failure, not a broken pipeline.
+//!
+//! Dropping auth is NOT a trust downgrade: artifact trust is the pinned Ed25519 key,
+//! the pinned Team ID and the manifest sha256 — none of which this lane touches.
+
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use serde::Deserialize;
 
-use aterm_update_core::token;
+use aterm_update_core::{HttpError, token};
 
 use crate::manifest::{Manifest, Ready};
 use crate::{PINNED_TEAM_ID, PINNED_UPDATE_PUBKEY, Source, bundle, install, paths::Staging, sig};
+
+/// Which credential lane the last COMPLETED releases-LIST request used. Read by the
+/// background loop to pick a check cadence the lane's rate-limit budget can afford
+/// (see `crate::spawn_background_check`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// No check has completed yet in this process.
+    Unknown,
+    /// A token was accepted.
+    Authenticated,
+    /// The channel answered with no credential at all — a public repo.
+    Anonymous,
+}
+
+/// [`Lane`] of the last completed check, as a `u8` so it can live in an atomic.
+static LANE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether the last check ended in a GitHub rate limit. Read by the background loop
+/// to LENGTHEN the next wait without recording a failure: a rate limit means "you
+/// asked too often", which is a cadence problem, not a broken updater.
+static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process has already logged that it is updating without a token. Once
+/// per process: it is a standing condition, not an event.
+static ANNOUNCED_ANONYMOUS: AtomicBool = AtomicBool::new(false);
+
+/// The lane the last completed check used.
+#[must_use]
+pub fn lane() -> Lane {
+    match LANE.load(Ordering::Relaxed) {
+        1 => Lane::Authenticated,
+        2 => Lane::Anonymous,
+        _ => Lane::Unknown,
+    }
+}
+
+/// Whether the last check was cut short by a GitHub rate limit.
+#[must_use]
+pub fn rate_limited() -> bool {
+    RATE_LIMITED.load(Ordering::Relaxed)
+}
+
+/// Record that a releases-LIST request SUCCEEDED on `lane`. This — not the token
+/// chain — is what clears the "this machine cannot update" latch: reading the channel
+/// is the property that matters, and on a public repo it holds with no credential.
+fn note_readable(authenticated: bool, source: &Source) {
+    LANE.store(if authenticated { 1 } else { 2 }, Ordering::Relaxed);
+    RATE_LIMITED.store(false, Ordering::Relaxed);
+    crate::no_token::clear();
+    if !authenticated && !ANNOUNCED_ANONYMOUS.swap(true, Ordering::Relaxed) {
+        crate::log(&format!(
+            "updating from github.com/{}/{} without a token (public channel) — \
+             unauthenticated checks share ~60 GitHub requests/hour per IP address, so \
+             this machine checks on a longer interval",
+            source.owner, source.repo
+        ));
+    }
+}
+
+/// The lane annotation appended to a HEALTHY status outcome, so `status.toml` /
+/// `aterm-ctl update status` answers "why is this machine slow to update?" on its own.
+///
+/// Empty on the authenticated lane (the default, and the one the 75-second cadence
+/// documents), so no existing status wording changes for a provisioned machine.
+fn lane_note() -> &'static str {
+    if lane() == Lane::Anonymous {
+        " — checking anonymously on a 15-minute interval (no update token provisioned; \
+         the unauthenticated GitHub budget is ~60 requests/hour per IP)"
+    } else {
+        ""
+    }
+}
+
+/// What the releases-LIST response says the check should do. Split out as a pure
+/// function of the classified error so the whole ladder is unit-testable without a
+/// network, a token, or an installed `.app`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ListDecision {
+    /// Re-issue the SAME request with no token (a resolved token was rejected).
+    RetryAnonymous,
+    /// This machine cannot read the channel and never will until an operator acts.
+    /// Carries the full explanation; NOT a health failure — a configuration state is
+    /// not a transient fault, and recording it as one would bury the real signal.
+    Blocked(String),
+    /// GitHub asked us to slow down. Back off; do not accrue a failure streak.
+    RateLimited(String),
+    /// A genuine failure: `network`-class ledger entry + `Err`.
+    Failed(String),
+}
+
+/// Turn the token chain's outcome into the credential a check proceeds WITH.
+///
+/// TOTAL BY CONSTRUCTION, and that is the entire point: there is no "stop" value it
+/// can return. The absence of a token is not evidence that this machine cannot
+/// update — aterm's channel is public and readable anonymously — so only a network
+/// response may decide that, in [`classify_list_error`]. The historical code gated
+/// here with an unconditional `return Ok(None)` ("idle: no update token
+/// provisioned"), which is exactly what made every unprovisioned Mac sit forever in
+/// front of a repo it could have read without any credential at all.
+///
+/// The `Err` arm keeps the diagnosis rather than discarding it: it is what
+/// `unreadable_explanation` uses to say "a token is present but was refused: …"
+/// instead of the misleading "not configured", and what `note_unusable_token` reports
+/// on a channel that turned out to be readable anyway.
+///
+/// Returning `(Option<token>, Option<diagnosis>)` — never a control-flow decision —
+/// is what keeps the gate from creeping back in: reintroducing one means changing
+/// this function's type, not quietly adding a branch.
+fn plan_credential(
+    resolved: Result<(String, &'static str), token::Diagnosis>,
+) -> (Option<String>, Option<token::Diagnosis>) {
+    match resolved {
+        Ok((tok, _source)) => (Some(tok), None),
+        Err(diagnosis) => (None, Some(diagnosis)),
+    }
+}
+
+/// Classify a failed releases-LIST request.
+///
+/// `had_token` is whether the TOKEN CHAIN produced one at the start of this check —
+/// deliberately not "did this particular request carry one", so the anonymous retry's
+/// own failure is still reported as the auth problem it is, rather than being
+/// mistaken for an unprovisioned machine.
+pub(crate) fn classify_list_error(
+    error: &HttpError,
+    had_token: bool,
+    already_retried: bool,
+    source: &Source,
+    diagnosis: Option<&token::Diagnosis>,
+) -> ListDecision {
+    match error {
+        HttpError::RateLimited { .. } => ListDecision::RateLimited(error.to_string()),
+        // GitHub answers 404 for a private repo an anonymous caller cannot see AND
+        // for a repo that does not exist — `GET /repos/{o}/{r}` is 404 in both cases
+        // too, so NO probe distinguishes them. Do not guess: name all three causes.
+        HttpError::NotFound { .. } | HttpError::Unauthorized { .. } if !had_token => {
+            ListDecision::Blocked(unreadable_explanation(error, source, diagnosis))
+        }
+        // A resolved token that GitHub rejects must not brick a machine whose channel
+        // is public: the ambient `gh auth token` the chain may have picked up can be
+        // stale, scoped elsewhere, or revoked. One anonymous retry, then give up.
+        HttpError::Unauthorized { .. } if !already_retried => ListDecision::RetryAnonymous,
+        // Everything else — including 404 WITH a token (a token that cannot see the
+        // repo is a real, actionable auth problem) — is today's failure path.
+        _ => ListDecision::Failed(error.to_string()),
+    }
+}
+
+/// The one message an operator gets when this machine cannot read its release
+/// channel and has no credential to try. It must survive being read months later out
+/// of `status.toml`, so it names the consequence, every possible cause, and the exact
+/// remedy for each.
+fn unreadable_explanation(
+    error: &HttpError,
+    source: &Source,
+    diagnosis: Option<&token::Diagnosis>,
+) -> String {
+    let code = match error {
+        HttpError::Unauthorized { code } => *code,
+        HttpError::NotFound { .. } => 404,
+        _ => 0,
+    };
+    // A token that was PRESENT and refused by our own chain ("chmod 600 it") is the
+    // actionable case and must never be collapsed into "not configured".
+    let rejections = diagnosis.map(token::Diagnosis::rejections).unwrap_or_default();
+    let chain = if rejections.is_empty() {
+        "no update token is provisioned".to_string()
+    } else {
+        format!("a token is present but was refused: {}", rejections.join("; "))
+    };
+    format!(
+        "aterm cannot read its release channel github.com/{}/{} (HTTP {code}) and {chain}, \
+         so this machine will NEVER receive an update until it is fixed. GitHub answers the \
+         same way for every cause and cannot tell them apart, so check all three: (1) the \
+         channel is PRIVATE — provision a token by running: {}; (2) the repository does not \
+         exist; (3) the configured channel is wrong — check `[update] owner`/`repo` in \
+         aterm's config, or $ATERM_UPDATE_OWNER / $ATERM_UPDATE_REPO.",
+        source.owner,
+        source.repo,
+        token::PROVISION_COMMAND
+    )
+}
 
 /// A GitHub Release (subset). Unknown fields are ignored.
 #[derive(Clone, Debug, Deserialize)]
@@ -50,41 +257,70 @@ struct Asset {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct NumericTag(Vec<u64>);
 
-/// Parse the ordering key for every exact-name candidate. Historical releases used
-/// numeric multi-part tags; those remain orderable during the one-time archive
-/// migration, but only the greatest key may become authority and it is subjected to
-/// the stricter two-component canonical spelling below.
-fn parse_numeric_tag(tag: &str) -> Result<NumericTag, String> {
-    let version = tag
-        .strip_prefix('v')
-        .ok_or_else(|| format!("update candidate tag {tag:?} is not numeric dotted vN.N"))?;
+/// What one release tag is to this client.
+enum TagKind {
+    /// A `vMAJOR.MINOR.PATCH` release on the current version scheme.
+    Candidate(NumericTag),
+    /// A pre-cut-over `vMAJOR.MINOR` release. The scheme changed to the unified
+    /// `MAJOR.MINOR.0` version (`VERSIONING.md`) and the old line was NOT
+    /// carried forward — those releases are not candidates and are skipped, not
+    /// errors, so the archive can stay published without stalling the channel.
+    Legacy,
+}
+
+/// Parse the ordering key for one exact-name candidate.
+///
+/// Only the canonical three-component `vMAJOR.MINOR.PATCH` spelling is a
+/// candidate. Two-component tags are the retired scheme ([`TagKind::Legacy`]).
+/// Anything else — non-numeric, empty or leading-zero components, a bare `v0` —
+/// is a hard error: garbage in the tag namespace must fail the check closed
+/// rather than silently narrow the candidate set.
+fn parse_numeric_tag(tag: &str) -> Result<TagKind, String> {
+    let malformed = || format!("update candidate tag {tag:?} is not numeric dotted vN.N.N");
+    let version = tag.strip_prefix('v').ok_or_else(malformed)?;
     let components: Vec<&str> = version.split('.').collect();
     if components.len() < 2 {
-        return Err(format!(
-            "update candidate tag {tag:?} is not numeric dotted vN.N"
-        ));
+        return Err(malformed());
     }
-    let components = components
-        .into_iter()
+    let parsed = components
+        .iter()
         .map(|component| {
-            if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(format!(
-                    "update candidate tag {tag:?} is not numeric dotted vN.N"
-                ));
+            // Reject empty and leading-zero spellings so a tag has exactly ONE
+            // canonical form and two tags can never share a numeric order.
+            if component.is_empty()
+                || !component.bytes().all(|byte| byte.is_ascii_digit())
+                || (component.len() > 1 && component.starts_with('0'))
+            {
+                return Err(malformed());
             }
             component.parse::<u64>().map_err(|_| {
                 format!("update candidate tag {tag:?} has an out-of-range numeric component")
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(NumericTag(components))
+    match parsed.len() {
+        2 => Ok(TagKind::Legacy),
+        3 => Ok(TagKind::Candidate(NumericTag(parsed))),
+        _ => Err(malformed()),
+    }
 }
 
+/// The tag contract: a release the client will install is spelled exactly
+/// `vMAJOR.MINOR.PATCH`, matching the workspace version with its DEV component
+/// reset to 0 (`VERSIONING.md`). `cargo ship cut` derives it from
+/// `[workspace.package] version`, so the shipped app, the published source
+/// snapshot, and the tag are one number.
+///
+/// `numeric` has already been proved three-component by [`parse_numeric_tag`];
+/// re-deriving the string here pins the *spelling* too, so `v01.2.3` can never
+/// be admitted alongside `v1.2.3`.
 fn canonical_authority_version(tag: &str, numeric: &NumericTag) -> Result<String, String> {
     match numeric.0.as_slice() {
-        [major, minor] if tag == format!("v{major}.{minor}") => Ok(format!("{major}.{minor}")),
+        [major, minor, patch] if tag == format!("v{major}.{minor}.{patch}") => {
+            Ok(format!("{major}.{minor}.{patch}"))
+        }
         _ => Err(format!(
-            "authoritative update tag {tag:?} is not canonical vMAJOR.MINOR"
+            "authoritative update tag {tag:?} is not canonical vMAJOR.MINOR.PATCH"
         )),
     }
 }
@@ -154,7 +390,12 @@ fn select_authoritative_release(
         let Some(manifest_index) = unique_asset_index(&release, "aterm-appcast.toml")? else {
             continue;
         };
-        let tag = parse_numeric_tag(&release.tag_name)?;
+        // Retired-scheme releases stay published but are never installed. Skipping
+        // (rather than erroring) is what lets the pre-cut-over archive coexist with
+        // the current channel.
+        let TagKind::Candidate(tag) = parse_numeric_tag(&release.tag_name)? else {
+            continue;
+        };
         if !seen_tags.insert(tag.clone()) {
             return Err(format!(
                 "duplicate published update candidates use numeric order {}",
@@ -163,8 +404,8 @@ fn select_authoritative_release(
         }
         let candidate = AuthoritativeRelease {
             tag,
-            // Lower legacy candidates need no canonical version. The selected
-            // numeric maximum is validated after the complete metadata pass.
+            // Losing candidates need no canonical version. The selected numeric
+            // maximum is validated after the complete metadata pass.
             version: String::new(),
             release,
             manifest_index,
@@ -328,11 +569,17 @@ fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
 /// Background check + stage. Returns the staged version string on success, or
 /// `None` when nothing newer is available / the updater is idle. Errors are
 /// transient/operational (network, parse) and are logged by the caller.
-pub fn check_and_stage(
-    current_build: u64,
-    _current_version: &str,
-    source: &Source,
-) -> Result<Option<String>, String> {
+///
+/// The running build's *version* is deliberately not a parameter: it plays no
+/// part in the decision. Selection is by numeric release tag
+/// ([`canonical_authority_version`]) and the downgrade gate is `current_build`
+/// against the manifest's `build_number`. Reintroducing a version comparison
+/// here would be wrong even under the single `MAJOR.MINOR.0` scheme: the patch
+/// slot is always 0 and a dev build carries the commit sha in SemVer build
+/// metadata (`0.5.0+g<sha>`), so a dev build and the release it should install
+/// compare EQUAL on the numeric triple — a version test could not tell them
+/// apart, and build metadata is explicitly not ordered (`VERSIONING.md`).
+pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<String>, String> {
     // Only stage for a real installed bundle (a dev build has nothing to swap).
     if bundle::resolve().is_none() {
         return Ok(None);
@@ -340,30 +587,32 @@ pub fn check_and_stage(
     let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
     // The Application Support dir is the Updates dir's parent.
     let support = staging.root.parent().ok_or("no support dir")?.to_path_buf();
-    let Some(tok) = token::resolve(&support) else {
-        // No token provisioned → stay idle (a private repo can't be read). Log it
-        // ONCE per process so the periodic loop doesn't spam, and surface it in the
-        // status file so an operator can see WHY the machine isn't updating.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static NO_TOKEN_LOGGED: AtomicBool = AtomicBool::new(false);
-        if !NO_TOKEN_LOGGED.swap(true, Ordering::Relaxed) {
-            crate::log("idle: no update token provisioned (see docs/RELEASING.md)");
-        }
-        crate::status::record(&staging, current_build, "idle: no update token provisioned");
-        return Ok(None);
-    };
+    // ONE walk of the token chain: the token, or the diagnosis explaining why there
+    // isn't one. Resolving and then separately diagnosing would re-spawn `security`
+    // and `gh` on every check of an unprovisioned machine.
+    //
+    // RESOLVE, DO NOT GATE. The absence of a token is not evidence that this machine
+    // cannot update — the channel is public, and only a network response can say. The
+    // historical unconditional early return here ("idle: no update token provisioned")
+    // is exactly what made every unprovisioned Mac sit forever in front of a repo it
+    // could have read anonymously.
+    let (mut tok, diagnosis) = plan_credential(token::resolve_or_diagnose(&support));
+    let had_token = tok.is_some();
 
     // Persisted monotonic recency floor (operator yank + rollback guard, F5/F6).
     let floor = crate::manifest::Floor::read(&staging.floor());
 
     // GitHub documents no ordering contract for List Releases. Enumerate the complete
     // bounded metadata set first, then choose the greatest canonical numeric
-    // vMAJOR.MINOR tag carrying the exact appcast name. Only after that decision do we
+    // vMAJOR.MINOR.PATCH tag carrying the exact appcast name (retired two-component
+    // tags are skipped, never ordered). Only after that decision do we
     // fetch one manifest (+ one signature under Tier SIG), so row order cannot select
     // an older release and broken historical assets add no download latency.
     const PER_PAGE: u32 = 100;
     const MAX_PAGES: u32 = 10;
     let mut release_catalog = Vec::new();
+    // At most one anonymous retry per check, and only after a token was REJECTED.
+    let mut already_retried = false;
     for page in 1..=MAX_PAGES {
         let url = format!(
             "https://api.github.com/repos/{}/{}/releases?per_page={PER_PAGE}&page={page}",
@@ -373,11 +622,71 @@ pub fn check_and_stage(
         // (The transient/persistent distinction the ledger needs lives in the CLASS
         // split — an asset that provably exists but can't be fetched is `pipeline`,
         // recorded below — so a broken download build can't hide behind "transient".)
-        let body = match aterm_update_core::api_get(&url, &tok) {
-            Ok(b) => b,
-            Err(e) => {
-                crate::health::Health::record_failure(&staging.health(), "network", &e);
-                return Err(e);
+        // The two states that are NOT failures — "cannot read the channel at all" and
+        // "rate limited" — leave the ledger alone and say so instead.
+        //
+        // The inner loop runs at most twice: `already_retried` latches, so
+        // `RetryAnonymous` can be taken only once for the whole check.
+        let body = loop {
+            let error = match aterm_update_core::api_get_classified(&url, tok.as_deref()) {
+                Ok(body) => {
+                    // The FIRST successful list response establishes the lane and
+                    // clears the stranded latch — reading the channel is the property
+                    // that matters, not holding a credential.
+                    note_readable(tok.is_some(), source);
+                    // A token that our own chain refused (a chmod 644 file, a mangled
+                    // paste) still costs this machine the 5000/hour budget even though
+                    // the public channel works. Say so, throttled, once in a while.
+                    if let Some(diagnosis) = diagnosis.as_ref() {
+                        crate::no_token::note_unusable_token(diagnosis);
+                    }
+                    break body;
+                }
+                Err(error) => error,
+            };
+            let decision =
+                classify_list_error(&error, had_token, already_retried, source, diagnosis.as_ref());
+            match decision {
+                ListDecision::RetryAnonymous => {
+                    already_retried = true;
+                    tok = None;
+                    // Throttled: this is a STANDING condition (a stale token stays
+                    // stale), re-observed on every check, so an unthrottled warning
+                    // would be ~48 identical lines an hour.
+                    crate::no_token::note_rejected_credential(&format!(
+                        "the configured update token was rejected ({error}); continuing \
+                         unauthenticated against github.com/{}/{} — updates still work \
+                         while the channel is public, but rotate the token with: {}",
+                        source.owner,
+                        source.repo,
+                        token::PROVISION_COMMAND
+                    ));
+                }
+                ListDecision::Blocked(explanation) => {
+                    crate::no_token::announce_unreadable(&staging, current_build, &explanation);
+                    return Ok(None);
+                }
+                ListDecision::RateLimited(message) => {
+                    // Deliberately no `record_failure`: a rate limit is not a broken
+                    // pipeline, and letting it accrue a streak would fire the "update
+                    // pipeline is likely broken" notification at a healthy machine
+                    // that simply checked too often. The latch lengthens the wait.
+                    RATE_LIMITED.store(true, Ordering::Relaxed);
+                    crate::status::record(
+                        &staging,
+                        current_build,
+                        &format!("update check deferred: {message}"),
+                    );
+                    return Ok(None);
+                }
+                ListDecision::Failed(message) => {
+                    crate::health::Health::record_failure(
+                        &staging.health(),
+                        "network",
+                        &message,
+                    );
+                    return Err(message);
+                }
             }
         };
         // Unparseable list JSON is the same `network` class (the LIST layer failed —
@@ -417,8 +726,11 @@ pub fn check_and_stage(
             return Ok(None);
         }
     };
-    let mut download =
-        |url: &str, max_bytes: u64| aterm_update_core::download_bytes(url, &tok, max_bytes);
+    // The asset fetches ride the SAME lane the list request settled on: if the token
+    // was rejected above, `tok` is already `None` and these go anonymous too.
+    let mut download = |url: &str, max_bytes: u64| {
+        aterm_update_core::download_bytes(url, tok.as_deref(), max_bytes)
+    };
     let fetched = fetch_authoritative_release(authoritative, PINNED_UPDATE_PUBKEY, &mut download);
     let appcast_fetch_error = fetched.appcast_fetch_error;
     let manifest_rejected = fetched.manifest_rejected;
@@ -472,7 +784,7 @@ pub fn check_and_stage(
             // The check itself ran fine (list fetched, nothing carries a manifest):
             // clear any stale failure streak so health reflects THIS check.
             crate::health::Health::record_success(&staging.health());
-            "no release carries an update manifest".to_string()
+            format!("no release carries an update manifest{}", lane_note())
         };
         crate::status::record(&staging, current_build, &msg);
         return Ok(None);
@@ -490,8 +802,9 @@ pub fn check_and_stage(
             &staging,
             current_build,
             &format!(
-                "up to date (latest release build {})",
-                manifest.build_number
+                "up to date (latest release build {}){}",
+                manifest.build_number,
+                lane_note()
             ),
         );
         return Ok(None);
@@ -566,7 +879,9 @@ pub fn check_and_stage(
     let _ = std::fs::remove_file(&part);
     // A failed DMG download is a `pipeline`-class ledger entry: the asset provably
     // exists (the release names it) but could not be fetched.
-    if let Err(e) = aterm_update_core::download_to(&dmg_asset.url, &tok, &part, 536_870_912) {
+    if let Err(e) =
+        aterm_update_core::download_to(&dmg_asset.url, tok.as_deref(), &part, 536_870_912)
+    {
         let _ = std::fs::remove_file(&part);
         crate::health::Health::record_failure(
             &staging.health(),
@@ -652,6 +967,304 @@ mod tests {
 
     const SIGNING_SEED: [u8; 32] = [19u8; 32];
 
+    fn test_source() -> Source {
+        Source {
+            owner: "alabsystems".into(),
+            repo: "aterm".into(),
+        }
+    }
+
+    fn unprovisioned() -> token::Diagnosis {
+        use aterm_update_core::token::{ProbeOutcome, SourceProbe};
+        token::Diagnosis {
+            resolved: None,
+            probes: vec![SourceProbe {
+                source: "$ATERM_UPDATE_TOKEN",
+                outcome: ProbeOutcome::Absent,
+            }],
+        }
+    }
+
+    fn not_found() -> HttpError {
+        HttpError::NotFound {
+            url: "https://api.github.com/repos/alabsystems/aterm/releases".into(),
+        }
+    }
+
+    /// THE regression this whole change exists to close. A machine with no token,
+    /// against a channel it cannot read, used to record an eight-word "idle" and
+    /// return — indistinguishable from "no updates available", forever. It must now
+    /// produce a Blocked decision whose text names the consequence, all three
+    /// indistinguishable causes, and the exact remedy for each.
+    #[test]
+    fn an_unreadable_channel_without_a_token_is_loud_and_actionable_not_idle() {
+        let source = test_source();
+        for error in [
+            not_found(),
+            HttpError::Unauthorized { code: 401 },
+            HttpError::Unauthorized { code: 403 },
+        ] {
+            let ListDecision::Blocked(text) =
+                classify_list_error(&error, false, false, &source, Some(&unprovisioned()))
+            else {
+                panic!("{error:?} with no token must block, not idle or fail");
+            };
+            // The consequence, in the words the status/notification surfaces assert.
+            assert!(text.contains("NEVER receive an update"), "{text}");
+            // The channel, so an operator can see WHICH repo was unreadable.
+            assert!(text.contains("github.com/alabsystems/aterm"), "{text}");
+            // All three causes: GitHub answers identically for every one of them, so
+            // guessing (and naming only "private repo") sends operators down the
+            // wrong path when the real fault is a typo'd owner/repo.
+            assert!(text.contains("PRIVATE"), "cause 1 missing: {text}");
+            assert!(text.contains("does not exist"), "cause 2 missing: {text}");
+            assert!(text.contains("ATERM_UPDATE_OWNER"), "cause 3 missing: {text}");
+            // The copy-pasteable fix for cause 1.
+            assert!(text.contains(token::PROVISION_COMMAND), "{text}");
+        }
+
+        // A token the CHAIN refused (chmod 644) is the actionable sub-case and must
+        // be named rather than folded into "not configured".
+        use aterm_update_core::token::{ProbeOutcome, SourceProbe};
+        let refused = token::Diagnosis {
+            resolved: None,
+            probes: vec![SourceProbe {
+                source: "0600 update-token file",
+                outcome: ProbeOutcome::Rejected("chmod 600 it"),
+            }],
+        };
+        let ListDecision::Blocked(text) =
+            classify_list_error(&not_found(), false, false, &source, Some(&refused))
+        else {
+            panic!("must block");
+        };
+        assert!(
+            text.contains("0600 update-token file (chmod 600 it)"),
+            "the refused source must be named: {text}"
+        );
+    }
+
+    /// THE regression this whole change exists to prevent: a missing token must not
+    /// stop a check before the network.
+    ///
+    /// Every unprovisioned Mac used to sit idle forever in front of a channel it
+    /// could read anonymously, because the token chain's `Err` arm returned
+    /// `Ok(None)` before any request. `plan_credential` is deliberately total — it
+    /// has no value that means "stop" — so the only way to reintroduce the gate is to
+    /// change its type, which this test pins.
+    ///
+    /// NOTE the residual gap this test does NOT close: a hand-written `return` added
+    /// directly inside `check_and_stage` still slips past every automated test here,
+    /// because `check_and_stage` resolves its own staging dir and network and cannot
+    /// be driven from a unit test. Closing that needs the fetch/staging seams to be
+    /// injectable — see the report accompanying this change.
+    #[test]
+    fn a_missing_token_never_stops_a_check_before_the_network() {
+        // The unprovisioned machine: the chain found nothing.
+        let diagnosis = unprovisioned();
+        let (tok, carried) = plan_credential(Err(diagnosis));
+        assert!(tok.is_none(), "no token was resolvable");
+        assert!(
+            carried.is_some(),
+            "the diagnosis must survive so the channel-unreadable explanation can name \
+             WHY there is no token, instead of the misleading 'not configured'"
+        );
+        // …and the check proceeds: the ONLY thing that may now declare this machine
+        // unable to update is a network response.
+        assert_eq!(
+            classify_list_error(
+                &HttpError::RateLimited {
+                    code: 429,
+                    url: "u".into(),
+                    authenticated: false
+                },
+                false,
+                false,
+                &test_source(),
+                carried.as_ref(),
+            ),
+            ListDecision::RateLimited(
+                "GitHub rate limit hit (HTTP 429) for u; the unauthenticated API allows ~60 \
+                 requests/hour per IP address — backing off, will retry on the next check"
+                    .to_string()
+            ),
+            "an anonymous check must reach — and be judged by — the network"
+        );
+
+        // A resolved token still flows through unchanged, with no diagnosis.
+        let (tok, carried) = plan_credential(Ok(("ghp_x".to_string(), "$ATERM_UPDATE_TOKEN")));
+        assert_eq!(tok.as_deref(), Some("ghp_x"));
+        assert!(carried.is_none());
+    }
+
+    /// A rate limit is not a broken pipeline and not an auth failure. It must reach
+    /// the caller as its own decision so the check backs off WITHOUT recording a
+    /// health failure — a streak there fires the "your update pipeline is likely
+    /// broken" notification at a machine that is merely checking too often.
+    #[test]
+    fn a_rate_limit_backs_off_and_is_never_an_auth_or_pipeline_failure() {
+        let source = test_source();
+        let url = "https://api.github.com/repos/alabsystems/aterm/releases".to_string();
+        for (had_token, authenticated) in [(true, true), (false, false)] {
+            let error = HttpError::RateLimited {
+                code: 429,
+                url: url.clone(),
+                authenticated,
+            };
+            let decision =
+                classify_list_error(&error, had_token, false, &source, Some(&unprovisioned()));
+            let ListDecision::RateLimited(text) = decision else {
+                panic!("a rate limit must classify as RateLimited, got {decision:?}");
+            };
+            assert!(
+                !text.contains("rotate") && !text.contains("NEVER receive an update"),
+                "a rate limit must not read as a revoked token or a stranded machine: {text}"
+            );
+            assert!(text.contains("backing off"), "{text}");
+        }
+        // The anonymous lane's advice has to name the budget that was actually hit —
+        // ~60/hour per IP, shared by every machine behind one NAT.
+        let anon = HttpError::RateLimited {
+            code: 403,
+            url,
+            authenticated: false,
+        };
+        let ListDecision::RateLimited(text) =
+            classify_list_error(&anon, false, false, &source, None)
+        else {
+            panic!("must be RateLimited");
+        };
+        assert!(text.contains("~60 requests/hour per IP"), "{text}");
+    }
+
+    /// A resolved token that GitHub rejects gets exactly ONE anonymous retry: a
+    /// stale ambient `gh auth token` must not brick a machine whose channel is
+    /// public. The retry is bounded — after it, the failure is reported as the auth
+    /// problem it is, and is NEVER mistaken for an unprovisioned machine (which would
+    /// tell the operator to provision a token they already have).
+    #[test]
+    fn a_rejected_token_is_retried_anonymously_exactly_once() {
+        let source = test_source();
+        for code in [401u16, 403] {
+            assert_eq!(
+                classify_list_error(
+                    &HttpError::Unauthorized { code },
+                    true,
+                    false,
+                    &source,
+                    None
+                ),
+                ListDecision::RetryAnonymous,
+                "HTTP {code} with a token must be retried without it"
+            );
+            // …and after the retry, it is a plain failure with today's wording.
+            let ListDecision::Failed(text) = classify_list_error(
+                &HttpError::Unauthorized { code },
+                true,
+                true,
+                &source,
+                None,
+            ) else {
+                panic!("the retry must not loop");
+            };
+            assert!(text.contains("rotate it"), "{text}");
+        }
+        // A 404 WITH a token is a real, actionable auth problem (the token cannot see
+        // the repo) — never a retry, and never the no-token "blocked" wording.
+        let ListDecision::Failed(text) =
+            classify_list_error(&not_found(), true, false, &source, None)
+        else {
+            panic!("404 with a token is a failure, not a retry or a strand");
+        };
+        assert!(text.contains("404"), "{text}");
+    }
+
+    /// Nothing about the ladder may turn a machine that HAS a working token into a
+    /// blocked one: `Blocked` is reachable only when the chain produced no token at
+    /// all, and transport/other statuses stay on today's `network`-class failure path
+    /// regardless of lane.
+    #[test]
+    fn a_machine_with_a_token_is_never_classified_as_unprovisioned() {
+        let source = test_source();
+        let every_error = [
+            not_found(),
+            HttpError::Unauthorized { code: 401 },
+            HttpError::Unauthorized { code: 403 },
+            HttpError::Status {
+                code: 500,
+                url: "https://api.github.com/x".into(),
+            },
+            HttpError::Transport("curl GET x failed (exit 6): dns".into()),
+            HttpError::Malformed("GitHub API returned HTTP <html> for x".into()),
+        ];
+        for error in &every_error {
+            for already_retried in [false, true] {
+                let decision =
+                    classify_list_error(error, true, already_retried, &source, None);
+                assert!(
+                    !matches!(decision, ListDecision::Blocked(_)),
+                    "{error:?} (retried={already_retried}) must not read as an \
+                     unprovisioned machine: {decision:?}"
+                );
+            }
+        }
+        // Transport and unexpected statuses are unchanged on BOTH lanes: they are
+        // genuine transient faults, so they keep the `network`-class Err path.
+        for had_token in [true, false] {
+            for error in [
+                HttpError::Transport("curl GET x failed (exit 6): dns".into()),
+                HttpError::Status {
+                    code: 500,
+                    url: "https://api.github.com/x".into(),
+                },
+            ] {
+                assert!(
+                    matches!(
+                        classify_list_error(&error, had_token, false, &source, None),
+                        ListDecision::Failed(_)
+                    ),
+                    "{error:?} must stay a failure (had_token={had_token})"
+                );
+            }
+        }
+    }
+
+    /// The lane latch is what the background loop reads to choose a cadence its
+    /// rate-limit budget can afford, and what clears the stranded state. A successful
+    /// anonymous read must clear the latch just like an authenticated one: on a
+    /// public channel, "we can read it" is the whole property.
+    #[test]
+    fn a_successful_anonymous_read_establishes_the_lane_and_clears_the_strand() {
+        let _serialized = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let source = test_source();
+        RATE_LIMITED.store(true, Ordering::Relaxed);
+        note_readable(false, &source);
+        assert_eq!(lane(), Lane::Anonymous);
+        assert!(
+            !rate_limited(),
+            "a completed read clears the rate-limit backoff latch"
+        );
+        assert!(!crate::no_token::is_stranded());
+        // …and the healthy status says WHICH lane, so `aterm-ctl update status` can
+        // answer "why is this Mac slow to update?" without anyone reading the log.
+        let note = lane_note();
+        assert!(note.contains("anonymously") && note.contains("15-minute"), "{note}");
+        assert!(
+            note.contains("no update token provisioned"),
+            "the healthy-but-slow status must name the remediable cause: {note}"
+        );
+
+        note_readable(true, &source);
+        assert_eq!(lane(), Lane::Authenticated);
+        assert_eq!(
+            lane_note(),
+            "",
+            "a provisioned machine's existing status wording must not change"
+        );
+    }
+
     fn test_staging(label: &str) -> Staging {
         static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -674,11 +1287,11 @@ mod tests {
     fn candidate_manifest() -> Manifest {
         Manifest {
             schema: 1,
-            version: "0.54.1".into(),
+            version: "0.54.0".into(),
             build_number: 54,
             commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
             sha256: "ab".repeat(32),
-            dmg: "aterm-0.54.1.dmg".into(),
+            dmg: "aterm-0.54.0.dmg".into(),
             min_build: None,
             changelog: None,
         }
@@ -821,9 +1434,9 @@ mod tests {
             [2, 1, 0],
         ];
         let base = [
-            release_with_appcast("v0.8", "older-8-503"),
-            release_with_appcast("v0.9", "older-9-503"),
-            release_with_appcast("v0.10", "authoritative-10"),
+            release_with_appcast("v0.8.0", "older-8-503"),
+            release_with_appcast("v0.9.0", "older-9-503"),
+            release_with_appcast("v0.10.0", "authoritative-10"),
         ];
 
         // Every concrete permutation must project onto the same numeric-max
@@ -833,7 +1446,7 @@ mod tests {
             let selected = select_authoritative_release(releases, "")
                 .expect("canonical catalog")
                 .expect("one authority");
-            assert_eq!(selected.tag, NumericTag(vec![0, 10]));
+            assert_eq!(selected.tag, NumericTag(vec![0, 10, 0]));
             let before = catalog_model_state(&model, order, false);
             let after = project_authority_selection(before.clone(), &selected);
             assert!(
@@ -853,14 +1466,16 @@ mod tests {
             }
         }
 
-        // The real migration catalog may include lower numeric multi-part tags.
-        // They project to ObserveLowerLegacy and do not change the selected max.
+        // The real migration catalog may include strictly-lower current-scheme
+        // tags carrying a large PATCH component. They project to
+        // ObserveLowerLegacy and do not change the selected max: ordering is by
+        // numeric vector, so `[0, 5, 14]` stays below `[0, 10, 0]`.
         let selected = select_authoritative_release(
             vec![
                 release_with_appcast("v0.5.14", "legacy-must-not-fetch"),
-                release_with_appcast("v0.10", "authoritative-10"),
-                release_with_appcast("v0.8", "older-8-503"),
-                release_with_appcast("v0.9", "older-9-503"),
+                release_with_appcast("v0.10.0", "authoritative-10"),
+                release_with_appcast("v0.8.0", "older-8-503"),
+                release_with_appcast("v0.9.0", "older-9-503"),
             ],
             "",
         )
@@ -877,13 +1492,16 @@ mod tests {
             "updater lower legacy migration arbitration",
         );
 
-        // Conversely, the real selector refuses a noncanonical numeric maximum.
+        // Conversely, the real selector refuses a noncanonical numeric maximum:
+        // `v0.10.0.1` orders above the canonical `v0.10.0` but is not a
+        // `vMAJOR.MINOR.PATCH` identity, so the whole check fails closed rather
+        // than quietly electing the canonical runner-up.
         let real_error = select_authoritative_release(
             vec![
-                release_with_appcast("v0.10", "canonical-lower"),
-                release_with_appcast("v0.10.1", "noncanonical-maximum"),
-                release_with_appcast("v0.8", "older-8-503"),
-                release_with_appcast("v0.9", "older-9-503"),
+                release_with_appcast("v0.10.0", "canonical-lower"),
+                release_with_appcast("v0.10.0.1", "noncanonical-maximum"),
+                release_with_appcast("v0.8.0", "older-8-503"),
+                release_with_appcast("v0.9.0", "older-9-503"),
             ],
             "",
         );
@@ -914,7 +1532,7 @@ mod tests {
         let mut download = |url: &str, _max_bytes: u64| {
             urls.push(url.to_string());
             match url {
-                "authoritative-10" => Ok(manifest_bytes("0.10", 10, 0)),
+                "authoritative-10" => Ok(manifest_bytes("0.10.0", 10, 0)),
                 "older-8-503" | "older-9-503" => {
                     Err("503 historical release asset unavailable".into())
                 }
@@ -944,12 +1562,12 @@ mod tests {
         // signature fetch, and still does not invoke either older release.
         let keypair = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
         let public_key = B64.encode(keypair.public_key().as_ref());
-        let manifest = manifest_bytes("0.10", 10, 0);
+        let manifest = manifest_bytes("0.10.0", 10, 0);
         let signature = keypair.sign(&manifest).as_ref().to_vec();
         let signed_base = [
-            release_with_signed_appcast("v0.8", "signed-old-8", "signed-old-8-sig"),
-            release_with_signed_appcast("v0.9", "signed-old-9", "signed-old-9-sig"),
-            release_with_signed_appcast("v0.10", "signed-high", "signed-high-sig"),
+            release_with_signed_appcast("v0.8.0", "signed-old-8", "signed-old-8-sig"),
+            release_with_signed_appcast("v0.9.0", "signed-old-9", "signed-old-9-sig"),
+            release_with_signed_appcast("v0.10.0", "signed-high", "signed-high-sig"),
         ];
         let selected = select_authoritative_release(signed_base.to_vec(), &public_key)
             .unwrap()
@@ -1079,7 +1697,7 @@ mod tests {
                 "FetchAuthoritativeUnreadable",
             ),
             (
-                Ok(manifest_bytes("0.9", 9, 0)),
+                Ok(manifest_bytes("0.9.0", 9, 0)),
                 "RejectAuthoritativeManifest",
             ),
         ] {
@@ -1124,7 +1742,7 @@ mod tests {
         // Malformed metadata is refused by the real selector before the transport
         // closure exists, and projects to RefuseMetadata with zero fetches.
         let real_error = select_authoritative_release(
-            vec![release_with_appcast("v0.010", "must-not-fetch")],
+            vec![release_with_appcast("v0.010.0", "must-not-fetch")],
             "",
         );
         assert!(real_error.is_err());
@@ -1145,14 +1763,14 @@ mod tests {
         // Missing, duplicate (in either REST order), and path-like/noncanonical
         // names are manifest-class rejections after exactly one authoritative
         // manifest fetch, with no older fallback and no DMG transport.
-        let mut missing_dmg = release_with_appcast("v0.10", "authoritative-10");
+        let mut missing_dmg = release_with_appcast("v0.10.0", "authoritative-10");
         missing_dmg
             .assets
-            .retain(|asset| asset.name != "aterm-0.10.dmg");
+            .retain(|asset| asset.name != "aterm-0.10.0.dmg");
 
-        let mut duplicate_dmg = release_with_appcast("v0.10", "authoritative-10");
+        let mut duplicate_dmg = release_with_appcast("v0.10.0", "authoritative-10");
         duplicate_dmg.assets.push(Asset {
-            name: "aterm-0.10.dmg".into(),
+            name: "aterm-0.10.0.dmg".into(),
             url: "duplicate-dmg".into(),
             size: 0,
         });
@@ -1163,22 +1781,22 @@ mod tests {
             (
                 "missing authoritative DMG",
                 missing_dmg,
-                manifest_bytes("0.10", 10, 0),
+                manifest_bytes("0.10.0", 10, 0),
             ),
             (
                 "duplicate authoritative DMG (forward order)",
                 duplicate_dmg,
-                manifest_bytes("0.10", 10, 0),
+                manifest_bytes("0.10.0", 10, 0),
             ),
             (
                 "duplicate authoritative DMG (reverse order)",
                 duplicate_dmg_reversed,
-                manifest_bytes("0.10", 10, 0),
+                manifest_bytes("0.10.0", 10, 0),
             ),
             (
                 "path-like authoritative DMG",
-                release_with_appcast("v0.10", "authoritative-10"),
-                manifest_bytes_with_dmg("0.10", 10, 0, "../aterm-0.10.dmg"),
+                release_with_appcast("v0.10.0", "authoritative-10"),
+                manifest_bytes_with_dmg("0.10.0", 10, 0, "../aterm-0.10.0.dmg"),
             ),
         ] {
             let selected = select_authoritative_release(vec![release], "")
@@ -1214,8 +1832,8 @@ mod tests {
             );
         }
 
-        // NEGATIVE CONTROL: corrupting the real v0.10 selection into row-order
-        // v0.9 cannot validate as CompleteMetadataArbitration.
+        // NEGATIVE CONTROL: corrupting the real v0.10.0 selection into row-order
+        // v0.9.0 cannot validate as CompleteMetadataArbitration.
         let selected = select_authoritative_release(base.to_vec(), "")
             .unwrap()
             .unwrap();
@@ -1230,16 +1848,19 @@ mod tests {
             Some("CompleteMetadataArbitration"),
             "updater row-order selection negative control",
         );
-        assert!(!admitted, "healthy model admitted v0.9 over v0.10: {why}");
+        assert!(
+            !admitted,
+            "healthy model admitted v0.9.0 over v0.10.0: {why}"
+        );
         assert!(!model.check_invariant("SelectedAuthorityIsNumericMaximum", &corrupted));
     }
 
     #[test]
     fn canonical_numeric_selection_is_permutation_invariant_and_skips_older_503() {
         let base = [
-            release_with_appcast("v0.9", "old-9-503"),
-            release_with_appcast("v0.10", "authoritative-10"),
-            release_with_appcast("v0.8", "old-8-503"),
+            release_with_appcast("v0.9.0", "old-9-503"),
+            release_with_appcast("v0.10.0", "authoritative-10"),
+            release_with_appcast("v0.8.0", "old-8-503"),
         ];
         for order in [
             [0usize, 1usize, 2usize],
@@ -1253,12 +1874,12 @@ mod tests {
             let authoritative = select_authoritative_release(releases, "")
                 .unwrap()
                 .expect("one authoritative release");
-            assert_eq!(authoritative.release.tag_name, "v0.10");
+            assert_eq!(authoritative.release.tag_name, "v0.10.0");
             let mut urls = Vec::new();
             let mut download = |url: &str, _max_bytes: u64| {
                 urls.push(url.to_string());
                 match url {
-                    "authoritative-10" => Ok(manifest_bytes("0.10", 10, 0)),
+                    "authoritative-10" => Ok(manifest_bytes("0.10.0", 10, 0)),
                     "old-9-503" | "old-8-503" => {
                         Err("503 historical release asset unavailable".into())
                     }
@@ -1266,7 +1887,7 @@ mod tests {
                 }
             };
             let fetched = fetch_authoritative_release(Some(authoritative), "", &mut download);
-            assert_eq!(fetched.selected.unwrap().0.version, "0.10");
+            assert_eq!(fetched.selected.unwrap().0.version, "0.10.0");
             assert_eq!(urls, ["authoritative-10"]);
             assert_eq!(fetched.manifest_fetch_attempts, 1);
             assert!(!fetched.appcast_fetch_error);
@@ -1277,11 +1898,11 @@ mod tests {
     fn signed_authority_fetches_one_manifest_and_one_signature_only() {
         let keypair = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
         let public_key = B64.encode(keypair.public_key().as_ref());
-        let manifest = manifest_bytes("0.10", 10, 0);
+        let manifest = manifest_bytes("0.10.0", 10, 0);
         let signature = keypair.sign(&manifest).as_ref().to_vec();
         let releases = vec![
-            release_with_signed_appcast("v0.9", "older-503", "older-signature"),
-            release_with_signed_appcast("v0.10", "highest-manifest", "highest-signature"),
+            release_with_signed_appcast("v0.9.0", "older-503", "older-signature"),
+            release_with_signed_appcast("v0.10.0", "highest-manifest", "highest-signature"),
         ];
         let authoritative = select_authoritative_release(releases, &public_key)
             .unwrap()
@@ -1298,14 +1919,17 @@ mod tests {
             }
         };
         let fetched = fetch_authoritative_release(Some(authoritative), &public_key, &mut download);
-        assert_eq!(fetched.selected.unwrap().0.version, "0.10");
+        assert_eq!(fetched.selected.unwrap().0.version, "0.10.0");
         assert_eq!(urls, ["highest-manifest", "highest-signature"]);
         assert_eq!(fetched.manifest_fetch_attempts, 1);
         assert!(!fetched.appcast_fetch_error);
     }
 
+    /// The archive carries current-scheme tags whose PATCH component is a huge
+    /// historical timestamp. They are perfectly orderable candidates — they just
+    /// order strictly below a higher MINOR, and none of them may be fetched.
     #[test]
-    fn lower_numeric_legacy_tags_are_tolerated_but_cannot_be_authority() {
+    fn lower_numeric_candidates_are_tolerated_but_cannot_be_authority() {
         let historical = [
             "v0.21.2607041853",
             "v0.20.2607041751",
@@ -1321,7 +1945,7 @@ mod tests {
             "v0.5.10",
             "v0.5.9",
         ];
-        let catalog = std::iter::once(release_with_appcast("v0.54", "authoritative-54"))
+        let catalog = std::iter::once(release_with_appcast("v0.54.0", "authoritative-54"))
             .chain(
                 historical
                     .iter()
@@ -1334,41 +1958,44 @@ mod tests {
             let selected = select_authoritative_release(releases, "")
                 .unwrap()
                 .expect("canonical maximum exists");
-            assert_eq!(selected.release.tag_name, "v0.54");
+            assert_eq!(selected.release.tag_name, "v0.54.0");
             let mut urls = Vec::new();
             let mut download = |url: &str, _max_bytes: u64| {
                 urls.push(url.to_string());
                 if url == "authoritative-54" {
-                    Ok(manifest_bytes("0.54", 54, 0))
+                    Ok(manifest_bytes("0.54.0", 54, 0))
                 } else {
                     Err("historical asset must not be fetched".into())
                 }
             };
             let fetched = fetch_authoritative_release(Some(selected), "", &mut download);
-            assert_eq!(fetched.selected.unwrap().0.version, "0.54");
+            assert_eq!(fetched.selected.unwrap().0.version, "0.54.0");
             assert_eq!(urls, ["authoritative-54"]);
             assert_eq!(fetched.manifest_fetch_attempts, 1);
         }
 
-        for same_or_newer_legacy in ["v0.54.1", "v0.55.1"] {
+        // A same-or-newer tag with too many components orders ABOVE the canonical
+        // maximum but has no `vMAJOR.MINOR.PATCH` identity. It must fail the whole
+        // check closed rather than let the runner-up be elected behind it.
+        for same_or_newer_noncanonical in ["v0.54.0.1", "v0.55.0.0"] {
             let err = select_authoritative_release(
                 vec![
-                    release_with_appcast("v0.54", "canonical"),
-                    release_with_appcast(same_or_newer_legacy, "must-not-fetch"),
+                    release_with_appcast("v0.54.0", "canonical"),
+                    release_with_appcast(same_or_newer_noncanonical, "must-not-fetch"),
                 ],
                 "",
             )
             .err()
             .expect("a noncanonical numeric maximum must fail closed");
             assert!(
-                err.contains(same_or_newer_legacy) && err.contains("canonical"),
+                err.contains(same_or_newer_noncanonical) && err.contains("numeric dotted"),
                 "{err}"
             );
         }
 
         let err = select_authoritative_release(
             vec![
-                release_with_appcast("v0.54", "canonical"),
+                release_with_appcast("v0.54.0", "canonical"),
                 release_with_appcast("v0.legacy.1", "must-not-fetch"),
             ],
             "",
@@ -1382,21 +2009,21 @@ mod tests {
     fn unsigned_or_duplicate_signature_on_highest_never_falls_back() {
         let keypair = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
         let public_key = B64.encode(keypair.public_key().as_ref());
-        let lower = release_with_signed_appcast("v0.9", "lower-manifest", "lower-signature");
+        let lower = release_with_signed_appcast("v0.9.0", "lower-manifest", "lower-signature");
 
         let err = select_authoritative_release(
             vec![
                 lower.clone(),
-                release_with_appcast("v0.10", "unsigned-highest"),
+                release_with_appcast("v0.10.0", "unsigned-highest"),
             ],
             &public_key,
         )
         .err()
         .expect("unsigned highest must defer");
-        assert!(err.contains("v0.10") && err.contains("unsigned"), "{err}");
+        assert!(err.contains("v0.10.0") && err.contains("unsigned"), "{err}");
 
         let mut duplicate_sig =
-            release_with_signed_appcast("v0.10", "highest-manifest", "highest-signature-a");
+            release_with_signed_appcast("v0.10.0", "highest-manifest", "highest-signature-a");
         duplicate_sig.assets.push(Asset {
             name: "aterm-appcast.toml.sig".into(),
             url: "highest-signature-b".into(),
@@ -1411,9 +2038,227 @@ mod tests {
         );
     }
 
+    /// The cut-over contract (`VERSIONING.md`): there is now exactly ONE version
+    /// — the workspace `MAJOR.MINOR.0` — and a release is that number with DEV
+    /// reset to 0, tagged `vMAJOR.MINOR.PATCH`. The pre-cut-over `vMAJOR.MINOR`
+    /// app-channel releases were NOT carried forward. They stay published in the
+    /// archive, so the selector must treat them as inert: never an error (that
+    /// would stall the channel behind history nobody can delete) and never a
+    /// candidate (that would strand the fleet on a retired release, because the
+    /// retired numbers are far LARGER than the ones the new scheme starts from).
+    #[test]
+    fn legacy_two_component_tags_are_never_installed() {
+        // The whole point of the cut-over: v0.61 is numerically enormous next to
+        // the first current-scheme release v0.5.0, and still loses — it is not
+        // ordered against the candidate at all, it is skipped.
+        let selected = select_authoritative_release(
+            vec![
+                release_with_appcast("v0.61", "retired-app-channel-head"),
+                release_with_appcast("v0.5.0", "current-head"),
+            ],
+            "",
+        )
+        .expect("a retired two-component release is skipped, not an error")
+        .expect("the current-scheme candidate is elected");
+        assert_eq!(
+            selected.release.tag_name, "v0.5.0",
+            "a retired two-component tag must never win selection"
+        );
+        assert_eq!(selected.version, "0.5.0");
+
+        // …and it is not merely unselected: the retired release's assets are
+        // never fetched, so no legacy manifest can reach the install path.
+        let mut urls = Vec::new();
+        let mut download = |url: &str, _max_bytes: u64| {
+            urls.push(url.to_string());
+            match url {
+                "current-head" => Ok(manifest_bytes("0.5.0", 2, 0)),
+                "retired-app-channel-head" => panic!("a retired release must never be fetched"),
+                unexpected => panic!("unexpected asset fetch: {unexpected}"),
+            }
+        };
+        let fetched = fetch_authoritative_release(Some(selected), "", &mut download);
+        assert_eq!(fetched.selected.unwrap().0.version, "0.5.0");
+        assert_eq!(urls, ["current-head"]);
+        assert_eq!(fetched.manifest_fetch_attempts, 1);
+
+        // Every ordering position is the same decision — the retired tag is
+        // invisible to arbitration, not a runner-up.
+        for legacy in ["v0.25", "v0.54", "v0.61", "v9.99"] {
+            let selected = select_authoritative_release(
+                vec![
+                    release_with_appcast(legacy, "retired-must-not-fetch"),
+                    release_with_appcast("v0.5.0", "current-head"),
+                ],
+                "",
+            )
+            .expect("retired two-component releases are inert archive history")
+            .expect("the current-scheme candidate is elected");
+            assert_eq!(selected.release.tag_name, "v0.5.0", "lost to {legacy}");
+        }
+    }
+
+    /// A release that does not carry the EXACT `aterm-appcast.toml` asset is not
+    /// a candidate at all, whatever its tag says. That asset requirement — not a
+    /// version floor — is what keeps the pre-cut-over archive inert now that the
+    /// lineage counts from the PUBLIC series (`v0.1.0`; `VERSIONING.md`).
+    ///
+    /// This matters because the archive is NOT all two-component/Legacy: the
+    /// pre-0.23 releases carry three-component *timestamp* tags
+    /// (`v0.15.2607021856` … `v0.21.2607041853`) plus a `v0.5.x` line, which
+    /// parse as canonical `vMAJOR.MINOR.PATCH` and therefore compete on numeric
+    /// order. `[0, 21, 2607041853]` outranks every MINOR below 21, so at the
+    /// public `0.x` lineage the archive WOULD win a numeric contest — see
+    /// [`a_low_lineage_really_does_lose_a_numeric_contest_to_the_archive`].
+    /// It never gets to have that contest: when the archive was retired every
+    /// appcast was renamed to `aterm-appcast-<tag>.toml`, so `select`'s
+    /// `unique_asset_index(&release, "aterm-appcast.toml")` skips those releases
+    /// before their tags are ever parsed.
+    ///
+    /// The retired lineage also lives in the PRIVATE staging repo, while shipped
+    /// clients read the public channel (`[workspace.metadata.aterm]
+    /// update_channel`), whose namespace carries only the current series. This
+    /// test pins the asset rule so the archive stays inert even for a machine
+    /// pointed back at the staging repo by `ATERM_UPDATE_OWNER`/`_REPO`.
+    #[test]
+    fn archive_releases_are_not_candidates_even_when_their_tags_outrank_us() {
+        // Real tags from this repo's history, in their real spellings, carrying
+        // the renamed asset the archive migration actually left behind.
+        let archive = [
+            "v0.21.2607041853",
+            "v0.20.2607041751",
+            "v0.15.2607021856",
+            "v0.5.14",
+            "v0.4.1",
+            "v0.3.0",
+        ];
+        for historical in archive {
+            let renamed = Release {
+                tag_name: historical.into(),
+                draft: false,
+                assets: vec![Asset {
+                    name: format!("aterm-appcast-{historical}.toml"),
+                    url: "archive-must-not-be-fetched".into(),
+                    size: 0,
+                }],
+            };
+            let selected = select_authoritative_release(
+                vec![renamed, release_with_appcast("v0.5.0", "current-head")],
+                "",
+            )
+            .expect("an archive release without the exact appcast asset is inert, not an error")
+            .expect("the current-series candidate is elected");
+            assert_eq!(
+                selected.release.tag_name, "v0.5.0",
+                "{historical} carries no aterm-appcast.toml and must never be elected"
+            );
+        }
+    }
+
+    /// The ordering hazard the asset rule is protecting, asserted head-on so it
+    /// can never be mistaken for impossible: give an archive timestamp tag the
+    /// canonical appcast asset and it BURIES the current public lineage.
+    ///
+    /// Nothing in the shipped channel does that — the archive's assets are
+    /// renamed and clients read the public repo — but if a future change ever
+    /// re-attached `aterm-appcast.toml` to an archive release, or published the
+    /// archive into the public channel, the fleet would elect a July-2026 build
+    /// and then sit at "up to date" forever (selection picks it; the
+    /// strictly-greater `build_number` apply gate then refuses it). This test is
+    /// the tripwire for that, and the reason the lineage must never depend on
+    /// out-numbering the archive.
+    #[test]
+    fn a_low_lineage_really_does_lose_a_numeric_contest_to_the_archive() {
+        let inverted = select_authoritative_release(
+            vec![
+                release_with_appcast("v0.21.2607041853", "archive"),
+                release_with_appcast("v0.5.0", "current-public-lineage"),
+            ],
+            "",
+        )
+        .expect("orderable")
+        .expect("a candidate is elected");
+        assert_eq!(
+            inverted.release.tag_name, "v0.21.2607041853",
+            "the archive outranks the public 0.x lineage numerically — the appcast \
+             asset rule, not a version floor, is what keeps it out of the channel"
+        );
+    }
+
+    /// A catalog that carries ONLY the retired archive is "nothing to install",
+    /// not a failure: the client stays on its build and the check is healthy.
+    #[test]
+    fn a_catalog_of_only_legacy_releases_selects_nothing() {
+        let only_legacy = ["v0.25", "v0.54", "v0.60", "v0.61"]
+            .iter()
+            .enumerate()
+            .map(|(index, tag)| release_with_appcast(tag, &format!("retired-{index}")))
+            .collect::<Vec<_>>();
+        let selected = select_authoritative_release(only_legacy, "")
+            .expect("retired releases are skipped, never an error");
+        assert!(
+            selected.is_none(),
+            "an archive-only catalog has no installable candidate"
+        );
+
+        // A pinned channel reaches the same conclusion without ever demanding a
+        // signature from a retired release (it is skipped before the signature
+        // policy applies).
+        let keypair = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
+        let public_key = B64.encode(keypair.public_key().as_ref());
+        let selected = select_authoritative_release(
+            vec![release_with_appcast("v0.61", "retired-unsigned")],
+            &public_key,
+        )
+        .expect("a retired unsigned release is skipped, not a signature failure");
+        assert!(selected.is_none());
+    }
+
+    /// Tag order is by numeric component, never lexicographic — now that the
+    /// PATCH component exists, `0.2.9 < 0.2.10` has to hold there too.
+    #[test]
+    fn numeric_order_beats_lexicographic_order_in_every_component() {
+        for (lower, higher) in [
+            ("v0.2.9", "v0.2.10"),
+            ("v0.9.0", "v0.10.0"),
+            ("v9.0.0", "v10.0.0"),
+        ] {
+            for catalog in [[lower, higher], [higher, lower]] {
+                let selected = select_authoritative_release(
+                    catalog
+                        .iter()
+                        .map(|tag| release_with_appcast(tag, tag))
+                        .collect(),
+                    "",
+                )
+                .unwrap()
+                .expect("a numeric maximum exists");
+                assert_eq!(
+                    selected.release.tag_name, higher,
+                    "{lower} must sort below {higher} in {catalog:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn malformed_and_duplicate_candidates_fail_before_download() {
-        for malformed in ["0.10", "V0.10", "v0", "v0.x"] {
+        // Structurally unparseable: no `v`, wrong case, too few or too many
+        // components, empty or nonnumeric components. Note that exactly TWO
+        // numeric components is NOT here — that is the retired scheme, which is
+        // skipped rather than refused (`legacy_two_component_tags_are_never_installed`).
+        for malformed in [
+            "0.10.0",
+            "V0.10.0",
+            "v",
+            "v0",
+            "v0.x.0",
+            "v0.1.2.3",
+            "v0..10",
+            "v0.10.",
+            "v.10.0",
+            "v0.10.0-rc1",
+        ] {
             let err = select_authoritative_release(
                 vec![release_with_appcast(malformed, "must-not-fetch")],
                 "",
@@ -1422,7 +2267,10 @@ mod tests {
             .expect("nonnumeric exact-name candidate must fail closed");
             assert!(err.contains("numeric dotted"), "{malformed}: {err}");
         }
-        for noncanonical_maximum in ["v0.10.0", "v00.10", "v0.010"] {
+        // Numeric but noncanonical: a leading zero gives one release two
+        // spellings, so it is refused outright rather than admitted alongside its
+        // canonical twin.
+        for noncanonical_maximum in ["v00.10.0", "v0.010.0", "v0.10.00", "v0.10.0000000"] {
             let err = select_authoritative_release(
                 vec![release_with_appcast(noncanonical_maximum, "must-not-fetch")],
                 "",
@@ -1430,12 +2278,12 @@ mod tests {
             .err()
             .expect("noncanonical numeric maximum must fail closed");
             assert!(
-                err.contains("authoritative") && err.contains("canonical"),
+                err.contains(noncanonical_maximum) && err.contains("numeric dotted"),
                 "{noncanonical_maximum}: {err}"
             );
         }
 
-        let mut duplicate_asset = release_with_appcast("v0.10", "manifest-a");
+        let mut duplicate_asset = release_with_appcast("v0.10.0", "manifest-a");
         duplicate_asset.assets.push(Asset {
             name: "aterm-appcast.toml".into(),
             url: "manifest-b".into(),
@@ -1448,8 +2296,8 @@ mod tests {
 
         let err = select_authoritative_release(
             vec![
-                release_with_appcast("v0.10", "manifest-a"),
-                release_with_appcast("v0.10", "manifest-b"),
+                release_with_appcast("v0.10.0", "manifest-a"),
+                release_with_appcast("v0.10.0", "manifest-b"),
             ],
             "",
         )
@@ -1460,29 +2308,27 @@ mod tests {
             "{err}"
         );
 
-        // Distinct spellings with the same numeric vector are an order collision,
-        // not two candidates that may be resolved by response position.
+        // Two spellings of one numeric vector can never both be candidates: the
+        // canonicality rule refuses the noncanonical twin outright, so a numeric
+        // order collision cannot be resolved by response position.
         let err = select_authoritative_release(
             vec![
-                release_with_appcast("v0.10", "manifest-a"),
-                release_with_appcast("v00.010", "manifest-b"),
+                release_with_appcast("v0.10.0", "manifest-a"),
+                release_with_appcast("v00.010.00", "manifest-b"),
             ],
             "",
         )
         .err()
-        .expect("duplicate numeric vector must fail closed");
-        assert!(
-            err.contains("duplicate published update candidates"),
-            "{err}"
-        );
+        .expect("an aliasing spelling must fail closed");
+        assert!(err.contains("numeric dotted"), "{err}");
     }
 
     #[test]
     fn authoritative_manifest_version_must_equal_canonical_tag() {
         let authoritative = select_authoritative_release(
             vec![
-                release_with_appcast("v0.9", "older-must-not-fetch"),
-                release_with_appcast("v0.10", "mismatched-highest"),
+                release_with_appcast("v0.9.0", "older-must-not-fetch"),
+                release_with_appcast("v0.10.0", "mismatched-highest"),
             ],
             "",
         )
@@ -1492,7 +2338,7 @@ mod tests {
         let mut download = |url: &str, _max_bytes: u64| {
             urls.push(url.to_string());
             match url {
-                "mismatched-highest" => Ok(manifest_bytes("0.9", 10, 0)),
+                "mismatched-highest" => Ok(manifest_bytes("0.9.0", 10, 0)),
                 "older-must-not-fetch" => panic!("older fallback must not be fetched"),
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
@@ -1536,17 +2382,17 @@ mod tests {
     #[test]
     fn parses_release_json_flags_drafts_and_finds_assets() {
         let json = r#"[
-          {"tag_name": "v1.0", "draft": false, "assets": [
+          {"tag_name": "v1.0.0", "draft": false, "assets": [
              {"name": "aterm-appcast.toml", "url": "https://api.github.com/repos/o/r/releases/assets/1", "size": 512},
              {"name": "aterm-1.0.0.dmg", "url": "https://api.github.com/repos/o/r/releases/assets/2", "size": 1000}
           ]},
-          {"tag_name": "v1.1", "draft": true, "assets": [
+          {"tag_name": "v1.1.0", "draft": true, "assets": [
              {"name": "aterm-appcast.toml", "url": "https://api.github.com/repos/o/r/releases/assets/3"}
           ]}
         ]"#;
         let rels: Vec<Release> = serde_json::from_str(json).unwrap();
         assert_eq!(rels.len(), 2);
-        assert_eq!(rels[0].tag_name, "v1.0");
+        assert_eq!(rels[0].tag_name, "v1.0.0");
         assert!(!rels[0].draft);
         assert!(
             rels[1].draft,

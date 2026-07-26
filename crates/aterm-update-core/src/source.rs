@@ -13,15 +13,36 @@
 /// runtime (env `ATERM_UPDATE_OWNER`, then the GUI's `[update] owner` config), so a
 /// fork/relocation needs no code change. Compiled in only as the last resort.
 ///
-/// NOT a hand-maintained literal: `build.rs` derives it from the single source of
-/// truth — the `[workspace.package] repository` URL in `Cargo.toml` — so the binary's
-/// default channel can never drift from where the repo actually lives.
+/// NOT a hand-maintained literal: `build.rs` derives it from the single tracked
+/// source of truth — `[workspace.metadata.aterm] update_channel` in the workspace
+/// `Cargo.toml`, falling back to `[workspace.package] repository` when no separate
+/// channel is declared — so the binary's default channel can never drift from the
+/// channel the release pipeline actually mirrors to.
+///
+/// That channel is the PUBLIC mirror, not the private publish repo: it can be read
+/// with no credential, which is what lets a freshly installed machine update before
+/// anyone has provisioned it a token.
 pub const DEFAULT_OWNER: &str = env!("ATERM_DEFAULT_OWNER");
 
 /// Default GitHub repository name the updater pulls releases from. Overridable at
 /// runtime exactly like [`DEFAULT_OWNER`] (env `ATERM_UPDATE_REPO`, then `[update]
-/// repo` config), and likewise derived from `Cargo.toml`'s `repository` by `build.rs`.
+/// repo` config), and likewise derived from the workspace manifest by `build.rs`.
 pub const DEFAULT_REPO: &str = env!("ATERM_DEFAULT_REPO");
+
+/// GitHub account this project is PUBLISHED under — derived by `build.rs` from
+/// `[workspace.package] repository` ALONE, never from `update_channel`.
+///
+/// Deliberately separate from [`DEFAULT_OWNER`]. The two were the same string until
+/// the update channel was repointed at a public mirror, and code that means "the
+/// account this project belongs to" must not drift with the channel. The concrete
+/// consumer is atpkg's signed package index, whose trust is ACCOUNT-BOUND (§8: a
+/// different owner requires pinning that owner's root key), so following a mirror
+/// repoint would silently change its trust root.
+pub const PUBLISH_OWNER: &str = env!("ATERM_PUBLISH_OWNER");
+
+/// Repository name this project is published under, the companion to
+/// [`PUBLISH_OWNER`] and derived the same way.
+pub const PUBLISH_REPO: &str = env!("ATERM_PUBLISH_REPO");
 
 /// The resolved GitHub release source: `github.com/<owner>/<repo>`. Construct it
 /// with [`Source::resolve`], which applies the precedence
@@ -198,10 +219,15 @@ mod tests {
 
     #[test]
     fn source_resolve_defaults_when_nothing_configured() {
-        // The documented default channel is github.com/alabsystems/aterm. These
-        // constants are DERIVED by build.rs from Cargo.toml's `repository`, so this
-        // also end-to-end checks that the build-time parse produced the right slug.
-        // (Env-independent — the env-override path is covered by the `pick_slug` tests.)
+        // The documented default channel is the PUBLIC mirror,
+        // github.com/alabsystems/aterm — deliberately NOT the private publish
+        // repo named by `[workspace.package] repository`. These constants are
+        // DERIVED by build.rs from `[workspace.metadata.aterm] update_channel`,
+        // so this also end-to-end checks that the build-time parse read that key
+        // (a fall-through to `repository` would spell "alabsystems" here).
+        // The release cutter's `mirror` step targets the same slug; the binding
+        // is asserted publisher-side in aterm-release's `mirror` module.
+        // (Env-independent — the env-override path is covered by `pick_slug`.)
         assert_eq!(DEFAULT_OWNER, "alabsystems");
         assert_eq!(DEFAULT_REPO, "aterm");
         // `Source::resolve` reads the real `ATERM_UPDATE_OWNER`/`_REPO`; only assert it

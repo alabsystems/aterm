@@ -90,6 +90,7 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         beam: !matches!(style, GlowStyle::Water | GlowStyle::Nyan),
         head_dx: 0.5,
         pack: None,
+        wake_persist_s: aterm_effects::cursor_glow::NYAN_WAKE_PERSIST,
     }
 }
 
@@ -516,17 +517,19 @@ fn ink_wrap_nyan_keeps_the_ribbon_no_zoom() {
     // and are excluded from the zoom pin by `cover`'s star-arm filter.
     //
     // REPIN (fresh-ink pop): every key typed on the landing row now also
-    // births a warm-white pop on its glyph cell whose ~150 ms birth-flash
-    // halo blooms ±2 cells around it (radial halos land in `rows_body`), so
-    // the 5 post-wrap keys legitimately widen the typed neighbourhood's
-    // coverage from ~10 to a measured 15 cols. The bound moves 12 → 18 (the
-    // same +3 headroom discipline as the original pin); the true zoom-bar
-    // discriminator remains the MID-BAND assert below — cells only a phantom
-    // jump vector could reach stay dark, pop or no pop.
+    // births a warm-white pop on its glyph cell whose birth-flash halo blooms
+    // ±2 cells around it (radial halos land in `rows_body`), so the 5 post-wrap
+    // keys legitimately widen the typed neighbourhood's coverage. The v0.59
+    // fresh-ink EMPHASIS (momentum-decoupled floor 0.90, brighter core 150 and
+    // birth halo 85, wider core footprint 0.95×0.72, longer ~0.85 s life) makes
+    // that pop reach a touch further — the measured coverage moves 15 → 19 cols.
+    // The bound moves 18 → 22 (the same +3 headroom discipline as the original
+    // pin); the true zoom-bar discriminator remains the MID-BAND assert below —
+    // cells only a phantom jump vector could reach stay dark, pop or no pop.
     let landing = ink.rows_body[(TEXT1 - 1) as usize].len();
     let landing_mid = mid_band(&ink.rows_body[(TEXT1 - 1) as usize]);
     assert!(
-        landing <= 18,
+        landing <= 22,
         "REGRESSION (nyan): landing row covered {landing} cols — the ZOOM bar is back"
     );
     assert_eq!(landing_mid, 0, "REGRESSION (nyan): mid-band rainbow");

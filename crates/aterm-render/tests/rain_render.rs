@@ -11,7 +11,7 @@
 //     one-row cell band;
 //   * pass-1c z-order: rain draws UNDER the row's glyphs and UNDER `cat_quads`
 //     (cats walk on rain), matching the GPU's
-//     `bg → scene_over → RainUnder → cat_over → glyphs` stream order;
+//     `bg → RainUnder → cat_over → glyphs` stream order;
 //   * `rain_add` is a radial, premultiplied `add_sat` post-pass: byte-exact
 //     against hand-computed integer falloff and monotonically brightening;
 //   * damaged path: animating rain (moved rows, a mutation-tick all-rows
@@ -290,7 +290,7 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
 
 /// Pass-1c z-order: rain draws UNDER the row's glyphs (a full-block cell stays
 /// pure fg) and UNDER `cat_quads` (a cat covering the rain wins) — the
-/// `scene_over → rain → cat → glyphs` order; cats walk on rain.
+/// `rain → cat → glyphs` order; cats walk on rain.
 #[test]
 fn rain_under_text_and_under_cats() {
     let Some(mut rend) = renderer() else {

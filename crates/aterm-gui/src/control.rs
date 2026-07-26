@@ -110,8 +110,6 @@ mod control_media;
 // `super::image_payload`, which now resolves to this sibling module's serializer.
 pub(crate) use control_media::image_payload;
 
-#[path = "control_app_fed.rs"]
-mod control_app_fed;
 /// Session-graph + capability-authority verbs (`sessions`/`family`/`ready`/
 /// `cast`/`edges`/`grant`/`revoke`/`whoami`). Child module of `control`;
 /// dispatched as `control_session::cmd_*` from [`handle`]. The file lives flat at
@@ -190,7 +188,6 @@ pub(crate) struct DimsSnapshot {
     pub(crate) pad_bottom: u32,
     pub(crate) head: u32,
     pub(crate) tab_rows: u32,
-    pub(crate) hud_rows: u32,
     pub(crate) viewers: u32,
     pub(crate) visible_viewers: u32,
     pub(crate) geometry: &'static str,
@@ -379,22 +376,25 @@ fn required_op(verb: &str) -> Option<Op> {
 ///     decision per variant, so a new privileged action cannot fall through to the benign
 ///     base gate). The CLIPBOARD actions (`Copy`/`Paste`/`SelectAll`) move the selection
 ///     onto / off the OS pasteboard — the SAME exfil/inject boundary as the `copy` verb —
-///     so they demand `ClipboardWrite`; the CONFIG actions demand `ConfigWrite` (those
-///     that REWRITE durable `aterm.toml` on invoke — `ShowHud`/`ShowResourcesHud`/
-///     `ShowEngineHud` persist `show_*_hud` via `user_set_panel`/`toggle_hud_master` — and
-///     those that raise the durable-config surface — `Preferences` opens `aterm.toml`,
-///     `ToggleSettings` raises the security-knob overlay). `OpenPalette` (a GATEWAY that
+///     so they demand `ClipboardWrite`; CONFIG actions that raise the durable-config
+///     surface demand `ConfigWrite` — `Preferences` opens Settings ▸ Manual,
+///     `ToggleSettings` raises the native security-settings tab). `OpenPalette` (a GATEWAY that
 ///     can dispatch EVERY action) and the update RE-EXEC twins (`SoftwareUpdate`/
 ///     `ApplyUpdate`, the MenuAction faces of the already-Owner-only `update` verb) demand
 ///     OWNER-ONLY — no fine op suffices. Font zoom / splits / fullscreen / tab & window
 ///     navigation are runtime-only view state (no persist), so they stay the benign
 ///     `WriteInput`. The wire name is the exact `MenuAction` Debug token (case-sensitive;
 ///     `controls menu` prints them, `action_by_name` matches them).
-///   * `open prefs` / `open settings` (`AuxTarget::Prefs`) raises the Settings overlay
-///     whose keystrokes flip default-OFF security knobs, so it demands `ConfigWrite`.
+///   * `open prefs` / `open settings` (`AuxTarget::Prefs`) and the versioned
+///     `open app settings /route` face raise the native Settings tab whose
+///     keystrokes flip default-OFF security knobs, so they demand `ConfigWrite`.
+///   * `act app/v1 ...` names a stable view, but that view's kind is intentionally
+///     resolved on the main thread after socket authorization. Treat the generic
+///     semantic-action gateway as `ConfigWrite` rather than trusting a caller-authored
+///     action prefix to claim it is not a Settings action.
 ///     `open menu`/`open palette` (`AuxTarget::Menu`, the palette gateway) and `open
 ///     update` (`AuxTarget::Update`, the software-update surface) demand OWNER-ONLY, the
-///     same as their `invoke` twins (about/perf/front stay the benign `WriteInput`).
+///     same as their `invoke` twins (about/front stay the benign `WriteInput`).
 ///
 /// Returns the ESCALATED requirement when the argument reaches a fenced capability, else
 /// `None` (the verb's base `required_op` already gates the argument). The dispatch
@@ -423,15 +423,38 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
         }
         // Classify by the TARGET TOKEN ONLY, never the whole tail: `cmd_open` acts on
         // the first token and treats a trailing `close` as the dismiss flag, so
-        // `open prefs close` DOES close the Settings overlay. Parsing `rest.trim()`
+        // `open prefs close` DOES close the Settings tab. Parsing `rest.trim()`
         // here made `AuxTarget::parse("prefs close")` (an exact match) return `None`,
         // collapsing the escalation to the base `WriteInput` — a scoped edge could then
         // dismiss a privileged overlay through the `close` variant it is fenced from
         // opening. Escalate on `open <target> [close]` identically to `open <target>`.
+        "open"
+            if matches!(
+                aterm_types::app_inspection::parse_open_app(rest),
+                Ok(aterm_types::app_inspection::OpenAppRequest::Settings { .. })
+            ) =>
+        {
+            // The versioned native Settings app is the same durable-config
+            // capability as the compatibility `open prefs` face.  Classify the
+            // full frozen grammar here, before the main-thread open hop, so a
+            // WriteInput edge cannot reach `/security` (or any other route) via
+            // `open app settings ...`.
+            Some(Escalation::Op(Op::ConfigWrite))
+        }
+        // `act app/v1 ...` is a gateway into a stable native view.  The view kind
+        // is deliberately resolved only on the main thread, after this socket
+        // policy runs, so the control thread cannot safely distinguish a Settings
+        // action from an Editor/Markdown action by trusting caller-authored action
+        // spelling.  Require ConfigWrite for the gateway.  Owner behavior and the
+        // v1 wire grammar/replies stay unchanged; a plain WriteInput edge can no
+        // longer dispatch `settings/control/...` through the semantic seam.
+        "act" if aterm_types::app_inspection::parse_act(rest).is_ok() => {
+            Some(Escalation::Op(Op::ConfigWrite))
+        }
         "open" => match crate::app_introspect::AuxTarget::parse(
             rest.split_whitespace().next().unwrap_or(""),
         ) {
-            // The Settings overlay flips default-OFF security knobs => ConfigWrite.
+            // The Settings tab flips default-OFF security knobs => ConfigWrite.
             Some(crate::app_introspect::AuxTarget::Prefs) => Some(Escalation::Op(Op::ConfigWrite)),
             // Raising the PALETTE (a gateway to every action) or the SOFTWARE-UPDATE
             // overlay (the re-exec surface) matches the OwnerOnly `invoke` twins, so
@@ -468,6 +491,24 @@ enum Escalation {
     OwnerOnly,
 }
 
+/// What currently owns controller-directed input in the front window.
+///
+/// This is an internal main-thread observation, not a wire type.  It extends the
+/// former overlay-only query with the native Settings tab so the socket policy
+/// cannot confuse "no modal overlay" with "ordinary terminal input" while the
+/// process-singleton Settings app is focused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FrontControlSurface {
+    /// No app/overlay consumes front input.
+    None,
+    /// A transient own-rendered overlay consumes input.
+    Overlay(crate::overlay::OverlayKind),
+    /// The process-singleton native Settings tab consumes input.
+    NativeSettings,
+    /// A native app other than Settings consumes input.
+    OtherNative,
+}
+
 /// Whether `scope` may exercise `need` against `ctx`'s session — the op-level core
 /// shared by the base op-scope gate and the indirect-seam [`escalated_op`] fence.
 /// `Owner` (the per-instance process god token) always holds; an `Edge` must present a
@@ -481,6 +522,13 @@ fn scope_holds_op(scope: Scope, need: Op, ctx: &SessionCtx) -> bool {
             let table = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
             decide_edge(&table, &presented, &ctx.self_id, need, &ctx.nonce).is_permitted()
         }
+    }
+}
+
+fn scope_holds_escalation(scope: Scope, need: Escalation, ctx: &SessionCtx) -> bool {
+    match need {
+        Escalation::Op(op) => scope_holds_op(scope, op, ctx),
+        Escalation::OwnerOnly => matches!(scope, Scope::Owner),
     }
 }
 
@@ -618,7 +666,6 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         "" | "status" => aterm_update::status(build),
         "check" => Some(aterm_update::check_now(
             build,
-            crate::build_info::version_display(),
             &aterm_update::Source::resolve(None, None),
         )),
         // PROOF-CARRYING DSU (RFC Rung 1): PRESS the button — apply a staged update
@@ -1224,6 +1271,10 @@ pub fn spawn(
     proxy: EventLoopProxy<Wake>,
     queue: ImageQueue,
     plan: control_auth::SocketPlan,
+    // The exact startup config generation already admitted by the process-wide
+    // service. The control thread must not perform a second config-file read
+    // before deciding whether to expose the optional TLS listener.
+    network_config: crate::app_config::Config,
     // The root session's (id, nonce) to publish as the recursion discovery graph
     // entry, written AFTER bind so it never races the stale sweep. `None` = skip.
     root_identity: Option<(SessionId, aterm_session::LaunchNonce)>,
@@ -1457,7 +1508,7 @@ pub fn spawn(
         // ATERM_PARENT_SESSION_ID / TERM_PROGRAM check) so a nested aterm never binds
         // a second surface — the env deny-list covers only the env path, not the
         // shared config file. The same per-launch token gates network and local hop.
-        crate::net_listen::maybe_spawn(token.as_str(), &sock_path);
+        crate::net_listen::maybe_spawn(token.as_str(), &sock_path, &network_config);
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
@@ -1836,6 +1887,7 @@ fn dispatch_app_verb(
         "window" => control_media::cmd_window(proxy, rest, sock_dir),
         "video" => control_media::cmd_video(proxy, rest, sock_dir, matches!(scope, Scope::Owner)),
         "chrome" => control_media::cmd_chrome(proxy),
+        "panes" => control_media::cmd_panes(proxy, None),
         "controls" => control_media::cmd_controls(proxy, rest),
         "inspect" => control_media::cmd_inspect(proxy, rest),
         "open" => control_media::cmd_open(proxy, rest),
@@ -1847,8 +1899,6 @@ fn dispatch_app_verb(
         "tab" => control_input::cmd_tab(proxy, rest),
         "hover" => control_input::cmd_hover(proxy, rest),
         "metrics" => control_query::cmd_metrics(active_term, rest),
-        "widgets" => control_query::cmd_widgets(rest),
-        "metric" => control_app_fed::cmd_metric(rest),
         _ => return None,
     };
     Some(response)
@@ -1870,6 +1920,18 @@ fn selector_is_live(store: &Store, selector: &Selector) -> bool {
     }
 }
 
+/// Stable protocol tombstones for verbs removed with the bottom HUD. They stay
+/// out of the advertised verb catalog and carry no authority class, but an old
+/// client gets an actionable failure instead of accidentally targeting a future
+/// verb with the same spelling.
+fn retired_bottom_hud_verb_error(verb: &str) -> Option<&'static str> {
+    match verb {
+        "widgets" => Some("ERR verb widgets was removed with the bottom HUD\n"),
+        "metric" => Some("ERR verb metric was removed with the bottom HUD\n"),
+        _ => None,
+    }
+}
+
 /// Handle requests whose authority/target class does not depend on a session.
 /// Returning `None` means the normal session/edge resolver must continue.
 #[allow(clippy::too_many_arguments)]
@@ -1886,6 +1948,9 @@ fn dispatch_before_session(
     use aterm_types::control_verbs::{Access, Target};
 
     let (selector, verb, rest) = request_head(line);
+    if let Some(error) = retired_bottom_hud_verb_error(verb) {
+        return Some(error.to_string());
+    }
     let Some(spec) = aterm_types::control_verbs::spec(verb) else {
         return Some("ERR unknown verb (try: help)\n".to_string());
     };
@@ -2066,6 +2131,10 @@ fn dispatch_request(
             return "ERR invalid control target\n".to_string();
         }
     }
+    // Capture the FRONT tab's id before `active_target` is consumed: an explicit
+    // `@<sid>` naming this very tab is routed through the App input seam rather
+    // than the background egress (see `front_routed_input`).
+    let front_active_session = active_target.as_ref().map(|(_, _, session, _)| *session);
     let target = match selector.as_ref() {
         Some(selector @ (Selector::Local(_) | Selector::Sid(_))) => {
             resolve_explicit(store, selector)
@@ -2091,6 +2160,7 @@ fn dispatch_request(
         queue,
         sock_dir,
         subscribers,
+        front_active_session,
     )
 }
 
@@ -3139,41 +3209,55 @@ fn dispatch_authorized(scope: Scope, verb: &str, rest: &str, target_ctx: &Sessio
 }
 
 /// PART B — the input-injection verbs that reach the FRONT window through the proxy →
-/// `App::input` seam and can therefore be SWALLOWED by (i.e. DRIVE) an open modal overlay,
-/// plus the direct-sink writers, refused as a set for defense in depth. `key`/`ctrl`/
+/// `App::input` seam and can therefore be SWALLOWED by (i.e. DRIVE) an open modal overlay
+/// or native Settings tab, plus the direct-sink writers, fenced as a set for defense in
+/// depth. `key`/`ctrl`/
 /// `mouse`/`paste`/`focus` post a `Wake::Input` that `App::input` routes into the overlay
 /// while one is modal; `send`/`feed`/`turn` write the PTY sink directly (they drive the
 /// shell, not the overlay) but are refused too so a scoped edge cannot race input while a
 /// human is mid-overlay. (`feed-bin` also writes the sink directly and is intercepted
 /// before this dispatch WITHOUT a proxy, so it takes no overlay hop — it cannot drive the
 /// overlay, only the shell.)
-fn is_overlay_driving_verb(verb: &str) -> bool {
+fn is_front_driving_verb(verb: &str) -> bool {
     matches!(
         verb,
         "key" | "ctrl" | "mouse" | "paste" | "focus" | "send" | "feed" | "turn"
     )
 }
 
-/// PART B pure decision: given the caller's `scope`, the `verb`, and the FRONT window's
-/// open overlay kind (from the [`Wake::FrontOverlayKind`] hop), return the wire error to
-/// send when a SCOPED-edge input verb must be refused because a PRIVILEGED overlay is
-/// open, else `None` (proceed). Owner is ALWAYS exempt (the god token may drive its own
-/// UI); a benign (About) or absent overlay never refuses; only the overlay-driving verbs
-/// are gated. Split out pure so the policy is unit-testable without the event-loop hop.
-fn overlay_drive_refusal(
+/// PART B pure decision: given the caller's `scope`, input `verb`, and the FRONT
+/// main-thread surface observation, return the authority escalation that REPLACES the
+/// verb's base WriteInput requirement.  Every overlay remains Owner-only (some bind
+/// clipboard/external-process actions); native Settings requires the durable-config
+/// fine op.  Owner skips the observation entirely and already satisfies either result.
+///
+/// Split out pure so the policy is unit-testable without the event-loop hop.  A failed
+/// hop is denied by the caller rather than being interpreted as `None` (fail closed).
+fn front_drive_escalation(
     scope: Scope,
     verb: &str,
-    front_overlay: Option<crate::overlay::OverlayKind>,
-) -> Option<String> {
-    if matches!(scope, Scope::Owner) || !is_overlay_driving_verb(verb) {
+    surface: FrontControlSurface,
+) -> Option<Escalation> {
+    if matches!(scope, Scope::Owner) || !is_front_driving_verb(verb) {
         return None;
     }
-    match front_overlay {
-        Some(kind) if kind.is_privileged() => Some(format!(
+    match surface {
+        FrontControlSurface::Overlay(_) => Some(Escalation::OwnerOnly),
+        FrontControlSurface::NativeSettings => Some(Escalation::Op(Op::ConfigWrite)),
+        FrontControlSurface::None | FrontControlSurface::OtherNative => None,
+    }
+}
+
+fn front_drive_denial(surface: FrontControlSurface) -> String {
+    match surface {
+        FrontControlSurface::Overlay(kind) => format!(
             "ERR overlay {} open (owner-only while open)\n",
             kind.keyword()
-        )),
-        _ => None,
+        ),
+        FrontControlSurface::NativeSettings => {
+            "ERR native settings open (config-write authority required)\n".to_string()
+        }
+        FrontControlSurface::None | FrontControlSurface::OtherNative => "ERR denied\n".to_string(),
     }
 }
 
@@ -3208,6 +3292,60 @@ fn cross_input(
             seam_egress(term, &ctx.sink, &ev, EgressMode::Backpressured);
             "OK\n".to_string()
         }
+        None => err.to_string(),
+    }
+}
+
+/// Should an explicit-selector request be applied through the App INPUT SEAM
+/// rather than the background egress? Exactly when the request named a session
+/// (`is_cross`) AND that session is the tab currently on screen.
+///
+/// A flagless request is already on the seam, so it is never "front-routed" by
+/// this predicate — it simply never reaches it. A named session that is NOT on
+/// screen keeps the direct, round-trip-free egress the background path exists
+/// for. The middle case — naming the tab you are looking at, which is what the
+/// documented `@self` selector expands to — is the one that was silently taking
+/// the background path and losing every side effect the seam owns (blink reset,
+/// viewport snap, selection clear, the typing-momentum hints every cursor effect
+/// reads, and the `video ... keys` ledger).
+///
+/// Pure so the law is testable without a running event loop; the answer is
+/// re-checked on the event loop before it is acted on, so a stale `front_active`
+/// can only cost a path, never a mis-delivery.
+const fn front_routed(is_cross: bool, front_active: Option<u64>, target: u64) -> bool {
+    is_cross
+        && match front_active {
+            Some(front) => front == target,
+            None => false,
+        }
+}
+
+/// The FRONT-ROUTED twin of [`cross_input`]: an explicit `@<sid>` whose target
+/// resolved to the tab currently on screen is not a background session at all, so
+/// its event goes through the App input seam (`Wake::Input` carrying the session)
+/// rather than straight to the sink.
+///
+/// This is what makes a named-session drive behave like the flagless one: the
+/// blink reset, viewport snap, selection clear, the typing-momentum hints every
+/// cursor effect reads, and the `video ... keys` ledger all live on that seam and
+/// were silently skipped by the direct egress. Authority is UNCHANGED — the
+/// cross-session gate has already run by the time we get here; only the execution
+/// path differs. The event loop re-resolves the session, so a tab switch racing
+/// this request lands on the hidden path for the named session instead of typing
+/// into whatever tab won.
+fn front_routed_input(
+    proxy: &EventLoopProxy<Wake>,
+    session: u64,
+    ev: Option<InputEvent>,
+    err: &str,
+) -> String {
+    match ev {
+        Some(ev) => control_input::input_reply_to_str(post_input_reply_to(
+            proxy,
+            Op::WriteInput,
+            vec![ev],
+            Some(session),
+        )),
         None => err.to_string(),
     }
 }
@@ -3426,6 +3564,10 @@ fn handle(
     queue: &ImageQueue,
     sock_dir: &std::path::Path,
     subscribers: &Subscribers,
+    // The session id of the tab currently on screen, if any — the caller has
+    // already resolved it, so naming it here costs nothing and lets an explicit
+    // `@<sid>` for that tab take the App input seam (see `front_routed_input`).
+    front_active_session: Option<u64>,
 ) -> String {
     // Tolerate CRLF clients; the protocol itself is bare-LF terminated.
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -3533,6 +3675,38 @@ fn handle(
         },
     };
     let ctx: &SessionCtx = &ctx;
+    // Does this explicit selector name the tab that is ON SCREEN? The caller
+    // already resolved the front tab, so this is a plain id compare — no extra
+    // round trip. Only a CROSS request can be front-routed (a flagless one is
+    // already on the App seam), and the event loop re-checks before applying, so
+    // a stale answer here is harmless.
+    let targets_front = front_routed(is_cross, front_active_session, session);
+
+    // Observe a scoped caller's FRONT input consumer before the op gate.  A native
+    // Settings tab has no modal `OverlayKind`, but key/mouse/paste events are still
+    // consumed by its reducer and can persist default-OFF security knobs.  The
+    // main-thread observation therefore supplies an additional argument-aware
+    // escalation: Settings -> ConfigWrite; any transient overlay -> Owner-only.
+    // Owner and cross-session requests never take this hop.  A failed hop is an
+    // authorization failure, never "no surface" (fail closed).
+    let front_surface =
+        if !is_cross && !matches!(scope, Scope::Owner) && is_front_driving_verb(verb) {
+            match control_media::call_main(proxy, |reply| Wake::FrontControlSurface { reply }) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    log_denial(
+                        AUDIT_SUBSYSTEM,
+                        &format!("self {verb} front-surface authorization failed"),
+                        aterm_containment::mode_or_containment(),
+                        &format!("could not observe front input authority: {error}"),
+                    );
+                    return "ERR denied\n".to_string();
+                }
+            }
+        } else {
+            FrontControlSurface::None
+        };
+    let front_escalation = front_drive_escalation(scope, verb, front_surface);
 
     // Op-scope gate (design 7.2). EXHAUSTIVE, fail-closed. Gates on the EFFECTIVE op
     // (`dispatch_authorized`): the verb's base op ESCALATED by its argument for the
@@ -3560,7 +3734,12 @@ fn handle(
             );
             return "ERR denied\n".to_string();
         }
-    } else if !matches!(scope, Scope::Owner) && !dispatch_authorized(scope, verb, rest, ctx) {
+    } else if !matches!(scope, Scope::Owner)
+        && !front_escalation.map_or_else(
+            || dispatch_authorized(scope, verb, rest, ctx),
+            |need| scope_holds_escalation(scope, need, ctx),
+        )
+    {
         // SELF path, Edge scope: re-verify the token against the session that is
         // active RIGHT NOW — NOT op-match alone. The control socket has ONE global
         // ActiveHandle that `sync_active_session` retargets to the new frontmost
@@ -3579,35 +3758,12 @@ fn handle(
             aterm_containment::mode_or_containment(),
             "edge not authorized against the now-active session",
         );
-        return "ERR denied\n".to_string();
+        return front_escalation.map_or_else(
+            || "ERR denied\n".to_string(),
+            |_| front_drive_denial(front_surface),
+        );
     }
     let term = &term;
-
-    // PART B — OVERLAY-DRIVE FENCE (defense in depth). A PRIVILEGED overlay (Settings /
-    // Palette / Update) open on the FRONT window swallows injected keystrokes / pointer
-    // events — `App::input` routes them INTO the modal overlay. Part A already stops a
-    // scoped edge from OPENING such an overlay; this closes the residual where the
-    // HUMAN/owner opened it and a scoped edge tries to DRIVE it. Owner is exempt (the god
-    // token may drive its own UI). SELF path only: a cross-session verb writes to the
-    // resolved target's PTY sink directly (never the front overlay). We read the overlay
-    // state via a main-thread hop — the SAME `App::overlay()` accessor `controls front`
-    // uses — never inside the src-blind `App::input` seam. The hop is taken ONLY for a
-    // scoped-edge overlay-driving verb, so Owner (the hot aterm-ctl path) is untouched.
-    if !is_cross
-        && !matches!(scope, Scope::Owner)
-        && is_overlay_driving_verb(verb)
-        && let Ok(front_overlay) =
-            control_media::call_main(proxy, |tx| Wake::FrontOverlayKind { reply: tx })
-        && let Some(err) = overlay_drive_refusal(scope, verb, front_overlay)
-    {
-        log_denial(
-            AUDIT_SUBSYSTEM,
-            &format!("self {verb} refused while a privileged overlay is open"),
-            aterm_containment::mode_or_containment(),
-            "scoped-edge input injection refused while a privileged overlay is open",
-        );
-        return err;
-    }
 
     // `--json` READ MODE: a structured-JSON foundation for the read verbs. The flag
     // is parsed off `rest` HERE (additive: a line without it is byte-identical text)
@@ -3630,10 +3786,6 @@ fn handle(
             "metrics" => Some(control_query::cmd_metrics_json(Some(term), &body)),
             "blocks" => Some(control_selection::cmd_blocks_json(term, &body)),
             "edges" | "grants" => Some(control_session::cmd_edges_json(ctx)),
-            // `widgets` has a json form (its own `OK {..}` line, Status-framed);
-            // routing it here means `widgets --json` can never silently return the
-            // text shape (the F24 silent-fallback class).
-            "widgets" => Some(control_query::cmd_widgets_json()),
             _ => None,
         };
         if let Some(out) = json {
@@ -3802,8 +3954,22 @@ fn handle(
         // shared `parse_*` helpers, and calls `seam_egress` DIRECTLY on the control
         // thread (no `Wake::Input`). Op-scope is already `WriteInput`-gated above
         // (`cross_session_authorized`), so these run only after the edge/owner check.
+        // An explicit `@<sid>` that resolved to the tab ON SCREEN is not a
+        // background target: route it through the App seam so a named-session
+        // drive is indistinguishable from a flagless one (see
+        // [`front_routed_input`]). Genuinely background targets keep the direct,
+        // round-trip-free egress below.
+        "key" if is_cross && targets_front => {
+            front_routed_input(proxy, session, parse_key(rest), "ERR\n")
+        }
         "key" if is_cross => cross_input(term, ctx, parse_key(rest), "ERR\n"),
         "key" => control_input::cmd_key(proxy, rest),
+        "ctrl" if is_cross && targets_front => front_routed_input(
+            proxy,
+            session,
+            parse_ctrl(rest),
+            "ERR usage: ctrl <single-letter>\n",
+        ),
         "ctrl" if is_cross => cross_input(
             term,
             ctx,
@@ -3867,13 +4033,17 @@ fn handle(
         // `chrome`: the resolved instance's front window native UI (app-level; `@<sid>`
         // routes to the instance, per the rule above — `@peer chrome` reads the peer's).
         "chrome" => control_media::cmd_chrome(proxy),
-        // `controls <target>` dumps an AUXILIARY GUI window's controls (the Preferences
-        // settings, or the Performance control panel's HUD toggles) as text — the
-        // analogue of `chrome` for the settings/perf GUIs. Built on the MAIN thread from
-        // the pure config/panel model (`App::read_aux_controls`), so it works HEADLESS.
+        // `panes`: the ACTIVE-tab split-pane layout (cell rects + focus + zoom —
+        // split-pane audit introspection). Cross-session (`@<sel>`): the window
+        // whose ACTIVE tab displays the resolved session — the `image` routing
+        // rule, so `@<sid> panes` and `@<sid> image` describe the SAME window.
+        "panes" => control_media::cmd_panes(proxy, is_cross.then_some(session)),
+        // `controls <target>` dumps an own-rendered app surface's controls as text — the
+        // analogue of `chrome`. Built on the main thread from the pure surface model, so
+        // it works headless.
         // App-level (the resolved instance's aux GUI); `@<sid>` routes to the instance.
         "controls" => control_media::cmd_controls(proxy, rest),
-        // `open <prefs|perf>`: app-level UI on the resolved instance (`@<sid>` routes).
+        // `open <target>`: app-level UI on the resolved instance (`@<sid>` routes).
         "open" => control_media::cmd_open(proxy, rest),
         // `invoke <action>`: fire a menu action by name (enabled-gated, single sink).
         // App-level per the rule above — `@peer invoke NewTab` opens a tab in the peer.
@@ -3890,10 +4060,10 @@ fn handle(
         // The dispatch already resolved `session`/`ctx` from the selector, so close
         // acts on exactly the addressed session — the death half of `spawn`.
         "close" => control_media::cmd_close(proxy, session, ctx.self_id.as_str()),
-        // `settings [open|close|toggle]` drives the CROSS-PLATFORM in-window settings
-        // overlay (`open settings` opens the SAME overlay — it survives as an alias
-        // from when it targeted the retired native Preferences window), so a driver
-        // can open it then `controls settings` / `image` it on any platform.
+        // `settings [open|close|toggle]` drives the CROSS-PLATFORM native Settings tab
+        // (`open settings` is the same compatibility alias), so a driver can open it
+        // then read its current native route with `controls settings` or capture the
+        // real frame with `image` on any platform.
         // App-level UI on the MAIN thread (write-class); `@<sid>` routes to the instance.
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
         // `tab`: drive the resolved instance's front-window tabs (app-level; `@<sid>`
@@ -3922,13 +4092,6 @@ fn handle(
         // grid supplies rows/cols). Lets a driving AI MEASURE responsiveness directly
         // rather than scraping the $ATERM_TRACE_LATENCY stderr log. Read-side.
         "metrics" => control_query::cmd_metrics(Some(term), rest),
-        // `widgets [json]` — the UNIFIED system-metrics snapshot (CPU/mem/GPU/disk/net
-        // + this tab's CPU/RSS) the widget tray renders. Read-only; serializes the one
-        // snapshot the metrics service samples, so the AI sees exactly what the UI does.
-        "widgets" => control_query::cmd_widgets(rest),
-        // `metric <name> <value>` -> push an app-fed sample (AI token spend, build
-        // progress, …) shown by the app-fed HUD panel. Write-class.
-        "metric" => control_app_fed::cmd_metric(rest),
         "lines" => control_query::cmd_lines(term),
         "line" => control_query::cmd_line(term, rest),
         "modes" => control_query::cmd_modes(term),
@@ -4065,6 +4228,19 @@ pub(crate) fn pct_encode(s: &str) -> String {
 /// so [`crate::cast`]'s asciicast emitter reuses the one JSON-escape (no divergence).
 pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
+    json_escape_into(&mut out, s);
+    out
+}
+
+/// [`json_escape`] APPENDING into a caller-owned buffer — byte-identical output,
+/// no allocation of its own.
+///
+/// The lossless styled frame escapes a glyph (and sometimes a hyperlink) for
+/// EVERY cell on screen — up to ~15 000 per snapshot on a large window, and
+/// again for every subscriber on every change — so the allocating twin above was
+/// paying a `String` per cell purely to be copied into the row buffer and
+/// dropped. This is the same loop writing where the answer is already going.
+pub(crate) fn json_escape_into(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -4074,11 +4250,13 @@ pub(crate) fn json_escape(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }
-    out
 }
 
 /// A `"key":"<escaped>"` JSON member.
@@ -4119,8 +4297,7 @@ fn take_json_flag(rest: &str) -> (bool, String) {
 /// ALLOWLIST, fail-open: only verbs whose grammar can never carry a literal
 /// `json`/`--json` token as argument DATA are refused. A payload-bearing verb
 /// (`send --json`, `turn … json`, `search json`, `await match json`) must
-/// receive the token verbatim, and `widgets` parses its own `json` sub-form —
-/// a blocklist would break that real wire traffic, so an unlisted verb keeps
+/// receive the token verbatim, so an unlisted verb keeps
 /// the silent text fall-through instead of risking a payload break.
 fn json_unsupported(verb: &str) -> Option<String> {
     matches!(
@@ -4154,17 +4331,73 @@ fn post_input_reply(
     op: Op,
     batch: Vec<InputEvent>,
 ) -> Result<InputOutcome, String> {
+    post_input_reply_to(proxy, op, batch, None)
+}
+
+/// [`post_input_reply`] with an EXPLICIT session target — the seam a verb that
+/// named `@<sid>` uses when that sid resolved to the tab currently on screen.
+/// `None` is the historical front-tab contract; `Some` is re-resolved on the
+/// event loop (see [`Wake::Input::session`]), so a tab switch racing the request
+/// degrades to the hidden-session path instead of typing into the wrong tab.
+fn post_input_reply_to(
+    proxy: &EventLoopProxy<Wake>,
+    op: Op,
+    batch: Vec<InputEvent>,
+    session: Option<u64>,
+) -> Result<InputOutcome, String> {
     let src = Source::Controller { op };
     control_media::call_main(proxy, |tx| Wake::Input {
         batch,
         src,
         reply: Some(tx),
+        session,
     })
     .map_err(|error| format!("ERR input dispatch failed: {error}\n"))
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// THE ROUTING LAW an explicit selector takes (regression: `@self` — the
+    /// selector the docs recommend — expands client-side to `@<sid>`, which was
+    /// classified as a background target even when it named the tab on screen.
+    /// It then egressed straight to the sink, skipping the App input seam and
+    /// therefore every side effect that seam owns: the typing-momentum hints all
+    /// the cursor effects read, and the `video ... keys` ledger, which reported
+    /// "no input attempts logged" to an AI that had driven the entire take.)
+    #[test]
+    fn an_explicit_selector_for_the_front_tab_is_routed_through_the_input_seam() {
+        use super::front_routed;
+        // Named the tab on screen -> the seam.
+        assert!(front_routed(true, Some(7), 7));
+        // Named a BACKGROUND tab -> the direct egress it exists for.
+        assert!(!front_routed(true, Some(7), 9));
+        // No front tab at all (headless with no window, every tab closed) ->
+        // nothing to be the front of; fail to the background path.
+        assert!(!front_routed(true, None, 7));
+        // A FLAGLESS request is already on the seam and must never be diverted
+        // through this predicate, whatever the front tab happens to be.
+        assert!(!front_routed(false, Some(7), 7));
+        assert!(!front_routed(false, None, 7));
+    }
+    #[test]
+    fn removed_bottom_hud_verbs_are_unadvertised_stable_tombstones() {
+        assert_eq!(
+            retired_bottom_hud_verb_error("widgets"),
+            Some("ERR verb widgets was removed with the bottom HUD\n")
+        );
+        assert_eq!(
+            retired_bottom_hud_verb_error("metric"),
+            Some("ERR verb metric was removed with the bottom HUD\n")
+        );
+        assert_eq!(retired_bottom_hud_verb_error("metrics"), None);
+        assert!(
+            aterm_types::control_verbs::spec("widgets").is_none()
+                && aterm_types::control_verbs::spec("metric").is_none(),
+            "retired verbs must not reappear in help, completion, or authority catalogs"
+        );
+    }
+
     /// `cwd` must not let an OSC 7 path forge control-protocol reply lines. OSC 7
     /// percent-decodes its path, so `%0A` becomes a raw newline; pct_encoding the
     /// cwd keeps the reply to its single terminating newline.
@@ -6290,7 +6523,7 @@ mod tests {
     /// partition is pinned to an explicit expected set (below). So no verb can SILENTLY
     /// change op-class: shifting a verb's class moves it between buckets and fails a set
     /// assert; adding a table verb without listing it here fails the exhaustiveness
-    /// count. This closes the gap where video/history/widgets/metrics/metric/hover/
+    /// count. This closes the gap where video/history/metrics/hover/
     /// ready/await/subscribe/family/edges/grants were previously unpinned.
     #[test]
     fn required_op_classifies_each_verb() {
@@ -6336,6 +6569,7 @@ mod tests {
                 "window",
                 "video",
                 "chrome",
+                "panes",
                 "controls",
                 "inspect",
                 "cast",
@@ -6346,7 +6580,6 @@ mod tests {
                 // `escalated_op_fences_invoke_and_open_indirect_seams`).
                 "meta",
                 "timeline",
-                "widgets",
                 "metrics",
                 "scroll",
                 "select",
@@ -6378,7 +6611,6 @@ mod tests {
                 "paste",
                 "resize",
                 "focus",
-                "metric",
                 "tab",
                 "open",
                 "invoke",
@@ -6488,20 +6720,6 @@ mod tests {
             escalated_op("invoke", "Preferences"),
             Some(EOp(Op::ConfigWrite))
         );
-        // The HUD toggles REWRITE durable `show_*_hud` in aterm.toml on invoke, so they
-        // are config-write too (a WriteInput edge must not flip a persisted key).
-        assert_eq!(
-            escalated_op("invoke", "ShowHud"),
-            Some(EOp(Op::ConfigWrite))
-        );
-        assert_eq!(
-            escalated_op("invoke", "ShowResourcesHud"),
-            Some(EOp(Op::ConfigWrite))
-        );
-        assert_eq!(
-            escalated_op("invoke", "ShowEngineHud"),
-            Some(EOp(Op::ConfigWrite))
-        );
         // The palette GATEWAY and the staged-update RE-EXEC twins are OWNER-ONLY — no
         // fine op expresses "only the god token", so even a granted fine-op edge is denied.
         assert_eq!(escalated_op("invoke", "OpenPalette"), Some(OwnerOnly));
@@ -6523,6 +6741,24 @@ mod tests {
         assert_eq!(
             escalated_op("open", "preferences"),
             Some(EOp(Op::ConfigWrite))
+        );
+        assert_eq!(
+            escalated_op("open", "app settings /security"),
+            Some(EOp(Op::ConfigWrite)),
+            "the versioned native Settings route has the same fine-op fence"
+        );
+        assert_eq!(
+            escalated_op(
+                "act",
+                "app/v1 view 42 settings/control/allow_osc52_query settings/set/allow_osc52_query true"
+            ),
+            Some(EOp(Op::ConfigWrite)),
+            "semantic Settings actions cannot inherit WriteInput"
+        );
+        assert_eq!(
+            escalated_op("open", "app editor file:///tmp/example.md"),
+            None,
+            "opening a document retains the established WriteInput class"
         );
         // `open menu`/`open palette` (gateway) and `open update` (re-exec surface) are
         // OWNER-ONLY — the same fence as their `invoke` twins.
@@ -6595,19 +6831,29 @@ mod tests {
             "write edge DENIED open prefs (config escalation)"
         );
         assert!(
+            !dispatch_allows(edge_write, "open", "app settings /security", &ctx),
+            "write edge DENIED native Settings route"
+        );
+        assert!(
+            !dispatch_allows(
+                edge_write,
+                "act",
+                "app/v1 view 42 settings/control/allow_osc52_query settings/set/allow_osc52_query true",
+                &ctx,
+            ),
+            "write edge DENIED semantic Settings action"
+        );
+        assert!(
             dispatch_allows(edge_write, "open", "about", &ctx),
             "write edge: open about (benign)"
         );
         // THE THIRD-PASS HOLE: a plain WriteInput edge is DENIED the privileged
         // MenuActions reachable via `invoke` — the palette gateway, the update re-exec
-        // twins, the persisted HUD toggles, the settings surface, and clipboard exfil.
+        // twins, the settings surface, and clipboard exfil.
         for rest in [
             "OpenPalette",
             "ApplyUpdate",
             "SoftwareUpdate",
-            "ShowResourcesHud",
-            "ShowEngineHud",
-            "ShowHud",
             "ToggleSettings",
             "Preferences",
             "Copy",
@@ -6657,6 +6903,19 @@ mod tests {
             dispatch_allows(edge_cfg, "open", "prefs", &ctx),
             "explicit config-write edge: open prefs"
         );
+        assert!(
+            dispatch_allows(edge_cfg, "open", "app settings /security", &ctx),
+            "explicit config-write edge: native Settings route"
+        );
+        assert!(
+            dispatch_allows(
+                edge_cfg,
+                "act",
+                "app/v1 view 42 settings/control/allow_osc52_query settings/set/allow_osc52_query true",
+                &ctx,
+            ),
+            "explicit config-write edge: semantic Settings action"
+        );
         // But OWNER-ONLY actions are denied even to a granted fine-op edge: no fine op —
         // ClipboardWrite or ConfigWrite — buys the palette gateway or the update re-exec.
         assert!(
@@ -6673,79 +6932,123 @@ mod tests {
         );
     }
 
-    /// PART B — the overlay-drive fence. A SCOPED edge's input-injection verb is REFUSED
-    /// while a PRIVILEGED overlay (Settings / Palette / Update) is open on the front
-    /// window (so a human-opened overlay cannot be driven by a scoped edge). Owner is
-    /// exempt; a benign (About) or absent overlay never refuses; non-input verbs are never
-    /// gated. Tests the PURE decision (`overlay_drive_refusal`); the full path adds the
-    /// `Wake::FrontOverlayKind` main-thread hop, exercised by the running app.
+    /// PART B — the front-drive fence. A scoped input verb escalates to Owner while
+    /// any overlay consumes input, and to ConfigWrite while native Settings consumes
+    /// input. Owner is exempt; an ordinary native app/terminal and non-input verbs keep
+    /// their base class. The full path obtains this exact enum through the
+    /// `Wake::FrontControlSurface` main-thread hop.
     #[test]
-    fn overlay_drive_fence_refuses_scoped_input_while_privileged_overlay_open() {
+    fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_settings() {
         use crate::overlay::OverlayKind;
         let scoped = edge(); // an Edge scope; authority already passed the op gate above
         let owner = Scope::Owner;
 
-        // SCOPED edge + input verb + a PRIVILEGED overlay => refused, naming the kind.
+        // Every overlay is a gateway with Owner-only bindings (About includes
+        // copy/open-URL), so all injected input verbs escalate identically.
         for kind in [
             OverlayKind::Settings,
+            OverlayKind::About,
             OverlayKind::Palette,
             OverlayKind::Update,
         ] {
             for verb in [
                 "key", "ctrl", "mouse", "paste", "focus", "send", "feed", "turn",
             ] {
-                let refusal = overlay_drive_refusal(scoped, verb, Some(kind));
-                let msg =
-                    refusal.unwrap_or_else(|| panic!("{verb} must be refused under {kind:?}"));
-                assert!(
-                    msg.starts_with("ERR overlay ") && msg.contains("owner-only while open"),
-                    "refusal names the open overlay: {msg:?}"
-                );
-                assert!(
-                    msg.contains(kind.keyword()),
-                    "refusal carries the kind keyword"
+                assert_eq!(
+                    front_drive_escalation(scoped, verb, FrontControlSurface::Overlay(kind)),
+                    Some(Escalation::OwnerOnly),
+                    "{verb} must be owner-only under {kind:?}"
                 );
             }
         }
 
-        // OWNER is ALWAYS exempt — the human path (owner token) is untouched.
+        // OWNER is ALWAYS exempt — the owner's established control path is untouched.
         for kind in [
             OverlayKind::Settings,
+            OverlayKind::About,
             OverlayKind::Palette,
             OverlayKind::Update,
         ] {
             assert_eq!(
-                overlay_drive_refusal(owner, "key", Some(kind)),
+                front_drive_escalation(owner, "key", FrontControlSurface::Overlay(kind)),
                 None,
                 "Owner may drive its own {kind:?} overlay"
             );
         }
 
-        // EVERY overlay is fenced — no carve-out. About looks informational but binds
-        // `c` -> about_copy (pbcopy) and `o` -> open_about_site (spawn), so a scoped
-        // edge injecting `key` while About is up must be refused just like the others.
+        // Native Settings is not an Overlay at all, but it still consumes the
+        // same key/mouse vocabulary and can emit ConfigPatch effects.
+        let escalation = front_drive_escalation(scoped, "key", FrontControlSurface::NativeSettings);
+        assert_eq!(escalation, Some(Escalation::Op(Op::ConfigWrite)));
+        let ctx = test_ctx();
         assert!(
-            overlay_drive_refusal(scoped, "key", Some(OverlayKind::About)).is_some(),
-            "About binds copy/open-URL keystrokes — a scoped edge must not drive it"
+            !scope_holds_escalation(
+                edge_granted(Op::WriteInput, &ctx),
+                escalation.unwrap(),
+                &ctx
+            ),
+            "a WriteInput edge cannot drive native Settings"
         );
-        // No overlay open => proceed.
-        assert_eq!(overlay_drive_refusal(scoped, "key", None), None);
-        // A NON-input verb (a read) is never gated by this fence, even under an overlay.
+        assert!(scope_holds_escalation(
+            edge_granted(Op::ConfigWrite, &ctx),
+            escalation.unwrap(),
+            &ctx,
+        ));
+
+        // No privileged front consumer => preserve the verb's ordinary authority.
         assert_eq!(
-            overlay_drive_refusal(scoped, "text", Some(OverlayKind::Settings)),
-            None,
-            "reads are not overlay-driving input"
-        );
-        assert_eq!(
-            overlay_drive_refusal(scoped, "screen", Some(OverlayKind::Palette)),
+            front_drive_escalation(scoped, "key", FrontControlSurface::None),
             None
+        );
+        assert_eq!(
+            front_drive_escalation(scoped, "key", FrontControlSurface::OtherNative),
+            None
+        );
+        // A NON-input verb is never dynamically escalated.
+        assert_eq!(
+            front_drive_escalation(scoped, "text", FrontControlSurface::NativeSettings),
+            None,
+            "reads are not front-driving input"
+        );
+    }
+
+    #[test]
+    fn real_native_settings_front_is_explicitly_fenced_while_owner_open_still_works() {
+        let mut app = crate::App::headless_for_test();
+        let before = app.native_config_service.snapshot();
+        assert_eq!(app.front_control_surface(), FrontControlSurface::None);
+
+        assert!(
+            app.open_settings_tab(crate::native_settings::SettingsRoute::Security),
+            "the established owner open path remains usable"
+        );
+        assert_eq!(
+            app.front_control_surface(),
+            FrontControlSurface::NativeSettings,
+            "the main-thread observation must not collapse native Settings into no overlay"
+        );
+
+        let ctx = test_ctx();
+        let write_edge = edge_granted(Op::WriteInput, &ctx);
+        let escalation = front_drive_escalation(write_edge, "key", app.front_control_surface())
+            .expect("native Settings replaces the base input authority");
+        assert!(!scope_holds_escalation(write_edge, escalation, &ctx));
+        assert_eq!(
+            app.native_config_service.snapshot().text,
+            before.text,
+            "denied scoped input cannot mutate config"
+        );
+        assert_eq!(
+            front_drive_escalation(Scope::Owner, "key", app.front_control_surface()),
+            None,
+            "Owner keeps the established input path"
         );
     }
 
     /// COPY-ON-SELECT EXFIL FENCE (pure decision): a scoped-edge `mouse` gesture must
     /// have its copy-on-select clipboard side-effect suppressed, while Owner (the
     /// god token / in-session automation) and — implicitly — a real human gesture do
-    /// NOT. Mirrors the `overlay_drive_refusal` Owner carve-out. This pins the
+    /// NOT. Mirrors the `front_drive_escalation` Owner carve-out. This pins the
     /// control-authority DECISION headlessly; the seam honouring it (a scoped-edge
     /// release does not auto-copy) is pinned by `copy_on_select_fires_only_on_...`.
     #[test]
@@ -8743,11 +9046,8 @@ mod tests {
             );
         }
         // Payload-bearing verbs keep the token as data (`send --json` writes the
-        // literal flag to the PTY; `search json` searches for it), and `widgets`
-        // parses its own `json` sub-form — all must fall through.
-        for v in [
-            "send", "paste", "feed", "turn", "search", "await", "widgets",
-        ] {
+        // literal flag to the PTY; `search json` searches for it) must fall through.
+        for v in ["send", "paste", "feed", "turn", "search", "await"] {
             assert_eq!(json_unsupported(v), None, "{v} must fall through");
         }
         // The json-CAPABLE verbs never reach the fallback (their emitters answer

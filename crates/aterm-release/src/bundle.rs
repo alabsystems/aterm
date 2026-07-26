@@ -28,9 +28,8 @@ pub struct BundleSpec {
     pub repo_root: PathBuf,
     /// `dist/` — receives aterm.app and the build.txt provenance record.
     pub out_dir: PathBuf,
-    /// Display version, plain MAJOR.MINOR ("0.26") → CFBundleShortVersionString
-    /// and the `aterm-<ver>-build.txt` name. (A real patch version is kept
-    /// verbatim — the `.0`-strip happens at the caller, matching build-app.sh.)
+    /// Workspace-derived release version, canonical MAJOR.MINOR.PATCH ("0.2.0") →
+    /// CFBundleShortVersionString and the `aterm-<ver>-build.txt` name.
     pub short_version: String,
     /// The claimed ledger number `n` → sealed CFBundleVersion. macOS/Gatekeeper
     /// require it to increase build-over-build, and the updater's anti-replay
@@ -85,7 +84,7 @@ fn git_out(repo_root: &Path, args: &[&str]) -> Option<String> {
 /// PlistBuddy replacement. Replaces the value of an existing `<key>` /
 /// `<string>` pair, or inserts the pair before the closing `</dict>` when the
 /// key is absent (PlistBuddy's `Add … || Set …` fallback, in one step):
-///   * CFBundleShortVersionString ← `short` (human version, MAJOR.MINOR)
+///   * CFBundleShortVersionString ← `short` (human version, MAJOR.MINOR.PATCH)
 ///   * CFBundleVersion            ← `build_number` (the monotonic ledger n)
 ///   * CFBundleIdentifier         ← `bundle_id`
 ///   * ATermGitCommit             ← `git_commit` (self-describing bundles:

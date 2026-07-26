@@ -24,7 +24,7 @@
 //! failed bind is logged and the listener simply does not start — never a panic,
 //! never a fallback to an unauthenticated port.
 
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -48,6 +48,227 @@ const NET_OP: &str = "drive";
 /// `server_config` ever gets to reject the bytes. Read via `take(cap + 1)` so
 /// hitting the cap is distinguishable from a file of exactly the cap size.
 const CRED_FILE_MAX: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerValueSource {
+    Config,
+    Environment(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListenerValue {
+    value: String,
+    source: ListenerValueSource,
+}
+
+impl ListenerValue {
+    fn source_label(&self, config_key: &str) -> String {
+        match self.source {
+            ListenerValueSource::Config => config_key.to_string(),
+            ListenerValueSource::Environment(variable) => format!("${variable}"),
+        }
+    }
+
+    fn authored_config_key(&self, config_key: &'static str) -> Option<&'static str> {
+        matches!(self.source, ListenerValueSource::Config).then_some(config_key)
+    }
+}
+
+/// The three effective listener selectors after applying the startup precedence
+/// exactly once. Environment values win even when empty or malformed, matching
+/// the values [`maybe_spawn`] will attempt rather than diagnosing shadowed TOML.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListenerInputs {
+    listen: Option<ListenerValue>,
+    cert: Option<ListenerValue>,
+    key: Option<ListenerValue>,
+}
+
+impl ListenerInputs {
+    pub(crate) fn presence(&self) -> [bool; 3] {
+        [
+            self.listen.is_some(),
+            self.cert.is_some(),
+            self.key.is_some(),
+        ]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.presence().into_iter().all(|present| present)
+    }
+}
+
+/// Resolve the exact env-over-config listener generation used by startup.
+pub(crate) fn listener_inputs(config: &crate::app_config::Config) -> ListenerInputs {
+    listener_inputs_with(config, |variable| std::env::var(variable).ok())
+}
+
+fn listener_inputs_with(
+    config: &crate::app_config::Config,
+    mut environment: impl FnMut(&str) -> Option<String>,
+) -> ListenerInputs {
+    let net = config.net.as_ref();
+    let resolve = |environment: &mut dyn FnMut(&str) -> Option<String>,
+                   variable: &'static str,
+                   configured: Option<&String>| {
+        environment(variable)
+            .map(|value| ListenerValue {
+                value,
+                source: ListenerValueSource::Environment(variable),
+            })
+            .or_else(|| {
+                configured.cloned().map(|value| ListenerValue {
+                    value,
+                    source: ListenerValueSource::Config,
+                })
+            })
+    };
+    ListenerInputs {
+        listen: resolve(
+            &mut environment,
+            ENV_LISTEN,
+            net.and_then(|net| net.listen.as_ref()),
+        ),
+        cert: resolve(
+            &mut environment,
+            ENV_CERT,
+            net.and_then(|net| net.cert.as_ref()),
+        ),
+        key: resolve(
+            &mut environment,
+            ENV_KEY,
+            net.and_then(|net| net.key.as_ref()),
+        ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerFailureField {
+    Listen,
+    Cert,
+    Key,
+    CertAndKey,
+}
+
+/// One non-binding startup-preflight failure. Diagnostics uses the field set to
+/// address the concrete TOML token(s); startup prints the same reason and exits
+/// before `TcpListener::bind`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ListenerPreflightError {
+    field: ListenerFailureField,
+    config_keys: Vec<&'static str>,
+    message: String,
+}
+
+impl ListenerPreflightError {
+    pub(crate) fn config_keys(&self) -> &[&'static str] {
+        &self.config_keys
+    }
+}
+
+impl std::fmt::Display for ListenerPreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+pub(crate) struct PreparedListener {
+    addr: String,
+    bind_addresses: Vec<SocketAddr>,
+    key_path: std::path::PathBuf,
+    cert_bytes: Vec<u8>,
+    key_bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for PreparedListener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedListener")
+            .field("addr", &self.addr)
+            .field("bind_addresses", &self.bind_addresses)
+            .field("key_path", &self.key_path)
+            .field("cert_bytes_len", &self.cert_bytes.len())
+            .field("key_bytes_len", &self.key_bytes.len())
+            .finish()
+    }
+}
+
+/// Validate every effective listener input without opening a network socket.
+/// Missing fields retain the secure-default no-op. A complete set is bounded-read,
+/// parsed as a numeric-IP bind address, and compiled through the exact rustls
+/// server-config builder startup uses; only the returned [`PreparedListener`]
+/// may proceed to bind. Requiring `IP:port` avoids putting an unbounded system
+/// DNS lookup in either startup or Manual's language-service worker.
+pub(crate) fn preflight_listener(
+    inputs: &ListenerInputs,
+) -> Result<Option<PreparedListener>, ListenerPreflightError> {
+    let (Some(listen), Some(cert), Some(key)) = (&inputs.listen, &inputs.cert, &inputs.key) else {
+        return Ok(None);
+    };
+
+    let bind_address = listen
+        .value
+        .parse::<SocketAddr>()
+        .map_err(|error| ListenerPreflightError {
+            field: ListenerFailureField::Listen,
+            config_keys: listen
+                .authored_config_key("net.listen")
+                .into_iter()
+                .collect(),
+            message: format!(
+                "network listener {} value {:?} is not a numeric IP:port bind address ({error}); no port is bound",
+                listen.source_label("net.listen"),
+                listen.value,
+            ),
+        })?;
+    let bind_addresses = vec![bind_address];
+
+    let cert_path = crate::net_connections::expand_tilde(&cert.value);
+    let cert_bytes = read_cred_file(&cert_path).map_err(|error| ListenerPreflightError {
+        field: ListenerFailureField::Cert,
+        config_keys: cert.authored_config_key("net.cert").into_iter().collect(),
+        message: format!(
+            "network listener certificate from {} ({:?}) is unreadable ({error}); no port is bound",
+            cert.source_label("net.cert"),
+            cert.value,
+        ),
+    })?;
+    let key_path = crate::net_connections::expand_tilde(&key.value);
+    let key_bytes = read_cred_file(&key_path).map_err(|error| ListenerPreflightError {
+        field: ListenerFailureField::Key,
+        config_keys: key.authored_config_key("net.key").into_iter().collect(),
+        message: format!(
+            "network listener private key from {} ({:?}) is unreadable ({error}); no port is bound",
+            key.source_label("net.key"),
+            key.value,
+        ),
+    })?;
+    aterm_net::tls::server_config(cert_bytes.clone(), key_bytes.clone()).map_err(|error| {
+        ListenerPreflightError {
+            field: ListenerFailureField::CertAndKey,
+            config_keys: [
+                cert.authored_config_key("net.cert"),
+                key.authored_config_key("net.key"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            message: format!(
+                "network listener certificate/key pair from {} and {} is rejected ({error}); no port is bound",
+                cert.source_label("net.cert"),
+                key.source_label("net.key"),
+            ),
+        }
+    })?;
+
+    Ok(Some(PreparedListener {
+        addr: listen.value.clone(),
+        bind_addresses,
+        key_path,
+        cert_bytes,
+        key_bytes,
+    }))
+}
 
 /// Bounded read of a config-supplied cert/key path. A bare `fs::read` trusts the
 /// path blindly: a FIFO/device there can block startup or feed bytes without
@@ -84,6 +305,29 @@ fn read_cred_file(p: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Whether this process was launched INSIDE another aterm.
+///
+/// ROOT-ONLY is the law it serves: only a top-level aterm opens a network
+/// surface; otherwise a nested instance reading the shared
+/// ~/.config/aterm/aterm.toml could bind a SECOND Owner-control listener. The env
+/// deny-list covers only the env selectors, never the shared config file, so this
+/// explicit check is the guard. Two independent "launched inside aterm" signals so
+/// it holds across BOTH spawn paths:
+///   * ATERM_PARENT_SESSION_ID — injected on the recursion path (integrated shells);
+///   * ATERM_CHILD=1 — the dedicated child marker set for EVERY child in main.rs's
+///     baseline env_add, INCLUDING the `-e <cmd>` path that skips recursion
+///     provisioning. Replaces the old `TERM_PROGRAM == "aterm"` check, which broke
+///     once TERM_PROGRAM became a configurable identity (honest default "aterm",
+///     overridable via ATERM_TERM_PROGRAM, e.g. =ghostty for app allowlists).
+///
+/// This reads PROCESS-GLOBAL environment state, so it belongs at the edges. The
+/// diagnostics lane takes the answer as a parameter rather than calling this
+/// deep inside its projection — see `listener_capability_warnings`.
+pub(crate) fn launched_inside_aterm() -> bool {
+    std::env::var_os(aterm_types::domain::ENV_PARENT_SESSION_ID).is_some()
+        || std::env::var_os("ATERM_CHILD").is_some()
+}
+
 /// Bind the inbound TLS listener and spawn its serve loop relaying authorized
 /// remote drivers into the local control socket at `sock_path` — but ONLY when the
 /// bind address + cert + key are all configured. They are resolved from the env
@@ -94,33 +338,14 @@ fn read_cred_file(p: &std::path::Path) -> Result<Vec<u8>, String> {
 /// `token_hex` is this instance's 64-char control token; it is the HMAC key for
 /// the network capability binding, so a remote driver must hold the same token it
 /// would use for the local `AUTH` handshake — no new secret, no weaker gate.
-pub fn maybe_spawn(token_hex: &str, sock_path: &str) {
-    // ROOT-ONLY. Only a top-level aterm — NOT one launched inside another aterm —
-    // opens a network surface; otherwise a nested instance reading the shared
-    // ~/.config/aterm/aterm.toml could bind a SECOND Owner-control listener. The env
-    // deny-list covers only the env selectors, never the shared config file, so this
-    // explicit check is the guard. Two independent "launched inside aterm" signals so
-    // it holds across BOTH spawn paths:
-    //   * ATERM_PARENT_SESSION_ID — injected on the recursion path (integrated shells);
-    //   * ATERM_CHILD=1 — the dedicated child marker set for EVERY child in main.rs's
-    //     baseline env_add, INCLUDING the `-e <cmd>` path that skips recursion
-    //     provisioning. Replaces the old `TERM_PROGRAM == "aterm"` check, which broke
-    //     once TERM_PROGRAM became a configurable identity (honest default "aterm",
-    //     overridable via ATERM_TERM_PROGRAM, e.g. =ghostty for app allowlists).
-    let launched_inside_aterm = std::env::var_os(aterm_types::domain::ENV_PARENT_SESSION_ID)
-        .is_some()
-        || std::env::var_os("ATERM_CHILD").is_some();
-    if launched_inside_aterm {
+pub fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::Config) {
+    if launched_inside_aterm() {
         return;
     }
-    // Env wins, then the [net] config table. Unresolved fields ⇒ listener OFF.
-    let net = crate::app_config::load_config().net.unwrap_or_default();
-    let listen = std::env::var(ENV_LISTEN).ok().or(net.listen);
-    let cert_path = std::env::var(ENV_CERT).ok().or(net.cert);
-    let key_path = std::env::var(ENV_KEY).ok().or(net.key);
-    let (Some(addr), Some(cert_path), Some(key_path)) = (listen, cert_path, key_path) else {
+    let inputs = listener_inputs(saved);
+    if !inputs.is_complete() {
         return; // secure default: no network port
-    };
+    }
 
     // The control token IS the channel-binding key. 64-char hex => 32 bytes.
     let Some(token) = EdgeToken::from_hex(token_hex) else {
@@ -128,29 +353,27 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str) {
         return;
     };
 
-    // The documented sample config uses `~/...` paths — expand them (HOME, else
-    // USERPROFILE on Windows) the same way the dial side expands `token_file`.
-    let cert = match read_cred_file(&crate::net_connections::expand_tilde(&cert_path)) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("aterm-gui: network-drive cert {cert_path} unreadable ({e}); disabled");
+    let prepared = match preflight_listener(&inputs) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("aterm-gui: {error}");
             return;
         }
     };
-    let key_expanded = crate::net_connections::expand_tilde(&key_path);
-    let key = match read_cred_file(&key_expanded) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("aterm-gui: network-drive key {key_path} unreadable ({e}); disabled");
-            return;
-        }
-    };
+    let PreparedListener {
+        addr,
+        bind_addresses,
+        key_path,
+        cert_bytes,
+        key_bytes,
+    } = prepared;
     // PERSISTENT drive token (R37): the channel-binding secret a `dial` peer presents.
     // Stored beside the operator's TLS key, so a saved dial credential SURVIVES a
     // remote restart — provisioned ONCE, not re-copied after every restart. Falls
     // back to the per-launch control token if the file can't be created (network
     // drive still works, it just needs re-provisioning per restart — pre-R37).
-    let (drive_hex, drive_minted) = std::path::Path::new(&key_expanded)
+    let (drive_hex, drive_minted) = key_path
         .parent()
         .and_then(crate::control_auth::load_or_create_network_drive_token)
         .unwrap_or_else(|| {
@@ -161,14 +384,16 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str) {
             (token_hex.to_string(), true)
         });
     let drive_token = EdgeToken::from_hex(&drive_hex).unwrap_or(token);
-    let config = match aterm_net::tls::server_config(cert, key) {
+    // Preflight already compiled this exact byte pair. Rebuilding the cheap
+    // rustls value here avoids exposing rustls as a second direct GUI dependency.
+    let config = match aterm_net::tls::server_config(cert_bytes, key_bytes) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("aterm-gui: server cert/key rejected ({e}); network drive disabled");
             return;
         }
     };
-    let listener = match TcpListener::bind(addr.as_str()) {
+    let listener = match TcpListener::bind(bind_addresses.as_slice()) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("aterm-gui: network drive bind failed at {addr}: {e}");
@@ -254,6 +479,41 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str) {
 mod tests {
     use super::*;
 
+    const TEST_CERT_DER: &[u8] = include_bytes!("../../aterm-net/src/testdata/cert.der");
+    const TEST_KEY_DER: &[u8] = include_bytes!("../../aterm-net/src/testdata/key.pkcs8.der");
+
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "aterm-listener-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn listener_config(
+        listen: &str,
+        cert: &std::path::Path,
+        key: &std::path::Path,
+    ) -> crate::app_config::Config {
+        toml::from_str(&format!(
+            "[net]\nlisten = {listen:?}\ncert = {:?}\nkey = {:?}\n",
+            cert.to_string_lossy(),
+            key.to_string_lossy(),
+        ))
+        .unwrap()
+    }
+
+    fn fixture_files(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        std::fs::create_dir_all(root).unwrap();
+        let cert = root.join("cert.der");
+        let key = root.join("key.der");
+        std::fs::write(&cert, TEST_CERT_DER).unwrap();
+        std::fs::write(&key, TEST_KEY_DER).unwrap();
+        (cert, key)
+    }
+
     /// The cert/key reader must fail fast on a mispointed path instead of
     /// hanging (writerless FIFO, pre-fix: blocked at `open()`) or ballooning
     /// (pre-fix: uncapped `fs::read`): a regular file under the cap round-trips
@@ -295,5 +555,141 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_listener_inputs_honor_environment_precedence_including_blank_values() {
+        let root = test_dir("env-precedence");
+        let (cert, key) = fixture_files(&root);
+        let config: crate::app_config::Config = toml::from_str(
+            "[net]\nlisten = \"config:1\"\ncert = \"config-cert\"\nkey = \"config-key\"\n",
+        )
+        .unwrap();
+        let inputs = listener_inputs_with(&config, |variable| match variable {
+            ENV_LISTEN => Some(String::new()),
+            ENV_CERT => Some("env-cert".to_string()),
+            ENV_KEY => Some("env-key".to_string()),
+            _ => None,
+        });
+        assert_eq!(inputs.listen.as_ref().unwrap().value, "");
+        assert_eq!(inputs.cert.as_ref().unwrap().value, "env-cert");
+        assert_eq!(inputs.key.as_ref().unwrap().value, "env-key");
+        assert!(matches!(
+            inputs.listen.as_ref().unwrap().source,
+            ListenerValueSource::Environment(ENV_LISTEN)
+        ));
+        let error = preflight_listener(&inputs).unwrap_err();
+        assert_eq!(
+            error.field,
+            ListenerFailureField::Listen,
+            "an explicitly blank environment override must not fall through to config"
+        );
+        assert!(
+            error.config_keys().is_empty(),
+            "an environment error has no TOML token for Manual to underline"
+        );
+
+        let inputs = listener_inputs_with(&config, |variable| match variable {
+            ENV_LISTEN => Some("127.0.0.1:7100".to_string()),
+            ENV_CERT => Some(cert.to_string_lossy().into_owned()),
+            ENV_KEY => Some(key.to_string_lossy().into_owned()),
+            _ => None,
+        });
+        assert!(
+            preflight_listener(&inputs).unwrap().is_some(),
+            "valid environment values must completely shadow invalid config values"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn listener_preflight_reports_missing_directory_and_oversize_credentials() {
+        let root = test_dir("bad-files");
+        let (_, key) = fixture_files(&root);
+        let missing = root.join("missing.der");
+        let error = preflight_listener(&listener_inputs(&listener_config(
+            "127.0.0.1:7100",
+            &missing,
+            &key,
+        )))
+        .unwrap_err();
+        assert_eq!(error.field, ListenerFailureField::Cert);
+        assert!(error.message.contains("unreadable"), "{error}");
+
+        let error = preflight_listener(&listener_inputs(&listener_config(
+            "127.0.0.1:7100",
+            &root,
+            &key,
+        )))
+        .unwrap_err();
+        assert_eq!(error.field, ListenerFailureField::Cert);
+        assert!(error.message.contains("unreadable"), "{error}");
+
+        let oversize = root.join("oversize.der");
+        std::fs::write(&oversize, vec![0u8; CRED_FILE_MAX as usize + 1]).unwrap();
+        let error = preflight_listener(&listener_inputs(&listener_config(
+            "127.0.0.1:7100",
+            &oversize,
+            &key,
+        )))
+        .unwrap_err();
+        assert_eq!(error.field, ListenerFailureField::Cert);
+        assert!(error.message.contains("larger than"), "{error}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn listener_preflight_rejects_malformed_address_and_tls_pair_without_binding() {
+        let root = test_dir("malformed");
+        let (cert, key) = fixture_files(&root);
+        let error = preflight_listener(&listener_inputs(&listener_config(
+            "not a bind address",
+            &cert,
+            &key,
+        )))
+        .unwrap_err();
+        assert_eq!(error.field, ListenerFailureField::Listen);
+        assert!(error.message.contains("bind address"), "{error}");
+        assert_eq!(error.config_keys(), ["net.listen"]);
+
+        let error = preflight_listener(&listener_inputs(&listener_config(
+            "localhost:7100",
+            &cert,
+            &key,
+        )))
+        .unwrap_err();
+        assert_eq!(error.field, ListenerFailureField::Listen);
+        assert!(error.message.contains("numeric IP:port"), "{error}");
+
+        std::fs::write(&cert, b"not a DER certificate").unwrap();
+        let error = preflight_listener(&listener_inputs(&listener_config(
+            "127.0.0.1:7100",
+            &cert,
+            &key,
+        )))
+        .unwrap_err();
+        assert_eq!(error.field, ListenerFailureField::CertAndKey);
+        assert!(error.message.contains("rejected"), "{error}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn valid_listener_preflight_compiles_tls_but_never_binds() {
+        let root = test_dir("valid");
+        let (cert, key) = fixture_files(&root);
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap().to_string();
+        let prepared = preflight_listener(&listener_inputs(&listener_config(&addr, &cert, &key)))
+            .unwrap()
+            .expect("complete valid listener");
+        assert_eq!(prepared.addr, addr);
+        assert_eq!(prepared.bind_addresses, [occupied.local_addr().unwrap()]);
+        assert_eq!(prepared.cert_bytes, TEST_CERT_DER);
+        assert_eq!(prepared.key_bytes, TEST_KEY_DER);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -88,10 +88,10 @@ fn deferred_line_empty_row_equivalence() {
     let extras = ScrolledRowExtras::default();
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras.clone());
+    let deferred = DeferredLine::new(&row, extras.clone(), Vec::new());
     let lazy_ref = deferred.to_line().clone();
 
-    let deferred2 = DeferredLine::new(&row, extras);
+    let deferred2 = DeferredLine::new(&row, extras, Vec::new());
     let lazy_owned = deferred2.into_line();
 
     assert_lines_equivalent(&eager, &lazy_ref, "empty row (to_line)");
@@ -105,7 +105,7 @@ fn deferred_line_empty_row_wrapped_equivalence() {
     let extras = ScrolledRowExtras::default();
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "empty wrapped row");
@@ -127,10 +127,10 @@ fn deferred_line_ascii_row_equivalence() {
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
 
-    let deferred = DeferredLine::new(&row, extras.clone());
+    let deferred = DeferredLine::new(&row, extras.clone(), Vec::new());
     let lazy_ref = deferred.to_line().clone();
 
-    let deferred2 = DeferredLine::new(&row, extras);
+    let deferred2 = DeferredLine::new(&row, extras, Vec::new());
     let lazy_owned = deferred2.into_line();
 
     assert_lines_equivalent(&eager, &lazy_ref, "ASCII row (to_line)");
@@ -152,7 +152,7 @@ fn deferred_line_styled_ascii_row_equivalence() {
     let extras = ScrolledRowExtras::default();
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "styled ASCII row");
@@ -174,7 +174,7 @@ fn deferred_line_wrapped_row_equivalence() {
     let extras = ScrolledRowExtras::default();
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "wrapped row");
@@ -200,7 +200,7 @@ fn deferred_line_complex_chars_equivalence() {
     extras.complex_chars.push((2, Arc::from("\u{1F600}"))); // grinning face
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "complex chars row");
@@ -224,7 +224,7 @@ fn deferred_line_combining_marks_equivalence() {
         .push((3, SmallVec::from_elem('\u{0301}', 1)));
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "combining marks row");
@@ -259,7 +259,7 @@ fn deferred_line_hyperlinks_equivalence() {
     });
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "hyperlinks row");
@@ -298,7 +298,7 @@ fn deferred_line_multiple_hyperlinks_equivalence() {
     });
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "multiple hyperlinks row");
@@ -329,7 +329,7 @@ fn deferred_line_rgb_colors_equivalence() {
     }
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "RGB colors row");
@@ -385,10 +385,10 @@ fn deferred_line_mixed_content_equivalence() {
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
 
-    let deferred1 = DeferredLine::new(&row, extras.clone());
+    let deferred1 = DeferredLine::new(&row, extras.clone(), Vec::new());
     let lazy_ref = deferred1.to_line().clone();
 
-    let deferred2 = DeferredLine::new(&row, extras);
+    let deferred2 = DeferredLine::new(&row, extras, Vec::new());
     let lazy_owned = deferred2.into_line();
 
     assert_lines_equivalent(&eager, &lazy_ref, "mixed content (to_line)");
@@ -433,7 +433,7 @@ fn deferred_line_wide_chars_equivalence() {
     let extras = ScrolledRowExtras::default();
 
     let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
-    let deferred = DeferredLine::new(&row, extras);
+    let deferred = DeferredLine::new(&row, extras, Vec::new());
     let lazy = deferred.into_line();
 
     assert_lines_equivalent(&eager, &lazy, "wide chars row");
@@ -461,7 +461,7 @@ fn lazy_buffer_drain_produces_equivalent_lines() {
     );
     let extras1 = ScrolledRowExtras::default();
     let eager1 = Grid::row_to_line_with_stored_extras(&row1, &extras1);
-    buf.push(DeferredLine::new(&row1, extras1));
+    buf.push(DeferredLine::new(&row1, extras1, Vec::new()));
 
     let row2 = rb.build(
         &b"Line two"
@@ -473,7 +473,7 @@ fn lazy_buffer_drain_produces_equivalent_lines() {
     );
     let extras2 = ScrolledRowExtras::default();
     let eager2 = Grid::row_to_line_with_stored_extras(&row2, &extras2);
-    buf.push(DeferredLine::new(&row2, extras2));
+    buf.push(DeferredLine::new(&row2, extras2, Vec::new()));
 
     assert_eq!(buf.len(), 2);
 
@@ -483,4 +483,259 @@ fn lazy_buffer_drain_produces_equivalent_lines() {
 
     assert_lines_equivalent(&eager1, &drained[0], "lazy buffer drain line 1");
     assert_lines_equivalent(&eager2, &drained[1], "lazy buffer drain line 2");
+}
+
+// =============================================================================
+// Cell-body recycling (the per-newline malloc the pool removes)
+//
+// Every row that scrolls off the ring becomes a `DeferredLine` whose cell
+// snapshot used to be a fresh `to_vec()` — one malloc per newline, INSIDE the
+// PTY reader's `term_lock` hold (~800 of them for a 64 KiB batch at 80 cols),
+// i.e. on the hold the UI thread's keystroke-echo present waits behind. These
+// pin the two properties that make recycling safe: a reused body carries no
+// state from its previous line, and the free-list cannot grow without bound.
+// =============================================================================
+
+#[test]
+fn recycled_cell_body_carries_no_state_from_the_previous_line() {
+    use crate::grid::scroll_convert::LazyBuffer;
+
+    let mut rb = RowBuilder::new();
+    let mut buf = LazyBuffer::new();
+
+    // A LONG, plain line first — its body is the one that gets recycled.
+    let long_cells: Vec<Cell> = (0..60u8)
+        .map(|i| Cell::from_ascii_fast(b'a' + i % 26))
+        .collect();
+    let long_row = rb.build(&long_cells, 80, false);
+    buf.push_row(&long_row, ScrolledRowExtras::default());
+    assert_eq!(buf.drain_all().count(), 1);
+    assert_eq!(
+        buf.pooled_bodies(),
+        1,
+        "a materialized line must hand its cell body back"
+    );
+
+    // Now a SHORTER, differently-styled, WRAPPED line reuses that body. If the
+    // reuse leaked the old length or old cells, this line would come back with
+    // trailing 'a'..'z' garbage — the failure mode `clear` + `extend_from_slice`
+    // (rather than a bare truncate/overwrite) rules out.
+    let fg = PackedColor::rgb(255, 128, 0);
+    let bg = PackedColor::rgb(0, 64, 128);
+    let short_cells: Vec<Cell> = b"hi"
+        .iter()
+        .map(|&b| Cell::with_style(b as char, fg, bg, CellFlags::BOLD))
+        .collect();
+    let short_row = rb.build(&short_cells, 80, true);
+    let mut extras = ScrolledRowExtras::default();
+    for col in 0..2u16 {
+        extras.rgb_fg.push((col, [255, 128, 0]));
+        extras.rgb_bg.push((col, [0, 64, 128]));
+    }
+
+    let eager = Grid::row_to_line_with_stored_extras(&short_row, &extras);
+    let fresh_body = DeferredLine::new(&short_row, extras.clone(), Vec::new()).into_line();
+
+    buf.push_row(&short_row, extras);
+    assert_eq!(
+        buf.pooled_bodies(),
+        0,
+        "the pooled body must actually be reused, not left idle"
+    );
+    let drained: Vec<_> = buf.drain_all().collect();
+
+    assert_lines_equivalent(&eager, &drained[0], "line built on a recycled body");
+    assert_eq!(
+        fresh_body.to_string(),
+        drained[0].to_string(),
+        "recycled body must produce the same text as a fresh Vec"
+    );
+}
+
+#[test]
+fn lazy_buffer_recycles_bodies_across_a_drain() {
+    use crate::grid::scroll_convert::LazyBuffer;
+
+    let mut rb = RowBuilder::new();
+    let mut buf = LazyBuffer::new();
+    let cells: Vec<Cell> = b"staged line"
+        .iter()
+        .map(|&b| Cell::from_ascii_fast(b))
+        .collect();
+    let row = rb.build(&cells, 80, false);
+
+    for _ in 0..8 {
+        buf.push_row(&row, ScrolledRowExtras::default());
+    }
+    assert_eq!(buf.pooled_bodies(), 0, "production drains the free-list");
+
+    assert_eq!(buf.drain_all().count(), 8);
+    assert_eq!(buf.pooled_bodies(), 8, "the drain refills the free-list");
+
+    // The next 8 scroll-offs must reach the allocator zero times.
+    for _ in 0..8 {
+        buf.push_row(&row, ScrolledRowExtras::default());
+    }
+    assert_eq!(
+        buf.pooled_bodies(),
+        0,
+        "every staged line should have taken a recycled body"
+    );
+}
+
+#[test]
+fn flood_backpressure_drop_recycles_bodies() {
+    use crate::grid::scroll_convert::LazyBuffer;
+
+    // `drop_oldest` is the THRU-5 backpressure path: it runs precisely when the
+    // reader is allocating a body per newline under its lock, so dropping those
+    // bodies to the allocator would leave the pool dry when it matters most.
+    let mut rb = RowBuilder::new();
+    let mut buf = LazyBuffer::new();
+    let cells: Vec<Cell> = b"dropped under flood"
+        .iter()
+        .map(|&b| Cell::from_ascii_fast(b))
+        .collect();
+    let row = rb.build(&cells, 80, false);
+
+    for _ in 0..5 {
+        buf.push_row(&row, ScrolledRowExtras::default());
+    }
+    buf.drop_oldest(3);
+    assert_eq!(buf.len(), 2, "drop_oldest still drops the staged lines");
+    assert_eq!(
+        buf.pooled_bodies(),
+        3,
+        "dropped lines' bodies must be recycled, not freed"
+    );
+}
+
+#[test]
+fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
+    use crate::grid::scroll_convert::LazyBuffer;
+
+    // DEPTH cap: many narrow bodies. Unbounded, a 700-line backlog drain would
+    // park 700 bodies forever.
+    let mut rb = RowBuilder::new();
+    let mut buf = LazyBuffer::new();
+    let narrow: Vec<Cell> = b"narrow"
+        .iter()
+        .map(|&b| Cell::from_ascii_fast(b))
+        .collect();
+    let narrow_row = rb.build(&narrow, 80, false);
+    for _ in 0..700 {
+        buf.push_row(&narrow_row, ScrolledRowExtras::default());
+    }
+    assert_eq!(buf.drain_all().count(), 700);
+    let depth = buf.pooled_bodies();
+    assert!(
+        depth <= 512,
+        "free-list depth must be capped (POOL_MAX_BUFFERS), got {depth}"
+    );
+
+    // CELL budget: the depth cap alone is a PER-WIDTH bound (512 × cols × 8 B),
+    // which a very wide window would turn into megabytes of idle free-list.
+    let mut buf = LazyBuffer::new();
+    let wide: Vec<Cell> = (0..900u16).map(|_| Cell::from_ascii_fast(b'w')).collect();
+    let wide_row = rb.build(&wide, 1000, false);
+    for _ in 0..200 {
+        buf.push_row(&wide_row, ScrolledRowExtras::default());
+    }
+    assert_eq!(buf.drain_all().count(), 200);
+    let wide_depth = buf.pooled_bodies();
+    assert!(
+        wide_depth < 200,
+        "the cell budget must bite long before the depth cap, got {wide_depth}"
+    );
+    // 512 KiB of bodies + the (drained, empty) deque and free-list spines. The
+    // un-pooled bodies alone would have been 200 × 900 × 8 B ≈ 1.4 MB.
+    let used = buf.memory_used();
+    assert!(
+        used < 640 * 1024,
+        "pooled + staged bytes must stay under the budget, got {used}"
+    );
+}
+
+#[test]
+fn width_change_drops_recycled_bodies_and_history_survives() {
+    use aterm_scrollback::Scrollback;
+
+    // Old-width bodies are useless after a resize (dead capacity when the width
+    // shrinks, a guaranteed realloc when it grows) — and the content must be
+    // unaffected either way, since a body is cleared and refilled from the row.
+    let scrollback = Scrollback::new(100, 1000, 100_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
+    for i in 0..40usize {
+        grid.carriage_return();
+        for c in format!("L{i}").chars() {
+            grid.write_char(c);
+        }
+        grid.line_feed();
+    }
+    grid.drain_lazy_buffer();
+    assert!(
+        grid.storage.lazy_buffer.pooled_bodies() > 0,
+        "the drain should have parked recycled bodies"
+    );
+
+    grid.resize(3, 40);
+    assert_eq!(
+        grid.storage.lazy_buffer.pooled_bodies(),
+        0,
+        "a width change must drop the old-width free-list"
+    );
+
+    // A rows-only resize keeps the pool (nothing about the bodies went stale).
+    grid.resize(5, 40);
+    let history: Vec<String> = (0..grid.scrollback_lines())
+        .rev()
+        .map(|rev| {
+            grid.history_line_rev(rev)
+                .map(|l| l.to_string().trim_end().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let expected: Vec<String> = (0..history.len()).map(|i| format!("L{i}")).collect();
+    assert_eq!(
+        history, expected,
+        "recycled bodies must not perturb scrollback content"
+    );
+}
+
+#[test]
+fn recycling_preserves_flooded_scrollback_content() {
+    use aterm_scrollback::Scrollback;
+
+    // End-to-end: enough newlines to cycle bodies through the pool many times
+    // (push → drain → push on the recycled body), asserting the history is
+    // still exactly L0..L299 in order.
+    let scrollback = Scrollback::new(400, 1000, 100_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
+    for i in 0..300usize {
+        grid.carriage_return();
+        for c in format!("L{i}").chars() {
+            grid.write_char(c);
+        }
+        grid.line_feed();
+        // Drain every few lines so the pool is exercised (fill → recycle → refill)
+        // rather than simply growing to a single big backlog.
+        if i % 7 == 0 {
+            grid.drain_lazy_bounded(4);
+        }
+    }
+    grid.drain_lazy_buffer();
+
+    let history: Vec<String> = (0..grid.scrollback_lines())
+        .rev()
+        .map(|rev| {
+            grid.history_line_rev(rev)
+                .map(|l| l.to_string().trim_end().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let expected: Vec<String> = (0..history.len()).map(|i| format!("L{i}")).collect();
+    assert_eq!(
+        history, expected,
+        "flooded history must be intact and ordered"
+    );
 }

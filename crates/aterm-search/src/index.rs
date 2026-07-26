@@ -53,9 +53,10 @@ pub const MAX_SEARCH_MATCHES: usize = 100_000;
 /// — e.g. the terminal's visible screen, which must stay searchable no matter how
 /// small the configured history cap — sizes its capacity via
 /// [`max_cached_for_retained`], the inverse of this mark. Single source of truth for
-/// the ratio: [`evict_oldest_lines`] and `max_cached_for_retained` both read it.
-const EVICTION_RETAIN_NUM: usize = 3;
-const EVICTION_RETAIN_DEN: usize = 4;
+/// the ratio: [`evict_oldest_lines`], `max_cached_for_retained`, and the
+/// lifecycle oracle's cap-eviction mirror all read it.
+pub(crate) const EVICTION_RETAIN_NUM: usize = 3;
+pub(crate) const EVICTION_RETAIN_DEN: usize = 4;
 
 /// Number of oldest rows that will be absent after indexing `total_lines`
 /// distinct, ascending line numbers into an index with `max_cached_lines`.
@@ -72,14 +73,11 @@ pub(crate) fn final_evicted_prefix(total_lines: usize, max_cached_lines: usize) 
         return 0;
     }
 
-    let target =
-        max_cached_lines.saturating_mul(EVICTION_RETAIN_NUM) / EVICTION_RETAIN_DEN;
+    let target = max_cached_lines.saturating_mul(EVICTION_RETAIN_NUM) / EVICTION_RETAIN_DEN;
     // Each eviction occurs immediately after the cache grows to max + 1 and
     // removes exactly this many distinct ascending rows.  The subtraction is
     // strictly positive on this branch (including the max=1/target=0 edge).
-    let rows_per_eviction = max_cached_lines
-        .saturating_add(1)
-        .saturating_sub(target);
+    let rows_per_eviction = max_cached_lines.saturating_add(1).saturating_sub(target);
     let rows_after_first = total_lines.saturating_sub(max_cached_lines.saturating_add(1));
     let eviction_count = 1usize.saturating_add(rows_after_first / rows_per_eviction);
     eviction_count
@@ -639,9 +637,7 @@ impl SearchIndex {
         // across the (opaque to it) Vec length. Identical iteration: take(n)
         // stops at min(n, len) and evict_count <= len by the guard above.
         for &line in line_nums.iter().take(evict_count) {
-            if let Some(text) = self.lines.remove(&line) {
-                self.remove_trigrams(line, &text);
-            }
+            self.lines.remove(&line);
             self.column_maps.remove(&line);
         }
 
@@ -654,6 +650,19 @@ impl SearchIndex {
             .unwrap_or(self.next_line);
         self.first_cached_line = self.lowest_retained_line;
         self.eviction_occurred = true;
+
+        // Trim every posting list to the new watermark in ONE front-drain, then
+        // prune emptied trigrams. Equivalent to removing each evicted line's
+        // trigrams one-by-one — every row below the watermark is evicted, so a
+        // posting entry is dropped iff its row is — but O(total_postings)
+        // instead of the O(evicted·len) of one-at-a-time front removals (the
+        // sortedvec container's front remove is a tail shift). See
+        // SparseBitmap::drop_below and the eviction-identity oracle.
+        let watermark = line_as_u32(self.lowest_retained_line);
+        self.trigrams.retain(|_, bitmap| {
+            bitmap.drop_below(watermark);
+            !bitmap.is_empty()
+        });
 
         // Warn once: results are now potentially incomplete for the lifetime of
         // this index. Repeated eviction passes do not re-warn (avoids log spam).
@@ -793,7 +802,7 @@ impl SearchIndex {
         &self,
         lower_query: &str,
         from_line: usize,
-    ) -> CandidateSource<'_> {
+    ) -> CandidateSource {
         if lower_query.is_empty() || self.lines.is_empty() {
             return CandidateSource::Empty;
         }
@@ -816,7 +825,7 @@ impl SearchIndex {
         &self,
         lower_query: &str,
         before_line: usize,
-    ) -> CandidateSource<'_> {
+    ) -> CandidateSource {
         if lower_query.is_empty() || self.lines.is_empty() {
             return CandidateSource::Empty;
         }
@@ -927,6 +936,34 @@ impl SearchIndex {
         self.first_eviction_warned = false;
     }
 
+    /// Release the index's backing allocations, not just its logical contents.
+    ///
+    /// [`clear`](Self::clear) empties every container but a `HashMap`/`Vec`
+    /// RETAINS the capacity it grew to, so a cleared index still holds the peak
+    /// heap of its busiest moment — a logical clear frees nothing observable to
+    /// the OS. `release` instead REPLACES each container with a fresh empty one,
+    /// dropping the grown allocation back to the allocator, and resets the same
+    /// watermarks `clear` does. This is the primitive an idle-eviction policy
+    /// calls to actually reclaim a dormant document's footprint; a later
+    /// `index_line` regrows the maps from empty. The reset is byte-for-byte the
+    /// same OBSERVABLE state as `clear` (a subsequent search behaves
+    /// identically) — only the retained capacity differs.
+    pub fn release(&mut self) {
+        // Assign fresh containers (not `.clear()`) so the old backing buffers
+        // are dropped, not merely emptied-in-place. Bloom drops to its floor
+        // capacity, matching a freshly constructed index.
+        self.bloom = BloomFilter::with_capacity(1000);
+        self.trigrams = FxHashMap::default();
+        self.lines = FxHashMap::default();
+        self.column_maps = FxHashMap::default();
+        self.line_count = 0;
+        self.first_cached_line = usize::MAX;
+        self.next_line = 0;
+        self.lowest_retained_line = 0;
+        self.eviction_occurred = false;
+        self.first_eviction_warned = false;
+    }
+
     /// Set the maximum number of cached lines before eviction.
     ///
     /// A value of 0 is clamped to 1 so the index always retains at least the
@@ -970,11 +1007,18 @@ impl SearchIndex {
                 .collect()
         };
         for line in stale {
-            if let Some(text) = self.lines.remove(&line) {
-                self.remove_trigrams(line, &text);
-            }
+            self.lines.remove(&line);
             self.column_maps.remove(&line);
         }
+        // Batch-trim postings below the retained boundary in one front-drain
+        // (see evict_oldest_lines): every removed row is < first_retained_line,
+        // so trimming each posting list to the watermark drops exactly their
+        // entries without an O(rows·len) per-row front-remove.
+        let watermark = line_as_u32(first_retained_line);
+        self.trigrams.retain(|_, bitmap| {
+            bitmap.drop_below(watermark);
+            !bitmap.is_empty()
+        });
         self.first_cached_line = first_retained_line.min(self.line_count);
         self.lowest_retained_line = self.lowest_retained_line.max(first_retained_line);
         self.eviction_occurred = true;
@@ -1479,6 +1523,10 @@ impl SearchIndex {
 
     /// Regex point navigation with one compilation shared by the first pass
     /// and optional wrap pass.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private twin of the stable point-search policy surface"
+    )]
     pub(crate) fn find_regex_direction(
         &self,
         query: &str,

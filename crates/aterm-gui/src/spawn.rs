@@ -908,6 +908,30 @@ pub(crate) fn prepare_deferred_reader(
     attach_reader_inner(session, window, proxy, factory, Some(gate.clone()))
 }
 
+/// Hand a FRESH reader a clean pair of shared latches: nothing this attach's thread
+/// does may be governed by state the PREVIOUS reader left behind.
+///
+/// `reader_stop` is the obvious half — [`park_reader`] raises it to stop the old
+/// thread, and a reader that starts with it still set would exit immediately.
+///
+/// `output_wake_pending` is the half that was missed, and it is the more damaging
+/// one. The latch is ARMED by the reader and CLEARED by the main thread's
+/// `Wake::Output` handler; a park (overlap handoff, deferred reattach) can therefore
+/// leave it armed with a wake that no handler will ever consume, because the session
+/// it named stopped producing output the moment its reader stopped. The new reader
+/// then hits [`gated_output_wake`]'s "armed and fresh" fast path and SUPPRESSES every
+/// wake it would post, so its grid is mutated with no event asking the UI to look —
+/// the session's screen freezes until the 100 ms self-expiry heals it (and re-freezes
+/// on the next inherited arm). Clearing here, after the old thread has been joined
+/// above and before the new one is spawned, means an arm can only ever be owned by
+/// the reader that posted it.
+fn reset_reader_latches(session: &Session) {
+    session.reader_stop.store(false, Ordering::Release);
+    // Relaxed matches the latch protocol everywhere else: grid content is
+    // synchronized by the term mutex, the latch only governs wake delivery.
+    session.output_wake_pending.store(0, Ordering::Relaxed);
+}
+
 fn attach_reader_inner(
     session: &mut Session,
     window: WindowId,
@@ -960,7 +984,7 @@ fn attach_reader_inner(
         .map_err(|error| format!("reserve PTY read buffer: {error}"))?;
     read_buf.resize(65_536, 0);
     let (wake_rd, wake_wr) = aterm_pty::make_wake_pipe().unwrap_or((-1, -1));
-    session.reader_stop.store(false, Ordering::Release);
+    reset_reader_latches(session);
     let reader = spawn_pty_reader(PtyReaderWiring {
         master: session.master,
         id: session.id,
@@ -972,6 +996,7 @@ fn attach_reader_inner(
         cast_tx,
         temporal_tx,
         byte_fanout: session.ctx.byte_fanout.clone(),
+        sink: session.ctx.sink.clone(),
         lat_epoch: factory.lat_epoch,
         last_output_ns: session.last_output_ns.clone(),
         latest_output_activity_ns: session.latest_output_activity_ns.clone(),
@@ -1101,6 +1126,40 @@ mod park_reader_tests {
         ));
         assert!(session.reader_join.is_none());
     }
+
+    /// A park leaves the wake latch armed with an event no handler will consume
+    /// (the session stopped producing output when its reader stopped). Re-attach
+    /// must hand the new reader a CLEAR latch, or `gated_output_wake`'s "armed and
+    /// fresh" fast path swallows every wake it posts and the session's screen
+    /// freezes for the latch expiry while its grid is being mutated.
+    #[test]
+    fn a_reattached_reader_never_inherits_a_dead_wake_arm() {
+        let session = crate::stub_session(78);
+        // The stale arm the old reader left: recent enough that the self-expiry
+        // would not heal it for another ~100 ms.
+        session
+            .output_wake_pending
+            .store(1_000, std::sync::atomic::Ordering::Relaxed);
+        session
+            .reader_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        super::reset_reader_latches(&session);
+
+        assert!(
+            !session.reader_stop.load(std::sync::atomic::Ordering::Acquire),
+            "a fresh reader must not start already stopped"
+        );
+        // The observable consequence, not just the field value: the very next
+        // burst's wake actually reaches the event loop.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        super::gated_output_wake(&session.output_wake_pending, 1_001, || tx.send(()).is_ok());
+        assert_eq!(
+            rx.try_iter().count(),
+            1,
+            "the first burst after a re-attach must post its wake"
+        );
+    }
 }
 
 /// Build the engine for a fresh live session: the configured grid (scrollback,
@@ -1126,11 +1185,13 @@ fn new_live_terminal(
     // the real per-config line limit + budget, and lines scrolled off the ring tier into
     // the store instead of being dropped. The GUI only ever resolves the in-memory
     // backend (no disk-tier config is exposed), so no scratch path is needed here.
-    // `with_defaults()` seeds a 100k-line / 100 MB store — the advertised default —
-    // which `apply_config` then narrows/widens to the resolved config (including
-    // `scrollback_lines = 0` ⇒ line limit `None` ⇒ unlimited, bounded only by the
-    // budget). The ring stays at the pre-store 10k, so history ≤10k is byte-identical to
-    // the old path and the store purely EXTENDS retention past it.
+    // `with_defaults()` seeds a 100k-line / 100 MB STORE. The user-facing limit is now
+    // one total across that store and the ring, so the no-config path below explicitly
+    // applies the advertised 100k total (leaving a 90k store share). `apply_config`
+    // performs the same split for configured totals, including `scrollback_lines = 0`
+    // ⇒ unlimited, bounded only by the budget. The ring stays at the pre-store 10k, so
+    // history ≤10k is byte-identical to the old path and the store purely extends
+    // retention past it.
     let mut t = Terminal::with_scrollback(
         rows,
         cols,
@@ -1139,6 +1200,8 @@ fn new_live_terminal(
     );
     if let Some(tc) = cfg {
         t.apply_config(tc);
+    } else {
+        t.set_scrollback_line_limit(Some(aterm_core::scrollback::DEFAULT_LINE_LIMIT));
     }
     // BROKEN-2: tell the engine the live OS color scheme at construction, so a
     // tab/split spawned after the window attached agrees with the rendered pixels and
@@ -1652,6 +1715,16 @@ fn spawn_pty_gather(
     free_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     filled_tx: std::sync::mpsc::SyncSender<GatherMsg>,
     parse_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    // This session's byte sink, purely so the `O_NONBLOCK` flip below can be
+    // DECLARED to it. `O_NONBLOCK` is a property of the open file DESCRIPTION, so
+    // the gather's flip applies to every writer of the fd — but the sink cannot
+    // observe it, and without that knowledge its UI-thread egress must assume the
+    // description might block and write one byte per `poll(2)` to stay parking-free.
+    // Telling it lets a whole keystroke frame go out in a single `write(2)`: with
+    // Kitty `REPORT_EVENT_TYPES` (which agent TUIs negotiate) one physical key is
+    // ~5-11 bytes for press AND release, i.e. ~20-44 syscalls on the winit event
+    // loop per keypress instead of ~4.
+    sink: Arc<SinkWriter>,
 ) -> Result<(), String> {
     std::thread::Builder::new()
         .name(format!("aterm-pty-gather-{id}"))
@@ -1683,6 +1756,12 @@ fn spawn_pty_gather(
             // emulation in aterm-session's sink. If the fcntl fails the master
             // stays blocking and the poll-guarded `drain_more` is used instead.
             let nonblock = aterm_pty::set_nonblocking(master, true).is_ok();
+            // Declare it to the sink so its non-parking egress may write whole frames.
+            // Passed as the fcntl's ACTUAL result, never assumed: claiming non-blocking
+            // on a description that still blocks would let an over-large frame park the
+            // event loop inside `write(2)` — the one hazard the per-byte cadence exists
+            // to dodge. `false` merely costs syscalls, so the failure direction is safe.
+            sink.note_master_nonblocking(nonblock);
             // Bench instrument (ATERM_GATHER_SINK=drop), read ONCE at thread start:
             // count + discard batches to measure the pure kernel→gather drain ceiling.
             let sink_drop = crate::bench_knobs::gather_sink_drop();
@@ -1795,6 +1874,10 @@ struct PtyReaderWiring {
     /// `try_send`s and drops on a full queue rather than blocking or growing unbounded.
     temporal_tx: Option<std::sync::mpsc::SyncSender<crate::temporal::TemporalMsg>>,
     byte_fanout: Arc<crate::cast::ByteFanout>,
+    /// This session's byte sink — carried ONLY so the gather can declare its
+    /// `O_NONBLOCK` flip (see [`spawn_pty_gather`]'s `sink` parameter). The reader
+    /// itself never writes through it; replies go via `reply_tx`.
+    sink: Arc<SinkWriter>,
     lat_epoch: Instant,
     last_output_ns: Arc<AtomicU64>,
     /// Most recent consumed PTY burst (ns on `lat_epoch`; 0 = none). Overwritten
@@ -1842,6 +1925,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         cast_tx,
         temporal_tx,
         byte_fanout,
+        sink,
         lat_epoch,
         last_output_ns,
         latest_output_activity_ns,
@@ -1879,6 +1963,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             free_rx,
             filled_tx,
             parse_in_flight.clone(),
+            sink,
         )?;
         (filled_rx, free_tx, parse_in_flight)
     };
@@ -1934,11 +2019,34 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 session: id,
                 window,
             });
-            // One gathered batch through the engine + every tap: THRU-2 sliced
-            // process() under the term lock, temporal spine, compress signal,
-            // cast/byte taps, query replies, latency stamp, coalesced wake.
+            // One gathered batch through the engine + every tap, in the order that
+            // keeps the glass closest to the bytes: latency stamp, THRU-2 sliced
+            // process() under the term lock (+ temporal spine), compress signal,
+            // query replies, coalesced wake — and only THEN the cast/byte taps,
+            // whose whole-batch copy no pixel depends on.
             // Shared by the unix parse loop and the windows inline loop.
             let mut ingest = |buf: &[u8]| {
+                // Stamp the leading edge of this output burst (always on; a single
+                // cheap CAS) so the present path can compute output->present latency
+                // for BOTH the `metrics` control verb and the $ATERM_TRACE_LATENCY
+                // log. `compare_exchange(0, …)` keeps the FIRST edge of a burst that
+                // spans several reads, so coalesced reads still measure the whole
+                // burst.
+                //
+                // Stamped HERE — BEFORE the chunked process loop — not after it. The
+                // slice this metric claims to report is "bytes arrived -> pixels", and
+                // the term-lock wait plus the VT parse are exactly the parts that grow
+                // without bound once the terminal falls behind a flood. Stamping after
+                // the loop started the measurement at "the bytes are already in the
+                // grid", so a terminal running seconds behind its shell still reported
+                // a few-millisecond `max_present_latency_ms`: the metric hid the one
+                // stall it exists to expose. Moving the stamp changes no coalescing
+                // semantics (it is still a CAS from 0, still first-edge-wins) — only
+                // where that edge honestly sits.
+                stamp_output_arrival(
+                    &last_output_ns,
+                    (lat_epoch.elapsed().as_nanos() as u64).max(1),
+                );
                 // THRU-5: deferred-compression backlog after this burst (set under the
                 // process lock below), read afterward to decide whether to wake the worker.
                 let mut backlog = 0usize;
@@ -2058,28 +2166,6 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 {
                     let _ = tx.try_send(());
                 }
-                // asciicast tap: record the PROGRAM OUTPUT burst (`buf[..r]`) only.
-                // The `take_response()` query replies below are the terminal's OWN
-                // bytes and must NOT appear as `"o"` events (design A.5.1 #3). Hand
-                // off lock-free; the writer thread owns the JSON-escape, the
-                // timestamp, and the locking.
-                // ONE heap copy of the burst, shared by the cast + byte-fanout taps via
-                // Arc (both only borrow the bytes). NOTE: the TEMPORAL RawIn is NOT sent
-                // here — it is enqueued PER CHUNK under the term_lock above, so a resize is
-                // ordered on the spine exactly where the engine saw it; the cast tap keeps
-                // the whole burst because it orders by its own timestamp timeline.
-                // Bench instrument (ATERM_CAST_TAP=off): price the always-on tap.
-                if !crate::bench_knobs::cast_tap_off() {
-                    let burst: std::sync::Arc<[u8]> = std::sync::Arc::from(buf);
-                    // `try_send`, not `send`: the cast queue is bounded (`CAST_QUEUE_CAP`). If the
-                    // writer thread stalls under an output flood, DROP this burst rather than block
-                    // the reader's hot path or let the queue grow without bound. Recording is
-                    // best-effort; a dropped burst is a gap, never an OOM.
-                    let _ = cast_tx.try_send(burst.clone());
-                    // Live byte fan-out (Item 2): tee the SAME burst to any `bytes`
-                    // subscribers — one refcount bump, never blocks the reader.
-                    byte_fanout.tee(&burst);
-                }
                 if let Some(resp) = response {
                     // ONE shared allocation for the reply, split between the spine
                     // record and the reply-writer hand-off (refcount bumps instead
@@ -2099,21 +2185,15 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     // child floods queries without draining stdin, which is self-inflicted.
                     let _ = reply_tx.try_send(resp);
                 }
-                // Stamp the leading edge of this output burst (always on; a single
-                // cheap CAS) so the present path can compute output->present latency
-                // for BOTH the `metrics` control verb and the $ATERM_TRACE_LATENCY
-                // log. `compare_exchange(0, …)` keeps the FIRST edge of a burst that
-                // spans several reads, so coalesced reads measure the whole burst.
-                let now = lat_epoch.elapsed().as_nanos() as u64;
-                let _ = last_output_ns.compare_exchange(
-                    0,
-                    now.max(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
                 // Coalesce wakes: post `Wake::Output` only on the latch's clear->armed
                 // edge (see [`gated_output_wake`] for the protocol's guarantees).
-                gated_output_wake(&output_wake_pending, now.max(1), || {
+                // The arm timestamp is read HERE rather than reused from the burst's
+                // arrival stamp: the latch's staleness expiry measures how long a POSTED
+                // wake has gone unhandled, so arming it with a pre-parse instant would
+                // charge this burst's whole parse to the main thread's handler budget
+                // and trip the lost-wake heal early on a long batch.
+                let now = (lat_epoch.elapsed().as_nanos() as u64).max(1);
+                gated_output_wake(&output_wake_pending, now, || {
                     proxy
                         .send_event(Wake::Output {
                             session: id,
@@ -2121,6 +2201,43 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         })
                         .is_ok()
                 });
+                // asciicast tap: record the PROGRAM OUTPUT burst (`buf[..r]`) only.
+                // The `take_response()` query replies above are the terminal's OWN
+                // bytes and must NOT appear as `"o"` events (design A.5.1 #3). Hand
+                // off lock-free; the writer thread owns the JSON-escape, the
+                // timestamp, and the locking.
+                // ONE heap copy of the burst, shared by the cast + byte-fanout taps via
+                // Arc (both only borrow the bytes). NOTE: the TEMPORAL RawIn is NOT sent
+                // here — it is enqueued PER CHUNK under the term_lock above, so a resize is
+                // ordered on the spine exactly where the engine saw it; the cast tap keeps
+                // the whole burst because it orders by its own timestamp timeline.
+                //
+                // ORDERED AFTER the wake, deliberately (touch-to-glass audit). The tap
+                // is a full heap allocation plus a memcpy of the whole batch — at flood
+                // bandwidth it roughly doubles the reader's ingest memory traffic — and
+                // it used to sit BETWEEN the grid mutation and the wake, so every
+                // presentable frame waited out a copy of bytes no pixel depends on. It
+                // cannot simply be dropped: the recorder is an ALWAYS-ON rolling buffer
+                // (the `cast` / `cast frames` control verbs serialize whatever the
+                // session has produced so far, with no prior arming step, which is what
+                // makes an unattended session observable after the fact) — unlike the
+                // temporal spine, which is opt-in and therefore fully gated to `None`.
+                // Recording order is unaffected: the writer thread timestamps at FOLD
+                // time off the recorder's own epoch and the channel is FIFO, and no
+                // caller was ever promised that a burst is recorded before the UI sees
+                // it (the hand-off has always been asynchronous).
+                // Bench instrument (ATERM_CAST_TAP=off): price the always-on tap.
+                if !crate::bench_knobs::cast_tap_off() {
+                    let burst: std::sync::Arc<[u8]> = std::sync::Arc::from(buf);
+                    // `try_send`, not `send`: the cast queue is bounded (`CAST_QUEUE_CAP`). If the
+                    // writer thread stalls under an output flood, DROP this burst rather than block
+                    // the reader's hot path or let the queue grow without bound. Recording is
+                    // best-effort; a dropped burst is a gap, never an OOM.
+                    let _ = cast_tx.try_send(burst.clone());
+                    // Live byte fan-out (Item 2): tee the SAME burst to any `bytes`
+                    // subscribers — one refcount bump, never blocks the reader.
+                    byte_fanout.tee(&burst);
+                }
             };
             #[cfg(windows)]
             loop {
@@ -2233,16 +2350,26 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
 /// THRU-2: the term-lock hold width for one ingest slice of a PTY burst. FINE
 /// (8 KiB) only while a keystroke is waiting to echo (`pending` — the
 /// lock-free [`crate::metrics::input_pending`] signal), so the press path and
-/// the echo present never queue behind more than ~one chunk's process time;
-/// the WHOLE remainder otherwise, so a pure output flood pays one lock
-/// round-trip per burst instead of eight. Pure; the reader re-evaluates it
-/// per hold, so a key arriving mid-flood shrinks the very next slice.
+/// the echo present never queue behind more than ~one chunk's process time; a
+/// WIDER but still CAPPED slice otherwise (see `IDLE_CHUNK`), so a pure output
+/// flood pays a quarter of the lock round-trips while a key that arrives after
+/// the hold began still waits out at most that cap. Pure; the reader
+/// re-evaluates it per hold, so a key arriving mid-flood shrinks the very next
+/// slice.
 fn ingest_chunk_width(pending: bool, remaining: usize) -> usize {
     const PROCESS_CHUNK: usize = 8 * 1024;
+    // The IDLE width is CAPPED, not unbounded (touch-to-glass audit): `pending` is
+    // sampled per hold, so an unbounded remainder meant a key arriving one
+    // microsecond AFTER the reader entered a whole-64-KiB hold waited out the
+    // ENTIRE batch — the loop's re-evaluation never runs because the idle branch
+    // produces exactly one iteration. Capping the idle hold bounds that worst-case
+    // wait to ~one quarter of a full burst while still paying 4x fewer lock
+    // round-trips than the fine slice.
+    const IDLE_CHUNK: usize = 16 * 1024;
     if pending {
         PROCESS_CHUNK.min(remaining)
     } else {
-        remaining
+        IDLE_CHUNK.min(remaining)
     }
 }
 
@@ -2251,19 +2378,70 @@ mod ingest_chunk_tests {
     use super::ingest_chunk_width;
 
     /// The interactivity contract: a pending keystroke caps every hold at the
-    /// fine slice; an idle input path takes the remainder whole; the tail
-    /// slice never overruns what is left.
+    /// fine slice; an idle input path takes a WIDER but still BOUNDED hold (so a
+    /// key arriving mid-burst waits at most one capped process, not a whole
+    /// 64 KiB batch); the tail slice never overruns what is left.
     #[test]
-    fn chunk_width_fine_when_pending_whole_when_idle() {
+    fn chunk_width_fine_when_pending_capped_when_idle() {
         assert_eq!(ingest_chunk_width(true, 64 * 1024), 8 * 1024);
         assert_eq!(ingest_chunk_width(true, 3 * 1024), 3 * 1024); // tail < chunk
-        assert_eq!(ingest_chunk_width(false, 64 * 1024), 64 * 1024);
+        assert_eq!(ingest_chunk_width(false, 64 * 1024), 16 * 1024);
+        assert_eq!(ingest_chunk_width(false, 12 * 1024), 12 * 1024); // tail < cap
         assert_eq!(ingest_chunk_width(false, 1), 1);
+        // The idle hold is always at least as wide as the pending one — the
+        // interactivity signal must never make the reader slower.
+        assert!(ingest_chunk_width(false, 64 * 1024) >= ingest_chunk_width(true, 64 * 1024));
         // Degenerate zero-remainder never yields a zero-progress loop upstream:
         // the reader's loop condition (`off < bytes.len()`) is what prevents a
         // zero-width call; document the pure fn's behavior anyway.
         assert_eq!(ingest_chunk_width(true, 0), 0);
         assert_eq!(ingest_chunk_width(false, 0), 0);
+    }
+}
+
+/// Arm the output->present measurement for a burst that is ABOUT TO BE PARSED.
+///
+/// `compare_exchange` from 0 (never a plain store): the first unpresented edge wins,
+/// so a burst that spans several PTY reads — or several gathered batches — is measured
+/// from where the terminal first fell behind, not from its final chunk. The present
+/// path consumes the stamp with a `swap(0)`, which re-opens the CAS for the next edge.
+/// `now_ns` is forced non-zero by the caller because 0 is the "no sample" sentinel.
+///
+/// Called BEFORE the engine sees the bytes. The parse and the term-lock wait are the
+/// terms that blow up when the terminal falls behind a flood, so stamping after them
+/// (the original placement) measured a slice that began at "already in the grid" and
+/// reported single-digit milliseconds while the screen ran seconds behind the shell.
+fn stamp_output_arrival(last_output_ns: &AtomicU64, now_ns: u64) {
+    let _ = last_output_ns.compare_exchange(0, now_ns, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod output_edge_stamp_tests {
+    use super::stamp_output_arrival;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// FIRST-EDGE-WINS is the property the pre-parse move had to preserve: several
+    /// bursts arriving before one present still measure from the earliest of them,
+    /// and the present's `swap(0)` re-opens the stamp for the next edge.
+    #[test]
+    fn first_unpresented_edge_wins_and_a_present_reopens_it() {
+        let stamp = AtomicU64::new(0);
+        stamp_output_arrival(&stamp, 10);
+        stamp_output_arrival(&stamp, 20);
+        stamp_output_arrival(&stamp, 30);
+        assert_eq!(
+            stamp.load(Ordering::Relaxed),
+            10,
+            "a multi-batch burst is measured from where the terminal first fell behind"
+        );
+        // The present path's consume.
+        assert_eq!(stamp.swap(0, Ordering::Relaxed), 10);
+        stamp_output_arrival(&stamp, 40);
+        assert_eq!(
+            stamp.load(Ordering::Relaxed),
+            40,
+            "the next edge arms freely once a present has booked the previous one"
+        );
     }
 }
 

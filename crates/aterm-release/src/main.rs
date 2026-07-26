@@ -23,6 +23,7 @@ mod dmg;
 mod gates;
 mod ledger;
 mod manifest_out;
+mod mirror;
 mod publish;
 mod sign;
 mod verify;

@@ -44,6 +44,59 @@ use crate::color_math::hsv2rgb;
 /// decorrelated across repeats of the same word at the same prompt).
 pub const SUPERNOVA_SALT: u64 = 0xF0CC_AC1A_5EED_B00F;
 
+/// THE THREE DEGREES of f-bomb detonation (owner, 2026-07-24: "3 degrees of
+/// f-bomb detonations … and one of the f-bombs should be a nuke-cloud").
+///
+/// A tier AXIS inside the existing `BurstKind::SuperNova`, deliberately NOT
+/// three separate burst kinds: forking the kind would fork `super_prepass`, the
+/// two-way burst mutex, `grant_ignition`, `MAX_ACTIVE_SUPERNOVAE`, the
+/// selection wash-split, the `S_MAX_BOUND` quad certificate and the GPU parity
+/// arm. One dispatch, three arms inside the pure emitter, none of that moves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SuperTier {
+    /// The everyday bang: a local wash and one ring, ~1.1 s. The FLOOR of the
+    /// ladder — before this tier existed, 90% of f-bombs detonated not at all.
+    Flash,
+    /// Today's supernova, byte-identical. The uncommon middle.
+    #[default]
+    Nova,
+    /// The mushroom cloud (`crate::nuke`). The jackpot, ~3.6 s.
+    Nuke,
+}
+
+/// Tier windows over an INDEPENDENT decode of the SAME birth draw. `mix` is the
+/// splitmix64 finalizer, so its high and low halves are independent: the low
+/// half already decides WHETHER to detonate (`% 100 < chance_pct`), and the
+/// high half decides WHICH tier. One draw, two decodes — no new RNG, no new
+/// state, and the tier inherits the roll's determinism and its row-alignment
+/// transfer for free.
+///
+/// 70 / 25 / 5 of DETONATIONS. At the shipping 30% chance that is ~21 Flash,
+/// ~7.5 Nova and ~1.5 Nuke per hundred f-bombs: the everyday case is a real
+/// bang, the supernova stays a treat, and the cloud is a genuine ~1-in-67 event.
+pub const TIER_FLASH_END: u64 = 700;
+pub const TIER_NOVA_END: u64 = 950;
+
+/// Decode the tier from the HIGH half of the birth draw.
+#[must_use]
+pub fn tier_of(draw: u64) -> SuperTier {
+    match (draw >> 32) % 1000 {
+        d if d < TIER_FLASH_END => SuperTier::Flash,
+        d if d < TIER_NOVA_END => SuperTier::Nova,
+        _ => SuperTier::Nuke,
+    }
+}
+
+/// Total visible window per tier — the host's `nova_done` edge and ember start.
+#[must_use]
+pub fn total_ms(tier: SuperTier) -> u64 {
+    match tier {
+        SuperTier::Flash => 1100,
+        SuperTier::Nova => SUPER_TOTAL_MS,
+        SuperTier::Nuke => crate::nuke::NUKE_TOTAL_MS,
+    }
+}
+
 /// Phase boundaries, ms.
 pub const CHARGE_END_MS: u64 = 350;
 pub const DETONATION_END_MS: u64 = 650;
@@ -1102,6 +1155,87 @@ mod tests {
 
     /// Pure-emitter determinism + phase windows: same (t, env) ⇒ identical
     /// bytes; charge/detonation/shockwave/debris live only in their windows.
+    /// THE THREE DEGREES actually split 70/25/5, and the tier decode is
+    /// INDEPENDENT of the detonate decode — they read different halves of the
+    /// same word, so a word that always detonates must still see all three
+    /// tiers, and the tier must not skew with `chance_pct`.
+    #[test]
+    fn tier_split_is_the_designed_distribution() {
+        let (mut flash, mut nova, mut nuke) = (0u32, 0u32, 0u32);
+        let n = 200_000u64;
+        for i in 0..n {
+            // Splitmix-finalized draws, the shape the roll site produces.
+            let mut x = i ^ SUPERNOVA_SALT;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let draw = x ^ (x >> 31);
+            match tier_of(draw) {
+                SuperTier::Flash => flash += 1,
+                SuperTier::Nova => nova += 1,
+                SuperTier::Nuke => nuke += 1,
+            }
+        }
+        let pct = |c: u32| f64::from(c) * 100.0 / n as f64;
+        assert!(
+            (pct(flash) - 70.0).abs() < 1.0,
+            "Flash {:.2}% off the designed 70%",
+            pct(flash)
+        );
+        assert!(
+            (pct(nova) - 25.0).abs() < 1.0,
+            "Nova {:.2}% off the designed 25%",
+            pct(nova)
+        );
+        assert!(
+            (pct(nuke) - 5.0).abs() < 1.0,
+            "Nuke {:.2}% off the designed 5%",
+            pct(nuke)
+        );
+
+        // INDEPENDENCE: among only the draws that DETONATE at a 30% chance, the
+        // tier split must be unchanged — otherwise the two decodes are
+        // correlated and the rarest tier would be reachable only at some
+        // frequencies.
+        let (mut df, mut dn, mut dk) = (0u32, 0u32, 0u32);
+        for i in 0..n {
+            let mut x = i ^ SUPERNOVA_SALT;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let draw = x ^ (x >> 31);
+            if draw % 100 >= 30 {
+                continue; // did not detonate
+            }
+            match tier_of(draw) {
+                SuperTier::Flash => df += 1,
+                SuperTier::Nova => dn += 1,
+                SuperTier::Nuke => dk += 1,
+            }
+        }
+        let tot = f64::from(df + dn + dk);
+        assert!(tot > 1000.0, "too few detonations to judge independence");
+        let dpct = |c: u32| f64::from(c) * 100.0 / tot;
+        assert!(
+            (dpct(df) - 70.0).abs() < 2.0 && (dpct(dk) - 5.0).abs() < 2.0,
+            "tier skews with the detonate decode: {:.1}/{:.1}/{:.1}",
+            dpct(df),
+            dpct(dn),
+            dpct(dk)
+        );
+    }
+
+    /// Each tier owns its own window, and they are strictly ordered — the
+    /// rarest degree is also the longest.
+    #[test]
+    fn tier_windows_are_ordered() {
+        assert!(total_ms(SuperTier::Flash) < total_ms(SuperTier::Nova));
+        assert!(total_ms(SuperTier::Nova) < total_ms(SuperTier::Nuke));
+        // Nova is UNCHANGED — the historical supernova must stay byte-identical.
+        assert_eq!(total_ms(SuperTier::Nova), SUPER_TOTAL_MS);
+        // A Flash ends before the debris phase even begins, which is what makes
+        // it read as the smaller event rather than a truncated supernova.
+        assert!(total_ms(SuperTier::Flash) < DEBRIS_START_MS);
+    }
+
     #[test]
     fn phases_live_in_their_windows() {
         let e = env(20, false, 64);

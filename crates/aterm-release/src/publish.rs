@@ -25,14 +25,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use aterm_update_core::Manifest;
 
 use crate::ledger::{self, Error, GitCli, GitRunner, Result, RunOut, git_ok, rev_parse};
-use crate::{buildplan, bundle, changelog, dmg, gates, manifest_out, sign, verify};
+use crate::{buildplan, bundle, changelog, dmg, gates, manifest_out, mirror, sign, verify};
 
 // ---------------------------------------------------------------------------
 // CLI-facing surface
@@ -47,7 +47,8 @@ pub struct CutOptions {
     pub dry_run: bool,
     /// Re-enter the journaled cut at its first incomplete step.
     pub resume: bool,
-    /// Override the default MINOR bump ("0.26" shape).
+    /// Override the version derived from `[workspace.package] version`
+    /// (canonical `MAJOR.MINOR.PATCH`, e.g. "0.3.0").
     pub set_version: Option<String>,
     /// Requested operator apply floor / yank. The emitted floor is the maximum
     /// of this value and the newest live channel manifest's carried floor.
@@ -97,8 +98,9 @@ pub fn fmt_elapsed(start: Instant) -> String {
 // version + slug helpers (pure, ported from the retired shell derivations)
 // ---------------------------------------------------------------------------
 
-/// Read `[workspace.package] version` — the sole version source (spec §1).
-/// Port of the retired awk read (quote-delimited, section-scoped).
+/// Read the source tree's `[workspace.package]` `MAJOR.MINOR.0` version —
+/// the ONE version lineage. A cut never rewrites it; it derives the release
+/// version from it (see [`release_version_from_workspace`]).
 pub fn workspace_version(cargo_toml: &str) -> Result<String> {
     let mut in_pkg = false;
     for line in cargo_toml.lines() {
@@ -121,52 +123,50 @@ pub fn workspace_version(cargo_toml: &str) -> Result<String> {
     ))
 }
 
-/// "0.26.0" → "0.26" — Cargo needs X.Y.Z; the human/tag form drops the .0
-/// (build_info::version_display does the identical strip in the binary).
-pub fn short_version(full: &str) -> String {
-    full.strip_suffix(".0").unwrap_or(full).to_string()
+/// Split a canonical three-component version into its numbers. The shape
+/// check is [`ledger::check_version_shape`], so every caller gets the same
+/// canonical-spelling refusal.
+fn version_components(version: &str) -> Result<(u64, u64, u64)> {
+    ledger::check_version_shape(version)?;
+    let mut parts = version.split('.').map(|p| {
+        p.parse::<u64>()
+            .map_err(|_| Error::new(format!("version {version:?} has an out-of-range component")))
+    });
+    let major = parts.next().expect("checked three components")?;
+    let minor = parts.next().expect("checked three components")?;
+    let patch = parts.next().expect("checked three components")?;
+    Ok((major, minor, patch))
 }
 
-/// Default version rule (spec §1): increment MINOR. "0.25" → "0.26".
-pub fn bump_minor(short: &str) -> Result<String> {
-    let (maj, min) = short
-        .split_once('.')
-        .ok_or_else(|| Error::new(format!("version {short:?} is not MAJOR.MINOR")))?;
-    let minor: u64 = min
-        .parse()
-        .map_err(|_| Error::new(format!("version {short:?} has a non-numeric MINOR")))?;
-    Ok(format!("{maj}.{}", minor + 1))
+/// THE cut-over rule: a RELEASE carries the workspace `MAJOR.MINOR.0` version.
+/// The patch slot is already `0` under the current scheme, so this is normally
+/// the identity — `release_version_from_workspace("0.5.0") == "0.5.0"` — and it
+/// additionally normalizes any lingering non-zero patch from the retired
+/// `MAJOR.MINOR.DEV` convention (`"0.2.1"` → `"0.2.0"`).
+///
+/// This is the single source of the version a cut publishes — the ledger is
+/// read for the BUILD NUMBER only. To cut again the operator bumps
+/// `[workspace.package] version`'s MINOR in Cargo.toml.
+pub fn release_version_from_workspace(workspace: &str) -> Result<String> {
+    let (major, minor, _dev) = version_components(workspace).map_err(|error| {
+        Error::new(format!(
+            "Cargo.toml [workspace.package] version is not canonical MAJOR.MINOR.0: {error}"
+        ))
+    })?;
+    Ok(format!("{major}.{minor}.0"))
 }
 
-/// Bump `[workspace.package] version` to `new_full` — behavioral port of
-/// prepare-release.sh's awk (only the FIRST `version =` inside that section is
-/// rewritten; the section ends at the next `[header]`; everything else is
-/// byte-untouched).
-pub fn bump_workspace_version(cargo_toml: &str, new_full: &str) -> Result<String> {
-    let mut out = Vec::new();
-    let mut in_pkg = false;
-    let mut done = false;
-    for line in cargo_toml.lines() {
-        if line.starts_with('[') {
-            in_pkg = line.trim() == "[workspace.package]";
-        } else if in_pkg && !done && line.trim_start().starts_with("version") {
-            // Same one-line replacement shape the awk printed.
-            out.push(format!("version = \"{new_full}\""));
-            done = true;
-            continue;
-        }
-        out.push(line.to_string());
-    }
-    if !done {
-        return Err(Error::new(
-            "Cargo.toml has no [workspace.package] version to bump".to_string(),
-        ));
-    }
-    let mut text = out.join("\n");
-    if cargo_toml.ends_with('\n') {
-        text.push('\n');
-    }
-    Ok(text)
+/// The next release version after `release`: bump MINOR, reset the third
+/// component to 0. `"0.2.0"` → `"0.3.0"`. Used only to TELL the operator what
+/// to bump `[workspace.package] version` to — a cut never applies it.
+pub fn bump_minor_release(release: &str) -> Result<String> {
+    let (major, minor, _patch) = version_components(release)?;
+    let minor = minor.checked_add(1).ok_or_else(|| {
+        Error::new(format!(
+            "version {release:?} cannot bump MINOR without overflow"
+        ))
+    })?;
+    Ok(format!("{major}.{minor}.0"))
 }
 
 /// "owner/repo" from `[workspace.package] repository` — the single source of
@@ -192,6 +192,17 @@ pub fn repo_slug(cargo_toml: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The PUBLIC update channel (`OWNER/REPO`) for a checkout, from the tracked
+/// `[workspace.metadata.aterm] update_channel`. `Ok(None)` = no public mirror
+/// configured. Resume and recovery re-read it from the worktree rather than the
+/// journal on purpose: it is tracked repository policy at the claim commit, not
+/// per-cut state, and re-reading keeps one answer for the whole pipeline.
+fn workspace_mirror_slug(repo: &Path) -> Result<Option<String>> {
+    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
+        .map_err(|error| Error::new(format!("read Cargo.toml: {error}")))?;
+    mirror::update_channel_slug(&cargo_text)
 }
 
 /// Parse the GitHub repository addressed by an `origin` URL.  Release state is
@@ -514,7 +525,7 @@ fn ensure_no_publisher_fence(git: &dyn GitRunner) -> Result<()> {
         return Err(Error::new(format!(
             "publisher fence {PUBLISHER_FENCE_REF} is active at token {} for claim {}; \
              another publisher or a killed process may still be in flight. Do not steal it: \
-             resume after that process exits, or run `cargo ship recover vX.Y <full-claim-sha>` \
+             resume after that process exits, or run `cargo ship recover vX.Y.Z <full-claim-sha>` \
              with `--old-publisher-stopped` only after proving the old process is stopped",
             fence.token, fence.owner
         )));
@@ -955,7 +966,7 @@ fn release_release_lease_inner(
 /// journal's existence (a journal on disk MEANS the claim is verified);
 /// "build" covers build+bundle+sign+dmg+manifest as one re-enterable unit
 /// (its outputs are all derived from `(version, build_number)` on disk).
-pub const STEPS: [&str; 12] = [
+pub const STEPS: [&str; 13] = [
     "lock",
     "build",
     "selfcheck",
@@ -967,6 +978,7 @@ pub const STEPS: [&str; 12] = [
     "archive",
     "cask",
     "verify",
+    "mirror",
     "unlock",
 ];
 
@@ -982,7 +994,27 @@ const LEGACY_STEPS: [&str; 9] = [
     "verify",
 ];
 
-pub const JOURNAL_FORMAT: u32 = 5;
+/// Format-5 step order — identical to [`STEPS`] minus the public-channel
+/// `mirror` step, which format 6 inserted between `verify` and `unlock`. A
+/// COMPLETED v5 journal must still read back as complete (it is history a
+/// `status`/fresh cut clears); walking it against the current list would report
+/// the mirror as its next step and misfile a finished cut as resumable.
+const STEPS_V5: [&str; 12] = [
+    "lock",
+    "build",
+    "selfcheck",
+    "draft",
+    "upload",
+    "preflip",
+    "tag",
+    "flip",
+    "archive",
+    "cask",
+    "verify",
+    "unlock",
+];
+
+pub const JOURNAL_FORMAT: u32 = 6;
 
 const fn legacy_journal_format() -> u32 {
     1
@@ -995,7 +1027,7 @@ pub struct Journal {
     /// Recovery protocol. Missing means the pre-lease/pre-archive v1 format.
     #[serde(default = "legacy_journal_format")]
     pub format: u32,
-    /// Display version being cut ("0.26").
+    /// Release version being cut, canonical `MAJOR.MINOR.PATCH` ("0.2.0").
     pub version: String,
     /// The verified ledger claim n.
     pub build_number: u64,
@@ -1037,6 +1069,22 @@ pub struct Journal {
     /// duplicate object.
     #[serde(default)]
     pub upload_intents: Vec<String>,
+    /// Immutable GitHub release object capability on the PUBLIC update channel
+    /// (`[workspace.metadata.aterm] update_channel`). The mirror is a second
+    /// repository with its own object identity, so it gets its own capability
+    /// rather than reusing [`Journal::release_id`].
+    #[serde(default)]
+    pub mirror_release_id: Option<u64>,
+    /// Durable one-shot create intent for the mirrored draft. Same contract as
+    /// [`Journal::draft_create_issued`]: once persisted, an invisible object
+    /// means "discover it", never "POST again" — a duplicate draft on the
+    /// public channel would be ambiguous authority in front of the whole fleet.
+    #[serde(default)]
+    pub mirror_create_issued: bool,
+    /// Exact asset names for which a mirror upload POST has ever been issued.
+    /// Append-only, exactly like [`Journal::upload_intents`].
+    #[serde(default)]
+    pub mirror_upload_intents: Vec<String>,
     /// Completed steps, in completion order (a subset of [`STEPS`]).
     #[serde(default)]
     pub done: Vec<String>,
@@ -1238,20 +1286,59 @@ impl Journal {
                 "release journal carries upload intents without its durable draft capability",
             ));
         }
+        // The public-channel mirror repeats the private side's capability
+        // invariants verbatim: an object ID implies a durable create intent,
+        // and upload intents imply both. A journal that failed these could
+        // authorize a second POST against the channel the whole fleet reads.
+        if self.format == JOURNAL_FORMAT && self.mirror_release_id.is_some_and(|id| id == 0) {
+            return Err(Error::new(
+                "release journal carries a zero mirror release ID",
+            ));
+        }
+        if self.format == JOURNAL_FORMAT
+            && self.mirror_release_id.is_some()
+            && !self.mirror_create_issued
+        {
+            return Err(Error::new(
+                "release journal carries a mirror release ID without durable create intent",
+            ));
+        }
+        let mut mirror_intents = std::collections::BTreeSet::new();
+        if self.format == JOURNAL_FORMAT
+            && self.mirror_upload_intents.iter().any(|name| {
+                name.is_empty()
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    })
+                    || !mirror_intents.insert(name)
+            })
+        {
+            return Err(Error::new(
+                "release journal mirror upload intents are empty, non-canonical, or duplicated",
+            ));
+        }
+        if self.format == JOURNAL_FORMAT
+            && !self.mirror_upload_intents.is_empty()
+            && (self.mirror_release_id.is_none() || !self.mirror_create_issued)
+        {
+            return Err(Error::new(
+                "release journal carries mirror upload intents without its durable mirror draft capability",
+            ));
+        }
         Ok(())
     }
 
     /// The first [`STEPS`] entry not yet journaled — where `--resume` re-enters.
-    /// `None` ⇒ the cut completed.
+    /// `None` ⇒ the cut completed. Older formats walk the step list they were
+    /// written against, so a completed journal stays completed across a format
+    /// bump that inserted a step (`mirror`, in format 6).
     pub fn first_incomplete(&self) -> Option<&'static str> {
-        if self.format == 1 {
-            LEGACY_STEPS
-                .iter()
-                .copied()
-                .find(|step| !self.is_done(step))
-        } else {
-            STEPS.iter().copied().find(|step| !self.is_done(step))
-        }
+        let steps: &[&'static str] = match self.format {
+            1 => &LEGACY_STEPS,
+            ..=5 => &STEPS_V5,
+            _ => &STEPS,
+        };
+        steps.iter().copied().find(|step| !self.is_done(step))
     }
 
     /// Older formats did not record every current authority (most recently
@@ -1608,70 +1695,18 @@ fn signed_channel_assets(releases: &[AppcastRelease]) -> Result<Vec<SignedChanne
     Ok(signed)
 }
 
-/// Replay the immutable epoch-1 evidence recorded in the permanent authority.
-/// Asset IDs bind the same GitHub objects across the cutter's metadata-only
-/// exact→archive rename; byte lengths and SHA-256 bind their contents; and the
-/// detached Ed25519 check proves that the retired key authenticated those exact
-/// manifest bytes. No prose/boolean can stand in for this proof.
-pub fn verify_retired_epoch_evidence_with(
-    authority: &ChannelSigningAuthority,
-    releases: &[AppcastRelease],
-    mut fetch_asset: impl FnMut(u64, u64, &str, &str) -> Result<Vec<u8>>,
-) -> Result<()> {
-    validate_channel_signing_authority(authority)?;
-    let rows: Vec<&AppcastRelease> = releases
-        .iter()
-        .filter(|release| !release.draft && release.tag == authority.retired_evidence_tag)
-        .collect();
-    let [release] = rows.as_slice() else {
-        return Err(Error::new(format!(
-            "retired-key evidence requires exactly one published {} release row; found {}",
-            authority.retired_evidence_tag,
-            rows.len()
-        )));
-    };
-    let pairs: Vec<SignedChannelAsset> = signed_channel_assets(releases)?
-        .into_iter()
-        .filter(|asset| asset.tag == authority.retired_evidence_tag)
-        .collect();
-    let [pair] = pairs.as_slice() else {
-        return Err(Error::new(format!(
-            "retired-key evidence requires exactly one signed manifest pair at {}; found {}",
-            authority.retired_evidence_tag,
-            pairs.len()
-        )));
-    };
-    let manifest_id = unique_asset_id(release, &pair.manifest_name)?
-        .ok_or_else(|| Error::new("retired evidence manifest metadata vanished"))?;
-    let signature_id = unique_asset_id(release, &pair.signature_name)?
-        .ok_or_else(|| Error::new("retired evidence signature metadata vanished"))?;
-    if manifest_id != authority.retired_manifest_asset_id
-        || signature_id != authority.retired_signature_asset_id
-    {
-        return Err(Error::new(
-            "retired-key evidence asset IDs differ from the permanent authority; refusing replacement bytes",
-        ));
-    }
-    let manifest = fetch_asset(
-        pair.release_id,
-        pair.manifest_asset_id,
-        &pair.tag,
-        &pair.manifest_name,
-    )?;
-    let signature = fetch_asset(
-        pair.release_id,
-        pair.signature_asset_id,
-        &pair.tag,
-        &pair.signature_name,
-    )?;
-    verify_retired_epoch_evidence_bytes(authority, &manifest, &signature)
-}
-
-/// Monotonic Tier-SIG ratchet derived only from published metadata.  Callers
-/// cannot opt it back out with a local boolean.
+/// The signing ratchet is retired: signing is never REQUIRED by published
+/// history. Older releases may still carry `.sig` assets, but an unsigned
+/// successor is always permitted (Tier REPO). This still validates that the
+/// signed-asset inventory is internally consistent (duplicate/orphan pairs are
+/// hard errors) so the archive planner sees coherent metadata; the verdict it
+/// returns to publish/archive decisions is unconditionally "not required".
 #[allow(dead_code)] // Public pure Tier-1/integration-test seam.
 pub fn channel_signature_required(releases: &[AppcastRelease]) -> Result<bool> {
-    Ok(!signed_channel_assets(releases)?.is_empty())
+    // Surface any metadata inconsistency (e.g. exact + archived signature on one
+    // release) as an error, but never force a signed successor.
+    let _ = signed_channel_assets(releases)?;
+    Ok(false)
 }
 
 /// One reversible metadata-only rename. `id` binds the operation to the same
@@ -1709,68 +1744,110 @@ fn unique_asset_id(release: &AppcastRelease, name: &str) -> Result<Option<u64>> 
     Ok(first)
 }
 
-/// Parse the release protocol's canonical `vMAJOR.MINOR` tag into a numeric
-/// order. GitHub's list-releases endpoint documents no response ordering, so
-/// channel authority must come from aterm's own version protocol rather than
-/// the position of a REST row.
-pub fn canonical_channel_tag_order(tag: &str) -> Result<(u64, u64)> {
-    let components = numeric_channel_tag_order(tag)?;
-    let [major, minor] = components.as_slice() else {
-        return Err(Error::new(format!(
-            "published appcast tag {tag:?} is not canonical vMAJOR.MINOR"
-        )));
-    };
-    let version = tag.strip_prefix('v').expect("numeric tag has v prefix");
-    if version != format!("{major}.{minor}") {
-        return Err(Error::new(format!(
-            "published appcast tag {tag:?} is not canonical vMAJOR.MINOR"
-        )));
-    }
-    Ok((*major, *minor))
+/// What one published release tag is to the CURRENT version protocol. The
+/// publisher's classification is byte-for-byte the client's
+/// (`aterm-update/src/github.rs`) — publisher and fleet must agree on which
+/// releases are even candidates.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TagKind {
+    /// A `vMAJOR.MINOR.PATCH` release on the current version scheme, carrying
+    /// its numeric ordering key.
+    Candidate(Vec<u64>),
+    /// A pre-cut-over `vMAJOR.MINOR` release. The scheme changed to the
+    /// unified `MAJOR.MINOR.0` version (`VERSIONING.md`) and the old line
+    /// was NOT carried forward — those releases stay published in the archive
+    /// but are never candidates, and are skipped rather than treated as
+    /// errors so the archive cannot stall the channel.
+    Legacy,
 }
 
-/// Historical aterm releases predate the canonical two-component tag protocol
-/// and include numeric tags such as `v0.21.2607041853`. They are still safely
-/// orderable relative to a canonical current tag. Non-numeric tags remain a
-/// hard refusal because the migrator cannot prove they are history.
-fn numeric_channel_tag_order(tag: &str) -> Result<Vec<u64>> {
-    let version = tag.strip_prefix('v').ok_or_else(|| {
+/// Classify one release tag.
+///
+/// Only the canonical three-component `vMAJOR.MINOR.PATCH` spelling is a
+/// candidate. Exactly two components are the retired scheme
+/// ([`TagKind::Legacy`]). Anything else — non-numeric, empty or leading-zero
+/// components, a bare `v0`, more than three components — is a hard error:
+/// garbage in the tag namespace must fail closed rather than silently narrow
+/// the candidate set.
+pub fn parse_release_tag(tag: &str) -> Result<TagKind> {
+    let malformed = || {
         Error::new(format!(
-            "published appcast tag {tag:?} is not numerically orderable"
+            "published appcast tag {tag:?} is not numeric dotted vN.N.N"
         ))
-    })?;
-    let mut components = Vec::new();
-    for component in version.split('.') {
-        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(Error::new(format!(
-                "published appcast tag {tag:?} is not numerically orderable"
-            )));
+    };
+    let version = tag.strip_prefix('v').ok_or_else(malformed)?;
+    let components: Vec<&str> = version.split('.').collect();
+    if components.len() < 2 {
+        return Err(malformed());
+    }
+    let mut parsed = Vec::with_capacity(components.len());
+    for component in components {
+        // Reject empty and leading-zero spellings so a tag has exactly ONE
+        // canonical form and two tags can never share a numeric order.
+        if component.is_empty()
+            || !component.bytes().all(|byte| byte.is_ascii_digit())
+            || (component.len() > 1 && component.starts_with('0'))
+        {
+            return Err(malformed());
         }
-        components.push(component.parse::<u64>().map_err(|_| {
+        parsed.push(component.parse::<u64>().map_err(|_| {
             Error::new(format!(
                 "published appcast tag {tag:?} has an overflowing numeric component"
             ))
         })?);
     }
-    if components.len() < 2 {
-        return Err(Error::new(format!(
-            "published appcast tag {tag:?} is not numerically orderable"
-        )));
+    match parsed.len() {
+        2 => Ok(TagKind::Legacy),
+        3 => Ok(TagKind::Candidate(parsed)),
+        _ => Err(malformed()),
     }
-    Ok(components)
+}
+
+/// Parse the release protocol's canonical `vMAJOR.MINOR.PATCH` tag into a
+/// numeric order. GitHub's list-releases endpoint documents no response
+/// ordering, so channel authority must come from aterm's own version protocol
+/// rather than the position of a REST row.
+///
+/// A retired two-component tag is NOT canonical authority — callers that must
+/// tolerate the published archive classify with [`parse_release_tag`] first.
+pub fn canonical_channel_tag_order(tag: &str) -> Result<(u64, u64, u64)> {
+    let not_canonical = || {
+        Error::new(format!(
+            "published appcast tag {tag:?} is not canonical vMAJOR.MINOR.PATCH"
+        ))
+    };
+    let TagKind::Candidate(components) = parse_release_tag(tag)? else {
+        return Err(not_canonical());
+    };
+    let [major, minor, patch] = components.as_slice() else {
+        return Err(not_canonical());
+    };
+    // `parse_release_tag` already refused non-canonical spellings; re-deriving
+    // the string pins the spelling to this exact tag too.
+    if tag.strip_prefix('v') != Some(format!("{major}.{minor}.{patch}").as_str()) {
+        return Err(not_canonical());
+    }
+    Ok((*major, *minor, *patch))
+}
+
+/// The canonical version string carried by a canonical release tag:
+/// `"v0.2.0"` → `"0.2.0"`.
+pub fn canonical_channel_tag_version(tag: &str) -> Result<String> {
+    let (major, minor, patch) = canonical_channel_tag_order(tag)?;
+    Ok(format!("{major}.{minor}.{patch}"))
 }
 
 /// Establish that the caller still owns the intended channel head before any
-/// historical metadata is touched. A stale v0.55 journal must never archive a
-/// subsequently published v0.56 head; comparing canonical channel versions is
+/// historical metadata is touched. A stale v0.2.0 journal must never archive a
+/// subsequently published v0.3.0 head; comparing canonical channel versions is
 /// independent of GitHub's undocumented list order.
 fn prove_archive_authority<'a>(
     releases: &'a [AppcastRelease],
     current_tag: &str,
     current_signature_required: bool,
 ) -> Result<&'a AppcastRelease> {
-    let (current_major, current_minor) = canonical_channel_tag_order(current_tag)?;
-    let current_order = vec![current_major, current_minor];
+    let (current_major, current_minor, current_patch) = canonical_channel_tag_order(current_tag)?;
+    let current_order = vec![current_major, current_minor, current_patch];
     let current: Vec<&AppcastRelease> = releases
         .iter()
         .filter(|release| !release.draft && release.tag == current_tag)
@@ -1802,7 +1879,13 @@ fn prove_archive_authority<'a>(
         let carries_exact = unique_asset_id(release, manifest_out::MANIFEST_ASSET)?.is_some()
             || unique_asset_id(release, manifest_out::MANIFEST_SIG_ASSET)?.is_some();
         if carries_exact && release.tag != current_tag {
-            let release_order = numeric_channel_tag_order(&release.tag)?;
+            // A retired two-component release can never be newer than a
+            // current-scheme head: it is not on this version line at all. It
+            // is still archived below (its exact asset leaves the client's
+            // discovery surface) — it just does not contest authority.
+            let TagKind::Candidate(release_order) = parse_release_tag(&release.tag)? else {
+                continue;
+            };
             if release_order >= current_order {
                 return Err(Error::new(format!(
                     "refusing stale archive for {current_tag}: same-or-newer published channel \
@@ -1997,9 +2080,9 @@ pub fn converge_appcast_archive(
 /// This differs from [`converge_appcast_archive`] only for the explicitly
 /// supported v0.27-v0.54 unsigned-bootstrap recovery epoch: signed v0.26
 /// history must not make that unsigned *historical* head impossible to
-/// archive. Callers must first validate the current manifest/signature pair
-/// against the permanent repository authority; production does so in
-/// `step_archive` immediately before this call.
+/// archive. When signing is configured, callers verify the current
+/// manifest/signature pair under the configured key before this call; an
+/// unsigned channel has no such pair to check.
 pub fn converge_appcast_archive_with_policy(
     remote: &mut impl AppcastArchiveRemote,
     current_tag: &str,
@@ -2199,76 +2282,13 @@ impl AppcastArchiveRemote for GhAppcastArchiveRemote<'_> {
 // cryptographic channel ratchet + exact asset reads
 // ---------------------------------------------------------------------------
 
-/// Permanent, reviewable trust anchor. Mutable GitHub asset history and a
-/// machine-local credential file are evidence/operational inputs, never the
-/// authority that decides whether the channel may become unsigned.
-pub const CHANNEL_SIGNING_AUTHORITY_FILE: &str = "release/channel-signing.toml";
-const RETIRED_MANIFEST_EVIDENCE_FILE: &str = "release/evidence/v0.26-aterm-appcast.toml.b64";
-const RETIRED_SIGNATURE_EVIDENCE_FILE: &str = "release/evidence/v0.26-aterm-appcast.toml.sig.b64";
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChannelSigningAuthority {
-    pub schema: u32,
-    pub epoch: u32,
-    pub activation_version: String,
-    pub current_pubkey: String,
-    pub current_fingerprint_sha256: String,
-    pub retired_epoch: u32,
-    pub retired_pubkey: String,
-    pub retired_fingerprint_sha256: String,
-    pub retired_evidence_tag: String,
-    pub retired_manifest_asset_id: u64,
-    pub retired_manifest_size: u64,
-    pub retired_manifest_sha256: String,
-    pub retired_signature_asset_id: u64,
-    pub retired_signature_size: u64,
-    pub retired_signature_sha256: String,
-    pub transition_reason: String,
-    pub old_pinned_clients_require_manual_bootstrap: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelSigningEpoch {
-    Retired,
-    Current,
-}
-
-/// Recovery is deliberately a different capability from publication. Current
-/// epoch targets use the normal publication authority; retired epoch targets
-/// may only abandon unpublished state or finish post-flip bookkeeping for an
-/// exact release that is already public.
+/// Recovery capability marker. In the Tier REPO model there is a single
+/// authority: recovery reconstructs a claim under the same optional-signing
+/// verdict a fresh cut would use. The historical retired-epoch mode is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryEpochMode {
     CurrentAuthority,
-    RetiredNonPublishingOnly,
 }
-
-// These values were independently re-derived with Apple's CryptoKit from the
-// deterministic repeated-byte seeds used by repository fixtures.  The runtime
-// gate below derives all 256 such keys with ring and these cross-implementation
-// vectors ensure that an implementation/seed-interpretation mismatch cannot
-// make the exclusion check vacuous.
-const FIXTURE_SEED_1_FINGERPRINT: &str =
-    "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e";
-const FIXTURE_SEED_7_FINGERPRINT: &str =
-    "fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889";
-const FIXTURE_SEED_19_FINGERPRINT: &str =
-    "56fae12f7716462746a3a802817ca762f4e6217028b66e1a70a2a6a2e71b7fc7";
-
-const REVIEWED_CURRENT_FINGERPRINT: &str =
-    "529d8b60583fdc58b13afdba7050de6b21c0740b86dd87e5af769a2afb6c30f4";
-const REVIEWED_RETIRED_FINGERPRINT: &str =
-    "b8d47d9179feb56b1cbbe61c000b81f18d1ac152507d8abd320e2a2297890f1f";
-const REVIEWED_RETIRED_EVIDENCE_TAG: &str = "v0.26";
-const REVIEWED_RETIRED_MANIFEST_ASSET_ID: u64 = 469_003_404;
-const REVIEWED_RETIRED_MANIFEST_SIZE: u64 = 9_216;
-const REVIEWED_RETIRED_MANIFEST_SHA256: &str =
-    "6c610f5b2ca35f05822612994a2805401c77e8a16a9d2ae57696c8a783a8d5ca";
-const REVIEWED_RETIRED_SIGNATURE_ASSET_ID: u64 = 469_003_406;
-const REVIEWED_RETIRED_SIGNATURE_SIZE: u64 = 64;
-const REVIEWED_RETIRED_SIGNATURE_SHA256: &str =
-    "32b35eb82d934b6a24efd2ec84c334d4e4efcebe47976f2a5a7c4e87c2ecd8c8";
 
 fn update_key_fingerprint(encoded: &str) -> Result<String> {
     let canonical = canonical_update_pubkey(encoded)?;
@@ -2276,332 +2296,6 @@ fn update_key_fingerprint(encoded: &str) -> Result<String> {
         .decode(canonical)
         .map_err(|_| Error::new("canonical update key failed to decode for fingerprint"))?;
     Ok(sha256_bytes(&raw))
-}
-
-/// Parse and validate the deliberately one-off epoch-2 transition.  Hard-coded
-/// epoch/activation/reason values make this incapable of becoming a generic
-/// key-rotation flag: any future epoch requires a reviewed schema/code change.
-pub fn parse_channel_signing_authority(text: &str) -> Result<ChannelSigningAuthority> {
-    let authority: ChannelSigningAuthority = toml::from_str(text)
-        .map_err(|error| Error::new(format!("parse channel signing authority: {error}")))?;
-    validate_channel_signing_authority(&authority)?;
-    Ok(authority)
-}
-
-pub fn validate_channel_signing_authority(authority: &ChannelSigningAuthority) -> Result<()> {
-    if authority.schema != 1
-        || authority.epoch != 2
-        || authority.retired_epoch != 1
-        || authority.activation_version != "0.55"
-        || authority.transition_reason != "lost-private-key"
-        || !authority.old_pinned_clients_require_manual_bootstrap
-    {
-        return Err(Error::new(
-            "channel signing authority is not the reviewed one-time epoch-1 → epoch-2 \
-             lost-key transition activating exactly at v0.55",
-        ));
-    }
-    if authority.retired_evidence_tag != REVIEWED_RETIRED_EVIDENCE_TAG
-        || authority.retired_manifest_asset_id == 0
-        || authority.retired_manifest_size == 0
-        || authority.retired_signature_asset_id == 0
-        || authority.retired_signature_size != 64
-    {
-        return Err(Error::new(
-            "channel signing authority has no canonical v0.26 manifest/signature evidence identity",
-        ));
-    }
-    let current = canonical_update_pubkey(&authority.current_pubkey)?;
-    let retired = canonical_update_pubkey(&authority.retired_pubkey)?;
-    if current != authority.current_pubkey || retired != authority.retired_pubkey {
-        return Err(Error::new(
-            "channel signing authority public keys are not canonical standard base64",
-        ));
-    }
-    let validate_digest = |name: &str, observed: &str| -> Result<()> {
-        if observed.len() != 64
-            || !observed
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            return Err(Error::new(format!(
-                "channel signing authority {name} is not canonical lowercase SHA-256"
-            )));
-        }
-        Ok(())
-    };
-    for (name, observed) in [
-        (
-            "current_fingerprint_sha256",
-            authority.current_fingerprint_sha256.as_str(),
-        ),
-        (
-            "retired_fingerprint_sha256",
-            authority.retired_fingerprint_sha256.as_str(),
-        ),
-        (
-            "retired_manifest_sha256",
-            authority.retired_manifest_sha256.as_str(),
-        ),
-        (
-            "retired_signature_sha256",
-            authority.retired_signature_sha256.as_str(),
-        ),
-    ] {
-        validate_digest(name, observed)?;
-    }
-    if authority.current_fingerprint_sha256 != update_key_fingerprint(&current)? {
-        return Err(Error::new(
-            "channel signing authority current_fingerprint_sha256 is not the SHA-256 of its raw 32-byte key",
-        ));
-    }
-    if authority.retired_fingerprint_sha256 != update_key_fingerprint(&retired)? {
-        return Err(Error::new(
-            "channel signing authority retired_fingerprint_sha256 is not the SHA-256 of its raw 32-byte key",
-        ));
-    }
-    if current == retired
-        || authority.current_fingerprint_sha256 == authority.retired_fingerprint_sha256
-    {
-        return Err(Error::new(
-            "lost-key epoch transition does not change the public-key identity",
-        ));
-    }
-    Ok(())
-}
-
-fn repeated_byte_fixture_fingerprint(seed: u8) -> Result<String> {
-    let key = Ed25519KeyPair::from_seed_unchecked(&[seed; 32])
-        .map_err(|_| Error::new("derive deterministic fixture key for exclusion gate"))?;
-    Ok(sha256_bytes(key.public_key().as_ref()))
-}
-
-/// Fail closed if either permanent channel identity is one of the trivially
-/// reconstructible repeated-byte keys used in tests. Three independently
-/// computed CryptoKit vectors make the ring-based all-256 scan non-vacuous.
-pub fn validate_fixture_key_non_equality(authority: &ChannelSigningAuthority) -> Result<()> {
-    validate_channel_signing_authority(authority)?;
-    for (seed, independently_computed) in [
-        (1, FIXTURE_SEED_1_FINGERPRINT),
-        (7, FIXTURE_SEED_7_FINGERPRINT),
-        (19, FIXTURE_SEED_19_FINGERPRINT),
-    ] {
-        if repeated_byte_fixture_fingerprint(seed)? != independently_computed {
-            return Err(Error::new(format!(
-                "fixture-key exclusion self-check disagrees with independent Ed25519 vector for seed {seed}"
-            )));
-        }
-    }
-    for seed in 0..=u8::MAX {
-        let fixture = repeated_byte_fixture_fingerprint(seed)?;
-        if authority.current_fingerprint_sha256 == fixture
-            || authority.retired_fingerprint_sha256 == fixture
-        {
-            return Err(Error::new(format!(
-                "permanent channel key matches reconstructible repeated-byte fixture seed {seed}; refusing production authority"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Bind the repository artifact to the exact identities and immutable v0.26
-/// evidence reviewed for the one-time epoch transition. Generic fixture
-/// authorities may exercise the pure verifier, but production `load` cannot
-/// silently select a different key or historical proof.
-pub fn validate_reviewed_channel_signing_authority(
-    authority: &ChannelSigningAuthority,
-) -> Result<()> {
-    validate_fixture_key_non_equality(authority)?;
-    let reviewed = authority.current_fingerprint_sha256 == REVIEWED_CURRENT_FINGERPRINT
-        && authority.retired_fingerprint_sha256 == REVIEWED_RETIRED_FINGERPRINT
-        && authority.retired_evidence_tag == REVIEWED_RETIRED_EVIDENCE_TAG
-        && authority.retired_manifest_asset_id == REVIEWED_RETIRED_MANIFEST_ASSET_ID
-        && authority.retired_manifest_size == REVIEWED_RETIRED_MANIFEST_SIZE
-        && authority.retired_manifest_sha256 == REVIEWED_RETIRED_MANIFEST_SHA256
-        && authority.retired_signature_asset_id == REVIEWED_RETIRED_SIGNATURE_ASSET_ID
-        && authority.retired_signature_size == REVIEWED_RETIRED_SIGNATURE_SIZE
-        && authority.retired_signature_sha256 == REVIEWED_RETIRED_SIGNATURE_SHA256;
-    if !reviewed {
-        return Err(Error::new(
-            "channel signing authority differs from the reviewed epoch-2 keys or immutable v0.26 evidence",
-        ));
-    }
-    Ok(())
-}
-
-pub fn load_channel_signing_authority(repo: &Path) -> Result<ChannelSigningAuthority> {
-    let path = repo.join(CHANNEL_SIGNING_AUTHORITY_FILE);
-    let text = fs::read_to_string(&path).map_err(|error| {
-        Error::new(format!(
-            "read permanent channel signing authority {}: {error}; signed-channel policy may \
-             not be inferred from mutable GitHub assets or machine-local configuration",
-            path.display()
-        ))
-    })?;
-    let authority = parse_channel_signing_authority(&text)?;
-    validate_reviewed_channel_signing_authority(&authority)?;
-    verify_committed_retired_epoch_evidence(repo, &authority)?;
-    Ok(authority)
-}
-
-fn version_order(version: &str) -> Result<(u64, u64)> {
-    canonical_channel_tag_order(&format!("v{version}"))
-}
-
-pub fn channel_signing_epoch_for_version(
-    authority: &ChannelSigningAuthority,
-    version: &str,
-) -> Result<ChannelSigningEpoch> {
-    validate_channel_signing_authority(authority)?;
-    Ok(
-        if version_order(version)? >= version_order(&authority.activation_version)? {
-            ChannelSigningEpoch::Current
-        } else {
-            ChannelSigningEpoch::Retired
-        },
-    )
-}
-
-fn authority_key_for_tag<'a>(authority: &'a ChannelSigningAuthority, tag: &str) -> Result<&'a str> {
-    validate_channel_signing_authority(authority)?;
-    let order = numeric_channel_tag_order(tag)?;
-    let activation = numeric_channel_tag_order(&format!("v{}", authority.activation_version))?;
-    Ok(if order >= activation {
-        &authority.current_pubkey
-    } else {
-        &authority.retired_pubkey
-    })
-}
-
-/// Enforce the one-time activation edge for a new publication. Before any
-/// epoch-2 release exists, the only permitted target is exactly v0.55. After
-/// activation, every later canonical version remains in epoch 2; publishing a
-/// new retired-epoch release is permanently closed.
-pub fn validate_channel_epoch_target(
-    authority: &ChannelSigningAuthority,
-    releases: &[AppcastRelease],
-    target_version: &str,
-) -> Result<ChannelSigningEpoch> {
-    let target_epoch = channel_signing_epoch_for_version(authority, target_version)?;
-    if target_epoch != ChannelSigningEpoch::Current {
-        return Err(Error::new(format!(
-            "the committed lost-key transition permanently closes new pre-v{} publications; \
-             requested v{target_version}",
-            authority.activation_version
-        )));
-    }
-    let activation_tag = format!("v{}", authority.activation_version);
-    let mut activation_exists = false;
-    let mut activation_rows = 0usize;
-    for release in releases.iter().filter(|release| !release.draft) {
-        if release.tag == activation_tag {
-            activation_rows += 1;
-            let archived_manifest = manifest_out::archived_manifest_asset(&release.tag);
-            let archived_signature = manifest_out::archived_manifest_signature_asset(&release.tag);
-            let has_manifest = unique_asset_id(release, manifest_out::MANIFEST_ASSET)?.is_some()
-                || unique_asset_id(release, &archived_manifest)?.is_some();
-            let has_signature = unique_asset_id(release, manifest_out::MANIFEST_SIG_ASSET)?
-                .is_some()
-                || unique_asset_id(release, &archived_signature)?.is_some();
-            activation_exists = has_manifest && has_signature;
-        }
-    }
-    if activation_rows > 1 {
-        return Err(Error::new(format!(
-            "permanent epoch activation tag {activation_tag} has {activation_rows} published release rows"
-        )));
-    }
-    if !activation_exists && target_version != authority.activation_version {
-        return Err(Error::new(format!(
-            "epoch 2 has not been activated: its first and only activation target is exactly v{}, \
-             not v{target_version}",
-            authority.activation_version
-        )));
-    }
-    Ok(ChannelSigningEpoch::Current)
-}
-
-/// Pure recovery-policy selector. This does not authorize any mutation: it
-/// fixes the epoch/key/required bit that the live recovery path must later
-/// prove against exact release state. In particular, it never calls
-/// [`validate_channel_epoch_target`], because finishing or abandoning a
-/// historical claim is not a new pre-activation publication.
-pub fn select_recovery_signature_policy(
-    authority: &ChannelSigningAuthority,
-    releases: &[AppcastRelease],
-    target_version: &str,
-    release_state: verify::ReleaseState,
-) -> Result<(RecoveryEpochMode, bool, Option<String>)> {
-    match channel_signing_epoch_for_version(authority, target_version)? {
-        ChannelSigningEpoch::Current => Ok((
-            RecoveryEpochMode::CurrentAuthority,
-            true,
-            Some(authority.current_pubkey.clone()),
-        )),
-        ChannelSigningEpoch::Retired => {
-            if release_state != verify::ReleaseState::Published {
-                return Ok((RecoveryEpochMode::RetiredNonPublishingOnly, false, None));
-            }
-            let tag = format!("v{target_version}");
-            let rows = releases
-                .iter()
-                .filter(|release| !release.draft && release.tag == tag)
-                .count();
-            if rows != 1 {
-                return Err(Error::new(format!(
-                    "historical recovery requires exactly one published {tag} release row; found {rows}"
-                )));
-            }
-            let signed_rows = signed_channel_assets(releases)?
-                .into_iter()
-                .filter(|asset| asset.tag == tag)
-                .count();
-            match signed_rows {
-                0 => Ok((RecoveryEpochMode::RetiredNonPublishingOnly, false, None)),
-                1 => Ok((
-                    RecoveryEpochMode::RetiredNonPublishingOnly,
-                    true,
-                    Some(authority.retired_pubkey.clone()),
-                )),
-                count => Err(Error::new(format!(
-                    "historical recovery found {count} signed manifest pairs for {tag}; expected at most one"
-                ))),
-            }
-        }
-    }
-}
-
-fn validate_epoch_signature_metadata(
-    authority: &ChannelSigningAuthority,
-    releases: &[AppcastRelease],
-) -> Result<()> {
-    for release in releases.iter().filter(|release| !release.draft) {
-        let archived_manifest = manifest_out::archived_manifest_asset(&release.tag);
-        let archived_signature = manifest_out::archived_manifest_signature_asset(&release.tag);
-        let carries_manifest = unique_asset_id(release, manifest_out::MANIFEST_ASSET)?.is_some()
-            || unique_asset_id(release, &archived_manifest)?.is_some();
-        let carries_signature = unique_asset_id(release, manifest_out::MANIFEST_SIG_ASSET)?
-            .is_some()
-            || unique_asset_id(release, &archived_signature)?.is_some();
-        // The repository also publishes atpkg indexes and platform artifacts
-        // under deliberately non-channel tag schemes. Only an exact/archived
-        // aterm appcast name opts a row into numeric channel authority.
-        if !carries_manifest && !carries_signature {
-            continue;
-        }
-        if authority_key_for_tag(authority, &release.tag)? != authority.current_pubkey {
-            continue;
-        }
-        if carries_manifest && !carries_signature {
-            return Err(Error::new(format!(
-                "epoch-2 release {} has a manifest but no paired signature; permanent authority \
-                 forbids an unsigned downgrade",
-                release.tag
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2648,78 +2342,12 @@ pub fn verify_detached_manifest_signature(
         .map_err(|_| Error::new("manifest signature does not verify under the channel public key"))
 }
 
-/// Verify the content-addressed retired-epoch evidence independently of its
-/// storage location. This is shared by the vendored durable proof and the live
-/// GitHub replay, so neither path can drift to a weaker predicate.
-pub fn verify_retired_epoch_evidence_bytes(
-    authority: &ChannelSigningAuthority,
-    manifest: &[u8],
-    signature: &[u8],
-) -> Result<()> {
-    validate_channel_signing_authority(authority)?;
-    let manifest_size = u64::try_from(manifest.len())
-        .map_err(|_| Error::new("retired evidence manifest length does not fit u64"))?;
-    let signature_size = u64::try_from(signature.len())
-        .map_err(|_| Error::new("retired evidence signature length does not fit u64"))?;
-    if manifest_size != authority.retired_manifest_size
-        || sha256_bytes(manifest) != authority.retired_manifest_sha256
-    {
-        return Err(Error::new(
-            "retired-key evidence manifest bytes do not match the permanent size/SHA-256 authority",
-        ));
-    }
-    if signature_size != authority.retired_signature_size
-        || sha256_bytes(signature) != authority.retired_signature_sha256
-    {
-        return Err(Error::new(
-            "retired-key evidence signature bytes do not match the permanent size/SHA-256 authority",
-        ));
-    }
-    verify_detached_manifest_signature(&authority.retired_pubkey, manifest, signature).map_err(
-        |error| {
-            Error::new(format!(
-                "retired-key evidence does not replay under the permanent epoch-1 key: {error}"
-            ))
-        },
-    )
-}
-
-fn read_base64_evidence(path: &Path) -> Result<Vec<u8>> {
-    let encoded = fs::read_to_string(path).map_err(|error| {
-        Error::new(format!(
-            "read immutable evidence {}: {error}",
-            path.display()
-        ))
-    })?;
-    let compact: String = encoded.chars().filter(|ch| !ch.is_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(compact)
-        .map_err(|_| {
-            Error::new(format!(
-                "decode immutable base64 evidence {}",
-                path.display()
-            ))
-        })
-}
-
-/// Replay the repository-vendored v0.26 bytes. Unlike mutable host metadata,
-/// this proof remains executable after a release-asset deletion and is checked
-/// every time production authority is loaded.
-pub fn verify_committed_retired_epoch_evidence(
-    repo: &Path,
-    authority: &ChannelSigningAuthority,
-) -> Result<()> {
-    let manifest = read_base64_evidence(&repo.join(RETIRED_MANIFEST_EVIDENCE_FILE))?;
-    let signature = read_base64_evidence(&repo.join(RETIRED_SIGNATURE_EVIDENCE_FILE))?;
-    verify_retired_epoch_evidence_bytes(authority, &manifest, &signature)
-}
-
 /// Pure/injected verifier for the legacy updater signature ratchet. Metadata first
 /// proves an exact, unique signature on the current head (never an archive-name
 /// fallback); then every signed historical pair is checked under the same key.
 /// The current signature may additionally be required byte-identical to the
 /// local cut artifact.
-#[allow(dead_code)] // retained as a negative-control seam beside epoch-2 production policy
+#[allow(dead_code)] // negative-control seam for the optional-signing verification path
 pub fn verify_channel_head_signature_with(
     releases: &[AppcastRelease],
     head_tag: &str,
@@ -2816,163 +2444,73 @@ pub fn verify_channel_head_signature_with(
     Ok(true)
 }
 
-/// Epoch-aware permanent-authority verifier. Historical pre-v0.55 signatures
-/// remain checkable under the retired public key, but unsigned v0.27–v0.54 heads
-/// are explicitly the bootstrap tier. Starting at the exact v0.55 activation,
-/// the current exact signature is mandatory forever even if every mutable
-/// remote signature disappears.
-pub fn verify_epoch_channel_head_signature_with(
-    authority: &ChannelSigningAuthority,
-    releases: &[AppcastRelease],
-    head_tag: &str,
-    head_manifest: &[u8],
-    local_head_signature: Option<&[u8]>,
-    mut fetch_asset: impl FnMut(u64, u64, &str, &str) -> Result<Vec<u8>>,
-) -> Result<bool> {
-    validate_channel_signing_authority(authority)?;
-    let signed = signed_channel_assets(releases)?;
-
-    // A current-epoch manifest without a paired signature is a permanent-policy
-    // violation, including archived history. Mutable metadata cannot erase it.
-    validate_epoch_signature_metadata(authority, releases)?;
-
-    let heads: Vec<&AppcastRelease> = releases
-        .iter()
-        .filter(|release| !release.draft && release.tag == head_tag)
-        .collect();
-    if heads.len() != 1 {
-        return Err(Error::new(format!(
-            "epoch signature verification requires exactly one published release {head_tag}; found {}",
-            heads.len()
-        )));
-    }
-    let head = heads[0];
-    if unique_asset_id(head, manifest_out::MANIFEST_ASSET)?.is_none() {
-        return Err(Error::new(format!(
-            "channel head {head_tag} has no exact {}",
-            manifest_out::MANIFEST_ASSET
-        )));
-    }
-    let head_key = authority_key_for_tag(authority, head_tag)?;
-    let current_epoch = head_key == authority.current_pubkey;
-    let head_has_signature = unique_asset_id(head, manifest_out::MANIFEST_SIG_ASSET)?.is_some();
-    if current_epoch && !head_has_signature {
-        return Err(Error::new(format!(
-            "epoch-2 channel head {head_tag} has no exact {}; no unsigned or archive-name fallback exists",
-            manifest_out::MANIFEST_SIG_ASSET
-        )));
-    }
-    if !current_epoch
-        && unique_asset_id(
-            head,
-            &manifest_out::archived_manifest_signature_asset(head_tag),
-        )?
-        .is_some()
-    {
-        return Err(Error::new(format!(
-            "pre-activation channel head {head_tag} carries only an archived signature name; \
-             updater authority cannot fall back to it"
-        )));
-    }
-
-    let mut verified_exact_head = false;
-    if head_has_signature {
-        let signature = fetch_asset(
-            head.release_id,
-            unique_asset_id(head, manifest_out::MANIFEST_SIG_ASSET)?
-                .expect("checked exact head signature"),
-            head_tag,
-            manifest_out::MANIFEST_SIG_ASSET,
-        )?;
-        if let Some(local) = local_head_signature
-            && local != signature
-        {
-            return Err(Error::new(
-                "published manifest signature is not byte-identical to the local cut artifact",
-            ));
-        }
-        verify_detached_manifest_signature(head_key, head_manifest, &signature).map_err(
-            |error| {
-                Error::new(format!(
-                    "channel head {head_tag} is invalid under its committed epoch key: {error}"
-                ))
-            },
-        )?;
-        verified_exact_head = true;
-    } else if local_head_signature.is_some() {
-        return Err(Error::new(
-            "local signature exists but the pre-activation live head is unsigned",
-        ));
-    }
-
-    for asset in signed {
-        if asset.tag == head_tag
-            && asset.manifest_name == manifest_out::MANIFEST_ASSET
-            && asset.signature_name == manifest_out::MANIFEST_SIG_ASSET
-            && verified_exact_head
-        {
-            continue;
-        }
-        let manifest = fetch_asset(
-            asset.release_id,
-            asset.manifest_asset_id,
-            &asset.tag,
-            &asset.manifest_name,
-        )?;
-        let signature = fetch_asset(
-            asset.release_id,
-            asset.signature_asset_id,
-            &asset.tag,
-            &asset.signature_name,
-        )?;
-        let key = authority_key_for_tag(authority, &asset.tag)?;
-        verify_detached_manifest_signature(key, &manifest, &signature).map_err(|error| {
-            Error::new(format!(
-                "signed epoch history {} / {} is invalid under its committed epoch key: {error}",
-                asset.tag, asset.signature_name
-            ))
-        })?;
-    }
-    Ok(verified_exact_head)
-}
-
 /// Live wrapper used by both cut-final verification and `cargo ship verify`.
+///
+/// Tier REPO model: with no configured/journaled update key the channel is
+/// unsigned and published signature history NEVER forces a signed successor.
+/// When a key IS configured, the exact live head signature is verified under
+/// it (and byte-compared against the local cut artifact during a live cut).
 pub fn verify_live_channel_head_signature(
-    repo: &Path,
+    _repo: &Path,
     slug: &str,
     head_tag: &str,
     head_manifest: &[u8],
     local_head_signature: Option<&[u8]>,
     journal_pubkey: Option<&str>,
 ) -> Result<bool> {
-    let authority = load_channel_signing_authority(repo)?;
-    let expected_key = authority_key_for_tag(&authority, head_tag)?;
-    if let Some(journal_pubkey) = journal_pubkey
-        && canonical_update_pubkey(journal_pubkey)? != expected_key
-    {
-        return Err(Error::new(
-            "journaled signature key differs from the permanent repository epoch authority",
-        ));
-    }
+    let Some(journal_pubkey) = journal_pubkey else {
+        // Unsigned channel: gh auth + SHA-256 + monotonic build number are the
+        // trust. No ratchet — older `.sig` assets never demand a signed head.
+        return Ok(false);
+    };
+    let pubkey = canonical_update_pubkey(journal_pubkey)?;
     let mut remote = GhAppcastArchiveRemote::read_only(slug);
     let releases = remote.list_releases()?;
-    verify_retired_epoch_evidence_with(
-        &authority,
+    let heads: Vec<&AppcastRelease> = releases
+        .iter()
+        .filter(|release| !release.draft && release.tag == head_tag)
+        .collect();
+    let [head] = heads.as_slice() else {
+        return Err(Error::new(format!(
+            "signature verification requires exactly one published release {head_tag}; found {}",
+            heads.len()
+        )));
+    };
+    if unique_asset_id(head, manifest_out::MANIFEST_ASSET)?.is_none() {
+        return Err(Error::new(format!(
+            "signed channel head {head_tag} has no exact {}",
+            manifest_out::MANIFEST_ASSET
+        )));
+    }
+    let signature_id = unique_asset_id(head, manifest_out::MANIFEST_SIG_ASSET)?.ok_or_else(|| {
+        Error::new(format!(
+            "signed channel head {head_tag} has no exact {}; archive-name fallback is forbidden",
+            manifest_out::MANIFEST_SIG_ASSET
+        ))
+    })?;
+    let head_signature = download_snapshot_appcast_asset(
+        slug,
         &releases,
-        |release_id, asset_id, tag, name| {
-            download_snapshot_appcast_asset(slug, &releases, release_id, asset_id, tag, name)
+        head.release_id,
+        signature_id,
+        head_tag,
+        manifest_out::MANIFEST_SIG_ASSET,
+    )?;
+    if let Some(local) = local_head_signature
+        && local != head_signature
+    {
+        return Err(Error::new(
+            "published manifest signature is not byte-identical to the local cut artifact",
+        ));
+    }
+    verify_detached_manifest_signature(&pubkey, head_manifest, &head_signature).map_err(
+        |error| {
+            Error::new(format!(
+                "signed channel head {head_tag} is invalid under the configured public key: {error}"
+            ))
         },
     )?;
-    verify_epoch_channel_head_signature_with(
-        &authority,
-        &releases,
-        head_tag,
-        head_manifest,
-        local_head_signature,
-        |release_id, asset_id, tag, name| {
-            download_snapshot_appcast_asset(slug, &releases, release_id, asset_id, tag, name)
-        },
-    )
+    Ok(true)
 }
 
 fn download_snapshot_appcast_asset(
@@ -3031,10 +2569,10 @@ fn signer_tool(repo: &Path) -> Result<PathBuf> {
         return Ok(tool);
     }
     Err(Error::new(
-        "the published channel already contains an exact or archived Ed25519 signature, \
-         but atpkg-keys is unavailable. Recover ~/.aterm/release.conf and the offline update \
-         signing key, then build the owner tool with `cargo build --release -p atpkg-keys`; \
-         refusing to claim or publish an unsigned successor",
+        "update signing is configured (~/.aterm/release.conf names a signing key), but \
+         atpkg-keys is unavailable to sign the manifest. Build the owner tool with \
+         `cargo build --release -p atpkg-keys`, or remove the signing configuration to cut \
+         an unsigned release (signing is optional)",
     ))
 }
 
@@ -4067,118 +3605,43 @@ fn verify_release_asset_digest_inner(
     }
 }
 
-fn validate_permanent_channel_history(
-    slug: &str,
-    releases: &[AppcastRelease],
-    authority: &ChannelSigningAuthority,
-) -> Result<()> {
-    validate_epoch_signature_metadata(authority, releases)?;
-    verify_retired_epoch_evidence_with(authority, releases, |release_id, asset_id, tag, name| {
-        download_snapshot_appcast_asset(slug, releases, release_id, asset_id, tag, name)
-    })?;
-    let signed = signed_channel_assets(releases)?;
-    validate_signed_channel_history(slug, releases, signed, authority)
-}
-
 fn preflight_signature_policy(
     repo: &Path,
-    slug: &str,
-    releases: &[AppcastRelease],
-    target_version: &str,
+    _slug: &str,
+    _releases: &[AppcastRelease],
+    _target_version: &str,
 ) -> Result<SignaturePolicy> {
-    let authority = load_channel_signing_authority(repo)?;
-    validate_channel_epoch_target(&authority, releases, target_version)?;
-    validate_permanent_channel_history(slug, releases, &authority)?;
-    let material = load_signing_material(repo)?.ok_or_else(|| {
-        Error::new(
-            "the permanent repository authority requires epoch-2 signing, but \
-             ~/.aterm/release.conf has no complete public/private signing configuration; no \
-             ledger claim was made",
-        )
-    })?;
-    if material.pubkey != authority.current_pubkey {
-        return Err(Error::new(
-            "the actual configured private key does not match the permanent epoch-2 repository \
-             public key; refusing substitution (key values suppressed)",
-        ));
+    // Signing is OPTIONAL opt-in. The channel is Tier REPO (gh-authenticated
+    // private repo + SHA-256 + monotonic build number); no signing key and no
+    // permanent authority file are required to cut. When a complete signing
+    // configuration IS present in ~/.aterm/release.conf the cut signs under
+    // that key, but nothing in the repository or published history can force a
+    // machine without a key to sign — so any gh-authenticated machine can cut.
+    match load_signing_material(repo)? {
+        Some(material) => Ok(SignaturePolicy {
+            required: true,
+            pubkey: Some(material.pubkey),
+        }),
+        None => Ok(SignaturePolicy {
+            required: false,
+            pubkey: None,
+        }),
     }
-    Ok(SignaturePolicy {
-        required: true,
-        pubkey: Some(authority.current_pubkey),
-    })
 }
 
-/// Recovery preflight preserves the strict publication activation edge while
-/// allowing a stranded retired-epoch owner ref to converge. Historical mode
-/// never loads the lost private key and never authorizes build/upload/flip: it
-/// verifies all permanent history and returns only the target's already-public
-/// retired-key (or explicit unsigned-bootstrap) identity.
+/// Recovery preflight in the Tier REPO model: there is no epoch/authority and
+/// no lost-key retired mode. Recovery reconstructs a claim under the same
+/// optional-signing verdict a fresh cut would use, so a keyless machine can
+/// recover an unsigned release and a key-configured machine keeps signing.
 fn preflight_recovery_signature_policy(
     repo: &Path,
     slug: &str,
     releases: &[AppcastRelease],
     target_version: &str,
-    release_state: verify::ReleaseState,
+    _release_state: verify::ReleaseState,
 ) -> Result<(SignaturePolicy, RecoveryEpochMode)> {
-    let authority = load_channel_signing_authority(repo)?;
-    let (mode, required, pubkey) =
-        select_recovery_signature_policy(&authority, releases, target_version, release_state)?;
-    if mode == RecoveryEpochMode::CurrentAuthority {
-        return preflight_signature_policy(repo, slug, releases, target_version)
-            .map(|policy| (policy, mode));
-    }
-    validate_permanent_channel_history(slug, releases, &authority)?;
-    Ok((SignaturePolicy { required, pubkey }, mode))
-}
-
-/// Public destructive-operation preflight (notably `yank`): prove the signing
-/// key/channel ratchet before anything is deleted.  The returned policy is
-/// intentionally hidden; callers only need the fail-closed verdict and the
-/// subsequent cut derives/persists it again after acquiring its own claim.
-#[allow(dead_code)] // public operator seam, exercised by integration/formal fixtures
-pub fn preflight_channel_signature_policy(
-    repo: &Path,
-    slug: &str,
-    target_version: &str,
-) -> Result<()> {
-    let mut remote = GhAppcastArchiveRemote::read_only(slug);
-    let releases = remote.list_releases()?;
-    preflight_signature_policy(repo, slug, &releases, target_version).map(|_| ())
-}
-
-fn validate_signed_channel_history(
-    slug: &str,
-    releases: &[AppcastRelease],
-    signed: Vec<SignedChannelAsset>,
-    authority: &ChannelSigningAuthority,
-) -> Result<()> {
-    for asset in signed {
-        let manifest = download_snapshot_appcast_asset(
-            slug,
-            releases,
-            asset.release_id,
-            asset.manifest_asset_id,
-            &asset.tag,
-            &asset.manifest_name,
-        )?;
-        let signature = download_snapshot_appcast_asset(
-            slug,
-            releases,
-            asset.release_id,
-            asset.signature_asset_id,
-            &asset.tag,
-            &asset.signature_name,
-        )?;
-        let pubkey = authority_key_for_tag(authority, &asset.tag)?;
-        verify_detached_manifest_signature(pubkey, &manifest, &signature).map_err(|error| {
-            Error::new(format!(
-                "signed channel history {} / {} is not valid under its permanent repository \
-                     epoch key: {error}; refusing silent key substitution/downgrade",
-                asset.tag, asset.signature_name
-            ))
-        })?;
-    }
-    Ok(())
+    let policy = preflight_signature_policy(repo, slug, releases, target_version)?;
+    Ok((policy, RecoveryEpochMode::CurrentAuthority))
 }
 
 fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
@@ -4443,6 +3906,14 @@ pub struct CutCtx {
     pub release_id: Option<u64>,
     pub draft_create_issued: bool,
     pub upload_intents: Vec<String>,
+    /// The PUBLIC update channel this cut mirrors to, from the tracked
+    /// `[workspace.metadata.aterm] update_channel`. `None` = no public mirror
+    /// is configured (clients then read [`CutCtx::slug`] directly) and the
+    /// `mirror` step is an announced no-op.
+    pub mirror_slug: Option<String>,
+    pub mirror_release_id: Option<u64>,
+    pub mirror_create_issued: bool,
+    pub mirror_upload_intents: Vec<String>,
     pub kind: CutKind,
     /// Present only for a real cut while its remote owner ref is held.
     pub lease: Option<ReleaseLeaseGuard>,
@@ -4555,6 +4026,85 @@ impl CutCtx {
                 "{operation} has no immutable GitHub release ID capability"
             ))
         })
+    }
+
+    // --- public-channel mirror capabilities --------------------------------
+    // Deliberate twins of the private-side methods above rather than a shared
+    // generic: the two repositories must never share an intent set, or a
+    // converged upload on one would silently authorize a POST on the other.
+
+    fn bind_mirror_release_id(&mut self, id: u64) -> Result<()> {
+        if id == 0 || self.mirror_release_id.is_some_and(|current| current != id) {
+            return Err(Error::new(
+                "mirror release ID is zero or differs from the already-bound draft capability",
+            ));
+        }
+        self.mirror_release_id = Some(id);
+        if let Some(journal) = &mut self.journal {
+            if journal.mirror_release_id.is_some_and(|current| current != id) {
+                return Err(Error::new(
+                    "journaled mirror release ID differs from the observed draft capability",
+                ));
+            }
+            journal.mirror_release_id = Some(id);
+            journal.save(&self.journal_path)?;
+        }
+        Ok(())
+    }
+
+    fn persist_mirror_create_intent(&mut self) -> Result<DurablePostPermit> {
+        if self.mirror_create_issued {
+            return Err(Error::new(
+                "mirror create intent already exists; refusing to mint another process-local POST permit",
+            ));
+        }
+        if self.kind == CutKind::Real && self.journal.is_none() {
+            return Err(Error::new(
+                "real mirror create has no durable journal; refusing to mint a POST permit",
+            ));
+        }
+        self.mirror_create_issued = true;
+        if let Some(journal) = &mut self.journal {
+            journal.mirror_create_issued = true;
+            journal.save(&self.journal_path)?;
+        }
+        Ok(DurablePostPermit(()))
+    }
+
+    fn mirror_upload_intent_issued(&self, name: &str) -> bool {
+        self.mirror_upload_intents
+            .iter()
+            .any(|issued| issued == name)
+    }
+
+    fn persist_mirror_upload_intent(&mut self, name: &str) -> Result<DurablePostPermit> {
+        if self.mirror_upload_intent_issued(name) {
+            return Err(Error::new(format!(
+                "mirror upload intent for {name} already exists; refusing to mint another process-local POST permit"
+            )));
+        }
+        if self.kind == CutKind::Real && self.journal.is_none() {
+            return Err(Error::new(
+                "real mirror upload has no durable journal; refusing to mint a POST permit",
+            ));
+        }
+        self.mirror_upload_intents.push(name.to_string());
+        if let Some(journal) = &mut self.journal {
+            journal.mirror_upload_intents.push(name.to_string());
+            journal.save(&self.journal_path)?;
+        }
+        Ok(DurablePostPermit(()))
+    }
+
+    /// Local paths of exactly the assets that cross to the public channel, in a
+    /// stable order. Derived from the same [`mirror::required_asset_names`] the
+    /// remote listing is checked against, so the upload set and the acceptance
+    /// rule cannot drift apart.
+    fn mirror_asset_paths(&self) -> Vec<PathBuf> {
+        mirror::required_asset_names(&self.version, self.signature_required)
+            .into_iter()
+            .map(|name| self.dist.join(name))
+            .collect()
     }
 }
 
@@ -5148,33 +4698,36 @@ pub fn ordinary_resume_claim_preflight(
     Ok(())
 }
 
-fn validate_recovery_provenance(
+pub(crate) fn validate_claim_provenance(
     bytes: &[u8],
     version: &str,
     build: u64,
     owner: &str,
 ) -> Result<()> {
     let text =
-        std::str::from_utf8(bytes).map_err(|_| Error::new("published provenance is not UTF-8"))?;
+        std::str::from_utf8(bytes).map_err(|_| Error::new("release provenance is not UTF-8"))?;
     let field = |name: &str| -> Result<&str> {
         let prefix = format!("{name}=");
         let mut values = text.lines().filter_map(|line| line.strip_prefix(&prefix));
-        let first = values.next().ok_or_else(|| {
-            Error::new(format!("published provenance has no exact {name}= field"))
-        })?;
+        let first = values
+            .next()
+            .ok_or_else(|| Error::new(format!("release provenance has no exact {name}= field")))?;
         if values.next().is_some() {
             return Err(Error::new(format!(
-                "published provenance duplicates {name}= identity"
+                "release provenance duplicates {name}= identity"
             )));
         }
         Ok(first)
     };
+    let owner_short = owner
+        .get(..12)
+        .ok_or_else(|| Error::new("release claim is too short for provenance identity"))?;
     if field("version")? != version
         || field("build")? != build.to_string()
-        || field("commit")? != owner
+        || field("commit")? != owner_short
     {
         return Err(Error::new(
-            "published provenance version/build/commit does not match the recovery claim",
+            "release provenance version/build/short-commit does not match the claim",
         ));
     }
     Ok(())
@@ -5293,7 +4846,7 @@ pub fn run_recover_lost(
             || journal.signature_pubkey.as_deref() != signature_policy.pubkey.as_deref())
     {
         return Err(Error::new(
-            "recovery journal signing policy/key differs from the permanent repository epoch authority",
+            "recovery journal signing policy/key differs from the current signing configuration",
         ));
     }
 
@@ -5550,7 +5103,7 @@ fn recover_published_cut(
     }
     let provenance =
         download_release_asset_for_release_id(slug, release_object.id, &provenance_name)?;
-    validate_recovery_provenance(&provenance, version, build, owner)?;
+    validate_claim_provenance(&provenance, version, build, owner)?;
 
     // Reconstruct only authoritative, remotely validated bytes.  The journal
     // begins after flip: build/upload are never replayed from guesses, while
@@ -5598,6 +5151,12 @@ fn recover_published_cut(
         release_id: Some(release_object.id),
         draft_create_issued: true,
         upload_intents: Vec::new(),
+        // A recovered cut has no mirror capability yet: the mirror step runs
+        // after `verify`, which this reconstruction has not reached, so it
+        // starts from a clean one-shot intent set.
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         done: [
             "lock",
             "build",
@@ -5643,6 +5202,10 @@ fn recover_published_cut(
         release_id: Some(release_object.id),
         draft_create_issued: true,
         upload_intents: Vec::new(),
+        mirror_slug: workspace_mirror_slug(repo)?,
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         kind: CutKind::Real,
         lease: Some(lease),
         fence: Some(fence),
@@ -5654,6 +5217,12 @@ fn recover_published_cut(
 
 /// The whole `cargo ship cut` (spec §7 order): gates → claim → build+package
 /// → self-check → draft-first publish → cask pin → post-publish verify.
+///
+/// The version comes from `[workspace.package] version` with the DEV
+/// component reset to 0 ([`release_version_from_workspace`]) — NOT from the
+/// ledger, which supplies only the build number. Cutting twice without
+/// bumping Cargo.toml therefore lands on the already-published guard in
+/// [`verify::derive_cut_mode`], which names the bump.
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let t0 = Instant::now();
     let dist = repo.join("dist");
@@ -5663,12 +5232,20 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read Cargo.toml: {e}")))?;
     let full = workspace_version(&cargo_text)?;
-    let cur_short = short_version(&full);
     let origin_slug = repo_slug(&cargo_text).ok_or_else(|| {
         Error::new(
             "Cargo.toml [workspace.package] repository is not an exact GitHub OWNER/REPO URL",
         )
     })?;
+    // The PUBLIC channel installed copies read. Parsed from the same tracked
+    // key `aterm-update-core/build.rs` compiles into every client, so the
+    // pipeline mirrors to exactly the place the fleet looks.
+    let mirror_slug = mirror::update_channel_slug(&cargo_text)?;
+    // THE version this cut publishes: the workspace version with DEV reset to
+    // 0. The ledger is still read (below) for the BUILD NUMBER claim, but it
+    // is no longer a version lineage — its historical two-component lines are
+    // retired-scheme accounting history.
+    let release_version = release_version_from_workspace(&full)?;
 
     let kind = if opts.dry_run {
         CutKind::DryRun
@@ -5744,16 +5321,16 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let changelog_text = fs::read_to_string(repo.join(changelog::CHANGELOG_FILE))
         .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
     let (version, recut) = if kind == CutKind::Real {
-        let has_section = changelog::has_section(&changelog_text, &cur_short);
+        let has_section = changelog::has_section(&changelog_text, &release_version);
         let published = if has_section {
             // Only hit the network when the wedge signature is plausible.
-            verify::release_state(&origin_slug, &format!("v{cur_short}"))?
+            verify::release_state(&origin_slug, &format!("v{release_version}"))?
                 == verify::ReleaseState::Published
         } else {
             false
         };
         let state = verify::RemoteState {
-            cargo_short: cur_short.clone(),
+            current_version: release_version.clone(),
             changelog_has_section: has_section,
             published,
         };
@@ -5763,11 +5340,11 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         }
     } else {
         // Dry-run/rehearse never roll, so there is no recut concept: version
-        // is the explicit override or the default bump; notes come from
-        // [Unreleased].
+        // is the explicit override or the workspace-derived release version;
+        // notes come from [Unreleased].
         match &opts.set_version {
             Some(v) => (v.clone(), false),
-            None => (bump_minor(&cur_short)?, false),
+            None => (release_version.clone(), false),
         }
     };
     ledger::check_version_shape(&version)?;
@@ -5779,7 +5356,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         CutKind::DryRun => " [dry-run]",
         CutKind::Rehearse => " [rehearse]",
     };
-    println!("aterm-release · cut v{version} (from {full}, main @ {head8}){flavor}");
+    println!("aterm-release · cut v{version} (workspace {full}, main @ {head8}){flavor}");
 
     // ---- gates (spec §6; <5s, before anything is committed) ---------------
     let gate_opts = gates::GateOpts {
@@ -5811,7 +5388,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     step(
         "",
         &format!(
-            "trust rustc ok ({}) · {} · disk ok ({} GiB free)",
+            "Cargo.lock exact/offline · trust rustc ok ({}) · {} · disk ok ({} GiB free)",
             gr.trust_rustc.display(),
             if gr.universal {
                 "x86_64 target ok"
@@ -5828,6 +5405,31 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     if kind == CutKind::Real {
         preflight_release_lease(&git)?;
         step("lease", "remote release lease is free (pre-claim)");
+        // Prove the public channel is writable BEFORE the ledger claim. The
+        // mirror is the last remote step; failing it after the claim would burn
+        // a build number and leave a live release the fleet cannot see, and no
+        // amount of `--resume` fixes a missing permission grant.
+        match &mirror_slug {
+            Some(slug) if *slug != origin_slug => {
+                preflight_mirror_target(slug)?;
+                step(
+                    "mirror",
+                    &format!("public update channel {slug} is public and writable (pre-claim)"),
+                );
+            }
+            Some(_) => {}
+            None => {
+                step(
+                    "mirror",
+                    &format!(
+                        "no {} {} declared — shipped builds will read {origin_slug}, which \
+                         needs a per-machine token",
+                        mirror::CHANNEL_TABLE,
+                        mirror::CHANNEL_KEY
+                    ),
+                );
+            }
+        }
     }
 
     // ---- channel floor (before claim: bad input must not burn a number) ----
@@ -5961,6 +5563,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         release_id: None,
         draft_create_issued: false,
         upload_intents: Vec::new(),
+        mirror_slug: mirror_slug.clone(),
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         kind,
         lease: None,
         fence: None,
@@ -5980,6 +5586,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             release_id: None,
             draft_create_issued: false,
             upload_intents: Vec::new(),
+            mirror_release_id: None,
+            mirror_create_issued: false,
+            mirror_upload_intents: Vec::new(),
             done: vec![],
         };
         j.save(&journal_path)?;
@@ -6056,6 +5665,10 @@ fn resume_cut(
         release_id: journal.release_id,
         draft_create_issued: journal.draft_create_issued,
         upload_intents: journal.upload_intents.clone(),
+        mirror_slug: workspace_mirror_slug(repo)?,
+        mirror_release_id: journal.mirror_release_id,
+        mirror_create_issued: journal.mirror_create_issued,
+        mirror_upload_intents: journal.mirror_upload_intents.clone(),
         kind: CutKind::Real,
         lease,
         fence,
@@ -6152,6 +5765,7 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
                 }
             }
             "verify" => step_verify(ctx)?,
+            "mirror" => step_mirror(ctx)?,
             "unlock" => {
                 if ctx.kind == CutKind::Real {
                     step_unlock(ctx)?;
@@ -6226,43 +5840,19 @@ fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
         return Ok(());
     }
     ensure_ctx_release_lease(ctx)?;
+    // Signing is local opt-in and no longer ratcheted by published history, so
+    // re-derive the same optional-signing verdict and confirm the cut has not
+    // drifted from the key state it claimed under (a key that vanished, or a
+    // configuration that appeared, mid-cut).
     let mut remote = GhAppcastArchiveRemote::read_only(&ctx.slug);
     let releases = remote.list_releases()?;
-    let authority = load_channel_signing_authority(&ctx.repo)?;
-    let observed = if channel_signing_epoch_for_version(&authority, &ctx.version)?
-        == ChannelSigningEpoch::Retired
-    {
-        if !ctx.is_done("flip") {
-            return Err(Error::new(format!(
-                "retired-epoch v{} recovery cannot rebuild, upload, tag, or flip; it may only abandon unpublished state or finish an exact already-published release",
-                ctx.version
-            )));
-        }
-        let release_state = verify::release_state(&ctx.slug, &ctx.tag)?;
-        let (policy, mode) = preflight_recovery_signature_policy(
-            &ctx.repo,
-            &ctx.slug,
-            &releases,
-            &ctx.version,
-            release_state,
-        )?;
-        if mode != RecoveryEpochMode::RetiredNonPublishingOnly
-            || release_state != verify::ReleaseState::Published
-        {
-            return Err(Error::new(
-                "retired-epoch post-flip recovery lost its exact published release authority",
-            ));
-        }
-        policy
-    } else {
-        preflight_signature_policy(&ctx.repo, &ctx.slug, &releases, &ctx.version)?
-    };
+    let observed = preflight_signature_policy(&ctx.repo, &ctx.slug, &releases, &ctx.version)?;
     if observed.required != ctx.signature_required
         || observed.pubkey.as_deref() != ctx.signature_pubkey.as_deref()
     {
         return Err(Error::new(
-            "channel signature policy advanced or changed after this cut's pre-claim scan; \
-             refusing to build/upload/flip under stale signing authority",
+            "local signing configuration changed after this cut's pre-claim scan; \
+             refusing to build/upload/flip under stale signing state",
         ));
     }
     ensure_ctx_release_lease(ctx)
@@ -6325,17 +5915,14 @@ fn step_unlock(ctx: &mut CutCtx) -> Result<()> {
 // pipeline steps
 // ---------------------------------------------------------------------------
 
-/// Fresh-cut release-commit content for the claim (spec §1: bump + lock
-/// refresh + changelog roll, ONE commit together with the ledger line). Runs
-/// on origin's blobs — after a lost CAS race the claim resets --hard and
+/// Fresh-cut release-commit content for the claim: roll the changelog in the
+/// same commit as the ledger line. Cargo.toml's `[workspace.package]` version
+/// and Cargo.lock stay byte-for-byte untouched — the workspace version is the
+/// operator's bump, and the cut only READS it (DEV → 0) to derive the release.
+///
+/// Runs on origin's blobs — after a lost CAS race the claim resets hard and
 /// calls this again, so it always re-reads the worktree fresh.
-fn regen_release_files(repo: &Path, version: &str, date: &str) -> Result<Vec<String>> {
-    let cargo_path = repo.join("Cargo.toml");
-    let cargo_text =
-        fs::read_to_string(&cargo_path).map_err(|e| Error::new(format!("read Cargo.toml: {e}")))?;
-    let bumped = bump_workspace_version(&cargo_text, &format!("{version}.0"))?;
-    fs::write(&cargo_path, bumped).map_err(|e| Error::new(format!("write Cargo.toml: {e}")))?;
-
+pub(crate) fn regen_release_files(repo: &Path, version: &str, date: &str) -> Result<Vec<String>> {
     let cl_path = repo.join(changelog::CHANGELOG_FILE);
     let cl_text = fs::read_to_string(&cl_path)
         .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
@@ -6343,37 +5930,7 @@ fn regen_release_files(repo: &Path, version: &str, date: &str) -> Result<Vec<Str
     fs::write(&cl_path, rolled)
         .map_err(|e| Error::new(format!("write {}: {e}", changelog::CHANGELOG_FILE)))?;
 
-    refresh_lock(repo)?;
-    Ok(vec![
-        "Cargo.toml".into(),
-        "Cargo.lock".into(),
-        changelog::CHANGELOG_FILE.into(),
-    ])
-}
-
-/// `cargo update --workspace` (offline first) — prepare-release.sh's exact
-/// lock refresh: workspace members carry the bumped version, nothing else
-/// moves. Fatal on failure: a stale Cargo.lock would mismatch the bumped
-/// Cargo.toml inside the release commit.
-fn refresh_lock(repo: &Path) -> Result<()> {
-    for args in [
-        ["update", "--workspace", "--offline"].as_slice(),
-        ["update", "--workspace"].as_slice(),
-    ] {
-        let out = Command::new("cargo")
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .map_err(|e| Error::new(format!("spawn cargo update: {e}")))?;
-        if out.status.success() {
-            return Ok(());
-        }
-    }
-    Err(Error::new(
-        "could not refresh Cargo.lock (cargo update --workspace failed offline AND online) — \
-         aborting before commit"
-            .to_string(),
-    ))
+    Ok(vec![changelog::CHANGELOG_FILE.into()])
 }
 
 /// Opt-in deep gate: `tools/verify.sh --full`, streamed (spec decisions
@@ -6523,31 +6080,25 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // Provenance AFTER signing: binary_sha256 must cover the SIGNED bytes.
     let provenance_path = bundle::write_provenance(&spec, &app, &signed_by)?;
     if ctx.signature_required {
-        let authority = load_channel_signing_authority(&ctx.repo)?;
-        if ctx.signature_pubkey.as_deref() != Some(authority.current_pubkey.as_str()) {
-            return Err(Error::new(
-                "build context signing key differs from permanent epoch-2 authority before provenance",
-            ));
-        }
+        // Optional signing: bind the provenance to the actual signing key's
+        // fingerprint. There is no permanent-authority/epoch record any more —
+        // the pin is simply the configured update key.
+        let fingerprint = ctx
+            .signature_pubkey
+            .as_deref()
+            .map(update_key_fingerprint)
+            .transpose()?
+            .ok_or_else(|| Error::new("signed build has no persisted public key"))?;
         let mut provenance = fs::read_to_string(&provenance_path).map_err(|error| {
             Error::new(format!(
-                "read {} for signing-epoch provenance: {error}",
+                "read {} for update-pin provenance: {error}",
                 provenance_path.display()
             ))
         })?;
-        provenance.push_str(&format!(
-            "update_signing_epoch={}\nupdate_key_activation=v{}\n\
-             update_pubkey_fingerprint_sha256={}\n\
-             retired_pubkey_fingerprint_sha256={}\n\
-             old_pinned_clients_require_manual_bootstrap=yes\n",
-            authority.epoch,
-            authority.activation_version,
-            authority.current_fingerprint_sha256,
-            authority.retired_fingerprint_sha256,
-        ));
+        provenance.push_str(&format!("update_pubkey_fingerprint_sha256={fingerprint}\n"));
         fs::write(&provenance_path, provenance).map_err(|error| {
             Error::new(format!(
-                "write {} signing-epoch provenance: {error}",
+                "write {} update-pin provenance: {error}",
                 provenance_path.display()
             ))
         })?;
@@ -6666,6 +6217,16 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             ctx.build
         )));
     }
+    let cf_short = manifest_out::plist_string(&plist_text, "CFBundleShortVersionString")
+        .ok_or_else(|| {
+            Error::new("stamped Info.plist has no CFBundleShortVersionString".to_string())
+        })?;
+    if cf_short != ctx.version {
+        return Err(Error::new(format!(
+            "self-check failed: CFBundleShortVersionString {cf_short:?} != claimed app version {:?}",
+            ctx.version
+        )));
+    }
 
     // Binary stamp == n. The GUI binary prints no raw build number on any
     // exiting flag, but `--diagnose` prints ATERM_BUILD_TIME — which build.rs
@@ -6684,6 +6245,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         )));
     }
     let diag_text = String::from_utf8_lossy(&diag.stdout).into_owned();
+    buildplan::validate_app_version_reports(&ctx.version, &[("shipped universal", &diag_text)])?;
     let expect_built = bundle::epoch_to_rfc3339(ctx.build);
     let built = diag_text.lines().find_map(|l| {
         l.split("built ")
@@ -6697,35 +6259,61 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             ctx.build
         )));
     }
+
+    // Every shipped argv0 identity is the same Mach-O and must agree on the
+    // ledger-derived app version. Exact stdout matching rejects stale cached
+    // library slices as well as alias-routing drift.
+    for (basename, identity) in [
+        ("aterm", "aterm"),
+        ("aterm-cli", "aterm"),
+        ("aterm-gui", "aterm-gui"),
+        ("aterm-ctl", "aterm-ctl"),
+    ] {
+        let output = Command::new(app.join("Contents/MacOS").join(basename))
+            .arg("--version")
+            .current_dir(&ctx.repo)
+            .output()
+            .map_err(|error| Error::new(format!("spawn {identity} --version: {error}")))?;
+        if !output.status.success() {
+            return Err(Error::new(format!(
+                "self-check failed: {identity} --version exited {}",
+                output.status
+            )));
+        }
+        buildplan::validate_named_cli_app_version(identity, &ctx.version, &output.stdout)?;
+    }
+
+    let provenance = fs::read(ctx.provenance_path())
+        .map_err(|error| Error::new(format!("read release provenance: {error}")))?;
+    validate_claim_provenance(&provenance, &ctx.version, ctx.build, &ctx.commit)?;
+
     if ctx.signature_required {
-        let authority = load_channel_signing_authority(&ctx.repo)?;
+        // Optional signing: prove the shipped binary embedded the fingerprint of
+        // the configured signing key, and that the provenance records it. There
+        // is no permanent authority or epoch metadata to bind against.
+        let fingerprint = ctx
+            .signature_pubkey
+            .as_deref()
+            .map(update_key_fingerprint)
+            .transpose()?
+            .ok_or_else(|| Error::new("signed channel has no persisted public key"))?;
         buildplan::validate_slice_update_pin_reports(
-            &authority.current_fingerprint_sha256,
+            &fingerprint,
             &[("shipped universal", &diag_text)],
         )?;
         let provenance = fs::read_to_string(ctx.provenance_path())
-            .map_err(|error| Error::new(format!("read signing-epoch provenance: {error}")))?;
-        for expected in [
-            format!("update_signing_epoch={}", authority.epoch),
-            format!("update_key_activation=v{}", authority.activation_version),
-            format!(
-                "update_pubkey_fingerprint_sha256={}",
-                authority.current_fingerprint_sha256
-            ),
-            "old_pinned_clients_require_manual_bootstrap=yes".to_string(),
-        ] {
-            if !provenance.lines().any(|line| line == expected) {
-                return Err(Error::new(format!(
-                    "release provenance is missing exact epoch authority field {expected:?}"
-                )));
-            }
+            .map_err(|error| Error::new(format!("read update-pin provenance: {error}")))?;
+        let expected = format!("update_pubkey_fingerprint_sha256={fingerprint}");
+        if !provenance.lines().any(|line| line == expected) {
+            return Err(Error::new(format!(
+                "release provenance is missing exact update-pin field {expected:?}"
+            )));
         }
         step(
             "",
             &format!(
-                "binary runtime reports epoch-{} key {}…; per-slice/provenance proof bound",
-                authority.epoch,
-                &authority.current_fingerprint_sha256[..12]
+                "binary runtime reports pinned update key {}…; per-slice/provenance proof bound",
+                &fingerprint[..12]
             ),
         );
     }
@@ -7977,6 +7565,516 @@ fn prove_origin_cask_pin(git: &dyn GitRunner, cask_rel: &str, expected: &str) ->
         return Err(Error::new(
             "origin/main does not carry the exact derived cask pin after publication",
         ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// step "mirror": copy the verified release to the PUBLIC update channel
+// ---------------------------------------------------------------------------
+
+/// Pre-claim proof that the public update channel is reachable AND writable by
+/// this operator's credential.
+///
+/// Deliberately runs before the ledger claim. The mirror itself is the last
+/// remote step of a cut, so discovering "no push permission on the channel"
+/// there would burn a build number, leave a live private release the fleet
+/// cannot see, and hold the lease until an OWNER-level permission grant — which
+/// is not something a resume can fix. Failing here costs nothing.
+pub fn preflight_mirror_target(slug: &str) -> Result<()> {
+    let endpoint = format!("repos/{slug}");
+    let out = gh_retry(&[
+        "api",
+        &endpoint,
+        "--jq",
+        r#"[(.private | tostring), (.permissions.push // false | tostring)] | @tsv"#,
+    ])
+    .map_err(|error| {
+        Error::new(format!(
+            "cannot read the public update channel {slug} named by {table} {key}: {error}. \
+             A 404 here means the repository does not exist or this account cannot see it; \
+             create it (public) and grant the release account write access.",
+            table = mirror::CHANNEL_TABLE,
+            key = mirror::CHANNEL_KEY,
+        ))
+    })?;
+    let row = out.stdout_utf8();
+    let row = row.trim();
+    let mut fields = row.split('\t');
+    let (Some(private), Some(push), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(Error::new(format!(
+            "public update channel {slug} returned a malformed repository row {row:?}"
+        )));
+    };
+    if push != "true" {
+        return Err(Error::new(format!(
+            "the authenticated account has no push permission on the public update \
+             channel {slug}, so `cargo ship cut` cannot mirror this release there and \
+             the fleet would never see it. This is an OWNER action, not a resume: grant \
+             the release account write access to {slug} (or clear \
+             `{table} {key}` in Cargo.toml to publish without a public mirror — shipped \
+             builds would then read the private repo and need a token). Refusing before \
+             the ledger claim so no build number is burned.",
+            table = mirror::CHANNEL_TABLE,
+            key = mirror::CHANNEL_KEY,
+        )));
+    }
+    if private == "true" {
+        return Err(Error::new(format!(
+            "the update channel {slug} is PRIVATE. Mirroring there would reproduce the \
+             very failure this channel exists to remove: a shipped build with no \
+             provisioned credential cannot read a private repo's releases and silently \
+             never updates. Make {slug} public, or point \
+             `{table} {key}` at a public repository.",
+            table = mirror::CHANNEL_TABLE,
+            key = mirror::CHANNEL_KEY,
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a MIRROR release object capability. The private side's
+/// [`validate_release_object_capability`] also binds `target_commitish` to the
+/// claim sha; the mirror deliberately cannot, because the public channel is a
+/// different repository whose history does not contain the claim commit at all
+/// (its releases are anchored at the public default branch). Identity there is
+/// the immutable release ID plus the tag plus the draft state — the three
+/// things a mutation must not have raced.
+fn validate_mirror_release_capability(
+    observed: Option<&ReleaseObjectIdentity>,
+    expected_id: u64,
+    expected_tag: &str,
+    expected_draft: bool,
+) -> Result<()> {
+    let observed = observed.ok_or_else(|| {
+        Error::new(format!(
+            "mirror release ID {expected_id} vanished before mutation"
+        ))
+    })?;
+    if observed.id != expected_id
+        || observed.tag != expected_tag
+        || observed.draft != expected_draft
+    {
+        return Err(Error::new(format!(
+            "mirror release ID {expected_id} changed tag/state; refusing mutation"
+        )));
+    }
+    Ok(())
+}
+
+/// Step "mirror" — the step that makes auto-update actually work.
+///
+/// It runs AFTER `verify`, so the private release is already live and fully
+/// proven, and BEFORE `unlock`, so the cut still holds its lease/fence and a
+/// failure is resumable rather than abandoned. The copy is draft-first and
+/// digest-verified exactly like the private publish: create one draft under a
+/// durable one-shot intent, upload each client-required asset once by immutable
+/// ID, re-download every one of them and prove it byte-identical to the local
+/// artifact, prove the exact asset set the updater elects, and only then flip.
+///
+/// Failure is a cut failure on purpose. The compiled-in channel of every shipped
+/// binary is the mirror, so a release that reaches the private repo and not the
+/// channel is invisible to the fleet — indistinguishable, from a user's Mac,
+/// from no release at all. That is the silent-never-updates bug; it must be
+/// loud and it must be resumable.
+fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
+    // Rehearsals publish to a scratch repo and must never touch the real public
+    // channel; dry-runs have already returned after selfcheck.
+    if ctx.kind != CutKind::Real {
+        return Ok(());
+    }
+    let Some(slug) = ctx.mirror_slug.clone() else {
+        step(
+            "mirror",
+            &format!(
+                "no {} {} declared — clients read {} directly; nothing to mirror",
+                mirror::CHANNEL_TABLE,
+                mirror::CHANNEL_KEY,
+                ctx.slug
+            ),
+        );
+        return Ok(());
+    };
+    if slug == ctx.slug {
+        step(
+            "mirror",
+            &format!("update channel is the publish repo {slug} — already published there"),
+        );
+        return Ok(());
+    }
+    ensure_ctx_release_lease(ctx)?;
+    preflight_mirror_target(&slug)?;
+
+    let observed = unique_release_object_by_tag(&slug, &ctx.tag)?;
+    let release_id = match mirror::mirror_plan(
+        ctx.mirror_create_issued,
+        observed.as_ref().map(|release| release.draft),
+    ) {
+        mirror::MirrorPlan::AwaitVisibility => {
+            return Err(Error::new(format!(
+                "mirror create intent for {} on {slug} was already durably issued, but no \
+                 release object is visible; refusing a duplicate POST. Re-run \
+                 `cargo ship cut --resume` after GitHub converges.",
+                ctx.tag
+            )));
+        }
+        mirror::MirrorPlan::CreateDraft => {
+            let release = create_mirror_draft(ctx, &slug)?;
+            step(
+                "mirror",
+                &format!("draft {} created on public channel {slug}", ctx.tag),
+            );
+            release.id
+        }
+        mirror::MirrorPlan::ConvergeDraft => {
+            let release = observed.expect("visible draft decision");
+            // A draft we never issued a create POST for is not ours to adopt.
+            // The journal refuses to bind an object ID without the matching
+            // durable intent (that pairing is what makes the one-shot protocol
+            // meaningful), so say WHY here instead of failing later inside a
+            // journal save with an opaque invariant message.
+            if !ctx.mirror_create_issued {
+                return Err(Error::new(format!(
+                    "a draft release for {} already exists on the public channel {slug} \
+                     (ID {}) but this cut never issued a create POST for it — it is a \
+                     leftover or foreign object, and adopting it would bind a capability \
+                     with no durable intent. Inspect and delete it, then \
+                     `cargo ship cut --resume`.",
+                    ctx.tag, release.id
+                )));
+            }
+            step(
+                "mirror",
+                &format!(
+                    "draft {} ID {} already on {slug} — converging",
+                    ctx.tag, release.id
+                ),
+            );
+            release.id
+        }
+        mirror::MirrorPlan::ConvergePublished => {
+            // Our own flip landed and the journal mark did not — the only
+            // benign reading. Prove the live channel head really is THIS build
+            // before treating it as ours; anything else is a foreign release
+            // sitting on our tag, and adopting it would publish someone else's
+            // bytes as this cut.
+            let release = observed.expect("visible published decision");
+            prove_mirror_channel_head(ctx, &slug, release.id)?;
+            step(
+                "mirror",
+                &format!(
+                    "{} already live on {slug} carrying build {} — converged",
+                    ctx.tag, ctx.build
+                ),
+            );
+            return Ok(());
+        }
+    };
+    ctx.bind_mirror_release_id(release_id)?;
+    let reread = release_object_by_id(&slug, release_id)?;
+    validate_mirror_release_capability(reread.as_ref(), release_id, &ctx.tag, true)?;
+
+    for file in ctx.mirror_asset_paths() {
+        if !file.is_file() {
+            return Err(Error::new(format!(
+                "mirror asset missing: {} — this cut's dist/ artifacts are gone, so the \
+                 public channel cannot be served the same bytes that were verified; \
+                 recover the cut rather than mirroring different bytes",
+                file.display()
+            )));
+        }
+        upload_mirror_asset(ctx, &slug, release_id, &file)?;
+    }
+
+    // Prove, from a FRESH remote listing, that the draft carries exactly the
+    // asset set the deployed updater elects — and that every one of those
+    // objects is byte-identical to the artifact `verify` just proved live on
+    // the private repo. Both proofs happen while the release is still a draft:
+    // a channel head is never allowed to become visible unproven.
+    prove_mirror_draft_assets(ctx, &slug, release_id)?;
+
+    let endpoint = format!("repos/{slug}/releases/{release_id}");
+    gh_retry_guarded(
+        &["api", "--method", "PATCH", &endpoint, "-F", "draft=false"],
+        || {
+            let current = release_object_by_id(&slug, release_id)?;
+            validate_mirror_release_capability(current.as_ref(), release_id, &ctx.tag, true)?;
+            ensure_ctx_release_lease(ctx)?;
+            Ok(())
+        },
+    )?;
+    let after = release_object_by_id(&slug, release_id)?;
+    validate_mirror_release_capability(after.as_ref(), release_id, &ctx.tag, false)?;
+    prove_mirror_channel_head(ctx, &slug, release_id)?;
+    step(
+        "mirror",
+        &format!(
+            "v{} (build {}) is live on the public channel {slug} — every install \
+             updates from here, no token required",
+            ctx.version, ctx.build
+        ),
+    );
+    Ok(())
+}
+
+/// One direct REST draft-create against the mirror, under the same one-shot
+/// durable-intent contract as [`create_draft`].
+///
+/// Unlike the private side this sends NO `target_commitish`: the claim commit
+/// does not exist in the public repository, and naming it would either fail the
+/// POST or (worse) bind the release to an unrelated object. GitHub anchors the
+/// tag at the channel repo's default branch when the draft is flipped, which is
+/// the correct meaning — the tag on the channel is a distribution marker, and
+/// the authenticity of the bytes comes from the manifest digest + optional
+/// pinned signature + codesign, never from the release's target.
+fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIdentity> {
+    let notes = fs::read_to_string(ctx.notes_path())
+        .map_err(|error| Error::new(format!("read mirror release notes: {error}")))?;
+    let title = format!("aterm {}", ctx.version);
+    let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{slug}/releases");
+    let payload_dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
+        "aterm-release-mirror-{}-{}",
+        std::process::id(),
+        RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )))?;
+    let payload_path = payload_dir.path().join("request.json");
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "tag_name": ctx.tag.as_str(),
+        "name": title,
+        "body": notes,
+        "draft": true,
+        "prerelease": false,
+    }))
+    .map_err(|error| Error::new(format!("serialize mirror release request: {error}")))?;
+    fs::write(&payload_path, payload)
+        .map_err(|error| Error::new(format!("write mirror release request: {error}")))?;
+    let payload_arg = payload_path
+        .to_str()
+        .ok_or_else(|| Error::new("mirror release request path is not UTF-8"))?;
+    let payload_arg = format!("@{payload_arg}");
+    let auth = prepare_github_auth_headers()?;
+    let args = [
+        "--silent",
+        "--show-error",
+        "--fail-with-body",
+        "--retry",
+        "0",
+        "--request",
+        "POST",
+        "--header",
+        &auth.curl_header_arg,
+        "--header",
+        "Content-Type: application/json",
+        "--data-binary",
+        &payload_arg,
+        "--url",
+        &endpoint,
+    ];
+    // Every fallible preflight precedes the durable edge; the non-cloneable
+    // permit is consumed by the POST that immediately follows.
+    ensure_ctx_release_lease(ctx)?;
+    let permit = ctx.persist_mirror_create_intent()?;
+    let out = issue_nonidempotent_post(permit, &args)?;
+    if out.success() {
+        let release = parse_release_object_response(&out.stdout)?;
+        validate_mirror_release_capability(Some(&release), release.id, &ctx.tag, true)?;
+        return Ok(release);
+    }
+    if let Some(release) = unique_release_object_by_tag(slug, &ctx.tag)? {
+        validate_mirror_release_capability(Some(&release), release.id, &ctx.tag, true)?;
+        return Ok(release);
+    }
+    Err(Error::new(format!(
+        "mirror draft create returned failure and no exact release object is visible for {} \
+         on {slug}; refusing an ambiguous retry in this invocation (resume after GitHub \
+         converges): {}",
+        ctx.tag,
+        out.stderr_utf8().trim()
+    )))
+}
+
+/// Converge one exact-name asset onto the mirrored draft under a durable
+/// one-shot intent. Structurally the same contract as
+/// [`upload_release_asset_by_id`], with one deliberate difference: an existing
+/// object with the WRONG bytes is never deleted and re-uploaded. On the private
+/// side that recovery exists because the draft is the only copy; here the
+/// authority already exists on the private repo, so a mismatch means something
+/// unexpected is holding our tag on the public channel and the safe move is to
+/// stop and let a human look.
+fn upload_mirror_asset(
+    ctx: &mut CutCtx,
+    slug: &str,
+    release_id: u64,
+    file: &Path,
+) -> Result<()> {
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::new("mirror asset filename is not UTF-8"))?;
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(Error::new(format!(
+            "mirror asset name {name:?} is outside the exact upload URL alphabet"
+        )));
+    }
+    let prior_intent = ctx.mirror_upload_intent_issued(name);
+    let observed = release_asset_identity_for_release_id_optional(slug, release_id, name)?;
+    match durable_post_decision(prior_intent, observed.is_some()) {
+        DurablePostDecision::AwaitVisibility => {
+            return Err(Error::new(format!(
+                "mirror upload intent for {name} was already durably issued, but the asset is \
+                 not visible; refusing a duplicate POST (resume after GitHub converges)"
+            )));
+        }
+        DurablePostDecision::ConvergeVisible => {
+            verify_release_asset_id_matches_local(slug, release_id, name, file).map_err(
+                |error| {
+                    Error::new(format!(
+                        "mirror asset {name} on {slug} already exists with different bytes than \
+                         the verified release artifact; refusing to overwrite a public-channel \
+                         object. Inspect release ID {release_id} on {slug} by hand: {error}"
+                    ))
+                },
+            )?;
+            return Ok(());
+        }
+        DurablePostDecision::PersistIntentThenPost => {}
+    }
+
+    let endpoint = exact_release_upload_url(slug, release_id, name)?;
+    let file_arg = file
+        .to_str()
+        .ok_or_else(|| Error::new("mirror asset path is not UTF-8"))?;
+    let data_arg = format!("@{file_arg}");
+    let auth = prepare_github_auth_headers()?;
+    let release = release_object_by_id(slug, release_id)?;
+    validate_mirror_release_capability(release.as_ref(), release_id, &ctx.tag, true)?;
+    ensure_ctx_release_lease(ctx)?;
+    let args = [
+        "--silent",
+        "--show-error",
+        "--fail-with-body",
+        "--retry",
+        "0",
+        "--request",
+        "POST",
+        "--header",
+        &auth.curl_header_arg,
+        "--header",
+        "Content-Type: application/octet-stream",
+        "--data-binary",
+        &data_arg,
+        "--url",
+        &endpoint,
+    ];
+    let permit = ctx.persist_mirror_upload_intent(name)?;
+    let out = issue_nonidempotent_post(permit, &args)?;
+    if release_asset_identity_for_release_id_optional(slug, release_id, name)?.is_some() {
+        verify_release_asset_id_matches_local(slug, release_id, name, file)?;
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "mirror upload of {name} returned {} but no asset is visible on {slug}; refusing an \
+         ambiguous duplicate retry in this invocation (resume after GitHub converges): {}",
+        if out.success() { "success" } else { "failure" },
+        out.stderr_utf8().trim()
+    )))
+}
+
+/// Prove the still-invisible mirrored draft carries EXACTLY the asset set the
+/// deployed updater elects, and that each of those objects is byte-identical to
+/// the local artifact `verify` proved live on the private repo.
+fn prove_mirror_draft_assets(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
+    let before = release_object_by_id(slug, release_id)?;
+    validate_mirror_release_capability(before.as_ref(), release_id, &ctx.tag, true)?;
+    let inventory_before = release_asset_inventory_for_release_id(slug, release_id)?;
+    let names: Vec<String> = inventory_before
+        .iter()
+        .map(|asset| asset.name.clone())
+        .collect();
+    mirror::validate_mirror_asset_set(&names, &ctx.version, ctx.signature_required)?;
+    for file in ctx.mirror_asset_paths() {
+        let name = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::new("mirror artifact filename is not UTF-8"))?;
+        verify_release_asset_id_matches_local(slug, release_id, name, &file)?;
+    }
+    let inventory_after = release_asset_inventory_for_release_id(slug, release_id)?;
+    if inventory_after != inventory_before {
+        return Err(Error::new(
+            "mirror asset name/immutable-ID/size inventory changed during byte verification",
+        ));
+    }
+    let after = release_object_by_id(slug, release_id)?;
+    validate_mirror_release_capability(after.as_ref(), release_id, &ctx.tag, true)?;
+    Ok(())
+}
+
+/// Replay the DEPLOYED CLIENT's election against the live public channel and
+/// require that it lands on this cut.
+///
+/// This is the acceptance test for the whole feature: not "we uploaded some
+/// files", but "a machine running this updater, with no token, now resolves
+/// exactly this build". It re-checks the elected release's tag, its exact asset
+/// set, and byte-identity of the manifest the client would download.
+fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
+    let live = release_object_by_id(slug, release_id)?;
+    validate_mirror_release_capability(live.as_ref(), release_id, &ctx.tag, false)?;
+    let names: Vec<String> = release_asset_inventory_for_release_id(slug, release_id)?
+        .into_iter()
+        .map(|asset| asset.name)
+        .collect();
+    mirror::validate_mirror_asset_set(&names, &ctx.version, ctx.signature_required)?;
+
+    // `stop_early: true` IS the client's replay: canonical tags only, exact
+    // `aterm-appcast.toml` only, greatest numeric tag wins regardless of REST
+    // row order — and it downloads exactly the one manifest a real updater
+    // would fetch.
+    let published = verify::scan_published(slug, true)?;
+    let head = verify::select_newest(&published).ok_or_else(|| {
+        Error::new(format!(
+            "public channel {slug} elects no release at all after mirroring v{} — installed \
+             copies would still report no update",
+            ctx.version
+        ))
+    })?;
+    if head.tag != ctx.tag {
+        return Err(Error::new(format!(
+            "public channel {slug} elects {}, not this cut's {}; the fleet would install a \
+             different build than the one just verified",
+            head.tag, ctx.tag
+        )));
+    }
+    if head.version != ctx.version || head.build != ctx.build {
+        return Err(Error::new(format!(
+            "the manifest the public channel {slug} serves carries v{} build {}, not this \
+             cut's v{} build {}",
+            head.version, head.build, ctx.version, ctx.build
+        )));
+    }
+    if head.asset != manifest_out::MANIFEST_ASSET {
+        return Err(Error::new(format!(
+            "public channel {slug} head resolved through asset {:?}, not the exact \
+             {} the client requires",
+            head.asset,
+            manifest_out::MANIFEST_ASSET
+        )));
+    }
+    let local_manifest = fs::read_to_string(ctx.manifest_path()).map_err(|error| {
+        Error::new(format!(
+            "read local manifest for mirror head proof {}: {error}",
+            ctx.manifest_path().display()
+        ))
+    })?;
+    if head.text != local_manifest {
+        return Err(Error::new(format!(
+            "the manifest served by the public channel {slug} is not byte-identical to this \
+             cut's dist/{}",
+            manifest_out::MANIFEST_ASSET
+        )));
     }
     Ok(())
 }

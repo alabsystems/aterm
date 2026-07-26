@@ -115,7 +115,9 @@ impl std::ops::Sub<Duration> for VerifyInstant {
     // operator; callers wanting a fallible form use `checked_sub`.
     #[cfg_attr(
         trust_verify,
-        trust::contract_panic(message_contains = "overflow when subtracting duration from instant")
+        trust::contract_panic(
+            message_contains = "overflow when subtracting duration from instant"
+        )
     )]
     // Skip: third-party `web_time::Duration` accessors (absent bodies).
     #[cfg_attr(trust_verify, trust::skip)]

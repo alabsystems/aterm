@@ -108,6 +108,7 @@ mod scrollback_accounting;
 mod search_content;
 mod storage;
 mod tier;
+mod tier_capabilities;
 mod tier_ops;
 mod watermark;
 
@@ -141,13 +142,14 @@ pub(crate) use disk_format::DiskColdConfig;
 pub use error::ScrollbackError;
 pub(crate) use hot_tier::HotTier;
 pub use iter::{ScrollbackIter, ScrollbackRevIter};
-pub use line::{CellAttrs, HyperlinkSpan, Line, UnderlineColorSpan};
+pub use line::{AttrRunCursor, CellAttrs, HyperlinkSpan, Line, UnderlineColorSpan};
 // Block codec, public for `TerminalCheckpoint` grid-body encode/decode (B.3.2).
 pub use line::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_tail_strict, serialize_lines,
 };
 pub use storage::ScrollbackStorage;
 pub(crate) use tier::WarmTier;
+pub use tier_capabilities::{ColdTierCodec, TierCapabilities};
 pub use watermark::WatermarkLevel;
 pub(crate) use watermark::{
     DEFAULT_RED_PERCENT, DEFAULT_YELLOW_PERCENT, YELLOW_EXIT_PERCENT, recompute_watermark,
@@ -239,6 +241,10 @@ pub struct Scrollback {
     /// Maximum total lines allowed (None = no limit).
     /// When set, older lines are discarded when this limit is exceeded.
     line_limit: Option<usize>,
+    /// Monotonic count of lines DROPPED by memory-pressure eviction (cold-tier
+    /// FIFO under the byte budget) — real retention loss, exposed out-of-band
+    /// (audit E10a). User-requested `set_line_limit` truncation is NOT counted.
+    pressure_evicted_lines: u64,
     /// Current memory pressure watermark level.
     watermark_level: WatermarkLevel,
     /// Absolute byte threshold for Yellow level (entry).
@@ -289,6 +295,7 @@ impl Scrollback {
             block_size: DEFAULT_BLOCK_SIZE,
             line_count: 0,
             line_limit: Some(DEFAULT_LINE_LIMIT),
+            pressure_evicted_lines: 0,
             watermark_level: WatermarkLevel::Green,
             yellow_threshold: threshold_bytes(DEFAULT_YELLOW_PERCENT, memory_budget),
             yellow_exit_threshold: threshold_bytes(YELLOW_EXIT_PERCENT, memory_budget),
@@ -344,6 +351,7 @@ impl Scrollback {
             block_size,
             line_count: 0,
             line_limit: Some(DEFAULT_LINE_LIMIT),
+            pressure_evicted_lines: 0,
             watermark_level: WatermarkLevel::Green,
             yellow_threshold: threshold_bytes(DEFAULT_YELLOW_PERCENT, memory_budget),
             yellow_exit_threshold: threshold_bytes(YELLOW_EXIT_PERCENT, memory_budget),

@@ -169,6 +169,64 @@ fn test_diff_bidi_change() {
 }
 
 #[test]
+fn test_diff_ambiguous_width_change() {
+    let config1 = TerminalConfig::default();
+    let mut config2 = TerminalConfig::default();
+    config2.ambiguous_width_double = true;
+
+    assert_eq!(config1.diff(&config2), vec![ConfigChange::AmbiguousWidth]);
+}
+
+#[test]
+fn test_diff_reports_every_runtime_config_change_class() {
+    let base = TerminalConfig::default();
+    let mut changed = TerminalConfig::builder().font_family("Menlo").build();
+    changed.cursor_style = CursorStyle::SteadyBar;
+    changed.cursor_blink = false;
+    changed.cursor_color = Some(Rgb::new(1, 2, 3));
+    changed.cursor_visible = false;
+    changed.default_foreground = Rgb::new(4, 5, 6);
+    changed.scrollback_limit = Some(42);
+    changed.auto_wrap = false;
+    changed.focus_reporting = true;
+    changed.bracketed_paste = true;
+    changed.allow_osc52_query = true;
+    changed.allow_window_ops = true;
+    changed.allow_notifications = true;
+    changed.allow_palette_reconfigure = true;
+    changed.memory_budget += 1;
+    changed.sync_timeout_ms += 1;
+    changed.bidi.mode = BiDiMode::Disabled;
+    changed.ambiguous_width_double = true;
+    changed.bold_is_bright = false;
+
+    assert_eq!(
+        base.diff(&changed),
+        vec![
+            ConfigChange::CursorStyle,
+            ConfigChange::CursorBlink,
+            ConfigChange::CursorColor,
+            ConfigChange::CursorVisible,
+            ConfigChange::Font,
+            ConfigChange::Colors,
+            ConfigChange::ScrollbackLimit,
+            ConfigChange::AutoWrap,
+            ConfigChange::FocusReporting,
+            ConfigChange::BracketedPaste,
+            ConfigChange::Osc52ClipboardQuery,
+            ConfigChange::WindowOps,
+            ConfigChange::Notifications,
+            ConfigChange::PaletteReconfigure,
+            ConfigChange::MemoryBudget,
+            ConfigChange::SyncTimeout,
+            ConfigChange::BiDi,
+            ConfigChange::AmbiguousWidth,
+            ConfigChange::StylePolicy,
+        ]
+    );
+}
+
+#[test]
 fn test_terminal_config_bidi_default() {
     let config = TerminalConfig::default();
     assert_eq!(config.bidi.mode, BiDiMode::Implicit);

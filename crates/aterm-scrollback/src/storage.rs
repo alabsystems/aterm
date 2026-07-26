@@ -291,6 +291,19 @@ impl ScrollbackStorage {
         dispatch!(self, watermark_level())
     }
 
+    /// Lines DROPPED by memory-pressure eviction — real retention loss, the
+    /// out-of-band truncation signal (audit E10a). The disk-backed store
+    /// relieves pressure by SPILLING warm blocks to its disk cold tier
+    /// (retained, not lost), so it reports 0 here.
+    #[must_use]
+    pub fn pressure_evicted_lines(&self) -> u64 {
+        match self {
+            ScrollbackStorage::Memory(sb) => sb.pressure_evicted_lines(),
+            #[cfg(feature = "disk-tier")]
+            ScrollbackStorage::Disk(_) => 0,
+        }
+    }
+
     /// Push a new line to the scrollback.
     // Skip: the tier-promotion driver — the blanket-drain/alloc class of the
     // tier operations it dispatches into (each individually classified).

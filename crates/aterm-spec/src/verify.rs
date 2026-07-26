@@ -16,15 +16,15 @@
 //! with no toolchain verifies for real, out of the box.
 //!
 //! **Tier escalation — the external Trust binaries**: wherever `ty` /
-//! `trust-ir` / `ay` are installed, the SAME obligations are ADDITIONALLY
-//! checked by the external tool (and the tool-only obligations — hand-written
-//! `.tla`, `--strict-vacuity` verdicts, `spec-link` closure, SMT certificates —
-//! run in full). The two tiers checking one derived model must agree; a
-//! disagreement PANICS (a checker bug is never silently swallowed). Obligations
-//! that exist ONLY to assert the external tool's independent agreement report a
-//! prominent one-line notice and return early where the tool is absent (the
-//! [`ty_escalation`]-family idiom) — the in-process tier still covered the
-//! model itself.
+//! `trust-ir` / `ay` are installed, their applicable analyses run too. `ty` checks
+//! the same derived model where supported, and those same-model verdicts must agree
+//! with the interpreter. Tool-only analyses — hand-written `.tla`,
+//! `--strict-vacuity` verdicts, TrustIr structural cross-reference analysis, and SMT
+//! certificates — have their own scoped contracts. In particular, aterm's current
+//! TrustIr artifact is explicitly `DesignOnly`: `spec-link` is a non-certifying
+//! structural analysis, not Ob.3 certification. A same-model disagreement PANICS;
+//! an external-only analysis reports a prominent one-line notice and returns early
+//! where its tool is absent (the [`ty_escalation`]-family idiom).
 //!
 //! ## The checker is part of Trust
 //!
@@ -50,7 +50,7 @@
 //! aterm_spec::verify::prove_and_catch_tiered(&m, "Thing non-vacuity");
 //! let (ok, why) = aterm_spec::verify::validate_transition_tiered(&m, &overrides, &prev, &next, Some("Push"), "Thing conformance");
 //!
-//! // External-tool-agreement obligation (runs only where the tool exists):
+//! // External-tool analysis (runs only where the tool exists):
 //! let Some(ty) = aterm_spec::verify::ty_escalation("Thing .tla check") else { return };
 //! ```
 //!
@@ -257,10 +257,11 @@ fn require(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) -> 
 }
 
 // ---------------------------------------------------------------------------
-// The ESCALATION tier (VERIFY-1, owner decision 2026-07-06): obligations that
-// assert the EXTERNAL tool's independent agreement run only where the tool is
-// installed. The notice is one prominent line naming exactly what did not run
-// and how to enable it — never silent, and never claimed as a discharged check.
+// The ESCALATION tier (VERIFY-1, owner decision 2026-07-06): EXTERNAL-tool
+// analyses run only where their tool is installed. The notice is one prominent
+// line naming exactly what did not run and how to enable it — never silent, and
+// never claimed as a discharged check. Same-model agreement is required only for
+// the tiered interpreter/ty paths below.
 // ---------------------------------------------------------------------------
 
 /// Shared escalation report + early-return decision.
@@ -268,8 +269,8 @@ fn escalation(bin: &str, build_hint: &str, found: Option<PathBuf>, label: &str) 
     if found.is_none() {
         eprintln!(
             "VERIFY ESCALATION TIER NOT RUN: Trust `{bin}` is not installed, so `{label}` \
-             (an external-tool-agreement obligation) did not run on this machine. The \
-             in-process interpreter tier still verified every derived model. Enable the \
+             (an external-tool-analysis obligation) did not run on this machine. The \
+             applicable in-process derived-model checks still ran. Enable the \
              escalation tier once: {build_hint}."
         );
     }
@@ -290,7 +291,9 @@ pub fn ty_escalation(label: &str) -> Option<PathBuf> {
     )
 }
 
-/// The `trust-ir` (`spec-link`) escalation tier. See [`ty_escalation`].
+/// The `trust-ir` (`spec-link`) escalation tier. aterm's current emitted artifact is
+/// explicitly `DesignOnly`, so this is non-certifying structural analysis rather than
+/// Ob.3 certification. See [`ty_escalation`] for discovery/notice behavior.
 #[must_use]
 pub fn trust_ir_escalation(label: &str) -> Option<PathBuf> {
     escalation(
@@ -842,14 +845,22 @@ mod tests {
     use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
     use crate::ty_model;
 
-    /// The two committed-dead `ConfigCatalogSnapshot` mutants are verified
+    /// The four committed-dead `ConfigCatalogSnapshot` mutants are verified
     /// negative controls: dial present, fire at Buggy=1, caught at Buggy=1.
     #[test]
     fn audit_accepts_config_catalog_snapshot_mutants() {
         let m = config_catalog_snapshot_model();
         assert_eq!(
-            audit_dead_negative_controls(&m, &["AdmitStaleTrail", "AdmitStaleNyan"]),
-            Ok(2)
+            audit_dead_negative_controls(
+                &m,
+                &[
+                    "AdmitStaleTrail",
+                    "AdmitStaleNyan",
+                    "AdmitStaleTheme",
+                    "AdmitStaleSparkle",
+                ],
+            ),
+            Ok(4)
         );
     }
 
@@ -897,7 +908,15 @@ mod tests {
     #[test]
     fn audit_rejects_dead_actions_without_committed_buggy_dial() {
         let m = interp::with_consts(&config_catalog_snapshot_model(), &[("Buggy", 2)]);
-        let r = audit_dead_negative_controls(&m, &["AdmitStaleTrail", "AdmitStaleNyan"]);
+        let r = audit_dead_negative_controls(
+            &m,
+            &[
+                "AdmitStaleTrail",
+                "AdmitStaleNyan",
+                "AdmitStaleTheme",
+                "AdmitStaleSparkle",
+            ],
+        );
         assert!(
             r.as_ref()
                 .is_err_and(|e| e.contains("no committed `Buggy = 0` dial")),

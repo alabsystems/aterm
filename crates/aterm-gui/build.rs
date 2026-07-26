@@ -6,10 +6,10 @@
 //
 //   ATERM_GIT_COMMIT   short commit the binary was built from (+ "-dirty" when the
 //                      working tree had uncommitted changes); "unknown" w/o git.
-//   ATERM_BUILD_NUMBER monotonic build number (the version is a plain MAJOR.MINOR;
-//                      ordering lives in this metadata): SOURCE_DATE_EPOCH — the
-//                      ledger claim `cargo ship cut` exports — wins when set; else
-//                      HEAD's committer Unix epoch (dev builds); "0" only w/o git.
+//   ATERM_BUILD_NUMBER monotonic build number (ordering is independent of the
+//                      display/source version): SOURCE_DATE_EPOCH — the ledger
+//                      claim `cargo ship cut` exports — wins when set; else HEAD's
+//                      committer Unix epoch (dev builds); "0" only w/o git.
 //   ATERM_BUILD_TIME   UTC build timestamp (RFC3339), or "unknown".
 //
 // Plus COMPILER provenance (which rustc produced this binary — matters because this
@@ -91,10 +91,9 @@ fn main() {
     };
     println!("cargo:rustc-env=ATERM_GIT_COMMIT={commit}");
 
-    // Monotonic build number, epoch-scale (seconds). The version is a plain
-    // MAJOR.MINOR (see `build_info::VERSION`); the monotonic ordering the updater's
-    // "apply only if greater" gate needs is metadata. A dev build derives it from
-    // HEAD's committer Unix epoch:
+    // Monotonic build number, epoch-scale (seconds). The updater's "apply only if
+    // greater" ordering lives in this metadata, independent of the app/source
+    // display version. A dev build derives it from HEAD's committer Unix epoch:
     //   * strictly monotonic across releases — a later release is a later commit;
     //   * STABLE across rebuilds of the same commit — the committer date is frozen in the
     //     commit object, so two builds of one release agree.
@@ -171,9 +170,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
     println!("cargo:rerun-if-env-changed=ATERM_COMPILER_FLAVOR");
 
-    // Re-stamp when HEAD moves (new commit / checkout) or the version changes (the
-    // workspace `[workspace.package] version` in the root Cargo.toml drives the build
-    // number). The workspace `.git` + Cargo.toml are two levels up from this manifest.
+    // Re-stamp when HEAD moves (new commit / checkout) or the workspace source
+    // version changes. The release build number comes from SOURCE_DATE_EPOCH;
+    // ordinary builds fall back to HEAD's committer epoch. The workspace `.git`
+    // + Cargo.toml are two levels up from this manifest.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
     println!("cargo:rerun-if-changed=../../Cargo.toml");

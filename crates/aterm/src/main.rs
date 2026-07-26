@@ -95,8 +95,12 @@ fn main() -> ExitCode {
     // or without a TTY, and their identity is the ONE command's ("aterm X.Y",
     // never "aterm-gui X.Y") — a piped `aterm --version` must not fall into
     // the window path. parse_args prints and exits for all of these.
-    let mode_free = matches!(first.as_str(), "help" | "-h" | "--help" | "-V" | "--version")
-        || aterm_cli::DIAG_COMMANDS.iter().any(|(name, _)| *name == first);
+    let mode_free = matches!(
+        first.as_str(),
+        "help" | "-h" | "--help" | "-V" | "--version"
+    ) || aterm_cli::DIAG_COMMANDS
+        .iter()
+        .any(|(name, _)| *name == first);
     if mode_free {
         let _ = aterm_cli::parse_args(rest);
         // parse_args returns only for a launch decision, which cannot happen
@@ -142,8 +146,8 @@ fn main() -> ExitCode {
         .position(|a| matches!(a.to_string_lossy().as_ref(), "-e" | "--command" | "--"))
         .unwrap_or(rest.len());
     let scan = &rest[..boundary];
-    let force_session = argv0 == "aterm-cli"
-        || scan.iter().any(|a| a.to_string_lossy() == "--session");
+    let force_session =
+        argv0 == "aterm-cli" || scan.iter().any(|a| a.to_string_lossy() == "--session");
     let windowish = !force_session
         && (scan.iter().any(|a| {
             matches!(

@@ -148,12 +148,7 @@ fn main() {
                 // The live particle ramp: farther-scattered = older = more
                 // faded, per-particle hue seed — the same colours the live
                 // ember/spark emitters and the settings-card demo resolve.
-                let pcol = style_particle_color(
-                    style,
-                    base,
-                    (k as f32 * 0.11).fract(),
-                    1.0 - life,
-                );
+                let pcol = style_particle_color(style, base, (k as f32 * 0.11).fract(), 1.0 - life);
                 let px0 = cx + cw as i32 / 2 + dx as i32 - sz / 2;
                 let py0 = cy + ch as i32 / 2 + dy as i32 - sz / 2;
                 push(&mut q, px0, py0, sz, sz, pcol, 210);
@@ -210,8 +205,7 @@ fn main() {
     let ncells = cells.len();
     // The live Lumen ramp (accent → cursor along the tail), through the same
     // shared function the style panel above used.
-    let lumen =
-        |pos: f32| style_comet_color(GlowStyle::Lumen, cursor, brighten(cursor), 0.0, pos);
+    let lumen = |pos: f32| style_comet_color(GlowStyle::Lumen, cursor, brighten(cursor), 0.0, pos);
 
     // BEFORE: full-cell staircase (exclude the head cell — the cursor owns it).
     {

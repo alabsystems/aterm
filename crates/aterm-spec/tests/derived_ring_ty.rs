@@ -22,34 +22,37 @@ use aterm_spec::derive::{
     Model, aa_edge_hardening_model, active_handle_model, asymmetric_pad_layout_model,
     capture_after_present_model, channel_bind_model, chrome_face_gate_model,
     closed_recovery_ledgers_model, coalesce_model, composite_accessibility_route_model,
-    config_catalog_snapshot_model, contrast_floor_model, control_connection_admission_model,
-    ct_frac_bearing_model, cursor_cat_curse_wince_model, cursor_cat_earn_floor_model,
-    cursor_cat_model, cursor_cutout_clip_model, cursor_model, damage_to_present_model,
-    deco_band_containment_model, deco_phase_model, done_mark_lru_model, dsu_quiescence_model,
-    effect_phase_lock_model, effect_present_rebase_model, emacs_search_navigation_model,
-    emacs_search_repeat_work_model, evict_full_model, exact_profanity_completion_model,
-    fallback_band_clip_model, fallback_precedence_model, fallback_scale_clamp_model,
-    fd_handoff_no_leak_model, flash_limiter_model, focus_modifier_cache_model, freshness_model,
-    gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
-    hdr_present_gate_model, hyperlink_scheme_cap_model, idle_deadline_model,
-    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
-    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
-    kitty_sidecar_durability_model, ligature_gate_model, mint_reachability_model,
-    motion_policy_model, native_async_delivery_model,
-    native_capture_source_model, native_close_plan_model, native_config_transaction_model,
-    native_control_routing_model, native_diagnostics_deadline_model,
-    native_document_publication_model, native_draft_journal_model,
+    config_catalog_snapshot_model, config_file_commit_cas_model, contrast_floor_model,
+    control_connection_admission_model, ct_frac_bearing_model, cursor_cat_curse_wince_model,
+    cursor_cat_earn_floor_model, cursor_cat_model, cursor_cutout_clip_model, cursor_model,
+    damage_to_present_model, deco_band_containment_model, deco_phase_model, done_mark_lru_model,
+    dsu_quiescence_model, effect_phase_lock_model, effect_present_rebase_model,
+    emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
+    exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
+    fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
+    focus_modifier_cache_model, gpu_loss_recovery_model, gpu_loss_route_model,
+    grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
+    hyperlink_scheme_cap_model, idle_deadline_model, ignition_reservation_lifecycle_model,
+    ignition_reservation_rekey_model, inject_floor_model, input_release_pairing_model,
+    kernel_model, key_injectivity_model, kitty_collectibles_model, kitty_flush_worker_model,
+    kitty_sidecar_durability_model, ligature_gate_model, manual_config_completion_model,
+    manual_config_diagnostics_lane_model, manual_config_handoff_model,
+    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
+    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
+    native_config_observation_handoff_model, native_config_transaction_model,
+    native_control_routing_model, native_document_publication_model, native_draft_journal_model,
     native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
     native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
-    native_recovery_interaction_model, native_reopen_ledger_model, native_settings_singleton_model,
-    native_tab_identity_model, native_update_admission_model, native_update_attempt_identity_model,
-    native_update_auto_intent_model, native_update_channel_scan_model,
-    native_update_disk_transaction_model, native_update_hidden_output_quiet_model,
-    native_update_menu_activation_model, native_update_overlap_handoff_model,
-    native_update_status_reconciliation_model, native_update_worker_queue_model,
-    native_updater_model, net_capability_grant_model, net_dial_after_grant_model, net_health_model,
-    nova_phase_model, nyan_exit_sampling_model, nyan_idle_twinkle_model,
-    nyan_jump_burst_lifecycle_model, nyan_sing_detector_model, nyan_sprite_loader_model,
+    native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
+    native_save_intent_latch_model, native_settings_draft_close_model,
+    native_settings_singleton_model, native_tab_identity_model, native_update_admission_model,
+    native_update_attempt_identity_model, native_update_auto_intent_model,
+    native_update_channel_scan_model, native_update_disk_transaction_model,
+    native_update_hidden_output_quiet_model, native_update_menu_activation_model,
+    native_update_overlap_handoff_model, native_update_status_reconciliation_model,
+    native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
+    net_dial_after_grant_model, nova_phase_model, nyan_exit_sampling_model,
+    nyan_idle_twinkle_model, nyan_jump_burst_lifecycle_model, nyan_sing_detector_model,
     nyan_terminus_admission_model, one_shot_peek_model, pad_absorption_model, pane_tree_model,
     per_window_metrics_model, predictive_echo_visibility_model, present_retry_model,
     presentation_gate_model, proxy_forward_model, rain_band_containment_model, rain_ignition_model,
@@ -58,21 +61,21 @@ use aterm_spec::derive::{
     release_durable_post_intent_model, release_historical_recovery_model,
     release_journal_prefix_model, release_key_epoch_transition_model,
     release_published_identity_model, release_publisher_fence_model,
-    release_yank_successor_first_model, ring_model, scroll_glide_model,
-    scrollback_maintenance_lane_model, seamless_nonce_model, self_governor_model,
-    semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
-    semantic_prewarm_request_swap_model, serious_mode_model, session_chrome_expiry_model,
-    session_pool_model, settings_page_scroll_model, shade_phase_model, snapshot_model,
-    sparkle_identity_model, sparkle_persist_capacity_model, sparkle_reflow_cardinality_model,
-    sparkle_retype_rearm_model, spawn_locale_model, stream_fade_gate_model, strike_selection_model,
-    styled_run_face_model, subscribe_model, surface_coverage_model, tab_nav_model,
-    tab_stop_handoff_model, tab_strip_model, text_blend_gate_model, tier_residency_model,
-    title_summary_managed_endpoint_model, title_summary_model,
-    title_summary_observation_scheduler_model, title_summary_runtime_model,
+    release_yank_successor_first_model, restore_manifest_single_use_model, ring_model,
+    scroll_glide_model, scrollback_maintenance_lane_model, seamless_nonce_model,
+    self_governor_model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
+    semantic_prewarm_request_swap_model, serious_mode_intent_queue_model, serious_mode_model,
+    session_chrome_expiry_model, session_pool_model, settings_page_scroll_model, shade_phase_model,
+    shared_budget_model, snapshot_model, sparkle_identity_model, sparkle_persist_capacity_model,
+    sparkle_reflow_cardinality_model, sparkle_retype_rearm_model, spawn_locale_model,
+    stream_fade_gate_model, strike_selection_model, styled_run_face_model, subscribe_model,
+    surface_coverage_model, tab_nav_model, tab_stop_handoff_model, tab_strip_model,
+    text_blend_gate_model, tier_residency_model, title_summary_managed_endpoint_model,
+    title_summary_model, title_summary_observation_scheduler_model, title_summary_runtime_model,
     title_summary_socket_owner_retry_model, top_anchored_scroll_history_model,
     trail_audio_lifecycle_model, trail_audio_start_latency_model, transact_model,
     vf_axis_clamp_model, vf_nudge_gate_model, vibrancy_contrast_model, visible_pad_crop_model,
-    watcher_latch_model, wide_center_model, window_routing_model,
+    watcher_failure_recovery_model, watcher_latch_model, wide_center_model, window_routing_model,
 };
 use aterm_spec::verify;
 use std::process::Command;
@@ -116,6 +119,39 @@ fn assert_proves_and_catches(m: &Model) {
 #[test]
 fn derived_subscribe_proves_and_catches_silent_loss() {
     assert_proves_and_catches(&subscribe_model());
+}
+
+#[test]
+fn derived_native_settings_draft_close_proves_and_catches_loss() {
+    let model = native_settings_draft_close_model();
+    let initial = model.init_state();
+    let dirty = model
+        .successors("Edit", &initial)
+        .into_iter()
+        .next()
+        .expect("Edit creates one retained draft state");
+
+    let mut unsafe_close = dirty.clone();
+    unsafe_close.insert("close_result", 2);
+    unsafe_close.insert("recovery_visible", 0);
+    assert!(
+        !model.check_invariant("DirtyNeverReady", &unsafe_close),
+        "negative control: a dirty Ready verdict must be rejected"
+    );
+    assert!(
+        !model.check_invariant("DirtyRecoveryVisible", &unsafe_close),
+        "negative control: blocked recovery cannot disappear"
+    );
+
+    let mut one_click_loss = dirty;
+    one_click_loss.insert("draft", 0);
+    one_click_loss.insert("discard_armed", 1);
+    one_click_loss.insert("recovery_visible", 0);
+    assert!(
+        !model.check_invariant("ConfirmationOwnsDraft", &one_click_loss),
+        "negative control: the first destructive gesture cannot drop the draft"
+    );
+    assert_proves_and_catches(&model);
 }
 
 /// Host-minted OSC-8 hyperlink scheme capability (orca deep-links §7): PROVES
@@ -536,25 +572,6 @@ fn derived_presentation_gate_proves_and_catches_text_colored_as_emoji() {
     assert_proves_and_catches(&presentation_gate_model());
 }
 
-/// Introspection G3 (metrics freshness): a figure presented as live is never staler
-/// than the TTL — the real `ty` PROVES `FreshWhenLive` at Buggy=0 over the whole
-/// bounded `(age, live)` space, and CATCHES the no-revert gate (a stalled sampler
-/// rendering its last value as live) at Buggy=1. Bound to the shipping
-/// `MetricsSnapshot::staled` by aterm-gui's `staleness_gate_matches_freshness_model`.
-#[test]
-fn derived_freshness_proves_and_catches_stale_live_value() {
-    assert_proves_and_catches(&freshness_model());
-}
-
-/// Introspection G3 (network-health honesty): the coarse classifier never claims a
-/// state it cannot prove — the real `ty` PROVES `HonestOnline`/`HonestOffline` at
-/// Buggy=0, and CATCHES a classifier that labels an unreachable link Online at Buggy=1.
-/// Bound to the shipping `net_health_classify` by aterm-gui's `net_health_matches_model`.
-#[test]
-fn derived_net_health_proves_and_catches_false_online() {
-    assert_proves_and_catches(&net_health_model());
-}
-
 /// M3 phase B (EDR "HDR glow" present gate): over every (config × surface-caps ×
 /// aurora-presence) combination and every Attach→Present sequence, `hdr_glow`
 /// OFF means NOTHING HDR ever happens — no Rgba16Float swapchain, no linear
@@ -614,26 +631,25 @@ fn derived_emacs_cached_repeat_proves_and_catches_linear_work() {
     assert_proves_and_catches(&emacs_search_repeat_work_model());
 }
 
-/// M1 (smooth-scroll glide convergence): an armed wheel glide makes strict
-/// progress toward its target on every deadline wake, disarms EXACTLY when it
-/// lands there, and therefore wakes a BOUNDED number of times per arm — the
-/// no-perpetual-wake half of the 0%-idle discipline. `ty` PROVES both
-/// `BoundedWakes` and `DisarmedAtTarget` (Buggy=0) and CATCHES the
-/// wake-without-progress mutant (a self-rearming deadline whose ease never
-/// ends; Buggy=1 → counterexample).
-/// Bound to the shipping `scroll_motion::Glide` by aterm-gui's
-/// `glide_disarms_in_bounded_wakes` / `glide_converges_monotonically_and_exactly`
-/// lattice tests (Tier-1, fixed wake cadences over the real sampling loop).
+/// M1/W11 (smooth-scroll convergence + accessibility settlement): a Full-policy
+/// wheel glide makes strict bounded progress and disarms exactly at its target;
+/// a Full→Reduced edge lands there and disarms AT ONCE, so Reduced owns no glide
+/// deadline. `ty` proves `BoundedWakes`, `DisarmedAtTarget`, and
+/// `ReducedSettled` (Buggy=0), and catches the audited mutant that keeps the
+/// intermediate row + armed deadline across `SetReduced` (Buggy=1).
+/// Bound to the shipping `scroll_motion::Glide` and App settle reducer by
+/// aterm-gui's convergence lattice tests plus
+/// `reduced_motion_settle_conforms_to_scroll_glide_model` (Tier-1).
 #[test]
-fn derived_scroll_glide_proves_and_catches_perpetual_wake() {
+fn derived_scroll_glide_proves_and_catches_unsettled_reduced_edge() {
     assert_proves_and_catches(&scroll_glide_model());
 }
 
 /// M1b (sub-row scroll translate chrome exemption): the render-side translate
 /// shifts a frame row by the fractional-pixel residual IFF the row is in the
-/// terminal-content grid band `[GridTop, GridBot)` — chrome (tab strip, HUD,
+/// terminal-content grid band `[GridTop, GridBot)` — chrome (tab strip, edge bars,
 /// split dividers) stays pinned. `ty` PROVES `ShiftOnlyInBand` (Buggy=0) and
-/// CATCHES the band-leak mutant that shifts the first HUD chrome row
+/// CATCHES the band-leak mutant that shifts the first bottom-chrome row
 /// (`row == GridBot`; Buggy=1 → counterexample). Bound to the shipping
 /// `scroll_translate::translate_grid_band_in_place` by aterm-render's
 /// exhaustive `chrome_pixels_are_invariant` lattice test (Tier-1) and the
@@ -1262,11 +1278,28 @@ fn derived_native_editor_viewport_proves_and_catches_fixed_desktop_capacity() {
     let compact = model.successors("Resize", &model.init_state())[0].clone();
     assert_eq!(compact["visible_lines"], 8);
     assert_eq!(compact["anchor_line"], 15);
+    assert_eq!(compact["short_visible_lines"], 40);
+    assert_eq!(compact["short_anchor_line"], 0);
     assert!(model.check_invariant("CaretVisibleAfterResize", &compact));
+    assert!(model.check_invariant("ShortDocumentFullyVisible", &compact));
+
+    let bottom = model.successors("Overscroll", &model.init_state())[0].clone();
+    assert_eq!(bottom["scroll_anchor_line"], 9);
+    assert!(model.check_invariant("StoredScrollAnchorPresentable", &bottom));
+    let reversed = model.successors("ReverseScroll", &bottom)[0].clone();
+    assert_eq!(reversed["scroll_anchor_line"], 8);
+    assert!(model.check_invariant("FirstReverseStepMoves", &reversed));
 
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let hidden = buggy.successors("Resize", &buggy.init_state())[0].clone();
     assert!(!buggy.check_invariant("CaretVisibleAfterResize", &hidden));
+    assert!(!buggy.check_invariant("ShortDocumentFullyVisible", &hidden));
+    let indebted = buggy.successors("Overscroll", &buggy.init_state())[0].clone();
+    assert_eq!(indebted["scroll_anchor_line"], 12);
+    assert!(!buggy.check_invariant("StoredScrollAnchorPresentable", &indebted));
+    let inert = buggy.successors("ReverseScroll", &indebted)[0].clone();
+    assert_eq!(inert["scroll_anchor_line"], 11);
+    assert!(!buggy.check_invariant("FirstReverseStepMoves", &inert));
 }
 
 #[test]
@@ -1285,6 +1318,109 @@ fn derived_native_editor_command_palette_proves_selection_and_exact_submit() {
     let exact_query = buggy.successors("TabComplete", &open)[0].clone();
     let wrong_dispatch = buggy.successors("Submit", &exact_query)[0].clone();
     assert!(!buggy.check_invariant("SubmitIsExactSelected", &wrong_dispatch));
+}
+
+#[test]
+fn derived_manual_config_completion_proves_keyboard_window_and_context_lifecycle() {
+    let model = manual_config_completion_model();
+    assert_proves_and_catches(&model);
+
+    let mut page_two = model.init_state();
+    for action in ["EnterSelection", "MoveNext", "MoveNext", "MoveNext"] {
+        assert!(model.fire(action, &mut page_two), "{action}: {page_two:?}");
+    }
+    assert_eq!(page_two["selected"], 3);
+    assert_eq!(page_two["window_start"], 3);
+    assert!(model.check_invariant("SelectedCandidateVisible", &page_two));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut hidden = buggy.init_state();
+    for action in ["EnterSelection", "MoveNext", "MoveNext", "MoveNext"] {
+        assert!(buggy.fire(action, &mut hidden), "{action}: {hidden:?}");
+    }
+    assert_eq!(hidden["selected"], 3);
+    assert_eq!(hidden["window_start"], 0);
+    assert!(!buggy.check_invariant("SelectedCandidateVisible", &hidden));
+}
+
+#[test]
+fn derived_manual_config_handoff_proves_path_reuse_and_exact_target_handling() {
+    let model = manual_config_handoff_model();
+    assert_proves_and_catches(&model);
+
+    let selected = model.successors("RevealAuthoredKey", &model.init_state())[0].clone();
+    assert_eq!(selected["selected_exact"], 1);
+    assert_eq!(selected["canonical_path_authority"], 1);
+    assert_eq!(selected["editor_instances"], 1);
+
+    let fallback = model.successors("SeedAbsentKey", &selected)[0].clone();
+    assert_eq!(fallback["search_exact"], 1);
+    assert_eq!(fallback["completion_ready"], 1);
+    assert_eq!(
+        fallback["editor_instances"], 1,
+        "the Manual editor is reused"
+    );
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let redirected = buggy.successors("RevealAuthoredKey", &buggy.init_state())[0].clone();
+    assert!(!buggy.check_invariant("HostOwnsCanonicalPath", &redirected));
+    assert!(!buggy.check_invariant("AuthoredTargetSelected", &redirected));
+}
+
+#[test]
+fn derived_native_packages_worker_proves_matching_completion_and_result_truth() {
+    let model = native_packages_worker_model();
+    assert_proves_and_catches(&model);
+
+    let mut state = model.init_state();
+    assert!(model.fire("BeginRefresh", &mut state));
+    assert!(model.fire("FinishRefresh", &mut state));
+    assert_eq!(state["observed"], 1);
+
+    assert!(model.fire("BeginCheck", &mut state));
+    assert_eq!(state["operation"], 2);
+    assert!(model.fire("FinishCheckFailure", &mut state));
+    assert_eq!(state["last_result"], 2);
+    assert_eq!(state["presented_result"], 2);
+    assert!(model.check_invariant("FinalResultIsPresented", &state));
+
+    // A silent refresh preserves the user's last process result.
+    assert!(model.fire("BeginRefresh", &mut state));
+    assert!(model.fire("FinishRefresh", &mut state));
+    assert_eq!(state["last_result"], 2);
+    assert_eq!(state["presented_result"], 2);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut stale_success = buggy.init_state();
+    assert!(buggy.fire("BeginCheck", &mut stale_success));
+    assert!(buggy.fire("FinishCheckFailure", &mut stale_success));
+    assert_eq!(stale_success["last_result"], 2);
+    assert_eq!(stale_success["presented_result"], 1);
+    assert!(!buggy.check_invariant("FinalResultIsPresented", &stale_success));
+}
+
+#[test]
+fn derived_manual_problem_navigation_proves_exact_reveal_and_full_semantics() {
+    let model = manual_config_problem_navigation_model();
+    assert_proves_and_catches(&model);
+
+    let mut one = model.successors("LoadOne", &model.init_state())[0].clone();
+    assert!(model.fire("JumpNext", &mut one));
+    assert_eq!(one["selected"], 0);
+    assert_eq!(one["caret_target"], 1);
+    assert_eq!(one["revealed"], 1);
+
+    let mut wrapped = model.successors("LoadThree", &model.init_state())[0].clone();
+    assert!(model.fire("JumpPrevious", &mut wrapped));
+    assert_eq!(wrapped["selected"], 2);
+    assert_eq!(wrapped["caret_target"], 3);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut paint_only = buggy.successors("LoadOne", &buggy.init_state())[0].clone();
+    assert!(buggy.fire("JumpNext", &mut paint_only));
+    assert!(!buggy.check_invariant("JumpMovesToExactProblem", &paint_only));
+    assert!(!buggy.check_invariant("JumpRevealsProblem", &paint_only));
+    assert!(!buggy.check_invariant("FullProblemIsSemantic", &paint_only));
 }
 
 #[test]
@@ -1400,39 +1536,6 @@ fn derived_settings_page_scroll_proves_and_catches_overscroll() {
     assert_eq!(overscrolled["limit"], 0);
     assert_eq!(overscrolled["cursor"], 1);
     assert!(!buggy.check_invariant("CursorBounded", &overscrolled));
-}
-
-/// Diagnostics refresh is a one-shot retained deadline, armed only for a visible
-/// watched route. The mutant ignores route visibility and leaks an idle wake.
-#[test]
-fn derived_native_diagnostics_deadline_proves_and_catches_invisible_wake() {
-    let model = native_diagnostics_deadline_model();
-    assert_proves_and_catches(&model);
-
-    // Exercise both legitimate watcher forms so the proof cannot collapse to
-    // "only focused OS windows refresh" and silently break headless recording.
-    let shown = model.successors("ShowRoute", &model.init_state())[0].clone();
-    let windowed = model.successors("AttachWindow", &shown)[0].clone();
-    let focused = model.successors("Focus", &windowed)[0].clone();
-    let armed = model.successors("Decide", &focused)[0].clone();
-    assert_eq!(armed["decision"], 1);
-    let due = model.successors("MarkDue", &armed)[0].clone();
-    let refreshed = model.successors("Decide", &due)[0].clone();
-    assert_eq!(refreshed["decision"], 3);
-    assert_eq!(refreshed["refreshed"], 1);
-    assert_eq!(refreshed["armed"], 0);
-
-    let shown = model.successors("ShowRoute", &model.init_state())[0].clone();
-    let recorded = model.successors("StartRecording", &shown)[0].clone();
-    let headless_armed = model.successors("Decide", &recorded)[0].clone();
-    assert_eq!(headless_armed["decision"], 1);
-
-    // Independent negative trace: the mutant arms while Diagnostics is hidden.
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let windowed = buggy.successors("AttachWindow", &buggy.init_state())[0].clone();
-    let focused = buggy.successors("Focus", &windowed)[0].clone();
-    let leaked = buggy.successors("Decide", &focused)[0].clone();
-    assert!(!buggy.check_invariant("DisarmedWhenUnwatched", &leaked));
 }
 
 /// Screenshot ordering is a present barrier: a staged native frame may be
@@ -1645,21 +1748,186 @@ fn derived_native_config_transaction_proves_and_catches_stale_overwrite() {
     assert!(!buggy.check_invariant("AtomicResetVisibility", &partial));
 }
 
+/// The worker/event-loop config handoff retains exact external generations
+/// across failed reconciliation, fences queued writes while authority is
+/// unknown, and resamples when a newer watcher edge overtakes a sample.
+#[test]
+fn derived_native_config_observation_handoff_proves_and_catches_loss() {
+    let model = native_config_observation_handoff_model();
+    assert_proves_and_catches(&model);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let observed = buggy.successors("ObserveFirst", &buggy.init_state())[0].clone();
+    let reconciling = buggy.successors("StartReconcile", &observed)[0].clone();
+    let lost = buggy.successors("FailReconcile", &reconciling)[0].clone();
+    assert!(!buggy.check_invariant("DeferredGenerationNeverLost", &lost));
+
+    let queued = buggy.successors("QueueWrite", &buggy.init_state())[0].clone();
+    let observed = buggy.successors("ObserveFirst", &queued)[0].clone();
+    let blind = buggy.successors("StartBlindWrite", &observed)[0].clone();
+    assert!(!buggy.check_invariant("UnknownAuthorityFencesWrites", &blind));
+
+    let observed = buggy.successors("ObserveFirst", &buggy.init_state())[0].clone();
+    let sampled = buggy.successors("StartReconcile", &observed)[0].clone();
+    let overtaken = buggy.successors("ObserveNewer", &sampled)[0].clone();
+    let stale = buggy.successors("AdmitStaleSample", &overtaken)[0].clone();
+    assert!(!buggy.check_invariant("LatestExactGenerationWins", &stale));
+}
+
+/// Three rapid Serious Mode toggles are semantic intents. Each queued intent
+/// rebases when it reaches the serialized config head, so ON→OFF→ON completes
+/// without a stale expected-value conflict. The mutant captures expectations at
+/// enqueue time and conflicts the third toggle after the second reduces.
+#[test]
+fn derived_serious_mode_intent_queue_proves_and_catches_stale_third_toggle() {
+    let model = serious_mode_intent_queue_model();
+    assert_proves_and_catches(&model);
+
+    let mut healthy = model.init_state();
+    for action in [
+        "StartToggle",
+        "QueueToggle",
+        "QueueToggle",
+        "Complete",
+        "Complete",
+        "Complete",
+    ] {
+        healthy = model.successors(action, &healthy)[0].clone();
+    }
+    assert_eq!(healthy["issued"], 3);
+    assert_eq!(healthy["completed"], 3);
+    assert_eq!(healthy["live"], 1);
+    assert_eq!(healthy["service"], 1);
+    assert_eq!(healthy["conflict"], 0);
+    assert!(model.check_invariant("IdleIsAuthoritative", &healthy));
+
+    let mut mixed = model.init_state();
+    for action in ["StartSetOn", "QueueToggle", "Complete", "Complete"] {
+        mixed = model.successors(action, &mixed)[0].clone();
+    }
+    assert_eq!(mixed["issued"], 2);
+    assert_eq!(mixed["completed"], 2);
+    assert_eq!(mixed["live"], 0);
+    assert_eq!(mixed["service"], 0);
+    assert_eq!(mixed["projection"], 0);
+    assert!(model.check_invariant("ProjectionTracksLatestIntent", &mixed));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut stale = buggy.init_state();
+    for action in [
+        "StartToggle",
+        "QueueToggle",
+        "QueueToggle",
+        "Complete",
+        "Complete",
+    ] {
+        stale = buggy.successors(action, &stale)[0].clone();
+    }
+    assert_eq!(stale["conflict"], 1);
+    assert!(!buggy.check_invariant("NoSerializedConflict", &stale));
+    assert!(!buggy.check_invariant("IdleIsAuthoritative", &stale));
+}
+
+#[test]
+fn derived_config_file_commit_cas_proves_and_catches_dual_lane_loss() {
+    let model = config_file_commit_cas_model();
+    assert_proves_and_catches(&model);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let manual = buggy.successors("BeginManual", &buggy.init_state())[0].clone();
+    let locked = buggy.successors("LockManual", &manual)[0].clone();
+    let unsynchronized = buggy.successors("ResolveManual", &locked)[0].clone();
+    assert!(!buggy.check_invariant("ManualDurableSynchronizesImmediately", &unsynchronized));
+
+    let begun = buggy.successors("BeginSettings", &buggy.init_state())[0].clone();
+    let retargeted = buggy.successors("Retarget", &begun)[0].clone();
+    let locked = buggy.successors("LockSettings", &retargeted)[0].clone();
+    let split = buggy.successors("ResolveSettings", &locked)[0].clone();
+    assert!(!buggy.check_invariant("NoSplitTargetCommit", &split));
+
+    // A stable admitted config symlink is a valid capability in the fixed model.
+    let stable_symlink = model.successors("BeginSettingsSymlink", &model.init_state())[0].clone();
+    let stable_locked = model.successors("LockSettings", &stable_symlink)[0].clone();
+    let stable_publish = model.successors("ResolveSettings", &stable_locked)[0].clone();
+    assert_eq!(stable_publish["settings_phase"], 3);
+    assert_eq!(stable_publish["disk"], 2);
+    assert!(model.check_invariant("NoChangedLinkPublication", &stable_publish));
+
+    // Recreating or retargeting that link after capture changes its generation;
+    // the mutant's blind publication makes the negative control non-vacuous.
+    let symlink = buggy.successors("BeginSettingsSymlink", &buggy.init_state())[0].clone();
+    let relinked = buggy.successors("Relink", &symlink)[0].clone();
+    let locked = buggy.successors("LockSettings", &relinked)[0].clone();
+    let published = buggy.successors("ResolveSettings", &locked)[0].clone();
+    assert!(!buggy.check_invariant("NoChangedLinkPublication", &published));
+
+    let begun = buggy.successors("BeginManual", &buggy.init_state())[0].clone();
+    let locked = buggy.successors("LockManual", &begun)[0].clone();
+    let indeterminate = buggy.successors("ResolveManualIndeterminate", &locked)[0].clone();
+    assert_eq!(indeterminate["manual_phase"], 5);
+    assert_eq!(indeterminate["manual_committed"], 0);
+    assert!(buggy.check_invariant("IndeterminateDoesNotClaimDurability", &indeterminate));
+    let blind_retry = buggy.successors("RetryIndeterminate", &indeterminate)[0].clone();
+    assert!(!buggy.check_invariant("ReconcileBeforeRetry", &blind_retry));
+
+    let mut same_base = buggy.init_state();
+    for action in [
+        "BeginManual",
+        "BeginSettings",
+        "LockManual",
+        "ResolveManual",
+        "LockSettings",
+        "ResolveSettings",
+    ] {
+        same_base = buggy.successors(action, &same_base)[0].clone();
+    }
+    assert!(!buggy.check_invariant("SameBaselineHasOneWinner", &same_base));
+    assert!(!buggy.check_invariant("NoStalePublication", &same_base));
+}
+
 #[test]
 fn derived_config_catalog_snapshot_proves_and_catches_split_generation() {
     let model = config_catalog_snapshot_model();
     assert_proves_and_catches(&model);
+
+    let refreshed = model.successors("RefreshAssets", &model.init_state())[0].clone();
+    assert!(model.check_invariant("SnapshotAtomic", &refreshed));
+    assert_eq!(refreshed["revision"], 1);
+    assert_eq!(refreshed["trail_generation"], 1);
+    assert_eq!(refreshed["theme_generation"], 1);
+    assert_eq!(refreshed["sparkle_generation"], 1);
+    assert_eq!(refreshed["asset_refresh"], 1);
+
+    let theme_refreshed = model.successors("RefreshThemes", &model.init_state())[0].clone();
+    assert!(model.check_invariant("SnapshotAtomic", &theme_refreshed));
+    assert_eq!(theme_refreshed["theme_generation"], 1);
+    assert_eq!(theme_refreshed["asset_refresh"], 2);
 
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let stale_trail = buggy.successors("AdmitStaleTrail", &buggy.init_state())[0].clone();
     assert!(!buggy.check_invariant("SnapshotAtomic", &stale_trail));
     assert_eq!(stale_trail["trail_generation"], 0);
     assert_eq!(stale_trail["nyan_generation"], 1);
+    assert_eq!(stale_trail["theme_generation"], 1);
+    assert_eq!(stale_trail["sparkle_generation"], 1);
 
     let stale_nyan = buggy.successors("AdmitStaleNyan", &buggy.init_state())[0].clone();
     assert!(!buggy.check_invariant("SnapshotAtomic", &stale_nyan));
     assert_eq!(stale_nyan["trail_generation"], 1);
     assert_eq!(stale_nyan["nyan_generation"], 0);
+
+    let stale_theme = buggy.successors("AdmitStaleTheme", &buggy.init_state())[0].clone();
+    assert!(!buggy.check_invariant("SnapshotAtomic", &stale_theme));
+    assert_eq!(stale_theme["trail_generation"], 1);
+    assert_eq!(stale_theme["nyan_generation"], 1);
+    assert_eq!(stale_theme["theme_generation"], 0);
+
+    let stale_sparkle = buggy.successors("AdmitStaleSparkle", &buggy.init_state())[0].clone();
+    assert!(!buggy.check_invariant("SnapshotAtomic", &stale_sparkle));
+    assert_eq!(stale_sparkle["trail_generation"], 1);
+    assert_eq!(stale_sparkle["nyan_generation"], 1);
+    assert_eq!(stale_sparkle["theme_generation"], 1);
+    assert_eq!(stale_sparkle["sparkle_generation"], 0);
 }
 
 #[test]
@@ -1702,9 +1970,10 @@ fn derived_native_document_publication_proves_and_catches_partial_publish() {
     assert!(!buggy.check_invariant("StaleTxnIsNoOp", &stale));
 }
 
-/// Watch observations defer behind an in-flight save, then preserve dirty
-/// local bytes ahead of a clean reload. The dirty-first mutant is observable
-/// only when both dirty and saving are true.
+/// Watch observations defer behind an in-flight save, rebind byte-equivalent
+/// disk generations without touching a draft, then preserve dirty local bytes
+/// ahead of a clean reload. The dirty-first mutant is observable when a higher
+/// priority fact and dirty are both true.
 #[test]
 fn derived_native_file_watch_proves_and_catches_priority_inversion() {
     let model = native_file_watch_model();
@@ -1713,9 +1982,32 @@ fn derived_native_file_watch_proves_and_catches_priority_inversion() {
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let changed = buggy.successors("ObserveChange", &buggy.init_state())[0].clone();
     let dirty = buggy.successors("MarkDirty", &changed)[0].clone();
-    let saving = buggy.successors("BeginSave", &dirty)[0].clone();
-    let inverted = buggy.successors("Resolve", &saving)[0].clone();
+    let equivalent = buggy.successors("MarkEquivalent", &dirty)[0].clone();
+    let inverted = buggy.successors("Resolve", &equivalent)[0].clone();
     assert!(!buggy.check_invariant("PriorityIsDeterministic", &inverted));
+}
+
+/// Repeated identical watcher failures emit one warning, preserve the admitted
+/// catalog, and only a successful theme observation or the newest exact config
+/// admission clears it. The mutant also lets stale config generation one clear
+/// a warning after generation two has become current.
+#[test]
+fn derived_watcher_failure_recovery_proves_and_catches_duplicate_or_hidden_failure() {
+    let model = watcher_failure_recovery_model();
+    assert_proves_and_catches(&model);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let failed = buggy.successors("ObserveFailure", &buggy.init_state())[0].clone();
+    let repeated = buggy.successors("RepeatFailure", &failed)[0].clone();
+    assert!(!buggy.check_invariant("FailureStatusExact", &repeated));
+    assert!(!buggy.check_invariant("FailureWakeDeduped", &repeated));
+    assert!(!buggy.check_invariant("FailedPollRetainsCatalog", &repeated));
+
+    let failed = buggy.successors("ObserveFailure", &buggy.init_state())[0].clone();
+    let first = buggy.successors("ObserveCandidateOne", &failed)[0].clone();
+    let second = buggy.successors("ObserveCandidateTwo", &first)[0].clone();
+    let stale = buggy.successors("AdmitCandidateOne", &second)[0].clone();
+    assert!(!buggy.check_invariant("ConfigRecoveryAdmitsLatest", &stale));
 }
 
 /// Draft fsync completions are generation-exact and a journal baseline is
@@ -1737,6 +2029,27 @@ fn derived_native_draft_journal_proves_and_catches_stale_or_unsafe_prune() {
     let checkpoint = buggy.successors("BeginCheckpoint", &saved)[0].clone();
     let stale = buggy.successors("RejectStaleProof", &checkpoint)[0].clone();
     assert!(!buggy.check_invariant("StaleProofIsNoOp", &stale));
+
+    let journal = buggy.successors("BeginJournal", &edited)[0].clone();
+    let external = buggy.successors("ExternalJournalCommit", &journal)[0].clone();
+    let wrong_image = buggy.successors("AcceptJournal", &external)[0].clone();
+    assert!(!buggy.check_invariant("JournalImageCas", &wrong_image));
+}
+
+#[test]
+fn derived_restore_manifest_claim_is_durable_single_use_and_unique() {
+    let model = restore_manifest_single_use_model();
+    assert_proves_and_catches(&model);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let locked = buggy.successors("LockTakeA", &buggy.init_state())[0].clone();
+    let claimed = buggy.successors("ClaimA", &locked)[0].clone();
+    let unsafe_return = buggy.successors("ReturnA", &claimed)[0].clone();
+    assert!(!buggy.check_invariant("ReturnOnlyAfterDurableClaim", &unsafe_return));
+
+    let writer = buggy.successors("LockWriter", &buggy.init_state())[0].clone();
+    let alias = buggy.successors("ReuseFixedTemporary", &writer)[0].clone();
+    assert!(!buggy.check_invariant("UniqueTemporaryNeverAliases", &alias));
 }
 
 /// Final-view close freezes the requested sequence and detaches no split leaf
@@ -1750,6 +2063,46 @@ fn derived_native_close_plan_proves_and_catches_partial_detach() {
     let one_view = buggy.successors("CloseMarkdownNonFinal", &buggy.init_state())[0].clone();
     let detached = buggy.successors("BeginFinalClose", &one_view)[0].clone();
     assert!(!buggy.check_invariant("AtomicTreeClose", &detached));
+}
+
+/// A completion with a newer document-owned Save/close intent either pumps the
+/// next generation or atomically resolves the chain. It cannot publish a final
+/// Saved state or leave a close plan idle below its frozen sequence.
+#[test]
+fn derived_native_save_intent_latch_proves_and_catches_dropped_completion_pump() {
+    let model = native_save_intent_latch_model();
+    assert_proves_and_catches(&model);
+
+    let mut healthy = model.init_state();
+    for action in [
+        "Edit",
+        "BeginSave",
+        "Edit",
+        "BeginCloseInflight",
+        "CompleteAndPump",
+        "CompleteFinal",
+        "CommitClose",
+    ] {
+        healthy = model.successors(action, &healthy)[0].clone();
+    }
+    assert_eq!(healthy["durable"], 2);
+    assert_eq!(healthy["closed"], 1);
+    assert_eq!(healthy["settled"], 1);
+    assert!(model.check_invariant("SettledCoversLatestRequest", &healthy));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut dropped = buggy.init_state();
+    for action in [
+        "Edit",
+        "BeginSave",
+        "Edit",
+        "BeginCloseInflight",
+        "CompleteAndPump",
+    ] {
+        dropped = buggy.successors(action, &dropped)[0].clone();
+    }
+    assert!(!buggy.check_invariant("SettledCoversLatestRequest", &dropped));
+    assert!(!buggy.check_invariant("WaitingCloseHasCompletionPump", &dropped));
 }
 
 /// Async completion is accepted only for its live owner/sink generation;
@@ -3899,60 +4252,78 @@ fn derived_top_anchored_scroll_proves_history_retention() {
 }
 
 #[test]
-fn derived_nyan_sprite_loader_proves_current_latest_bounded_publication() {
-    let model = nyan_sprite_loader_model();
+fn derived_manual_diagnostics_lane_proves_latest_revision_and_stale_rejection() {
+    let model = manual_config_diagnostics_lane_model();
     assert_proves_and_catches(&model);
 
-    let mut coalesced = model.init_state();
+    let mut burst = model.init_state();
     for action in [
         "RequestFirst",
-        "RequestSecondWhileFull",
-        "RequestThirdReplacesPending",
-        "WorkerTakesQueued",
-        "RetryLatestPending",
+        "RequestSecond",
+        "RequestThird",
+        "WorkerTakes",
+        "DispatchLatestPending",
         "WorkerCompletes",
-        "RejectStaleGeneration",
-        "WorkerTakesQueued",
+        "RejectStale",
+        "WorkerTakes",
         "WorkerCompletes",
-        "AcceptCurrentResult",
+        "AcceptCurrent",
     ] {
-        assert!(
-            model.fire(action, &mut coalesced),
-            "{action}: {coalesced:?}"
-        );
+        assert!(model.fire(action, &mut burst), "{action}: {burst:?}");
     }
-    assert_eq!(coalesced.get("installed_generation"), Some(&3));
-    assert_eq!(coalesced.get("fanout_requested"), Some(&1));
-    assert_eq!(coalesced.get("request_count"), Some(&0));
-    assert_eq!(coalesced.get("pending_count"), Some(&0));
-
-    let mut wrong_path = model.init_state();
-    for action in [
-        "RequestFirst",
-        "WorkerTakesQueued",
-        "WorkerCompletes",
-        "CorruptCurrentResultPath",
-        "RejectWrongPath",
-    ] {
-        assert!(
-            model.fire(action, &mut wrong_path),
-            "{action}: {wrong_path:?}"
-        );
-    }
-    assert_eq!(wrong_path.get("installed_generation"), Some(&0));
+    assert_eq!(burst.get("published_revision"), Some(&3));
+    assert_eq!(burst.get("pending_revision"), Some(&0));
+    assert_eq!(burst.get("stale_published"), Some(&0));
 
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let mut stale = buggy.init_state();
+    let mut lost_latest = buggy.init_state();
+    for action in ["RequestFirst", "RequestSecond", "RequestThird"] {
+        assert!(
+            buggy.fire(action, &mut lost_latest),
+            "{action}: {lost_latest:?}"
+        );
+    }
+    assert!(!buggy.check_invariant("LatestRequestRemainsRepresented", &lost_latest));
+    assert!(!buggy.check_invariant("PendingSlotNamesLatest", &lost_latest));
+}
+
+#[test]
+fn derived_font_catalog_generation_rejects_stale_completion() {
+    let model = aterm_spec::derive::font_catalog_generation_model();
+    assert_proves_and_catches(&model);
+    let mut state = model.init_state();
     for action in [
         "RequestFirst",
-        "RequestSecondWhileFull",
-        "WorkerTakesQueued",
-        "WorkerCompletes",
-        "RejectStaleGeneration",
+        "RequestSecond",
+        "CompleteFirst",
+        "RejectStale",
+        "CompleteSecond",
+        "PublishCurrent",
     ] {
-        assert!(buggy.fire(action, &mut stale), "{action}: {stale:?}");
+        assert!(model.fire(action, &mut state), "{action}: {state:?}");
     }
-    assert!(!buggy.check_invariant("StaleResultNeverPublishes", &stale));
+    assert_eq!(state.get("published"), Some(&2));
+    assert_eq!(state.get("stale_published"), Some(&0));
+}
+
+#[test]
+fn derived_font_theme_generation_reprepares_overtaken_config() {
+    let model = aterm_spec::derive::font_theme_generation_model();
+    assert_proves_and_catches(&model);
+    let mut state = model.init_state();
+    for action in [
+        "RequestConfig",
+        "ThemeChanged",
+        "CompleteOldTheme",
+        "ReprepareLatestTheme",
+        "CompleteLatestTheme",
+        "PublishCurrent",
+    ] {
+        assert!(model.fire(action, &mut state), "{action}: {state:?}");
+    }
+    assert_eq!(state.get("published"), Some(&2));
+    assert_eq!(state.get("published_theme"), Some(&1));
+    assert_eq!(state.get("stale_published"), Some(&0));
 }
 
 /// A staged update remains a real, selectable `ApplyUpdate` command over both
@@ -5182,6 +5553,98 @@ fn derived_kitty_sidecar_proves_bidirectional_reconcile_and_catches_rollback() {
     assert_proves_and_catches(&kitty_sidecar_durability_model());
 }
 
+/// Contended Kitty Log batches remain conserved while the worker retries
+/// without a new delivery; the full ordinary lane and retained exit tail move
+/// through distinct ownership states before coalescing; exit either joins after
+/// its finite lock budget or detaches a regular-IO stall only at the UI-owned
+/// deadline. The Buggy branch drops the host tail instead of moving it into the
+/// dedicated exit lane.
+#[test]
+fn derived_kitty_flush_worker_proves_finite_exit_ownership() {
+    let model = kitty_flush_worker_model();
+    assert_proves_and_catches(&model);
+
+    let mut state = model.init_state();
+    for action in ["QueueNormal", "DrainNormal"] {
+        assert!(model.fire(action, &mut state), "{action}");
+        for invariant in &model.invariants {
+            assert!(
+                model.check_invariant(invariant.name, &state),
+                "{action} violated {} in {state:?}",
+                invariant.name
+            );
+        }
+    }
+    assert_eq!(state["pending"], 1);
+    assert_eq!(state["exiting"], 0);
+    assert!(
+        !model.action_enabled("Contend", &state),
+        "ordinary-runtime contention must not spend the terminal retry budget"
+    );
+    for action in [
+        "QueueNormal",
+        "RetainTailOnFull",
+        "BeginExit",
+        "OfferTail",
+        "DrainNormal",
+        "AbsorbTail",
+        "Flush",
+        "Join",
+    ] {
+        assert!(model.fire(action, &mut state), "{action}");
+        for invariant in &model.invariants {
+            assert!(
+                model.check_invariant(invariant.name, &state),
+                "{action} violated {} in {state:?}",
+                invariant.name
+            );
+        }
+    }
+    assert_eq!(state["accepted"], 3);
+    assert_eq!(state["persisted"], 3);
+    assert_eq!(state["joined"], 1);
+
+    let mut exhausted = model.init_state();
+    for action in ["QueueNormal", "DrainNormal", "BeginExit"] {
+        assert!(model.fire(action, &mut exhausted), "exhaustion {action}");
+    }
+    for _ in 0..4 {
+        assert!(model.fire("Contend", &mut exhausted));
+    }
+    assert_eq!(exhausted["retries"], 4);
+    assert!(
+        !model.action_enabled("Flush", &exhausted),
+        "RetryCap must not admit an unbudgeted fifth flush attempt"
+    );
+    assert!(
+        !model.action_enabled("StallIo", &exhausted),
+        "RetryCap must not admit an unbudgeted fifth potentially-stalled attempt"
+    );
+    assert!(model.action_enabled("Join", &exhausted));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut dropped = buggy.init_state();
+    for action in [
+        "QueueNormal",
+        "DrainNormal",
+        "QueueNormal",
+        "RetainTailOnFull",
+        "BeginExit",
+        "OfferTail",
+    ] {
+        assert!(buggy.fire(action, &mut dropped), "buggy {action}");
+    }
+    assert_eq!(dropped["accepted"], 3);
+    assert_eq!(dropped["normal_lane"], 1);
+    assert_eq!(dropped["pending"], 1);
+    assert_eq!(dropped["host_tail"], 0);
+    assert_eq!(dropped["exit_lane"], 0);
+    assert!(
+        !buggy.check_invariant("AcceptedConserved", &dropped),
+        "Buggy=1 must reproduce the one-lane exit-tail loss"
+    );
+}
+
 /// Sparkle-words v2 supernova phases (design §6.1/§9): the monotone
 /// Armed→Dip→Flash→Ring→Debris→Ember→Settled walk flashes AT MOST ONCE per
 /// arm (`OneFlashPerArm`), with a Rearm that must reset BOTH `phase` and
@@ -5217,6 +5680,52 @@ fn derived_one_shot_peek_proves_and_catches_repeek() {
 #[test]
 fn derived_cursor_cat_proves_and_catches_hidden_expiry() {
     assert_proves_and_catches(&cursor_cat_model());
+}
+
+/// The cursor-trail master owns only ordinary Nyan momentum. With the master
+/// off, typing is a semantic no-op for the ordinary host arm; a collection
+/// still enters its promised visible hello. The mutant reproduces the former
+/// leak by arming and drawing the ordinary branch while its owner is off.
+#[test]
+fn derived_cursor_cat_trail_master_blocks_ordinary_but_not_hello() {
+    let healthy = cursor_cat_model();
+
+    let mut off = healthy.init_state();
+    assert!(healthy.fire("TypeWhileTrailOff", &mut off));
+    assert_eq!(off[&"trail_master"], 0);
+    assert_eq!(off[&"ordinary_armed"], 0);
+    assert_eq!(off[&"ordinary_visible"], 0);
+    assert!(healthy.check_invariant("TrailMasterOwnsOrdinary", &off));
+
+    let mut hello = healthy.init_state();
+    assert!(healthy.fire("Collect", &mut hello));
+    assert_eq!(hello[&"trail_master"], 0);
+    assert_eq!(hello[&"phase"], 1);
+    assert_eq!(hello[&"visible"], 1);
+    assert!(healthy.check_invariant("HelloIndependentOfTrailMaster", &hello));
+
+    let mut retracted = healthy.init_state();
+    assert!(healthy.fire("EnableTrail", &mut retracted));
+    assert!(healthy.fire("TypeOrdinary", &mut retracted));
+    assert_eq!(retracted[&"ordinary_visible"], 1);
+    assert!(healthy.fire("DisableTrail", &mut retracted));
+    assert_eq!(retracted[&"ordinary_armed"], 0);
+    assert_eq!(retracted[&"ordinary_visible"], 0);
+
+    let mut buggy = cursor_cat_model();
+    for cst in &mut buggy.consts {
+        if cst.0 == "Buggy" {
+            cst.1 = 1;
+        }
+    }
+    let mut leaked = buggy.init_state();
+    assert!(buggy.fire("TypeWhileTrailOff", &mut leaked));
+    assert_eq!(leaked[&"ordinary_armed"], 1);
+    assert_eq!(leaked[&"ordinary_visible"], 1);
+    assert!(
+        !buggy.check_invariant("TrailMasterOwnsOrdinary", &leaked),
+        "the master-off ordinary-flight mutant must violate the owner gate"
+    );
 }
 
 /// Partial text is inert; complete curses produce distinct, bounded wince
@@ -5564,6 +6073,19 @@ fn derived_ligature_gate_proves_and_catches_unflagged_collapse() {
     // separately by the L0 lattice `tests/ligature_slice.rs` (ty has no
     // multiplication).
     assert_proves_and_catches(&ligature_gate_model());
+}
+
+#[test]
+fn derived_shared_budget_proves_and_catches_global_overrun() {
+    // Module-global scrollback budget sharing (audit E1): PROVES that once
+    // every live pane has applied its equal share (`min(cfg, global/live)`),
+    // the applied budgets sum within the ONE global cap, across every
+    // join/leave/apply interleaving — and that a departed pane holds no
+    // share. CATCHES the global-less mutant (each pane applies its full
+    // configured budget) as two fresh live panes overrunning the cap — the
+    // exact N-panes-multiply-into-OOM class the global budget exists to
+    // close. Tier-1 binding: aterm-core/tests/conformance_shared_budget.rs.
+    assert_proves_and_catches(&shared_budget_model());
 }
 
 #[test]

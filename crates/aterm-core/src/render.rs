@@ -250,15 +250,13 @@ pub struct FirePatch {
     pub mode: FireMode,
 }
 
-/// One textured sprite quad of a **Scene** — aterm's data-driven "Living Panels"
-/// habitat that can replace the text performance HUD with an animated, GPU-rendered
-/// world (a cat meadow, a cosmos, a numbers pulse, …). A `SpriteQuad` is a rectangle
-/// sampled from an RGBA8 *scene atlas* (procedurally baked, or supplied by a sprite
+/// One textured sprite quad for a renderer-owned animated overlay. A `SpriteQuad` is a rectangle
+/// sampled from an RGBA8 sprite atlas (procedurally baked, or supplied by a sprite
 /// sheet) and composited SOURCE-OVER (straight alpha) onto the frame — the SAME blend
 /// the inline-image / colour-emoji / settings-tray paths already use, so the CPU fill
 /// and the GPU sampled quad land the IDENTICAL pixel (parity by construction).
 ///
-/// The host (`aterm-scene` + the windowed frontend) owns ALL art and animation and
+/// The host effects engine owns ALL art and animation and
 /// hands the renderer a fully-resolved list each frame; the renderer is a dumb,
 /// parity-safe consumer. The host upholds the same dirty-gate invariants as
 /// [`GlowQuad`]: (1) the dest rect is in GRID-INTERIOR pixels (pad-relative; the
@@ -266,8 +264,7 @@ pub struct FirePatch {
 /// ONE cell-row band (`row`) — a sprite spanning rows is emitted as per-row slices —
 /// so the row-scoped dirty gate + GPU scissor cover it exactly. Atlas coordinates are
 /// integer TEXELS (not normalized UV) so the type stays `Copy + Eq` and the damage
-/// cache compares it byte-exactly (no float reflexivity hazard). An empty `scene_over`
-/// is byte-identical to the pre-scene render path.
+/// cache compares it byte-exactly (no float reflexivity hazard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SpriteQuad {
     /// The viewport row band this quad lives in (its sole row, for the dirty gate).
@@ -280,13 +277,13 @@ pub struct SpriteQuad {
     pub w: u16,
     /// Dest height in pixels (kept within the single `row` cell band).
     pub h: u16,
-    /// Source rect X in the scene atlas, in texels.
+    /// Source rect X in the sprite atlas, in texels.
     pub ax: u16,
-    /// Source rect Y in the scene atlas, in texels.
+    /// Source rect Y in the sprite atlas, in texels.
     pub ay: u16,
-    /// Source rect width in the scene atlas, in texels.
+    /// Source rect width in the sprite atlas, in texels.
     pub aw: u16,
-    /// Source rect height in the scene atlas, in texels.
+    /// Source rect height in the sprite atlas, in texels.
     pub ah: u16,
     /// Multiply tint `0x00RRGGBB` applied to the sampled texel (`0x00FF_FFFF` = none).
     pub tint: u32,
@@ -348,7 +345,7 @@ pub struct FreeSprite {
 /// same-rect z flip is a real content change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FreeZ {
-    /// Drawn after the cell backgrounds / legacy scene+cat sprites, before glyphs.
+    /// Drawn after the cell backgrounds / under-text sprites, before glyphs.
     #[default]
     UnderText,
     /// Drawn after glyphs and word decorations, before the cursor.
@@ -363,12 +360,11 @@ pub enum FreeSampler {
     /// NEAREST 1:1 (cats).
     #[default]
     Nearest,
-    /// Bilinear (deferred — scene-style scaled art).
+    /// Bilinear (deferred — scaled sprite art).
     Linear,
 }
 
-/// The RGBA8 **scene atlas** carried alongside a frame's [`SpriteQuad`]s: the texture
-/// every scene sprite samples (procedurally baked by `aterm-scene`, or a sprite sheet).
+/// An RGBA8 sprite atlas carried alongside a frame's [`SpriteQuad`]s.
 /// Shared by `Arc` so cloning a [`RenderInput`] is cheap, and identified by a monotonic
 /// `version` so the GPU re-uploads the texture only when the atlas actually changes (a
 /// skin/theme switch). Straight-alpha, row-major, length `width*height*4`.
@@ -663,24 +659,6 @@ pub struct RenderInput {
     /// rainbow cursor. Host-owned animation (see `cursor_rainbow`); `None` is
     /// byte-identical to the ordinary cursor path. Ignored for bar/underline cursors.
     pub cursor_fill_override: Option<u32>,
-    /// SCENE source-over sprite quads for this frame — the animated "Living Panels"
-    /// habitat painted into the HUD band, UNDER the terminal text (z-order: after the
-    /// cell backgrounds, before glyphs). Sampled from the host's RGBA8 scene atlas and
-    /// composited straight-alpha src-over, exactly like inline images. Host-owned
-    /// animation; the engine leaves it untouched. EMPTY in the common case (feature off)
-    /// → byte-identical to the pre-scene render path. See [`SpriteQuad`].
-    pub scene_over: Vec<SpriteQuad>,
-    /// SCENE additive LIGHT sprites (sun, fireflies, comet trails, nebula, sparkles) —
-    /// textured quads sampled from the same scene atlas but composited with PREMULTIPLIED
-    /// ADDITIVE blend (the sampled coverage × `tint` × `alpha` is saturating-added, the
-    /// same math as a `DecoBlend::Add` decoration / the LUMEN glow). Drawn at the SCENE
-    /// z-order: over [`scene_over`](RenderInput::scene_over), still UNDER the terminal
-    /// text. EMPTY in the common case → byte-identical to the pre-scene path.
-    pub scene_add: Vec<SpriteQuad>,
-    /// The RGBA8 atlas the scene quads sample (shared `Arc`; `None` when no scene is
-    /// active). Carried with the snapshot so both renderers sample identical texels and
-    /// the GPU can cache its upload by [`SceneAtlas::version`].
-    pub scene_atlas: Option<std::sync::Arc<SceneAtlas>>,
     /// The "sparkle word" decorations for this frame: small sprites stamped over
     /// cells of matched profanity / feline words. Host-owned (the windowed
     /// frontend matches text + drives the animation; `cell_frame_into` leaves it
@@ -722,19 +700,19 @@ pub struct RenderInput {
     pub fire_halo: Vec<FireHaloCell>,
     /// Peeking-cat sprites (Sparkle Words v2), drawn UNDER text — CPU pass 1c
     /// inside `render_row` (between the cell-bg fill and inline images) / GPU
-    /// `emit_base_pre` right after `scene_over` — so the cat sits under the
+    /// `emit_base_pre` before glyph ink — so the cat sits under the
     /// row-above's glyphs, under the word's own glyphs, and under inline images
     /// on BOTH backends. Each quad lies in exactly one row band (the documented
     /// [`SpriteQuad`] invariant; a cat spanning two rows is emitted as a head
     /// quad in row `r-1` plus a chin-slice quad in row `r`). Sampled from
     /// [`cat_atlas`](RenderInput::cat_atlas) with NEAREST 1:1 (host bakes at
-    /// exact destination size), unlike the bilinear `scene_over` regime.
+    /// exact destination size.
     /// Host-owned animation; the engine leaves it untouched. EMPTY in the
     /// common case (feature off / no match) → byte-identical to the pre-cat
     /// render path.
     pub cat_quads: Vec<SpriteQuad>,
     /// RGBA8 atlas for [`cat_quads`](RenderInput::cat_quads) (host-baked by the
-    /// `CatBaker`, versioned like [`scene_atlas`](RenderInput::scene_atlas)):
+    /// `CatBaker`, versioned by [`SceneAtlas::version`]:
     /// shared `Arc` so cloning is cheap; the GPU re-uploads only when
     /// [`SceneAtlas::version`] changes (a rebake must repaint). `None` when no
     /// cat is live.
@@ -769,8 +747,8 @@ pub struct RenderInput {
     /// pre-nova render path.
     pub nova_add: Vec<GlowQuad>,
     /// PHOSPHOR rain glyph sprites (Matrix digital rain), drawn UNDER text —
-    /// CPU pass 1c between [`scene_over`](RenderInput::scene_over) and
-    /// [`cat_quads`](RenderInput::cat_quads) / GPU `RainUnder` in the same slot
+    /// CPU pass 1c before [`cat_quads`](RenderInput::cat_quads) / GPU
+    /// `RainUnder` in the same slot
     /// — so cats walk on rain and every glyph stays legible over it. Each quad
     /// lies in EXACTLY ONE row band (the documented [`SpriteQuad`] invariant;
     /// rows-only dirty marking ghosts a band violator). Sampled from
@@ -832,17 +810,30 @@ pub struct RenderInput {
     /// dirtying a cell.
     pub scroll_frac_px: i32,
     /// M1b GRID/CHROME PARTITION: the terminal-content row band `[grid_top_row,
-    /// grid_bot_row)` within this frame's rows. Chrome (the prepended tab-strip, the
-    /// appended HUD, split-pane dividers) lives OUTSIDE this band and is PINNED —
+    /// grid_bot_row)` within this frame's rows. Chrome (the prepended tab-strip,
+    /// transient edge bars, split-pane dividers) lives OUTSIDE this band and is PINNED —
     /// the [`scroll_frac_px`](Self::scroll_frac_px) translate touches only the grid
     /// band's pixels, so every chrome pixel is invariant under the shift. The
     /// default `grid_bot_row == 0` means "no grid band" ⇒ no translate (the
     /// byte-identical pre-M1b path); the windowed compose path fills these from the
-    /// strip/HUD splice counts. Excluded from `PartialEq`/`Eq` for the same reason
+    /// app-chrome splice counts. Excluded from `PartialEq`/`Eq` for the same reason
     /// as `scroll_frac_px`.
     pub grid_top_row: usize,
     /// One past the last terminal-content row — see [`grid_top_row`](Self::grid_top_row).
     pub grid_bot_row: usize,
+    /// FOCUSED-PANE effect-clip box `(x0, y0, x1, y1)` in WINDOW-ABSOLUTE
+    /// device pixels — the same space as the `cursor_glow_add` stream (split
+    /// composition sets it to the focused pane's box; `None` = single-pane /
+    /// no clip). PRESENT-TIME GPU post-fx (the bloom halo composite and the
+    /// heat-shimmer refraction) intersect their pass regions with it so
+    /// blurred light and displaced haze never cross a split divider into a
+    /// neighbour pane (split-pane audit). The content pipeline never reads it:
+    /// every content-affecting effect stream is already host-clipped before
+    /// the renderer sees it. Excluded from `PartialEq`/`Eq` like
+    /// [`scroll_frac_px`](Self::scroll_frac_px) — present-time-consumed,
+    /// never part of the content damage diff (any real layout change dirties
+    /// cells anyway).
+    pub fx_clip: Option<(u16, u16, u16, u16)>,
     /// A clone of the active text selection, for per-cell highlighting.
     pub selection: TextSelection,
     /// Per-row, sparse emoji grapheme-cluster strings (`term.cluster_row(r)`):
@@ -924,9 +915,6 @@ impl Clone for RenderInput {
             glow_under: self.glow_under.clone(),
             fire_patch: self.fire_patch.clone(),
             cursor_fill_override: self.cursor_fill_override,
-            scene_over: self.scene_over.clone(),
-            scene_add: self.scene_add.clone(),
-            scene_atlas: self.scene_atlas.clone(),
             word_decorations: self.word_decorations.clone(),
             ink: self.ink.clone(),
             char_fg: self.char_fg.clone(),
@@ -945,6 +933,7 @@ impl Clone for RenderInput {
             scroll_frac_px: self.scroll_frac_px,
             grid_top_row: self.grid_top_row,
             grid_bot_row: self.grid_bot_row,
+            fx_clip: self.fx_clip,
             selection: self.selection.clone(),
             clusters: self.clusters.clone(),
             combining: self.combining.clone(),
@@ -977,13 +966,15 @@ impl Clone for RenderInput {
         self.cursor_style = source.cursor_style;
         self.cursor_trail.clone_from(&source.cursor_trail);
         self.cursor_trail_color = source.cursor_trail_color;
+        // (split-pane audit) `cursor_fill_override` was missing here — the
+        // one field `clone` copied that this override didn't, violating the
+        // byte-for-byte contract above with a stale forge fill in the stored
+        // prior frame.
+        self.cursor_fill_override = source.cursor_fill_override;
         self.cursor_glow_add.clone_from(&source.cursor_glow_add);
         self.glow_halo.clone_from(&source.glow_halo);
         self.glow_under.clone_from(&source.glow_under);
         self.fire_patch.clone_from(&source.fire_patch);
-        self.scene_over.clone_from(&source.scene_over);
-        self.scene_add.clone_from(&source.scene_add);
-        self.scene_atlas.clone_from(&source.scene_atlas);
         self.word_decorations.clone_from(&source.word_decorations);
         self.ink.clone_from(&source.ink);
         self.char_fg.clone_from(&source.char_fg);
@@ -1002,6 +993,7 @@ impl Clone for RenderInput {
         self.scroll_frac_px = source.scroll_frac_px;
         self.grid_top_row = source.grid_top_row;
         self.grid_bot_row = source.grid_bot_row;
+        self.fx_clip = source.fx_clip;
         self.selection.clone_from(&source.selection);
         self.clusters.clone_from(&source.clusters);
         self.combining.clone_from(&source.combining);
@@ -1019,6 +1011,15 @@ impl Clone for RenderInput {
 // previous frame's to decide which rows are dirty; `snapshot_seq` is metadata that
 // changes every damaged frame, so including it would make every frame compare
 // unequal and defeat row-level reuse. Every content field is itself `Eq`.
+//
+// ATLASES compare by SNAPSHOT IDENTITY (`Arc::as_ptr`), never `version`
+// (split-pane audit): baker versions are deterministic PER ENGINE INSTANCE
+// (the fingerprint contract), so a rebuilt engine replays its predecessor's
+// version sequence with different texels — version-equality would call two
+// different-content frames "equal", the exact stale-atlas aliasing the
+// audit outlawed. Every rebake publishes a fresh `Arc`, and a stable frame
+// re-presents the same `Arc`, so identity is both sound and stable — the
+// same law as the dirty-row gates and the GPU texture cache.
 impl PartialEq for RenderInput {
     fn eq(&self, other: &Self) -> bool {
         self.rows == other.rows
@@ -1034,24 +1035,20 @@ impl PartialEq for RenderInput {
             && self.glow_halo == other.glow_halo
             && self.glow_under == other.glow_under
             && self.fire_patch == other.fire_patch
-            && self.scene_over == other.scene_over
-            && self.scene_add == other.scene_add
-            && self.scene_atlas.as_ref().map(|a| a.version)
-                == other.scene_atlas.as_ref().map(|a| a.version)
             && self.word_decorations == other.word_decorations
             && self.ink == other.ink
             && self.char_fg == other.char_fg
             && self.fire_halo == other.fire_halo
             && self.cat_quads == other.cat_quads
-            && self.cat_atlas.as_ref().map(|a| a.version)
-                == other.cat_atlas.as_ref().map(|a| a.version)
+            && self.cat_atlas.as_ref().map(std::sync::Arc::as_ptr)
+                == other.cat_atlas.as_ref().map(std::sync::Arc::as_ptr)
             && self.free_sprites == other.free_sprites
-            && self.free_atlas.as_ref().map(|a| a.version)
-                == other.free_atlas.as_ref().map(|a| a.version)
+            && self.free_atlas.as_ref().map(std::sync::Arc::as_ptr)
+                == other.free_atlas.as_ref().map(std::sync::Arc::as_ptr)
             && self.nova_add == other.nova_add
             && self.rain_quads == other.rain_quads
-            && self.rain_atlas.as_ref().map(|a| a.version)
-                == other.rain_atlas.as_ref().map(|a| a.version)
+            && self.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
+                == other.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
             && self.rain_add == other.rain_add
             && self.display_offset == other.display_offset
             && self.selection == other.selection
@@ -1107,9 +1104,6 @@ impl RenderInput {
             glow_under: Vec::new(),
             fire_patch: Vec::new(),
             cursor_fill_override: None,
-            scene_over: Vec::new(),
-            scene_add: Vec::new(),
-            scene_atlas: None,
             word_decorations: Vec::new(),
             ink: Vec::new(),
             char_fg: Vec::new(),
@@ -1128,6 +1122,7 @@ impl RenderInput {
             scroll_frac_px: 0,
             grid_top_row: 0,
             grid_bot_row: 0,
+            fx_clip: None,
             selection: TextSelection::new(),
             clusters: Vec::new(),
             combining: Vec::new(),
@@ -1149,7 +1144,7 @@ impl RenderInput {
     /// the sparkle-word decorations, the animated ink fg
     /// overrides, the peeking-cat sprites (quads + atlas Arc nulled), the supernova
     /// additive light, the PHOSPHOR rain (quads + additive halos + atlas Arc
-    /// nulled), and the animated Scene (sprites + additive light + atlas). Used
+    /// nulled). Used
     /// by the `image plain` introspection capture so an AI reads the bare screen — the
     /// bling is architecturally a set of separate layers, so suppressing it is exactly
     /// this. The cell grid is untouched.
@@ -1159,9 +1154,6 @@ impl RenderInput {
         self.glow_halo.clear();
         self.glow_under.clear();
         self.fire_patch.clear();
-        self.scene_over.clear();
-        self.scene_add.clear();
-        self.scene_atlas = None;
         self.word_decorations.clear();
         self.ink.clear();
         self.char_fg.clear();
@@ -1467,12 +1459,15 @@ mod rain_channel_tests {
     }
 
     /// The damage cache compares snapshots with `PartialEq`; rain IS content,
-    /// so a change in any channel must compare unequal — but the atlas is
-    /// compared by VERSION only (a same-version rebake must stay equal, or a
-    /// progressive bake would defeat row-level reuse; RainBaker bumps the
-    /// version whenever texels must repaint).
+    /// so a change in any channel must compare unequal — and the atlas is
+    /// compared by SNAPSHOT IDENTITY (`Arc::as_ptr`, split-pane audit): baker
+    /// versions replay across rebuilt engines with different texels, so a
+    /// version key would alias stale content. Every rebake publishes a fresh
+    /// `Arc` (a new publish must compare unequal), and a stable frame
+    /// re-presents the SAME `Arc` (which must stay equal, or a resting rain
+    /// field would defeat row-level reuse).
     #[test]
-    fn partial_eq_sees_rain_content_and_atlas_version_only() {
+    fn partial_eq_sees_rain_content_and_atlas_identity() {
         let base = populated();
 
         let mut quads_changed = base.clone();
@@ -1530,13 +1525,23 @@ mod rain_channel_tests {
 
         let mut version_bumped = base.clone();
         version_bumped.rain_atlas = Some(rain_atlas(8, 0xFF));
-        assert_ne!(base, version_bumped, "atlas version bump must be seen");
+        assert_ne!(base, version_bumped, "a fresh atlas publish must be seen");
 
+        // A REBUILT engine deterministically replays version numbers with
+        // different texels — identity (not version) must catch it.
         let mut same_version_rebake = base.clone();
         same_version_rebake.rain_atlas = Some(rain_atlas(7, 0x00));
-        assert_eq!(
+        assert_ne!(
             base, same_version_rebake,
-            "a same-version rebake (different texels, equal version) compares EQUAL"
+            "a same-version DIFFERENT-Arc publish (rebuilt engine) compares UNEQUAL"
+        );
+
+        // The stable steady state: the SAME published snapshot re-presented.
+        let mut same_arc = base.clone();
+        same_arc.rain_atlas.clone_from(&base.rain_atlas);
+        assert_eq!(
+            base, same_arc,
+            "re-presenting the same published Arc stays EQUAL (resting rain is free)"
         );
     }
 
@@ -1561,8 +1566,9 @@ mod rain_channel_tests {
         dst.clone_from(&source);
         assert_eq!(dst.rain_quads, source.rain_quads);
         assert_eq!(
-            dst.rain_atlas.as_ref().map(|a| a.version),
-            source.rain_atlas.as_ref().map(|a| a.version)
+            dst.rain_atlas.as_ref().map(std::sync::Arc::as_ptr),
+            source.rain_atlas.as_ref().map(std::sync::Arc::as_ptr),
+            "clone_from carries the SAME published Arc (identity, the eq law)"
         );
         assert_eq!(dst.rain_add, source.rain_add);
         assert_eq!(dst.glow_halo, source.glow_halo);

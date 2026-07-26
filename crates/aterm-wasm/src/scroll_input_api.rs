@@ -101,7 +101,7 @@ impl ScrollInputState {
 
     /// Stamp this residual onto a frame snapshot: the presented
     /// `scroll_frac_px` plus the grid band. The web canvas has NO spliced
-    /// chrome rows (no tab strip / HUD in the framebuffer), so the band is
+    /// app-chrome rows in the framebuffer, so the band is
     /// the whole grid `[0, grid_rows)`. Called EVERY frame — a kept scratch
     /// would otherwise carry a stale shift after the residual resets.
     pub(crate) fn stamp(&self, input: &mut RenderInput, grid_rows: usize, cell_h: usize) {

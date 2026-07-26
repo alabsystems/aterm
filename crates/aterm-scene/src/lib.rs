@@ -1,67 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-scene` — the pure, deterministic animation kit. Its live role is the shared
-//! **RGB mixing / easing math** ([`mix_rgb`], [`smoothstep`], [`lerp`]) and the sprite
-//! **[`atlas`]** ([`Tile`]/[`Atlas`]) that the `aterm-effects` aurora/sparkle/cat engine
-//! builds on.
-//!
-//! It ALSO carries a full "Living Panels" scene framework (below) that has **no live
-//! consumer** — the GUI Scene feature was removed (it never shipped art). The framework
-//! is retained as dead code pending a possible rewrite; nothing depends on it.
-//!
-//! ## Three layers, cleanly separated
-//!
-//! 1. **Signals** ([`signal`]) — a normalized, art-agnostic telemetry bus. The host
-//!    samples real sources (CPU/mem/net/fps/app-fed streams) into a [`SignalSet`]; the
-//!    art only ever reads this bus, never hardware. Unavailable signals stay *honest*
-//!    (a missing GPU counter is `None`, never a fake 0).
-//! 2. **Bindings** ([`bind`]) — a data-driven map from abstract [`Drive`]s (energy,
-//!    crowd, arrivals, …) onto signal sources, so "which stat drives which behaviour"
-//!    is configuration, not code. [`Binding::resolve`] turns a [`SignalSet`] into
-//!    [`Drives`].
-//! 3. **Scenes** ([`scene`]) — host-side animators shaped exactly like aterm's
-//!    `cursor_glow` aurora: [`Scene::tick`] advances bounded entity pools from an
-//!    *injected* `dt` (no wall clock → unit-testable, deterministic given a seed), and
-//!    [`Scene::emit`] produces a [`SceneFrame`] of axis-aligned sprite quads (sampled
-//!    from a procedurally-baked RGBA8 [`Atlas`]) plus additive light. The renderer is a
-//!    dumb, parity-safe consumer; ALL art lives here.
-//!
-//! ## Engineering invariants (the bar this crate holds itself to)
-//!
-//! - **Deterministic.** Same seed + same `dt`/`Drives` stream ⇒ byte-identical frames.
-//!   Randomness is a seedable xorshift ([`Rng`]); there is no `Instant`, no global state.
-//! - **Bounded.** Every entity pool has a hard `CAP`; spawn is refused at the cap and
-//!   the emitted quad count is bounded — defended by a `ty_model!` (Tier-0) and a
-//!   pure-Rust property test (Tier-1, [`meadow`] tests).
-//! - **Panic-free.** No `unwrap`/`expect`/indexing that can trap on the tick/emit path;
-//!   all arithmetic is saturating/clamped (the renderer is a hot path).
-//! - **Idle-to-zero.** [`Scene::is_active`] reports `false` once nothing is moving, so
-//!   the host can return the event loop to 0% idle (the `cursor_glow` battery contract).
+//! `aterm-scene` — shared deterministic animation primitives used by the live effects
+//! engine: RGB mixing, easing, vector-path filling, and the [`Tile`] raster surface.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 pub mod atlas;
-pub mod bind;
-#[cfg(feature = "bridge")]
-pub mod bridge;
-pub mod placeholder;
-pub mod raster;
-pub mod registry;
-pub mod scene;
-pub mod signal;
 pub mod vector;
 
-pub use atlas::{Atlas, AtlasRect, Sprite, Tile};
-pub use bind::{Binding, Drive, Drives, Source};
-pub use placeholder::Placeholder;
-pub use raster::{Canvas, composite, sample};
-pub use registry::{build_scene, default_binding, scene_names};
-pub use scene::{Env, LocalSprite, Palette, Scene, SceneFrame, TextPulse};
-pub use signal::{AppSignal, Sig, SignalKey, SignalSet};
-pub use vector::{fill_path, fill_path_fixed, parse_path, PathCmd, PathSeg, PathTransform};
+pub use atlas::Tile;
+pub use vector::{PathCmd, PathSeg, PathTransform, fill_path, fill_path_fixed, parse_path};
 
 // =====================================================================================
 // Deterministic randomness + frame-rate-independent math (the shared kinematics kit).

@@ -76,6 +76,15 @@ pub struct NotifyMsg {
 /// DISTINCT, so the overflow is dropped — never coalesced.
 const NOTIFY_QUEUE_CAP: usize = 16;
 
+/// Whether this build has a host that can turn a queued notification into an
+/// operating-system notification. Keep Settings' availability projection tied
+/// to the same cfg as [`spawn_delivery`] so a channel-draining portability stub
+/// can never be presented as working delivery.
+#[must_use]
+pub(crate) const fn delivery_available() -> bool {
+    cfg!(any(target_os = "macos", windows))
+}
+
 /// Spawn the single, process-wide notification delivery thread and return the
 /// `SyncSender` each tab clones into its engine callbacks. The thread parks on
 /// `recv()` (0% idle when no notifications arrive) and exits when every sender

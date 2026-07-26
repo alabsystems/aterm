@@ -22,7 +22,11 @@
 //! so a crash mid-restore can never loop.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The current on-disk schema. Bumped on any incompatible layout change; a manifest with
 /// a different schema is ignored (fresh start), never mis-parsed.
@@ -132,6 +136,10 @@ pub(crate) struct NativeLeafRestore {
     pub route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// This Editor is the canonical aterm.toml Manual surface. Additive for
+    /// backward compatibility; ordinary Editor restores remain `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub config_editor: bool,
     #[serde(default)]
     pub source_anchor: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,6 +162,7 @@ impl NativeLeafRestore {
             restore_tag: "settings".to_string(),
             route: Some(route),
             uri: None,
+            config_editor: false,
             source_anchor: 0,
             selection: None,
             editor_selections: Vec::new(),
@@ -169,6 +178,7 @@ impl NativeLeafRestore {
             restore_tag: restore_tag.to_string(),
             route: None,
             uri: Some(uri),
+            config_editor: false,
             source_anchor: 0,
             selection: None,
             editor_selections: Vec::new(),
@@ -194,6 +204,9 @@ impl NativeLeafRestore {
                 && self.primary_selection >= self.editor_selections.len())
         {
             return Some("invalid editor selection state");
+        }
+        if self.config_editor && self.restore_tag != "editor" {
+            return Some("config-editor identity requires an Editor restore");
         }
         match self.restore_tag.as_str() {
             "settings" => self
@@ -224,10 +237,11 @@ impl NativeLeafRestore {
 
     fn copyable_metadata(&self) -> String {
         let mut metadata = format!(
-            "restore_tag={:?}\nroute={:?}\nuri={:?}\nsource_anchor={}\nviewport_anchor={}\ndurable_seq={}",
+            "restore_tag={:?}\nroute={:?}\nuri={:?}\nconfig_editor={}\nsource_anchor={}\nviewport_anchor={}\ndurable_seq={}",
             self.restore_tag,
             self.route,
             self.uri,
+            self.config_editor,
             self.source_anchor,
             self.viewport_anchor,
             self.durable_seq
@@ -906,25 +920,274 @@ pub(crate) fn manifest_path() -> Option<PathBuf> {
     aterm_types::dirs::data_dir().map(|d| d.join("aterm").join("session.toml"))
 }
 
-/// Atomically write `manifest` to `path`: create the parent dir, write a temp sibling,
-/// then rename over the target so a crash mid-write never leaves a half-file.
+/// Durably write `manifest` under the process-shared restore lock. Publication
+/// uses a unique create-new sibling, file sync, atomic replacement, and directory
+/// sync; a fixed `.tmp` name can neither collide nor be truncated.
 pub(crate) fn write_to(path: &Path, manifest: &RestoreManifest) -> Result<(), String> {
     let toml = manifest.to_toml()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, toml).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))?;
-    Ok(())
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("restore manifest {} has no parent", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
+    with_restore_lock(path, || write_restore_locked(path, toml.as_bytes()))
 }
 
-/// Read + DELETE the manifest at `path` (single-use: a crash mid-restore can't loop).
-/// `None` when the file is absent, unreadable, malformed, or carries a stale schema.
+/// Claim the manifest atomically, durably remove its public name, then parse the
+/// claimed bytes. The rename is the single-use commit point: a crash during
+/// parsing/apply cannot expose the same manifest to the next launch.
+///
+/// `None` means absent, consumed-but-invalid, or an I/O failure. Failures are
+/// logged because this compatibility API intentionally falls back to a fresh
+/// window rather than blocking launch.
 pub(crate) fn take_from(path: &Path) -> Option<RestoreManifest> {
-    let s = std::fs::read_to_string(path).ok()?;
-    let _ = std::fs::remove_file(path); // single-use; a delete failure is non-fatal
-    RestoreManifest::from_toml(&s)
+    match take_from_result(path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("aterm-gui: restore manifest not consumed: {error}");
+            None
+        }
+    }
+}
+
+fn write_restore_locked(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("restore manifest {} has no parent", path.display()))?;
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("session.toml"));
+    let (temporary, mut file) = create_unique_restore_sibling(parent, name, "write")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("protect {}: {error}", temporary.display()))?;
+    }
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+        drop(file);
+        replace_restore_file(&temporary, path)
+            .map_err(|error| format!("publish {}: {error}", path.display()))?;
+        sync_restore_directory(parent).map_err(|error| {
+            format!(
+                "{} was published but directory durability is indeterminate: {error}",
+                path.display()
+            )
+        })
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn take_from_result(path: &Path) -> Result<Option<RestoreManifest>, String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!("restore manifest {} has no parent", path.display()));
+    };
+    if !parent.exists() {
+        return Ok(None);
+    }
+    with_restore_lock(path, || {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("session.toml"));
+        let claim = unique_restore_sibling_path(parent, name, "claimed")?;
+        claim_restore_file(path, &claim)
+            .map_err(|error| format!("claim {}: {error}", path.display()))?;
+        sync_restore_directory(parent).map_err(|error| {
+            format!(
+                "{} was claimed but single-use durability is indeterminate: {error}",
+                path.display()
+            )
+        })?;
+
+        let parsed = match fs::read_to_string(&claim) {
+            Ok(text) => RestoreManifest::from_toml(&text),
+            Err(error) => {
+                eprintln!(
+                    "aterm-gui: claimed restore read {} failed: {error}",
+                    claim.display()
+                );
+                None
+            }
+        };
+        if let Err(error) = fs::remove_file(&claim) {
+            eprintln!(
+                "aterm-gui: claimed restore cleanup {} failed: {error}",
+                claim.display()
+            );
+        } else if let Err(error) = sync_restore_directory(parent) {
+            eprintln!(
+                "aterm-gui: claimed restore cleanup sync {} failed: {error}",
+                parent.display()
+            );
+        }
+        Ok(parsed)
+    })
+}
+
+fn with_restore_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("restore manifest {} has no parent", path.display()))?;
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("session.toml"));
+    let lock_path = parent.join(format!(".{}.aterm-restore.lock", name.to_string_lossy()));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("open restore lock {}: {error}", lock_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        lock.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("protect restore lock {}: {error}", lock_path.display()))?;
+    }
+    lock.lock()
+        .map_err(|error| format!("lock restore manifest {}: {error}", path.display()))?;
+    operation()
+}
+
+fn create_unique_restore_sibling(
+    parent: &Path,
+    name: &OsStr,
+    purpose: &str,
+) -> Result<(PathBuf, File), String> {
+    let seed = next_restore_seed();
+    for attempt in 0_u32..64 {
+        let candidate = restore_sibling_path(parent, name, purpose, seed, attempt);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create {}: {error}", candidate.display())),
+        }
+    }
+    Err("could not allocate a unique restore temporary".to_string())
+}
+
+fn unique_restore_sibling_path(
+    parent: &Path,
+    name: &OsStr,
+    purpose: &str,
+) -> Result<PathBuf, String> {
+    let seed = next_restore_seed();
+    for attempt in 0_u32..64 {
+        let candidate = restore_sibling_path(parent, name, purpose, seed, attempt);
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) => return Err(format!("inspect {}: {error}", candidate.display())),
+        }
+    }
+    Err("could not allocate a unique restore claim".to_string())
+}
+
+fn restore_sibling_path(
+    parent: &Path,
+    name: &OsStr,
+    purpose: &str,
+    seed: u64,
+    attempt: u32,
+) -> PathBuf {
+    parent.join(format!(
+        ".{}.aterm-{purpose}-{}-{seed}-{attempt}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ))
+}
+
+fn next_restore_seed() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    ordinal ^ nanos.rotate_left(19)
+}
+
+#[cfg(not(windows))]
+fn replace_restore_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, target)
+}
+
+#[cfg(not(windows))]
+fn claim_restore_file(source: &Path, claim: &Path) -> std::io::Result<()> {
+    fs::rename(source, claim)
+}
+
+#[cfg(windows)]
+fn replace_restore_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    move_restore_file(temporary, target, true)
+}
+
+#[cfg(windows)]
+fn claim_restore_file(source: &Path, claim: &Path) -> std::io::Result<()> {
+    move_restore_file(source, claim, false)
+}
+
+#[cfg(windows)]
+fn move_restore_file(source: &Path, target: &Path, replace: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    // SAFETY: both UTF-16 buffers are NUL-terminated and remain live for the call.
+    let moved = unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), flags) };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_restore_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_restore_directory(_path: &Path) -> std::io::Result<()> {
+    // Windows publication/claim uses MOVEFILE_WRITE_THROUGH above.
+    Ok(())
 }
 
 /// Write the manifest to the standard [`manifest_path`] (graceful-quit hook).
@@ -1340,6 +1603,86 @@ metadata = "opaque=copy-me"
         assert_eq!(m, back);
         assert!(!path.exists(), "single-use: manifest deleted on read");
         assert!(take_from(&path).is_none(), "a second take finds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_durable_write_replaces_existing_without_touching_fixed_temp_alias() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-restore-replace-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.toml");
+        let fixed = path.with_extension("toml.tmp");
+        std::fs::write(&fixed, "unrelated").unwrap();
+        std::fs::write(&path, "stale").unwrap();
+
+        let manifest = sample();
+        write_to(&path, &manifest).unwrap();
+        assert_eq!(
+            RestoreManifest::from_toml(&std::fs::read_to_string(&path).unwrap()),
+            Some(manifest)
+        );
+        assert_eq!(std::fs::read_to_string(&fixed).unwrap(), "unrelated");
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            !name.contains("aterm-write")
+        }));
+
+        // Tier-1 projection of the genuine locked unique-temp publication.
+        let model = aterm_spec::derive::restore_manifest_single_use_model();
+        let locked = model.successors("LockWriter", &model.init_state())[0].clone();
+        let temporary = model.successors("CreateUniqueTemporary", &locked)[0].clone();
+        let published = model.successors("PublishManifest", &temporary)[0].clone();
+        assert_eq!(published["visible"], 1);
+        assert!(model.check_invariant("UniqueTemporaryNeverAliases", &published));
+        let rejected_alias = model.successors("ReuseFixedTemporary", &locked);
+        assert_eq!(rejected_alias, vec![locked]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_takers_have_exactly_one_committed_consumer() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-restore-consume-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("session.toml");
+        let manifest = sample();
+        write_to(&path, &manifest).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut takers = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            takers.push(std::thread::spawn(move || {
+                barrier.wait();
+                take_from(&path)
+            }));
+        }
+        barrier.wait();
+        let results = takers
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_some()).count(), 1);
+        assert!(results.into_iter().flatten().all(|value| value == manifest));
+        assert!(!path.exists());
+        assert!(take_from(&path).is_none());
+
+        // Tier-1 projection of the one real winner and absent loser. Returning
+        // before SyncClaim is the explicit negative control.
+        let model = aterm_spec::derive::restore_manifest_single_use_model();
+        let locked = model.successors("LockTakeA", &model.init_state())[0].clone();
+        let claimed = model.successors("ClaimA", &locked)[0].clone();
+        assert!(model.successors("ReturnA", &claimed).is_empty());
+        let synced = model.successors("SyncClaim", &claimed)[0].clone();
+        let returned = model.successors("ReturnA", &synced)[0].clone();
+        let loser_locked = model.successors("LockTakeB", &returned)[0].clone();
+        let absent = model.successors("ObserveAbsentB", &loser_locked)[0].clone();
+        assert_eq!(absent["returned"], 1);
+        assert!(model.check_invariant("AtMostOneConsumer", &absent));
+        assert!(model.check_invariant("ReturnOnlyAfterDurableClaim", &absent));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

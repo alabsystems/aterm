@@ -6,7 +6,8 @@
 //! ([`about_fields`]) and over the control socket
 //! (`aterm-ctl version`, see [`crate::control`]).
 //!
-//! `VERSION`/`GIT_COMMIT`/`BUILD_TIME` are stamped at compile time by `build.rs`.
+//! `VERSION` comes from the shared application identity; `GIT_COMMIT` and
+//! `BUILD_TIME` are stamped at compile time by `build.rs`.
 //! [`binary_signature`] is computed at runtime from the actual executable, so it
 //! reflects the EXACT shipped bytes (the `.app`'s signed binary hashes differently
 //! from the bare `target/release` binary — which is correct: it is what's running).
@@ -18,8 +19,9 @@ pub(crate) const AUTHOR_ATTRIBUTION: &str = "By Andrew Yates";
 pub(crate) const COMPANY: &str = "ALab";
 pub(crate) const AUTHOR_COMPANY_BYLINE: &str = "By Andrew Yates · ALab";
 
-/// Semantic version, from Cargo's `[package] version`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Application identity shared across the one binary. Release builds use the
+/// private app-channel claim; ordinary builds use Cargo's source version.
+pub const VERSION: &str = aterm_types::version::APP_VERSION;
 
 /// Short git commit the binary was built from — with a `-dirty` suffix when the
 /// working tree had uncommitted changes. `"unknown"` when git was unavailable at
@@ -29,13 +31,14 @@ pub const GIT_COMMIT: &str = env!("ATERM_GIT_COMMIT");
 /// UTC build timestamp (RFC3339), or `"unknown"`. Stamped by `build.rs`.
 pub const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
 
-/// Monotonic build number, stamped by `build.rs`. The version (above) is a plain
-/// `MAJOR.MINOR`; the monotonic ordering the updater needs lives here in metadata.
-/// For a RELEASE this is the number `cargo ship cut` claims in the append-only
+/// Monotonic build number, stamped by `build.rs`. The updater's ordering lives
+/// here in metadata, independent of the app/source display version above. For a
+/// RELEASE this is the number `cargo ship cut` claims in the append-only
 /// `RELEASES.ledger` (`max(last + 1, unix_now)` — strictly increasing by
-/// construction, epoch-scale) and pins via `SOURCE_DATE_EPOCH`; a dev build falls
-/// back to HEAD's committer Unix epoch — the same seconds scale, so dev and release
-/// builds stay mutually ordered. Used as the macOS `CFBundleVersion`.
+/// construction, epoch-scale) and pins via `SOURCE_DATE_EPOCH`; a dev build
+/// falls back to HEAD's committer Unix epoch — the same seconds scale, so dev
+/// and release builds stay mutually ordered. Used as the macOS
+/// `CFBundleVersion`.
 pub const BUILD_NUMBER: &str = env!("ATERM_BUILD_NUMBER");
 
 /// Full first line of the producing compiler's `-vV`, e.g.
@@ -101,17 +104,19 @@ pub fn compiler_commit_short() -> &'static str {
     }
 }
 
-/// The DISPLAY version: a plain `MAJOR.MINOR` (Cargo carries `MAJOR.MINOR.0`; the
-/// trailing `.0` is stripped). The build number, commit, compiler/toolchain, and build
-/// time are their OWN provenance rows (see [`about_fields`] / [`control_line`]), never
-/// crammed into the version string — a simple version, stats in metadata.
+/// The DISPLAY version. There is ONE lineage, Cargo's `MAJOR.MINOR.0`:
+/// releases carry it with DEV reset to 0 (e.g. `0.2.0`), ordinary
+/// development builds carry it verbatim (e.g. `0.2.1`).
+/// The build number, commit, compiler/toolchain, and build
+/// time are their OWN provenance rows (see [`about_fields`] / [`control_line`]).
 ///
-/// Display-ONLY by contract: the in-app updater orders builds by the monotonic
-/// [`BUILD_NUMBER`] alone (its `current_version` parameter is informational — see
-/// `aterm-update`), so this string can never affect an update comparison.
+/// Display-ONLY by contract: the running build's version is not an input to the
+/// updater at all — `aterm_update::check_now` does not take one. Selection is by
+/// the release's `vMAJOR.MINOR.PATCH` tag and the apply gate is the monotonic
+/// [`BUILD_NUMBER`], so this string can never affect an update comparison.
 #[must_use]
 pub fn version_display() -> &'static str {
-    VERSION.strip_suffix(".0").unwrap_or(VERSION)
+    VERSION
 }
 
 /// The compiler's bare release, e.g. `1.96.0` / `1.96.0-dev` — the second token of
@@ -214,20 +219,13 @@ pub fn control_line() -> String {
 mod tests {
     use super::*;
 
-    /// The display version is a plain MAJOR.MINOR — provenance (build number, commit,
-    /// compiler) lives in the other rows, never smuggled into the version string.
+    /// The display version is the shared application identity — provenance
+    /// (build number, commit, compiler) lives in the other rows.
     #[test]
-    fn version_display_is_bare_major_minor() {
+    fn version_display_is_shared_application_identity() {
         let v = version_display();
         assert!(!v.contains('+'), "no compiler suffix in the version: {v}");
-        assert_eq!(
-            v,
-            VERSION.strip_suffix(".0").unwrap_or(VERSION),
-            "the trailing .0 of Cargo's MAJOR.MINOR.0 is stripped"
-        );
-        if VERSION.ends_with(".0") {
-            assert_eq!(v.split('.').count(), 2, "leaves exactly MAJOR.MINOR: {v}");
-        }
+        assert_eq!(v, aterm_types::version::APP_VERSION);
     }
 
     /// On this box (stock cargo, no override, no trust toolchain) the flavor

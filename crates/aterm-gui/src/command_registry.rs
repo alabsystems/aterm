@@ -110,6 +110,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::SoftwareUpdate => spec("app.settings.updates", S::App, A::UpdateStage, C::Any),
         M::Version => spec("app.settings.version", S::App, A::Observe, C::Any),
         M::ApplyUpdate => spec("update.apply", S::Process, A::UpdateApply, C::Any),
+        // Keep the stable command identity: the source now opens in native Manual.
         M::Preferences => spec("config.open_source", S::Process, A::ConfigMutate, C::Any),
         M::Quit => spec("app.quit", S::Process, A::LocalUi, C::Any),
         M::NewWindow => spec("window.new", S::Process, A::LocalUi, C::Any),
@@ -155,10 +156,6 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             A::ConfigMutate,
             C::Any,
         ),
-        M::ShowHud => spec("hud.toggle", S::Window, A::ConfigMutate, C::Any),
-        M::ShowResourcesHud => spec("hud.resources.toggle", S::Window, A::ConfigMutate, C::Any),
-        M::ShowEngineHud => spec("hud.engine.toggle", S::Window, A::ConfigMutate, C::Any),
-        M::ShowPerformancePanel => spec("app.performance.open", S::App, A::Observe, C::Any),
         M::ToggleSettings => spec("app.settings.open", S::App, A::ConfigMutate, C::Any),
         M::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
         M::Minimize => spec("window.minimize", S::Window, A::LocalUi, C::Any),
@@ -207,7 +204,6 @@ pub(crate) const fn keybinding_command(action: keybinding::Action) -> CommandSpe
         K::JumpNextPrompt => spec("terminal.prompt_next", S::View, A::LocalUi, C::Terminal),
         K::ToggleSettings => spec("app.settings.open", S::App, A::ConfigMutate, C::Any),
         K::ToggleAbout => spec("app.settings.about", S::App, A::LocalUi, C::Any),
-        K::ToggleSparkleWords => spec("effects.sparkle.toggle", S::Process, A::LocalUi, C::Any),
         K::ToggleMatrixRain => spec("effects.rain.toggle", S::Process, A::LocalUi, C::Any),
         K::ToggleSeriousMode => spec(
             "effects.serious.toggle",
@@ -252,12 +248,36 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
         "editor/goto-line" => spec("document.goto_line", S::Document, A::LocalUi, C::Native),
         "editor/commands" => spec("document.commands", S::Document, A::LocalUi, C::Native),
         "editor/revert" => spec("document.revert", S::Document, A::DocumentWrite, C::Native),
+        "editor/config-problem-next" | "editor/config-problem-previous" => {
+            spec("config.problem.navigate", S::View, A::LocalUi, C::Native)
+        }
         _ if action
             .strip_prefix("editor/completion/")
             .and_then(|index| index.parse::<usize>().ok())
             .is_some_and(|index| index < 8) =>
         {
             spec("document.command.choose", S::View, A::LocalUi, C::Native)
+        }
+        _ if crate::native_config_language::is_config_completion_action(action) => spec(
+            "config.completion.choose",
+            S::Document,
+            A::DocumentWrite,
+            C::Native,
+        ),
+        _ if action
+            .strip_prefix("editor/config-page/")
+            .and_then(|suffix| suffix.split_once('/'))
+            .and_then(|(target, candidates)| {
+                Some((
+                    target.parse::<usize>().ok()?,
+                    candidates.parse::<usize>().ok()?,
+                ))
+            })
+            .is_some_and(|(target, candidates)| {
+                candidates > 0 && candidates <= 8 && target < candidates
+            }) =>
+        {
+            spec("config.completion.page", S::View, A::LocalUi, C::Native)
         }
         _ if action.starts_with("markdown/outline/") => {
             spec("markdown.section.goto", S::View, A::LocalUi, C::Native)
@@ -357,6 +377,24 @@ mod tests {
         let link = native_document_action("markdown/link/7").unwrap();
         assert_eq!(link.id.as_str(), "markdown.resource.open");
         assert_eq!(link.authority, ActionAuthority::ExternalOpen);
+        let completion = crate::native_config_language::ConfigCompletionEdit {
+            replacement: 0..3,
+            expected: "win".to_string(),
+            insertion: "window_theme = \"auto\"".to_string(),
+            post_insert_selection: 16..20,
+            display: "window_theme".to_string(),
+            help: "System appearance".to_string(),
+        };
+        let context = crate::native_config_language::ConfigCompletionContext::new(1, 2, 3);
+        let config_action =
+            crate::native_config_language::config_completion_action(context, 7, &completion);
+        let config = native_document_action(&config_action).unwrap();
+        assert_eq!(config.id.as_str(), "config.completion.choose");
+        assert_eq!(config.authority, ActionAuthority::DocumentWrite);
+        let out_of_range =
+            crate::native_config_language::config_completion_action(context, 8, &completion);
+        assert!(native_document_action(&out_of_range).is_none());
+        assert!(native_document_action("editor/config-completion/0/save").is_none());
         assert!(native_document_action("markdown/unknown/7").is_none());
     }
 

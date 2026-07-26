@@ -16,7 +16,7 @@ use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
 use aterm_effects::cursor_glow::GlowStyle;
-use aterm_effects::trail_sound::{CHANNELS, SoundEvent, SoundGesture, SoundKind, TrailSynth};
+use aterm_effects::trail_sound::{CHANNELS, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth};
 
 const SR: u32 = 48_000;
 
@@ -91,6 +91,7 @@ fn main() {
                 let (ct, kind, pan, heat) = cues[cue_i];
                 synth.push(SoundEvent {
                     style,
+                    voice: SoundVoice::Style,
                     kind: SoundGesture::Trail(kind),
                     pan,
                     heat,

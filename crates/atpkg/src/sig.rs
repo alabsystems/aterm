@@ -48,6 +48,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ring::signature::{ED25519, UnparsedPublicKey};
 
+const MAX_FLOOR_BYTES: usize = 128;
+
 /// A blob of bytes that has **passed signature verification**. The inner `Vec<u8>` is
 /// private and there is no public constructor, so the only way to obtain a
 /// `VerifiedBytes` is via [`verify_index`], [`verify_index_with`], or [`verify_pkg`].
@@ -283,7 +285,7 @@ impl Floor {
     /// The recorded floor, or `0` if the file is missing or unparseable (fail-open
     /// only for first contact, per §8).
     fn read_floor(&self) -> u64 {
-        std::fs::read_to_string(&self.path)
+        crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_FLOOR_BYTES)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0)
@@ -526,6 +528,35 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "floor file must be 0600");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_sparse_floor_is_bounded_first_contact() {
+        let dir = private_tmp_dir("floor-sparse");
+        let path = dir.join("index_build.floor");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_FLOOR_BYTES + 1) as u64).unwrap();
+        assert_eq!(Floor::new(path).current(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_symlink_floor_return_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = private_tmp_dir("floor-special");
+        let path = dir.join("index_build.floor");
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_c` is a live NUL-terminated path in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        assert_eq!(Floor::new(path.clone()).current(), 0);
+        std::fs::remove_file(&path).unwrap();
+        let target = dir.join("foreign-floor");
+        std::fs::write(&target, "99\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(Floor::new(path).current(), 0, "floor links are refused");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // The post-verify parsers live in `crate::manifest` now (the real `toml` parser

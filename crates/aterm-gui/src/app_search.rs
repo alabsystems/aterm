@@ -714,7 +714,18 @@ impl App {
         if terminal.session != session {
             return;
         }
-        let term = term_lock(&terminal.term);
+        // TRY-lock, never block. This runs from the `Wake::Output` handler, i.e. once
+        // per PTY reader BATCH — at flood rate, on the UI thread. A blocking acquire
+        // here parks the main thread behind the reader's whole-batch `process()` hold
+        // for every burst, on the very mutex the keystroke echo's present also needs;
+        // with a find bar open during a flood that is unbounded main-thread starvation.
+        // Skipping one refresh is invisible (a stale search invalidation is corrected
+        // by the next burst, and `match_content_seq` still catches the drift); a
+        // blocked event loop is not. Mirrors the try_lock discipline the title
+        // observer already uses on this same path.
+        let Ok(term) = terminal.term.try_lock() else {
+            return;
+        };
         let revision_stale = term.absolute_row_revision() != expected_revision;
         let content_stale = term.content_seq() != expected_content_seq;
         drop(term);

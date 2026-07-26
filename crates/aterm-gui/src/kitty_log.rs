@@ -26,9 +26,11 @@
 //! Multi-process safety: every flush is a READ-MERGE-WRITE under the sibling
 //! lock (summed counts, min `first_seen`, max `last_seen`, unioned language
 //! chips) — a debounced dump of in-memory totals would last-writer-win a
-//! second aterm's sightings away. The crash-loss window is exactly the deltas
-//! since the last flush (≤ the 30 s debounce + whatever the exit flush
-//! misses on a hard kill) — documented, accepted.
+//! second aterm's sightings away. A contended lock is never waited on: the
+//! worker retains and coalesces that delta, then makes a finite best-effort
+//! retry at exit so another process cannot hang quit. The crash-loss window is
+//! the deltas since the last flush (≤ the 30 s debounce, plus a permanently
+//! contended exit or a hard kill) — documented, accepted for observability.
 //! The semantic unlock set is lossless across supported rollback chains. A
 //! mirror erased and recreated within the same timestamp second (or across a
 //! backward wall-clock jump) is information-theoretically indistinguishable
@@ -39,25 +41,31 @@
 //! (`config_watcher.rs`): every IO here is best-effort and never panics, so
 //! the log silently degrades to in-memory-only there — the settings page
 //! still shows this session's sightings, nothing persists.
+//! Ledger admission is also fail-open but finite: both TOML files must be
+//! same-handle regular, non-link UTF-8 files no larger than
+//! [`MAX_KITTY_LEDGER_BYTES`]. A FIFO, link/reparse point, device, oversized
+//! file, or malformed TOML is treated exactly like an absent ledger. Flushes
+//! likewise refuse to replace a non-regular or linked destination.
 //!
 //! [`KittyLogHost`] is the App-side state: the in-memory totals the settings
 //! page renders (settings-open does NO synchronous IO), the unflushed delta,
 //! the `(session, ident)` dedupe ring (multi-window shared sessions count a
 //! cat once; a vim round-trip's grace-expiry recount is absorbed for
 //! [`RING_TTL`]), and the drain-time debounce that hands the delta to a
-//! detached short-lived writer thread (the `config_watcher` thread precedent
-//! — no new wakes or timers, never the render thread).
+//! long-lived background writer (the `config_watcher` thread precedent — no
+//! filesystem work on the render thread). Startup admission is performed by
+//! that worker and imported through a nonblocking one-shot poll.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_effects::cat_glyphs_gen::{GLYPH_IDS, GLYPHS, GlyphKind};
 use aterm_effects::kitty_registry::{
-    KittyLook, KittyShownAs, KittySighting, TRAIT_BLAZE, TRAIT_BOW, TRAIT_CROWN, TRAIT_EAR_NICK,
-    TRAIT_HETEROCHROMIA, TRAIT_SHY, TRAIT_SUNGLASSES, TRAIT_WITCH_HAT, age_from_key, age_key,
-    glyph_from_key, glyph_key,
+    KittyLook, KittyMagic, KittyShownAs, KittySighting, KittyType, TRAIT_BLAZE, TRAIT_BOW,
+    TRAIT_CROWN, TRAIT_EAR_NICK, TRAIT_HETEROCHROMIA, TRAIT_SHY, TRAIT_SUNGLASSES, TRAIT_WITCH_HAT,
+    age_from_key, age_key, glyph_from_key, glyph_key,
 };
-use aterm_lexicon::{Lexicon, primary_lang};
+use aterm_lexicon::{LangSet, Lexicon, primary_lang};
 use serde::{Deserialize, Serialize};
 
 /// The ledger's filename, a sibling of `aterm.toml` (see the module doc for
@@ -68,8 +76,31 @@ const KITTY_LOG_FILE: &str = "kitty-log.toml";
 /// isolated from the legacy ledger so a destructive rollback cannot drop them.
 const KITTY_COLLECTIBLES_FILE: &str = "kitty-collectibles.toml";
 
+/// Maximum accepted and emitted size of either Kitty Log TOML file.
+///
+/// The semantic schema has at most every shown type × every magic bucket ×
+/// every `LangSet` slot, plus two generated-roster copies in the sidecar
+/// (`collectibles` and `legacy_mirror`). Budgeting a generous 2 KiB for every
+/// possible row ties the ceiling to those source-of-truth registries without
+/// making ordinary roster growth an accidental compatibility break. It also
+/// makes startup parsing and the background read→merge→write path finite
+/// under hostile filesystem input. Files outside the admission envelope are
+/// observability failures and therefore read as the documented empty/default
+/// state.
+const MAX_KITTY_LEDGER_ROWS: usize =
+    KittyType::ALL.len() * KittyMagic::ALL.len() * LangSet::CAPACITY + (2 * GLYPH_IDS.len());
+const MAX_KITTY_LEDGER_BYTES: usize = MAX_KITTY_LEDGER_ROWS * 2 * 1024;
+
 fn collectibles_path(legacy_path: &Path) -> PathBuf {
     legacy_path.with_file_name(KITTY_COLLECTIBLES_FILE)
+}
+
+/// Purpose-specific admission boundary shared by the legacy ledger and its
+/// sidecar. The effects helper opens once, uses non-blocking/no-follow flags on
+/// Unix (and refuses Windows reparse points), verifies that same handle is a
+/// regular file, then reads at most `MAX + 1` bytes before requiring UTF-8.
+fn read_kitty_ledger_text(path: &Path) -> Option<String> {
+    aterm_effects::file_feed::read_bounded_regular_utf8(path, MAX_KITTY_LEDGER_BYTES).ok()
 }
 
 /// Dedupe-ring capacity: how many recently-logged `(session, ident)` pairs are
@@ -86,6 +117,22 @@ const RING_TTL: Duration = Duration::from_secs(600);
 /// most this often (plus once more on exit). Checked only at the existing tick
 /// drains — no new wakes, no timers, zero idle cost.
 const FLUSH_DEBOUNCE: Duration = Duration::from_secs(30);
+/// A retained batch retries after transient lock contention even when no new
+/// sighting arrives. Empty workers still block indefinitely on `recv`, so this
+/// timer has exactly zero idle cost.
+const FLUSH_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// A contended best-effort ledger must never turn application quit into an
+/// unbounded join. The worker keeps the coalesced delta for later deliveries,
+/// then makes this small, finite retry budget after the sender closes.
+const EXIT_LOCK_RETRIES: usize = 4;
+const EXIT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
+/// Main-thread quit waits only this long for the best-effort ledger worker.
+/// Regular-file operations can stall indefinitely on a dead network mount, so
+/// the worker is detached after this deadline and process teardown wins over
+/// observability durability.
+const EXIT_JOIN_BUDGET: Duration = Duration::from_millis(100);
+const EXIT_JOIN_POLL: Duration = Duration::from_millis(1);
 
 /// One aggregated collection-book row, keyed `(kitty_type, magic, lang)` —
 /// the registry `config_key()` spellings and the primary language CODE
@@ -344,8 +391,7 @@ impl KittyLog {
     /// like `Health::read` — under Containment the read is denied and this
     /// yields the same empty default).
     pub(crate) fn read(path: &Path) -> Self {
-        let mut log: Self = std::fs::read_to_string(path)
-            .ok()
+        let mut log: Self = read_kitty_ledger_text(path)
             .and_then(|t| toml::from_str(&t).ok())
             .unwrap_or_default();
         log.normalize_collectibles();
@@ -364,8 +410,7 @@ impl KittyLog {
         // Every new writer takes locks in this order. A rollback binary takes
         // only the first lock, so it cannot erase transitional rows while this
         // process is moving them to the sidecar.
-        let _legacy_lock = lock(path);
-        let _sidecar_lock = lock(&sidecar_path);
+        let locks = lock_pair(path, &sidecar_path);
         let mut log = Self::read(path);
         let embedded = std::mem::take(&mut log.collectibles);
         let persisted = Self::read_collectible_store(&sidecar_path);
@@ -380,20 +425,24 @@ impl KittyLog {
         );
         let desired = KittyCollectibleStore::mirrored(&reconciled);
         let sidecar_current = persisted.as_ref() == Some(&desired);
-        let sidecar_safe = sidecar_current
-            || (reconciled.is_empty() && persisted.is_none())
-            || Self::write_collectible_store_state(&sidecar_path, &desired);
+        // Lock contention is an ordinary multi-process observation, not
+        // permission to race an unlocked migration. Reconcile the two bounded
+        // snapshots for this process, but defer every repair write until a
+        // later flush can own both locks.
+        let sidecar_safe = locks.is_some()
+            && (sidecar_current
+                || (reconciled.is_empty() && persisted.is_none())
+                || Self::write_collectible_store_state(&sidecar_path, &desired));
         log.collectibles = reconciled;
         if sidecar_safe && embedded != log.collectibles {
-            log.write(path);
+            let _ = log.write(path);
         }
         log
     }
 
     fn read_collectible_store(path: &Path) -> Option<KittyCollectibleStore> {
-        let mut store: KittyCollectibleStore = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| toml::from_str(&text).ok())?;
+        let mut store: KittyCollectibleStore =
+            read_kitty_ledger_text(path).and_then(|text| toml::from_str(&text).ok())?;
         store.collectibles = Self::normalized_collectibles(store.collectibles);
         store.legacy_mirror = store.legacy_mirror.map(Self::normalized_collectibles);
         Some(store)
@@ -725,15 +774,28 @@ impl KittyLog {
     /// Flush `delta` into the ledger at `path`: READ-MERGE-WRITE under the
     /// sibling `.lock` (see the module doc — a dump of in-memory totals would
     /// last-writer-win a second process's sightings). No-op for an empty
-    /// delta. Best-effort everywhere: a denied lock proceeds unlocked, a
-    /// denied write is dropped (Containment ⇒ silent in-memory).
-    pub(crate) fn flush_merge(path: &Path, delta: &KittyLog) {
+    /// delta. Best-effort everywhere: a denied or contended lock returns
+    /// immediately and the background worker retains the coalesced delta for a
+    /// later delivery; a denied write remains an observability failure.
+    ///
+    /// `true` means this delta reached the legacy ledger (or was empty).
+    /// `false` means the caller may retry without double-counting it.
+    pub(crate) fn flush_merge(path: &Path, delta: &KittyLog) -> bool {
         if delta.is_empty() {
-            return; // no-op skip: never rewrite (or create) the file for nothing
+            return true; // no-op skip: never rewrite (or create) the file for nothing
+        }
+        // The lock files are siblings of the ledgers, so first-run profiles
+        // must create the config directory before attempting `open_lock`.
+        // This runs only on the background writer (or in focused tests), never
+        // on the render/present path. A hostile/non-directory final component
+        // fails open and leaves the delta in memory.
+        if !prepare_ledger_parent(path) {
+            return false;
         }
         let sidecar_path = collectibles_path(path);
-        let _legacy_lock = lock(path);
-        let _sidecar_lock = lock(&sidecar_path);
+        let Some((_legacy_lock, _sidecar_lock)) = lock_pair(path, &sidecar_path) else {
+            return false;
+        };
         let mut merged = Self::read(path);
         let embedded = std::mem::take(&mut merged.collectibles);
         let persisted = Self::read_collectible_store(&sidecar_path);
@@ -769,26 +831,65 @@ impl KittyLog {
             sidecar_was_valid || collection.collectibles.is_empty()
         };
         if !sidecar_safe {
-            return;
+            return false;
         }
         merged.merge_from(delta);
         merged.collectibles = collection.collectibles;
-        merged.write(path);
+        merged.write(path)
     }
 
     /// Best-effort atomic write: create-parent, pid+seq-unique sibling temp,
     /// rename (mirrors `Health::write` + `save_prefs_edits`). Never panics.
-    fn write(&self, path: &Path) {
-        let _ = atomic_write_toml(path, self);
+    fn write(&self, path: &Path) -> bool {
+        atomic_write_toml(path, self)
     }
 }
 
+/// Create and validate the ledger's immediate parent before lock acquisition.
+/// `create_dir_all` is idempotent for an ordinary first-run config directory;
+/// the post-create `symlink_metadata` check refuses a final symlink/reparse
+/// point instead of treating it as Kitty Log authority.
+fn prepare_ledger_parent(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(parent) else {
+        return false;
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn atomic_write_toml(path: &Path, value: &impl Serialize) -> bool {
+    use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    // A Kitty Log path is machine-owned, but its directory remains writable by
+    // the user. Never turn a planted FIFO/link/reparse point into a regular
+    // ledger as a side effect of best-effort observability.
+    if !ledger_destination_is_safe(path) {
+        return false;
+    }
     let Ok(text) = toml::to_string(value) else {
         return false;
     };
+    if text.len() > MAX_KITTY_LEDGER_BYTES {
+        return false;
+    }
     if let Some(parent) = path.parent()
         && std::fs::create_dir_all(parent).is_err()
     {
@@ -802,7 +903,20 @@ fn atomic_write_toml(path: &Path, value: &impl Serialize) -> bool {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    if std::fs::write(&tmp, text).is_err() {
+    // `create_new` is atomic and refuses a pre-planted temp symlink instead of
+    // following it and truncating an unrelated target.
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(text.as_bytes()));
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    // Narrow the replacement race. If the destination changed to a hostile
+    // type while TOML was serialized/staged, preserve it and discard our temp.
+    if !ledger_destination_is_safe(path) {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
@@ -814,21 +928,116 @@ fn atomic_write_toml(path: &Path, value: &impl Serialize) -> bool {
     }
 }
 
-/// Best-effort sibling lock (`kitty-log.toml.lock`) guarding a whole
-/// read→merge→write. `None` on failure — the caller proceeds unlocked rather
-/// than drop the flush (the ledger is observability, never a gate). Held for
-/// the guard's lifetime; `flock` is released by the kernel on drop/exit.
-fn lock(path: &Path) -> Option<std::fs::File> {
-    let f = std::fs::OpenOptions::new()
+/// Whether an atomic ledger commit may create or replace this final path.
+/// Missing is expected on first sighting; an existing target must itself be a
+/// regular, non-link file. `symlink_metadata` intentionally inspects the final
+/// directory entry rather than following it.
+fn ledger_destination_is_safe(path: &Path) -> bool {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn lock_not_regular() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "Kitty Log lock is not a regular non-link file",
+    )
+}
+
+/// Open one lock rendezvous without following or waiting on a hostile final
+/// component. The same handle which is subsequently locked is proved regular.
+#[cfg(unix)]
+fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         // A lock file is a rendezvous, not data — never clobber its contents.
         .truncate(false)
-        .open(path.with_extension("toml.lock"))
-        .ok()?;
-    f.lock().ok()?;
-    Some(f)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(lock_not_regular());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(lock_not_regular());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => return Err(lock_not_regular()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(lock_not_regular());
+    }
+    Ok(file)
+}
+
+/// Best-effort sibling lock (`kitty-log.toml.lock`) guarding a whole
+/// read→merge→write. Every failure, including another process owning the lock,
+/// returns immediately. Held for the guard's lifetime; the kernel releases the
+/// advisory lock on drop/exit.
+fn try_lock(path: &Path) -> Option<std::fs::File> {
+    let lock_path = path.with_extension("toml.lock");
+    let file = open_lock(&lock_path).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+fn lock_pair(legacy_path: &Path, sidecar_path: &Path) -> Option<(std::fs::File, std::fs::File)> {
+    let legacy = try_lock(legacy_path)?;
+    let sidecar = try_lock(sidecar_path)?;
+    Some((legacy, sidecar))
 }
 
 /// Best-effort RFC3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) — the ledger's
@@ -870,7 +1079,7 @@ pub(crate) struct KittyLogView {
     /// The host's revision counter at snapshot time (bumps once per recorded
     /// sighting — a cheap staleness check and the repaint fingerprint term).
     pub(crate) revision: u64,
-    /// The in-memory totals (startup file read + this session's sightings).
+    /// The in-memory totals (admitted startup ledger + this session's sightings).
     pub(crate) log: KittyLog,
 }
 
@@ -878,7 +1087,7 @@ impl Default for KittyLogView {
     /// The NEVER-SYNCED sentinel: `revision = u64::MAX` can never equal the
     /// host's counter (which starts at 0 and bumps once per sighting), so a
     /// freshly opened overlay always takes its first snapshot — even when the
-    /// host holds only the startup file read at revision 0.
+    /// host holds only the admitted startup ledger at revision 0.
     fn default() -> Self {
         Self {
             revision: u64::MAX,
@@ -902,9 +1111,9 @@ pub(crate) struct KittyLogHost {
     /// (no config dir — tests use this too, so they never touch the user's
     /// real ledger).
     path: Option<PathBuf>,
-    /// Display totals: the startup file read plus every sighting recorded
-    /// this session (flushed or not) — what the settings page renders,
-    /// memory-only, no IO on the interaction path.
+    /// Display totals: the asynchronously admitted startup ledger plus every
+    /// sighting recorded this session (flushed or not) — what the settings
+    /// page renders, memory-only, no IO on the interaction path.
     mem: KittyLog,
     /// Sightings recorded since the last flush (the read-merge-write delta).
     delta: KittyLog,
@@ -926,8 +1135,10 @@ pub(crate) struct KittyLogHost {
     /// in-memory-only host starts no thread. Deltas are handed over a bounded
     /// channel with a NON-blocking `try_send`, so the render thread never
     /// creates/joins a thread or blocks on disk IO (TYPING-5); [`flush_exit`]
-    /// sends the final delta and joins. `None` only for an in-memory host or a
-    /// failed pre-arm (which falls back to the exit-path inline flush).
+    /// offers the final delta and waits only [`EXIT_JOIN_BUDGET`]. The worker's
+    /// filesystem can stall indefinitely, so an unfinished worker is detached
+    /// at that deadline and cannot wedge quit. `None` only for an in-memory
+    /// host or a failed pre-arm; observability then remains memory-only.
     ///
     /// [`flush_exit`]: Self::flush_exit
     writer: Option<KittyWriter>,
@@ -943,38 +1154,137 @@ struct KittyWriter {
     /// Bounded so a pathologically slow disk can't grow an unbounded backlog;
     /// the sender `try_send`s and coalesces on full (see `maybe_flush`).
     tx: std::sync::mpsc::SyncSender<KittyLog>,
-    /// The worker; joined only by `flush_exit` (after the sender is dropped, so
-    /// `recv` returns `Err` and the loop exits cleanly).
-    handle: std::thread::JoinHandle<()>,
+    /// Dedicated one-shot exit lane. This queue is empty for the worker's
+    /// entire runtime and receives at most the final debounced tail, so a full
+    /// ordinary queue can never make shutdown silently discard that tail.
+    exit_tx: std::sync::mpsc::SyncSender<KittyLog>,
+    /// One-shot startup admission produced by this same background worker.
+    /// Polling is nonblocking and the receiver is discarded after one result.
+    initial: Option<std::sync::mpsc::Receiver<KittyLog>>,
+    /// The worker; joined only when it finishes within the quit deadline. A
+    /// completed worker returns any batch that exhausted its finite exit-flush
+    /// budget so the host, rather than thread teardown, retains ownership.
+    handle: std::thread::JoinHandle<KittyLog>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExitFlushResult {
+    persisted: bool,
+    attempts: usize,
+}
+
+fn flush_pending_at_exit(path: &Path, pending: &KittyLog) -> ExitFlushResult {
+    if pending.is_empty() {
+        return ExitFlushResult {
+            persisted: true,
+            attempts: 0,
+        };
+    }
+    for attempt in 1..=EXIT_LOCK_RETRIES {
+        if KittyLog::flush_merge(path, pending) {
+            return ExitFlushResult {
+                persisted: true,
+                attempts: attempt,
+            };
+        }
+        if attempt < EXIT_LOCK_RETRIES {
+            std::thread::sleep(EXIT_LOCK_RETRY_DELAY);
+        }
+    }
+    ExitFlushResult {
+        persisted: false,
+        attempts: EXIT_LOCK_RETRIES,
+    }
+}
+
+fn offer_exit_tail(
+    exit_tx: &std::sync::mpsc::SyncSender<KittyLog>,
+    tail: KittyLog,
+) -> Option<KittyLog> {
+    match exit_tx.try_send(tail) {
+        Ok(()) => None,
+        Err(
+            std::sync::mpsc::TrySendError::Full(tail)
+            | std::sync::mpsc::TrySendError::Disconnected(tail),
+        ) => Some(tail),
+    }
+}
+
+fn run_kitty_writer(
+    path: PathBuf,
+    rx: std::sync::mpsc::Receiver<KittyLog>,
+    exit_rx: std::sync::mpsc::Receiver<KittyLog>,
+    initial_tx: Option<std::sync::mpsc::SyncSender<KittyLog>>,
+) -> KittyLog {
+    // Startup ledger admission can stall on a remote/dead mount; keep it
+    // entirely off the UI thread. It is sampled before this worker accepts new
+    // deltas, so merging the one-shot result with session memory cannot
+    // double-count a flush.
+    if let Some(initial_tx) = initial_tx {
+        let _ = initial_tx.try_send(KittyLog::read_with_sidecar(&path));
+    }
+    // A contended batch stays owned by this worker and coalesces with later
+    // deliveries. The ordinary loop ends when its sender drops at shutdown.
+    let mut pending = KittyLog::default();
+    loop {
+        if pending.is_empty() {
+            let Ok(delta) = rx.recv() else { break };
+            pending.merge_from(&delta);
+        } else {
+            match rx.recv_timeout(FLUSH_RETRY_DELAY) {
+                Ok(delta) => pending.merge_from(&delta),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if KittyLog::flush_merge(&path, &pending) {
+            pending = KittyLog::default();
+        }
+    }
+    // The exit lane is independent of the capacity-one ordinary queue and its
+    // sender is dropped alongside `tx`, so this receive is finite. Merge the
+    // last debounced tail before applying the existing bounded exit retry.
+    if let Ok(tail) = exit_rx.recv() {
+        pending.merge_from(&tail);
+    }
+    if flush_pending_at_exit(&path, &pending).persisted {
+        KittyLog::default()
+    } else {
+        pending
+    }
 }
 
 impl KittyWriter {
     /// Spawn the worker bound to `path`. `None` if the thread can't be spawned
-    /// (best-effort, matching the old `.ok()` on spawn — the delta is dropped
-    /// inside the documented crash-loss window).
+    /// (best-effort, matching the old `.ok()` on spawn). The host then remains
+    /// memory-only and retains later deltas rather than attempting filesystem
+    /// work from the render or exit path.
     fn spawn(path: PathBuf) -> Option<Self> {
         // Depth 1: the worker can hold one in-flight batch while another queues;
         // a third arriving before the first drains coalesces back into `delta`.
         let (tx, rx) = std::sync::mpsc::sync_channel::<KittyLog>(1);
+        // This second capacity-one lane is reserved exclusively for
+        // `flush_exit`; it cannot be full from ordinary render-side traffic.
+        let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<KittyLog>(1);
+        let (initial_tx, initial_rx) = std::sync::mpsc::sync_channel::<KittyLog>(1);
         let handle = std::thread::Builder::new()
             .name("kitty-log-flush".into())
-            .spawn(move || {
-                // Each delta is a quick read-merge-write; the loop ends when the
-                // last sender drops (recv → Err), i.e. at `flush_exit`.
-                while let Ok(delta) = rx.recv() {
-                    KittyLog::flush_merge(&path, &delta);
-                }
-            })
+            .spawn(move || run_kitty_writer(path, rx, exit_rx, Some(initial_tx)))
             .ok()?;
-        Some(Self { tx, handle })
+        Some(Self {
+            tx,
+            exit_tx,
+            initial: Some(initial_rx),
+            handle,
+        })
     }
 }
 
 impl KittyLogHost {
     /// Host state persisting beside the given CONFIG path (the ledger is the
     /// `kitty-log.toml` sibling). `None` — or a parentless path — degrades to
-    /// in-memory-only. The one startup read is fail-open (absent / corrupt /
-    /// Containment-denied ⇒ empty).
+    /// in-memory-only. The worker's one startup read is fail-open (absent /
+    /// corrupt / Containment-denied ⇒ empty) and never delays construction.
     pub(crate) fn load(config_path: Option<PathBuf>) -> Self {
         Self::load_with_writer_spawn(config_path, KittyWriter::spawn)
     }
@@ -991,24 +1301,15 @@ impl KittyLogHost {
             .as_deref()
             .and_then(Path::parent)
             .map(|d| d.join(KITTY_LOG_FILE));
-        let mem = path
-            .as_deref()
-            .map(KittyLog::read_with_sidecar)
-            .unwrap_or_default();
-        let companion = mem
-            .collectibles
-            .iter()
-            .rev()
-            .find_map(KittyCollectible::look);
         // Pre-arm outside `observe`/present. A parked receiver consumes no CPU;
-        // the first sighting now performs only the bounded `try_send` below.
+        // the worker performs both startup admission and later persistence.
         let writer = path.clone().and_then(spawn);
         Self {
             path,
-            mem,
+            mem: KittyLog::default(),
             delta: KittyLog::default(),
             revision: 0,
-            companion,
+            companion: None,
             ring: Vec::new(),
             ring_next: 0,
             last_flush: None,
@@ -1023,22 +1324,81 @@ impl KittyLogHost {
         Self::load(None)
     }
 
-    /// The in-memory totals (the `controls prefs` closed-overlay fallback).
+    /// The in-memory totals exposed to model-level regression tests.
+    #[cfg(test)]
     pub(crate) fn log(&self) -> &KittyLog {
         &self.mem
     }
 
+    #[cfg(test)]
+    fn await_initial_load(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.initial.is_some())
+            && Instant::now() < deadline
+        {
+            self.poll_initial_load();
+            if self
+                .writer
+                .as_ref()
+                .is_some_and(|writer| writer.initial.is_some())
+            {
+                std::thread::yield_now();
+            }
+        }
+        self.poll_initial_load();
+    }
+
+    /// Import the worker's one-shot startup ledger without waiting. The worker
+    /// samples before processing any session delta; combining that immutable
+    /// base with `mem` therefore preserves sightings recorded while admission
+    /// was in flight without duplicating a persisted batch.
+    fn poll_initial_load(&mut self) {
+        let loaded = self.writer.as_mut().and_then(|writer| {
+            let receiver = writer.initial.as_ref()?;
+            match receiver.try_recv() {
+                Ok(loaded) => {
+                    writer.initial = None;
+                    Some(loaded)
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    writer.initial = None;
+                    None
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            }
+        });
+        let Some(mut loaded) = loaded else { return };
+        loaded.merge_from(&self.mem);
+        if loaded == self.mem {
+            return;
+        }
+        self.mem = loaded;
+        self.companion = self
+            .mem
+            .collectibles
+            .iter()
+            .rev()
+            .find_map(KittyCollectible::look);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     /// The current change stamp (bumps once per recorded sighting).
+    #[cfg(test)]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
 
     /// The collected identity used by the cursor companion (O(1), no I/O).
-    pub(crate) fn companion_look(&self) -> Option<KittyLook> {
+    pub(crate) fn companion_look(&mut self) -> Option<KittyLook> {
+        self.poll_initial_load();
         self.companion
     }
 
     /// Snapshot for the settings overlay (memory only — no IO).
+    #[cfg(test)]
     pub(crate) fn view(&self) -> KittyLogView {
         KittyLogView {
             revision: self.revision,
@@ -1063,6 +1423,7 @@ impl KittyLogHost {
     where
         I: IntoIterator<Item = KittySighting>,
     {
+        self.poll_initial_load();
         let mut discovery = None;
         for s in sightings {
             if !enabled {
@@ -1116,10 +1477,11 @@ impl KittyLogHost {
     /// worker does the whole read-merge-write; the render thread only performs a
     /// bounded `try_send`, so a slow/networked config dir can no longer stall a
     /// render frame (TYPING-5). If the worker is still busy with a prior
-    /// batch (bounded channel full), the delta is COALESCED back into `self.delta`
-    /// and retried on the next observe — no counts are lost. If construction-time
-    /// pre-arm failed, the delta remains resident for [`Self::flush_exit`]'s
-    /// inline durability fallback; render never retries thread creation.
+    /// batch (bounded channel full), the delta remains COALESCED in `self.delta`;
+    /// `flush_exit` offers that host-owned tail through the independent shutdown
+    /// lane. The worker's bounded backoff applies to batches it already owns. If
+    /// construction-time pre-arm failed, the delta remains resident; render and
+    /// quit never retry filesystem work synchronously.
     fn maybe_flush(&mut self, now: Instant) {
         if self.delta.is_empty() {
             return;
@@ -1134,8 +1496,8 @@ impl KittyLogHost {
             return; // in-memory-only: totals stay in `mem`, the delta is moot
         }
         let Some(writer) = self.writer.as_ref() else {
-            // Pre-arm failed. Keep the accumulated delta for `flush_exit`'s
-            // inline fallback; never retry thread creation from a render frame.
+            // Pre-arm failed. Keep the accumulated in-memory delta; never retry
+            // thread creation from a render frame or perform synchronous exit IO.
             return;
         };
         self.last_flush = Some(now);
@@ -1152,8 +1514,8 @@ impl KittyLogHost {
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(delta)) => {
                 // Worker died. Preserve the batch and detach the already-dead
-                // handle without joining from render; exit-time inline flush is
-                // now the sole durability owner.
+                // handle without joining from render. Observability remains
+                // memory-only rather than moving filesystem work onto the UI.
                 self.delta = delta;
                 self.last_flush = None;
                 let _ = self.writer.take();
@@ -1161,49 +1523,56 @@ impl KittyLogHost {
         }
     }
 
-    /// Exit-path flush: hand the writer any remaining delta with a BLOCKING send
-    /// (we are past the event loop — blocking is fine), then drop the sender so
-    /// the worker drains its queue, sees `recv → Err`, and exits, and join it —
-    /// so every batch lands before quit with no last-writer-wins race. With no
-    /// writer (in-memory-only, or nothing ever flushed) fall back to an inline
-    /// merge of whatever accumulated.
+    /// Exit-path flush: offer the writer any remaining delta without waiting,
+    /// close its channel, and join only if the worker finishes within
+    /// [`EXIT_JOIN_BUDGET`]. Advisory lock acquisition is nonblocking, but an
+    /// ordinary file operation can still stall forever on a dead mount; that
+    /// worker is detached at the deadline so best-effort observability can
+    /// never wedge process quit.
     pub(crate) fn flush_exit(&mut self) {
-        let delta = std::mem::take(&mut self.delta);
-        match self.writer.take() {
-            Some(KittyWriter { tx, handle }) => {
-                // Deliver the tail only if there's something to write; then drop
-                // the sender — the worker still drains any already-queued batch
-                // (buffered items survive the sender drop) before `recv → Err`.
-                let unsent = if delta.is_empty() {
-                    None
-                } else {
-                    tx.send(delta).err().map(|error| error.0)
-                };
-                drop(tx);
-                let _ = handle.join();
-                if let Some(delta) = unsent
-                    && let Some(path) = &self.path
-                {
-                    KittyLog::flush_merge(path, &delta);
-                }
+        self.poll_initial_load();
+        if let Some(KittyWriter {
+            tx,
+            exit_tx,
+            initial: _,
+            handle,
+        }) = self.writer.take()
+        {
+            let delta = std::mem::take(&mut self.delta);
+            if !delta.is_empty()
+                && let Some(delta) = offer_exit_tail(&exit_tx, delta)
+            {
+                // A disconnected worker cannot take ownership. Retain the
+                // batch in memory instead of reporting or modeling it as
+                // accepted; quit remains best-effort and nonblocking.
+                self.delta = delta;
             }
-            None => {
-                // No worker ever started (in-memory-only, or nothing flushed).
-                if !delta.is_empty()
-                    && let Some(path) = &self.path
-                {
-                    KittyLog::flush_merge(path, &delta);
-                }
+            drop(tx);
+            drop(exit_tx);
+            let deadline = Instant::now() + EXIT_JOIN_BUDGET;
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(EXIT_JOIN_POLL);
+            }
+            if handle.is_finished()
+                && let Ok(unpersisted) = handle.join()
+            {
+                // Retry exhaustion is not an ownership sink. The process is
+                // still quitting, but retaining the batch here keeps the
+                // lifecycle truthful and lets callers/tests observe that it
+                // was not durably accepted.
+                self.delta.merge_from(&unpersisted);
             }
         }
+        // `None` is the in-memory-only or pre-arm-failure path: never perform
+        // exit I/O there.
     }
 }
 
 // ---- The collection book (settings §F4.6) -------------------------------------------
 
-/// One rendered collection-book row — the SHARED model behind the settings
-/// painter, `SettingsState::controls_lines`, and the `controls prefs`
-/// closed-overlay fallback (screen == introspection by construction).
+/// One rendered collection-book row — shared by the legacy settings painter and
+/// `SettingsState::controls_lines` model tests. Native Settings owns its own compiled
+/// semantic projection.
 pub(crate) struct KittyBookRow {
     /// Rarity tier: `legendary` / `rare` / `traits` / `common`.
     pub(crate) tier: &'static str,
@@ -1350,10 +1719,9 @@ pub(crate) fn kitty_book(log: &KittyLog) -> KittyBook {
     }
 }
 
-/// Serialize the book as `kittylog …` introspection lines — consumed by BOTH
-/// `SettingsState::controls_lines` (open overlay) and the `read_aux_controls`
-/// closed-overlay fallback, from the same [`kitty_book`] model the painter
-/// renders (screen == introspection).
+/// Serialize the retired Settings-card book as `kittylog …` introspection lines for
+/// legacy model tests. Production `controls settings` compiles the native route's
+/// semantic tree and does not append an off-screen Kitty Log catalog.
 pub(crate) fn book_lines(log: &KittyLog) -> Vec<String> {
     let book = kitty_book(log);
     let mut out = Vec::with_capacity(book.rows.len() + 1);
@@ -1386,9 +1754,9 @@ pub(crate) fn book_lines(log: &KittyLog) -> Vec<String> {
 mod tests {
     use super::*;
     use aterm_effects::cat_glyphs_gen::CatGlyphId;
-    use aterm_effects::kitty_registry::{KittyMagic, KittyType};
-    use aterm_lexicon::LangSet;
-    use aterm_spec::derive::{kitty_collectibles_model, kitty_sidecar_durability_model};
+    use aterm_spec::derive::{
+        kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
+    };
     use aterm_spec::verify;
     use std::collections::BTreeMap;
 
@@ -1425,6 +1793,32 @@ mod tests {
         let mut old = log.clone();
         old.collectibles.clear();
         old.write(path);
+    }
+
+    fn exact_limit_toml(prefix: &str) -> String {
+        assert!(prefix.len() < MAX_KITTY_LEDGER_BYTES);
+        let mut text = String::with_capacity(MAX_KITTY_LEDGER_BYTES);
+        text.push_str(prefix);
+        text.push('#');
+        text.push_str(&"x".repeat(MAX_KITTY_LEDGER_BYTES - text.len()));
+        assert_eq!(text.len(), MAX_KITTY_LEDGER_BYTES);
+        text
+    }
+
+    fn host_startup_and_exit(config_path: PathBuf) -> (u64, usize) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let lex = Lexicon::builtin();
+            let mut host = KittyLogHost::load(Some(config_path));
+            host.await_initial_load();
+            let startup = (host.log().sightings, host.log().collectibles.len());
+            host.observe(91, [sighting(91)], lex, Instant::now(), true);
+            host.flush_exit();
+            let _ = done_tx.send(startup);
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("host startup plus background flush/exit must be bounded")
     }
 
     /// Both durable files round-trip and expose the same rollback-readable
@@ -1475,10 +1869,394 @@ mod tests {
         assert!(KittyLog::read(&p).is_empty(), "absent ⇒ empty");
         std::fs::write(&p, "not = [valid").unwrap();
         assert!(KittyLog::read(&p).is_empty(), "corrupt ⇒ empty");
+        std::fs::write(&p, [0xff, 0xfe]).unwrap();
+        assert!(KittyLog::read(&p).is_empty(), "non-UTF-8 ⇒ empty");
         std::fs::write(&p, "sightings = 3\nfuture_key = true\n").unwrap();
         let l = KittyLog::read(&p);
         assert_eq!(l.sightings, 3, "known fields survive unknown keys");
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn ledger_cap_accepts_exact_limit_and_rejects_oversized_sparse_files() {
+        let legacy = tmp("bounded-legacy");
+        std::fs::write(&legacy, exact_limit_toml("sightings = 7\n"))
+            .expect("write exact-limit legacy ledger");
+        assert_eq!(
+            KittyLog::read(&legacy).sightings,
+            7,
+            "the documented limit is inclusive"
+        );
+
+        let sidecar = collectibles_path(&legacy);
+        std::fs::write(
+            &sidecar,
+            exact_limit_toml("collectibles = []\nlegacy_mirror = []\n"),
+        )
+        .expect("write exact-limit sidecar");
+        assert_eq!(
+            KittyLog::read_collectible_store(&sidecar),
+            Some(KittyCollectibleStore {
+                collectibles: Vec::new(),
+                legacy_mirror: Some(Vec::new()),
+            }),
+            "the same inclusive boundary applies to the sidecar"
+        );
+
+        let oversized_legacy = tmp("oversized-sparse-legacy");
+        std::fs::File::create(&oversized_legacy)
+            .and_then(|file| file.set_len((MAX_KITTY_LEDGER_BYTES + 1) as u64))
+            .expect("create oversized sparse legacy ledger");
+        assert!(
+            KittyLog::read(&oversized_legacy).is_empty(),
+            "oversized legacy ledger fails open without reading its body"
+        );
+
+        let oversized_sidecar = collectibles_path(&oversized_legacy);
+        std::fs::File::create(&oversized_sidecar)
+            .and_then(|file| file.set_len((MAX_KITTY_LEDGER_BYTES + 1) as u64))
+            .expect("create oversized sparse collectible sidecar");
+        assert_eq!(
+            KittyLog::read_collectible_store(&oversized_sidecar),
+            None,
+            "oversized sidecar is the absent/default state"
+        );
+
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+        let _ = std::fs::remove_dir_all(oversized_legacy.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path CString");
+        // SAFETY: `path` is a live NUL-terminated pathname and `mkfifo` retains
+        // no pointer after returning.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_fifo_cannot_block_startup_or_background_flush_exit() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let legacy = tmp("fifo-legacy");
+        make_fifo(&legacy);
+        let config = legacy.with_file_name("aterm.toml");
+        assert_eq!(
+            host_startup_and_exit(config),
+            (0, 0),
+            "a writerless legacy FIFO is admitted as empty"
+        );
+        assert!(
+            std::fs::symlink_metadata(&legacy)
+                .expect("legacy FIFO remains")
+                .file_type()
+                .is_fifo(),
+            "best-effort flush must not replace a hostile legacy target"
+        );
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_fifo_cannot_block_startup_or_background_flush_exit() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let legacy = tmp("fifo-sidecar");
+        let sidecar = collectibles_path(&legacy);
+        make_fifo(&sidecar);
+        let config = legacy.with_file_name("aterm.toml");
+        assert_eq!(
+            host_startup_and_exit(config),
+            (0, 0),
+            "a writerless collectible FIFO is admitted as empty"
+        );
+        assert!(
+            std::fs::symlink_metadata(&sidecar)
+                .expect("sidecar FIFO remains")
+                .file_type()
+                .is_fifo(),
+            "best-effort flush must not replace a hostile sidecar target"
+        );
+        assert!(
+            !legacy.exists(),
+            "an unsafe authoritative sidecar must gate the mirror write"
+        );
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_lock_fifo_cannot_block_startup_or_flush_exit() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let legacy = tmp("fifo-lock");
+        let lock_path = legacy.with_extension("toml.lock");
+        make_fifo(&lock_path);
+        assert_eq!(
+            host_startup_and_exit(legacy.with_file_name("aterm.toml")),
+            (0, 0),
+            "a writerless lock FIFO must fail immediately"
+        );
+        assert!(
+            std::fs::symlink_metadata(&lock_path)
+                .expect("lock FIFO remains")
+                .file_type()
+                .is_fifo(),
+            "best-effort locking must not replace a hostile rendezvous"
+        );
+        assert!(!legacy.exists(), "an unlocked flush must be deferred");
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    }
+
+    #[test]
+    fn held_sibling_lock_never_parks_flush_exit() {
+        let legacy = tmp("held-lock");
+        let lock_path = legacy.with_extension("toml.lock");
+        let held = open_lock(&lock_path).expect("open first regular lock handle");
+        held.try_lock().expect("hold sibling lock");
+
+        assert_eq!(
+            host_startup_and_exit(legacy.with_file_name("aterm.toml")),
+            (0, 0),
+            "startup plus exit stays bounded while another process owns the lock"
+        );
+        assert!(!legacy.exists(), "a contended flush must not race unlocked");
+        drop(held);
+
+        let mut delta = KittyLog::default();
+        delta.record(&sighting(7), Lexicon::builtin(), "2026-07-21T00:00:00Z");
+        // The sibling lock this test held is not the only contender. `flush_exit`
+        // DETACHES a worker that outlives EXIT_JOIN_BUDGET — deliberate, so that
+        // process teardown wins over ledger durability — which means the host's
+        // own writer may still be working through its finite retry budget at this
+        // instant. `flush_merge` takes the lock with a SINGLE try, so asserting it
+        // succeeds the moment the sibling lock drops quietly required that
+        // detached thread to have already exited: a scheduling accident, not a
+        // property of the code. (Reproduced ~1 run in 4 of the full aterm-gui
+        // suite; never alone, because alone nothing delays the worker.)
+        //
+        // Retry within a bounded window instead. The claim — "once contention
+        // clears, the retained batch is writable" — is unchanged and still fails
+        // for a path that never becomes writable; only the accidental demand that
+        // contention already be over at one exact instant is dropped.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut wrote = KittyLog::flush_merge(&legacy, &delta);
+        while !wrote && Instant::now() < deadline {
+            std::thread::sleep(EXIT_LOCK_RETRY_DELAY);
+            wrote = KittyLog::flush_merge(&legacy, &delta);
+        }
+        assert!(
+            wrote,
+            "the same retained batch is writable after contention clears"
+        );
+        assert_eq!(KittyLog::read(&legacy).sightings, 1);
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    }
+
+    #[test]
+    fn finite_exit_lock_retries_conform_and_reject_dropped_pending_batch() {
+        let model = kitty_flush_worker_model();
+        let project = |accepted,
+                       normal_lane,
+                       host_tail,
+                       exit_lane,
+                       pending,
+                       persisted,
+                       exiting,
+                       retries,
+                       joined| {
+            [
+                ("accepted", accepted),
+                ("normal_lane", normal_lane),
+                ("host_tail", host_tail),
+                ("exit_lane", exit_lane),
+                ("pending", pending),
+                ("persisted", persisted),
+                ("exiting", exiting),
+                ("retries", retries),
+                ("joined", joined),
+                ("stalled", 0),
+                ("deadline", 0),
+                ("detached", 0),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+        };
+        let validate = |action: &str,
+                        before: &BTreeMap<&'static str, i64>,
+                        after: &BTreeMap<&'static str, i64>| {
+            let (ok, why) = verify::validate_transition_tiered(
+                &model,
+                &[],
+                before,
+                after,
+                Some(action),
+                "real Kitty Log finite exit flush",
+            );
+            assert!(ok, "model rejected {action}: {why}");
+        };
+
+        let initial = model.init_state();
+        let queued = project(1, 1, 0, 0, 0, 0, 0, 0, 0);
+        validate("QueueNormal", &initial, &queued);
+        let drained = project(1, 0, 0, 0, 1, 0, 0, 0, 0);
+        validate("DrainNormal", &queued, &drained);
+        assert!(
+            !model.action_enabled("Contend", &drained),
+            "active-runtime contention must not consume the fresh exit retry budget"
+        );
+        let exiting = project(1, 0, 0, 0, 1, 0, 1, 0, 0);
+        validate("BeginExit", &drained, &exiting);
+
+        let legacy = tmp("exit-retry-conformance");
+        let lock_path = legacy.with_extension("toml.lock");
+        let held = open_lock(&lock_path).expect("open first regular lock handle");
+        held.try_lock().expect("hold sibling lock");
+        let mut delta = KittyLog::default();
+        delta.record(&sighting(8), Lexicon::builtin(), "2026-07-21T00:00:00Z");
+        let result = flush_pending_at_exit(&legacy, &delta);
+        assert_eq!(
+            result,
+            ExitFlushResult {
+                persisted: false,
+                attempts: EXIT_LOCK_RETRIES,
+            },
+            "the shipping exit helper consumes exactly the finite retry budget"
+        );
+        assert!(
+            !legacy.exists(),
+            "contention must retain rather than race the batch"
+        );
+
+        let mut before = exiting;
+        for retry in 1..=result.attempts {
+            let after = project(1, 0, 0, 0, 1, 0, 1, retry as i64, 0);
+            validate("Contend", &before, &after);
+            before = after;
+        }
+        assert!(!model.action_enabled("Flush", &before));
+        assert!(!model.action_enabled("StallIo", &before));
+        let joined = project(1, 0, 0, 0, 1, 0, 1, EXIT_LOCK_RETRIES as i64, 1);
+        validate("Join", &before, &joined);
+
+        // Bind the whole genuine worker/host terminal lifecycle, not only the
+        // retry helper: with the lock held through shutdown, the worker returns
+        // its exhausted batch through JoinHandle and flush_exit restores host
+        // ownership exactly as the joined projection above requires.
+        let mut host = KittyLogHost::load(Some(legacy.clone()));
+        host.observe(9, [sighting(9)], Lexicon::builtin(), Instant::now(), true);
+        host.flush_exit();
+        assert!(host.writer.is_none());
+        assert_eq!(
+            host.delta.sightings, 1,
+            "retry exhaustion must return the worker-owned batch to the host"
+        );
+        assert!(
+            !legacy.exists(),
+            "the genuine worker must not claim a contended batch was persisted"
+        );
+        drop(held);
+
+        let dropped = project(1, 0, 0, 0, 0, 0, 1, 1, 0);
+        assert!(
+            !model.check_invariant("AcceptedConserved", &dropped),
+            "negative control: dropping a contended batch must violate conservation"
+        );
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_lock_symlink_is_neither_followed_nor_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let legacy = tmp("symlink-lock");
+        let lock_path = legacy.with_extension("toml.lock");
+        let victim = legacy.with_file_name("lock-victim");
+        std::fs::write(&victim, "untouched").expect("write lock victim");
+        symlink(&victim, &lock_path).expect("plant final lock symlink");
+
+        assert_eq!(
+            host_startup_and_exit(legacy.with_file_name("aterm.toml")),
+            (0, 0),
+            "a final lock symlink must fail immediately"
+        );
+        assert!(
+            std::fs::symlink_metadata(&lock_path)
+                .expect("lock link remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read untouched lock victim"),
+            "untouched"
+        );
+        assert!(!legacy.exists(), "an unlocked flush must be deferred");
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_ledgers_are_neither_followed_nor_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let legacy = tmp("symlink-legacy");
+        let victim = legacy.with_file_name("legacy-victim.toml");
+        let victim_text = "sightings = 99\n";
+        std::fs::write(&victim, victim_text).expect("write legacy victim");
+        symlink(&victim, &legacy).expect("plant legacy final symlink");
+        assert_eq!(
+            host_startup_and_exit(legacy.with_file_name("aterm.toml")),
+            (0, 0),
+            "startup must not follow the legacy symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&legacy)
+                .expect("legacy link remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read untouched legacy victim"),
+            victim_text
+        );
+
+        let sidecar_legacy = tmp("symlink-sidecar");
+        let sidecar = collectibles_path(&sidecar_legacy);
+        let sidecar_victim = sidecar_legacy.with_file_name("sidecar-victim.toml");
+        let lex = Lexicon::builtin();
+        let mut seeded = KittyLog::default();
+        seeded.record(&sighting(1), lex, "2026-07-01T00:00:00Z");
+        let sidecar_victim_text =
+            toml::to_string(&KittyCollectibleStore::mirrored(&seeded.collectibles))
+                .expect("serialize sidecar victim");
+        std::fs::write(&sidecar_victim, &sidecar_victim_text).expect("write sidecar victim");
+        symlink(&sidecar_victim, &sidecar).expect("plant sidecar final symlink");
+        assert_eq!(
+            host_startup_and_exit(sidecar_legacy.with_file_name("aterm.toml")),
+            (0, 0),
+            "startup must not follow the sidecar symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&sidecar)
+                .expect("sidecar link remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sidecar_victim).expect("read untouched sidecar victim"),
+            sidecar_victim_text
+        );
+        assert!(
+            !sidecar_legacy.exists(),
+            "an unsafe authoritative sidecar must gate the mirror write"
+        );
+
+        let _ = std::fs::remove_dir_all(legacy.parent().unwrap());
+        let _ = std::fs::remove_dir_all(sidecar_legacy.parent().unwrap());
     }
 
     /// Flushing merges with what another process already wrote (summed
@@ -1517,6 +2295,27 @@ mod tests {
         assert_eq!(cell.langs, ["en", "ms"], "chips union");
         assert_eq!(merged.last_seen, "2026-07-03T09:00:00Z");
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn first_flush_bootstraps_a_missing_config_directory_before_locking() {
+        let seed = tmp("missing-parent");
+        let root = seed.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&root).unwrap();
+        let path = root.join("fresh/profile").join(KITTY_LOG_FILE);
+        let lex = Lexicon::builtin();
+        let mut delta = KittyLog::default();
+        delta.record(&sighting(1), lex, "2026-07-01T09:00:00Z");
+
+        assert!(KittyLog::flush_merge(&path, &delta));
+        assert_eq!(KittyLog::read_with_sidecar(&path).sightings, 1);
+        assert!(path.with_extension("toml.lock").is_file());
+        assert!(
+            collectibles_path(&path)
+                .with_extension("toml.lock")
+                .is_file()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2077,16 +2876,23 @@ mod tests {
         // Process B flushes the later discovery before delayed process A.
         let late = delta(CatGlyphId::SpecSleeping, 12, "2026-07-02T00:00:00Z");
         let early = delta(CatGlyphId::SpecWitch, 3, "2026-07-01T00:00:00Z");
-        KittyLog::flush_merge(&p, &late);
-        KittyLog::flush_merge(&p, &early);
+        let flush = |delta: &KittyLog| {
+            let result = flush_pending_at_exit(&p, delta);
+            assert!(
+                result.persisted,
+                "the semantic ordering check requires an accepted durable flush"
+            );
+        };
+        flush(&late);
+        flush(&early);
 
         // The same semantic key also arrives out of order. Its collectible
         // appearance must come from the earliest discovery, not the process
         // that happened to acquire the file lock first.
         let same_late = delta(CatGlyphId::SpecYarn, 14, "2026-07-03T00:00:00Z");
         let same_early = delta(CatGlyphId::SpecYarn, 1, "2026-06-30T00:00:00Z");
-        KittyLog::flush_merge(&p, &same_late);
-        KittyLog::flush_merge(&p, &same_early);
+        flush(&same_late);
+        flush(&same_early);
 
         let loaded = KittyLog::read_with_sidecar(&p);
         assert_eq!(
@@ -2104,7 +2910,8 @@ mod tests {
         assert_eq!(yarn.first_seen, "2026-06-30T00:00:00Z");
         assert_eq!(yarn.last_seen, "2026-07-03T00:00:00Z");
 
-        let host = KittyLogHost::load(Some(p.clone()));
+        let mut host = KittyLogHost::load(Some(p.clone()));
+        host.await_initial_load();
         assert_eq!(
             host.companion_look().map(|look| look.variant),
             Some(CatGlyphId::SpecSleeping),
@@ -2115,13 +2922,14 @@ mod tests {
             Some("Cinnamon Roll"),
             "rarest selection consumes chronological ledger order"
         );
+        host.flush_exit();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     /// TYPING-5 negative control: even when the one construction-time writer
     /// pre-arm fails, observing the first sighting must not retry a thread spawn
-    /// from the render path. The delta stays resident and `flush_exit` preserves
-    /// the existing inline durability fallback.
+    /// from the render path. The delta stays resident, while `flush_exit` avoids
+    /// a synchronous filesystem fallback that could wedge quit.
     #[test]
     fn observe_never_spawns_after_writer_prearm_failure() {
         let lex = Lexicon::builtin();
@@ -2151,19 +2959,29 @@ mod tests {
         );
 
         host.flush_exit();
-        assert_eq!(KittyLog::read_with_sidecar(&ledger).sightings, 1);
+        assert!(
+            !ledger.exists(),
+            "a failed pre-arm degrades observability instead of doing exit IO"
+        );
         let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
     }
 
     #[test]
-    fn disconnected_prearmed_writer_preserves_delta_for_exit_flush() {
+    fn disconnected_prearmed_writer_keeps_delta_in_memory_without_exit_io() {
         let lex = Lexicon::builtin();
         let ledger = tmp("writer-disconnected");
         let mut host = KittyLogHost::load_with_writer_spawn(Some(ledger.clone()), |_| {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
             drop(rx);
-            let handle = std::thread::spawn(|| {});
-            Some(KittyWriter { tx, handle })
+            drop(exit_rx);
+            let handle = std::thread::spawn(KittyLog::default);
+            Some(KittyWriter {
+                tx,
+                exit_tx,
+                initial: None,
+                handle,
+            })
         });
 
         host.observe(7, [sighting(11)], lex, Instant::now(), true);
@@ -2173,16 +2991,282 @@ mod tests {
         );
         assert_eq!(host.delta.sightings, 1, "the rejected batch stays owned");
         host.flush_exit();
+        assert!(
+            !ledger.exists(),
+            "a failed pre-arm must not fall back to synchronous exit IO"
+        );
+        let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
+    }
+
+    #[test]
+    fn exit_detaches_a_filesystem_stalled_worker_at_the_deadline() {
+        let lex = Lexicon::builtin();
+        let ledger = tmp("writer-stalled-exit");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut host = KittyLogHost::load_with_writer_spawn(Some(ledger.clone()), |_| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::spawn(move || {
+                let owned_batch = rx.recv().unwrap_or_default();
+                let _ = release_rx.recv();
+                drop(exit_rx);
+                owned_batch
+            });
+            Some(KittyWriter {
+                tx,
+                exit_tx,
+                initial: None,
+                handle,
+            })
+        });
+        host.observe(7, [sighting(11)], lex, Instant::now(), true);
+
+        let started = Instant::now();
+        host.flush_exit();
+        assert!(
+            started.elapsed() < EXIT_JOIN_BUDGET + Duration::from_millis(100),
+            "quit must detach a worker whose regular-file operation never returns"
+        );
+
+        // Tier-1 projection of that genuine stalled worker: delivery and exit
+        // precede the unreturned IO, the UI-owned deadline advances without
+        // mutating the accepted batch, and only its final edge admits detach.
+        let model = kitty_flush_worker_model();
+        let project = |stalled, deadline, detached| {
+            [
+                ("accepted", 1),
+                ("normal_lane", 0),
+                ("host_tail", 0),
+                ("exit_lane", 0),
+                ("pending", 1),
+                ("persisted", 0),
+                ("exiting", 1),
+                ("retries", 0),
+                ("joined", 0),
+                ("stalled", stalled),
+                ("deadline", deadline),
+                ("detached", detached),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+        };
+        let before_stall = project(0, 0, 0);
+        let stalled = project(1, 0, 0);
+        let tick_one = project(1, 1, 0);
+        let tick_two = project(1, 2, 0);
+        let detached = project(1, 2, 1);
+        for (action, before, after) in [
+            ("StallIo", &before_stall, &stalled),
+            ("TickDeadline", &stalled, &tick_one),
+            ("TickDeadline", &tick_one, &tick_two),
+            ("Detach", &tick_two, &detached),
+        ] {
+            let (ok, why) = verify::validate_transition_tiered(
+                &model,
+                &[],
+                before,
+                after,
+                Some(action),
+                "real Kitty Log stalled-IO exit deadline",
+            );
+            assert!(ok, "model rejected {action}: {why}");
+        }
+        let early_detach = project(1, 0, 1);
+        assert!(
+            !model.check_invariant("DetachedOnlyAtDeadline", &early_detach),
+            "negative control: detaching before the deadline must be rejected"
+        );
+        let _ = release_tx.send(());
+        let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
+    }
+
+    #[test]
+    fn contended_batch_retries_after_lock_release_without_a_new_sighting() {
+        let lex = Lexicon::builtin();
+        let ledger = tmp("writer-lock-retry");
+        let sidecar = collectibles_path(&ledger);
+        let locks = lock_pair(&ledger, &sidecar).expect("hold both ledger locks");
+        let mut host = KittyLogHost::load(Some(ledger.clone()));
+        host.observe(7, [sighting(11)], lex, Instant::now(), true);
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(!ledger.exists(), "held lock keeps the batch pending");
+
+        drop(locks);
+        let deadline = Instant::now() + FLUSH_RETRY_DELAY + Duration::from_secs(2);
+        while !ledger.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ledger.exists(),
+            "the pending worker batch retries without another sighting"
+        );
+        host.flush_exit();
         assert_eq!(KittyLog::read_with_sidecar(&ledger).sightings, 1);
+        let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
+    }
+
+    #[test]
+    fn full_normal_queue_cannot_drop_the_dedicated_exit_tail() {
+        let ledger = tmp("writer-full-normal-exit-tail");
+        let lex = Lexicon::builtin();
+        // The injected worker takes batch one into its local accumulator, tells
+        // the test that ownership moved, then waits on the exit lane before it
+        // touches the ordinary receiver again. Batch two therefore fills the
+        // capacity-one normal queue and debounced batch three remains host-owned:
+        // all three real ownership containers are occupied simultaneously.
+        // Only the REAL KittyLogHost::flush_exit call can unblock the worker.
+        // Reverting that call site to `tx.try_send` would hit Full, close exit_rx
+        // without a tail, and fail without depending on thread scheduling.
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let mut host = KittyLogHost::load_with_writer_spawn(Some(ledger.clone()), move |path| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<KittyLog>(1);
+            let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<KittyLog>(1);
+            let handle = std::thread::spawn(move || {
+                let Ok(mut pending) = rx.recv() else {
+                    return KittyLog::default();
+                };
+                let _ = pending_tx.send(());
+                let Ok(tail) = exit_rx.recv() else {
+                    return pending;
+                };
+                let Ok(normal) = rx.recv() else {
+                    pending.merge_from(&tail);
+                    return pending;
+                };
+                pending.merge_from(&normal);
+                pending.merge_from(&tail);
+                if KittyLog::flush_merge(&path, &pending) {
+                    KittyLog::default()
+                } else {
+                    pending
+                }
+            });
+            Some(KittyWriter {
+                tx,
+                exit_tx,
+                initial: None,
+                handle,
+            })
+        });
+        let t0 = Instant::now();
+        host.observe(7, [sighting(11)], lex, t0, true);
+        assert!(host.delta.is_empty(), "the normal queue accepted batch one");
+        pending_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the worker owns batch one before the queue is refilled");
+        host.observe(8, [sighting(22)], lex, t0 + FLUSH_DEBOUNCE, true);
+        assert!(host.delta.is_empty(), "the normal queue accepted batch two");
+        host.observe(
+            9,
+            [sighting(33)],
+            lex,
+            t0 + FLUSH_DEBOUNCE + Duration::from_secs(1),
+            true,
+        );
+        assert_eq!(
+            host.delta.sightings, 1,
+            "batch three remains host-owned while pending and normal are occupied"
+        );
+
+        // Tier-1: expose each genuine ownership handoff. The ordinary queue is
+        // full, so the second accepted batch remains host-owned until exit,
+        // crosses the dedicated lane, and is absorbed only after the normal
+        // batch drains. The Buggy branch below is the retired one-lane send: it
+        // clears host ownership without establishing exit-lane ownership.
+        let model = kitty_flush_worker_model();
+        let project =
+            |accepted, normal_lane, host_tail, exit_lane, pending, persisted, exiting, joined| {
+                [
+                    ("accepted", accepted),
+                    ("normal_lane", normal_lane),
+                    ("host_tail", host_tail),
+                    ("exit_lane", exit_lane),
+                    ("pending", pending),
+                    ("persisted", persisted),
+                    ("exiting", exiting),
+                    ("retries", 0),
+                    ("joined", joined),
+                    ("stalled", 0),
+                    ("deadline", 0),
+                    ("detached", 0),
+                ]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+            };
+        let validate = |action: &str,
+                        before: &BTreeMap<&'static str, i64>,
+                        after: &BTreeMap<&'static str, i64>| {
+            let (ok, why) = verify::validate_transition_tiered(
+                &model,
+                &[],
+                before,
+                after,
+                Some(action),
+                "Kitty Log dedicated exit-tail delivery",
+            );
+            assert!(ok, "model rejected {action}: {why}");
+        };
+        let initial = model.init_state();
+        let queued_one = project(1, 1, 0, 0, 0, 0, 0, 0);
+        validate("QueueNormal", &initial, &queued_one);
+        let pending_one = project(1, 0, 0, 0, 1, 0, 0, 0);
+        validate("DrainNormal", &queued_one, &pending_one);
+        let queued_two = project(2, 1, 0, 0, 1, 0, 0, 0);
+        validate("QueueNormal", &pending_one, &queued_two);
+        let retained = project(3, 1, 1, 0, 1, 0, 0, 0);
+        validate("RetainTailOnFull", &queued_two, &retained);
+        let exiting = project(3, 1, 1, 0, 1, 0, 1, 0);
+        validate("BeginExit", &retained, &exiting);
+        let offered = project(3, 1, 0, 1, 1, 0, 1, 0);
+        validate("OfferTail", &exiting, &offered);
+        let normal_pending = project(3, 0, 0, 1, 2, 0, 1, 0);
+        validate("DrainNormal", &offered, &normal_pending);
+        let both_pending = project(3, 0, 0, 0, 3, 0, 1, 0);
+        validate("AbsorbTail", &normal_pending, &both_pending);
+
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let mut dropped_tail = buggy.init_state();
+        for action in [
+            "QueueNormal",
+            "DrainNormal",
+            "QueueNormal",
+            "RetainTailOnFull",
+            "BeginExit",
+            "OfferTail",
+        ] {
+            assert!(buggy.fire(action, &mut dropped_tail), "buggy {action}");
+        }
+        assert_eq!(dropped_tail["accepted"], 3);
+        assert_eq!(dropped_tail["pending"], 1);
+        assert_eq!(dropped_tail["normal_lane"], 1);
+        assert!(
+            !buggy.check_invariant("AcceptedConserved", &dropped_tail),
+            "negative control: the retired saturated one-lane exit send must lose ownership"
+        );
+
+        host.flush_exit();
+        assert!(
+            host.delta.is_empty(),
+            "successful shutdown transfers and persists every owned batch"
+        );
+        let saved = KittyLog::read_with_sidecar(&ledger);
+        assert_eq!(saved.sightings, 3);
+        assert_eq!(saved.collectibles.len(), 1);
+        assert_eq!(saved.collectibles[0].count, 3);
+        let persisted = project(3, 0, 0, 0, 0, 3, 1, 0);
+        validate("Flush", &both_pending, &persisted);
+        let joined = project(3, 0, 0, 0, 0, 3, 1, 1);
+        validate("Join", &persisted, &joined);
         let _ = std::fs::remove_dir_all(ledger.parent().unwrap());
     }
 
     /// The long-lived writer path end-to-end (TYPING-5): a real-path host
     /// pre-arms ONE background worker before any sighting; `observe` hands its
     /// delta over the bounded channel without replacing/spawning a worker. A
-    /// second sighting is debounced and accumulates; `flush_exit` delivers the
-    /// tail, drops the sender, and JOINS the worker, so every count is durable
-    /// before quit.
+    /// second sighting is debounced and accumulates; `flush_exit` offers the
+    /// tail over its shutdown-only lane and joins the healthy local worker
+    /// within its finite deadline, so every count is durable before quit
+    /// without trusting filesystem latency or ordinary-queue scheduling.
     #[test]
     fn background_writer_persists_and_drains_on_exit() {
         let lex = Lexicon::builtin();

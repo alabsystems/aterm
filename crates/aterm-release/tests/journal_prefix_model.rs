@@ -29,6 +29,9 @@ mod ledger;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
+#[path = "../src/mirror.rs"]
+#[allow(dead_code)]
+mod mirror;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
@@ -45,7 +48,7 @@ fn journal(done: Vec<String>) -> publish::Journal {
     let release_id = done.iter().any(|step| step == "draft").then_some(55);
     publish::Journal {
         format: publish::JOURNAL_FORMAT,
-        version: "0.55".into(),
+        version: "0.55.0".into(),
         build_number: 55,
         commit: "0123456789abcdef0123456789abcdef01234567".into(),
         min_build: Some(55),
@@ -56,6 +59,11 @@ fn journal(done: Vec<String>) -> publish::Journal {
         release_id,
         draft_create_issued: release_id.is_some(),
         upload_intents: Vec::new(),
+        // The public-channel mirror capability is a separate one-shot set; a
+        // prefix model over the private steps never issues against it.
+        mirror_release_id: None,
+        mirror_create_issued: false,
+        mirror_upload_intents: Vec::new(),
         done,
     }
 }
@@ -172,9 +180,17 @@ fn every_production_done_subset_matches_exact_prefix_model() {
     ] {
         assert!(journal(done).save(&path).is_err());
     }
-    let mut bad_version = journal(Vec::new());
-    bad_version.version = "0.55.1".into();
-    assert!(bad_version.save(&path).is_err());
+    // The journal carries the canonical MAJOR.MINOR.PATCH release version, so
+    // the retired two-component spelling, an over-long one, and a non-canonical
+    // leading-zero component are all refused before any resume authority.
+    for bad in ["0.55", "0.55.1.2", "0.55.01", "0.55.x", ""] {
+        let mut bad_version = journal(Vec::new());
+        bad_version.version = bad.into();
+        assert!(
+            bad_version.save(&path).is_err(),
+            "journal accepted non-canonical version {bad:?}"
+        );
+    }
     let mut bad_owner = journal(Vec::new());
     bad_owner.commit = "abcd".into();
     assert!(bad_owner.save(&path).is_err());

@@ -80,7 +80,9 @@ fn project(s: &Surface) -> (u64, u64) {
 fn validate_transition(prev: (u64, u64), next: (u64, u64)) -> (bool, String) {
     let m = ring_model();
     let state = |(seq, lo): (u64, u64)| -> BTreeMap<&'static str, i64> {
-        [("seq", seq as i64), ("lo", lo as i64)].into_iter().collect()
+        [("seq", seq as i64), ("lo", lo as i64)]
+            .into_iter()
+            .collect()
     };
     verify::validate_transition_tiered(
         &m,
@@ -106,7 +108,6 @@ fn drive_real_eventlog(n: u64) -> Vec<(u64, u64)> {
 
 #[test]
 fn real_eventlog_conforms_to_ring_spec() {
-
     let dir = std::env::temp_dir().join(format!("aterm-conf-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mk tempdir");
 

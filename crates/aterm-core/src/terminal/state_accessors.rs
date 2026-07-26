@@ -638,19 +638,35 @@ impl Terminal {
     /// like the other host authorizations and are excluded from checkpoints.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "hyperlink_scheme_cap", action = "Authorize")
+        aterm_spec::refines(
+            machine = "hyperlink_scheme_cap",
+            action = "Authorize",
+            project = "conformance_hyperlink_scheme_cap::project"
+        )
     )]
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "hyperlink_scheme_cap", action = "AuthorizeOther")
+        aterm_spec::refines(
+            machine = "hyperlink_scheme_cap",
+            action = "AuthorizeOther",
+            project = "conformance_hyperlink_scheme_cap::project"
+        )
     )]
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "hyperlink_scheme_cap", action = "RefuseAtCap")
+        aterm_spec::refines(
+            machine = "hyperlink_scheme_cap",
+            action = "RefuseAtCap",
+            project = "conformance_hyperlink_scheme_cap::project"
+        )
     )]
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "hyperlink_scheme_cap", action = "RefuseNeverAllow")
+        aterm_spec::refines(
+            machine = "hyperlink_scheme_cap",
+            action = "RefuseNeverAllow",
+            project = "conformance_hyperlink_scheme_cap::project"
+        )
     )]
     pub fn authorize_hyperlink_scheme(&mut self, scheme: &str) -> bool {
         self.hyperlink_auth.authorize_scheme(scheme)
@@ -661,7 +677,11 @@ impl Terminal {
     /// scheme are refused at parse time again. Absent schemes are a no-op.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "hyperlink_scheme_cap", action = "Revoke")
+        aterm_spec::refines(
+            machine = "hyperlink_scheme_cap",
+            action = "Revoke",
+            project = "conformance_hyperlink_scheme_cap::project"
+        )
     )]
     pub fn revoke_hyperlink_scheme(&mut self, scheme: &str) {
         self.hyperlink_auth.revoke_scheme(scheme);

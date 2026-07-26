@@ -18,8 +18,8 @@ use aterm_spec::interp::{State, admits};
 use crate::document_store::{DocumentStore, DocumentTxnOutcome, TextEdit};
 use crate::native_app::{
     AppEffect, AppEvent, AppKind, AppViewState, CompletionSink, ConfigPatch, ConfigPatchOutcome,
-    EditorApp, EditorViewState, ExternalOpenOutcome, MarkdownApp, MarkdownViewState, NativeApp,
-    NativeRuntime, ReplyToken, SemanticInput, ServiceId, WorkOwner,
+    EditorApp, ExternalOpenOutcome, MarkdownApp, MarkdownViewState, NativeApp, NativeRuntime,
+    ReplyToken, SemanticInput, ServiceId, WorkOwner,
 };
 use crate::native_config_service::{
     ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ExpectedValue, VersionedConfigService,
@@ -357,7 +357,7 @@ impl AsyncHarness {
             .attach_view(
                 ViewId::from_stored(3),
                 editor_instance,
-                AppViewState::Editor(EditorViewState::default()),
+                AppViewState::Editor(Box::default()),
             )
             .expect("Editor view");
 
@@ -600,8 +600,9 @@ impl AsyncHarness {
             DocumentTxnOutcome::Committed { .. }
         ));
         let snapshot = self.documents.snapshot(self.document).unwrap();
+        let revision = self.documents.revision(self.document).unwrap();
         self.runtime
-            .publish_document(self.document, &snapshot.text, true);
+            .publish_document(self.document, &snapshot.text, revision, true);
         self.facts.accepted += 1;
         self.facts.state_updates += 1;
     }

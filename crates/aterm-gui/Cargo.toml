@@ -20,10 +20,10 @@ path = "src/main.rs"
 # into the inline-image placement/blit path). The production `cargo build
 # -p aterm-gui` therefore renders sixel; a consumer that wants the byte-identical
 # no-sixel engine can still build with `--no-default-features`.
-# `a11y-accesskit` is ON by default too: every overlay surface (Settings / About /
-# Palette / Update) fans its ONE model out to a cross-platform accessibility tree
-# (see `src/overlay.rs::OverlayModel::a11y`), so a screen reader reads the same
-# state the pixels + `controls` verb do. The EXACT-pinned `accesskit_winit =0.33.1`
+# `a11y-accesskit` is ON by default too: native tab apps (including Settings,
+# Manual, About, and Update) and the transient command palette expose the same
+# semantic model their renderer consumes, so a screen reader reads the same state
+# the pixels + `controls` verb do. The EXACT-pinned `accesskit_winit =0.33.1`
 # resolves against the vendored winit 0.30.13 through the workspace
 # `[patch.crates-io]` redirect (a SINGLE winit instance links), so shipping it on is
 # clean today. On macOS it is mutually exclusive with `a11y-appkit` (both claim the
@@ -51,9 +51,9 @@ a11y-appkit = [
     # the build only with the publisher — the default build stays byte-identical.
     "objc2-foundation/NSRange",
 ]
-# CROSS-PLATFORM accessibility via AccessKit: every overlay surface (Settings / About /
-# Palette / Update) maps its ONE model to a native a11y tree (UIA on Windows, AT-SPI on
-# Linux, NSAccessibility on macOS) from the SAME model the pixels + `controls` verb use.
+# CROSS-PLATFORM accessibility via AccessKit: native tab apps and the command palette
+# map their renderer-owned semantic models to native a11y trees (UIA on Windows, AT-SPI
+# on Linux, NSAccessibility on macOS) from the SAME data the pixels consume.
 # ON by default (see `default` above) now that it links cleanly against the vendored winit
 # 0.30.13 (single winit instance via the workspace patch). Mutually exclusive with
 # `a11y-appkit` on macOS (both would claim the content view's accessibility tree), enforced
@@ -107,6 +107,11 @@ aterm-policy = { workspace = true }
 # notarized + Team-ID-pinned DMG, and swaps aterm.app on next launch. Inert in a
 # plain `cargo build` (no pinned Team ID) and a no-op outside an installed .app.
 aterm-update = { workspace = true }
+# Manual's config language service validates package-owner slugs with the exact
+# URL-safety predicate consumed by both the updater and atpkg. The crate is
+# already present through those dependencies; naming it here prevents a second,
+# subtly different validator from drifting into the editor.
+aterm-update-core = { workspace = true }
 # Settings ▸ Packages: read the co-located toolchain manager's OWN durable state
 # (status.toml, dev-link markers, inert/enabled posture) in-process — same source
 # of truth as the `atpkg` verbs, no parallel parser to drift. Network/install
@@ -256,7 +261,7 @@ x11rb = { version = "0.13", default-features = false }
 # Markdown and editor tab actions; these are binding features in the same crate.
 # AppKit (objc2-app-kit 0.2) is already linked
 # in-process via softbuffer/winit; these add bindings, not a dep.
-objc2-app-kit = { version = "0.2", features = ["NSGraphics", "NSColorSpace", "NSColor", "NSWindow", "NSView", "NSResponder", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSRunningApplication", "NSPasteboard", "NSToolbar", "NSToolbarItem", "NSImage", "NSControl", "NSCell", "NSButton", "NSBezierPath", "NSText", "NSTextField", "NSFont", "NSTrackingArea", "NSSegmentedControl", "NSSegmentedCell", "NSAnimation", "NSAppearance", "NSAlert", "NSPanel", "NSSavePanel", "NSOpenPanel"] }
+objc2-app-kit = { version = "0.2", features = ["block2", "NSGraphics", "NSColorSpace", "NSColor", "NSWindow", "NSView", "NSResponder", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSRunningApplication", "NSPasteboard", "NSToolbar", "NSToolbarItem", "NSImage", "NSControl", "NSCell", "NSButton", "NSBezierPath", "NSText", "NSTextField", "NSFont", "NSTrackingArea", "NSSegmentedControl", "NSSegmentedCell", "NSAnimation", "NSAppearance", "NSAlert", "NSPanel", "NSSavePanel", "NSOpenPanel"] }
 # objc2 + objc2-foundation are now ALWAYS built on macOS (not just the optional
 # `a11y-appkit` feature): menu.rs declares an NSObject action target (objc2's
 # declare_class!) and uses NSString/MainThreadMarker for the menu. Both are
@@ -265,6 +270,7 @@ objc2-app-kit = { version = "0.2", features = ["NSGraphics", "NSColorSpace", "NS
 # bindings; the base crates are no longer gated behind it.)
 objc2-foundation = { version = "0.2", features = ["NSString", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop"] }
 objc2 = { version = "0.5" }
+block2 = "0.5"
 # macOS Keychain storage for network-drive tokens (net_connections.rs): a saved
 # connection's drive secret lives in the Keychain (generic password), never in
 # aterm.toml. Only the small `passwords` API is used (Security.framework is an

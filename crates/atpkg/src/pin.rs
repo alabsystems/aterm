@@ -19,6 +19,9 @@ use std::path::PathBuf;
 use crate::platform::ensure_private_dir;
 use crate::store::Layout;
 
+const MAX_PIN_FILE_BYTES: usize = 256 * 1024;
+const MAX_PINNED_PROGRAMS: usize = 2048;
+
 /// `pins` — the `0600` newline-delimited pin-state file directly under the vetted prefix.
 fn pins_path(layout: &Layout) -> PathBuf {
     layout.prefix.join("pins")
@@ -28,15 +31,19 @@ fn pins_path(layout: &Layout) -> PathBuf {
 /// suppression state, not trust input — its absence must never be an error).
 #[must_use]
 pub fn pinned_set(layout: &Layout) -> BTreeSet<String> {
-    fs::read_to_string(pins_path(layout))
-        .map(|body| {
-            body.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    let Ok(body) =
+        crate::metadata_io::read_bounded_regular_utf8(&pins_path(layout), MAX_PIN_FILE_BYTES)
+    else {
+        return BTreeSet::new();
+    };
+    let mut out = BTreeSet::new();
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if out.len() >= MAX_PINNED_PROGRAMS {
+            return BTreeSet::new();
+        }
+        out.insert(line.to_string());
+    }
+    out
 }
 
 /// Whether `program` is locally pinned (held against update/sync).
@@ -155,6 +162,41 @@ mod tests {
         let l = layout("absent");
         assert!(!is_pinned(&l, "ay"));
         assert!(pinned_set(&l).is_empty());
+        let _ = fs::remove_dir_all(&l.prefix);
+    }
+
+    #[test]
+    fn oversized_sparse_and_overcount_pin_files_fail_closed() {
+        let l = layout("bounded");
+        let path = pins_path(&l);
+        let file = fs::File::create(&path).unwrap();
+        file.set_len((MAX_PIN_FILE_BYTES + 1) as u64).unwrap();
+        assert!(pinned_set(&l).is_empty());
+
+        let body: String = (0..=MAX_PINNED_PROGRAMS)
+            .map(|index| format!("p{index}\n"))
+            .collect();
+        fs::write(&path, body).unwrap();
+        assert!(pinned_set(&l).is_empty(), "over-count is never partial");
+        let _ = fs::remove_dir_all(&l.prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_symlink_pin_files_return_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let l = layout("special");
+        let path = pins_path(&l);
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_c` is a live NUL-terminated path in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        assert!(pinned_set(&l).is_empty());
+        fs::remove_file(&path).unwrap();
+        let target = l.prefix.join("target-pins");
+        fs::write(&target, "ay\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(pinned_set(&l).is_empty(), "pin links are not followed");
         let _ = fs::remove_dir_all(&l.prefix);
     }
 }

@@ -83,10 +83,10 @@ impl PreviewScene {
 
     const fn badge_label(self) -> &'static str {
         match self {
-            Self::Appearance => "APPEARANCE",
-            Self::Typography => "TYPE & DENSITY",
-            Self::CursorMotion => "CURSOR RUNWAY",
-            Self::WindowTabs => "WINDOW & TABS",
+            Self::Appearance => "COLOR PREVIEW",
+            Self::Typography => "TEXT PREVIEW",
+            Self::CursorMotion => "CURSOR PREVIEW",
+            Self::WindowTabs => "WINDOW PREVIEW",
         }
     }
 }
@@ -213,6 +213,10 @@ pub(crate) struct CursorPreviewSpec {
     pub(crate) intensity: f32,
     pub(crate) radius: f32,
     pub(crate) ring: bool,
+    /// Seconds of recent travel the Nyan TYPING WAKE shows — the settings dial's
+    /// value, carried here so the live preview lengthens and shortens the plume
+    /// exactly as the real terminal will. `0` = wake off.
+    pub(crate) wake_persist_s: f32,
 }
 
 impl Default for CursorPreviewSpec {
@@ -230,6 +234,7 @@ impl Default for CursorPreviewSpec {
             intensity: 0.7,
             radius: 0.6,
             ring: true,
+            wake_persist_s: aterm_effects::cursor_glow::NYAN_WAKE_PERSIST,
         }
     }
 }
@@ -253,6 +258,9 @@ impl CursorPreviewSpec {
             intensity: finite_or(self.intensity, 0.0).clamp(0.0, 1.0),
             radius: finite_or(self.radius, 0.0).clamp(0.0, 2.0),
             ring: self.ring,
+            // Same fail-OFF posture the engine takes: a non-finite dial value
+            // must disable the wake, never leak into its length math.
+            wake_persist_s: finite_or(self.wake_persist_s, 0.0).clamp(0.0, 1.5),
         }
     }
 
@@ -467,6 +475,9 @@ pub(crate) struct SettingsPreviewSpec {
     /// primitive carries this identity through delayed rasterization.
     pub(crate) font_candidate: SemanticFontCandidate,
     pub(crate) appearance: AppearancePreviewSpec,
+    /// Live OS appearance used only when `appearance.window_theme` is `auto`.
+    /// It is deliberately independent of the terminal candidate palette.
+    pub(crate) system_dark: bool,
     pub(crate) typography: TypographyPreviewSpec,
     pub(crate) post_fx: CursorPostFxSpec,
     pub(crate) window_tabs: WindowTabsPreviewSpec,
@@ -502,6 +513,7 @@ impl Default for SettingsPreviewSpec {
             synthetic_styles: true,
             font_candidate: SemanticFontCandidate::default(),
             appearance: AppearancePreviewSpec::default(),
+            system_dark: false,
             typography: TypographyPreviewSpec::default(),
             post_fx: CursorPostFxSpec::default(),
             window_tabs: WindowTabsPreviewSpec::default(),
@@ -634,6 +646,11 @@ impl SettingsPreviewSpec {
         self
     }
 
+    pub(crate) fn with_system_dark(mut self, system_dark: bool) -> Self {
+        self.system_dark = system_dark;
+        self
+    }
+
     pub(crate) fn with_typography_candidate(mut self, typography: TypographyPreviewSpec) -> Self {
         self.typography = typography;
         self
@@ -665,6 +682,7 @@ impl SettingsPreviewSpec {
                 bold_is_bright: self.appearance.bold_is_bright,
                 faint_opacity: finite_or(self.appearance.faint_opacity, 0.5).clamp(0.0, 1.0),
             },
+            system_dark: self.system_dark,
             typography: TypographyPreviewSpec {
                 cursor_break_ligatures: self.typography.cursor_break_ligatures,
                 underline_position: self.typography.underline_position.clamp(-32, 32),
@@ -830,6 +848,91 @@ impl SettingsPreviewSpec {
     }
 
     pub(crate) fn semantic_value(&self) -> String {
+        let spec = self.normalized();
+        let candidate = friendly_preview_value(&spec.focused_value);
+        match spec.scene {
+            PreviewScene::Appearance => {
+                let colors = spec.terminal_theme.map_or_else(
+                    || "the current terminal colors".to_string(),
+                    |theme| {
+                        format!(
+                            "foreground #{:06X}, background #{:06X}, and cursor #{:06X}",
+                            theme.fg, theme.bg, theme.cursor
+                        )
+                    },
+                );
+                let window = match spec.appearance.window_theme.as_str() {
+                    "light" => "Light window appearance",
+                    "dark" => "Dark window appearance",
+                    _ if spec.system_dark && cfg!(target_os = "macos") => {
+                        "window appearance that follows macOS, currently Dark"
+                    }
+                    _ if cfg!(target_os = "macos") => {
+                        "window appearance that follows macOS, currently Light"
+                    }
+                    _ if spec.system_dark => {
+                        "window appearance that follows the system, currently Dark"
+                    }
+                    _ => "window appearance that follows the system, currently Light",
+                };
+                format!("Color theme sample for {candidate}: {colors}, with {window}.")
+            }
+            PreviewScene::Typography => format!(
+                "Text sample for {candidate} at {} pixels; ligatures are {} and synthetic styles are {}.",
+                trim_float(spec.font_px),
+                if spec.ligatures { "on" } else { "off" },
+                if spec.synthetic_styles { "on" } else { "off" },
+            ),
+            PreviewScene::CursorMotion => {
+                if spec.cursor.trail_unavailable() {
+                    return "Cursor preview unavailable because the selected trail could not be loaded."
+                        .to_string();
+                }
+                let motion = if spec.reduction_suppresses_motion() {
+                    "Static because Reduce Motion is active"
+                } else {
+                    match spec.normalized_animation() {
+                        PreviewAnimation::Continuous => "Live",
+                        PreviewAnimation::BlinkEdge { .. } => "Live cursor blink",
+                        PreviewAnimation::None => "Static",
+                    }
+                };
+                let trail = if spec.cursor.trail_enabled && spec.cursor.has_resolved_trail() {
+                    format!(
+                        "{} cursor trail",
+                        friendly_preview_value(spec.cursor.trail_style.label())
+                    )
+                } else {
+                    "cursor with no trail".to_string()
+                };
+                format!("{motion} preview of the {trail}.")
+            }
+            PreviewScene::WindowTabs => format!(
+                "Window sample: {} columns by {} lines, {} tab-strip {}. Title “release”; Description “shipping”; Activity fallback `running tests` is {}. Formats: tab {}; window {}.",
+                spec.window_tabs.columns,
+                spec.window_tabs.lines,
+                spec.window_tabs.tab_strip_rows,
+                if spec.window_tabs.tab_strip_rows == 1 {
+                    "row"
+                } else {
+                    "rows"
+                },
+                if spec.window_tabs.generate_activity {
+                    "shown"
+                } else {
+                    "off"
+                },
+                spec.window_tabs.tab_title_format,
+                spec.window_tabs.window_title_format,
+            ),
+        }
+    }
+
+    /// Detailed renderer audit projection for introspection and regression
+    /// oracles. This deliberately does not back the accessibility value: terms
+    /// such as internal primitive names, fingerprints, and tone-map details are
+    /// useful to developers but punishing when spoken by assistive technology.
+    pub(crate) fn audit_value(&self) -> String {
         let spec = self.normalized();
         let motion = match spec.normalized_animation() {
             PreviewAnimation::None if spec.reduction_suppresses_motion() => {
@@ -1013,6 +1116,9 @@ impl SettingsPreviewSpec {
         spec.appearance.selection_inactive.hash(&mut hash);
         spec.appearance.bold_is_bright.hash(&mut hash);
         spec.appearance.faint_opacity.to_bits().hash(&mut hash);
+        if spec.appearance.window_theme == "auto" {
+            spec.system_dark.hash(&mut hash);
+        }
         spec.typography.cursor_break_ligatures.hash(&mut hash);
         spec.typography.underline_position.hash(&mut hash);
         spec.typography.underline_thickness.hash(&mut hash);
@@ -1134,23 +1240,38 @@ impl SettingsPreviewSpec {
         let caption_y =
             crate::tray_raster::row_baseline(rect.y + 4.0, header_h, caption_size.get());
         let scene_badge = spec.scene.badge_label();
-        let scene_width = crate::tray_raster::ui_text_width(scene_badge, caption_size.get());
+        let scene_width = crate::tray_raster::ui_text_width_for(
+            TextFace::UiBold,
+            scene_badge,
+            caption_size.get(),
+        );
         let available = (rect.width - inset * 2.0).max(0.0);
-        let candidate_badge =
-            bounded_badge(&format!("{}={}", spec.focused_key, spec.focused_value), 30);
+        let candidate_badge = bounded_badge(&spec.candidate_badge(), 30);
         let mut state = format!("{candidate_badge} · {}", spec.state_badge());
-        let mut state_width = crate::tray_raster::ui_text_width(&state, caption_size.get());
+        let mut state_width =
+            crate::tray_raster::ui_text_width_for(TextFace::UiBold, &state, caption_size.get());
         if scene_width + 8.0 + state_width > available {
             state = format!(
                 "{} · {}",
                 bounded_badge(&candidate_badge, 20),
                 spec.compact_state_badge()
             );
-            state_width = crate::tray_raster::ui_text_width(&state, caption_size.get());
+            state_width =
+                crate::tray_raster::ui_text_width_for(TextFace::UiBold, &state, caption_size.get());
         }
         if state_width > available {
-            state = bounded_badge(&candidate_badge, 24);
-            state_width = crate::tray_raster::ui_text_width(&state, caption_size.get());
+            state = bounded_badge(&spec.compact_state_badge(), 24);
+            state_width =
+                crate::tray_raster::ui_text_width_for(TextFace::UiBold, &state, caption_size.get());
+        }
+        if state_width > available {
+            // Character caps are only a first-pass readability heuristic:
+            // proportional glyphs and Dynamic Type make their pixel width
+            // unknowable. The final preview-header projection therefore fits
+            // the actual UI-bold measure and remains UTF-8 safe.
+            state = bounded_badge_width(&state, available, caption_size.get());
+            state_width =
+                crate::tray_raster::ui_text_width_for(TextFace::UiBold, &state, caption_size.get());
         }
         let show_scene = scene_width + 8.0 + state_width <= available;
         if show_scene {
@@ -1172,10 +1293,10 @@ impl SettingsPreviewSpec {
             TextWeight::Regular,
             TextFace::UiBold,
             rgba(
-                if spec.reduced_motion || spec.cursor.trail_unavailable() {
-                    roles.text_secondary
-                } else {
+                if matches!(spec.normalized_animation(), PreviewAnimation::Continuous) {
                     roles.success
+                } else {
+                    roles.text_secondary
                 },
                 255,
             ),
@@ -1215,15 +1336,33 @@ impl SettingsPreviewSpec {
             &spec.font_candidate,
         );
         if spec.scene == PreviewScene::WindowTabs {
-            paint_window_tabs(prims, terminal, &spec, terminal_theme, roles);
+            paint_window_tabs(prims, terminal, &spec, roles);
             prims.push(DrawPrim::ClipPop);
             return;
+        }
+        let mut terminal_specimen = spec.terminal_specimen(terminal_theme);
+        if spec.scene == PreviewScene::Appearance {
+            terminal_specimen.font_px = appearance_specimen_font_px(
+                terminal,
+                terminal_specimen.font_px,
+                terminal_specimen.line_height,
+            );
+            let specimen_clip = appearance_specimen_clip(terminal);
+            prims.push(DrawPrim::ClipPush {
+                x: specimen_clip.x,
+                y: specimen_clip.y,
+                w: specimen_clip.width,
+                h: specimen_clip.height,
+            });
         }
         prims.push(DrawPrim::TerminalSpecimen {
             x: terminal.x,
             y: terminal.y,
-            spec: Box::new(spec.terminal_specimen(terminal_theme)),
+            spec: Box::new(terminal_specimen),
         });
+        if spec.scene == PreviewScene::Appearance {
+            prims.push(DrawPrim::ClipPop);
+        }
         if spec.scene == PreviewScene::Appearance {
             paint_window_theme_sample(prims, terminal, &spec, terminal_theme);
         }
@@ -1247,38 +1386,50 @@ impl SettingsPreviewSpec {
 
     fn state_badge(&self) -> String {
         if self.cursor.trail_unavailable() {
-            "TRAIL PACK UNAVAILABLE".to_string()
+            "Trail unavailable".to_string()
         } else if self.reduction_suppresses_motion() {
-            "STATIC · REDUCED MOTION".to_string()
+            "Reduced motion".to_string()
         } else {
             match self.normalized_animation() {
-                PreviewAnimation::None => format!("{} PX · STATIC", trim_float(self.font_px)),
-                PreviewAnimation::BlinkEdge { .. } => "LIVE · CURSOR BLINK".to_string(),
-                PreviewAnimation::Continuous => {
-                    format!(
-                        "LIVE · {}",
-                        self.cursor.trail_style.label().to_ascii_uppercase()
-                    )
-                }
+                PreviewAnimation::None => match self.scene {
+                    PreviewScene::Appearance => "Color sample".to_string(),
+                    PreviewScene::Typography => "Text sample".to_string(),
+                    PreviewScene::WindowTabs => "Layout sample".to_string(),
+                    PreviewScene::CursorMotion => "Static preview".to_string(),
+                },
+                PreviewAnimation::BlinkEdge { .. } => "Live cursor blink".to_string(),
+                PreviewAnimation::Continuous => "Live trail".to_string(),
             }
         }
     }
 
-    /// A compact but still literal header status for phone-width hosts. The
-    /// complete renderer facts remain in the preview's semantic value; this is
-    /// only the visible glance label paired with the scene name.
+    fn candidate_badge(&self) -> String {
+        let subject = match self.focused_key.as_str() {
+            crate::prefs::EDIT_THEME => "Theme",
+            crate::prefs::EDIT_WINDOW_THEME => "Window",
+            crate::prefs::EDIT_CURSOR_TRAIL_STYLE => "Trail",
+            crate::prefs::EDIT_CURSOR_STYLE => "Cursor",
+            crate::prefs::EDIT_FONT_FAMILY => "Font",
+            crate::prefs::EDIT_FONT_PX => "Size",
+            crate::prefs::EDIT_TAB_STRIP_ROWS => "Tabs",
+            _ => "Preview",
+        };
+        format!("{subject}: {}", friendly_preview_value(&self.focused_value))
+    }
+
+    /// Compact, user-facing glance label for narrow preview headers.
     fn compact_state_badge(&self) -> String {
         if self.cursor.trail_unavailable() {
-            "PACK UNAVAILABLE".to_string()
+            "Trail unavailable".to_string()
         } else if self.reduction_suppresses_motion() {
-            "REDUCED MOTION".to_string()
+            "Reduced motion".to_string()
         } else {
             match self.normalized_animation() {
-                PreviewAnimation::None => format!("{} PX · STATIC", trim_float(self.font_px)),
-                PreviewAnimation::BlinkEdge { .. } => "LIVE · BLINK".to_string(),
+                PreviewAnimation::None => self.candidate_badge(),
+                PreviewAnimation::BlinkEdge { .. } => "Live blink".to_string(),
                 PreviewAnimation::Continuous => format!(
-                    "LIVE · {}",
-                    self.cursor.trail_style.label().to_ascii_uppercase()
+                    "{} · Live",
+                    friendly_preview_value(self.cursor.trail_style.label())
                 ),
             }
         }
@@ -1321,6 +1472,7 @@ impl SettingsPreviewSpec {
                 intensity: self.cursor.intensity,
                 radius: self.cursor.radius,
                 ring: self.cursor.ring,
+                wake_persist_s: self.cursor.wake_persist_s,
             },
             resolution,
             theme.cursor,
@@ -1394,18 +1546,37 @@ fn paint_font_candidate_pill(
     spec: &SettingsPreviewSpec,
     roles: Roles,
 ) {
+    paint_font_candidate_pill_at_scale(
+        prims,
+        terminal,
+        spec,
+        roles,
+        crate::native_appearance::text_scale(),
+    );
+}
+
+fn paint_font_candidate_pill_at_scale(
+    prims: &mut Vec<DrawPrim>,
+    terminal: LogicalRect,
+    spec: &SettingsPreviewSpec,
+    roles: Roles,
+    text_scale: f32,
+) {
     let Some((label, warning)) = spec.font_candidate_pill() else {
         return;
     };
-    let text_size = TypeStep::Caption
-        .px(11.5)
-        .scaled(crate::native_appearance::text_scale());
+    let text_size = TypeStep::Caption.px(11.5).scaled(text_scale);
     let pill_h = (text_size.get() + 7.0)
         .max(19.0)
         .min((terminal.height - 8.0).max(1.0));
     let max_chars = if terminal.width < 300.0 { 34 } else { 58 };
     let label = bounded_badge(&label, max_chars);
-    let text_width = crate::tray_raster::ui_text_width(&label, text_size.get());
+    // The terminal has a 5pt outer inset and the pill has 8pt text padding on
+    // both sides. Refit the actual UiBold label to that exact pixel budget;
+    // character/grapheme caps alone cannot bound proportional text at 2×.
+    let label = bounded_badge_width(&label, (terminal.width - 26.0).max(0.0), text_size.get());
+    let text_width =
+        crate::tray_raster::ui_text_width_for(TextFace::UiBold, &label, text_size.get());
     let pill_w = (text_width + 16.0)
         .min((terminal.width - 10.0).max(1.0))
         .max(1.0);
@@ -1440,6 +1611,93 @@ fn paint_font_candidate_pill(
     ));
 }
 
+/// Paint the window-control signature for the platform this binary targets and
+/// return the leading inset available to title text. Top Settings and the
+/// Advanced Window/Tabs sample deliberately share this primitive so neither
+/// surface can claim macOS traffic lights on another platform.
+fn paint_platform_window_controls(
+    prims: &mut Vec<DrawPrim>,
+    x: f32,
+    y: f32,
+    title_h: f32,
+    light: bool,
+) -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = light;
+        for (index, color) in [[0xFF, 0x5F, 0x57], [0xFE, 0xBC, 0x2E], [0x28, 0xC8, 0x40]]
+            .into_iter()
+            .enumerate()
+        {
+            prims.push(DrawPrim::Dot {
+                cx: x + 9.0 + index as f32 * 10.0,
+                cy: y + title_h * 0.5,
+                r: 3.0,
+                color: rgba(color, 255),
+                breathe: false,
+            });
+        }
+        43.0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        prims.push(DrawPrim::Stroke {
+            x: x + 7.0,
+            y: y + (title_h - 7.0) * 0.5,
+            w: 7.0,
+            h: 7.0,
+            radius: 1.0,
+            width: 1.0,
+            color: rgba(window_chrome_text_color(light), 210),
+        });
+        22.0
+    }
+}
+
+/// Text/control ink conditioned against the preview titlebar itself. Native UI
+/// roles are conditioned against the terminal-derived Settings surface, which
+/// may have the opposite luminance from a forced Light/Dark window chrome.
+const fn window_chrome_text_color(light: bool) -> [u8; 3] {
+    if light {
+        [0x64, 0x68, 0x72]
+    } else {
+        [0xB9, 0xBD, 0xC9]
+    }
+}
+
+const APPEARANCE_SPECIMEN_ROWS: usize = 3;
+const APPEARANCE_SWATCH_BOTTOM_INSET: f32 = 10.0;
+const APPEARANCE_SWATCH_HEIGHT: f32 = 6.0;
+const APPEARANCE_SPECIMEN_SWATCH_GAP: f32 = 4.0;
+const APPEARANCE_RENDERER_LINE_ALLOWANCE: f32 = 1.25;
+
+fn appearance_swatch_y(terminal: LogicalRect) -> f32 {
+    (terminal.bottom() - APPEARANCE_SWATCH_BOTTOM_INSET).max(terminal.y + 20.0)
+}
+
+fn appearance_specimen_clip(terminal: LogicalRect) -> LogicalRect {
+    LogicalRect::new(
+        terminal.x,
+        terminal.y,
+        terminal.width,
+        (appearance_swatch_y(terminal) - APPEARANCE_SPECIMEN_SWATCH_GAP - terminal.y).max(1.0),
+    )
+}
+
+fn appearance_specimen_font_px(
+    terminal: LogicalRect,
+    requested_font_px: f32,
+    line_height: f32,
+) -> f32 {
+    let rows = APPEARANCE_SPECIMEN_ROWS as f32;
+    let line_height = line_height.max(0.5);
+    let cap = appearance_specimen_clip(terminal).height
+        / rows
+        / line_height
+        / APPEARANCE_RENDERER_LINE_ALLOWANCE;
+    requested_font_px.min(cap.max(1.0))
+}
+
 fn paint_window_theme_sample(
     prims: &mut Vec<DrawPrim>,
     terminal: LogicalRect,
@@ -1449,7 +1707,7 @@ fn paint_window_theme_sample(
     let light = match spec.appearance.window_theme.as_str() {
         "light" => true,
         "dark" => false,
-        _ => !aterm_render::theme_is_dark(terminal_theme.bg),
+        _ => !spec.system_dark,
     };
     let width = terminal.width.min(112.0);
     let x = terminal.right() - width;
@@ -1467,33 +1725,62 @@ fn paint_window_theme_sample(
         fill: rgba(fill, 255),
         blur: false,
     });
-    for (index, color) in [[0xFF, 0x5F, 0x57], [0xFE, 0xBC, 0x2E], [0x28, 0xC8, 0x40]]
-        .into_iter()
-        .enumerate()
-    {
-        prims.push(DrawPrim::Dot {
-            cx: x + 9.0 + index as f32 * 10.0,
-            cy: terminal.y + 9.5,
-            r: 3.0,
-            color: rgba(color, 255),
-            breathe: false,
-        });
-    }
+    let title_inset = paint_platform_window_controls(prims, x, terminal.y, 19.0, light);
     prims.push(DrawPrim::Line {
-        x1: x + 43.0,
+        x1: x + title_inset,
         y1: terminal.y + 9.5,
         x2: terminal.right() - 8.0,
         y2: terminal.y + 9.5,
         width: 2.0,
-        color: rgba(
-            if light {
-                [0x64, 0x68, 0x72]
-            } else {
-                [0xB9, 0xBD, 0xC9]
-            },
-            210,
-        ),
+        color: rgba(window_chrome_text_color(light), 210),
     });
+
+    // The semantic terminal specimen remains the primary renderer proof, but a
+    // freshly opened Settings tab may need one asynchronous font-preparation
+    // turn before glyphs land. Keep the small Top card useful on that first
+    // frame with a renderer-native monospace label and literal ANSI swatches.
+    // These use the candidate palette and therefore cannot collapse into the
+    // blank background-only sample the old 132pt card produced.
+    let candidate = spec
+        .terminal_theme
+        .unwrap_or_else(|| PreviewTerminalTheme::from(terminal_theme));
+    if terminal.height >= 42.0 && !spec.prepared_font.is_ready() {
+        let sample_size = TypeStep::Caption.px(11.5);
+        prims.push(text_prim(
+            terminal.x + 8.0,
+            terminal.y + 37.0,
+            "$ aterm".to_string(),
+            sample_size,
+            TextWeight::Regular,
+            TextFace::Mono,
+            rgba(crate::settings::u32_rgb(candidate.fg), 255),
+        ));
+        prims.push(text_prim(
+            terminal.x + 67.0,
+            terminal.y + 37.0,
+            "ready".to_string(),
+            sample_size,
+            TextWeight::Bold,
+            TextFace::Mono,
+            rgba(crate::settings::u32_rgb(candidate.ansi[10]), 255),
+        ));
+    }
+    let swatch_gap = 3.0;
+    let swatch_count = 8.0;
+    let swatch_width =
+        ((terminal.width - 16.0 - swatch_gap * (swatch_count - 1.0)) / swatch_count).max(2.0);
+    let swatch_y = appearance_swatch_y(terminal);
+    for (index, color) in candidate.ansi[8..].iter().copied().enumerate() {
+        prims.push(DrawPrim::Panel {
+            x: terminal.x + 8.0 + index as f32 * (swatch_width + swatch_gap),
+            y: swatch_y,
+            w: swatch_width,
+            h: APPEARANCE_SWATCH_HEIGHT,
+            radius: 2.0,
+            fill: rgba(crate::settings::u32_rgb(color), 255),
+            blur: false,
+        });
+    }
 }
 
 fn packed_rgb(value: u32) -> aterm_types::Rgb {
@@ -1513,15 +1800,24 @@ fn build_terminal_specimen_input(
     use aterm_core::selection::{SelectionSide, SelectionType};
     use aterm_core::terminal::{CursorStyle, Terminal};
 
-    const ROWS: usize = 5;
     const COLS: usize = 32;
-    const SOURCE: &str = concat!(
+    const FULL_SOURCE: &str = concat!(
         "\u{1b}[31mANSI 4 \u{1b}[1mBOLD\u{1b}[0m \u{1b}[2mFAINT\u{1b}[0m\r\n",
         "!= => -> \u{1b}[3mITAL\u{1b}[0m \u{1b}[1;3mB+I\u{1b}[0m cursor\r\n",
         "\u{1b}[4mgypq_j underline\u{1b}[0m\r\n",
         "CJK 你好  symbols ∑✓♥\r\n",
         "emoji 😀 🚀 👩‍💻"
     );
+    const APPEARANCE_SOURCE: &str = concat!(
+        "\u{1b}[31mANSI 4 \u{1b}[1mBOLD\u{1b}[0m \u{1b}[2mFAINT\u{1b}[0m\r\n",
+        "!= => -> \u{1b}[3mITAL\u{1b}[0m \u{1b}[1;3mB+I\u{1b}[0m cursor\r\n",
+        "\u{1b}[4mgypq_j underline\u{1b}[0m"
+    );
+    let (rows, source) = if spec.scene == PreviewScene::Appearance {
+        (APPEARANCE_SPECIMEN_ROWS, APPEARANCE_SOURCE)
+    } else {
+        (5, FULL_SOURCE)
+    };
 
     let mut terminal_config = aterm_core::config::TerminalConfig {
         default_foreground: packed_rgb(theme.fg),
@@ -1545,10 +1841,10 @@ fn build_terminal_specimen_input(
         }
         terminal_config.custom_palette = Some(palette);
     }
-    let mut terminal = Terminal::new(ROWS as u16, COLS as u16);
+    let mut terminal = Terminal::new(rows as u16, COLS as u16);
     let _ = terminal.apply_config(&terminal_config);
-    terminal.process(SOURCE.as_bytes());
-    let mut input = terminal.cell_frame(ROWS, COLS);
+    terminal.process(source.as_bytes());
+    let mut input = terminal.cell_frame(rows, COLS);
     input.cursor_row = 1;
     // Cursor is inside the `!=` run so cursor-break-ligatures exercises the
     // same shaping split a terminal uses while editing operators.
@@ -1575,7 +1871,8 @@ fn build_terminal_specimen_input(
     }
 
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    SOURCE.hash(&mut hash);
+    source.hash(&mut hash);
+    rows.hash(&mut hash);
     theme.fg.hash(&mut hash);
     theme.bg.hash(&mut hash);
     theme.cursor.hash(&mut hash);
@@ -1737,7 +2034,6 @@ fn paint_window_tabs(
     prims: &mut Vec<DrawPrim>,
     rect: LogicalRect,
     spec: &SettingsPreviewSpec,
-    theme: Theme,
     roles: Roles,
 ) {
     // Static, explicitly-authored examples: this demonstrates composition and
@@ -1770,10 +2066,15 @@ fn paint_window_tabs(
         " · ",
     );
     let title_h = 19.0;
-    let title_fill = match spec.appearance.window_theme.as_str() {
-        "light" => [0xE9, 0xEA, 0xEE],
-        "dark" => [0x20, 0x22, 0x2A],
-        _ => crate::settings::u32_rgb(theme.bg),
+    let light = match spec.appearance.window_theme.as_str() {
+        "light" => true,
+        "dark" => false,
+        _ => !spec.system_dark,
+    };
+    let title_fill = if light {
+        [0xE9, 0xEA, 0xEE]
+    } else {
+        [0x20, 0x22, 0x2A]
     };
     prims.push(DrawPrim::Panel {
         x: rect.x,
@@ -1784,27 +2085,16 @@ fn paint_window_tabs(
         fill: rgba(title_fill, 255),
         blur: false,
     });
-    for (index, color) in [[0xFF, 0x5F, 0x57], [0xFE, 0xBC, 0x2E], [0x28, 0xC8, 0x40]]
-        .into_iter()
-        .enumerate()
-    {
-        prims.push(DrawPrim::Dot {
-            cx: rect.x + 9.0 + index as f32 * 10.0,
-            cy: rect.y + title_h * 0.5,
-            r: 3.0,
-            color: rgba(color, 255),
-            breathe: false,
-        });
-    }
+    let title_inset = paint_platform_window_controls(prims, rect.x, rect.y, title_h, light);
     let caption = TypeStep::Caption.px(13.75);
     prims.push(text_prim(
-        rect.x + 43.0,
+        rect.x + title_inset,
         crate::tray_raster::row_baseline(rect.y, title_h, caption.get()),
-        window_identity,
+        format!("Settings · {window_identity}"),
         caption,
         TextWeight::Regular,
         TextFace::UiBold,
-        rgba(roles.text_primary, 255),
+        rgba(window_chrome_text_color(light), 255),
     ));
     if spec.window_tabs.show_build_badge {
         prims.push(DrawPrim::Panel {
@@ -2223,14 +2513,57 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
 }
 
-fn bounded_badge(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let prefix = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
+fn bounded_badge(value: &str, max_graphemes: usize) -> String {
+    let mut end = 0;
+    for (count, (offset, grapheme)) in value.grapheme_indices().enumerate() {
+        if count == max_graphemes {
+            return format!("{}…", &value[..end]);
+        }
+        end = offset + grapheme.len();
     }
+    value.to_string()
+}
+
+fn bounded_badge_width(value: &str, max_width: f32, px: f32) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    if crate::tray_raster::ui_text_width_for(TextFace::UiBold, value, px) <= max_width {
+        return value.to_string();
+    }
+    let ellipsis = "…";
+    let ellipsis_width = crate::tray_raster::ui_text_width_for(TextFace::UiBold, ellipsis, px);
+    if ellipsis_width > max_width {
+        return String::new();
+    }
+    let mut end = 0;
+    for (offset, grapheme) in value.grapheme_indices() {
+        let next = offset + grapheme.len();
+        if crate::tray_raster::ui_text_width_for(TextFace::UiBold, &value[..next], px)
+            + ellipsis_width
+            > max_width
+        {
+            break;
+        }
+        end = next;
+    }
+    format!("{}…", &value[..end])
+}
+
+fn friendly_preview_value(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return "Default".to_string();
+    }
+    let value = value
+        .strip_prefix("pack:")
+        .map(|id| format!("Trail Pack {id}"))
+        .unwrap_or_else(|| value.replace(['_', '-'], " "));
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return "Default".to_string();
+    };
+    first.to_uppercase().chain(chars).collect()
 }
 
 fn trim_float(value: f32) -> String {
@@ -2336,6 +2669,24 @@ mod tests {
             .expect("preview panel exists")
     }
 
+    fn test_relative_luminance(color: [u8; 3]) -> f32 {
+        let linear = |channel: u8| {
+            let value = f32::from(channel) / 255.0;
+            if value <= 0.040_45 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color[0]) + 0.7152 * linear(color[1]) + 0.0722 * linear(color[2])
+    }
+
+    fn test_contrast_ratio(left: [u8; 3], right: [u8; 3]) -> f32 {
+        let left = test_relative_luminance(left);
+        let right = test_relative_luminance(right);
+        (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    }
+
     fn preview_text(spec: SettingsPreviewSpec) -> Vec<String> {
         compiled(spec)
             .tray(Theme::default(), 13.0)
@@ -2354,7 +2705,7 @@ mod tests {
         assert_eq!(base.animation(), PreviewAnimation::None);
         let text = preview_text(base.clone());
         for expected in [
-            "release — shipping",
+            "Settings · release — shipping",
             "release · shipping",
             "tests · running tests",
             "TITLE  ·  release",
@@ -2368,11 +2719,11 @@ mod tests {
                 "missing truthful Smart Titles example {expected:?}: {text:?}"
             );
         }
-        let semantic = base.semantic_value();
-        assert!(semantic.contains("stable Title `release`"));
-        assert!(semantic.contains("authored Description `shipping`"));
-        assert!(semantic.contains("generated Activity fallback `running tests` is shown"));
-        assert!(semantic.contains("no live provider-health claim"));
+        let audit = base.audit_value();
+        assert!(audit.contains("stable Title `release`"));
+        assert!(audit.contains("authored Description `shipping`"));
+        assert!(audit.contains("generated Activity fallback `running tests` is shown"));
+        assert!(audit.contains("no live provider-health claim"));
 
         let description_first = SettingsPreviewSpec::window_tabs(
             WindowTabsPreviewSpec {
@@ -2386,7 +2737,7 @@ mod tests {
         assert!(
             description_first_text
                 .iter()
-                .any(|line| line == "shipping — release")
+                .any(|line| line == "Settings · shipping — release")
         );
         assert!(
             description_first_text
@@ -2454,20 +2805,116 @@ mod tests {
                 "phone preview retains a candidate glance label"
             );
             let (right_x, right, right_px) = *headers.last().unwrap();
+            assert!(
+                !right.contains('='),
+                "header exposes a raw config assignment: {right}"
+            );
+            assert!(
+                !right.contains('_'),
+                "header exposes a raw config key: {right}"
+            );
             if headers.len() == 2 {
                 let (left_x, left, left_px) = headers[0];
-                let left_right = left_x + crate::tray_raster::ui_text_width(left, left_px);
+                let left_right =
+                    left_x + crate::tray_raster::ui_text_width_for(TextFace::UiBold, left, left_px);
                 assert!(
                     left_right + 7.99 <= right_x,
                     "preview header overlaps: {left:?} ends at {left_right:.1}, {right:?} starts at {right_x:.1}"
                 );
             }
             assert!(
-                right_x + crate::tray_raster::ui_text_width(right, right_px)
+                right_x + crate::tray_raster::ui_text_width_for(TextFace::UiBold, right, right_px)
                     <= rect.right() - 10.0 + 0.01,
                 "preview state stays inside its right inset"
             );
         }
+    }
+
+    #[test]
+    fn maximum_text_preview_badges_fit_by_ui_width_and_preserve_utf8() {
+        // 286.5pt compact host, less page/card/header insets. Caption is
+        // 13.75pt at the supported 2× maximum.
+        let available = 214.5;
+        let px = 27.5;
+        for source in [
+            "Theme: Catppuccin Mocha",
+            "Theme: Aurora 👩‍💻 Observatory — a deliberately very long personal color theme",
+            "Trail: Trail Pack hyper-dimensional-rainbow-kitties",
+        ] {
+            let fitted = bounded_badge_width(source, available, px);
+            assert!(std::str::from_utf8(fitted.as_bytes()).is_ok());
+            assert!(fitted.ends_with('…'), "{source:?} => {fitted:?}");
+            assert!(
+                crate::tray_raster::ui_text_width_for(TextFace::UiBold, &fitted, px)
+                    <= available + 0.01,
+                "{source:?} => {fitted:?}"
+            );
+        }
+        assert_eq!(
+            bounded_badge_width("Theme: Nord", available, px),
+            "Theme: Nord"
+        );
+    }
+
+    #[test]
+    fn preview_badge_limits_preserve_complete_grapheme_clusters() {
+        for (source, expected) in [("A👩‍💻WWWW", "A👩‍💻…"), ("AéWWWW", "Aé…"), ("A🇺🇳WWWW", "A🇺🇳…")]
+        {
+            assert_eq!(bounded_badge(source, 2), expected);
+            let px = 27.5;
+            let exact_width =
+                crate::tray_raster::ui_text_width_for(TextFace::UiBold, expected, px) + 0.01;
+            assert_eq!(
+                bounded_badge_width(source, exact_width, px),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_large_type_font_candidate_pill_contains_its_unicode_text() {
+        let family = "Aurora 👩‍💻 Observatory élan 🇺🇳 — deliberately long candidate family";
+        let mut spec = SettingsPreviewSpec::typography(14.0)
+            .with_focus(crate::prefs::EDIT_FONT_FAMILY, family);
+        spec.font_status = "unavailable; fallback active".to_string();
+        let terminal = LogicalRect::new(12.0, 20.0, 112.0, 72.0);
+        let mut prims = Vec::new();
+        paint_font_candidate_pill_at_scale(
+            &mut prims,
+            terminal,
+            &spec,
+            Roles::from_theme(Theme::default()),
+            2.0,
+        );
+
+        let panel = prims
+            .iter()
+            .find_map(|prim| match prim {
+                DrawPrim::Panel { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
+                _ => None,
+            })
+            .expect("font candidate pill panel");
+        let text = prims
+            .iter()
+            .find_map(|prim| match prim {
+                DrawPrim::Text { x, s, px, face, .. } => Some((*x, s.as_str(), *px, *face)),
+                _ => None,
+            })
+            .expect("font candidate pill text");
+        assert!(text.1.ends_with('…'), "{:?}", text.1);
+        assert!(std::str::from_utf8(text.1.as_bytes()).is_ok());
+        assert!(panel.0 >= terminal.x);
+        assert!(panel.1 >= terminal.y);
+        assert!(panel.0 + panel.2 <= terminal.right() + 0.01);
+        assert!(panel.1 + panel.3 <= terminal.bottom() + 0.01);
+        let text_right = text.0 + crate::tray_raster::ui_text_width_for(text.3, text.1, text.2);
+        assert!(
+            text_right <= panel.0 + panel.2 - 8.0 + 0.01,
+            "text {:?} ends at {text_right:.2} outside pill {:?}",
+            text.1,
+            panel
+        );
     }
 
     #[test]
@@ -2477,14 +2924,17 @@ mod tests {
             SettingsPreviewSpec::typography(24.0).with_reduced_motion(true),
         ] {
             assert_eq!(static_spec.animation(), PreviewAnimation::None);
-            assert_eq!(static_spec.state_badge(), "24 PX · STATIC");
+            assert!(matches!(
+                static_spec.state_badge().as_str(),
+                "Color sample" | "Text sample"
+            ));
             assert!(!static_spec.semantic_value().contains("reduced motion"));
         }
 
         let moving = SettingsPreviewSpec::default().with_reduced_motion(true);
         assert_eq!(moving.animation(), PreviewAnimation::None);
-        assert_eq!(moving.state_badge(), "STATIC · REDUCED MOTION");
-        assert!(moving.semantic_value().contains("reduced motion; static"));
+        assert_eq!(moving.state_badge(), "Reduced motion");
+        assert!(moving.semantic_value().contains("Reduce Motion"));
     }
 
     #[test]
@@ -2530,6 +2980,266 @@ mod tests {
         assert_eq!(
             panel_fill(&nord_prims, 8.0),
             rgba(crate::settings::u32_rgb(NORD.bg), 255)
+        );
+    }
+
+    #[test]
+    fn automatic_window_samples_follow_the_os_not_the_terminal_palette() {
+        // Deliberately pair a dark terminal palette with OS Light, then flip
+        // only the host appearance. Auto must repaint both preview scenes.
+        let appearance_light = SettingsPreviewSpec::appearance(14.0)
+            .with_terminal_theme(NORD)
+            .with_system_dark(false);
+        let appearance_dark = appearance_light.clone().with_system_dark(true);
+        assert!(
+            appearance_light
+                .semantic_value()
+                .contains("currently Light"),
+            "Auto's accessible value announces the resolved system appearance"
+        );
+        assert!(
+            appearance_dark.semantic_value().contains("currently Dark"),
+            "Auto's accessible value follows a system appearance change"
+        );
+        assert!(
+            differences(
+                &pixels(appearance_light.clone()),
+                &pixels(appearance_dark.clone())
+            ) > 40
+        );
+        assert_ne!(
+            appearance_light.paint_fingerprint(),
+            appearance_dark.paint_fingerprint()
+        );
+
+        let tabs_light = SettingsPreviewSpec::window_tabs(WindowTabsPreviewSpec::default(), 14.0)
+            .with_terminal_theme(NORD)
+            .with_system_dark(false);
+        let tabs_dark = tabs_light.clone().with_system_dark(true);
+        assert!(differences(&pixels(tabs_light), &pixels(tabs_dark)) > 40);
+
+        // An explicit appearance is independent of the OS side of Auto.
+        let explicit = appearance_light.with_appearance(AppearancePreviewSpec {
+            window_theme: "dark".to_string(),
+            ..AppearancePreviewSpec::default()
+        });
+        let explicit_flip = explicit.clone().with_system_dark(true);
+        assert_eq!(
+            differences(&pixels(explicit.clone()), &pixels(explicit_flip.clone())),
+            0
+        );
+        assert_eq!(
+            explicit.paint_fingerprint(),
+            explicit_flip.paint_fingerprint()
+        );
+    }
+
+    #[test]
+    fn window_preview_controls_match_the_compiled_platform() {
+        let mut prims = Vec::new();
+        let rect = LogicalRect::new(4.0, 6.0, 240.0, 120.0);
+        paint_window_tabs(
+            &mut prims,
+            rect,
+            &SettingsPreviewSpec::window_tabs(WindowTabsPreviewSpec::default(), 14.0),
+            Roles::from_theme(Theme::default()),
+        );
+        let title_x = prims.iter().find_map(|primitive| match primitive {
+            DrawPrim::Text { x, s, .. } if s.starts_with("Settings · ") => Some(*x),
+            _ => None,
+        });
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(title_x, Some(rect.x + 43.0));
+            assert_eq!(
+                prims
+                    .iter()
+                    .filter(|primitive| matches!(
+                        primitive,
+                        DrawPrim::Dot { cy, .. } if *cy <= rect.y + 19.0
+                    ))
+                    .count(),
+                3
+            );
+            assert!(
+                !prims
+                    .iter()
+                    .any(|primitive| matches!(primitive, DrawPrim::Stroke { .. }))
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(title_x, Some(rect.x + 22.0));
+            assert_eq!(
+                prims
+                    .iter()
+                    .filter(|primitive| matches!(primitive, DrawPrim::Stroke { .. }))
+                    .count(),
+                1
+            );
+            assert!(!prims.iter().any(|primitive| matches!(
+                primitive,
+                DrawPrim::Dot { cy, .. } if *cy <= rect.y + 19.0
+            )));
+        }
+
+        // The terminal/native Settings palette can be dark while window chrome
+        // is explicitly Light (and vice versa). Caption ink therefore belongs
+        // to the titlebar, not `roles.text_primary`; pin both paint identity and
+        // WCAG-normal-text contrast against the exact fills used above.
+        for (window_theme, light, fill) in [
+            ("light", true, [0xE9, 0xEA, 0xEE]),
+            ("dark", false, [0x20, 0x22, 0x2A]),
+        ] {
+            let mut prims = Vec::new();
+            let spec = SettingsPreviewSpec::window_tabs(WindowTabsPreviewSpec::default(), 14.0)
+                .with_appearance(AppearancePreviewSpec {
+                    window_theme: window_theme.to_string(),
+                    ..AppearancePreviewSpec::default()
+                });
+            paint_window_tabs(&mut prims, rect, &spec, Roles::from_theme(Theme::default()));
+            let caption = prims.iter().find_map(|primitive| match primitive {
+                DrawPrim::Text { s, color, .. } if s.starts_with("Settings · ") => Some(*color),
+                _ => None,
+            });
+            let ink = window_chrome_text_color(light);
+            assert_eq!(caption, Some(rgba(ink, 255)), "{window_theme} caption ink");
+            assert!(
+                test_contrast_ratio(ink, fill) >= 4.5,
+                "{window_theme} caption must contrast with its own titlebar"
+            );
+        }
+    }
+
+    #[test]
+    fn small_top_theme_card_always_shows_text_and_the_candidate_ansi_palette() {
+        let candidate = PreviewTerminalTheme {
+            ansi: [
+                0x101010, 0xAA0000, 0x00AA00, 0xAAAA00, 0x0000AA, 0xAA00AA, 0x00AAAA, 0xAAAAAA,
+                0x303030, 0xFF3030, 0x30FF30, 0xFFFF30, 0x3030FF, 0xFF30FF, 0x30FFFF, 0xFFFFFF,
+            ],
+            ..NORD
+        };
+        let spec = SettingsPreviewSpec::appearance(14.0)
+            .with_terminal_theme(candidate)
+            .with_focus(crate::prefs::EDIT_THEME, "Nord");
+        let rect = LogicalRect::new(0.0, 0.0, 360.0, 132.0);
+        let mut prims = Vec::new();
+        spec.paint(
+            &mut prims,
+            rect,
+            Theme::default(),
+            Roles::from_theme(Theme::default()),
+        );
+        assert!(prims.iter().any(|primitive| matches!(
+            primitive,
+            DrawPrim::Text { s, face: TextFace::Mono, .. } if s == "$ aterm"
+        )));
+        let swatches = prims
+            .iter()
+            .filter_map(|primitive| match primitive {
+                DrawPrim::Panel {
+                    x,
+                    y,
+                    w,
+                    h,
+                    radius,
+                    fill,
+                    ..
+                } if (*radius - 2.0).abs() < f32::EPSILON && (*h - 6.0).abs() < f32::EPSILON => {
+                    Some((*x, *y, *w, *fill))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            swatches.len(),
+            8,
+            "the complete bright ANSI row remains visible"
+        );
+        for (index, (x, y, width, fill)) in swatches.iter().enumerate() {
+            assert_eq!(
+                *fill,
+                rgba(crate::settings::u32_rgb(candidate.ansi[index + 8]), 255)
+            );
+            assert!(*x >= rect.x && *x + *width <= rect.right() + 0.01);
+            assert!(*y >= rect.y && *y + 6.0 <= rect.bottom() + 0.01);
+        }
+    }
+
+    #[test]
+    fn small_top_theme_card_keeps_the_real_specimen_above_its_palette_band() {
+        // Install and capture the same prepared renderer source a live native
+        // Settings view receives. The fallback label belongs only to the
+        // unavailable first frame and must not paint over a real specimen.
+        let _ = compiled(SettingsPreviewSpec::appearance(14.0));
+        let prepared = crate::tray_raster::prepare_semantic_font(
+            &crate::widget::SemanticFontCandidate::default(),
+        );
+        assert!(prepared.is_ready());
+        let spec = SettingsPreviewSpec::appearance(24.0).with_prepared_font(prepared);
+        let rect = LogicalRect::new(0.0, 0.0, 360.0, 132.0);
+        let mut prims = Vec::new();
+        spec.paint(
+            &mut prims,
+            rect,
+            Theme::default(),
+            Roles::from_theme(Theme::default()),
+        );
+
+        let specimen = prims
+            .iter()
+            .find_map(|primitive| match primitive {
+                DrawPrim::TerminalSpecimen { spec, .. } => Some(spec.as_ref()),
+                _ => None,
+            })
+            .expect("real terminal specimen");
+        assert_eq!(specimen.input.cells.len(), APPEARANCE_SPECIMEN_ROWS);
+        let terminal = LogicalRect::new(10.0, 32.0, 340.0, 90.0);
+        let specimen_clip = appearance_specimen_clip(terminal);
+        let projected_height = specimen.font_px
+            * specimen.line_height.max(0.5)
+            * APPEARANCE_RENDERER_LINE_ALLOWANCE
+            * APPEARANCE_SPECIMEN_ROWS as f32;
+        assert!(
+            projected_height <= specimen_clip.height + 0.01,
+            "{projected_height} > {}",
+            specimen_clip.height
+        );
+        let terminal_text = specimen
+            .input
+            .cells
+            .iter()
+            .flatten()
+            .map(|cell| cell.ch)
+            .collect::<String>();
+        assert!(terminal_text.contains("gypq_j underline"));
+
+        let swatch_y = appearance_swatch_y(terminal);
+        assert!(specimen_clip.bottom() + APPEARANCE_SPECIMEN_SWATCH_GAP <= swatch_y + 0.01);
+        assert!(prims.iter().all(|primitive| !matches!(
+            primitive,
+            DrawPrim::Text { s, .. } if s == "$ aterm" || s == "ready"
+        )));
+        assert!(prims.iter().any(|primitive| matches!(
+            primitive,
+            DrawPrim::ClipPush { x, y, w, h }
+                if (*x - specimen_clip.x).abs() < 0.01
+                    && (*y - specimen_clip.y).abs() < 0.01
+                    && (*w - specimen_clip.width).abs() < 0.01
+                    && (*h - specimen_clip.height).abs() < 0.01
+        )));
+        assert!(
+            prims
+                .iter()
+                .filter(|primitive| matches!(
+                    primitive,
+                    DrawPrim::Panel { y, h, .. }
+                        if (*y - swatch_y).abs() < 0.01
+                            && (*h - APPEARANCE_SWATCH_HEIGHT).abs() < 0.01
+                ))
+                .count()
+                >= 8
         );
     }
 
@@ -2710,7 +3420,7 @@ mod tests {
         assert_eq!(synthwave_spec.animation(), PreviewAnimation::Continuous);
         assert!(
             synthwave_spec
-                .semantic_value()
+                .audit_value()
                 .contains("shared CursorGlow custom Trail Pack interpreter is live")
         );
         assert_ne!(
@@ -2767,8 +3477,8 @@ mod tests {
             ..CursorPostFxSpec::default()
         });
         assert_eq!(custom.cursor.trail_style, PreviewTrailStyle::Phaser);
-        assert!(custom.semantic_value().contains("shown independently"));
-        assert!(custom.semantic_value().contains("dormant"));
+        assert!(custom.audit_value().contains("shown independently"));
+        assert!(custom.audit_value().contains("dormant"));
         let crate::app_config::NyanSpriteAsset::Ready { rgba: carried, .. } =
             &custom.post_fx.nyan_asset
         else {
@@ -2812,8 +3522,8 @@ mod tests {
         .with_phase(900);
 
         assert_eq!(unavailable.animation(), PreviewAnimation::None);
-        assert_eq!(unavailable.state_badge(), "TRAIL PACK UNAVAILABLE");
-        assert!(unavailable.semantic_value().contains("fails closed"));
+        assert_eq!(unavailable.state_badge(), "Trail unavailable");
+        assert!(unavailable.audit_value().contains("fails closed"));
         assert_eq!(
             unavailable.paint_fingerprint(),
             unavailable.clone().with_phase(1_500).paint_fingerprint(),
@@ -2846,7 +3556,7 @@ mod tests {
             })
             .with_phase(900);
             assert_eq!(spec.animation(), PreviewAnimation::None, "{raw}");
-            assert!(spec.semantic_value().contains("fails closed"), "{raw}");
+            assert!(spec.audit_value().contains("fails closed"), "{raw}");
             let grid = PreviewGrid::new(
                 LogicalRect::new(0.0, 0.0, 420.0, 150.0),
                 spec.font_px,
@@ -2860,8 +3570,8 @@ mod tests {
     }
 
     #[test]
-    fn semantic_value_is_truthful_about_renderer_scope() {
-        let value = SettingsPreviewSpec::default().semantic_value();
+    fn audit_value_is_truthful_about_renderer_scope() {
+        let value = SettingsPreviewSpec::default().audit_value();
         assert!(value.contains("renderer preview"));
         assert!(value.contains("host-prepared renderer snapshot unavailable"));
         assert!(value.contains("portable SDR tone-map: bloom"));
@@ -2874,7 +3584,7 @@ mod tests {
             trail_style: PreviewTrailStyle::Nyan,
             ..CursorPreviewSpec::default()
         })
-        .semantic_value();
+        .audit_value();
         assert!(nyan.contains("Nyan ribbon geometry"));
         assert!(nyan.contains("built-in CatBaker asset ready"));
         assert!(!nyan.contains("not simulated"));
@@ -2884,9 +3594,39 @@ mod tests {
             trail_style: PreviewTrailStyle::Off,
             ..CursorPreviewSpec::default()
         })
-        .semantic_value();
+        .audit_value();
         assert!(off.contains("No CursorGlow trail primitive is emitted"));
         assert!(!off.contains("Nyan ribbon"));
+    }
+
+    #[test]
+    fn accessibility_values_are_concise_user_language_while_audit_stays_detailed() {
+        let specimens = [
+            SettingsPreviewSpec::appearance(14.0)
+                .with_terminal_theme(NORD)
+                .with_focus(crate::prefs::EDIT_THEME, "Nord"),
+            SettingsPreviewSpec::typography(16.0)
+                .with_focus(crate::prefs::EDIT_FONT_FAMILY, "Berkeley Mono"),
+            SettingsPreviewSpec::default(),
+            SettingsPreviewSpec::window_tabs(WindowTabsPreviewSpec::default(), 14.0),
+        ];
+        for spec in specimens {
+            let value = spec.semantic_value();
+            assert!(value.len() < 240, "spoken preview is too long: {value}");
+            for internal in [
+                "normalized-candidate",
+                "CursorGlow",
+                "CatBaker",
+                "tone-map",
+                "fingerprint",
+            ] {
+                assert!(!value.contains(internal), "{internal} leaked into {value}");
+            }
+        }
+        let audit = SettingsPreviewSpec::default().audit_value();
+        assert!(audit.contains("normalized-candidate"));
+        assert!(audit.contains("CursorGlow"));
+        assert!(audit.contains("tone-map"));
     }
 
     #[test]
@@ -2898,6 +3638,7 @@ mod tests {
                 ..SemanticFontCandidate::default()
             })
             .with_focus(crate::prefs::EDIT_FONT_FAMILY, family);
+        let audit = spec.audit_value();
         let compiled = compiled(spec);
         let preview = compiled
             .semantic(&crate::native_ui::UiKey::new("preview"))
@@ -2921,8 +3662,24 @@ mod tests {
         let crate::native_ui::SemanticValue::Text(value) = &preview.value else {
             panic!("preview semantic value is textual")
         };
-        assert!(value.contains("In-specimen font status:"));
         assert!(value.contains(family));
+        assert!(audit.contains("In-specimen font status:"));
+        assert!(audit.contains(family));
+    }
+
+    #[test]
+    fn settled_default_font_is_presented_as_the_live_host_not_an_unavailable_choice() {
+        let mut spec = SettingsPreviewSpec::typography(14.0)
+            .with_focus(crate::prefs::EDIT_FONT_FAMILY, "default");
+        // This is the exact settled status emitted for the host candidate by
+        // `SemanticFontResolution::Host`.  Keep the presentation assertion in
+        // this module, beside the classifier that owns the warning capsule.
+        spec.font_status = "committed renderer font cascade ready".to_string();
+
+        assert_eq!(
+            spec.font_candidate_pill(),
+            Some(("Live specimen · Regular: default".to_string(), false))
+        );
     }
 
     #[test]
@@ -3041,7 +3798,7 @@ mod tests {
         assert_eq!(late.animation(), PreviewAnimation::None);
         assert_eq!(early.paint_fingerprint(), late.paint_fingerprint());
         assert_eq!(pixels(early.clone()), pixels(late));
-        assert!(early.semantic_value().contains("blink off"));
+        assert!(early.audit_value().contains("blink off"));
     }
 
     #[test]

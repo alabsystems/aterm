@@ -20,6 +20,15 @@ impl Scrollback {
         self.update_watermark_level();
     }
 
+    /// Monotonic count of lines DROPPED by memory-pressure eviction (the byte
+    /// budget's cold-tier FIFO) — real retention loss, surfaced OUT-OF-BAND
+    /// (audit E10a: no sentinel content is ever injected). User-requested
+    /// `set_line_limit` truncation is intentional and NOT counted.
+    #[must_use]
+    pub fn pressure_evicted_lines(&self) -> u64 {
+        self.pressure_evicted_lines
+    }
+
     /// Update both diagnostic and budget aggregates from per-tier counters.
     ///
     /// Spelled `saturating_add`: each operand is bytes of memory this process

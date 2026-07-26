@@ -7,11 +7,12 @@
 //! ([`crate::markdown`]), and the actions — Check for Updates, Install & Relaunch (only
 //! when a strictly-newer build is staged), and Close. It is the DETAILED update screen the
 //! tab-strip ↻ icon, the App-menu "Software Update…" item, the macOS toolbar ↻ button, and
-//! the fading "update ready" nudge all open. Modelled on the About overlay: ONE structured
-//! snapshot ([`UpdateState`], captured from [`aterm_update::status`]) drives the pixels AND
-//! the `controls update` introspection text, and ONE pure [`update_layout`] drives the
-//! painter AND the mouse hit-test, so screen == introspection and a click always lands on
-//! exactly what is on screen.
+//! the fading "update ready" nudge all open. Shipping update details now render in the
+//! native Settings `/updates` route, where `controls update` serializes that route's exact
+//! compiled semantic frame. This former card model remains a regression fixture: ONE
+//! structured snapshot ([`UpdateState`], captured from [`aterm_update::status`]) drives its
+//! pixels and test projection, and ONE pure [`update_layout`] drives its painter and mouse
+//! hit-test.
 
 use aterm_render::Theme;
 
@@ -225,8 +226,9 @@ impl UpdateState {
         (0, total, total.min(MAX_NOTES))
     }
 
-    /// Machine-readable lines for the `controls update` introspection verb — the same
-    /// state the card paints, so screen == introspection.
+    /// Test projection for the retired standalone update card. The shipping
+    /// `controls update` alias serializes the compiled native Settings `/updates` tree.
+    #[cfg(test)]
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let mut out = Vec::new();
         out.push(format!(
@@ -296,9 +298,8 @@ pub(crate) fn a11y_hit(node: accesskit::NodeId) -> Option<UpdateHit> {
     }
 }
 
-/// The Software Update overlay's accessibility tree — the FIFTH observer of the SAME
-/// [`UpdateState`] the pixels ([`update_tray`]) and the `controls update` verb
-/// ([`UpdateState::controls_lines`]) read. A window root parents static
+/// The retired Software Update card's accessibility tree reads the same [`UpdateState`]
+/// as its pixels ([`update_tray`]). A window root parents static
 /// [`accesskit::Role::Label`] nodes for the current-build line, the status headline, and the
 /// (staged-only) version detail, plus one [`accesskit::Role::Button`] per PRESENT action —
 /// Close always, Check iff `enabled`, Install iff [`UpdateState::has_update`] — one button

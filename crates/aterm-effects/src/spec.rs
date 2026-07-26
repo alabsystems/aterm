@@ -179,34 +179,7 @@ pub const MAX_TOY_WORD_BYTES: usize = 128;
 /// FIFO/device cannot stall startup and an oversized file costs at most the
 /// compiler ceiling plus one sentinel byte.
 pub fn read_toy_pack_file(path: &std::path::Path) -> std::io::Result<String> {
-    use std::io::Read;
-
-    // Check before opening: opening a FIFO for reading can block indefinitely.
-    // Recheck the opened handle to narrow the metadata/open replacement window.
-    let metadata = std::fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "toy pack path is not a regular file",
-        ));
-    }
-    let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "toy pack path is not a regular file",
-        ));
-    }
-    let limit = MAX_TOY_PACK_BYTES + 1;
-    let capacity = metadata.len().min(limit as u64) as usize;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(limit as u64).read_to_end(&mut bytes)?;
-    String::from_utf8(bytes).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("toy pack is not UTF-8: {error}"),
-        )
-    })
+    crate::file_feed::read_bounded_regular_utf8(path, MAX_TOY_PACK_BYTES)
 }
 
 /// The §6 dispatch table carried on the resolved config: registered custom
@@ -220,12 +193,81 @@ pub struct SpecTable {
     overrides: FxHashMap<u64, SpecId>,
 }
 
+/// Which shared runtime tunings have at least one admitted word-effect
+/// consumer. The custom-axis fields are derived from the compiled [`SpecTable`], not from the
+/// mere presence of a `[[sparkle_words.custom]]` or Toy Pack path: graphic-only,
+/// Glow, SuperNova, and zero-chance recipes do not make unrelated controls
+/// effective.
+///
+/// Custom TwoTone recipes own their repeat choice through
+/// [`InkSpec::sweep_once`]. Consequently there is deliberately no
+/// "global ink loop" capability here; the global `ink.loop` setting affects
+/// class-default specs only. `twotone_ink` does identify consumers of the
+/// shared sweep duration and strength.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpecConsumerCapabilities {
+    /// A positive-chance classic Nova burst consumes the shared magic toggle.
+    pub nova_burst: bool,
+    /// A positive-chance Sparkle or Starburst consumes palette/density/timing/jitter.
+    pub sparkle_or_starburst_burst: bool,
+    /// At least one custom Rainbow ink axis consumes shared ink strength.
+    pub rainbow_ink: bool,
+    /// At least one custom TwoTone ink axis consumes strength and sweep timing.
+    pub twotone_ink: bool,
+    /// A Nova + TwoTone composition also consumes Nova magic through its ink
+    /// palette, even when that recipe's burst chance is zero.
+    pub nova_twotone_ink: bool,
+    /// At least one scannable, non-ignored Emphasis surface reaches the class
+    /// default rather than a custom override. Filled by the host's prepared
+    /// lexicon+spec projection; a bare `SpecTable` leaves this false.
+    pub emphasis_class_default: bool,
+}
+
 impl SpecTable {
     /// Whether any custom spec is registered — the §6 emphasis-class resolve
     /// gate term (`enabled && (ink_enabled || has_custom_specs)`).
     #[must_use]
     pub fn has_custom(&self) -> bool {
         !self.specs.is_empty()
+    }
+
+    /// Exact shared-setting consumers in this already-compiled table.
+    ///
+    /// `specs` contains only recipes that were attached to at least one
+    /// non-empty word by [`Self::insert_custom`], so empty declarations cannot
+    /// manufacture a live consumer. Calling this after Toy Pack overlay yields
+    /// the same admitted inline + pack generation the renderer uses.
+    #[must_use]
+    pub fn consumer_capabilities(&self) -> SpecConsumerCapabilities {
+        let mut capabilities = SpecConsumerCapabilities::default();
+        // Overlay keeps the compact spec arena resident and rewrites only the
+        // dispatch map. Walk reachable ids, not the arena, so a Toy Pack
+        // recipe fully shadowed by a later inline override cannot keep a
+        // setting falsely live.
+        for id in self.overrides.values() {
+            let Some(spec) = self.specs.get(usize::from(*id)) else {
+                continue;
+            };
+            let rainbow = matches!(
+                spec.ink.map(|ink| ink.colorway),
+                Some(Colorway::Rainbow { .. })
+            );
+            let twotone = matches!(
+                spec.ink.map(|ink| ink.colorway),
+                Some(Colorway::TwoTone { .. })
+            );
+            capabilities.rainbow_ink |= rainbow;
+            capabilities.twotone_ink |= twotone;
+
+            if let Some(burst) = spec.burst {
+                let rolls = burst.chance_pct > 0;
+                capabilities.nova_burst |= rolls && burst.kind == BurstKind::Nova;
+                capabilities.sparkle_or_starburst_burst |=
+                    rolls && matches!(burst.kind, BurstKind::Sparkle | BurstKind::Starburst);
+                capabilities.nova_twotone_ink |= burst.kind == BurstKind::Nova && twotone;
+            }
+        }
+        capabilities
     }
 
     /// The per-word override for a scan match, if any. Wins over the class
@@ -370,17 +412,30 @@ fn parse_hex(s: &str) -> Option<u32> {
     u32::from_str_radix(h, 16).ok()
 }
 
+/// Whether a custom ink colorway is one of the two runtime-supported shapes.
+/// Two-tone is deliberately exact: a third comma-separated color is not an
+/// ignored extension but an invalid value that falls back to rainbow.
+#[must_use]
+pub fn custom_colorway_is_valid(s: &str) -> bool {
+    let s = s.trim();
+    s == "rainbow" || parse_two_tone(s).is_some()
+}
+
+fn parse_two_tone(s: &str) -> Option<(u32, u32)> {
+    let rest = s.strip_prefix("twotone:")?;
+    let mut colors = rest.split(',');
+    let c0 = colors.next().and_then(parse_hex)?;
+    let c1 = colors.next().and_then(parse_hex)?;
+    colors.next().is_none().then_some((c0, c1))
+}
+
 /// Resolve a colorway string: `"rainbow"` (default) or
 /// `"twotone:#RRGGBB,#RRGGBB"`. Unknown values fail open to rainbow — the
 /// custom framework's flagship default.
 fn parse_colorway(s: &str) -> Colorway {
     let s = s.trim();
-    if let Some(rest) = s.strip_prefix("twotone:") {
-        let mut it = rest.split(',');
-        if let (Some(c0), Some(c1)) = (it.next().and_then(parse_hex), it.next().and_then(parse_hex))
-        {
-            return Colorway::TwoTone { c0, c1 };
-        }
+    if let Some((c0, c1)) = parse_two_tone(s) {
+        return Colorway::TwoTone { c0, c1 };
     }
     match rainbow_ink().colorway {
         c @ Colorway::Rainbow { .. } => c,
@@ -1547,11 +1602,14 @@ ink = { kind = "self_glow", window_ms = 9000 }
         let oversized = root.join("oversized.toml");
         std::fs::write(&oversized, vec![b'x'; MAX_TOY_PACK_BYTES + 32])
             .expect("write oversized fixture");
-        let source = read_toy_pack_file(&oversized).expect("oversized read is capped");
-        assert_eq!(source.len(), MAX_TOY_PACK_BYTES + 1);
+        let oversized_error =
+            read_toy_pack_file(&oversized).expect_err("oversized manifest rejected by reader");
+        assert_eq!(oversized_error.kind(), std::io::ErrorKind::InvalidData);
         assert!(
-            compile_toy_pack_toml(&source).is_err(),
-            "the sentinel byte reaches the compiler's source-size diagnostic"
+            oversized_error
+                .to_string()
+                .contains(&MAX_TOY_PACK_BYTES.to_string()),
+            "{oversized_error}"
         );
 
         std::fs::remove_dir_all(root).expect("remove reader fixtures");
@@ -1675,6 +1733,24 @@ graphic = { collection = "cats" }
     }
 
     #[test]
+    fn custom_twotone_requires_exactly_two_colors_and_runtime_falls_back() {
+        let valid = "twotone:#112233,#445566";
+        let extra = "twotone:#112233,#445566,#778899";
+        assert!(custom_colorway_is_valid(valid));
+        assert!(!custom_colorway_is_valid(extra));
+        assert!(!custom_colorway_is_valid("twotone:#112233"));
+
+        assert!(matches!(
+            parse_colorway(valid),
+            Colorway::TwoTone {
+                c0: 0x0011_2233,
+                c1: 0x0044_5566,
+            }
+        ));
+        assert!(matches!(parse_colorway(extra), Colorway::Rainbow { .. }));
+    }
+
+    #[test]
     fn spec_table_overlay_is_deterministic_and_later_wins() {
         let spec = |kind| WordEffectSpec {
             burst: Some(BurstSpec {
@@ -1782,6 +1858,115 @@ ink = { colorway = "rainbow" }
                 collection: Collection::Cats,
                 dwell_ms: (2200, 3598)
             })
+        );
+    }
+
+    #[test]
+    fn consumer_capabilities_name_only_actual_shared_tuning_consumers() {
+        let mut table = SpecTable::default();
+        let burst = |kind, chance_pct| WordEffectSpec {
+            burst: Some(BurstSpec { kind, chance_pct }),
+            ..WordEffectSpec::default()
+        };
+
+        // Negative controls: these are genuine admitted custom recipes, but
+        // none consumes Nova magic, legacy sparkle tuning, or global ink
+        // strength/sweep timing.
+        table.insert_custom(
+            "graphic-only",
+            WordEffectSpec {
+                graphic: Some(GraphicSpec {
+                    collection: Collection::Cats,
+                    dwell_ms: (2_200, 3_598),
+                }),
+                ..WordEffectSpec::default()
+            },
+        );
+        table.insert_custom("glow", burst(BurstKind::Glow, 100));
+        table.insert_custom("supernova", burst(BurstKind::SuperNova, 100));
+        table.insert_custom("rolled-off-sparkle", burst(BurstKind::Sparkle, 0));
+        table.insert_custom(
+            "self-glow",
+            WordEffectSpec {
+                ink: Some(InkSpec {
+                    colorway: Colorway::SelfGlow {
+                        lift: 0.2,
+                        amp: 0.3,
+                        window_ms: 800,
+                    },
+                    sweep_once: true,
+                }),
+                ..WordEffectSpec::default()
+            },
+        );
+        assert_eq!(
+            table.consumer_capabilities(),
+            SpecConsumerCapabilities::default(),
+            "unrelated admitted recipes must not make shared controls look live"
+        );
+
+        table.insert_custom("nova", burst(BurstKind::Nova, 1));
+        table.insert_custom("sparkle", burst(BurstKind::Sparkle, 1));
+        table.insert_custom("starburst", burst(BurstKind::Starburst, 100));
+        table.insert_custom(
+            "rainbow",
+            WordEffectSpec {
+                ink: Some(rainbow_ink()),
+                ..WordEffectSpec::default()
+            },
+        );
+        table.insert_custom(
+            "nova-twotone-no-burst",
+            WordEffectSpec {
+                ink: Some(InkSpec {
+                    colorway: Colorway::TwoTone {
+                        c0: 0x0011_2233,
+                        c1: 0x0044_5566,
+                    },
+                    // A custom recipe owns this choice. It does not become a
+                    // consumer of the global `ink.loop` setting.
+                    sweep_once: false,
+                }),
+                burst: Some(BurstSpec {
+                    kind: BurstKind::Nova,
+                    chance_pct: 0,
+                }),
+                ..WordEffectSpec::default()
+            },
+        );
+        assert_eq!(
+            table.consumer_capabilities(),
+            SpecConsumerCapabilities {
+                nova_burst: true,
+                sparkle_or_starburst_burst: true,
+                rainbow_ink: true,
+                twotone_ink: true,
+                nova_twotone_ink: true,
+                emphasis_class_default: false,
+            }
+        );
+
+        // An inline override can make an imported pack recipe unreachable.
+        // The arena keeps both specs for compact ids, but capability projection
+        // follows the live dispatch map and therefore drops the shadowed burst.
+        let mut imported = SpecTable::default();
+        imported.insert_custom("shared", burst(BurstKind::Sparkle, 100));
+        let mut inline = SpecTable::default();
+        inline.insert_custom(
+            "shared",
+            WordEffectSpec {
+                graphic: Some(GraphicSpec {
+                    collection: Collection::Cats,
+                    dwell_ms: (2_200, 3_598),
+                }),
+                ..WordEffectSpec::default()
+            },
+        );
+        imported.overlay(inline);
+        assert_eq!(
+            imported.consumer_capabilities(),
+            SpecConsumerCapabilities::default(),
+            "a fully shadowed Toy Pack burst is not an admitted consumer"
         );
     }
 }

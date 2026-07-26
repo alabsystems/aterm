@@ -116,6 +116,17 @@ impl GithubFetcher {
         self
     }
 
+    /// The credential this fetcher presents, or `None` to request anonymously.
+    ///
+    /// `GithubFetcher::new` documents that an EMPTY token means "public repo over the
+    /// anonymous API"; the network layer is now token-optional, so that intent is
+    /// expressed directly instead of being smuggled through as an empty `Bearer`
+    /// header (which the layer now refuses outright). atpkg's own token resolution is
+    /// unchanged — this only maps "no token" onto the anonymous lane.
+    fn credential(&self) -> Option<&str> {
+        (!self.token.is_empty()).then_some(self.token.as_str())
+    }
+
     /// The `<owner>/<repo>` slug `program`'s release fetches go to: the config
     /// fetch override when one is declared, else the index-declared `repo` under
     /// this fetcher's account.
@@ -140,7 +151,7 @@ impl GithubFetcher {
         let mut url = String::from("https://api.github.com/repos/");
         url.push_str(slug);
         url.push_str("/releases?per_page=20");
-        parse_releases(&aterm_update_core::api_get(&url, &self.token)?)
+        parse_releases(&aterm_update_core::api_get(&url, self.credential())?)
     }
 
     /// List a repo's recent releases under this fetcher's own account.
@@ -159,8 +170,8 @@ impl crate::flow::Fetcher for GithubFetcher {
         for r in &releases {
             if let Some((toml_url, sig_url)) = find_pair(&r.assets, "index.toml") {
                 let index_bytes =
-                    aterm_update_core::download_bytes(toml_url, &self.token, MANIFEST_CAP)?;
-                let sig = aterm_update_core::download_bytes(sig_url, &self.token, SIG_CAP)?;
+                    aterm_update_core::download_bytes(toml_url, self.credential(), MANIFEST_CAP)?;
+                let sig = aterm_update_core::download_bytes(sig_url, self.credential(), SIG_CAP)?;
                 out.push(Candidate {
                     label: r.tag_name.clone(),
                     index_bytes,
@@ -191,8 +202,9 @@ impl crate::flow::Fetcher for GithubFetcher {
         // fetch override redirects it (with the same token) when declared.
         for r in &self.releases_at(&self.slug_for(program, repo))? {
             if let Some((toml_url, sig_url)) = find_pair(&r.assets, &name) {
-                let toml = aterm_update_core::download_bytes(toml_url, &self.token, MANIFEST_CAP)?;
-                let sig = aterm_update_core::download_bytes(sig_url, &self.token, SIG_CAP)?;
+                let toml =
+                    aterm_update_core::download_bytes(toml_url, self.credential(), MANIFEST_CAP)?;
+                let sig = aterm_update_core::download_bytes(sig_url, self.credential(), SIG_CAP)?;
                 return Ok((toml, sig));
             }
         }
@@ -207,7 +219,12 @@ impl crate::flow::Fetcher for GithubFetcher {
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
         for r in &self.releases(repo)? {
             if let Some(a) = r.assets.iter().find(|a| a.name == asset) {
-                return aterm_update_core::download_to(&a.url, &self.token, dest, ARTIFACT_CAP);
+                return aterm_update_core::download_to(
+                    &a.url,
+                    self.credential(),
+                    dest,
+                    ARTIFACT_CAP,
+                );
             }
         }
         // Manual concat of the previous `format!("no asset {asset} in {repo} releases")`
@@ -233,7 +250,12 @@ impl crate::flow::Fetcher for GithubFetcher {
         // `[packages.links]` fetch override redirects it identically (same token).
         for r in &self.releases_at(&self.slug_for(program, repo))? {
             if let Some(a) = r.assets.iter().find(|a| a.name == asset) {
-                return aterm_update_core::download_to(&a.url, &self.token, dest, ARTIFACT_CAP);
+                return aterm_update_core::download_to(
+                    &a.url,
+                    self.credential(),
+                    dest,
+                    ARTIFACT_CAP,
+                );
             }
         }
         let mut msg = String::from("no asset ");
@@ -284,7 +306,16 @@ impl crate::flow::Fetcher for DirFetcher {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
         let toml = self.dir.join("index.toml");
         let sig = self.dir.join("index.toml.sig");
-        match (std::fs::read(&toml), std::fs::read(&sig)) {
+        match (
+            crate::metadata_io::read_bounded_regular(
+                &toml,
+                usize::try_from(MANIFEST_CAP).unwrap_or(usize::MAX),
+            ),
+            crate::metadata_io::read_bounded_regular(
+                &sig,
+                usize::try_from(SIG_CAP).unwrap_or(usize::MAX),
+            ),
+        ) {
             (Ok(index_bytes), Ok(sig)) => Ok(vec![Candidate {
                 label: "dir".into(),
                 index_bytes,
@@ -307,8 +338,16 @@ impl crate::flow::Fetcher for DirFetcher {
         let name = format!("pkg-{program}-{build}.toml");
         let toml = self.dir.join(&name);
         let sig = self.dir.join(format!("{name}.sig"));
-        let raw = std::fs::read(&toml).map_err(|e| format!("read {}: {e}", toml.display()))?;
-        let sig = std::fs::read(&sig).map_err(|e| format!("read {}.sig: {e}", name))?;
+        let raw = crate::metadata_io::read_bounded_regular(
+            &toml,
+            usize::try_from(MANIFEST_CAP).unwrap_or(usize::MAX),
+        )
+        .map_err(|e| format!("read {}: {e}", toml.display()))?;
+        let sig = crate::metadata_io::read_bounded_regular(
+            &sig,
+            usize::try_from(SIG_CAP).unwrap_or(usize::MAX),
+        )
+        .map_err(|e| format!("read {}.sig: {e}", name))?;
         Ok((raw, sig))
     }
 
@@ -398,8 +437,7 @@ mod tests {
     fn override_redirects_only_the_named_programs_slug() {
         let mut overrides = std::collections::BTreeMap::new();
         overrides.insert("orc".to_string(), "alabsystems/orc-private".to_string());
-        let f = GithubFetcher::new("alabsystems".into(), String::new())
-            .with_overrides(overrides);
+        let f = GithubFetcher::new("alabsystems".into(), String::new()).with_overrides(overrides);
         // The overridden program fetches from the declared owner/repo…
         assert_eq!(f.slug_for("orc", "orc"), "alabsystems/orc-private");
         // …even if the index declares a differently-named repo for it…
@@ -421,5 +459,54 @@ mod tests {
         let f = DirFetcher::new(d.clone());
         assert_eq!(f.source_id(), format!("dir:{}", canon.display()));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dir_manifest_sparse_oversize_is_rejected_without_allocation() {
+        use crate::flow::Fetcher as _;
+
+        let d = std::env::temp_dir().join(format!("atpkg-dirfetch-sparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let index = std::fs::File::create(d.join("index.toml")).unwrap();
+        index.set_len(MANIFEST_CAP + 1).unwrap();
+        std::fs::write(d.join("index.toml.sig"), b"sig").unwrap();
+        assert!(
+            DirFetcher::new(d.clone())
+                .index_candidates()
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_manifest_fifo_and_symlink_return_without_blocking() {
+        use crate::flow::Fetcher as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let d = std::env::temp_dir().join(format!("atpkg-dirfetch-special-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let index = d.join("index.toml");
+        let index_c = std::ffi::CString::new(index.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `index_c` is a live NUL-terminated path in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(index_c.as_ptr(), 0o600) }, 0);
+        std::fs::write(d.join("index.toml.sig"), b"sig").unwrap();
+        let fetcher = DirFetcher::new(d.clone());
+        assert!(fetcher.index_candidates().unwrap().is_empty());
+
+        std::fs::remove_file(&index).unwrap();
+        let target = d.join("index-target.toml");
+        std::fs::write(&target, b"index").unwrap();
+        std::os::unix::fs::symlink(&target, &index).unwrap();
+        assert!(fetcher.index_candidates().unwrap().is_empty());
+
+        let pkg = d.join("pkg-ay-1.toml");
+        std::os::unix::fs::symlink(&target, &pkg).unwrap();
+        std::fs::write(d.join("pkg-ay-1.toml.sig"), b"sig").unwrap();
+        assert!(fetcher.pkg_manifest("ignored", "ay", 1).is_err());
+        let _ = std::fs::remove_dir_all(d);
     }
 }

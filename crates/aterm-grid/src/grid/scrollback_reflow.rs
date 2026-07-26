@@ -121,7 +121,6 @@ impl Grid {
     /// Convert reflowed scrollback [`Line`]s into ring-buffer scrollback rows
     /// and prepend them ahead of the visible window, honoring `max_scrollback`.
     fn prepend_ring_scrollback_lines(&mut self, lines: Vec<Line>, new_cols: u16) {
-        use super::scroll_convert::DeferredLine;
         // Cap to the ring's scrollback budget: only the newest lines fit when
         // history exceeds the configured limit (oldest evicted — correct).
         let cap = self.storage.max_scrollback;
@@ -135,9 +134,7 @@ impl Grid {
         if skip > 0 && self.storage.scrollback_detached_for_reflow {
             for line in &lines[..skip] {
                 let (row, extras) = self.build_scrollback_row(line, new_cols);
-                self.storage
-                    .lazy_buffer
-                    .push(DeferredLine::new(&row, extras));
+                self.storage.lazy_buffer.push_row(&row, extras);
             }
         }
         let kept = &lines[skip..];
@@ -339,7 +336,12 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
         let unit = super::scroll_materialize::advance_grapheme_unit_wide(text, &mut byte_idx);
         let chars_consumed = unit.chars;
         char_idx += chars_consumed;
-        let width = if unit.wide { 2 } else { 1 };
+        let attrs = line.get_attr(unit_char_start);
+        let width = if super::scroll_materialize::stored_unit_is_wide(unit, attrs) {
+            2
+        } else {
+            1
+        };
         // Advance past spans fully left of `col`; sorted + disjoint ⇒ at most one
         // remaining span can contain `col`. O(cells + spans) overall.
         while span_idx < spans.len() && spans[span_idx].end_col <= col {
@@ -358,7 +360,7 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
             .map(|s| s.color);
         units.push(Unit {
             text: &text[unit_byte_start..byte_idx],
-            attrs: line.get_attr(unit_char_start),
+            attrs,
             link,
             underline_color,
             width,
@@ -593,5 +595,61 @@ mod tests {
         assert_eq!(out[0].as_str().unwrap(), "世");
         assert_eq!(out[1].as_str().unwrap(), "界");
         assert!(out[1].is_wrapped());
+    }
+
+    #[test]
+    fn rewrap_preserves_stored_ambiguous_width_with_narrow_control() {
+        use crate::CellFlags;
+
+        const AMBIGUOUS: char = '\u{00B7}'; // MIDDLE DOT, East Asian Width=A
+        assert_eq!(aterm_grapheme::char_width(AMBIGUOUS), 1);
+        assert_eq!(aterm_grapheme::char_width_cjk(AMBIGUOUS), 2);
+
+        let wide = CellAttrs::new(
+            CellAttrs::DEFAULT.fg,
+            CellAttrs::DEFAULT.bg,
+            CellFlags::WIDE.bits(),
+        );
+        let wide_line = Line::with_attrs(
+            "\u{00B7}Z",
+            [wide, CellAttrs::DEFAULT].into_iter().collect(),
+        );
+        let out = reflow_scrollback_lines(&[wide_line], 2);
+        assert_eq!(out.len(), 2, "stored-wide middle dot occupies both columns");
+        assert_eq!(out[0].as_str(), Some("\u{00B7}"));
+        assert_eq!(out[1].as_str(), Some("Z"));
+        assert!(
+            CellFlags::from_bits(out[0].get_attr(0).flags).contains(CellFlags::WIDE),
+            "rewrap keeps the write-time WIDE authority for later materialization"
+        );
+
+        let narrow_line = Line::from("\u{00B7}Z");
+        let narrow = reflow_scrollback_lines(&[narrow_line], 2);
+        assert_eq!(narrow.len(), 1, "narrow control still fits both glyphs");
+        assert_eq!(narrow[0].as_str(), Some("\u{00B7}Z"));
+    }
+
+    #[test]
+    fn rewrap_vs15_overrides_inconsistent_stored_wide_flag() {
+        use crate::CellFlags;
+
+        let stored_wide = CellAttrs::new(
+            CellAttrs::DEFAULT.fg,
+            CellAttrs::DEFAULT.bg,
+            CellFlags::WIDE.bits(),
+        );
+        let line = Line::with_attrs(
+            "\u{231A}\u{FE0E}Z",
+            [stored_wide, stored_wide, CellAttrs::DEFAULT]
+                .into_iter()
+                .collect(),
+        );
+        let out = reflow_scrollback_lines(&[line], 2);
+        assert_eq!(
+            out.len(),
+            1,
+            "VS15 keeps the watch narrow despite WIDE attrs"
+        );
+        assert_eq!(out[0].as_str(), Some("\u{231A}\u{FE0E}Z"));
     }
 }

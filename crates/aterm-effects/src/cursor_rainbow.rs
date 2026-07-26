@@ -38,6 +38,8 @@ use web_time::Instant;
 
 use aterm_render::{GlowQuad, premul_rgb};
 
+use crate::cursor_glow::OVER_INK_COV_CAP;
+
 use crate::cursor_glow::Geom;
 
 /// The block-cursor base the rainbow blooms FROM: white on a dark theme, a soft
@@ -70,13 +72,36 @@ const MIX_MAX: f32 = 0.82;
 /// cell, fading to nothing by the radius — so the overlapping thin bars read as one
 /// SOFT rainbow rim, not a few hard nested rectangles. The radius grows and the light
 /// intensifies with energy, over a small always-on idle floor so a focused idle cursor
-/// keeps a dim rainbow glow. The radius is kept tight (≤ half a cell) so the additive
-/// light hugs the block and never washes the neighbouring text.
-const HALO_LAYERS: i32 = 6;
-const HALO_RADIUS_IDLE: f32 = 0.10; // cells
-const HALO_RADIUS_MAX: f32 = 0.48;
-const HALO_BASE_COV: f32 = 82.0; // innermost-layer peak coverage (× energy)
-const HALO_IDLE_FLOOR: f32 = 0.16; // brightness kept while idle (× the breath)
+/// keeps a dim rainbow glow.
+///
+/// LEGIBILITY, 2026-07-24 (owner, twice: "the rainbow it too bright when I type
+/// so I can't read the text very easily" / "the rainbow and stars are too
+/// bright ... I can't see the letters still"): THE RINGS STACK, and the old
+/// "hugs the block and never washes the neighbouring text" claim was checked
+/// per-quad, never per-PIXEL. With six layers at radius 0.48 the LEFT bars of
+/// layers 0/1/2 all covered the pixel column one px outside the cursor cell,
+/// summing 93+60+33 = 186/255 of SATURATED additive light onto the edge of the
+/// just-typed glyph; the full-width TOP bars dumped 48 across a 20px band up to
+/// 10px INTO THE ROW ABOVE. Four layers at radius 0.22 and base 28 sum to 46 at
+/// that same worst column — inside [`crate::cursor_glow::OVER_INK_COV_CAP`] —
+/// and the rim now stays in the inter-character gutter (0.22*14 = 3px) instead
+/// of reaching most of the way across the neighbour cell. The rim reads SOFTER,
+/// not absent: the hue spread, the spin, the breath and the energy ramp are all
+/// untouched.
+const HALO_LAYERS: i32 = 4;
+const HALO_RADIUS_IDLE: f32 = 0.06; // cells
+const HALO_RADIUS_MAX: f32 = 0.22;
+const HALO_BASE_COV: f32 = 28.0; // innermost-layer peak coverage (× energy)
+/// Brightness kept while idle (× the breath). RAISED 0.16 -> 0.30 alongside the
+/// `HALO_BASE_COV` 82 -> 28 cut, NOT lowered with it: the settled ember's
+/// coverage is `HALO_BASE_COV · 1.0 · HALO_IDLE_FLOOR · (0.35 + PULSE_DEPTH ·
+/// breath)`, and `as u8` TRUNCATES. A first pass took the floor to 0.10, which
+/// put the innermost ring at 0.98..2.52 — so the resting rainbow ember
+/// quantized to literally ZERO across most of its breath and the idle cursor
+/// simply lost its glow. At 0.30 the ember sits at 2.9..7.6, comparable to the
+/// retired 4.6..11.8, while the ACTIVE halo — the layer the legibility complaint
+/// is actually about — still drops with the base.
+const HALO_IDLE_FLOOR: f32 = 0.30;
 /// Hue spread across the halo rings (turns): each ring sits a step further
 /// along the wheel than the one inside it, so the rim reads as an actual
 /// RAINBOW rippling outward from the block (it used to be six rings of one
@@ -94,19 +119,39 @@ const SETTLED_ENERGY: f32 = 0.02;
 /// 60 fps tick disarms — before the next flip can fire one.
 const TWINKLE_DUR: f32 = 0.16;
 /// How far the block fill glints toward the star colour at the flare peak.
-const TWINKLE_MIX: f32 = 0.6;
+/// Lowered 0.6 -> 0.35 on 2026-07-24 with the rest of the legibility retune.
+const TWINKLE_MIX: f32 = 0.35;
 /// Star-arm overhang past the block edge, as a fraction of the cell's OWN axis
-/// (the halo's per-axis discipline) — under the half-cell hug bound, so the
-/// star never washes the neighbour glyphs.
-const TWINKLE_REACH: f32 = 0.45;
-/// Peak additive coverage of the star arms / glitter dots (≤ the halo's cap).
-const TWINKLE_ARM_COV: f32 = 150.0;
-const TWINKLE_DOT_COV: f32 = 130.0;
+/// (the halo's per-axis discipline). Narrowed 0.45 -> 0.20 on 2026-07-24: at
+/// 0.45 the "never washes the neighbour glyphs" claim was simply false — the
+/// arms are a 4px bar THROUGH the cell centre overhanging BOTH neighbours.
+const TWINKLE_REACH: f32 = 0.20;
+/// Peak additive coverage of the star arms / glitter dots. Lowered 150/130 ->
+/// 44/38 on 2026-07-24 and bounded by
+/// [`crate::cursor_glow::OVER_INK_COV_CAP`]. The retired comment claimed these
+/// were "≤ the halo's cap" — but that cap was 160, so this was a 150-coverage
+/// white bar drawn across the letters on either side of the cursor, fired on
+/// every blink flip while typing.
+const TWINKLE_ARM_COV: f32 = 44.0;
+const TWINKLE_DOT_COV: f32 = 38.0;
 /// Scintillation cycles across one flare — the "glitter" wobble layered over
 /// the smooth pop envelope, phase-shifted per flare by the flip counter so
 /// consecutive twinkles don't repeat exactly. Deterministic: a pure sine of
 /// the injected clock, no RNG (the comet-glint precedent).
-const TWINKLE_SCINT: f32 = 2.4;
+///
+/// PHOTOSENSITIVITY BOUND: this is cycles per [`TWINKLE_DUR`], so the on-screen
+/// flash rate is `TWINKLE_SCINT / TWINKLE_DUR` Hz. At the retired 2.4 that was
+/// 15 Hz — five times the WCAG 2.3.1 general-flash threshold (3 Hz), and by far
+/// the fastest oscillator anywhere in the effect family. It very likely sat
+/// under the standard's small-safe-area exemption (the star arms cover few
+/// pixels), so this is not a claimed conformance failure — but it was
+/// undocumented, unbounded, and the fix is one constant. 0.5 puts it at 3.1 Hz:
+/// the flare still glints (one wobble over a 160 ms pop is exactly the
+/// "catches the light" read), it simply no longer strobes.
+///
+/// INVARIANT: keep `TWINKLE_SCINT / TWINKLE_DUR <= 3.2` if either is retuned.
+/// Pinned by `twinkle_flash_rate_stays_under_the_photosensitivity_bound`.
+const TWINKLE_SCINT: f32 = 0.5;
 
 /// Per-tick dt clamp (seconds) across a continuously charged interval. A fully
 /// settled cursor freezes its hue/breath, and a fresh charge starts from that
@@ -339,7 +384,7 @@ impl CursorRainbow {
                 let gx = (t * radius_x) as i32 + 1;
                 let gy = (t * radius_y) as i32 + 1;
                 let falloff = (1.0 - t) * (1.0 - t);
-                let cov = (HALO_BASE_COV * falloff * halo_energy).min(160.0) as u8;
+                let cov = (HALO_BASE_COV * falloff * halo_energy).min(OVER_INK_COV_CAP) as u8;
                 if cov == 0 {
                     continue;
                 }
@@ -378,7 +423,7 @@ impl CursorRainbow {
             let ch = geom.ch as i32;
             let cx = geom.origin_x as i32 + cc as i32 * cw;
             let cy = geom.origin_y as i32 + cr as i32 * ch;
-            let arm_cov = (TWINKLE_ARM_COV * pop * shimmer * cfg.intensity).min(160.0) as u8;
+            let arm_cov = (TWINKLE_ARM_COV * pop * shimmer * cfg.intensity).min(OVER_INK_COV_CAP) as u8;
             if arm_cov > 0 {
                 // Star-white arms on dark themes; the vivid live hue on light
                 // ones (additive white is invisible over a light background).
@@ -414,7 +459,7 @@ impl CursorRainbow {
             // integer hash of the flip counter — different corners each blink,
             // identical for identical clocks (no RNG). Snappier envelope (pop²)
             // so they wink after the arms bloom.
-            let dot_cov = (TWINKLE_DOT_COV * pop * pop * cfg.intensity).min(160.0) as u8;
+            let dot_cov = (TWINKLE_DOT_COV * pop * pop * cfg.intensity).min(OVER_INK_COV_CAP) as u8;
             if dot_cov > 0 {
                 let s = (ch / 8).max(2);
                 for k in 0..2u32 {
@@ -1334,6 +1379,24 @@ mod tests {
     /// The twinkle is a pure clock function: identical instants + identical flip
     /// sequences ⇒ byte-identical quads and equal fingerprints (the CPU/GPU
     /// parity + repaint-key contract; no RNG anywhere in the flare).
+    /// PHOTOSENSITIVITY BOUND (UX audit, 2026-07-24). The twinkle's
+    /// scintillation was the fastest oscillator in the whole effect family at
+    /// 15 Hz — five times the WCAG 2.3.1 general-flash threshold. Nothing
+    /// bounded it, and nothing named it. This pins the RATE rather than either
+    /// constant, so retuning the flare length can never silently re-introduce a
+    /// strobe.
+    #[test]
+    fn twinkle_flash_rate_stays_under_the_photosensitivity_bound() {
+        let hz = TWINKLE_SCINT / TWINKLE_DUR;
+        assert!(
+            hz <= 3.2,
+            "twinkle scintillation is {hz} Hz — over the 3 Hz general-flash bound"
+        );
+        // …and it must still WOBBLE: a rate of zero would be a silent removal
+        // of the glint rather than a bound on it.
+        assert!(TWINKLE_SCINT > 0.0, "the flare must still scintillate");
+    }
+
     #[test]
     fn twinkle_is_deterministic() {
         let g = geom();

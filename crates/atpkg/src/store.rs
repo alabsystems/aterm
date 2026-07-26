@@ -165,6 +165,14 @@ pub fn discard_build(build_dir: &Path) {
     if let Some(marker) = ready_marker_path(build_dir) {
         let _ = std::fs::remove_file(marker);
     }
+    // Also remove the source-build provenance sidecar (a sibling `<build>.provenance`), so a
+    // later SIGNED reinstall reusing this build number can never be mis-verified as
+    // source-built by a stale sidecar. Mirrors the `.ready` sibling naming.
+    if let Some(name) = build_dir.file_name().and_then(|n| n.to_str()) {
+        let mut prov = String::from(name);
+        prov.push_str(".provenance");
+        let _ = std::fs::remove_file(build_dir.with_file_name(prov));
+    }
 }
 
 /// The default prefix under `home`. On Unix `…/Library/Application Support/aterm/pkg`

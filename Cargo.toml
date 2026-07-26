@@ -23,8 +23,36 @@ expose = ["aterm"] # THE one command — window + session + every verb IN ONE BI
 # argv[0] — so nothing else lands in `bundle` as a separate binary.
 bundle = []
 
+# THE UPDATE CHANNEL shipped binaries read, as ONE tracked `OWNER/REPO` slug.
+#
+# This is deliberately NOT `[workspace.package] repository`. The two answer
+# different questions:
+#   * `repository` = where the SOURCE and the release pipeline live. It stays
+#     the private staging repo; `cargo ship cut` publishes there, gated by the
+#     ledger/lease/fence protocol, and it is the slug the cutter binds
+#     `git remote get-url origin` against.
+#   * `update_channel` = where INSTALLED COPIES look for updates. It is the
+#     PUBLIC mirror, so a fresh machine can read the channel with no token at
+#     all (an unauthenticated `GET /repos/alabsystems/aterm/releases` is 200).
+#
+# Two consumers read this one key, and a test proves they agree:
+#   * crates/aterm-update-core/build.rs stamps it into ATERM_DEFAULT_OWNER /
+#     ATERM_DEFAULT_REPO, the compiled-in default behind `Source::resolve`
+#     (still overridable per machine by ATERM_UPDATE_OWNER/_REPO env or the
+#     `[update] owner/repo` config — this is only the last-resort default);
+#   * crates/aterm-release (the `mirror` pipeline step) copies each finished,
+#     verified release here after `verify` and before `unlock`.
+#
+# Repointing this is NOT an authenticity change: trust is the manifest SHA-256,
+# the optional pinned Ed25519 key, codesign + the pinned Team ID. The channel
+# only decides where bytes come from. DELETING the key is legal and means "no
+# public mirror": clients then default to `repository` and the `mirror` step
+# becomes an announced no-op.
+[workspace.metadata.aterm]
+update_channel = "alabsystems/aterm"
+
 [workspace.package]
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -85,9 +113,8 @@ aterm-ffi = { path = "crates/aterm-ffi" }
 aterm-sandbox = { path = "crates/aterm-sandbox" }
 aterm-render = { path = "crates/aterm-render" }
 aterm-gpu = { path = "crates/aterm-gpu" }
-# The shared deterministic RGB/atlas/rasterizer kit (mix_rgb, smoothstep, Tile/Atlas)
-# used by aterm-effects. (Also carries an unused "Living Panels" scene framework — no
-# live consumer; the GUI Scene feature was removed.)
+# Shared deterministic colour/easing, vector-path, and Tile raster primitives
+# used by aterm-effects.
 aterm-scene = { path = "crates/aterm-scene" }
 # The shared cursor-aurora + sparkle-words effect engines (extracted from aterm-gui
 # so the web embedders drive the same art).

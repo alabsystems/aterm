@@ -207,7 +207,7 @@ const FIX_SMALL_ROLLED: &str = "\
 
 ## [Unreleased]
 
-## [0.26] - 2026-07-06
+## [0.2.0] - 2026-07-06
 
 ### Added
 - **X** — thing.
@@ -366,29 +366,33 @@ fn gate_refuses_triple_quote_with_the_file_line_number() {
 
 #[test]
 fn roll_matches_the_byte_exact_golden() {
-    let rolled = changelog::roll(FIX_SMALL, "0.26", "2026-07-06").unwrap();
+    let rolled = changelog::roll(FIX_SMALL, "0.2.0", "2026-07-06").unwrap();
     assert_eq!(rolled, FIX_SMALL_ROLLED);
 }
 
 #[test]
 fn roll_matches_the_retired_awk_on_the_real_changelog() {
-    // Version 99.99 will never exist in the file, so this stays valid across
+    // Version 99.99.0 will never exist in the file, so this stays valid across
     // every future real roll of CHANGELOG.md.
     let real = real_changelog();
-    let mine = changelog::roll(&real, "99.99", "2026-07-06").unwrap();
-    let oracle = awk(ROLL_AWK, &[("ver", "99.99"), ("date", "2026-07-06")], &real);
+    let mine = changelog::roll(&real, "99.99.0", "2026-07-06").unwrap();
+    let oracle = awk(
+        ROLL_AWK,
+        &[("ver", "99.99.0"), ("date", "2026-07-06")],
+        &real,
+    );
     assert_eq!(mine, oracle, "roll diverges from prepare-release.sh's awk");
 }
 
 #[test]
 fn roll_refuses_missing_unreleased_and_double_roll() {
-    let err = changelog::roll("# Changelog\n\n## [0.25] - x\n- y\n", "0.26", "2026-07-06")
+    let err = changelog::roll("# Changelog\n\n## [0.25] - x\n- y\n", "0.2.0", "2026-07-06")
         .unwrap_err()
         .to_string();
     assert!(err.contains("no \"## [Unreleased]\""), "{err}");
 
-    let rolled = changelog::roll(FIX_SMALL, "0.26", "2026-07-06").unwrap();
-    let err = changelog::roll(&rolled, "0.26", "2026-07-07")
+    let rolled = changelog::roll(FIX_SMALL, "0.2.0", "2026-07-06").unwrap();
+    let err = changelog::roll(&rolled, "0.2.0", "2026-07-07")
         .unwrap_err()
         .to_string();
     assert!(err.contains("already"), "{err}");
@@ -400,28 +404,28 @@ fn roll_refuses_missing_unreleased_and_double_roll() {
 
 #[test]
 fn rolled_body_extracts_verbatim_with_scaffolds_and_comments_kept() {
-    let rolled = changelog::roll(FIX_SMALL, "0.26", "2026-07-06").unwrap();
+    let rolled = changelog::roll(FIX_SMALL, "0.2.0", "2026-07-06").unwrap();
     // VERBATIM: the ### scaffold ships (unlike real_body, which is a gate
     // filter, not the shipping text) — only edge blank lines are trimmed.
     assert_eq!(
-        changelog::rolled_body(&rolled, "0.26").unwrap(),
+        changelog::rolled_body(&rolled, "0.2.0").unwrap(),
         "### Added\n- **X** — thing."
     );
 
     let with_comment =
-        "## [0.26] - 2026-07-06\n\n<!-- note to self -->\n- entry\n\n## [0.25] - x\n- y\n";
+        "## [0.2.0] - 2026-07-06\n\n<!-- note to self -->\n- entry\n\n## [0.25] - x\n- y\n";
     assert_eq!(
-        changelog::rolled_body(with_comment, "0.26").unwrap(),
+        changelog::rolled_body(with_comment, "0.2.0").unwrap(),
         "<!-- note to self -->\n- entry"
     );
 
     assert!(
-        changelog::rolled_body(FIX_SMALL, "9.99").is_err(),
+        changelog::rolled_body(FIX_SMALL, "9.99.0").is_err(),
         "missing section must error"
     );
-    let empty = "## [0.26] - 2026-07-06\n\n\n## [0.25] - x\n- y\n";
+    let empty = "## [0.2.0] - 2026-07-06\n\n\n## [0.25] - x\n- y\n";
     assert!(
-        changelog::rolled_body(empty, "0.26").is_err(),
+        changelog::rolled_body(empty, "0.2.0").is_err(),
         "empty section must error"
     );
 }
@@ -432,9 +436,9 @@ fn rolled_body_matches_the_retired_extract_pipeline_after_a_real_roll() {
     // extract the rolled section — and demand extract-changelog.sh's
     // section|trim_blanks pipeline agrees byte-for-byte.
     let real = real_changelog();
-    let rolled = changelog::roll(&real, "99.99", "2026-07-06").unwrap();
-    let oracle = awk_extract("99.99", &rolled);
-    match changelog::rolled_body(&rolled, "99.99") {
+    let rolled = changelog::roll(&real, "99.99.0", "2026-07-06").unwrap();
+    let oracle = awk_extract("99.99.0", &rolled);
+    match changelog::rolled_body(&rolled, "99.99.0") {
         // awk `print` terminates the last line; rolled_body returns unterminated.
         Ok(mine) => assert_eq!(format!("{mine}\n"), oracle),
         // If [Unreleased] is empty right after a real cut, both sides must
@@ -449,10 +453,17 @@ fn rolled_body_matches_the_retired_extract_pipeline_after_a_real_roll() {
 
 #[test]
 fn has_section_is_exact_about_versions() {
+    // `## [0.25]` is a real retired-scheme heading — CHANGELOG.md is
+    // append-only history, so has_section must keep finding those verbatim.
     assert!(changelog::has_section(FIX_SMALL, "0.25"));
-    assert!(!changelog::has_section(FIX_SMALL, "9.99"));
-    // Prefix discipline: 0.26 must not match a hypothetical 0.26.1 heading.
-    assert!(!changelog::has_section("## [0.26.1] - x\n", "0.26"));
+    assert!(!changelog::has_section(FIX_SMALL, "9.99.0"));
+    // Prefix discipline: 0.2.0 must not match a hypothetical 0.2.0.1 heading,
+    // and 0.2.1 must not match the numerically distinct 0.2.10.
+    assert!(!changelog::has_section("## [0.2.0.1] - x\n", "0.2.0"));
+    assert!(!changelog::has_section("## [0.2.10] - x\n", "0.2.1"));
+    // The retired two-component heading is NOT the current-scheme release of
+    // the same numbers: a recut probe for 0.25.0 must not latch onto `[0.25]`.
+    assert!(!changelog::has_section(FIX_SMALL, "0.25.0"));
 }
 
 #[test]

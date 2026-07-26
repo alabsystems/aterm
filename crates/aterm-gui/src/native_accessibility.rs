@@ -385,6 +385,15 @@ pub(crate) enum RoutedAccessibilityAction {
         key: UiKey,
         lines: i32,
     },
+    ReplaceSelectedText {
+        key: UiKey,
+        text: String,
+    },
+    SetTextSelection {
+        key: UiKey,
+        anchor_byte: usize,
+        focus_byte: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,6 +405,7 @@ pub(crate) enum AccessibilityActionError {
     MissingValue,
     WrongValueKind,
     NonFiniteValue,
+    InvalidTextSelection,
 }
 
 /// Validate and lower a platform request against the exact route table that was published.
@@ -455,6 +465,48 @@ pub(crate) fn route_accessibility_action(
             key: route.key.clone(),
             lines: 3,
         }),
+        Action::ReplaceSelectedText => match (route.role, request.data.as_ref()) {
+            (SemanticRole::TextViewport, Some(accesskit::ActionData::Value(value))) => {
+                Ok(RoutedAccessibilityAction::ReplaceSelectedText {
+                    key: route.key.clone(),
+                    text: value.to_string(),
+                })
+            }
+            (_, None) => Err(AccessibilityActionError::MissingValue),
+            _ => Err(AccessibilityActionError::WrongValueKind),
+        },
+        Action::SetTextSelection => {
+            let (
+                SemanticRole::TextViewport,
+                Some(accesskit::ActionData::SetTextSelection(selection)),
+            ) = (route.role, request.data.as_ref())
+            else {
+                return Err(if request.data.is_none() {
+                    AccessibilityActionError::MissingValue
+                } else {
+                    AccessibilityActionError::WrongValueKind
+                });
+            };
+            let target = published
+                .virtual_text
+                .iter()
+                .find(|target| target.node == request.target_node)
+                .ok_or(AccessibilityActionError::InvalidTextSelection)?;
+            let source_byte = |position: TextPosition| {
+                target
+                    .lines
+                    .iter()
+                    .find(|line| line.node == position.node)
+                    .and_then(|line| line.character_source_offsets.get(position.character_index))
+                    .and_then(|byte| usize::try_from(*byte).ok())
+                    .ok_or(AccessibilityActionError::InvalidTextSelection)
+            };
+            Ok(RoutedAccessibilityAction::SetTextSelection {
+                key: route.key.clone(),
+                anchor_byte: source_byte(selection.anchor)?,
+                focus_byte: source_byte(selection.focus)?,
+            })
+        }
         Action::Blur
         | Action::Collapse
         | Action::Expand
@@ -463,13 +515,11 @@ pub(crate) fn route_accessibility_action(
         | Action::Increment
         | Action::HideTooltip
         | Action::ShowTooltip
-        | Action::ReplaceSelectedText
         | Action::ScrollLeft
         | Action::ScrollRight
         | Action::ScrollIntoView
         | Action::ScrollToPoint
         | Action::SetScrollOffset
-        | Action::SetTextSelection
         | Action::SetSequentialFocusNavigationStartingPoint
         | Action::ShowContextMenu => Err(AccessibilityActionError::UnsupportedAction),
     }
@@ -572,7 +622,6 @@ fn materialize_visible_text(
             line_node.set_character_lengths(character_lengths);
             line_node.set_character_positions(positions.clone());
             line_node.set_character_widths(widths.clone());
-            line_node.set_read_only();
             if projection.total_lines > projected.number.saturating_add(1) {
                 line_node.set_is_line_breaking_object();
             }
@@ -632,6 +681,40 @@ fn materialize_visible_text(
                 children: Vec::new(),
             });
         }
+    }
+
+    // The editor modeline is a real status surface, including live config
+    // diagnostics. Project it as a polite live region instead of leaving the
+    // information available only to sighted users in painted footer pixels.
+    if let Some(status) = spec
+        .semantic_status
+        .as_deref()
+        .or(spec.status.as_deref())
+        .filter(|status| !status.is_empty())
+    {
+        let status_key = UiKey::new(format!("{}/status", key.as_str()));
+        let status_id = id_for(&status_key);
+        if let Some(first) = by_id.insert(status_id, status_key.clone()) {
+            return Err(AccessibilityProjectionError::IdCollision {
+                first,
+                second: status_key,
+            });
+        }
+        let mut status_node = Node::new(Role::Status);
+        status_node.set_label("Editor status");
+        status_node.set_value(status.to_string());
+        status_node.set_live(Live::Polite);
+        status_node.set_bounds(Rect {
+            x0: f64::from(rect.x),
+            y0: f64::from(rect.bottom() - geometry.footer_h),
+            x1: f64::from(rect.right()),
+            y1: f64::from(rect.bottom()),
+        });
+        pending.push(PendingNode {
+            id: status_id,
+            node: status_node,
+            children: Vec::new(),
+        });
     }
 
     let visible_range = lines.first().map_or(0, |line| line.source.start)
@@ -1109,7 +1192,8 @@ fn lower_role(role: SemanticRole) -> Role {
         SemanticRole::Switch => Role::Switch,
         SemanticRole::Slider => Role::Slider,
         SemanticRole::TextField => Role::TextInput,
-        SemanticRole::RichText | SemanticRole::TextViewport => Role::Document,
+        SemanticRole::RichText => Role::Document,
+        SemanticRole::TextViewport => Role::MultilineTextInput,
         SemanticRole::Link => Role::Link,
         SemanticRole::Navigation => Role::Navigation,
         SemanticRole::Status => Role::Status,
@@ -1185,9 +1269,15 @@ fn lower_actions(node: &mut Node, semantic: &SemanticNode, focusable: bool) {
         SemanticRole::TextField if has_reducer_action => {
             node.add_action(Action::SetValue);
         }
-        SemanticRole::RichText | SemanticRole::TextViewport => {
+        SemanticRole::RichText => {
             node.add_action(Action::ScrollUp);
             node.add_action(Action::ScrollDown);
+        }
+        SemanticRole::TextViewport => {
+            node.add_action(Action::ScrollUp);
+            node.add_action(Action::ScrollDown);
+            node.add_action(Action::ReplaceSelectedText);
+            node.add_action(Action::SetTextSelection);
         }
         SemanticRole::Slider
         | SemanticRole::TextField
@@ -1210,6 +1300,8 @@ fn supported_actions(node: &Node) -> Vec<Action> {
         Action::SetValue,
         Action::ScrollUp,
         Action::ScrollDown,
+        Action::ReplaceSelectedText,
+        Action::SetTextSelection,
     ]
     .into_iter()
     .filter(|action| node.supports_action(*action))
@@ -1229,8 +1321,8 @@ fn rect_to_accesskit(rect: LogicalRect) -> Rect {
 mod tests {
     use super::*;
     use crate::native_ui::{
-        ButtonSpec, Control, Flow, GroupSpec, Insets, Layout, Length, SliderSpec, SwitchSpec,
-        TextFieldSpec, TextSpec, TextViewportSpec, UiContent, UiNode, UiTree,
+        ButtonSpec, Control, Flow, GroupSpec, Insets, Layout, Length, SliderSpec, StyleRef,
+        SwitchSpec, TextFieldSpec, TextSpec, TextViewportSpec, UiContent, UiNode, UiTree,
     };
 
     fn button(key: &str, label: &str) -> UiNode {
@@ -1392,7 +1484,7 @@ mod tests {
             (SemanticRole::Slider, Role::Slider),
             (SemanticRole::TextField, Role::TextInput),
             (SemanticRole::RichText, Role::Document),
-            (SemanticRole::TextViewport, Role::Document),
+            (SemanticRole::TextViewport, Role::MultilineTextInput),
             (SemanticRole::Link, Role::Link),
             (SemanticRole::Navigation, Role::Navigation),
             (SemanticRole::Status, Role::Status),
@@ -1400,6 +1492,78 @@ mod tests {
         for (semantic, accesskit) in mappings {
             assert_eq!(lower_role(semantic), accesskit);
         }
+    }
+
+    #[test]
+    fn paint_only_responsive_status_copy_is_not_published_to_accessibility() {
+        const COMPLETE: &str = "On, currently silent while this window is unfocused.";
+        let visual = crate::native_ui::fit_native_status_label(COMPLETE, 96.0);
+        assert_ne!(visual, COMPLETE, "fixture must exercise responsive copy");
+        let compiled = UiTree::new(
+            UiNode::new(
+                "app",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+            )
+            .layout(Layout::column())
+            .children(vec![
+                UiNode::new(
+                    "status",
+                    UiContent::Group(GroupSpec {
+                        label: Some(COMPLETE.to_string()),
+                        role: SemanticRole::Status,
+                        style: StyleRef::Plain,
+                    }),
+                )
+                .layout(Layout::default().height(Length::Fixed(24.0)))
+                .children(vec![
+                    UiNode::new(
+                        "status/visual",
+                        UiContent::Text(TextSpec {
+                            text: visual.clone(),
+                            role: SemanticRole::Status,
+                            style: StyleRef::Plain,
+                        }),
+                    )
+                    .paint_only(),
+                ]),
+            ]),
+        )
+        .compile(LogicalRect::new(0.0, 0.0, 96.0, 24.0))
+        .unwrap();
+
+        assert!(compiled.paint.iter().any(|node| {
+            node.key == UiKey::new("status/visual")
+                && matches!(&node.content, UiContent::Text(spec) if spec.text == visual)
+        }));
+        assert_eq!(compiled.semantics.len(), 2);
+        assert!(compiled.semantic(&UiKey::new("status/visual")).is_none());
+
+        let projection = project_native_accessibility(&compiled, None).unwrap();
+        assert_eq!(projection.update().nodes.len(), 2);
+        assert!(
+            projection
+                .id_for_key(&UiKey::new("status/visual"))
+                .is_none()
+        );
+        let statuses = projection
+            .update()
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .filter(|node| node.role() == Role::Status)
+            .collect::<Vec<_>>();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].live(), Some(Live::Polite));
+        assert_eq!(statuses[0].label(), Some(COMPLETE));
+        assert_eq!(statuses[0].value(), None);
+        assert!(statuses[0].children().is_empty());
+        assert!(
+            projection
+                .update()
+                .nodes
+                .iter()
+                .all(|(_, node)| node.label() != Some(visual.as_str()))
+        );
     }
 
     #[test]
@@ -1702,6 +1866,8 @@ mod tests {
                     primary: true,
                 }],
                 carets: vec![(4, true)],
+                syntax: Vec::new(),
+                diagnostics: Vec::new(),
             }],
         };
         let tree = UiTree::new(
@@ -1717,7 +1883,10 @@ mod tests {
                     selectable: true,
                     projection: Some(visible),
                     preedit: String::new(),
-                    status: None,
+                    status: Some("1 config error · Save blocked".to_string()),
+                    semantic_status: Some(
+                        "Config error · Ln 7, Col 3 · complete diagnostic message".to_string(),
+                    ),
                     minibuffer: None,
                     cursor_label: None,
                     dirty: false,
@@ -1731,14 +1900,15 @@ mod tests {
             .compile(LogicalRect::new(0.0, 0.0, 800.0, 600.0))
             .unwrap();
         let projection = project_native_accessibility(&compiled, None).unwrap();
-        assert_eq!(projection.update().nodes.len(), 3);
+        assert_eq!(projection.update().nodes.len(), 4);
         assert_eq!(projection.virtual_text().len(), 1);
         let target = &projection.virtual_text()[0];
         let document = node(&projection, "editor/document");
-        assert_eq!(document.role(), Role::Document);
+        assert_eq!(document.role(), Role::MultilineTextInput);
         assert_eq!(document.label(), Some("README.md editor"));
         assert_eq!(document.value(), None, "provider identity is not announced");
-        assert!(!document.supports_action(Action::SetTextSelection));
+        assert!(document.supports_action(Action::SetTextSelection));
+        assert!(document.supports_action(Action::ReplaceSelectedText));
         assert!(document.supports_action(Action::ScrollDown));
         assert_eq!(target.visible_range, 100..105);
         assert_eq!(target.lines.len(), 1);
@@ -1787,6 +1957,64 @@ mod tests {
             Some(&expected_positions[..])
         );
         assert_eq!(text_run.character_widths(), Some(&expected_widths[..]));
+        assert!(!text_run.is_read_only());
+        let status_id = stable_node_id(&UiKey::new("editor/document/status"));
+        let status = projection
+            .update()
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == status_id)
+            .map(|(_, node)| node)
+            .expect("editor status live region");
+        assert_eq!(status.role(), Role::Status);
+        assert_eq!(status.live(), Some(Live::Polite));
+        assert_eq!(
+            status.value(),
+            Some("Config error · Ln 7, Col 3 · complete diagnostic message")
+        );
+
+        let published = PublishedNativeAccessibility::with_virtual_text(
+            ViewId::from_stored(7),
+            1,
+            projection.routes().to_vec(),
+            projection.virtual_text().to_vec(),
+        );
+        let replacement = accesskit::ActionRequest {
+            action: Action::ReplaceSelectedText,
+            target_tree: TreeId::ROOT,
+            target_node: target.node,
+            data: Some(accesskit::ActionData::Value("replacement".into())),
+        };
+        assert_eq!(
+            route_accessibility_action(&published, &replacement),
+            Ok(RoutedAccessibilityAction::ReplaceSelectedText {
+                key: UiKey::new("editor/document"),
+                text: "replacement".to_string(),
+            })
+        );
+        let selection = accesskit::ActionRequest {
+            action: Action::SetTextSelection,
+            target_tree: TreeId::ROOT,
+            target_node: target.node,
+            data: Some(accesskit::ActionData::SetTextSelection(TextSelection {
+                anchor: TextPosition {
+                    node: line.node,
+                    character_index: 0,
+                },
+                focus: TextPosition {
+                    node: line.node,
+                    character_index: 2,
+                },
+            })),
+        };
+        assert_eq!(
+            route_accessibility_action(&published, &selection),
+            Ok(RoutedAccessibilityAction::SetTextSelection {
+                key: UiKey::new("editor/document"),
+                anchor_byte: 100,
+                focus_byte: 103,
+            })
+        );
 
         let request = projection
             .request_virtual_text(target.node, 9_000_000..9_000_200)
@@ -1819,6 +2047,8 @@ mod tests {
                 text: "x".to_string(),
                 selections: Vec::new(),
                 carets: Vec::new(),
+                syntax: Vec::new(),
+                diagnostics: Vec::new(),
             })
             .collect();
         let tree = UiTree::new(
@@ -1839,6 +2069,7 @@ mod tests {
                     }),
                     preedit: String::new(),
                     status: None,
+                    semantic_status: None,
                     minibuffer: None,
                     cursor_label: None,
                     dirty: false,

@@ -41,6 +41,10 @@ impl Grid {
                 total += std::mem::size_of::<super::scroll_convert::ScrolledRowExtras>();
             }
         }
+        // Staged-but-undrained scroll-off lines (Wave-3 adversarial review):
+        // under flood backpressure the lazy buffer holds raw ~8 B/cell rows the
+        // tiered store has not absorbed yet — bytes the ring watermark must see.
+        total += self.storage.lazy_buffer.memory_used();
         if let Some(scrollback) = &self.storage.scrollback {
             total += scrollback.total_memory_used();
         }

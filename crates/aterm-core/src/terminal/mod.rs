@@ -69,6 +69,7 @@ mod window_auth;
 // Phase 1+2: Universal block model, process detection, and AtermApi.
 mod shell_api;
 
+pub mod scrollback_shared_budget;
 mod search_budgeted;
 mod search_index;
 mod stack_response;
@@ -105,7 +106,7 @@ pub(crate) use aterm_types::charset::CharacterSetState;
 pub use aterm_types::{ColorPalette, Rgb};
 pub use aterm_types::{KittyKeyboardFlags, KittyKeyboardState};
 pub use blocks_api::BlockText;
-pub use builder::TerminalBuilder;
+pub use builder::{TIERED_RING_CAP_DEFAULT, TerminalBuilder};
 pub use callbacks::{
     CALLBACK_REGISTRY, CallbackCategory, CallbackInfo, SshConductorCallbackEvent,
     TmuxCallbackEvent, callback_by_name, callback_count, callback_info,

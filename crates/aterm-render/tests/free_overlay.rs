@@ -129,26 +129,38 @@ fn empty_free_fields_are_byte_identical_also_after_clear_overlays() {
 }
 
 #[test]
-fn render_input_eq_compares_sprites_by_value_and_atlas_by_version() {
+fn render_input_eq_compares_sprites_by_value_and_atlas_by_identity() {
     let mut term = Terminal::new(3, 12);
     term.process(b"\x1b[?25l");
     let mut a = term.cell_frame(3, 12);
     let mut b = term.cell_frame(3, 12);
     a.free_sprites = vec![free(2, 5, 8, 8)];
     b.free_sprites = vec![free(2, 5, 8, 8)];
-    // Two DISTINCT Arcs at the same version: content-equal (Arc identity and
-    // texel bytes are not compared — version is the atlas identity).
+    // ATLASES compare by SNAPSHOT IDENTITY (`Arc::as_ptr`), never `version`
+    // (split-pane audit): baker versions are deterministic PER ENGINE INSTANCE,
+    // so a rebuilt engine replays its predecessor's version sequence with
+    // different texels. Two DISTINCT Arcs at the same version are exactly that
+    // case — calling them equal is the stale-atlas aliasing the audit outlawed.
     a.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 7)));
     b.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 7)));
+    assert_ne!(
+        a, b,
+        "a same-version DIFFERENT-Arc publish (rebuilt engine) compares UNEQUAL"
+    );
+
+    // The stable steady state: the SAME published snapshot re-presented.
+    b.free_atlas.clone_from(&a.free_atlas);
     assert_eq!(
         a, b,
-        "equal sprites + equal atlas version must compare equal"
+        "re-presenting the same published Arc stays EQUAL (a settled overlay is free)"
     );
 
     b.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 8)));
-    assert_ne!(a, b, "an atlas-version bump alone must compare unequal");
+    assert_ne!(a, b, "a fresh atlas publish must compare unequal");
 
-    b.free_atlas = Some(Arc::new(patterned_atlas(16, 16, 7)));
+    // SPRITES stay by VALUE — hold the atlas identity fixed so only the sprite
+    // field under test differs.
+    b.free_atlas.clone_from(&a.free_atlas);
     b.free_sprites[0].z = FreeZ::OverText;
     assert_ne!(a, b, "a same-rect z flip is a real content change");
 

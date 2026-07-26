@@ -19,7 +19,8 @@ use aterm_render::Frame;
 #[cfg(any(target_os = "macos", windows))]
 use crate::WindowId;
 use crate::app_render::{
-    OverlayGlow, apply_bell_invert, apply_drop_overlay, apply_overlay_at, composite_tray,
+    OverlayGlow, apply_bell_invert, apply_drop_overlay, apply_overlay_at, blit_pane_into,
+    composite_tray, fill_divider_grid_cells, terminal_blank_cell,
 };
 use crate::control::{DimsSnapshot, ImageReq};
 use crate::platform::AppRt;
@@ -282,7 +283,24 @@ fn run_encode_job(job: EncodeJob) {
             }
             lats_ms.sort_by(|a, b| a.total_cmp(b));
             let analysis = if inputs.is_empty() {
-                "  \"analysis\": {\"note\": \"no input attempts logged (pass `keys` and type during the recording)\"},\n".to_string()
+                // HONESTY, not blame. An empty log has THREE causes and the
+                // reader cannot tell them apart, so name all three instead of
+                // assuming the driver forgot to type. The third is a real
+                // routing gap worth stating outright: a CROSS-SESSION verb
+                // (`@<sid>`, which is what the recommended `@self` selector
+                // expands to client-side) writes through the seam DIRECTLY on
+                // the control thread and never reaches the App input path this
+                // ledger hooks — so an AI that drove the whole take with
+                // `@self key …` gets an empty log and, until now, was told it
+                // had not typed.
+                "  \"analysis\": {\"note\": \"no input attempts logged. Causes, in order of \
+                 likelihood: (1) nothing was typed during the take; (2) input was driven with \
+                 `send`/`feed`, which write to the PTY directly and are not input attempts; \
+                 (3) input was driven CROSS-SESSION (`@<sid>`, including the expansion of \
+                 `@self`) — that path egresses on the control thread and bypasses this ledger, \
+                 so drive with a FLAGLESS `key` verb (the active tab) when you need the \
+                 keystroke log\"},\n"
+                    .to_string()
             } else if lats_ms.is_empty() {
                 format!(
                     "  \"analysis\": {{\n    \"key_response\": [\n{glyph_lines}\n    ],\n    \
@@ -453,33 +471,31 @@ fn run_encode_job(job: EncodeJob) {
 pub(crate) enum AuxTarget {
     /// The frontmost terminal window (the existing `window`/`chrome` behavior).
     Front,
-    /// The native Settings home route. `controls prefs` retains its legacy preference-row
-    /// projection; versioned semantic inspection uses `inspect app/v1`.
+    /// The native Settings tab. `controls prefs` keeps its historical line prefixes,
+    /// but its route, preference rows, and additive `ui` records come from the exact
+    /// compiled native semantic tree. `inspect app/v1` remains the versioned form.
     Prefs,
-    /// The native Performance control panel (`App::_perf_panel`).
-    Perf,
-    /// The native Settings `/about` route. `controls about` retains its compatibility
-    /// provenance projection.
+    /// The native Settings `/about` route. `controls about` projects the exact compiled
+    /// native semantic frame when that route is open.
     About,
     /// The in-window command PALETTE overlay (`WindowState::palette`) — an own-rendered card
     /// on the FRONT window, captured by the front `image`/`window` path. `controls menu`
     /// serialises its (filtered) command rows. The single source of truth for the menu.
     Menu,
-    /// The native Settings `/updates` route. `controls update` retains its compatibility
-    /// updater-state projection.
+    /// The native Settings `/updates` route. `controls update` projects the exact compiled
+    /// native semantic frame when that route is open.
     Update,
 }
 
 impl AuxTarget {
     /// Parse a verb's target keyword (case-insensitive). Empty / `front` / `window` /
     /// `terminal` → [`AuxTarget::Front`]; `prefs` / `preferences` / `settings` →
-    /// [`AuxTarget::Prefs`]; `perf` / `performance` → [`AuxTarget::Perf`]. An unrecognized
-    /// keyword yields `None` so the verb can reject it with a clear error.
+    /// [`AuxTarget::Prefs`]. An unrecognized keyword yields `None` so the verb can
+    /// reject it with a clear error.
     pub(crate) fn parse(s: &str) -> Option<AuxTarget> {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "front" | "window" | "terminal" => Some(AuxTarget::Front),
             "prefs" | "preferences" | "settings" => Some(AuxTarget::Prefs),
-            "perf" | "performance" => Some(AuxTarget::Perf),
             "about" => Some(AuxTarget::About),
             "menu" | "palette" => Some(AuxTarget::Menu),
             "update" | "software-update" => Some(AuxTarget::Update),
@@ -492,7 +508,6 @@ impl AuxTarget {
         match self {
             AuxTarget::Front => "front",
             AuxTarget::Prefs => "prefs",
-            AuxTarget::Perf => "perf",
             AuxTarget::About => "about",
             AuxTarget::Menu => "menu",
             AuxTarget::Update => "update",
@@ -535,6 +550,179 @@ fn dims_axis(surface: u32, frame: u32) -> (i64, u32, u32, u32, u32) {
 
 fn dims_px(cells: u32, cell_px: u32, extra_px: u32) -> u32 {
     cells.saturating_mul(cell_px).saturating_add(extra_px)
+}
+
+fn native_settings_closed_controls_lines() -> Vec<String> {
+    vec![
+        // Keep the historical first line byte-for-byte for callers that only
+        // test open/closed. The following records define the truthful native
+        // scope: a closed tab has no visible route or controls.
+        "state open=false".to_string(),
+        "prefs fields=0".to_string(),
+        "native surface=native-tab route=- controls=0 semantics=0".to_string(),
+    ]
+}
+
+fn native_settings_state_line(
+    state: &crate::native_settings::SettingsViewState,
+    field_count: usize,
+    status: &str,
+) -> String {
+    let searching = !state.search.trim().is_empty();
+    let editing = state.editing_field.as_deref().unwrap_or("");
+    format!(
+        "state open=true landing={} pane=native-tab category={} selected={} scroll={} \
+         editing={editing:?} status={status:?} searching={searching} query={:?} \
+         shown={field_count} total={field_count} surface=native-tab route={} page={:?}",
+        state.route == crate::native_settings::SettingsRoute::Home && !searching,
+        state.route.label(),
+        state.page_scroll,
+        state.page_scroll,
+        state.search,
+        state.route.path(),
+        state.route.label(),
+    )
+}
+
+fn native_settings_field_kind(
+    field: &crate::prefs::EditField,
+    trail_pack_ids: &[String],
+    themes: &crate::app_config::ThemeCatalog,
+) -> String {
+    match field.kind {
+        crate::prefs::EditKind::Float => "float".to_string(),
+        crate::prefs::EditKind::Integer => "integer".to_string(),
+        crate::prefs::EditKind::Bool => "bool".to_string(),
+        crate::prefs::EditKind::Text => "text".to_string(),
+        crate::prefs::EditKind::Enum { .. }
+            if field.key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE =>
+        {
+            format!(
+                "enum options=[{}]",
+                crate::prefs::cursor_trail_style_options(trail_pack_ids.iter().map(String::as_str))
+                    .join(",")
+            )
+        }
+        crate::prefs::EditKind::Enum { options } => {
+            format!("enum options=[{}]", options.join(","))
+        }
+        crate::prefs::EditKind::Theme => format!(
+            "theme options=[{}]",
+            crate::native_settings::settings_theme_options(themes).join(",")
+        ),
+        crate::prefs::EditKind::Color => "color".to_string(),
+    }
+}
+
+fn native_settings_effective_value(value: &crate::native_ui::SemanticValue) -> String {
+    match value {
+        crate::native_ui::SemanticValue::None => String::new(),
+        crate::native_ui::SemanticValue::Text(value) => value.clone(),
+        crate::native_ui::SemanticValue::Bool(value) => value.to_string(),
+        crate::native_ui::SemanticValue::Number { value, .. } => value.to_string(),
+    }
+}
+
+fn native_settings_controls_lines(
+    state: &crate::native_settings::SettingsViewState,
+    compiled: &crate::native_ui::CompiledUi,
+    trail_pack_ids: &[String],
+) -> Vec<String> {
+    // A legacy `field` record exists only when the exact compiled native tree
+    // contains that setting control. Navigation, actions, status cards, and
+    // previews remain available in the additive canonical `ui` records below.
+    let fields = compiled
+        .semantics
+        .iter()
+        .filter_map(|node| {
+            let key = node.key.as_str().strip_prefix("settings/control/")?;
+            let field = state.legacy.fields.iter().find(|field| field.key == key)?;
+            Some((node, field))
+        })
+        .collect::<Vec<_>>();
+    let status = state.feedback.as_deref().unwrap_or("");
+    let mut out = Vec::with_capacity(3 + fields.len() + compiled.semantics.len());
+    out.push(native_settings_state_line(state, fields.len(), status));
+    out.push(format!("prefs fields={}", fields.len()));
+    for (node, field) in fields {
+        // Preserve the compatibility meanings: `value` is the registry seed
+        // (configured text, and resolved state for historical Bool rows), while
+        // `effective` is the value the native control actually presents after
+        // defaults and live policy projection.
+        let value = field.seed.as_deref().unwrap_or("");
+        let effective = native_settings_effective_value(&node.value);
+        let kind = native_settings_field_kind(field, trail_pack_ids, &state.config_assets().themes);
+        let action = node
+            .action
+            .as_ref()
+            .map_or("-", crate::native_ui::ActionId::as_str);
+        out.push(format!(
+            "field key={} label={:?} value={:?} effective={effective:?} kind={kind} \
+             visible=true native-key={:?} action={action}",
+            field.key,
+            field.label,
+            value,
+            node.key.as_str(),
+        ));
+    }
+    let controls = compiled
+        .semantics
+        .iter()
+        .filter(|node| node.action.is_some())
+        .count();
+    out.push(format!(
+        "native surface=native-tab route={} controls={controls} semantics={}",
+        state.route.path(),
+        compiled.semantics.len(),
+    ));
+    out.extend(compiled.controls_lines());
+    out
+}
+
+fn native_settings_unavailable_controls_lines(
+    state: &crate::native_settings::SettingsViewState,
+    error: &str,
+) -> Vec<String> {
+    vec![
+        native_settings_state_line(state, 0, error),
+        "prefs fields=0".to_string(),
+        format!(
+            "native surface=native-tab route={} controls=0 semantics=0 error={error:?}",
+            state.route.path()
+        ),
+    ]
+}
+
+fn native_settings_route_not_open_controls_lines(
+    alias: &str,
+    expected: crate::native_settings::SettingsRoute,
+    current: Option<&crate::native_settings::SettingsViewState>,
+) -> Vec<String> {
+    let current_route = current.map_or("-", |state| state.route.path());
+    let error = if let Some(state) = current {
+        format!(
+            "controls {alias} targets the native Settings {} route, but the front Settings presentation is {}; use `open {alias}` first",
+            expected.path(),
+            state.route.path(),
+        )
+    } else {
+        format!(
+            "controls {alias} targets the native Settings {} route, which is not visible in the front window; use `open {alias}` first",
+            expected.path(),
+        )
+    };
+    let state = current.map_or_else(
+        || "state open=false".to_string(),
+        |state| native_settings_state_line(state, 0, &error),
+    );
+    vec![
+        state,
+        "prefs fields=0".to_string(),
+        format!(
+            "native surface=native-tab alias={alias} route={current_route} expected-route={} controls=0 semantics=0 error={error:?}",
+            expected.path(),
+        ),
+    ]
 }
 
 impl App {
@@ -599,7 +787,6 @@ impl App {
             pad_top,
             head,
             tab_rows,
-            hud_rows,
             frame_w,
             frame_h,
             surface_w,
@@ -623,12 +810,9 @@ impl App {
             let pad_top = u32::try_from(ws.metrics.pad_top).unwrap_or(u32::MAX);
             let head = u32::try_from(ws.metrics.head).unwrap_or(u32::MAX);
             let tab_rows = u32::from(self.tab_strip_rows);
-            let hud_rows = u32::from(self.hud_rows.min(ws.hud_cap));
             let window_rows = u32::from(ws.rows);
             let window_cols = u32::from(ws.cols);
-            let composed_rows = window_rows
-                .saturating_add(tab_rows)
-                .saturating_add(hud_rows);
+            let composed_rows = window_rows.saturating_add(tab_rows);
             let frame_w = dims_px(window_cols, cell_w, pad.saturating_mul(2));
             let frame_h = dims_px(
                 composed_rows,
@@ -652,7 +836,6 @@ impl App {
                 pad_top,
                 head,
                 tab_rows,
-                hud_rows,
                 frame_w,
                 frame_h,
                 surface_w,
@@ -699,7 +882,6 @@ impl App {
                 pad,
                 pad_top,
                 head,
-                0,
                 0,
                 frame_w,
                 frame_h,
@@ -776,7 +958,6 @@ impl App {
             pad_bottom: pad,
             head,
             tab_rows,
-            hud_rows,
             viewers: u32::try_from(windows.len()).unwrap_or(u32::MAX),
             visible_viewers: u32::try_from(visible_viewers).unwrap_or(u32::MAX),
             geometry,
@@ -790,14 +971,11 @@ impl App {
     /// Build this window's sparkle-word decorations into `input_scratch`, mirroring the
     /// live redraw (`redraw_window`), so the headless `image`/`snapshot` capture renders
     /// the SAME sparkle/cat-paw/orca-splash decorations as the glass — WYSIWYG. Must run
-    /// AFTER `cell_frame_into` and BEFORE the tab-strip/HUD splices (which shift the
+    /// AFTER `cell_frame_into` and BEFORE the tab-strip splice (which shifts the
     /// decorations down with the grid). No-op when the feature is off, or on the
     /// alt-screen with `suppress_in_alt_screen` set (default off — the capture
     /// decorates full-screen TUIs exactly like the glass).
     pub(crate) fn splice_word_decorations(&mut self, wid: crate::WindowId, now: Instant) {
-        // Same redraw-safe atomic/try-recv poll as the on-glass path. Image
-        // capture never opens or decodes the configured sprite on the UI thread.
-        let _ = self.poll_nyan_sprite_and_fanout();
         // Resolve the sparkle config if it hasn't been (headless never runs
         // `redraw_window`, which is the only other site that recomputes it), so the
         // capture reflects the configured decorations.
@@ -827,6 +1005,19 @@ impl App {
         // Keep this before all feature early-outs so a capture can never retain
         // an earlier Nyan generation merely because word sparkles are disabled.
         self.install_window_config_assets(wid);
+        // SPLIT TABS (split-pane audit): sparkle decorations are single-pane
+        // machinery, and the coherence REFILL below re-extracts the FRONT
+        // terminal into `input_scratch` at window dims — which would clobber
+        // the multi-pane composite `compose_capture_cells` just built (the
+        // exact front-pane-stretched-over-the-window lie the composed capture
+        // fixes). The live compose path carries no decorations either, so the
+        // WYSIWYG move is to skip the splice wholesale on a composed frame.
+        if self
+            .active_tree(wid)
+            .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
+        {
+            return;
+        }
         let Some((cfg, lexicon)) = self
             .sparkle
             .as_ref()
@@ -892,9 +1083,12 @@ impl App {
         } else {
             ws.cursor_cat.static_frame(now)
         };
-        let nyan_enabled = (animate_cat
-            && matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::Nyan))
-            || cat_frame.collection_hello;
+        let nyan_enabled = crate::app_render::cursor_cat_presentation_enabled(
+            animate_cat,
+            glow_cfg.enabled,
+            glow_cfg.style,
+            cat_frame.collection_hello,
+        );
         let (rows, cols) = (ws.rows as usize, ws.cols as usize);
         let effect_geom = crate::word_decorations::EffectGeom {
             cell_w: cell_w as u16,
@@ -1017,6 +1211,7 @@ impl App {
             primed_wince_hits = crate::app_render::drain_curse_bonk_cues(
                 &mut ws.word_decos,
                 glow_cfg.style,
+                self.config.trail_sound_voice(),
                 effect_geom.cols,
                 None,
                 false,
@@ -1056,6 +1251,7 @@ impl App {
         let curse_drain = crate::app_render::drain_curse_bonk_cues(
             &mut ws.word_decos,
             glow_cfg.style,
+            self.config.trail_sound_voice(),
             effect_geom.cols,
             None,
             false,
@@ -1165,6 +1361,19 @@ impl App {
     /// the spliced layers via `clear_overlays` downstream, and this runs BEFORE
     /// `splice_tab_strip` (the strip shifts the quads down with the grid).
     fn splice_cursor_fx(&mut self, wid: crate::WindowId, now: Instant) {
+        // SPLIT TABS (split-pane audit): the headless capture tick drives the
+        // SINGLE-PANE effect machinery (front-terminal cursor, window-content
+        // coords) — on a composed multi-pane frame its quads would land at
+        // un-offset positions over the composite. A windowed capture keeps
+        // its last-present quads (already composed-correct) via the gate
+        // inside; the composed HEADLESS capture skips the tick and stays
+        // effect-free — honest, never wrong-place light.
+        if self
+            .active_tree(wid)
+            .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
+        {
+            return;
+        }
         // ONE engine clock: while a recording targets this window its offscreen
         // present loop owns the tick (see `capture_ticks_cursor_fx`).
         let recording_here = self.video_rec.as_ref().is_some_and(|r| r.window == wid);
@@ -1332,21 +1541,18 @@ impl App {
             return;
         };
         let strip_rows = self.tab_strip_rows as usize;
-        // Trailing HUD rows are chrome too — captured here so the .txt below can drop
-        // them (the front borrow can't read `self.*`). Use the window's EFFECTIVE HUD
-        // count (`min(hud_rows, hud_cap)`) so the trim matches what `splice_hud_bar`
-        // actually appended on a window too short for the full stack.
-        let hud_rows = self
-            .hud_rows
-            .min(self.windows.get(&front).map_or(u16::MAX, |ws| ws.hud_cap))
-            as usize;
         let (rows, cols) = match self.windows.get(&front) {
             Some(ws) => (ws.rows as usize, ws.cols as usize),
             None => return,
         };
         // Lock only to snapshot the grid; render + serialize without the lock.
         let theme_cursor = self.theme.cursor & 0x00FF_FFFF;
-        {
+        // SPLIT TABS (post-merge re-audit): the SIGUSR1 snapshot shares the
+        // `image` verb's composed-capture recipe — a terminal-only multi-pane
+        // tab writes the divider-grid + per-pane composite, never the front
+        // pane stretched over the window. Single-pane/zoomed keeps the
+        // original front-terminal refill below.
+        if !self.compose_capture_cells(front, rows, cols, theme_cursor) {
             let Some(ws) = self.windows.get_mut(&front) else {
                 return;
             };
@@ -1382,30 +1588,10 @@ impl App {
         // grid, so splice it here too — the snapshot pixels then match the glass. A
         // no-op when the strip is disabled. Done BEFORE the disjoint-field borrow.
         self.splice_tab_strip(front);
-        // Sample the interval-driven panels here too: headless has no window tick,
-        // so this is what makes CPU/net/app-fed live in `image`/`snapshot` output.
-        // SKIPPED when the windowed HUD tick is driving (same gate as `render_image`):
-        // the sample is a process-tree + sysctl scan on the event-loop thread, and the
-        // capture then shows the tick's figures — the same numbers the on-glass HUD
-        // shows (WYSIWYG). Headless, and a windowed front with the tick DISARMED
-        // (HUD off / unfocused), still sample here so the capture stays live.
-        let hud_tick_driving = self
-            .windows
-            .get(&front)
-            .is_some_and(|ws| ws.os_window.is_some() && ws.next_hud_tick.is_some());
-        if !hud_tick_driving {
-            let hud_now = Instant::now();
-            let tab_pid = self.frontmost_tab_pid();
-            self.metrics_service.sample(tab_pid, None, hud_now);
-            for p in &mut self.panels {
-                p.poll(hud_now);
-            }
-        }
         // WYSIWYG: the live present paints the Cmd-F find bar over the bottom terminal row
         // while searching, so splice it here too — a headless `image`/`snapshot` then shows
         // the find bar exactly as the glass does. A no-op when not searching.
         self.splice_find_bar(front);
-        self.splice_hud_bar(front);
         // OVERLAY the modal Settings panel (a no-op when closed), exactly as the live
         // present does — so the SACRED `image`/`snapshot` introspection captures the open
         // settings surface WYSIWYG (what an AI reads == what is on glass). Completes
@@ -1521,8 +1707,7 @@ impl App {
         let mut text = String::with_capacity(rows * (cols + 1));
         // Skip the tab-strip CHROME rows so the .txt is terminal text only (a no-op
         // skip when the strip is disabled — byte-identical to the pre-strip snapshot).
-        let txt_end = ws.input_scratch.cells.len().saturating_sub(hud_rows);
-        for cells in ws.input_scratch.cells[strip_rows..txt_end].iter() {
+        for cells in ws.input_scratch.cells[strip_rows..].iter() {
             accessibility::push_visible_row(&mut text, cells, cols);
         }
         // Deflate + writes belong on the encode worker (the same 50–150 ms Retina
@@ -1641,7 +1826,7 @@ impl App {
         });
         let mut frame = backend.render_input(introspect_gpu, &mut ws.input_scratch, tray_arg);
         let render_ns = render_t0.elapsed().as_nanos() as u64;
-        crate::metrics::record_present(0, render_ns);
+        crate::metrics::record_offscreen_raster(render_ns);
         if !backend.is_gpu()
             && let Some(card) = ws.settings_card.as_ref()
         {
@@ -1678,10 +1863,6 @@ impl App {
             want_bytes,
             reply,
         });
-        let now = Instant::now();
-        for panel in &mut self.panels {
-            panel.on_present(render_ns, 0, now);
-        }
     }
 
     fn native_image_metadata(
@@ -1888,6 +2069,163 @@ impl App {
         hash.finish() | 1
     }
 
+    /// The `panes` control verb's payload: a window's ACTIVE-tab pane layout
+    /// as parse-stable `k=v` rows (split-pane audit introspection — a
+    /// headless driver asserts split state, reads zoom, and aims per-pane
+    /// mouse/focus actions off these cell rects). One `layout …` header, then
+    /// one `pane …` row per VISIBLE pane (a zoomed tab reports the single
+    /// zoomed rect — what the glass shows). Cell coords; the 1-cell divider
+    /// gaps are exactly the cells no rect covers. `session` = cross-session
+    /// target: the window whose ACTIVE tab displays it (the `image` routing
+    /// rule, so `@<sid> panes` and `@<sid> image` describe the SAME window).
+    /// Empty when no window resolves (the verb frames `OK 0` — for a cross
+    /// target that means "no window displays this session", never a silent
+    /// fallback to the front window).
+    pub(crate) fn read_pane_layout(&self, session: Option<u64>) -> Vec<String> {
+        let win = match session {
+            Some(id) => self.windows_displaying(id).next(),
+            None => self.frontmost_window,
+        };
+        let Some(wid) = win else {
+            return Vec::new();
+        };
+        let Some(ws) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        let active = ws.tab_set.active_index().unwrap_or(0);
+        let Some(tree) = self.active_tree(wid) else {
+            // Native / mixed tree: no terminal pane geometry to report — an
+            // honest empty layout, never a guess.
+            return vec![format!(
+                "layout tab={active} panes=0 zoomed=false terminal=false"
+            )];
+        };
+        let focus = tree.focus();
+        let rects = tree.compute_layout(ws.rows, ws.cols);
+        let mut lines = Vec::with_capacity(rects.len() + 1);
+        lines.push(format!(
+            "layout tab={} panes={} zoomed={} terminal=true",
+            active,
+            rects.len(),
+            tree.is_zoomed(),
+        ));
+        for r in &rects {
+            lines.push(format!(
+                "pane session={} rect={},{},{}x{} focused={}",
+                r.session,
+                r.row_off,
+                r.col_off,
+                r.rows,
+                r.cols,
+                r.session == focus,
+            ));
+        }
+        lines
+    }
+
+    /// Rebuild `input_scratch`'s CELL grid as the composed multi-pane frame
+    /// for the `image`/`snapshot` capture (split-pane audit): divider-seam
+    /// fill + per-pane `cell_frame_into` blits + the FOCUSED pane's solid
+    /// cursor and metadata — the `redraw_compose` cell recipe, minus the
+    /// per-frame effect production. Deliberately:
+    /// - consumes NO damage (`take_damage` is absent — a capture is a READ;
+    ///   the live present keeps its own damage etiquette);
+    /// - leaves the retained effect overlays (rain/glow/trail/…) untouched —
+    ///   they are the last-present state for this exact layout, WYSIWYG;
+    /// - resolves `default_bg` to UNSET and rides only the FOCUSED pane's
+    ///   OSC-12 cursor colour, exactly like the live compose.
+    ///
+    /// Returns `false` (untouched scratch) for single-pane, zoomed, or
+    /// non-terminal trees — the caller then takes the original front-terminal
+    /// snapshot path.
+    fn compose_capture_cells(
+        &mut self,
+        front: WindowId,
+        rows: usize,
+        cols: usize,
+        theme_cursor: u32,
+    ) -> bool {
+        let Some((focus, rects)) = self
+            .active_tree(front)
+            .filter(|t| t.len() > 1 && !t.is_zoomed())
+            .map(|t| {
+                (
+                    t.focus(),
+                    t.compute_layout(
+                        rows.min(u16::MAX as usize) as u16,
+                        cols.min(u16::MAX as usize) as u16,
+                    ),
+                )
+            })
+        else {
+            return false;
+        };
+        let theme = self.theme;
+        let panes: Vec<(crate::pane::PaneRect, Arc<Mutex<Terminal>>)> = rects
+            .iter()
+            .filter_map(|r| self.pool.get(r.session).map(|s| (*r, s.term.clone())))
+            .collect();
+        let Some(ws) = self.windows.get_mut(&front) else {
+            return false;
+        };
+        // GLASS-LESS windows never present, so any retained effect overlays
+        // came from earlier SINGLE-PANE capture ticks — cross-space stale on
+        // a composite (post-merge re-audit). Drop them; a WINDOWED capture
+        // keeps its last-present quads, which ARE composed-correct.
+        if ws.os_window.is_none() {
+            ws.input_scratch.clear_overlays();
+        }
+        fill_divider_grid_cells(&mut ws.input_scratch, rows, cols, theme);
+        ws.input_scratch.default_bg = aterm_core::render::COLOR_UNSET;
+        ws.input_scratch.base_y = 0;
+        ws.input_scratch.absolute_row_revision = 0;
+        let mut cursor_color = aterm_core::render::COLOR_UNSET;
+        for (r, term) in &panes {
+            let (sub_rows, sub_cols) = (usize::from(r.rows), usize::from(r.cols));
+            let blank = {
+                let mut term = term_lock(term);
+                term.cell_frame_into(&mut ws.pane_scratch, sub_rows, sub_cols);
+                if r.session == focus {
+                    // Focused pane's absolute-row metadata + live OSC-12
+                    // cursor colour, from the SAME snapshot as its cells —
+                    // the live compose's frame contract.
+                    ws.input_scratch.base_y = ws.pane_scratch.base_y;
+                    ws.input_scratch.absolute_row_revision = ws.pane_scratch.absolute_row_revision;
+                    cursor_color = term
+                        .cursor_color()
+                        .map_or(theme_cursor, |c| aterm_render::rgb_to_u32([c.r, c.g, c.b]));
+                }
+                terminal_blank_cell(&term)
+            };
+            let cursor = (r.session == focus && ws.pane_scratch.cursor_visible).then_some((
+                ws.pane_scratch.cursor_row,
+                ws.pane_scratch.cursor_col,
+                ws.pane_scratch.cursor_style,
+            ));
+            // `pane_scratch` and `input_scratch` are disjoint fields of `ws`.
+            blit_pane_into(
+                &mut ws.input_scratch,
+                &ws.pane_scratch,
+                usize::from(r.row_off),
+                usize::from(r.col_off),
+                blank,
+            );
+            if r.session == focus {
+                match cursor {
+                    Some((cr, cc, style)) => {
+                        ws.input_scratch.cursor_row = usize::from(r.row_off) + cr;
+                        ws.input_scratch.cursor_col = usize::from(r.col_off) + cc;
+                        ws.input_scratch.cursor_visible = true;
+                        ws.input_scratch.cursor_style = style;
+                    }
+                    None => ws.input_scratch.cursor_visible = false,
+                }
+            }
+        }
+        ws.input_scratch.cursor_color = cursor_color;
+        true
+    }
+
     /// Render the CURRENT terminal for the control socket's `image` verb (the
     /// same renderer the window uses, GPU path if active). Runs on the main
     /// thread per [`crate::Wake::Control`] — but ONLY the render + WYSIWYG
@@ -1981,8 +2319,16 @@ impl App {
                 });
         // Theme cursor fallback, read before the &mut self.windows borrow below.
         let theme_cursor = self.theme.cursor & 0x00FF_FFFF;
-        // Lock only to snapshot the grid; render without the lock.
-        {
+        // SPLIT TABS (split-pane audit): a terminal-only multi-pane tab's
+        // WYSIWYG frame is the divider-grid + per-pane composite the live
+        // `redraw_compose` presents — capturing only the front pane stretched
+        // over the window lied about the glass. `compose_capture_cells`
+        // rebuilds exactly the composed CELL grid (no damage consumed — a
+        // capture is a read; retained effect overlays untouched — they are
+        // the last-present state for this exact layout). A single-pane (or
+        // zoomed) tab keeps the original front-terminal snapshot below.
+        if !self.compose_capture_cells(front, rows, cols, theme_cursor) {
+            // Lock only to snapshot the grid; render without the lock.
             let Some(ws) = self.windows.get_mut(&front) else {
                 let _ = reply.send(Ok((0, 0, None)));
                 return;
@@ -2017,34 +2363,9 @@ impl App {
         // WYSIWYG: splice the tab strip above the terminal grid so the `image` verb
         // matches the glass (a no-op when the strip is disabled). Before the borrow.
         self.splice_tab_strip(front);
-        // Sample the interval-driven panels here too: headless has no window tick,
-        // so this is what makes CPU/net/app-fed live in `image`/`snapshot` output.
-        // The single metrics sample, so headless `image`/`snapshot` (and the `widgets`
-        // verb read right after) reflect current figures even with no window tick.
-        // SKIPPED when the windowed HUD tick is driving (an on-glass front window
-        // with its HUD tick ARMED — main.rs samples once per HUD_INTERVAL): the
-        // sample is a process-tree + sysctl scan on the event-loop thread, and a
-        // visually-polling agent (1-5 Hz `image`) would charge it to every capture
-        // while the human types. The capture then shows the tick's figures — the
-        // same numbers the on-glass HUD shows (WYSIWYG). Headless, and a windowed
-        // front with the tick DISARMED (HUD off / unfocused), still sample here so
-        // `image`/`widgets` stay live.
-        let hud_tick_driving = self
-            .windows
-            .get(&front)
-            .is_some_and(|ws| ws.os_window.is_some() && ws.next_hud_tick.is_some());
-        if !hud_tick_driving {
-            let hud_now = Instant::now();
-            let tab_pid = self.frontmost_tab_pid();
-            self.metrics_service.sample(tab_pid, None, hud_now);
-            for p in &mut self.panels {
-                p.poll(hud_now);
-            }
-        }
         // WYSIWYG: paint the Cmd-F find bar over the bottom terminal row (a no-op when not
         // searching), exactly as the live present does, so a headless capture matches glass.
         self.splice_find_bar(front);
-        self.splice_hud_bar(front);
         // OVERLAY the modal Settings panel (a no-op when closed), exactly as the live
         // present does — so the SACRED `image`/`snapshot` introspection captures the open
         // settings surface WYSIWYG (what an AI reads == what is on glass). Completes
@@ -2117,7 +2438,7 @@ impl App {
             });
         let mut frame = backend.render_input(introspect_gpu, &mut ws.input_scratch, tray_arg);
         let render_ns = render_t0.elapsed().as_nanos() as u64;
-        crate::metrics::record_present(0, render_ns);
+        crate::metrics::record_offscreen_raster(render_ns);
         // I-2: match the on-screen visual-bell invert (see `snapshot`) so the
         // `image` verb is WYSIWYG even during a bell flash. Suppressed while ANY modal
         // overlay is open — the SAME `overlay_open()` gate the glass present and the
@@ -2256,12 +2577,6 @@ impl App {
             want_bytes,
             reply,
         });
-        // Feed the frame-coupled panels (Perf) AFTER the disjoint-field borrows above
-        // end (the destructure held `windows`/`backend`; `self.panels` is separate).
-        let hud_now = Instant::now();
-        for p in &mut self.panels {
-            p.on_present(render_ns, 0, hud_now);
-        }
     }
 
     /// Read the frontmost window's NATIVE macOS chrome — the window's `NSToolbar`
@@ -2863,7 +3178,7 @@ impl App {
         {
             composite_tray(&mut frame.pixels, frame.width, frame.height, card);
         }
-        crate::metrics::record_present(0, render_t0.elapsed().as_nanos() as u64);
+        crate::metrics::record_offscreen_raster(render_t0.elapsed().as_nanos() as u64);
         Ok(frame)
     }
 
@@ -2883,20 +3198,13 @@ impl App {
 }
 
 impl App {
-    /// Capture an AUXILIARY GUI window — the Preferences window or the Performance
-    /// control panel — to the confined PNG, replying its `(width, height)`.
-    /// Serves the `window prefs` / `window perf` introspection verbs (main thread, per
+    /// Capture an auxiliary own-rendered GUI surface to the confined PNG, replying its
+    /// `(width, height)`. Serves Settings-route aliases such as `window prefs`
+    /// (main thread, per
     /// [`crate::Wake::CaptureAuxWindow`]).
     ///
-    /// [`AuxTarget::Front`] delegates to the unchanged [`Self::capture_window`] (the
-    /// frontmost terminal window). For the aux windows we read the directly-owned
-    /// `NSWindow`'s `windowNumber()` straight off its retained handle (no winit
-    /// `NSView -> window()` hop) and reuse the EXACT same `capture_window_pixels` +
-    /// `encode_rgba8_png` + confined `write_private_at` path `capture_window` uses — so
-    /// the sacred capture path, the path confinement, and the Screen-Recording-permission
-    /// error are all identical. Replies `Err` (never panics) when the target window is not
-    /// open or capture fails; captured pixels are encoded + written on the encode
-    /// worker, which sends `reply` after the write.
+    /// Every supported target lives in the front aterm frame, so this delegates to the
+    /// ordinary capture path and preserves its confinement and encoding behavior.
     #[cfg(target_os = "macos")]
     pub(crate) fn capture_aux_window(
         &mut self,
@@ -2904,55 +3212,8 @@ impl App {
         confined: control_auth::ConfinedImage,
         reply: std::sync::mpsc::Sender<Result<(u32, u32), String>>,
     ) {
-        // Front, native Settings, and every overlay are rendered into the front
-        // window's WYSIWYG frame. Preferences has no auxiliary OS window.
-        if matches!(target, AuxTarget::Prefs) {
-            return self.capture_window_of(self.frontmost_window, confined, reply);
-        }
-        if matches!(
-            target,
-            AuxTarget::Front | AuxTarget::About | AuxTarget::Menu | AuxTarget::Update
-        ) {
-            return self.capture_window(confined, reply);
-        }
-        // Resolve the aux window's CGWindowID off its retained handle (None = not open).
-        let window_number = match target {
-            AuxTarget::Perf => self._perf_panel.as_ref().and_then(|h| h.window_number()),
-            AuxTarget::Front
-            | AuxTarget::Prefs
-            | AuxTarget::About
-            | AuxTarget::Menu
-            | AuxTarget::Update => {
-                unreachable!("handled above")
-            }
-        };
-        let Some(n) = window_number else {
-            // `window_number()` is None both when the window was never built AND when it
-            // was closed/minimized (an ordered-out NSWindow reports windowNumber() <= 0),
-            // so the handle may be present-but-hidden — point the caller at `open` either
-            // way (it shows/re-shows the window).
-            let kw = target.keyword();
-            let _ = reply.send(Err(format!(
-                "{kw} window is not on screen (closed or never opened); \
-                 send `open {kw}` to show it, then retry"
-            )));
-            return;
-        };
-        // Same confined-write path as `capture_window`: photograph by CGWindowID here
-        // (main thread), then encode RGBA8 → PNG + write via the `images/` dir fd
-        // (O_NOFOLLOW) on the encode worker.
-        match capture_window_pixels(n as u32) {
-            Ok((rgba, width, height)) => self.submit_encode_job(EncodeJob::WindowRgba {
-                rgba,
-                width,
-                height,
-                target: confined,
-                reply,
-            }),
-            Err(e) => {
-                let _ = reply.send(Err(e));
-            }
-        }
+        let _ = target;
+        self.capture_window(confined, reply);
     }
 
     /// Off macOS there is no CoreGraphics window server to photograph, so the aux-window
@@ -2970,96 +3231,68 @@ impl App {
         ));
     }
 
-    /// Read an AUXILIARY window's CONTROLS as human-readable text lines — the `controls
-    /// prefs` / `controls perf` introspection verbs (the analogue of `chrome` for aux
-    /// windows). Serves [`crate::Wake::ReadAuxControls`] on the main thread.
+    fn read_native_settings_controls(
+        &self,
+        route_alias: Option<(&'static str, crate::native_settings::SettingsRoute)>,
+    ) -> Vec<String> {
+        let target = route_alias.map_or_else(
+            || self.native_settings_view_target(),
+            |(_, route)| self.native_settings_route_view_target(route),
+        );
+        let Some((wid, instance, view, state)) = target else {
+            return match route_alias {
+                Some((alias, route)) => native_settings_route_not_open_controls_lines(
+                    alias,
+                    route,
+                    self.native_settings_front_view_target()
+                        .map(|(_, _, _, state)| state),
+                ),
+                None => native_settings_closed_controls_lines(),
+            };
+        };
+
+        // Prefer the retained frame lowered into the Settings card whenever it is
+        // current. This binds compatibility inspection to the same artifact as pixels,
+        // hit testing, and accessibility. An inactive native view has no on-glass cache;
+        // compile that exact stable view/viewport rather than borrowing the focused one.
+        if let Some(frame) = self
+            .cached_native_ui(wid)
+            .filter(|frame| frame.stamp.instance == instance && frame.stamp.view == view)
+        {
+            return native_settings_controls_lines(
+                state,
+                &frame.compiled,
+                &state.config_assets().trail_packs.ids,
+            );
+        }
+        let compiled = self
+            .native_ui_viewport_for(wid, view)
+            .and_then(|viewport| self.compiled_native_ui_for(wid, instance, view, viewport));
+        match compiled {
+            Ok(compiled) => native_settings_controls_lines(
+                state,
+                &compiled,
+                &state.config_assets().trail_packs.ids,
+            ),
+            Err(error) => native_settings_unavailable_controls_lines(state, &error),
+        }
+    }
+
+    /// Read an auxiliary own-rendered surface's controls as human-readable text lines.
+    /// Serves [`crate::Wake::ReadAuxControls`] on the main thread.
     ///
-    /// Built from the SAME PURE models the windows render from — `prefs::editable_fields`
-    /// over the live `self.config`, `perf_panel::perf_panel_lines` over the live panel
-    /// state — rather than walking `NSView` subviews. So it is deterministic, AppKit-free
-    /// (works HEADLESS, where the window may never be built), and byte-identical to what
-    /// the window shows. `Front` has no settings list — point the caller at `chrome`.
+    /// Built from the same pure models the windows render from rather than walking OS
+    /// subviews, so it is deterministic and AppKit-free (and works headlessly). For
+    /// Settings, the compatibility `state` / `prefs fields` / `field` records are
+    /// derived from the exact compiled native tree and followed by its canonical `ui`
+    /// records; they never serialize the retired overlay model.
     pub(crate) fn read_aux_controls(&self, target: AuxTarget) -> Vec<String> {
         match target {
-            AuxTarget::Prefs => {
-                // Preserve the historical `controls prefs` schema by projecting the
-                // SettingsState embedded in the live native Settings view. New clients
-                // use `inspect app/v1`; both read the same controller, never a hidden
-                // overlay or auxiliary window.
-                if let Some(s) = self.native_settings_legacy_state() {
-                    return crate::overlay::OverlayModel::controls_lines(s);
-                }
-                let snapshot = crate::prefs::editable_fields(&self.config);
-                // The loaded Trail Pack ids for the `cursor_trail_style` domain
-                // (empty + no IO when none are configured).
-                let trail_pack_ids = self.config_assets.trail_packs.ids.clone();
-                let mut out = Vec::with_capacity(snapshot.len() + 2);
-                out.push("state open=false".to_string());
-                out.push(format!("prefs fields={}", snapshot.len()));
-                for f in &snapshot {
-                    // `value` is the user's CONFIGURED raw value (blank = unset);
-                    // `effective` is what is actually in use (the placeholder hint).
-                    let value = f.seed.as_deref().unwrap_or("");
-                    // `kind` makes the control TYPE machine-readable; an Enum also lists
-                    // its allowed `options` so a reader (an AI driving settings) knows the
-                    // exact value domain — e.g. cursor_trail_style's phaser/fire + packs.
-                    let kind = match f.kind {
-                        crate::prefs::EditKind::Float => "float".to_string(),
-                        crate::prefs::EditKind::Integer => "integer".to_string(),
-                        crate::prefs::EditKind::Bool => "bool".to_string(),
-                        crate::prefs::EditKind::Text => "text".to_string(),
-                        crate::prefs::EditKind::Enum { .. }
-                            if f.key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE =>
-                        {
-                            format!(
-                                "enum options=[{}]",
-                                crate::prefs::cursor_trail_style_options(
-                                    trail_pack_ids.iter().map(String::as_str)
-                                )
-                                .join(",")
-                            )
-                        }
-                        crate::prefs::EditKind::Enum { options } => {
-                            format!("enum options=[{}]", options.join(","))
-                        }
-                        // Theme options are the live built-in registry (resolved here so
-                        // the introspected domain tracks `scheme::builtin_names`).
-                        crate::prefs::EditKind::Theme => {
-                            format!(
-                                "theme options=[{}]",
-                                aterm_types::scheme::builtin_names().join(",")
-                            )
-                        }
-                        crate::prefs::EditKind::Color => "color".to_string(),
-                    };
-                    out.push(format!(
-                        "field key={} label={:?} value={:?} effective={:?} kind={}",
-                        f.key, f.label, value, f.placeholder, kind
-                    ));
-                }
-                // §F4.6: the Kitty Log collection book is part of the settings
-                // surface — append its rows from the App's in-memory store so
-                // the page verifies headlessly with the overlay CLOSED, via the
-                // same `kittylog …` serialization the open overlay emits.
-                out.extend(crate::kitty_log::book_lines(self.kitty_log.log()));
-                out
-            }
-            AuxTarget::Perf => {
-                let toggles: Vec<(crate::hud_bar::PanelId, bool)> = crate::hud_bar::PanelId::ALL
-                    .iter()
-                    .map(|&id| (id, self.panel_enabled(id)))
-                    .collect();
-                crate::perf_panel::perf_panel_lines(&toggles)
-            }
-            AuxTarget::About => {
-                // Prefer the LIVE open overlay (focused row + copy status) so the text
-                // matches the painted card; else a fresh snapshot so `controls about` works
-                // headless / when the overlay is closed.
-                match self.front().and_then(|ws| ws.about()) {
-                    Some(a) => a.controls_lines(),
-                    None => crate::about::AboutState::new().controls_lines(),
-                }
-            }
+            AuxTarget::Prefs => self.read_native_settings_controls(None),
+            AuxTarget::About => self.read_native_settings_controls(Some((
+                "about",
+                crate::native_settings::SettingsRoute::About,
+            ))),
             AuxTarget::Menu => {
                 // Prefer the LIVE open palette (query + cursor + resolved enabled/checked)
                 // so the text matches the painted card; else a fresh LIVE-RESOLVED
@@ -3076,23 +3309,229 @@ impl App {
                         .controls_lines(),
                 }
             }
-            AuxTarget::Update => {
-                // Prefer the LIVE open overlay (its captured snapshot + checking state) so
-                // the text matches the painted card; else a fresh snapshot so `controls
-                // update` works headless / when the overlay is closed.
-                match self.front().and_then(|ws| ws.update_screen()) {
-                    Some(u) => u.controls_lines(),
-                    None => self.update_snapshot(false).controls_lines(),
-                }
-            }
+            AuxTarget::Update => self.read_native_settings_controls(Some((
+                "update",
+                crate::native_settings::SettingsRoute::SoftwareUpdate,
+            ))),
             AuxTarget::Front => match self.front().and_then(|ws| ws.overlay()) {
-                // The front window's modal overlay is what a front `image` capture shows,
-                // so `controls front` reports THAT slot (open/closed + kind + fp + scroll
-                // extent). A windowed-⌘ Settings NSWindow is reached via `controls settings`
-                // / `window prefs`, not here. Live state, no geometry — headless-safe.
                 Some(o) => vec![o.status_line()],
                 None => vec!["overlay open=false".to_string()],
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_settings_compatibility_controls_tests {
+    use super::{App, AuxTarget};
+    use crate::WindowId;
+    use crate::native_settings::SettingsRoute;
+    use crate::native_ui::UiKey;
+
+    #[test]
+    fn about_and_update_aliases_emit_the_exact_retained_native_frame() {
+        for (target, route, retired_prefix) in [
+            (AuxTarget::About, SettingsRoute::About, "about "),
+            (AuxTarget::Update, SettingsRoute::SoftwareUpdate, "update "),
+        ] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            assert!(app.open_settings_tab(route));
+            assert!(app.prepare_native_input_scratch(wid));
+
+            let (expected_ui, actionable, semantics) = {
+                let frame = app.windows[&wid]
+                    .native_ui_compiled
+                    .as_ref()
+                    .expect("native Settings frame retained beside its raster");
+                assert_eq!(frame.stamp.view, app.active_native_view(wid).unwrap().1);
+                assert!(
+                    frame
+                        .compiled
+                        .semantic(&UiKey::new(format!("settings/page{}", route.path())))
+                        .is_some(),
+                    "the retained frame owns the requested {route:?} page root"
+                );
+                (
+                    frame.compiled.controls_lines(),
+                    frame
+                        .compiled
+                        .semantics
+                        .iter()
+                        .filter(|node| node.action.is_some())
+                        .count(),
+                    frame.compiled.semantics.len(),
+                )
+            };
+
+            let actual = app.read_aux_controls(target);
+            assert!(
+                actual[0].contains("state open=true")
+                    && actual[0].contains("pane=native-tab")
+                    && actual[0].contains(&format!("route={}", route.path()))
+                    && actual[0].contains(&format!("page={:?}", route.label())),
+                "alias identity must name the live native route: {:?}",
+                actual[0]
+            );
+            assert!(actual.iter().any(|line| {
+                line == &format!(
+                    "native surface=native-tab route={} controls={actionable} semantics={semantics}",
+                    route.path()
+                )
+            }));
+            let actual_ui = actual
+                .iter()
+                .filter(|line| line.starts_with("ui "))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual_ui, expected_ui,
+                "compatibility alias must serialize the exact semantic artifact retained for paint"
+            );
+            assert!(
+                actual.iter().all(|line| !line.starts_with(retired_prefix)),
+                "retired standalone projection leaked through {target:?}: {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_specific_aliases_never_fabricate_a_closed_or_different_page() {
+        let mut app = App::headless_for_test();
+        for (target, route, alias) in [
+            (AuxTarget::About, SettingsRoute::About, "about"),
+            (AuxTarget::Update, SettingsRoute::SoftwareUpdate, "update"),
+        ] {
+            let closed = app.read_aux_controls(target);
+            assert_eq!(closed[0], "state open=false");
+            assert!(closed[2].contains(&format!("alias={alias}")));
+            assert!(closed[2].contains(&format!("route=- expected-route={}", route.path())));
+            assert!(closed[2].contains(&format!("use `open {alias}` first")));
+            assert!(closed.iter().all(|line| !line.starts_with("ui ")));
+        }
+
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        for (target, route, alias) in [
+            (AuxTarget::About, SettingsRoute::About, "about"),
+            (AuxTarget::Update, SettingsRoute::SoftwareUpdate, "update"),
+        ] {
+            let mismatch = app.read_aux_controls(target);
+            assert!(
+                mismatch[0].contains("state open=true")
+                    && mismatch[0].contains("route=/home")
+                    && mismatch[0].contains(&format!("use `open {alias}` first")),
+                "route mismatch is explicit: {:?}",
+                mismatch[0]
+            );
+            assert!(mismatch[2].contains(&format!("alias={alias}")));
+            assert!(mismatch[2].contains(&format!("route=/home expected-route={}", route.path())));
+            assert!(mismatch.iter().all(|line| !line.starts_with("ui ")));
+            assert!(
+                mismatch
+                    .iter()
+                    .all(|line| { !line.starts_with("about ") && !line.starts_with("update ") })
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_field_metadata_uses_the_selected_view_asset_generation() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.cols = 160;
+            window.rows = 50;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let view_assets = std::sync::Arc::clone(
+            app.native_settings_view_target()
+                .expect("native Settings view")
+                .3
+                .config_assets(),
+        );
+
+        // Simulate the host advancing to a different catalog while this view remains on
+        // its admitted generation. The old projection mixed this host-only id into the
+        // view's compatibility enum metadata even though its canonical `ui` rows were
+        // compiled from `view_assets`.
+        const HOST_ONLY: &str = "host-generation-only-pack";
+        let mut host_assets = (*app.config_assets).clone();
+        host_assets.trail_packs = std::sync::Arc::new(crate::app_config::TrailPackCatalog {
+            ids: vec![HOST_ONLY.to_string()],
+            ..crate::app_config::TrailPackCatalog::default()
+        });
+        app.config_assets = std::sync::Arc::new(host_assets);
+        assert!(!std::sync::Arc::ptr_eq(&app.config_assets, &view_assets));
+
+        let lines = app.read_aux_controls(AuxTarget::Prefs);
+        let trail = lines
+            .iter()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "field key={} ",
+                    crate::prefs::EDIT_CURSOR_TRAIL_STYLE
+                ))
+            })
+            .expect("Top Settings exposes the cursor-trail picker");
+        let expected = crate::prefs::cursor_trail_style_options(
+            view_assets.trail_packs.ids.iter().map(String::as_str),
+        )
+        .join(",");
+        assert!(
+            trail.contains(&format!("kind=enum options=[{expected}]")),
+            "field metadata must share the selected view generation: {trail}"
+        );
+        assert!(
+            !trail.contains(HOST_ONLY),
+            "host generation leaked into a stale view: {trail}"
+        );
+    }
+
+    #[test]
+    fn route_aliases_never_describe_a_matching_background_window() {
+        for (target, background_route, alias) in [
+            (AuxTarget::About, SettingsRoute::About, "about"),
+            (AuxTarget::Update, SettingsRoute::SoftwareUpdate, "update"),
+        ] {
+            let mut app = App::headless_for_test();
+            let background = WindowId(0);
+            assert!(app.open_settings_tab(background_route));
+            let (_, background_view) = app
+                .active_native_view(background)
+                .expect("background Settings route");
+
+            let session = app.next_session_id;
+            let front = app.insert_logical_window(crate::stub_session(session), 24, 80);
+            assert_eq!(app.frontmost_window, Some(front));
+            assert!(app.open_settings_tab(SettingsRoute::Home));
+            assert!(matches!(
+                app.native_runtime.view_state(background_view),
+                Some(crate::native_app::AppViewState::Settings(state))
+                    if state.route == background_route
+            ));
+            assert!(matches!(
+                app.active_native_view(front)
+                    .and_then(|(_, view)| app.native_runtime.view_state(view)),
+                Some(crate::native_app::AppViewState::Settings(state))
+                    if state.route == SettingsRoute::Home
+            ));
+
+            let lines = app.read_aux_controls(target);
+            assert!(
+                lines[0].contains("route=/home")
+                    && lines[0].contains(&format!("use `open {alias}` first")),
+                "front-route mismatch must be explicit: {:?}",
+                lines[0]
+            );
+            assert!(lines[2].contains(&format!(
+                "alias={alias} route=/home expected-route={}",
+                background_route.path()
+            )));
+            assert!(
+                lines.iter().all(|line| !line.starts_with("ui ")),
+                "background semantics must not describe the front capture: {lines:?}"
+            );
         }
     }
 }

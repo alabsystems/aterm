@@ -29,6 +29,9 @@ struct Protocol {
     baseline: Seq,
     checkpoint_ready: bool,
     stale_rejected: i64,
+    journal_disk_generation: i64,
+    plan_disk_generation: i64,
+    disk_conflict_rejected: bool,
 }
 
 fn relative(seq: Seq, origin: Seq) -> i64 {
@@ -60,6 +63,13 @@ fn projection(
     state.insert("stale_rejected", protocol.stale_rejected);
     state.insert("stale_accepted", 0);
     state.insert("unsafe_prune", 0);
+    state.insert("journal_disk_generation", protocol.journal_disk_generation);
+    state.insert("plan_disk_generation", protocol.plan_disk_generation);
+    state.insert(
+        "disk_conflict_rejected",
+        i64::from(protocol.disk_conflict_rejected),
+    );
+    state.insert("wrong_image_accepted", 0);
     state
 }
 
@@ -117,6 +127,9 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         baseline: disk.seq,
         checkpoint_ready: false,
         stale_rejected: 0,
+        journal_disk_generation: 0,
+        plan_disk_generation: 0,
+        disk_conflict_rejected: false,
     };
 
     // A genuine committed edit becomes the latest desired journal head.
@@ -141,6 +154,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     protocol.inflight = 1;
     protocol.target = first.target_seq;
     protocol.generation += 1;
+    protocol.plan_disk_generation = protocol.journal_disk_generation;
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "BeginJournal");
 
@@ -160,6 +174,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         JournalCompletion::Durable { seq, .. } if seq == first.target_seq
     ));
     protocol.inflight = 0;
+    protocol.journal_disk_generation += 1;
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "AcceptJournal");
 
@@ -177,6 +192,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     protocol.inflight = 1;
     protocol.target = latest.target_seq;
     protocol.generation += 1;
+    protocol.plan_disk_generation = protocol.journal_disk_generation;
     let after_begin = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after_begin, "BeginJournal");
 
@@ -187,6 +203,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         JournalAppendResult::Committed(JournalAppendProof {
             appended_len: latest.bytes.len(),
             encoded_fingerprint: latest.encoded_fingerprint,
+            published_image: latest.expected_image.unwrap(),
             file_synced: true,
             renamed_over_journal: true,
             directory_synced: true,
@@ -213,6 +230,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         JournalCompletion::Durable { seq, .. } if seq == latest.target_seq
     ));
     protocol.inflight = 0;
+    protocol.journal_disk_generation += 1;
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "AcceptJournal");
 
@@ -272,6 +290,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     protocol.baseline = saved.seq;
     protocol.checkpoint_ready = false;
     protocol.generation += 1;
+    protocol.plan_disk_generation = protocol.journal_disk_generation;
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "BeginCheckpoint");
 
@@ -282,6 +301,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         JournalCompletion::Durable { seq, .. } if seq == plan.target_seq
     ));
     protocol.inflight = 0;
+    protocol.journal_disk_generation += 1;
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "AcceptCheckpoint");
     assert_eq!(

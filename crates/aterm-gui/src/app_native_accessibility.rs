@@ -346,6 +346,17 @@ impl App {
                 AppEvent::Action(ActionInvocation { id: action, value })
             }
             RoutedAccessibilityAction::Scroll { lines, .. } => AppEvent::ScrollLines(lines),
+            RoutedAccessibilityAction::ReplaceSelectedText { text, .. } => {
+                AppEvent::InsertText(text)
+            }
+            RoutedAccessibilityAction::SetTextSelection {
+                anchor_byte,
+                focus_byte,
+                ..
+            } => AppEvent::EditorSetSelection {
+                anchor: anchor_byte,
+                head: focus_byte,
+            },
         };
         if self
             .dispatch_native_view_event(wid, owner.view, event)

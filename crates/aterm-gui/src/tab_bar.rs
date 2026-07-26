@@ -618,12 +618,17 @@ enum StripRole {
 /// (hoisted out of the per-cell [`strip_cell`] — the blends are frame-invariant).
 #[derive(Clone, Copy)]
 struct StripColors {
-    /// Full-strength foreground (active-tab text + the `+` affordance).
+    /// Full-strength foreground (the `+` affordance and, by default, the
+    /// active-tab text).
     fg: [u8; 3],
     /// The terminal body background (bare strip + inactive tabs sit on this).
     body_bg: [u8; 3],
     /// The active tab's raised-button background.
     active_bg: [u8; 3],
+    /// The active tab's LABEL ink. Equal to `fg` for the theme-derived strip; a
+    /// user `active_tab_color` override replaces it with black/white by the
+    /// override's own luminance so the label stays readable on any pick.
+    active_fg: [u8; 3],
     /// Dimmed foreground for inactive tab labels.
     inactive_fg: [u8; 3],
     /// Theme accent used by the selected underline and state marks.
@@ -680,16 +685,36 @@ fn strip_colors(theme: Theme) -> StripColors {
         fg: rgb(theme.fg),
         body_bg: rgb(theme.bg),
         active_bg: blend(theme.bg, theme.fg, active_t),
+        active_fg: rgb(theme.fg),
         inactive_fg: blend(theme.fg, theme.bg, inactive_t),
         accent: rgb(theme.cursor),
     }
+}
+
+/// [`strip_colors`] with the user's selected-tab color override (config
+/// `active_tab_color`) applied: the ACTIVE tab's background becomes the exact
+/// chosen color and its label ink flips black/white by that color's luminance
+/// (the same [`bg_is_light`] classifier the native toolbar pill uses, so the
+/// two renderers can never disagree). `None` = the theme-derived strip,
+/// byte-identical to [`strip_colors`].
+fn strip_colors_with_active(theme: Theme, active_override: Option<[u8; 3]>) -> StripColors {
+    let mut colors = strip_colors(theme);
+    if let Some(active_bg) = active_override {
+        colors.active_bg = active_bg;
+        colors.active_fg = if bg_is_light(active_bg) {
+            [0, 0, 0]
+        } else {
+            [255, 255, 255]
+        };
+    }
+    colors
 }
 
 /// Is this background a LIGHT one? A cheap perceptual-luma threshold (no sRGB-linear
 /// round-trip needed for a binary dark/light decision). Every bundled dark scheme
 /// sits well below the threshold and every light scheme well above it, so the
 /// appearance-aware `strip_colors` branch never misclassifies a built-in. The ONE
-/// dark/light classifier for all chrome (this strip, `hud_bar`, and the native
+/// dark/light classifier for all chrome (this strip and the native
 /// toolbar's strip appearance via [`theme_is_dark`]) so they can never disagree.
 pub(crate) fn bg_is_light(bg: [u8; 3]) -> bool {
     let luma = 0.299 * f32::from(bg[0]) + 0.587 * f32::from(bg[1]) + 0.114 * f32::from(bg[2]);
@@ -724,7 +749,7 @@ fn strip_cell(ch: char, colors: &StripColors, role: StripRole) -> RenderCell {
     // seam between the active tab and the terminal content directly below it.
     let (fg, bg, bold, underline, underline_color) = match role {
         StripRole::Active => (
-            colors.fg,
+            colors.active_fg,
             colors.active_bg,
             true,
             UnderlineStyle::Single,
@@ -741,7 +766,7 @@ fn strip_cell(ch: char, colors: &StripColors, role: StripRole) -> RenderCell {
         // A raised, underlined highlighted button (like the active tab) so the update
         // alert draws the eye without a hardcoded chrome colour.
         StripRole::Update => (
-            colors.fg,
+            colors.active_fg,
             colors.active_bg,
             true,
             UnderlineStyle::Single,
@@ -806,7 +831,7 @@ pub fn paint_strip(
     active: usize,
     theme: Theme,
 ) {
-    let _ = paint_strip_impl(row, segments, titles, None, active, theme);
+    let _ = paint_strip_impl(row, segments, titles, None, active, theme, None);
 }
 
 /// Paint the shipping strip from canonical presentation metadata and return sparse
@@ -821,8 +846,17 @@ pub(crate) fn paint_strip_with_metadata(
     metadata: &[TabStripMetadata],
     active: usize,
     theme: Theme,
+    active_override: Option<[u8; 3]>,
 ) -> Vec<(usize, ImageRef)> {
-    paint_strip_impl(row, segments, titles, Some(metadata), active, theme)
+    paint_strip_impl(
+        row,
+        segments,
+        titles,
+        Some(metadata),
+        active,
+        theme,
+        active_override,
+    )
 }
 
 fn paint_strip_impl(
@@ -832,9 +866,10 @@ fn paint_strip_impl(
     metadata: Option<&[TabStripMetadata]>,
     active: usize,
     theme: Theme,
+    active_override: Option<[u8; 3]>,
 ) -> Vec<(usize, ImageRef)> {
     // Derive the strip tones ONCE (frame-invariant), not per cell.
-    let colors = strip_colors(theme);
+    let colors = strip_colors_with_active(theme, active_override);
     let mut images = Vec::new();
     // Background fill: every strip cell is body-coloured chrome unless a segment
     // overwrites it, so gaps between segments read as strip, not terminal.
@@ -1287,6 +1322,7 @@ mod tests {
             &metadata,
             0,
             theme,
+            None,
         );
         let first = segments[0];
         let layout = tab_content_layout(&first, metadata[0]);
@@ -1394,6 +1430,7 @@ mod tests {
             &metadata,
             0,
             theme,
+            None,
         );
         assert!(
             images

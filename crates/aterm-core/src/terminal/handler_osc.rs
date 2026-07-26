@@ -346,7 +346,11 @@ impl TerminalHandler<'_> {
     // by conformance_hyperlink_scheme_cap's action_enabled checks.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "hyperlink_scheme_cap", action = "Accept")
+        aterm_spec::refines(
+            machine = "hyperlink_scheme_cap",
+            action = "Accept",
+            project = "conformance_hyperlink_scheme_cap::project"
+        )
     )]
     pub(super) fn handle_osc_8(&mut self, params: &[&[u8]]) {
         // OSC 8 format: OSC 8 ; params ; URI ST
@@ -1378,7 +1382,9 @@ mod tests {
         let mut term = Terminal::new(24, 80);
         // Smuggling shapes: whitespace, percent-encoded colon, empty, digit /
         // `+`/`.`/`-` lead, embedded colon — none may mint.
-        for s in ["orca\t", "orca ", "ORCA%3A", "", "1orca", "+orca", ".orca", "-orca", "orc:a"] {
+        for s in [
+            "orca\t", "orca ", "ORCA%3A", "", "1orca", "+orca", ".orca", "-orca", "orc:a",
+        ] {
             assert!(
                 !term.authorize_hyperlink_scheme(s),
                 "malformed scheme {s:?} must be refused"

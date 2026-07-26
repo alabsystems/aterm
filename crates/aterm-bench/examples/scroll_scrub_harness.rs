@@ -177,12 +177,16 @@ fn jump_top_pass(term: &mut Terminal) -> usize {
     let depth = term.grid().scrollback_lines();
     // Sweep the oldest `span` lines (all in the warm/cold tiers, past the 10k live
     // ring), guarding against a shallow fill.
-    let span = (JUMP_REPS * JUMP_STRIDE).min(depth.saturating_sub(ROWS as usize)).max(1);
+    let span = (JUMP_REPS * JUMP_STRIDE)
+        .min(depth.saturating_sub(ROWS as usize))
+        .max(1);
     for i in 0..JUMP_REPS {
         term.grid_mut().scroll_to_bottom();
         // A deep offset near the top, stepped by a page each rep (wrapping within
         // the oldest region) so every materialize is a fresh cold-page decode.
-        let off = depth.saturating_sub((i * JUMP_STRIDE) % span).max(ROWS as usize);
+        let off = depth
+            .saturating_sub((i * JUMP_STRIDE) % span)
+            .max(ROWS as usize);
         term.grid_mut().scroll_display(off as i32);
         black_box(materialize_visible(term));
     }

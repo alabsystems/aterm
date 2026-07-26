@@ -34,13 +34,16 @@ use ledger::{ClaimPlan, Error, GitCli, GitRunner, LEDGER_FLOOR, RunOut};
 /// number an exact-equality assertion instead of a range check.
 const NOW: u64 = 1_790_000_000;
 
-/// Byte-exact copy of the committed seed (spec §2) — the whole-file equality
-/// asserts below hang off these exact bytes.
-const SEED_LEDGER: &str = "# aterm release ledger — append-only; one line per claimed build number. Never edit or reuse.\n1783354739 0.25\n";
+/// The committed seed (spec §2) re-spelled in the ONE version scheme — the
+/// whole-file equality asserts below hang off these exact bytes. The real
+/// `RELEASES.ledger` keeps its pre-cut-over two-component lines verbatim
+/// (append-only history is never edited); `parse_takes_last_record_and_names_
+/// malformed_lines` covers that mixed-history file directly.
+const SEED_LEDGER: &str = "# aterm release ledger — append-only; one line per claimed build number. Never edit or reuse.\n1783354739 0.25.0\n";
 
 /// Minimal changelog: the claim's "cut elsewhere" abort reads
 /// origin/main:CHANGELOG.md, so the fixture repo must carry one.
-const SEED_CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Added\n- **Something real** — an entry.\n\n## [0.25] - 2026-07-06\n\n- old notes.\n";
+const SEED_CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Added\n- **Something real** — an entry.\n\n## [0.25.0] - 2026-07-06\n\n- old notes.\n";
 
 // --------------------------------------------------------------------------
 // fixture: bare origin + a rival clone (the "other machine") + the claimant's
@@ -271,7 +274,7 @@ fn assert_clean_at_origin_tip(fix: &Fixture) {
         "HEAD not reset to the real origin tip"
     );
     assert!(
-        !origin_subjects(fix).contains("release: v0.26"),
+        !origin_subjects(fix).contains("release: v0.26.0"),
         "an aborted claim must never land a release commit on origin"
     );
 }
@@ -282,18 +285,36 @@ fn assert_clean_at_origin_tip(fix: &Fixture) {
 
 #[test]
 fn parse_takes_last_record_and_names_malformed_lines() {
-    let good = "# comment\n1783354739 0.25\n1783918101 0.26\n";
+    let good = "# comment\n1783354739 0.25.0\n1783918101 0.26.0\n";
     let t = ledger::tail(good).unwrap();
-    assert_eq!((t.build, t.version.as_str()), (1_783_918_101, "0.26"));
+    assert_eq!((t.build, t.version.as_str()), (1_783_918_101, "0.26.0"));
+
+    // The REAL post-cut-over file: pre-cut-over history keeps its retired
+    // two-component versions verbatim (append-only, never edited) and a
+    // three-component line is appended on top. The ledger grammar is column
+    // 1 — the build number — so column 2's shape is never parsed, and the
+    // mixed file must read back with its exact three-component tail.
+    let mixed = "# comment\n1784869524 0.61\n1790000000 0.2.0\n";
+    let t = ledger::tail(mixed).unwrap();
+    assert_eq!((t.build, t.version.as_str()), (1_790_000_000, "0.2.0"));
+    let records = ledger::parse(mixed).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.build, record.version.as_str()))
+            .collect::<Vec<_>>(),
+        [(1_784_869_524, "0.61"), (1_790_000_000, "0.2.0")],
+        "retired history stays readable; it is just never a cut's source"
+    );
 
     // Every malformed shape aborts and names its 1-based line — blank lines
     // included: the ledger is append-only, so ANY unparseable edit is treated
     // as corruption, never skipped over.
     let cases: [(&str, usize); 4] = [
-        ("# c\n1783354739 0.25\n\n1783918101 0.26\n", 3), // blank line
-        ("1783354739\n", 1),                              // one field
-        ("1783354739 0.25 extra\n", 1),                   // three fields
-        ("abc 0.25\n", 1),                                // non-numeric build
+        ("# c\n1783354739 0.25.0\n\n1783918101 0.26.0\n", 3), // blank line
+        ("1783354739\n", 1),                                  // one field
+        ("1783354739 0.25.0 extra\n", 1),                     // three fields
+        ("abc 0.25.0\n", 1),                                  // non-numeric build
     ];
     for (text, line) in cases {
         let err = ledger::tail(text).unwrap_err().to_string();
@@ -315,15 +336,27 @@ fn next_build_is_monotonic_and_floored() {
         ledger::next_build(LEDGER_FLOOR, 0).unwrap(),
         LEDGER_FLOOR + 1
     );
-    // Below the v0.25 floor entirely → refuse to mint.
+    // Below the v0.25 seed floor entirely → refuse to mint.
     assert!(ledger::next_build(5, 10).is_err());
 }
 
+/// One version scheme: canonical `MAJOR.MINOR.PATCH`. The retired
+/// two-component spelling is refused like any other malformed shape — a claim
+/// may never mint a build number for a version no client can select.
 #[test]
-fn claim_rejects_non_major_minor_versions() {
+fn claim_rejects_non_canonical_three_component_versions() {
     // Shape-checked before any git runs, so a dead path is fine as the repo.
     let git = GitCli::new("/nonexistent");
-    for bad in ["0.26.1", "v0.26", "0.2x", "26", ""] {
+    for bad in [
+        "0.26",     // the retired two-component scheme
+        "v0.26.1",  // tag spelling, not a version
+        "0.2.x",    // non-numeric component
+        "0.26.1.2", // four components
+        "01.2.3",   // leading zero
+        "0..1",     // empty component
+        "26",       // one component
+        "",
+    ] {
         let plan = ClaimPlan {
             version: bad,
             now: NOW,
@@ -333,7 +366,7 @@ fn claim_rejects_non_major_minor_versions() {
         let err = ledger::claim(&git, Path::new("/nonexistent"), &plan, &mut |_| Ok(vec![]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("MAJOR.MINOR"), "{bad:?} → {err}");
+        assert!(err.contains("MAJOR.MINOR.PATCH"), "{bad:?} → {err}");
     }
 }
 
@@ -345,13 +378,13 @@ fn claim_rejects_non_major_minor_versions() {
 fn happy_path_claims_appends_and_verifies() {
     let fix = Fixture::new("happy");
     let git = GitCli::new(&fix.work);
-    let (res, ns) = do_claim(&git, &fix.work, "0.26", false);
+    let (res, ns) = do_claim(&git, &fix.work, "0.26.0", false);
     let c = res.unwrap();
     assert_eq!(c.build, NOW);
-    assert_eq!(c.ledger_line, "1790000000 0.26");
+    assert_eq!(c.ledger_line, "1790000000 0.26.0");
     assert_eq!(ns, vec![NOW]);
     // The verified claim commit is on origin, message per spec §1.
-    assert!(origin_subjects(&fix).contains("release: v0.26 (build 1790000000)"));
+    assert!(origin_subjects(&fix).contains("release: v0.26.0 (build 1790000000)"));
     assert_eq!(
         c.commit,
         run(&fix.work, "git", &["rev-parse", "HEAD"]).trim()
@@ -359,18 +392,18 @@ fn happy_path_claims_appends_and_verifies() {
     // Whole-file byte equality: seed untouched, our line appended.
     assert_eq!(
         origin_file(&fix, "RELEASES.ledger"),
-        format!("{SEED_LEDGER}1790000000 0.26\n")
+        format!("{SEED_LEDGER}1790000000 0.26.0\n")
     );
     // The regenerated content landed in the SAME single commit.
-    assert_eq!(origin_file(&fix, "BUMP"), "0.26 build 1790000000\n");
+    assert_eq!(origin_file(&fix, "BUMP"), "0.26.0 build 1790000000\n");
 }
 
 #[test]
 fn stale_head_aborts_with_pull_first() {
     let fix = Fixture::new("stale");
-    rival_append(&fix, "1790000042 0.99"); // origin moves before the claim starts
+    rival_append(&fix, "1790000042 0.99.0"); // origin moves before the claim starts
     let git = GitCli::new(&fix.work);
-    let (res, ns) = do_claim(&git, &fix.work, "0.26", false);
+    let (res, ns) = do_claim(&git, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("pull first"), "{err}");
     // Gate fired before anything was generated or committed.
@@ -381,13 +414,13 @@ fn stale_head_aborts_with_pull_first() {
 #[test]
 fn cas_loser_regenerates_from_origin_with_higher_n() {
     let fix = Fixture::new("cas");
-    let winner = "1790000123 0.99"; // > the loser's first n → forces a bigger retry n
+    let winner = "1790000123 0.99.0"; // > the loser's first n → forces a bigger retry n
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
             rival_append(&fix, winner);
         }
     });
-    let (res, ns) = do_claim(&runner, &fix.work, "0.26", false);
+    let (res, ns) = do_claim(&runner, &fix.work, "0.26.0", false);
     let c = res.unwrap();
     // Loser retried with a strictly-higher number (winner's tail + 1).
     assert_eq!(c.build, 1_790_000_124);
@@ -399,11 +432,11 @@ fn cas_loser_regenerates_from_origin_with_higher_n() {
     // (spec decision 3; the reset-soft design verifiably did).
     assert_eq!(
         origin_file(&fix, "RELEASES.ledger"),
-        format!("{SEED_LEDGER}{winner}\n1790000124 0.26\n")
+        format!("{SEED_LEDGER}{winner}\n1790000124 0.26.0\n")
     );
     // The commit content was REGENERATED for the retry's n, not reused.
-    assert_eq!(origin_file(&fix, "BUMP"), "0.26 build 1790000124\n");
-    assert!(origin_subjects(&fix).contains("release: v0.26 (build 1790000124)"));
+    assert_eq!(origin_file(&fix, "BUMP"), "0.26.0 build 1790000124\n");
+    assert!(origin_subjects(&fix).contains("release: v0.26.0 (build 1790000124)"));
 }
 
 #[test]
@@ -413,19 +446,19 @@ fn cas_loser_may_remint_same_n_while_clock_leads() {
     // max(tail+1, now) = now again — same number, still strictly above the
     // new tail, and never published anywhere in between. Documents the
     // max(…, now) subtlety of spec §2.
-    let winner = "1789999000 0.98";
+    let winner = "1789999000 0.98.0";
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
             rival_append(&fix, winner);
         }
     });
-    let (res, ns) = do_claim(&runner, &fix.work, "0.26", false);
+    let (res, ns) = do_claim(&runner, &fix.work, "0.26.0", false);
     let c = res.unwrap();
     assert_eq!(c.build, NOW);
     assert_eq!(ns, vec![NOW, NOW]);
     assert_eq!(
         origin_file(&fix, "RELEASES.ledger"),
-        format!("{SEED_LEDGER}{winner}\n1790000000 0.26\n")
+        format!("{SEED_LEDGER}{winner}\n1790000000 0.26.0\n")
     );
 }
 
@@ -435,9 +468,9 @@ fn retry_cap_aborts_clean_with_nothing_burned() {
     // A rival lands a fresh push before EVERY attempt — the claimant must
     // lose all 5 rounds, then stop cleanly.
     let runner = HookRunner::new(&fix.work, |attempt| {
-        rival_append(&fix, &format!("17900002{attempt:02} 0.9{attempt}"));
+        rival_append(&fix, &format!("17900002{attempt:02} 0.9{attempt}.0"));
     });
-    let (res, ns) = do_claim(&runner, &fix.work, "0.26", false);
+    let (res, ns) = do_claim(&runner, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("5 times"), "{err}");
     assert_eq!(runner.pushes.get(), 5);
@@ -446,7 +479,7 @@ fn retry_cap_aborts_clean_with_nothing_burned() {
     // Every winner line survived, byte-exact, in order.
     let mut expected = SEED_LEDGER.to_string();
     for a in 1..=5u32 {
-        expected.push_str(&format!("17900002{a:02} 0.9{a}\n"));
+        expected.push_str(&format!("17900002{a:02} 0.9{a}.0\n"));
     }
     assert_eq!(origin_file(&fix, "RELEASES.ledger"), expected);
 }
@@ -456,15 +489,15 @@ fn remote_tag_means_version_cut_elsewhere() {
     let fix = Fixture::new("tag-elsewhere");
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
-            rival_append(&fix, "1790000300 0.26");
-            run(&fix.rival, "git", &["tag", "v0.26"]);
-            run(&fix.rival, "git", &["push", "-q", "origin", "v0.26"]);
+            rival_append(&fix, "1790000300 0.26.0");
+            run(&fix.rival, "git", &["tag", "v0.26.0"]);
+            run(&fix.rival, "git", &["push", "-q", "origin", "v0.26.0"]);
         }
     });
-    let (res, _) = do_claim(&runner, &fix.work, "0.26", false);
+    let (res, _) = do_claim(&runner, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(
-        err.contains("cut elsewhere") && err.contains("tag v0.26"),
+        err.contains("cut elsewhere") && err.contains("tag v0.26.0"),
         "{err}"
     );
     assert_eq!(
@@ -480,10 +513,10 @@ fn remote_changelog_section_means_version_cut_elsewhere() {
     let fix = Fixture::new("section-elsewhere");
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
-            rival_land_section(&fix, "1790000300 0.26", "0.26");
+            rival_land_section(&fix, "1790000300 0.26.0", "0.26.0");
         }
     });
-    let (res, _) = do_claim(&runner, &fix.work, "0.26", false);
+    let (res, _) = do_claim(&runner, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(
         err.contains("cut elsewhere") && err.contains("changelog"),
@@ -500,17 +533,17 @@ fn recut_flag_claims_fresh_n_past_existing_section() {
     // must ride past it instead of aborting.
     let runner = HookRunner::new(&fix.work, |attempt| {
         if attempt == 1 {
-            rival_land_section(&fix, "1790000300 0.26", "0.26");
+            rival_land_section(&fix, "1790000300 0.26.0", "0.26.0");
         }
     });
-    let (res, _) = do_claim(&runner, &fix.work, "0.26", true);
+    let (res, _) = do_claim(&runner, &fix.work, "0.26.0", true);
     let c = res.unwrap();
     assert_eq!(c.build, 1_790_000_301); // fresh, strictly above the wedged claim
     // The wedged cut's artifacts survive byte-exact next to the new claim.
     let remote = origin_file(&fix, "RELEASES.ledger");
-    assert!(remote.contains("1790000300 0.26\n"));
-    assert!(remote.ends_with("1790000301 0.26\n"));
-    assert!(origin_file(&fix, "CHANGELOG.md").contains("## [0.26] - 2026-01-01"));
+    assert!(remote.contains("1790000300 0.26.0\n"));
+    assert!(remote.ends_with("1790000301 0.26.0\n"));
+    assert!(origin_file(&fix, "CHANGELOG.md").contains("## [0.26.0] - 2026-01-01"));
 }
 
 #[test]
@@ -518,11 +551,11 @@ fn malformed_remote_ledger_aborts_before_any_commit() {
     let fix = Fixture::new("malformed");
     // Corrupt the ledger on origin (line 3 non-numeric), then bring the
     // claimant to the tip so the corruption — not the tip gate — is what fires.
-    rival_append(&fix, "not-a-number 0.26");
+    rival_append(&fix, "not-a-number 0.26.0");
     run(&fix.work, "git", &["fetch", "-q", "origin", "main"]);
     run(&fix.work, "git", &["reset", "-q", "--hard", "origin/main"]);
     let git = GitCli::new(&fix.work);
-    let (res, ns) = do_claim(&git, &fix.work, "0.26", false);
+    let (res, ns) = do_claim(&git, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("line 3") && err.contains("not a u64"), "{err}");
     // Parse failure precedes regenerate/commit/push — nothing happened.
@@ -540,7 +573,7 @@ fn offline_fetch_fails_closed() {
         &["remote", "set-url", "origin", gone.to_str().unwrap()],
     );
     let git = GitCli::new(&fix.work);
-    let (res, ns) = do_claim(&git, &fix.work, "0.26", false);
+    let (res, ns) = do_claim(&git, &fix.work, "0.26.0", false);
     let err = res.unwrap_err().to_string();
     assert!(err.contains("no offline cuts"), "{err}");
     assert!(ns.is_empty(), "no offline claim may generate anything");

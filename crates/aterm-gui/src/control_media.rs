@@ -358,24 +358,21 @@ fn image_file_reply(
 ///     (titlebar, traffic lights, unified toolbar, full-width tab strip) AND the
 ///     terminal content. This is the original behavior and closes the gap `image`
 ///     leaves (`image` rasterizes only the content framebuffer, no OS chrome).
-///   * `prefs` / `settings` — the Preferences / settings window.
-///   * `perf` / `performance` — the Performance control panel.
+///   * `prefs` / `settings` — the Settings surface.
 ///
-/// The aux targets (`prefs`/`perf`) are directly-owned `NSWindow`s that the front-window
-/// path is structurally blind to; they are captured by their own window number. A first
-/// token that is NOT a known keyword is treated as the PATH (so the original
-/// `window [path]` wire shape still works); a literal filename `prefs`/`perf`/`front`
+/// A first token that is not a known keyword is treated as the path (so the original
+/// `window [path]` wire shape still works); a literal filename `prefs`/`front`
 /// must therefore be given a target first (e.g. `window front prefs`).
 ///
 /// PATH CONFINEMENT (mirrors [`cmd_image`]): the `path` is validated by
 /// `confine_image_path` to a single filename inside the socket dir's `images/` subdir,
 /// so the socket can never overwrite an arbitrary file. The default name varies by
-/// target (`aterm-window.png` / `aterm-prefs.png` / `aterm-perf.png`).
+/// target (`aterm-window.png` / `aterm-prefs.png`).
 ///
 /// MAIN-THREAD HOP (mirrors [`cmd_chrome`]): reaching a window's `NSWindow` + reading its
 /// window number + calling `CGWindowListCreateImage` may ONLY happen on the main thread,
 /// but this runs on a background control thread. So we post [`Wake::CaptureWindow`]
-/// (front) or [`Wake::CaptureAuxWindow`] (prefs/perf) with the confined target + a
+/// (front) or [`Wake::CaptureAuxWindow`] (Settings routes) with the confined target + a
 /// one-shot reply channel and BLOCK; the main thread captures and replies `Ok((w, h))`
 /// or an `Err(msg)` surfaced verbatim as `ERR <msg>` (missing Screen Recording grant /
 /// window not open / off-macOS).
@@ -385,10 +382,13 @@ pub(crate) fn cmd_window(
     sock_dir: &std::path::Path,
 ) -> String {
     use crate::app_introspect::AuxTarget;
-    // Optional leading target keyword: `window [front|prefs|perf] [path]`. A first token
+    // Optional leading target keyword: `window [front|prefs] [path]`. A first token
     // that is not a known keyword is the PATH (default front), preserving `window [path]`.
     let mut it = rest.split_whitespace();
     let first = it.next().unwrap_or("");
+    if matches!(first.to_ascii_lowercase().as_str(), "perf" | "performance") {
+        return "ERR target perf was removed with the bottom HUD\n".to_string();
+    }
     let (aux, path_arg) = match AuxTarget::parse(first) {
         Some(t) if !first.is_empty() => (t, it.next().unwrap_or("")),
         _ => (AuxTarget::Front, rest.trim()),
@@ -396,7 +396,6 @@ pub(crate) fn cmd_window(
     let default_name = match aux {
         AuxTarget::Front => "aterm-window.png",
         AuxTarget::Prefs => "aterm-prefs.png",
-        AuxTarget::Perf => "aterm-perf.png",
         AuxTarget::About => "aterm-about.png",
         AuxTarget::Menu => "aterm-menu.png",
         AuxTarget::Update => "aterm-update.png",
@@ -698,35 +697,39 @@ pub(crate) fn cmd_video(
     }
 }
 
-/// `controls <target>` -> dump a compatibility GUI target's controls as text: the
-/// Settings preference rows (`field key=… label=… value=… effective=…`) or the
-/// Performance control panel's toggles (`toggle key=… label=… enabled=…`). The analogue
-/// of `chrome` for the settings/perf GUIs — so an AI can SEE what those screens show and
-/// their current values WITHOUT a screenshot. `<target>` is `prefs`/`settings` or
-/// `perf`/`performance` (an unknown target is rejected with a clear `ERR`).
+/// `controls <target>` dumps a compatibility GUI target's semantic controls as text, the
+/// analogue of `chrome`, so a driver can read native tabs and transient surfaces without
+/// a screenshot.
 ///
 /// Unlike the pixel `window` capture, this works HEADLESS and needs no Screen Recording
-/// grant: the main thread builds the lines from the PURE config/panel model
-/// (`App::read_aux_controls`), not by walking AppKit views, so the window need not even
-/// be open. Framed `OK <n>\n` + `<n>` rows, the SAME multi-line shape as `chrome`/`text`.
+/// grant: the main thread compiles the native Settings model or calls a transient
+/// surface's concrete serializer (`App::read_aux_controls`), never walking AppKit views.
+/// A closed Settings tab truthfully reports zero visible controls. Framed `OK <n>\n` +
+/// `<n>` rows, the SAME multi-line shape as `chrome`/`text`.
 pub(crate) fn cmd_controls(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     use crate::app_introspect::AuxTarget;
     let trimmed = rest.trim();
-    // The aux windows AND the front window's modal overlay have a controls surface.
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "perf" | "performance"
+    ) {
+        return "ERR target perf was removed with the bottom HUD\n".to_string();
+    }
+    // Native Settings aliases AND the front window's transient overlay have a controls
+    // surface.
     // `front` (and a bare/empty arg, which `parse` maps to Front) reports the front
     // window's open overlay slot (open/closed + kind + fp + scroll extent) — headless-safe.
     let target = match AuxTarget::parse(trimmed) {
         Some(
             t @ (AuxTarget::Front
             | AuxTarget::Prefs
-            | AuxTarget::Perf
             | AuxTarget::About
             | AuxTarget::Menu
             | AuxTarget::Update),
         ) => t,
         _ => {
             return format!(
-                "ERR unsupported target {trimmed:?} (use: front | prefs | perf | about | menu | update)\n"
+                "ERR unsupported target {trimmed:?} (use: front | prefs | about | menu | update)\n"
             );
         }
     };
@@ -782,15 +785,15 @@ pub(crate) fn cmd_act(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 
 /// `open <target> [close]` -> open or close a compatibility GUI target. `prefs`,
 /// `about`, and `update` resolve to routes in the native Settings tab; `menu` is a
-/// transient palette and `perf`/`performance` is the Performance control panel.
+/// transient palette.
 /// The versioned, explicit forms are `open app settings [/route]` and
 /// `inspect app/v1 ...`. Reuses the SAME open paths as human menu items.
 ///
-/// MAIN-THREAD HOP: touching `App` state (and building the perf `NSWindow`) may ONLY
+/// MAIN-THREAD HOP: touching `App` state may only
 /// happen on the main thread, but this runs on a background control thread — so we post
 /// [`Wake::OpenAuxWindow`] + a one-shot reply and BLOCK; the main thread opens the
-/// surface and replies `Ok(())` (now open) or `Err(msg)` (no front window; for `perf`:
-/// headless / off-macOS). Single-line `OK opened <target>` / `ERR`.
+/// surface and replies `Ok(())` (now open) or `Err(msg)`. Single-line
+/// `OK opened <target>` / `ERR`.
 pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     use crate::app_introspect::AuxTarget;
     let trimmed = rest.trim();
@@ -810,23 +813,23 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let (target_tok, close) = match trimmed.split_once(char::is_whitespace) {
         Some((t, r)) if r.trim() == "close" => (t, true),
         Some(_) => {
-            return "ERR usage: open <prefs|perf|about|menu|update> [close]\n".to_string();
+            return "ERR usage: open <prefs|about|menu|update> [close]\n".to_string();
         }
         None => (trimmed, false),
     };
     // Only the aux windows can be opened; `front` is always open (and a bare/empty arg
-    // maps to Front) — reject with the verb's advertised `prefs | perf` contract.
+    // maps to Front) — reject with the verb's advertised contract.
+    if matches!(
+        target_tok.to_ascii_lowercase().as_str(),
+        "perf" | "performance"
+    ) {
+        return "ERR target perf was removed with the bottom HUD\n".to_string();
+    }
     let target = match AuxTarget::parse(target_tok) {
-        Some(
-            t @ (AuxTarget::Prefs
-            | AuxTarget::Perf
-            | AuxTarget::About
-            | AuxTarget::Menu
-            | AuxTarget::Update),
-        ) => t,
+        Some(t @ (AuxTarget::Prefs | AuxTarget::About | AuxTarget::Menu | AuxTarget::Update)) => t,
         _ => {
             return format!(
-                "ERR unsupported target {target_tok:?} (use: prefs | perf | about | menu | update)\n"
+                "ERR unsupported target {target_tok:?} (use: prefs | about | menu | update)\n"
             );
         }
     };
@@ -852,10 +855,59 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 /// Posts to the main
 /// thread (the sole `App` mutator) and BLOCKS on a one-shot reply carrying the resulting
 /// open state. Single-line `OK settings open` / `OK settings closed` / `ERR …`.
+fn normalize_settings_section_name(input: &str) -> String {
+    input
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Resolve the native label/path a person sees in Settings, plus the useful names from
+/// the retired category model. Deliberately no `performance` alias: that visual page and
+/// the bottom HUD it controlled were deleted, while specialist config remains in Manual.
+fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::SettingsRoute> {
+    use crate::native_settings::SettingsRoute;
+
+    let normalized = normalize_settings_section_name(input);
+    if let Some(route) = SettingsRoute::ALL.into_iter().find(|route| {
+        normalize_settings_section_name(route.label()) == normalized
+            || normalize_settings_section_name(route.path()) == normalized
+    }) {
+        return Some(route);
+    }
+    match normalized.as_str() {
+        "prefs" | "preferences" | "settings" | "top" | "general" => Some(SettingsRoute::Home),
+        "modified settings" => Some(SettingsRoute::Modified),
+        "manual config" | "config" => Some(SettingsRoute::Manual),
+        "text" | "typography" | "text and fonts" => Some(SettingsRoute::TextFonts),
+        "cursor" | "cursor and motion" => Some(SettingsRoute::CursorMotion),
+        "windows" | "window and tabs" | "window & tabs" => Some(SettingsRoute::WindowTabs),
+        "input" | "keyboard" | "keyboard and input" => Some(SettingsRoute::KeyboardInput),
+        "update" | "software updates" => Some(SettingsRoute::SoftwareUpdate),
+        _ => None,
+    }
+}
+
+fn settings_section_usage() -> String {
+    crate::native_settings::SettingsRoute::ALL
+        .into_iter()
+        .map(|route| route.label().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    // `settings set <key> <value…>` / `settings unset <key>`: commit ONE field by
-    // key through the validated config seam (works with the Settings tab closed and
-    // headless). Keys are what `controls prefs` prints; a value may contain spaces.
+    // `settings set <key> <value…>` / `settings unset <key>`: enqueue ONE field in
+    // the same serialized/versioned config lane as native Settings (works with the
+    // Settings tab closed and headless). Keys come from the shared Settings/Manual
+    // schema; `controls prefs` intentionally reports only controls visible on the
+    // current native route. A value may contain spaces. The main thread posts the job
+    // and stays free; this control thread blocks on the carried reply until durable
+    // completion/reconcile.
     let t = rest.trim();
     let (word, tail) = match t.split_once(char::is_whitespace) {
         Some((w, r)) => (w, r.trim_start()),
@@ -882,32 +934,26 @@ pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> 
             value,
             reply: tx,
         }) {
-            Ok(Ok(status)) => format!("OK {status}\n"),
-            Ok(Err(e)) => format!("ERR {e}\n"),
+            Ok(completion) => settings_field_wire_reply(completion),
             Err(e) => format!("ERR {e}\n"),
         };
     }
-    // `settings section <name>`: land the OPEN surface on a category (skipping the
-    // §L landing hero) — the driver's Get-started + sidebar click in one hop.
+    // `settings section <name>`: land the OPEN surface on the native page whose label or
+    // stable path the caller supplied. Compatibility aliases remain accepted, but a
+    // deleted legacy page can never creep back into the advertised choices.
     if word == "section" {
-        let want = tail.trim().to_lowercase();
-        let Some(section) = crate::prefs::Section::ORDER
-            .iter()
-            .copied()
-            .find(|s| s.label().to_lowercase() == want)
-        else {
-            let names: Vec<String> = crate::prefs::Section::ORDER
-                .iter()
-                .map(|s| s.label().to_lowercase())
-                .collect();
+        let Some(route) = parse_settings_section_route(tail) else {
             return format!(
                 "ERR unknown section {:?} (use: {})\n",
                 tail.trim(),
-                names.join(" | ")
+                settings_section_usage()
             );
         };
-        return match call_main(proxy, |tx| Wake::SettingsShowSection { section, reply: tx }) {
-            Ok(Ok(())) => format!("OK settings section {}\n", section.label().to_lowercase()),
+        return match call_main(proxy, |tx| Wake::SettingsShowSection { route, reply: tx }) {
+            Ok(Ok(())) => format!(
+                "OK settings section {}\n",
+                route.path().trim_start_matches('/')
+            ),
             Ok(Err(e)) => format!("ERR {e}\n"),
             Err(e) => format!("ERR {e}\n"),
         };
@@ -927,6 +973,13 @@ pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> 
         Ok(Some(false)) => "OK settings closed\n".to_string(),
         Ok(None) => "ERR no front window\n".to_string(),
         Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+fn settings_field_wire_reply(completion: Result<String, String>) -> String {
+    match completion {
+        Ok(status) => format!("OK {status}\n"),
+        Err(error) => format!("ERR {error}\n"),
     }
 }
 
@@ -953,7 +1006,14 @@ pub(crate) fn cmd_invoke(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 /// override on the focused window's FRONT session (the same per-session state
 /// View ▸ Matrix Rain and the `toggle_matrix_rain` keybinding flip). `status`
 /// is the observability face scripts/tests read:
-/// `OK config_enabled=<bool> session_override=<none|on|off> effective=<bool>`.
+/// `OK config_enabled=<bool> session_override=<none|on|off> effective=<bool>
+/// engine=<none|live> active=<bool> scope=<window|focused-pane>
+/// focused=<bool> animating=<bool>` — the engine tail reports the actual
+/// render state (split-pane audit): `scope` says whether emission covers the
+/// whole window (single-pane / zoomed) or the focused pane of a split,
+/// `active` is the wake-arming `is_active()`, and `focused`/`animating`
+/// surface the W11 motion facts (an unfocused or Reduced window emits
+/// nothing regardless of the enable bits).
 /// Main-thread hop like `open`/`controls` (one-shot reply channel); works
 /// headless. Runtime-only — nothing durable is written (the Settings switch /
 /// `settings set` own the `[matrix_rain]` config bit).
@@ -1042,9 +1102,92 @@ pub(crate) fn cmd_chrome(proxy: &EventLoopProxy<Wake>) -> String {
     out
 }
 
+/// `panes` -> the ACTIVE-tab split-pane layout (split-pane audit
+/// introspection): a `layout tab=<i> panes=<n> zoomed=<bool>` header + one
+/// `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> focused=<bool>`
+/// row per visible pane, in CELL coords. `session` = a cross-session target:
+/// the layout of the window whose ACTIVE tab displays that session (the
+/// `image` routing rule); `None` = the front window. A pure main-thread read
+/// (`Wake::ReadPanes`, the `chrome` round-trip shape); works headless.
+pub(crate) fn cmd_panes(proxy: &EventLoopProxy<Wake>, session: Option<u64>) -> String {
+    let lines = match call_main(proxy, |tx| Wake::ReadPanes { session, reply: tx }) {
+        Ok(lines) => lines,
+        Err(e) => return format!("ERR {e}\n"),
+    };
+    let mut out = format!("OK {}\n", lines.len());
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod video_parse_tests {
     use super::*;
+
+    #[test]
+    fn settings_section_parser_accepts_every_visible_label_and_stable_path() {
+        for route in crate::native_settings::SettingsRoute::ALL {
+            assert_eq!(
+                parse_settings_section_route(route.label()),
+                Some(route),
+                "visible label {:?}",
+                route.label()
+            );
+            assert_eq!(
+                parse_settings_section_route(route.path()),
+                Some(route),
+                "stable path {:?}",
+                route.path()
+            );
+        }
+    }
+
+    #[test]
+    fn settings_section_parser_keeps_useful_aliases_but_not_deleted_pages() {
+        use crate::native_settings::SettingsRoute;
+
+        for (alias, route) in [
+            ("cursor", SettingsRoute::CursorMotion),
+            ("cursor and motion", SettingsRoute::CursorMotion),
+            ("typography", SettingsRoute::TextFonts),
+            ("input", SettingsRoute::KeyboardInput),
+            ("update", SettingsRoute::SoftwareUpdate),
+            ("prefs", SettingsRoute::Home),
+        ] {
+            assert_eq!(parse_settings_section_route(alias), Some(route), "{alias}");
+        }
+        for removed in [
+            "performance",
+            "hud",
+            "bottom hud",
+            "kitty log",
+            "diagnostics",
+        ] {
+            assert_eq!(parse_settings_section_route(removed), None, "{removed}");
+        }
+        let usage = settings_section_usage();
+        assert!(usage.contains("cursor & motion"));
+        assert!(usage.contains("text & fonts"));
+        assert!(!usage.contains("performance"));
+        assert!(!usage.contains("hud"));
+    }
+
+    #[test]
+    fn settings_field_wire_reply_preserves_success_and_failure_framing() {
+        assert_eq!(
+            settings_field_wire_reply(Ok("saved: copy_on_select = true".to_string())),
+            "OK saved: copy_on_select = true\n"
+        );
+        assert_eq!(
+            settings_field_wire_reply(Err(
+                "publication unverified for copy_on_select; reload aterm.toml".to_string()
+            )),
+            "ERR publication unverified for copy_on_select; reload aterm.toml\n",
+            "a non-success completion must never acquire an OK prefix"
+        );
+    }
 
     fn native_image_metadata() -> crate::control::ImageFrameMetadata {
         crate::control::ImageFrameMetadata {

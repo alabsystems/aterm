@@ -524,7 +524,10 @@ mod tests {
     fn authorize_scheme_refuses_malformed_shapes_and_overlength() {
         let mut auth = HyperlinkAuth::new();
         for s in ["", "1orca", "+orca", "or ca", "orca\t", "or%3aca", "orc:a"] {
-            assert!(!auth.authorize_scheme(s), "malformed shape must refuse {s:?}");
+            assert!(
+                !auth.authorize_scheme(s),
+                "malformed shape must refuse {s:?}"
+            );
         }
         assert!(!auth.authorize_scheme(&"a".repeat(MAX_EXTRA_SCHEME_LEN + 1)));
         assert!(auth.extra_schemes().is_empty());

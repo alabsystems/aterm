@@ -1686,7 +1686,7 @@ impl App {
                 }
             };
         let metrics = self.unattached_window_metrics();
-        let mut ws_b = WindowState::new_terminal(
+        let ws_b = WindowState::new_terminal(
             term,
             master,
             sink,
@@ -1698,10 +1698,8 @@ impl App {
             vec![layout],
             crate::tab_model::TabSet::new(tab),
         );
-        if let Some(sprite) = self.nyan_sprite_loader.installed() {
-            ws_b.word_decos.set_nyan_sprite_shared(Some(sprite));
-        }
         self.windows.insert(wid_b, ws_b);
+        self.install_window_config_assets(wid_b);
         self.frontmost_window = Some(wid_b);
         // Re-mirror BOTH viewers: B is the new frontmost (also re-points the global
         // control/notify handle to B). A is unchanged — it still displays `s`. NOTE:
@@ -2391,7 +2389,16 @@ impl App {
         }
 
         let closes_window = self.close_active_tab();
-        if closes_window.is_none() {
+        let blocked_recovery_owns_focus = self.windows.get(&window).is_some_and(|state| {
+            state
+                .tab_set
+                .get(tab)
+                .is_some_and(|target| target.root.contains(view))
+                && state
+                    .palette()
+                    .is_some_and(|palette| palette.is_native_close_recovery_for(window, view))
+        });
+        if closes_window.is_none() && !blocked_recovery_owns_focus {
             if let Some(state) = self.windows.get_mut(&window) {
                 let target_index = state
                     .tab_set
@@ -2434,12 +2441,135 @@ impl App {
         self.close_tab_at(window, index)
     }
 
+    /// Focus the exact leaf that refused a close and expose only the typed
+    /// recovery commands returned by its reducer. Keeping this in the tab host
+    /// makes every close entry point (including background/control targets)
+    /// converge on one visible, generation-bound recovery surface.
+    fn surface_native_close_recovery(
+        &mut self,
+        wid: WindowId,
+        tab: crate::tab_model::TabId,
+        view: crate::tab_model::ViewId,
+        native: crate::tab_model::NativeViewRef,
+        recovery: Vec<crate::native_app::Command>,
+    ) -> Result<(), String> {
+        let window = self
+            .windows
+            .get_mut(&wid)
+            .ok_or_else(|| "blocked native close window disappeared".to_string())?;
+        let target = window
+            .tab_set
+            .get(tab)
+            .ok_or_else(|| "blocked native close tab disappeared".to_string())?;
+        if !target.root.contains(view) {
+            return Err("blocked native close view left its tab".to_string());
+        }
+        window.tab_set.switch_to(tab);
+        let focused = window
+            .tab_set
+            .active_mut()
+            .is_some_and(|target| target.set_focus(view));
+        if !focused {
+            return Err("blocked native close view could not be focused".to_string());
+        }
+        self.frontmost_window = Some(wid);
+        self.resync_active_or_window(wid);
+        self.palette_enter_native_close_recovery(wid, native.instance, view, recovery)
+    }
+
+    /// Run one native reducer's close transaction without mutating topology.
+    /// `Ok(false)` means the app deliberately retained its view (Blocked or
+    /// Pending); a Blocked verdict has already made its recovery capabilities
+    /// visible through [`Self::surface_native_close_recovery`].
+    fn prepare_native_leaf_close(
+        &mut self,
+        wid: WindowId,
+        tab: crate::tab_model::TabId,
+        view: crate::tab_model::ViewId,
+        native: crate::tab_model::NativeViewRef,
+        scope: crate::native_app::CloseScope,
+    ) -> Result<bool, String> {
+        let (readiness, effects) = self
+            .native_runtime
+            .prepare_close(
+                native.instance,
+                view,
+                crate::native_app::CloseRequest { scope },
+            )
+            .map_err(|error| format!("native close failed: {error:?}"))?;
+        if !effects.is_empty() {
+            return Err("native close preparation emitted unhandled effects".to_string());
+        }
+        match readiness {
+            crate::native_app::CloseReadiness::Ready => Ok(true),
+            crate::native_app::CloseReadiness::Pending { .. } => Ok(false),
+            crate::native_app::CloseReadiness::Blocked { recovery } => {
+                self.surface_native_close_recovery(wid, tab, view, native, recovery)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Preflight every native leaf in one window before an irreversible window
+    /// teardown. No document or topology edge changes until all reducers agree.
+    pub(crate) fn prepare_window_native_shutdown(
+        &mut self,
+        wid: WindowId,
+        scope: crate::native_app::CloseScope,
+    ) -> Result<bool, String> {
+        let leaves = self
+            .windows
+            .get(&wid)
+            .ok_or_else(|| "unknown native-close window".to_string())?
+            .tab_set
+            .tabs()
+            .iter()
+            .flat_map(|tab| {
+                tab.root.leaves().into_iter().filter_map(|view| {
+                    let crate::tab_model::View::Native(native) =
+                        self.view_store.get(view).copied()?
+                    else {
+                        return None;
+                    };
+                    Some((tab.id, view, native))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (tab, view, native) in leaves {
+            if !self.prepare_native_leaf_close(wid, tab, view, native, scope)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Process-wide counterpart of [`Self::prepare_window_native_shutdown`].
+    /// The first blocker is focused and surfaced; every window/view remains
+    /// live. Quit and update-relaunch feed their distinct semantic scope into
+    /// this same reducer-owned barrier.
+    pub(crate) fn prepare_all_native_shutdown(
+        &mut self,
+        scope: crate::native_app::CloseScope,
+    ) -> Result<bool, String> {
+        let windows = self.windows.keys().copied().collect::<Vec<_>>();
+        for wid in windows {
+            if !self.prepare_window_native_shutdown(wid, scope)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn prepare_quit_native_shutdown(&mut self) -> Result<bool, String> {
+        self.prepare_all_native_shutdown(crate::native_app::CloseScope::AppQuit)
+    }
+
     /// Close one focused leaf of a heterogeneous tab as a host transaction.
     /// Native readiness/document durability is proven before topology changes;
     /// terminal ownership is detached only after the canonical tree has a live
     /// repaired focus. The tab necessarily survives because this is called only
     /// for a multi-leaf tree.
-    fn close_focused_mixed_leaf(&mut self, wid: WindowId) -> Result<(), String> {
+    pub(crate) fn close_focused_mixed_leaf(&mut self, wid: WindowId) -> Result<(), String> {
         let recovery = self
             .closed_view_record_for_active(wid)
             .ok_or_else(|| "focused view has no recoverable placement".to_string())?;
@@ -2464,18 +2594,13 @@ impl App {
             return Err("view close deferred until update child rollback".to_string());
         }
         if let crate::tab_model::View::Native(native) = linked {
-            let (readiness, effects) = self
-                .native_runtime
-                .prepare_close(
-                    native.instance,
-                    view,
-                    crate::native_app::CloseRequest {
-                        scope: crate::native_app::CloseScope::View,
-                    },
-                )
-                .map_err(|error| format!("native view close failed: {error:?}"))?;
-            if !effects.is_empty() || !matches!(readiness, crate::native_app::CloseReadiness::Ready)
-            {
+            if !self.prepare_native_leaf_close(
+                wid,
+                tab_id,
+                view,
+                native,
+                crate::native_app::CloseScope::View,
+            )? {
                 return Err("native view close is not ready".to_string());
             }
             if let Some(document) = self.native_runtime.document_id(native.instance)
@@ -2551,18 +2676,13 @@ impl App {
             else {
                 continue;
             };
-            let (readiness, effects) = self
-                .native_runtime
-                .prepare_close(
-                    native.instance,
-                    *view,
-                    crate::native_app::CloseRequest {
-                        scope: crate::native_app::CloseScope::Tab,
-                    },
-                )
-                .map_err(|error| format!("native close failed: {error:?}"))?;
-            if !effects.is_empty() || !matches!(readiness, crate::native_app::CloseReadiness::Ready)
-            {
+            if !self.prepare_native_leaf_close(
+                wid,
+                tab_id,
+                *view,
+                native,
+                crate::native_app::CloseScope::Tab,
+            )? {
                 return Err("one or more native leaves are not ready to close".to_string());
             }
         }
@@ -3011,7 +3131,7 @@ impl App {
         )
     )]
     pub(crate) fn close_tab_at(&mut self, wid: WindowId, i: usize) -> bool {
-        let Some((tab_id, is_native, terminal_index, canonical_count, previous_active)) =
+        let Some((tab_id, is_native, terminal_index, canonical_count)) =
             self.windows.get(&wid).and_then(|ws| {
                 let tab = ws.tab_set.tab_at(i)?;
                 Some((
@@ -3019,7 +3139,6 @@ impl App {
                     !is_terminal_tab(tab, &self.view_store),
                     terminal_projection_index(&ws.tab_set, &self.view_store, tab.id),
                     ws.tab_set.len(),
-                    ws.tab_set.active_id(),
                 ))
             })
         else {
@@ -3040,12 +3159,9 @@ impl App {
             return match self.close_active_native_tab(wid) {
                 Ok(()) => canonical_count == 1,
                 Err(_) => {
-                    if let Some(previous) = previous_active
-                        && let Some(ws) = self.windows.get_mut(&wid)
-                    {
-                        ws.tab_set.switch_to(previous);
-                        align_terminal_projection_to_active(ws, &self.view_store);
-                    }
+                    // Keep the refused tab selected: its app-owned banner and
+                    // the exact recovery palette explain why topology stayed
+                    // intact. Restoring the prior tab made close look inert.
                     self.resync_active_or_window(wid);
                     false
                 }
@@ -3430,6 +3546,222 @@ mod mixed_tab_tests {
         assert!(app.native_runtime.view_state(view).is_some());
     }
 
+    fn enter_settings_draft(app: &mut App, wid: WindowId, view: crate::tab_model::ViewId) {
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            crate::native_app::AppEvent::FocusChanged(Some(crate::native_ui::UiKey::new(format!(
+                "settings/control/{}",
+                crate::prefs::EDIT_FONT_FAMILY
+            )))),
+        )
+        .unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::SelectAll),
+        )
+        .unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
+                "Topology Draft Mono".to_string(),
+            )),
+        )
+        .unwrap();
+    }
+
+    fn assert_exact_settings_close_recovery(app: &App, wid: WindowId) {
+        let lines = app.windows[&wid]
+            .palette()
+            .expect("blocked close opens recovery palette")
+            .controls_lines();
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.contains("rows=2 shown=2")),
+            "only app-supplied recovery is surfaced: {lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("target=native"))
+                .count(),
+            2,
+            "exactly two native recovery rows: {lines:?}"
+        );
+        for action in ["settings/drafts/review", "settings/drafts/discard-all"] {
+            assert!(
+                lines.iter().any(|line| {
+                    line.contains("target=native")
+                        && line.contains(&format!("action={action}"))
+                        && line.contains("enabled=true")
+                }),
+                "recovery exposes {action}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_w_mixed_leaf_preserves_settings_draft_and_surfaces_exact_recovery() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (instance, settings) = app.active_native_view(wid).unwrap();
+        let (_, terminal) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let tab = app.windows[&wid].tab_set.active_id().unwrap();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .tab_set
+            .active_mut()
+            .unwrap()
+            .set_focus(settings);
+        app.sync_window(wid);
+        enter_settings_draft(&mut app, wid, settings);
+        let before = app.windows[&wid].tab_set.get(tab).unwrap().root.leaves();
+
+        assert_eq!(app.close_active_tab(), None);
+        assert_eq!(
+            app.windows[&wid].tab_set.get(tab).unwrap().root.leaves(),
+            before,
+            "blocked Cmd-W cannot detach either mixed leaf"
+        );
+        assert!(before.contains(&terminal));
+        assert_eq!(app.active_native_view(wid), Some((instance, settings)));
+        assert_exact_settings_close_recovery(&app, wid);
+        assert!(
+            !app.native_runtime
+                .presentation(instance, settings)
+                .unwrap()
+                .closable
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn deferred_mixed_leaf_replay_keeps_the_exact_close_blocker_visible() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (instance, settings) = app.active_native_view(wid).unwrap();
+        let (_, terminal) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let tab = app.windows[&wid].tab_set.active_id().unwrap();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .tab_set
+            .active_mut()
+            .unwrap()
+            .set_focus(settings);
+        app.sync_window(wid);
+        enter_settings_draft(&mut app, wid, settings);
+        let before = app.windows[&wid].tab_set.get(tab).unwrap().root.leaves();
+
+        // Simulate a close replay after an update handoff rollback while the user
+        // has since selected another tab. A refused replay must not restore that
+        // newer selection over the reducer-owned recovery surface.
+        app.switch_tab_in(wid, 0);
+        assert!(app.active_native_view(wid).is_none());
+        assert_eq!(
+            app.replay_deferred_handoff_view_close(wid, tab, settings),
+            None
+        );
+        assert_eq!(
+            app.windows[&wid].tab_set.get(tab).unwrap().root.leaves(),
+            before
+        );
+        assert!(before.contains(&terminal));
+        assert_eq!(app.active_native_view(wid), Some((instance, settings)));
+        assert_exact_settings_close_recovery(&app, wid);
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn background_whole_tab_and_settings_control_close_focus_blocker_and_recovery() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (instance, settings) = app.active_native_view(wid).unwrap();
+        enter_settings_draft(&mut app, wid, settings);
+        app.switch_tab_in(wid, 0);
+        assert!(app.active_native_view(wid).is_none());
+
+        assert_eq!(app.apply_tab_cmd(TabAction::Close(Some(1))), (1, 2));
+        assert_eq!(app.active_native_view(wid), Some((instance, settings)));
+        assert_exact_settings_close_recovery(&app, wid);
+        assert_eq!(app.windows[&wid].tab_set.len(), 2);
+        assert!(app.native_runtime.view_state(settings).is_some());
+        app.palette_activate();
+        assert!(app.windows[&wid].palette().is_none());
+        assert!(matches!(
+            app.native_runtime.view_state(settings),
+            Some(crate::native_app::AppViewState::Settings(state))
+                if state.route == crate::native_settings::SettingsRoute::Modified
+        ));
+
+        app.switch_tab_in(wid, 0);
+        assert!(!app.close_settings_tabs());
+        assert_eq!(app.active_native_view(wid), Some((instance, settings)));
+        assert_exact_settings_close_recovery(&app, wid);
+        assert_eq!(app.windows[&wid].tab_set.len(), 2);
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn window_native_shutdown_barrier_retains_all_topology_until_explicit_discard() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (instance, settings) = app.active_native_view(wid).unwrap();
+        enter_settings_draft(&mut app, wid, settings);
+        let tabs = app.windows[&wid].tab_set.len();
+
+        assert!(
+            !app.prepare_window_native_shutdown(wid, crate::native_app::CloseScope::Window)
+                .unwrap()
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), tabs);
+        assert!(app.native_runtime.view_state(settings).is_some());
+        assert_exact_settings_close_recovery(&app, wid);
+        assert!(!app.prepare_quit_native_shutdown().unwrap());
+        assert_eq!(app.windows[&wid].tab_set.len(), tabs);
+        assert_exact_settings_close_recovery(&app, wid);
+        assert!(
+            !app.prepare_all_native_shutdown(crate::native_app::CloseScope::Relaunch)
+                .unwrap()
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), tabs);
+        assert_exact_settings_close_recovery(&app, wid);
+
+        for _ in 0..2 {
+            app.dispatch_native_view_event(
+                wid,
+                settings,
+                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new("settings/drafts/discard-all"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        }
+        assert!(
+            app.prepare_window_native_shutdown(wid, crate::native_app::CloseScope::Window)
+                .unwrap()
+        );
+        assert!(
+            app.native_runtime
+                .presentation(instance, settings)
+                .unwrap()
+                .closable
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), tabs);
+        assert!(app.structural_invariants_ok());
+    }
+
     #[test]
     fn focused_terminal_eof_collapses_mixed_tree_without_orphans() {
         use aterm_spec::derive::pane_tree_model;
@@ -3498,7 +3830,11 @@ mod mixed_tab_tests {
             app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
         let background_tab = app.windows[&wid].tab_set.active_id().unwrap();
 
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        // Stage a genuinely separate foreground tab. Reopening Settings now
+        // correctly finds and focuses the nonfocused Settings leaf above, so
+        // it can no longer be abused as a way to manufacture this tab.
+        let foreground_session = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(foreground_session));
         let foreground_tab = app.windows[&wid].tab_set.active_id().unwrap();
         assert_ne!(foreground_tab, background_tab);
         assert!(app.exit_session_logical(session).is_empty());

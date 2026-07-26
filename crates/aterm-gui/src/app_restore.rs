@@ -55,6 +55,7 @@ fn recovery_capability(
                     crate::native_app::AppKind::Editor
                 },
                 uri: uri.clone(),
+                config_editor: native.config_editor,
             })
         }
         _ => None,
@@ -302,7 +303,16 @@ impl App {
                     (
                         crate::native_app::AppKind::Settings,
                         crate::native_app::AppViewState::Settings(settings),
-                    ) => restore::NativeLeafRestore::settings(settings.route.path().to_string()),
+                    ) => restore::NativeLeafRestore::settings(
+                        if settings.route == crate::native_settings::SettingsRoute::Manual {
+                            // Manual is a launcher for the separately persisted
+                            // config Editor tab, never a restorable interstitial.
+                            crate::native_settings::SettingsRoute::Home.path()
+                        } else {
+                            settings.route.path()
+                        }
+                        .to_string(),
+                    ),
                     (
                         crate::native_app::AppKind::Markdown,
                         crate::native_app::AppViewState::Markdown(_),
@@ -336,6 +346,8 @@ impl App {
                         });
                     }
                     crate::native_app::AppViewState::Editor(editor) => {
+                        descriptor.config_editor =
+                            self.native_runtime.config_editor_enabled(native.instance);
                         if let Some(buffer) = editor.buffer.as_ref() {
                             descriptor.editor_selections = buffer
                                 .selections
@@ -1303,11 +1315,16 @@ impl App {
     ) -> Result<BuiltRestoreLeaf, String> {
         match descriptor.restore_tag.as_str() {
             "settings" => {
-                let route = descriptor
+                let mut route = descriptor
                     .route
                     .as_deref()
                     .and_then(crate::native_settings::SettingsRoute::from_path)
                     .ok_or_else(|| "Settings route is unavailable".to_string())?;
+                if route == crate::native_settings::SettingsRoute::Manual {
+                    // Compatibility with manifests captured before Manual became
+                    // a real Editor: restore the Settings launcher to Top Settings.
+                    route = crate::native_settings::SettingsRoute::Home;
+                }
                 self.stage_settings_restore_view(wid, route)?;
             }
             "markdown" | "editor" => {
@@ -1320,7 +1337,11 @@ impl App {
                 } else {
                     crate::native_app::AppKind::Editor
                 };
-                self.stage_document_restore_view(wid, kind, uri)?;
+                if descriptor.config_editor {
+                    self.ensure_and_open_config_editor_in_window(wid)?;
+                } else {
+                    self.stage_document_restore_view(wid, kind, uri)?;
+                }
             }
             _ => return Err("This app is unavailable in this build".to_string()),
         }
@@ -1337,34 +1358,42 @@ impl App {
         wid: WindowId,
         route: crate::native_settings::SettingsRoute,
     ) -> Result<(), String> {
-        let Some(instance) = self
-            .native_runtime
-            .instance_by_kind(crate::native_app::AppKind::Settings)
-        else {
-            return self
-                .open_settings_tab(route)
-                .then_some(())
-                .ok_or_else(|| "Settings could not be opened".to_string());
-        };
         let snapshot = self.native_config_service.snapshot();
         let mut state = crate::native_settings::SettingsViewState::from_snapshot(&snapshot)
             .expect("versioned config service snapshots are valid Settings input");
         let _ = state.replace_title_summary_health(self.title_summary_health());
         state.navigate(route);
-        self.install_native_tab(
-            wid,
-            instance,
-            crate::native_app::AppViewState::Settings(Box::new(state)),
-            crate::tab_model::TabPresentation {
-                title: "Settings".to_string(),
-                icon: Some(crate::tab_model::TabIconKind::Settings),
-                indicators: crate::tab_model::TabIndicators::default(),
-                closable: true,
-                tooltip: Some(format!("Settings · {}", route.label())),
-            },
-        )
-        .map(|_| ())
-        .map_err(|error| format!("Settings restore view could not be installed: {error:?}"))
+        let view_state = crate::native_app::AppViewState::Settings(Box::new(state));
+        let presentation = crate::tab_model::TabPresentation {
+            title: "Settings".to_string(),
+            icon: Some(crate::tab_model::TabIconKind::Settings),
+            indicators: crate::tab_model::TabIndicators::default(),
+            closable: true,
+            tooltip: Some(format!("Settings · {}", route.label())),
+        };
+        let install = if let Some(instance) = self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+        {
+            self.install_native_tab(wid, instance, view_state, presentation)
+                .map(|_| ())
+        } else {
+            let checking = matches!(
+                self.native_updater_service.snapshot().phase,
+                crate::native_updater_service::UpdaterPhase::Checking
+                    | crate::native_updater_service::UpdaterPhase::Available
+                    | crate::native_updater_service::UpdaterPhase::Downloading
+            );
+            let app = crate::native_app::NativeApp::Settings(
+                crate::native_settings::SettingsApp::new_at_config_revision(
+                    self.update_snapshot(checking),
+                    snapshot.revision,
+                ),
+            );
+            self.install_new_native_tab(wid, app, view_state, presentation)
+                .map(|_| ())
+        };
+        install.map_err(|error| format!("Settings restore view could not be installed: {error:?}"))
     }
 
     fn stage_document_restore_view(
@@ -1390,9 +1419,9 @@ impl App {
             crate::native_app::AppKind::Markdown => crate::native_app::AppViewState::Markdown(
                 crate::native_app::MarkdownViewState::default(),
             ),
-            crate::native_app::AppKind::Editor => crate::native_app::AppViewState::Editor(
-                crate::native_app::EditorViewState::default(),
-            ),
+            crate::native_app::AppKind::Editor => {
+                crate::native_app::AppViewState::Editor(Box::default())
+            }
             crate::native_app::AppKind::Settings | crate::native_app::AppKind::Recovery => {
                 return Err("restore descriptor is not a document app".to_string());
             }
@@ -1854,7 +1883,20 @@ mod tests {
             Some(crate::native_app::RecoveryCapability::Document {
                 kind: crate::native_app::AppKind::Markdown,
                 ref uri,
+                config_editor: false,
             }) if uri == "file:///tmp/Guide.md"
+        ));
+
+        let mut manual =
+            restore::NativeLeafRestore::document("editor", "file:///tmp/aterm.toml".to_string());
+        manual.config_editor = true;
+        assert!(matches!(
+            super::recovery_capability(&manual),
+            Some(crate::native_app::RecoveryCapability::Document {
+                kind: crate::native_app::AppKind::Editor,
+                ref uri,
+                config_editor: true,
+            }) if uri == "file:///tmp/aterm.toml"
         ));
 
         let mut diagnostics_only = restore::NativeLeafRestore::document(
@@ -2798,6 +2840,136 @@ mod tests {
                 if state.route == crate::native_settings::SettingsRoute::About
         ));
         assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn manual_editor_identity_survives_capture_restore_and_blocks_malformed_save() {
+        const CHILD: &str = "ATERM_CONFIG_RESTORE_IDENTITY_CHILD";
+        const ROOT: &str = "ATERM_CONFIG_RESTORE_IDENTITY_ROOT";
+        const EXACT: &str = "app_restore::tests::manual_editor_identity_survives_capture_restore_and_blocks_malformed_save";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "aterm-config-restore-identity-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", EXACT, "--nocapture"])
+                .env(CHILD, "1")
+                .env(ROOT, &root)
+                .env("XDG_CONFIG_HOME", &root)
+                .env("RUST_TEST_THREADS", "1")
+                .status()
+                .expect("launch isolated config-restore test");
+            let _ = std::fs::remove_dir_all(root);
+            assert!(status.success());
+            return;
+        }
+
+        let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let config = root.join("aterm/aterm.toml");
+        let mut source = App::headless_for_test();
+        assert!(source.open_settings_tab(crate::native_settings::SettingsRoute::Manual));
+        assert!(config.is_file(), "Manual resolves the isolated aterm.toml");
+        let (_, source_view) = source.active_native_view(WindowId(0)).unwrap();
+        let descriptor = match source.view_restore_descriptor(source_view).unwrap() {
+            restore::RestoredView::Native(descriptor) => descriptor,
+            other => panic!("expected native config Editor, got {other:?}"),
+        };
+        assert_eq!(descriptor.restore_tag, "editor");
+        assert!(descriptor.config_editor);
+
+        let mut retry = App::headless_for_test();
+        let retried = retry.execute_recovery_request(
+            WindowId(0),
+            crate::native_app::RecoveryRequest::Retry(
+                crate::native_app::RecoveryCapability::Document {
+                    kind: crate::native_app::AppKind::Editor,
+                    uri: descriptor.uri.clone().unwrap(),
+                    config_editor: true,
+                },
+            ),
+        );
+        assert!(matches!(
+            retried,
+            crate::native_app::RecoveryOutcome::Opened { .. }
+        ));
+        let (retry_instance, _) = retry.active_native_view(WindowId(0)).unwrap();
+        assert!(
+            retry.native_runtime.config_editor_enabled(retry_instance),
+            "Recovery Retry preserves Manual's privileged editor reducer"
+        );
+
+        let mut restored = App::headless_for_test();
+        restored.restore_into_window(
+            WindowId(0),
+            restore::WindowLayout {
+                rows: 24,
+                cols: 80,
+                active_tab: 0,
+                outer_x: None,
+                outer_y: None,
+                tabs: Vec::new(),
+                native_tabs: Vec::new(),
+                tab_order: Vec::new(),
+                active_item: Some(0),
+                restored_tabs: vec![restore::RestoredTab {
+                    root: restore::RestoredSplitTree::leaf(restore::RestoredView::Native(
+                        descriptor,
+                    )),
+                    focused_path: Vec::new(),
+                    zoomed: false,
+                }],
+            },
+        );
+        let (instance, view) = restored
+            .active_native_view(WindowId(0))
+            .expect("config Editor restored");
+        assert!(restored.native_runtime.config_editor_enabled(instance));
+        let document = restored.native_runtime.document_id(instance).unwrap();
+        restored
+            .dispatch_native_event(
+                WindowId(0),
+                crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
+                    "font_px = \"not a number\"\n".to_string(),
+                )),
+            )
+            .unwrap();
+        assert!(
+            restored
+                .native_runtime
+                .config_editor_save_error(document)
+                .is_some(),
+            "restored Manual retains the config save gate"
+        );
+        let save = restored
+            .native_runtime
+            .commands(instance, view)
+            .unwrap()
+            .into_iter()
+            .find(|command| command.id.as_str() == "editor/save")
+            .unwrap();
+        assert!(!save.enabled, "malformed restored Manual cannot Save");
+    }
+
+    #[test]
+    fn legacy_manual_settings_restore_normalizes_with_or_without_singleton() {
+        let wid = WindowId(0);
+        let descriptor = restore::NativeLeafRestore::settings("/manual".to_string());
+        for preinstall_singleton in [false, true] {
+            let mut app = App::headless_for_test();
+            if preinstall_singleton {
+                assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+            }
+            let (view, _, _) = app.restore_native_leaf(wid, &descriptor).unwrap();
+            assert!(matches!(
+                app.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Settings(state))
+                    if state.route == crate::native_settings::SettingsRoute::Home
+            ));
+            app.remove_view_link(view);
+        }
     }
 
     #[test]

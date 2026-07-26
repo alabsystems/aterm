@@ -87,3 +87,13 @@ fn chunked_process_is_byte_identical_to_whole_burst() {
         );
     }
 }
+
+#[test]
+fn xtversion_reports_the_shared_application_identity() {
+    let mut terminal = Terminal::new(24, 80);
+    terminal.process(b"\x1b[>0q");
+    assert_eq!(
+        terminal.take_response().as_deref(),
+        Some(format!("\x1bP>|aterm({})\x1b\\", aterm_types::version::APP_VERSION).as_bytes())
+    );
+}

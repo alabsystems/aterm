@@ -15,7 +15,7 @@
 //! aterm-render's `no_procedural_glyphs_env`).
 
 use aterm_types::Rgb;
-use aterm_types::scheme::{ThemeError, load};
+use aterm_types::scheme::{MAX_USER_THEME_FILE_BYTES, ThemeError, load};
 
 #[test]
 fn load_reads_user_theme_file_then_not_found() {
@@ -35,6 +35,17 @@ fn load_reads_user_theme_file_then_not_found() {
         "name = Custom\nforeground = #ddeeff\nbackground = #102030\ncolor1 = #ff0000\n",
     )
     .expect("write theme");
+    std::fs::write(
+        theme_dir.join("Broken.conf"),
+        "foreground = definitely-not-a-colour\n",
+    )
+    .expect("write invalid theme");
+    std::fs::write(theme_dir.join("Notes.txt"), "not a theme").expect("write unrelated file");
+    let oversized = std::fs::File::create(theme_dir.join("Huge.conf")).expect("create huge theme");
+    oversized
+        .set_len((MAX_USER_THEME_FILE_BYTES + 1) as u64)
+        .expect("size huge theme");
+    drop(oversized);
 
     // SAFETY: single `#[test]` in its own integration-test binary — no other
     // thread exists in this process to read the environment concurrently. We
@@ -45,6 +56,8 @@ fn load_reads_user_theme_file_then_not_found() {
     }
     let loaded = load("Custom");
     let missing = load("DoesNotExist_xyz");
+    let huge = load("Huge");
+    let traversal = load("../../outside");
     // Restore before asserting so a failure can't leak the override.
     unsafe {
         match prev {
@@ -60,4 +73,6 @@ fn load_reads_user_theme_file_then_not_found() {
     assert_eq!(s.background, Rgb::new(0x10, 0x20, 0x30));
     assert_eq!(s.ansi[1], Rgb::new(0xff, 0x00, 0x00));
     assert!(matches!(missing, Err(ThemeError::NotFound(_))));
+    assert!(matches!(huge, Err(ThemeError::Io(message)) if message.contains("limit")));
+    assert!(matches!(traversal, Err(ThemeError::Parse { line: 0, .. })));
 }

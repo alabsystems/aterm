@@ -31,6 +31,7 @@ const ENV_MANIFEST: &str = "ATERM_SEAMLESS_MANIFEST";
 const ENV_FDS: &str = "ATERM_SEAMLESS_FDS";
 const ENV_NONCE: &str = "ATERM_SEAMLESS_NONCE";
 const ENV_LAYOUT: &str = "ATERM_SEAMLESS_LAYOUT";
+const ENV_TARGET: &str = "ATERM_SEAMLESS_TARGET";
 
 const ADOPTION_PROOF_DOMAIN: &[u8] = b"aterm-seamless-adoption-v1\0";
 const LAYOUT_PROOF_DOMAIN: &[u8] = b"aterm-seamless-layout-v1\0";
@@ -143,25 +144,7 @@ pub(crate) fn adoption_proof(
     hasher.update(u32::try_from(nonce.len()).ok()?.to_be_bytes());
     hasher.update(nonce.as_bytes());
     hasher.update(target_build.to_be_bytes());
-    let target_commit = target_commit.trim().to_ascii_lowercase();
-    let (commit_base, dirty) = target_commit
-        .strip_suffix("-dirty")
-        .map_or((target_commit.as_str(), false), |base| (base, true));
-    let commit_prefix =
-        if commit_base.as_bytes().iter().all(u8::is_ascii_hexdigit) && commit_base.len() >= 7 {
-            let mut normalized = commit_base[..commit_base.len().min(12)].to_string();
-            if dirty {
-                normalized.push_str("-dirty");
-            }
-            normalized
-        } else if commit_base == "unknown"
-            && !dirty
-            && (cfg!(debug_assertions) || std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some())
-        {
-            "unknown".to_string()
-        } else {
-            return None;
-        };
+    let commit_prefix = normalize_commit(target_commit)?;
     hasher.update(u32::try_from(commit_prefix.len()).ok()?.to_be_bytes());
     hasher.update(commit_prefix.as_bytes());
     hasher.update(layout_digest);
@@ -178,13 +161,57 @@ pub(crate) fn adoption_proof(
     })
 }
 
+/// The ONE canonical spelling of a build's git commit, shared by every side of
+/// the handoff. The parent's expectation comes from a release ticket (which may
+/// carry a full 40-hex sha); the child's comes from its compiled-in
+/// `build_info::GIT_COMMIT` (12 hex, optionally `-dirty`). Both must reduce to
+/// the same string or the two sides are provably describing different binaries.
+///
+/// Extracted out of [`adoption_proof`] deliberately: the build/commit identity
+/// is now an EXPLICIT equality check between the parent's expectation and the
+/// child's self-report (see [`take_target_identity`]), not an implicit hash
+/// input that silently poisons an otherwise-correct digest.
+#[must_use]
+pub(crate) fn normalize_commit(commit: &str) -> Option<String> {
+    let commit = commit.trim().to_ascii_lowercase();
+    let (base, dirty) = commit
+        .strip_suffix("-dirty")
+        .map_or((commit.as_str(), false), |base| (base, true));
+    if base.as_bytes().iter().all(u8::is_ascii_hexdigit) && base.len() >= 7 {
+        let mut normalized = base[..base.len().min(12)].to_string();
+        if dirty {
+            normalized.push_str("-dirty");
+        }
+        return Some(normalized);
+    }
+    // `unknown` is only ever a debug/dev shape; it must never authorize a
+    // release handoff.
+    (base == "unknown"
+        && !dirty
+        && (cfg!(debug_assertions) || std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some()))
+    .then(|| "unknown".to_string())
+}
+
 /// Canonical, attempt-bound commitment to the complete window/tab/pane layout.
-/// The same bounded serializer is validated before the parent spawns and parsed
-/// by the child, so this hashes semantic handoff input rather than a path or
-/// mutable global restore slot.
+///
+/// BYTE-IDENTITY LAW (the fix for the cross-version `AdoptionMismatch`): this is
+/// a pure function of the *wire the parent writes*, and both sides MUST hash
+/// those same bytes. The parent writes exactly `layout.to_toml()` to the layout
+/// sidecar (`restore::write_to`) and hashes it here; the child hashes the bytes
+/// it READ from that sidecar ([`layout_wire_digest`]) instead of re-serializing
+/// its own parse. Re-serialization was the bug: it required the NEW binary's
+/// TOML codec to be a byte fixed point on the OLD binary's wire, which no
+/// schema bump, added `serde` field, or field reorder preserves — and an update
+/// crosses a version boundary by definition.
 #[must_use]
 pub(crate) fn layout_digest(layout: &crate::restore::RestoreManifest) -> Option<[u8; 32]> {
-    let wire = layout.to_toml().ok()?;
+    layout_wire_digest(&layout.to_toml().ok()?)
+}
+
+/// [`layout_digest`] keyed on the exact serialized bytes. This is what the
+/// child uses, over the bytes it consumed from the parent's sidecar.
+#[must_use]
+pub(crate) fn layout_wire_digest(wire: &str) -> Option<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(LAYOUT_PROOF_DOMAIN);
     hasher.update(u64::try_from(wire.len()).ok()?.to_be_bytes());
@@ -215,12 +242,15 @@ fn screen_digest_refs(mut screens: Vec<(u64, &TerminalCheckpoint)>) -> Option<[u
     if screens.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return None;
     }
-    let mut aggregate = 0_u64;
     let mut aggregate_cells = 0_u64;
-    let mut hasher = Sha256::new();
-    hasher.update(SCREEN_PROOF_DOMAIN);
-    hasher.update(u32::try_from(screens.len()).ok()?.to_be_bytes());
-    for (local_id, checkpoint) in screens {
+    // Project each live checkpoint into EXACTLY the bytes `write_outgoing` puts
+    // on the wire (`serde_json` meta + the verbatim grid blobs), then hash those
+    // bytes. The child hashes the same three byte strings after reading them
+    // back, so the two digests agree by construction rather than by both codecs
+    // happening to be fixed points across a version boundary.
+    let mut metas = Vec::new();
+    metas.try_reserve_exact(screens.len()).ok()?;
+    for (local_id, checkpoint) in &screens {
         let meta = CheckpointMeta::from_checkpoint(checkpoint);
         let cap = checkpoint_grid_cap(&meta)?;
         if admit_checkpoint_dimensions(
@@ -235,28 +265,71 @@ fn screen_digest_refs(mut screens: Vec<(u64, &TerminalCheckpoint)>) -> Option<[u
         if !checkpoint.parser_ground
             || checkpoint.alt_grid.is_some() != checkpoint.alt_cursor.is_some()
             || !checkpoint_grid_is_canonical(&checkpoint.grid, checkpoint.rows, checkpoint.cols)
+            || u64::try_from(checkpoint.grid.len()).ok()? > cap
+            || checkpoint.alt_grid.as_ref().is_some_and(|alt| {
+                u64::try_from(alt.len()).is_ok_and(|len| len > cap)
+                    || !checkpoint_grid_is_canonical(alt, checkpoint.rows, checkpoint.cols)
+            })
         {
             return None;
         }
-        let meta = serde_json::to_vec(&meta).ok()?;
-        let grid_len = u64::try_from(checkpoint.grid.len()).ok()?;
-        if grid_len > cap {
-            return None;
-        }
+        metas.push((*local_id, serde_json::to_vec(&meta).ok()?));
+    }
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(screens.len()).ok()?;
+    for ((local_id, meta), (_, checkpoint)) in metas.iter().zip(screens.iter()) {
+        entries.push(ScreenWireEntry {
+            local_id: *local_id,
+            meta,
+            grid: &checkpoint.grid,
+            alt_grid: checkpoint.alt_grid.as_deref(),
+        });
+    }
+    screen_wire_digest(&mut entries)
+}
+
+/// One session's screen carry AS BYTES — precisely what crosses the wire.
+struct ScreenWireEntry<'a> {
+    local_id: u64,
+    /// The `serde_json` `CheckpointMeta` blob (`ScreenCarry::meta`), verbatim.
+    meta: &'a [u8],
+    /// The main grid sidecar's `serialize_lines` bytes, verbatim.
+    grid: &'a [u8],
+    /// The alt grid sidecar's bytes when the carry declares one.
+    alt_grid: Option<&'a [u8]>,
+}
+
+/// THE canonical screen commitment. Sorting by local id removes capture-order
+/// ambiguity; length framing prevents any concatenation alias. Both the outgoing
+/// process (over the bytes it is about to write) and the incoming process (over
+/// the bytes it just read) call THIS function on THE SAME BYTES — that identity,
+/// not codec luck, is what makes the adoption proof survive a version boundary.
+fn screen_wire_digest(entries: &mut [ScreenWireEntry<'_>]) -> Option<[u8; 32]> {
+    if entries.len() > MAX_HANDOFF_SESSIONS {
+        return None;
+    }
+    entries.sort_unstable_by_key(|entry| entry.local_id);
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].local_id == pair[1].local_id)
+    {
+        return None;
+    }
+    let mut aggregate = 0_u64;
+    let mut hasher = Sha256::new();
+    hasher.update(SCREEN_PROOF_DOMAIN);
+    hasher.update(u32::try_from(entries.len()).ok()?.to_be_bytes());
+    for entry in entries {
+        let grid_len = u64::try_from(entry.grid.len()).ok()?;
         aggregate = aggregate.checked_add(grid_len)?;
-        hasher.update(local_id.to_be_bytes());
-        hasher.update(u64::try_from(meta.len()).ok()?.to_be_bytes());
-        hasher.update(&meta);
+        hasher.update(entry.local_id.to_be_bytes());
+        hasher.update(u64::try_from(entry.meta.len()).ok()?.to_be_bytes());
+        hasher.update(entry.meta);
         hasher.update(grid_len.to_be_bytes());
-        hasher.update(&checkpoint.grid);
-        match checkpoint.alt_grid.as_ref() {
+        hasher.update(entry.grid);
+        match entry.alt_grid {
             Some(alt) => {
                 let alt_len = u64::try_from(alt.len()).ok()?;
-                if alt_len > cap
-                    || !checkpoint_grid_is_canonical(alt, checkpoint.rows, checkpoint.cols)
-                {
-                    return None;
-                }
                 aggregate = aggregate.checked_add(alt_len)?;
                 hasher.update([1]);
                 hasher.update(alt_len.to_be_bytes());
@@ -642,8 +715,21 @@ fn manifest_path_matches_nonce(path: &std::path::Path, nonce: &str) -> bool {
     !pid.is_empty() && pid.as_bytes().iter().all(u8::is_ascii_digit) && file_nonce == nonce
 }
 
+/// The physical artifacts one outgoing attempt published, plus the ONE screen
+/// commitment computed over the exact bytes it wrote.
+pub(crate) struct OutgoingHandoff {
+    pub manifest_path: String,
+    pub nonce: String,
+    pub fds_wire: String,
+    /// [`screen_wire_digest`] over the carried meta/grid bytes as written. The
+    /// worker asserts this equals the digest the main thread committed to before
+    /// parking; a difference is a preparation failure, never a silent mismatch
+    /// that only surfaces as the child's unexplained `AdoptionMismatch`.
+    pub screen_digest: [u8; 32],
+}
+
 /// Write the outgoing handoff manifest (nonce-stamped, `0600`, in the `0700` control dir)
-/// and return `(manifest_path, nonce, fds_wire)` to set as env on the child `Command`.
+/// and return the [`OutgoingHandoff`] whose first three fields become the child's env.
 /// `None` when there is no private control dir (then the caller re-execs WITHOUT the
 /// seamless env → a normal cold apply). Every fd in `fds` is a child-owned CLOEXEC
 /// duplicate; the caller clears the flag only in that command's `pre_exec` closure.
@@ -660,7 +746,7 @@ pub(crate) fn write_outgoing(
     fds: &HandoffFds,
     screens: &[(u64, TerminalCheckpoint)],
     window: Option<WindowCarry>,
-) -> Option<(String, String, String)> {
+) -> Option<OutgoingHandoff> {
     let dir = crate::control_auth::socket_dir()?;
     let nonce = random_nonce();
     let path = dir.join(format!("seamless-{}-{nonce}.toml", std::process::id()));
@@ -688,6 +774,7 @@ pub(crate) fn write_outgoing(
     let mut manifest = manifest.clone();
     manifest.window = window;
     let mut written_blobs = Vec::with_capacity(screens.len().saturating_mul(2));
+    let mut carried_metas: Vec<(u64, String)> = Vec::with_capacity(screens.len());
     let mut aggregate_cells = 0_u64;
     let mut aggregate_bytes = 0_u64;
     for (local_id, cp) in screens {
@@ -775,6 +862,7 @@ pub(crate) fn write_outgoing(
         } else {
             None
         };
+        carried_metas.push((*local_id, meta.clone()));
         rec.screen = Some(ScreenCarry {
             schema: ScreenCarry::SCHEMA,
             meta,
@@ -782,6 +870,30 @@ pub(crate) fn write_outgoing(
             alt_grid_file,
         });
     }
+    // THE commitment, taken over the bytes actually published above (the same
+    // meta strings, the same grid blobs). The child recomputes it from the bytes
+    // it reads back, so both sides hash one byte string with one function.
+    let mut wire_entries = Vec::with_capacity(screens.len());
+    for (local_id, cp) in screens {
+        let Some((_, meta)) = carried_metas.iter().find(|(id, _)| id == local_id) else {
+            for path in written_blobs {
+                let _ = std::fs::remove_file(path);
+            }
+            return None;
+        };
+        wire_entries.push(ScreenWireEntry {
+            local_id: *local_id,
+            meta: meta.as_bytes(),
+            grid: &cp.grid,
+            alt_grid: cp.alt_grid.as_deref(),
+        });
+    }
+    let Some(carry_digest) = screen_wire_digest(&mut wire_entries) else {
+        for path in written_blobs {
+            let _ = std::fs::remove_file(path);
+        }
+        return None;
+    };
     let manifest = &manifest;
 
     let Some(toml) = manifest.to_toml().ok() else {
@@ -814,7 +926,12 @@ pub(crate) fn write_outgoing(
         }
         return None;
     }
-    Some((path.to_string_lossy().into_owned(), nonce, fds.encode()))
+    Some(OutgoingHandoff {
+        manifest_path: path.to_string_lossy().into_owned(),
+        nonce,
+        fds_wire: fds.encode(),
+        screen_digest: carry_digest,
+    })
 }
 
 /// The consumed incoming handoff: the adopted live sessions plus the outgoing
@@ -833,7 +950,15 @@ pub(crate) struct IncomingHandoff {
     pub expected: Option<Vec<(u64, i32, i32)>>,
     /// Attempt-bound layout sidecar consumed from the same private nonce prefix.
     pub layout: Option<crate::restore::RestoreManifest>,
-    /// Canonical commitment recomputed from the exact parsed checkpoint bytes.
+    /// [`layout_wire_digest`] over the EXACT sidecar bytes this process read —
+    /// never over a re-serialization of `layout`. The outgoing process hashed
+    /// the identical bytes when it wrote them, so this matches across a version
+    /// boundary; re-serializing here is what produced `AdoptionMismatch`.
+    /// `None` on the legacy bridge, which carries no attempt-bound sidecar and
+    /// never computes an adoption proof.
+    pub layout_digest: Option<[u8; 32]>,
+    /// [`screen_wire_digest`] over the EXACT carried meta/grid bytes, for the
+    /// same reason.
     pub screen_digest: Option<[u8; 32]>,
     /// True only for the one-release v0.52/v0.53 bridge: a ready channel was
     /// present, the v2 Commit and layout envs were genuinely absent, and the
@@ -1177,6 +1302,87 @@ pub(crate) struct ReadySignal {
     nonce: String,
     layout_digest: [u8; 32],
     screen_digest: [u8; 32],
+    /// The build/commit the PARENT expects this process to be, already checked
+    /// equal to our own `build_info` by [`take_target_identity`]. Hashing the
+    /// agreed value keeps "I am the binary you asked for" as a real property
+    /// while making a disagreement an explicit, logged refusal instead of a
+    /// poisoned digest surfacing as an unexplained `AdoptionMismatch`.
+    target: HandoffTarget,
+}
+
+/// The exact binary identity the outgoing process authorized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HandoffTarget {
+    pub build: u64,
+    /// Already reduced by [`normalize_commit`].
+    pub commit: String,
+}
+
+impl HandoffTarget {
+    /// This process's own compiled-in identity. Used when the parent published
+    /// no expectation (an older parent, or the legacy bridge).
+    #[must_use]
+    pub(crate) fn own() -> Option<Self> {
+        Some(Self {
+            build: crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+            commit: normalize_commit(crate::build_info::GIT_COMMIT)?,
+        })
+    }
+}
+
+/// Encode the parent's expectation for [`ENV_TARGET`]. A spoofed value can only
+/// ever LOSE a handoff: the parent compares the child's proof against its OWN
+/// expectation, so a forged target simply produces a digest the parent rejects.
+#[must_use]
+pub(crate) fn encode_target_identity(build: u64, commit: &str) -> String {
+    format!("{build} {}", commit.trim())
+}
+
+/// Consume [`ENV_TARGET`] and PROVE this process is the binary the parent
+/// authorized. Returns the agreed identity, or `None` after logging exactly
+/// which component disagreed — the diagnostic that was missing when every
+/// handoff in the field died as a bare `AdoptionMismatch`.
+///
+/// SAFETY (env): the caller guarantees this runs before any thread spawn,
+/// alongside [`take_incoming`].
+#[must_use]
+pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
+    let raw = std::env::var(ENV_TARGET).ok();
+    // SAFETY: single-threaded launcher (caller contract), so `remove_var` is sound.
+    unsafe { std::env::remove_var(ENV_TARGET) };
+    let own = HandoffTarget::own();
+    let Some(raw) = raw else {
+        // Older parent: it hashes ITS ticket's target and we hash our own
+        // build_info, exactly as before. Unchanged behaviour, no new failure.
+        return own;
+    };
+    let Some(own) = own else {
+        eprintln!(
+            "aterm-gui: seamless handoff refused: this build reports commit \
+             `{}`, which is not a usable identity",
+            crate::build_info::GIT_COMMIT
+        );
+        return None;
+    };
+    let (build, commit) = raw.trim().split_once(' ')?;
+    let Some(expected) = build
+        .parse::<u64>()
+        .ok()
+        .zip(normalize_commit(commit))
+        .map(|(build, commit)| HandoffTarget { build, commit })
+    else {
+        eprintln!("aterm-gui: seamless handoff refused: malformed target identity `{raw}`");
+        return None;
+    };
+    if expected != own {
+        eprintln!(
+            "aterm-gui: seamless handoff refused: the outgoing process authorized \
+             build {} commit {}, but this binary is build {} commit {}",
+            expected.build, expected.commit, own.build, own.commit
+        );
+        return None;
+    }
+    Some(expected)
 }
 
 #[cfg(unix)]
@@ -1199,6 +1405,10 @@ impl ReadySignal {
             nonce: nonce.to_owned(),
             layout_digest,
             screen_digest,
+            target: HandoffTarget::own().unwrap_or(HandoffTarget {
+                build: 0,
+                commit: "unknown".to_string(),
+            }),
         }
     }
 
@@ -1207,11 +1417,10 @@ impl ReadySignal {
     /// observable by the parent.
     #[must_use]
     pub(crate) fn proof(&self, adopted: &[(u64, i32, i32)]) -> Option<AdoptionProof> {
-        let target_build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
         adoption_proof(
             &self.nonce,
-            target_build,
-            crate::build_info::GIT_COMMIT,
+            self.target.build,
+            &self.target.commit,
             &self.layout_digest,
             &self.screen_digest,
             adopted,
@@ -1485,6 +1694,7 @@ pub(crate) fn take_ready_fd(
     nonce: Option<String>,
     layout_digest: Option<[u8; 32]>,
     screen_digest: Option<[u8; 32]>,
+    target: Option<HandoffTarget>,
     adopted_fds: &[i32],
 ) -> Option<ReadySignal> {
     let raw = std::env::var(ENV_READY_FD).ok();
@@ -1511,6 +1721,7 @@ pub(crate) fn take_ready_fd(
         nonce: nonce?,
         layout_digest: layout_digest?,
         screen_digest: screen_digest?,
+        target: target?,
     })
 }
 
@@ -1557,6 +1768,7 @@ pub(crate) fn take_ready_fd(
     _nonce: Option<String>,
     _layout_digest: Option<[u8; 32]>,
     _screen_digest: Option<[u8; 32]>,
+    _target: Option<HandoffTarget>,
     _adopted_fds: &[i32],
 ) -> Option<ReadySignal> {
     None
@@ -1650,21 +1862,36 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
     if !legacy_protocol && !modern_protocol {
         return IncomingHandoff::default();
     }
-    let layout = if legacy_protocol {
-        take_legacy_layout_capped()
-            .filter(|layout| legacy_layout_is_exact(Some(layout), &expected_ids))
+    let (layout, layout_digest) = if legacy_protocol {
+        // The legacy bridge reads the mutable global restore slot, not an
+        // attempt-bound sidecar, so there is no parent-written wire to commit
+        // to. It signals with `signal_legacy` — ONE byte, no proof compared by
+        // anyone — so this digest is only ever a `ReadySignal` field that is
+        // never hashed against a peer. Deriving it locally is therefore sound
+        // here, and only here.
+        let layout = take_legacy_layout_capped()
+            .filter(|layout| legacy_layout_is_exact(Some(layout), &expected_ids));
+        let digest = layout.as_ref().and_then(layout_digest);
+        (layout, digest)
     } else {
-        layout_path.and_then(|layout_path| {
-            let layout_path = std::path::Path::new(&layout_path);
-            let expected_layout = std::path::Path::new(&path).with_extension("layout.toml");
-            if !layout_path.starts_with(&dir) || layout_path != expected_layout {
-                return None;
-            }
-            take_regular_capped(layout_path, &dir, MAX_HANDOFF_LAYOUT_BYTES)
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .and_then(|wire| crate::restore::RestoreManifest::from_toml(&wire))
-                .filter(|layout| layout.covers_exact_seamless_ids(&expected_ids))
-        })
+        layout_path
+            .and_then(|layout_path| {
+                let layout_path = std::path::Path::new(&layout_path);
+                let expected_layout = std::path::Path::new(&path).with_extension("layout.toml");
+                if !layout_path.starts_with(&dir) || layout_path != expected_layout {
+                    return None;
+                }
+                let wire = take_regular_capped(layout_path, &dir, MAX_HANDOFF_LAYOUT_BYTES)
+                    .and_then(|bytes| String::from_utf8(bytes).ok())?;
+                // COMMIT TO THE BYTES, NOT TO THE PARSE. `layout` below is only
+                // used to rebuild panes; the digest the parent will compare
+                // against is a pure function of this exact wire.
+                let digest = layout_wire_digest(&wire)?;
+                let layout = crate::restore::RestoreManifest::from_toml(&wire)
+                    .filter(|layout| layout.covers_exact_seamless_ids(&expected_ids))?;
+                Some((layout, digest))
+            })
+            .map_or((None, None), |(layout, digest)| (Some(layout), Some(digest)))
     };
     // Both direct old exec and one-channel overlap require the legacy global
     // layout to join exactly to the authenticated PTY identities. Only the
@@ -1760,17 +1987,38 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
     let Some(adopted) = adopted else {
         return IncomingHandoff::default();
     };
-    let Some(screen_refs) = adopted
+    // COMMIT TO THE CARRIED BYTES. `checkpoint.grid`/`alt_grid` are the sidecar
+    // blobs VERBATIM (`normalize_incoming_checkpoint_grid` validates canonicality
+    // and returns its input unchanged), and `rec.screen.meta` is the parent's
+    // JSON string unparsed — so this hashes exactly what `write_outgoing` hashed.
+    // Re-deriving the meta from `CheckpointMeta::from_checkpoint(&rebuilt)` (the
+    // old behaviour) required the NEW binary's `CheckpointMeta` serde shape to be
+    // byte-identical to the OLD binary's: one added field broke every handoff.
+    let Some(mut wire_entries) = adopted
         .iter()
-        .map(|item| Some((item.local_id, item.checkpoint.as_ref()?)))
+        .map(|item| {
+            let checkpoint = item.checkpoint.as_ref()?;
+            let carry = manifest
+                .sessions
+                .iter()
+                .find(|rec| rec.local_id == item.local_id)?
+                .screen
+                .as_ref()?;
+            Some(ScreenWireEntry {
+                local_id: item.local_id,
+                meta: carry.meta.as_bytes(),
+                grid: &checkpoint.grid,
+                alt_grid: checkpoint.alt_grid.as_deref(),
+            })
+        })
         .collect::<Option<Vec<_>>>()
     else {
         return IncomingHandoff::default();
     };
-    let screen_digest = screen_digest_refs(screen_refs);
-    let Some(screen_digest) = screen_digest else {
+    let Some(screen_digest) = screen_wire_digest(&mut wire_entries) else {
         return IncomingHandoff::default();
     };
+    drop(wire_entries);
     #[cfg(unix)]
     incoming_pty_guard.transfer_all();
     IncomingHandoff {
@@ -1779,6 +2027,7 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
         nonce: Some(env_nonce),
         expected: Some(expected),
         layout,
+        layout_digest,
         screen_digest: Some(screen_digest),
         legacy_layout_bridge,
     }
@@ -2141,8 +2390,9 @@ cols = 20
                 .collect::<Vec<_>>();
             let ready = take_ready_fd(
                 incoming.nonce.clone(),
-                incoming.layout.as_ref().and_then(layout_digest),
+                incoming.layout_digest,
                 incoming.screen_digest,
+                HandoffTarget::own(),
                 &adopted_fds,
             );
             assert_eq!(ready.is_some(), should_adopt, "ready proof shape: {label}");
@@ -2456,7 +2706,10 @@ cols = 20
         }
 
         let prearmed = prearm_incoming_fds();
-        assert!(!prearmed.rejects_boot(), "the modern overlap shape is valid");
+        assert!(
+            !prearmed.rejects_boot(),
+            "the modern overlap shape is valid"
+        );
         assert!(
             !prearmed.final_exec_fds().is_empty(),
             "descriptors survive for the final exec"
@@ -2562,8 +2815,12 @@ cols = 20
         std::fs::create_dir_all(&dir).ok();
         crate::restore::write(&exact_legacy_layout(&[0])).expect("legacy layout");
 
-        let (path, nonce, wire) =
-            write_outgoing(&manifest, &fds, &screens, manifest.window).expect("write handoff");
+        let OutgoingHandoff {
+            manifest_path: path,
+            nonce,
+            fds_wire: wire,
+            ..
+        } = write_outgoing(&manifest, &fds, &screens, manifest.window).expect("write handoff");
         // SAFETY: mutation serialized by ENV_LOCK (see above); `take_incoming`
         // clears these three vars again before this test releases the lock.
         unsafe {
@@ -2694,8 +2951,12 @@ cols = 20
         std::fs::create_dir_all(&dir).ok();
         crate::restore::write(&exact_legacy_layout(&ids)).expect("legacy layout");
 
-        let (path, nonce, wire) =
-            write_outgoing(&manifest, &fds, &screens, manifest.window).expect("write handoff");
+        let OutgoingHandoff {
+            manifest_path: path,
+            nonce,
+            fds_wire: wire,
+            ..
+        } = write_outgoing(&manifest, &fds, &screens, manifest.window).expect("write handoff");
         // SAFETY: mutation serialized by ENV_LOCK; take_incoming clears these again.
         unsafe {
             std::env::set_var(ENV_MANIFEST, &path);
@@ -2769,12 +3030,24 @@ cols = 20
         // SAFETY (all set/remove below): serialized by ENV_LOCK for the whole body.
         unsafe { std::env::remove_var("ATERM_HANDOFF_READY_FD") };
         assert!(
-            take_ready_fd(Some("n".to_string()), Some([7; 32]), Some([8; 32]), &[],).is_none(),
+            take_ready_fd(
+                Some("n".to_string()),
+                Some([7; 32]),
+                Some([8; 32]),
+                HandoffTarget::own(),
+                &[],
+            ).is_none(),
             "absent env → None"
         );
         unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", "not-a-number") };
         assert!(
-            take_ready_fd(Some("n".to_string()), Some([7; 32]), Some([8; 32]), &[],).is_none(),
+            take_ready_fd(
+                Some("n".to_string()),
+                Some([7; 32]),
+                Some([8; 32]),
+                HandoffTarget::own(),
+                &[],
+            ).is_none(),
             "garbage → None"
         );
         assert!(
@@ -2783,7 +3056,13 @@ cols = 20
         );
         unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", "1") };
         assert!(
-            take_ready_fd(Some("n".to_string()), Some([7; 32]), Some([8; 32]), &[],).is_none(),
+            take_ready_fd(
+                Some("n".to_string()),
+                Some([7; 32]),
+                Some([8; 32]),
+                HandoffTarget::own(),
+                &[],
+            ).is_none(),
             "stdio refused"
         );
         // A real PTY master: the is_tty backstop must refuse it (a confused
@@ -2802,7 +3081,13 @@ cols = 20
         assert_eq!(rc, 0, "openpty");
         unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", m.to_string()) };
         assert!(
-            take_ready_fd(Some("n".to_string()), Some([7; 32]), Some([8; 32]), &[],).is_none(),
+            take_ready_fd(
+                Some("n".to_string()),
+                Some([7; 32]),
+                Some([8; 32]),
+                HandoffTarget::own(),
+                &[],
+            ).is_none(),
             "a tty is refused"
         );
         aterm_pty::close_fd(m);
@@ -2826,7 +3111,13 @@ cols = 20
         let _ = aterm_pty::set_cloexec(wr, false);
         // SAFETY: serialized by ENV_LOCK.
         unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", wr.to_string()) };
-        let owned = take_ready_fd(Some("n".to_string()), Some([7; 32]), Some([8; 32]), &[])
+        let owned = take_ready_fd(
+            Some("n".to_string()),
+            Some([7; 32]),
+            Some([8; 32]),
+            HandoffTarget::own(),
+            &[],
+        )
             .expect("a live pipe fd is adopted");
         assert!(
             std::env::var_os("ATERM_HANDOFF_READY_FD").is_none(),
@@ -3166,5 +3457,967 @@ cols = 20
             std::thread::yield_now();
         }
         std::fs::remove_dir_all(&scratch).expect("remove parent-death scratch");
+    }
+
+    // ======================================================================
+    // THE HAPPY PATH. Until 2026-07 there was no test anywhere that a full
+    // seamless handoff COMPLETES — every test proved a way for it to fail
+    // closed, and the RFC said in as many words that the models prove safety
+    // but "do not prove the happy path completes". In the field it never
+    // completed: not once, across three releases. These tests drive the real
+    // handshake end to end and assert SUCCESS, plus the three ways it must
+    // still fail closed.
+    // ======================================================================
+
+    /// One full outgoing-side preparation, ready to be consumed by the child
+    /// half of the same process. `layout_wire_override` writes a DIFFERENT byte
+    /// string to the layout sidecar than this binary's codec would produce —
+    /// standing in for "the outgoing process was a different build".
+    #[cfg(unix)]
+    struct StagedHandoff {
+        manifest_path: std::path::PathBuf,
+        nonce: String,
+        fds_wire: String,
+        expected: AdoptionProof,
+        masters: Vec<i32>,
+        slaves: Vec<i32>,
+        scratch: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn stage_outgoing_handoff(
+        label: &str,
+        sessions: usize,
+        layout_wire_override: Option<&dyn Fn(&str) -> String>,
+    ) -> StagedHandoff {
+        stage_outgoing_handoff_with(label, sessions, layout_wire_override, None)
+    }
+
+    /// As [`stage_outgoing_handoff`], but `meta_wire_override` also rewrites the
+    /// `CheckpointMeta` JSON the outgoing process publishes — standing in for
+    /// "the outgoing process's meta codec was a different version". The parent's
+    /// screen commitment is recomputed over the REWRITTEN bytes, because that is
+    /// what a differently-versioned parent would have hashed.
+    #[cfg(unix)]
+    fn stage_outgoing_handoff_with(
+        label: &str,
+        sessions: usize,
+        layout_wire_override: Option<&dyn Fn(&str) -> String>,
+        meta_wire_override: Option<&dyn Fn(&str) -> String>,
+    ) -> StagedHandoff {
+        let scratch = std::env::temp_dir().join(format!(
+            "aterm-handoff-e2e-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        // SAFETY: every caller holds ENV_LOCK for its whole body.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &scratch);
+            std::env::set_var("HOME", &scratch);
+        }
+        let dir = crate::control_auth::socket_dir().expect("scratch control dir");
+        std::fs::create_dir_all(&dir).expect("control dir");
+
+        let mut masters = Vec::new();
+        let mut slaves = Vec::new();
+        let mut records = Vec::new();
+        let mut live = Vec::new();
+        let mut screens = Vec::new();
+        for index in 0..sessions {
+            let (mut master, mut slave) = (0i32, 0i32);
+            // SAFETY: valid out-params; openpty fills them on success.
+            let rc = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, 0, "openpty {index}");
+            masters.push(master);
+            slaves.push(slave);
+            let local_id = index as u64;
+            records.push(SessionRecord {
+                local_id,
+                sid: format!("s-e2e-{index}"),
+                parent: None,
+                state: "alive".to_string(),
+                title: "zsh".to_string(),
+                screen: None,
+                user_title: None,
+                description: None,
+                icon: None,
+            });
+            live.push((local_id, master, 4000 + index as i32));
+            let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
+            terminal.process(
+                format!("\x1b[1;38;5;202muser@mac\x1b[0m ~ % session {index}").as_bytes(),
+            );
+            screens.push((
+                local_id,
+                terminal.checkpoint_visible().expect("parser is Ground"),
+            ));
+        }
+        let manifest = SessionHandoff {
+            schema: SessionHandoff::SCHEMA,
+            window: Some(WindowCarry {
+                rows: 24,
+                cols: 80,
+                outer_x: Some(120),
+                outer_y: Some(64),
+            }),
+            sessions: records,
+        };
+        let fds = HandoffFds {
+            entries: live.clone(),
+        };
+        let outgoing = write_outgoing(&manifest, &fds, &screens, manifest.window)
+            .expect("outgoing handoff is written");
+
+        // The PARENT's layout commitment is a pure function of the bytes it
+        // writes to the sidecar — `restore::write_to` writes exactly
+        // `to_toml()`, and `layout_digest` hashes exactly that.
+        let ids = live.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+        let layout = exact_legacy_layout(&ids);
+        let layout_wire = layout.to_toml().expect("serialize layout");
+        let layout_wire = layout_wire_override.map_or(layout_wire.clone(), |f| f(&layout_wire));
+        let layout_path = std::path::Path::new(&outgoing.manifest_path).with_extension("layout.toml");
+        std::fs::write(&layout_path, layout_wire.as_bytes()).expect("layout sidecar");
+        let parent_layout_digest = layout_wire_digest(&layout_wire).expect("parent layout digest");
+
+        // A differently-versioned outgoing process would have published — and
+        // hashed — different meta bytes. Rewrite the manifest it just wrote, then
+        // take the parent's commitment over exactly those bytes.
+        let mutated_metas: Vec<(u64, String)> = meta_wire_override.map_or_else(Vec::new, |f| {
+            // Round-trip through the manifest codec rather than patching TOML
+            // text: the MANIFEST bytes are not hashed by anyone (only
+            // `ScreenCarry::meta` is), so re-serializing it here is sound and
+            // immune to how the codec escapes an embedded JSON string.
+            // The published file is `<nonce>\n<manifest toml>`.
+            let body = std::fs::read_to_string(&outgoing.manifest_path).expect("read manifest");
+            let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+            let mut published =
+                SessionHandoff::from_toml(toml).expect("parse the published manifest");
+            let mut mutated = Vec::new();
+            for rec in &mut published.sessions {
+                let carry = rec.screen.as_mut().expect("every session carries a screen");
+                let next = f(&carry.meta);
+                assert_ne!(next, carry.meta, "the override must actually change the meta");
+                carry.meta = next.clone();
+                mutated.push((rec.local_id, next));
+            }
+            let republished = format!(
+                "{file_nonce}\n{}",
+                published.to_toml().expect("reserialize manifest")
+            );
+            std::fs::write(&outgoing.manifest_path, republished.as_bytes())
+                .expect("republish the rewritten manifest");
+            mutated
+        });
+        let parent_screen_digest = if mutated_metas.is_empty() {
+            outgoing.screen_digest
+        } else {
+            let mut entries = screens
+                .iter()
+                .map(|(local_id, cp)| ScreenWireEntry {
+                    local_id: *local_id,
+                    meta: mutated_metas
+                        .iter()
+                        .find(|(id, _)| id == local_id)
+                        .map(|(_, meta)| meta.as_bytes())
+                        .expect("every session has a rewritten meta"),
+                    grid: &cp.grid,
+                    alt_grid: cp.alt_grid.as_deref(),
+                })
+                .collect::<Vec<_>>();
+            screen_wire_digest(&mut entries).expect("parent screen digest over the rewritten wire")
+        };
+
+        let expected = adoption_proof(
+            &outgoing.nonce,
+            crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+            crate::build_info::GIT_COMMIT,
+            &parent_layout_digest,
+            &parent_screen_digest,
+            &live,
+        )
+        .expect("parent expectation");
+
+        StagedHandoff {
+            manifest_path: std::path::PathBuf::from(&outgoing.manifest_path),
+            nonce: outgoing.nonce,
+            fds_wire: outgoing.fds_wire,
+            expected,
+            masters,
+            slaves,
+            scratch,
+        }
+    }
+
+    #[cfg(unix)]
+    impl StagedHandoff {
+        fn publish_env(&self, ready_write: i32, commit_read: i32, target: Option<String>) {
+            let layout_path = self.manifest_path.with_extension("layout.toml");
+            // SAFETY: serialized by ENV_LOCK, held by the calling test.
+            unsafe {
+                std::env::set_var(ENV_MANIFEST, &self.manifest_path);
+                std::env::set_var(ENV_NONCE, &self.nonce);
+                std::env::set_var(ENV_FDS, &self.fds_wire);
+                std::env::set_var(ENV_LAYOUT, &layout_path);
+                std::env::set_var(ENV_READY_FD, ready_write.to_string());
+                std::env::set_var(ENV_COMMIT_FD, commit_read.to_string());
+                std::env::set_var(ENV_PARENT_PID, libc::getppid().to_string());
+                match target {
+                    Some(value) => std::env::set_var(ENV_TARGET, value),
+                    None => std::env::remove_var(ENV_TARGET),
+                }
+            }
+        }
+
+        fn teardown(self) {
+            for fd in self.masters.into_iter().chain(self.slaves) {
+                aterm_pty::close_fd(fd);
+            }
+            let _ = std::fs::remove_dir_all(&self.scratch);
+        }
+    }
+
+    #[cfg(unix)]
+    fn pipe_pair(label: &str) -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        // SAFETY: plain pipe(2) into a valid 2-slot out-array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "{label} pipe");
+        (fds[0], fds[1])
+    }
+
+    /// Drive the CHILD half exactly as `run()` does: consume the manifest,
+    /// prove the target identity, adopt the ready channel, compute the proof.
+    #[cfg(unix)]
+    fn child_proof() -> Option<(AdoptionProof, ReadySignal, Vec<(u64, i32, i32)>)> {
+        let incoming = take_incoming();
+        if incoming.adopted.is_empty() {
+            return None;
+        }
+        let target = take_target_identity()?;
+        let adopted_fds = incoming
+            .adopted
+            .iter()
+            .map(|adopted| adopted.master)
+            .collect::<Vec<_>>();
+        let ready = take_ready_fd(
+            incoming.nonce.clone(),
+            incoming.layout_digest,
+            incoming.screen_digest,
+            Some(target),
+            &adopted_fds,
+        )?;
+        let adopted = incoming
+            .adopted
+            .iter()
+            .map(|item| (item.local_id, item.master, item.pid))
+            .collect::<Vec<_>>();
+        let proof = ready.proof(&adopted)?;
+        Some((proof, ready, adopted))
+    }
+
+    /// THE TEST THAT WAS MISSING. Parent prepares → child consumes, adopts and
+    /// proves → the two proofs MATCH → the parent's Commit wire is accepted by
+    /// the child's own `commit_wire_matches`. Multi-session so a subset or a
+    /// cross-wire cannot pass.
+    #[test]
+    #[cfg(unix)]
+    fn a_full_seamless_handoff_completes_and_commits() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+        ];
+        let staged = stage_outgoing_handoff("ok", 3, None);
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+
+        let (proof, ready, adopted) = child_proof().expect("the child adopts and proves");
+        assert_eq!(adopted.len(), 3, "every session is adopted, none lost");
+        assert_eq!(
+            proof, staged.expected,
+            "THE HANDOFF COMPLETES: the child's proof equals the parent's expectation"
+        );
+        assert!(ready.signal_proof(proof), "ProofReady is published");
+
+        // The parent's side of the wire: read ProofReady, then Commit.
+        let mut wire = [0u8; READY_WIRE_LEN];
+        // SAFETY: bounded read into a live fixed buffer from our own pipe.
+        let read = unsafe { libc::read(ready_read, wire.as_mut_ptr().cast(), wire.len()) };
+        assert_eq!(read, READY_WIRE_LEN as isize, "the whole proof wire arrives");
+        assert_eq!(
+            AdoptionProof::from_wire(&wire),
+            Some(staged.expected),
+            "the parent recognizes the proof it was waiting for"
+        );
+        assert!(
+            staged.expected.commit_wire_matches(&staged.expected.to_commit_wire()),
+            "the exact Commit the parent would send is the one the child accepts"
+        );
+        assert_ne!(
+            staged.expected.to_commit_wire(),
+            staged.expected.to_wire(),
+            "Commit and ProofReady are distinct authorities on the wire"
+        );
+
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// THE REGRESSION GUARD FOR FIX #1. The outgoing process is a DIFFERENT
+    /// BUILD: its layout codec emitted `schema = 1`, which this binary's
+    /// `RestoreManifest::from_toml` accepts and then rewrites to `schema = 2`.
+    ///
+    /// Hashing the WIRE (what the child does now) matches the parent exactly.
+    /// Re-serializing the parse (what the child did until 2026-07) produces a
+    /// different digest and therefore `AdoptionMismatch` — which is what every
+    /// handoff in the field actually died of. The second assertion below IS the
+    /// revert check: it computes the old child's digest and shows it differs.
+    #[test]
+    #[cfg(unix)]
+    fn a_handoff_across_a_version_boundary_still_completes() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+        ];
+        let older_codec = |wire: &str| {
+            assert!(wire.contains("schema = 2"), "today's wire: {wire}");
+            wire.replacen("schema = 2", "schema = 1", 1)
+        };
+        let staged = stage_outgoing_handoff("xver", 1, Some(&older_codec));
+        // What the OLD child would have committed to: re-serialize its parse.
+        let old_wire = std::fs::read_to_string(staged.manifest_path.with_extension("layout.toml"))
+            .expect("sidecar");
+        let reserialized = crate::restore::RestoreManifest::from_toml(&old_wire)
+            .expect("the child still ACCEPTS the older wire")
+            .to_toml()
+            .expect("reserialize");
+        assert_ne!(
+            reserialized, old_wire,
+            "precondition: this binary's codec is NOT a fixed point on the older wire"
+        );
+        assert_ne!(
+            layout_wire_digest(&reserialized),
+            layout_wire_digest(&old_wire),
+            "REVERTING fix #1 (re-serializing the parse) provably breaks the proof"
+        );
+
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        let (proof, _ready, _adopted) = child_proof().expect("the child adopts and proves");
+        assert_eq!(
+            proof, staged.expected,
+            "hashing the WIRE makes the two sides agree ACROSS the version boundary"
+        );
+
+        drop(_ready);
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// THE REGRESSION GUARD FOR THE SCREEN HALF OF FIX #1 — and it is a
+    /// SEPARATE guard on purpose. The layout test above rewrites only the layout
+    /// sidecar, so reverting the SCREEN commitment to the old
+    /// re-derive-from-the-rebuilt-checkpoint behaviour left every test green: the
+    /// screen half was covered vacuously. It no longer is.
+    ///
+    /// Here the outgoing process is a NEWER build whose `CheckpointMeta` carries
+    /// one extra key. `CheckpointMeta` has no `deny_unknown_fields`, so this
+    /// binary parses the carry happily and silently DROPS the key — and would
+    /// then hash 17 fields where the parent hashed 18. Hashing the carried bytes
+    /// makes the two sides agree anyway; re-deriving from the parse cannot.
+    #[test]
+    #[cfg(unix)]
+    fn a_handoff_across_a_screen_meta_version_boundary_still_completes() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+        ];
+        // One additive key, exactly as a newer build's meta codec would emit it.
+        let newer_meta_codec = |meta: &str| {
+            assert!(meta.starts_with('{'), "meta json: {meta}");
+            meta.replacen('{', "{\"scene_overlay\":true,", 1)
+        };
+        let staged = stage_outgoing_handoff_with("xvermeta", 2, None, Some(&newer_meta_codec));
+
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        let (proof, _ready, adopted) = child_proof().expect("the child adopts and proves");
+        assert_eq!(adopted.len(), 2, "both sessions adopt across the meta boundary");
+        assert_eq!(
+            proof, staged.expected,
+            "hashing the CARRIED META BYTES makes the two sides agree across a \
+             CheckpointMeta version boundary; re-deriving from the parse does not"
+        );
+
+        drop(_ready);
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// FAIL CLOSED #1 — a WRONG BUILD cannot claim the PTYs. The parent
+    /// authorized a different build; the child refuses before any proof exists,
+    /// so no ready signal is ever published.
+    #[test]
+    #[cfg(unix)]
+    fn a_wrong_build_child_refuses_the_handoff() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+        ];
+        let staged = stage_outgoing_handoff("wrongbuild", 1, None);
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        let own = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                own.wrapping_add(1),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        assert!(
+            child_proof().is_none(),
+            "a candidate that is not the authorized build must never publish a proof"
+        );
+        for fd in [ready_read, ready_write, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// FAIL CLOSED #2 — a WRONG SESSION SET cannot pass. The child's proof
+    /// commits to the `(local_id, fd, pid)` set it ACTUALLY adopted, so a
+    /// dropped or substituted session yields a digest the parent rejects.
+    #[test]
+    #[cfg(unix)]
+    fn a_wrong_session_set_cannot_match_the_parent_expectation() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+        ];
+        let staged = stage_outgoing_handoff("wrongset", 3, None);
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        let (_proof, ready, adopted) = child_proof().expect("the child adopts and proves");
+
+        let mut subset = adopted.clone();
+        subset.pop();
+        assert_ne!(
+            ready.proof(&subset),
+            Some(staged.expected),
+            "a SUBSET of the authorized PTY set must not prove complete adoption"
+        );
+        let mut swapped = adopted.clone();
+        swapped[0].2 = swapped[0].2.wrapping_add(1);
+        assert_ne!(
+            ready.proof(&swapped),
+            Some(staged.expected),
+            "a substituted shell pid must not prove the authorized adoption"
+        );
+        assert_eq!(
+            ready.proof(&adopted),
+            Some(staged.expected),
+            "…while the EXACT set still does"
+        );
+
+        drop(ready);
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// FAIL CLOSED #3 — ProofReady is NOT Commit. A child holding a valid proof
+    /// must not accept the proof wire, a foreign build's Commit, or a Commit for
+    /// a different session set as release authority.
+    #[test]
+    #[cfg(unix)]
+    fn a_missing_or_foreign_commit_never_releases_the_readers() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+        ];
+        let staged = stage_outgoing_handoff("nocommit", 2, None);
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        let (proof, _ready, adopted) = child_proof().expect("the child adopts and proves");
+
+        assert!(
+            !proof.commit_wire_matches(&proof.to_wire()),
+            "the ProofReady wire is NOT a Commit: the magic differs"
+        );
+        let mut subset = adopted;
+        subset.pop();
+        let other = adoption_proof(
+            &staged.nonce,
+            crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+            crate::build_info::GIT_COMMIT,
+            &[0x11; 32],
+            &[0x22; 32],
+            &subset,
+        )
+        .expect("a foreign proof");
+        assert!(
+            !proof.commit_wire_matches(&other.to_commit_wire()),
+            "a Commit minted for a different attempt must not release these readers"
+        );
+        let mut corrupt = proof.to_commit_wire();
+        corrupt[READY_WIRE_LEN - 1] ^= 0x01;
+        assert!(
+            !proof.commit_wire_matches(&corrupt),
+            "a one-bit-corrupted Commit must not release these readers"
+        );
+        assert!(
+            proof.commit_wire_matches(&proof.to_commit_wire()),
+            "…only the exact Commit does"
+        );
+
+        drop(_ready);
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+}
+
+/// F4 ADJUDICATION — the adoption-proof asymmetry that WAS.
+///
+/// HISTORICAL, AND NOW A REGRESSION FENCE. Until 2026-07 the parent committed
+/// to LIVE in-memory state while the child committed to the SAME state after a
+/// serialize→deserialize→RE-SERIALIZE round trip performed by a DIFFERENT
+/// BINARY. These tests characterize the codecs whose drift that arrangement
+/// turned into `AdoptionMismatch`. The shipping child no longer re-serializes
+/// anything — it hashes the exact bytes it consumed (`layout_wire_digest`,
+/// `screen_wire_digest`) — so each "break" below is now a statement about the
+/// CODEC, not about the protocol, and the protocol-level proof that the fix
+/// holds lives in `tests::a_handoff_across_a_version_boundary_still_completes`.
+#[cfg(test)]
+mod f4_adoption_proof_asymmetry {
+    use super::*;
+    use crate::restore::{
+        RestoreManifest, RestoredSplitTree, RestoredTab, RestoredView, TerminalLeafRestore,
+        WindowLayout,
+    };
+
+    /// EXACTLY what `layout_digest` does, but keyed on the WIRE the parent
+    /// wrote rather than on a struct. `layout_digest(m) == wire_digest(m.to_toml())`
+    /// by construction (see `seamless::layout_digest`), so this lets a test stand in
+    /// for "build A's parent-side digest" using only build A's bytes.
+    fn wire_digest(wire: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(LAYOUT_PROOF_DOMAIN);
+        hasher.update(u64::try_from(wire.len()).unwrap().to_be_bytes());
+        hasher.update(wire.as_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Exactly what the child USED TO do: re-derive the digest from the PARSED
+    /// layout. Retained here as the counterfactual the fence measures against.
+    fn child_digest_of_wire(wire: &str) -> Option<[u8; 32]> {
+        layout_digest(&RestoreManifest::from_toml(wire)?)
+    }
+
+    fn realistic_layout() -> RestoreManifest {
+        RestoreManifest::new(vec![WindowLayout {
+            rows: 46,
+            cols: 168,
+            active_tab: 0,
+            outer_x: Some(120),
+            outer_y: Some(64),
+            tabs: Vec::new(),
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: Some(0),
+            restored_tabs: vec![RestoredTab {
+                root: RestoredSplitTree::Split {
+                    axis: crate::restore::SplitKind::Vertical,
+                    ratio: 0.618_034,
+                    first: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
+                        TerminalLeafRestore {
+                            cwd: Some("/Users//example/aterm".to_string()),
+                            title: "zsh".to_string(),
+                            profile: None,
+                            local_id: Some(0),
+                            user_title: None,
+                            description: None,
+                            icon: None,
+                        },
+                    ))),
+                    second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
+                        TerminalLeafRestore {
+                            cwd: Some("/Users//example".to_string()),
+                            title: "claude".to_string(),
+                            profile: None,
+                            local_id: Some(1),
+                            user_title: None,
+                            description: None,
+                            icon: None,
+                        },
+                    ))),
+                },
+                focused_path: vec![crate::restore::RestoreBranch::Second],
+                zoomed: false,
+            }],
+        }])
+    }
+
+    /// CONTROL. Same binary on both ends: the parent's live digest and the
+    /// child's reparsed digest agree. So F4 is NOT an unconditional break.
+    #[test]
+    fn same_build_parent_and_child_layout_digests_agree() {
+        let layout = realistic_layout();
+        let wire = layout.to_toml().expect("parent serializes its live layout");
+        let parent = layout_digest(&layout).expect("parent digest");
+        assert_eq!(parent, wire_digest(&wire), "parent digest == digest of wire");
+        let child = child_digest_of_wire(&wire).expect("child parses the parent wire");
+        assert_eq!(
+            parent, child,
+            "same-build round trip is a fixed point:\n{wire}"
+        );
+    }
+
+    /// CROSS-VERSION BREAK #1 — the manifest SCHEMA constant.
+    /// `RestoreManifest::from_toml` ACCEPTS `LEGACY_SCHEMA` and then
+    /// unconditionally REWRITES `manifest.schema = SCHEMA`. A parent built when
+    /// `SCHEMA == 1` writes `schema = 1`; the child re-emits `schema = 2`. The
+    /// adoption proof therefore CANNOT match, and nothing in the protocol
+    /// notices — the parent reports `AdoptionMismatch`.
+    #[test]
+    fn cross_version_schema_bump_breaks_the_layout_digest() {
+        let layout = realistic_layout();
+        let modern = layout.to_toml().expect("serialize");
+        assert!(modern.contains("schema = 2"), "today's wire: {modern}");
+        // The bytes an older parent (SCHEMA == 1) would have written+hashed.
+        let old_parent_wire = modern.replacen("schema = 2", "schema = 1", 1);
+        let old_parent_digest = wire_digest(&old_parent_wire);
+        let child_digest =
+            child_digest_of_wire(&old_parent_wire).expect("child still ACCEPTS the legacy schema");
+        assert_ne!(
+            old_parent_digest, child_digest,
+            "a schema bump must break the proof"
+        );
+        eprintln!(
+            "F4/schema: parent={} child={} (child re-emitted `schema = 2`)",
+            hex12(&old_parent_digest),
+            hex12(&child_digest)
+        );
+    }
+
+    /// CROSS-VERSION BREAK #2 — an ADDED serde field.
+    /// `RestoredTab::zoomed` is `#[serde(default)]` with NO
+    /// `skip_serializing_if`, so it is ALWAYS emitted. A parent built before
+    /// `zoomed` existed writes a wire without it; the child defaults it and
+    /// re-emits `zoomed = false`. Same semantic layout, different digest.
+    /// EVERY future additive field of this shape re-breaks the handoff.
+    #[test]
+    fn cross_version_added_field_breaks_the_layout_digest() {
+        let modern = realistic_layout().to_toml().expect("serialize");
+        assert!(modern.contains("zoomed = false"), "wire: {modern}");
+        let old_parent_wire = modern.replacen("zoomed = false\n", "", 1);
+        let old_parent_digest = wire_digest(&old_parent_wire);
+        let child_digest = child_digest_of_wire(&old_parent_wire)
+            .expect("child parses the older wire (serde default)");
+        assert_ne!(
+            old_parent_digest, child_digest,
+            "an additive always-emitted field must break the proof"
+        );
+        eprintln!(
+            "F4/field: parent={} child={} (child re-emitted `zoomed = false`)",
+            hex12(&old_parent_digest),
+            hex12(&child_digest)
+        );
+    }
+
+    /// The general lemma both breaks are instances of: the child's digest
+    /// equals the parent's IFF the child's parse+reserialize is a byte fixed
+    /// point on the parent's wire. Nothing in the protocol establishes that
+    /// across a version boundary, and the parent's own pre-flight round-trip
+    /// check (`app_input.rs` ~579) runs the PARENT's codec against itself.
+    #[test]
+    fn layout_digest_equality_is_exactly_wire_fixed_pointness() {
+        let modern = realistic_layout().to_toml().expect("serialize");
+        for (label, wire) in [
+            ("identical build", modern.clone()),
+            (
+                "schema-1 parent",
+                modern.replacen("schema = 2", "schema = 1", 1),
+            ),
+            ("pre-zoomed parent", modern.replacen("zoomed = false\n", "", 1)),
+        ] {
+            let parsed = RestoreManifest::from_toml(&wire).expect("parses");
+            let reserialized = parsed.to_toml().expect("reserialize");
+            let fixed_point = reserialized == wire;
+            let digests_match = child_digest_of_wire(&wire) == Some(wire_digest(&wire));
+            assert_eq!(
+                fixed_point, digests_match,
+                "{label}: digest equality IS wire fixed-pointness"
+            );
+            eprintln!("F4/lemma: {label}: fixed_point={fixed_point} digests_match={digests_match}");
+        }
+    }
+
+    // ---- screen side -------------------------------------------------------
+
+    fn live_checkpoint() -> aterm_core::terminal::TerminalCheckpoint {
+        let mut t = aterm_core::terminal::Terminal::new(24, 80);
+        t.process(b"\x1b[1;38;5;202muser@mac\x1b[0m ~/aterm % cargo test");
+        for i in 0..8 {
+            t.process(format!("\r\ntest line {i}").as_bytes());
+        }
+        t.checkpoint_visible().expect("parser is Ground")
+    }
+
+    /// CONTROL for the screen side. The child never passed `screen_digest`
+    /// through verbatim — it RE-DERIVED it from the reconstructed checkpoints,
+    /// so the screen half carried the SAME round-trip exposure as the layout
+    /// half. It now hashes the carried bytes instead. Same build ⇒ equal either
+    /// way, which is what this control pins.
+    #[test]
+    fn same_build_parent_and_child_screen_digests_agree() {
+        let cp = live_checkpoint();
+        let parent = screen_digest(&[(0, cp.clone())]).expect("parent screen digest");
+
+        // Exactly the child's path: meta JSON off the wire → CheckpointMeta →
+        // into_checkpoint → screen_digest_refs.
+        let carry = ScreenCarry {
+            schema: ScreenCarry::SCHEMA,
+            meta: serde_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta"),
+            grid_file: "unused".to_string(),
+            alt_grid_file: None,
+        };
+        let meta = parse_checkpoint_meta(&carry, false).expect("child parses meta");
+        let rebuilt = meta.into_checkpoint(cp.grid.clone(), None);
+        let child = screen_digest_refs(vec![(0, &rebuilt)]).expect("child screen digest");
+        assert_eq!(parent, child, "same-build screen round trip is a fixed point");
+    }
+
+    /// CROSS-VERSION BREAK #3 — the screen half, `CheckpointMeta` drift.
+    /// `CheckpointMeta` has NO `deny_unknown_fields`. A parent built with an
+    /// 18th meta field writes it; the older child silently DROPS it and hashes
+    /// 17 keys. The parent hashed 18. `AdoptionMismatch`, with no diagnostic.
+    #[test]
+    fn cross_version_extra_meta_field_breaks_the_screen_digest() {
+        let cp = live_checkpoint();
+        let meta_json =
+            serde_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta json");
+        // What a NEWER parent's wire looks like: one additive key the running
+        // (older) child does not know.
+        let newer_parent_meta = meta_json.replacen('{', "{\"scene_overlay\":true,", 1);
+        let parent_digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(newer_parent_meta.as_bytes());
+            let d: [u8; 32] = hasher.finalize().into();
+            d
+        };
+        let carry = ScreenCarry {
+            schema: ScreenCarry::SCHEMA,
+            meta: newer_parent_meta.clone(),
+            grid_file: "unused".to_string(),
+            alt_grid_file: None,
+        };
+        let parsed = parse_checkpoint_meta(&carry, false).expect("child parses (no deny_unknown)");
+        let child_meta = serde_json::to_string(&parsed).expect("child reserializes");
+        assert_ne!(
+            newer_parent_meta, child_meta,
+            "the child dropped the unknown key"
+        );
+        let child_digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(child_meta.as_bytes());
+            let d: [u8; 32] = hasher.finalize().into();
+            d
+        };
+        assert_ne!(parent_digest, child_digest);
+        eprintln!(
+            "F4/meta: parent meta {} bytes, child meta {} bytes — screen_digest inputs differ",
+            newer_parent_meta.len(),
+            child_meta.len()
+        );
+    }
+
+    /// CROSS-VERSION BREAK #4 — the HARDER screen failure. `parse_checkpoint_meta`
+    /// demands EVERY key in its `REQUIRED` list. If a newer child adds an 18th
+    /// meta field to that list, an older parent's 17-key wire is REFUSED
+    /// outright: the child adopts NOTHING, never writes a proof, and the parked
+    /// parent reads EOF — `ChildDied`, the 0.58-era symptom.
+    #[test]
+    fn cross_version_missing_required_meta_key_refuses_adoption_entirely() {
+        let cp = live_checkpoint();
+        let mut value: serde_json::Value =
+            serde_json::to_value(CheckpointMeta::from_checkpoint(&cp)).expect("meta value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("secure_keyboard_entry")
+            .expect("key was present");
+        let carry = ScreenCarry {
+            schema: ScreenCarry::SCHEMA,
+            meta: serde_json::to_string(&value).expect("json"),
+            grid_file: "unused".to_string(),
+            alt_grid_file: None,
+        };
+        assert!(
+            parse_checkpoint_meta(&carry, false).is_none(),
+            "a single missing REQUIRED key destroys the whole adoption"
+        );
+    }
+
+    // ---- build / commit identity -------------------------------------------
+
+    /// F4(b). The child proves with ITS OWN `build_info::BUILD_NUMBER` /
+    /// `GIT_COMMIT`; the parent expects the apply ticket's
+    /// `target_build`/`target_commit`. Any disagreement is a silent
+    /// `AdoptionMismatch`.
+    #[test]
+    fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
+        let ids = [(0u64, 7i32, 4242i32)];
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let (ld, sd) = ([1u8; 32], [2u8; 32]);
+        let base = adoption_proof(nonce, 1_784_869_524, "7bf23bbe1234", &ld, &sd, &ids).unwrap();
+
+        // (i) the swap did not take: the child is still the OLD binary.
+        let stale_build =
+            adoption_proof(nonce, 1_784_825_157, "7bf23bbe1234", &ld, &sd, &ids).unwrap();
+        assert_ne!(base, stale_build, "build number mismatch breaks the proof");
+
+        // (ii) a `-dirty` working tree on either side.
+        let dirty =
+            adoption_proof(nonce, 1_784_869_524, "7bf23bbe1234-dirty", &ld, &sd, &ids).unwrap();
+        assert_ne!(base, dirty, "`-dirty` breaks the proof");
+
+        // (iii) SAFE: 40-hex vs 12-hex vs mixed case all normalize together.
+        let long = adoption_proof(
+            nonce,
+            1_784_869_524,
+            "7BF23BBE1234567890ABCDEF1234567890ABCDEF",
+            &ld,
+            &sd,
+            &ids,
+        )
+        .unwrap();
+        assert_eq!(base, long, "commit length/case normalization is symmetric");
+
+        // (iv) an un-stamped build cannot prove at all in a RELEASE binary:
+        // `unknown` is admitted ONLY under debug_assertions or the debug env.
+        let unknown = adoption_proof(nonce, 1_784_869_524, "unknown", &ld, &sd, &ids);
+        let admitted =
+            cfg!(debug_assertions) || std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some();
+        assert_eq!(
+            unknown.is_some(),
+            admitted,
+            "`unknown` commit is release-fatal (no proof is ever emitted)"
+        );
+    }
+
+    fn hex12(d: &[u8; 32]) -> String {
+        d[..6].iter().map(|b| format!("{b:02x}")).collect()
     }
 }

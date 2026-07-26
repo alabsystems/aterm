@@ -22,6 +22,14 @@ use serde::{Deserialize, Serialize};
 use crate::platform::ensure_private_dir;
 use crate::store::Layout;
 
+/// Maximum serialized size of one private dev-link marker.
+pub const MAX_LINK_MARKER_BYTES: usize = 128 * 1024;
+/// Maximum bin paths retained in one dev-link marker.
+pub const MAX_LINK_MARKER_BINS: usize = 1024;
+/// Maximum directory entries inspected and program names returned by one
+/// linked-program enumeration.
+pub const MAX_LINKED_PROGRAMS: usize = 256;
+
 /// What a [`link`]/[`refresh`] did: the bins symlinked, and any refused (sensitive-name).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkOutcome {
@@ -88,7 +96,7 @@ fn safe_component(name: &str) -> bool {
 /// Whether `program` is currently dev-linked (its `0600` link marker exists).
 #[must_use]
 pub fn is_linked(layout: &Layout, program: &str) -> bool {
-    safe_component(program) && layout.link_marker(program).exists()
+    safe_component(program) && read_marker_for_program(layout, program).is_ok()
 }
 
 /// Dev-link `program`: symlink each of `bins` (relative paths under `checkout`) into `bin/`,
@@ -132,6 +140,22 @@ pub fn link(
     if !checkout.is_dir() {
         return Err(LinkError::NoCheckout(checkout.clone()));
     }
+    if bins.len() > MAX_LINK_MARKER_BINS {
+        return Err(LinkError::Io(format!(
+            "link marker has {} bins; limit is {MAX_LINK_MARKER_BINS}",
+            bins.len()
+        )));
+    }
+    let marker = LinkMarker {
+        schema: 1,
+        program: program.to_string(),
+        checkout: checkout.display().to_string(),
+        bins: bins.iter().map(|b| b.display().to_string()).collect(),
+        linked_at: String::new(),
+    };
+    // Validate the complete marker before mutating any shim, so a request
+    // which cannot be recorded never leaves a partially linked dev loop.
+    serialize_marker(&marker).map_err(|e| LinkError::Io(e.to_string()))?;
     ensure_private_dir(&layout.bin_dir()).map_err(|e| LinkError::Io(e.to_string()))?;
     ensure_private_dir(&layout.links_dir()).map_err(|e| LinkError::Io(e.to_string()))?;
 
@@ -158,13 +182,6 @@ pub fn link(
         return Err(LinkError::NoBins);
     }
 
-    let marker = LinkMarker {
-        schema: 1,
-        program: program.to_string(),
-        checkout: checkout.display().to_string(),
-        bins: bins.iter().map(|b| b.display().to_string()).collect(),
-        linked_at: String::new(),
-    };
     write_marker(&layout.link_marker(program), &marker)
         .map_err(|e| LinkError::Io(e.to_string()))?;
     Ok(LinkOutcome { linked, refused })
@@ -178,10 +195,13 @@ pub fn unlink(layout: &Layout, program: &str) -> Result<(), LinkError> {
         return Err(LinkError::BadName(program.to_string()));
     }
     let marker_path = layout.link_marker(program);
-    let text =
-        fs::read_to_string(&marker_path).map_err(|_| LinkError::NotLinked(program.to_string()))?;
-    let marker: LinkMarker =
-        toml::from_str(&text).map_err(|_| LinkError::NotLinked(program.to_string()))?;
+    let marker = read_marker_for_program(layout, program).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LinkError::NotLinked(program.to_string())
+        } else {
+            LinkError::Io(format!("could not read link marker for {program}: {error}"))
+        }
+    })?;
     let checkout = PathBuf::from(&marker.checkout);
     for rel in &marker.bins {
         let Some(name) = bin_tool_name(Path::new(rel)) else {
@@ -209,23 +229,40 @@ pub fn unlink(layout: &Layout, program: &str) -> Result<(), LinkError> {
 /// than silently re-point a developer's live dev loop.
 #[must_use]
 pub fn linked_checkout(layout: &Layout, program: &str) -> Option<PathBuf> {
+    linked_checkout_checked(layout, program).ok().flatten()
+}
+
+/// Checked counterpart of [`linked_checkout`]. Missing is `Ok(None)`; an
+/// existing malformed, oversized, special, or link-like marker is an error the
+/// caller can surface instead of silently treating the program as unmanaged.
+pub fn linked_checkout_checked(layout: &Layout, program: &str) -> std::io::Result<Option<PathBuf>> {
     if !safe_component(program) {
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{program:?} is not a safe program name"),
+        ));
     }
-    let text = fs::read_to_string(layout.link_marker(program)).ok()?;
-    let marker: LinkMarker = toml::from_str(&text).ok()?;
-    Some(PathBuf::from(marker.checkout))
+    match read_marker_for_program(layout, program) {
+        Ok(marker) => Ok(Some(PathBuf::from(marker.checkout))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Re-assert a program's dev links (idempotent): re-run [`link`] from the recorded marker,
 /// picking up any newly-built/added bins. No build is invoked — building is producer scope,
 /// absent from the consumer (a documented divergence from aterm-pkg's `refresh`).
 pub fn refresh(layout: &Layout, program: &str) -> Result<LinkOutcome, LinkError> {
-    let marker_path = layout.link_marker(program);
-    let text =
-        fs::read_to_string(&marker_path).map_err(|_| LinkError::NotLinked(program.to_string()))?;
-    let marker: LinkMarker =
-        toml::from_str(&text).map_err(|_| LinkError::NotLinked(program.to_string()))?;
+    if !safe_component(program) {
+        return Err(LinkError::BadName(program.to_string()));
+    }
+    let marker = read_marker_for_program(layout, program).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LinkError::NotLinked(program.to_string())
+        } else {
+            LinkError::Io(format!("could not read link marker for {program}: {error}"))
+        }
+    })?;
     let checkout = PathBuf::from(&marker.checkout);
     let bins: Vec<PathBuf> = marker.bins.iter().map(PathBuf::from).collect();
     link(layout, program, &checkout, &bins)
@@ -234,25 +271,136 @@ pub fn refresh(layout: &Layout, program: &str) -> Result<LinkOutcome, LinkError>
 /// The names of all dev-linked programs (the safe-component file names under `links/`).
 #[must_use]
 pub fn linked_programs(layout: &Layout) -> Vec<String> {
+    linked_programs_checked(layout).unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn directory_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn directory_identity(metadata: &fs::Metadata) -> (Option<u32>, Option<u64>) {
+    use std::os::windows::fs::MetadataExt as _;
+    (metadata.volume_serial_number(), metadata.file_index())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn directory_identity(metadata: &fs::Metadata) -> (u64, Option<std::time::SystemTime>) {
+    (metadata.len(), metadata.modified().ok())
+}
+
+/// Enumerate linked program names with a strict entry/result cap and explicit
+/// diagnostics for a link-like, replaced, or non-directory `links/` path.
+pub fn linked_programs_checked(layout: &Layout) -> std::io::Result<Vec<String>> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(layout.links_dir()) else {
-        return out;
+    let directory = layout.links_dir();
+    let before = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(error),
     };
-    for e in entries.flatten() {
+    if !before.file_type().is_dir() || crate::platform::is_reparse(&before) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "package links path is not a real directory",
+        ));
+    }
+    let identity = directory_identity(&before);
+    let entries = fs::read_dir(&directory)?;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_LINKED_PROGRAMS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("package links directory exceeds the {MAX_LINKED_PROGRAMS}-entry limit"),
+            ));
+        }
+        let e = entry?;
         if let Some(n) = e.file_name().to_str()
             && safe_component(n)
         {
             out.push(n.to_string());
         }
     }
+    let after = fs::symlink_metadata(&directory)?;
+    if !after.file_type().is_dir()
+        || crate::platform::is_reparse(&after)
+        || directory_identity(&after) != identity
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "package links directory changed while it was enumerated",
+        ));
+    }
     out.sort();
-    out
+    Ok(out)
+}
+
+fn read_marker_for_program(layout: &Layout, program: &str) -> std::io::Result<LinkMarker> {
+    let marker = read_marker(&layout.link_marker(program))?;
+    if marker.program != program {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "link marker program {:?} does not match filename {program:?}",
+                marker.program
+            ),
+        ));
+    }
+    Ok(marker)
+}
+
+fn read_marker(path: &Path) -> std::io::Result<LinkMarker> {
+    let text = crate::metadata_io::read_bounded_regular_utf8(path, MAX_LINK_MARKER_BYTES)?;
+    let marker: LinkMarker = toml::from_str(&text).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("link marker is invalid: {error}"),
+        )
+    })?;
+    if !safe_component(&marker.program) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "link marker contains an unsafe program name",
+        ));
+    }
+    if marker.bins.len() > MAX_LINK_MARKER_BINS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "link marker has {} bins; limit is {MAX_LINK_MARKER_BINS}",
+                marker.bins.len()
+            ),
+        ));
+    }
+    Ok(marker)
+}
+
+fn serialize_marker(marker: &LinkMarker) -> std::io::Result<String> {
+    if marker.bins.len() > MAX_LINK_MARKER_BINS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "link marker has {} bins; limit is {MAX_LINK_MARKER_BINS}",
+                marker.bins.len()
+            ),
+        ));
+    }
+    let text = toml::to_string(marker)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if text.len() > MAX_LINK_MARKER_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("link marker exceeds the {MAX_LINK_MARKER_BYTES}-byte limit"),
+        ));
+    }
+    Ok(text)
 }
 
 /// Write the marker `0600` via temp + rename.
 fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
-    let text = toml::to_string(marker)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let text = serialize_marker(marker)?;
     let parent = dest.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -426,5 +574,98 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&l.prefix);
         let _ = fs::remove_dir_all(&co);
+    }
+
+    #[test]
+    fn link_marker_bin_count_is_rejected_before_shim_mutation() {
+        let l = layout("bin-cap");
+        let co = checkout("bin-cap", &["ay"]);
+        let bins = vec![PathBuf::from("target/release/ay"); MAX_LINK_MARKER_BINS + 1];
+        let error = link(&l, "ay", &co, &bins).unwrap_err();
+        assert!(error.to_string().contains("limit is"), "{error}");
+        assert!(
+            crate::platform::resolve_shim(&l.shim("ay")).is_none(),
+            "an unrecordable request must not mutate shims"
+        );
+        let _ = fs::remove_dir_all(&l.prefix);
+        let _ = fs::remove_dir_all(&co);
+    }
+
+    #[test]
+    fn linked_program_enumeration_accepts_exact_cap_and_rejects_one_more() {
+        let l = layout("entry-cap");
+        fs::create_dir_all(l.links_dir()).unwrap();
+        for index in 0..MAX_LINKED_PROGRAMS {
+            fs::write(l.links_dir().join(format!("p{index:03}")), b"x").unwrap();
+        }
+        assert_eq!(
+            linked_programs_checked(&l).unwrap().len(),
+            MAX_LINKED_PROGRAMS
+        );
+        fs::write(l.links_dir().join("overflow"), b"x").unwrap();
+        let error = linked_programs_checked(&l).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("entry limit"), "{error}");
+        assert!(
+            linked_programs(&l).is_empty(),
+            "compatibility wrapper fails closed instead of returning a partial set"
+        );
+        let _ = fs::remove_dir_all(&l.prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_retargetable_link_markers_are_explicit_errors() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let l = layout("marker-special");
+        fs::create_dir_all(l.links_dir()).unwrap();
+        let marker = l.link_marker("ay");
+        let marker_c = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `marker_c` is a live NUL-terminated path in our private fixture.
+        assert_eq!(unsafe { libc::mkfifo(marker_c.as_ptr(), 0o600) }, 0);
+        let fifo_error = linked_checkout_checked(&l, "ay").unwrap_err();
+        assert_eq!(fifo_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!is_linked(&l, "ay"));
+        fs::remove_file(&marker).unwrap();
+
+        let first = l.prefix.join("first.toml");
+        let second = l.prefix.join("second.toml");
+        let marker_text = |checkout: &str| {
+            toml::to_string(&LinkMarker {
+                schema: 1,
+                program: "ay".to_string(),
+                checkout: checkout.to_string(),
+                bins: Vec::new(),
+                linked_at: String::new(),
+            })
+            .unwrap()
+        };
+        fs::write(&first, marker_text("/first")).unwrap();
+        fs::write(&second, marker_text("/second")).unwrap();
+        std::os::unix::fs::symlink(&first, &marker).unwrap();
+        assert!(linked_checkout_checked(&l, "ay").is_err());
+        fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(&second, &marker).unwrap();
+        assert!(
+            linked_checkout_checked(&l, "ay").is_err(),
+            "retargeting the link never makes a link-like marker admissible"
+        );
+        let _ = fs::remove_dir_all(&l.prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_directory_symlink_is_rejected_instead_of_followed() {
+        let l = layout("directory-link");
+        let foreign = layout("directory-link-foreign");
+        fs::create_dir_all(foreign.links_dir()).unwrap();
+        fs::write(foreign.links_dir().join("ay"), b"foreign").unwrap();
+        std::os::unix::fs::symlink(foreign.links_dir(), l.links_dir()).unwrap();
+        let error = linked_programs_checked(&l).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("real directory"));
+        let _ = fs::remove_dir_all(&l.prefix);
+        let _ = fs::remove_dir_all(&foreign.prefix);
     }
 }

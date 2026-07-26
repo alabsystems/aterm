@@ -32,7 +32,15 @@ pub struct RainBaker {
     rgba: Vec<u8>,
     /// Monotonic; bumped on EVERY rebake batch and every restart, so a
     /// partially-baked atlas re-uploads progressively and the repaint key
-    /// sees each batch.
+    /// sees each batch. PER-INSTANCE on purpose: the engine fingerprint folds
+    /// this version, and cross-engine determinism (two engines fed identical
+    /// inputs emit identical fingerprints) is a pinned contract — so the
+    /// sequence must be a pure function of this baker's history, never a
+    /// process-global counter. The GPU texture cache therefore must NOT key
+    /// on `(version, w, h)` alone (a REBUILT engine deterministically replays
+    /// the same sequence and would alias its predecessor's stale texels): it
+    /// keys on the published snapshot's Arc IDENTITY, which is unique per
+    /// publish by construction (split-pane audit).
     version: u64,
     /// Next tile index to bake; `>= ROM_GLYPHS` ⇒ complete.
     next_tile: usize,
@@ -283,6 +291,39 @@ mod tests {
             b.atlas().is_none(),
             "no atlas until the first new-bake batch"
         );
+    }
+
+    /// SPLIT-PANE AUDIT: versions are deterministic PER INSTANCE (the engine
+    /// fingerprint contract), so a rebuilt baker REPLAYS its predecessor's
+    /// version sequence — which is exactly why the GPU texture cache must key
+    /// on the published snapshot's Arc IDENTITY, never `(version, w, h)`
+    /// alone. Pin both halves: the sequences collide, and every publish is a
+    /// fresh allocation (per-publish-unique identity).
+    #[test]
+    fn rebuilt_bakers_replay_versions_but_publish_fresh_arcs() {
+        let rom = rasterize_master();
+        let mut first = Vec::new();
+        let mut arcs: Vec<Arc<SceneAtlas>> = Vec::new();
+        for run in 0..2 {
+            let mut b = RainBaker::default();
+            b.begin_frame(10, 20);
+            let mut seq = vec![b.version()];
+            while !b.complete() {
+                b.bake_tiles(&rom);
+                seq.push(b.version());
+                let a = b.atlas().expect("baked batch publishes");
+                assert!(
+                    !arcs.iter().any(|prev| Arc::ptr_eq(prev, &a)),
+                    "every publish is a distinct allocation"
+                );
+                arcs.push(a);
+            }
+            if run == 0 {
+                first = seq;
+            } else {
+                assert_eq!(seq, first, "rebuilt baker replays the version sequence");
+            }
+        }
     }
 
     /// A same-metric `begin_frame` is a no-op (no restart churn per tick).

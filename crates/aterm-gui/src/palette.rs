@@ -141,7 +141,7 @@ pub(crate) struct PaletteRow {
     /// Whether the command is currently actionable; a disabled row paints dim and Enter
     /// on it is a no-op (mirroring `validateMenuItem:` greying).
     pub enabled: bool,
-    /// A checkbox state for toggle commands (HUD widgets, Settings, full-screen); `None`
+    /// A checkbox state for toggle commands (Settings, full-screen); `None`
     /// for plain commands. `Some(true)` paints a check glyph.
     pub checked: Option<bool>,
 }
@@ -166,13 +166,7 @@ pub(crate) struct NativeCommandScope {
 pub(crate) struct PaletteLive {
     /// A text selection exists (gates Copy).
     pub has_selection: bool,
-    /// The master `show_hud` switch is on (checkmark on Show Bottom HUD).
-    pub hud_master: bool,
-    /// The Resources HUD band is on (checkmark on its toggle).
-    pub resources_hud: bool,
-    /// The aterm Engine HUD band is on (checkmark on its toggle).
-    pub engine_hud: bool,
-    /// The cross-platform Settings overlay is open (checkmark on its toggle).
+    /// A native Settings tab is open (checkmark on its singleton toggle).
     pub settings_open: bool,
     /// The FRONT session's effective matrix-rain state (its runtime override,
     /// else the config `enabled` bit) — the checkmark on Matrix Rain. False
@@ -260,6 +254,40 @@ impl PaletteState {
         self
     }
 
+    /// Build the focused recovery surface returned by a native app's blocked
+    /// close transaction. Unlike the ordinary palette, this contains exactly
+    /// the recovery capabilities supplied by `CloseReadiness::Blocked`; global
+    /// menu rows cannot push the explanation/actions out of the visible band.
+    pub(crate) fn native_close_recovery(scope: NativeCommandScope) -> Self {
+        let mut state = Self::new().with_native_commands(scope);
+        state
+            .rows
+            .retain(|row| matches!(&row.action, PaletteTarget::Native(_)));
+        state.selected = 0;
+        state.scroll = 0;
+        state.clamp_scroll();
+        state
+    }
+
+    /// Whether this is the recovery-only surface for one exact live native
+    /// target. Ordinary palettes always retain menu rows, so they cannot be
+    /// mistaken for a close refusal when deferred teardown replay decides
+    /// whether the blocker must keep focus.
+    pub(crate) fn is_native_close_recovery_for(
+        &self,
+        window: crate::WindowId,
+        view: crate::tab_model::ViewId,
+    ) -> bool {
+        !self.rows.is_empty()
+            && self.rows.iter().all(|row| {
+                matches!(
+                    &row.action,
+                    PaletteTarget::Native(target)
+                        if target.window == window && target.view == view
+                )
+            })
+    }
+
     /// Replace only app-scoped rows, preserving the global `MENU_MODEL`, live query, and
     /// menu resolution. Active-tab changes use this to remove native commands on terminal
     /// tabs or retarget a different native app without rebuilding menu state.
@@ -301,7 +329,7 @@ impl PaletteState {
     }
 
     /// Fold live `App` state into per-row `enabled`/`checked`, mirroring `validateMenuItem:`:
-    /// toggle commands (HUD bands, Settings, full-screen) get a checkmark; selection- and
+    /// toggle commands (Settings, full-screen) get a checkmark; selection- and
     /// tab-gated commands are disabled when their precondition is absent. Everything else
     /// stays enabled (the honest "no predicate ⇒ always available").
     ///
@@ -377,9 +405,6 @@ impl PaletteState {
             row.checked = None;
             row.enabled = true;
             match action {
-                MenuAction::ShowHud => row.checked = Some(live.hud_master),
-                MenuAction::ShowResourcesHud => row.checked = Some(live.resources_hud),
-                MenuAction::ShowEngineHud => row.checked = Some(live.engine_hud),
                 MenuAction::ToggleSettings => row.checked = Some(live.settings_open),
                 MenuAction::ToggleFullScreen => row.checked = Some(live.fullscreen),
                 MenuAction::ToggleSeriousMode => row.checked = Some(live.serious_mode),
@@ -809,7 +834,7 @@ pub(crate) struct PaletteState {
 }
 
 impl PaletteState {
-    /// Resolve an action BY NAME — the `action={:?}` token [`OverlayModel::controls_lines`]
+    /// Resolve an action BY NAME — the `action={:?}` token [`Self::controls_lines`]
     /// prints (e.g. `NewTab`) — for the socket `invoke` verb. Refusal names its reason:
     /// a row the live [`PaletteState::resolve`] predicates DISABLED errs as disabled
     /// (never a silent no-op — the same `validateMenuItem:` conditions the native bar
@@ -1355,16 +1380,9 @@ mod tests {
     fn resolve_sets_checkmarks() {
         let mut s = PaletteState::new();
         s.resolve(&PaletteLive {
-            engine_hud: true,
             settings_open: false,
             ..Default::default()
         });
-        let engine = s
-            .rows
-            .iter()
-            .find(|r| r.action == MenuAction::ShowEngineHud)
-            .unwrap();
-        assert_eq!(engine.checked, Some(true));
         let settings = s
             .rows
             .iter()
@@ -2066,8 +2084,6 @@ mod tests {
         };
         let mut s = PaletteState::new();
         s.resolve(&PaletteLive {
-            engine_hud: true,
-            resources_hud: true,
             has_selection: true,
             multi_tab: true,
             ..Default::default()

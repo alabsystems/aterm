@@ -6,7 +6,7 @@
 
 use std::ops::Range;
 
-use crate::bitmap::{SparseBitmap, SparseBitmapRange};
+use crate::bitmap::SparseBitmap;
 
 use super::index::SearchIndex;
 use super::types::SearchMatch;
@@ -15,26 +15,31 @@ use crate::grapheme::ColumnMap;
 /// Source of candidate line numbers for search iteration.
 ///
 /// For short queries (< 3 chars), uses a lazy range to avoid O(n) allocation.
-/// For trigram queries, uses a lazy owned bitmap iterator in either direction.
-/// `BTreeSet`'s consuming iterator is double-ended, so backward navigation does
-/// not need to collect or sort candidate line IDs.
-pub(super) enum CandidateSource<'a> {
+/// For trigram queries, decodes the involved posting lists ONCE (a transient
+/// per-query working set) and drives navigation off the smallest decoded list,
+/// membership-checking the rest with a binary search. The compressed store is
+/// not seekable, so the decode is what makes both directions — and the
+/// double-ended reverse walk — cheap without a per-probe decode.
+pub(super) enum CandidateSource {
     /// Empty source.
     Empty,
-    /// Borrowed posting-list range with lazy membership checks in the other
-    /// query posting lists. Used by case-insensitive forward search.
+    /// Smallest decoded posting list, range-bounded at the navigation cursor,
+    /// with lazy membership checks in the other query posting lists. Used by
+    /// case-insensitive forward search.
     FilteredForward {
-        /// Smallest posting list, range-bounded at the navigation cursor.
-        candidates: SparseBitmapRange<'a>,
-        /// Remaining posting lists that every yielded candidate must occupy.
-        filters: Vec<&'a SparseBitmap>,
+        /// Smallest posting list (decoded), range-bounded at the cursor.
+        candidates: std::vec::IntoIter<u32>,
+        /// Remaining posting lists (decoded ascending) every yielded candidate
+        /// must occupy — probed by binary search.
+        filters: Vec<Vec<u32>>,
     },
     /// Reverse counterpart of [`FilteredForward`](Self::FilteredForward).
     FilteredBackward {
-        /// Smallest posting list, range-bounded at the navigation cursor.
-        candidates: SparseBitmapRange<'a>,
-        /// Remaining posting lists that every yielded candidate must occupy.
-        filters: Vec<&'a SparseBitmap>,
+        /// Smallest posting list (decoded), range-bounded at the cursor.
+        candidates: std::vec::IntoIter<u32>,
+        /// Remaining posting lists (decoded ascending) every yielded candidate
+        /// must occupy — probed by binary search.
+        filters: Vec<Vec<u32>>,
     },
     /// Lazy ascending range of line numbers (for short-query forward search).
     Range(Range<u32>),
@@ -42,36 +47,44 @@ pub(super) enum CandidateSource<'a> {
     RangeRev(std::iter::Rev<Range<u32>>),
 }
 
-impl<'a> CandidateSource<'a> {
+/// Decode the posting lists and split off the smallest as the navigation
+/// driver. The candidate SET (values present in EVERY list) is independent of
+/// which list drives, so choosing the smallest is a pure cost optimization that
+/// preserves byte-identical results.
+fn decode_smallest_first(postings: &[&SparseBitmap]) -> Option<(Vec<u32>, Vec<Vec<u32>>)> {
+    if postings.is_empty() {
+        return None;
+    }
+    let mut decoded: Vec<Vec<u32>> = postings.iter().map(|bitmap| bitmap.to_vec()).collect();
+    decoded.sort_unstable_by_key(Vec::len);
+    let primary = decoded.remove(0);
+    Some((primary, decoded))
+}
+
+impl CandidateSource {
     /// Build a lazy ascending intersection from borrowed posting lists.
-    pub(super) fn from_postings_forward(
-        mut postings: Vec<&'a SparseBitmap>,
-        from_line: u32,
-    ) -> Self {
-        if postings.is_empty() {
+    pub(super) fn from_postings_forward(postings: Vec<&SparseBitmap>, from_line: u32) -> Self {
+        let Some((mut primary, filters)) = decode_smallest_first(&postings) else {
             return Self::Empty;
-        }
-        postings.sort_unstable_by_key(|bitmap| bitmap.len());
-        let primary = postings.remove(0);
+        };
+        let start = primary.partition_point(|&v| v < from_line);
+        primary.drain(..start);
         Self::FilteredForward {
-            candidates: primary.range_from(from_line),
-            filters: postings,
+            candidates: primary.into_iter(),
+            filters,
         }
     }
 
     /// Build a lazy descending intersection from borrowed posting lists.
-    pub(super) fn from_postings_backward(
-        mut postings: Vec<&'a SparseBitmap>,
-        before_line: u32,
-    ) -> Self {
-        if postings.is_empty() {
+    pub(super) fn from_postings_backward(postings: Vec<&SparseBitmap>, before_line: u32) -> Self {
+        let Some((mut primary, filters)) = decode_smallest_first(&postings) else {
             return Self::Empty;
-        }
-        postings.sort_unstable_by_key(|bitmap| bitmap.len());
-        let primary = postings.remove(0);
+        };
+        let end = primary.partition_point(|&v| v < before_line);
+        primary.truncate(end);
         Self::FilteredBackward {
-            candidates: primary.range_before(before_line),
-            filters: postings,
+            candidates: primary.into_iter(),
+            filters,
         }
     }
 
@@ -84,14 +97,12 @@ impl<'a> CandidateSource<'a> {
                 candidates,
                 filters,
             } => candidates
-                .find(|&&candidate| filters.iter().all(|bitmap| bitmap.contains(candidate)))
-                .copied(),
+                .find(|candidate| filters.iter().all(|list| list.binary_search(candidate).is_ok())),
             Self::FilteredBackward {
                 candidates,
                 filters,
             } => candidates
-                .rfind(|&&candidate| filters.iter().all(|bitmap| bitmap.contains(candidate)))
-                .copied(),
+                .rfind(|candidate| filters.iter().all(|list| list.binary_search(candidate).is_ok())),
             Self::Range(range) => range.next(),
             Self::RangeRev(rev) => rev.next(),
         }
@@ -109,7 +120,7 @@ pub(crate) struct SearchMatchIterator<'a> {
     /// The query string.
     query: &'a str,
     /// Candidate line numbers source.
-    candidates: CandidateSource<'a>,
+    candidates: CandidateSource,
     /// Candidate line currently being verified, if any.
     current_line: Option<usize>,
     /// Next byte boundary to search on the current line.
@@ -121,7 +132,7 @@ impl<'a> SearchMatchIterator<'a> {
     pub(super) fn new(
         index: &'a SearchIndex,
         query: &'a str,
-        candidates: CandidateSource<'a>,
+        candidates: CandidateSource,
     ) -> Self {
         Self {
             index,
@@ -150,7 +161,15 @@ impl Iterator for SearchMatchIterator<'_> {
                     }
                 };
                 while let Some(tail) = text.get(self.next_byte..) {
-                    let Some(relative) = tail.find(self.query) else {
+                    // E9b: SIMD memmem for the forward literal verify, matching
+                    // the reverse iterator's `memmem::rfind`. Byte-identical to
+                    // `tail.find(self.query)`: a byte-aligned occurrence of a
+                    // valid-UTF-8 needle in a valid-UTF-8 haystack is necessarily
+                    // char-aligned, so the offset is the same one str::find's
+                    // two-way scan returns — just found with the faster scanner.
+                    let Some(relative) =
+                        memchr::memmem::find(tail.as_bytes(), self.query.as_bytes())
+                    else {
                         break;
                     };
                     let abs_pos = self.next_byte.checked_add(relative)?;
@@ -188,7 +207,7 @@ pub(crate) struct SearchMatchReverseIterator<'a> {
     /// The query string.
     query: &'a str,
     /// Candidate line numbers source (yields in descending order).
-    candidates: CandidateSource<'a>,
+    candidates: CandidateSource,
     /// Candidate line currently being verified, if any.
     current_line: Option<usize>,
     /// Exclusive byte-start boundary for the next overlapping reverse match.
@@ -200,7 +219,7 @@ impl<'a> SearchMatchReverseIterator<'a> {
     pub(super) fn new(
         index: &'a SearchIndex,
         query: &'a str,
-        candidates: CandidateSource<'a>,
+        candidates: CandidateSource,
     ) -> Self {
         Self {
             index,
@@ -256,6 +275,45 @@ impl Iterator for SearchMatchReverseIterator<'_> {
             self.before_byte = usize::MAX;
             #[cfg(test)]
             super::index::count_search_from_line_candidate();
+        }
+    }
+}
+
+#[cfg(test)]
+mod memmem_forward_tests {
+    use crate::SearchIndex;
+
+    /// E9b: the forward case-sensitive literal path (now memmem-backed) yields
+    /// exactly what a str::find reference scan would — same lines, same start
+    /// columns, same order — including overlapping matches and a multi-byte
+    /// UTF-8 needle. Guards the memmem swap against any offset/boundary drift.
+    #[test]
+    fn forward_literal_matches_equal_a_str_find_reference() {
+        let lines = ["BANANA split", "aXaXa here", "café au café", "no hit"];
+        let mut index = SearchIndex::new();
+        for (i, text) in lines.iter().enumerate() {
+            index.index_line(i, text);
+        }
+        for needle in ["ANA", "aX", "café", "X", "z"] {
+            // Reference: str::find sweep per line, column = char index of the
+            // byte offset, advancing one char to preserve overlaps.
+            let mut reference: Vec<(usize, usize)> = Vec::new();
+            for (line, text) in lines.iter().enumerate() {
+                let mut start = 0;
+                while let Some(rel) = text[start..].find(needle) {
+                    let byte = start + rel;
+                    let col = text[..byte].chars().count();
+                    reference.push((line, col));
+                    let step = text[byte..].chars().next().map_or(1, char::len_utf8);
+                    start = byte + step;
+                }
+            }
+            let got: Vec<(usize, usize)> = index
+                .search_with_positions(needle)
+                .into_iter()
+                .map(|m| (m.line, m.start_col))
+                .collect();
+            assert_eq!(got, reference, "needle {needle:?}");
         }
     }
 }

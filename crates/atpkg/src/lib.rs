@@ -34,12 +34,13 @@
 //! [`sig::Reject::Disabled`] before any crypto runs. A plain `cargo build` installs,
 //! verifies, and trusts nothing.
 
-/// The `atpkg` CLI (all verbs), callable in-process by the ONE `aterm` binary.
-pub mod cli;
 pub mod activate;
 pub mod appgate;
 pub mod apply;
 pub mod cache;
+/// The `atpkg` CLI (all verbs), callable in-process by the ONE `aterm` binary.
+pub mod cli;
+pub mod companions;
 pub mod compat;
 pub mod config;
 pub mod cost;
@@ -57,13 +58,16 @@ pub mod kani;
 pub mod linkmode;
 pub mod lock;
 pub mod manifest;
+mod metadata_io;
 pub mod net;
 pub mod ops;
 pub mod pin;
 pub mod platform;
 pub mod relocate;
+pub mod seed;
 pub mod select;
 pub mod sig;
+pub mod sourcebuild;
 pub mod status;
 pub mod store;
 pub mod tree;
@@ -90,7 +94,8 @@ pub use kani::{
     KaniError, nightly_components_ready, relocate_sysroot, wire_kani_link, write_toolchain_version,
 };
 pub use linkmode::{
-    LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_programs, refresh, unlink,
+    LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_checkout_checked,
+    linked_programs, linked_programs_checked, refresh, unlink,
 };
 pub use lock::{StoreLock, StoreLockError, try_lock_store};
 pub use manifest::{
@@ -108,6 +113,12 @@ pub use status::{ProgramStatus, Status};
 pub use store::{Layout, default_prefix, shim_allowed, vet_prefix};
 pub use tree::{sha256_file, tree_root};
 pub use verify::{VerifyOutcome, verify_all, verify_program};
+
+// The batteries-included companion-tools surface (docs/COMPANION-TOOLS.md): the source-build
+// (keyless) lane, complementary to the signed `install --default-set` bootstrap.
+pub use companions::{Companion, Manifest as CompanionManifest, SeedPolicy};
+pub use seed::{Ledger as SeedLedger, SeedResult, SkipReason, reconcile_source};
+pub use sourcebuild::{Installed as SourceInstalled, Provenance, SourceBuildError, build_and_install};
 
 /// The base64 Ed25519 **root** public key this binary trusts, baked in at compile
 /// time from `ATERM_PKG_ROOTKEY`. Empty (the default when the env var is unset at
@@ -131,6 +142,28 @@ pub const PINNED_PKG_ROOTKEY: &str = match option_env!("ATERM_PKG_ROOTKEY") {
 #[must_use]
 pub fn enabled() -> bool {
     !PINNED_PKG_ROOTKEY.is_empty() && std::env::var_os("ATPKG_DISABLE").is_none()
+}
+
+/// Effective CLI posture: a non-empty out-of-band root override is the same
+/// verification anchor the verbs consume, and can therefore enable an
+/// otherwise-unpinned build. This is the shared admission predicate for the
+/// CLI and aterm's native Packages surface.
+#[must_use]
+pub fn manager_enabled() -> bool {
+    manager_enabled_with(
+        PINNED_PKG_ROOTKEY,
+        std::env::var("ATPKG_ROOTKEY_OVERRIDE").ok().as_deref(),
+        std::env::var_os("ATPKG_DISABLE").is_some(),
+    )
+}
+
+#[must_use]
+pub fn manager_enabled_with(pinned: &str, override_key: Option<&str>, disabled: bool) -> bool {
+    !disabled
+        && !override_key
+            .filter(|key| !key.is_empty())
+            .unwrap_or(pinned)
+            .is_empty()
 }
 
 /// A short, dependency-free fingerprint of the pinned root key, so `atpkg doctor` can

@@ -2,17 +2,15 @@
 // Copyright 2026 Andrew Yates
 //
 // Peeking-cat sprites (Sparkle Words v2, `RenderInput.cat_quads` + `cat_atlas`)
-// and the SCENE z-order fix on the CPU renderer. The contract under test:
+// on the CPU renderer. The contract under test:
 //   * empty cat fields (quads empty / atlas absent — and quads empty WITH an
 //     atlas set) are byte-identical to the pre-cat path, also after
 //     `clear_overlays` (the `image plain` contract);
-//   * pass 1c z-order: cat + scene_over sprites draw UNDER the row's glyphs and
-//     UNDER inline images (matching the GPU's `emit_base_pre` stream order —
-//     the fix for the verified scene_over CPU-over/GPU-under divergence);
+//   * pass 1c z-order: cat sprites draw UNDER the row's glyphs and UNDER inline
+//     images (matching the GPU's `emit_base_pre` stream order);
 //   * the cat stamp is NEAREST 1:1 and endpoint-exact (tint 0xFFFFFF + alpha
 //     255 + opaque texels land the EXACT atlas bytes; a checker atlas yields NO
-//     intermediate colours), while `scene_over` STAYS bilinear (a scaled
-//     checker sprite yields interpolated intermediates);
+//     intermediate colours);
 //   * damaged path: a moved cat re-renders with no ghosting (cached == fresh);
 //   * dirty gate: settled (non-empty but EQUAL) cat quads at the same atlas
 //     version gate-hit with zero rows marked; a change marks exactly the
@@ -253,58 +251,6 @@ fn cat_stamp_is_nearest_and_endpoint_exact_at_one_to_one() {
             );
         }
     }
-}
-
-/// The scene z-fix does NOT change the scene's sampling regime: `scene_over`
-/// stays BILINEAR (matching the GPU's LINEAR `scene_sampler`) — a scaled 2×2
-/// checker sprite must produce interpolated intermediate greys — while drawing
-/// UNDER the text (a full-block glyph over the sprite stays pure fg).
-#[test]
-fn scene_over_draws_under_text_and_stays_bilinear() {
-    let Some(mut rend) = renderer() else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    let (cw, ch) = rend.cell_size();
-    let mut term = Terminal::new(2, 8);
-    term.process("\x1b[?25l█".as_bytes());
-
-    let mut input = term.cell_frame(2, 8);
-    input.scene_atlas = Some(Arc::new(checker_atlas(3)));
-    // Scaled dest (16×ch from a 2×2 source) spanning cells 0..2 of row 0.
-    input.scene_over = vec![SpriteQuad {
-        row: 0,
-        x: 0,
-        y: 0,
-        w: (2 * cw) as u16,
-        h: ch as u16,
-        ax: 0,
-        ay: 0,
-        aw: 2,
-        ah: 2,
-        tint: 0x00FF_FFFF,
-        alpha: 255,
-        flip_x: false,
-    }];
-    let f = rend.render_input(&input);
-
-    // Under-text: the block cell is pure fg (the z-fix pin, CPU side).
-    let fg = rgb_to_u32(input.cells[0][0].fg);
-    assert!(
-        cell_pixels(&f, cw, ch, 0, 0).iter().all(|&p| p == fg),
-        "scene_over must draw UNDER the text after the z-fix"
-    );
-    // Bilinear: the uncovered half must contain an interpolated grey — a value
-    // NEAREST could never produce from a black/white checker.
-    let has_intermediate = cell_pixels(&f, cw, ch, 0, 1).iter().any(|&p| {
-        let r = (p >> 16) & 0xff;
-        r > 32 && r < 224
-    });
-    assert!(
-        has_intermediate,
-        "scene_over must STAY bilinear (interpolated greys) — it must not be \
-         folded into the NEAREST cat stamp"
-    );
 }
 
 /// Damaged-path no-ghosting: prime a persistent damage cache with a cat at row

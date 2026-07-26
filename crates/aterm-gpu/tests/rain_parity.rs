@@ -9,7 +9,7 @@
 // the pinned effect-only bar — target <= 1, hard <= 2 — but it additionally
 // exercises the one path cat parity leaves trivial: TINT. The rain ramp makes
 // `SpriteQuad::tint` load-bearing (CPU quantizes the multiply to 8 bits via
-// `(c*f+127)/255`; the GPU multiplies in f32 in `fs_scene_over`), and the
+// `(c*f+127)/255`; the GPU multiplies in f32 in `fs_sprite_over`), and the
 // tests here assert the emission carries non-trivial tints so the pin can
 // never go vacuous (design §9).
 //

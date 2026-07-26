@@ -71,6 +71,24 @@ impl BufferAccess for Grid {
         self.row_text(row)
     }
 
+    /// ONE row lookup for the whole line — the override the trait's doc asks
+    /// for. `Row::is_cell_wide_continuation` is the canonical predicate (it
+    /// reads the cell's own `WIDE_CONTINUATION` flag rather than inferring it
+    /// from a neighbour), so this is both cheaper AND more direct than the
+    /// default's per-cell `is_wide(col - 1)` inference.
+    fn line_wide_continuations(&self, line: i32) -> Option<Vec<bool>> {
+        if line < 0 {
+            // ONE materialization for the whole line — the point of batching.
+            // `Cell::is_wide_continuation` reads the cell's own flag, so this
+            // needs no neighbour inference.
+            return scrollback_row(self, line)
+                .map(|row| row.cells.iter().map(crate::Cell::is_wide_continuation).collect());
+        }
+        let row = line_to_visible_row(line)?;
+        let cols = self.cols();
+        Some((0..cols).map(|c| self.is_wide_continuation_at(row, c)).collect())
+    }
+
     fn is_wide(&self, line: i32, col: u16) -> bool {
         if line < 0 {
             return scrollback_row(self, line)

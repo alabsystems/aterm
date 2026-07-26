@@ -263,8 +263,10 @@ fn real_terminal_reset_identity_resume_and_retirement_refine_the_model() {
     assert_eq!(completed.search_id, after_cancel.search_id);
     assert_eq!(completed.rows_fed, usize::from(ROWS));
 
-    // Completion drops owner state. Presenting the completed search_id cannot
-    // resurrect it: this is a new reset-marked logical stream.
+    // Completion RETIRES the owner cursor (the completed index is retained for
+    // search_summary to read, fed E-1, but is no longer resumable). Presenting
+    // the completed search_id cannot resurrect it: this is a new reset-marked
+    // logical stream.
     let after_completion = terminal
         .search_budgeted("y", true, false, Some(completed.search_id), 0)
         .expect("completed identity is retired");

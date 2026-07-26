@@ -213,7 +213,7 @@ notes    = "kat/katten = cat/cats (consonant doubling handled by suffix 'ten'); 
 class    = "profanity"
 lang     = "sv"
 mode     = "forms"
-forms    = ["fan", "skit", "jävla", "jävlar", "knulla", "knullar", "helvete"]
+forms    = ["fan"]
 cjk      = false
 ambiguous= true
 notes    = "fan = damn/devil (collides with EN 'fan' and the proper name -> ambiguous); skit = shit; jävla/jävlar = fucking/bloody; knulla/knullar = fuck (inf/pres); helvete = hell."
@@ -313,7 +313,7 @@ notes    = "кот=tomcat, кошка=she-cat; котёнок/котята=kitte
 class    = "profanity"
 lang     = "uk"
 mode     = "forms"
-forms    = ["курва","лайно","бляха","хуй","пизда","йобаний","сука"]
+forms    = ["хуй", "пизда", "сука"]
 cjk      = false
 ambiguous= true
 notes    = "курва is shared across many Slavic langs (pl kurwa, cs/sk kurva) so cross-language collision; лайно=shit, бляха(-муха) euphemistic. Cyrillic script."
@@ -331,7 +331,7 @@ notes    = "кіт=tomcat, кішка=she-cat; кошеня/кошенята=kit
 class    = "profanity"
 lang     = "pl"
 mode     = "forms"
-forms    = ["kurwa","chuj","jebany","jebać","pierdolić","gówno","pizda","skurwysyn"]
+forms    = ["gówno", "pizda"]
 cjk      = false
 ambiguous= true
 notes    = "kurwa is the flagship Polish expletive but the form is shared with cs/sk (kurva) — cross-language collision. chuj=dick, jebany/jebać/pierdolić verbal, gówno=shit."
@@ -349,7 +349,7 @@ notes    = "kot=cat (masc), kotka=she-cat; kotek/kociak/kicia diminutives ('kitt
 class    = "profanity"
 lang     = "cs"
 mode     = "forms"
-forms    = ["kurva","hovno","prdel","do prdele","kunda","jebat","zkurvený","sráč"]
+forms    = ["prdel", "kunda", "jebat"]
 cjk      = false
 ambiguous= true
 notes    = "kurva shared with sk/pl(kurwa). hovno=shit, do prdele='to the arse' (very common interjection), kunda vulgar, jebat verbal."
@@ -362,15 +362,6 @@ forms    = ["kočka","kočky","kotě","koťata","kocour","kočička","kočičky"
 cjk      = false
 ambiguous= false
 notes    = "kočka=cat (default fem), kocour=tomcat; kotě/koťata=kitten(s); kočička/číča affectionate 'kitty'. kočka is also slang for an attractive woman."
-
-[[entry]]
-class    = "profanity"
-lang     = "sk"
-mode     = "forms"
-forms    = ["kurva","jebať","piča","do piče","hovno","skurvený","sráč"]
-cjk      = false
-ambiguous= true
-notes    = "kurva shared with cs/pl. jebať verbal, piča/do piče vulgar, hovno=shit."
 
 [[entry]]
 class    = "feline"
@@ -439,7 +430,7 @@ notes    = "mačka=cat; mače=kitten; maca/mačić/mačkica 'kitty'. maca collid
 class    = "profanity"
 lang     = "lt"
 mode     = "forms"
-forms    = ["šūdas","šūdai","velnias","po velnių","rupūžė","kurva"]
+forms    = ["velnias", "po velnių", "rupūžė"]
 cjk      = false
 ambiguous= true
 notes    = "Lithuanian has weak native swearing; šūdas=shit is the main one. velnias=devil and rupūžė=toad are everyday words used as mild curses (ambiguous, not exclusively profane); kurva is a Slavic loan."
@@ -457,7 +448,7 @@ notes    = "katė=cat (fem), katinas=tomcat; kačiukas/kačiukai=kitten(s); katy
 class    = "profanity"
 lang     = "lv"
 mode     = "forms"
-forms    = ["mēsls","mēsli","sūds","velns","dirsa","pakaļa"]
+forms    = ["velns", "pakaļa"]
 cjk      = false
 ambiguous= true
 notes    = "Latvian mild swearing: mēsls/mēsli (dung/trash) and sūds=shit are the common expletives; velns=devil and pakaļa=behind are ordinary words used as curses (ambiguous, not exclusively profane); dirsa vulgar."
@@ -574,7 +565,7 @@ lang     = "eu"
 mode     = "forms"
 cjk      = false
 ambiguous= true
-forms    = ["kaka","kakazaharra","puta","puta","ostia","alua","zakil"]
+forms    = ["kaka", "puta", "ostia"]
 notes    = "Basque has no native single 'fuck' verb; strongest native expletive is kaka (shit) / kaka zaharra ('old shit'). puta (whore), ostia (< Sp. hostia), alu(a) (cunt), zakil (dick) are heavily used, mostly Spanish-influenced. AMBIGUOUS: puta/puta and ostia collide with Spanish profanity; kaka collides with et/eu seed and child-speak 'poop' in several languages."
 
 [[entry]]
@@ -594,7 +585,7 @@ lang     = "ar"
 mode     = "forms"
 cjk      = false
 ambiguous= true
-forms    = ["نيك","ينيك","لعنة","خرا","خراء","كس","كسمك","طيز"]
+forms    = ["لعنة", "كس", "طيز"]
 notes    = "Real Arabic expletives: نيك (fuck) + inflection ينيك; كس/كسمك and طيز are crude colloquial. لعنة=curse/damn, خرا(ء)=shit. ambiguous: نيك resembles transliterated name 'Nick'; طيز/كس spellings overlap with benign roots in some dialects. Listed without ال/و/ب clitics."
 
 [[entry]]
@@ -613,7 +604,7 @@ lang     = "he"
 mode     = "forms"
 cjk      = false
 ambiguous= true
-forms    = ["זין","חרא","כוס","זיון","לזיין","בן זונה"]
+forms    = ["זין", "כוס"]
 notes    = "זין=dick (also = letter zayin / 'weapon', collision); חרא=shit; כוס=cunt — identical spelling to כּוֹס 'cup/glass', strong collision; זיון/לזיין=fuck (noun/inf); בן זונה=son of a whore. Without ה/ו clitics."
 
 [[entry]]
@@ -632,7 +623,7 @@ lang     = "fa"
 mode     = "forms"
 cjk      = false
 ambiguous= true
-forms    = ["کیر","کس","تخمی","ریدم","کونی","جنده","کسکش"]
+forms    = ["کس"]
 notes    = "کیر=dick; کس=cunt — also کَس='person/somebody', strong collision; تخمی=crappy; ریدم=I shat; کونی=faggot(slur); جنده=whore; کسکش=pimp. Persian script (shared with ur but distinct vocab)."
 
 [[entry]]
@@ -689,7 +680,7 @@ lang     = "bn"
 mode     = "forms"
 cjk      = false
 ambiguous= true
-forms    = ["বাল","মাগি","চোদা","খানকি","বাঞ্চোত","শালা"]
+forms    = ["বাল", "শালা"]
 notes    = "বাল=pubic hair (mild expletive), মাগি=slut, চোদা=fuck, খানকি=whore, বাঞ্চোত=sisterfucker, শালা=mild abuse — literally 'brother-in-law', so collides with the kinship term."
 
 [[entry]]
@@ -883,7 +874,7 @@ notes    = "Plural by reduplication (kucing-kucing); kitten is multiword 'anak k
 class    = "profanity"
 lang     = "ms"
 mode     = "forms"
-forms    = ["pukimak", "pundek", "babi", "sial", "bangsat", "anjing", "lancau"]
+forms    = ["babi", "sial", "anjing"]
 cjk      = false
 ambiguous= true
 notes    = "pukimak (~'your mother's cunt') and pundek/lancau are the strong Malay expletives. babi (lit. 'pig'), sial (lit. 'unlucky/damn') and anjing (lit. 'dog') are also ordinary words -> ambiguous within-language. Shares anjing/bangsat with Indonesian."
@@ -903,7 +894,7 @@ notes    = "Plural via reduplication; kitten = multiword 'anak kucing'. Essentia
 class    = "profanity"
 lang     = "sw"
 mode     = "forms"
-forms    = ["tomba", "kutomba", "mavi", "shenzi", "kuma", "kumamako", "mkundu"]
+forms    = ["kuma"]
 cjk      = false
 ambiguous= true
 notes    = "tomba/kutomba is the literal 'fuck' verb. mavi=shit, shenzi=savage/barbaric (insult), kuma=vulgar vagina, kumamako='your mother's...', mkundu=anus. 'kuma' collides with name/word in other langs (e.g. Japanese kuma=bear) -> ambiguous."
@@ -923,7 +914,7 @@ notes    = "N-class noun: singular and plural both 'paka'. Kitten = 'paka mdogo'
 class    = "profanity"
 lang     = "tl"
 mode     = "forms"
-forms    = ["putangina", "tangina", "putang ina", "gago", "gaga", "puta", "tarantado"]
+forms    = ["gago", "gaga", "puta"]
 cjk      = false
 ambiguous= true
 notes    = "putangina (~'your mother is a whore') is the strongest general-purpose expletive; tangina/putang ina are its contraction/full form. gago/gaga=fool (m/f). 'puta' and 'gago' collide with Spanish/Portuguese -> ambiguous."
@@ -943,7 +934,7 @@ notes    = "pusa=cat; 'pusang' is pusa + ligature -ng; plural is analytic 'mga p
 class    = "profanity"
 lang     = "af"
 mode     = "forms"
-forms    = ["fok", "fokken", "fokof", "fokop", "gefok", "kak", "poes", "naai", "doos"]
+forms    = ["kak", "poes", "naai", "doos"]
 cjk      = false
 ambiguous= true
 notes    = "fok is the real 'fuck' (fokken=fucking, fokof=fuck off, fokop=fuck up, gefok=fucked); kak=shit, poes=cunt, naai=screw, doos=cunt/idiot. poes/naai/doos are ordinary Dutch words (cat/pussy, sew, box) and 'kak' too -> ambiguous via Dutch collision."
@@ -986,3 +977,159 @@ notes    = "kucing=cat (shared with id/ms); kitten = 'kucing cilik' (small cat) 
 # product decision — earlier hype-oriented seeds were removed). The
 # class exists so user words flow in via [sparkle_words.emphasis].extra_words
 # (or a lexicon override file) with zero lexicon changes.
+
+
+# ===================== profanity: un-gated split (2026-07-24) =====================
+# These surfaces were previously trapped behind `ambiguous = true` alongside
+# genuine homographs, so 18 languages' profanity NEVER LOADED on the shipped
+# default (`languages = ["en"]`) — 97 of 323 surfaces, 30%. Polish `kurwa`,
+# Arabic, Hebrew, Persian, Bengali, Swedish and Tagalog all silently had no
+# f-bomb. The gate is real and stays on the surfaces that earn it (Swedish
+# `fan` vs English "fan", Hebrew `כוס` = cup, zh 操/草/干 = everyday words,
+# Romanian `fut` prefixing "future"); it does NOT belong on a surface whose
+# only collision is with ANOTHER language's profanity, which fires profanity
+# either way.
+
+[[entry]]
+class    = "profanity"
+lang     = "sv"
+mode     = "forms"
+forms    = ["jävla", "jävlar", "knulla", "knullar", "helvete", "skit"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "uk"
+mode     = "forms"
+forms    = ["курва", "лайно", "бляха", "йобаний"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "pl"
+mode     = "forms"
+forms    = ["kurwa", "chuj", "jebany", "jebać", "pierdolić", "skurwysyn"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "cs"
+mode     = "forms"
+forms    = ["kurva", "hovno", "do prdele", "zkurvený", "sráč"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "sk"
+mode     = "forms"
+forms    = ["kurva", "jebať", "piča", "do piče", "hovno", "skurvený", "sráč"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "lt"
+mode     = "forms"
+forms    = ["šūdas", "šūdai", "kurva"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "lv"
+mode     = "forms"
+forms    = ["mēsls", "mēsli", "sūds", "dirsa"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "eu"
+mode     = "forms"
+forms    = ["kakazaharra", "alua", "zakil"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "ar"
+mode     = "forms"
+forms    = ["نيك", "ينيك", "خرا", "خراء", "كسمك"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "he"
+mode     = "forms"
+forms    = ["חרא", "זיון", "לזיין", "בן זונה"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "fa"
+mode     = "forms"
+forms    = ["کیر", "تخمی", "ریدم", "کونی", "جنده", "کسکش"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "bn"
+mode     = "forms"
+forms    = ["মাগি", "চোদা", "খানকি", "বাঞ্চোত"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "ms"
+mode     = "forms"
+forms    = ["pukimak", "pundek", "lancau", "bangsat"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "sw"
+mode     = "forms"
+forms    = ["tomba", "kutomba", "mavi", "shenzi", "kumamako", "mkundu"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "tl"
+mode     = "forms"
+forms    = ["putangina", "tangina", "putang ina", "tarantado"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "af"
+mode     = "forms"
+forms    = ["fok", "fokken", "fokof", "fokop", "gefok"]
+cjk      = false
+ambiguous= false
+notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."

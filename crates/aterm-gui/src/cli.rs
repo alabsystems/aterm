@@ -104,6 +104,7 @@ const KEYS_HELP: &str = concat!(
     "    Cmd-click         Open a hyperlink / detected URL (http/https/mailto).\n",
     "    Cmd-F             Find (screen + scrollback): type, Enter/Shift-Enter, Esc.\n",
     "    Cmd-S / Cmd-R     Emacs search forward / backward; repeat to navigate + wrap.\n",
+    "    Cmd-,             Open the native Settings tab; Manual edits aterm.toml.\n",
     "    Cmd-N             Open a new window (separate process).\n",
     "    Cmd-T             Open a new tab (new shell, same window).\n",
     "    Cmd-W             Close the active tab; closing the last tab quits.\n",
@@ -119,8 +120,8 @@ const KEYS_HELP: &str = concat!(
     "    Ctrl+= / Ctrl+-      Zoom the font in / out.   Ctrl+0  Reset zoom.\n",
     "    Ctrl+click           Open a hyperlink / detected URL (http/https/mailto).\n",
     "    Ctrl+Shift+F         Find (screen + scrollback): type, Enter/Shift-Enter, Esc.\n",
-    "    Ctrl+Shift+S         Settings: edit config live (arrows move, Enter/Space\n",
-    "                         toggle/cycle, Esc closes). This IS \"Preferences\".\n",
+    "    Ctrl+Shift+S         Open the native Settings tab on Top Settings.\n",
+    "                         Use Manual there for assisted aterm.toml editing.\n",
     "    Ctrl+Shift+A         About: name / version / build in a simple info dialog\n",
     "                         (OK, the close dot, or Esc closes). This IS the \"About\" menu.\n",
     "    Ctrl+Shift+N         Open a new window (separate process).\n",
@@ -154,7 +155,7 @@ const HELP_TAIL: &str = concat!(
     "    CLAUDE*, ANTHROPIC_*, COPILOT_*, CODEX_*, CURSOR_*, AI_*, and _DEVTOOL_* — so they\n",
     "    never leak into your session. An inner agent whose context vars went missing was\n",
     "    sanitized here by design (aterm_types::env_sanitize), not lost.\n\n",
-    "CONFIG:  ~/.config/aterm/aterm.toml  (hot-reloaded; precedence env > config > default)\n",
+    "CONFIG:  ~/.config/aterm/aterm.toml  (live settings reload; launch/session settings disclose their timing; precedence env > config > default)\n",
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
     "              palette [array of #RRGGBB], window_theme, tab_strip_rows.\n",
@@ -170,7 +171,8 @@ const HELP_TAIL: &str = concat!(
     "              (the LUMEN aurora), cursor_trail_color/_accent/_intensity/_radius,\n",
     "              cursor_trail_ms/_length/_ring, cursor_trail_bloom (+_strength/_radius),\n",
     "              trail_sounds, trail_sound_volume (the styles' sound palettes),\n",
-    "              trail_sound_bed (the ambient background texture; default off).\n",
+    "              trail_sound_bed (the ambient background texture; default off),\n",
+    "              trail_sound_style (auto | mechanical — the typing-sound palette).\n",
     "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
     "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
     "              stem_gamma (aliases $ATERM_STEM_GAMMA),\n",
@@ -182,7 +184,6 @@ const HELP_TAIL: &str = concat!(
     "  Behaviour   gpu, scrollback_lines, columns, lines, copy_on_select,\n",
     "              option_as_meta, search_history_lines, focus_boost (Windows:\n",
     "              shell priority follows window focus; default on).\n",
-    "  HUD         show_resources_hud, show_engine_hud.\n",
     "  Security    allow_window_ops, allow_notifications, allow_palette_reconfigure,\n",
     "              allow_kitty_file_transfer  (all opt-in, default off).\n",
     "  Keys        [keybindings] \"chord\"=\"action\"; [key_sequences] \"chord\"=raw bytes.\n",
@@ -190,11 +191,12 @@ const HELP_TAIL: &str = concat!(
 
 /// A documented starter config written by `--write-config`. Linux-tuned (real
 /// key names, sensible non-macOS defaults); EVERY line is commented, so writing it
-/// changes nothing — it just makes the (hot-reloading) settings surface
+/// changes nothing — it just makes the settings surface
 /// DISCOVERABLE for a new user who has no `aterm.toml` yet.
 const STARTER_CONFIG: &str = "\
 # aterm — ~/.config/aterm/aterm.toml
-# Every setting is optional; uncomment to override. Edits hot-reload on save.
+# Every setting is optional; uncomment to override. Live settings reload on save;
+# renderer/initial-grid settings require relaunch, and session settings require a new session.
 # Environment (ATERM_*) and CLI flags take precedence over this file.
 
 # --- shell --------------------------------------------------------------------
@@ -218,14 +220,14 @@ const STARTER_CONFIG: &str = "\
 # theme = \"Default\"               # a built-in scheme, or \"dark:<name>,light:<name>\"
 # foreground = \"#C8D3F5\"
 # background = \"#1A1B26\"
-# cursor_style = \"block\"          # block | bar | underline
+# cursor_style = \"block\"          # block | bar
 # cursor_blink = true
 # selection_color = \"#33415E\"
 # selection_foreground = \"#FFFFFF\" # selected-text ink; unset = auto contrast floor
 # selection_inactive = false       # dim the selection band while the window is unfocused
-# window_colorspace = \"srgb\"       # GPU present tag: srgb (colour-managed) | display-p3 (legacy stretched)
+# window_colorspace = \"srgb\"       # macOS GPU CAMetalLayer tag: srgb (colour-managed) | display-p3 (legacy stretched)
 # minimum_contrast = 1.0           # per-cell WCAG contrast floor, 1.0 (off) ..= 21.0
-# background_opacity = 1.0         # window glass, 0.0 (transparent) ..= 1.0 (solid); <1.0 auto-floors contrast to 4.5:1 (GPU only)
+# background_opacity = 1.0         # macOS GPU window glass, 0.0 (transparent) ..= 1.0 (solid); other renderers stay solid; <1.0 auto-floors contrast to 4.5:1
 # background_material = \"none\"     # macOS vibrancy behind glass: none | hud | sidebar | under-window
 # window_padding = 12.0            # interior padding, logical px per edge (0..=64; hot-applies)
 # window_padding_top = 2.0         # tighter TOP-edge override (0..=window_padding; the titlebar band supplies the rest)
@@ -257,7 +259,7 @@ const STARTER_CONFIG: &str = "\
 
 # --- motion / cursor aurora -----------------------------------------------------
 # serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off
-# motion = \"auto\"                 # auto (follow OS Reduce Motion) | full | reduced
+# motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown (default ON)
 # cursor_trail_style = \"nyan rainbow\"  # nyan rainbow (banded rainbow ribbon; a blinking block twinkles like a little star; DEFAULT) | phaser (full-spectrum additive hue sweep) | comet (cadence-comet body + light crown) | lumen | sparkle | fire | laser | water | beam (steady power-down tube of cool light) | off
@@ -267,23 +269,26 @@ const STARTER_CONFIG: &str = "\
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
 # cursor_trail_intensity = 0.7         # aurora brightness 0.0..=1.0
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0.0..=2.0)
+# cursor_trail_wake_ms = 300           # nyan TYPING WAKE: ms of recent travel the
+#                                      # plume under your words shows (0 = off, max 1500)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
-# trail_sounds = true              # the trail styles' signature SOUND palettes (droplets, crackle, chimes, the beam's hum) on the same spawn edge as the light; silent whenever the trail is (default ON)
+# trail_sounds = true              # macOS-only trail-style audio (parsed but inert elsewhere); silent whenever the trail is (default ON)
 # trail_sound_volume = 0.4         # 0.0..=1.0 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell)
 # trail_sound_bed = false          # the continuous ambient BED texture behind the notes (default OFF; true re-enables the per-style drone)
+# trail_sound_style = \"auto\"     # typing-sound palette: auto = follow the trail style; mechanical = keyboard click + thock (aliases: mech, thock)
 # cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
 # cursor_trail_bloom_strength = 0.85   # 0.0..=3.0 (halo intensity)
 # cursor_trail_bloom_radius = 2.2      # 0.5..=8.0 (half-res blur texels)
 # cursor_fire_shimmer = true           # GPU-only heat-haze refraction above burning cells (default ON)
 # hdr_glow = true                      # EDR cursor glow above SDR white (GPU + HDR panel, macOS EDR or Windows scRGB; provably inert on SDR; default ON)
-# cursor_glow_sdr_boost = 0.25         # SDR crown strength 0..=1 on non-HDR desktops (dark themes only — light themes self-degrade; 0 = off)
-# stream_fade = true               # streamed output fades in (\"ink that dries\"; DEFAULT OFF; obeys Reduce Motion)
+# cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only — light themes self-degrade; 0 = off)
+# stream_fade = true               # set true to enable streamed-output fade-in (default OFF; obeys Reduce Motion)
 # stream_fade_ms = 90              # fade-in duration in ms (16..=1000)
 # temporal_recording = false       # record a per-session replay spine (query via `aterm-ctl temporal [tick]`); default off, costs memory
 
 # --- text shaping -------------------------------------------------------------
 # ligatures = true                 # programming ligatures (=>, !=, >=, ===, ...)
-# cursor_break_ligatures = false   # render the cursor cell per-cell (cursor never sits on a ligature)
+# cursor_break_ligatures = true    # break the cursor cell out of ligatures (default false leaves ligatures intact)
 # line_height = 1.0                # cell-box multiplier 0.8..=2.0 (leading splits half above/below)
 # adjust_baseline = 0              # px baseline escape hatch (±32) for off-metric faces
 # adjust_underline_position = 0    # px underline shift (±32, + = down) over the font's post table
@@ -305,24 +310,22 @@ const STARTER_CONFIG: &str = "\
 # copy_on_select = true            # auto-copy mouse selection to clipboard (DEFAULT on; false opts out)
 # show_build_badge = false         # OPTIONAL floating top-right v<version>·<build> pill — DEFAULT off
                                    # (the version lives in the menu bar: the v<version> menu opens About)
-# confirm_multiline_paste = true   # confirm a multi-line paste when bracketed paste is off
+# confirm_multiline_paste = true   # macOS/Windows: confirm unbracketed multiline paste; preserved but no prompt elsewhere
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
-# show_resources_hud = true        # bottom HUD: system CPU/mem/net (reads /proc) — DEFAULT on
-# show_engine_hud = true           # bottom HUD: aterm's own render speed/memory — DEFAULT on (false opts out)
 
 # --- security opt-ins (all default OFF) ---------------------------------------
-# allow_window_ops = false
+# allow_window_ops = false         # XTWINOPS title/text-grid-size reports; GUI manipulation and most geometry requests are ignored
 # allow_notifications = false
 # allow_palette_reconfigure = false
 # allow_kitty_file_transfer = false
 
 # --- sparkle words (purely visual; NEVER affects copied text, logs, or recordings)
 # Decorate matched words: a randomized SPARKLE over profanity (the \"fuck\" family in
-# every major language), a steady CAT-PAW over cat/kitty words, and a randomized SPLASH
-# of water droplets over orca/cetacean words. Distinct, independently customizable
-# effects. ALL THREE are ON by default. Set `enabled = false` (whole feature) or a
-# category's `enabled = false` to silence; `toggle_sparkle_words` is the instant panic-off.
-# Bind the keybinding action \"toggle_sparkle_words\" for an instant panic-off.
+# every major language) and a steady CAT-PAW over cat/kitty words. Both live toys are
+# ON by default. Retained orca/cetacean settings parse for compatibility but are suspended
+# and have no effect. Use the independent Sparkle words and Keyword kitties
+# switches in Settings, or set a live category's `enabled = false` here, to
+# silence either product. The retained master `enabled = false` silences both.
 # [sparkle_words]
 # enabled = true                   # master switch (default ON; false → byte-identical render)
 # languages = [\"en\"]               # un-gate ambiguous homographs (fr \"chat\", de \"Kater\"); [\"all\"] = every language
@@ -337,7 +340,7 @@ const STARTER_CONFIG: &str = "\
 #                                  #   episodes escalate to the FUCK SUPER NOVA (supernova_chance)
 #                                  #   | \"nova\" = the v2 classic nova (one flash per appearance,
 #                                  #   WCAG-limited to <= 2 ignitions/s window-wide) | \"sparkle\" = v1
-# supernova_chance = 10            # rainbow-only escalation chance, percent (0..=100; 0 disables)
+# supernova_chance = 30            # rainbow-only escalation chance, percent (0..=100; 0 disables)
 # magic = true                     # Quasar (1/512) / Singularity (1/1024) rare nova variants
 # palette = [\"#ffd447\", \"#ff7ce5\", \"#7cf0ff\"]   # sparkle tints; empty → lively hue rotation
 # density = 3                      # sparks per word per frame (1..=12)
@@ -348,25 +351,15 @@ const STARTER_CONFIG: &str = "\
 # ignore_words = [\"fluff\"]         # never decorate these as profanity
 # [sparkle_words.feline]
 # enabled = true                   # the friendly default (takes effect only when master on)
-# style = \"cat\"                    # \"cat\" = the v2 peeking cat | \"paw\" = the v1 steady paw
-#                                  # NOTE: below cell_h 14px / cell_w 7px the cat auto-falls back to the paw
-# idle = true                      # blink/ear-twitch one-shots (<= 1 event/s, focus-gated;
-#                                  #   false => exact 0% between damage)
-# gaze = true                      # pupils track the cursor (present-driven, zero new wakes;
-#                                  #   reduced_motion => centered pupils, no tracking)
+# style = \"cat\"                    # \"cat\" is the only graphic mode; legacy \"paw\" is
+#                                  #   ink-only and renders no paw graphic (Manual-only)
 # magic = true                     # Fortune (1/512) / Nebula (1/1024) rare cats
-# color = \"#f7a8b8\"                # paw tint
-# intensity = 0.7
 # allow_bare_cat = true            # DEFAULT on: decorate the literal 3-letter \"cat\" (also the shell command)
 # cjk_single_char = false          # decorate a lone 猫 anywhere (high false-positive rate)
 # log = true                       # record sightings into the Kitty Log collection book
-#                                  #   (kitty-log.toml beside aterm.toml; Settings › Kitty Log)
+#                                  #   (machine-owned kitty-log.toml beside aterm.toml)
 # extra_words = [\"mittens\"]        # extra words to treat as feline
 # ignore_words = [\"cats\"]          # never decorate these as feline
-# [sparkle_words.orca]
-# enabled = true                   # NOTE: the orca class is SUSPENDED in v3 (soft gate; the knob
-# extra_words = [\"narwhal\"]        #   is kept for the orca redo) — extra words still parse
-# ignore_words = [\"orca\"]          # never decorate these as orca
 # [[sparkle_words.custom]]         # v3 custom word effects: data, not code (repeatable block)
 # words = [\"ultrathink\"]           # surfaces (2-char+ ok — explicit config is consent; CJK ok)
 # ink = { colorway = \"rainbow\" }   # or \"twotone:#RRGGBB,#RRGGBB\"; omit for no ink
@@ -408,13 +401,8 @@ const STARTER_CONFIG: &str = "\
 #                                  #   there is no \"keep\" — nothing animates forever)
 # suppress_in_alt_screen = false   # true → fullscreen TUIs (vim/less/htop/claude) never rain
 # output_material = true           # supported literal codepoints from REAL output; current composer band protected
-# materialize = false              # v1: parsed but INERT — the condense-from-rain sweep
-#                                  #   is deferred until its flash gates land (design §14)
 # turn_wave = true                 # synchronized head sweep when the agent's turn completes
 # bell_alert = true                # visual bell → 2 s constant-luminance amber hue ramp
-# ink_text = false                 # v1: parsed but INERT — occupied-cell recolour is v1.1
-# phosphor = false                 # v1: parsed but INERT — the GPU luxe glow layer is
-#                                  #   deferred until measured green (design §14)
 # seed = 0                         # 0 = stable per-window field; nonzero = reproducible
 
 # --- bundled ALab toolchain manager (atpkg): the SAME table the co-located `atpkg`
@@ -474,6 +462,18 @@ fn flag_value(flag: &str, args: &mut impl Iterator<Item = String>) -> String {
             std::process::exit(2);
         }
     }
+}
+
+fn valid_font_px_flag(value: &str) -> bool {
+    value
+        .parse::<f32>()
+        .is_ok_and(|px| px.is_finite() && (crate::FONT_PX_MIN..=crate::FONT_PX_MAX).contains(&px))
+}
+
+fn valid_initial_dimension_flag(value: &str, min: u16, max: u16) -> bool {
+    value
+        .parse::<u16>()
+        .is_ok_and(|dimension| (min..=max).contains(&dimension))
 }
 
 /// CLI: `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`.
@@ -611,10 +611,14 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             // --- ATERM_* knobs promoted to first-class flags (flag > env). ---
             "--font-px" => {
                 let v = flag_value("--font-px", &mut args);
-                if v.parse::<f32>().map(|p| p.is_finite()).unwrap_or(false) {
+                if valid_font_px_flag(&v) {
                     flag_env("ATERM_FONT_PX", &v);
                 } else {
-                    eprintln!("aterm-gui: --font-px expects a number, got '{v}' (try --help)");
+                    eprintln!(
+                        "aterm-gui: --font-px expects a number from {} through {}, got '{v}' (try --help)",
+                        crate::FONT_PX_MIN,
+                        crate::FONT_PX_MAX,
+                    );
                     std::process::exit(2);
                 }
             }
@@ -639,7 +643,13 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                     std::process::exit(2);
                 }
             }
-            "--gpu" => flag_env("ATERM_GPU", "1"),
+            "--gpu" => {
+                // Symmetric last-flag-wins precedence: an inherited or earlier
+                // --cpu must not outrank this explicit later flag.
+                // SAFETY: startup, single-threaded (see flag_env).
+                unsafe { std::env::remove_var("ATERM_CPU") };
+                flag_env("ATERM_GPU", "1");
+            }
             // CPU override: clear any inherited/earlier ATERM_GPU so the GPU path
             // is not taken (config `gpu = true` still loses to an explicit --cpu).
             "--cpu" => {
@@ -665,19 +675,23 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             "--headless" => flag_env("ATERM_HEADLESS", "1"),
             "--columns" => {
                 let v = flag_value("--columns", &mut args);
-                if v.parse::<u16>().is_ok() {
+                if valid_initial_dimension_flag(&v, 20, 500) {
                     flag_env("ATERM_COLUMNS", &v);
                 } else {
-                    eprintln!("aterm-gui: --columns expects an integer, got '{v}' (try --help)");
+                    eprintln!(
+                        "aterm-gui: --columns expects an integer from 20 through 500, got '{v}' (try --help)"
+                    );
                     std::process::exit(2);
                 }
             }
             "--lines" => {
                 let v = flag_value("--lines", &mut args);
-                if v.parse::<u16>().is_ok() {
+                if valid_initial_dimension_flag(&v, 5, 300) {
                     flag_env("ATERM_LINES", &v);
                 } else {
-                    eprintln!("aterm-gui: --lines expects an integer, got '{v}' (try --help)");
+                    eprintln!(
+                        "aterm-gui: --lines expects an integer from 5 through 300, got '{v}' (try --help)"
+                    );
                     std::process::exit(2);
                 }
             }
@@ -743,6 +757,61 @@ mod tests {
     }
 
     #[test]
+    fn font_px_flag_accepts_exact_runtime_domain_only() {
+        for accepted in ["6", "12.5", "200"] {
+            assert!(super::valid_font_px_flag(accepted), "{accepted}");
+        }
+        for rejected in ["5.99", "201", "500", "NaN", "inf", "nope"] {
+            assert!(!super::valid_font_px_flag(rejected), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn initial_dimension_flags_accept_exact_documented_domains_only() {
+        for accepted in ["20", "80", "500"] {
+            assert!(
+                super::valid_initial_dimension_flag(accepted, 20, 500),
+                "columns {accepted}"
+            );
+        }
+        for rejected in ["0", "1", "19", "501", "65536", "nope"] {
+            assert!(
+                !super::valid_initial_dimension_flag(rejected, 20, 500),
+                "columns {rejected}"
+            );
+        }
+        for accepted in ["5", "24", "300"] {
+            assert!(
+                super::valid_initial_dimension_flag(accepted, 5, 300),
+                "lines {accepted}"
+            );
+        }
+        for rejected in ["0", "1", "4", "301", "65536", "nope"] {
+            assert!(
+                !super::valid_initial_dimension_flag(rejected, 5, 300),
+                "lines {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_and_cpu_flag_arms_are_symmetric_last_writer_wins() {
+        let source = include_str!("cli.rs");
+        let gpu = source
+            .split_once("\"--gpu\" => {")
+            .and_then(|(_, tail)| tail.split_once("\"--cpu\" =>"))
+            .map(|(arm, _)| arm)
+            .expect("GPU flag arm");
+        assert!(gpu.contains("remove_var(\"ATERM_CPU\")"));
+        let cpu = source
+            .split_once("\"--cpu\" => {")
+            .and_then(|(_, tail)| tail.split_once("\"--containment\" =>"))
+            .map(|(arm, _)| arm)
+            .expect("CPU flag arm");
+        assert!(cpu.contains("remove_var(\"ATERM_GPU\")"));
+    }
+
+    #[test]
     fn every_advertised_verb_is_dispatchable() {
         // Each advertised verb must have a real `"<flag>" =>` match arm in this
         // file (the dispatch side). Reading the source keeps the gate honest
@@ -778,6 +847,47 @@ mod tests {
                 "the env-hygiene note must name the {prefix} deny prefix"
             );
         }
+    }
+
+    #[test]
+    fn starter_config_discloses_timing_defaults_and_platform_limits() {
+        let line_for = |key: &str| {
+            super::STARTER_CONFIG
+                .lines()
+                .find(|line| line.trim_start().starts_with(&format!("# {key} =")))
+                .unwrap_or_else(|| panic!("missing starter line for {key}"))
+        };
+
+        assert!(super::HELP_TAIL.contains("launch/session settings disclose their timing"));
+        assert!(
+            super::STARTER_CONFIG.contains(
+                "renderer/initial-grid settings require relaunch, and session settings require a new session"
+            )
+        );
+
+        let cursor_break = line_for("cursor_break_ligatures");
+        assert!(cursor_break.contains("= true"), "{cursor_break}");
+        assert!(cursor_break.contains("default false"), "{cursor_break}");
+
+        let colorspace = line_for("window_colorspace");
+        assert!(
+            colorspace.contains("macOS GPU CAMetalLayer"),
+            "{colorspace}"
+        );
+        let opacity = line_for("background_opacity");
+        assert!(opacity.contains("macOS GPU window glass"), "{opacity}");
+        assert!(opacity.contains("other renderers stay solid"), "{opacity}");
+        let audio = line_for("trail_sounds");
+        assert!(audio.contains("macOS-only"), "{audio}");
+        assert!(audio.contains("inert elsewhere"), "{audio}");
+        let sdr_glow = line_for("cursor_glow_sdr_boost");
+        assert!(sdr_glow.contains("GPU-only"), "{sdr_glow}");
+        let stream_fade = line_for("stream_fade");
+        assert!(stream_fade.contains("set true to enable"), "{stream_fade}");
+        assert!(stream_fade.contains("default OFF"), "{stream_fade}");
+        let paste = line_for("confirm_multiline_paste");
+        assert!(paste.contains("macOS/Windows"), "{paste}");
+        assert!(paste.contains("no prompt elsewhere"), "{paste}");
     }
 
     #[test]
@@ -877,14 +987,25 @@ mod tests {
                  `[table]` header? Keep all bare top-level keys ABOVE every table."
             );
         }
-        // The M2 "ink that dries" keys are default-ON, so the ONLY discoverable
-        // way to turn the fade off is the starter config — guard that they never
-        // silently drop out of it again.
+        // The M2 "ink that dries" keys default OFF in an absent config; the
+        // generated starter file opts in. Guard that this intentional starter
+        // choice and its duration never silently drop out of the sample.
         for must in ["stream_fade", "stream_fade_ms"] {
             assert!(
                 checked.iter().any(|k| k == must),
-                "STARTER_CONFIG dropped `{must}` — the default-on stream fade has no \
-                 other discoverable off switch."
+                "STARTER_CONFIG dropped `{must}` — keep the explicit starter-file \
+                 stream-fade opt-in and its duration together."
+            );
+        }
+        for inert in [
+            "[sparkle_words.orca]",
+            "materialize =",
+            "ink_text =",
+            "phosphor =",
+        ] {
+            assert!(
+                !super::STARTER_CONFIG.contains(inert),
+                "new starter configs must not advertise compatibility-only `{inert}`"
             );
         }
     }
@@ -949,11 +1070,11 @@ mod tests {
             mr.suppress_in_alt_screen.is_some(),
             "starter documents `suppress_in_alt_screen`"
         );
-        assert!(mr.materialize.is_some(), "starter documents `materialize`");
         assert!(mr.turn_wave.is_some(), "starter documents `turn_wave`");
         assert!(mr.bell_alert.is_some(), "starter documents `bell_alert`");
-        assert!(mr.ink_text.is_some(), "starter documents `ink_text`");
-        assert!(mr.phosphor.is_some(), "starter documents `phosphor`");
+        assert_eq!(mr.materialize, None, "starter omits inert materialize");
+        assert_eq!(mr.ink_text, None, "starter omits inert ink_text");
+        assert_eq!(mr.phosphor, None, "starter omits inert phosphor");
         assert!(mr.seed.is_some(), "starter documents `seed`");
         // The starter documents the DEFAULT-OFF posture (costume mode is opt-in).
         assert_eq!(mr.enabled, Some(false), "the starter example ships OFF");

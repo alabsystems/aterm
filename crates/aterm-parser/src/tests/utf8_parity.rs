@@ -153,9 +153,9 @@ fn invalid_sequences_emit_replacement_not_garbage() {
 #[test]
 fn incomplete_trailing_lead_after_complete_char_matches_bytewise() {
     let straddles: &[&[u8]] = &[
-        &[0xE4, 0xB8, 0xAD, 0xE4], // 中 + a lone trailing 3-byte lead
-        &[0xE4, 0xB8, 0xAD, 0xF0, 0x9F], // 中 + a truncated 4-byte lead
-        &[0xC3, 0xA9, 0xC3],       // é + a lone trailing 2-byte lead
+        &[0xE4, 0xB8, 0xAD, 0xE4],             // 中 + a lone trailing 3-byte lead
+        &[0xE4, 0xB8, 0xAD, 0xF0, 0x9F],       // 中 + a truncated 4-byte lead
+        &[0xC3, 0xA9, 0xC3],                   // é + a lone trailing 2-byte lead
         &[0xF0, 0x9F, 0x98, 0x80, 0xE4, 0xB8], // 😀 + a truncated 3-byte lead
         &[0xE4, 0xB8, 0xAD, 0xE4, 0xB8, 0xAD, 0xE4], // 中中 + a lone 3-byte lead
     ];

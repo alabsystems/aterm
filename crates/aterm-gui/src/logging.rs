@@ -99,7 +99,7 @@ fn write_crash_report(
     writeln!(
         f,
         "aterm-gui {} crashed at unix {}.{:03}\n{info}\n\nbacktrace:\n{backtrace}",
-        env!("CARGO_PKG_VERSION"),
+        aterm_types::version::APP_VERSION,
         ts.as_secs(),
         ts.subsec_millis(),
     )
@@ -277,7 +277,7 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let report = std::fs::read_to_string(&path).unwrap();
-        assert!(report.contains(env!("CARGO_PKG_VERSION")));
+        assert!(report.contains(aterm_types::version::APP_VERSION));
         assert!(report.contains("panicked at 'boom', main.rs:7"));
         assert!(report.contains("backtrace:\n0: frame_a"));
         // A later report from the same pid replaces, not appends.

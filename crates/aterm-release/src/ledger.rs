@@ -232,12 +232,13 @@ pub fn next_build(last: u64, now: u64) -> Result<u64> {
 /// are deterministic and so every retry reuses ONE clock reading — retries
 /// derive monotonicity from the ledger tail, never from time moving.
 pub struct ClaimPlan<'a> {
-    /// Display version being cut, e.g. "0.26" (MAJOR.MINOR — spec §1).
+    /// Release version being cut, e.g. "0.2.0" (canonical MAJOR.MINOR.PATCH —
+    /// the workspace version with DEV reset to 0).
     pub version: &'a str,
     /// Unix seconds, read once by the caller.
     pub now: u64,
     /// The recut path (spec §5) legitimately re-claims a version whose
-    /// `## [X.Y]` changelog section already sits on origin (rolled by the
+    /// `## [X.Y.Z]` changelog section already sits on origin (rolled by the
     /// earlier wedged cut) — it sets this to skip the section half of the
     /// "cut elsewhere" abort. The remote-TAG abort always applies: a tag
     /// means the version was fully published somewhere.
@@ -253,7 +254,7 @@ pub struct Claim {
     pub build: u64,
     /// The release commit's full sha (== origin/main at verification time).
     pub commit: String,
-    /// The exact ledger line we appended, e.g. "1783918101 0.26".
+    /// The exact ledger line we appended, e.g. "1783918101 0.2.0".
     pub ledger_line: String,
 }
 
@@ -262,12 +263,13 @@ pub struct Claim {
 /// race here costs seconds.
 ///
 /// `regenerate` produces the rest of the release commit's content for a given
-/// n (version bump, Cargo.lock refresh, changelog roll — chunk C wires the
-/// real one) and returns the repo-relative paths it wrote, which are staged
-/// alongside the ledger. It is re-run from scratch on every retry because the
-/// retry resets hard to origin/main and rebuilds the WHOLE commit from
-/// origin's blobs — the reset-soft alternative was rejected for verifiably
-/// clobbering the winner's ledger line (spec decision 3).
+/// n (the changelog roll; the workspace version is the operator's bump and is
+/// never rewritten by a cut)
+/// and returns the repo-relative paths it wrote, which are staged alongside
+/// the ledger. It is re-run from scratch on every retry because the retry
+/// resets hard to origin/main and rebuilds the WHOLE commit from origin's
+/// blobs — the reset-soft alternative was rejected for verifiably clobbering
+/// the winner's ledger line (spec decision 3).
 pub fn claim(
     git: &dyn GitRunner,
     worktree: &Path,
@@ -372,8 +374,8 @@ pub fn claim(
             )));
         }
 
-        // Same-version-cut-elsewhere abort: if origin now carries tag vX.Y or
-        // a "## [X.Y]" changelog section, this version is being (or was) cut
+        // Same-version-cut-elsewhere abort: if origin now carries tag vX.Y.Z
+        // or a "## [X.Y.Z]" changelog section, this version is being (or was) cut
         // on another machine — racing it with a second number would publish
         // two artifacts claiming one version.
         let tag_ref = format!("refs/tags/v{}", plan.version);
@@ -441,20 +443,28 @@ fn show_origin_ledger(git: &dyn GitRunner) -> Result<String> {
         .map_err(|_| Error::new(format!("origin/main:{LEDGER_FILE} is not valid UTF-8")))
 }
 
-/// The display version is spliced into a tag name, a changelog heading and
-/// the ledger grammar — reject anything that is not exactly MAJOR.MINOR
-/// digits before it can poison those greps (spec §1: the scheme is
-/// MAJOR.MINOR, period). Public: cli.rs applies the same shape check to
-/// `--set-version` / `--abandon` / `verify vX.Y` arguments up front.
+/// The release version is spliced into a tag name, a changelog heading, the
+/// DMG asset name and the ledger grammar — reject anything that is not
+/// exactly three canonical numeric components before it can poison those
+/// greps. There is ONE version scheme: `MAJOR.MINOR.PATCH` (the workspace
+/// `MAJOR.MINOR.0` with DEV reset to 0 — see `VERSIONING.md`).
+///
+/// Canonical means non-empty, ASCII digits only, and no leading zero unless
+/// the component IS `"0"`: one version must have exactly ONE spelling, or two
+/// tags could share a numeric order. Public: cli.rs applies the same shape
+/// check to `--set-version` / `--abandon` / `verify vX.Y.Z` arguments up
+/// front.
 pub fn check_version_shape(version: &str) -> Result<()> {
     let parts: Vec<&str> = version.split('.').collect();
-    let ok = parts.len() == 2
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let ok = parts.len() == 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && (p.len() == 1 || !p.starts_with('0'))
+        });
     if !ok {
         return Err(Error::new(format!(
-            "version {version:?} is not MAJOR.MINOR (e.g. \"0.26\")"
+            "version {version:?} is not canonical MAJOR.MINOR.PATCH (e.g. \"0.2.0\")"
         )));
     }
     Ok(())

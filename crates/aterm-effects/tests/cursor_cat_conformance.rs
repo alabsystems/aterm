@@ -44,6 +44,9 @@ fn project(
         ("forced", i64::from(frame.discovery)),
         ("presented_once", 1),
         ("wall_expired", 0),
+        ("trail_master", 0),
+        ("ordinary_armed", 0),
+        ("ordinary_visible", 0),
     ]
     .into_iter()
     .collect()

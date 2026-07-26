@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use aterm_core::terminal::RenderCell;
 use aterm_render::Theme;
 
-use crate::hud_bar;
+use crate::chrome_band;
 use crate::settings::{blank_row, write_str};
 
 /// How long a config-warning banner stays up before auto-dismissing.
@@ -62,7 +62,7 @@ impl ConfigNotice {
     }
 }
 
-/// PURE grid-cell row builder (the HUD/notice band style): exactly `panel_rows` rows, each
+/// PURE grid-cell row builder: exactly `panel_rows` rows, each
 /// exactly `cols` wide so the splice overwrites frame rows in place. Row 0 is a bold
 /// title on a seam (the panel's top edge); each following row is one warning, truncated
 /// to width, in the theme's WARN/VALUE colours. Reuses `settings::{blank_row,write_str}`
@@ -73,7 +73,7 @@ pub(crate) fn notice_rows(
     panel_rows: usize,
     theme: Theme,
 ) -> Vec<Vec<RenderCell>> {
-    let c = hud_bar::hud_colors(theme);
+    let c = chrome_band::band_colors(theme);
     let mut rows: Vec<Vec<RenderCell>> = (0..panel_rows)
         .map(|r| blank_row(cols, c.label, c.bar_bg, r == 0))
         .collect();
