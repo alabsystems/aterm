@@ -1937,10 +1937,32 @@ pub fn recovery_redraw_model() -> Model {
 /// policy plus retained cross-session RTT: confirmation alone paints, the Codex
 /// gate is ignored, and a new pane can inherit slow eligibility. The mutant
 /// makes the fast-link blink, app-owned ghost, and RTT leak reachable.
+///
+/// HYSTERESIS (`fast_streak` / `retracted`). The gate is a LATCH, not a
+/// comparator, and this model must say so: `ConfirmFast` used to set `slow = 0`
+/// outright, which is the SINGLE-SAMPLE close the implementation deliberately
+/// replaced (`FAST_SAMPLES_TO_HIDE` consecutive decisive fast turns, a smoothed
+/// estimate that agrees, and an EMPTY pending set). The old abstraction only
+/// looked sound because the conformance test fired `ConfirmFast` at an already
+/// closed latch — so the one property the model exists to pin, "speculation
+/// never blinks off on one lucky turn", was unpinned. `fast_streak` counts the
+/// decisive fast turns (capped at `Hide`) and `retracted` marks the STEP on
+/// which the gate went 1 -> 0, because the defect is a retraction taken on thin
+/// evidence, not a steady state: `RetractOnlyOnSustainedFastEvidence` then makes
+/// the single-sample close (and any close with pixels still in flight — the
+/// blink itself) an outright counterexample. `ConfirmFastInFlight` is the same
+/// fast turn taken while type-ahead is still on glass; at `Buggy=0` it may
+/// advance the streak but never close, which is what keeps that clause of the
+/// invariant non-vacuous.
 pub fn predictive_echo_visibility_model() -> Model {
     crate::ty_model! {
         PredictiveEchoVisibility {
             const Buggy = 0;
+            // FAST_SAMPLES_TO_HIDE: consecutive decisive fast turns required before
+            // Adaptive may stop painting. Opening takes fewer (asymmetric on
+            // purpose — closing is the destructive direction), which the abstract
+            // `ConfirmSlow` folds into one step.
+            const Hide = 3;
             var app_owned = 0;
             var slow = 0;
             var confirmed = 0;
@@ -1948,16 +1970,35 @@ pub fn predictive_echo_visibility_model() -> Model {
             var visible = 0;
             var erased = 0;
             var fresh = 1;
+            var fast_streak = 0;
+            var retracted = 0;
 
             action ConfirmFast when (app_owned == 0 && pending == 0) {
-                slow = 0;
+                fast_streak = if fast_streak <= Hide - 1 { fast_streak + 1 } else { Hide };
+                slow = if Buggy == 1 { 0 }
+                       else if Hide <= fast_streak + 1 { 0 }
+                       else { slow };
+                retracted = if Buggy == 1 { slow }
+                            else if slow == 1 && Hide <= fast_streak + 1 { 1 }
+                            else { 0 };
                 fresh = 0;
                 confirmed = 1;
                 visible = 0;
                 erased = 0;
             }
+            action ConfirmFastInFlight when (app_owned == 0 && pending == 1) {
+                fast_streak = if fast_streak <= Hide - 1 { fast_streak + 1 } else { Hide };
+                slow = if Buggy == 1 { 0 } else { slow };
+                retracted = if Buggy == 1 { slow } else { 0 };
+                visible = if Buggy == 1 { 0 } else { visible };
+                erased = if Buggy == 1 { visible } else { 0 };
+                fresh = 0;
+                confirmed = 1;
+            }
             action ConfirmSlow when (app_owned == 0 && pending == 0) {
                 slow = 1;
+                fast_streak = 0;
+                retracted = 0;
                 fresh = 0;
                 confirmed = 1;
                 visible = 0;
@@ -1973,16 +2014,19 @@ pub fn predictive_echo_visibility_model() -> Model {
                     0
                 };
                 erased = 0;
+                retracted = 0;
             }
             action Expire when (pending == 1) {
                 pending = 0;
                 erased = visible;
                 visible = 0;
+                retracted = 0;
             }
             action Echo when (pending == 1) {
                 pending = 0;
                 visible = 0;
                 erased = 0;
+                retracted = 0;
             }
             action EnterComposer {
                 app_owned = 1;
@@ -1990,6 +2034,7 @@ pub fn predictive_echo_visibility_model() -> Model {
                 visible = if Buggy == 1 { visible } else { 0 };
                 confirmed = if Buggy == 1 { confirmed } else { 0 };
                 erased = 0;
+                retracted = 0;
             }
             action LeaveComposer {
                 app_owned = 0;
@@ -1997,12 +2042,14 @@ pub fn predictive_echo_visibility_model() -> Model {
                 visible = 0;
                 confirmed = 0;
                 erased = 0;
+                retracted = 0;
             }
             action Submit {
                 pending = 0;
                 visible = 0;
                 confirmed = 0;
                 erased = 0;
+                retracted = 0;
             }
             action SwitchSession {
                 app_owned = 0;
@@ -2012,11 +2059,18 @@ pub fn predictive_echo_visibility_model() -> Model {
                 pending = 0;
                 visible = 0;
                 erased = 0;
+                // Dropping the estimate is not a RETRACTION: nothing was measured
+                // that says this link is fast, so the streak restarts at zero and
+                // the step carries no evidence obligation (`FreshSessionHasNoInheritedRtt`
+                // is what covers this direction).
+                fast_streak = 0;
+                retracted = 0;
             }
 
             invariant Bounds:
                 app_owned <= 1 && slow <= 1 && confirmed <= 1 &&
-                pending <= 1 && visible <= 1 && erased <= 1 && fresh <= 1;
+                pending <= 1 && visible <= 1 && erased <= 1 && fresh <= 1 &&
+                fast_streak <= Hide && retracted <= 1;
             invariant AppOwnedHasNoPrediction:
                 if app_owned == 1 { pending == 0 && visible == 0 } else { 1 == 1 };
             invariant FastAdaptiveNeverPaints:
@@ -2031,6 +2085,14 @@ pub fn predictive_echo_visibility_model() -> Model {
                 };
             invariant FreshSessionHasNoInheritedRtt:
                 if fresh == 1 { slow == 0 } else { 1 == 1 };
+            // The gate may stop painting ONLY on sustained fast evidence with
+            // nothing in flight. Stated about the retracting STEP because that is
+            // where the damage is: a close is an erase of pixels the user is
+            // looking at, so one lucky fast turn (or any turn with type-ahead still
+            // pending) closing the gate IS the blink, whatever the steady state
+            // looks like afterwards.
+            invariant RetractOnlyOnSustainedFastEvidence:
+                if retracted == 1 { Hide <= fast_streak && pending == 0 } else { 1 == 1 };
         }
     }
 }

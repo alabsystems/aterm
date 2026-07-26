@@ -102,7 +102,7 @@ notes    = "gatto/gatti/gatta/gatte + diminutives gattino/gattina (kitten). mici
 class    = "profanity"
 lang     = "pt"
 mode     = "forms"
-forms    = ["foder", "fodido", "fodida", "fode", "foda", "merda", "caralho"]
+forms    = ["fodido","fodida","fode","foda","merda","caralho"]
 cjk      = false
 ambiguous= false
 notes    = "foder = 'to fuck' (fod- root); fodido/-a = 'fucked'; merda = shit; caralho = strong intensifier ('dick')."
@@ -122,7 +122,7 @@ notes    = "gato/gata + plurals + diminutives gatinho/gatinha (kitten). bichano/
 class    = "profanity"
 lang     = "ca"
 mode     = "forms"
-forms    = ["merda", "collons", "hòstia", "cony", "carall"]
+forms    = ["merda","collons","hòstia","carall"]
 cjk      = false
 ambiguous= false
 notes    = "merda = shit; collons = 'balls/damn' (main expletive); cony = strong vulgarism; hòstia/carall intensifiers."
@@ -255,7 +255,7 @@ notes    = "katt/katter = cat/cats; kattunge/kattunger = kitten(s); katten = the
 class    = "profanity"
 lang     = "da"
 mode     = "forms"
-forms    = ["fanden", "lort", "kneppe", "knepper", "satan", "pis", "helvede"]
+forms    = ["fanden","lort","kneppe","knepper","pis","helvede"]
 cjk      = false
 ambiguous= false
 notes    = "fanden = the devil/damn; lort = shit/turd; kneppe/knepper = fuck (inf/pres); satan = intensifier; pis = piss/crap; helvede = hell."
@@ -439,7 +439,7 @@ notes    = "Lithuanian has weak native swearing; šūdas=shit is the main one. v
 class    = "feline"
 lang     = "lt"
 mode     = "forms"
-forms    = ["katė","katės","katinas","kačiukas","kačiukai","katytė"]
+forms    = ["katės","katinas","kačiukas","kačiukai","katytė"]
 cjk      = false
 ambiguous= false
 notes    = "katė=cat (fem), katinas=tomcat; kačiukas/kačiukai=kitten(s); katytė 'kitty'."
@@ -457,7 +457,7 @@ notes    = "Latvian mild swearing: mēsls/mēsli (dung/trash) and sūds=shit are
 class    = "feline"
 lang     = "lv"
 mode     = "forms"
-forms    = ["kaķis","kaķi","kaķēns","kaķēni","kaķene","kaķītis"]
+forms    = ["kaķis","kaķēns","kaķēni","kaķene","kaķītis"]
 cjk      = false
 ambiguous= false
 notes    = "kaķis=cat (masc default), kaķene=she-cat; kaķēns/kaķēni=kitten(s); kaķītis 'kitty'."
@@ -527,7 +527,7 @@ lang     = "tr"
 mode     = "forms"
 cjk      = false
 ambiguous= false
-forms    = ["siktir","sikerim","sikeyim","amına","amına koyayım","bok","orospu","piç"]
+forms    = ["siktir","sikerim","sikeyim","amına","amına koyayım","bok","orospu"]
 notes    = "sik- = 'fuck' verb: siktir ('fuck off'), sikerim/sikeyim (1sg). amına koyayım is the heavy 'amına' family. bok = shit, orospu = whore, piç = bastard. CASING CAVEAT: Turkish has dotted/dotless i: lowercase of 'I' is 'ı' (dotless) and of 'İ' is 'i'; forms with ı (amına, sıçtır variants) must NOT be matched via a non-Turkish lowercase that maps İ→i / I→i. Use Turkish-locale case folding."
 
 [[entry]]
@@ -546,7 +546,7 @@ lang     = "et"
 mode     = "forms"
 cjk      = false
 ambiguous= false
-forms    = ["kurat","kuradi","sitt","sita","perse","raisk","persse"]
+forms    = ["kurat","kuradi","sitt","raisk","persse"]
 notes    = "kurat = devil, the prime Estonian curse (gen kuradi). sitt = shit (gen sita). perse = arse, persse 'up the arse' (common interjection). raisk = 'damn/carrion'. Estonian lacks a direct high-frequency 'fuck' verb; these are the real strong expletives."
 
 [[entry]]
@@ -854,7 +854,7 @@ notes    = "ແມວ (maew) = cat. ລູກແມວ = kitten ('child cat'). L
 class    = "profanity"
 lang     = "id"
 mode     = "forms"
-forms    = ["anjing", "anjir", "ngentot", "kontol", "memek", "bangsat", "tai", "taik"]
+forms    = ["anjing","anjir","ngentot","kontol","memek","bangsat","taik"]
 cjk      = false
 ambiguous= false
 notes    = "anjing (lit. 'dog') and tai/taik (lit. 'shit') double as ordinary nouns in-language; anjir is the softened euphemism. ngentot/entot is the literal 'fuck' verb. kontol=dick, memek=cunt, bangsat=bastard/vermin."
@@ -994,7 +994,7 @@ notes    = "kucing=cat (shared with id/ms); kitten = 'kucing cilik' (small cat) 
 class    = "profanity"
 lang     = "sv"
 mode     = "forms"
-forms    = ["jävla", "jävlar", "knulla", "knullar", "helvete", "skit"]
+forms    = ["jävla","jävlar","knulla","knullar","helvete"]
 cjk      = false
 ambiguous= false
 notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
@@ -1030,7 +1030,7 @@ notes    = "Un-gated split: surfaces with no benign homograph in any other langu
 class    = "profanity"
 lang     = "sk"
 mode     = "forms"
-forms    = ["kurva", "jebať", "piča", "do piče", "hovno", "skurvený", "sráč"]
+forms    = ["kurva","jebať","do piče","hovno","skurvený","sráč"]
 cjk      = false
 ambiguous= false
 notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
@@ -1048,7 +1048,7 @@ notes    = "Un-gated split: surfaces with no benign homograph in any other langu
 class    = "profanity"
 lang     = "lv"
 mode     = "forms"
-forms    = ["mēsls", "mēsli", "sūds", "dirsa"]
+forms    = ["mēsls","mēsli","dirsa"]
 cjk      = false
 ambiguous= false
 notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
@@ -1133,3 +1133,102 @@ forms    = ["fok", "fokken", "fokof", "fokop", "gefok"]
 cjk      = false
 ambiguous= false
 notes    = "Un-gated split: surfaces with no benign homograph in any other language. The ambiguous siblings keep the gate."
+
+[[entry]]
+class    = "profanity"
+lang     = "pt"
+mode     = "forms"
+forms    = ["foder"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: foder -> foder. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for pt — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous pt entry and gated behind ambiguous=true, so a pt user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "profanity"
+lang     = "ca"
+mode     = "forms"
+forms    = ["cony"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: cony -> cony. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for ca — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous ca entry and gated behind ambiguous=true, so a ca user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "profanity"
+lang     = "da"
+mode     = "forms"
+forms    = ["satan"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: satan -> satan. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for da — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous da entry and gated behind ambiguous=true, so a da user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "feline"
+lang     = "lt"
+mode     = "forms"
+forms    = ["katė"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: katė -> kate. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for lt — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous lt entry and gated behind ambiguous=true, so a lt user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "feline"
+lang     = "lv"
+mode     = "forms"
+forms    = ["kaķi"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: kaķi -> kaki. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for lv — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous lv entry and gated behind ambiguous=true, so a lv user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "profanity"
+lang     = "tr"
+mode     = "forms"
+forms    = ["piç"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: piç -> pic. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for tr — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous tr entry and gated behind ambiguous=true, so a tr user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "profanity"
+lang     = "et"
+mode     = "forms"
+forms    = ["sita","perse"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: sita -> sita, perse -> perse. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for et — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous et entry and gated behind ambiguous=true, so a et user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "profanity"
+lang     = "id"
+mode     = "forms"
+forms    = ["tai"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: tai -> tai. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for id — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous id entry and gated behind ambiguous=true, so a id user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "profanity"
+lang     = "sv"
+mode     = "forms"
+forms    = ["skit"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: skit -> skit. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for sv — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous sv entry and gated behind ambiguous=true, so a sv user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "profanity"
+lang     = "sk"
+mode     = "forms"
+forms    = ["piča"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: piča -> pica. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for sk — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous sk entry and gated behind ambiguous=true, so a sk user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+[[entry]]
+class    = "profanity"
+lang     = "lv"
+mode     = "forms"
+forms    = ["sūds"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: sūds -> suds. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for lv — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous lv entry and gated behind ambiguous=true, so a lv user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."

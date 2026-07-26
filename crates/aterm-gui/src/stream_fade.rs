@@ -268,16 +268,20 @@ impl StreamFade {
     /// * Otherwise rows are aligned by content hash first (a row that merely
     ///   scrolled keeps its ages), then changed rows diff per cell against the
     ///   same viewport position.
+    ///
+    /// `cols` is the frame's declared [`aterm_core::render::RenderInput::cols`],
+    /// not an inner-row length. Engine rows are sparse prefixes, so even the
+    /// first row may be empty while later rows contain output.
     pub(crate) fn update(
         &mut self,
         cells: &mut [Vec<RenderCell>],
+        cols: usize,
         view: ViewKey,
         permitted: bool,
         fade_ms: u64,
         now: Instant,
     ) -> bool {
         let rows = cells.len();
-        let cols = cells.first().map_or(0, Vec::len);
 
         // 1) Fingerprint THIS frame (raw, pre-tint) + per-row content hashes.
         self.fp_scratch.clear();
@@ -285,15 +289,16 @@ impl StreamFade {
         self.hash_scratch.clear();
         for row in cells.iter() {
             let mut rh = FNV_OFFSET;
-            for c in row.iter().take(cols) {
-                let f = cell_fp(c);
+            // `cell_frame_into` deliberately emits SPARSE inner rows: an omitted
+            // tail is the terminal's implicit empty cell through the declared
+            // `RenderInput.cols`, not a malformed/ragged frame. Fingerprint the
+            // full logical row with a stable absent-slot sentinel so a short top
+            // row cannot shrink the whole age map and later rows remain visible
+            // to the diff.
+            for col in 0..cols {
+                let f = row.get(col).map_or(0, cell_fp);
                 self.fp_scratch.push(f);
                 rh = fnv(rh, f);
-            }
-            // Ragged rows never come out of `cell_frame_into`; pad defensively
-            // so the flat index math below stays in bounds regardless.
-            for _ in row.len()..cols {
-                self.fp_scratch.push(0);
             }
             self.hash_scratch.push(rh);
         }
@@ -354,7 +359,17 @@ impl StreamFade {
                     *slot = None;
                     continue;
                 }
-                let cell = &mut cells[i / cols][i % cols];
+                // A materialized cell may disappear back into the sparse,
+                // implicit-empty tail while its slot is young. That transition
+                // still belongs in the fingerprint map, but there are no cell
+                // bytes to tint; retire it instead of indexing a ragged row.
+                let Some(cell) = cells
+                    .get_mut(i / cols)
+                    .and_then(|row| row.get_mut(i % cols))
+                else {
+                    *slot = None;
+                    continue;
+                };
                 cell.fg = tinted_fg(cell.fg, cell.bg, alpha);
                 tinted = true;
                 let until = b + Duration::from_millis(fade_ms);
@@ -587,7 +602,7 @@ mod tests {
 
         // Frame 1: re-baseline (fresh view) — settled ink, byte-exact.
         let mut f1 = base.clone();
-        assert!(!sf.update(&mut f1, VIEW, true, FADE_MS, t0));
+        assert!(!sf.update(&mut f1, 8, VIEW, true, FADE_MS, t0));
         assert_eq!(f1, base, "the baseline frame must not tint");
 
         // Frame 2: a new word arrives → young cells tint (non-vacuity).
@@ -595,7 +610,7 @@ mod tests {
         let mut f2 = with_ink.clone();
         let t1 = t0 + Duration::from_millis(5);
         assert!(
-            sf.update(&mut f2, VIEW, true, FADE_MS, t1),
+            sf.update(&mut f2, 8, VIEW, true, FADE_MS, t1),
             "fresh ink must tint"
         );
         assert_ne!(f2, with_ink, "young cells must differ from the raw mirror");
@@ -607,7 +622,7 @@ mod tests {
         let mut f3 = with_ink.clone();
         let t2 = t1 + Duration::from_millis(FADE_MS);
         assert!(
-            !sf.update(&mut f3, VIEW, true, FADE_MS, t2),
+            !sf.update(&mut f3, 8, VIEW, true, FADE_MS, t2),
             "dry ink must not tint"
         );
         assert_eq!(f3, with_ink, "the converged frame must be byte-identical");
@@ -624,20 +639,20 @@ mod tests {
         let mut sf = StreamFade::default();
         let base = grid_of(&["prompt$ ", "        "]);
         let mut f1 = base.clone();
-        sf.update(&mut f1, VIEW, true, FADE_MS, t0);
+        sf.update(&mut f1, 8, VIEW, true, FADE_MS, t0);
 
         // Start a fade…
         let inked = grid_of(&["prompt$ ", "output  "]);
         let mut f2 = inked.clone();
         let t1 = t0 + Duration::from_millis(5);
-        assert!(sf.update(&mut f2, VIEW, true, FADE_MS, t1));
+        assert!(sf.update(&mut f2, 8, VIEW, true, FADE_MS, t1));
 
         // …then a bypass (keystroke echo): exact bytes, mid-flight fade cut.
         let echoed = grid_of(&["prompt$ x", "output   "]);
         let mut f3 = echoed.clone();
         let t2 = t1 + Duration::from_millis(5);
         assert!(
-            !sf.update(&mut f3, VIEW, false, FADE_MS, t2),
+            !sf.update(&mut f3, 9, VIEW, false, FADE_MS, t2),
             "bypass must not tint"
         );
         assert_eq!(f3, echoed, "bypassed output must be byte-identical");
@@ -647,7 +662,7 @@ mod tests {
         let mut f4 = echoed.clone();
         let t3 = t2 + Duration::from_millis(5);
         assert!(
-            !sf.update(&mut f4, VIEW, true, FADE_MS, t3),
+            !sf.update(&mut f4, 9, VIEW, true, FADE_MS, t3),
             "no re-tint after a bypass"
         );
         assert_eq!(f4, echoed, "settled echo must never fade late");
@@ -666,12 +681,13 @@ mod tests {
         let inked = vec![vec![cell('X', [255, 255, 255], [0, 0, 0])]];
 
         let mut f = blank.clone();
-        sf.update(&mut f, VIEW, true, FADE_MS, t0);
+        sf.update(&mut f, 1, VIEW, true, FADE_MS, t0);
         let mut prev = [0u8; 3];
         for age in 0..=FADE_MS {
             let mut frame = inked.clone();
             sf.update(
                 &mut frame,
+                1,
                 VIEW,
                 true,
                 FADE_MS,
@@ -704,13 +720,13 @@ mod tests {
         let mut sf = StreamFade::default();
         let f1_raw = grid_of(&["alpha   ", "beta    ", "        "]);
         let mut f1 = f1_raw.clone();
-        sf.update(&mut f1, VIEW, true, FADE_MS, t0);
+        sf.update(&mut f1, 8, VIEW, true, FADE_MS, t0);
 
         // One line of output scrolls everything up; rows 0/1 are old content.
         let f2_raw = grid_of(&["beta    ", "        ", "gamma   "]);
         let mut f2 = f2_raw.clone();
         let t1 = t0 + Duration::from_millis(500); // long after baseline: old ink is dry
-        assert!(sf.update(&mut f2, VIEW, true, FADE_MS, t1));
+        assert!(sf.update(&mut f2, 8, VIEW, true, FADE_MS, t1));
         assert_eq!(f2[0], f2_raw[0], "a scrolled row must stay byte-exact");
         assert_ne!(f2[2], f2_raw[2], "the new line must tint");
     }
@@ -722,14 +738,14 @@ mod tests {
         let t0 = Instant::now();
         let mut sf = StreamFade::default();
         let mut f1 = grid_of(&["vim buffer  "]);
-        sf.update(&mut f1, (7, true, false), false, FADE_MS, t0); // alt screen: bypassed
+        sf.update(&mut f1, 12, (7, true, false), false, FADE_MS, t0); // alt screen: bypassed
 
         // Leaving the alternate screen restores completely different content.
         let shell = grid_of(&["prompt$     "]);
         let mut f2 = shell.clone();
         let t1 = t0 + Duration::from_millis(5);
         assert!(
-            !sf.update(&mut f2, (7, false, false), true, FADE_MS, t1),
+            !sf.update(&mut f2, 12, (7, false, false), true, FADE_MS, t1),
             "an alt-screen exit must not fade the restored screen"
         );
         assert_eq!(f2, shell, "the restored view is settled ink");
@@ -741,11 +757,11 @@ mod tests {
         let t0 = Instant::now();
         let mut sf = StreamFade::default();
         let mut f1 = grid_of(&["abcdef", "      "]);
-        sf.update(&mut f1, VIEW, true, FADE_MS, t0);
+        sf.update(&mut f1, 6, VIEW, true, FADE_MS, t0);
         let wide = grid_of(&["abcdefgh", "        "]);
         let mut f2 = wide.clone();
         let t1 = t0 + Duration::from_millis(5);
-        assert!(!sf.update(&mut f2, VIEW, true, FADE_MS, t1));
+        assert!(!sf.update(&mut f2, 8, VIEW, true, FADE_MS, t1));
         assert_eq!(f2, wide, "a resized frame must not tint");
     }
 }

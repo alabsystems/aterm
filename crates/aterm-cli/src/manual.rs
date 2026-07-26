@@ -99,6 +99,46 @@ GOTCHAS
         body: None, // generated — see `introspection_page()`
     },
     Topic {
+        name: "agents",
+        tagline: "make coding agents aterm-aware — the 3-line primer installer",
+        body: Some(
+            r#"agents — make coding agents aterm-aware (`aterm agents`, the primer installer).
+
+WHAT IT IS
+  A coding agent (Claude Code, Codex CLI, Gemini CLI, OpenCode, ...) never reads the
+  terminal's scrollback — the only channel that reliably reaches its context in EVERY
+  project is its global context file (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md,
+  ~/.gemini/GEMINI.md, ~/.config/opencode/AGENTS.md). `aterm agents` manages a short,
+  marked, SELF-GATING primer block in those files: how to DETECT aterm
+  ($TERM_PROGRAM=aterm / $ATERM_CHILD=1), that `aterm help` prints the agent operating
+  brief, and why the agent's CLAUDE*/CODEX_*/... env vars were stripped. Outside aterm
+  the block tells the agent to ignore itself, so installing it is harmless everywhere.
+
+KEY USAGE
+  aterm agents               status: each agent, its context file, installed/stale/absent
+  aterm agents install       install/update the block for every DETECTED agent
+                             (its config dir exists); undetected agents are skipped
+  aterm agents install codex force one agent by name (creates the file if needed)
+  aterm agents remove        remove exactly the managed block, everywhere
+  aterm agents primer        print the block — paste into any project AGENTS.md/CLAUDE.md
+
+WHEN TO REACH FOR IT
+  Once per machine, and again after installing a new coding agent: run
+  `aterm agents install` so any agent launched inside aterm knows what aterm is and how
+  to go deeper. A screen banner cannot do this job — an agent's context never sees the
+  terminal's output, which is exactly why the primer rides in the agent's own files.
+
+GOTCHAS
+  * IDEMPOTENT and surgical: the block lives between `<!-- aterm primer ... -->` markers;
+    re-running install updates it in place, `remove` deletes exactly the block, and user
+    content outside the markers is never touched (an unterminated marker fails closed).
+  * A bare `install` skips undetected agents (no config dir = not in use) — name an
+    agent explicitly to force it.
+  * The primer is intentionally 3 lines: detection, `aterm help`, env hygiene. Depth
+    lives HERE, behind `aterm help`, not in the agent's context file."#,
+        ),
+    },
+    Topic {
         name: "atpkg",
         tagline: "toolchain package manager — install / update / verify",
         body: Some(
@@ -429,6 +469,10 @@ fn overview_page() -> String {
             "drive <args>",
             "the agent drive CLI (await / send / turn helpers)",
         ),
+        (
+            "agents [<cmd>]",
+            "make coding agents aterm-aware (install the 3-line primer; run once)",
+        ),
     ];
     // Column width across the verb signatures and the topic names.
     let width = TOPICS
@@ -574,6 +618,10 @@ fn agent_page(sid: Option<&str>) -> String {
     s.push_str("  aterm help <topic>         a deep dive on any tool\n");
     s.push_str(
         "  aterm ctl help             the live control-verb catalog from a running session\n",
+    );
+    s.push_str(
+        "  aterm agents               keep the coding-agent primer installed — how an agent\n\
+         \x20                            like you learns aterm exists (see `aterm help agents`)\n",
     );
     s
 }

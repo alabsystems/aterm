@@ -131,6 +131,28 @@ impl WatcherSpec {
     fn is_row(&self) -> bool {
         matches!(self, WatcherSpec::RowMatches { .. })
     }
+
+    /// Whether the predicate must be evaluated ONCE AT ARM, not only on the next
+    /// batch — i.e. whether it is **level**- rather than edge-triggered.
+    ///
+    /// Both kinds here are statements about the surface as it ALREADY IS, so an
+    /// arm-only-then-wait evaluation answers "no" while the answer is plainly
+    /// "yes": an already-matching row for `RowMatches`, and an ALREADY-ADVANCED
+    /// `content_seq` for `SeqAdvanced`. The latter is the exact shape of a
+    /// turn-based agent's dirty check — "did anything change since the seq I
+    /// recorded last turn?" — which must be answerable without waiting for the
+    /// *next* unrelated batch to arrive (and, on a quiet session, forever).
+    ///
+    /// `IdleFor` and `BlockComplete` are deliberately excluded: idle is
+    /// arm-relative by design (see [`WatcherSet::arm`]), and `BlockComplete`
+    /// latching at arm would make `await block` fire on the PREVIOUS block.
+    #[inline]
+    fn needs_arm_eval(&self) -> bool {
+        matches!(
+            self,
+            WatcherSpec::RowMatches { .. } | WatcherSpec::SeqAdvanced { .. }
+        )
+    }
 }
 
 /// A latched satisfaction. For [`WatcherSpec::IdleFor`], `at` is the exact
@@ -343,7 +365,8 @@ impl WatcherSet {
     }
 
     /// **The seam call** — run from `post_process` after every batch (and once at
-    /// arm for a fresh `RowMatches`), with `now == transient.process_now`
+    /// arm for a level-triggered spec: a fresh `RowMatches` or `SeqAdvanced`),
+    /// with `now == transient.process_now`
     /// (injected, never read here). Stamps activity if `content_seq` advanced and
     /// latches any predicate that holds, evaluating all four kinds in ONE pass.
     /// Surface-read-only: `rows[idx]` supplies visible-row text for `RowMatches`
@@ -511,11 +534,13 @@ impl super::Terminal {
 
     /// Arm a surface watcher (the L1 `await`/`subscribe` verbs call this). `now`
     /// is the host's arming instant. Returns `None` (fail-closed) if the
-    /// per-session watcher budget is full. A `RowMatches` spec is evaluated
-    /// immediately so an already-matching row latches at arm.
+    /// per-session watcher budget is full. A level-triggered spec
+    /// ([`WatcherSpec::needs_arm_eval`] — `RowMatches` and `SeqAdvanced`) is
+    /// evaluated immediately, so an already-matching row or an already-advanced
+    /// `content_seq` latches at arm instead of waiting for the next batch.
     #[must_use]
     pub fn watch(&mut self, spec: WatcherSpec, now: Instant) -> Option<WatchId> {
-        let is_row = spec.is_row();
+        let arm_eval = spec.needs_arm_eval();
         // Seed the activity baseline to the CURRENT content_seq so the first
         // observe after arming does not read a PHANTOM advance (the kernel clock
         // defaults to 0, which would otherwise look like a fresh content jump and
@@ -523,7 +548,13 @@ impl super::Terminal {
         let seq = self.content_seq();
         self.watchers.seed_seq(seq);
         let id = self.watchers.arm(spec, now)?;
-        if is_row {
+        if arm_eval {
+            // Note the ordering: `seed_seq` above has already set the activity
+            // baseline to `seq`, so this pass sees `advanced == false` and does
+            // NOT stamp phantom activity (which would reset a concurrent
+            // `IdleFor` deadline). `SeqAdvanced` latches on `content_seq >
+            // after`, which is independent of `advanced`, so the arm-time
+            // evaluation is correct precisely because it is activity-neutral.
             self.observe_at(now);
         }
         Some(id)

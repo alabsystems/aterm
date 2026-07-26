@@ -211,15 +211,46 @@ impl TerminalBuilder {
             };
         }
         if let Some(fg) = self.foreground {
-            terminal.color.default_foreground = fg;
+            terminal.set_default_foreground(fg);
         }
         if let Some(bg) = self.background {
-            terminal.color.default_background = bg;
+            terminal.set_default_background(bg);
         }
         if let Some(font) = self.font {
             terminal.font = font;
         }
 
         terminal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_colors_survive_dynamic_color_set_and_reset() {
+        let foreground = Rgb::new(0x11, 0x22, 0x33);
+        let background = Rgb::new(0x44, 0x55, 0x66);
+        let mut terminal = TerminalBuilder::new()
+            .foreground(foreground)
+            .background(background)
+            .build();
+
+        terminal.process(b"\x1b]10;rgb:aa/bb/cc\x07\x1b]11;rgb:77/88/99\x07");
+        assert_ne!(terminal.default_foreground(), foreground);
+        assert_ne!(terminal.default_background(), background);
+
+        terminal.process(b"\x1b]110\x07\x1b]111\x07");
+        assert_eq!(
+            terminal.default_foreground(),
+            foreground,
+            "OSC 110 restores the builder-configured foreground"
+        );
+        assert_eq!(
+            terminal.default_background(),
+            background,
+            "OSC 111 restores the builder-configured background"
+        );
     }
 }

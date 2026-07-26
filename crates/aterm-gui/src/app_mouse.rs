@@ -723,12 +723,18 @@ impl App {
         strip_col_for_pixel(x, y, cw, ch, cols, self.tab_strip_rows, pad, pad_top, head)
     }
 
-    /// A left click on the Cmd-F find bar's `Aa` (case) / `.*` (regex) indicators fires
-    /// the matching toggle — the SAME action as the ⌥⌘C / ⌥⌘R chords, so a mouse user
-    /// can flip modes without the keyboard. `row`/`col` are TERMINAL cell coordinates
+    /// A left click on the Cmd-F find panel. On the `Aa` (case) / `.*` (regex)
+    /// indicators it fires the matching toggle — the SAME action as the ⌥⌘C / ⌥⌘R
+    /// chords, so a mouse user can flip modes without the keyboard. Inside the query
+    /// WELL it moves the caret to the character under the pointer, like any text field
+    /// (past the text ⇒ the end). `row`/`col` are TERMINAL cell coordinates
     /// (`pixel_to_cell`), matching the geometry `splice_find_bar` recorded in
-    /// [`crate::FindBarHit`]. Precise: returns `false` (unconsumed) off the indicator
-    /// spans or when not searching, so ordinary terminal clicks fall through untouched.
+    /// [`crate::FindBarHit`].
+    ///
+    /// Returns `false` (unconsumed) when not searching or off the panel entirely, so
+    /// ordinary terminal clicks fall through untouched. A click anywhere ELSE on the
+    /// panel's band IS consumed: the band is chrome, and a drag started on it would
+    /// otherwise select the panel's own text as if it were terminal output.
     pub(crate) fn find_bar_click(&mut self, wid: WindowId, row: u16, col: u16) -> bool {
         let Some(hit) = self
             .windows
@@ -737,19 +743,24 @@ impl App {
         else {
             return false;
         };
-        if row as usize != hit.row {
+        let row = row as usize;
+        if !hit.band.contains(&row) {
             return false;
+        }
+        if row != hit.row {
+            return true; // the panel's pad / hints rows: inert chrome, but consumed
         }
         let col = col as usize;
         if hit.case_cols.is_some_and(|r| r.contains(&col)) {
             self.search_toggle_case();
-            true
         } else if hit.regex_cols.is_some_and(|r| r.contains(&col)) {
             self.search_toggle_regex();
-            true
-        } else {
-            false
+        } else if hit.field_cols.contains(&col) {
+            // The well's first cell shows character `field_scroll`, so the click's
+            // distance into it is the character index — the same mapping the paint used.
+            self.search_click_caret_in(wid, hit.field_scroll + (col - hit.field_cols.start));
         }
+        true
     }
 
     /// Pixel-precise gate for [`Self::find_bar_click`]: `true` only when window pixel
@@ -757,19 +768,19 @@ impl App {
     /// [`Self::pixel_to_cell`] would clamp it to. That clamp is the hazard: a click in
     /// the top `pad_top` border (or anywhere above the grid) snaps to row 0 —
     /// coincidentally the bar's row in the usual TOP placement — and a click in the
-    /// bottom `pad` snaps to the last terminal row (the bar's row when it floats to the
-    /// bottom), so without this gate either would false-toggle a mode. The band is
-    /// `[pad_top + head + frame_row*ch, +ch)` on the frame's y-axis, where
-    /// `frame_row = tab_strip_rows + hit.row` mirrors the strip prepend `splice_find_bar`
+    /// bottom `pad` snaps to the last terminal row (the panel's last row when it floats
+    /// to the bottom), so without this gate either would false-toggle a mode. The band is
+    /// `[pad_top + head + frame_row*ch, + rows*ch)` on the frame's y-axis, where
+    /// `frame_row = tab_strip_rows + hit.band.start` mirrors the strip prepend `splice_find_bar`
     /// applied; the x-check rejects clicks past the grid's right edge (which clamp onto
     /// the last column). `None` bar ⇒ `false`. Uses the SAME [`Self::window_to_frame`]
     /// band-strip as `pixel_to_cell`, so the two can't disagree in the settled state.
     pub(crate) fn find_bar_pixel_hit(&self, wid: WindowId, x: f64, y: f64) -> bool {
-        let Some(hit_row) = self
+        let Some(band) = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.find_bar_hit.as_ref())
-            .map(|h| h.row)
+            .map(|h| h.band.clone())
         else {
             return false;
         };
@@ -785,9 +796,10 @@ impl App {
         // bottom-anchored bar never risked this; the top bar does.)
         let (ox, oy) = self.frame_origin(wid);
         let (fx, fy) = (x - ox as f64, y - oy as f64);
-        let frame_row = self.tab_strip_rows as usize + hit_row;
+        let frame_row = self.tab_strip_rows as usize + band.start;
         let top = (pad_top + self.win_head(wid) + frame_row * ch) as f64;
-        if fy < top || fy >= top + ch as f64 || fx < pad as f64 {
+        let bottom = top + (band.len() * ch) as f64;
+        if fy < top || fy >= bottom || fx < pad as f64 {
             return false;
         }
         // Reject clicks past the right edge — `pixel_to_cell` would clamp their column

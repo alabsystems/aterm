@@ -1345,19 +1345,47 @@ pub enum NyanSpriteSource {
 /// screenful — enough for the scroll hit — and never grows without bound as a
 /// build log streams distinct lines through it. `String`/`Vec` keys are exact,
 /// so no hash-collision argument is needed for correctness.
+///
+/// The retired generation's HEAP BUFFERS are kept (`spare`) rather than freed.
+/// A memo MISS is strictly more expensive than the pre-memo scan it wraps — it
+/// copies the row text and the match list into a new entry — and the shape
+/// where every probe misses is a full-screen TUI repaint: one malloc+free pair
+/// per row per frame, on the render thread, in a crate that is otherwise
+/// allocation-free after warm-up. Measured on the 60×200 repaint probe
+/// (`scan_memo_cost`; all three engines run the same frames and the FASTEST
+/// frame of each is reported, because a shared box's mean measures the
+/// scheduler): the miss-path bookkeeping costs 2.5–4.2 µs on a 100–135 µs
+/// rescan. Recycling's own TIMING delta is inside that box's noise (±1 µs,
+/// either sign), so the claim for it is not throughput: it is that a warmed
+/// all-miss frame stops calling the allocator at all — 11 559 of the probe's
+/// 11 800 entry buffers refilled instead of malloc'd — because one discarded
+/// generation is exactly the buffer count the incoming generation asks for.
+/// Per-row malloc/free on the render thread is what turns a busy screen into a
+/// tail-latency spike, and it is the one thing this crate promises not to do.
 #[derive(Default)]
 struct ScanMemo {
     hot: FxHashMap<String, Vec<Match>>,
     cold: FxHashMap<String, Vec<Match>>,
+    /// Emptied entry buffers from the generation `install` just discarded,
+    /// waiting to be refilled by the incoming one. Bounded by `gen_cap`, so the
+    /// memo's footprint stays ≈ 3 generations rather than 2 — the same order,
+    /// still tied to the viewport, and it is what makes the ALL-MISS steady
+    /// state allocation-free instead of only the all-hit one.
+    spare: Vec<(String, Vec<Match>)>,
     /// Live per-generation entry cap (from the viewport row count).
     gen_cap: usize,
-    /// Fingerprint of the [`ScanOptions`] the resident entries were produced
-    /// under. Lexicon rebuilds and `[sparkle_words]` edits already route
-    /// through `hard_reset` (which clears the memo outright); this is the
-    /// standing guard for any caller that changes the gates WITHOUT one — a
-    /// stale `allow_bare_cat`/`ignore` entry would keep decorating a word the
-    /// user just denied, on a byte-idle grid, until the text next changed.
-    opts_fp: u64,
+    /// Fingerprint of the OTHER TWO scanner inputs the resident entries were
+    /// produced under — the [`ScanOptions`] and the [`Lexicon`] itself (see
+    /// [`scan_inputs_fp`]). The memo keys on the row text alone, so anything
+    /// else `scan_into_with_scratch` reads has to live here or a hit answers
+    /// with a different function's output. `[sparkle_words]` edits and lexicon
+    /// rebuilds already route through `hard_reset` (which clears the memo
+    /// outright); this is the standing guard for any caller that swaps a gate
+    /// or a lexicon WITHOUT one — a stale `allow_bare_cat`/`ignore` entry would
+    /// keep decorating a word the user just denied, and a stale LEXICON entry
+    /// would keep decorating language-gated forms the user just turned off, on
+    /// a byte-idle grid, until the text next changed.
+    inputs_fp: u64,
     /// Test-only: force every probe to miss so the equivalence battery can
     /// drive a second engine down the always-re-lex path.
     #[cfg(test)]
@@ -1366,20 +1394,66 @@ struct ScanMemo {
     hits: u64,
     #[cfg(test)]
     misses: u64,
+    /// Test-only: how many entries had to be built from a FRESH allocation
+    /// because `spare` was empty. The all-miss allocation regression asserts
+    /// this stops growing — a counter, not a global allocator hook, so the
+    /// claim is checkable from a unit test.
+    #[cfg(test)]
+    fresh_buffers: u64,
+    /// Test-only: run the PRE-RECYCLING miss path (allocate a key + match list
+    /// per miss, free the retired generation). The cost probe drives it in the
+    /// same interleaved run as the pooled engine — measuring the two in
+    /// separate runs measures this box's load, not the pool.
+    #[cfg(test)]
+    no_recycle: bool,
 }
 
 impl ScanMemo {
     fn clear(&mut self) {
-        self.hot.clear();
-        self.cold.clear();
+        // Retirement (fingerprint change / `hard_reset`) drops the ENTRIES but
+        // keeps their buffers for the generation that immediately follows: the
+        // whole viewport is about to be re-scanned and re-remembered, so
+        // freeing here would only mean re-allocating a screenful of rows on the
+        // very next frame.
+        let keep = self.pool_target();
+        Self::recycle(&mut self.spare, &mut self.hot, keep);
+        Self::recycle(&mut self.spare, &mut self.cold, keep);
     }
 
-    /// Per-rescan prologue: retire everything if the scan gates moved, and size
-    /// the generations to the viewport. Called once per rescan, not per row.
-    fn fit(&mut self, rows: usize, opts_fp: u64) {
-        if self.opts_fp != opts_fp {
+    /// How many retired buffers the pool holds: ONE generation — exactly what
+    /// the incoming generation will ask `remember` for before the next
+    /// rotation, so the steady state neither allocates nor grows.
+    fn pool_target(&self) -> usize {
+        #[cfg(test)]
+        if self.no_recycle {
+            return 0;
+        }
+        self.gen_cap.max(1)
+    }
+
+    /// Move `gone`'s entry buffers into `spare` (up to `keep` of them),
+    /// freeing whatever does not fit, and leave `gone` EMPTY BUT ALLOCATED —
+    /// the map's table is resident scratch under the same rule its entries are.
+    fn recycle(
+        spare: &mut Vec<(String, Vec<Match>)>,
+        gone: &mut FxHashMap<String, Vec<Match>>,
+        keep: usize,
+    ) {
+        let room = keep.saturating_sub(spare.len());
+        // `take(room)` stops FILLING the pool at the cap; the remaining entries
+        // are still removed when the `Drain` is dropped, so this is a clear()
+        // that keeps what the next generation will ask for.
+        spare.extend(gone.drain().take(room));
+        debug_assert!(gone.is_empty(), "the drain must empty the generation");
+    }
+
+    /// Per-rescan prologue: retire everything if the scan gates OR the lexicon
+    /// moved, and size the generations to the viewport. Called once per rescan,
+    /// not per row.
+    fn fit(&mut self, rows: usize, inputs_fp: u64) {
+        if self.inputs_fp != inputs_fp {
             self.clear();
-            self.opts_fp = opts_fp;
+            self.inputs_fp = inputs_fp;
         }
         // TWO screenfuls per generation, not one: at exactly one screenful a
         // single new line would rotate the generation every frame, so the next
@@ -1389,6 +1463,11 @@ impl ScanMemo {
         self.gen_cap = rows
             .saturating_mul(2)
             .clamp(SCAN_MEMO_MIN_GEN, SCAN_MEMO_MAX_GEN);
+        // The spare pool tracks the viewport too: a window that shrank (or a
+        // pane that split) must not keep the big grid's screenful of row
+        // buffers alive for the rest of the session. No-op — not even a walk —
+        // whenever the pool already fits.
+        self.spare.truncate(self.gen_cap);
     }
 
     /// Probe for `text`, promoting a cold-generation hit into hot. `true` means
@@ -1430,27 +1509,61 @@ impl ScanMemo {
         self.hot.get(text).map_or(&[][..], Vec::as_slice)
     }
 
-    /// Record a freshly scanned row.
+    /// Record a freshly scanned row, refilling a retired entry's buffers rather
+    /// than allocating a key + match list per miss (see the `spare` field: on
+    /// an all-miss screen that malloc/free pair ran once per row per frame, on
+    /// the render thread).
     fn remember(&mut self, text: &str, matches: &[Match]) {
-        self.install(text.to_owned(), matches.to_vec());
+        // `bypass` is the memo switched OFF, not merely forced to miss: the
+        // equivalence battery's control engine must run the pre-memo code path
+        // exactly, and the cost probe's `memo=false` legs are only a baseline
+        // if they also skip the bookkeeping below.
+        #[cfg(test)]
+        if self.bypass {
+            return;
+        }
+        #[cfg(test)]
+        if self.no_recycle {
+            // The pre-pool path, counted the same way, so the all-miss
+            // allocation regression can state the delta the pool removes.
+            self.fresh_buffers += 1;
+            self.install(text.to_owned(), matches.to_vec());
+            return;
+        }
+        let (mut key, mut value) = self.spare.pop().unwrap_or_else(|| {
+            #[cfg(test)]
+            {
+                self.fresh_buffers += 1;
+            }
+            (String::new(), Vec::new())
+        });
+        key.clear();
+        key.push_str(text);
+        value.clear();
+        value.extend_from_slice(matches);
+        self.install(key, value);
     }
 
     fn install(&mut self, key: String, value: Vec<Match>) {
         if self.hot.len() >= self.gen_cap.max(1) {
             // Generation rotation, not eviction: the screenful that just went
             // cold still answers next frame's scroll, and the generation before
-            // it is dropped in one free instead of a per-entry LRU walk on the
-            // typing path.
-            self.cold.clear();
+            // it is retired in one walk instead of a per-entry LRU walk on the
+            // typing path. That walk hands its buffers to `spare` — exactly one
+            // generation of them, which is exactly what the incoming generation
+            // is about to ask `remember` for.
+            let keep = self.pool_target();
+            Self::recycle(&mut self.spare, &mut self.cold, keep);
             std::mem::swap(&mut self.hot, &mut self.cold);
         }
         self.hot.insert(key, value);
     }
 }
 
-/// Fold every input that can change what [`Lexicon::scan_into_with_scratch`]
-/// returns for a fixed row text into one key. Computed ONCE per rescan (the
-/// `ignore` walk is O(|deny list|), not O(rows · |deny list|)).
+/// Fold every SCAN-GATE input that can change what
+/// [`Lexicon::scan_into_with_scratch`] returns for a fixed row text into one
+/// key. Computed ONCE per rescan (the `ignore` walk is O(|deny list|), not
+/// O(rows · |deny list|)).
 fn scan_opts_fp(opts: &ScanOptions<'_>) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -1474,6 +1587,46 @@ fn scan_opts_fp(opts: &ScanOptions<'_>) -> u64 {
     fp
 }
 
+/// The memo's FULL retirement key: the scan gates ([`scan_opts_fp`]) plus the
+/// identity of the lexicon the entries were scanned against.
+///
+/// WHY THE LEXICON IS IN THE KEY. `scan_into_with_scratch` reads
+/// `(text, opts, self)`. The memo keys on the text and `fit` retires on the
+/// opts, which left the THIRD input unguarded: with the same cells and the same
+/// gates but the lexicon swapped (`languages = ["en","ro"]` → `["en"]`, a user
+/// `[[entry]]` override edited, a Toy Pack unloaded) every row hits and the
+/// frame is decorated by the lexicon the user just replaced — a wrong
+/// decoration set on screen, not merely a stale one. `Match::form_id` is
+/// unique only WITHIN the instance that produced it, so the identity/ordinal
+/// machinery downstream inherits the error rather than catching it.
+/// `hard_reset` is the intended rebuild hook (v3 §1.1), but that is a caller
+/// CONVENTION; a cache may not depend on its callers being polite.
+///
+/// WHAT THE KEY IS. aterm-lexicon exposes no build digest, and this runs on the
+/// keystroke path (once per rescan, inside the present carrying the echo), so
+/// an O(|lexicon|) content hash — tens of thousands of folded surfaces — would
+/// cost more than the memo saves. The key is therefore the strongest strictly
+/// O(1) fold the public surface allows:
+///
+/// * the instance ADDRESS. The scanner's `&Lexicon` is a stable place for the
+///   memo's whole life — production holds it in an `Arc` inside the resolved
+///   sparkle runtime and publishes a NEW `Arc` on rebuild, so the address never
+///   moves under a live memo and never repeats between two lexicons that are
+///   alive at the same moment. That covers every real swap: the language-set
+///   change above, a per-window runtime, an override reload, a test fixture.
+/// * `spaced_form_count()`, which separates the one case an address cannot —
+///   a rebuild the allocator happened to hand the freed address of the lexicon
+///   it replaced. Two different lexicons at the same address with an equal
+///   folded-surface count would still collide; closing that residual needs a
+///   digest computed ONCE at build time inside aterm-lexicon (that crate is
+///   outside this change), which this fold would then subsume both terms with.
+fn scan_inputs_fp(lexicon: &Lexicon, opts: &ScanOptions<'_>) -> u64 {
+    // `fold_u64` is this module's whole-scalar FNV-1a step, over the same prime
+    // the gate fold above mixes bytes with.
+    let fp = fold_u64(scan_opts_fp(opts), std::ptr::from_ref(lexicon) as usize as u64);
+    fold_u64(fp, lexicon.spaced_form_count() as u64)
+}
+
 #[derive(Default)]
 pub struct WordDecorations {
     occ: Vec<Occurrence>,
@@ -1493,6 +1646,13 @@ pub struct WordDecorations {
     /// The rescan's tokenise+lexicon-lookup memo — see [`ScanMemo`]. Holds the
     /// only per-row work that is a pure function of the row's text.
     scan_memo: ScanMemo,
+    /// Test-only mutation switch: suppress the memo-hit rebuild of
+    /// `scan_chars`. Exists so the battery can prove the `scan_chars` /
+    /// `scan_text` invariant is GUARDED (a named `debug_assert_eq!` at the
+    /// seam) instead of surfacing as an out-of-bounds panic deep inside
+    /// `genome::simhash_ctx` while a frame is being drawn.
+    #[cfg(test)]
+    mutate_skip_scan_chars_rebuild: bool,
     /// Lexicon token/fold/CJK workspace, resident so typing-damage rescans
     /// allocate nothing after the scanner reaches its high-water capacities.
     scan_scratch: ScanScratch,
@@ -2347,7 +2507,7 @@ impl WordDecorations {
             return;
         }
         let opts = cfg.scan_opts();
-        self.scan_memo.fit(rows, scan_opts_fp(&opts));
+        self.scan_memo.fit(rows, scan_inputs_fp(lexicon, &opts));
         // A language-gated collision at the editing caret is provisional: the
         // user may still be typing a longer ordinary word (`fut` -> `future`).
         // Scrolled-back content has no live input cursor, so it is settled.
@@ -2520,7 +2680,7 @@ impl WordDecorations {
             return;
         }
         let opts = cfg.scan_opts();
-        self.scan_memo.fit(rows, scan_opts_fp(&opts));
+        self.scan_memo.fit(rows, scan_inputs_fp(lexicon, &opts));
         let mut out = self.rescan_begin();
         let mut ink_full = false;
         let mut start_row = 0usize;
@@ -2781,7 +2941,15 @@ impl WordDecorations {
         } else {
             &self.scan_matches
         };
-        if hit && !matches.is_empty() {
+        // Test-only mutation switch for the guard below: the battery uses it to
+        // reproduce exactly the break this rebuild prevents (see
+        // `memo_hit_without_the_scan_chars_rebuild_trips_the_guard`). Always
+        // `true` in a shipping build — no branch and no field exist there.
+        #[cfg(test)]
+        let rebuild_scan_chars = !self.mutate_skip_scan_chars_rebuild;
+        #[cfg(not(test))]
+        let rebuild_scan_chars = true;
+        if hit && rebuild_scan_chars && !matches.is_empty() {
             // A hit skipped the scanner, so `scan_chars` still holds the
             // PREVIOUS row's stream — and the deferred-birth SimHash below
             // indexes it with THIS row's `m.start`/`m.end`, which would fold a
@@ -2792,6 +2960,23 @@ impl WordDecorations {
             // case) skips even this.
             self.scan_chars.clear();
             self.scan_chars.extend(self.scan_text.chars());
+        }
+        // INVARIANT (named here because the memo made it breakable): whenever
+        // this row has matches, `scan_chars` IS this row's char stream. The
+        // match spans below are CHAR indices into `scan_text`, and
+        // `genome::simhash_ctx` walks `scan_chars` from them UNGUARDED
+        // (`chars[pos - 1]`), so a `scan_chars` left holding a SHORTER previous
+        // row is not a wrong pixel — it is an index-out-of-bounds panic inside
+        // the rescan, i.e. inside the present that is drawing the frame. The
+        // miss path gets this from `scan_into_with_scratch`'s own opening
+        // `clear()` + `extend(chars())`; the hit path gets it from the block
+        // right above, which is the ONLY thing keeping the two in sync.
+        if !matches.is_empty() {
+            debug_assert_eq!(
+                self.scan_chars.len(),
+                self.scan_text.chars().count(),
+                "scan_chars must mirror scan_text before the match loop indexes it"
+            );
         }
         for &m in matches {
             let start_col = self.scan_colmap.get(m.start).copied().unwrap_or(0);
@@ -7699,6 +7884,138 @@ mod tests {
         );
     }
 
+    /// The LEXICON is the scanner's third input and the memo keys on none of
+    /// it, so it has to ride the retirement fingerprint too (see
+    /// [`scan_inputs_fp`]). Same cells, same `ScanOptions`, only
+    /// `languages = ["en","ro"]` → `["en"]`: every row's text is unchanged, so
+    /// every row HITS, and without the lexicon in the key the frame keeps
+    /// showing the language-gated Romanian form the user just switched off —
+    /// a wrong decoration set on screen, not a stale one.
+    #[test]
+    fn scan_memo_retires_when_the_lexicon_changes() {
+        let (rows, cols) = (3usize, 32usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        // `futu` is a `ro`-gated ambiguous profanity form: present in the
+        // en+ro lexicon, absent from the en-only one, with the SAME scan gates.
+        term.process(b"totally futu here\r\n");
+        let with_ro = Lexicon::with_languages(&["en", "ro"]);
+        let en_only = Lexicon::with_languages(&["en"]);
+        let c = cfg();
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let now = Instant::now();
+        let mut wd = WordDecorations::default();
+        let profane = |wd: &WordDecorations| wd.occ.iter().any(|o| o.class == Class::Profanity);
+        wd.rescan_from_cells(
+            &snap.cells,
+            &snap.line_sizes,
+            rows,
+            cols,
+            &with_ro,
+            &c,
+            1,
+            now,
+        );
+        assert!(
+            profane(&wd),
+            "the fixture must decorate the language-gated form under en+ro"
+        );
+
+        // Same cells, same epoch-advance, same options — ONLY the lexicon.
+        wd.rescan_from_cells(
+            &snap.cells,
+            &snap.line_sizes,
+            rows,
+            cols,
+            &en_only,
+            &c,
+            2,
+            now,
+        );
+        assert!(
+            !profane(&wd),
+            "a swapped lexicon must not be answered from the old lexicon's memo"
+        );
+
+        // ...and back: a fingerprint, not a latch.
+        wd.rescan_from_cells(
+            &snap.cells,
+            &snap.line_sizes,
+            rows,
+            cols,
+            &with_ro,
+            &c,
+            3,
+            now,
+        );
+        assert!(
+            profane(&wd),
+            "restoring the language must restore the decoration"
+        );
+    }
+
+    /// Two rows whose CHAR streams differ in length (a wide CJK lead makes the
+    /// second row one char shorter than its column count), so a memo hit that
+    /// skipped the `scan_chars` rebuild leaves this row's char-indexed match
+    /// spans pointing past the end of the PREVIOUS row's stream — the
+    /// unguarded `chars[pos - 1]` in `genome::simhash_ctx`, i.e. an
+    /// out-of-bounds panic inside the present. The invariant is now named at
+    /// the seam that owns it; this drives the mutation and proves the guard,
+    /// not the crash, is what fires.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "scan_chars must mirror scan_text")]
+    fn memo_hit_without_the_scan_chars_rebuild_trips_the_guard() {
+        let (rows, cols) = (4usize, 24usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process("a kitty naps\r\n\u{5BBD} cat here\r\n".as_bytes());
+        let lex = Lexicon::with_languages(&["en"]);
+        let c = cfg();
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let now = Instant::now();
+        let mut wd = WordDecorations::default();
+        // Frame 1 populates the memo and leaves `scan_chars` holding the LAST
+        // row's (wide-lead, one char shorter) stream.
+        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 1, now);
+        assert!(
+            wd.occ.iter().any(|o| o.class == Class::Feline),
+            "the fixture must match on the first row, or the hit proves nothing"
+        );
+        wd.mutate_skip_scan_chars_rebuild = true;
+        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 2, now);
+    }
+
+    /// The unmutated shape of the same fixture: the guard above may not be a
+    /// tripwire the healthy hit path stumbles over. The second frame is served
+    /// ENTIRELY from the memo (so every row runs the assertion under a stale
+    /// candidate stream) and lands on the same decoration set.
+    #[test]
+    fn memo_hit_over_a_wide_row_keeps_the_frame_and_the_guard_quiet() {
+        let (rows, cols) = (4usize, 24usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process("a kitty naps\r\n\u{5BBD} cat here\r\n".as_bytes());
+        let lex = Lexicon::with_languages(&["en"]);
+        let c = cfg();
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let now = Instant::now();
+        let mut wd = WordDecorations::default();
+        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 1, now);
+        let first = deco_state(&wd);
+        let misses = wd.scan_memo.misses;
+        wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, 2, now);
+        assert_eq!(
+            wd.scan_memo.misses, misses,
+            "the second frame must be served entirely from the memo"
+        );
+        assert_eq!(
+            first,
+            deco_state(&wd),
+            "the memo-served frame must decorate identically"
+        );
+    }
+
     #[test]
     fn geometry_scan_samples_and_freezes_the_prospective_cat_footprint() {
         let (rows, cols) = (4usize, 20usize);
@@ -8493,6 +8810,113 @@ mod tests {
             caps(&wd),
             warm,
             "resident capacities must not grow after warmup"
+        );
+    }
+
+    /// §13 allocation regression, MISS side. The test above covers the all-HIT
+    /// steady state the memo exists for; this covers the shape it is WORST at —
+    /// a full-screen TUI repaint whose every row's text is new every frame, so
+    /// every probe misses and every miss wants a key + match-list buffer. That
+    /// is the one path where the memo is net-new work on a crate that is
+    /// otherwise allocation-free after warm-up, so the buffers come from the
+    /// generation the memo just retired: after warm-up such a frame allocates
+    /// NOTHING, and `fresh_buffers` (bumped only when the pool ran dry) is the
+    /// direct witness.
+    #[test]
+    fn allocation_regression_all_miss_repaint_reuses_retired_buffers() {
+        let lex = lex();
+        let c = cfg();
+        let t0 = Instant::now();
+        let (rows, cols) = (8usize, 48usize);
+        let mut wd = WordDecorations::default();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let mut snap = aterm_core::render::RenderInput::default();
+        let mut line = String::new();
+        // One full-screen repaint: every row carries the frame number, so no
+        // row's text can ever be answered from the memo.
+        let mut repaint = |wd: &mut WordDecorations, term: &mut Terminal, e: u64| {
+            term.process(b"\x1b[H");
+            for r in 0..rows {
+                line.clear();
+                // FIXED-WIDTH frame tag: a counter that widens from 99 to 100
+                // would shift every match's COLUMN, and columns seed identities
+                // — persist churn that has nothing to do with the buffers this
+                // test is about.
+                for digit in [1000u64, 100, 10, 1] {
+                    let d = u8::try_from(e / digit % 10).expect("one digit");
+                    line.push(char::from(b'0' + d));
+                }
+                line.push(' ');
+                line.push_str(&r.to_string());
+                line.push_str(" a happy kitty says fuck");
+                term.process(line.as_bytes());
+                if r + 1 < rows {
+                    term.process(b"\r\n");
+                }
+            }
+            term.cell_frame_into(&mut snap, rows, cols);
+            wd.rescan_from_cells(&snap.cells, &snap.line_sizes, rows, cols, &lex, &c, e, t0);
+        };
+        // Warm-up: several full generations (`gen_cap` is two screenfuls, so a
+        // rotation lands every `gen_cap / rows` frames) plus the episode
+        // machinery reaching its high-water capacities.
+        for e in 1..=60u64 {
+            repaint(&mut wd, &mut term, e);
+        }
+        let caps = |wd: &WordDecorations| {
+            [
+                wd.scan_memo.hot.capacity(),
+                wd.scan_memo.cold.capacity(),
+                wd.scan_memo.spare.capacity(),
+                wd.scan_text.capacity(),
+                wd.scan_chars.capacity(),
+                wd.scan_matches.capacity(),
+                wd.scan_colmap.capacity(),
+                wd.occ.capacity(),
+                wd.persist.capacity(),
+            ]
+        };
+        let warm = caps(&wd);
+        let fresh = wd.scan_memo.fresh_buffers;
+        for e in 61..=260u64 {
+            repaint(&mut wd, &mut term, e);
+        }
+        assert_eq!(
+            wd.scan_memo.hits, 0,
+            "the fixture must miss on every row, or it is not measuring the miss path"
+        );
+        assert_eq!(
+            wd.scan_memo.misses,
+            260 * rows as u64,
+            "every row of every frame must have reached the scanner"
+        );
+        assert_eq!(
+            wd.scan_memo.fresh_buffers, fresh,
+            "a warmed all-miss repaint must refill retired buffers, not allocate new ones"
+        );
+        assert_eq!(
+            caps(&wd),
+            warm,
+            "resident capacities must not grow on the all-miss path either"
+        );
+
+        // Non-vacuity, and the size of what the pool returns: the SAME frames
+        // on an engine that allocates per miss (the path as first shipped) buy
+        // a key + match-list pair for every row of every frame.
+        let mut control = WordDecorations::default();
+        control.scan_memo.no_recycle = true;
+        let mut control_term = Terminal::new(rows as u16, cols as u16);
+        for e in 1..=260u64 {
+            repaint(&mut control, &mut control_term, e);
+        }
+        assert_eq!(
+            control.scan_memo.fresh_buffers,
+            260 * rows as u64,
+            "the control must allocate one buffer pair per missed row"
+        );
+        assert!(
+            fresh < 260 * rows as u64 / 10,
+            "the pooled engine must allocate only while it warms up (fresh: {fresh})"
         );
     }
 
@@ -15020,6 +15444,83 @@ mod scan_memo_bench {
                 "SCROLL 1 line  memo={:5}: {:?}/frame (includes cell_frame_into)",
                 !bypass,
                 started.elapsed() / u32::try_from(frames).expect("small")
+            );
+        }
+
+        // (3) FULL-SCREEN REPAINT — the memo's WORST case: a TUI whose every
+        // row's text is new every frame, so every probe misses and the memo's
+        // bookkeeping (key + match-list buffers, insert, generation rotation)
+        // is pure overhead on top of the full lexicon pass it cannot avoid.
+        // `memo=false` here is the pre-memo baseline (`bypass` switches the
+        // cache off, it does not merely force misses), so the two lines below
+        // ARE the regression this shape is suspected of.
+        //
+        // Both engines are driven over the SAME frames and each is timed around
+        // its own rescan only: a full-screen repaint costs more to push through
+        // the parser than to scan, and this box's clock drifts under load, so
+        // separate runs of the two legs measure the machine rather than the
+        // memo. Interleaved, the drift lands on both.
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let mut snap = aterm_core::render::RenderInput::default();
+        let mut line = String::new();
+        // Three engines, same frames: the pre-memo baseline, the memo as first
+        // shipped (a fresh key + match-list allocation per miss), and the memo
+        // with the retired generation's buffers recycled.
+        let mut engines: Vec<(&str, WordDecorations, Duration)> =
+            ["no memo   ", "memo alloc", "memo pool "]
+                .into_iter()
+                .map(|label| {
+                    let mut wd = WordDecorations::default();
+                    wd.scan_memo.bypass = label.starts_with("no memo");
+                    wd.scan_memo.no_recycle = label.starts_with("memo alloc");
+                    (label, wd, Duration::MAX)
+                })
+                .collect();
+        for e in 0..frames {
+            term.process(b"\x1b[H");
+            for r in 0..rows {
+                // A per-(frame, row) prefix in front of the same prose: the
+                // scanner's work per row is unchanged, only the memo key is
+                // new — so the delta between the two legs is the memo's
+                // miss-path cost and nothing else.
+                line.clear();
+                line.push_str(&e.to_string());
+                line.push(' ');
+                line.push_str(&r.to_string());
+                line.push(' ');
+                line.push_str(PROSE);
+                term.process(line.as_bytes());
+            }
+            term.cell_frame_into(&mut snap, rows, cols);
+            for (_, wd, best) in &mut engines {
+                let started = Instant::now();
+                wd.rescan_from_cells_with_geom(
+                    &snap.cells,
+                    &snap.line_sizes,
+                    rows,
+                    cols,
+                    &lex,
+                    &cfg,
+                    e,
+                    now,
+                    geom,
+                    0,
+                );
+                // MIN, not mean: this box builds other crates while the probe
+                // runs, and a preempted frame measures the scheduler. The
+                // fastest frame of each engine is the one that ran undisturbed.
+                *best = (*best).min(started.elapsed());
+            }
+        }
+        for (label, wd, spent) in &engines {
+            println!(
+                "REPAINT all-miss {label}: {:?} fastest frame (rescan only) \
+                 misses={} resident={} spare={} fresh={}",
+                *spent,
+                wd.scan_memo.misses,
+                wd.scan_memo.hot.len() + wd.scan_memo.cold.len(),
+                wd.scan_memo.spare.len(),
+                wd.scan_memo.fresh_buffers,
             );
         }
     }

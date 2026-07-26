@@ -1456,6 +1456,40 @@ fn note_offscreen_written(win: &mut WindowGpu, rect: Option<[u32; 4]>, dims: (u3
     win.offscreen_dirty_since_sync = union_rect_opt(win.offscreen_dirty_since_sync, rect, dims);
 }
 
+/// The offscreen frame's stream groups, in DRAW ORDER — the index space of
+/// [`coalesce_frame_passes`]'s `enabled`/`srgb` arrays, of [`GROUP_SRGB`] and of
+/// the `pass_of` map `encode_frame` walks. Module-level so the coalescing tests
+/// name the SAME groups the encode does.
+const G_BASE_BG: usize = 0;
+const G_GLOW_UNDER: usize = 1;
+const G_BASE_FG: usize = 2;
+const G_GLOW: usize = 3;
+const G_WDECO_OVER: usize = 4;
+const G_WDECO_ADD: usize = 5;
+const G_FREE_OVER: usize = 6;
+const G_CURSOR: usize = 7;
+const FRAME_GROUPS: usize = 8;
+
+/// Which attachment view each stream group MUST be drawn into: `true` == the
+/// sRGB-typed view (base / source-over streams, so fixed-function ALPHA_BLENDING
+/// composites in LINEAR light == the CPU `blend`), `false` == the plain Unorm view
+/// (One/One additive, byte-exact with the CPU `add_sat`).
+///
+/// THE PRODUCTION MAP, and the ONLY one: `encode_frame` hands this array straight
+/// to [`coalesce_frame_passes`], and the coalescing tests consume it too. A copy
+/// in the test module would be a lie waiting to happen — re-tag a stream's colour
+/// space here and a twin keeps asserting the OLD tag, so the coalescer would be
+/// free to fuse a group across an sRGB/Unorm boundary and composite it in the
+/// wrong light with every test still green. Wrong-colour regressions do not show
+/// up in a pass count, which is all a twin can check.
+const GROUP_SRGB: [bool; FRAME_GROUPS] = {
+    let mut srgb = [true; FRAME_GROUPS];
+    srgb[G_GLOW_UNDER] = false; // EMBERFORGE flame body (One/One)
+    srgb[G_GLOW] = false; // aurora / nova / rain halos (One/One)
+    srgb[G_WDECO_ADD] = false; // sparkle-word additive layer (One/One)
+    srgb
+};
+
 /// Pack the frame's ENABLED stream groups (indexed in DRAW ORDER) into as few
 /// render passes as the two attachment views allow: walk the groups and start a
 /// new pass only when the view a group needs differs from the previous enabled
@@ -1466,7 +1500,12 @@ fn note_offscreen_written(win: &mut WindowGpu, rect: Option<[u32; 4]>, dims: (u3
 /// WHY: on a TBDR GPU (Metal) the load/store actions are per-ATTACHMENT, so every
 /// extra pass on the offscreen costs a full-framebuffer tile load + store that the
 /// dirty-row scissor cannot restrict — ~23 MB each at 3024x1964x4B, paid even by a
-/// pass that draws nothing. Merging two neighbours that already write the SAME
+/// pass that draws nothing. ENUMERATED reach: 0-3 passes saved depending on which
+/// effects are live, 0-1 on the typing frames the review measured (the tally is
+/// in `encode_frame`, pinned by `pass_count_versus_the_pre_coalescer_shape`) —
+/// the shape this replaced already fused the base halves and already skipped
+/// empty groups, so this is never a collapse of the whole group count.
+/// Merging two neighbours that already write the SAME
 /// view with Load/Store under the same scissor deletes a boundary and nothing
 /// else, so the result is byte-identical; the function deliberately preserves
 /// draw ORDER (it never hoists a group past another), because the additive and
@@ -6347,10 +6386,19 @@ impl GpuRenderer {
         }
         surf.config.width = w;
         surf.config.height = h;
+        self.configure_surface_retagging_scrgb(surf);
+    }
+
+    /// Configure an existing surface, preserving the invariant that an f16
+    /// swapchain stays scRGB-tagged.
+    ///
+    /// DX12 rebuilds its swapchain on EVERY `Surface::configure`, not just a
+    /// resize, and each rebuild reverts to the DXGI gamma-2.2 default colour
+    /// space. Any call site that reconfigures a live surface must therefore
+    /// re-tag, or an EDR (f16) present silently washes out with >1.0 clipped by
+    /// DWM. No-op on SDR swapchains and off DX12.
+    fn configure_surface_retagging_scrgb(&self, surf: &mut GpuSurface) {
         surf.surface.configure(&self.ctx.device, &surf.config);
-        // A reconfigure rebuilds the DX12 swapchain, which reverts to the DXGI
-        // gamma-2.2 default colorspace; re-tag scRGB so an EDR (f16) present stays
-        // correct across resizes (no-op on SDR swapchains / off DX12).
         if surf.config.format == wgpu::TextureFormat::Rgba16Float {
             let _ = Self::tag_swapchain_scrgb(&surf.surface);
         }
@@ -6517,7 +6565,10 @@ impl GpuRenderer {
         if surf.config.alpha_mode != want_alpha || surf.config.usage != want_usage {
             surf.config.alpha_mode = want_alpha;
             surf.config.usage = want_usage;
-            surf.surface.configure(&self.ctx.device, &surf.config);
+            // Re-tag: `swapchain_usage_for` flips when a recording arms/disarms,
+            // so arming `video` on an EDR window reconfigures the DX12 swapchain
+            // and would otherwise drop scRGB mid-session.
+            self.configure_surface_retagging_scrgb(surf);
         }
 
         // Acquire the next swapchain texture BEFORE any compose work, so a dropped
@@ -6533,11 +6584,11 @@ impl GpuRenderer {
         // `redraw_total - compose - raster_submit`, contaminated by the post-present
         // tail. A blocking `nextDrawable` here is what queues keyDowns in the OS
         // event queue; measure it directly.
-        let acquire_started = std::time::Instant::now();
+        let acquire_started = web_time::Instant::now();
         let frame = match surf.surface.get_current_texture() {
             C::Success(f) | C::Suboptimal(f) => f,
             C::Outdated | C::Lost => {
-                surf.surface.configure(&self.ctx.device, &surf.config);
+                self.configure_surface_retagging_scrgb(surf);
                 // DROPPED: config no longer matches (common on a fresh window whose
                 // CAMetalLayer is not yet composited). Reconfigured; retry next redraw.
                 return Err(SurfacePresentFailure::Reconfigured);
@@ -6702,12 +6753,16 @@ impl GpuRenderer {
         let use_present_off = fx_present && !bake_in_place;
         // ONE command buffer for the rest of the present. The composite below and
         // the letterbox blit further down used to commit SEPARATE Metal command
-        // buffers (a glow frame cost three commits: encode, composite, blit), and
-        // each commit is real driver work on the frame that carries the keystroke
-        // echo. Commands in one buffer execute in RECORD order, which is exactly
-        // the order the two submits produced, so nothing is reordered. Created
-        // here — AFTER the tray bake and the sub-row shift, which submit their own
-        // encoders — so those still land first.
+        // buffers, and each commit is real driver work on the frame that carries
+        // the keystroke echo. DERIVED from the submit sites: a glow frame commits
+        // TWO buffers now, not
+        // one — `encode_frame` still owns and submits its own, so the count went
+        // 3 (encode, composite, blit) -> 2 (encode, composite+blit). Budget
+        // against 2; a frame that also bakes the tray or shifts the sub-row band
+        // commits more still (those submit their own encoders, and this one is
+        // created AFTER them so they keep landing first). Commands in one buffer
+        // execute in RECORD order, which is exactly the order the two folded
+        // submits produced, so nothing is reordered.
         let mut enc = self
             .ctx
             .device
@@ -7809,12 +7864,13 @@ impl GpuRenderer {
     /// `None` ("everything") for any writer that is not the scissored encode, so
     /// the failure mode of an unaccounted writer is a full copy, not stale glass.
     ///
-    /// LATENCY — ONE COMMAND BUFFER. `enc` is the CALLER's encoder (the same one
-    /// that records the letterbox blit), not a private one that submitted itself.
-    /// The glow present used to commit three command buffers per frame — encode,
-    /// composite, blit — and a Metal commit is not free on the latency path. GPU
-    /// order within one command buffer is exactly the record order, so folding the
-    /// composite into the blit encoder cannot reorder any pass.
+    /// LATENCY — ONE FEWER COMMIT. `enc` is the CALLER's encoder (the same one
+    /// that records the letterbox blit), not a private one that submitted itself,
+    /// and a Metal commit is not free on the latency path. DERIVED: the glow
+    /// present went from three commits per frame — encode, composite, blit — to
+    /// TWO, not to one: `encode_frame` still submits its own buffer, and only the
+    /// composite folded into the blit's. GPU order within one command buffer is
+    /// exactly the record order, so the fold cannot reorder any pass.
     fn compose_present_offscreen(
         &mut self,
         win: &mut WindowGpu,
@@ -9710,11 +9766,27 @@ impl GpuRenderer {
         // through the SAME shared helpers as the CPU `draw_cursor` so both paths
         // repaint identical slices.
         //
-        // Cursor-row cell width (doubled on any DEC double-size line).
-        let cur_cw = if cr < rows {
-            aterm_render::row_cell_w(input.line_sizes[cr], cw)
+        // Cursor-row cell width (doubled on any DEC double-size line) and the
+        // cursor cell's grid-relative left pixel.
+        //
+        // A UNIFORM cursor row keeps the hoisted `cc · cur_cw` origin verbatim
+        // (`cur_run` stays None ⇒ no clip), so every single-pane frame is
+        // byte-identical. On a MIXED row — split panes whose composite row carries
+        // per-pane DEC line sizes — the cursor belongs to exactly ONE pane's run,
+        // so its origin and advance come from that run and `cur_run` carries the
+        // run's window-pixel box: the fill, the non-block rects and the cut-out
+        // clip below are all bounded by it, so a double-width pane's cursor can
+        // never paint into its neighbour. CPU twin: `draw_cursor`.
+        let (cur_x, cur_cw, cur_run) = if cr < rows {
+            if aterm_render::row_is_uniform(input, cr) {
+                let rcw = aterm_render::row_cell_w(input.line_sizes[cr], cw);
+                (cc * rcw, rcw, None)
+            } else {
+                let (x, rcw, x0, x1) = aterm_render::cell_x_run(input, cr, cc, cw);
+                (x, rcw, Some((pad + x0, pad + x1)))
+            }
         } else {
-            cw
+            (cc * cw, cw, None)
         };
         // A block cursor on a WIDE lead (CJK/emoji) covers the glyph's whole
         // 2-cell footprint (the CPU's `cur_w`), so the ideograph inverts as one.
@@ -9741,10 +9813,18 @@ impl GpuRenderer {
         };
         // The cursor rect's x-span: every cut-out slice is clipped to it, so a
         // glyph whose ink exits the rect (a ligature spanning its lead cells)
-        // never has its OUTSIDE ink re-drawn in bg — partition/no-bleed.
+        // never has its OUTSIDE ink re-drawn in bg — partition/no-bleed. On a
+        // mixed row the span is additionally INTERSECTED with the cursor's run box
+        // (never widened), matching the fill below: the cut-out must repaint
+        // exactly the pixels the fill covered, and the fill stops at the pane box.
         let (cut_x0, cut_x1) = if cut_out_on {
-            let x0 = (pad + cc * cur_cw) as i32;
-            (x0, x0 + cur_block_w as i32)
+            let x0 = (pad + cur_x) as i32;
+            let (mut lo, mut hi) = (x0, x0 + cur_block_w as i32);
+            if let Some((rx0, rx1)) = cur_run {
+                lo = lo.max(rx0 as i32);
+                hi = hi.min(rx1 as i32);
+            }
+            (lo, hi)
         } else {
             (0, 0)
         };
@@ -9772,6 +9852,10 @@ impl GpuRenderer {
                     .unwrap_or(aterm_core::grid::LineSize::SingleWidth),
                 cw,
             );
+            // Is ONE DEC line size in force across this row? Hoisted per row so the
+            // ordinary frame (and every split whose panes sit on ordinary lines)
+            // keeps the plain `c · rcw` origin below with no per-column lookup.
+            let row_uniform = aterm_render::row_is_uniform(input, r);
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 // An image-covered cell skips its glyph (image-vs-glyph
                 // precedence, mirroring the CPU `image_covers` guard), so it
@@ -9801,8 +9885,16 @@ impl GpuRenderer {
                     // Shade dithers key on the cell's ABSOLUTE pixel parity
                     // (no-op otherwise) — identical fold to the CPU blit and
                     // the quad-emission loop below, so the atlas holds the
-                    // exact phase variants those quads will reference.
-                    let key = aterm_render::shade_phase_key(key, pad + c * rcw, grid_top + r * ch);
+                    // exact phase variants those quads will reference. The x
+                    // operand must therefore be the SAME origin that loop emits:
+                    // `c · rcw` on a uniform row, the run-relative origin on a
+                    // mixed one (a pane starting mid-row shifts the parity).
+                    let cell_x = if row_uniform {
+                        c * rcw
+                    } else {
+                        aterm_render::cell_x_run(input, r, c, cw).0
+                    };
+                    let key = aterm_render::shade_phase_key(key, pad + cell_x, grid_top + r * ch);
                     keys.insert(key);
                     // Combining-mark glyphs share the mono atlas.
                     if input.cluster_at(r, c).is_none()
@@ -10008,6 +10100,19 @@ impl GpuRenderer {
             let rcw = aterm_render::row_cell_w(line_size, cw);
             let (scale, anchor_y) =
                 aterm_render::row_scale(line_size, grid_top + r * ch, ch, r + 1 == input.rows);
+            // Per-column DEC line-size seam. `line_sizes[r]` is ONE value per row,
+            // which a COMPOSED row cannot always honour: side-by-side panes are
+            // independent terminals, so the lines they contribute to one composite
+            // row may carry different DECDWL/DECDHL. Rows where they agree — every
+            // single-pane frame, and every split whose panes sit on ordinary lines
+            // — are `row_is_uniform`, and the loops below keep their hoisted
+            // `c · rcw` origins and unclipped quads verbatim (this is the hot
+            // instance-building path; it gains one hoisted bool, no per-column
+            // lookup). A MIXED row instead places each cell through
+            // `cell_x_run` — the ONE seam the CPU renderer also places through —
+            // and clips its quads to the run's pixel box, so a double-width pane
+            // scales and paints only inside its own pane box.
+            let row_uniform = aterm_render::row_is_uniform(input, r);
             // Animated-ink fg overrides for THIS row: the SAME once-per-row
             // slice + lockstep merge-walk as the CPU `render_row` (shared
             // `ink_row_slice`/`InkWalk`, one compare per cell — no hashing, no
@@ -10053,13 +10158,28 @@ impl GpuRenderer {
                 });
             }
             for (c, cell) in cells.iter().take(cols).enumerate() {
+                // This cell's origin, advance and (mixed rows only) run box in
+                // window pixels: the hoisted row arithmetic on a uniform row, its
+                // own run's on a mixed one (see `row_uniform`).
+                let (cx, ccw, run) = if row_uniform {
+                    (c * rcw, rcw, None)
+                } else {
+                    let (x, cw_run, x0, x1) = aterm_render::cell_x_run(input, r, c, cw);
+                    (x, cw_run, Some((pad + x0, pad + x1)))
+                };
                 // Stop once a cell's origin is off the RIGHT of the clamped framebuffer
                 // (`clip_cols` ⇒ the width was clamped): the rest of the row is
                 // off-screen. `+ rcw` keeps a boundary cell's glyph bearing.
-                if clip_cols && pad + c * rcw >= w as usize + rcw {
-                    break;
+                // A MIXED row is not monotone in x (a double-width run's tail sits
+                // right of the NEXT run's origin), so there it skips the cell
+                // instead of ending the row; uniform rows still break, as before.
+                if clip_cols && pad + cx >= w as usize + ccw {
+                    if row_uniform {
+                        break;
+                    }
+                    continue;
                 }
-                let x0u = sat_pos_u16(pad + c * rcw);
+                let x0u = sat_pos_u16(pad + cx);
                 // A lead cell is wide iff the NEXT cell is its continuation.
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
                 let color = if selection.contains_cell(sel_row, c as u16, is_wide_lead, cell.wide) {
@@ -10075,14 +10195,40 @@ impl GpuRenderer {
                     }
                     c
                 };
+                // Mixed row: the fill is clipped to the run's pixel box, so a
+                // double-width pane's cells (which advance by 2·cw and would
+                // otherwise tile clear across the composite row) stop at the pane
+                // boundary. Uniform rows push the full-width rect they always did —
+                // a whole-row DECDWL still overhangs `w` and is trimmed by the
+                // framebuffer, byte-for-byte as before.
+                let (bx, bw) = match run {
+                    None => (x0u, ccw as u16),
+                    Some((rx0, rx1)) => {
+                        let Some((sx, sw)) = clip_x_span(pad + cx, ccw, rx0, rx1) else {
+                            continue;
+                        };
+                        (sat_pos_u16(sx), sw as u16)
+                    }
+                };
                 bg_inst.push(BgInstance {
-                    rect: [x0u, y0u, rcw as u16, ch as u16],
+                    rect: [bx, y0u, bw, ch as u16],
                     color,
                 });
             }
             for (c, cell) in cells.iter().take(cols).enumerate() {
-                if clip_cols && pad + c * rcw >= w as usize + rcw {
-                    break; // off the right edge of the clamped framebuffer — see vis_rows
+                // Same per-column placement as the bg loop above (uniform rows keep
+                // `c · rcw`), so a cell's glyph lands on its own fill.
+                let (cx, ccw, run) = if row_uniform {
+                    (c * rcw, rcw, None)
+                } else {
+                    let (x, cw_run, x0, x1) = aterm_render::cell_x_run(input, r, c, cw);
+                    (x, cw_run, Some((pad + x0, pad + x1)))
+                };
+                if clip_cols && pad + cx >= w as usize + ccw {
+                    if row_uniform {
+                        break; // off the right edge of the clamped framebuffer — see vis_rows
+                    }
+                    continue; // a mixed row's runs are not monotone in x — see above
                 }
                 // Image-covered cells skip their glyph (image-vs-glyph
                 // precedence) — the CPU `image_covers` guard, mirrored. A z<0 image
@@ -10116,7 +10262,30 @@ impl GpuRenderer {
                 // The same absolute shade-phase fold as the CPU blit + the
                 // atlas pass above (a no-op for non-shade keys), so this quad
                 // references the atlas slot holding the right dither variant.
-                let key = aterm_render::shade_phase_key(key, pad + c * rcw, grid_top + r * ch);
+                let key = aterm_render::shade_phase_key(key, pad + cx, grid_top + r * ch);
+                // The scale THIS cell's quads are emitted under. Uniform row: the
+                // row's `scale`, untouched. Mixed row: the same scale with its
+                // x-clip INTERSECTED with the run's pixel box (max/min — a clip is
+                // only ever narrowed, never widened), so a double-width pane's
+                // glyphs are cut at its pane boundary instead of painting over the
+                // neighbour. The CPU blit takes the identical `clip_x0`/`clip_x1`
+                // dest-column window, so the two backends drop the same texels.
+                //
+                // NOTE (known seam gap, must be closed on BOTH renderers at once):
+                // `xs`/`ys`/`anchor_y` still come from the ROW-level line size —
+                // `cell_x_run` yields placement, not a per-run `Scale`. On a
+                // composed row whose row-level value disagrees with a run, that run's
+                // glyphs get the run's ADVANCE but the row's ENLARGEMENT. Fixing it
+                // unilaterally here would break CPU/GPU parity, so it wants a shared
+                // `aterm_render` helper (run line size → `row_scale`) landed in both.
+                let scale = match run {
+                    None => scale,
+                    Some((rx0, rx1)) => aterm_render::Scale {
+                        clip_x0: scale.clip_x0.max(rx0 as i32),
+                        clip_x1: scale.clip_x1.min(rx1 as i32),
+                        ..scale
+                    },
+                };
                 // W4: this column contributes a cut-out slice — the cursor cell
                 // itself, or a member of the cursor's ligated run whose covering
                 // glyph spans the cursor cell. The FULL quad stays in the normal
@@ -10129,9 +10298,13 @@ impl GpuRenderer {
                 // blended fill — no cut-out slice, mirroring the CPU's blend+skip.
                 let in_cutout =
                     cut_out_on && cursor_opaque && r == cr && c >= cut_lo && c <= cut_hi;
+                // The cut-out slice's clip: the cursor rect INTERSECTED with
+                // whatever clip `scale` already carries (the run box on a mixed
+                // row, the wide-open `i32::MIN/MAX` on a uniform one — where this
+                // is exactly the old `clip_x0: cut_x0, clip_x1: cut_x1`).
                 let cut_scale = aterm_render::Scale {
-                    clip_x0: cut_x0,
-                    clip_x1: cut_x1,
+                    clip_x0: scale.clip_x0.max(cut_x0),
+                    clip_x1: scale.clip_x1.min(cut_x1),
                     ..scale
                 };
                 // Colour emoji: blit straight RGBA from the colour atlas. The
@@ -10144,7 +10317,7 @@ impl GpuRenderer {
                         continue;
                     }
                     let Some((rect, uv)) = aterm_render::glyph_quad(
-                        (pad + c * rcw) as f32,
+                        (pad + cx) as f32,
                         anchor_y,
                         baseline,
                         scale,
@@ -10168,7 +10341,7 @@ impl GpuRenderer {
                     });
                     if in_cutout
                         && let Some((rect, uv)) = aterm_render::glyph_quad(
-                            (pad + c * rcw) as f32,
+                            (pad + cx) as f32,
                             anchor_y,
                             baseline,
                             cut_scale,
@@ -10230,7 +10403,7 @@ impl GpuRenderer {
                     theme_selection,
                 ));
                 let Some((rect, uv)) = aterm_render::glyph_quad(
-                    (pad + c * rcw) as f32,
+                    (pad + cx) as f32,
                     anchor_y,
                     baseline,
                     scale,
@@ -10269,9 +10442,43 @@ impl GpuRenderer {
                 if fire_present && let Some(strength) = halo_walk.at(c as u16) {
                     let a = aterm_render::fire_halo_alpha(strength);
                     for &(dx, dy) in &aterm_render::HALO_DILATE_OFFSETS {
+                        // Uniform row: shift the base quad, exactly as before —
+                        // with no x-clip in force that IS the CPU's offset copy,
+                        // byte for byte. Mixed row: re-derive the stamp AT the
+                        // shifted origin, because the CPU clips each copy AFTER
+                        // the offset (`blit_mono_halo(gx0 + dx, …, clip_x0,
+                        // clip_x1)`); shifting an already-clipped rect would spill
+                        // the ring one px past the pane box and drop one px inside
+                        // it. The `dy` shift stays post-hoc either way, matching
+                        // the existing y treatment.
+                        let (hrect, huv) = match run {
+                            None => (
+                                [rect[0] + dx as f32, rect[1] + dy as f32, rect[2], rect[3]],
+                                uv,
+                            ),
+                            Some(_) => {
+                                let Some((hr, hu)) = aterm_render::glyph_quad(
+                                    (pad + cx) as f32 + dx as f32,
+                                    anchor_y,
+                                    baseline,
+                                    scale,
+                                    slot.ax,
+                                    slot.ay,
+                                    slot.gw,
+                                    slot.gh,
+                                    slot.xmin,
+                                    slot.ymin,
+                                    aw,
+                                    ah,
+                                ) else {
+                                    continue;
+                                };
+                                ([hr[0], hr[1] + dy as f32, hr[2], hr[3]], hu)
+                            }
+                        };
                         glyph_halo_inst.push(GlyphInstance {
-                            rect: [rect[0] + dx as f32, rect[1] + dy as f32, rect[2], rect[3]],
-                            uv,
+                            rect: hrect,
+                            uv: huv,
                             color: [halo_rgb[0], halo_rgb[1], halo_rgb[2], a],
                             bg: [0, 0, 0, 0],
                         });
@@ -10289,7 +10496,7 @@ impl GpuRenderer {
                 // is integer under NEAREST, so its texels equal the fg quad's.
                 if in_cutout
                     && let Some((rect, uv)) = aterm_render::glyph_quad(
-                        (pad + c * rcw) as f32,
+                        (pad + cx) as f32,
                         anchor_y,
                         baseline,
                         cut_scale,
@@ -10332,6 +10539,10 @@ impl GpuRenderer {
             // pixel.
             let (scale, anchor_y) =
                 aterm_render::row_scale(line_size, grid_top + r * ch, ch, r + 1 == input.rows);
+            // Per-column DEC line-size seam, hoisted exactly as in the base-glyph
+            // loop: uniform rows keep `c · rcw` and an unclipped quad, mixed rows
+            // centre the mark in ITS RUN's cell and clip to the run box.
+            let row_uniform = aterm_render::row_is_uniform(input, r);
             let sel_row = r as i32 - display_offset;
             // Fresh lockstep ink + char_fg walks for this loop's own column
             // scan: combining marks FOLLOW ink — and the EMBERFORGE char_fg
@@ -10347,8 +10558,17 @@ impl GpuRenderer {
                     aterm_render::char_fg_row_slice(&input.char_fg, row)
                 }));
             for (c, cell) in cells.iter().take(cols).enumerate() {
-                if clip_cols && pad + c * rcw >= w as usize + rcw {
-                    break; // off the right edge of the clamped framebuffer — see vis_rows
+                let (cx, ccw, run) = if row_uniform {
+                    (c * rcw, rcw, None)
+                } else {
+                    let (x, cw_run, x0, x1) = aterm_render::cell_x_run(input, r, c, cw);
+                    (x, cw_run, Some((pad + x0, pad + x1)))
+                };
+                if clip_cols && pad + cx >= w as usize + ccw {
+                    if row_uniform {
+                        break; // off the right edge of the clamped framebuffer — see vis_rows
+                    }
+                    continue; // a mixed row's runs are not monotone in x — see the base loop
                 }
                 // Image-covered cells skip their combining overlay too (the CPU
                 // overlays marks only inside the non-image glyph path).
@@ -10400,11 +10620,32 @@ impl GpuRenderer {
                         continue;
                     }
                     // Centre the mark's ink in the cell (see CPU `mark_cell_x`):
-                    // identical integer arithmetic → identical pixel position.
-                    let cx = aterm_render::mark_cell_x(c, rcw, slot.gw as usize, slot.xmin, scale)
-                        + pad as i32;
+                    // identical integer arithmetic → identical pixel position. On a
+                    // mixed row the cell is the RUN's cell — same helper, fed the
+                    // run's advance with a zero column and shifted onto the run's
+                    // origin, so the centring term is bit-for-bit the uniform one
+                    // (`mark_cell_x` is `c·rcw` plus a term in `rcw` alone).
+                    let mx = if row_uniform {
+                        aterm_render::mark_cell_x(c, rcw, slot.gw as usize, slot.xmin, scale)
+                            + pad as i32
+                    } else {
+                        aterm_render::mark_cell_x(0, ccw, slot.gw as usize, slot.xmin, scale)
+                            + (pad + cx) as i32
+                    };
+                    // Mixed row: narrow the mark's clip to the run box (never widen)
+                    // — a mark centred in a double-width run's last visible cell
+                    // must not spill into the neighbouring pane. CPU twin: the same
+                    // `clip_x0`/`clip_x1` window on its combining blit.
+                    let scale = match run {
+                        None => scale,
+                        Some((rx0, rx1)) => aterm_render::Scale {
+                            clip_x0: scale.clip_x0.max(rx0 as i32),
+                            clip_x1: scale.clip_x1.min(rx1 as i32),
+                            ..scale
+                        },
+                    };
                     let Some((rect, uv)) = aterm_render::glyph_quad(
-                        cx as f32, anchor_y, baseline, scale, slot.ax, slot.ay, slot.gw, slot.gh,
+                        mx as f32, anchor_y, baseline, scale, slot.ax, slot.ay, slot.gw, slot.gh,
                         slot.xmin, slot.ymin, aw, ah,
                     ) else {
                         continue;
@@ -10440,6 +10681,11 @@ impl GpuRenderer {
                 // Row cell advance, doubled on a DEC double-size line — exactly the
                 // `cw` the CPU Pass 1b passes as the per-cell x stride.
                 let rcw = aterm_render::row_cell_w(input.line_sizes[r], cw);
+                // Per-column DEC line-size seam (see the base-glyph loop): uniform
+                // rows keep the `c · rcw` stride, mixed rows take each tile's own
+                // run — a pane's image tiles must be spaced by ITS line size, not a
+                // neighbour's, and must stop at its pane box.
+                let row_uniform = aterm_render::row_is_uniform(input, r);
                 // Inset the image tile's dest origin by `(pad, grid_top)`, exactly
                 // like the CPU `blit_image_cell` call site (which passes `pad_x +
                 // c*cw`, `y0 = grid_top + r*cell_h`). Without this the inline image
@@ -10451,9 +10697,15 @@ impl GpuRenderer {
                     if *c >= cols {
                         continue;
                     }
+                    let (cx, ccw, run) = if row_uniform {
+                        (*c * rcw, rcw, None)
+                    } else {
+                        let (x, cw_run, x0, x1) = aterm_render::cell_x_run(input, r, *c, cw);
+                        (x, cw_run, Some((pad + x0, pad + x1)))
+                    };
                     // Off the right edge of the clamped framebuffer → no visible pixels.
                     // (`row_images` isn't column-sorted, so `continue`, not `break`.)
-                    if clip_cols && pad + *c * rcw >= w as usize + rcw {
+                    if clip_cols && pad + cx >= w as usize + ccw {
                         continue;
                     }
                     let fp_w = image.image.cols as usize * cw;
@@ -10473,9 +10725,23 @@ impl GpuRenderer {
                     if sx0 >= dw || sy0 >= dh {
                         continue;
                     }
-                    let tile_w = (cw as u32).min(dw - sx0);
+                    let mut tile_w = (cw as u32).min(dw - sx0);
                     let tile_h = (ch as u32).min(dh - sy0);
-                    let x0 = (pad + *c * rcw) as f32;
+                    // Mixed row: the tile is additionally clipped to its run's box.
+                    // The tile is 1:1 (never DEC-scaled), so trimming the dest width
+                    // trims exactly that many source texels — the `uv` below is
+                    // derived from `tile_w`, so it follows — which is precisely what
+                    // the CPU's per-cell copy clipped to the same window drops. Only
+                    // the RIGHT edge can cut: `cell_x_run` never returns an origin
+                    // left of its own run.
+                    if let Some((_, rx1)) = run {
+                        let vis = u32::try_from(rx1.saturating_sub(pad + cx)).unwrap_or(u32::MAX);
+                        tile_w = tile_w.min(vis);
+                        if tile_w == 0 {
+                            continue;
+                        }
+                    }
+                    let x0 = (pad + cx) as f32;
                     let rect = [x0, y0, tile_w as f32, tile_h as f32];
                     let uv = [
                         sx0 as f32 / pw,
@@ -10511,15 +10777,25 @@ impl GpuRenderer {
             // `cursor_blend_pipeline` (see emit_cursor), blending over the cell.
             let mut color = rgb4_u32(cursor_fill);
             color[3] = cursor_cov;
-            self.inst.cursor_block.push(BgInstance {
-                rect: [
-                    sat_pos_u16(pad + cc * cur_cw),
-                    sat_pos_u16(grid_top + cr * ch),
-                    cur_block_w as u16,
-                    ch as u16,
-                ],
-                color,
-            });
+            // Mixed row: the fill is clipped to the cursor's own run box — the
+            // SAME intersection `cut_x0/cut_x1` took, so the fill and its cut-out
+            // still cover exactly the same pixels. Uniform rows push the identical
+            // rect they always did.
+            let fill = match cur_run {
+                None => Some((pad + cur_x, cur_block_w)),
+                Some((rx0, rx1)) => clip_x_span(pad + cur_x, cur_block_w, rx0, rx1),
+            };
+            if let Some((fx, fw)) = fill {
+                self.inst.cursor_block.push(BgInstance {
+                    rect: [
+                        sat_pos_u16(fx),
+                        sat_pos_u16(grid_top + cr * ch),
+                        fw as u16,
+                        ch as u16,
+                    ],
+                    color,
+                });
+            }
         }
 
         // Line decorations (underline / strikethrough / overline) OVER the
@@ -10551,6 +10827,11 @@ impl GpuRenderer {
             }
             let y0 = grid_top + r * ch;
             let rcw = aterm_render::row_cell_w(input.line_sizes[r], cw);
+            // Per-column DEC line-size seam (see the base-glyph loop): uniform rows
+            // keep `c · rcw` and unclipped rects; a mixed row's cell takes its own
+            // run's origin/advance — its dash period and undercurl tile width too —
+            // and every rect it emits is clipped to that run's box.
+            let row_uniform = aterm_render::row_is_uniform(input, r);
             // Fresh lockstep ink + char_fg walks for this loop's own column
             // scan: line decorations follow cell semantics, so they follow ink
             // — and the EMBERFORGE char_fg recolour (ink wins when both govern
@@ -10565,8 +10846,17 @@ impl GpuRenderer {
                     aterm_render::char_fg_row_slice(&input.char_fg, row)
                 }));
             for (c, cell) in cells.iter().take(cols).enumerate() {
-                if clip_cols && pad + c * rcw >= w as usize + rcw {
-                    break; // off the right edge of the clamped framebuffer — see vis_rows
+                let (cx, ccw, run) = if row_uniform {
+                    (c * rcw, rcw, None)
+                } else {
+                    let (x, cw_run, x0, x1) = aterm_render::cell_x_run(input, r, c, cw);
+                    (x, cw_run, Some((pad + x0, pad + x1)))
+                };
+                if clip_cols && pad + cx >= w as usize + ccw {
+                    if row_uniform {
+                        break; // off the right edge of the clamped framebuffer — see vis_rows
+                    }
+                    continue; // a mixed row's runs are not monotone in x — see the base loop
                 }
                 if cell.wide
                     || (matches!(cell.underline, UnderlineStyle::None)
@@ -10575,9 +10865,9 @@ impl GpuRenderer {
                 {
                     continue;
                 }
-                let x = pad + c * rcw;
+                let x = pad + cx;
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
-                let dw = if is_wide_lead { 2 * rcw } else { rcw };
+                let dw = if is_wide_lead { 2 * ccw } else { ccw };
                 // W5b: decorations route through the SAME floors as the glyph
                 // fg via the shared `effective_deco_color`/`effective_glyph_fg`,
                 // fed the INK/CHAR_FG-substituted base_fg (Sparkle Words v2 /
@@ -10611,7 +10901,7 @@ impl GpuRenderer {
                     x,
                     y0,
                     dw,
-                    rcw,
+                    ccw,
                     ch,
                     dm,
                     curly_mask_ok,
@@ -10650,6 +10940,17 @@ impl GpuRenderer {
                     std::mem::swap(&mut deco_rects, &mut skip_rects);
                 }
                 for &[rx, ry, rw, rh] in &deco_rects {
+                    // Mixed row: every deco rect is clipped to the run box, so a
+                    // double-width pane's underline stops at its pane boundary
+                    // instead of ruling across its neighbour. Uniform rows push the
+                    // rect untouched (`run` is None).
+                    let clipped = match run {
+                        None => Some((rx, rw)),
+                        Some((qx0, qx1)) => clip_x_span(rx, rw, qx0, qx1),
+                    };
+                    let Some((rx, rw)) = clipped else {
+                        continue;
+                    };
                     self.inst.deco.push(BgInstance {
                         rect: [sat_pos_u16(rx), sat_pos_u16(ry), rw as u16, rh as u16],
                         color: ucolor,
@@ -10665,15 +10966,24 @@ impl GpuRenderer {
                         curl_spans.push((x, dw));
                     }
                     let curl_x0 = aterm_render::UNDERCURL_SPRITE * cw;
-                    for ti in 0..dw / rcw.max(1) {
-                        let tx0 = x + ti * rcw;
+                    for ti in 0..dw / ccw.max(1) {
+                        let tx0 = x + ti * ccw;
                         for &(sx, sw) in &curl_spans {
-                            let lo = sx.max(tx0);
-                            let hi = (sx + sw).min(tx0 + rcw);
+                            let mut lo = sx.max(tx0);
+                            let mut hi = (sx + sw).min(tx0 + ccw);
+                            // Mixed row: narrow the drawn span to the run box. `u0`
+                            // and `uw` below are derived FROM `lo`/`hi` through the
+                            // same linear tile map, so the sprite stays pinned to
+                            // the tile and only the clipped texels are dropped —
+                            // the CPU mask blit drops exactly those.
+                            if let Some((qx0, qx1)) = run {
+                                lo = lo.max(qx0);
+                                hi = hi.min(qx1);
+                            }
                             if lo >= hi {
                                 continue;
                             }
-                            let scale = cw as f32 / rcw as f32;
+                            let scale = cw as f32 / ccw as f32;
                             let u0 = curl_x0 as f32 + (lo - tx0) as f32 * scale;
                             let uw = (hi - lo) as f32 * scale;
                             self.inst.curl.push(GlyphInstance {
@@ -10708,6 +11018,14 @@ impl GpuRenderer {
                     dm,
                 );
                 for &[rx, ry, rw, rh] in &deco_rects {
+                    // Same run-box clip as the underline rects above.
+                    let clipped = match run {
+                        None => Some((rx, rw)),
+                        Some((qx0, qx1)) => clip_x_span(rx, rw, qx0, qx1),
+                    };
+                    let Some((rx, rw)) = clipped else {
+                        continue;
+                    };
                     self.inst.deco.push(BgInstance {
                         rect: [sat_pos_u16(rx), sat_pos_u16(ry), rw as u16, rh as u16],
                         color: fgc,
@@ -10737,12 +11055,24 @@ impl GpuRenderer {
                 if t.row >= rows || t.col >= cols || !row_active(t.row) {
                     continue;
                 }
-                let rcw = aterm_render::row_cell_w(input.line_sizes[t.row], cw);
+                // Per-column DEC line-size seam (see the base-glyph loop): a bed
+                // cell belongs to ONE pane's run, so on a mixed row its origin and
+                // advance come from that run.
+                let (tx, tcw, bound) = if aterm_render::row_is_uniform(input, t.row) {
+                    let rcw = aterm_render::row_cell_w(input.line_sizes[t.row], cw);
+                    (t.col * rcw, rcw, cols * cw)
+                } else {
+                    let (x, cw_run, _, x1) = aterm_render::cell_x_run(input, t.row, t.col, cw);
+                    (x, cw_run, x1)
+                };
                 // Grid-interior bound (the CPU rule, verbatim): on a DEC
                 // double-width row a stale mid-fade col past `cols/2` would
                 // land the bed in the window pad band — skip it. Single-width
-                // rows reduce to the `col < cols` check above (identity).
-                if (t.col + 1) * rcw > cols * cw {
+                // rows reduce to the `col < cols` check above (identity). On a
+                // mixed row the bound is the cell's RUN box rather than the whole
+                // grid — the same rule one pane in: a bed that would land outside
+                // its own pane is dropped, not clipped (the CPU drops it too).
+                if tx + tcw > bound {
                     continue;
                 }
                 let cell_bg = rendered
@@ -10762,11 +11092,13 @@ impl GpuRenderer {
                 }
                 self.inst.trail.push(BgInstance {
                     rect: [
-                        // Saturate the whole `pad + col·rcw` offset in one step: the old
+                        // Saturate the whole `pad + x` offset in one step: the old
                         // inner `(t.col * rcw) as u16` WRAPPED before the saturating_add.
-                        sat_pos_u16(pad + t.col * rcw),
+                        // `tx`/`tcw` come from the run seam above, so a mixed row
+                        // places the bed inside its own pane.
+                        sat_pos_u16(pad + tx),
                         sat_pos_u16(grid_top + t.row * ch),
-                        rcw as u16,
+                        tcw as u16,
                         ch as u16,
                     ],
                     color: c4,
@@ -11029,19 +11361,23 @@ impl GpuRenderer {
                 c[3] = cursor_cov;
                 c
             };
+            // Mixed row: each rect is clipped to the cursor's own run box (the
+            // hollow block's right rail is the one that would otherwise land in the
+            // neighbouring pane); uniform rows keep every rect as-is, since
+            // `cur_run` is None and the map is the identity it always was.
             self.inst.cursor.extend(
-                aterm_render::cursor_rects(
-                    style,
-                    pad + cc * cur_cw,
-                    grid_top + cr * ch,
-                    cur_cw,
-                    ch,
-                )
-                .into_iter()
-                .map(|[x, y, rw, rh]| BgInstance {
-                    rect: [sat_pos_u16(x), sat_pos_u16(y), rw as u16, rh as u16],
-                    color: cursor_color,
-                }),
+                aterm_render::cursor_rects(style, pad + cur_x, grid_top + cr * ch, cur_cw, ch)
+                    .into_iter()
+                    .filter_map(|[x, y, rw, rh]| {
+                        let (x, rw) = match cur_run {
+                            None => (x, rw),
+                            Some((rx0, rx1)) => clip_x_span(x, rw, rx0, rx1)?,
+                        };
+                        Some(BgInstance {
+                            rect: [sat_pos_u16(x), sat_pos_u16(y), rw as u16, rh as u16],
+                            color: cursor_color,
+                        })
+                    }),
             );
         }
 
@@ -12049,10 +12385,37 @@ impl GpuRenderer {
         // Every pass on this attachment is a FULL-FRAMEBUFFER tile load + store:
         // in Metal the load/store actions are per-ATTACHMENT and the dirty-row
         // scissor does NOT restrict them, so a 3024x1964x4B offscreen pays ~23 MB
-        // of traffic per pass even when the pass draws nothing. The previous shape
-        // opened one pass per non-empty group and reached six on a frame with the
-        // aurora, the sparkle words and the cursor all live — ~140 MB of tile
-        // traffic to echo ONE character, on exactly the frame the user feels.
+        // of traffic per pass even when the pass draws nothing.
+        //
+        // ENUMERATED EFFECT — budget against THIS, not against the group count.
+        // "Enumerated", not "measured": these counts are derived by walking the
+        // pre-coalescer pass ladder recovered from 5bf3b421 against each live-group
+        // set, and the byte figures are arithmetic (3024x1964x4 = 23.76 MB). Calling
+        // analysis a measurement is the same overstatement this comment exists to
+        // remove, one step smaller. The
+        // shape this replaced (5bf3b421) already fused the base halves and already
+        // skipped an empty group's pass, so what coalescing removes is 0-3 passes
+        // depending entirely on WHICH effects are live, and the typing frames the
+        // review actually measured sat at 0-1:
+        //   * no additive stream (effects off, every parity test): 1 pass before
+        //     and after — 0 saved;
+        //   * aurora + cursor: base | glow | cursor, 3 before and after — 0 saved,
+        //     every neighbour pair already changes view;
+        //   * aurora + sparkle-ADD + cursor (sparkle words with no paw): 4 -> 3 —
+        //     ONE pass, ~23 MB off a ~92 MB frame;
+        //   * add the paw (`wdeco_over`), or run EMBERFORGE's `glow_under`: 5
+        //     before and after — 0 saved, same reason as the aurora frame;
+        //   * a FREE sprite (the cat) with the aurora and the cursor: the old
+        //     shape opened one pass per source-over group even when they were
+        //     adjacent, so `free_over | cursor` merges — 4 -> 3, ONE saved;
+        //   * that same sprite frame WITH the sparkle additive layer: 5 -> 3, two
+        //     saved (the additive group splits the run the sprite and cursor would
+        //     otherwise have joined, so coalescing recovers both boundaries);
+        //   * enumerated worst case (`glow_under` + paw + sprite + cursor): 3 saved.
+        // `pass_count_versus_the_pre_coalescer_shape` pins that whole tally.
+        // The win that is NOT style-dependent is the smaller one: a deleted
+        // boundary carries the pipeline/atlas trackers across, so the merged pass
+        // drops the rebinds the second pass used to re-issue.
         //
         // So: walk the groups in draw order and start a new pass ONLY when the
         // required view differs from the previous ENABLED group's; consecutive
@@ -12060,9 +12423,7 @@ impl GpuRenderer {
         // by construction — no draw is reordered and no stream changes view; the
         // only thing deleted is a pass boundary between two neighbours that were
         // already writing the same view with Load/Store under the same scissor,
-        // which is a no-op. (Deleting a boundary also carries the pipeline/atlas
-        // trackers across, dropping redundant rebinds — same GPU state, fewer
-        // commands.)
+        // which is a no-op.
         //
         // It deliberately does NOT hoist an additive group ACROSS an intervening
         // source-over group to force the two Unorm groups together: add and over
@@ -12077,16 +12438,9 @@ impl GpuRenderer {
         // A frame with NO additive stream (every parity test, ordinary typing with
         // the effects off) falls out of the same rule as ONE sRGB pass carrying
         // the whole draw sequence — the historical fused path, unchanged.
-        const G_BASE_BG: usize = 0;
-        const G_GLOW_UNDER: usize = 1;
-        const G_BASE_FG: usize = 2;
-        const G_GLOW: usize = 3;
-        const G_WDECO_OVER: usize = 4;
-        const G_WDECO_ADD: usize = 5;
-        const G_FREE_OVER: usize = 6;
-        const G_CURSOR: usize = 7;
-        const GROUPS: usize = 8;
-        // `enabled` / `srgb` per group, in DRAW ORDER. Each `enabled` term mirrors
+        // `enabled` per group, in DRAW ORDER; the view each group needs is the
+        // module-level [`GROUP_SRGB`] (shared verbatim with the coalescing tests,
+        // so no copy of it can drift). Each `enabled` term mirrors
         // EXACTLY the skip conditions of the draws inside its emit macro
         // (`draw_stream!`'s `buf.is_some()`, plus the `deco_bind` / `free_bind` /
         // `image_plane` guards), so a disabled group had zero draws and dropping
@@ -12095,8 +12449,7 @@ impl GpuRenderer {
         // `upload` returned `None` for a non-empty stream. `G_BASE_BG` is
         // UNCONDITIONALLY enabled: it anchors pass 0, which carries `load_op` — a
         // `Clear` that must run even when every stream is empty.
-        let mut enabled = [false; GROUPS];
-        let mut srgb = [true; GROUPS];
+        let mut enabled = [false; FRAME_GROUPS];
         enabled[G_BASE_BG] = true;
         // EMBERFORGE under-glyph light: splits the base in two so the flame body
         // lands UNDER the glyph ink. With it empty, base_bg and base_fg are
@@ -12104,7 +12457,6 @@ impl GpuRenderer {
         // base pass.
         enabled[G_GLOW_UNDER] =
             glow_under_buf.is_some() || fire_add_buf.is_some() || fire_over_buf.is_some();
-        srgb[G_GLOW_UNDER] = false;
         enabled[G_BASE_FG] = glyph_buf.is_some()
             || glyph_halo_buf.is_some()
             || color_buf.is_some()
@@ -12117,10 +12469,8 @@ impl GpuRenderer {
             || nova_add_buf.is_some()
             || rain_add_buf.is_some()
             || rain_add_over_buf.is_some();
-        srgb[G_GLOW] = false;
         enabled[G_WDECO_OVER] = deco_bind.is_some() && wdeco_over_buf.is_some();
         enabled[G_WDECO_ADD] = deco_bind.is_some() && wdeco_add_buf.is_some();
-        srgb[G_WDECO_ADD] = false;
         enabled[G_FREE_OVER] = free_bind.is_some() && free_over_buf.is_some();
         enabled[G_CURSOR] = cursor_block_buf.is_some()
             || cursor_glyph_buf.is_some()
@@ -12129,7 +12479,7 @@ impl GpuRenderer {
 
         // group -> pass index (`usize::MAX` == disabled, matches no pass), plus
         // the view each pass attaches. Shared by the plan below and the encode.
-        let (pass_of, pass_srgb, passes) = coalesce_frame_passes(&enabled, &srgb);
+        let (pass_of, pass_srgb, passes) = coalesce_frame_passes(&enabled, &GROUP_SRGB);
 
         for p in 0..passes {
             // Only pass 0 carries `load_op` (the Clear/Load decision above); every
@@ -12216,6 +12566,30 @@ impl GpuRenderer {
 #[inline]
 fn sat_pos_u16(v: usize) -> u16 {
     u16::try_from(v).unwrap_or(u16::MAX)
+}
+
+/// Narrow a SOLID quad's horizontal span `[x, x + w)` to the window-pixel window
+/// `[x0, x1)`, yielding the surviving `(x, w)` — `None` when nothing survives.
+///
+/// Called ONLY on a MIXED DEC line-size row (see `aterm_render::cell_x_run`).
+/// There, each column advances by ITS OWN run's cell width, so a double-width
+/// run of N columns paints 2·N·cell_w px while its pane box is only N·cell_w
+/// wide: without this clamp one pane's fills would spill across the composite
+/// row and repaint its neighbour. The CPU twin is the dest-column window its
+/// fills/blits already clamp to (`clip_x0`/`clip_x1`), and the arithmetic here is
+/// the same integer intersection, so both backends drop the identical pixels.
+///
+/// A UNIFORM row never calls this: its quads keep the pre-span, unclipped
+/// geometry byte-for-byte (a full-width DECDWL row still emits `cols·2·cell_w`
+/// of fills and lets the framebuffer/scissor trim them, exactly as before).
+#[inline]
+fn clip_x_span(x: usize, w: usize, x0: usize, x1: usize) -> Option<(usize, usize)> {
+    let lo = x.max(x0);
+    let hi = (x + w).min(x1);
+    if hi <= lo {
+        return None;
+    }
+    Some((lo, hi - lo))
 }
 
 /// IEEE 754 binary16 → f32, exact (every half value is representable in f32).
@@ -12314,20 +12688,59 @@ fn theme_color_alpha(c: u32, a: f64) -> wgpu::Color {
 mod tests {
     use aterm_render::GlowQuad;
 
-    /// The offscreen frame's stream groups in DRAW ORDER, mirroring the
-    /// `G_*` constants in `encode_frame`. `true` == the group needs the
-    /// sRGB-typed view (base / source-over), `false` == the plain Unorm view
-    /// (One/One additive, byte-exact with the CPU `add_sat`).
-    const GROUP_SRGB: [bool; 8] = [
-        true,  // base_bg
-        false, // glow_under (EMBERFORGE flame body)
-        true,  // base_fg
-        false, // glow (aurora / nova / rain halos)
-        true,  // wdeco_over (sparkle-word paw)
-        false, // wdeco_add (sparkle)
-        true,  // free_over
-        true,  // cursor
-    ];
+    // The group -> view map under test is the PRODUCTION one (`super::GROUP_SRGB`,
+    // the array `encode_frame` hands to the coalescer), never a copy: see its doc
+    // for the wrong-colour regression a twin would hide.
+    use super::{
+        FRAME_GROUPS, G_BASE_BG, G_BASE_FG, G_CURSOR, G_FREE_OVER, G_GLOW, G_GLOW_UNDER,
+        G_WDECO_ADD, G_WDECO_OVER, GROUP_SRGB,
+    };
+
+    /// The colour space each stream group composites in is a CORRECTNESS fact, and
+    /// the coalescer is allowed to fuse exactly the neighbours that share one. Pin
+    /// the production map against the physical reason for each entry — the three
+    /// One/One additive streams need the plain Unorm view to stay byte-exact with
+    /// the CPU `add_sat`, everything else blends source-over and must land on the
+    /// sRGB-typed view so the hardware blend happens in LINEAR light. Re-tagging a
+    /// stream here without moving its pipeline's target format would let its draws
+    /// merge into a neighbour's pass and composite in the wrong light; the tests
+    /// below (pass counts, ordering) cannot see that, because the pass count of a
+    /// wrongly-tagged frame is perfectly legal.
+    #[test]
+    fn production_group_view_map_matches_each_stream_blend_mode() {
+        // The additive (One/One) groups — and ONLY these — take the Unorm view.
+        let additive = [G_GLOW_UNDER, G_GLOW, G_WDECO_ADD];
+        for (g, &is_srgb) in GROUP_SRGB.iter().enumerate() {
+            assert_eq!(
+                is_srgb,
+                !additive.contains(&g),
+                "group {g}: an additive group on the sRGB view would add in linear \
+                 light (not the CPU `add_sat`), and a source-over group on the \
+                 Unorm view would blend in sRGB light (not the CPU `blend`)"
+            );
+        }
+        // Group 0 anchors pass 0, which carries `load_op` — a `Clear` in the
+        // frame's own colour space. It is source-over base fill, so sRGB.
+        assert_eq!(G_BASE_BG, 0);
+        assert!(GROUP_SRGB[G_BASE_BG]);
+        // Draw order is the index order, and the constants must tile 0..N exactly
+        // — a duplicate or a hole would silently drop a group from the encode.
+        let mut idx = [
+            G_BASE_BG,
+            G_GLOW_UNDER,
+            G_BASE_FG,
+            G_GLOW,
+            G_WDECO_OVER,
+            G_WDECO_ADD,
+            G_FREE_OVER,
+            G_CURSOR,
+        ];
+        idx.sort_unstable();
+        assert!(
+            idx.iter().enumerate().all(|(i, &g)| i == g) && idx.len() == FRAME_GROUPS,
+            "the G_* constants must be a permutation of 0..FRAME_GROUPS in draw order"
+        );
+    }
 
     /// The coalescer must be MAXIMAL and ORDER-PRESERVING for every possible set
     /// of live streams: passes are numbered in draw order, a pass holds only
@@ -12339,13 +12752,13 @@ mod tests {
     /// Exhaustive over all 256 enable patterns.
     #[test]
     fn frame_passes_coalesce_maximally_without_reordering() {
-        for bits in 0u32..256 {
-            let mut enabled = [false; 8];
+        for bits in 0u32..(1 << FRAME_GROUPS) {
+            let mut enabled = [false; FRAME_GROUPS];
             for (g, e) in enabled.iter_mut().enumerate() {
                 *e = bits & (1 << g) != 0;
             }
             let (pass_of, pass_srgb, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
-            let live: Vec<usize> = (0..8).filter(|&g| enabled[g]).collect();
+            let live: Vec<usize> = (0..FRAME_GROUPS).filter(|&g| enabled[g]).collect();
             assert_eq!(
                 passes,
                 live.windows(2)
@@ -12378,7 +12791,7 @@ mod tests {
                     );
                 }
             }
-            for g in 0..8 {
+            for g in 0..FRAME_GROUPS {
                 if !enabled[g] {
                     assert_eq!(
                         pass_of[g],
@@ -12402,32 +12815,120 @@ mod tests {
     fn additive_groups_fuse_only_when_no_over_group_separates_them() {
         // base_bg, base_fg, glow, wdeco_add, cursor — the rainbow-cursor +
         // sparkle-words typing frame.
-        let mut enabled = [false; 8];
-        enabled[0] = true; // base_bg
-        enabled[2] = true; // base_fg
-        enabled[3] = true; // glow
-        enabled[5] = true; // wdeco_add
-        enabled[7] = true; // cursor
+        let mut enabled = [false; FRAME_GROUPS];
+        enabled[G_BASE_BG] = true;
+        enabled[G_BASE_FG] = true;
+        enabled[G_GLOW] = true;
+        enabled[G_WDECO_ADD] = true;
+        enabled[G_CURSOR] = true;
         let (pass_of, _, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
         assert_eq!(passes, 3, "base(sRGB) | glow+sparkle(Unorm) | cursor(sRGB)");
         assert_eq!(
-            pass_of[3], pass_of[5],
+            pass_of[G_GLOW], pass_of[G_WDECO_ADD],
             "aurora and sparkle-add are neighbours on the Unorm view — one pass"
         );
-        assert_eq!(pass_of[0], pass_of[2], "the base halves stay fused");
+        assert_eq!(
+            pass_of[G_BASE_BG], pass_of[G_BASE_FG],
+            "the base halves stay fused"
+        );
 
         // Same frame plus the paw decoration (source-over) BETWEEN the two
         // additive groups: the fuse must be declined.
-        enabled[4] = true; // wdeco_over
+        enabled[G_WDECO_OVER] = true;
         let (pass_of, _, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
         assert_eq!(passes, 5, "the intervening over-stream forces the split");
         assert_ne!(
-            pass_of[3], pass_of[5],
+            pass_of[G_GLOW], pass_of[G_WDECO_ADD],
             "fusing across a source-over draw would shift pixels by A·a"
         );
         assert!(
-            pass_of[3] < pass_of[4] && pass_of[4] < pass_of[5],
+            pass_of[G_GLOW] < pass_of[G_WDECO_OVER] && pass_of[G_WDECO_OVER] < pass_of[G_WDECO_ADD],
             "draw order must survive the split verbatim"
+        );
+    }
+
+    /// The pass shape this replaced (renderer.rs at 5bf3b421), as a model: ONE
+    /// fused sRGB pass when no additive stream is live, otherwise one pass per
+    /// non-empty group with the base halves fused unless `glow_under` parts them.
+    /// Here so the efficacy numbers in `encode_frame`'s comment are executable
+    /// rather than remembered.
+    fn pre_coalescer_passes(enabled: &[bool; FRAME_GROUPS]) -> usize {
+        if !(enabled[G_GLOW_UNDER] || enabled[G_GLOW] || enabled[G_WDECO_ADD]) {
+            return 1;
+        }
+        let mut passes = if enabled[G_GLOW_UNDER] {
+            // A1 (bg) + A2 (the flame body) + A3 (glyph ink, gated).
+            2 + usize::from(enabled[G_BASE_FG])
+        } else {
+            1 // the fused base pass
+        };
+        for g in [G_GLOW, G_WDECO_OVER, G_WDECO_ADD, G_FREE_OVER, G_CURSOR] {
+            passes += usize::from(enabled[g]);
+        }
+        passes
+    }
+
+    /// PIN THE EFFICACY CLAIM. A perf comment that overstates its win is a trap
+    /// for whoever budgets against it, so the per-style tally in `encode_frame`
+    /// is asserted, not asserted-in-prose: coalescing NEVER costs a pass, saves
+    /// nothing at all on the quiet frames, and the headline "one pass off the
+    /// sparkle-words echo" is exactly one — while a free-sprite frame, where the
+    /// old shape split adjacent source-over groups, is worth two. The exhaustive
+    /// half also caps the whole claim at 3, so nobody can restate this as a
+    /// collapse of the group count.
+    #[test]
+    fn pass_count_versus_the_pre_coalescer_shape() {
+        let frame = |groups: &[usize]| {
+            let mut enabled = [false; FRAME_GROUPS];
+            enabled[G_BASE_BG] = true; // always on: it anchors pass 0's load_op
+            for &g in groups {
+                enabled[g] = true;
+            }
+            let (_, _, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
+            (pre_coalescer_passes(&enabled), passes)
+        };
+        // Effects off — the parity tests and ordinary typing. One pass, always.
+        assert_eq!(frame(&[G_BASE_FG, G_CURSOR]), (1, 1));
+        // Aurora + cursor: every neighbour pair already changes view.
+        assert_eq!(frame(&[G_BASE_FG, G_GLOW, G_CURSOR]), (3, 3));
+        // Sparkle words emitting only the additive layer — the headline frame.
+        assert_eq!(frame(&[G_BASE_FG, G_GLOW, G_WDECO_ADD, G_CURSOR]), (4, 3));
+        // ... and with the paw between the two additive groups, nothing fuses.
+        assert_eq!(
+            frame(&[G_BASE_FG, G_GLOW, G_WDECO_OVER, G_WDECO_ADD, G_CURSOR]),
+            (5, 5)
+        );
+        // EMBERFORGE's under-glyph light parts the base in both shapes alike.
+        assert_eq!(frame(&[G_GLOW_UNDER, G_BASE_FG, G_GLOW, G_CURSOR]), (5, 5));
+        // A free sprite (the cat) rides just before the cursor: two adjacent
+        // source-over groups the old shape split into two full tile round-trips.
+        assert_eq!(
+            frame(&[G_BASE_FG, G_GLOW, G_WDECO_ADD, G_FREE_OVER, G_CURSOR]),
+            (5, 3)
+        );
+
+        // Exhaustive: the coalescer can never open MORE passes than the shape it
+        // replaced, and the most it can ever remove is 3.
+        let mut worst = 0;
+        for bits in 0u32..(1 << FRAME_GROUPS) {
+            let mut enabled = [false; FRAME_GROUPS];
+            for (g, e) in enabled.iter_mut().enumerate() {
+                *e = bits & (1 << g) != 0;
+            }
+            enabled[G_BASE_BG] = true;
+            let (_, _, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
+            let before = pre_coalescer_passes(&enabled);
+            assert!(
+                passes <= before,
+                "coalescing must never ADD a full-framebuffer tile round-trip \
+                 (bits {bits:#010b}: {before} -> {passes})"
+            );
+            worst = worst.max(before - passes);
+        }
+        assert_eq!(
+            worst, 3,
+            "the tally in `encode_frame` claims a 3-pass maximum; if this moved, \
+             the comment is now wrong and a reader is budgeting against fiction"
         );
     }
 
@@ -12437,15 +12938,19 @@ mod tests {
     /// quietest possible frame.
     #[test]
     fn effects_free_frame_is_a_single_pass() {
-        let mut enabled = [false; 8];
-        enabled[0] = true; // base_bg
-        enabled[2] = true; // base_fg
-        enabled[6] = true; // free_over
-        enabled[7] = true; // cursor
+        let mut enabled = [false; FRAME_GROUPS];
+        enabled[G_BASE_BG] = true;
+        enabled[G_BASE_FG] = true;
+        enabled[G_FREE_OVER] = true;
+        enabled[G_CURSOR] = true;
         let (pass_of, pass_srgb, passes) = super::coalesce_frame_passes(&enabled, &GROUP_SRGB);
         assert_eq!(passes, 1);
         assert!(pass_srgb[0]);
-        assert!([0, 2, 6, 7].iter().all(|&g| pass_of[g] == 0));
+        assert!(
+            [G_BASE_BG, G_BASE_FG, G_FREE_OVER, G_CURSOR]
+                .iter()
+                .all(|&g| pass_of[g] == 0)
+        );
     }
 
     /// The incremental present-copy tracker's safety property: `None` ("unknown

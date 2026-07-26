@@ -554,6 +554,33 @@ pub struct FireHaloCell {
 /// with live values.
 pub const COLOR_UNSET: u32 = 0xFF00_0000;
 
+/// One run of columns in a COMPOSED row that carries its own DEC line size.
+///
+/// A single-pane frame never needs these: [`RenderInput::line_sizes`] governs the
+/// whole row and [`RenderInput::line_size_spans`] stays empty — the ordinary,
+/// allocation-free path, byte-identical to the pre-span renderer.
+///
+/// Split-pane composition is the case a row-level line size CANNOT express. Two
+/// panes side by side are independent terminals, so the lines they contribute to
+/// one composite row may differ in DECDWL/DECDHL state. Collapsing that to a
+/// single value means one pane's line size scales the other pane's glyphs, which
+/// visibly corrupts the innocent pane.
+///
+/// Columns are COMPOSITE columns (the destination grid), so `start_col` is also
+/// the run's pixel origin in cell units: a glyph at composite column `c` inside
+/// this run draws at `start_col * cell_w + (c - start_col) * run_cell_w`, clipped
+/// to the run's box. For a run starting at 0 that reduces exactly to the uniform
+/// `c * run_cell_w` the renderers used before spans existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineSizeSpan {
+    /// First composite column of the run (inclusive).
+    pub start_col: usize,
+    /// One past the last composite column of the run (exclusive).
+    pub end_col: usize,
+    /// The DEC line size every column in the run renders at.
+    pub line_size: LineSize,
+}
+
 /// Everything a renderer reads from a `&Terminal` for one frame, snapshotted into
 /// plain owned data — the engine emits it via [`crate::terminal::Terminal::cell_frame_into`].
 ///
@@ -848,7 +875,25 @@ pub struct RenderInput {
     /// Per-row DEC line size (DECDWL/DECDHL via `ESC # 3..6`): the renderer draws
     /// double-width / double-height rows scaled. `SingleWidth` (the default) is
     /// the ordinary path.
+    ///
+    /// AUTHORITATIVE only while the matching [`line_size_spans`](Self::line_size_spans)
+    /// row is empty — which is every single-terminal frame, and every split whose
+    /// panes all sit on ordinary lines. For a composed row that DOES carry runs
+    /// this degrades to a SUMMARY: it reports a non-single value when any pane on
+    /// the row is a DEC line, so row-level consumers (the sparkle-word cat
+    /// suppressor, the double-height damage gate) keep working unchanged. It is
+    /// then NOT a placement input — ask
+    /// [`line_size_run_at`](Self::line_size_run_at) instead, which is the only
+    /// seam that can answer per column.
     pub line_sizes: Vec<LineSize>,
+    /// Per-row column runs carrying a NON-UNIFORM DEC line size, for composed
+    /// split-pane frames. EMPTY (the ordinary case) means the row is uniform and
+    /// [`line_sizes`](Self::line_sizes) governs it end to end.
+    ///
+    /// Populated only by the pane compositor, and only for rows where the panes
+    /// actually disagree — see [`LineSizeSpan`] and [`Self::line_size_run_at`].
+    /// When non-empty for a row, the runs partition `0..cols` in ascending order.
+    pub line_size_spans: Vec<Vec<LineSizeSpan>>,
     /// Per-row, sparse inline-image placements (`term.images_row(r)`):
     /// `(col, ImageRef)` for every cell covered by an iTerm2 OSC 1337 `File=`
     /// image. The renderer decodes each image once (keyed by the `Arc` inside the
@@ -938,6 +983,7 @@ impl Clone for RenderInput {
             clusters: self.clusters.clone(),
             combining: self.combining.clone(),
             line_sizes: self.line_sizes.clone(),
+            line_size_spans: self.line_size_spans.clone(),
             images: self.images.clone(),
             default_bg: self.default_bg,
             cursor_color: self.cursor_color,
@@ -998,6 +1044,7 @@ impl Clone for RenderInput {
         self.clusters.clone_from(&source.clusters);
         self.combining.clone_from(&source.combining);
         self.line_sizes.clone_from(&source.line_sizes);
+        self.line_size_spans.clone_from(&source.line_size_spans);
         self.images.clone_from(&source.images);
         self.default_bg = source.default_bg;
         self.cursor_color = source.cursor_color;
@@ -1055,6 +1102,7 @@ impl PartialEq for RenderInput {
             && self.clusters == other.clusters
             && self.combining == other.combining
             && self.line_sizes == other.line_sizes
+            && self.line_size_spans == other.line_size_spans
             && self.images == other.images
             && self.default_bg == other.default_bg
             && self.cursor_color == other.cursor_color
@@ -1127,6 +1175,7 @@ impl RenderInput {
             clusters: Vec::new(),
             combining: Vec::new(),
             line_sizes: Vec::new(),
+            line_size_spans: Vec::new(),
             images: Vec::new(),
             default_bg: COLOR_UNSET,
             cursor_color: COLOR_UNSET,
@@ -1209,6 +1258,58 @@ impl RenderInput {
             .map(|i| &row[i].1)
     }
 
+    /// The DEC line-size RUN governing (`row`, `col`): its line size and the
+    /// composite column range `start_col..end_col` it spans.
+    ///
+    /// This is the ONE seam both renderers use to place a glyph horizontally, so
+    /// they cannot disagree about a composed row. The returned range is also the
+    /// clip box: a double-width run must not bleed past its own pane.
+    ///
+    /// Fast path — and the only path a single-pane frame ever takes — is an empty
+    /// [`line_size_spans`](Self::line_size_spans) row, which yields the uniform
+    /// run `0..cols` at [`line_sizes`](Self::line_sizes)`[row]`. That reduces the
+    /// caller's arithmetic to exactly the pre-span `col * cell_w`.
+    ///
+    /// A row with spans returns the run containing `col`. Spans partition
+    /// `0..cols`, so a miss is impossible for an in-range column; an out-of-range
+    /// column falls back to the uniform run rather than panicking, because the
+    /// renderers index this from clamped-framebuffer loops.
+    #[must_use]
+    pub fn line_size_run_at(&self, row: usize, col: usize) -> (LineSize, usize, usize) {
+        let uniform = || {
+            (
+                self.line_sizes.get(row).copied().unwrap_or_default(),
+                0,
+                self.cols,
+            )
+        };
+        let Some(spans) = self.line_size_spans.get(row) else {
+            return uniform();
+        };
+        if spans.is_empty() {
+            return uniform();
+        }
+        // A row WITH runs does not consult `line_sizes[row]`: that value is only a
+        // summary for row-level consumers (see the field docs), and a column no
+        // run claims is unclaimed composite space — a divider seam, or padding
+        // beside a pane — which renders single-width by definition.
+        let gap = (LineSize::SingleWidth, 0, self.cols);
+        // Ascending, non-overlapping: the last run starting at or before `col`
+        // is the only candidate.
+        match spans.binary_search_by_key(&col, |s| s.start_col) {
+            Ok(i) => (spans[i].line_size, spans[i].start_col, spans[i].end_col),
+            Err(0) => gap,
+            Err(i) => {
+                let s = &spans[i - 1];
+                if col < s.end_col {
+                    (s.line_size, s.start_col, s.end_col)
+                } else {
+                    gap
+                }
+            }
+        }
+    }
+
     /// Whether the image at (`row`,`col`), if any, HIDES the cell's glyph — i.e. it
     /// is drawn OVER the text (`z_index >= 0`, the default). A Kitty `z < 0` image is
     /// drawn BEHIND the text, so it does NOT hide the glyph and this returns `false`.
@@ -1217,6 +1318,126 @@ impl RenderInput {
     pub fn image_hides_glyph_at(&self, row: usize, col: usize) -> bool {
         self.image_at(row, col)
             .is_some_and(|r| r.image.z_index >= 0)
+    }
+}
+
+#[cfg(test)]
+mod line_size_run_tests {
+    use super::{LineSizeSpan, RenderInput};
+    use crate::grid::LineSize;
+
+    fn input(rows: usize, cols: usize) -> RenderInput {
+        let mut i = RenderInput::empty();
+        i.rows = rows;
+        i.cols = cols;
+        i.line_sizes = vec![LineSize::SingleWidth; rows];
+        i.line_size_spans = vec![Vec::new(); rows];
+        i
+    }
+
+    /// The uniform row is the ONLY path a single-pane frame takes, and it must
+    /// reduce to the pre-span behaviour exactly: the row's own line size, over
+    /// the whole grid, so callers compute `col * cell_w` as before.
+    #[test]
+    fn empty_spans_yield_the_row_line_size_over_the_whole_row() {
+        let mut i = input(2, 10);
+        i.line_sizes[1] = LineSize::DoubleWidth;
+        assert_eq!(i.line_size_run_at(0, 0), (LineSize::SingleWidth, 0, 10));
+        assert_eq!(i.line_size_run_at(0, 9), (LineSize::SingleWidth, 0, 10));
+        assert_eq!(i.line_size_run_at(1, 4), (LineSize::DoubleWidth, 0, 10));
+    }
+
+    /// A run governs exactly its own columns; a column outside every run falls
+    /// back to single width, which is what an unclaimed composite column renders
+    /// as. This is the property that keeps one pane's DECDWL off its neighbour.
+    #[test]
+    fn a_run_governs_only_its_own_columns() {
+        let mut i = input(1, 11);
+        i.line_size_spans[0] = vec![LineSizeSpan {
+            start_col: 6,
+            end_col: 11,
+            line_size: LineSize::DoubleWidth,
+        }];
+        for c in 0..6 {
+            assert_eq!(
+                i.line_size_run_at(0, c),
+                (LineSize::SingleWidth, 0, 11),
+                "column {c} sits outside the run"
+            );
+        }
+        for c in 6..11 {
+            assert_eq!(
+                i.line_size_run_at(0, c),
+                (LineSize::DoubleWidth, 6, 11),
+                "column {c} sits inside the run"
+            );
+        }
+    }
+
+    /// Boundaries: `start_col` is inclusive and `end_col` exclusive, and the
+    /// binary search must land correctly on a run's first column, its last, and
+    /// the gap between two runs.
+    #[test]
+    fn run_boundaries_are_half_open_and_gaps_fall_back() {
+        let mut i = input(1, 12);
+        i.line_size_spans[0] = vec![
+            LineSizeSpan {
+                start_col: 0,
+                end_col: 3,
+                line_size: LineSize::DoubleHeightTop,
+            },
+            LineSizeSpan {
+                start_col: 8,
+                end_col: 12,
+                line_size: LineSize::DoubleWidth,
+            },
+        ];
+        assert_eq!(i.line_size_run_at(0, 0).0, LineSize::DoubleHeightTop);
+        assert_eq!(i.line_size_run_at(0, 2).0, LineSize::DoubleHeightTop);
+        // 3..8 is the gap between the two panes.
+        assert_eq!(i.line_size_run_at(0, 3), (LineSize::SingleWidth, 0, 12));
+        assert_eq!(i.line_size_run_at(0, 7), (LineSize::SingleWidth, 0, 12));
+        assert_eq!(i.line_size_run_at(0, 8).0, LineSize::DoubleWidth);
+        assert_eq!(i.line_size_run_at(0, 11).0, LineSize::DoubleWidth);
+    }
+
+    /// On a row that carries runs, `line_sizes[row]` is only a SUMMARY for
+    /// row-level consumers — it says "some pane here is a DEC line". Placement
+    /// must NOT inherit it: a divider seam between two panes is unclaimed
+    /// composite space and renders single-width, even though the summary is
+    /// double-width. This is the exact confusion the old row-level field caused.
+    #[test]
+    fn a_spanned_row_never_inherits_the_row_level_summary() {
+        let mut i = input(1, 11);
+        // The compositor sets both: the run (authoritative) and the summary.
+        i.line_sizes[0] = LineSize::DoubleWidth;
+        i.line_size_spans[0] = vec![LineSizeSpan {
+            start_col: 6,
+            end_col: 11,
+            line_size: LineSize::DoubleWidth,
+        }];
+        for c in 0..6 {
+            assert_eq!(
+                i.line_size_run_at(0, c),
+                (LineSize::SingleWidth, 0, 11),
+                "column {c} is unclaimed composite space, not the summary's width"
+            );
+        }
+        assert_eq!(i.line_size_run_at(0, 6), (LineSize::DoubleWidth, 6, 11));
+    }
+
+    /// The renderers index this from clamped-framebuffer loops, so an
+    /// out-of-range row or column must fall back, never panic.
+    #[test]
+    fn out_of_range_lookups_fall_back_instead_of_panicking() {
+        let mut i = input(1, 4);
+        i.line_size_spans[0] = vec![LineSizeSpan {
+            start_col: 0,
+            end_col: 2,
+            line_size: LineSize::DoubleWidth,
+        }];
+        assert_eq!(i.line_size_run_at(0, 99), (LineSize::SingleWidth, 0, 4));
+        assert_eq!(i.line_size_run_at(9, 0), (LineSize::SingleWidth, 0, 4));
     }
 }
 

@@ -22,8 +22,10 @@ use aterm_hash::{FxHashMap, FxHashSet};
 use aterm_core::grid::LineSize;
 // FREE-floating overlay sprites (FREE_OVERLAY_LAYER_DESIGN §3.2.2): consumed by
 // the CPU phase runner below. Not re-exported through `aterm-render-api` (yet),
-// so they come straight from the core contract crate.
-use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
+// so they come straight from the core contract crate. `LineSizeSpan` joins them
+// for the same reason: the PER-COLUMN DEC line-size seam a composed (split-pane)
+// row needs, which the row-level `RenderInput::line_sizes` cannot express.
+use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, LineSizeSpan};
 // A-3: the CPU renderer no longer borrows `&Terminal` — it consumes only the
 // engine-built `RenderInput`. `Terminal` is imported solely in the test module
 // (which builds terminals + calls `Terminal::cell_frame` to feed the renderer).
@@ -4866,6 +4868,23 @@ impl Renderer {
             .and_then(|f| f.path.clone())
     }
 
+    /// TEST/DEBUG: the RUNTIME fallback decision for `ch` — the source path, the
+    /// collection face index chosen for it, and the glyph id ttf-parser reports
+    /// at that index. The triple every wrong-glyph question needs answered at
+    /// once.
+    #[doc(hidden)]
+    pub fn debug_runtime_fallback(&mut self, ch: char) -> Option<(String, u32, Option<u16>)> {
+        self.debug_block_on_lazy_fallbacks();
+        let ctx = self.runtime_probe_ctx();
+        let i = self.runtime_fallback.resolve(ch, ctx)?;
+        let face = self.runtime_fallback.faces.get(i)?;
+        let gid = ttf_parser::Face::parse(&face.bytes, face.index)
+            .ok()
+            .and_then(|f| f.glyph_index(ch))
+            .map(|g| g.0);
+        Some((face.path.clone(), face.index, gid))
+    }
+
     /// TEST/DEBUG: the pending symbol-fallback candidate paths.
     #[doc(hidden)]
     #[must_use]
@@ -5447,8 +5466,36 @@ impl Renderer {
     /// loads the lazy system face on first use.
     fn fallback_has(&mut self, ch: char) -> bool {
         self.ensure_fallback();
+        if self.fallback_pick.contains_key(&ch) {
+            return true;
+        }
         for (i, face) in self.fallback_chain.iter().enumerate() {
-            if face.font.lookup_glyph_index(ch) != 0 {
+            // COVERAGE FROM THE UNICODE CMAP (ttf-parser), NOT fontdue's char
+            // lookup — the SAME authority the primary tier already uses, and for
+            // the same reason (`primary_unicode_gid`): fontdue mis-selects a Mac
+            // Roman subtable on Apple `.ttc` fonts, so it answers "yes, I have
+            // that character" for code points the face does not cover, handing
+            // back a bogus glyph id from the wrong subtable.
+            //
+            // The primary tier was fixed for this; the FALLBACK tier was not,
+            // and it is the tier that actually meets non-Latin text. On a stock
+            // macOS the default CJK fallback is `Hiragino Sans GB.ttc` — a
+            // CHINESE face that covers no Hangul whatsoever (every syllable maps
+            // to glyph 0 in its real Unicode cmap). fontdue nonetheless claimed
+            // 어, 스 and 트, so the chain stopped there and drew whatever those
+            // bogus ids pointed at: `한국어 조합 테스트` rendered as
+            // `한국糯 조합 테陇腋` — confident, deterministic Han glyphs standing
+            // in for Korean, while the syllables fontdue happened not to claim
+            // fell through to a face that really covers them and looked fine.
+            //
+            // `Face::parse` is a lazy table-directory read (no outline work), and
+            // this runs once per code point — the winner is memoized in
+            // `fallback_pick` and short-circuited above.
+            let covered = ttf_parser::Face::parse(&face.bytes, face.index)
+                .ok()
+                .and_then(|f| f.glyph_index(ch))
+                .is_some_and(|g| g.0 != 0);
+            if covered {
                 self.fallback_pick.insert(ch, i);
                 return true;
             }
@@ -6018,6 +6065,7 @@ impl Renderer {
                 let b = bytes.clone();
                 // Fallback faces are never instantiated (W9 coords are the
                 // PRIMARY's): default instance, slot 0.
+                //
                 self.ct_glyph(kp, &b, index, g, eff_px, &[], 0)
             })
         };
@@ -9412,20 +9460,119 @@ struct RowCtx<'a> {
     ink_row: &'a [InkCell],
     char_fg_row: &'a [CharFg],
     fire_halo_row: &'a [FireHaloCell],
+    /// The viewport row this context describes — the key both halves hand to
+    /// [`Renderer::mixed_cell_place`] to place a column on a MIXED row.
+    row: usize,
     /// Top pixel of the row band (`grid_top + r·cell_h`).
     y0: usize,
     /// Live-screen selection row for viewport row `r` (`r - display_offset`).
     sel_row: i32,
-    /// On-screen cell advance (doubled on DECDWL/DECDHL rows).
+    /// On-screen cell advance (doubled on DECDWL/DECDHL rows). Governs EVERY
+    /// column only when `uniform`; on a mixed row it is the row-level fallback
+    /// and each column's real advance comes from [`Renderer::mixed_cell_place`].
     cw: usize,
     scale: Scale,
     anchor_y: i32,
+    /// Whether ONE DEC line size governs the whole row ([`row_is_uniform`]) —
+    /// true for every single-pane frame and for any split whose panes all sit on
+    /// ordinary lines, which is why the per-column seam costs the hot glyph loop
+    /// nothing but a hoisted, perfectly-predicted branch.
+    uniform: bool,
     sel_bg: u32,
     bg_t: u32,
     frame_bg: u32,
 }
 
+/// Where composite column `col` of a MIXED row lands in pixels — everything the
+/// uniform path gets for free from the hoisted `pad + col·cw`.
+///
+/// A row is mixed ONLY under split-pane composition, where each pane contributes
+/// its own DEC line size to a disjoint column range of the ONE composite row
+/// (see [`LineSizeSpan`]). The row-level `line_sizes[row]` cannot express that:
+/// collapsing it made the last pane blitted scale its neighbours' glyphs.
+#[derive(Clone, Copy)]
+struct CellPlace {
+    /// Absolute left pixel of the cell (`pad` already added).
+    x: usize,
+    /// The cell's on-screen advance under ITS run's DEC line size.
+    w: usize,
+    /// Absolute pixel box `[lo, hi)` of the run — i.e. of the contributing pane.
+    /// Nothing this cell paints may land outside it: a DECDWL run consumes TWICE
+    /// the pixels its columns own, so without this bound its doubled cells march
+    /// straight over the pane beside it. (That is the whole bug this seam fixes;
+    /// clipping is what makes the second half of a double-width pane's columns
+    /// fall off the PANE's right edge exactly as they fall off the screen's edge
+    /// on an unsplit DECDWL row.)
+    lo: usize,
+    hi: usize,
+    /// The run's glyph enlargement, with `[lo, hi)` already folded into the
+    /// x-clip — so a blit through it cannot paint outside the pane.
+    scale: Scale,
+    /// The run's (DECDHL-shifted) glyph anchor row.
+    anchor_y: i32,
+}
+
+/// The visible part of the pixel span `[x, x + w)` inside the window `[lo, hi)`,
+/// or `None` when the span lies entirely outside it.
+///
+/// The clamp every MIXED-row fill goes through: [`Renderer::fill_rect`] clips to
+/// the FRAME, which on a composed row is not the same statement as clipping to
+/// the pane. Uniform callers pass the open window `(0, usize::MAX)`, for which
+/// this returns the input span unchanged (and `w == 0` maps to `None`, exactly
+/// what `fill_rect`'s own `x0 >= x1` early-out already did) — byte-identical.
+fn clip_span_to_run(x: usize, w: usize, lo: usize, hi: usize) -> Option<(usize, usize)> {
+    let x0 = x.max(lo);
+    let x1 = x.saturating_add(w).min(hi);
+    // `checked_sub` is the underflow bar: a span entirely LEFT of the window has
+    // `x1 < x0`, and `x1 - x0` on usize would panic rather than clip.
+    x1.checked_sub(x0).filter(|d| *d > 0).map(|d| (x0, d))
+}
+
 impl Renderer {
+    /// Resolve column `col` of MIXED row `row` (band top `y0`) to its pixel
+    /// placement — the ONE statement of the per-column rule, so every pass
+    /// (bg, glyph, decoration, image, trail, sparkle, cursor) places a composed
+    /// row identically and none of them can drift.
+    ///
+    /// NEVER called for a uniform row: see [`RowCtx::uniform`] / [`row_is_uniform`].
+    /// The uniform path keeps its hoisted `pad + col·cw` arithmetic verbatim, so
+    /// the hot glyph loop pays nothing for this seam — no per-column run lookup,
+    /// no changed math, byte-identical output.
+    fn mixed_cell_place(
+        &self,
+        input: &RenderInput,
+        row: usize,
+        col: usize,
+        y0: usize,
+    ) -> CellPlace {
+        let (x, w, cx0, cx1) = cell_x_run(input, row, col, self.cell_w);
+        // `cell_x_run` answers in GRID-relative px (the space the pre-span
+        // `col * cw` lived in); every consumer here wants window-absolute, so the
+        // interior pad is added ONCE, here, and the run box travels with it.
+        let (x, lo, hi) = (self.pad + x, self.pad + cx0, self.pad + cx1);
+        // The run's OWN line size drives the enlargement too, not just the
+        // advance: a DECDWL pane's glyphs must be 2× while its single-width
+        // neighbour on the same composite row stays 1×. Deriving `scale` from the
+        // row-level `line_sizes[row]` is precisely the collapse that corrupted
+        // the innocent pane.
+        let (line_size, _, _) = input.line_size_run_at(row, col);
+        let (mut scale, anchor_y) = row_scale(line_size, y0, self.cell_h, row + 1 == input.rows);
+        // NARROW, never widen. `row_scale` hands back the open x window
+        // (`Scale::NORMAL`'s `i32::MIN..i32::MAX`), so this intersection IS the
+        // pane box here; a caller that has already carved its own window (the
+        // cursor cut-out's W4 rect) intersects ITS bound with this one in turn.
+        scale.clip_x0 = scale.clip_x0.max(lo as i32);
+        scale.clip_x1 = scale.clip_x1.min(hi as i32);
+        CellPlace {
+            x,
+            w,
+            lo,
+            hi,
+            scale,
+            anchor_y,
+        }
+    }
+
     /// Build row `r`'s [`RowCtx`]. Split out of the fused
     /// [`Self::render_row`] so the phase runner pays the setup once per row
     /// per half with no per-row allocation.
@@ -9457,6 +9604,13 @@ impl Renderer {
             .unwrap_or(LineSize::SingleWidth);
         let cw = row_cell_w(line_size, self.cell_w);
         let (scale, anchor_y) = row_scale(line_size, y0, self.cell_h, r + 1 == input.rows);
+        // …but a COMPOSED row can carry a different DEC line size PER COLUMN RUN
+        // (one per split pane — `LineSizeSpan`), and no single row-level value
+        // can stand for that. Decided ONCE per row here: uniform rows (every
+        // single-pane frame) keep the three hoisted values above and the passes'
+        // original `pad + c·cw` arithmetic; a mixed row sends each column through
+        // `mixed_cell_place` instead. One branch per pass, none per column.
+        let uniform = row_is_uniform(input, r);
         // Animated-ink fg overrides for THIS row (Sparkle Words v2): sliced ONCE
         // per row, then merge-walked in lockstep with the pass-2/pass-3 column
         // loops (one compare per cell — `InkWalk`). ORDERING INVARIANT (both
@@ -9497,11 +9651,13 @@ impl Renderer {
             ink_row,
             char_fg_row,
             fire_halo_row,
+            row: r,
             y0,
             sel_row,
             cw,
             scale,
             anchor_y,
+            uniform,
             sel_bg,
             bg_t,
             frame_bg,
@@ -9523,9 +9679,11 @@ impl Renderer {
         let selection = &input.selection;
         let RowCtx {
             cells,
+            row,
             y0,
             sel_row,
             cw,
+            uniform,
             sel_bg,
             bg_t,
             frame_bg,
@@ -9544,7 +9702,20 @@ impl Renderer {
                     cell_bg
                 }
             };
-            self.fill_rect(pixels, w, h, self.pad + c * cw, y0, cw, self.cell_h, bg);
+            if uniform {
+                self.fill_rect(pixels, w, h, self.pad + c * cw, y0, cw, self.cell_h, bg);
+            } else {
+                // Composed row: the cell sits where ITS pane's run puts it, and
+                // the fill is clamped to that run's box. Without the clamp a
+                // DECDWL pane's doubled fills would repaint the neighbouring
+                // pane's background — the same bleed the glyphs suffer, one pass
+                // earlier and just as visible (a selection band or SGR bg
+                // marching across the split).
+                let p = self.mixed_cell_place(input, row, c, y0);
+                if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
+                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, bg);
+                }
+            }
         }
     }
 
@@ -9613,6 +9784,7 @@ impl Renderer {
             cw,
             scale,
             anchor_y,
+            uniform,
             sel_bg,
             ..
         } = *ctx;
@@ -9663,6 +9835,20 @@ impl Renderer {
         for (c, cell) in cells.iter().take(cols).enumerate() {
             if !image_covers(row_images, c) && !cell.wide && cell.ch != ' ' && !cell.ch.is_control()
             {
+                // HORIZONTAL PLACEMENT. Uniform row (every single-pane frame):
+                // the hoisted `pad_x + c·cw` / `cw` / `scale` / `anchor_y` the
+                // pre-span renderer used, verbatim — no run lookup, no changed
+                // arithmetic, byte-identical pixels. Mixed row: the column's OWN
+                // DEC run supplies the origin, the advance AND the enlargement,
+                // with the run's box folded into the glyph clip — which is what
+                // stops a double-width pane from scaling and overpainting its
+                // neighbour's glyphs (the bug the per-column seam exists for).
+                let (x, cw, scale, anchor_y) = if uniform {
+                    (pad_x + c * cw, cw, scale, anchor_y)
+                } else {
+                    let p = self.mixed_cell_place(input, r, c, y0);
+                    (p.x, p.w, p.scale, p.anchor_y)
+                };
                 let cluster = cluster_for(row_clusters, c);
                 // Ink override BEFORE any floor (see the ink_row comment above),
                 // then the EMBERFORGE char_fg override at the same seam — INK
@@ -9690,8 +9876,12 @@ impl Renderer {
                 };
                 // Shade dithers key on the cell's ABSOLUTE pixel parity (a
                 // no-op for every other glyph) — the GPU quad emission folds
-                // the identical phase, so the atlases stay in lockstep.
-                let key = shade_phase_key(key, pad_x + c * cw, y0);
+                // the identical phase, so the atlases stay in lockstep. `x` IS
+                // `pad_x + c * cw` on a uniform row (the fold is unchanged);
+                // on a mixed row the phase follows the cell to where its run
+                // actually places it, so the dither still keys on the pixel the
+                // glyph lands on.
+                let key = shade_phase_key(key, x, y0);
                 // Selected cells floor their glyph fg against the selection bg so
                 // colour-on-selection stays legible (GPU mirrors this identically).
                 let selected = selection.contains_cell(
@@ -9734,7 +9924,7 @@ impl Renderer {
                     self.blit_glyph_halo(
                         pixels,
                         w,
-                        (pad_x + c * cw) as i32,
+                        x as i32,
                         anchor_y,
                         key,
                         scale,
@@ -9744,7 +9934,7 @@ impl Renderer {
                 self.blit(
                     pixels,
                     w,
-                    (pad_x + c * cw) as i32,
+                    x as i32,
                     anchor_y,
                     key,
                     fg,
@@ -9767,7 +9957,13 @@ impl Renderer {
                             let mi = self.glyph_image(mk);
                             (mi.width(), mi.xmin())
                         };
-                        let cx = mark_cell_x(c, cw, gw, xmin, scale) + pad_x as i32;
+                        // `mark_cell_x_at` takes the cell's LEFT PIXEL rather
+                        // than re-deriving it from `c * rcw`, because on a
+                        // composed row the column's run — not the row — decides
+                        // where that is. On a uniform row `x == pad_x + c * cw`,
+                        // so this is the old `mark_cell_x(c, cw, ..) + pad_x`
+                        // term for term (same centring, same integer division).
+                        let cx = mark_cell_x_at(x as i32, cw, gw, xmin, scale);
                         // Combining marks paint in the SAME effective fg as their
                         // base glyph — W5b floors (selection / min-contrast) applied
                         // to the INK-substituted `base_fg`, so accented forms both
@@ -9794,7 +9990,20 @@ impl Renderer {
                 if c >= cols {
                     continue;
                 }
-                self.blit_image_cell(ic, pixels, w, h, pad_x + c * cw, y0, image);
+                if uniform {
+                    self.blit_image_cell(ic, pixels, w, h, pad_x + c * cw, y0, image, w);
+                } else {
+                    // Composed row: the tile follows the column's own pane run
+                    // and is cut off at that run's right edge. An image is the
+                    // one stream that keeps its BASE `cell_w` tile on a doubled
+                    // row (unchanged here), but its ORIGIN still doubles — so
+                    // without the bound a picture in a DECDWL pane would march
+                    // its tiles across the pane beside it.
+                    let p = self.mixed_cell_place(input, r, c, y0);
+                    if p.x < p.hi {
+                        self.blit_image_cell(ic, pixels, w, h, p.x, y0, image, p.hi);
+                    }
+                }
             }
         }
         // Pass 3: line decorations (underline / strikethrough / overline)
@@ -9831,7 +10040,18 @@ impl Renderer {
             {
                 continue;
             }
-            let x = pad_x + c * cw;
+            // Placement, as in pass 2: hoisted on a uniform row; the column's own
+            // DEC run on a mixed one, where `lo..hi` is the pane box every rect
+            // below is clamped to — so a DECDWL pane's underline stops at the
+            // split instead of striking through its neighbour's text. The open
+            // `0..usize::MAX` window makes the uniform arm's clamp a provable
+            // no-op (see `clip_span`), keeping one code path for both.
+            let (x, cw, lo, hi) = if uniform {
+                (pad_x + c * cw, cw, 0, usize::MAX)
+            } else {
+                let p = self.mixed_cell_place(input, r, c, y0);
+                (p.x, p.w, p.lo, p.hi)
+            };
             let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
             let dw = if is_wide_lead { 2 * cw } else { cw };
             // Ink — and, when no ink governs the cell, char_fg — follows into
@@ -9890,11 +10110,15 @@ impl Renderer {
                     deco::intersect_rect_spans(&mut skipped_scratch, rect, &keep_spans);
                 }
                 for &[rx, ry, rw, rh] in &skipped_scratch {
-                    self.fill_rect(pixels, w, h, rx, ry, rw, rh, ucolor);
+                    if let Some((fx, fw)) = clip_span_to_run(rx, rw, lo, hi) {
+                        self.fill_rect(pixels, w, h, fx, ry, fw, rh, ucolor);
+                    }
                 }
             } else {
                 for &[rx, ry, rw, rh] in &deco_scratch {
-                    self.fill_rect(pixels, w, h, rx, ry, rw, rh, ucolor);
+                    if let Some((fx, fw)) = clip_span_to_run(rx, rw, lo, hi) {
+                        self.fill_rect(pixels, w, h, fx, ry, fw, rh, ucolor);
+                    }
                 }
             }
             // Strike/overline follow the SAME shared floor as the glyph fg (W5b),
@@ -9918,7 +10142,9 @@ impl Renderer {
                 dm,
             );
             for &[rx, ry, rw, rh] in &deco_scratch {
-                self.fill_rect(pixels, w, h, rx, ry, rw, rh, fgc);
+                if let Some((fx, fw)) = clip_span_to_run(rx, rw, lo, hi) {
+                    self.fill_rect(pixels, w, h, fx, ry, fw, rh, fgc);
+                }
             }
         }
         // Pass 3b: AA cosine undercurls (style Curly, mask-supported cell
@@ -9929,7 +10155,14 @@ impl Renderer {
                 if cell.wide || !matches!(cell.underline, UnderlineStyle::Curly) {
                     continue;
                 }
-                let x = pad_x + c * cw;
+                // Same placement rule as pass 3 above (hoisted when uniform, the
+                // column's own run when mixed).
+                let (x, cw, lo, hi) = if uniform {
+                    (pad_x + c * cw, cw, 0, usize::MAX)
+                } else {
+                    let p = self.mixed_cell_place(input, r, c, y0);
+                    (p.x, p.w, p.lo, p.hi)
+                };
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
                 let dw = if is_wide_lead { 2 * cw } else { cw };
                 let selected = selection.contains_cell(sel_row, c as u16, is_wide_lead, cell.wide);
@@ -9955,6 +10188,19 @@ impl Renderer {
                 if !skip {
                     keep_spans.clear();
                     keep_spans.push((x, dw));
+                }
+                // The curl is a PANE-LOCAL decoration on a composed row: clamp
+                // its spans to the run box before they reach the blender, which
+                // knows only the frame. Skipped entirely when uniform, so the
+                // ordinary path never touches the scratch.
+                if !uniform {
+                    keep_spans.retain_mut(|s| match clip_span_to_run(s.0, s.1, lo, hi) {
+                        Some(v) => {
+                            *s = v;
+                            true
+                        }
+                        None => false,
+                    });
                 }
                 self.blend_undercurl(pixels, w, h, y0, cw, dm, ucolor, &keep_spans);
             }
@@ -10048,14 +10294,23 @@ impl Renderer {
         // DEC double-width/height rows blit scaled glyphs; the 1:1 placement
         // math below does not apply — draw those rows' underlines unskipped
         // (shared predicate; the GPU mirrors it).
-        if !matches!(
+        //
+        // On a COMPOSED row the size that governs is the one of the RUN column
+        // `c` sits in, NOT the row-level value: a composite row can read
+        // SingleWidth while the pane owning this column is on DECDWL, and
+        // carving ink out of a 2×-blitted glyph with 1:1 math would skip the
+        // wrong pixels. Uniform rows (every single-pane frame) take the same
+        // `line_sizes[r]` lookup as before — the run seam costs them nothing.
+        let line_size = if row_is_uniform(input, r) {
             input
                 .line_sizes
                 .get(r)
                 .copied()
-                .unwrap_or(LineSize::SingleWidth),
-            LineSize::SingleWidth
-        ) {
+                .unwrap_or(LineSize::SingleWidth)
+        } else {
+            input.line_size_run_at(r, c).0
+        };
+        if !matches!(line_size, LineSize::SingleWidth) {
             return false;
         }
         let Some(cell) = input.cells.get(r).and_then(|row| row.get(c)) else {
@@ -10167,16 +10422,32 @@ impl Renderer {
             {
                 continue;
             }
-            let line_size = input.line_sizes[t.row];
-            let cw = row_cell_w(line_size, self.cell_w);
-            // Grid-interior bound: on a DEC double-width row the per-cell
-            // advance doubles, so a trail col past `cols/2` would land in the
-            // window pad band. Single-width rows reduce to the `col < cols`
-            // check above (identity).
-            if (t.col + 1) * cw > grid_w {
+            let y0 = self.grid_top() + t.row * self.cell_h;
+            let place = if row_is_uniform(input, t.row) {
+                let cw = row_cell_w(input.line_sizes[t.row], self.cell_w);
+                // Grid-interior bound: on a DEC double-width row the per-cell
+                // advance doubles, so a trail col past `cols/2` would land in the
+                // window pad band. Single-width rows reduce to the `col < cols`
+                // check above (identity).
+                if (t.col + 1) * cw > grid_w {
+                    None
+                } else {
+                    Some((self.pad + t.col * cw, cw))
+                }
+            } else {
+                // Composed row: the bed cell sits where ITS pane's run puts it,
+                // clamped to that run's box. That is the SAME effects-box law as
+                // the grid-interior bound above, now enforced per PANE instead of
+                // per row — a comet crossing a DECDWL pane must stop at the split,
+                // not smear over the cells of the pane beside it. (A run's box is
+                // inside the grid by construction, so the interior bound is
+                // subsumed rather than dropped.)
+                let p = self.mixed_cell_place(input, t.row, t.col, y0);
+                clip_span_to_run(p.x, p.w, p.lo, p.hi)
+            };
+            let Some((x0, cw)) = place else {
                 continue;
-            }
-            let (x0, y0) = (self.pad + t.col * cw, self.grid_top() + t.row * self.cell_h);
+            };
             // Blend the resolved trail colour over THIS cell's own background at
             // the cell's coverage, then fill the cell with the result — a comet
             // segment that fades into the background as `alpha` decays. Phase C
@@ -10833,7 +11104,20 @@ impl Renderer {
             {
                 continue;
             }
-            let rcw = row_cell_w(input.line_sizes[row], self.cell_w);
+            // Placement: the row-level advance on a uniform row (byte-identical
+            // to the pre-span sprite). On a COMPOSED row the sprite follows the
+            // column's OWN pane run — origin AND stretch width — and is bounded
+            // by that pane's box, so a sparkle on a DECDWL pane stops at the
+            // split. `[lo, hi)` is the frame width on a uniform row, which is the
+            // bound the per-pixel test already applied (identity).
+            let (rcw, ox, lo, hi) = if row_is_uniform(input, row) {
+                let rcw = row_cell_w(input.line_sizes[row], self.cell_w);
+                let ox = self.pad as isize + (col * rcw) as isize + d.dx as isize;
+                (rcw, ox, 0, w)
+            } else {
+                let p = self.mixed_cell_place(input, row, col, self.grid_top() + row * self.cell_h);
+                (p.w, p.x as isize + d.dx as isize, p.lo, p.hi.min(w))
+            };
             if rcw == 0 {
                 continue;
             }
@@ -10855,7 +11139,6 @@ impl Renderer {
                 }
             }
             let mask = self.deco_mask(d.glyph, bcw, ch);
-            let ox = self.pad as isize + (col * rcw) as isize + d.dx as isize;
             let oy = self.grid_top() as isize + (row * self.cell_h) as isize + d.dy as isize;
             for my in 0..ch {
                 let py = oy + my as isize;
@@ -10874,7 +11157,7 @@ impl Renderer {
                         continue;
                     }
                     let px = ox + mx as isize;
-                    if px < 0 || px as usize >= w {
+                    if px < lo as isize || px as usize >= hi {
                         continue;
                     }
                     let a = ((u32::from(cov) * u32::from(d.alpha) + 127) / 255) as u8;
@@ -10934,15 +11217,24 @@ impl Renderer {
             // `(pad, grid_top)` exactly like `render_row`, so the cursor lands
             // on its (padded, head-shifted) cell.
             let (pad_x, pad_y) = (self.pad, self.grid_top());
-            let line_size = input.line_sizes[cr];
-            let cw = row_cell_w(line_size, self.cell_w);
-            let (scale, anchor_y) = row_scale(
-                line_size,
-                pad_y + cr * self.cell_h,
-                self.cell_h,
-                cr + 1 == rows,
-            );
-            let (x0, y0) = (pad_x + cc * cw, pad_y + cr * self.cell_h);
+            let y0 = pad_y + cr * self.cell_h;
+            // …and on a COMPOSED row only the cursor's OWN pane run governs it:
+            // the cursor belongs to one pane, so it takes that run's advance,
+            // enlargement and anchor, and everything it paints is bounded by that
+            // run's box `[run_lo, run_hi)` — the cursor of a DECDWL pane must not
+            // reach into the pane beside it. Uniform rows (every single-pane
+            // frame) keep the row-level lookup and the open bound, so the fills
+            // and the cut-out below are byte-identical to the pre-span cursor.
+            let uniform = row_is_uniform(input, cr);
+            let (cw, scale, anchor_y, x0, run_lo, run_hi) = if uniform {
+                let line_size = input.line_sizes[cr];
+                let cw = row_cell_w(line_size, self.cell_w);
+                let (scale, anchor_y) = row_scale(line_size, y0, self.cell_h, cr + 1 == rows);
+                (cw, scale, anchor_y, pad_x + cc * cw, 0, usize::MAX)
+            } else {
+                let p = self.mixed_cell_place(input, cr, cc, y0);
+                (p.w, p.scale, p.anchor_y, p.x, p.lo, p.hi)
+            };
             let is_block = matches!(style, CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock);
             // W4: a block cursor on a WIDE lead (CJK/emoji) covers the glyph's
             // whole 2-cell footprint (the deco pass precedent for underlines), so
@@ -10983,12 +11275,16 @@ impl Renderer {
             let cursor_cov = (self.cursor_opacity * 255.0).round() as u8;
             if cursor_cov < 255 {
                 for [rx, ry, rw, rh] in cursor_rects(style, x0, y0, cur_w, self.cell_h) {
-                    self.blend_rect(pixels, w, h, rx, ry, rw, rh, cursor_fill, cursor_cov);
+                    if let Some((fx, fw)) = clip_span_to_run(rx, rw, run_lo, run_hi) {
+                        self.blend_rect(pixels, w, h, fx, ry, fw, rh, cursor_fill, cursor_cov);
+                    }
                 }
                 return;
             }
             for [rx, ry, rw, rh] in cursor_rects(style, x0, y0, cur_w, self.cell_h) {
-                self.fill_rect(pixels, w, h, rx, ry, rw, rh, cursor_fill);
+                if let Some((fx, fw)) = clip_span_to_run(rx, rw, run_lo, run_hi) {
+                    self.fill_rect(pixels, w, h, fx, ry, fw, rh, cursor_fill);
+                }
             }
             // The drawability guard is unchanged from pre-W4: a blank cursor cell
             // is never ligated and has no glyph (nothing to cut out), and a wide
@@ -11020,9 +11316,17 @@ impl Renderer {
                 // overwritten in bg — the partition/no-bleed invariant. The
                 // complement of the cursor rect stays byte-identical to the
                 // no-cursor frame (tests/cursor_ink.rs).
+                //
+                // INTERSECTION, not replacement: on a composed row `scale`
+                // already carries the pane box (`mixed_cell_place` folded it in),
+                // and the cursor rect must NARROW that window, never widen it —
+                // a doubled cursor whose rect ran past the pane edge would
+                // otherwise recolour the neighbour's glyph ink. A uniform row's
+                // `scale` carries the open `i32::MIN..i32::MAX` window, for which
+                // this is exactly the old "clip = the cursor rect".
                 let clip = Scale {
-                    clip_x0: x0 as i32,
-                    clip_x1: (x0 + cur_w) as i32,
+                    clip_x0: scale.clip_x0.max(x0 as i32),
+                    clip_x1: scale.clip_x1.min((x0 + cur_w) as i32),
                     ..scale
                 };
                 // W2: the cut-out composites over the cursor block just painted
@@ -11058,12 +11362,22 @@ impl Renderer {
                     };
                     // Same absolute shade phase as the base pass (the column's
                     // own absolute x, matching `render_row`'s fold), so the block
-                    // cursor cuts out the exact dither variant underneath it.
-                    let key = shade_phase_key(key, pad_x + c * cw, y0);
+                    // cursor cuts out the exact dither variant underneath it. On
+                    // a composed row that x comes from the column's own run — the
+                    // cut-out has to land on the pixels the base pass painted, or
+                    // it recolours the wrong ones. (The clip stays the CURSOR
+                    // cell's: the cut-out may never paint outside the cursor rect,
+                    // which already lies inside the cursor's pane.)
+                    let cx = if uniform {
+                        pad_x + c * cw
+                    } else {
+                        self.mixed_cell_place(input, cr, c, y0).x
+                    };
+                    let key = shade_phase_key(key, cx, y0);
                     self.blit(
                         pixels,
                         w,
-                        (pad_x + c * cw) as i32,
+                        cx as i32,
                         anchor_y,
                         key,
                         cut_color,
@@ -11140,6 +11454,13 @@ impl Renderer {
     /// the background pass already filled (so a transparent PNG shows the cell
     /// bg). The decoded+scaled image is cached by the payload `Arc` identity +
     /// footprint size, so it is decoded at most once per distinct placement.
+    ///
+    /// `x_clip` is an exclusive RIGHT bound in framebuffer px: on a COMPOSED
+    /// (split-pane) row it is the owning DEC run's box edge, so a tile in a
+    /// double-width pane is cut off at the split instead of spilling into the
+    /// pane beside it. Every uniform-row caller passes `w` (the frame width),
+    /// for which the bound is the frame clip this already applied —
+    /// byte-identical to the pre-span blit.
     #[allow(clippy::too_many_arguments)]
     fn blit_image_cell(
         &self,
@@ -11150,6 +11471,7 @@ impl Renderer {
         x0: usize,
         y0: usize,
         image: &aterm_core::grid::extra::ImageRef,
+        x_clip: usize,
     ) {
         let cw = self.cell_w;
         let ch = self.cell_h;
@@ -11185,6 +11507,8 @@ impl Renderer {
         // Source origin for THIS cell's tile within the footprint-scaled image.
         let sx0 = image.cell_col as usize * cw;
         let sy0 = image.cell_row as usize * ch;
+        // Frame edge AND (on a composed row) pane edge: one bound, taken once.
+        let x_end = w.min(x_clip);
         for dy in 0..ch {
             let py = y0 + dy;
             if py >= h {
@@ -11196,7 +11520,7 @@ impl Renderer {
             }
             for dx in 0..cw {
                 let pxx = x0 + dx;
-                if pxx >= w {
+                if pxx >= x_end {
                     break;
                 }
                 let sx = sx0 + dx;
@@ -12101,19 +12425,50 @@ fn image_covers(row_images: &[(usize, aterm_core::grid::extra::ImageRef)], col: 
         .is_ok_and(|i| row_images[i].1.image.z_index >= 0)
 }
 
-/// Whether any row's DEC line size is a double-HEIGHT band (DECDHL top/bottom).
+/// Whether any row of `input` carries a double-HEIGHT band (DECDHL top/bottom) —
+/// row-level OR inside a per-column [`LineSizeSpan`] of a COMPOSED row.
 /// Such a row's 2× glyph is clipped across two adjacent row bands, so a single
 /// dirty row can't be repainted in isolation — the damage path falls back to a
 /// full render when this holds for either the cached or the incoming frame.
-fn any_double_height(line_sizes: &[LineSize]) -> bool {
-    line_sizes
-        .iter()
-        .any(|ls| matches!(ls, LineSize::DoubleHeightTop | LineSize::DoubleHeightBottom))
+///
+/// The SPAN arm is not optional. Split-pane composition can put DECDHL on ONE
+/// pane of a composite row whose row-level `line_sizes` entry reads SingleWidth,
+/// and missing that would let the damaged path repaint one band of a two-band
+/// glyph and seam it. The asymmetry is deliberate: over-reporting costs only a
+/// full repaint, under-reporting corrupts the frame — so this stays conservative.
+/// An empty span list (every single-pane frame) reduces to exactly the old
+/// row-level scan, so the ordinary damage gate is unchanged.
+fn any_double_height(input: &RenderInput) -> bool {
+    let is_dh = |ls: &LineSize| {
+        matches!(
+            ls,
+            LineSize::DoubleHeightTop | LineSize::DoubleHeightBottom
+        )
+    };
+    input.line_sizes.iter().any(is_dh)
+        || input
+            .line_size_spans
+            .iter()
+            .any(|spans| spans.iter().any(|s| is_dh(&s.line_size)))
+}
+
+/// Row `r`'s per-column DEC line-size runs, or an EMPTY slice when the row is
+/// uniform — a missing row and an empty span list are the same statement ("one
+/// line size governs the whole row"), so both map to `&[]` and compare equal.
+/// The row-index-tolerant accessor [`row_differs_shifted`] needs: unlike `cells`,
+/// `line_size_spans` is legitimately left empty by producers that never compose
+/// (headless, tests), so it cannot be indexed.
+fn row_spans(input: &RenderInput, r: usize) -> &[LineSizeSpan] {
+    input
+        .line_size_spans
+        .get(r)
+        .map_or(&[][..], Vec::as_slice)
 }
 
 /// Whether row `r`'s render-relevant inputs differ between two frames: the
-/// resolved cells, the sparse cluster / combining-mark lists, the DEC line size,
-/// or the row's inline-image placements. (Display-offset is frame-global and
+/// resolved cells, the sparse cluster / combining-mark lists, the DEC line size
+/// (row-level AND the per-column runs a composed row carries), or the row's
+/// inline-image placements. (Display-offset is frame-global and
 /// gates the whole damaged path; the selection is diffed separately per row via
 /// [`selection_row_span`], so neither is re-checked here.) Equality here is
 /// exact, so an unchanged row is provably safe to reuse from the cache.
@@ -12133,14 +12488,23 @@ fn row_differs(a: &RenderInput, b: &RenderInput, r: usize) -> bool {
 /// comparison, but at independent row indices). The E7 whole-row scroll-blit
 /// uses it to prove a retained row survives a rigid shift: `a`'s viewport row
 /// `ra` equals `b`'s viewport row `rb` in cells / clusters / combining / DEC
-/// line size / inline images, and since row rasterization is a pure translation
-/// in Y (the same invariant the M1b band translate relies on) EQUAL content at
-/// two rows rasterizes to byte-identical pixels once shifted by the row delta.
+/// line size (row-level AND per-column runs) / inline images, and since row
+/// rasterization is a pure translation in Y (the same invariant the M1b band
+/// translate relies on) EQUAL content at two rows rasterizes to byte-identical
+/// pixels once shifted by the row delta.
+///
+/// The SPAN clause is load-bearing, not belt-and-braces: on a composed row the
+/// runs — not `line_sizes[r]` — decide every column's x, width, enlargement and
+/// clip. A frame in which only a pane's DECDWL state changed leaves cells,
+/// clusters, combining, `line_sizes` and images all equal, so without this the
+/// row would be judged unchanged, reused from the cache, and NEVER repainted at
+/// its new size.
 fn row_differs_shifted(a: &RenderInput, ra: usize, b: &RenderInput, rb: usize) -> bool {
     a.cells[ra] != b.cells[rb]
         || a.clusters[ra] != b.clusters[rb]
         || a.combining[ra] != b.combining[rb]
         || a.line_sizes[ra] != b.line_sizes[rb]
+        || row_spans(a, ra) != row_spans(b, rb)
         || a.images[ra] != b.images[rb]
 }
 
@@ -12512,8 +12876,8 @@ pub(crate) fn scroll_blit_plan(
     if prev.rows != rows
         || prev.cols != input.cols
         || prev.default_bg != input.default_bg
-        || any_double_height(&prev.line_sizes)
-        || any_double_height(&input.line_sizes)
+        || any_double_height(prev)
+        || any_double_height(input)
     {
         return None;
     }
@@ -12728,8 +13092,8 @@ pub fn compute_dirty_rows(
         && prev_input.cols == cols
         && (prev_input.display_offset == input.display_offset || anchor_eq)
         && prev_input.default_bg == input.default_bg
-        && !any_double_height(&prev_input.line_sizes)
-        && !any_double_height(&input.line_sizes);
+        && !any_double_height(prev_input)
+        && !any_double_height(input);
     if !reusable {
         return DirtyDecision::FullRepaint;
     }
@@ -13364,6 +13728,48 @@ pub fn row_cell_w(line_size: LineSize, cell_w: usize) -> usize {
     }
 }
 
+/// Horizontal placement of composite column `col` in `row`: the cell's left pixel
+/// (grid-relative, before `pad`), the cell width there, and the CLIP BOX of the
+/// DEC line-size run it belongs to.
+///
+/// This is the ONE seam that maps a column to pixels. Both renderers go through
+/// it so they cannot disagree about a composed row, and it is the reason a
+/// double-width pane cannot bleed into its neighbour: the run's box is the clip.
+///
+/// A uniform row — every single-pane frame, and every split where the panes all
+/// sit on ordinary lines — takes the run `0..cols`, so this returns exactly the
+/// pre-span `col * row_cell_w(..)` with a clip box of the whole grid. The math
+/// is identical, not merely equivalent.
+///
+/// In a tight column loop, gate on [`row_is_uniform`] first and keep the hoisted
+/// `col * rcw` form for the uniform case; call this only on the rare mixed row.
+#[must_use]
+pub fn cell_x_run(
+    input: &RenderInput,
+    row: usize,
+    col: usize,
+    cell_w: usize,
+) -> (usize, usize, usize, usize) {
+    let (line_size, start_col, end_col) = input.line_size_run_at(row, col);
+    let w = row_cell_w(line_size, cell_w);
+    let clip_x0 = start_col * cell_w;
+    let clip_x1 = end_col * cell_w;
+    (clip_x0 + col.saturating_sub(start_col) * w, w, clip_x0, clip_x1)
+}
+
+/// Whether `row` is uniform — i.e. one DEC line size governs every column, so a
+/// column loop can hoist `row_cell_w` and use plain `col * rcw` arithmetic.
+///
+/// True for every single-pane frame and for any split whose panes all sit on
+/// ordinary lines, which is why spans cost the hot path nothing.
+#[must_use]
+pub fn row_is_uniform(input: &RenderInput, row: usize) -> bool {
+    input
+        .line_size_spans
+        .get(row)
+        .is_none_or(std::vec::Vec::is_empty)
+}
+
 /// Destination rect + atlas UV for the VISIBLE part of an atlas glyph under
 /// `scale`, for the GPU. `cell_left` is the cell's left pixel (column × row cell
 /// width); `anchor_y` the (DECDHL-shifted) cell top; `baseline` the renderer
@@ -13427,8 +13833,21 @@ pub fn glyph_quad(
 /// the identical pixel in both — preserving CPU/GPU parity.
 #[must_use]
 pub fn mark_cell_x(c: usize, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> i32 {
+    mark_cell_x_at((c * rcw) as i32, rcw, gw, xmin, scale)
+}
+
+/// [`mark_cell_x`] from the cell's LEFT PIXEL instead of its column index — the
+/// form a COMPOSED row needs, where `c * rcw` is not where the cell is: the
+/// column's DEC line-size RUN decides that (see [`cell_x_run`]).
+///
+/// The centring term is a pure offset from `cell_left`, so this is SPACE-AGNOSTIC:
+/// pass a grid-relative left and get a grid-relative result, pass an absolute one
+/// (pad included) and get an absolute one. `mark_cell_x(c, rcw, ..)` is exactly
+/// `mark_cell_x_at((c * rcw) as i32, rcw, ..)`, which is why the uniform CPU path
+/// and the GPU's column-indexed call site stay byte-identical through the change.
+#[must_use]
+pub fn mark_cell_x_at(cell_left: i32, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> i32 {
     let xs = scale.xs.max(1) as i32;
-    let cell_left = (c * rcw) as i32;
     cell_left + (rcw as i32 - gw as i32 * xs) / 2 - xmin * xs
 }
 

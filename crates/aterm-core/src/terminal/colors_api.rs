@@ -111,9 +111,19 @@ impl Terminal {
         (color.r, color.g, color.b)
     }
 
-    /// Set an indexed color in the palette.
+    /// Set a host-configured indexed color in the palette.
+    ///
+    /// This seeds both the live slot and its reset baseline: a later OSC 4 may
+    /// replace the live value, while OSC 104 and RIS restore `color`. The first
+    /// configured slot starts from the built-in palette rather than cloning the
+    /// live palette, so a prior program-issued OSC 4 mutation can never become a
+    /// host reset default accidentally.
     pub fn set_palette_color(&mut self, index: u8, color: Rgb) {
         self.color.palette.set(index, color);
+        self.color
+            .configured_palette
+            .get_or_insert_with(ColorPalette::new)
+            .set(index, color);
     }
 
     /// Set indexed color from primitive RGB components.
@@ -121,9 +131,10 @@ impl Terminal {
         self.set_palette_color(index, Rgb { r, g, b });
     }
 
-    /// Reset the color palette to defaults.
+    /// Reset the live and host-configured color palette to built-in defaults.
     pub fn reset_color_palette(&mut self) {
         self.color.palette.reset();
+        self.color.configured_palette = None;
     }
 
     /// Reset a single palette slot to the built-in default color.
@@ -141,9 +152,13 @@ impl Terminal {
         self.color.default_foreground
     }
 
-    /// Set the default foreground color.
+    /// Set the host-configured default foreground color.
+    ///
+    /// This seeds both the live value and the reset baseline: a later OSC 10
+    /// may replace the live value, while OSC 110 restores `color`.
     pub fn set_default_foreground(&mut self, color: Rgb) {
         self.color.default_foreground = color;
+        self.color.configured_foreground = color;
     }
 
     /// Get the default background color.
@@ -155,9 +170,13 @@ impl Terminal {
         self.color.default_background
     }
 
-    /// Set the default background color.
+    /// Set the host-configured default background color.
+    ///
+    /// This seeds both the live value and the reset baseline: a later OSC 11
+    /// may replace the live value, while OSC 111 restores `color`.
     pub fn set_default_background(&mut self, color: Rgb) {
         self.color.default_background = color;
+        self.color.configured_background = color;
     }
 
     /// Get the cursor color, if explicitly set.
@@ -185,5 +204,71 @@ impl Terminal {
     #[must_use]
     pub fn selection_background(&self) -> Option<Rgb> {
         self.color.selection_background
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_default_setters_seed_osc_reset_baselines() {
+        let mut term = Terminal::new(2, 8);
+        let foreground = Rgb::new(0x11, 0x22, 0x33);
+        let background = Rgb::new(0x44, 0x55, 0x66);
+        term.set_default_foreground(foreground);
+        term.set_default_background(background);
+
+        term.process(b"\x1b]10;rgb:aa/bb/cc\x07\x1b]11;rgb:77/88/99\x07");
+        assert_ne!(term.default_foreground(), foreground);
+        assert_ne!(term.default_background(), background);
+
+        term.process(b"\x1b]110\x07\x1b]111\x07");
+        assert_eq!(term.default_foreground(), foreground);
+        assert_eq!(term.default_background(), background);
+    }
+
+    #[test]
+    fn public_palette_setter_seeds_osc_and_ris_reset_baseline() {
+        let mut term = Terminal::new(2, 8);
+        term.set_allow_palette_reconfigure(true);
+        let configured = Rgb::new(0x11, 0x22, 0x33);
+        let transient = Rgb::new(0xaa, 0xbb, 0xcc);
+        term.set_palette_color(1, configured);
+
+        term.process(b"\x1b]4;1;rgb:aa/bb/cc\x07");
+        assert_eq!(term.palette_color(1), transient);
+        term.process(b"\x1b]104;1\x07");
+        assert_eq!(
+            term.palette_color(1),
+            configured,
+            "OSC 104 restores the host-configured palette slot"
+        );
+
+        term.process(b"\x1b]4;1;rgb:aa/bb/cc\x07");
+        term.process(b"\x1bc");
+        assert_eq!(
+            term.palette_color(1),
+            configured,
+            "RIS restores the same host-configured palette baseline"
+        );
+    }
+
+    #[test]
+    fn public_palette_reset_durably_restores_built_in_baseline() {
+        let mut term = Terminal::new(2, 8);
+        term.set_allow_palette_reconfigure(true);
+        let built_in = ColorPalette::new().get(1);
+        term.set_palette_color_components(1, 0x11, 0x22, 0x33);
+        term.reset_color_palette();
+        assert_eq!(term.palette_color(1), built_in);
+
+        term.process(b"\x1b]4;1;rgb:aa/bb/cc\x07");
+        term.process(b"\x1b]104;1\x07");
+        assert_eq!(
+            term.palette_color(1),
+            built_in,
+            "OSC 104 must not resurrect the cleared host palette"
+        );
     }
 }

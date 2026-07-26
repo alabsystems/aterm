@@ -372,6 +372,9 @@ impl AuthorityKey {
 pub(crate) struct Coordinator {
     entries: HashMap<u64, Entry>,
     retries: HashMap<u64, Instant>,
+    /// Consecutive CONTENDED observation attempts per session, driving the retry
+    /// backoff in [`Coordinator::defer_observation`]. Cleared on the first success.
+    contended: HashMap<u64, u32>,
     /// Due observations already ordered for later event-loop turns. One call pops
     /// at most one item; keeping the remainder here prevents active-session
     /// priority or newly due work from starving the existing batch.
@@ -471,6 +474,7 @@ impl Coordinator {
         Self {
             entries: HashMap::new(),
             retries: HashMap::new(),
+            contended: HashMap::new(),
             due_observation_queue: VecDeque::new(),
             pending: HashMap::new(),
             in_flight: None,
@@ -893,6 +897,12 @@ impl Coordinator {
         if !retry_pending_after(ObservationRetryTransition::Retired) {
             self.retries.remove(&session);
         }
+        // The contended-observation strike count is per-session state that must
+        // die with the session. Unconditionally, unlike `retries` — a retirement
+        // ends the backoff regardless of whether a retry was still pending, and
+        // a session that happened to be contended when it closed would otherwise
+        // leave its entry here for the life of the process.
+        self.contended.remove(&session);
         self.pending.remove(&session);
         if self.priority_pending_session == Some(session) {
             self.priority_pending_session = None;
@@ -1344,6 +1354,7 @@ impl Coordinator {
             self.in_flight = None;
             if disabled && !retry_pending_after(ObservationRetryTransition::Disabled) {
                 self.retries.clear();
+                self.contended.clear();
                 self.due_observation_queue.clear();
             }
             self.worker_retry_at = None;
@@ -1396,9 +1407,35 @@ impl Coordinator {
         }
     }
 
+    /// Base retry delay after ONE contended observation.
+    const OBSERVE_RETRY_BASE: Duration = Duration::from_millis(4);
+    /// Ceiling for the contended-observation backoff. A title description that lands
+    /// half a second late during a `cat` is indistinguishable from one that lands 4 ms
+    /// late; an event loop that cannot park is not.
+    const OBSERVE_RETRY_CAP: Duration = Duration::from_millis(512);
+
     fn defer_observation(&mut self, session: u64, now: Instant) {
         if retry_pending_after(ObservationRetryTransition::Contended) {
-            let retry_at = now + Duration::from_millis(4);
+            // BACK OFF UNDER SUSTAINED CONTENTION. The observation takes the terminal
+            // by try_lock, and under a flood the PTY reader holds that mutex a large
+            // fraction of the time — so the try_lock fails on essentially every burst.
+            // A fixed 4 ms retry was therefore re-armed hundreds to thousands of times
+            // per second and was ALWAYS in the future, which forced the event loop
+            // awake at ~250 Hz to service a title heuristic and put a permanent 4 ms
+            // floor under whatever deadline the frame pacing had computed. The
+            // keystroke path pays for that twice: in loop turns it did not need, and
+            // in a pacing deadline chosen by the wrong owner.
+            //
+            // Doubling per consecutive failure (4, 8, 16 ... 512 ms) makes the cost of
+            // contention fall as contention persists, which is exactly backwards from
+            // the fixed delay. The first success clears it, so an idle terminal is
+            // still observed promptly.
+            let strikes = self.contended.entry(session).or_insert(0);
+            *strikes = strikes.saturating_add(1);
+            let backoff = Self::OBSERVE_RETRY_BASE
+                .saturating_mul(1u32 << (*strikes - 1).min(7))
+                .min(Self::OBSERVE_RETRY_CAP);
+            let retry_at = now + backoff;
             self.retries.insert(session, retry_at);
             if let Some(entry) = self.entries.get_mut(&session)
                 && entry.next_refresh.is_some_and(|deadline| deadline <= now)
@@ -1409,6 +1446,9 @@ impl Coordinator {
     }
 
     fn observation_succeeded(&mut self, session: u64) {
+        // The lock was free: this session is not contended, so the next failure
+        // starts the ladder over rather than inheriting a stale ceiling.
+        self.contended.remove(&session);
         if !retry_pending_after(ObservationRetryTransition::Succeeded) {
             self.retries.remove(&session);
         }
@@ -1468,6 +1508,7 @@ impl Coordinator {
             sessions.insert(0, active);
         }
         self.retries.clear();
+        self.contended.clear();
         self.due_observation_queue.clear();
         for session in &sessions {
             self.retries.insert(*session, now);
@@ -7008,6 +7049,53 @@ mod tests {
         served.sort_unstable();
         assert_eq!(served, (1..=512).collect::<Vec<_>>());
         assert!(coordinator.due_observations(now, Some(active)).is_empty());
+    }
+
+    /// REGRESSION: sustained lock contention must make the retry CHEAPER, not
+    /// re-arm the same short deadline forever.
+    ///
+    /// The observation snapshots the terminal by try_lock. Under a flood the PTY
+    /// reader holds that mutex most of the time, so the try_lock fails on
+    /// essentially every output burst — and `Wake::Output` fires at the reader's
+    /// BATCH rate. A fixed 4 ms retry was therefore always pending, forcing the event
+    /// loop awake at ~250 Hz for a title heuristic and putting a permanent 4 ms floor
+    /// under whatever deadline frame pacing had chosen. Backing off means the cost of
+    /// contention falls as contention persists.
+    #[test]
+    fn contended_observations_back_off_instead_of_pinning_the_event_loop() {
+        let mut coordinator = Coordinator::new(None);
+        let now = Instant::now();
+        let session = 7u64;
+
+        let delay_after = |c: &mut Coordinator, strikes: usize| {
+            c.retries.remove(&session);
+            c.contended.remove(&session);
+            for _ in 0..strikes {
+                c.defer_observation(session, now);
+            }
+            c.retries.get(&session).map(|at| at.duration_since(now))
+        };
+
+        let base = Coordinator::OBSERVE_RETRY_BASE;
+        assert_eq!(delay_after(&mut coordinator, 1), Some(base));
+        assert_eq!(delay_after(&mut coordinator, 2), Some(base * 2));
+        assert_eq!(delay_after(&mut coordinator, 3), Some(base * 4));
+        // ...and it is CAPPED, so a permanently wedged reader cannot push the title
+        // refresh out past usefulness (or overflow the shift).
+        let capped = delay_after(&mut coordinator, 40);
+        assert_eq!(capped, Some(Coordinator::OBSERVE_RETRY_CAP));
+
+        // One success clears the ladder: an idle terminal is still observed promptly
+        // rather than inheriting a stale ceiling from an earlier flood.
+        coordinator.observation_succeeded(session);
+        assert!(!coordinator.contended.contains_key(&session));
+        coordinator.retries.remove(&session);
+        coordinator.defer_observation(session, now);
+        assert_eq!(
+            coordinator.retries.get(&session).map(|at| at.duration_since(now)),
+            Some(base),
+            "the ladder restarts at the base delay after a successful observation"
+        );
     }
 
     #[test]

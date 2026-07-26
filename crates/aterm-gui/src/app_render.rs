@@ -3464,6 +3464,12 @@ pub(crate) fn fill_divider_grid_cells(
     dst.line_sizes.clear();
     dst.line_sizes
         .resize(rows, aterm_core::grid::LineSize::SingleWidth);
+    // Per-pane line-size runs, rebuilt from scratch each compose frame like the
+    // other per-row sparse lists. Rows stay EMPTY unless a pane actually lands a
+    // non-single DEC line size on them, so the ordinary split keeps the uniform
+    // `line_sizes` fast path.
+    dst.line_size_spans.clear();
+    dst.line_size_spans.resize_with(rows, Vec::new);
     // The per-row `images` vec is part of the `RenderInput` length==rows contract
     // the CPU renderer indexes by row unguarded; the previous code never resized
     // it here, so a compose frame (after a grow) left `images` shorter than `rows`
@@ -3550,10 +3556,44 @@ pub(crate) fn blit_pane_into(
         if blank_start < pane_end {
             dst_row[blank_start..pane_end].fill(blank);
         }
-        if let Some(ls) = src.line_sizes.get(sr)
-            && let Some(dst_ls) = dst.line_sizes.get_mut(dr)
+        // DEC line size is a PER-PANE fact, and a composite row can hold several
+        // panes. Writing it to the row-level `dst.line_sizes[dr]` made the last
+        // pane blitted win the whole row, so a neighbour sitting on an ordinary
+        // line had its glyphs scaled by someone else's DECDWL. Record the pane's
+        // own column run instead, and leave the row-level value alone.
+        //
+        // Only NON-single runs are recorded: a column covered by no span already
+        // renders `SingleWidth` (the composite's reset default), which is exactly
+        // what a single-width pane wants. So the ordinary split — every pane on
+        // ordinary lines — leaves `line_size_spans` empty and keeps the uniform
+        // fast path, byte-identical to before.
+        if let Some(ls) = src.line_sizes.get(sr).copied()
+            && ls != aterm_core::grid::LineSize::SingleWidth
         {
-            *dst_ls = *ls;
+            let end_col = col_off.saturating_add(src.cols).min(dst_cols);
+            if col_off < end_col
+                && let Some(spans) = dst.line_size_spans.get_mut(dr)
+            {
+                spans.push(aterm_core::render::LineSizeSpan {
+                    start_col: col_off,
+                    end_col,
+                    line_size: ls,
+                });
+                // Panes are not guaranteed to blit left-to-right, and
+                // `line_size_run_at` binary-searches by `start_col`.
+                spans.sort_unstable_by_key(|s| s.start_col);
+                // Row-level SUMMARY (see the `line_sizes` field docs): "some pane
+                // on this row is a DEC line". Placement reads the runs, but the
+                // row-level consumers that cannot be per-column — the sparkle-word
+                // cat suppressor, the double-height damage gate — still read this,
+                // and must not go blind just because the truth moved into runs.
+                // It also means a placement site not yet converted to the run seam
+                // degrades to the OLD whole-row scaling rather than to something
+                // new, which is the safer way to be wrong.
+                if let Some(dst_ls) = dst.line_sizes.get_mut(dr) {
+                    *dst_ls = ls;
+                }
+            }
         }
         // The per-row (col, _) lists must stay sorted by column with one entry per
         // column so the renderers' per-column lookups binary-search instead of
@@ -8213,6 +8253,7 @@ impl App {
                     // bytes with no fade rather than costing a whole-grid diff every frame.
                     ws.stream_fade.update(
                         &mut ws.input_scratch.cells,
+                        ws.input_scratch.cols,
                         (fade_token, fade_alt, fade_scrolled),
                         fade_permitted,
                         fade_ms,
@@ -8443,13 +8484,28 @@ impl App {
                         // and never re-armed. Read-only projection — never bytes.
                         let no_echo =
                             g.is_alternate_screen() || g.kitty_suppresses_predictive_echo();
+                        // Resolve through a resident scratch row memoised by row index:
+                        // every pending guess shares one row (same-row model + at most
+                        // one wrapped head), so a type-ahead queue of N used to rebuild
+                        // the identical row N times — N allocations and N full-row
+                        // resolves — inside the term-lock scope the PTY reader needs.
+                        // Moved OUT of `ws` so the closure does not re-borrow it
+                        // alongside `ws.predictor`, and moved back after.
+                        let mut scratch = std::mem::take(&mut ws.pred_row_scratch);
+                        let mut cached: Option<u16> = None;
                         ws.predictor
                             .reconcile(Some((cur.row, cur.col)), no_echo, now, |r, c| {
-                                g.render_row(r as usize)
+                                if cached != Some(r) {
+                                    scratch.clear();
+                                    g.render_row_into(r as usize, &mut scratch);
+                                    cached = Some(r);
+                                }
+                                scratch
                                     .get(c as usize)
                                     .map(|cell| cell.ch)
                                     .filter(|ch| *ch != ' ')
                             });
+                        ws.pred_row_scratch = scratch;
                         false
                     }
                 };
@@ -10994,6 +11050,7 @@ impl App {
                     (
                         crate::find_bar::FindBarView {
                             query: s.query.clone(),
+                            cursor: s.cursor,
                             idx: s.current + 1,
                             total: s.matches.len(),
                             case_sensitive: s.case_sensitive,
@@ -11029,20 +11086,27 @@ impl App {
         let Some(term_bottom) = term_rows.checked_sub(1) else {
             return; // zero-row terminal
         };
-        // ADAPTIVE PLACEMENT: the bar rides the TOP terminal row (directly below the tab
-        // strip — find lives at the top of the window), but if the CURRENT match (what
-        // the user just navigated to) sits there, a top bar would hide it. With ≥2
-        // terminal rows, float the bar to the BOTTOM terminal row instead so the match
-        // stays visible; the seam always rides the bar's content-facing edge. The apply
-        // path lands scrollback matches on row 1 (below the bar) so this float is the
-        // exception — the clamp at the oldest history line — not the common step.
-        let bar_row = if term_rows > 1 && cur_term_row.map(|r| r + focus_row_off) == Some(0) {
-            term_bottom
+        // ADAPTIVE PLACEMENT: the panel rides the TOP terminal rows (directly below the
+        // tab strip — find lives at the top of the window), but if the CURRENT match
+        // (what the user just navigated to) sits under it, a top panel would hide it.
+        // When the terminal is tall enough to hold the band twice over, float the panel
+        // to the BOTTOM rows instead so the match stays visible; the seam always rides
+        // the panel's content-facing edge. The apply path lands scrollback matches just
+        // below the band, so this float is the exception — the clamp at the oldest
+        // history line — not the common step. A terminal shorter than the band gets a
+        // degraded (2-row, then 1-row) panel rather than none.
+        let band_rows = crate::find_bar::FIND_BAR_ROWS.min(term_rows);
+        let match_under_top_band = cur_term_row
+            .map(|r| r + focus_row_off)
+            .is_some_and(|r| r >= 0 && (r as usize) < band_rows);
+        let bar_row = if term_rows > band_rows && match_under_top_band {
+            term_rows - band_rows
         } else {
             0
         };
+        let band = bar_row..bar_row + band_rows;
         let frame_bar_row = strip + bar_row;
-        let seam_at_top = bar_row == term_bottom;
+        let seam_at_top = band.end > term_bottom;
         // Tint off the live OSC-11 background (like splice_notice) so the
         // bar stays WCAG-AA legible on a program-recoloured background.
         let mut theme = self.theme;
@@ -11066,8 +11130,7 @@ impl App {
                 ((u16::from(bg[2]) + u16::from(sel[2])) / 2) as u8,
             ]
         };
-        let (built, case_cols, regex_cols) =
-            crate::find_bar::find_bar_row_with_indicators(&view, cols, theme, seam_at_top);
+        let painted = crate::find_bar::find_bar_paint(&view, cols, band_rows, theme, seam_at_top);
         let hi_u32 = aterm_render::rgb_to_u32(hi);
         let cell_h = self.win_cell_size(wid).1;
         let offset = self.windows.get(&wid).map_or(delta.saturating_neg(), |ws| {
@@ -11116,7 +11179,7 @@ impl App {
             let i = visible_matches.start + relative;
             let term_row = i64::from(sel_row).saturating_add(offset);
             debug_assert!(term_row >= 0 && (term_row as usize) < term_rows);
-            if term_row as usize == bar_row {
+            if band.contains(&(term_row as usize)) {
                 continue;
             }
             let is_current = i == cur_idx;
@@ -11145,27 +11208,33 @@ impl App {
                 // so it is left to the renderer's selection floor.
             }
         }
-        debug_assert_eq!(built.len(), cols);
-        ws.input_scratch.cells[frame_bar_row] = built;
-        // Clear the parallel per-row arrays so the covered row's terminal content (emoji
-        // clusters / combining marks / inline images) can't bleed through, and mark the row
-        // single-width — exactly as splice_config_notice does for the rows it overwrites.
-        if let Some(c) = ws.input_scratch.clusters.get_mut(frame_bar_row) {
-            c.clear();
+        debug_assert_eq!(painted.rows.len(), band_rows);
+        let frame_band = frame_bar_row..frame_bar_row + band_rows;
+        for (offset_row, built) in painted.rows.into_iter().enumerate() {
+            debug_assert_eq!(built.len(), cols);
+            let frame_row = frame_bar_row + offset_row;
+            ws.input_scratch.cells[frame_row] = built;
+            // Clear the parallel per-row arrays so the covered row's terminal content
+            // (emoji clusters / combining marks / inline images) can't bleed through, and
+            // mark the row single-width — exactly as splice_config_notice does for the
+            // rows it overwrites.
+            if let Some(c) = ws.input_scratch.clusters.get_mut(frame_row) {
+                c.clear();
+            }
+            if let Some(c) = ws.input_scratch.combining.get_mut(frame_row) {
+                c.clear();
+            }
+            if let Some(im) = ws.input_scratch.images.get_mut(frame_row) {
+                im.clear();
+            }
+            if let Some(ls) = ws.input_scratch.line_sizes.get_mut(frame_row) {
+                *ls = aterm_core::grid::LineSize::SingleWidth;
+            }
         }
-        if let Some(c) = ws.input_scratch.combining.get_mut(frame_bar_row) {
-            c.clear();
-        }
-        if let Some(im) = ws.input_scratch.images.get_mut(frame_bar_row) {
-            im.clear();
-        }
-        if let Some(ls) = ws.input_scratch.line_sizes.get_mut(frame_bar_row) {
-            *ls = aterm_core::grid::LineSize::SingleWidth;
-        }
-        // If the terminal cursor sits on the row the bar now covers (e.g. ⌘F at a shell
+        // If the terminal cursor sits on a row the panel now covers (e.g. ⌘F at a shell
         // prompt pinned to the bottom line), hide it so its block doesn't render on top of
-        // the bar — the bar draws its own caret after the query. `cursor_row` is a frame row.
-        if ws.input_scratch.cursor_row == frame_bar_row {
+        // the panel — the panel draws its own caret in the field. `cursor_row` is a frame row.
+        if frame_band.contains(&ws.input_scratch.cursor_row) {
             ws.input_scratch.cursor_visible = false;
         }
         // The bar hides the cursor — hide the cursor EFFECTS on its row too. The
@@ -11178,21 +11247,21 @@ impl App {
         // and the single-row-band invariant, so dropping by tag removes exactly
         // the bar-band light. Pure per-frame recompute — the next frame's splice
         // re-derives from fresh engine output, so nothing is lost off-bar.
-        let bar_row16 = u16::try_from(frame_bar_row).unwrap_or(u16::MAX);
-        let bar_y0 = i64::try_from(frame_bar_row.saturating_mul(cell_h)).unwrap_or(i64::MAX);
-        let bar_y1 = bar_y0.saturating_add(i64::try_from(cell_h).unwrap_or(0));
+        let band16 = u16::try_from(frame_band.start).unwrap_or(u16::MAX)
+            ..u16::try_from(frame_band.end).unwrap_or(u16::MAX);
+        let in_band = |row: u16| band16.contains(&row);
+        let bar_y0 = i64::try_from(frame_band.start.saturating_mul(cell_h)).unwrap_or(i64::MAX);
+        let bar_y1 = i64::try_from(frame_band.end.saturating_mul(cell_h)).unwrap_or(i64::MAX);
         ws.input_scratch
             .cursor_trail
-            .retain(|t| t.row != frame_bar_row);
-        ws.input_scratch.char_fg.retain(|c| c.row != bar_row16);
-        ws.input_scratch.fire_halo.retain(|c| c.row != bar_row16);
-        ws.input_scratch
-            .cursor_glow_add
-            .retain(|q| q.row != bar_row16);
-        ws.input_scratch.glow_under.retain(|q| q.row != bar_row16);
-        ws.input_scratch.fire_patch.retain(|q| q.row != bar_row16);
-        ws.input_scratch.glow_halo.retain(|q| q.row != bar_row16);
-        ws.input_scratch.ink.retain(|c| c.row != bar_row16);
+            .retain(|t| !frame_band.contains(&t.row));
+        ws.input_scratch.char_fg.retain(|c| !in_band(c.row));
+        ws.input_scratch.fire_halo.retain(|c| !in_band(c.row));
+        ws.input_scratch.cursor_glow_add.retain(|q| !in_band(q.row));
+        ws.input_scratch.glow_under.retain(|q| !in_band(q.row));
+        ws.input_scratch.fire_patch.retain(|q| !in_band(q.row));
+        ws.input_scratch.glow_halo.retain(|q| !in_band(q.row));
+        ws.input_scratch.ink.retain(|c| !in_band(c.row));
         ws.input_scratch.word_decorations.retain(|decoration| {
             // Decorations deliberately jitter by signed `dy` and occupy one
             // cell-height stamp, so a neighbour can spill into the bar even
@@ -11202,10 +11271,10 @@ impl App {
             let y1 = y0.saturating_add(i64::try_from(cell_h).unwrap_or(0));
             y1 <= bar_y0 || y0 >= bar_y1
         });
-        ws.input_scratch.nova_add.retain(|q| q.row != bar_row16);
-        ws.input_scratch.cat_quads.retain(|q| q.row != bar_row16);
-        ws.input_scratch.rain_quads.retain(|q| q.row != bar_row16);
-        ws.input_scratch.rain_add.retain(|q| q.row != bar_row16);
+        ws.input_scratch.nova_add.retain(|q| !in_band(q.row));
+        ws.input_scratch.cat_quads.retain(|q| !in_band(q.row));
+        ws.input_scratch.rain_quads.retain(|q| !in_band(q.row));
+        ws.input_scratch.rain_add.retain(|q| !in_band(q.row));
         // Free sprites have no row tag: their signed grid-interior pixel extent
         // is authoritative. Chrome owns the whole bar band, so drop any sprite
         // that intersects it (rather than letting a multi-row cat/sparkle paint
@@ -11215,27 +11284,30 @@ impl App {
             let y1 = y0.saturating_add(i64::from(sprite.h));
             y1 <= bar_y0 || y0 >= bar_y1
         });
-        // PIN the bar out of the sub-row scroll band so the smooth-scroll pixel translate
-        // leaves it fixed: at the bottom, shrink `grid_bot_row` (exclusive) to drop its row;
-        // floated to the top, raise `grid_top_row` past the bar. Guarded so the band never
+        // PIN the panel out of the sub-row scroll band so the smooth-scroll pixel translate
+        // leaves it fixed: at the bottom, shrink `grid_bot_row` (exclusive) past its rows;
+        // at the top, raise `grid_top_row` past them. Guarded so the band never
         // inverts, and a 0 band (headless capture, no set_scroll_band) is left untouched.
-        let frame_bottom = nrows - 1;
-        if frame_bar_row == frame_bottom {
-            if ws.input_scratch.grid_bot_row > frame_bar_row {
+        if frame_band.end == nrows {
+            if ws.input_scratch.grid_bot_row > frame_band.start {
                 let top = ws.input_scratch.grid_top_row;
-                ws.input_scratch.grid_bot_row = frame_bar_row.max(top);
+                ws.input_scratch.grid_bot_row = frame_band.start.max(top);
             }
-        } else if ws.input_scratch.grid_top_row <= frame_bar_row {
+        } else if ws.input_scratch.grid_top_row < frame_band.end {
             let bot = ws.input_scratch.grid_bot_row;
-            ws.input_scratch.grid_top_row = (frame_bar_row + 1).min(bot);
+            ws.input_scratch.grid_top_row = frame_band.end.min(bot);
         }
-        // Record where the clickable toggle indicators landed (their row + column spans),
-        // derived from the SAME builder inputs as the paint, so the mouse hit-test reads
-        // exact geometry instead of re-deriving the adaptive placement.
+        // Record where the clickable toggle indicators + the editable well landed (their
+        // row + column spans + the well's horizontal scroll), derived from the SAME
+        // builder inputs as the paint, so the mouse hit-test reads exact geometry instead
+        // of re-deriving the adaptive placement.
         ws.find_bar_hit = Some(crate::FindBarHit {
-            row: bar_row,
-            case_cols,
-            regex_cols,
+            row: bar_row + painted.field_row,
+            case_cols: painted.case_cols,
+            regex_cols: painted.regex_cols,
+            field_cols: painted.field_cols,
+            field_scroll: painted.field_scroll,
+            band,
         });
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
     }
@@ -12421,20 +12493,58 @@ mod find_bar_splice_tests {
         row_text(app, wid, 0)
     }
 
-    /// End-to-end: the Cmd-F find bar becomes VISIBLE on the TOP terminal row once
+    /// FRAME text of the find panel's FIELD row (the `Find: ` prompt + the well) —
+    /// located through the geometry the splice recorded, so these tests never
+    /// hard-code which row inside the band carries the field.
+    fn field_row_text(app: &App, wid: WindowId) -> String {
+        let hit = app.windows[&wid]
+            .find_bar_hit
+            .as_ref()
+            .expect("the panel recorded its geometry");
+        row_text(app, wid, app.tab_strip_rows as usize + hit.row)
+    }
+
+    /// The whole find panel band as one string (rows joined) — for content assertions
+    /// that don't care which row of the panel a run landed on.
+    fn panel_text(app: &App, wid: WindowId) -> String {
+        let hit = app.windows[&wid]
+            .find_bar_hit
+            .as_ref()
+            .expect("the panel recorded its geometry");
+        let strip = app.tab_strip_rows as usize;
+        hit.band
+            .clone()
+            .map(|row| row_text(app, wid, strip + row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Seed the open find's query the way a user's typing does — through the one seam
+    /// that keeps the caret on a char boundary at the end of the text.
+    fn seed_query(app: &mut App, wid: WindowId, query: &str) {
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .search
+            .as_mut()
+            .unwrap()
+            .set_query(query.to_string());
+    }
+
+    /// End-to-end: the Cmd-F find PANEL becomes VISIBLE on the TOP terminal rows once
     /// find mode is active — the FIND-1 gap (search was wired but only surfaced in the
     /// window title). Uses the REAL search path (`search_recompute` over live content)
-    /// so the match count on the bar reflects the engine, and asserts the splice is a
-    /// no-op before searching (byte-identical frame). The matches sit AWAY from the top
-    /// row, so this exercises the DEFAULT top placement (no adaptive float).
+    /// so the match count on the panel reflects the engine, and asserts the splice is a
+    /// no-op before searching (byte-identical frame). The matches sit BELOW the panel's
+    /// band, so this exercises the DEFAULT top placement (no adaptive float).
     #[test]
     fn find_bar_appears_on_top_row_while_searching() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
 
-        // Two "foo" hits on live row 2 — clear of the top row the bar now owns.
+        // Two "foo" hits on live row 4 — clear of the rows the panel now owns.
         let term = app.pool.get(0).expect("session 0").term.clone();
-        term_lock(&term).process(b"\r\n\r\nfoo and foo here\r\n");
+        term_lock(&term).process(b"\r\n\r\n\r\n\r\nfoo and foo here\r\n");
 
         // BEFORE searching: the splice is a no-op — no find bar on the top row.
         fill_scratch(&mut app, wid);
@@ -12446,13 +12556,7 @@ mod find_bar_splice_tests {
 
         // Enter find mode (the real entry point) and run the real match over live content.
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "foo".to_string();
+        seed_query(&mut app, wid, "foo");
         app.search_recompute();
         assert_eq!(
             app.windows
@@ -12467,22 +12571,34 @@ mod find_bar_splice_tests {
             "engine finds both 'foo' hits"
         );
 
-        // Render + splice: the TOP row now shows the query and the 1-based position,
-        // and the matches' own row is left uncovered.
+        // Render + splice: the panel's band owns the TOP rows, its field row shows the
+        // query and the 1-based position, and the matches' own row is left uncovered.
         fill_scratch(&mut app, wid);
         app.splice_find_bar(wid);
-        let row = top_row_text(&app, wid);
-        assert!(
-            row.contains("Find: foo"),
-            "find bar shows the query: {row:?}"
+        let band = app.windows[&wid]
+            .find_bar_hit
+            .as_ref()
+            .expect("panel geometry")
+            .band
+            .clone();
+        assert_eq!(
+            band,
+            0..crate::find_bar::FIND_BAR_ROWS,
+            "the panel owns the top band"
         );
+        let row = field_row_text(&app, wid);
+        assert!(
+            row.contains("Find: "),
+            "find panel shows the prompt: {row:?}"
+        );
+        assert!(row.contains("foo"), "find panel shows the query: {row:?}");
         assert!(
             row.contains("1/2"),
-            "find bar shows the match position: {row:?}"
+            "find panel shows the match position: {row:?}"
         );
         assert!(
-            row_text(&app, wid, 2).contains("foo and foo here"),
-            "the match row stays uncovered below the top bar"
+            row_text(&app, wid, 4).contains("foo and foo here"),
+            "the match row stays uncovered below the panel"
         );
 
         // Exiting find mode restores a byte-identical frame (no find bar).
@@ -12505,24 +12621,60 @@ mod find_bar_splice_tests {
         term_lock(&term).process(b"nothing to see\r\n");
 
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "zzz".to_string();
+        seed_query(&mut app, wid, "zzz");
         app.search_recompute();
 
         let (_rows, cols) = fill_scratch(&mut app, wid);
         app.splice_find_bar(wid);
-        let ws = app.windows.get(&wid).unwrap();
-        // No matches ⇒ no current match to protect ⇒ the bar sits at its default TOP row.
-        let top = ws.input_scratch.cells.first().unwrap();
-        assert_eq!(top.len(), cols, "spliced row stays full width");
-        let row: String = top.iter().map(|c| c.ch).collect();
-        assert!(row.contains("Find: zzz"), "{row:?}");
-        assert!(row.contains("no matches"), "{row:?}");
+        // No matches ⇒ no current match to protect ⇒ the panel sits at its default TOP.
+        let band = app.windows[&wid]
+            .find_bar_hit
+            .as_ref()
+            .expect("panel geometry")
+            .band
+            .clone();
+        assert_eq!(band, 0..crate::find_bar::FIND_BAR_ROWS);
+        let cells = &app.windows[&wid].input_scratch.cells;
+        for row in band {
+            assert_eq!(cells[row].len(), cols, "every spliced row stays full width");
+        }
+        let field = field_row_text(&app, wid);
+        assert!(field.contains("zzz"), "{field:?}");
+        assert!(field.contains("no matches"), "{field:?}");
+    }
+
+    /// A terminal SHORTER than the panel degrades instead of panicking or vanishing:
+    /// the band shrinks to the rows available (dropping the pad first, then the hints)
+    /// and the field row always survives, still exactly `cols` wide.
+    #[test]
+    fn find_panel_degrades_on_a_terminal_shorter_than_the_band() {
+        for rows in [1u16, 2, 3] {
+            let mut app = App::headless_for_test();
+            let wid = app.insert_logical_window(crate::stub_session(1), rows, 60);
+            app.frontmost_window = Some(wid);
+            app.search_enter();
+            seed_query(&mut app, wid, "q");
+            let (_, cols) = fill_scratch(&mut app, wid);
+            app.splice_find_bar(wid);
+            let hit = app.windows[&wid]
+                .find_bar_hit
+                .clone()
+                .expect("the panel still paints on a short terminal");
+            assert_eq!(
+                hit.band,
+                0..usize::from(rows).min(crate::find_bar::FIND_BAR_ROWS),
+                "band clamps to the rows available (rows={rows})"
+            );
+            assert!(hit.band.contains(&hit.row), "the field row survives");
+            let cells = &app.windows[&wid].input_scratch.cells;
+            for row in hit.band.clone() {
+                assert_eq!(cells[row].len(), cols, "rows={rows}");
+            }
+            assert!(
+                field_row_text(&app, wid).contains("Find: "),
+                "rows={rows} keeps the field"
+            );
+        }
     }
 
     /// The real compositor must not walk deep history on every presented frame.
@@ -12570,13 +12722,7 @@ mod find_bar_splice_tests {
         // Park the cursor on the top row (CUP home) — the row the bar now owns.
         term_lock(&term).process(b"\x1b[1;1H");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "x".to_string();
+        seed_query(&mut app, wid, "x");
         app.search_recompute();
         let (rows, _cols) = fill_scratch(&mut app, wid);
         // Precondition: the engine put the cursor on the top row (and the terminal is
@@ -12595,13 +12741,7 @@ mod find_bar_splice_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "absent".into();
+        seed_query(&mut app, wid, "absent");
         app.search_recompute();
         fill_scratch(&mut app, wid);
         let (_, ch) = app.win_cell_size(wid);
@@ -12665,7 +12805,8 @@ mod find_bar_splice_tests {
         fill_scratch(&mut app, wid);
         let rows = app.windows[&wid].input_scratch.rows;
         let base_y = app.windows[&wid].input_scratch.base_y;
-        assert!(rows >= 2);
+        let band_rows = crate::find_bar::FIND_BAR_ROWS;
+        assert!(rows >= band_rows + 2);
         {
             let search = app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap();
             search.query = "x".into();
@@ -12679,7 +12820,9 @@ mod find_bar_splice_tests {
             .input_scratch
             .word_decorations
             .push(aterm_render::WordDecoration {
-                row: u16::try_from(rows - 2).unwrap_or(u16::MAX),
+                // The row directly ABOVE the floated band, jittering one pixel down into
+                // it; row-tag-only scrubbing would miss this neighbour spill.
+                row: u16::try_from(rows - band_rows - 1).unwrap_or(u16::MAX),
                 col: 0,
                 dx: 0,
                 dy: 1,
@@ -12690,7 +12833,9 @@ mod find_bar_splice_tests {
             });
         app.splice_find_bar(wid);
         let ws = &app.windows[&wid];
-        assert_eq!(ws.find_bar_hit.as_ref().unwrap().row, rows - 1);
+        let hit = ws.find_bar_hit.as_ref().unwrap();
+        assert_eq!(hit.band, rows - band_rows..rows, "panel floated to the bottom");
+        assert_eq!(hit.row, rows - band_rows + 1, "field row inside that band");
         assert!(ws.input_scratch.word_decorations.is_empty());
     }
 
@@ -12769,13 +12914,7 @@ mod find_bar_splice_tests {
         // "hit" at cols 3..=5 on live rows 0 and 1.
         term_lock(&term).process(b"aa hit bb\r\ncc hit dd\r\n");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
         assert_eq!(
             app.windows.get(&wid).unwrap().input_scratch.display_offset,
@@ -12821,13 +12960,7 @@ mod find_bar_splice_tests {
         }
         term_lock(&term).process(&input);
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
         // current = matches[0] = the oldest hit, which is in scrollback; find scrolled it up.
         let cur_row = app
@@ -12848,16 +12981,17 @@ mod find_bar_splice_tests {
             "viewport scrolled up to show the top match"
         );
         app.splice_find_bar(wid);
-        // The current (scrollback) match landed at screen row 1 — below the top bar —
-        // cols 0..=2, highlighted; the bar itself owns row 0.
+        // The current (scrollback) match landed on the first row BELOW the panel band,
+        // cols 0..=2, highlighted; the panel itself owns the rows above it.
         let hi = highlight_bg();
+        let landing = crate::find_bar::FIND_BAR_ROWS;
+        let panel = panel_text(&app, wid);
+        assert!(panel.contains("hit"), "panel echoes the query: {panel:?}");
         let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
-        let bar: String = cells[0].iter().map(|c| c.ch).collect();
-        assert!(bar.contains("Find: hit"), "bar owns the top row: {bar:?}");
-        for (col, cell) in cells[1][0..=2].iter().enumerate() {
+        for (col, cell) in cells[landing][0..=2].iter().enumerate() {
             assert_eq!(
                 cell.bg, hi,
-                "scrollback match tinted at screen row 1 (below the bar), col {col}"
+                "scrollback match tinted at screen row {landing} (below the panel), col {col}"
             );
         }
     }
@@ -12877,13 +13011,7 @@ mod find_bar_splice_tests {
         // live row, exactly where the default bar placement would cover it.
         term_lock(&term).process(b"hit");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
         // The single match is on the top row (selection row 0, viewport unscrolled).
         let cur = app
@@ -12899,28 +13027,35 @@ mod find_bar_splice_tests {
 
         fill_scratch(&mut app, wid);
         app.splice_find_bar(wid);
-        let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
-        // Bar floated to the BOTTOM row; the current match is UNCOVERED on the top row.
-        let top: String = cells[0].iter().map(|c| c.ch).collect();
-        let bottom: String = cells[rows - 1].iter().map(|c| c.ch).collect();
+        let band_rows = crate::find_bar::FIND_BAR_ROWS;
+        let band = app.windows[&wid]
+            .find_bar_hit
+            .as_ref()
+            .expect("panel geometry")
+            .band
+            .clone();
+        assert_eq!(band, rows - band_rows..rows, "panel floated to the bottom");
+        // The current match is UNCOVERED on the top row; the panel's field row echoes it.
+        let field = field_row_text(&app, wid);
         assert!(
-            bottom.contains("Find: hit"),
-            "bar floated to the bottom row: {bottom:?}"
+            field.contains("Find: ") && field.contains("hit"),
+            "floated panel keeps its field: {field:?}"
         );
+        let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
+        let top: String = cells[0].iter().map(|c| c.ch).collect();
         assert!(
             top.contains("hit"),
             "current match still visible on top: {top:?}"
         );
-        // The seam is now an overline on the bar row, never the bottom-edge underline.
+        // The seam is now an overline on the band's TOP row, never a bottom underline.
         assert!(
-            cells[rows - 1].iter().any(|c| c.overline),
-            "bottom-floated bar draws an overline seam"
+            cells[band.start].iter().any(|c| c.overline),
+            "bottom-floated panel draws an overline seam on its top edge"
         );
         assert!(
-            cells[rows - 1]
-                .iter()
-                .all(|c| c.underline == UnderlineStyle::None),
-            "bottom-floated bar drops the underline seam"
+            band.clone()
+                .all(|row| cells[row].iter().all(|c| c.underline == UnderlineStyle::None)),
+            "bottom-floated panel drops the underline seam"
         );
     }
 
@@ -12936,13 +13071,7 @@ mod find_bar_splice_tests {
         // a second visible match witnesses whether highlight-all still ran.
         term_lock(&term).process(b"hit\r\nhit");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
         assert_eq!(
             app.windows[&wid].search.as_ref().unwrap().matches[0].0,
@@ -12964,21 +13093,23 @@ mod find_bar_splice_tests {
         }
 
         app.splice_find_bar(wid);
-        let ws = &app.windows[&wid];
-        let top: String = ws.input_scratch.cells[0].iter().map(|c| c.ch).collect();
+        let field = field_row_text(&app, wid);
         assert!(
-            top.contains("Find: hit"),
-            "stale geometry does not hide the bar: {top:?}"
+            field.contains("Find: ") && field.contains("hit"),
+            "stale geometry does not hide the panel: {field:?}"
         );
+        let ws = &app.windows[&wid];
         assert_eq!(
-            ws.find_bar_hit.as_ref().map(|hit| hit.row),
-            Some(0),
-            "stale current-row geometry cannot float the bar"
+            ws.find_bar_hit.as_ref().map(|hit| hit.band.clone()),
+            Some(0..crate::find_bar::FIND_BAR_ROWS),
+            "stale current-row geometry cannot float the panel"
         );
         let hi = highlight_bg();
         assert!(
-            ws.input_scratch.cells[1][0..3]
+            ws.input_scratch
+                .cells
                 .iter()
+                .flatten()
                 .all(|cell| cell.bg != hi),
             "stale cached matches cannot tint a newer frame"
         );
@@ -13004,13 +13135,7 @@ mod find_bar_splice_tests {
         let input = format!("hit\r\n{sgr}hit\x1b[0m\r\n");
         term_lock(&term).process(input.as_bytes());
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
 
         fill_scratch(&mut app, wid);
@@ -13109,13 +13234,7 @@ mod find_bar_splice_tests {
         let term = app.pool.get(0).expect("session 0").term.clone();
         term_lock(&term).process(b"click target here\r\n");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "target".to_string();
+        seed_query(&mut app, wid, "target");
         app.search_recompute();
         // The splice records where the indicators landed.
         fill_scratch(&mut app, wid);
@@ -13155,16 +13274,51 @@ mod find_bar_splice_tests {
                 .is_regex
         );
         assert!(app.search_sticky_regex);
-        // A click OFF the indicators (col 0, the `Find:` prompt) is NOT consumed and flips
+        // A click OFF the indicators but ON the panel (col 0, the `Find:` prompt) is
+        // CONSUMED — the band is chrome, not selectable terminal output — and flips
         // nothing.
         assert!(
-            !app.find_bar_click(wid, row, 0),
-            "off-indicator click ignored"
+            app.find_bar_click(wid, row, 0),
+            "a click on the panel is consumed"
         );
         let s = app.windows.get(&wid).unwrap().search.as_ref().unwrap();
         assert!(
             s.case_sensitive && s.is_regex,
             "off-indicator click changed no toggle"
+        );
+        // A click OFF the panel entirely falls through to the terminal untouched.
+        let below = u16::try_from(hit.band.end).unwrap();
+        assert!(
+            !app.find_bar_click(wid, below, 0),
+            "a click below the panel is not consumed"
+        );
+
+        // A click INSIDE the well puts the caret on the character under the pointer —
+        // the text-field behaviour, hit-tested through the recorded well geometry.
+        let field = hit.field_cols.clone();
+        let caret_col = u16::try_from(field.start + 3).unwrap();
+        assert!(app.find_bar_click(wid, row, caret_col), "well click consumed");
+        let s = app.windows.get(&wid).unwrap().search.as_ref().unwrap();
+        assert_eq!(s.query, "target", "clicking the well never edits the text");
+        assert_eq!(s.cursor, 3, "caret landed on the clicked character");
+        // …on BOTH sides of the caret. The well maps cell → character directly (the
+        // block caret costs no cell), so a click to the RIGHT of the caret must not
+        // land one character short.
+        app.search_edit_in(wid, crate::app_search::SearchEdit::MoveStart);
+        let right_of_caret = u16::try_from(field.start + 4).unwrap();
+        assert!(app.find_bar_click(wid, row, right_of_caret), "well click consumed");
+        assert_eq!(
+            app.windows[&wid].search.as_ref().unwrap().cursor,
+            4,
+            "a click right of the caret lands on the clicked character"
+        );
+        // Past the end of the text, the caret parks at the end (never mid-nowhere).
+        let past = u16::try_from(field.start + 40).unwrap();
+        assert!(app.find_bar_click(wid, row, past), "well click consumed");
+        assert_eq!(
+            app.windows[&wid].search.as_ref().unwrap().cursor,
+            "target".len(),
+            "a click past the text parks the caret at the end"
         );
     }
 
@@ -13185,13 +13339,7 @@ mod find_bar_splice_tests {
         // "hit" on terminal rows 0 and 1 (two matches; matches[0] is the current one).
         term_lock(&term).process(b"hit one\r\nhit two\r\n");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
 
         let (rows, _) = fill_scratch(&mut app, wid); // input_scratch = `rows` terminal rows
@@ -13199,18 +13347,25 @@ mod find_bar_splice_tests {
         app.splice_find_bar(wid);
 
         let hi = highlight_bg();
+        let band_rows = crate::find_bar::FIND_BAR_ROWS;
+        let hit = app.windows[&wid]
+            .find_bar_hit
+            .clone()
+            .expect("panel geometry");
+        // Panel band ends on the TRUE frame bottom (`strip + term_bottom = rows`), so in
+        // TERMINAL rows it is `rows - band_rows .. rows`, not one row high.
+        assert_eq!(hit.band, rows - band_rows..rows, "panel on the frame bottom");
+        let field = field_row_text(&app, wid);
+        assert!(
+            field.contains("Find: ") && field.contains("hit"),
+            "the field row rides inside that band: {field:?}"
+        );
         let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
         assert_eq!(cells.len(), rows + 1, "strip added exactly one frame row");
-        // Bar on the TRUE frame bottom (`strip + term_bottom = rows`), not `rows - 1`.
-        let bottom: String = cells[rows].iter().map(|c| c.ch).collect();
+        let above_band: String = cells[rows - band_rows].iter().map(|c| c.ch).collect();
         assert!(
-            bottom.contains("Find: hit"),
-            "bar on the frame bottom row: {bottom:?}"
-        );
-        let term_bottom: String = cells[rows - 1].iter().map(|c| c.ch).collect();
-        assert!(
-            !term_bottom.contains("Find:"),
-            "bar is NOT one row high (would be the off-by-strip bug): {term_bottom:?}"
+            !above_band.contains("Find:"),
+            "panel is NOT one row high (would be the off-by-strip bug): {above_band:?}"
         );
         // Matches from terminal rows 0 and 1 are tinted at FRAME rows strip+0=1 and strip+1=2.
         for (term_row, frame_row) in [(0usize, 1usize), (1, 2)] {
@@ -13238,16 +13393,10 @@ mod find_bar_splice_tests {
         let wid = WindowId(0);
         app.tab_strip_rows = 1;
         let term = app.pool.get(0).expect("session 0").term.clone();
-        // "hit" on terminal rows 2 and 3 — clear of the top row the bar defaults to.
-        term_lock(&term).process(b"\r\n\r\nhit one\r\nhit two\r\n");
+        // "hit" on terminal rows 4 and 5 — clear of the band the panel defaults to.
+        term_lock(&term).process(b"\r\n\r\n\r\n\r\nhit one\r\nhit two\r\n");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
 
         let (rows, _) = fill_scratch(&mut app, wid);
@@ -13255,21 +13404,30 @@ mod find_bar_splice_tests {
         app.splice_find_bar(wid);
 
         let hi = highlight_bg();
+        let hit = app.windows[&wid]
+            .find_bar_hit
+            .clone()
+            .expect("panel geometry");
+        assert_eq!(
+            hit.band,
+            0..crate::find_bar::FIND_BAR_ROWS,
+            "panel band starts at the first TERMINAL row (below the strip)"
+        );
+        // Panel directly below the strip: its field row is a FRAME row ≥ strip + 0 = 1.
+        let field = field_row_text(&app, wid);
+        assert!(
+            field.contains("Find: ") && field.contains("hit"),
+            "panel directly below the tab strip: {field:?}"
+        );
         let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
         assert_eq!(cells.len(), rows + 1, "strip added exactly one frame row");
-        // Bar directly below the strip (frame row strip + 0 = 1), strip row untouched.
-        let bar: String = cells[1].iter().map(|c| c.ch).collect();
-        assert!(
-            bar.contains("Find: hit"),
-            "bar directly below the tab strip: {bar:?}"
-        );
         let strip_row: String = cells[0].iter().map(|c| c.ch).collect();
         assert!(
             !strip_row.contains("Find:"),
             "the strip row keeps its own chrome: {strip_row:?}"
         );
-        // Matches from terminal rows 2 and 3 are tinted at FRAME rows 3 and 4.
-        for (term_row, frame_row) in [(2usize, 3usize), (3, 4)] {
+        // Matches from terminal rows 4 and 5 are tinted at FRAME rows 5 and 6.
+        for (term_row, frame_row) in [(4usize, 5usize), (5, 6)] {
             for (col, cell) in cells[frame_row][0..=2].iter().enumerate() {
                 assert_eq!(
                     cell.bg, hi,
@@ -13297,13 +13455,7 @@ mod find_bar_splice_tests {
         term_lock(&term).process(&input);
 
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
         // The current (oldest) match is in scrollback: find scrolled the viewport up.
         let offset = term_lock(&term).grid().display_offset();
@@ -13391,13 +13543,7 @@ mod find_bar_splice_tests {
         let term = app.pool.get(0).expect("session 0").term.clone();
         term_lock(&term).process(b"hit");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".into();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
 
         let region_bottom = rows - 2;
@@ -13435,13 +13581,7 @@ mod find_bar_splice_tests {
 
         term_lock(&term).process(format!("\x1b[{rows};1HFOOTERNEEDLE").as_bytes());
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "FOOTERNEEDLE".into();
+        seed_query(&mut app, wid, "FOOTERNEEDLE");
         app.search_recompute();
         assert_eq!(
             app.windows[&wid]
@@ -13523,13 +13663,7 @@ mod find_bar_splice_tests {
             3,
             "enter captured the origin viewport"
         );
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
         assert_ne!(
             term_lock(&term).grid().display_offset(),
@@ -13616,13 +13750,7 @@ mod find_bar_splice_tests {
         assert!(q.is_empty() && n == 0, "nothing to recall on a fresh app");
 
         // Type + accept "hit" — remembered app-sticky.
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
         app.search_accept();
 
@@ -13653,13 +13781,7 @@ mod find_bar_splice_tests {
         let term = app.pool.get(0).expect("session 0").term.clone();
         term_lock(&term).process(b"target line here\r\n");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "target".to_string();
+        seed_query(&mut app, wid, "target");
         app.search_recompute();
         fill_scratch(&mut app, wid);
         app.splice_find_bar(wid);
@@ -13728,13 +13850,7 @@ mod find_bar_splice_tests {
         let term = app.pool.get(0).expect("session 0").term.clone();
         term_lock(&term).process(b"target line here\r\n");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "target".to_string();
+        seed_query(&mut app, wid, "target");
         app.search_recompute();
         fill_scratch(&mut app, wid);
         app.splice_find_bar(wid);
@@ -13749,24 +13865,29 @@ mod find_bar_splice_tests {
         let (cw, ch) = app.win_cell_size(wid);
         let pad = app.win_pad(wid);
         let rows = app.windows.get(&wid).unwrap().rows as usize;
-        let frame_row = app.tab_strip_rows as usize + hit.row;
+        let clamp_row = hit.band.end - 1;
+        let frame_row = app.tab_strip_rows as usize + clamp_row;
         // The `Aa` indicator's x, but a y two pixels BELOW the last cell row — in the bottom
-        // pad, outside the bar's cell band.
+        // pad, outside the panel's cell band.
         let x = (pad + case.start * cw) as f64 + cw as f64 / 2.0;
         let y_below = (pad + (frame_row + 1) * ch) as f64 + 2.0;
-        // Pre-conditions that make this the dangerous case: the bar is on the bottom row
-        // (the current match on the TOP row floated it there) and `pixel_to_cell` DOES
-        // clamp the below-grid press up onto it — so without the gate the click would
-        // land on the `Aa` cell and false-toggle.
+        // Pre-conditions that make this the dangerous case: the panel floated to the
+        // BOTTOM (the current match sits on the top row) and `pixel_to_cell` DOES clamp
+        // the below-grid press up into its band — so without the gate the click would be
+        // taken as a panel click on the `Aa` column.
         assert_eq!(
-            hit.row,
-            rows - 1,
-            "bar floated to the bottom row (the clamp target)"
+            hit.band.end,
+            rows,
+            "panel floated to the bottom (the clamp target)"
         );
         assert_eq!(
             app.pixel_to_cell(wid, x, y_below).0 as usize,
-            hit.row,
-            "the below-grid press clamps onto the bar row"
+            clamp_row,
+            "the below-grid press clamps into the panel band"
+        );
+        assert!(
+            !app.find_bar_pixel_hit(wid, x, y_below),
+            "the pixel gate rejects the pad press the row-clamp would have admitted"
         );
         app.windows.get_mut(&wid).unwrap().last_cursor_px = (x, y_below);
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
@@ -13795,16 +13916,10 @@ mod find_bar_splice_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.pool.get(0).expect("session 0").term.clone();
-        // Matches away from the top row, so the bar keeps its default TOP placement.
-        term_lock(&term).process(b"\r\n\r\ntarget line here\r\n");
+        // Matches below the panel band, so it keeps its default TOP placement.
+        term_lock(&term).process(b"\r\n\r\n\r\n\r\ntarget line here\r\n");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "target".to_string();
+        seed_query(&mut app, wid, "target");
         app.search_recompute();
         fill_scratch(&mut app, wid);
         app.splice_find_bar(wid);
@@ -13818,15 +13933,19 @@ mod find_bar_splice_tests {
         let case = hit.case_cols.expect("Aa drawn");
         let (cw, _ch) = app.win_cell_size(wid);
         let pad = app.win_pad(wid);
-        assert_eq!(hit.row, 0, "bar sits on its default top row");
+        assert_eq!(hit.band.start, 0, "panel sits at its default top placement");
         // The `Aa` indicator's x, but a y ABOVE the first cell row — in the top pad,
-        // outside the bar's cell band; `pixel_to_cell` clamps it down onto row 0.
+        // outside the panel's cell band; `pixel_to_cell` clamps it down into the band.
         let x = (pad + case.start * cw) as f64 + cw as f64 / 2.0;
         let y_above = pad as f64 - 2.0;
         assert_eq!(
             app.pixel_to_cell(wid, x, y_above).0 as usize,
-            hit.row,
-            "the above-grid press clamps onto the bar row"
+            hit.band.start,
+            "the above-grid press clamps into the panel band"
+        );
+        assert!(
+            !app.find_bar_pixel_hit(wid, x, y_above),
+            "the pixel gate rejects the pad press the row-clamp would have admitted"
         );
         app.windows.get_mut(&wid).unwrap().last_cursor_px = (x, y_above);
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
@@ -13870,13 +13989,7 @@ mod find_bar_splice_tests {
         }
         term_lock(&term).process(&input);
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "UNIQNEEDLE".to_string();
+        seed_query(&mut app, wid, "UNIQNEEDLE");
         app.search_recompute();
         let match_base_y = app
             .windows
@@ -13937,10 +14050,10 @@ mod find_bar_splice_tests {
     }
 
     /// PIXEL-BAND BOUNDARIES + x-GATE (fix #9 coverage): `find_bar_pixel_hit` admits a click
-    /// only inside the bar's exact cell band `[top, top+ch)` and inside the grid columns.
-    /// Locks the off-by-one edges (first/last device row accept; one px outside either edge
-    /// rejects) and the right-edge x-gate (a press past the last column rejects, so
-    /// `pixel_to_cell`'s column clamp can't land it on an indicator span).
+    /// only inside the panel's exact cell band `[top, top + rows*ch)` and inside the grid
+    /// columns. Locks the off-by-one edges (first/last device row of the BAND accept; one px
+    /// outside either edge rejects) and the right-edge x-gate (a press past the last column
+    /// rejects, so `pixel_to_cell`'s column clamp can't land it on an indicator span).
     #[test]
     fn find_bar_pixel_hit_boundaries_and_right_edge() {
         let mut app = App::headless_for_test();
@@ -13948,13 +14061,7 @@ mod find_bar_splice_tests {
         let term = app.pool.get(0).expect("session 0").term.clone();
         term_lock(&term).process(b"boundary target\r\n");
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "target".to_string();
+        seed_query(&mut app, wid, "target");
         app.search_recompute();
         fill_scratch(&mut app, wid);
         app.splice_find_bar(wid);
@@ -13970,17 +14077,18 @@ mod find_bar_splice_tests {
         let pad_top = app.win_pad_top(wid);
         let head = app.win_head(wid);
         let cols = app.windows.get(&wid).unwrap().cols as usize;
-        let frame_row = app.tab_strip_rows as usize + hit.row;
+        let frame_row = app.tab_strip_rows as usize + hit.band.start;
         let top = (pad_top + head + frame_row * ch) as f64;
+        let height = (hit.band.len() * ch) as f64;
         let x_in = (pad + 5 * cw) as f64 + cw as f64 / 2.0; // a column well inside the grid
-        // The exact first and last device rows of the band ACCEPT.
+        // The exact first and last device rows of the BAND accept.
         assert!(
             app.find_bar_pixel_hit(wid, x_in, top),
             "py == top (first band row) accepts"
         );
         assert!(
-            app.find_bar_pixel_hit(wid, x_in, top + ch as f64 - 1.0),
-            "py == top+ch-1 (last band row) accepts"
+            app.find_bar_pixel_hit(wid, x_in, top + height - 1.0),
+            "py == top+height-1 (last band row) accepts"
         );
         // One device pixel outside either edge REJECTS.
         assert!(
@@ -13988,8 +14096,8 @@ mod find_bar_splice_tests {
             "py == top-1 (row above) rejects"
         );
         assert!(
-            !app.find_bar_pixel_hit(wid, x_in, top + ch as f64),
-            "py == top+ch (first row below) rejects"
+            !app.find_bar_pixel_hit(wid, x_in, top + height),
+            "py == top+height (first row below) rejects"
         );
         // Right-edge x-gate: a press past the last grid column rejects even in-band.
         let x_past = (pad + cols * cw) as f64 + 1.0;
@@ -14015,13 +14123,7 @@ mod find_bar_splice_tests {
         let term = app.pool.get(0).expect("session 0").term.clone();
         term_lock(&term).process(b"hit one\r\nhit two\r\n"); // two live matches
         app.search_enter();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .search
-            .as_mut()
-            .unwrap()
-            .query = "hit".to_string();
+        seed_query(&mut app, wid, "hit");
         app.search_recompute();
 
         // Split the visible tab so `active_tree(wid).len() > 1` (the multi_pane gate).
@@ -14038,13 +14140,13 @@ mod find_bar_splice_tests {
         fill_scratch(&mut app, wid);
         app.splice_find_bar(wid);
         let hi = highlight_bg();
-        let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
-        // The bar is still drawn (it's window chrome), but NO match tint is applied anywhere.
-        let bottom: String = cells.last().unwrap().iter().map(|c| c.ch).collect();
+        // The panel is still drawn (it's window chrome), but NO match tint is applied.
+        let field = field_row_text(&app, wid);
         assert!(
-            bottom.contains("Find: hit"),
-            "the find bar is still spliced in a split: {bottom:?}"
+            field.contains("Find: ") && field.contains("hit"),
+            "the find panel is still spliced in a split: {field:?}"
         );
+        let cells = &app.windows.get(&wid).unwrap().input_scratch.cells;
         for (r, row) in cells.iter().enumerate() {
             assert!(
                 row.iter().all(|c| c.bg != hi),
@@ -14485,5 +14587,133 @@ mod rain_host_tests {
             input.char_fg[0].row, 4,
             "char_fg shifts identically (the shared GRID-stream rule)"
         );
+    }
+}
+
+/// VISUAL CAPTURE of the ⌘F find panel: drives the REAL App/splice path, renders the
+/// resulting frame through the REAL CPU rasterizer (`aterm_render::Renderer`), and dumps
+/// PNGs — so the chrome can be reviewed as PIXELS rather than as row-text asserts. Not a
+/// gate: `#[ignore]`d (it needs a system font) and asserted only for "it produced frames".
+///
+/// ```sh
+/// FIND_PANEL_PNG_DIR=/tmp/find cargo test -p aterm-gui --lib \
+///     find_panel_visual_capture -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod find_panel_visual_tests {
+    use crate::app_search::SearchEdit;
+    use crate::{App, WindowId, term_lock};
+
+    /// Fill the scratch from the engine and splice the panel, exactly as a real redraw
+    /// does, then render + write `name.png`.
+    fn capture(app: &mut App, wid: WindowId, dir: &std::path::Path, name: &str) -> bool {
+        let (rows, cols) = {
+            let ws = &app.windows[&wid];
+            (ws.rows as usize, ws.cols as usize)
+        };
+        let terminal = app.front_terminal(wid).expect("front terminal").term.clone();
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut term = term_lock(&terminal);
+            term.cell_frame_into(&mut ws.input_scratch, rows, cols);
+        }
+        app.splice_find_bar(wid);
+        let Some(mut cpu) = aterm_render::Renderer::from_system(20.0, aterm_render::Theme::default())
+        else {
+            return false; // no system monospace font (headless CI) — skip.
+        };
+        let frame = cpu.render_input(&app.windows[&wid].input_scratch);
+        let mut rgb = Vec::with_capacity(frame.pixels.len() * 3);
+        for &p in &frame.pixels {
+            rgb.push((p >> 16) as u8);
+            rgb.push((p >> 8) as u8);
+            rgb.push(p as u8);
+        }
+        let path = dir.join(format!("{name}.png"));
+        let file = std::fs::File::create(&path).expect("create png");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width as u32, frame.height as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .expect("png header")
+            .write_image_data(&rgb)
+            .expect("png data");
+        eprintln!("wrote {} ({}x{})", path.display(), frame.width, frame.height);
+        true
+    }
+
+    fn content(app: &App, lines: &[&str]) {
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let mut bytes = Vec::new();
+        for line in lines {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.extend_from_slice(b"\r\n");
+        }
+        term_lock(&term).process(&bytes);
+    }
+
+    #[test]
+    #[ignore = "visual capture: needs a system font; run with --ignored"]
+    fn find_panel_visual_capture() {
+        let dir = std::env::var("FIND_PANEL_PNG_DIR")
+            .map_or_else(|_| std::env::temp_dir().join("find-panel"), std::path::PathBuf::from);
+        std::fs::create_dir_all(&dir).expect("output dir");
+        let lines = [
+            "alpha needle one",
+            "beta line two",
+            "gamma needle three",
+            "delta four",
+            "epsilon needle five",
+            "zeta seven eight",
+        ];
+
+        // 1. Just opened: the empty well shows its placeholder + the full keymap.
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        content(&app, &lines);
+        app.search_enter();
+        if !capture(&mut app, wid, &dir, "1-empty") {
+            eprintln!("no system font — visual capture skipped");
+            return;
+        }
+
+        // 2. Typed query with live matches: position readout + highlight-all tint.
+        for ch in "needle".chars() {
+            app.search_edit_in(wid, SearchEdit::Insert(ch.to_string()));
+        }
+        capture(&mut app, wid, &dir, "2-typed");
+
+        // 3. Caret parked mid-query (^A then ⌥→): the field's edit position on glass.
+        app.search_edit_in(wid, SearchEdit::MoveStart);
+        app.search_edit_in(wid, SearchEdit::MoveCharRight);
+        app.search_edit_in(wid, SearchEdit::MoveCharRight);
+        capture(&mut app, wid, &dir, "3-caret-mid");
+
+        // 4. A query far wider than the well: it scrolls to keep the caret in view.
+        app.search_edit_in(wid, SearchEdit::KillToEnd);
+        app.search_edit_in(wid, SearchEdit::KillToStart);
+        app.search_edit_in(
+            wid,
+            SearchEdit::Insert(
+                "a-very-long-query-that-runs-past-the-end-of-the-field-and-keeps-going".into(),
+            ),
+        );
+        capture(&mut app, wid, &dir, "4-overlong");
+
+        // 5. No matches: the honest zero-hit readout.
+        app.search_edit_in(wid, SearchEdit::KillToStart);
+        app.search_edit_in(wid, SearchEdit::Insert("zzz".into()));
+        capture(&mut app, wid, &dir, "5-no-match");
+
+        // 6. A narrow window: the right side degrades before the field is squeezed.
+        let narrow = app.insert_logical_window(crate::stub_session(1), 20, 52);
+        app.frontmost_window = Some(narrow);
+        content(&app, &lines);
+        app.search_enter();
+        for ch in "needle".chars() {
+            app.search_edit_in(narrow, SearchEdit::Insert(ch.to_string()));
+        }
+        capture(&mut app, narrow, &dir, "6-narrow");
     }
 }

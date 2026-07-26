@@ -473,6 +473,7 @@ dependencies = [
  "aterm-pty",
  "aterm-render",
  "aterm-sandbox",
+ "aterm-tempfile",
  "aterm-types",
  "libc",
 ]

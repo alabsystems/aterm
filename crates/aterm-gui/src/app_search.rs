@@ -48,6 +48,88 @@ impl SearchDirection {
     }
 }
 
+/// One text-field edit of the find query — the vocabulary behind the find bar's
+/// caret. The bar is a REAL single-line text field, so it speaks the standard
+/// macOS/readline motions (^A/^E/^B/^F, ⌥←/⌥→ by word, Home/End) and kills
+/// (^K/^U/^W, ⌥⌫, ⌘⌫) rather than only appending and popping at the end.
+///
+/// Split out of the key handler so the whole editing model is pure, unit-testable
+/// state ([`SearchState::edit`]) and repeatable on a held key
+/// ([`crate::SearchRepeatAction`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SearchEdit {
+    /// Insert typed/pasted text at the caret. Control characters are stripped: a
+    /// find query is one line, and ⎋/⏎/⇥ are COMMANDS here, never content.
+    Insert(String),
+    DeleteBack,
+    DeleteForward,
+    DeleteWordBack,
+    DeleteWordForward,
+    KillToStart,
+    KillToEnd,
+    MoveCharLeft,
+    MoveCharRight,
+    MoveWordLeft,
+    MoveWordRight,
+    MoveStart,
+    MoveEnd,
+    /// Put the caret at a byte offset (a click in the field's well). Clamped and
+    /// floored onto a char boundary by [`SearchState::edit`].
+    MoveTo(usize),
+}
+
+/// Word characters for the ⌥-arrow / ^W / ⌥⌫ motions: alphanumerics plus `_`, the
+/// readline convention. Everything else (space, punctuation, path separators) is a
+/// boundary, so ⌥← walks a path or a shell command one component at a time.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Byte offset of the previous word boundary before `at`: skip any separators
+/// immediately behind the caret, then the word itself. `at` must be a char boundary
+/// (every caret position is).
+fn prev_word_boundary(s: &str, at: usize) -> usize {
+    let mut idx = at.min(s.len());
+    let back = |i: usize| -> Option<(usize, char)> {
+        s[..i].chars().next_back().map(|c| (i - c.len_utf8(), c))
+    };
+    while let Some((prev, ch)) = back(idx) {
+        if is_word_char(ch) {
+            break;
+        }
+        idx = prev;
+    }
+    while let Some((prev, ch)) = back(idx) {
+        if !is_word_char(ch) {
+            break;
+        }
+        idx = prev;
+    }
+    idx
+}
+
+/// Byte offset of the next word boundary after `at` — the forward twin of
+/// [`prev_word_boundary`].
+fn next_word_boundary(s: &str, at: usize) -> usize {
+    let mut idx = at.min(s.len());
+    let ahead = |i: usize| -> Option<(usize, char)> {
+        s[i..].chars().next().map(|c| (i + c.len_utf8(), c))
+    };
+    while let Some((next, ch)) = ahead(idx) {
+        if is_word_char(ch) {
+            break;
+        }
+        idx = next;
+    }
+    while let Some((next, ch)) = ahead(idx) {
+        if !is_word_char(ch) {
+            break;
+        }
+        idx = next;
+    }
+    idx
+}
+
 /// In-progress Cmd-F find over the full live screen + scrollback history. Matches are
 /// `(row, start_col, end_col)` in SELECTION coordinates (0..rows = live screen,
 /// negative = scrollback); the current one is highlighted by setting the text
@@ -55,6 +137,10 @@ impl SearchDirection {
 #[derive(Default)]
 pub(crate) struct SearchState {
     pub(crate) query: String,
+    /// Caret position in [`Self::query`], as a BYTE offset on a char boundary. Every
+    /// mutation goes through [`Self::edit`]/[`Self::set_query`], which maintain that
+    /// invariant, and the find bar paints the caret here (not merely after the text).
+    pub(crate) cursor: usize,
     pub(crate) matches: Vec<(i32, u16, u16)>,
     /// Exact point-relative hit when it lies outside the capped batch. Keeping
     /// it separate avoids inserting/removing/shifting 100k elements on every
@@ -119,6 +205,144 @@ pub(crate) struct SearchState {
 }
 
 impl SearchState {
+    /// Replace the whole query (recall, find-again, scripted seeds) and park the
+    /// caret at its END — the single seam that keeps [`Self::cursor`] on a char
+    /// boundary inside the new text.
+    pub(crate) fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.cursor = self.query.len();
+    }
+
+    /// Apply one text-field [`SearchEdit`], returning `true` when the QUERY TEXT
+    /// changed (so the caller re-runs the search) and `false` for a pure caret move
+    /// (which only needs a repaint — the caret is part of the painted state).
+    ///
+    /// Pure and total: every offset is clamped into the query and floored onto a char
+    /// boundary, so no edit — including one applied a frame after the text it was
+    /// classified against — can panic or split a multi-byte character.
+    pub(crate) fn edit(&mut self, edit: SearchEdit) -> bool {
+        self.cursor = self.floor_boundary(self.cursor.min(self.query.len()));
+        let at = self.cursor;
+        match edit {
+            SearchEdit::Insert(text) => {
+                // ⎋/⏎/⇥ and friends are COMMANDS in find mode, and a multi-line
+                // clipboard is not a query: keep the printable characters only. The two
+                // Unicode line/paragraph separators are line breaks that `is_control`
+                // does NOT classify as such, so they are named explicitly.
+                let text: String = text
+                    .chars()
+                    .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
+                    .collect();
+                if text.is_empty() {
+                    return false;
+                }
+                self.query.insert_str(at, &text);
+                self.cursor = at + text.len();
+                true
+            }
+            SearchEdit::DeleteBack => {
+                let start = self.prev_char(at);
+                if start == at {
+                    return false;
+                }
+                self.query.replace_range(start..at, "");
+                self.cursor = start;
+                true
+            }
+            SearchEdit::DeleteForward => {
+                let end = self.next_char(at);
+                if end == at {
+                    return false;
+                }
+                self.query.replace_range(at..end, "");
+                true
+            }
+            SearchEdit::DeleteWordBack => {
+                let start = prev_word_boundary(&self.query, at);
+                if start == at {
+                    return false;
+                }
+                self.query.replace_range(start..at, "");
+                self.cursor = start;
+                true
+            }
+            SearchEdit::DeleteWordForward => {
+                let end = next_word_boundary(&self.query, at);
+                if end == at {
+                    return false;
+                }
+                self.query.replace_range(at..end, "");
+                true
+            }
+            SearchEdit::KillToStart => {
+                if at == 0 {
+                    return false;
+                }
+                self.query.replace_range(..at, "");
+                self.cursor = 0;
+                true
+            }
+            SearchEdit::KillToEnd => {
+                if at == self.query.len() {
+                    return false;
+                }
+                self.query.truncate(at);
+                true
+            }
+            SearchEdit::MoveCharLeft => {
+                self.cursor = self.prev_char(at);
+                false
+            }
+            SearchEdit::MoveCharRight => {
+                self.cursor = self.next_char(at);
+                false
+            }
+            SearchEdit::MoveWordLeft => {
+                self.cursor = prev_word_boundary(&self.query, at);
+                false
+            }
+            SearchEdit::MoveWordRight => {
+                self.cursor = next_word_boundary(&self.query, at);
+                false
+            }
+            SearchEdit::MoveStart => {
+                self.cursor = 0;
+                false
+            }
+            SearchEdit::MoveEnd => {
+                self.cursor = self.query.len();
+                false
+            }
+            SearchEdit::MoveTo(offset) => {
+                self.cursor = self.floor_boundary(offset.min(self.query.len()));
+                false
+            }
+        }
+    }
+
+    /// The largest char boundary at or before `at` (already clamped to the query).
+    fn floor_boundary(&self, at: usize) -> usize {
+        let mut at = at;
+        while at > 0 && !self.query.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    fn prev_char(&self, at: usize) -> usize {
+        self.query[..at]
+            .chars()
+            .next_back()
+            .map_or(at, |c| at - c.len_utf8())
+    }
+
+    fn next_char(&self, at: usize) -> usize {
+        self.query[at..]
+            .chars()
+            .next()
+            .map_or(at, |c| at + c.len_utf8())
+    }
+
     /// Temporary native-title projection while find owns the chrome. Kept on
     /// the search state so warning expiry can restore the exact latest status
     /// without duplicating its formatting policy.
@@ -240,6 +464,13 @@ impl SearchState {
         };
         for &b in self.query.as_bytes() {
             mix(b);
+        }
+        // The CARET is painted state: a bare ^A/^E/⌥←, which changes no match, still
+        // has to reach glass, so the edit position is part of the fingerprint.
+        for word in [self.cursor as u64] {
+            for b in word.to_le_bytes() {
+                mix(b);
+            }
         }
         for word in [self.current as u64, self.matches.len() as u64] {
             for b in word.to_le_bytes() {
@@ -493,28 +724,55 @@ impl App {
     /// flag, remember it as the app-sticky default, and re-run. No-op when not in find
     /// mode. The regex twin is [`Self::search_toggle_regex`].
     pub(crate) fn search_toggle_case(&mut self) {
-        let Some(now) = self.front_mut().and_then(|ws| ws.search.as_mut()).map(|s| {
-            s.case_sensitive = !s.case_sensitive;
-            s.case_sensitive
-        }) else {
+        let Some(wid) = self.frontmost_window else {
+            return;
+        };
+        self.search_toggle_case_in(wid);
+    }
+
+    /// Window-targeted match-case toggle (the routed-keystroke twin, like
+    /// [`Self::search_accept_in`]).
+    pub(crate) fn search_toggle_case_in(&mut self, wid: crate::WindowId) {
+        let Some(now) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.search.as_mut())
+            .map(|s| {
+                s.case_sensitive = !s.case_sensitive;
+                s.case_sensitive
+            })
+        else {
             return;
         };
         self.search_sticky_case = now;
-        self.search_recompute();
+        self.search_recompute_in(wid);
     }
 
     /// Toggle regex mode (⌥⌘R / a click on the `.*` indicator): flip the active find's
     /// flag, remember it as the app-sticky default, and re-run. No-op when not in find
     /// mode. The case twin is [`Self::search_toggle_case`].
     pub(crate) fn search_toggle_regex(&mut self) {
-        let Some(now) = self.front_mut().and_then(|ws| ws.search.as_mut()).map(|s| {
-            s.is_regex = !s.is_regex;
-            s.is_regex
-        }) else {
+        let Some(wid) = self.frontmost_window else {
+            return;
+        };
+        self.search_toggle_regex_in(wid);
+    }
+
+    /// Window-targeted regex toggle — the twin of [`Self::search_toggle_case_in`].
+    pub(crate) fn search_toggle_regex_in(&mut self, wid: crate::WindowId) {
+        let Some(now) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.search.as_mut())
+            .map(|s| {
+                s.is_regex = !s.is_regex;
+                s.is_regex
+            })
+        else {
             return;
         };
         self.search_sticky_regex = now;
-        self.search_recompute();
+        self.search_recompute_in(wid);
     }
 
     /// Re-run the find for the current query over the FULL live screen + scrollback
@@ -531,6 +789,10 @@ impl App {
     /// and highlight paths can re-anchor the (frame-relative) rows if output scrolls the
     /// grid before they run. `incomplete` (history deeper than the index cap) becomes
     /// [`SearchState::truncated`]; an invalid regex sets `regex_error`.
+    /// Frontmost-window convenience wrapper. Every PRODUCTION caller is the
+    /// window-targeted `search_recompute_in` form (a keystroke stays bound to the window it was
+    /// routed to), so this survives for the headless tests that drive one window.
+    #[cfg(test)]
     pub(crate) fn search_recompute(&mut self) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -785,17 +1047,24 @@ impl App {
                     sel.update_selection(row, c1, SelectionSide::Right);
                 }
             }
-            // A scrollback match (re-anchored row < 0) is scrolled into view — landing on
-            // row 1, one line BELOW the top, because the find bar rides the TOP row
-            // (`splice_find_bar`): a row-0 landing would put every scrollback match under
-            // the bar and bounce it to the bottom on each step. At the very oldest history
-            // line there is nothing left to scroll past, so `scroll_display` clamps, the
-            // match sits at row 0, and the bar's adaptive placement floats to the bottom
-            // instead. A 1-row terminal has no "below the top" — land at 0.
-            if let Some(row) = row
-                && row < 0
-            {
-                term.scroll_display(-row + i32::from(rows > 1));
+            // MOVE THE CONTENT, NOT THE CHROME. The panel rides the TOP rows
+            // (`splice_find_bar`), so any match landing under it would be hidden; the
+            // splice's fallback is to float the whole panel to the bottom, which makes
+            // the search UI jump across the window as you step through hits. Scrolling
+            // the VIEWPORT so the match clears the band keeps the panel still — the
+            // behaviour every native find bar has — and leaves the float for the one
+            // case scrolling cannot fix: no history left above the match, where
+            // `scroll_display` clamps and the splice floats instead. Applies to
+            // scrollback matches (row < 0) and live ones alike; a terminal shorter than
+            // the panel keeps whatever clearance it has.
+            if let Some(row) = row {
+                let clearance = i32::try_from(crate::find_bar::FIND_BAR_ROWS)
+                    .unwrap_or(1)
+                    .min(i32::from(rows.saturating_sub(1)))
+                    .max(0);
+                if row < clearance {
+                    term.scroll_display(clearance - row);
+                }
             }
         }
         let warning_armed = ws
@@ -954,7 +1223,7 @@ impl App {
             .map(|(_, _, row, start, end)| (row, start, end));
         self.search_enter_direction(forward);
         if let Some(search) = self.front_mut().and_then(|ws| ws.search.as_mut()) {
-            search.query = query;
+            search.set_query(query);
             if let Some((row, start, _)) = anchor {
                 search.anchor_absolute_row = row;
                 search.anchor_col = start;
@@ -991,7 +1260,7 @@ impl App {
         if query_empty && !self.search_last_query.is_empty() {
             let recalled = self.search_last_query.clone();
             if let Some(s) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
-                s.query = recalled;
+                s.set_query(recalled);
                 // Empty-query recall has explicit whole-buffer semantics: the
                 // first forward hit or last backward hit, independent of the
                 // entry point captured for a still-empty find bar.
@@ -1010,25 +1279,122 @@ impl App {
         self.search_step_in(wid, forward);
     }
 
+    /// Apply one text-field [`SearchEdit`] to window `wid`'s find query. A TEXT change
+    /// re-runs the search (incremental find); a pure caret move only repaints — the
+    /// caret is painted state (it is folded into [`SearchState::fingerprint`]), so a
+    /// bare ^A/^E must still reach glass without paying for a full recompute.
+    pub(crate) fn search_edit_in(&mut self, wid: crate::WindowId, edit: SearchEdit) {
+        let Some(changed) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.search.as_mut())
+            .map(|search| search.edit(edit))
+        else {
+            return;
+        };
+        if changed {
+            self.search_recompute_in(wid);
+        } else if let Some(window) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.os_window.as_ref())
+        {
+            window.request_redraw();
+        }
+    }
+
+    /// ⌘V in the find field: insert the system clipboard at the caret (control bytes
+    /// and line breaks are stripped by [`SearchState::edit`] — a find query is one
+    /// line). This is the field's paste, NOT the terminal's: nothing reaches the PTY.
+    pub(crate) fn search_paste_in(&mut self, wid: crate::WindowId) {
+        if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
+            return;
+        }
+        // macOS/Windows read the clipboard in-process and instantly, so deliver on the
+        // UI thread. Linux/X11 mirrors `paste_clipboard`'s discipline: the OWN-selection
+        // read is instant, but a FOREIGN owner needs a `ConvertSelection` round-trip that
+        // can park the event loop for ~1 s — that goes to the worker, which posts
+        // `Wake::FindPasteReady` back here.
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(text) = crate::control::pbpaste() {
+                self.search_edit_in(wid, SearchEdit::Insert(text));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(text) = crate::control::pbpaste_owned() {
+                self.search_edit_in(wid, SearchEdit::Insert(text));
+                return;
+            }
+            let Some(proxy) = self.proxy.clone() else {
+                return;
+            };
+            let _ = std::thread::Builder::new()
+                .name("aterm-x11-paste".into())
+                .spawn(move || {
+                    if let Some(text) = crate::control::pbpaste() {
+                        let _ = proxy.send_event(crate::Wake::FindPasteReady { wid, text });
+                    }
+                });
+        }
+    }
+
+    /// A click at cell `col` inside the find field's WELL: put the caret on the
+    /// character under the pointer (the last one when the click lands past the text),
+    /// exactly like a native single-line field. `scroll` is the well's horizontal
+    /// offset and `offset` the click's cell distance into it, both recorded by the
+    /// paint ([`crate::FindBarHit`]), so this never re-derives the layout.
+    pub(crate) fn search_click_caret_in(&mut self, wid: crate::WindowId, slot: usize) {
+        let Some(byte) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.search.as_ref())
+            .map(|search| {
+                search
+                    .query
+                    .char_indices()
+                    .nth(slot)
+                    .map_or(search.query.len(), |(byte, _)| byte)
+            })
+        else {
+            return;
+        };
+        self.search_edit_in(wid, SearchEdit::MoveTo(byte));
+    }
+
     /// Leave find mode via ⏎ ACCEPT (emacs `RET`): the viewport STAYS wherever the find
     /// navigation left it and the current match KEEPS its selection highlight (ready for
     /// ⌘C), so find doubles as fast navigation through a big scrollback. The accepted
     /// query is remembered app-sticky for `^S`/`^R` empty-query recall next find.
+    /// Frontmost-window convenience wrapper. Every PRODUCTION caller is the
+    /// window-targeted `search_accept_in` form (a keystroke stays bound to the window it was
+    /// routed to), so this survives for the headless tests that drive one window.
+    #[cfg(test)]
     pub(crate) fn search_accept(&mut self) {
         let Some(wid) = self.frontmost_window else {
             return;
         };
+        self.search_accept_in(wid);
+    }
+
+    /// Window-targeted ⏎ ACCEPT. A keystroke stays bound to the window it was routed to
+    /// for the whole press episode (see `terminal_emacs_search_pressed`), so the exits
+    /// must act on THAT window — re-resolving the frontmost one here would let ⏎ in a
+    /// background window close the front window's find.
+    pub(crate) fn search_accept_in(&mut self, wid: crate::WindowId) {
         if let Some((revision_stale, content_stale)) = self.search_stamp_mismatch(wid)
             && (revision_stale || content_stale)
         {
             self.invalidate_search_results(wid, revision_stale);
         }
         if self
-            .front()
+            .windows
+            .get(&wid)
             .and_then(|ws| ws.search.as_ref())
             .is_some_and(|search| search.results_dirty)
         {
-            self.search_recompute();
+            self.search_recompute_in(wid);
         }
         if self
             .windows
@@ -1046,16 +1412,17 @@ impl App {
             self.invalidate_search_results(wid, revision_stale);
             return;
         }
-        let session = self
-            .frontmost_window
-            .and_then(|wid| self.front_terminal(wid))
-            .map(|terminal| terminal.session);
-        let accepted = self.front().and_then(|ws| ws.search.as_ref()).map(|s| {
-            let anchor = s
-                .current_match()
-                .map(|(row, start, end)| (s.match_base_y + i64::from(row), start, end));
-            (s.query.clone(), s.match_absolute_row_revision, anchor)
-        });
+        let session = self.front_terminal(wid).map(|terminal| terminal.session);
+        let accepted = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.search.as_ref())
+            .map(|s| {
+                let anchor = s
+                    .current_match()
+                    .map(|(row, start, end)| (s.match_base_y + i64::from(row), start, end));
+                (s.query.clone(), s.match_absolute_row_revision, anchor)
+            });
         if let Some((q, revision, anchor)) = accepted
             && !q.is_empty()
         {
@@ -1064,25 +1431,40 @@ impl App {
                 .zip(anchor)
                 .map(|(session, (row, start, end))| (session, revision, row, start, end));
         }
-        self.search_close(false);
+        self.search_close_in(wid, false);
     }
 
     /// Leave find mode via ⎋/^G CANCEL (emacs `C-g`): clear the highlight and RESTORE
     /// the viewport captured at [`Self::search_enter`] — re-anchored by
     /// `base_y_now − origin_base_y` past any output that streamed in mid-find — so an
     /// abandoned find never teleports the user away from what they were reading.
+    /// Frontmost-window convenience wrapper. Every PRODUCTION caller is the
+    /// window-targeted `search_cancel_in` form (a keystroke stays bound to the window it was
+    /// routed to), so this survives for the headless tests that drive one window.
+    #[cfg(test)]
     pub(crate) fn search_cancel(&mut self) {
-        let origin = self.front().and_then(|ws| ws.search.as_ref()).map(|s| {
-            (
-                s.origin_display_offset,
-                s.origin_base_y,
-                s.origin_absolute_row_revision,
-            )
-        });
+        let Some(wid) = self.frontmost_window else {
+            return;
+        };
+        self.search_cancel_in(wid);
+    }
+
+    /// Window-targeted ⎋/^G CANCEL — the twin of [`Self::search_accept_in`], for the
+    /// same press-episode-stays-on-its-window reason.
+    pub(crate) fn search_cancel_in(&mut self, wid: crate::WindowId) {
+        let origin = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.search.as_ref())
+            .map(|s| {
+                (
+                    s.origin_display_offset,
+                    s.origin_base_y,
+                    s.origin_absolute_row_revision,
+                )
+            });
         if let Some((origin_offset, origin_base_y, origin_revision)) = origin
-            && let Some(term) = self
-                .frontmost_window
-                .and_then(|wid| self.front_terminal(wid).map(|t| t.term.clone()))
+            && let Some(term) = self.front_terminal(wid).map(|t| t.term.clone())
         {
             let mut terminal = term_lock(&term);
             if terminal.absolute_row_revision() == origin_revision {
@@ -1097,7 +1479,7 @@ impl App {
                 }
             }
         }
-        self.search_close(true);
+        self.search_close_in(wid, true);
     }
 
     /// Leave find mode NEUTRALLY (non-keystroke plumbing paths): clear the highlight +
@@ -1120,13 +1502,19 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return;
         };
+        self.search_close_in(wid, clear_selection);
+    }
+
+    fn search_close_in(&mut self, wid: crate::WindowId, clear_selection: bool) {
         let Some(term) = self
             .front_terminal(wid)
             .map(|terminal| terminal.term.clone())
         else {
             return;
         };
-        let Some(ws) = self.front_mut() else { return };
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
         ws.search = None;
         ws.find_bar_hit = None; // drop the clickable-indicator geometry with the overlay
         if clear_selection {
@@ -1147,7 +1535,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchDirection, SearchMatch, SearchState, map_matches};
+    use super::{SearchDirection, SearchEdit, SearchMatch, SearchState, map_matches};
     use crate::{App, WindowId, term_lock};
 
     /// A `SearchState` pre-seeded with three matches (scrollback row -1, live rows
@@ -1250,7 +1638,124 @@ mod tests {
             .get_mut(&wid)
             .and_then(|window| window.search.as_mut())
             .expect("active search")
-            .query = query.into();
+            .set_query(query.into());
+    }
+
+    /// A find state holding `query` with the caret at its end — the state typing
+    /// leaves behind, and the starting point for the editing tests below.
+    fn field(query: &str) -> SearchState {
+        let mut state = SearchState::default();
+        state.set_query(query.to_string());
+        assert_eq!(state.cursor, query.len(), "typing parks the caret at the end");
+        state
+    }
+
+    /// Insertion happens AT THE CARET (not always at the end), and the caret follows
+    /// the inserted text — the difference between a text field and an append-only box.
+    #[test]
+    fn insert_lands_at_the_caret() {
+        let mut s = field("bc");
+        // ^A is a pure motion: `false` = no text change, so no re-search is triggered.
+        assert!(!s.edit(SearchEdit::MoveStart));
+        assert_eq!((s.query.as_str(), s.cursor), ("bc", 0));
+
+        assert!(s.edit(SearchEdit::Insert("a".into())));
+        assert_eq!((s.query.as_str(), s.cursor), ("abc", 1));
+        assert!(!s.edit(SearchEdit::MoveEnd));
+        assert!(s.edit(SearchEdit::Insert("d".into())));
+        assert_eq!((s.query.as_str(), s.cursor), ("abcd", 4));
+    }
+
+    /// ⎋ / ⏎ / ⇥ are COMMANDS in find mode: their text (`\u{1b}`, `\r`, `\t` — what
+    /// winit reports for them) must never reach the query, and a multi-line paste is
+    /// flattened rather than typed in. This is the escape-typed-into-the-box bug.
+    #[test]
+    fn control_characters_never_enter_the_query() {
+        let mut s = field("");
+        for control in ["\u{1b}", "\r", "\n", "\t", "\u{8}"] {
+            assert!(
+                !s.edit(SearchEdit::Insert(control.into())),
+                "{control:?} is not query text"
+            );
+            assert_eq!(s.query, "", "{control:?} left the query untouched");
+        }
+        assert!(s.edit(SearchEdit::Insert("two\nlines\there".into())));
+        assert_eq!(s.query, "twolineshere", "a pasted query stays one line");
+    }
+
+    /// Deletions respect the caret and the word boundaries readline uses: ⌫ / ⌦ by
+    /// character, ^W / ⌥⌫ by word, ^U / ^K to the line edges.
+    #[test]
+    fn deletions_respect_caret_and_word_boundaries() {
+        let mut s = field("alpha beta");
+        assert!(s.edit(SearchEdit::DeleteBack));
+        assert_eq!((s.query.as_str(), s.cursor), ("alpha bet", 9));
+
+        assert!(s.edit(SearchEdit::DeleteWordBack));
+        assert_eq!((s.query.as_str(), s.cursor), ("alpha ", 6));
+
+        let mut s = field("src/main.rs");
+        s.edit(SearchEdit::MoveStart);
+        assert!(s.edit(SearchEdit::DeleteForward));
+        assert_eq!((s.query.as_str(), s.cursor), ("rc/main.rs", 0));
+        // ⌥⌦ eats one path component (the separator counts as a boundary).
+        assert!(s.edit(SearchEdit::DeleteWordForward));
+        assert_eq!(s.query, "/main.rs");
+
+        let mut s = field("keep this");
+        s.edit(SearchEdit::MoveWordLeft);
+        assert_eq!(s.cursor, 5, "⌥← lands before the last word");
+        assert!(s.edit(SearchEdit::KillToEnd));
+        assert_eq!((s.query.as_str(), s.cursor), ("keep ", 5));
+        assert!(s.edit(SearchEdit::KillToStart));
+        assert_eq!((s.query.as_str(), s.cursor), ("", 0));
+        // Nothing left to kill ⇒ no text change ⇒ no wasted re-search.
+        assert!(!s.edit(SearchEdit::KillToEnd));
+        assert!(!s.edit(SearchEdit::DeleteBack));
+        assert!(!s.edit(SearchEdit::DeleteForward));
+    }
+
+    /// Every motion and edit is CHARACTER-wise on a multi-byte query, and a caret that
+    /// somehow lands mid-codepoint (or past the end) is floored/clamped rather than
+    /// panicking or splitting a character.
+    #[test]
+    fn editing_is_utf8_safe() {
+        let mut s = field("héllo");
+        assert!(s.edit(SearchEdit::DeleteBack));
+        assert_eq!(s.query, "héll");
+        s.edit(SearchEdit::MoveStart);
+        s.edit(SearchEdit::MoveCharRight);
+        assert_eq!(s.cursor, 1);
+        s.edit(SearchEdit::MoveCharRight);
+        assert_eq!(s.cursor, 3, "the caret steps OVER the two-byte é");
+        assert!(s.edit(SearchEdit::DeleteBack));
+        assert_eq!((s.query.as_str(), s.cursor), ("hll", 1));
+
+        // A desynced caret: mid-codepoint and past the end are both survivable.
+        let mut s = field("éß");
+        s.cursor = 1;
+        assert!(s.edit(SearchEdit::Insert("x".into())));
+        assert_eq!(s.query, "xéß", "a mid-codepoint caret floors to the boundary");
+        let mut s = field("é");
+        s.cursor = 99;
+        assert!(s.edit(SearchEdit::DeleteBack));
+        assert_eq!(s.query, "");
+        // A click past the text parks the caret at the end.
+        let mut s = field("abc");
+        assert!(!s.edit(SearchEdit::MoveTo(99)));
+        assert_eq!(s.cursor, 3);
+    }
+
+    /// The caret is PAINTED state, so it has to be part of the repaint fingerprint —
+    /// otherwise a bare ^A/^E would move the caret with nothing reaching glass.
+    #[test]
+    fn fingerprint_tracks_the_caret() {
+        let mut s = field("abc");
+        let at_end = s.fingerprint();
+        s.edit(SearchEdit::MoveStart);
+        assert_ne!(s.fingerprint(), at_end, "a caret move must re-present");
+        s.edit(SearchEdit::MoveEnd);
+        assert_eq!(s.fingerprint(), at_end, "and settle back when it returns");
     }
 
     /// `map_matches` converts engine ABSOLUTE rows to SELECTION rows (`abs − base_y`,

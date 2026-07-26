@@ -44,6 +44,13 @@ mod driver;
 // what aterm is, how to drive it, and every tool in the toolchain.
 mod manual;
 
+// The coding-agent primer installer behind `aterm agents` — manages the 3-line,
+// self-gating aterm primer in agents' global context files (~/.claude/CLAUDE.md,
+// ~/.codex/AGENTS.md, ...), the one channel that reliably reaches an agent's
+// context in every project. The delivery half of the manual: `manual` is what an
+// agent reads once it knows to run `aterm help`; `primer` is how it learns to.
+mod primer;
+
 /// Polished `--help` text: synopsis, description, OPTIONS, ENVIRONMENT, EXAMPLES.
 /// Mirrors `aterm-gui`'s `parse_cli()` help in tone and layout, scoped to what the
 /// daily-driver CLI actually does (transparent passthrough of `$SHELL`).
@@ -103,6 +110,9 @@ const HELP: &str = concat!(
     "    aterm pkg <args>          Install / update / verify the toolchain (the package manager).\n",
     "    aterm fleet <args>        Federate many sessions' events; dispatch commands back.\n",
     "    aterm drive <args>        The agent drive CLI (await / send / turn helpers).\n",
+    "    aterm agents [<cmd>]      Make coding agents aterm-aware: manage the 3-line aterm\n",
+    "                              primer in their global context files (status | install |\n",
+    "                              remove | primer). Run once per machine.\n",
     "\n",
     "TOOLCHAIN (use aterm to run all our programs; see docs/ATERM-DISTRIBUTION-WEDGE.md):\n",
     "    aterm <tool> [args]       Run a pinned, installed tool, e.g. `aterm ay`, `aterm ty`,\n",
@@ -442,6 +452,10 @@ enum CliAction {
     /// WITHOUT spawning a shell. `topic` is the optional deep-dive selector; `None`
     /// prints the front page (or, inside an aterm session, the agent brief).
     Manual { topic: Option<String> },
+    /// `agents [<cmd> [<agent>…]]`: manage the coding-agent primer (via [`primer`])
+    /// and exit WITHOUT spawning a shell. `rest` is everything after the word
+    /// `agents` (subcommand + optional agent names), parsed by the module itself.
+    Agents { rest: Vec<String> },
     /// A usage error (unknown option, missing `--containment` value): the message
     /// is already framed for stderr; exit 2 without launching a shell.
     Usage(String),
@@ -484,6 +498,15 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
     if args.peek().map(String::as_str) == Some("help") {
         let _ = args.next();
         return CliAction::Manual { topic: args.next() };
+    }
+    // `aterm agents …` dispatches the same way, git-style: the primer installer is
+    // the first operand, everything after it belongs to the `primer` module's own
+    // little parser (subcommand + agent names). Prints and exits, no shell spawned.
+    if args.peek().map(String::as_str) == Some("agents") {
+        let _ = args.next();
+        return CliAction::Agents {
+            rest: args.collect(),
+        };
     }
     // A leading diagnostic subcommand (`aterm show-config`) dispatches BEFORE any
     // flag parsing — git-style: the subcommand is the first operand. It prints
@@ -604,6 +627,28 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
             }
             std::process::exit(code);
         }
+        CliAction::Agents { rest } => {
+            // Same print/exit discipline as the diag path: success to stdout, a
+            // failure/usage report to stderr with its code, so it scripts.
+            let Some(home) = primer::home_dir() else {
+                eprintln!(
+                    "aterm agents: cannot resolve the home directory ({} is unset)",
+                    if cfg!(windows) {
+                        "%USERPROFILE%"
+                    } else {
+                        "$HOME"
+                    }
+                );
+                std::process::exit(1);
+            };
+            let (out, code) = primer::agents_report(&home, &rest);
+            if code == 0 {
+                print!("{out}");
+            } else {
+                eprint!("{out}");
+            }
+            std::process::exit(code);
+        }
         CliAction::Usage(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);
@@ -678,6 +723,7 @@ pub fn is_tool_candidate(first: Option<&str>) -> bool {
             !w.is_empty()
                 && !w.starts_with('-')
                 && w != "help"
+                && w != "agents"
                 && !VERB_BINS.iter().any(|(v, _)| *v == w)
                 && !DIAG_COMMANDS.iter().any(|(name, _)| *name == w)
         }
@@ -914,6 +960,27 @@ mod tests {
         );
         // aterm's own `help` must never be shadowed by a co-distributed tool named `help`.
         assert!(!is_tool_candidate(Some("help")));
+    }
+
+    #[test]
+    fn agents_word_routes_to_the_primer_installer_and_is_advertised() {
+        // `aterm agents …` parses like `help`: a git-style leading operand, dispatched
+        // before flag parsing / shell spawn; everything after it belongs to `primer`.
+        assert_eq!(decide(&["agents"]), CliAction::Agents { rest: vec![] });
+        assert_eq!(
+            decide(&["agents", "install", "claude"]),
+            CliAction::Agents {
+                rest: vec!["install".to_string(), "claude".to_string()]
+            }
+        );
+        // Advertised as its own VERB line so it never ships undocumented.
+        assert!(
+            HELP.lines()
+                .any(|l| l.trim_start().starts_with("aterm agents")),
+            "`aterm agents` is not advertised in --help"
+        );
+        // Never shadowed by a co-distributed tool named `agents`.
+        assert!(!is_tool_candidate(Some("agents")));
     }
 
     #[test]

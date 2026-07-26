@@ -758,6 +758,39 @@ pub fn clear_key_arrival() {
 /// `metrics` verb can surface it; also logged under `ATERM_LATENCY_TRACE`.
 pub fn note_pty_write() {
     let key = LAT_KEY_NS.swap(0, Ordering::Relaxed);
+    note_pty_write_at(key);
+}
+
+/// CLAIM the pending key-arrival stamp without recording anything, handing it to
+/// whoever will actually perform the write.
+///
+/// The paste-ordering FIFO defers a keystroke's egress to a writer thread, so the
+/// UI thread's `note_pty_write` was consuming the arrival stamp at ENQUEUE time —
+/// recording the ~microsecond cost of pushing onto a channel and leaving the real
+/// write, which is queued behind up to the whole paste, measured by nothing. The
+/// instrument therefore reported its BEST numbers in precisely the window where a
+/// human's key→write is at its worst. Pair with [`note_pty_write_at`].
+#[must_use]
+pub fn take_key_arrival() -> u64 {
+    LAT_KEY_NS.swap(0, Ordering::Relaxed)
+}
+
+/// Hand a claimed arrival stamp BACK, for a deferral that did not happen after all
+/// (the FIFO writer was gone, so the caller falls back to an inline write). Without
+/// this the claim would silently swallow the sample on the fallback path — the same
+/// measurement hole [`take_key_arrival`] exists to close, just one branch over.
+/// A `0` restores nothing; a stamp already re-armed by a newer key wins.
+pub fn restore_key_arrival(key: u64) {
+    if key != 0 {
+        let _ = LAT_KEY_NS.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// Record a key→write slice against an arrival stamp claimed earlier by
+/// [`take_key_arrival`] — for writes that complete OFF the UI thread. A `0` stamp
+/// (no key behind this write: a control verb, an already-consumed arrival) records
+/// nothing, exactly as the inline path's early return does.
+pub fn note_pty_write_at(key: u64) {
     if key == 0 {
         return;
     }

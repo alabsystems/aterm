@@ -1195,6 +1195,51 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::FileTypeExt as _;
 
+    /// Retry a journal operation while it reports the product's TRANSIENT
+    /// contention error.
+    ///
+    /// Journal writes take a sibling advisory lock, and this binary runs 2,400
+    /// tests on parallel threads plus a process-global document worker
+    /// (`native_document_queue`) that performs real journal rewrites. So a
+    /// "recovery journal ... is busy" is expected weather here, and the product
+    /// says so in the message: it is retryable, not a failure. Asserting success
+    /// at one instant asserted that every other writer had already finished —
+    /// which held when the suite ran alone and failed roughly one run in sixteen
+    /// under two concurrent suites.
+    ///
+    /// Bounded, so a lock that never frees still fails; and only the busy error
+    /// is retried — every other error returns on the first attempt.
+    fn settle_busy<T>(mut attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match attempt() {
+                Err(error)
+                    if error.contains("is busy") && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                settled => return settled,
+            }
+        }
+    }
+
+    /// [`settle_busy`] for the rewrite path, which reports contention as a
+    /// `JournalRewriteResult::Failed` rather than an `Err`.
+    fn settle_rewrite(path: &Path, plan: &JournalRewritePlan) -> JournalRewriteResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let result = execute_journal_rewrite(path, plan);
+            let busy = match &result {
+                JournalRewriteResult::Failed(message) => message.contains("is busy"),
+                _ => false,
+            };
+            if !busy || std::time::Instant::now() >= deadline {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn test_root(name: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("aterm-draft-journal-{}-{name}", std::process::id()));
@@ -1313,7 +1358,7 @@ mod tests {
         assert!(error.contains("retry"), "{error}");
 
         drop(held);
-        let initialized = host.initialize(decision, &disk, &disk).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
         assert!(recover_journal_for(initialized.key, &fs::read(initialized.path).unwrap()).is_ok());
         let _ = fs::remove_dir_all(root);
     }
@@ -1434,7 +1479,7 @@ mod tests {
         fs::write(&victim, &original).unwrap();
         std::os::unix::fs::symlink(&victim, &initialized.path).unwrap();
         assert!(matches!(
-            execute_journal_rewrite(&initialized.path, &rewrite),
+            settle_rewrite(&initialized.path, &rewrite),
             JournalRewriteResult::Failed(message) if message.contains("preflight")
         ));
         assert_eq!(fs::read(&victim).unwrap(), original);
@@ -1498,7 +1543,7 @@ mod tests {
         };
         let canonical = "file:///tmp/draft.md";
         let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = host.initialize(decision, &disk, &current).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &current)).unwrap();
         let original = fs::read(&initialized.path).unwrap();
 
         let conflict = host.inspect_open(canonical, b"external").unwrap();
@@ -1507,7 +1552,7 @@ mod tests {
             Some(RecoveryNotice::DiskConflict)
         ));
         let (other_store, _, external) = snapshots("external");
-        let preserved = host.initialize(conflict, &external, &external).unwrap();
+        let preserved = settle_busy(|| host.initialize(conflict.clone(), &external, &external)).unwrap();
         assert_eq!(
             fs::read(preserved.preserved_path.unwrap()).unwrap(),
             original
@@ -1517,7 +1562,7 @@ mod tests {
         fs::write(&preserved.path, b"torn").unwrap();
         let corrupt = host.inspect_open(canonical, b"external").unwrap();
         assert!(matches!(corrupt.notice, Some(RecoveryNotice::Corrupt(_))));
-        let kept = host.initialize(corrupt, &external, &external).unwrap();
+        let kept = settle_busy(|| host.initialize(corrupt.clone(), &external, &external)).unwrap();
         assert_eq!(fs::read(kept.preserved_path.unwrap()).unwrap(), b"torn");
         let _ = fs::remove_dir_all(root);
     }
@@ -1530,7 +1575,7 @@ mod tests {
         let canonical = "file:///tmp/draft.md";
         let first = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
         let stale = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = host.initialize(first, &disk, &disk).unwrap();
+        let initialized = settle_busy(|| host.initialize(first.clone(), &disk, &disk)).unwrap();
         let before = fs::read(&initialized.path).unwrap();
 
         let error = host.initialize(stale, &disk, &disk).unwrap_err();
@@ -1745,7 +1790,7 @@ mod tests {
         else {
             panic!("checkpoint rewrite expected")
         };
-        let mut bad = match execute_journal_rewrite(&path, &plan) {
+        let mut bad = match settle_rewrite(&path, &plan) {
             JournalRewriteResult::Committed(proof) => proof,
             other => panic!("rewrite failed: {other:?}"),
         };
@@ -1770,7 +1815,7 @@ mod tests {
         else {
             panic!("checkpoint retry expected")
         };
-        let result = execute_journal_rewrite(&path, &plan);
+        let result = settle_rewrite(&path, &plan);
         assert_eq!(
             journals.complete_rewrite(id, plan.generation, result),
             JournalCompletion::Durable {
@@ -1832,7 +1877,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            execute_journal_rewrite(&initialized.path, &rewrite),
+            settle_rewrite(&initialized.path, &rewrite),
             JournalRewriteResult::Failed(message) if message.contains("image changed")
         ));
         let recovered =

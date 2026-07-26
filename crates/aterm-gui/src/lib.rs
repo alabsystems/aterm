@@ -1395,8 +1395,9 @@ struct RepaintKey {
 enum SearchRepeatAction {
     Step(bool),
     Repeat(bool),
-    Backspace,
-    Text(String),
+    /// One text-field edit of the query — insertion, caret motion, or a kill. Held
+    /// keys repeat through this, so ⌫, ←/→ and ^K behave like they do in any field.
+    Edit(crate::app_search::SearchEdit),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1880,6 +1881,11 @@ enum Wake {
         text: String,
         source: Source,
     },
+    /// The same Linux/X11 worker hand-off for a ⌘V made while the FIND BAR is open:
+    /// the clipboard body is inserted at the find field's caret instead of being
+    /// delivered to the PTY (see `App::search_paste_in`). Never constructed off Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    FindPasteReady { wid: WindowId, text: String },
     /// The multi-line paste SHEET was answered (macOS). The pastejacking confirmation
     /// is a window sheet rather than an app-modal `NSAlert`, so it cannot block the
     /// event loop and cannot depend on the app holding activation to receive a
@@ -4084,6 +4090,22 @@ impl SessionPool {
         if let Some(p) = self.sessions.get_mut(&id) {
             p.views = p.views.saturating_sub(1);
             if p.views == 0 {
+                // Retire this terminal's contribution to the process-wide vi mirror
+                // BEFORE dropping it — `vi_toggle` is the mirror's only other
+                // decrement, so a terminal that dies in copy-mode would otherwise
+                // strand a `+1` that nothing can ever clear (see
+                // `app_input::vi_note_terminal_gone`).
+                //
+                // `try_lock`: this runs on a session teardown path and must never
+                // block behind a wedged reader. Losing the race merely leaves the
+                // mirror conservative — the same fail-safe direction it already has,
+                // and no worse than not having attempted it.
+                let was_vi = p
+                    .session
+                    .term
+                    .try_lock()
+                    .is_ok_and(|t| t.vi_is_active());
+                crate::app_input::vi_note_terminal_gone(was_vi);
                 self.sessions.remove(&id);
                 return true;
             }
@@ -4459,20 +4481,28 @@ enum NativeRasterWork {
     },
 }
 
-/// Painted geometry of the find bar's clickable `Aa` (case) / `.*` (regex) indicators:
-/// the bar's cell row and each indicator's half-open column span, in the render grid's
-/// coordinates. Written by `App::splice_find_bar` every frame it draws the bar (so it
-/// tracks the adaptive top/bottom placement and the right-alignment), and consulted by
-/// the mouse path to turn a click into a toggle. `None` on either span means that
-/// indicator wasn't drawn (window too narrow).
+/// Painted geometry of the find panel's INTERACTIVE parts: the clickable `Aa` (case) /
+/// `.*` (regex) indicators and the query well, in the render grid's coordinates.
+/// Written by `App::splice_find_bar` every frame it draws the panel (so it tracks the
+/// adaptive top/bottom placement and the right-alignment), and consulted by the mouse
+/// path to turn a click into a toggle or a caret move. `None` on either indicator span
+/// means it wasn't drawn (window too narrow).
 #[derive(Clone)]
 pub(crate) struct FindBarHit {
-    /// Cell row the bar occupies this frame (bottom row, or the top row when floated).
+    /// Cell row of the panel's FIELD line this frame — the only interactive row.
     pub row: usize,
     /// Column span of the `Aa` case indicator, or `None` if the right side was dropped.
     pub case_cols: Option<std::ops::Range<usize>>,
     /// Column span of the `.*` regex indicator, or `None` if the right side was dropped.
     pub regex_cols: Option<std::ops::Range<usize>>,
+    /// Column span of the editable well (the query field).
+    pub field_cols: std::ops::Range<usize>,
+    /// Character index shown in the well's first cell (its horizontal scroll), so a
+    /// click at column `c` targets character `field_scroll + (c − field_cols.start)`.
+    pub field_scroll: usize,
+    /// Rows the whole panel band occupies this frame, starting at its top row — the
+    /// span the pixel hit-test accepts as "inside the find panel".
+    pub band: std::ops::Range<usize>,
 }
 
 #[derive(Clone)]
@@ -5315,6 +5345,19 @@ struct WindowState {
     /// fallback) on the first frame / after a resize / on the deco-rescan and
     /// split-pane compose paths that do not reclaim.
     strip_row_pool: Vec<Vec<RenderCell>>,
+    /// Resident scratch row for the predictive-echo reconcile probe, so resolving a
+    /// cell does not allocate.
+    ///
+    /// `reconcile`'s `observe` closure runs once per retired guess plus once for the
+    /// first unconfirmed one, and it used `Terminal::render_row`, which allocates a
+    /// fresh `Vec<RenderCell>` and materialises the WHOLE row every call — the engine
+    /// ships `render_row_into` precisely so scanning callers do not. Every pending
+    /// guess is on the same row by construction (the predictor is a same-row model,
+    /// plus at most one wrapped head), so a type-ahead queue of N rebuilt the
+    /// identical row N times per frame, inside the term-lock scope the PTY reader is
+    /// waiting on. Memoised by row index and refilled in place, that collapses to one
+    /// non-allocating fill per frame.
+    pred_row_scratch: Vec<RenderCell>,
     /// Reused per-tab title buffer for the tab strip — refilled in place every redraw
     /// (`redraw_tab_strip_state`) and consumed by `splice_tab_strip_with`, so the
     /// per-frame fingerprint + strip paint allocate no `Vec<String>` and no per-tab
@@ -6102,6 +6145,7 @@ impl WindowState {
             current_title: "aterm".to_string(),
             store_title: (u64::MAX, String::new()),
             input_scratch: RenderInput::empty(),
+            pred_row_scratch: Vec::new(),
             pane_scratch: RenderInput::empty(),
             leaf_render_cache: std::collections::BTreeMap::new(),
             tab_segments: Vec::new(),
@@ -6893,6 +6937,20 @@ struct App {
     /// entries reference this pool; a native-only workspace leaves it empty. A
     /// window caches capability-bearing handles only for its focused terminal leaf.
     pool: SessionPool,
+    /// Learned predictive-echo link estimate PARKED per session, so a tab switch
+    /// does not throw it away.
+    ///
+    /// The estimate (smoothed echo RTT + the display latch's streaks) describes the
+    /// LINK, which belongs to the session; the `Predictor` that holds it lives on the
+    /// window. `sync_window` used to `reset_session()` on every front change, so a
+    /// tab-heavy ssh workflow re-earned the Adaptive latch from scratch after every
+    /// switch — roughly the first characters of the next line were unpredicted, every
+    /// time, on exactly the links prediction exists for. Parking the outgoing
+    /// session's estimate here and installing the incoming one keeps the "a slow SSH
+    /// pane must never make a local pane speculate" guarantee (each pane gets its OWN
+    /// estimate, and an unknown session gets `Default` = nothing measured) while
+    /// making the knowledge survive the switch. Pruned with the session in `detach`.
+    link_estimates: HashMap<u64, aterm_predict::LinkEstimate>,
     /// Stable typed view registry. Terminal entries link to `pool`; native
     /// entries link to the in-process app runtime without fabricating PTYs.
     view_store: tab_model::ViewStore,
@@ -8250,6 +8308,7 @@ impl App {
             windows,
             pool,
             view_store,
+            link_estimates,
             ..
         } = self;
         let Some(ws) = windows.get_mut(&wid) else {
@@ -8377,7 +8436,21 @@ impl App {
         // Same-front bookkeeping still drops coordinate-bound guesses but preserves
         // that session's useful link estimate.
         if front_changed {
-            ws.predictor.reset_session();
+            // PARK the outgoing session's learned link estimate and INSTALL the
+            // incoming one, rather than discarding what this pane already knows.
+            // `take_link_estimate` clears the predictor as `reset_session` did, so the
+            // in-flight-guess and cross-pane-speculation guarantees are unchanged —
+            // only the RTT/latch knowledge now follows the session instead of dying
+            // with the switch.
+            if let Some(front_content::FrontContent::Terminal { session, .. }) = previous_front {
+                link_estimates.insert(session, ws.predictor.take_link_estimate());
+            } else {
+                ws.predictor.reset_session();
+            }
+            if let Some(front_content::FrontContent::Terminal { session, .. }) = ws.front_content {
+                ws.predictor
+                    .restore_link_estimate(link_estimates.get(&session).copied().unwrap_or_default());
+            }
         } else {
             ws.predictor.reset();
         }
@@ -8721,6 +8794,7 @@ impl App {
             system_reduce_motion: false,
             _reduce_motion: None,
             pool,
+            link_estimates: HashMap::new(),
             view_store,
             native_runtime: native_app::NativeRuntime::new(),
             native_config_service,
@@ -12605,6 +12679,12 @@ impl ApplicationHandler<Wake> for App {
             // closed while the read was in flight) is tolerated — `input` is a no-op
             // for an absent window. Never constructed off Linux (see the variant).
             Wake::PasteReady { wid, text, source } => self.deliver_paste(wid, text, source),
+            // The same worker's find-field hand-off: insert at the caret instead of
+            // delivering to the PTY. A find closed while the read was in flight makes
+            // `search_edit_in` a no-op, exactly like a stale `wid`.
+            Wake::FindPasteReady { wid, text } => {
+                self.search_edit_in(wid, crate::app_search::SearchEdit::Insert(text));
+            }
             // The pastejacking sheet was answered. `deliver_paste_confirmed` (not
             // `deliver_paste`) so the guard does not ask a second time.
             Wake::PasteConfirmed {
@@ -14232,6 +14312,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // SEAMLESS WINDOW CARRY: reappear at the outgoing window's position.
         seamless_position: seamless_window.and_then(|w| Some((w.outer_x?, w.outer_y?))),
         pool,
+        link_estimates: HashMap::new(),
         view_store,
         native_runtime: native_app::NativeRuntime::new(),
         native_config_service,
@@ -14443,6 +14524,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         crate::memory_pressure::install(move |critical| {
             let _ = mp_proxy.send_event(Wake::MemoryPressure { critical });
         });
+        // HELD KEYS MUST REPEAT. Opting into IME (which aterm does for every window,
+        // so composition works) is also what tells macOS this app wants diacritic
+        // press-and-hold — so holding `a` opened the accent palette and the repeat
+        // stream simply stopped arriving. Register the opt-out before the first
+        // window exists, while AppKit is still reading the value. See
+        // `platform::disable_press_and_hold`.
+        crate::platform::disable_press_and_hold();
     }
     // Arm the dev/CI main-thread stall watchdog (L0 freeze-hazard guard) just before
     // handing control to winit. A no-op in release unless `$ATERM_WATCHDOG` is set;
@@ -22523,6 +22611,31 @@ mod spec_xref_gate {
             .collect()
     }
 
+    /// Tell a `trust-ir` that is simply too OLD apart from a real spec finding.
+    ///
+    /// This costs an afternoon to work out from first principles, because the
+    /// binary's `--version` string does NOT change across rebuilds — a stale tool
+    /// and a genuine rejection look identical from the outside. The tell is exit 2
+    /// (the tool's I/O/parse code, not its findings code) together with a parse
+    /// error on a `spec_module` keyword that this repo's lowering emits: the
+    /// installed binary predates that grammar, so it dies before analysing
+    /// anything. Returned as a suffix appended to the failure messages below.
+    fn stale_trust_ir_hint(exit_code: Option<i32>, report: &str) -> String {
+        if exit_code == Some(2) && report.contains("unexpected token in spec_module") {
+            "\n\n  LIKELY A STALE `trust-ir` — NOT A SPEC FAILURE.\n  \
+             Exit 2 is the tool's I/O/parse code, and the report rejects a token this\n  \
+             repo's lowering emits, so the installed binary predates that grammar.\n  \
+             Rebuild it:\n    \
+             cd $HOME/trust/first-party/trust-ir && cargo build --release -p trust-ir-cli\n  \
+             The BINARY is the `-cli` package: building `-p trust-ir` compiles only the\n  \
+             library and silently leaves the old binary in place. `--version` is\n  \
+             unchanged by a rebuild, so confirm via the binary's mtime/size instead."
+                .to_string()
+        } else {
+            String::new()
+        }
+    }
+
     /// Classify only the two honest outcomes aterm can consume:
     ///
     /// * a genuine exit-0 `certifying` report, or
@@ -23789,8 +23902,9 @@ mod spec_xref_gate {
                 panic!(
                     "trust-ir spec-link produced neither a certifying result nor an explicit \
                      design-only zero-violation analysis — structural/Ob/L1/L2/S0-S2 failures \
-                     remain hard errors. Report:\n{report}\n--- module ({} bytes) ---\n{module_txt}",
+                     remain hard errors. Report:\n{report}\n--- module ({} bytes) ---\n{module_txt}{}",
                     module_txt.len(),
+                    stale_trust_ir_hint(exit_code, &report),
                 )
             });
             if disposition == SpecLinkDisposition::Certifying {
@@ -23929,7 +24043,8 @@ mod spec_xref_gate {
             Some(1),
             "the explicit DesignOnly negative control must fail with exact exit code 1; \
              signals/crashes and other nonzero exits do not demonstrate the intended rejection. \
-             Report:\n{bad_report}"
+             Report:\n{bad_report}{}",
+            stale_trust_ir_hint(bad_exit_code, &bad_report),
         );
         assert!(
             classify_spec_link(bad_exit_code, &bad_report).is_none()
@@ -24071,6 +24186,79 @@ mod compose_tests {
         assert_eq!(row[2], seam, "the divider column is left as a seam cell");
         assert_eq!(row[3].ch, 'C');
         assert_eq!(row[4].ch, 'D');
+    }
+
+    /// DEC line size is a PER-PANE fact, and a composite row can hold several
+    /// panes. The compositor used to write it to the row-level
+    /// `RenderInput::line_sizes[dr]`, so the LAST pane blitted won the whole row
+    /// and a neighbour sitting on an ordinary line had its glyphs scaled by
+    /// someone else's DECDWL — a visible corruption of an innocent pane that no
+    /// row-level value can express. Each pane's line size must stay confined to
+    /// its own columns.
+    #[test]
+    fn blit_confines_each_pane_line_size_to_its_own_columns() {
+        use aterm_core::grid::LineSize;
+        let theme = Theme::default();
+        // 1x11 window: [left pane 0..5] [divider 5] [right pane 6..11].
+        let mut dst = RenderInput::empty();
+        fill_divider_grid(&mut dst, 1, 11, theme);
+
+        let (left, left_blank) = pane_snapshot("AB", 1, 5);
+        // ESC # 6 = DECDWL: this pane's line really is double-width.
+        let (right, right_blank) = pane_snapshot("\x1b#6CD", 1, 5);
+        assert_eq!(
+            left.line_sizes[0],
+            LineSize::SingleWidth,
+            "control: the left pane is an ordinary line"
+        );
+        assert_eq!(
+            right.line_sizes[0],
+            LineSize::DoubleWidth,
+            "control: the right pane really did take DECDWL"
+        );
+
+        // Blit the double-width pane LAST — the order that used to lose.
+        blit_pane_into(&mut dst, &left, 0, 0, left_blank);
+        blit_pane_into(&mut dst, &right, 0, 6, right_blank);
+
+        for c in 0..6 {
+            assert_eq!(
+                dst.line_size_run_at(0, c).0,
+                LineSize::SingleWidth,
+                "column {c} is left-pane/divider and must not inherit the right pane's DECDWL"
+            );
+        }
+        for c in 6..11 {
+            let (ls, start_col, end_col) = dst.line_size_run_at(0, c);
+            assert_eq!(ls, LineSize::DoubleWidth, "right-pane column {c}");
+            assert_eq!(
+                (start_col, end_col),
+                (6, 11),
+                "the run is the clip box: a double-width pane must not bleed left of its own columns"
+            );
+        }
+    }
+
+    /// The ordinary split — every pane on an ordinary line — must leave the
+    /// span list EMPTY so the renderers keep their uniform `col * cell_w` fast
+    /// path. Spans are a rare-case escape hatch, not a per-frame cost.
+    #[test]
+    fn blit_leaves_ordinary_splits_uniform() {
+        let theme = Theme::default();
+        let mut dst = RenderInput::empty();
+        fill_divider_grid(&mut dst, 2, 11, theme);
+        let (left, left_blank) = pane_snapshot("AB", 2, 5);
+        let (right, right_blank) = pane_snapshot("CD", 2, 5);
+        blit_pane_into(&mut dst, &left, 0, 0, left_blank);
+        blit_pane_into(&mut dst, &right, 0, 6, right_blank);
+        assert!(
+            dst.line_size_spans.iter().all(std::vec::Vec::is_empty),
+            "an all-single-width split must record no runs"
+        );
+        assert!(
+            aterm_render::row_is_uniform(&dst, 0),
+            "the renderers must still see row 0 as uniform"
+        );
     }
 
     /// A terminal snapshot deliberately keeps unwritten row tails sparse. The

@@ -31,5 +31,9 @@ aterm-types = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[dev-dependencies]
+# Scratch home directories for the `aterm agents` installer tests (primer.rs).
+aterm-tempfile = { workspace = true }
+
 [lints]
 workspace = true

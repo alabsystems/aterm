@@ -1507,3 +1507,51 @@ mod tests {
         assert_eq!(window_theme_to_winit(WindowTheme::Dark), Some(Theme::Dark));
     }
 }
+
+/// Opt this application OUT of macOS diacritic press-and-hold, so a HELD key
+/// REPEATS instead of opening the accent palette.
+///
+/// aterm opts every window into IME (`set_ime_allowed(true)` in `app_window.rs`) so
+/// CJK/dead-key composition works. In winit that makes `keyDown:` route every key
+/// through `interpretKeyEvents` on a view that implements `NSTextInputClient` and
+/// `firstRectForCharacterRange:` — which is precisely the configuration macOS reads
+/// as "this responder wants press-and-hold". So holding any diacritic-capable
+/// letter (a e i o u n c s y z l …) suppresses the autorepeat keyDown stream after
+/// the ~500 ms hold threshold and shows the accent palette instead. The 2nd..Nth
+/// repeat never reaches `App::on_key` at all: for roughly half the alphabet, held
+/// key repeat is not slow, it is ABSENT — and no amount of render or lock tuning
+/// can touch it, because the events are never delivered.
+///
+/// `registerDefaults:` rather than an `Info.plist` key: `NSUserDefaults` does not
+/// read the bundle Info.plist, so the plist route that circulates as folklore does
+/// nothing. Registration also covers the UN-BUNDLED `aterm` binary, which has no
+/// Info.plist to carry a key in the first place.
+///
+/// It registers a DEFAULT, not a value: a user who genuinely wants the accent
+/// palette can still override it with
+/// `defaults write com.aterm.aterm ApplePressAndHoldEnabled -bool true`, because an
+/// explicitly-written user default outranks a registered one. Must run before the
+/// first window is created, while AppKit is still reading the value.
+#[cfg(target_os = "macos")]
+pub(crate) fn disable_press_and_hold() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
+
+    // SAFETY: standard NSUserDefaults registration with an owned dictionary of
+    // owned objects; no raw pointers escape and nothing here is thread-affine
+    // (`registerDefaults:` is documented as safe from any thread, and this is called
+    // from the main thread at startup regardless).
+    unsafe {
+        let key = NSString::from_str("ApplePressAndHoldEnabled");
+        // NSNumber -> NSValue -> NSObject -> AnyObject: three upcasts, because
+        // `registerDefaults:` is typed on the erased element. Chained `into_super`
+        // rather than a `Retained::cast`, so the upcast stays checked by the
+        // class hierarchy instead of asserted.
+        let boxed = NSNumber::new_bool(false);
+        let value: Retained<AnyObject> =
+            Retained::into_super(Retained::into_super(Retained::into_super(boxed)));
+        let defaults = NSDictionary::from_vec(&[&*key], vec![value]);
+        NSUserDefaults::standardUserDefaults().registerDefaults(&defaults);
+    }
+}

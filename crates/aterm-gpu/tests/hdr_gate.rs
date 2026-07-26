@@ -252,3 +252,44 @@ fn gpu_hdr_off_never_boosts() {
         );
     }
 }
+
+/// SOURCE-SCAN CLOSURE (the scRGB re-tag): every live-surface reconfigure must
+/// go through `Renderer::configure_surface_retagging_scrgb`.
+///
+/// DX12 rebuilds the swapchain on EVERY `Surface::configure`, not just a resize,
+/// and each rebuild reverts to the DXGI gamma-2.2 default colour space. A bare
+/// `surf.surface.configure(..)` at any call site therefore silently drops the
+/// scRGB tag and washes out an EDR (f16) present, with >1.0 clipped by DWM.
+///
+/// This defect was live for the composite-alpha / copyable-usage reconcile:
+/// `swapchain_usage_for(surf.copyable, win.video.is_some())` flips when a
+/// recording arms, so starting a `video` capture on an EDR window reconfigured
+/// the swapchain and lost the tag mid-session. The domain is not a value space
+/// we can enumerate, so the closure is pinned structurally here — this is a
+/// Windows/DX12 path, so it cannot be exercised on a macOS or Linux CI runner.
+#[test]
+fn every_surface_reconfigure_retags_scrgb() {
+    const RENDERER: &str = include_str!("../src/renderer.rs");
+
+    let bare = RENDERER
+        .match_indices("surf.surface.configure(")
+        .filter(|(i, _)| {
+            // The one legitimate occurrence is the helper's own body; identify it
+            // by the retag that must immediately follow within the same function.
+            let tail = &RENDERER[*i..];
+            let window = &tail[..tail.len().min(400)];
+            !window.contains("tag_swapchain_scrgb")
+        })
+        .count();
+
+    assert_eq!(
+        bare, 0,
+        "found {bare} bare `surf.surface.configure(..)` call(s) in renderer.rs that do not \
+         re-tag scRGB; route them through `configure_surface_retagging_scrgb` instead"
+    );
+
+    assert!(
+        RENDERER.contains("fn configure_surface_retagging_scrgb"),
+        "the retag helper must exist for this closure to mean anything"
+    );
+}

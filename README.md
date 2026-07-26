@@ -107,6 +107,14 @@ the timing works. Its local control protocol lives outside the PTY byte stream,
 while actual text and key input still enter through the same terminal paths used
 by a person.
 
+Coding agents learn that aterm exists once per machine: `aterm agents install`
+places a three-line, self-gating primer in the global context files of Claude
+Code, Codex CLI, Gemini CLI, and OpenCode (`~/.claude/CLAUDE.md`,
+`~/.codex/AGENTS.md`, ...), so an agent launched inside any aterm session knows
+to detect it (`$TERM_PROGRAM`/`$ATERM_CHILD`) and to run `aterm help` for the
+full agent operating brief. `aterm agents` shows status, `remove` uninstalls,
+and `aterm help agents` explains the mechanism.
+
 ```mermaid
 flowchart LR
     H[Human] <-->|keyboard · mouse · pixels| A[aterm]
@@ -197,9 +205,19 @@ session with a person. Start with the CLI—every result has a protocol-level
 equivalent:
 
 ```sh
-aterm ctl screen
-aterm ctl turn 'cargo test'
-aterm ctl await screen-changed timeout=5000
+aterm ctl text                          # the visible screen, one row per line
+aterm ctl turn 'cargo test'             # ONE human turn: type it, verified submit
+aterm ctl wait                          # block until that command completes (OSC 133)
+```
+
+`aterm ctl screen` returns the same screen as full per-cell JSON (glyph, colours,
+attributes) when you need more than text. To block on something other than command
+completion, `await` takes one of four predicates — `idle <ms>`, `seq [<n>]`,
+`match <re>`, `block` — with an optional `timeout=<ms>`:
+
+```sh
+aterm ctl await idle 200 timeout=5000   # output has been quiet for 200ms
+aterm ctl await match 'test result:'    # a regex appears on screen
 ```
 
 This is the right boundary for an agent orchestrator, test harness, development

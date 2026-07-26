@@ -25,7 +25,14 @@
 //!      [`Predictor::predict_char`]) / [`Predictor::predict_backspace`] on a keypress,
 //!   2. [`Predictor::reconcile`] after child output is applied to the grid,
 //!   3. [`Predictor::overlay`] when composing a frame (the glyphs to paint), and
-//!   4. [`Predictor::reset`] when the coordinate space changes (resize / pane swap).
+//!   4. [`Predictor::reset`] when the coordinate space changes (resize / pane swap) —
+//!      and [`Predictor::note_scroll`] when the grid scrolls, which moves the cell
+//!      every pending guess (an ABSOLUTE row/col) is waiting on.
+//!
+//! A host with tabs owns one more seam: the learned echo estimate is a property of the
+//! SESSION, not of the window, so it is SWAPPED across a front change
+//! ([`Predictor::take_link_estimate`] / [`Predictor::restore_link_estimate`]) rather
+//! than thrown away. [`Predictor::reset_session`] remains the "no estimate known" path.
 //!
 //! ## Safety (why this never corrupts the screen)
 //! * **Adaptive display.** Predictions are always *tracked* (to measure echo RTT),
@@ -87,6 +94,31 @@ impl PredictMode {
             Self::Off
         }
     }
+}
+
+/// Everything a [`Predictor`] has LEARNED about how fast the far end echoes, and
+/// nothing about where any guess was on screen.
+///
+/// The estimate is a property of the SESSION — the PTY and the link behind it — not
+/// of the window that happens to be showing it. A tabbed host must therefore SWAP it:
+/// [`Predictor::take_link_estimate`] when a session goes to the background,
+/// [`Predictor::restore_link_estimate`] when it comes forward again. Clearing it
+/// instead ([`Predictor::reset_session`], the "no estimate known" path) makes every
+/// front change re-earn the display latch from scratch — `SLOW_SAMPLES_TO_DISPLAY`
+/// unpredicted characters at the head of every line typed after a tab switch, on
+/// exactly the tab-heavy ssh workflow the feature exists for.
+///
+/// OPAQUE by construction: the fields are private, so a host can store one and hand
+/// it back but cannot forge a "this link is slow" verdict no measurement earned.
+/// [`Default`] is "nothing measured yet" — what a brand-new session starts with, and
+/// exactly what `reset_session` leaves behind.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LinkEstimate {
+    srtt: Option<f32>,
+    slow_samples: u8,
+    fast_samples: u8,
+    adaptive_slow: bool,
+    expiry_backoff: u8,
 }
 
 /// One predicted glyph at an absolute grid cell, awaiting confirmation from output.
@@ -209,12 +241,24 @@ pub struct Predictor {
     /// pixels of in-flight ones: a stale guess still reconciles (and still feeds the
     /// RTT estimate) but can neither anchor a new guess nor arm the new line's gate.
     epoch: u64,
-    /// The most recent grid width seen by `predict_char*`. Only the wrap-consistency
-    /// check in [`reconcile`](Self::reconcile) reads it: a guess that continues at
-    /// column 0 of the next row is confirmed against a real cursor parked in the
-    /// DEFERRED-WRAP slot (last column of the previous row), which is where a terminal
-    /// leaves it after echoing the final column.
+    /// The most recent grid width seen by `predict_char*`. Only [`reconcile`](Self::reconcile)
+    /// reads it, for the two margin questions: a guess that continues at column 0 of
+    /// the next row is confirmed against a real cursor parked in the DEFERRED-WRAP slot
+    /// (last column of the previous row), which is where a terminal leaves it after
+    /// echoing the final column — and whether the cursor it is looking at is in that
+    /// slot at all (`deferred_wrap`).
     grid_cols: u16,
+    /// The terminal is PARKED in the deferred-wrap slot: at the last [`reconcile`](Self::reconcile)
+    /// the real cursor sat on the final column of a row whose cell was already FILLED.
+    /// That parking is indistinguishable by cursor position alone from a cursor sitting
+    /// on a free last column, and the difference decides where the next keystroke
+    /// echoes: a parked terminal wraps it to column 0 of the next row. Anchoring a
+    /// fresh guess on the raw cursor there placed it ON TOP of the glyph just echoed —
+    /// a wrong character painted over a correct one every time a command line reached
+    /// the right margin and the pending set had drained, flushed a burst later when
+    /// `reconcile` found the real cell diverged. Recorded from the freshest real
+    /// observation because `predict_char_in_grid` has no grid to consult.
+    deferred_wrap: bool,
     /// A character we could not model was declined while guesses were pending. Those
     /// guesses are anchored to its LEFT and remain valid, but everything typed after it
     /// would be predicted one or more columns too far left (the real echo will insert
@@ -315,6 +359,12 @@ impl Predictor {
         }
         let (row, col) = match anchor {
             Some(p) => (p.row, p.col.saturating_add(1)),
+            // The live cursor is a free cell ONLY if the terminal is not parked in the
+            // deferred-wrap slot (see `deferred_wrap`): there the cell under the cursor
+            // is already echoed content and the next glyph lands on the next row. Hand
+            // the shared wrap lane below an out-of-range column so the wrap — and the
+            // bottom-edge decline — is decided in exactly one place.
+            None if self.deferred_wrap && cursor.1.saturating_add(1) == cols => (cursor.0, cols),
             None => cursor,
         };
         let (row, col) = if col >= cols {
@@ -404,11 +454,14 @@ impl Predictor {
         real_cursor: Option<(u16, u16)>,
         alt_screen: bool,
         now: Instant,
-        observe: impl Fn(u16, u16) -> Option<char>,
+        mut observe: impl FnMut(u16, u16) -> Option<char>,
     ) {
         // The alternate screen owns the cursor and does not line-echo: never predict.
         if alt_screen {
             self.flush();
+            // An app-drawn cursor says nothing about a pending line wrap, and the
+            // observation would be stale by the time the primary screen returns.
+            self.deferred_wrap = false;
             return;
         }
 
@@ -487,6 +540,18 @@ impl Predictor {
                 _ => self.flush(),
             }
         }
+
+        // Latch the deferred-wrap parking for the NEXT keystroke (see `deferred_wrap`).
+        // Computed last, from this turn's real cursor, so a flush above cannot leave a
+        // stale reading behind: the observation describes the SCREEN, not our guesses.
+        // A blank (or space) final cell reads as "not parked" — the terminal has not
+        // filled that column yet, so the next glyph really does land in it.
+        self.deferred_wrap = match real_cursor {
+            Some((rr, rc)) if self.grid_cols > 0 && rc.saturating_add(1) == self.grid_cols => {
+                observe(rr, rc).is_some()
+            }
+            _ => false,
+        };
     }
 
     /// The predictions to OVERLAY this frame. Expires stale unconfirmed guesses first
@@ -653,18 +718,88 @@ impl Predictor {
     pub fn reset(&mut self) {
         self.flush();
         self.epoch_row = None;
+        // The coordinate space changed, so the last cursor/cell reading describes a
+        // screen that no longer exists — re-latch it from the next real reconcile.
+        self.deferred_wrap = false;
     }
 
-    /// Drop all predictor state when the host switches to a different terminal
-    /// session. Unlike [`reset`](Self::reset), this also forgets the learned echo
-    /// RTT: latency belongs to the PTY/link that produced it, not to the window
+    /// The grid SCROLLED between arming and echo (output pushed content up). Every
+    /// pending guess is stored at an ABSOLUTE row, so a scroll silently slides the cell
+    /// each one is waiting on.
+    ///
+    /// [`reconcile`](Self::reconcile)'s cursor-consistency check catches most of that —
+    /// the real cursor scrolls along with the text, so it stops matching — but it runs
+    /// AFTER the confirmation loop, which compares glyphs only: a scrolled-in cell
+    /// holding the same character confirms an echo that never happened, feeding a bogus
+    /// RTT sample and arming the epoch's display gate for a line that has not echoed.
+    /// The guesses are not wrong, their COORDINATES are, and nothing in this crate can
+    /// re-derive them from the host's grid — so the set is retired. Cheap no-op when
+    /// nothing is pending, which is the case for every scroll that happens while the
+    /// user is not typing ahead.
+    pub fn note_scroll(&mut self) {
+        self.reset();
+    }
+
+    /// Drop all predictor state when the host switches to a terminal session it has
+    /// NO estimate for. Unlike [`reset`](Self::reset), this also forgets the learned
+    /// echo RTT: latency belongs to the PTY/link that produced it, not to the window
     /// containing whichever pane happens to be focused next.
+    ///
+    /// This is the "nothing known about this link" path. A host that can KEEP what it
+    /// learned per session should swap instead — [`take_link_estimate`](Self::take_link_estimate)
+    /// / [`restore_link_estimate`](Self::restore_link_estimate) — because clearing on
+    /// every front change makes a tab-heavy ssh workflow re-earn the display latch
+    /// after each switch, leaving the first `SLOW_SAMPLES_TO_DISPLAY` characters of
+    /// every line unpredicted for a link that never changed.
     pub fn reset_session(&mut self) {
         self.reset();
         self.srtt = None;
         self.slow_samples = 0;
         self.fast_samples = 0;
         self.adaptive_slow = false;
+        // The cold-link probe is the same measurement as the RTT, one window wide: a
+        // widened window that outlives its link makes an unknown pane wait up to the
+        // ceiling before a wrong guess self-heals. Unknown link ⇒ probe from the floor.
+        self.expiry_backoff = 0;
+    }
+
+    /// Take the learned link estimate OUT, leaving the predictor exactly as
+    /// [`reset_session`](Self::reset_session) would (no guesses, no epoch, no
+    /// estimate). The returned [`LinkEstimate`] is the OUTGOING session's property:
+    /// park it in a per-session map and hand it back with
+    /// [`restore_link_estimate`](Self::restore_link_estimate) when that session is in
+    /// front again, instead of throwing away a measurement the link still satisfies.
+    pub fn take_link_estimate(&mut self) -> LinkEstimate {
+        let est = LinkEstimate {
+            srtt: self.srtt,
+            slow_samples: self.slow_samples,
+            fast_samples: self.fast_samples,
+            adaptive_slow: self.adaptive_slow,
+            expiry_backoff: self.expiry_backoff,
+        };
+        // Route the clearing through `reset_session` itself so "what a take leaves
+        // behind" and "what an unknown session starts with" can never drift apart.
+        self.reset_session();
+        est
+    }
+
+    /// Install the estimate of the session now in front. `LinkEstimate::default()` is
+    /// the never-measured session and is therefore equivalent to
+    /// [`reset_session`](Self::reset_session).
+    ///
+    /// The incoming session's LINK is known; its SCREEN is not — pending guesses and
+    /// the confirmation epoch belong to the pane we just left, so they go. That is
+    /// what keeps the no-unechoed-flash guarantee intact across a swap: a restored
+    /// `adaptive_slow` only decides that speculation is WORTH showing on this link,
+    /// never that the line now under the cursor has echoed. The epoch is still earned
+    /// per line, on this line.
+    pub fn restore_link_estimate(&mut self, est: LinkEstimate) {
+        self.reset();
+        self.srtt = est.srtt;
+        self.slow_samples = est.slow_samples;
+        self.fast_samples = est.fast_samples;
+        self.adaptive_slow = est.adaptive_slow;
+        self.expiry_backoff = est.expiry_backoff;
     }
 
     /// Clear pending predictions and end the confirmation epoch (display re-arms only
@@ -1504,6 +1639,287 @@ mod tests {
             p.overlay(local).is_empty(),
             "a new session learns its own fast RTT instead of inheriting the old slow link"
         );
+    }
+
+    #[test]
+    fn the_deferred_wrap_slot_is_not_a_free_cell() {
+        // The line reached the right margin and the echo caught up, so the pending set
+        // is empty and the next keystroke anchors on the LIVE cursor — which the
+        // terminal has parked in the deferred-wrap slot, ON TOP of the glyph it just
+        // echoed. Guessing there painted a wrong character over a correct one on every
+        // command line long enough to wrap (the case the wrap lane exists for), and
+        // then flushed the whole set a burst later when the real cell diverged.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char_in_grid('a', (0, 79), (80, 24), now));
+        p.reconcile(Some((0, 79)), false, now, cell(&[((0, 79), 'a')]));
+        assert!(p.idle(), "control: the echo retired the guess");
+
+        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now));
+        let shown = p.overlay(now);
+        assert_eq!(
+            (shown[0].row, shown[0].col, shown[0].ch),
+            (1, 0, 'b'),
+            "a parked cursor wraps the next glyph to the following row"
+        );
+    }
+
+    #[test]
+    fn a_free_last_column_is_still_predicted_in_place() {
+        // The complement, and the reason the parking is read from the CELL rather than
+        // from the cursor column: same position, empty cell, nothing parked. The
+        // program will put the next glyph exactly there, so wrapping it would leave a
+        // hole at the margin and shift the whole tail of the line one cell.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char_in_grid('a', (0, 78), (80, 24), now));
+        p.reconcile(Some((0, 79)), false, now, cell(&[((0, 78), 'a')]));
+        assert!(p.idle());
+        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now));
+        let shown = p.overlay(now);
+        assert_eq!((shown[0].row, shown[0].col), (0, 79));
+    }
+
+    #[test]
+    fn a_deferred_wrap_on_the_last_row_declines_without_painting() {
+        // There is no row to wrap INTO, and the parked cell is echoed content that is
+        // not ours to overwrite — so the only honest answer is to decline. (The
+        // anchor-extended twin of this edge is `bottom_row_declines_without_flushing`.)
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char_in_grid('a', (23, 79), (80, 24), now));
+        p.reconcile(Some((23, 79)), false, now, cell(&[((23, 79), 'a')]));
+        assert!(
+            !p.predict_char_in_grid('b', (23, 79), (80, 24), now),
+            "no row 24 to wrap into, and the slot holds the echoed 'a'"
+        );
+        assert!(p.idle(), "declining paints nothing and erases nothing");
+    }
+
+    #[test]
+    fn a_wrap_the_terminal_did_not_defer_keeps_the_wrapped_guess() {
+        // Not every wrap is parked: a program that emits the next glyph in the same
+        // burst (or a host sampling the cursor after it) reports (row+1, 0) directly.
+        // The wrapped guess sits exactly there, so the PLAIN cursor-consistency arm
+        // must accept it — the deferred-wrap tolerance is an addition, not a
+        // replacement, and a wrapped guess must not depend on the parking to survive.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char_in_grid('a', (0, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now)); // wraps to (1,0)
+        p.reconcile(Some((1, 0)), false, now, cell(&[((0, 79), 'a')]));
+        let shown = p.overlay(now);
+        assert_eq!(shown.len(), 1, "'a' retires; the wrapped 'b' is no divergence");
+        assert_eq!((shown[0].row, shown[0].col, shown[0].ch), (1, 0, 'b'));
+    }
+
+    #[test]
+    fn a_scrolled_cursor_does_not_pass_for_the_deferred_wrap_slot() {
+        // Guesses carry ABSOLUTE rows, so a scroll between arming and echo slides the
+        // cell every one of them is waiting on. The cursor scrolls WITH the text, so
+        // the deferred-wrap tolerance must keep insisting on the exact previous row:
+        // a one-row-off match would hold a wrapped guess against a cell that now
+        // belongs to a different line.
+        let mut p = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(p.predict_char_in_grid('a', (5, 79), (80, 24), now));
+        assert!(p.predict_char_in_grid('b', (5, 79), (80, 24), now)); // wraps to (6,0)
+        p.reconcile(Some((5, 79)), false, now, cell(&[((5, 79), 'a')]));
+        assert_eq!(p.overlay(now).len(), 1, "control: the park keeps 'b' alive");
+
+        // One line of output scrolls the grid: the typed line — and the cursor parked
+        // at its margin — are a row higher, and row 6 is still unwritten.
+        p.reconcile(Some((4, 79)), false, now, cell(&[((4, 79), 'a')]));
+        assert!(p.idle(), "a stale absolute row is retired, not tolerated");
+    }
+
+    #[test]
+    fn a_scroll_retires_guesses_instead_of_confirming_them_against_moved_cells() {
+        // The confirmation loop compares GLYPHS at absolute rows and runs BEFORE the
+        // cursor-consistency check, so a scroll that slides another line's identical
+        // character under a pending guess confirms an echo that never happened: a bogus
+        // RTT sample, and (Adaptive) a display gate armed by a line that never echoed.
+        // Only the host knows the grid scrolled; the guesses are not wrong, their
+        // COORDINATES are, and nothing in this crate can re-derive them.
+        let now = t0();
+        let mut unaware = Predictor::new(PredictMode::Adaptive);
+        assert!(unaware.predict_char_in_grid('a', (5, 0), (80, 24), now));
+        unaware.reconcile(Some((5, 1)), false, now, cell(&[((5, 0), 'a')]));
+        assert!(
+            unaware.confirmed_epoch,
+            "control: a glyph-equal cell really does confirm"
+        );
+
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        assert!(p.predict_char_in_grid('a', (5, 0), (80, 24), now));
+        p.note_scroll();
+        assert!(p.idle(), "a scrolled guess is retired, not re-aimed");
+        p.reconcile(Some((5, 1)), false, now, cell(&[((5, 0), 'a')]));
+        assert!(
+            !p.confirmed_epoch,
+            "…so a moved cell can never arm the display gate"
+        );
+    }
+
+    #[test]
+    fn a_backgrounded_session_keeps_its_link_estimate() {
+        // The link RTT is a property of the SESSION, not of the window. The host calls
+        // its front-change path on every tab switch, so CLEARING the estimate there
+        // made a tab-heavy ssh workflow re-earn the display latch after each switch —
+        // the first SLOW_SAMPLES_TO_DISPLAY characters of every line unpredicted, for a
+        // link that never changed.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let slow = Duration::from_millis(60);
+        let fast = Duration::from_millis(1);
+        let mut at = echo_turn(&mut p, 'a', 0, now, slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.predict_char('c', (0, 2), 80, at));
+        assert_eq!(p.overlay(at).len(), 1, "control: the slow link paints");
+
+        // The ssh session goes to the background; its estimate leaves with it.
+        let ssh = p.take_link_estimate();
+        assert!(
+            p.idle(),
+            "the outgoing pane's guesses do not follow the window"
+        );
+        // The local pane in front now speculates on its OWN evidence only.
+        at = echo_turn(&mut p, 'x', 0, at, fast);
+        assert!(p.predict_char('y', (0, 1), 80, at));
+        assert!(p.overlay(at).is_empty(), "a fast local link stays dark");
+        let local = p.take_link_estimate();
+
+        // Back to the ssh session: ONE confirmed echo on the new line is enough,
+        // because the LINK never stopped being slow — only the line has to re-prove
+        // itself (the no-unechoed-flash guarantee is per line, and still earned here).
+        p.restore_link_estimate(ssh);
+        at = echo_turn(&mut p, 'a', 0, at, slow);
+        assert!(p.predict_char('b', (0, 1), 80, at));
+        assert_eq!(
+            p.overlay(at).len(),
+            1,
+            "a restored slow-link estimate paints the second keystroke"
+        );
+
+        // …and the local session's own estimate comes back just as measured.
+        p.restore_link_estimate(local);
+        at = echo_turn(&mut p, 'x', 0, at, fast);
+        assert!(p.predict_char('y', (0, 1), 80, at));
+        assert!(
+            p.overlay(at).is_empty(),
+            "restoring a fast session's estimate must not paint either"
+        );
+    }
+
+    /// REGRESSION (adversarial review): `restore_link_estimate` must RESET before it
+    /// installs, and that line must be pinned by a test that fails without it.
+    ///
+    /// The sibling test drives the swap through `take_link_estimate` first — which
+    /// already resets — so deleting `self.reset()` from `restore_link_estimate` left
+    /// every test passing while the guarantee it protects was gone. This drives
+    /// `restore` DIRECTLY on a pane with a displayed guess, which is what a host does
+    /// when it installs a parked estimate into a predictor it did not just take from.
+    /// Without the reset, pane A's ghost survives onto pane B's screen.
+    #[test]
+    fn restoring_an_estimate_clears_the_outgoing_panes_pixels() {
+        let mut a = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert!(a.predict_char('x', (3, 4), 80, now));
+        assert_eq!(a.overlay(now).len(), 1, "pane A has a ghost on glass");
+        assert!(a.is_displaying(now));
+
+        // Install some OTHER session's link estimate directly, with A's guess live.
+        a.restore_link_estimate(LinkEstimate::default());
+
+        assert!(
+            a.overlay(now).is_empty(),
+            "the outgoing pane's speculative pixels must not survive the swap"
+        );
+        assert!(!a.is_displaying(now));
+        assert!(
+            !a.confirmed_epoch,
+            "nor may its confirmation license the incoming line"
+        );
+    }
+
+    #[test]
+    fn a_restored_guess_never_inherits_the_other_pane_s_confirmation() {
+        // The swap carries the LINK, never the SCREEN. A session whose estimate says
+        // "slow" still has to watch THIS line echo before anything is painted, or the
+        // password prompt waiting in the tab we just switched to would show its first
+        // secret keystroke on arrival.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let slow = Duration::from_millis(60);
+        let mut at = echo_turn(&mut p, 'a', 0, now, slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        let ssh = p.take_link_estimate();
+        p.restore_link_estimate(ssh);
+        assert!(p.predict_char('s', (9, 0), 80, at));
+        assert!(
+            p.overlay(at).is_empty(),
+            "an unechoed keystroke on the restored pane's line must not display"
+        );
+    }
+
+    #[test]
+    fn a_default_estimate_is_the_no_estimate_path() {
+        // The contrast that makes the swap worth having, and the guard against the two
+        // being confused: what the host holds for a session it has never measured is
+        // `LinkEstimate::default()`, and restoring THAT must still re-earn the latch.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        let slow = Duration::from_millis(60);
+        let mut at = echo_turn(&mut p, 'a', 0, now, slow);
+        at = echo_turn(&mut p, 'b', 1, at, slow);
+        assert!(p.adaptive_slow, "control: the latch is open");
+
+        p.restore_link_estimate(LinkEstimate::default());
+        at = echo_turn(&mut p, 'a', 0, at, slow);
+        assert!(p.predict_char('b', (0, 1), 80, at));
+        assert!(
+            p.overlay(at).is_empty(),
+            "an unmeasured session re-earns the latch from its own samples"
+        );
+        at += slow;
+        p.reconcile(Some((0, 2)), false, at, cell(&[((0, 1), 'b')]));
+        assert!(p.predict_char('c', (0, 2), 80, at));
+        assert_eq!(p.overlay(at).len(), 1, "…and opens it on the second sample");
+    }
+
+    #[test]
+    fn the_cold_link_probe_travels_with_the_session_estimate() {
+        // The expiry backoff measures the same thing the RTT does — how long THIS link
+        // makes a guess wait — so it belongs to the estimate. Left behind, a widened
+        // window outlives its link and makes the next pane sit on a wrong guess for up
+        // to the ceiling; re-walked from the floor, a slow link re-probes 250 → 2000 ms
+        // after every tab switch before it can confirm anything at all.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        assert!(p.predict_char('a', (0, 0), 80, now));
+        let _ = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 1));
+        assert_eq!(p.expiry_backoff, 1, "control: the timeout widened the probe");
+
+        let est = p.take_link_estimate();
+        assert_eq!(p.expiry_backoff, 0, "an unknown link probes from the floor");
+        p.restore_link_estimate(est);
+        assert_eq!(p.expiry_backoff, 1, "…the probing session gets its window back");
+    }
+
+    #[test]
+    fn session_reset_restarts_the_cold_link_probe() {
+        // `reset_session` is the "nothing known about this link" path, so it must leave
+        // NOTHING measured behind. A surviving backoff is a stale window: the new pane
+        // would wait up to 2 s before a wrong guess self-heals on a link that never
+        // timed out once.
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        let now = t0();
+        assert!(p.predict_char('a', (0, 0), 80, now));
+        let _ = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 1));
+        assert_eq!(p.expiry_backoff, 1, "control: the timeout widened the probe");
+        p.reset_session();
+        assert_eq!(p.expiry_backoff, 0);
+        assert_eq!(p.glitch_window(), Duration::from_millis(GLITCH_FLOOR_MS));
     }
 
     #[test]

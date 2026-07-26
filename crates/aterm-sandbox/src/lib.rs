@@ -296,6 +296,22 @@ mod tests {
     #[cfg(unix)]
     use imp::{RlimitResource, set_limit};
 
+    /// Why: `RLIMIT_*` is PROCESS-wide, but cargo runs these tests concurrently in
+    /// ONE process — so a test that mutates NOFILE is observed by another's
+    /// read-back. `apply_preserves_the_hard_ceiling…` finishes by RAISING soft
+    /// NOFILE to 1024, which surfaced as `apply_actually_sets_the_limit` reading
+    /// 1024 where it had just set 256. It only flakes under load (a loaded machine
+    /// interleaves them differently), so it survived many green runs.
+    #[cfg(unix)]
+    static NOFILE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialize a NOFILE-mutating test. Poison is ignored deliberately: one test
+    /// panicking must not cascade into unrelated failures in the others.
+    #[cfg(unix)]
+    fn nofile_guard() -> std::sync::MutexGuard<'static, ()> {
+        NOFILE_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // `RlimitResource` (not a bare `c_int`): on Linux the libc RLIMIT_* constants
     // and `getrlimit`'s first arg are `__rlimit_resource_t` (u32), so a `c_int`
     // parameter mismatches and the test build does not compile there.
@@ -385,6 +401,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unsupported_limit_does_not_block_the_working_ones() {
+        let _serialized = nofile_guard();
         // Regression: `RLIMIT_AS` EINVALs on macOS; the old `?`-early-return
         // there skipped the `RLIMIT_NOFILE` that DOES work, so the child got
         // ZERO confinement. Applying an (often-unsupported) huge AS alongside a
@@ -435,6 +452,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn apply_actually_sets_the_limit() {
+        let _serialized = nofile_guard();
         // Lower RLIMIT_NOFILE to a value still far above what a test needs, then
         // read it back to prove `apply` performed the syscall. Lowering NOFILE is
         // safe (we only need a handful of fds) and is reversible up to the hard
@@ -454,6 +472,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn apply_preserves_the_hard_ceiling_so_a_shell_can_raise_its_soft_limit() {
+        let _serialized = nofile_guard();
         // REGRESSION GUARD — `/Users//.../.zshrc:ulimit:N: value exceeds hard limit`.
         // The User-mode sandbox runs the user's $SHELL transparently, so it must
         // install its limit as a SOFT default and LEAVE THE HARD CEILING ALONE.

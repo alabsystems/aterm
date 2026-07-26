@@ -3023,9 +3023,23 @@ mod tests {
 
         let started = Instant::now();
         host.flush_exit();
+        // DETACHMENT is proven structurally, not by the clock: this worker blocks
+        // on `release_rx` until the send at the very end of this test, so a
+        // `flush_exit` that JOINED it could never return and execution could not
+        // reach this line at all. The assertion below therefore only guards
+        // PROMPTNESS — that quit honours its budget instead of lingering.
+        //
+        // So derive it from that budget with wide margin rather than pinning it at
+        // budget + 100ms. `flush_exit` polls in EXIT_JOIN_POLL (1ms) sleeps, and a
+        // 1ms sleep on a machine running 2,400 sibling tests can overshoot by far
+        // more than the old 100ms of slack — that bound measured the scheduler.
+        // A multiple still catches a real regression (quit waiting seconds for a
+        // dead network mount) without failing on scheduling noise.
         assert!(
-            started.elapsed() < EXIT_JOIN_BUDGET + Duration::from_millis(100),
-            "quit must detach a worker whose regular-file operation never returns"
+            started.elapsed() < EXIT_JOIN_BUDGET * 10,
+            "quit must detach a worker whose regular-file operation never returns \
+             promptly: took {:?}, budget is {EXIT_JOIN_BUDGET:?}",
+            started.elapsed(),
         );
 
         // Tier-1 projection of that genuine stalled worker: delivery and exit

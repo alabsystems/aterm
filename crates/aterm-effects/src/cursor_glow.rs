@@ -859,8 +859,8 @@ const NYAN_WAKE_SEG_CAP: usize = 96;
 const NYAN_WAKE_SEG: f32 = 0.30;
 /// Steady-plume weight versus per-keystroke PULSE weight. The plume is the
 /// continuous body; the pulses are the cadence riding on it.
-const NYAN_WAKE_BASE: f32 = 0.86;
-const NYAN_WAKE_PULSE: f32 = 0.48;
+const NYAN_WAKE_BASE: f32 = 0.62;
+const NYAN_WAKE_PULSE: f32 = 0.38;
 /// Pulse decay (seconds) and gaussian half-width (cells). ~190 ms and ~0.45 of a
 /// cell: distinct puffs at a hunt-and-peck rhythm, a merged plume at speed.
 const NYAN_WAKE_PULSE_TAU: f32 = 0.19;
@@ -871,7 +871,7 @@ const NYAN_WAKE_PULSE_W: f32 = 0.45;
 /// whole line of glyphs sits on, whereas this light never touches a glyph at
 /// all: it lands in the leading, where the only thing it can wash out is empty
 /// background.
-const NYAN_WAKE_COV: f32 = 240.0;
+const NYAN_WAKE_COV: f32 = 150.0;
 /// Plume THICKNESS in cells at the nozzle and at the far tail. Both are inside
 /// the inter-line leading the plume is centred on; the taper is what makes it
 /// read as a comet rather than a rule.
@@ -880,10 +880,20 @@ const NYAN_WAKE_H_TAIL: f32 = 0.070;
 /// The soft BLOOM under the plume: a wide flat halo per few segments, at this
 /// share of the segment's coverage. Gives the hard-edged core depth without
 /// blurring it — bright things stay small, big things stay dim.
-const NYAN_WAKE_BLOOM_GAIN: f32 = 0.52;
+const NYAN_WAKE_BLOOM_GAIN: f32 = 0.30;
 /// One bloom halo per this many core segments (the bloom is broad, so it needs
 /// far fewer samples than the core to read as continuous).
 const NYAN_WAKE_BLOOM_STRIDE: usize = 3;
+/// COMPOSITE CEILING at the nozzle: the crisp core and its bloom share the same
+/// pixels and their light ADDS, so this bounds the pair.
+///
+/// Without it the two summed past 238 at the shipped defaults and the nozzle
+/// clipped to pure white — which does not merely read "too bright", it DESTROYS
+/// the design: the whole white-gold → yellow → orange → red → violet cooling
+/// ramp is invisible wherever the pixel saturates, so the hot half of the plume
+/// collapses into one flat white smear. Bounded here, the ramp is always the
+/// thing you see. Pinned by `nyan_wake_never_saturates_its_own_ramp`.
+const NYAN_WAKE_COMPOSITE_CAP: f32 = 190.0;
 
 /// The wake's HEAT ramp at `s` (0 at the nozzle → 1 at the tail): white-gold →
 /// yellow → orange → red → violet. The ribbon's own spectrum, ordered the way a
@@ -1707,6 +1717,25 @@ pub struct CursorGlow {
     /// window's worth of later output-driven clicks instead of leaking
     /// silence forever.
     keyed_click_at: Option<Instant>,
+    /// When the PREVIOUS key-time click was cued — the inter-key cadence clock
+    /// the timbre prediction reads ([`Self::cue_keystroke`]). Deliberately NOT
+    /// [`Self::keyed_click_at`]: that one zeroes the instant the ledger empties,
+    /// which at ordinary typing speed happens after every single echo, so it
+    /// would report "no previous key" mid-burst and predict a cold click.
+    /// Never cleared on the dark/reset paths either — a stale value only
+    /// widens the measured gap, and a wide gap earns exactly zero cadence
+    /// credit, which is the right answer for the first key of a new burst.
+    key_cue_at: Option<Instant>,
+    /// The live style/pack's per-keystroke heat GAIN and cooling τ, snapshotted
+    /// by the last DRAWING [`Self::tick`]. [`Self::cue_keystroke`] runs from the
+    /// host's key handler, which holds no [`GlowConfig`] — without these it
+    /// could not reconstruct the heat the echo is about to reach, and the
+    /// key-time click would carry the PRE-keystroke timbre (one keystroke of
+    /// lag in the sound, the exact "feels behind" the seam exists to remove).
+    /// Read only behind [`Self::sound_live`], and no tick sets that without
+    /// writing these, so the zeroed `Default` is unreachable in the cue path.
+    heat_gain_live: f32,
+    heat_tau_live: f32,
     /// Whether the LAST [`Self::tick`] ran the LIVE path (master on, real
     /// geometry, nonzero amplitude). [`Self::cue_keystroke`] records nothing
     /// unless this is set, which is what keeps the "sound is silenced by
@@ -2442,14 +2471,61 @@ impl CursorGlow {
     /// Record one sound cue (drops when the backlog is full). Non-cursor
     /// gestures carry no travel direction (`dir = 0`).
     fn cue_sound(&mut self, kind: crate::trail_sound::SoundKind, col: u16) {
+        self.cue_sound_at(kind, col, self.blaze());
+    }
+
+    /// [`Self::cue_sound`] with the blaze supplied rather than sampled — the
+    /// seam the KEY-TIME click needs. Every echo-born cue passes `blaze()` and
+    /// is byte-identical; only [`Self::cue_keystroke`] passes something else
+    /// (the heat its own keystroke is about to produce, which `self.heat` does
+    /// not yet carry because the echo that charges it has not arrived).
+    fn cue_sound_at(&mut self, kind: crate::trail_sound::SoundKind, col: u16, heat: f32) {
         if self.sound_cues.len() < Self::MAX_SOUND_CUES {
             self.sound_cues.push(SoundCue {
                 kind,
                 col,
-                heat: self.blaze(),
+                heat,
                 hue: self.hue,
                 dir: 0,
             });
+        }
+    }
+
+    /// The cadence CREDIT one keystroke at inter-key gap `gap` earns: full at
+    /// ≤ [`Self::HEAT_GAP_FULL`], none at ≥ [`Self::HEAT_GAP_ZERO`]. Hoisted
+    /// out of the echo's heat ramp so the key-time click's timbre prediction
+    /// reads the SAME curve — two copies of this would drift and the click
+    /// would slowly stop matching the light it is the twin of.
+    fn heat_cadence(gap: f32) -> f32 {
+        1.0 - ((gap - Self::HEAT_GAP_FULL) / (Self::HEAT_GAP_ZERO - Self::HEAT_GAP_FULL))
+            .clamp(0.0, 1.0)
+    }
+
+    /// The per-keystroke heat GAIN this style/pack charges. Fire earns its
+    /// blaze over ~30-40 keys; a Trail Pack may override (custom only);
+    /// `None` and every built-in keep the shared [`Self::HEAT_GAIN`]
+    /// byte-for-byte.
+    fn heat_gain(cfg: &GlowConfig, fire: bool) -> f32 {
+        if fire {
+            Self::FIRE_HEAT_GAIN
+        } else if let Some(g) = cfg.pack.as_ref().and_then(|p| p.heat.gain) {
+            g
+        } else {
+            Self::HEAT_GAIN
+        }
+    }
+
+    /// The heat COOLING τ this style/pack runs. Fire cools on its own slower τ
+    /// (momentum survives a short thought); a Trail Pack may override (custom
+    /// only); `None` and every built-in keep [`Self::HEAT_DECAY_TAU`]
+    /// byte-for-byte.
+    fn heat_tau(cfg: &GlowConfig) -> f32 {
+        if matches!(cfg.style, GlowStyle::Fire) {
+            Self::FIRE_HEAT_TAU
+        } else if let Some(tau) = cfg.pack.as_ref().and_then(|p| p.heat.tau) {
+            tau
+        } else {
+            Self::HEAT_DECAY_TAU
         }
     }
 
@@ -2496,6 +2572,33 @@ impl CursorGlow {
     /// The cue's column is the last KNOWN cursor cell — the pre-echo one, so
     /// its stereo pan sits one cell left of where the echo cue would have put
     /// it. Sub-cell panning is inaudible; being early is not.
+    ///
+    /// TIMBRE — the cue carries the heat this keystroke is ABOUT to produce,
+    /// not the heat that preceded it. The echo-born cue this seam replaced was
+    /// recorded AFTER `spawn`'s heat ramp, so it rode the freshly-charged
+    /// blaze; sampling `blaze()` here instead would put the sound one whole
+    /// keystroke behind the light — the same "one round trip late" quality the
+    /// seam exists to delete, moved from the click's TIMING into its TONE. It
+    /// is audible, not academic: heat scales the synth's level as
+    /// `0.55 + 0.45·heat` and its ember layer as `0.1 + 0.28·heat`, so one
+    /// missing [`Self::HEAT_GAIN`] step measures 0.81-1.49 dB on the RENDERED
+    /// click (+3.2 dB on the ember layer taken alone) — at the loudness JND,
+    /// in the same direction, on every click of the cold→hot ramp of every
+    /// burst. Pinned by `one_keystroke_of_heat_lag_is_audible` in
+    /// `trail_sound`, which is where the numbers come from.
+    ///
+    /// So reconstruct what `spawn` will compute: cool the standing heat/flare
+    /// by the gap since the last tick's lazy decay (`heat_at`), then charge the
+    /// SAME cadence credit the echo will, off the KEY clock rather than the
+    /// echo clock — under a flood the key intervals are the true typing rhythm
+    /// and the echo intervals are frame quantization. `self.heat` itself is
+    /// deliberately NOT written: the light must keep charging at the echo,
+    /// where the classification (forward / deletion / navigation) is actually
+    /// known, so this prediction cannot alter a single pixel.
+    ///
+    /// `hue` needs no such treatment — it is a free-running sweep phase with no
+    /// keystroke term, and the key-time sample is the phase the ear hears the
+    /// click AT, which is the more correct one of the two.
     pub fn cue_keystroke(&mut self, now: Instant) -> bool {
         // Dark ⇒ silent, by the same law the spawn edge gets for free.
         if !self.sound_live {
@@ -2511,13 +2614,44 @@ impl CursorGlow {
             .last
             .or_else(|| self.last_visible.map(|(c, _)| c))
             .map_or(0, |(_, c)| c);
-        self.cue_sound(crate::trail_sound::SoundKind::Typed, col);
+        let heat = self.keyed_blaze(now);
+        self.cue_sound_at(crate::trail_sound::SoundKind::Typed, col, heat);
+        self.key_cue_at = Some(now);
         self.keyed_clicks = self
             .keyed_clicks
             .saturating_add(1)
             .min(Self::MAX_KEYED_CLICKS);
         self.keyed_click_at = Some(now);
         true
+    }
+
+    /// The blaze a key-time click carries: the standing heat/flare cooled to
+    /// `now` exactly as the next tick's lazy decay will cool them, plus the
+    /// cadence credit this keystroke's own echo is about to add. Pure read —
+    /// see the TIMBRE contract on [`Self::cue_keystroke`].
+    ///
+    /// The τ/gain come from the last drawing tick's snapshot, so a Fire session
+    /// predicts on `FIRE_HEAT_GAIN`/`FIRE_HEAT_TAU` and a Trail Pack on its own
+    /// overrides. `heat_tau_live == 0` is unreachable behind `sound_live`, but
+    /// a zero τ would divide to `-inf`; fall back to the standing heat rather
+    /// than emit a NaN into the synth.
+    fn keyed_blaze(&self, now: Instant) -> f32 {
+        let dt = self
+            .heat_at
+            .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32());
+        let (heat, flare) = if dt > 0.0 && self.heat_tau_live > 0.0 {
+            (
+                self.heat * (-dt / self.heat_tau_live).exp(),
+                self.flare * (-dt / Self::FLARE_DECAY_TAU).exp(),
+            )
+        } else {
+            (self.heat, self.flare)
+        };
+        let gap = self
+            .key_cue_at
+            .map_or(f32::MAX, |t| now.saturating_duration_since(t).as_secs_f32());
+        let charged = (heat + Self::heat_cadence(gap) * self.heat_gain_live).min(1.0);
+        charged.max(flare).clamp(0.0, 1.0)
     }
 
     /// Spend one key-time click credit if one is fresh — `true` means this
@@ -3340,14 +3474,10 @@ impl CursorGlow {
                 // Fire cools on its own slower τ (momentum survives a short
                 // thought); every other style keeps the shipped 0.9 s. A Trail
                 // Pack may override the decay τ (custom only): `None` and every
-                // built-in (no pack) keep HEAT_DECAY_TAU byte-for-byte.
-                let heat_tau = if matches!(cfg.style, GlowStyle::Fire) {
-                    Self::FIRE_HEAT_TAU
-                } else if let Some(tau) = cfg.pack.as_ref().and_then(|p| p.heat.tau) {
-                    tau
-                } else {
-                    Self::HEAT_DECAY_TAU
-                };
+                // built-in (no pack) keep HEAT_DECAY_TAU byte-for-byte. Shared
+                // with the key-time click's timbre prediction via `heat_tau`,
+                // so the two cannot drift apart.
+                let heat_tau = Self::heat_tau(cfg);
                 self.heat *= (-dt / heat_tau).exp();
                 if self.heat < 0.005 {
                     self.heat = 0.0;
@@ -3536,6 +3666,12 @@ impl CursorGlow {
         // seam shut, so keys pressed while the aurora is off/unfocused stay
         // silent instead of banking cues for the frame that turns it back on.
         self.sound_live = true;
+        // …and with it the thermal constants the key-time click needs to
+        // predict its own timbre. Written HERE, in lockstep with `sound_live`,
+        // so the invariant "`cue_keystroke` never reads a `Default` zero" is
+        // one line to check rather than a search of every early return.
+        self.heat_gain_live = Self::heat_gain(cfg, matches!(cfg.style, GlowStyle::Fire));
+        self.heat_tau_live = Self::heat_tau(cfg);
 
         // Spawn on a real move between two visible positions — where "visible"
         // BRIDGES ConPTY's per-echo hide window (see the `last_visible` field doc:
@@ -4532,19 +4668,12 @@ impl CursorGlow {
             // "sustained forward momentum heats it"); the other styles keep
             // their shipped direction-blind heat byte-identically.
             if (forward || !fire) && !deletion && !navigation {
-                let cadence = 1.0
-                    - ((gap - Self::HEAT_GAP_FULL) / (Self::HEAT_GAP_ZERO - Self::HEAT_GAP_FULL))
-                        .clamp(0.0, 1.0);
-                let gain = if fire {
-                    Self::FIRE_HEAT_GAIN
-                } else if let Some(g) = cfg.pack.as_ref().and_then(|p| p.heat.gain) {
-                    // Trail Pack heat gain override (custom only): a pack tunes how
-                    // fast its typing heat charges. `None` (and every built-in,
-                    // which carries no pack) keeps the shared HEAT_GAIN byte-for-byte.
-                    g
-                } else {
-                    Self::HEAT_GAIN
-                };
+                // Both terms are hoisted into shared helpers — the key-time
+                // click reconstructs this exact ramp to time-align its TIMBRE
+                // with the light (see `cue_keystroke`), and a second copy of
+                // the curve here would silently drift away from it.
+                let cadence = Self::heat_cadence(gap);
+                let gain = Self::heat_gain(cfg, fire);
                 self.heat = (self.heat + cadence * gain).min(1.0);
                 // The COAL BED charges on a much wider cadence window: human-
                 // rhythm writing (300-400ms/key) earns most of its credit, so
@@ -4737,6 +4866,26 @@ impl CursorGlow {
         // so the cursor sound sits in the same key as the tune. Direction is
         // the column sign when the move is horizontal, else the row sign
         // (moving UP the screen reads as brighter/up).
+        //
+        // ONE KEYPRESS, ONE CLICK — DEBITED ONLY BY THE ARMS A PRINTABLE KEY'S ECHO
+        // CAN LAND ON (`typing` and the `else` Jump), never by `deletion` or
+        // `navigation`.
+        //
+        // Retiring the credit ahead of the chain looks more exhaustive and is
+        // WRONG, measurably. Those two arms are hint-only: `deletion` is
+        // direction-blind (a forward +1 move satisfies it) and `navigation` tests no
+        // shape at all, so the dominant case is a printable key's echo being
+        // OVERTAKEN by the next key's hint and misclassifying into one of them. The
+        // printable echo then still surfaces — and with the credit already retired
+        // it falls through to `typing` with an empty ledger and cues a spurious
+        // LETTER click on a Backspace or an arrow. Measured: `x` then Backspace
+        // yields [Typed, Backspace, Typed] — three sounds for two physical keys —
+        // where debiting inside the arms yields [Typed, Backspace].
+        //
+        // The orphan this trades away is real but strictly milder: a swallowed
+        // printable echo can leave a credit that mutes one later genuine click,
+        // and it self-clears at `KEYED_CLICK_FRESH`. A wrong sound now beats a
+        // missing sound later.
         if deletion {
             self.cue_sound(crate::trail_sound::SoundKind::Backspace, cc);
         } else if navigation {
@@ -4766,7 +4915,27 @@ impl CursorGlow {
                 self.cue_sound(crate::trail_sound::SoundKind::Typed, cc);
             }
         } else {
-            self.cue_sound(crate::trail_sound::SoundKind::Jump, cc);
+            // A printable keystroke does NOT always echo as `typing`: whenever its
+            // echo moves the cursor more than one cell — vim normal-mode motions
+            // (`w b e 0 $ G } %`, `f<char>`), any printable key in less/htop/fzf, a
+            // multi-cell IME commit — it classifies here as a Jump. The key-time
+            // credit must therefore be spent on THIS arm too, or one keypress speaks
+            // twice: `Typed` at the key plus `Jump` at the echo. The synth cannot
+            // thin that pair, because `Jump` is on the MIN_GAP bypass list, so the
+            // double is audible even at 1 ms separation.
+            //
+            // The leak is the worse half: an unspent credit survives
+            // `KEYED_CLICK_FRESH` and is then taken by the NEXT typing spawn — which
+            // may have no key behind it at all — so one `w` in vim bought a spurious
+            // click AND muted a real one.
+            //
+            // The KEY click wins: it already reached the ear at the physical press,
+            // which is the entire point of the seam. A Jump with no credit behind it
+            // (pure PTY output, a program repositioning the cursor) still cues here
+            // byte-identically to before the seam existed.
+            if !self.take_keyed_click(now) {
+                self.cue_sound(crate::trail_sound::SoundKind::Jump, cc);
+            }
         }
         let boost = if typing {
             match cfg.style {
@@ -10235,11 +10404,23 @@ impl CursorGlow {
             let d = (head_px - (x as f32 + seg as f32 * 0.5)) / cwf;
             // The steady body plus every live keystroke's travelling pulse. Pure
             // float math — the clock work was hoisted above.
-            let mut w = NYAN_WAKE_BASE * nyan_wake_body(d, len);
+            // The steady body plus the STRONGEST live keystroke beat here — MAX,
+            // never a sum. A beat is a local event, not an accumulating field:
+            // summing them meant that at a fast cadence (~5 pulses live inside
+            // one PULSE_TAU) the total exceeded 1.0 across the ENTIRE plume, the
+            // clamp flattened it, and the effect degenerated into a uniform
+            // saturated bar — losing the exponential falloff AND the puff texture
+            // at exactly the speed they exist for. Max keeps every puff distinct
+            // and cannot pile up.
+            //
+            // BASE + PULSE == 1 by construction (asserted below), so `w` is
+            // bounded WITHOUT a clamp: the falloff and the heat ramp are always
+            // free to read, at every cadence.
+            let mut beat = 0.0f32;
             for &(pd, decay) in &pulses[..n_pulses] {
-                w += NYAN_WAKE_PULSE * nyan_wake_pulse_space(d - pd) * decay;
+                beat = beat.max(nyan_wake_pulse_space(d - pd) * decay);
             }
-            let w = w.min(1.0);
+            let w = NYAN_WAKE_BASE * nyan_wake_body(d, len) + NYAN_WAKE_PULSE * beat;
             if w <= 0.004 {
                 x -= seg;
                 segs += 1;
@@ -10266,7 +10447,12 @@ impl CursorGlow {
                     // it needs far fewer samples than the core to read as
                     // continuous). Bright things stay small; big things stay dim.
                     if segs % NYAN_WAKE_BLOOM_STRIDE == 0 {
-                        let bcov = (cov * NYAN_WAKE_BLOOM_GAIN) as u8;
+                        // Only the headroom the core left under the composite
+                        // ceiling — the same rule the fresh-ink pop's birth
+                        // flash follows.
+                        let bcov = (cov * NYAN_WAKE_BLOOM_GAIN)
+                            .min((NYAN_WAKE_COMPOSITE_CAP - cov).max(0.0))
+                            as u8;
                         if bcov > 0 {
                             push_halo(
                                 halos,
@@ -12148,6 +12334,351 @@ mod tests {
         let cues: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].kind, SoundKind::Typed);
+    }
+
+    /// REGRESSION (adversarial review): a printable key whose echo lands as a
+    /// JUMP rather than as `typing` must still speak exactly ONCE, and must not
+    /// leave its credit behind.
+    ///
+    /// A bare Character arms the key seam regardless of how far its echo moves the
+    /// cursor — so vim normal-mode motions (`w b e 0 $ G`), any printable key in
+    /// less/htop/fzf, and multi-cell IME commits all echo as a Jump. Debiting the
+    /// ledger only on the `typing` arm therefore produced BOTH audible defects at
+    /// once: `Typed` at the key plus `Jump` at the echo (which the synth cannot thin,
+    /// because Jump bypasses MIN_GAP), and an unspent credit that the next typing
+    /// advance — possibly pure output with no key behind it — silently swallowed.
+    #[test]
+    fn a_key_whose_echo_jumps_still_clicks_exactly_once() {
+        use crate::trail_sound::SoundKind;
+        let mut glow = CursorGlow::default();
+        let g = geom();
+        let c = cfg(GlowStyle::Nyan, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut out);
+        let _ = glow.drain_sound_cues().count();
+
+        // The key speaks immediately.
+        let key = t0 + Duration::from_millis(1);
+        assert!(glow.cue_keystroke(key));
+        let cues: Vec<_> = glow.drain_sound_cues().collect();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].kind, SoundKind::Typed);
+
+        // Its echo is a multi-cell JUMP (e.g. `w` in vim): no `note_typed`, and the
+        // cursor lands far away, so `spawn` takes the Jump arm — which must find the
+        // credit and stay silent rather than speak a second time for one keypress.
+        let echo = t0 + Duration::from_millis(40);
+        glow.tick(Some((6, 9)), echo, &c, g, &mut out);
+        assert_eq!(
+            glow.drain_sound_cues().count(),
+            0,
+            "one keypress must not produce Typed at the key AND Jump at the echo"
+        );
+
+        // ...and the credit is GONE, so a later genuine typing advance is not muted.
+        let later = t0 + Duration::from_millis(80);
+        glow.note_typed(later);
+        glow.tick(Some((6, 10)), later, &c, g, &mut out);
+        let cues: Vec<_> = glow.drain_sound_cues().collect();
+        assert_eq!(cues.len(), 1, "the Jump must not leak the credit forward");
+        assert_eq!(cues[0].kind, SoundKind::Typed);
+    }
+
+    /// REGRESSION (adversarial review, the ledger audit): EVERY spawn arm must
+    /// settle an outstanding key-time credit — not just `typing` and the `else`
+    /// Jump the earlier waves fixed.
+    ///
+    /// The orphan is reachable: a printable key clicks at the press and arms a
+    /// credit, then its echo is swallowed (a start-of-line Backspace erases
+    /// nothing, an app eats the glyph) or folds into the NEXT key's echo. That
+    /// next echo carries a Backspace or navigation hint, so it takes the
+    /// `deletion` / `navigation` arm — and those arms used to leave the credit
+    /// standing. Because the freshness anchor is re-stamped by every LATER key,
+    /// a live typing burst keeps the orphan fresh indefinitely, and it is
+    /// finally spent muting a genuine click. That is exactly the failure class
+    /// the Jump bug demonstrated, one arm over.
+    ///
+    /// Retiring must NOT silence those arms: a Backspace / arrow is a different
+    /// key that never clicked at press time, so its own gesture still speaks.
+    /// Each row asserts BOTH halves plus the un-muted follow-up click, so the
+    /// test cannot be satisfied by simply muting the arm.
+    #[test]
+    fn every_spawn_arm_settles_the_key_time_ledger() {
+        use crate::trail_sound::SoundKind;
+        // (arm name, hint to arm before the echo, the echo's landing cell, the
+        // gesture that echo must STILL speak — `None` for the arms a printable
+        // key's own echo lands on, which suppress themselves by design.)
+        type Arm = (
+            &'static str,
+            fn(&mut CursorGlow, Instant),
+            (u16, u16),
+            Option<SoundKind>,
+        );
+        let arms: [Arm; 4] = [
+            (
+                "deletion",
+                |gl, t| gl.note_backspace(t),
+                (2, 4),
+                Some(SoundKind::Backspace),
+            ),
+            (
+                "navigation",
+                |gl, t| gl.note_navigation(t),
+                (2, 0),
+                Some(SoundKind::Sweep { dir: -1 }),
+            ),
+            ("typing", |gl, t| gl.note_typed(t), (2, 6), None),
+            ("jump", |_, _| {}, (5, 30), None),
+        ];
+        for (name, arm_hint, land, expect) in arms {
+            let mut glow = CursorGlow::default();
+            let g = geom();
+            let c = cfg(GlowStyle::Water, true);
+            let t0 = Instant::now();
+            let mut out = Vec::new();
+            glow.tick(Some((2, 5)), t0, &c, g, &mut out);
+            let _ = glow.drain_sound_cues().count();
+
+            // The printable key: one click now, one credit owed.
+            let key = t0 + Duration::from_millis(1);
+            assert!(glow.cue_keystroke(key), "{name}: the key must click");
+            assert_eq!(glow.drain_sound_cues().count(), 1, "{name}");
+
+            // The observed echo takes this arm.
+            let echo = t0 + Duration::from_millis(30);
+            arm_hint(&mut glow, echo);
+            glow.tick(Some(land), echo, &c, g, &mut out);
+            let cues: Vec<_> = glow.drain_sound_cues().collect();
+            match expect {
+                Some(kind) => {
+                    assert_eq!(cues.len(), 1, "{name}: its own gesture must still speak");
+                    assert_eq!(cues[0].kind, kind, "{name}");
+                }
+                None => assert_eq!(
+                    cues.len(),
+                    0,
+                    "{name}: a printable key's own echo must not speak twice"
+                ),
+            }
+            // ONLY the two arms a printable key's echo can land on settle the
+            // credit. `deletion` and `navigation` deliberately leave it standing:
+            // they are hint-only and can MISCLASSIFY a printable echo that the next
+            // key's hint overtook, and retiring it there makes that key's real echo
+            // fall through to `typing` with an empty ledger and cue a spurious letter
+            // click on a Backspace or arrow (see the race test below).
+            let settles = matches!(name, "typing" | "jump");
+            assert_eq!(
+                glow.keyed_clicks,
+                u8::from(!settles),
+                "{name}: wrong ledger disposition for this arm"
+            );
+
+            // The COST of that disposition, stated rather than hidden. On the two
+            // settling arms a later genuine keystroke clicks normally. On the
+            // hint-only arms the standing credit is spent by the next typing
+            // advance, so one later click is swallowed — the orphan is real. It is
+            // the accepted side of the trade: it self-clears at KEYED_CLICK_FRESH,
+            // whereas retiring the credit here produces an immediate WRONG sound
+            // (a letter click on a Backspace), and a missing sound later is milder
+            // than a wrong sound now.
+            let later = echo + Duration::from_millis(120);
+            glow.note_typed(later);
+            let (lr, lc) = land;
+            glow.tick(Some((lr, lc + 1)), later, &c, g, &mut out);
+            let cues: Vec<_> = glow.drain_sound_cues().collect();
+            if settles {
+                assert_eq!(cues.len(), 1, "{name}: a later real keystroke was muted");
+                assert_eq!(cues[0].kind, SoundKind::Typed, "{name}");
+            } else {
+                assert_eq!(
+                    cues.len(),
+                    0,
+                    "{name}: documents the accepted orphan — the standing credit \
+                     silences exactly one later click, then expires"
+                );
+            }
+        }
+    }
+
+    /// REGRESSION (adversarial review): a letter followed quickly by Backspace or
+    /// an arrow must produce TWO sounds for TWO physical keys — never three.
+    ///
+    /// `deletion` and `navigation` are hint-only: `deletion` is direction-blind (a
+    /// forward +1 move satisfies it) and `navigation` tests no shape at all. So the
+    /// second key's hint can arrive before the FIRST key's echo does, and the
+    /// letter's echo then misclassifies into that arm. An earlier fix retired the
+    /// key-time credit ahead of the whole chain to make the ledger "exhaustive";
+    /// that made the letter's real echo fall through to `typing` with an empty
+    /// ledger and cue a spurious LETTER click on a Backspace — three sounds for two
+    /// keys. The synth only hides it when the two echoes land inside MIN_GAP, i.e.
+    /// it survives exactly on the laggy per-character links this seam exists for.
+    #[test]
+    fn a_letter_then_backspace_race_speaks_twice_not_three_times() {
+        use crate::trail_sound::SoundKind;
+        for (name, hint, land, second) in [
+            (
+                "backspace",
+                (|gl: &mut CursorGlow, t: Instant| gl.note_backspace(t))
+                    as fn(&mut CursorGlow, Instant),
+                (2, 6),
+                (2, 5),
+            ),
+            (
+                "navigation",
+                (|gl: &mut CursorGlow, t: Instant| gl.note_navigation(t))
+                    as fn(&mut CursorGlow, Instant),
+                (2, 6),
+                (2, 5),
+            ),
+        ] {
+            let mut glow = CursorGlow::default();
+            let g = geom();
+            let c = cfg(GlowStyle::Water, true);
+            let t0 = Instant::now();
+            let mut out = Vec::new();
+            glow.tick(Some((2, 5)), t0, &c, g, &mut out);
+            let _ = glow.drain_sound_cues().count();
+
+            let mut spoken: Vec<SoundKind> = Vec::new();
+
+            // KEY 1: a printable character. Clicks at the press.
+            assert!(glow.cue_keystroke(t0 + Duration::from_millis(1)), "{name}");
+            spoken.extend(glow.drain_sound_cues().map(|c| c.kind));
+
+            // KEY 2 arrives before key 1's echo does, and stamps its hint.
+            hint(&mut glow, t0 + Duration::from_millis(10));
+
+            // Key 1's echo lands while key 2's hint is still fresh, so it takes the
+            // hint-only arm rather than `typing`.
+            glow.tick(Some(land), t0 + Duration::from_millis(20), &c, g, &mut out);
+            spoken.extend(glow.drain_sound_cues().map(|c| c.kind));
+
+            // Key 2's own echo.
+            glow.tick(Some(second), t0 + Duration::from_millis(40), &c, g, &mut out);
+            spoken.extend(glow.drain_sound_cues().map(|c| c.kind));
+
+            assert_eq!(
+                spoken.len(),
+                2,
+                "{name}: two physical keys produced {} sounds: {spoken:?}",
+                spoken.len()
+            );
+            assert_eq!(spoken[0], SoundKind::Typed, "{name}: key 1 clicks at the press");
+            assert_ne!(
+                spoken[1],
+                SoundKind::Typed,
+                "{name}: the second sound is key 2's own gesture, not a spurious \
+                 letter click"
+            );
+        }
+    }
+
+    /// The KEY-TIME CLICK'S TIMBRE must be the timbre of the keystroke it
+    /// belongs to, not of the one before it.
+    ///
+    /// `heat` scales the synth's note level (`0.55 + 0.45·heat`) and its ember
+    /// layer (`0.1 + 0.28·heat`). The echo-born cue this seam replaced was
+    /// recorded AFTER `spawn`'s heat ramp, so it rode the freshly-charged
+    /// blaze. Sampling `blaze()` at the key instead put the sound one whole
+    /// keystroke behind the light — the same lateness the seam removes from the
+    /// TIMING, reintroduced in the TONE. This pins the fix: the key-time cue
+    /// carries the charge its own keystroke is about to add, tracking the pure
+    /// echo-time engine within a few percent (the residue is only the round-trip
+    /// cooling, and the key-time value is the correct one — it is the heat at
+    /// the instant the ear actually hears the click).
+    #[test]
+    fn the_key_time_click_carries_its_own_keystrokes_heat() {
+        let g = geom();
+        let c = cfg(GlowStyle::Water, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+
+        // Two engines, one script: 6 keys at 100 ms (a brisk human cadence,
+        // inside the full-credit ramp) with a 5 ms local echo. `keyed` cues at
+        // the key; `echo_only` is the pre-seam engine and cues at the echo.
+        let mut keyed = CursorGlow::default();
+        let mut echo_only = CursorGlow::default();
+        keyed.tick(Some((2, 0)), t0, &c, g, &mut out);
+        echo_only.tick(Some((2, 0)), t0, &c, g, &mut out);
+
+        let mut charged = 0usize;
+        for i in 1..=6u64 {
+            let key = t0 + Duration::from_millis(i * 100);
+            let echo = key + Duration::from_millis(5);
+
+            // What the OLD code cued: the standing blaze, un-charged.
+            let stale = keyed.blaze();
+            assert!(keyed.cue_keystroke(key));
+            let keyed_cue: Vec<_> = keyed.drain_sound_cues().collect();
+            assert_eq!(keyed_cue.len(), 1);
+            let hot = keyed_cue[0].heat;
+
+            keyed.note_typed(echo);
+            keyed.tick(Some((2, i as u16)), echo, &c, g, &mut out);
+            assert_eq!(
+                keyed.drain_sound_cues().count(),
+                0,
+                "the echo spends the credit"
+            );
+
+            echo_only.note_typed(echo);
+            echo_only.tick(Some((2, i as u16)), echo, &c, g, &mut out);
+            let ref_cue: Vec<_> = echo_only.drain_sound_cues().collect();
+            assert_eq!(ref_cue.len(), 1);
+
+            // The first key of a burst earns NO cadence credit (its gap is
+            // unbounded), exactly like its echo — so the prediction is not a
+            // blind constant, and cold-start clicks stay cold.
+            if i == 1 {
+                assert!(
+                    (hot - stale).abs() < 1e-6,
+                    "a cold first key must not invent heat: {hot} vs {stale}"
+                );
+            } else {
+                charged += 1;
+                assert!(
+                    hot > stale + 0.05,
+                    "key {i} cued the PRE-keystroke heat ({hot} vs stale {stale}) \
+                     — the timbre is one keystroke behind"
+                );
+                assert!(
+                    (hot - ref_cue[0].heat).abs() < 0.02,
+                    "key {i}: key-time heat {hot} must track the echo-time \
+                     engine's {}",
+                    ref_cue[0].heat
+                );
+            }
+        }
+        assert_eq!(charged, 5, "the ramp legs must actually have run");
+    }
+
+    /// The A/B twin of the test above, on the IDENTICAL cursor transition: with no
+    /// key-time credit behind it, that same (2,0) -> (6,9) move DOES cue a Jump.
+    ///
+    /// The pair is what makes the regression test non-vacuous. Alone, "0 cues at the
+    /// echo" could equally mean the Jump arm was never reached; together they show the
+    /// arm IS reached for this transition and that spending the credit is precisely
+    /// what silences it. It also pins the untouched case — a program repositioning the
+    /// cursor with no keypress behind it still speaks exactly as it did pre-seam.
+    #[test]
+    fn an_unkeyed_jump_still_speaks() {
+        use crate::trail_sound::SoundKind;
+        let mut glow = CursorGlow::default();
+        let g = geom();
+        let c = cfg(GlowStyle::Nyan, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut out);
+        let _ = glow.drain_sound_cues().count();
+
+        // Same destination and same elapsed time as the regression test, minus the
+        // `cue_keystroke` — the ONLY difference between the two runs.
+        let jump = t0 + Duration::from_millis(40);
+        glow.tick(Some((6, 9)), jump, &c, g, &mut out);
+        let cues: Vec<_> = glow.drain_sound_cues().collect();
+        assert_eq!(cues.len(), 1, "an unkeyed jump is still a Jump");
+        assert_eq!(cues[0].kind, SoundKind::Jump);
     }
 
     /// A BATCHED echo run spends ONE credit (one spawn, one cue), and the
@@ -22189,6 +22720,97 @@ halo = "add"
             assert!(
                 !glow.under_quads().is_empty(),
                 "the ribbon still renders with the wake off"
+            );
+        }
+    }
+
+    /// THE PLUME MUST NEVER SATURATE ITS OWN RAMP. Three properties that only
+    /// matter together, and whose absence is what turned the plume into a flat
+    /// white bar at speed:
+    ///
+    /// 1. `BASE + PULSE == 1` exactly, so the per-segment weight is bounded by
+    ///    CONSTRUCTION and the clamp is unreachable. (It was 0.86 + 0.48 = 1.34,
+    ///    so even a single fresh beat clamped.)
+    /// 2. Live beats combine by MAX, not by sum, so a fast cadence — five or
+    ///    more pulses inside one `PULSE_TAU` — cannot pile the weight over the
+    ///    top across the whole plume, flattening the exponential falloff and the
+    ///    puff texture at exactly the speed they exist for.
+    /// 3. The crisp core and its bloom share pixels, so their sum is bounded
+    ///    below the point where the channels clip. A clipped nozzle does not
+    ///    read "bright", it reads WHITE — and the entire white-gold → orange →
+    ///    violet cooling story is invisible wherever that happens.
+    #[test]
+    fn nyan_wake_never_saturates_its_own_ramp() {
+        assert!(
+            (NYAN_WAKE_BASE + NYAN_WAKE_PULSE - 1.0).abs() < 1e-6,
+            "the weight must be bounded by construction, not by a clamp: \
+             {NYAN_WAKE_BASE} + {NYAN_WAKE_PULSE}"
+        );
+        assert!(
+            NYAN_WAKE_COV * (1.0 + NYAN_WAKE_BLOOM_GAIN) <= 255.0,
+            "core + bloom must stay inside a byte before any cap even applies"
+        );
+        let g = geom();
+        let mut c = nyan_pop_cfg();
+        c.intensity = 1.0; // the brightest the host can ever ask for
+        // A SPRINT: keys far faster than a human types, which is the cadence that
+        // used to saturate every segment of the plume.
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        let end = type_run(&mut glow, 2, 3, 20, 32, &c, g, t0);
+        let (quads, halos) = wake_of(&glow, end, &c, g);
+        assert!(!quads.is_empty(), "a sprint draws a plume");
+        // (a) No emitted sample may reach the clipping point, core or bloom.
+        for q in &quads {
+            let r = (q.color >> 16) & 0xff;
+            assert!(
+                r <= NYAN_WAKE_COMPOSITE_CAP as u32,
+                "a core sample breached the composite ceiling: {q:?}"
+            );
+        }
+        // (b) The composite where core and bloom overlap stays under the cap.
+        for h in &halos {
+            let bloom = (h.color >> 16) & 0xff;
+            let core = quads
+                .iter()
+                .filter(|q| {
+                    let (a, b) = (q.x as i32, q.x as i32 + q.w as i32);
+                    (h.cx as i32) >= a && (h.cx as i32) < b
+                })
+                .map(|q| (q.color >> 16) & 0xff)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                core + bloom <= NYAN_WAKE_COMPOSITE_CAP as u32 + 1,
+                "core {core} + bloom {bloom} breached the composite ceiling"
+            );
+        }
+        // (c) THE RAMP SURVIVES: the plume is not one flat colour. Sample the
+        // hot end and the cool end and require a real hue journey — this is the
+        // property saturation destroys, and the reason the cap exists.
+        let head_px = (glow.wake_head.unwrap().1 * g.cw as f32) as i32;
+        let at = |lo: i32, hi: i32| -> Option<u32> {
+            quads
+                .iter()
+                .filter(|q| {
+                    let d = head_px - q.x as i32;
+                    d >= lo * g.cw as i32 && d < hi * g.cw as i32
+                })
+                .map(|q| q.color)
+                .next()
+        };
+        let (hot, cool) = (at(0, 2), at(4, 8));
+        if let (Some(hot), Some(cool)) = (hot, cool) {
+            let chan = |c: u32, sh: u32| ((c >> sh) & 0xff) as i32;
+            // Warm-white at the nozzle: blue nearly keeps pace with red.
+            // Cooled behind: blue has fallen away relative to red, or the whole
+            // sample has dimmed — either way the two are visibly different.
+            assert_ne!(hot, cool, "the plume is one flat colour — the ramp is gone");
+            let hot_gap = chan(hot, 16) - chan(hot, 0);
+            let cool_gap = chan(cool, 16) - chan(cool, 0);
+            assert!(
+                hot_gap != cool_gap,
+                "the plume does not cool along its length (gap {hot_gap} vs {cool_gap})"
             );
         }
     }

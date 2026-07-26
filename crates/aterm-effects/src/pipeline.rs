@@ -996,6 +996,7 @@ impl EffectsPipeline {
             input.glow_under.clear();
             input.char_fg.clear();
             input.fire_halo.clear();
+            input.cursor_fill_override = None;
             input.word_decorations.clear();
             input.ink.clear();
             input.cat_quads.clear();
@@ -1089,6 +1090,17 @@ impl EffectsPipeline {
         input.char_fg.extend_from_slice(self.glow.charred());
         input.fire_halo.clear();
         input.fire_halo.extend_from_slice(self.glow.halo_cells());
+        // Fire's FORGE cursor is visible state just like its flame streams:
+        // carry the warm-metal fill through the shared RenderInput seam on the
+        // wasm/gpu-web hosts too. Stamp this field on EVERY enabled frame so a
+        // Fire -> non-Fire toggle cannot retain the prior fill in the reused
+        // scratch. The renderer applies the resolved body colour to the live
+        // DECSCUSR shape, matching the native GUI's shared override seam.
+        input.cursor_fill_override = (self.glow_cfg.enabled
+            && self.glow_cfg.intensity > 0.0
+            && matches!(self.glow_cfg.style, GlowStyle::Fire))
+        .then(|| self.glow.forge_fill())
+        .flatten();
 
         // Sparkle words: rescan only when the grid changed (damage epoch),
         // animate every applied frame. Alt-screen handling mirrors native:

@@ -17,6 +17,14 @@ pub(crate) struct BandColors {
     pub label: [u8; 3],
     pub value: [u8; 3],
     pub warn: [u8; 3],
+    /// Background of an editable WELL inset in the band (the find bar's query
+    /// field). The terminal's own background, so the band reads as a raised panel
+    /// with a recessed input in it — and so `value` text in the well keeps the
+    /// terminal's own fg/bg contrast rather than the band's smaller one.
+    pub field_bg: [u8; 3],
+    /// Text caret drawn in that well — the theme's CURSOR colour, contrast-floored
+    /// against `field_bg` so it stays visible on a recoloured background.
+    pub caret: [u8; 3],
 }
 
 fn rgb(c: u32) -> [u8; 3] {
@@ -77,11 +85,22 @@ pub(crate) fn band_colors(theme: Theme) -> BandColors {
         rgb(0x00F1_FA8C)
     };
     const AA: f64 = 4.5;
+    let field_bg = rgb(theme.bg);
     BandColors {
         bar_bg,
-        label: blend(theme.fg, theme.bg, if light { 0.40 } else { 0.48 }),
+        // `label` is the SECONDARY tone, not an optional one: it carries the find
+        // panel's whole hint row, its placeholder, and every inactive toggle. Held to
+        // the same AA floor as `value` — a dim role still has to be readable, and
+        // `value` (bold, full contrast) keeps the hierarchy on its own.
+        label: ensure_contrast(
+            blend(theme.fg, theme.bg, if light { 0.40 } else { 0.48 }),
+            bar_bg,
+            AA,
+        ),
         value: ensure_contrast(rgb(theme.fg), bar_bg, AA),
         warn: ensure_contrast(warn_base, bar_bg, AA),
+        field_bg,
+        caret: ensure_contrast(rgb(theme.cursor), field_bg, AA),
     }
 }
 
@@ -125,12 +144,22 @@ mod tests {
                 selection: parts.selection,
             };
             let colors = band_colors(theme);
-            for (role, value) in [("value", colors.value), ("warn", colors.warn)] {
+            for (role, value) in [
+                ("value", colors.value),
+                ("warn", colors.warn),
+                ("label", colors.label),
+            ] {
                 assert!(
                     contrast(value, colors.bar_bg) >= 4.5,
                     "{name} {role} must meet WCAG-AA"
                 );
             }
+            // The inset well carries the find query + its caret: both must clear AA
+            // against the WELL's background, not the band's.
+            assert!(
+                contrast(colors.caret, colors.field_bg) >= 4.5,
+                "{name} caret must meet WCAG-AA in the well"
+            );
         }
     }
 }

@@ -332,6 +332,10 @@ impl App {
             // detach preserves every entry for the remaining shared view.
             self.session_chrome.remove(&session);
             self.session_chrome_retry.remove(&session);
+            // The parked predictive-echo link estimate dies with the session too —
+            // the entry describes a link that no longer exists, and without this the
+            // map would accumulate one entry per closed tab for the process lifetime.
+            self.link_estimates.remove(&session);
             self.session_chrome_expiry.cancel_session(session);
             self.title_drift.forget(session);
             for window in self.windows.values_mut() {

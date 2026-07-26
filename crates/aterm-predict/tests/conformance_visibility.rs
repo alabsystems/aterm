@@ -14,6 +14,18 @@ fn echoed_a(row: u16, col: u16) -> Option<char> {
     ((row, col) == (0, 0)).then_some('a')
 }
 
+/// One complete DRAINED type→echo turn on row 0: arm `ch` at `col`, then confirm it
+/// `rtt` later with the real cursor advanced past it. Returns the confirmation
+/// instant. Only valid with an empty pending set (it anchors on the passed cursor).
+fn echo_turn(p: &mut Predictor, ch: char, col: u16, at: Instant, rtt: Duration) -> Instant {
+    assert!(p.predict_char(ch, (0, col), 80, at));
+    let done = at + rtt;
+    p.reconcile(Some((0, col + 1)), false, done, move |row, c| {
+        ((row, c) == (0, col)).then_some(ch)
+    });
+    done
+}
+
 #[test]
 fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
     let model = aterm_spec::derive::predictive_echo_visibility_model();
@@ -100,4 +112,107 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
     let mut inherited = model.init_state();
     inherited.insert("slow", 1);
     assert!(!model.check_invariant("FreshSessionHasNoInheritedRtt", &inherited));
+}
+
+/// The gate is a LATCH: it stops painting only after a SUSTAINED fast run with
+/// nothing in flight. The model used to close on a single abstract `ConfirmFast`,
+/// and the binding above never noticed because it only ever fired that action at an
+/// already-closed latch — so the one property the model exists to pin was unpinned.
+/// This drives the sequence a single-sample close cannot survive, on BOTH sides.
+#[test]
+fn the_display_gate_closes_only_on_sustained_fast_evidence() {
+    let model = aterm_spec::derive::predictive_echo_visibility_model();
+    let mut st = model.init_state();
+    let mut p = Predictor::new(PredictMode::Adaptive);
+    let now = Instant::now();
+    let slow = Duration::from_millis(60);
+    let fast = Duration::from_millis(1);
+
+    // Two consecutive 60 ms confirmations are the shipping classifier's stable-slow
+    // transition, which the model folds into one `ConfirmSlow`.
+    let mut at = echo_turn(&mut p, 'a', 0, now, slow);
+    at = echo_turn(&mut p, 'b', 1, at, slow);
+    assert!(model.fire("ConfirmSlow", &mut st));
+    assert!(p.predict_char('c', (0, 2), 80, at));
+    assert!(model.fire("Key", &mut st));
+    assert_eq!(st["visible"], 1);
+    assert_eq!(p.overlay(at).len(), 1, "control: the slow link paints");
+
+    // A fast turn taken while type-ahead is still on glass. Closing HERE is the blink
+    // itself — the very turn that decides speculation is unnecessary is the turn that
+    // un-paints the glyph the user is looking at.
+    assert!(p.predict_char('d', (0, 3), 80, at));
+    at += fast;
+    p.reconcile(Some((0, 3)), false, at, |row, col| {
+        ((row, col) == (0, 2)).then_some('c')
+    });
+    assert!(model.fire("ConfirmFastInFlight", &mut st));
+    assert_eq!(st["slow"], 1, "a gate flip with pixels in flight is the blink");
+    assert_eq!(st["retracted"], 0);
+    assert_eq!(st["visible"], 1);
+    assert_eq!(p.overlay(at).len(), 1, "the shipping gate keeps painting 'd'");
+
+    // Drain, then one DECISIVE fast turn with nothing pending: still open. The model
+    // counts turns; the implementation additionally waits for its smoothed estimate to
+    // agree, so the two are bound at the DECISIONS (open / still open / closed), not
+    // turn for turn — the same abstraction `ConfirmSlow` already makes.
+    at += fast;
+    p.reconcile(Some((0, 4)), false, at, |row, col| {
+        ((row, col) == (0, 3)).then_some('d')
+    });
+    assert!(model.fire("Echo", &mut st));
+    at = echo_turn(&mut p, 'e', 4, at, fast);
+    assert!(model.fire("ConfirmFast", &mut st));
+    assert_eq!(st["slow"], 1, "one decisive fast turn must not close the gate");
+    assert_eq!(st["retracted"], 0);
+    assert!(p.predict_char('z', (0, 5), 80, at));
+    assert!(model.fire("Key", &mut st));
+    assert_eq!(st["visible"], 1);
+    assert_eq!(
+        p.overlay(at).len(),
+        1,
+        "…and the shipping gate is still painting too"
+    );
+
+    // Keep echoing locally until the implementation's EWMA agrees as well. Only then
+    // does the third decisive turn retire the latch on both sides.
+    at += fast;
+    p.reconcile(Some((0, 6)), false, at, |row, col| {
+        ((row, col) == (0, 5)).then_some('z')
+    });
+    assert!(model.fire("Echo", &mut st));
+    for col in 6..10 {
+        at = echo_turn(&mut p, 'x', col, at, fast);
+    }
+    assert!(model.fire("ConfirmFast", &mut st));
+    assert_eq!(st["slow"], 0, "a sustained fast run finally closes it");
+    assert_eq!(st["retracted"], 1, "…and that step is the retraction");
+    assert!(model.check_invariant("RetractOnlyOnSustainedFastEvidence", &st));
+
+    assert!(p.predict_char('q', (0, 10), 80, at));
+    assert!(model.fire("Key", &mut st));
+    assert_eq!(st["visible"], 0);
+    assert!(
+        p.overlay(at).is_empty(),
+        "a settled local link stops painting on both sides"
+    );
+
+    // Tier-0 negative controls for the retraction rule: the deleted single-sample
+    // close, and a close taken with pixels still in flight, are both rejected.
+    let mut single_sample = model.init_state();
+    single_sample.insert("retracted", 1);
+    single_sample.insert("fast_streak", 1);
+    assert!(
+        !model.check_invariant("RetractOnlyOnSustainedFastEvidence", &single_sample),
+        "one fast sample is not evidence enough to un-paint a ghost"
+    );
+
+    let mut closed_in_flight = model.init_state();
+    closed_in_flight.insert("retracted", 1);
+    closed_in_flight.insert("fast_streak", 3);
+    closed_in_flight.insert("pending", 1);
+    assert!(
+        !model.check_invariant("RetractOnlyOnSustainedFastEvidence", &closed_in_flight),
+        "even a full streak may not close the gate over pixels in flight"
+    );
 }

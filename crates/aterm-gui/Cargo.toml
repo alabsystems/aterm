@@ -171,6 +171,11 @@ sha2 = { workspace = true }
 embed-resource = "3"
 
 [dev-dependencies]
+# VISUAL CAPTURE (`find_panel_visual_capture`, #[ignore]d): dump a real rendered
+# find-panel frame to a PNG so the chrome can be reviewed as pixels, not asserts —
+# the same pattern `aterm-gpu`'s rain screenshot harness uses.
+png = "0.17"
+
 # The GUI's physical-key Tier-1 test drives `App::on_key` itself. Winit's native
 # platform payload is intentionally private, so its narrowly gated synthetic
 # constructor is enabled only for test/bench targets, never the shipped binary.
@@ -268,7 +273,7 @@ objc2-app-kit = { version = "0.2", features = ["block2", "NSGraphics", "NSColorS
 # already in the tree transitively via objc2-app-kit, so this adds bindings only.
 # (The `a11y-appkit` feature below just enables the extra NSAccessibility
 # bindings; the base crates are no longer gated behind it.)
-objc2-foundation = { version = "0.2", features = ["NSString", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop"] }
+objc2-foundation = { version = "0.2", features = ["NSString", "NSUserDefaults", "NSDictionary", "NSValue", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop"] }
 objc2 = { version = "0.5" }
 block2 = "0.5"
 # macOS Keychain storage for network-drive tokens (net_connections.rs): a saved

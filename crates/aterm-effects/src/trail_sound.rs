@@ -4240,6 +4240,103 @@ mod tests {
         }
     }
 
+    /// THE BACKLOG-CROWDING REFUTATION (adversarial review). The claim under
+    /// test: the glow engine's 8-slot cue backlog can overflow under a stalled
+    /// present, and a dropped keystroke cue is a lost click — so the backlog
+    /// should be grown, or its drop policy made value-ranked.
+    ///
+    /// It is the governor, not the backlog, that decides how many clicks a
+    /// stalled frame delivers. `since_voice` advances only with RENDERED
+    /// samples, and a drain pushes the whole backlog inside one host tick with
+    /// no render between — so every cue after the first shares one audio
+    /// instant, sits inside [`MIN_GAP`], and is thinned to silence INSIDE the
+    /// synth. A 24-deep backlog is audibly identical to a 1-deep one. Growing
+    /// the cap therefore buys exactly zero clicks, and evicting a "less
+    /// valuable" older cue to make room for a newer keystroke buys zero too:
+    /// the newcomer still lands at the tail of the same batch and is thinned by
+    /// whatever preceded it.
+    ///
+    /// (The bypass kinds — Jump/Sweep/Land/Bonk/riff — are the deliberate
+    /// exception and are asserted separately; a keystroke is not one of them.)
+    #[test]
+    fn a_drained_cue_batch_speaks_once_however_deep_the_backlog() {
+        for style in STYLES {
+            let one = {
+                let mut s = TrailSynth::new(48_000.0, 11);
+                s.push(ev(style, SoundKind::Typed));
+                s.live_voices()
+            };
+            assert!(one > 0, "{style:?}: a lone keystroke must speak");
+            // 8 = today's MAX_SOUND_CUES; 24 = any cap a "size it for the worst
+            // burst" fix would reach for. Neither adds a voice.
+            for depth in [8usize, 24] {
+                let mut s = TrailSynth::new(48_000.0, 11);
+                for _ in 0..depth {
+                    s.push(ev(style, SoundKind::Typed));
+                }
+                assert_eq!(
+                    s.live_voices(),
+                    one,
+                    "{style:?}: {depth} keystroke cues drained together must \
+                     speak exactly as loudly as one — the min-gap governor \
+                     thins the rest, so backlog depth cannot buy a click"
+                );
+            }
+        }
+    }
+
+    /// THE MEASUREMENT behind the key-time click's timbre fix (adversarial
+    /// review asked for evidence that a one-keystroke heat lag is not
+    /// inaudible). `heat` rides the note level as `0.55 + 0.45·heat` and the
+    /// ember/thump layer as `0.1 + 0.28·heat`, so one missing `HEAT_GAIN` step
+    /// (0.16, the glow engine's per-keystroke charge at full cadence) is a
+    /// systematic level error through the whole cold→hot ramp of every typing
+    /// burst — not a one-off.
+    ///
+    /// Measured, not asserted. Rendered spread across the palettes: 1.06-1.49
+    /// dB from a cold start (Fire highest — its ember layer carries more of the
+    /// heat term) and 0.81-1.19 dB mid-ramp. The bound below is the floor of
+    /// that. ~0.8 dB sits right at the loudness JND, and it lands on EVERY
+    /// click of the ramp in the same direction, which is what makes it read as
+    /// "the sound is behind" rather than as one quiet note.
+    #[test]
+    fn one_keystroke_of_heat_lag_is_audible() {
+        // Bed OFF isolates the discrete note (the click itself) — the bed's
+        // slow texture would smear the comparison.
+        let peak_at = |style, heat: f32| {
+            let mut s = TrailSynth::new(48_000.0, 5);
+            s.push(SoundEvent {
+                heat,
+                bed: false,
+                ..ev(style, SoundKind::Typed)
+            });
+            let mut buf = [0.0f32; 960];
+            let mut peak = 0.0f32;
+            for _ in 0..100 {
+                s.render(&mut buf);
+                for &x in &buf {
+                    peak = peak.max(x.abs());
+                }
+            }
+            peak
+        };
+        // The glow engine's HEAT_GAIN at full typing cadence.
+        const STEP: f32 = 0.16;
+        for style in STYLES {
+            // Cold start (the loudest part of the ramp) and mid-ramp.
+            for base in [0.0f32, 0.4] {
+                let (lag, live) = (peak_at(style, base), peak_at(style, base + STEP));
+                let db = 20.0 * (live / lag).log10();
+                assert!(
+                    db >= 0.75,
+                    "{style:?} @ heat {base}: one keystroke of heat lag is only \
+                     {db:.2} dB ({lag} -> {live}) — if this ever goes inaudible, \
+                     `cue_keystroke`'s timbre prediction can be retired"
+                );
+            }
+        }
+    }
+
     /// OWNER PROOF ("that ambient bed — I don't like it": beds are OFF by
     /// default): events carrying `bed: false` — what every host event carries
     /// under the `trail_sound_bed` default — never energise the bed layer, so

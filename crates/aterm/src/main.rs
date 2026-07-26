@@ -10,6 +10,7 @@
 //! ```text
 //! aterm <verb> …            ctl / pkg / fleet / drive → in-process library calls
 //! aterm help [topic]        the toolchain manual (aterm-cli's parser owns it)
+//! aterm agents […]          the coding-agent primer installer (aterm-cli owns it)
 //! aterm <tool> …            managed-store toolchain dispatch (via `pkg`)
 //! aterm            (a TTY)  the transparent session — your shell, modeled live
 //! aterm         (no TTY)    the window (a Finder/.app launch has no TTY)
@@ -97,7 +98,7 @@ fn main() -> ExitCode {
     // the window path. parse_args prints and exits for all of these.
     let mode_free = matches!(
         first.as_str(),
-        "help" | "-h" | "--help" | "-V" | "--version"
+        "help" | "agents" | "-h" | "--help" | "-V" | "--version"
     ) || aterm_cli::DIAG_COMMANDS
         .iter()
         .any(|(name, _)| *name == first);

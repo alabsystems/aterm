@@ -1942,6 +1942,7 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         clusters: _, // folded into per-cell "glyph" (cell_grapheme)
         combining: _, // folded into per-cell "glyph" (cell_grapheme)
         line_sizes: _, // frame "line_sizes" (F2)
+        line_size_spans: _, // OMITTED: compose-time per-pane refinement of `line_sizes`. This frame is extracted from ONE Terminal, whose rows are uniform, so it is always empty here; the split-pane composite is not the styled-frame source.
         images: _,  // frame "images" (F1)
         default_bg: _, // OMITTED: host-resolved live default-bg for the padding band, not per-cell content (cells carry their own bg)
         cursor_color: _, // OMITTED: host-resolved live cursor colour, host-owned

@@ -38,16 +38,38 @@ fn prediction_visibility_requires_redraw(was_visible: bool, is_visible: bool) ->
 /// Whether a typing click cued at the KEY could ever reach a speaker — the
 /// host half of the touch-to-glass audio seam (`CursorGlow::cue_keystroke`).
 ///
-/// Deliberately narrow. The ENGINE owns the darkness law (master switch, real
-/// geometry, nonzero amplitude) and the render drain owns focus/resize/volume
-/// policy; this seam only answers "is there an output at all, and is the sound
-/// knob open", so a build whose sound can only ever be silence — headless, a
-/// non-macOS stub, a permanently failed worker, the knob off, volume 0 — never
-/// pays the cue-delivering redraw on its hottest path. Same "never runs
-/// headless-muted" policy as `tone_infer_active`.
+/// The ENGINE owns the darkness law (master switch, real geometry, nonzero
+/// amplitude); this seam answers "could a click cued right now reach a speaker",
+/// so a build whose sound can only ever be silence — headless, a non-macOS stub,
+/// a permanently failed worker, the knob off, volume 0 — never pays the
+/// cue-delivering redraw on its hottest path. Same "never runs headless-muted"
+/// policy as `tone_infer_active`.
+///
+/// IT MUST AGREE WITH THE DRAIN, not merely approximate it. Cueing at the key
+/// also arms a CREDIT that the echo's `spawn` spends to stay silent (one
+/// character, one click). If the drain then drops the cue for a policy this gate
+/// ignored, the credit outlives the click it stood for: the key made no sound,
+/// and the echo — which pre-seam would have clicked — is muted by a credit for a
+/// click that never happened. So the two MUTE policies the drain folds into its
+/// gain, serious mode (`SeriousEffect::TerminalSound`) and the post-resize quiet
+/// window, are checked HERE too, at the moment the credit is armed.
+///
+/// Focus is deliberately NOT a term: the drain's raw-focus check exists to stop a
+/// recording-pinned BACKGROUND window talking over the foreground one, and a
+/// physical keypress by definition arrives at the focused window.
+///
+/// A policy that flips between the key and the drain (a resize starting inside
+/// that one frame) still orphans a credit, but only for the ledger's freshness
+/// window, after which it expires on its own.
 #[inline]
-fn keystroke_click_audible(worker_live: bool, sounds_on: bool, volume: f32) -> bool {
-    worker_live && sounds_on && volume > 0.0
+fn keystroke_click_audible(
+    worker_live: bool,
+    sounds_on: bool,
+    volume: f32,
+    sound_allowed: bool,
+    resize_quiet: bool,
+) -> bool {
+    worker_live && sounds_on && volume > 0.0 && sound_allowed && !resize_quiet
 }
 
 /// Whether an input event carries fresh, discrete intent that may start one new
@@ -982,6 +1004,14 @@ mod paste_order {
         sink: Arc<SinkWriter>,
         ev: InputEvent,
         pending: Arc<AtomicUsize>,
+        /// The hardware key-arrival stamp CLAIMED from the metrics module at
+        /// enqueue, so the writer thread can book the true key→write slice once the
+        /// bytes actually leave. `0` when no keystroke is behind this job (a paste
+        /// body, a control verb). Without this the UI thread consumed the stamp at
+        /// enqueue and recorded the cost of a channel push, so the histogram read
+        /// its BEST exactly while a keystroke sat behind a draining paste — its
+        /// single largest real outlier class, invisible.
+        key_ns: u64,
     }
 
     /// One session's serializer: the FIFO sender, its outstanding-job count, and a
@@ -1012,6 +1042,10 @@ mod paste_order {
                 &job.ev,
                 crate::input::EgressMode::Backpressured,
             );
+            // The bytes are on the wire NOW — book the slice the UI thread could
+            // not: hardware key arrival → completed write, including the time this
+            // job spent queued behind the paste ahead of it.
+            crate::metrics::note_pty_write_at(job.key_ns);
             job.pending.fetch_sub(1, Ordering::AcqRel);
             ACTIVE.fetch_sub(1, Ordering::AcqRel);
         }
@@ -1081,19 +1115,40 @@ mod paste_order {
         // this same (UI) thread then observes pending > 0 and queues behind us.
         pending.fetch_add(1, Ordering::AcqRel);
         ACTIVE.fetch_add(1, Ordering::AcqRel);
+        // Claim the arrival here so the UI thread's `note_pty_write` cannot
+        // consume it on the way out and book a channel push as the write.
+        //
+        // A PASTE claims nothing. Cmd-V arms a key-arrival stamp like any other
+        // press, and `paste_clipboard` runs synchronously on the UI thread before
+        // the stamp is cleared — so an unconditional claim here books the ENTIRE
+        // paste, written under `EgressMode::Backpressured`, as ONE key_write
+        // sample. A large paste into a slow child then files seconds against a
+        // metric that means "keystroke to PTY", and because `MAX_KEY_WRITE_NS` is
+        // a `fetch_max` that never resets, that reading poisons the maximum for
+        // the life of the process. Hoisted out of the literal because `ev` moves
+        // into the struct two fields above this one.
+        let key_ns = if matches!(ev, InputEvent::Paste(_)) {
+            0
+        } else {
+            crate::metrics::take_key_arrival()
+        };
         let job = Job {
             term: term.clone(),
             sink: sink.clone(),
             ev,
             pending,
+            key_ns,
         };
         match tx.send(job) {
             Ok(()) => Ok(()),
             Err(std::sync::mpsc::SendError(job)) => {
                 // Writer gone (should not happen while the entry lives): undo the
-                // counters and hand the event back for an inline write.
+                // counters and hand the event back for an inline write. Give the
+                // arrival stamp back too, or the inline fallback would measure
+                // nothing — the deferral we claimed it for never happened.
                 job.pending.fetch_sub(1, Ordering::AcqRel);
                 ACTIVE.fetch_sub(1, Ordering::AcqRel);
+                crate::metrics::restore_key_arrival(job.key_ns);
                 Err(job.ev)
             }
         }
@@ -1156,6 +1211,29 @@ fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent>
         Key::Named(NamedKey::End) => Some(ScrollIntent::Bottom),
         _ => None,
     }
+}
+
+/// Whether an open FIND FIELD suspends a configured `[keybindings]` action, so the
+/// keystroke drives the query instead. True for the text-level and viewport-level
+/// actions (typing, copying, scrolling — the ones a focused text field owns or would be
+/// desynced by); false for app-level ones (windows, tabs, panes, font, settings, and
+/// find itself), which keep working with the panel open.
+fn find_suspends_action(action: keybinding::Action) -> bool {
+    use keybinding::Action as A;
+    matches!(
+        action,
+        A::Copy
+            | A::Paste
+            | A::ScrollPageUp
+            | A::ScrollPageDown
+            | A::ScrollLineUp
+            | A::ScrollLineDown
+            | A::ScrollToTop
+            | A::ScrollToBottom
+            | A::JumpPrevPrompt
+            | A::JumpNextPrompt
+            | A::ToggleViMode
+    )
 }
 
 /// Classify the terminal-only Emacs navigation chords after layout normalization.
@@ -1225,9 +1303,11 @@ fn is_plain_enter(ev: &InputEvent) -> bool {
 /// It is only ever consulted as "is it zero?", and every update is made under the
 /// SAME `term_lock` that performed the toggle (reading back `vi_is_active` there
 /// costs nothing), so the mirror cannot disagree with the engine. A terminal
-/// destroyed while still in copy-mode leaks its `+1`, which merely reverts the
-/// gate to asking the engine — the fail-safe direction, since a non-zero mirror
-/// only costs what every keystroke paid before this fix.
+/// destroyed while still in copy-mode used to leak its `+1`; that is now
+/// balanced by [`vi_note_terminal_gone`], whose doc explains why the leak was
+/// worth closing even though its direction was fail-safe — a single "close a tab
+/// while in vi" permanently surrendered the lock elision this mirror exists to
+/// provide.
 static VI_ACTIVE_TERMINALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Record the post-toggle vi state of one terminal in the mirror above. MUST be
@@ -1243,6 +1323,23 @@ fn vi_note_toggled(now_active: bool) {
         // deliberate and safe — both `vi_toggle` call sites run on the GUI thread,
         // so there is no second writer to race with.
         VI_ACTIVE_TERMINALS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A terminal that was in copy-mode is GOING AWAY (its last view detached), so
+/// retire its contribution to the mirror.
+///
+/// Without this the count is a one-way ratchet: `vi_toggle` is the only decrement,
+/// so closing a tab while copy-mode is on strands a `+1` that nothing can ever
+/// clear. The gate then reads "maybe active" forever and BOTH per-keystroke vi
+/// checks fall back to taking the terminal mutex — for the rest of the process,
+/// silently. The direction is fail-safe (correctness never depended on the
+/// mirror, only speed), which is exactly why it would never be noticed: one
+/// "close a tab while in vi" permanently gives back the lock elision this mirror
+/// exists to provide, worth ~0.15-0.37 ms per keystroke under output load.
+pub(crate) fn vi_note_terminal_gone(was_active: bool) {
+    if was_active {
+        vi_note_toggled(false);
     }
 }
 
@@ -1935,6 +2032,11 @@ impl App {
                         self.trail_audio.is_live(),
                         self.config.trail_sounds_or_default(),
                         self.config.trail_sound_volume(),
+                        self.serious_mode_policy()
+                            .allows(crate::motion::SeriousEffect::TerminalSound),
+                        self.windows
+                            .get(&wid)
+                            .is_some_and(|ws| ws.resize_sound_quiet(input_now)),
                     );
                     // ONE term-lock scope for every press-path terminal touch: the
                     // viewport snap, the "typing deselects" clear, and the predictor's
@@ -2265,9 +2367,16 @@ impl App {
                             // command's confirmation and would flash the secret.
                             let was_displaying = ws.predictor.is_displaying(input_now);
                             ws.predictor.note_line_submit();
-                            // `note_line_submit` flushes immediately. If a ghost was
-                            // on glass, request its erase even when the foreground
-                            // app takes a long time to produce the next frame.
+                            // `note_line_submit` no longer FLUSHES — it ends the epoch
+                            // and leaves the submitted line's in-flight guesses
+                            // painting (flushing them made the tail of the command
+                            // vanish at the exact instant of commit, one RTT before
+                            // the real echo caught up, which read as the terminal
+                            // stalling on Enter). Visibility can still CHANGE here
+                            // though: the new epoch's guesses go dark while
+                            // grandfathered ones keep their pixels, so the redraw
+                            // request stays load-bearing — it just delivers a
+                            // transition now rather than a wholesale erase.
                             if prediction_visibility_requires_redraw(was_displaying, false)
                                 && let Some(w) = ws.os_window.as_ref()
                             {
@@ -4390,6 +4499,16 @@ impl App {
             // chord — is policy on_key owns and the helper cannot capture.
             let base = base_logical_key(&ev);
             match keybinding::resolve_chord(&base, mods, &self.keybindings, &self.key_sequences) {
+                // A configured chord that would TYPE, COPY, or MOVE THE VIEWPORT is
+                // suspended while the find field owns input — otherwise a user who bound
+                // `ctrl+a` or `cmd+v` loses that chord inside the field, and `Paste`
+                // writes the clipboard to the PTY from under a focused text field (the
+                // same modal-focus leak the `[key_sequences]` guard below exists to stop).
+                // Everything else — window/tab/pane/font/settings, and Find itself —
+                // still fires: those are app-level, not text-level.
+                keybinding::ChordResolution::Action(action)
+                    if find_suspends_action(action)
+                        && self.windows.get(&wid).is_some_and(|ws| ws.search.is_some()) => {}
                 keybinding::ChordResolution::Action(action) => {
                     let repeat_action = match action {
                         keybinding::Action::ScrollPageUp => Some(ScrollIntent::Up),
@@ -4509,7 +4628,13 @@ impl App {
         // of reaching the PTY — every mainstream terminal reserves the Shift+ forms for
         // this. Plain (un-shifted) PageUp/Home/End still encode to the app below. Runs
         // BEFORE snap_to_bottom so scrolling up isn't immediately undone.
-        if let Some(intent) = scrollback_chord(mods, &ev) {
+        // …but NOT while the find field owns input: ⇧Home would jump the viewport to the
+        // oldest scrollback line while the panel still highlights a match somewhere else,
+        // desyncing the view from the find. Unshifted Home/End reach the field below as
+        // the caret motions they are in any text field.
+        if let Some(intent) = scrollback_chord(mods, &ev)
+            .filter(|_| self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()))
+        {
             if let Some(session) = self.front_terminal(wid).map(|terminal| terminal.session) {
                 self.note_local_repeat_press(
                     wid,
@@ -4918,12 +5043,32 @@ impl App {
         true
     }
 
+    /// Classify a find-mode keystroke into the repeatable action it drives: a match
+    /// step/repeat, or one text-field [`SearchEdit`] (motion, kill, or insert). The
+    /// find field is a REAL single-line text field, so it answers the standard
+    /// macOS/readline chords — `^A`/`Home`/`⌘←` to the start, `^E`/`End`/`⌘→` to the
+    /// end, `^B`/`^F` and `←`/`→` by character, `⌥←`/`⌥→` by word, `^K`/`^U`/`^W`/
+    /// `⌥⌫`/`⌘⌫` to kill, `^D`/`⌦` forward-delete — and every one of them repeats on a
+    /// held key through this classification.
+    ///
+    /// Two deliberate exclusions: `↑`/`↓` step MATCHES (they are the non-emacs muscle
+    /// memory for `^R`/`^S`, and a one-line field has no vertical motion to lose), and
+    /// plain `⌥`+letter is NOT bound — macOS composes query characters there (é, ß, ƒ),
+    /// so word motion lives on `⌥`+ARROW only.
+    ///
+    /// The trailing text arm accepts only PRINTABLE text: `ev.text` carries `"\u{1b}"`
+    /// for ⎋, `"\r"` for ⏎ and `"\t"` for ⇥ (winit's `NamedKey::to_text`), and inserting
+    /// those made ⎋ type an escape into the query instead of closing the bar — the named
+    /// keys below it are commands, never content.
     fn search_repeat_action(
         &self,
         wid: WindowId,
         mods: ModifiersState,
         ev: &KeyEvent,
     ) -> Option<crate::SearchRepeatAction> {
+        use crate::app_search::SearchEdit;
+        use crate::SearchRepeatAction as Action;
+
         if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
             return None;
         }
@@ -4933,19 +5078,46 @@ impl App {
         let ctrl = mods.control_key() && !mods.super_key() && !mods.alt_key();
         let bare_cmd =
             mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key();
+        // macOS text-field convention: ⌥ = by word, ⌘ = to the end of the line.
+        let by_word = mods.alt_key() && !mods.control_key() && !mods.super_key();
+        let to_edge = mods.super_key() && !mods.control_key() && !mods.alt_key();
+        let edit = |e: SearchEdit| Some(Action::Edit(e));
         match &ev.logical_key {
-            Key::Named(NamedKey::ArrowDown) => Some(crate::SearchRepeatAction::Step(true)),
-            Key::Named(NamedKey::ArrowUp) => Some(crate::SearchRepeatAction::Step(false)),
-            Key::Named(NamedKey::Backspace) => Some(crate::SearchRepeatAction::Backspace),
-            _ if ctrl && base_is("s") => Some(crate::SearchRepeatAction::Repeat(true)),
-            _ if ctrl && base_is("r") => Some(crate::SearchRepeatAction::Repeat(false)),
-            _ if bare_cmd && base_is("s") => Some(crate::SearchRepeatAction::Repeat(true)),
-            _ if bare_cmd && base_is("r") => Some(crate::SearchRepeatAction::Repeat(false)),
+            Key::Named(NamedKey::ArrowDown) => Some(Action::Step(true)),
+            Key::Named(NamedKey::ArrowUp) => Some(Action::Step(false)),
+            Key::Named(NamedKey::ArrowLeft) if to_edge => edit(SearchEdit::MoveStart),
+            Key::Named(NamedKey::ArrowRight) if to_edge => edit(SearchEdit::MoveEnd),
+            Key::Named(NamedKey::ArrowLeft) if by_word => edit(SearchEdit::MoveWordLeft),
+            Key::Named(NamedKey::ArrowRight) if by_word => edit(SearchEdit::MoveWordRight),
+            Key::Named(NamedKey::ArrowLeft) => edit(SearchEdit::MoveCharLeft),
+            Key::Named(NamedKey::ArrowRight) => edit(SearchEdit::MoveCharRight),
+            Key::Named(NamedKey::Home) => edit(SearchEdit::MoveStart),
+            Key::Named(NamedKey::End) => edit(SearchEdit::MoveEnd),
+            Key::Named(NamedKey::Backspace) if to_edge => edit(SearchEdit::KillToStart),
+            Key::Named(NamedKey::Backspace) if by_word => edit(SearchEdit::DeleteWordBack),
+            Key::Named(NamedKey::Backspace) => edit(SearchEdit::DeleteBack),
+            Key::Named(NamedKey::Delete) if by_word => edit(SearchEdit::DeleteWordForward),
+            Key::Named(NamedKey::Delete) => edit(SearchEdit::DeleteForward),
+            // Match navigation keeps first claim on ^S/^R (emacs isearch-repeat).
+            _ if ctrl && base_is("s") => Some(Action::Repeat(true)),
+            _ if ctrl && base_is("r") => Some(Action::Repeat(false)),
+            _ if bare_cmd && base_is("s") => Some(Action::Repeat(true)),
+            _ if bare_cmd && base_is("r") => Some(Action::Repeat(false)),
+            _ if ctrl && base_is("a") => edit(SearchEdit::MoveStart),
+            _ if ctrl && base_is("e") => edit(SearchEdit::MoveEnd),
+            _ if ctrl && base_is("b") => edit(SearchEdit::MoveCharLeft),
+            _ if ctrl && base_is("f") => edit(SearchEdit::MoveCharRight),
+            _ if ctrl && base_is("d") => edit(SearchEdit::DeleteForward),
+            _ if ctrl && base_is("h") => edit(SearchEdit::DeleteBack),
+            _ if ctrl && base_is("k") => edit(SearchEdit::KillToEnd),
+            _ if ctrl && base_is("u") => edit(SearchEdit::KillToStart),
+            _ if ctrl && base_is("w") => edit(SearchEdit::DeleteWordBack),
             _ if !mods.super_key() && !mods.control_key() => ev
                 .text
                 .as_ref()
+                .map(|text| -> String { text.chars().filter(|c| !c.is_control()).collect() })
                 .filter(|text| !text.is_empty())
-                .map(|text| crate::SearchRepeatAction::Text(text.to_string())),
+                .map(|text| Action::Edit(SearchEdit::Insert(text))),
             _ => None,
         }
     }
@@ -4987,18 +5159,7 @@ impl App {
         match action {
             crate::SearchRepeatAction::Step(forward) => self.search_step_in(wid, forward),
             crate::SearchRepeatAction::Repeat(forward) => self.search_repeat_in(wid, forward),
-            crate::SearchRepeatAction::Backspace => {
-                if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
-                    search.query.pop();
-                }
-                self.search_recompute_in(wid);
-            }
-            crate::SearchRepeatAction::Text(text) => {
-                if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
-                    search.query.push_str(&text);
-                }
-                self.search_recompute_in(wid);
-            }
+            crate::SearchRepeatAction::Edit(edit) => self.search_edit_in(wid, edit),
         }
     }
 
@@ -5016,12 +5177,24 @@ impl App {
     /// pre-find viewport), `↓`/`↑` mirror `^S`/`^R` for non-emacs muscle memory. The
     /// case/regex toggles live on `⌥⌘C`/`⌥⌘R` — NOT plain ⌥ chords, which must stay
     /// free for Option-composed query characters (é, ß, …) on macOS.
+    ///
+    /// Everything else about the query is TEXT-FIELD editing, classified (and made
+    /// key-repeatable) by [`Self::search_repeat_action`]: caret motion, word/line kills,
+    /// and printable insertion. `⌘V` pastes the clipboard into the FIELD (never the
+    /// PTY). ⎋ and ⏎ are commands here, so they must not survive as inserted text —
+    /// see the control-character filter on that classifier's text arm.
     fn on_key_search_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
             return false;
         }
-        if let Some(action) = self.search_repeat_action(wid, mods, ev) {
-            self.apply_search_repeat_action(wid, action);
+        // A live IME composition owns its keystrokes: the composed result arrives once,
+        // as `Ime::Commit` (which `on_ime_commit` routes into the field). Inserting the
+        // composing keys here as well would type every dead-key press AND its result.
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| !ws.preedit.is_empty())
+        {
             return true;
         }
         // Chords match on the modifier-independent BASE key — macOS ⌥ composes a
@@ -5032,17 +5205,32 @@ impl App {
             |want: &str| matches!(&base, Key::Character(c) if c.eq_ignore_ascii_case(want));
         let ctrl = mods.control_key() && !mods.super_key() && !mods.alt_key();
         let cmd_alt = mods.super_key() && mods.alt_key() && !mods.control_key();
+        let bare_cmd =
+            mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key();
+        // ⌘C is NOT the field's: `search_accept`'s contract is that the current match is
+        // left selected "ready for ⌘C", which is a lie if the find bar swallows it. Fall
+        // through to the terminal's copy so the match can be copied WITHOUT closing find.
+        if bare_cmd && base_is("c") {
+            return false;
+        }
+        if let Some(action) = self.search_repeat_action(wid, mods, ev) {
+            self.apply_search_repeat_action(wid, action);
+            return true;
+        }
         match &ev.logical_key {
-            Key::Named(NamedKey::Escape) => self.search_cancel(),
+            Key::Named(NamedKey::Escape) => self.search_cancel_in(wid),
             // ⏎ accepts (emacs RET): leave find mode, STAYING at the current match.
-            Key::Named(NamedKey::Enter) => self.search_accept(),
+            Key::Named(NamedKey::Enter) => self.search_accept_in(wid),
             // ^G: the emacs abort chord — cancel, restoring the pre-find viewport.
-            _ if ctrl && base_is("g") => self.search_cancel(),
+            _ if ctrl && base_is("g") => self.search_cancel_in(wid),
+            // ⌘V pastes into the FIELD (one line, control bytes stripped) — the find
+            // bar owns the keystroke, so nothing reaches the shell behind it.
+            _ if bare_cmd && base_is("v") => self.search_paste_in(wid),
             // ⌥⌘C / ⌥⌘R: match-case / regex toggles (remembered app-sticky for the next
-            // find, and shared with the clickable `Aa`/`.*` indicators via
+            // find, and shared with the clickable `[Aa]`/`[.*]` indicators via
             // `search_toggle_*`).
-            _ if cmd_alt && base_is("c") => self.search_toggle_case(),
-            _ if cmd_alt && base_is("r") => self.search_toggle_regex(),
+            _ if cmd_alt && base_is("c") => self.search_toggle_case_in(wid),
+            _ if cmd_alt && base_is("r") => self.search_toggle_regex_in(wid),
             _ => {}
         }
         true
@@ -6007,6 +6195,17 @@ impl App {
             return;
         }
         if text.is_empty() {
+            return;
+        }
+        // FIND MODE owns composed text too. On macOS the ⌥-dead-key sequences the find
+        // keymap deliberately leaves unbound (⌥e e → é, ⌥s → ß) arrive HERE as an IME
+        // commit, not as `KeyEvent::text` — without this they would land in the SHELL
+        // behind an open find bar, which is both a lost query character and a leak.
+        if self.windows.get(&wid).is_some_and(|ws| ws.search.is_some()) {
+            self.search_edit_in(wid, crate::app_search::SearchEdit::Insert(text));
+            if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                w.request_redraw();
+            }
             return;
         }
         // Phase 0.5: committed text goes through the seam's Text path (the sole
@@ -7196,6 +7395,17 @@ impl App {
         }
     }
 
+    /// The window whose FIND FIELD currently owns text input, if any. Menu key
+    /// equivalents (⌘V / ⌘A) reach the app through AppKit rather than `on_key`, so the
+    /// menu dispatcher has to ask this the same question find mode asks.
+    fn find_field_window(&self) -> Option<WindowId> {
+        let wid = self.frontmost_window?;
+        self.windows
+            .get(&wid)
+            .is_some_and(|ws| ws.search.is_some())
+            .then_some(wid)
+    }
+
     pub(crate) fn dispatch_menu_action(&mut self, el: &ActiveEventLoop, action: menu::MenuAction) {
         use menu::MenuAction;
         match action {
@@ -7274,7 +7484,15 @@ impl App {
             MenuAction::Copy => {
                 let _ = self.copy_selection();
             }
-            MenuAction::Paste => self.paste_clipboard(),
+            // ⌘V while the FIND FIELD is open belongs to the field, not the shell. The
+            // AppKit key equivalent consumes the keyDown before `on_key` ever runs (see
+            // the Cmd-Q fallback note there), so without this branch the find bar's own
+            // paste arm is unreachable on macOS and the clipboard lands in the PTY
+            // BEHIND the panel — the classic modal-focus leak.
+            MenuAction::Paste => match self.find_field_window() {
+                Some(wid) => self.search_paste_in(wid),
+                None => self.paste_clipboard(),
+            },
             // Tab-context copies invoked WITHOUT a tab context (the `invoke`
             // verb / a future palette row): act on the frontmost window's
             // ACTIVE tab — the same "the front tab is the subject" convention
@@ -7292,7 +7510,16 @@ impl App {
                     self.dispatch_tab_menu_action(el, window, tab, action);
                 }
             }
-            MenuAction::SelectAll => self.select_all(),
+            // Select All belongs to the TERMINAL's selection, which the find bar is
+            // currently using to mark its match — running it under an open find would
+            // replace that highlight and snap the viewport to the live bottom while the
+            // panel still reads `3/7`. The field has no selection model of its own yet,
+            // so under find this is deliberately inert rather than wrong.
+            MenuAction::SelectAll => {
+                if self.find_field_window().is_none() {
+                    self.select_all();
+                }
+            }
             // Diverts to the settings search when the focused window shows the
             // Settings card — the ⌘F key equivalent lands here, not in on_key.
             MenuAction::Find => self.find_requested(),
@@ -8685,7 +8912,9 @@ mod local_repeat_behavior_tests {
             physical,
             LocalRepeatAction::Search {
                 session,
-                action: SearchRepeatAction::Text("q".to_string()),
+                action: SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert(
+                    "q".to_string(),
+                )),
             },
         );
 
@@ -8723,7 +8952,9 @@ mod local_repeat_behavior_tests {
             physical,
             LocalRepeatAction::Search {
                 session,
-                action: SearchRepeatAction::Text("focus_routing_needle".to_string()),
+                action: SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert(
+                    "focus_routing_needle".to_string(),
+                )),
             },
         );
 
@@ -8901,7 +9132,10 @@ mod terminal_emacs_search_input_tests {
             app.physical_press_owners.get(&cmd_s),
             Some(PhysicalPressOwner::Local { .. })
         ));
-        app.apply_search_repeat_action(wid, SearchRepeatAction::Text("hit".into()));
+        app.apply_search_repeat_action(
+            wid,
+            SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert("hit".into())),
+        );
         assert_eq!(app.windows[&wid].search.as_ref().unwrap().current, 0);
         app.route_physical_repeat(wid, cmd_s);
         assert_eq!(app.windows[&wid].search.as_ref().unwrap().current, 1);
@@ -8940,7 +9174,10 @@ mod terminal_emacs_search_input_tests {
 
         let cmd_r = PhysicalKey::Code(KeyCode::KeyR);
         app.terminal_emacs_search_pressed(wid, cmd_r, false);
-        app.apply_search_repeat_action(wid, SearchRepeatAction::Text("CODEX_NEEDLE".into()));
+        app.apply_search_repeat_action(
+            wid,
+            SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert("CODEX_NEEDLE".into())),
+        );
         assert_eq!(app.windows[&wid].search.as_ref().unwrap().current, 1);
 
         let region_bottom = rows - 2;
@@ -8970,7 +9207,10 @@ mod terminal_emacs_search_input_tests {
 
         let classic_key = PhysicalKey::Code(KeyCode::KeyR);
         app.terminal_emacs_search_pressed(wid, classic_key, false);
-        app.apply_search_repeat_action(wid, SearchRepeatAction::Text("CLAUDE_CLASSIC".into()));
+        app.apply_search_repeat_action(
+            wid,
+            SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert("CLAUDE_CLASSIC".into())),
+        );
         assert_eq!(app.windows[&wid].search.as_ref().unwrap().current, 1);
         app.release_physical_press(wid, classic_key);
         app.search_cancel();
@@ -8978,7 +9218,10 @@ mod terminal_emacs_search_input_tests {
         term_lock(&term).process(b"\x1b[?1049h\x1b[HCLAUDE_ALT\r\nCLAUDE_ALT");
         let alt_key = PhysicalKey::Code(KeyCode::KeyR);
         app.terminal_emacs_search_pressed(wid, alt_key, false);
-        app.apply_search_repeat_action(wid, SearchRepeatAction::Text("CLAUDE_ALT".into()));
+        app.apply_search_repeat_action(
+            wid,
+            SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert("CLAUDE_ALT".into())),
+        );
         let alternate = app.windows[&wid].search.as_ref().unwrap();
         assert_eq!(alternate.matches.len(), 2);
         assert_eq!(alternate.current, 1);
@@ -11636,20 +11879,35 @@ mod predictive_echo_input_gate_tests {
     /// the hottest path would be pure cost: no audio host (headless, a
     /// non-macOS stub, a permanently failed worker), the `trail_sounds`
     /// knob off, or a muted volume.
+    ///
+    /// The last two conjuncts additionally close a CREDIT LEAK, which is why
+    /// this gate may not merely approximate the drain's: cueing at the key also
+    /// arms a credit the echo spends to stay silent, so a cue the drain drops
+    /// leaves a credit standing for a click that never sounded — muting the echo
+    /// that pre-seam would have clicked.
     #[test]
     fn a_click_that_cannot_be_heard_is_never_cued() {
-        assert!(keystroke_click_audible(true, true, 0.4));
+        assert!(keystroke_click_audible(true, true, 0.4, true, false));
         assert!(
-            !keystroke_click_audible(false, true, 0.4),
+            !keystroke_click_audible(false, true, 0.4, true, false),
             "no live worker ⇒ no redraw for a click nothing can play"
         );
         assert!(
-            !keystroke_click_audible(true, false, 0.4),
+            !keystroke_click_audible(true, false, 0.4, true, false),
             "trail sounds off ⇒ silent by the user's own knob"
         );
         assert!(
-            !keystroke_click_audible(true, true, 0.0),
+            !keystroke_click_audible(true, true, 0.0, true, false),
             "volume 0 is mute, exactly as the render drain's gain law reads it"
+        );
+        assert!(
+            !keystroke_click_audible(true, true, 0.4, false, false),
+            "serious mode mutes terminal sound at the drain, so it must not arm a credit here"
+        );
+        assert!(
+            !keystroke_click_audible(true, true, 0.4, true, true),
+            "the post-resize quiet window drains silently — a credit armed inside it \
+             would mute the NEXT echo instead"
         );
     }
 
@@ -11848,6 +12106,45 @@ mod vi_dispatch_tests {
         for _ in 0..base {
             super::vi_note_toggled(true);
         }
+    }
+
+    /// REGRESSION: a terminal that DIES in copy-mode must retire its contribution.
+    ///
+    /// `vi_toggle` used to be the mirror's only decrement, making the count a
+    /// one-way ratchet: close a tab while copy-mode is on and the stranded `+1`
+    /// pinned the gate "maybe active" for the rest of the PROCESS, so both
+    /// per-keystroke vi checks silently went back to taking the terminal mutex —
+    /// the exact lock elision this mirror exists to provide, given away for good by
+    /// one ordinary user action, in the fail-safe direction that guarantees nobody
+    /// notices.
+    #[test]
+    fn a_terminal_dying_in_copy_mode_does_not_strand_the_mirror() {
+        let _serial = VI_MIRROR_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let base = VI_ACTIVE_TERMINALS.load(Ordering::Relaxed);
+
+        // A terminal enters copy-mode, then is torn down while still in it.
+        super::vi_note_toggled(true);
+        assert_eq!(VI_ACTIVE_TERMINALS.load(Ordering::Relaxed), base + 1);
+        super::vi_note_terminal_gone(true);
+
+        assert_eq!(
+            VI_ACTIVE_TERMINALS.load(Ordering::Relaxed),
+            base,
+            "the dead terminal's +1 must not outlive it"
+        );
+
+        // A terminal torn down while NOT in copy-mode contributed nothing and must
+        // not over-decrement someone else's live copy-mode.
+        super::vi_note_toggled(true);
+        super::vi_note_terminal_gone(false);
+        assert_eq!(
+            VI_ACTIVE_TERMINALS.load(Ordering::Relaxed),
+            base + 1,
+            "a terminal that was not in vi must not decrement a live one"
+        );
+        assert!(vi_any_active(), "the still-live copy-mode terminal holds the gate");
+        super::vi_note_toggled(false);
+        assert_eq!(VI_ACTIVE_TERMINALS.load(Ordering::Relaxed), base);
     }
 }
 
@@ -12353,5 +12650,360 @@ mod full_nyan_sing_seam_tests {
                 "…into the crossfade, never a hard cut"
             );
         }
+    }
+}
+
+/// THE FIND FIELD IS A TEXT FIELD. These drive the shipping `on_key` routing with real
+/// winit events (including the `text` payloads winit actually reports for the named
+/// keys), so they pin the whole chain — classification, repeat ownership, and the
+/// `App`-side edit — not just the pure editing model in `app_search`.
+#[cfg(test)]
+mod find_field_key_tests {
+    use crate::{App, WindowId, term_lock};
+    use winit::event::{ElementState, KeyEvent};
+    use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr};
+
+    /// A pressed key event shaped like the platform's: `text` is what winit reports,
+    /// INCLUDING the control strings it produces for ⎋ (`\u{1b}`), ⏎ (`\r`) and ⇥
+    /// (`\t`) — the payloads that used to be typed straight into the query.
+    fn press(logical: Key, text: Option<&str>) -> KeyEvent {
+        KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(KeyCode::KeyA),
+            logical,
+            text.map(SmolStr::new),
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+        )
+    }
+
+    fn named(key: NamedKey) -> KeyEvent {
+        press(Key::Named(key), key.to_text())
+    }
+
+    fn character(ch: &str) -> KeyEvent {
+        press(Key::Character(SmolStr::new(ch)), Some(ch))
+    }
+
+    fn set_mods(app: &mut App, wid: WindowId, mods: ModifiersState) {
+        app.windows.get_mut(&wid).unwrap().mods = mods;
+    }
+
+    fn query(app: &App, wid: WindowId) -> Option<(String, usize)> {
+        app.windows[&wid]
+            .search
+            .as_ref()
+            .map(|search| (search.query.clone(), search.cursor))
+    }
+
+    fn type_str(app: &mut App, wid: WindowId, text: &str) {
+        for ch in text.chars() {
+            app.on_key(wid, character(&ch.to_string()));
+        }
+    }
+
+    /// ⎋ CLOSES the find bar — it is a command, never a character. winit reports
+    /// `text = "\u{1b}"` for it, and the classifier used to insert exactly that, so ⎋
+    /// typed an escape into the query and the bar stayed open.
+    #[test]
+    fn escape_closes_the_bar_and_types_nothing() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.search_enter();
+        type_str(&mut app, wid, "abc");
+        assert_eq!(query(&app, wid), Some(("abc".to_string(), 3)));
+
+        app.on_key(wid, named(NamedKey::Escape));
+        assert!(
+            app.windows[&wid].search.is_none(),
+            "⎋ closed the find bar"
+        );
+        // And the cancelled query never became text: reopening starts empty.
+        app.search_enter();
+        assert_eq!(query(&app, wid), Some((String::new(), 0)));
+    }
+
+    /// ⏎ ACCEPTS (closes, keeping the match), and ⇥ is inert — neither leaves its
+    /// control character in the query.
+    #[test]
+    fn enter_accepts_and_tab_is_not_typed() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term_lock(&term).process(b"needle here\r\n");
+        app.search_enter();
+        type_str(&mut app, wid, "needle");
+
+        app.on_key(wid, named(NamedKey::Tab));
+        assert_eq!(
+            query(&app, wid),
+            Some(("needle".to_string(), 6)),
+            "⇥ leaves no tab in the query"
+        );
+
+        app.on_key(wid, named(NamedKey::Enter));
+        assert!(app.windows[&wid].search.is_none(), "⏎ accepted and closed");
+        assert_eq!(app.search_last_query, "needle", "accept remembered it");
+    }
+
+    /// ^A / ^E / ←→ / ⌥← / ^K / ^U / ^W behave like they do in any macOS text field,
+    /// and typing lands at the caret rather than being appended.
+    #[test]
+    fn standard_text_field_chords_edit_the_query() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.search_enter();
+        type_str(&mut app, wid, "beta");
+
+        // ^A → start of line, then typing inserts THERE.
+        set_mods(&mut app, wid, ModifiersState::CONTROL);
+        app.on_key(wid, character("a"));
+        assert_eq!(query(&app, wid), Some(("beta".to_string(), 0)), "^A");
+        set_mods(&mut app, wid, ModifiersState::empty());
+        type_str(&mut app, wid, "al");
+        assert_eq!(query(&app, wid), Some(("albeta".to_string(), 2)));
+
+        // ^E → end of line.
+        set_mods(&mut app, wid, ModifiersState::CONTROL);
+        app.on_key(wid, character("e"));
+        assert_eq!(query(&app, wid), Some(("albeta".to_string(), 6)), "^E");
+
+        // ^B / ^F step by character.
+        app.on_key(wid, character("b"));
+        assert_eq!(query(&app, wid).unwrap().1, 5, "^B");
+        app.on_key(wid, character("f"));
+        assert_eq!(query(&app, wid).unwrap().1, 6, "^F");
+
+        // ^K from the middle kills to the end; ^U kills to the start.
+        set_mods(&mut app, wid, ModifiersState::empty());
+        app.on_key(wid, named(NamedKey::ArrowLeft));
+        app.on_key(wid, named(NamedKey::ArrowLeft));
+        assert_eq!(query(&app, wid), Some(("albeta".to_string(), 4)), "←←");
+        set_mods(&mut app, wid, ModifiersState::CONTROL);
+        app.on_key(wid, character("k"));
+        assert_eq!(query(&app, wid), Some(("albe".to_string(), 4)), "^K");
+        app.on_key(wid, character("u"));
+        assert_eq!(query(&app, wid), Some((String::new(), 0)), "^U");
+
+        // ^W deletes the previous word.
+        set_mods(&mut app, wid, ModifiersState::empty());
+        type_str(&mut app, wid, "one two");
+        set_mods(&mut app, wid, ModifiersState::CONTROL);
+        app.on_key(wid, character("w"));
+        assert_eq!(query(&app, wid), Some(("one ".to_string(), 4)), "^W");
+
+        // ⌥← walks back a word (a plain ⌥+letter must stay free for composed input,
+        // so word motion lives on the arrows).
+        set_mods(&mut app, wid, ModifiersState::empty());
+        type_str(&mut app, wid, "two three");
+        set_mods(&mut app, wid, ModifiersState::ALT);
+        app.on_key(wid, named(NamedKey::ArrowLeft));
+        assert_eq!(query(&app, wid), Some(("one two three".to_string(), 8)), "⌥←");
+        // ⌥⌫ eats that word; ⌘⌫ clears back to the start.
+        app.on_key(wid, named(NamedKey::Backspace));
+        assert_eq!(query(&app, wid), Some(("one three".to_string(), 4)), "⌥⌫");
+        set_mods(&mut app, wid, ModifiersState::SUPER);
+        app.on_key(wid, named(NamedKey::Backspace));
+        assert_eq!(query(&app, wid), Some(("three".to_string(), 0)), "⌘⌫");
+        // ⌘→ / ⌘← are the line-edge motions.
+        app.on_key(wid, named(NamedKey::ArrowRight));
+        assert_eq!(query(&app, wid).unwrap().1, 5, "⌘→");
+        app.on_key(wid, named(NamedKey::ArrowLeft));
+        assert_eq!(query(&app, wid).unwrap().1, 0, "⌘←");
+
+        // Home / End / ⌦ round out the field's vocabulary.
+        set_mods(&mut app, wid, ModifiersState::empty());
+        app.on_key(wid, named(NamedKey::End));
+        assert_eq!(query(&app, wid).unwrap().1, 5, "End");
+        app.on_key(wid, named(NamedKey::Home));
+        assert_eq!(query(&app, wid).unwrap().1, 0, "Home");
+        app.on_key(wid, named(NamedKey::Delete));
+        assert_eq!(query(&app, wid), Some(("hree".to_string(), 0)), "⌦");
+    }
+
+    /// COMPOSED text (macOS ⌥-dead keys, CJK IME) reaches the FIELD, not the shell.
+    /// The keymap leaves plain ⌥+letter unbound precisely so those compose; on macOS
+    /// they arrive as an IME commit rather than as key text, so the find bar has to
+    /// claim that path too.
+    #[test]
+    fn ime_commit_types_into_the_field_not_the_shell() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let before = term_lock(&term).content_seq();
+        app.search_enter();
+        type_str(&mut app, wid, "caf");
+        app.on_ime_commit(wid, "\u{e9}".to_string());
+        assert_eq!(
+            query(&app, wid),
+            Some(("caf\u{e9}".to_string(), 5)),
+            "the composed character landed in the query at the caret"
+        );
+        assert_eq!(
+            term_lock(&term).content_seq(),
+            before,
+            "and never reached the shell"
+        );
+        // With find closed the commit takes the ordinary PTY path again (headless has
+        // no shell to echo it, so this pins only that the find branch stopped claiming
+        // it — the terminal content is untouched either way).
+        app.search_cancel();
+        app.on_ime_commit(wid, "\u{e9}".to_string());
+        assert!(app.windows[&wid].search.is_none());
+    }
+
+    /// The COMMAND chords, exercised through the real key routing rather than by
+    /// calling the App methods: ^G aborts (restoring the pre-find viewport, like ⎋),
+    /// and ⌥⌘C / ⌥⌘R flip match-case / regex — including from the composed glyph macOS
+    /// puts in `logical_key` for an ⌥ chord (⌥⌘C arrives as "ç").
+    #[test]
+    fn command_chords_abort_and_toggle_through_the_key_path() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let mut lines = Vec::new();
+        for i in 0..80 {
+            lines.extend_from_slice(format!("line {i} needle\r\n").as_bytes());
+        }
+        term_lock(&term).process(&lines);
+        // The user was reading 5 lines above the live bottom when they pressed ⌘F.
+        term_lock(&term).scroll_display(5);
+        let origin = term_lock(&term).grid().display_offset();
+
+        app.search_enter();
+        type_str(&mut app, wid, "needle");
+        assert!(
+            term_lock(&term).grid().display_offset() != origin,
+            "find navigated away from the origin viewport"
+        );
+        // ⌥⌘C / ⌥⌘R through the key path. macOS puts the ⌥-COMPOSED glyph in the
+        // event's text (ç / ®) while the logical key stays the base letter under a Cmd
+        // chord — which is exactly why these arms match on `base_logical_key`.
+        set_mods(&mut app, wid, ModifiersState::SUPER | ModifiersState::ALT);
+        app.on_key(wid, press(Key::Character(SmolStr::new("c")), Some("ç")));
+        assert!(app.windows[&wid].search.as_ref().unwrap().case_sensitive, "⌥⌘C");
+        app.on_key(wid, press(Key::Character(SmolStr::new("r")), Some("®")));
+        assert!(app.windows[&wid].search.as_ref().unwrap().is_regex, "⌥⌘R");
+
+        // ^G: the emacs abort — closes AND restores the viewport the find started from.
+        set_mods(&mut app, wid, ModifiersState::CONTROL);
+        app.on_key(wid, character("g"));
+        assert!(app.windows[&wid].search.is_none(), "^G closed the find bar");
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            origin,
+            "^G restored the pre-find viewport"
+        );
+    }
+
+    /// The field claims TEXT input, not the whole keyboard: ⌘C still copies the match
+    /// the find bar highlighted (its accept contract promises exactly that), and ⇧Home
+    /// no longer yanks the viewport out from under an open find.
+    #[test]
+    fn the_field_claims_text_input_not_every_chord() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let mut lines = Vec::new();
+        for i in 0..60 {
+            lines.extend_from_slice(format!("line {i} needle\r\n").as_bytes());
+        }
+        term_lock(&term).process(&lines);
+        app.search_enter();
+        type_str(&mut app, wid, "needle");
+        let found = term_lock(&term).grid().display_offset();
+
+        // ⇧Home would jump to the oldest line; with find open it is suspended.
+        set_mods(&mut app, wid, ModifiersState::SHIFT);
+        app.on_key(wid, named(NamedKey::Home));
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            found,
+            "a scrollback chord cannot desync the viewport from the find"
+        );
+        assert!(app.windows[&wid].search.is_some(), "…and find stays open");
+
+        // ⌘C is NOT swallowed: it falls through to the terminal copy of the match.
+        set_mods(&mut app, wid, ModifiersState::SUPER);
+        assert!(
+            !app.on_key_search_mode(wid, ModifiersState::SUPER, &character("c")),
+            "⌘C falls through to the terminal's copy"
+        );
+        assert!(
+            term_lock(&term).selection_to_string().is_some(),
+            "the find left a match selected for that copy"
+        );
+    }
+
+    /// The routing predicates the OTHER input doors consult: AppKit menu equivalents
+    /// (⌘V / ⌘A never reach `on_key`) and configured `[keybindings]` actions.
+    #[test]
+    fn other_input_doors_defer_to_an_open_field() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(
+            app.find_field_window().is_none(),
+            "no find ⇒ the menu keeps its ordinary targets"
+        );
+        app.search_enter();
+        assert_eq!(
+            app.find_field_window(),
+            Some(wid),
+            "an open find claims ⌘V / ⌘A from the menu bar"
+        );
+        // Text- and viewport-level configured actions are suspended; app-level ones
+        // (windows, tabs, panes, font, find itself) keep working with the panel open.
+        use crate::keybinding::Action;
+        for action in [
+            Action::Paste,
+            Action::Copy,
+            Action::ScrollToTop,
+            Action::ScrollPageUp,
+            Action::JumpPrevPrompt,
+            Action::ToggleViMode,
+        ] {
+            assert!(super::find_suspends_action(action), "{action:?}");
+        }
+        for action in [
+            Action::Find,
+            Action::NewTab,
+            Action::CloseTab,
+            Action::FontIncrease,
+            Action::SplitVertical,
+            Action::ToggleSettings,
+        ] {
+            assert!(!super::find_suspends_action(action), "{action:?}");
+        }
+    }
+
+    /// The find field owns the keystroke: none of its editing chords reach the PTY,
+    /// and the query still drives the real search (the caret moves are not searches).
+    #[test]
+    fn field_editing_re_runs_the_search_but_never_reaches_the_shell() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term_lock(&term).process(b"alpha beta gamma\r\n");
+        let before = term_lock(&term).content_seq();
+
+        app.search_enter();
+        type_str(&mut app, wid, "beta");
+        assert_eq!(
+            app.windows[&wid].search.as_ref().unwrap().matches.len(),
+            1,
+            "typing re-ran the real search"
+        );
+        // Backspacing to a prefix widens the match set again.
+        app.on_key(wid, named(NamedKey::Backspace));
+        assert_eq!(app.windows[&wid].search.as_ref().unwrap().query, "bet");
+        assert_eq!(app.windows[&wid].search.as_ref().unwrap().matches.len(), 1);
+        set_mods(&mut app, wid, ModifiersState::CONTROL);
+        app.on_key(wid, character("a"));
+        set_mods(&mut app, wid, ModifiersState::empty());
+        assert_eq!(
+            term_lock(&term).content_seq(),
+            before,
+            "no find-field keystroke reached the shell"
+        );
     }
 }

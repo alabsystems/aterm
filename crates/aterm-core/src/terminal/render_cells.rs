@@ -745,6 +745,12 @@ impl Terminal {
         // `images_row_into` — do NOT fold it into the cell pass.
         self.images_frame_into(&mut scratch.images, rows);
 
+        // A single terminal's frame is UNIFORM per row, so it never carries
+        // line-size runs. Clearing is load-bearing, not hygiene: this scratch is
+        // reused across frames, and a window that was split a moment ago left
+        // per-pane runs here. Without this, dropping back to one pane would keep
+        // scaling columns by a pane that no longer exists.
+        scratch.line_size_spans.clear();
         scratch.line_sizes.clear();
         scratch.line_sizes.extend((0..rows).map(|r| {
             u16::try_from(r)
