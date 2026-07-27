@@ -315,10 +315,12 @@ impl GpuContext {
     }
 
     /// Create an offscreen colour target (Rgba8Unorm; render + copy-src +
-    /// texture-binding). `TEXTURE_BINDING` is additive — it lets the on-glass
-    /// blit SAMPLE this exact texture into the swapchain, so the pixels on screen
-    /// are byte-identical to the readback the AI introspection sees. The parity
-    /// tests (which build the atlas on the CPU, not this texture) are unaffected.
+    /// texture-binding). `TEXTURE_BINDING` is additive — it lets the application
+    /// present blit SAMPLE this exact texture into the swapchain destination, so
+    /// submitted destination bytes match the introspection readback at the
+    /// app-owned boundary. The platform compositor and scanout are unobserved.
+    /// The parity tests (which build the atlas on the CPU, not this texture) are
+    /// unaffected.
     pub fn offscreen_texture(&self, width: u32, height: u32) -> wgpu::Texture {
         // Defensive floor at this `create_texture` choke point: clamp to the device's
         // max 2D texture dimension (mirrors `Renderer::create_atlas_texture`). Without

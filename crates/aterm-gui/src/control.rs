@@ -19,12 +19,16 @@
 //! [`Wake::Control`], and blocks on the reply channel; the main thread drains
 //! the queue, renders, writes the PNG, and replies with the frame dimensions.
 //!
-//! `image` (and the SIGUSR1 snapshot) is WYSIWYG: it renders the exact pixels
-//! the window shows, INCLUDING the current cursor blink phase and the hollow
-//! unfocused-cursor override — so a focused blinking session may legitimately
-//! capture a frame with no cursor pixels. Headless sessions pin the blink
-//! phase on (always deterministic). For deterministic cursor state regardless
-//! of phase, use the `cursor` verb (row, col, visible, style).
+//! In a window, `image` (and the SIGUSR1 snapshot) renders the current terminal
+//! through the SAME renderer and the SAME splice/composite sequence the window
+//! present uses — a re-render from the retained application input, not a copy of
+//! a presented destination. It captures the live cursor state, INCLUDING
+//! the current cursor blink phase and the hollow unfocused-cursor override — so
+//! a focused blinking session may legitimately capture a frame with no cursor
+//! pixels. This boundary does not observe compositor visibility or scanout.
+//! Headless sessions instead render a semantic frame and pin the blink phase on
+//! (always deterministic). For deterministic cursor state regardless of phase,
+//! use the `cursor` verb (row, col, visible, style).
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -570,8 +574,9 @@ fn cmd_help() -> String {
 #
 # SEEING a terminal (yours or a peer's) — five modes, pick by need:
 #   text / screen        what the PROGRAM wrote (plain rows / lossless styled grid)
-#   image                what the HUMAN sees (real rendered frame: decorations, tab strip,
-#                        overlays; `image plain` strips host bling for bare pixels)
+#   image                what ATERM submitted (client frame: decorations, tab strip,
+#                        overlays; `image plain` strips host bling for bare pixels;
+#                        compositor visibility/scanout is outside this boundary)
 #   subscribe            the LIVE movie (pushed frames; add every-frame for animations)
 #   cast | temporal <t>  HISTORY: replayable timestamped recording | the screen as it WAS
 #                        at instant <t> (temporal needs config temporal_recording=true)
@@ -4006,12 +4011,12 @@ fn handle(
             term,
             rest.strip_prefix("read").unwrap_or(rest).trim_start(),
         ),
-        // Framebuffer rasterize. Cross-session (`@<sel>`): render the window whose
-        // ACTIVE tab displays the resolved session — offscreen, the same WYSIWYG
-        // path as self — so one terminal can SEE another's real rendered frame
-        // (decorations, tab strip, overlays included). A session no window shows
-        // (background tab) fails honestly inside the render instead of silently
-        // capturing the WRONG (front) session.
+        // Framebuffer capture. Cross-session (`@<sel>`): capture the window whose
+        // ACTIVE tab displays the resolved session through the same app-present
+        // path as self, including decorations, tab strip, and overlays. A session
+        // no window shows (background tab) fails honestly instead of silently
+        // capturing the WRONG (front) session. This is client-destination truth,
+        // not platform-compositor visibility or scanout.
         "image" => {
             control_media::cmd_image(proxy, queue, rest, sock_dir, is_cross.then_some(session))
         }
@@ -4024,10 +4029,11 @@ fn handle(
         // window. So `@peer window` screenshots the PEER's window. Auth is enforced
         // upstream (the cross-session gate) before we get here.
         "window" => control_media::cmd_window(proxy, rest, sock_dir),
-        // `video <seconds> [full] [keys] [pace]`: record the front window's PRESENTED
-        // frames (the true temporal composite — the pixel twin of `cast frames`) into
-        // a PNG sequence + index.json an AI reads to SEE smoothness/flashes and to
-        // correlate pre-routing input attempts with later frames. `keys` is owner-only
+        // `video <seconds> [full] [keys] [pace]`: record the front window's GPU
+        // swapchain-destination frames submitted with application present calls into
+        // a PNG sequence + index.json. An AI can inspect renderer smoothness/flashes
+        // and correlate pre-routing input attempts with later submitted frames; the
+        // tap does not observe compositor selection or scanout. `keys` is owner-only
         // (enforced inside); its samples are not PTY-delivery or glyph receipts.
         "video" => control_media::cmd_video(proxy, rest, sock_dir, matches!(scope, Scope::Owner)),
         // `chrome`: the resolved instance's front window native UI (app-level; `@<sid>`

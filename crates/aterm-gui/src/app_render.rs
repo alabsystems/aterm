@@ -3678,6 +3678,154 @@ fn blit_rgba_over(
     }
 }
 
+/// Would this rendered row have been permuted by the BiDi reorder?
+///
+/// Delegates the predicate to `aterm-bidi` — the same classifier
+/// `apply_bidi_reorder` consults — so "which rows are visually reordered" cannot
+/// drift between the code that reorders and the code that refuses to paint over
+/// the result. `false` means logical order == visual order for this row, which
+/// is the precondition every logical-coordinate painter silently assumes.
+#[allow(
+    dead_code,
+    reason = "landed with its tests ahead of the host wiring (step 6-11 of docs/RFC-inline-suggest.md); the painter and its BiDi guard are the parts worth reviewing independently of the plumbing"
+)]
+fn row_needs_bidi(rowv: &[RenderCell]) -> bool {
+    rowv.iter().any(|c| aterm_bidi::has_bidi(&[c.ch]))
+}
+
+/// The cells an inline suggestion actually occupied, in the scratch's
+/// coordinates: `start` inclusive, `end` exclusive-ish (the last cell written is
+/// `end`).
+///
+/// Returned rather than a bare `bool` because the ghost is machine-invented text
+/// that must be MASKED from every published surface — copy, selection,
+/// scrollback, recordings and the `aterm-observe` introspection capture. The
+/// caller cannot reconstruct the extent from the suggestion string alone (wrap
+/// position, the bottom-edge stop and the blank-cell stop all shorten it), and
+/// `paint_prediction_ghosts`' caller only gets away with a `bool` because it
+/// still holds the `&[Prediction]` that names every cell it painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaintedGhost {
+    /// First cell written, `(row, col)`.
+    start: (usize, usize),
+    /// Last cell written, `(row, col)`.
+    end: (usize, usize),
+}
+
+/// Paint an inline suggestion (ghost text) starting at `(row, col)`, wrapping at
+/// the right margin. Returns the extent painted, or `None` if nothing was.
+///
+/// Sibling of [`paint_prediction_ghosts`] with two deliberate differences.
+///
+/// * **Dimmer.** A prediction is *your own text arriving*; a suggestion is an
+///   OFFER. Predictions blend halfway to the background, suggestions three
+///   quarters, so the two are distinguishable at a glance and the offer never
+///   competes with real output for attention.
+/// * **It is a string, not a cell set.** The suggestion has no per-cell
+///   provenance to reconcile — it is accepted whole (or by word) or it is not.
+///
+/// Stops — rather than overwriting — at three boundaries: the bottom edge (a
+/// suggestion that scrolled the grid would move real output), a row the BiDi
+/// reorder would permute, and the first NON-BLANK cell.
+///
+/// That last one is load-bearing. Under `fish` or `zsh-autosuggestions` the
+/// shell has *already* painted its own suggestion as REAL grid content to the
+/// right of the cursor; without this guard aterm would paint a second, different
+/// completion on top of it. It equally covers the user having moved back into
+/// the middle of a line, where everything right of the cursor is their own text.
+#[allow(
+    dead_code,
+    reason = "landed with its tests ahead of the host wiring — see `row_needs_bidi`"
+)]
+fn paint_suggestion(
+    scratch: &mut RenderInput,
+    text: &str,
+    start: (usize, usize),
+    cols: usize,
+    blank: RenderCell,
+) -> Option<PaintedGhost> {
+    if text.is_empty() || cols == 0 {
+        return None;
+    }
+    // BIDI, half one: the suggestion's own glyphs. Painting an RTL character
+    // would itself make the row bidi — the reorder that runs before the NEXT
+    // frame would then permute cells this ghost is addressing logically. Checked
+    // once, up front, over the whole string.
+    if text.chars().any(|c| aterm_bidi::has_bidi(&[c])) {
+        return None;
+    }
+    let (mut row, mut col) = start;
+    let mut painted: Option<PaintedGhost> = None;
+    // BIDI, half two: the rows painted into. `Terminal::cell_frame_into` ends
+    // with `apply_bidi_reorder`, so a scratch row is in VISUAL order — but the
+    // suggestion's column is a LOGICAL offset from the cursor. On a row holding
+    // an RTL run the two disagree and the ghost lands on top of real text.
+    //
+    // Hoisted out of the per-character loop: the predicate is a property of the
+    // ROW, and re-deriving it for every glyph made the painter quadratic
+    // (`O(chars × row_len)` — a 60-char suggestion on a 200-column row cost
+    // 12 000 classifications per frame, on the render path).
+    let mut checked: Option<usize> = None;
+    for ch in text.chars() {
+        if col >= cols {
+            row += 1;
+            col = 0;
+        }
+        let Some(rowv) = scratch.cells.get_mut(row) else {
+            break; // bottom edge: stop rather than scroll real content
+        };
+        if checked != Some(row) {
+            if row_needs_bidi(rowv) {
+                break;
+            }
+            checked = Some(row);
+        }
+        // NEVER overwrite real content. A cell inside the row's trimmed length
+        // holding anything but a space is the shell's own autosuggestion, or the
+        // user's own text with the cursor moved back into it — either way it is
+        // not ours. Cells past the trimmed length do not exist yet and are ours
+        // to extend into.
+        if rowv.get(col).is_some_and(|c| c.ch != ' ') {
+            break;
+        }
+        let template = rowv.last().copied().unwrap_or(blank);
+        let mut pad = template;
+        pad.ch = ' ';
+        while rowv.len() <= col {
+            rowv.push(pad);
+        }
+        let cell = &mut rowv[col];
+        let (fg, bg) = (cell.fg, cell.bg);
+        cell.ch = ch;
+        // Three quarters of the way to the background — see the doc comment.
+        cell.fg = [
+            ((fg[0] as u16 + 3 * bg[0] as u16) / 4) as u8,
+            ((fg[1] as u16 + 3 * bg[1] as u16) / 4) as u8,
+            ((fg[2] as u16 + 3 * bg[2] as u16) / 4) as u8,
+        ];
+        cell.wide = false;
+        cell.emoji_presentation = false;
+        cell.bold = false;
+        cell.italic = false;
+        cell.underline = aterm_core::terminal::UnderlineStyle::None;
+        cell.strikethrough = false;
+        cell.overline = false;
+        cell.underline_color = None;
+        painted = Some(match painted {
+            None => PaintedGhost {
+                start: (row, col),
+                end: (row, col),
+            },
+            Some(p) => PaintedGhost {
+                end: (row, col),
+                ..p
+            },
+        });
+        col += 1;
+    }
+    painted
+}
+
 /// Overlay pending speculative-echo GHOSTS onto a terminal-coordinate snapshot —
 /// `input_scratch` on the single-pane path, the focused pane's `pane_scratch`
 /// (pane-local coords, BEFORE the blit offsets it into window space) on the
@@ -3759,6 +3907,160 @@ mod overlay_card_theme_tests {
             ws.input_scratch.default_bg = aterm_core::render::COLOR_UNSET;
         }
         assert_eq!(app.overlay_card_theme(wid0).bg, 0x00FF_FFFF);
+    }
+}
+
+#[cfg(test)]
+mod suggestion_paint_tests {
+    use super::paint_suggestion;
+    use aterm_core::terminal::RenderCell;
+    use aterm_render::RenderInput;
+
+    fn blank() -> RenderCell {
+        RenderCell {
+            ch: ' ',
+            fg: [200, 200, 200],
+            bg: [0, 0, 0],
+            wide: false,
+            emoji_presentation: false,
+            bold: false,
+            italic: false,
+            underline: aterm_core::terminal::UnderlineStyle::None,
+            strikethrough: false,
+            overline: false,
+            underline_color: None,
+        }
+    }
+
+    fn scratch(rows: usize) -> RenderInput {
+        let mut s = RenderInput::empty();
+        s.cells = vec![Vec::new(); rows];
+        s
+    }
+
+    #[test]
+    fn suggestion_paints_dimmer_than_a_prediction() {
+        let mut s = scratch(2);
+        assert!(paint_suggestion(&mut s, "ab", (0, 2), 10, blank()).is_some());
+        assert_eq!(s.cells[0][2].ch, 'a');
+        assert_eq!(s.cells[0][3].ch, 'b');
+        assert_eq!(
+            s.cells[0][2].fg,
+            [50, 50, 50],
+            "three quarters to bg — a prediction dims only halfway ([100;3])"
+        );
+    }
+
+    #[test]
+    fn suggestion_wraps_at_the_right_margin() {
+        let mut s = scratch(2);
+        assert!(paint_suggestion(&mut s, "xyz", (0, 2), 4, blank()).is_some());
+        assert_eq!(s.cells[0][2].ch, 'x');
+        assert_eq!(s.cells[0][3].ch, 'y');
+        assert_eq!(s.cells[1][0].ch, 'z', "continues on the next row");
+    }
+
+    #[test]
+    fn suggestion_stops_at_the_bottom_edge_instead_of_scrolling() {
+        let mut s = scratch(1);
+        // Only one row exists; the tail would need a second.
+        assert!(paint_suggestion(&mut s, "abcde", (0, 2), 4, blank()).is_some());
+        assert_eq!(s.cells.len(), 1, "no row was added — real output must not move");
+        assert_eq!(s.cells[0][2].ch, 'a');
+        assert_eq!(s.cells[0][3].ch, 'b');
+    }
+
+    #[test]
+    fn empty_text_paints_nothing() {
+        let mut s = scratch(2);
+        assert!(paint_suggestion(&mut s, "", (0, 0), 10, blank()).is_none());
+        assert!(s.cells[0].is_empty());
+    }
+
+    #[test]
+    fn degenerate_geometry_paints_nothing() {
+        let mut s = scratch(2);
+        assert!(paint_suggestion(&mut s, "abc", (0, 0), 0, blank()).is_none());
+    }
+
+    /// The scratch is bidi-REORDERED (visual order) but the suggestion column is
+    /// a LOGICAL offset, so on an RTL row the two disagree. Refusing is the only
+    /// safe option; painting would land the ghost on top of real text.
+    #[test]
+    fn an_rtl_row_is_refused_rather_than_mispainted() {
+        let mut s = scratch(1);
+        let mut hebrew = blank();
+        hebrew.ch = 'ש';
+        s.cells[0] = vec![hebrew, blank()];
+        assert!(
+            paint_suggestion(&mut s, "abc", (0, 2), 10, blank()).is_none(),
+            "a row the BiDi reorder would permute must not take a logical-coord ghost"
+        );
+        assert_eq!(s.cells[0][0].ch, 'ש', "real content untouched");
+    }
+
+    /// An RTL glyph in the SUGGESTION would make the row bidi, so the next
+    /// frame's reorder would permute the very cells this ghost addresses
+    /// logically. Refused up front, before any cell is touched.
+    #[test]
+    fn an_rtl_suggestion_is_refused_on_an_ltr_row() {
+        let mut s = scratch(1);
+        s.cells[0] = vec![blank(), blank()];
+        assert!(paint_suggestion(&mut s, "שלום", (0, 2), 10, blank()).is_none());
+        assert_eq!(s.cells[0].len(), 2, "no cell was touched");
+    }
+
+    /// The row predicate is hoisted out of the character loop; a multi-row
+    /// suggestion must still re-check when it wraps onto a NEW row.
+    #[test]
+    fn wrapping_onto_an_rtl_row_stops_at_that_row() {
+        let mut s = scratch(2);
+        let mut heb = blank();
+        heb.ch = 'ש';
+        s.cells[0] = vec![blank(), blank()];
+        s.cells[1] = vec![heb];
+        assert!(paint_suggestion(&mut s, "xyz", (0, 2), 4, blank()).is_some());
+        assert_eq!(s.cells[0][2].ch, 'x');
+        assert_eq!(s.cells[0][3].ch, 'y');
+        assert_eq!(s.cells[1][0].ch, 'ש', "the wrapped tail must not land on an RTL row");
+    }
+
+    /// Under `fish` / `zsh-autosuggestions` the shell has ALREADY painted its
+    /// own completion as real grid content right of the cursor. Painting a
+    /// second, different one on top of it is the worst outcome available.
+    #[test]
+    fn a_non_blank_cell_stops_the_ghost() {
+        let mut s = scratch(1);
+        let mut shell_sugg = blank();
+        shell_sugg.ch = 'Z';
+        // "$ " then a blank we may use, then the shell's own suggestion.
+        s.cells[0] = vec![blank(), blank(), blank(), shell_sugg];
+        let g = paint_suggestion(&mut s, "abc", (0, 2), 10, blank()).expect("one cell");
+        assert_eq!(s.cells[0][2].ch, 'a', "the blank cell was ours to take");
+        assert_eq!(s.cells[0][3].ch, 'Z', "the shell's suggestion is untouched");
+        assert_eq!(g.start, (0, 2));
+        assert_eq!(g.end, (0, 2), "the extent stops at the collision");
+    }
+
+    /// The extent is what a host masks from copy / a11y / introspection, so it
+    /// must describe the cells actually written — not the string it was asked
+    /// to paint.
+    #[test]
+    fn the_reported_extent_tracks_a_wrap() {
+        let mut s = scratch(2);
+        let g = paint_suggestion(&mut s, "xyz", (0, 2), 4, blank()).expect("painted");
+        assert_eq!(g.start, (0, 2));
+        assert_eq!(g.end, (1, 0), "ends on the wrapped row");
+    }
+
+    #[test]
+    fn a_pure_ltr_row_still_paints() {
+        let mut s = scratch(1);
+        let mut a = blank();
+        a.ch = '$';
+        s.cells[0] = vec![a, blank()];
+        assert!(paint_suggestion(&mut s, "ab", (0, 2), 10, blank()).is_some());
+        assert_eq!(s.cells[0][2].ch, 'a');
     }
 }
 
@@ -11876,7 +12178,22 @@ impl App {
         if Some((rows, cols)) == self.windows.get(&wid).map(|ws| (ws.rows, ws.cols)) {
             return false;
         }
+        // NYAN RESIZE STREAK license. The relayout leap is a gesture the user's hand
+        // made, so it earns the rainbow ZOOM even from cold typing momentum — but
+        // only ONCE per gesture. `resize_live_drag` is set exactly around the
+        // interactive throttle (`on_resize_throttled`), so the leading edge and every
+        // ~20 Hz mid-drag step arm nothing and the drag stays quiet; the TRAILING
+        // settle (`flush_pending_resize`) and every out-of-band re-grid (the
+        // control-socket `resize` verb, a scale-factor or font-zoom change) run with
+        // the flag clear and arm the single streak. Read the flag BEFORE borrowing
+        // `ws`. Past the unchanged-geometry early-return above, so a no-op resize
+        // (the control-echo follow-up `Resized`, a same-size settle) licenses nothing.
+        let reflow_gesture = !self.resize_live_drag;
         if let Some(ws) = self.windows.get_mut(&wid) {
+            if reflow_gesture {
+                let now = std::time::Instant::now();
+                ws.cursor_glow.note_reflow(now);
+            }
             ws.rows = rows;
             ws.cols = cols;
             // The grid dimensions (and thus the cursor coordinate space predictions are
@@ -11896,6 +12213,25 @@ impl App {
         // with no splits each pane fills its whole tab = the full window grid.
         // `resize_panes` records each pane's asciicast + temporal-spine resize event.
         self.resize_panes(wid);
+        // RE-BASELINE THE SCROLL ANCHOR (must follow `resize_panes`, which is what
+        // reflows). A height SHRINK pushes the vanished viewport rows into
+        // scrollback, so `scrollback_lines()` rises by exactly the same Δ the grid
+        // clamps the cursor row down by. The redraw path reads that counter as a
+        // PTY-driven scroll (`scrolled_rows` below) and calls `note_scroll(Δ)`,
+        // which translates the trail engines' remembered cell up by Δ — exactly
+        // cancelling the relayout move, so the engines observe NO move at all and
+        // never spawn. Re-anchoring here attributes the reflow's own Δ to the
+        // reflow (where it belongs) instead of laundering it through the scroll
+        // channel; a genuine PTY scroll on a later frame still translates
+        // normally, because the next redraw diffs against this fresh baseline.
+        if let Some(sb) = self
+            .focused_session_id(wid)
+            .and_then(|id| self.session_by_id(id))
+            .map(|s| term_lock(&s.term).grid().scrollback_lines())
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            ws.poof_scrollback = Some(sb);
+        }
         // The GPU swapchain was already sized to the true window client area above
         // (via `sync_gpu_surface_size`, before the early-return), independent of the
         // grid geometry; the offscreen stays grid-sized and is letterboxed into it in

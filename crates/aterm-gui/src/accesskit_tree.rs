@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! P2 — the retired overlay model's cross-platform accessibility prototype. Production
-//! Settings accessibility and `controls settings` both consume the native compiled
-//! semantic tree; this feature-gated module remains only for legacy model coverage. It
+//! Cross-platform AccessKit projection for the compiled Settings semantic model.
+//! Settings accessibility and `controls settings` both consume that native compiled
+//! semantic tree. This module
 //! maps [`crate::settings::SettingsState`] into an [`accesskit::TreeUpdate`] that
 //! `accesskit_winit` fans out to the OS
 //! accessibility APIs (UIA on Windows, AT-SPI on Linux, NSAccessibility on macOS) — so a
@@ -14,8 +14,8 @@
 //! pushes `update_if_active(|| settings_tree(state))` on change is the OS event-loop
 //! wiring (runtime-verified with a real screen reader), built on top of this seam.
 //!
-//! Gated behind the non-default `a11y-accesskit` feature (see this crate's `Cargo.toml`),
-//! so the production build neither links AccessKit nor compiles this module.
+//! Gated behind the default-on `a11y-accesskit` feature (see this crate's
+//! `Cargo.toml`); builds that explicitly disable the feature omit AccessKit.
 
 // macOS: AccessKit's NSAccessibility provider and the `a11y-appkit` grid publisher both
 // claim the content view's accessibility tree — enabling both yields a corrupt/duplicated

@@ -190,7 +190,8 @@ mod tests {
                 declared,
                 "srgb={srgb}: sRGB view fmt neither texture fmt nor declared alias"
             );
-            // Stored bytes are always sRGB-encoded (screenshot==glass).
+            // Stored bytes are always sRGB-encoded: readback and the
+            // application-submitted destination share this byte contract.
             assert_eq!(
                 tex.add_srgb_suffix(),
                 TextureFormat::Rgba8UnormSrgb,

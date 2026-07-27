@@ -507,8 +507,9 @@ WHAT IT IS
   engine + socket with no window — exposes a control socket speaking a small newline
   protocol. (The plain `aterm` passthrough CLI serves NONE: it is a transparent shell
   wrapper, not an introspection host.) The `aterm ctl` client talks that socket: read the
-  rendered screen (as text or real pixels), send keystrokes, wait on events, and drive a
-  whole fleet — the SAME view and control a human has. A session is addressed by its sid;
+  terminal state (as text/styled cells) or application-rendered client pixels, send
+  keystrokes, wait on events, and drive a whole fleet through the same application input
+  path. OS compositor and display output are outside this interface. A session is addressed by its sid;
   `@<sid>` routes a verb to that session, relayed transparently even across instances and
   machines.
 

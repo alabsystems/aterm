@@ -1568,8 +1568,9 @@ enum Wake {
     /// caps the capture rate (already clamped 1..=120 at parse) and
     /// `budget_bytes` sizes the frame store (already clamped 64..=4096 MiB at
     /// parse). See `aterm_gpu::video_tap` for why this captures the SWAPCHAIN
-    /// (the exact presented bytes, including layers every offscreen readback
-    /// misses).
+    /// destination (the exact bytes submitted alongside `present()`, including
+    /// layers every offscreen readback misses; compositor selection/scanout is
+    /// not observed).
     Video {
         dur_ms: u64,
         full_res: bool,
@@ -4965,6 +4966,22 @@ struct WindowState {
     /// early-out consults it so the frame that ERASES a ghost (a backspace/flush that
     /// empties a displayed set leaves the grid unchanged) is not skipped.
     pred_shown: bool,
+    /// Inline suggestion (ghost text) for the focused pane: the history-ranked
+    /// completion painted dim after the cursor. Distinct from `predictor` — that
+    /// speculates about bytes ALREADY SENT to the PTY and reconciles them against
+    /// the echo, while this offers bytes the PTY has never seen and that are only
+    /// ever written by an explicit accept. Inert unless `inline_suggest` opts in.
+    #[allow(
+        dead_code,
+        reason = "the pane's suggestion state, landed ahead of the render/input wiring in docs/RFC-inline-suggest.md steps 6-11"
+    )]
+    suggest: aterm_suggest::Ghost,
+    /// Whether the LAST presented frame painted a suggestion. Same role as
+    /// `pred_shown`: a suggestion that disappears (accepted, dismissed, diverged)
+    /// changes no grid cell, so without this the erase frame is skipped and a stale
+    /// ghost lingers.
+    #[allow(dead_code, reason = "paired with `suggest`; see its note")]
+    sugg_shown: bool,
     /// Whether the LAST presented frame composed multiple panes. A change in this
     /// (single-pane ⇄ split) relocates the cursor between coordinate spaces, so the
     /// cursor animators are reset on the transition to avoid a spurious one-frame
@@ -5228,8 +5245,9 @@ struct WindowState {
     /// the first frame is immediate. CRITICAL: aurora-only presents must NOT stamp this
     /// — otherwise the ~60fps aurora animation tail after a cursor move keeps this
     /// "fresh", so the soft cap defers the NEXT keystroke's echo by up to a frame
-    /// interval, adding input-to-photon latency to essentially every keystroke. Gated by
-    /// `content_pending` so only content presents update it.
+    /// interval, adding up to one software frame of echo scheduling latency to
+    /// essentially every keystroke. Gated by `content_pending` so only content
+    /// presents update it.
     last_present_at: Option<Instant>,
     /// Set when a redraw is requested to service genuine CONTENT (a `Wake::Output`
     /// echo/output, or a deferred bulk-output flush) rather than a cursor-aurora
@@ -6101,6 +6119,8 @@ impl WindowState {
             blink_reseed: false,
             predictor: crate::predict::Predictor::new(crate::predict::PredictMode::Off),
             pred_shown: false,
+            suggest: aterm_suggest::Ghost::new(aterm_suggest::Engine::default()),
+            sugg_shown: false,
             last_composed: None,
             glow_scratch: Vec::new(),
             word_decos: crate::word_decorations::WordDecorations::default(),
@@ -7316,11 +7336,11 @@ struct App {
     /// Latency self-introspection ($ATERM_TRACE_LATENCY). When on, each PTY
     /// reader stamps the leading edge of its output bursts into ITS session's
     /// `last_output_ns` (nanos since `lat_epoch`), and `redraw()` logs
-    /// output→present latency after `present()` — the software-controllable
-    /// slice of input-to-photon (the rest is fixed panel scan-out, identical
-    /// across every terminal). Attribution is per-window: the present books
-    /// only stamps from sessions VISIBLE in the presenting window (see
-    /// `present_latency_ns`).
+    /// output→application-present-return latency after `present()`. This is a
+    /// software-side proxy only: compositor selection, display timing, scanout,
+    /// and photons are unobserved. Attribution is per-window: the present books
+    /// only stamps from sessions included in that window's submitted destination
+    /// (see `present_latency_ns`).
     trace_latency: bool,
     lat_epoch: Instant,
     /// Desktop-notification SUPPRESSION SET, read by the `notify` delivery thread:
@@ -13229,10 +13249,9 @@ pub fn attach_parent_console() {
 /// the window.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Anchor the metrics clock at the top of the window path so
-    // `first_present_ms` (the self-measured time-to-glass, ARENA-START) means
-    // entry->first-present, not whichever-metric-fired-first->first-present.
-    // (the self-measured time-to-glass, ARENA-START) means main→first-present,
-    // not whichever-metric-fired-first→first-present.
+    // `first_present_ms` means main entry → first successful application-present
+    // return, not whichever-metric-fired-first → first present. Platform
+    // compositor and scanout timing are outside this boundary.
     metrics::mark_process_start();
     // Child-copy fd posture must be repaired before the updater spawns any
     // codesign/PlistBuddy/spctl helper. The updater receives this exact list
@@ -13458,7 +13477,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // NOTE (thread-safety floor): the font-warm spawn that used to live HERE was the
     // process's first thread. It moved to the first-present hook in `app_render.rs`
     // (launch speed: its "read every system font's cmap" IO contended with GPU init
-    // + shell spawn on the time-to-glass critical path; the `OnceLock` coordination
+    // + shell spawn on the first-present critical path; the `OnceLock` coordination
     // is unchanged, so a pre-warm uncovered glyph blocks on the in-progress build —
     // bounded, correct). The single-threaded-process requirement of the env
     // mutations above (`remove_var`, `seamless::take_incoming`) still holds: NO
@@ -24931,7 +24950,7 @@ mod tab_strip_math_tests {
 mod recursion_provision_tests {
     use crate::spawn::{
         install_parent_edges, is_valid_session_id, parse_injected_identity,
-        provision_child_recursion_env,
+        provision_child_identity_env, provision_child_recursion_env,
     };
     use aterm_session::{EdgeTable, LaunchNonce, Op, SessionId};
 
@@ -24969,7 +24988,13 @@ mod recursion_provision_tests {
     #[test]
     fn provision_child_env_is_symmetric_across_all_three_ops() {
         let parent = SessionId::generate();
-        let (env, prov) = provision_child_recursion_env(&parent);
+        // The spawn path injects BOTH halves into `env_add`: IDENTITY (parent id,
+        // unconditional — every session, `-e` included) and RECURSION (adopted sid
+        // + nonce, gated on hosting an inner aterm). The 4↔5 seam is over their
+        // union, so the test composes them exactly as `spawn` does.
+        let mut env = provision_child_identity_env(&parent);
+        let (recursion_env, prov) = provision_child_recursion_env(&parent);
+        env.extend(recursion_env);
         let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone());
 
         // The child adopts the injected identity and installs the parent's edges.

@@ -143,8 +143,9 @@ pub(crate) struct SessionFactory {
 fn ai_hint_banner() -> Option<String> {
     std::env::var_os("ATERM_AI_HINT")?;
     Some(
-        "\x1b[2m✶ aterm: this terminal is AI-introspectable — read its live screen \
-         (text + real pixels), drive it like a user, and measure its latency, with \
+        "\x1b[2m✶ aterm: this terminal is AI-introspectable — read its live terminal state \
+         and application-rendered client pixels, drive it through the application input path, \
+         and measure application latency with \
          `aterm-ctl` (see `aterm-ctl --help`; `aterm-ctl metrics` for responsiveness).\
          \x1b[0m\r\n"
             .to_string(),
@@ -234,10 +235,30 @@ impl From<&ChildProvision> for crate::proxy::ProxyEntry {
 /// read+write+signal authority over the inner session AUTOMATICALLY — no manual
 /// `grant`. Minting ALL THREE ops is required or recursion would be silently
 /// read-only.
+/// The child's view of WHO SPAWNED IT — pure identity, no capability.
+///
+/// Split out of [`provision_child_recursion_env`] because the two answer different
+/// questions and only one of them is conditional. `ENV_PARENT_SESSION_ID` names the
+/// hosting session so a child can address it as `@self`; it grants nothing on its
+/// own (the edges are what carry authority, and they stay behind the recursion
+/// gate). Every session therefore gets it — including a one-shot `-e <cmd>` session,
+/// which is precisely the case that hosts an agent CLI whose hooks need to find the
+/// pane they are running in.
+///
+/// Deny-listed like the rest of the provisioning vars, so an INHERITED copy never
+/// survives a hop; each direct child receives a fresh value through `env_add`.
+pub(crate) fn provision_child_identity_env(parent_sid: &SessionId) -> Vec<(String, String)> {
+    use aterm_types::domain::ENV_PARENT_SESSION_ID;
+    vec![(
+        ENV_PARENT_SESSION_ID.to_string(),
+        parent_sid.as_str().to_string(),
+    )]
+}
+
 pub(crate) fn provision_child_recursion_env(
-    parent_sid: &SessionId,
+    _parent_sid: &SessionId,
 ) -> (Vec<(String, String)>, ChildProvision) {
-    use aterm_types::domain::{ENV_LAUNCH_NONCE, ENV_PARENT_SESSION_ID, ENV_SESSION_ID};
+    use aterm_types::domain::{ENV_LAUNCH_NONCE, ENV_SESSION_ID};
     let prov = ChildProvision {
         child_sid: SessionId::generate(),
         child_nonce: LaunchNonce::generate(),
@@ -245,7 +266,8 @@ pub(crate) fn provision_child_recursion_env(
         write: EdgeToken::generate(),
         signal: EdgeToken::generate(),
     };
-    // IDENTITY only (non-secret): the child's adopted id+nonce and the parent id.
+    // ADOPTION identity (non-secret): the child's adopted id+nonce. The parent id
+    // is NOT here — it is unconditional now, see `provision_child_identity_env`.
     // The edge-token SECRETS are NOT in env (audit finding F1) — the caller routes
     // them through a 0600 file (or, only if no private dir exists, the fallback env
     // channel). `prov` carries the tokens for the caller to place + retain.
@@ -255,10 +277,6 @@ pub(crate) fn provision_child_recursion_env(
             prov.child_sid.as_str().to_string(),
         ),
         (ENV_LAUNCH_NONCE.to_string(), prov.child_nonce.to_hex()),
-        (
-            ENV_PARENT_SESSION_ID.to_string(),
-            parent_sid.as_str().to_string(),
-        ),
     ];
     (env, prov)
 }
@@ -468,6 +486,14 @@ pub(crate) fn spawn_session(
             .unwrap_or_else(|| (SessionId::generate(), LaunchNonce::generate())),
         None => (SessionId::generate(), LaunchNonce::generate()),
     };
+    // IDENTITY is unconditional (adoption aside, where env cannot be re-injected):
+    // every child learns which session hosts it, so `@self` resolves from any
+    // descendant process. This is deliberately NOT gated on `exec_command`, unlike
+    // the capability provisioning below — `aterm -e claude` is exactly the case that
+    // needs it, since an agent CLI's hooks address the pane through this var.
+    if adopt.is_none() {
+        env_add.extend(provision_child_identity_env(&self_id));
+    }
     // A one-shot `-e <cmd>` session never hosts an inner aterm, so skip child
     // recursion provisioning entirely — the injected tokens + the retained
     // `ProxyEntry` would be permanently unused. Returns the child sid to retain
@@ -844,6 +870,63 @@ impl DeferredReaderGate {
             };
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod child_identity_env_tests {
+    use super::{provision_child_identity_env, provision_child_recursion_env};
+    use aterm_session::SessionId;
+    use aterm_types::domain::{ENV_LAUNCH_NONCE, ENV_PARENT_SESSION_ID, ENV_SESSION_ID};
+
+    fn keys(env: &[(String, String)]) -> Vec<&str> {
+        env.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// IDENTITY carries the parent id and NOTHING else — it is emitted for every
+    /// session, including one-shot `-e <cmd>`, so it must grant no authority.
+    #[test]
+    fn identity_env_is_parent_id_only() {
+        let parent = SessionId::generate();
+        let env = provision_child_identity_env(&parent);
+        assert_eq!(keys(&env), vec![ENV_PARENT_SESSION_ID]);
+        assert_eq!(env[0].1, parent.as_str());
+    }
+
+    /// The two provisioning halves must not overlap: recursion carries ADOPTION
+    /// identity (child sid + nonce) and must no longer emit the parent id, or a
+    /// shell session would receive a duplicate key in `env_add`.
+    #[test]
+    fn recursion_env_no_longer_emits_parent_id() {
+        let parent = SessionId::generate();
+        let (env, _prov) = provision_child_recursion_env(&parent);
+        let k = keys(&env);
+        assert!(k.contains(&ENV_SESSION_ID), "adoption sid must remain");
+        assert!(k.contains(&ENV_LAUNCH_NONCE), "adoption nonce must remain");
+        assert!(
+            !k.contains(&ENV_PARENT_SESSION_ID),
+            "parent id moved to provision_child_identity_env; emitting it here too \
+             would duplicate the key for shell sessions"
+        );
+    }
+
+    /// The union is what a NON-exec (shell) session injects; it must still cover
+    /// every var the recursion contract promised before the split.
+    #[test]
+    fn identity_plus_recursion_covers_the_original_contract() {
+        let parent = SessionId::generate();
+        let mut env = provision_child_identity_env(&parent);
+        let (rec, _prov) = provision_child_recursion_env(&parent);
+        env.extend(rec);
+        let k = keys(&env);
+        for want in [ENV_PARENT_SESSION_ID, ENV_SESSION_ID, ENV_LAUNCH_NONCE] {
+            assert!(k.contains(&want), "missing {want} after split");
+        }
+        let mut sorted = k.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "no key may be emitted twice");
     }
 }
 

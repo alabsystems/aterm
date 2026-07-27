@@ -24,7 +24,7 @@
 </p>
 
 > [!IMPORTANT]
-> **Source release:** this snapshot is `v0.5.0`. This repository
+> **Source release:** this snapshot is `v0.7.0`. This repository
 > contains the buildable product source and authentic product captures for a
 > macOS-first preview. It does **not** include a prebuilt binary, installer,
 > public updater channel, or bundled ALab tool packages.
@@ -42,7 +42,7 @@ cargo build --locked -p aterm
 ```
 
 Confirm the public version with `./target/debug/aterm --version`; it should print
-`aterm 0.5.0`. Build from the workspace rather than using `cargo install`:
+`aterm 0.7.0`. Build from the workspace rather than using `cargo install`:
 aterm's crates are not independently published to crates.io yet. Linux and
 Windows code is present, but macOS is the exercised preview target for this
 first public source release.
@@ -69,8 +69,8 @@ tools installed in the ALab environment are one command away.
 | **Drive** | Text, keys, paste, mouse, focus, resize, selection, and clipboard operations | Signals are a separate out-of-band operation, not simulated human keystrokes |
 | **Coordinate** | Event-driven `await`, `ready`, `wait`, and whole-turn settlement | `turn` settles on display quiescence, not arbitrary process completion; `wait` uses OSC-133 command marks |
 | **Stream** | `screen`, `cursor`, `cells`, `bytes`, `events`, and `sessions` subscriptions | Resynchronization is explicit through gap markers |
-| **Render + record** | PNG frames, bounded asciicast history, opt-in temporal recording, and presented-frame video | Video requires the GPU backend and starts only when requested |
-| **Measure** | Live render, frame, input, and output-to-present counters | This README makes no aggregate performance claim |
+| **Render + record** | PNG frames, bounded asciicast history, opt-in temporal recording, and GPU swapchain-tap video | Video records submitted destination bytes—not compositor visibility or scanout—and starts only when requested |
+| **Measure** | Live render, frame, input, and application-present-return counters | Software-side diagnostics; GPU completion, compositor pickup, scanout, and photons are outside the metric boundary |
 | **Extend** | Themes, settings, Trail Packs, process control, and Rust/WASM engine source | Workspace path APIs are available, but crates.io packaging and API stability are not |
 | **Delight** | Cursor companions, rainbow trails, fire, laser, water, sparkle, and sound | Signature trail sounds are currently a macOS feature |
 
@@ -129,9 +129,10 @@ The control-enabled window and headless modes provide:
 
 - **Structured observation:** `text`, `screen`, individual cells and lines,
   cursor state, terminal modes, search, command blocks, and session metadata.
-- **Rendered truth:** `image` captures the frame aterm renders. GPU `video`
-  records presented frames, including effects that may exist only during
-  presentation.
+- **Rendered truth:** `image` captures aterm's rendered client frame. GPU
+  `video` records the swapchain-destination bytes submitted with successful
+  application present calls, including app-owned presentation-only effects; it
+  does not observe compositor selection, visibility, scanout, or photons.
 - **Human-style input:** `send`, `key`, mouse, paste, focus, resize, selection,
   and clipboard requests converge on the terminal's input path. Process signals
   remain explicit and out of band.
@@ -191,7 +192,7 @@ aterm ty --help       # explicit-state specification checker
 aterm trust --help    # compiler toolchain
 ```
 
-That describes ALab's managed environment. The `v0.5.0` source snapshot does
+That describes ALab's managed environment. The `v0.7.0` source snapshot does
 not ship those packages, and tool availability varies by channel and platform.
 
 ## Use aterm in your own project
@@ -392,4 +393,4 @@ Unless a file says otherwise, aterm is licensed under the
 [Apache License 2.0](LICENSE). MIT-licensed project components use
 [LICENSE-MIT](LICENSE-MIT), and bundled or derived third-party material retains
 its own terms. See [NOTICE](NOTICE) for the distribution inventory and
-[PUBLICATION.md](PUBLICATION.md) for the `v0.5.0` source-snapshot boundary.
+[PUBLICATION.md](PUBLICATION.md) for the `v0.7.0` source-snapshot boundary.

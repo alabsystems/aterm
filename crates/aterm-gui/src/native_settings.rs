@@ -12555,9 +12555,9 @@ fn about_page(
         (
             "Capture".to_string(),
             if large_type_narrow {
-                "Exact pixels"
+                "App-render pixels"
             } else {
-                "WYSIWYG control image"
+                "Exact app-render pixels"
             }
             .to_string(),
         ),

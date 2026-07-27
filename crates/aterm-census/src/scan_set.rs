@@ -1441,6 +1441,7 @@ mod tests {
             "crates/aterm-session/src",
             "crates/aterm-shell-integration/src",
             "crates/aterm-sixel/src",
+            "crates/aterm-suggest/src",
             "crates/aterm-tempfile/src",
             "crates/aterm-types/src",
             "crates/aterm-uds/src",

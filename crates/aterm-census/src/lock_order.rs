@@ -3102,14 +3102,14 @@ mod tests {
     #[test]
     fn scanned_set_covers_the_full_gui_process_closure() {
         // The scan set is DERIVED (scan_set::derive_gui_scan_set) — the full
-        // aterm-gui process surface, currently 44 crates. The exact member
+        // aterm-gui process surface, currently 45 crates. The exact member
         // list is pinned by scan_set's derived_closure_matches_the_pinned_canary;
         // this asserts the census actually WALKS the derived set and reports
         // its provenance + exclusions in the transcript.
         let out = run_lock_order_census(&repo_root());
         assert!(
             out.log
-                .contains("across 44 workspace crate(s) + 5 vendored crate(s)"),
+                .contains("across 45 workspace crate(s) + 5 vendored crate(s)"),
             "the census must report the full derived closure + the scanned vendored \
              crates:\n{}",
             out.log

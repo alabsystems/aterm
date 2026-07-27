@@ -289,21 +289,21 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "image [path] : render the REAL frame -> PNG, reply OK <w> <h> <path> (bare filename confined to the runtime images/ dir; auto-named when omitted). image --bytes = return the PNG base64'd OVER THE WIRE (OK 1 + `<w> <h> <nbytes> <base64>`) instead of a server-local path — the form a REMOTE (dial/TLS) driver uses. image --meta = opt into additive final-pixel identity plus terminal/native/composite phase, raster, paint, geometry, theme, and per-leaf metadata (existing replies stay byte-for-byte unchanged; with --bytes the reply is OK 2 + metadata and PNG rows). image plain = bare pixels; image read = inline OSC-1337 images as base64. @<sid> renders that session's window",
+        "image [path] : capture the APPLICATION-RENDERED CLIENT FRAME -> PNG, reply OK <w> <h> <path> (bare filename confined to the runtime images/ dir; auto-named when omitted). In a window the frame is bound to a successful application-present transaction; headless is a semantic-renderer artifact. Platform compositor visibility and scanout are not observed. image --bytes = return the PNG base64'd OVER THE WIRE (OK 1 + `<w> <h> <nbytes> <base64>`) instead of a server-local path — the form a REMOTE (dial/TLS) driver uses. image --meta = opt into an additive captured-frame pixel fingerprint plus terminal/native/composite phase, raster, paint, geometry, theme, and per-leaf metadata (existing replies stay byte-for-byte unchanged; with --bytes the reply is OK 2 + metadata and PNG rows). image plain = bare pixels; image read = inline OSC-1337 images as base64. @<sid> captures the app-render frame of the window showing that session",
     ),
     v(
         "window",
         Read,
         Status,
         App,
-        "window [<target>] [path] : screenshot a GUI window -> PNG, reply OK <w> <h> <path> (target: front|prefs|about|menu|update, default front; bare filename confined to images/)",
+        "window [<target>] [path] : assemble a full-window artifact (platform-owned chrome + the exact submitted client destination) -> PNG, reply OK <w> <h> <path> (target: front|prefs|about|menu|update, default front; bare filename confined to images/). Compositor visibility and scanout are not observed",
     ),
     v(
         "video",
         Read,
         Status,
         App,
-        "record N seconds (0.5..=60) of the front window's PRESENTED frames -> frame_NNNN.png + index.json (same-clock timestamps). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input driven through the ACTIVE-TAB verbs — a CROSS-SESSION `@<sid>` verb, which is what the `@self` selector expands to, egresses on the control thread and is NOT logged, so drive FLAGLESS when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; the server keeps the newest 8 recordings. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized=); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms. key->frame latency = first frame showing the glyph minus inputs[].t_us; cadence gaps = frames[].t_us deltas vs ~16667",
+        "record N seconds (0.5..=60) of the front window's WSI-SUBMITTED destination frames -> frame_NNNN.png + index.json (same-clock timestamps; compositor visibility and scanout are not observed). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input driven through the ACTIVE-TAB verbs — a CROSS-SESSION `@<sid>` verb, which is what the `@self` selector expands to, egresses on the control thread and is NOT logged, so drive FLAGLESS when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; the server keeps the newest 8 recordings. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized=); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms. key->captured-frame latency = first recorded submitted destination containing the glyph minus inputs[].t_us; cadence gaps = frames[].t_us deltas vs ~16667",
     ),
     v(
         "chrome",
@@ -378,7 +378,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         App,
-        "render/latency counters [reset|percentiles] - percentiles: p50/p95/p99 input->present / output->present / frame-render distributions; plain line carries max_frame_gap_ms= (worst present->present hitch since reset, the scrub/stutter signal) and ends first_present_ms= (main->first-present time-to-glass)",
+        "render/latency counters [reset|percentiles] - percentiles: p50/p95/p99 input->application-present-return / output->application-present-return / frame-render distributions; plain line carries max_frame_gap_ms= (worst successful-present-return gap since reset, the software-side scrub/stutter signal) and ends first_present_ms= (main->first successful application-present return; compositor/scanout unobserved)",
     ),
     // drive input
     v(

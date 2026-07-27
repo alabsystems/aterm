@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-suggest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm inline suggestion engine — the pure, clock-injected ranker that turns the shell-integration command corpus (OSC 133/633 blocks: text, cwd, exit code, timing) into ONE ghost completion for the line being typed."
+
+[dependencies]
+# The ONE width authority in the workspace, for the same reason `aterm-predict`
+# depends on it: what may be painted speculatively is a WIDTH question. A ghost
+# is written one cell per char with `wide = false`, so a double-width glyph in a
+# completion would corrupt the cells to its right. Truncating at the first
+# non-single-width character is delegated here rather than re-tabled locally.
+aterm-grapheme = { workspace = true }
+
+[lints]
+workspace = true

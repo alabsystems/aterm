@@ -52,7 +52,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -122,6 +122,7 @@ aterm-effects = { path = "crates/aterm-effects" }
 # The mosh-style predictive-echo state machine (extracted from aterm-gui so the
 # web embedders drive the same speculative typing).
 aterm-predict = { path = "crates/aterm-predict" }
+aterm-suggest = { path = "crates/aterm-suggest" }
 aterm-core = { path = "crates/aterm-core" }
 aterm-shell-integration = { path = "crates/aterm-shell-integration" }
 aterm-search = { path = "crates/aterm-search" }

@@ -613,13 +613,13 @@ fn parse_video_args(rest: &str) -> Result<VideoArgs, String> {
 }
 
 /// `video <seconds> [full] [keys] [pace] [fps=<n>] [budget=<MiB>]` — record the
-/// front window's PRESENTED frames (the exact bytes handed to present,
+/// front window's exact swapchain bytes handed to the WSI present path,
 /// including the swapchain-only glow/chrome layers every single-frame tool
-/// misses) and dump a PNG sequence + index.json. One-shot: blocks until the
-/// dump's completion marker is on disk (the encode of a multi-second recording
-/// can take a while — documented in the verb help). `keys` (the same-clock
-/// keystroke log) is OWNER-only: recording someone's keystrokes is not a
-/// screen-read.
+/// misses. Compositor visibility and scanout are not observable here. The verb
+/// dumps a PNG sequence + index.json and blocks until the completion marker is
+/// on disk (a multi-second recording can take a while, as its help documents).
+/// `keys` (the same-clock keystroke log) is OWNER-only: recording someone's
+/// keystrokes is not a screen-read.
 pub(crate) fn cmd_video(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,

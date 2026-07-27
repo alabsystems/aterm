@@ -342,28 +342,31 @@ pub(crate) fn cmd_dims(
 ///
 /// Fields: `backend=<cpu|gpu>`, grid `rows`/`cols` (`busy` in text / `null` in
 /// JSON when the terminal mutex is occupied, without withholding the remaining
-/// lock-free diagnostics), `frames` (real presents since reset — a steady screen
-/// does NOT advance it), `last_/max_present_latency_ms` (the
-/// `output→present` slice `$ATERM_TRACE_LATENCY` logs, most-recent + worst), and the
+/// lock-free diagnostics), `frames` (successful application presents since reset
+/// — a steady app-render frame does NOT advance it),
+/// `last_/max_present_latency_ms` (the `output→application-present-return`
+/// slice `$ATERM_TRACE_LATENCY` logs, most-recent + worst), and the
 /// LAG SIGNATURE: `last_/max_frame_render_ms` + `slow_frames` (frames over the ~30 fps
 /// budget, `slow_threshold_ms`). A non-zero `slow_frames`, a large
 /// `max_frame_render_ms`, or `backend=cpu` under heavy output all mean the terminal is
 /// lagging. Values are the process-global [`crate::metrics`] counters + the grid size.
 ///
-/// PACING/SHED SIGNATURE (the 2026-07-05 incident class): `last_/max_input_present_ms`
-/// (key arrival → the content present that showed it — what typing FEELS like),
+/// PACING/SHED SIGNATURE (the 2026-07-05 incident class):
+/// `last_/max_input_present_ms` (key arrival → the first attributed successful
+/// content-present return — a software-side typing-latency proxy),
 /// `sync_armed`/`sync_rel_end`/`sync_rel_timeout` (DEC-2026 hold episodes by release
 /// cause — timeouts climbing during ordinary typing = the SYNC-1 bug), `sync_holding`,
 /// and `perf_reduced` + `shed_transitions` (the load-shed latch; engaged during light
 /// typing, or flapping at idle, are both wrong).
 ///
-/// STARTUP: `first_present_ms` — main entry → the first presented frame (the
-/// self-measured time-to-glass, ARENA-START's internal number); 0.00 until the
-/// first present, and NOT zeroed by `metrics reset` (a startup fact, not a
-/// window stat).
+/// STARTUP: `first_present_ms` — main entry → the first successful application
+/// present return; 0.00 until that boundary and NOT zeroed by `metrics reset`
+/// (a startup fact, not a window stat). None of these timestamps observes
+/// compositor selection, display timing, scanout, or photons.
 ///
-/// `metrics percentiles` -> the latency DISTRIBUTIONS: input→present,
-/// output→present, frame-render, key→write, and pre-present compose histograms
+/// `metrics percentiles` -> the latency DISTRIBUTIONS:
+/// input→application-present-return, output→application-present-return,
+/// frame-render, key→write, and pre-present compose histograms
 /// as `n_*` + p50/p95/p99 ms fields, conservative by construction (bucket upper
 /// edge). Same funnel and honesty bounds as the scalars; zeroed by `metrics
 /// reset` like the maxima.
@@ -1951,12 +1954,12 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
     } = ri;
 }
 
-/// `screen` -> the full LOSSLESS styled grid as a single-line JSON frame, wrapped
+/// `screen` -> the full LOSSLESS engine-styled grid as a single-line JSON frame, wrapped
 /// in the standard `OK 1\n<json>\n` read framing (so the existing line-count
-/// client streams it unchanged). This is the keystone "see everything" verb: it
-/// carries per-cell colour + every resolved decoration + the cursor + dims + seq,
-/// so an outer agent reconstructs exactly what a human sees in the inner TUI.
-/// `--json` is implied (the verb is always styled JSON).
+/// client streams it unchanged). It carries per-cell style, selection, cursor,
+/// dimensions, and sequence state. Host-owned visual effects and decorations are
+/// intentionally omitted, so this is a terminal-model projection rather than a
+/// claim about the application framebuffer or display. `--json` is implied.
 pub(crate) fn cmd_screen_styled_json(term: &Arc<Mutex<Terminal>>) -> String {
     // Gather under ONE lock hold (internally consistent frame), then serialize
     // with the lock RELEASED — the per-cell format!/base64 never blocks keystroke

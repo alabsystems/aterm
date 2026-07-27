@@ -156,6 +156,28 @@ const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
 const SPI_GETHIGHCONTRAST: u32 = 0x0042;
 const HCF_HIGHCONTRASTON: u32 = 0x0000_0001;
 
+/// Accept a GDI window photograph only when both fallible transfer stages
+/// completed in full. `PrintWindow == 0` leaves the target bitmap unspecified;
+/// likewise, a positive-but-short `GetDIBits` return copied only a prefix of the
+/// requested image. Neither may be promoted to a successful exact capture.
+fn validate_window_capture_transfer(
+    print_succeeded: bool,
+    copied_lines: i32,
+    expected_lines: i32,
+) -> Result<(), String> {
+    if !print_succeeded {
+        return Err("PrintWindow failed".to_string());
+    }
+    if copied_lines != expected_lines {
+        return Err(if copied_lines == 0 {
+            "GetDIBits failed".to_string()
+        } else {
+            format!("GetDIBits copied {copied_lines} of {expected_lines} window-capture scanlines")
+        });
+    }
+    Ok(())
+}
+
 /// The `HWND` behind a winit [`Window`], or `None` when there is no Win32 handle
 /// (headless / not-yet-realized). Mirrors `main.rs::window_hwnd`.
 fn hwnd_of(window: &Window) -> Option<isize> {
@@ -539,6 +561,19 @@ pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32)
         if w <= 0 || h <= 0 {
             return Err(format!("window has no area ({w}x{h})"));
         }
+        let (width, height) = (
+            usize::try_from(w).map_err(|_| "window capture width does not fit memory")?,
+            usize::try_from(h).map_err(|_| "window capture height does not fit memory")?,
+        );
+        let buffer_len = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "window capture buffer dimensions overflow".to_string())?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(buffer_len)
+            .map_err(|error| format!("window capture buffer allocation failed: {error}"))?;
+        buf.resize(buffer_len, 0);
+
         let screen = GetDC(0);
         if screen == 0 {
             return Err("GetDC(screen) failed".to_string());
@@ -556,9 +591,27 @@ pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32)
             return Err("GDI DC/bitmap creation failed".to_string());
         }
         let old = SelectObject(mem, bmp);
-        // Best-effort: even a 0 (failure) return often leaves a usable bitmap, so we
-        // still try GetDIBits and only fail if THAT fails.
-        let _printed = PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT);
+        if old == 0 {
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            ReleaseDC(0, screen);
+            return Err("SelectObject(bitmap) failed".to_string());
+        }
+
+        // `PrintWindow` owns the only supported transition from live HWND pixels
+        // into this bitmap. A zero BOOL means failure and leaves the bitmap
+        // unspecified, so it can never be treated as a best-effort success.
+        let print_succeeded = PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT) != 0;
+
+        // Win32 requires `hbmp` NOT to be selected into a DC while GetDIBits reads
+        // it. Restore the old object first; if that fails, destroy the DC (which
+        // releases its selected objects) before deleting the bitmap.
+        if SelectObject(mem, old) == 0 {
+            DeleteDC(mem);
+            DeleteObject(bmp);
+            ReleaseDC(0, screen);
+            return Err("SelectObject(restore) failed".to_string());
+        }
         let mut bmi = BitmapInfoHeader {
             size: core::mem::size_of::<BitmapInfoHeader>() as u32,
             width: w,
@@ -568,23 +621,23 @@ pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32)
             compression: 0, // BI_RGB
             ..Default::default()
         };
-        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-        let lines = GetDIBits(
-            mem,
-            bmp,
-            0,
-            h as u32,
-            buf.as_mut_ptr().cast::<c_void>(),
-            &mut bmi,
-            DIB_RGB_COLORS,
-        );
-        SelectObject(mem, old);
+        let lines = if print_succeeded {
+            GetDIBits(
+                mem,
+                bmp,
+                0,
+                h as u32,
+                buf.as_mut_ptr().cast::<c_void>(),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
         DeleteObject(bmp);
         DeleteDC(mem);
         ReleaseDC(0, screen);
-        if lines == 0 {
-            return Err("GetDIBits failed".to_string());
-        }
+        validate_window_capture_transfer(print_succeeded, lines, h)?;
         // GetDIBits yields BGRX (blue,green,red, alpha undefined); make it opaque RGBA.
         for px in buf.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
@@ -598,6 +651,7 @@ pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32)
 mod tests {
     use super::{
         DWMSBT_MAINWINDOW, DWMSBT_NONE, DWMSBT_TABBEDWINDOW, DWMSBT_TRANSIENTWINDOW, backdrop_for,
+        validate_window_capture_transfer,
     };
     use crate::app_config::BackgroundMaterial;
 
@@ -628,6 +682,25 @@ mod tests {
                 DWMSBT_TABBEDWINDOW
             ),
             (1, 2, 3, 4)
+        );
+    }
+
+    #[test]
+    fn window_capture_transfer_requires_print_and_every_scanline() {
+        assert_eq!(validate_window_capture_transfer(true, 720, 720), Ok(()));
+        assert_eq!(
+            validate_window_capture_transfer(false, 720, 720).unwrap_err(),
+            "PrintWindow failed",
+            "GetDIBits-looking bytes cannot redeem a failed PrintWindow"
+        );
+        assert_eq!(
+            validate_window_capture_transfer(true, 0, 720).unwrap_err(),
+            "GetDIBits failed"
+        );
+        assert_eq!(
+            validate_window_capture_transfer(true, 719, 720).unwrap_err(),
+            "GetDIBits copied 719 of 720 window-capture scanlines",
+            "a nonzero partial copy is still an incomplete image"
         );
     }
 }

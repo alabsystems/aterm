@@ -273,9 +273,73 @@ pub fn unix_now() -> u64 {
 
 /// One `gh` invocation, captured. Spawn failure is an error; a non-zero exit
 /// is returned to the caller (probes need to see "not found" exits).
+/// The release-org token, read from disk. `cargo ship cut` otherwise authenticates
+/// EVERY call with `gh auth token`, which on the owner's machine is the dev account
+/// (`alabsystems`) and has no push on the public update channel — so the mirror
+/// step could never write there, and the cut refused at
+/// [`preflight_mirror_target`] with the access sitting unused next to it.
+///
+/// Same file the publication engine uses (`publication/bin/pub` `MIRROR_TOKEN_PATH`,
+/// documented in its `KEYS.md`), so the two pipelines finally share one credential
+/// for the release org instead of disagreeing about whether it exists.
+fn channel_token_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".secrets/gh_access_token_alabsystems"))
+}
+
+/// Read + canonicalize the release-org token. `None` when absent, so a machine
+/// without it keeps the previous behaviour (`gh auth`) and simply cannot mirror.
+fn channel_token() -> Option<String> {
+    let token = fs::read_to_string(channel_token_path()?).ok()?;
+    let token = token.trim().to_string();
+    (!token.is_empty() && !token.bytes().any(|b| b.is_ascii_control())).then_some(token)
+}
+
+/// Is a channel-scoped credential in force for the current operation?
+///
+/// Set only by [`ChannelCred`], around work that talks EXCLUSIVELY to the public
+/// channel. `step_mirror` qualifies: it reads its asset bytes from local `dist/`
+/// files and every remote call it makes is against the channel slug, so no private
+/// read can be mis-credentialed by the swap. A blanket process-wide swap would NOT
+/// be safe for a step that also reads the private release.
+static CHANNEL_CRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII scope: channel credential in force until dropped, including on the error
+/// paths — a `?` inside the scope must not leave the flag set for later private work.
+struct ChannelCred;
+
+impl ChannelCred {
+    fn enter() -> Self {
+        CHANNEL_CRED.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ChannelCred {
+    fn drop(&mut self) {
+        CHANNEL_CRED.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The token to authenticate the current call with, or `None` for `gh`'s own auth.
+/// Kept out of argv: callers put it in the environment or a private header file.
+fn active_channel_token() -> Option<String> {
+    CHANNEL_CRED
+        .load(Ordering::SeqCst)
+        .then(channel_token)
+        .flatten()
+}
+
 pub fn gh_raw(args: &[&str]) -> Result<RunOut> {
-    let out = Command::new("gh")
-        .args(args)
+    let mut command = Command::new("gh");
+    command.args(args);
+    // `GH_TOKEN` overrides `gh auth` for this child only — never a global env
+    // mutation, so a concurrent private-repo call is unaffected.
+    if let Some(token) = active_channel_token() {
+        command.env("GH_TOKEN", token);
+    }
+    let out = command
         .output()
         .map_err(|e| Error::new(format!("failed to spawn gh {}: {e}", args.join(" "))))?;
     Ok(RunOut {
@@ -1507,18 +1571,28 @@ fn prepare_github_auth_headers() -> Result<GithubAuthHeaders> {
     let curl_help = std::str::from_utf8(&curl.stdout)
         .map_err(|_| Error::new("curl transport help is not UTF-8"))?;
     validate_one_shot_curl_help(curl_help)?;
-    let token = Command::new("gh")
-        .args(github_auth_token_args())
-        .output()
-        .map_err(|error| Error::new(format!("spawn GitHub token preflight: {error}")))?;
-    if !token.status.success() {
-        return Err(Error::new(
-            "GitHub authentication token is unavailable before durable POST intent",
-        ));
-    }
-    let token = std::str::from_utf8(&token.stdout)
-        .map_err(|_| Error::new("GitHub authentication token is not UTF-8"))?
-        .trim();
+    // Under a channel scope the upload targets the PUBLIC channel, which `gh auth`
+    // cannot write; use the release-org token for the header file instead. Outside
+    // the scope this is unchanged.
+    let owned = match active_channel_token() {
+        Some(token) => token,
+        None => {
+            let out = Command::new("gh")
+                .args(github_auth_token_args())
+                .output()
+                .map_err(|error| Error::new(format!("spawn GitHub token preflight: {error}")))?;
+            if !out.status.success() {
+                return Err(Error::new(
+                    "GitHub authentication token is unavailable before durable POST intent",
+                ));
+            }
+            std::str::from_utf8(&out.stdout)
+                .map_err(|_| Error::new("GitHub authentication token is not UTF-8"))?
+                .trim()
+                .to_string()
+        }
+    };
+    let token = owned.as_str();
     if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_control()) {
         return Err(Error::new(
             "GitHub authentication token is empty or non-canonical",
@@ -2958,7 +3032,8 @@ pub fn drain_bounded_diagnostic(
 
 fn exact_release_asset_download(slug: &str, id: u64) -> Result<std::process::Child> {
     let endpoint = format!("repos/{slug}/releases/assets/{id}");
-    Command::new("gh")
+    let mut command = Command::new("gh");
+    command
         .args([
             "api",
             "--method",
@@ -2968,7 +3043,16 @@ fn exact_release_asset_download(slug: &str, id: u64) -> Result<std::process::Chi
             &endpoint,
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // This is a STREAMING download, so it spawns its own child instead of going
+    // through `gh_raw` — and therefore needs the channel credential threaded in
+    // explicitly. Missing it is exactly how the first v0.6.0 cut failed: the mirror
+    // uploaded the DMG to the public channel fine and then 404'd re-downloading its
+    // OWN asset, because the read fell back to the dev account.
+    if let Some(token) = active_channel_token() {
+        command.env("GH_TOKEN", token);
+    }
+    command
         .spawn()
         .map_err(|error| Error::new(format!("spawn exact GitHub asset-ID download: {error}")))
 }
@@ -5411,6 +5495,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         // amount of `--resume` fixes a missing permission grant.
         match &mirror_slug {
             Some(slug) if *slug != origin_slug => {
+                // Prove the CHANNEL credential, not `gh auth`: the mirror step will
+                // authenticate with the release-org token, so a preflight on the dev
+                // account would refuse a cut that would actually have succeeded.
+                let _cred = ChannelCred::enter();
                 preflight_mirror_target(slug)?;
                 step(
                     "mirror",
@@ -7703,6 +7791,11 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
         return Ok(());
     }
     ensure_ctx_release_lease(ctx)?;
+    // EVERYTHING below this line talks to the public channel and nothing else: the
+    // asset bytes come from local `dist/` files, and the two `ctx.slug` uses above are
+    // a message and the equality guard. So the release-org credential is safe to hold
+    // for the whole step, and it drops on every exit path including `?`.
+    let _cred = ChannelCred::enter();
     preflight_mirror_target(&slug)?;
 
     let observed = unique_release_object_by_tag(&slug, &ctx.tag)?;

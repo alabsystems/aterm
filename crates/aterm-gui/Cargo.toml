@@ -77,6 +77,18 @@ aterm-effects = { workspace = true }
 # The mosh-style predictive-echo state machine (extracted so the web embedders
 # share it); aliased at the crate root so `crate::predict::*` reads unchanged.
 aterm-predict = { workspace = true }
+# The inline-suggestion (ghost text) engine: a bounded LRU corpus of
+# shell-integration command blocks plus a pure, clock-injected ranker. Lives in
+# its own crate for the same reason `aterm-predict` does — the state machine is
+# host-agnostic, so the native GUI and the web embedders can drive ONE
+# implementation, and it stays unit-testable without a PTY or a grid.
+aterm-suggest = { workspace = true }
+# The workspace BiDi authority, for ONE predicate: `has_bidi`. The render scratch
+# is bidi-REORDERED (visual order) by `cell_frame_into`, while speculative
+# painters address cells in LOGICAL coords — so a ghost on an RTL row lands in
+# the wrong cell. Refusing such rows is fail-closed, and reusing the real
+# classifier keeps that decision from drifting from the reorder that caused it.
+aterm-bidi = { workspace = true }
 aterm-buffer = { path = "../aterm-buffer" }
 aterm-grapheme = { workspace = true }
 aterm-codec = { workspace = true }

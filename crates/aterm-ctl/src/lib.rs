@@ -62,21 +62,27 @@
 //! * `search <pat>`    — print one `"<row> <col> <len>"` line per match.
 //! * `send <text>`     — write `<text>` to the PTY (trailing literal `\n` ⇒ CR).
 //! * `key <name>`      — send a named key (`enter`, `tab`, `up`, …) to the PTY.
-//! * `image [path]`    — render the screen to a PNG; print `OK <w> <h> <path>`.
-//!   WYSIWYG: includes cursor blink phase / unfocused-hollow override (headless
-//!   sessions are always deterministic); use `cursor` for phase-independent state.
-//! * `window [<target>] [path]` — capture an ENTIRE macOS window to a PNG; print
+//! * `image [path]`    — render aterm's own client frame to a PNG, including
+//!   compiled native-app surfaces; print `OK <w> <h> <path>`. This is a re-render
+//!   through the same renderer and composition rules the window present uses, so
+//!   it carries no native OS chrome, works headless, and never needs OS
+//!   screen-capture permission. It includes the cursor blink phase /
+//!   unfocused-hollow override (headless sessions are deterministic); use `cursor`
+//!   for phase-independent state.
+//! * `window [<target>] [path]` — capture a full-window artifact to a PNG; print
 //!   `OK <w> <h> <path>`. `<target>` selects which window: omitted/`front` = the
-//!   front terminal window (native OS chrome — titlebar, traffic lights, unified
-//!   toolbar, full-width tab strip — AND the terminal content); `prefs`/`settings`
-//!   = the native Settings tab in that same window. Unlike `image` (terminal content
-//!   framebuffer only), this photographs
-//!   the real composited on-screen pixels via CoreGraphics, so an AI can SEE the
-//!   whole window or any GUI screen. A first token that is a known target keyword
-//!   always selects that window — to write to a file literally named
-//!   `prefs`/`front`, give a target first (e.g. `window front prefs`). macOS
-//!   only; needs Screen Recording permission (a clear `ERR` explains how to grant it
-//!   if missing); a missing target or headless / off-macOS gets a clear `ERR`.
+//!   front terminal window WITH native platform chrome (titlebar, traffic lights,
+//!   unified toolbar, full-width tab strip); `prefs`/`settings` = the native
+//!   Settings tab in that same window. How the chrome is obtained differs by
+//!   platform: macOS photographs the real composited window via CoreGraphics,
+//!   while Windows stitches chrome around a `PrintWindow` client capture. Either
+//!   way it does not observe compositor selection, colour management, scanout,
+//!   occlusion, or photons. A first token that is a known target keyword always
+//!   selects that window — to write to a file literally named `prefs`/`front`, give
+//!   a target first (e.g. `window front prefs`). It requires an attached OS window;
+//!   macOS also needs Screen Recording permission (a clear `ERR` explains how to
+//!   grant it if missing). A missing target, headless instance, or unsupported
+//!   platform gets a clear `ERR`.
 //! * `controls <target>` — dump a GUI surface's controls as text. For
 //!   `prefs`/`settings`, compatibility `field key=… label=… value=… effective=…`
 //!   rows describe only setting controls on the current native route; the following

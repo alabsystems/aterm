@@ -1109,8 +1109,9 @@ pub struct Renderer {
     /// text never sits flush against the window edge. The border is filled with
     /// the theme background. `0` = no padding (the historical behavior; every
     /// render test that asserts `cols·cell_w × rows·cell_h` dims keeps that). The
-    /// SAME renderer (hence the SAME `pad`) backs the on-screen present and the
-    /// `image`/snapshot introspection, so both are pixel-identical by construction.
+    /// SAME renderer (hence the SAME `pad`) backs the application-present source
+    /// and `image`/snapshot introspection, so their app-render pixels are identical
+    /// by construction. The platform compositor and scanout are outside this claim.
     pad: usize,
     /// Extra TOP-ONLY band in px between the frame's top edge and the padded
     /// grid (window-space effects layer / titlebar headroom): the vertical frame
@@ -19569,9 +19570,9 @@ mod tests {
     /// Interior padding insets the grid by `pad` on every edge: the framebuffer
     /// grows by `2·pad` per axis, the rendered grid is the unpadded render shifted
     /// to `(pad, pad)`, and the freed border is theme background. This is the
-    /// property the on-screen present AND the `image`/snapshot introspection both
-    /// rely on (they share this one renderer, so both get the identical padded
-    /// pixels — the WYSIWYG parity constraint).
+    /// property the application-present source AND `image`/snapshot introspection
+    /// both rely on (they share this one renderer, so both get identical padded
+    /// app-render pixels).
     #[test]
     fn padding_insets_grid_and_grows_framebuffer() {
         let Some(mut r) = renderer() else {

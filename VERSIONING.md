@@ -9,7 +9,7 @@ public release   MAJOR.MINOR.0
 dev build        MAJOR.MINOR.0+g<short-sha>
 ```
 
-- **The patch slot is always `0`** (`0.5.0` today). Bump `MINOR` freely — that
+- **The patch slot is always `0`** (`0.7.0` today). Bump `MINOR` freely — that
   is the knob meant for constant motion. Public tags are always `vMAJOR.MINOR.0`.
 - **The commit sha rides in SemVer build metadata (`+g…`), never the patch
   slot.** `0.1.0+g9d1ce1d2` satisfies `version = "0.1"`, `"0.1.0"` and
@@ -19,9 +19,9 @@ dev build        MAJOR.MINOR.0+g<short-sha>
 - **Never mint a version from a dirty tree** — `pub version` appends `.dirty`,
   which is not publishable.
 
-`0.5.0` is what the public source snapshot carries, what the macOS app reports
-in About and `aterm --version`, the release tag `v0.5.0`, the manifest
-`version`, and the DMG name `aterm-0.5.0.dmg`.
+`0.7.0` is what the public source snapshot carries, what the macOS app reports
+in About and `aterm --version`, the release tag `v0.7.0`, the manifest
+`version`, and the DMG name `aterm-0.7.0.dmg`.
 
 > **The lineage is the PUBLIC one, and it is authoritative.** aterm's public
 > series began at `v0.1.0` (`public/v0.1.0`) and that is the number the project
@@ -44,39 +44,48 @@ against that single value.
 Bump the MINOR **first**, then cut — the patch slot stays `0`:
 
 ```sh
-pub bump --minor --commit   # 0.5.0 -> 0.6.0
+pub bump --minor --commit   # 0.7.0 -> 0.8.0
 ```
 
-Cutting twice without a bump is refused: `verify::derive_cut_mode` sees `v0.5.0`
+Cutting twice without a bump is refused: `verify::derive_cut_mode` sees `v0.7.0`
 already published and tells the operator to bump `[workspace.package] version`,
-naming the next release (`v0.6.0`). MAJOR moves the same way.
+naming the next release (`v0.8.0`). MAJOR moves the same way.
 
-The workspace sits at `0.5.0`, so the next cut publishes `v0.5.0` with no bump at
+The workspace sits at `0.7.0`, so the next cut publishes `v0.7.0` with no bump at
 all; the bump above is what the cut *after* that one needs. Run
 `pub version --release` rather than trusting this paragraph — it prints what
 `alabsystems` would actually tag.
 
-> **Why the lineage resumes at `0.5.0` and not `0.2.0`.** `gates::tag_free` mints
-> a **bare** `v{version}` tag on the private origin, and that namespace already
-> holds real historical tags: `v0.1.0`, `v0.3.0`, `v0.4.0`, `v0.4.1` and
-> `v0.5.9`..`v0.5.14`. Of the `v0.N.0` spellings the cutter actually mints, only
-> `0.1`, `0.3` and `0.4` are consumed — so `0.5.0` is the lowest MINOR from which
-> **every** subsequent bump (`0.6.0`, `0.7.0`, …) is collision-free, permanently.
-> The archive's `v0.15.*`..`v0.21.*` tags are three-component *timestamps*, never
-> `.0`, so they never contest a `vN.N.0` mint.
->
-> This is a bounded, evidence-checked skip inside the public lineage — not a
-> restart. Verify before any bump rather than trusting this list:
->
-> ```sh
-> git ls-remote --tags origin 'refs/tags/v*.*.0'
-> ```
->
-> The durable fix is the `public/` prefix (`DEV_TAG_PREFIX_DEFAULT` in
-> `publish/config.sh`), which gives publication its own namespace. It is not wired
-> into `gates::tag_free`/`ledger` yet: the publisher re-plays the client's election
-> against the private repo (`verify::scan_release_page`), and that replay only
-> admits canonical `vX.Y.Z`, so prefixing the mint needs the replay moved with it.
+## Where the version comes from — and the three places it does NOT
+
+**`[workspace.package] version` in `Cargo.toml` is the only answer.** Read it.
+Never recall it, never infer it. Three sources look authoritative and are not:
+
+1. **`RELEASES.ledger`'s version column is the RETIRED lineage.** It records the
+   old two-component app numbering (`v0.25`…`v0.61`) that this scheme replaced.
+   The ledger is still the **build-number** authority — `n = max(tail + 1,
+   unix_now)` — and that use is correct. But its version column says nothing about
+   what to publish, and quoting "ledger tail (0.61)" as version evidence is simply
+   reading the retired system. (In practice `unix_now` now always exceeds the
+   stored tail, so the tail no longer affects even the build number.)
+2. **A bare `gh release list` resolves to the PRIVATE repo**, whose newest release
+   is that same retired `v0.61` — which invites a bogus "v0.62". The public channel
+   named by `[workspace.metadata.aterm] update_channel` is a *different repository*.
+3. **Tags on the private origin** include real historical `v0.1.0`, `v0.3.0`,
+   `v0.4.x`, `v0.5.9`..`v0.5.14` and pre-0.23 three-component *timestamp* tags
+   (`v0.15.2607021856`…). None of them are this lineage. They matter only as a
+   `tag_free` collision check at mint time, never as a version source:
+
+   ```sh
+   git ls-remote --tags origin 'refs/tags/v*.*.0'   # collision check, NOT a version
+   ```
+
+The durable fix for the collision surface is the `public/` prefix
+(`DEV_TAG_PREFIX_DEFAULT` in `publish/config.sh`), which gives publication its own
+namespace. It is not wired into `gates::tag_free`/`ledger` yet: the publisher
+re-plays the client's election against the private repo
+(`verify::scan_release_page`), and that replay only admits canonical `vX.Y.Z`, so
+prefixing the mint needs the replay moved with it.
 
 ## Public source snapshot
 

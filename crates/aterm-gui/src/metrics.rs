@@ -16,11 +16,14 @@
 //!
 //! A single "last frame" number can't reveal sustained jank, so this also keeps the
 //! WORST-CASE and a SLOW-FRAME COUNT since the last [`reset`]:
-//! - `frames_presented` — frames actually pushed to the surface since reset (the D-1
-//!   early-out returns BEFORE the present, so a steady screen does not inflate this).
-//! - `last_/max_present_latency_ns` — the `output→present` delay (PTY-output leading
-//!   edge → the frame that showed it; the number `$ATERM_TRACE_LATENCY` logs), most
-//!   recent and worst-since-reset.
+//! - `frames_presented` — successful application present calls since reset (the
+//!   D-1 early-out returns BEFORE present, so a steady app-render frame does not
+//!   inflate this).
+//! - `last_/max_present_latency_ns` — the
+//!   `output→application-present-return` delay (PTY-output leading edge → the
+//!   first attributed successful present return; the number
+//!   `$ATERM_TRACE_LATENCY` logs), most recent and worst-since-reset. It does not
+//!   observe compositor selection, display timing, scanout, or photons.
 //! - `last_/max_frame_render_ns` — causal CPU wall time: compose plus CPU
 //!   raster/copy, or time spent encoding GPU commands and calling `queue.submit`,
 //!   most recent and worst-since-reset. This is not completed GPU execution;
@@ -401,10 +404,10 @@ impl PresentDropReason {
 }
 
 /// Anchor the process-lifetime clock at the top of `main()` so
-/// `first_present_ns` measures main-entry → first present (the self-measured
-/// time-to-glass, ARENA-START's internal number). Without this call the clock
-/// self-anchors at whichever metric fires first and the startup figure is
-/// meaningless — call it before any thread spawns.
+/// `first_present_ns` measures main-entry → first successful application-present
+/// return. Without this call the clock self-anchors at whichever metric fires
+/// first and the startup figure is meaningless — call it before any thread
+/// spawns. Platform compositor and scanout timing are outside this boundary.
 pub fn mark_process_start() {
     let _ = now_ns();
 }
@@ -524,9 +527,10 @@ static H_PRE_PRESENT: Histogram = Histogram::new();
 static H_ACQUIRE_WAIT: Histogram = Histogram::new();
 
 /// The three live distributions, for the `metrics percentiles` verb:
-/// input→present (what typing feels like), output→present (the
-/// `$ATERM_TRACE_LATENCY` slice), and causal frame CPU work (compose plus CPU
-/// raster/copy or GPU command encode/queue-submit).
+/// input→application-present-return (a software-side typing proxy),
+/// output→application-present-return (the `$ATERM_TRACE_LATENCY` slice), and
+/// causal frame CPU work (compose plus CPU raster/copy or GPU command
+/// encode/queue-submit).
 #[must_use]
 pub fn distributions() -> (&'static Histogram, &'static Histogram, &'static Histogram) {
     (&H_INPUT_PRESENT, &H_PRESENT_LATENCY, &H_FRAME_RENDER)
@@ -577,25 +581,27 @@ pub fn note_acquire_wait(ns: u64) {
 /// these so a driver can DETECT sustained lag rather than read a momentary value.
 pub const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333; // 1/30 s
 
-/// Record one presented frame. `latency_ns` is the `output→present` delay for this
-/// frame, or `0` when no output burst was pending (a blink/selection/resize repaint)
-/// — a `0` leaves the last real measurement in place and is NOT a slow-frame input.
+/// Record one successful application present. `latency_ns` is the
+/// `output→application-present-return` delay for this frame, or `0` when no
+/// output burst was pending (a blink/selection/resize repaint) — a `0` leaves
+/// the last real measurement in place and is NOT a slow-frame input.
 /// `render_ns` is this frame's causal CPU wall time: compose plus CPU raster/copy,
 /// or time spent encoding GPU commands and calling `queue.submit`. It is not
 /// completed GPU execution and excludes surface acquisition and final-present
 /// pacing.
 pub fn record_present(latency_ns: u64, render_ns: u64) {
     FRAMES_PRESENTED.fetch_add(1, Ordering::Relaxed);
-    // First present ever = the self-measured time-to-glass (see
-    // `mark_process_start`). CAS keeps the first, races included.
+    // First successful application-present return (see `mark_process_start`).
+    // CAS keeps the first, races included.
     let _ = FIRST_PRESENT_NS.compare_exchange(0, now_ns(), Ordering::Relaxed, Ordering::Relaxed);
     if latency_ns != 0 {
         LAST_PRESENT_LATENCY_NS.store(latency_ns, Ordering::Relaxed);
         MAX_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed);
         H_PRESENT_LATENCY.record(latency_ns);
-        // A CONTENT present: close the pending input→present slice, if any. A
-        // latency of 0 (blink/selection repaint) leaves the stamp pending — the
-        // echo of that keystroke has not been shown yet.
+        // A CONTENT present: close the pending
+        // input→application-present-return slice, if any. A latency of 0
+        // (blink/selection repaint) leaves the stamp pending — no attributed
+        // content present has completed yet.
         let stamp = INPUT_STAMP_NS.swap(0, Ordering::Relaxed);
         if stamp != 0 {
             let d = now_ns().saturating_sub(stamp);

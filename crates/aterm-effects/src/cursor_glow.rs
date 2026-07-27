@@ -1216,13 +1216,13 @@ struct Starburst {
     /// Deterministic per-burst seed (angle offset + rainbow-tint rotation) so
     /// two stacked bursts don't overlay identically.
     seed: f32,
-    /// How many chunky Kirby stars this burst scatters (1..=[`CursorGlow::NYAN_BURST_STARS`]),
+    /// How many stars this burst scatters (1..=[`CursorGlow::NYAN_BURST_STARS`]),
     /// GRADUATED by the jump distance at spawn: a short Option-B/F hop throws
     /// one small star, a screen-crossing fling throws the full handful. Read by
     /// `emit_nyan_starburst`; keeps the emitter a pure function of the burst.
     stars: u8,
     /// How many 4-point TWINKLE SPARKLES this burst scatters alongside its
-    /// Kirby stars — the owner's "sparkles aligned with the stars that appear
+    /// burst stars — the owner's "sparkles aligned with the stars that appear
     /// when I'm typing in nyan mode". ZERO for every discrete-JUMP landing (so
     /// the shipped jump starburst stays byte-identical), non-zero only for a
     /// FAST-GLIDE landing. Rendered through `push_twinkle_star` — literally the
@@ -1256,15 +1256,16 @@ struct GlideStar {
     seed: f32,
 }
 
-/// Inner-vertex radius of a Kirby star as a fraction of its outer radius: 0.42
-/// makes a CHUNKY 5-point star (deep enough to read as a star, fat enough to be
-/// solid and cute), not the spiky sparkle a small fraction (~0.16) would give.
-const NYAN_STAR_INNER_FRAC: f32 = 0.42;
-/// A scattered Kirby star's SPIN over its life, in full turns: ~1.4 rotations
-/// so it tumbles gently (cute), not a firework whirl.
-const NYAN_STAR_SPIN: f32 = 1.4;
-/// A scattered Kirby star's radius as a fraction of a cell height — chunky,
-/// about a third of a cell.
+/// A scattered burst star's ARM LENGTH as a fraction of a cell height — about a
+/// third of a cell, so a landing star reads a touch larger than the typing
+/// starfield's twinkles without becoming a different object.
+///
+/// (Was the outer radius of a chunky solid 5-point polygon. The burst now draws
+/// [`push_twinkle_star`], the same 4-point twinkle as the starfield and the
+/// glide sparkles — owner, 2026-07-26: the 5-point stars "are cute but they
+/// don't match the nyan theme". Its companions — an inner-vertex fraction and a
+/// per-star spin — died with the polygon: a plus has no inner vertices, and an
+/// axis-aligned twinkle must not rotate.)
 const NYAN_STAR_R_FRAC: f32 = 0.30;
 
 /// One FIRE METEOR — the fire style's inter-line / long-jump streak: a
@@ -1655,6 +1656,26 @@ pub struct CursorGlow {
     /// paired move (one press = one snap, so a spinner can never surf one
     /// stale hint).
     return_hint: Option<Instant>,
+    /// A fresh REFLOW hint ([`Self::note_reflow`] — the host committed a grid
+    /// GEOMETRY change: an interactive window resize, a font-zoom re-grid, a
+    /// scale-factor change): the license for the un-hinted Nyan jump
+    /// choreography when typing momentum is cold, exactly as
+    /// [`Self::return_hint`] licenses a bare Enter.
+    ///
+    /// A resize IS a user gesture — the hand dragged the window edge — even
+    /// though it carries no keystroke, so it earns the ZOOM the same way an
+    /// idle-prompt Enter does. The anti-stray contract is untouched: a
+    /// spinner's CUP loop, a background TUI repaint, and hours of idle output
+    /// arm nothing and so still mint nothing (see
+    /// `cold_program_warp_mints_no_nyan_choreography`). The host arms this on
+    /// the resize SETTLE only, never on the leading edge or the mid-drag
+    /// throttle steps, so one drag gestures exactly one streak rather than one
+    /// per 50 ms reflow.
+    ///
+    /// Expires after [`Self::REFLOW_HINT_FRESH`]; consumed by the paired move
+    /// (one gesture = one streak, so a resize storm can never surf one stale
+    /// hint).
+    reflow_hint: Option<Instant>,
     /// A fresh KILL key-hint ([`Self::note_kill`] — Ctrl-K/U/W, Alt-D,
     /// word-delete Backspaces, forward Delete): the license for the erase POOF.
     /// A poof can only fire within [`Self::KILL_HINT_FRESH`] of a kill key AND
@@ -2067,7 +2088,7 @@ impl CursorGlow {
     /// than piling rays into the quad budget (the owner's unbound-allocate ask).
     const NYAN_BURST_CAP: usize = 3;
     /// Minimum jump distance (cells) that upgrades a Nyan jump from "just the
-    /// ZOOM streak" to "ZOOM streak PLUS a landing Kirby-star scatter". LOWERED
+    /// ZOOM streak" to "ZOOM streak PLUS a landing star scatter". LOWERED
     /// 6.0 → 2.0 so ANY qualifying word-jump (an Option-B/F short hop, a
     /// two-cell leap) always earns at least ONE small star of feedback — the
     /// old 6-cell cliff left short jumps with nothing. The star COUNT and reach
@@ -2076,7 +2097,7 @@ impl CursorGlow {
     /// full [`Self::NYAN_BURST_STARS`] chunky stars.
     const NYAN_BURST_MIN_DIST: f32 = 2.0;
     /// Chunky spinning solid rainbow 5-point stars in a FULL (far-jump)
-    /// starburst — the Kirby-star payload that REPLACED the old 12-ray firework.
+    /// starburst — the twinkle-star payload that REPLACED the old 12-ray firework.
     /// A short jump throws fewer (graduated by distance, floor 1); this is the
     /// ceiling. Per-burst quad cost is a closed form (stars × ~2·R scanline rows
     /// × ≤2 spans, capped by [`Self::MAX_QUADS`]) — cheaper than the old rays.
@@ -2177,6 +2198,11 @@ impl CursorGlow {
     /// Freshness window for the RETURN key-hint ([`Self::return_hint`]) —
     /// same pairing budget as the typed hint: one frame-quantized move.
     const RETURN_HINT_FRESH: f32 = 0.25;
+    /// Freshness window for the REFLOW hint ([`Self::reflow_hint`]). Wider than
+    /// the keystroke hints for the same reason as [`Self::KILL_HINT_FRESH`]: the
+    /// reflow's cursor relocation is only observed on the NEXT redraw, and the
+    /// shell's SIGWINCH prompt repaint can land a frame or two after that.
+    const REFLOW_HINT_FRESH: f32 = 0.40;
     /// A kill key-hint stays armed this long for its row-shrink echo (seconds)
     /// — see [`Self::note_kill`]. Wider than the typed hint: a kill's erase is
     /// often a full-box TUI repaint (Ink rewrites every prompt row), which can
@@ -2809,6 +2835,17 @@ impl CursorGlow {
         self.return_hint = Some(now);
     }
 
+    /// The host committed a grid GEOMETRY change (a settled window resize, a
+    /// font-zoom re-grid, a scale-factor change) — arm the REFLOW license (see
+    /// [`Self::reflow_hint`]). Never gates bytes; never classifies as typing.
+    ///
+    /// Arm this on the resize SETTLE, not the leading edge: the throttle applies
+    /// a reflow every ~50 ms during a live drag, and one streak per step reads as
+    /// a rainbow scribble rather than a gesture.
+    pub fn note_reflow(&mut self, now: Instant) {
+        self.reflow_hint = Some(now);
+    }
+
     /// How many committed presses landed within the trailing `window`
     /// seconds — the press BUDGET consumed by the anti-stray gates (see
     /// [`Self::type_press_ring`]). Capacity-bounded by the ring; reads only.
@@ -3304,6 +3341,7 @@ impl CursorGlow {
         self.type_hint = None;
         self.kill_hint = None;
         self.blink_hint = None;
+        self.reflow_hint = None;
         self.ctx_alt = false;
         self.last_poof = None;
         // The row probes are coordinate-space state exactly like `last`: a
@@ -3390,6 +3428,7 @@ impl CursorGlow {
             self.type_hint = None;
             self.kill_hint = None;
             self.blink_hint = None;
+            self.reflow_hint = None;
             self.last_poof = None;
             self.row_cur.clear();
             self.row_prev.clear();
@@ -3641,6 +3680,7 @@ impl CursorGlow {
             self.type_hint = None;
             self.kill_hint = None;
             self.blink_hint = None;
+            self.reflow_hint = None;
             self.last_poof = None;
             self.row_cur.clear();
             self.row_prev.clear();
@@ -3806,7 +3846,7 @@ impl CursorGlow {
                 reach: Self::GLIDE_LAND_REACH * geom.ch as f32,
                 seed,
                 // A MODEST colour payload: the owner is simultaneously asking
-                // for less brightness, so a glide landing throws 2 Kirby stars
+                // for less brightness, so a glide landing throws 2 burst stars
                 // where a screen-crossing jump throws the full handful.
                 stars: 2,
                 sparkles: Self::GLIDE_LAND_SPARKLES,
@@ -3967,7 +4007,7 @@ impl CursorGlow {
                 // streak into `halos` (additive light is invisible on white).
                 self.emit_nyan_jumps(now, cfg, geom, &mut under, &mut halos);
             }
-            // LANDING KIRBY STARS (Nyan only): the chunky spinning rainbow
+            // LANDING STARBURST (Nyan only): the scattered rainbow
             // stars scattered at the landing, ADDITIONAL to the ZOOM streak
             // above and the landing ring/particles below (all still fire). DARK
             // fills solid stars into `out` (over-ink, coverage-capped) so they
@@ -5370,6 +5410,12 @@ impl CursorGlow {
                     .take_if(|t| {
                         now.saturating_duration_since(*t).as_secs_f32() <= Self::RETURN_HINT_FRESH
                     })
+                    .is_some()
+                || self
+                    .reflow_hint
+                    .take_if(|t| {
+                        now.saturating_duration_since(*t).as_secs_f32() <= Self::REFLOW_HINT_FRESH
+                    })
                     .is_some())
         {
             // (`!navigation`: a Ctrl-A/E / Home/End scrub must NOT throw the
@@ -5381,15 +5427,31 @@ impl CursorGlow {
             // COLD program-driven warp (a spinner's CUP loop, a background
             // TUI repaint, hours of idle output) mints nothing: the owner's
             // "stray piece of trail without text" was exactly this branch
-            // celebrating cursor deltas no keystroke ever caused.)
+            // celebrating cursor deltas no keystroke ever caused.
+            //
+            // A settled RESIZE ([`Self::reflow_hint`]) is the third license,
+            // alongside the warm spine and the bare Enter: the hand dragged the
+            // window edge, so the relayout leap is a gesture the user made and
+            // earns its streak even from cold. It is a HINT, never move shape —
+            // the cold program-driven warp above arms nothing and stays mute.)
             if self.nyan_jumps.len() >= Self::NYAN_JUMP_CAP {
                 self.nyan_jumps.remove(0);
             }
             let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
             let (oxf, oyf) = (geom.origin_x as f32, geom.origin_y as f32);
+            // CROSS-GEOMETRY ORIGIN CLAMP. `(pr, pc)` is the cell the cursor
+            // occupied under the PREVIOUS geometry, but the pixel conversion runs
+            // on THIS tick's `geom`. After a shrink the prior cell can sit outside
+            // the new effects box, and `geom.beam_clip()` would truncate the tail
+            // — the streak would start mid-air with its launch end cut off. Clamp
+            // into the live grid so the whole swoosh always lands inside the box.
+            // A no-op whenever the geometry did not change (every non-reflow
+            // jump), so the historical output is byte-identical.
+            let pr_c = pr.min(geom.rows.saturating_sub(1) as u16);
+            let pc_c = pc.min(geom.cols.saturating_sub(1) as u16);
             self.nyan_jumps.push(JumpStreak {
-                x0: oxf + (pc as f32 + 0.5) * cwf,
-                y0: oyf + (pr as f32 + 0.5) * chf,
+                x0: oxf + (pc_c as f32 + 0.5) * cwf,
+                y0: oyf + (pr_c as f32 + 0.5) * chf,
                 x1: oxf + (cc as f32 + 0.5) * cwf,
                 y1: oyf + (cr as f32 + 0.5) * chf,
                 born: now,
@@ -5411,7 +5473,10 @@ impl CursorGlow {
             // capped (a Ctrl-A/E mash stays bounded), the terminus is ribbon-
             // gated (finding 3), and both honour reduced-motion (finding 2).
             let landing = (oxf + (cc as f32 + 0.5) * cwf, oyf + (cr as f32 + 0.5) * chf);
-            let terminus = (oxf + (pc as f32 + 0.5) * cwf, oyf + (pr as f32 + 0.5) * chf);
+            let terminus = (
+                oxf + (pc_c as f32 + 0.5) * cwf,
+                oyf + (pr_c as f32 + 0.5) * chf,
+            );
             self.emit_nyan_jump_landing(now, geom, dist, landing, terminus);
             // The hue still advances and the landing ring/particles below still
             // fire; only the per-cell spark path is skipped.
@@ -8933,7 +8998,7 @@ impl CursorGlow {
         landing: (f32, f32),
         terminus: (f32, f32),
     ) {
-        // FEATURE B — the Kirby-star landing scatter (any qualifying jump,
+        // FEATURE B — the landing star scatter (any qualifying jump,
         // burst-capped). GRADUATED by distance: a short Option-B/F hop
         // (dist ≈ 2) throws ONE small star, a screen-crossing fling throws the
         // full [`Self::NYAN_BURST_STARS`], with the scatter reach scaling too.
@@ -9051,22 +9116,27 @@ impl CursorGlow {
         }
     }
 
-    /// FEATURE B — emit the Nyan landing KIRBY STARS (owner: "more like Kirby
-    /// from Nintendo stars, not a firework"): for each live [`Starburst`], a
-    /// handful of CHUNKY SPINNING SOLID rainbow 5-point stars that pop-and-
-    /// scatter off the landing and gently tumble-and-bounce, replacing the old
-    /// 12-ray radial firework. Each star:
+    /// FEATURE B — emit the Nyan LANDING STARBURST: for each live [`Starburst`],
+    /// a handful of rainbow stars that pop-and-scatter off the landing and
+    /// bounce gently, replacing the old 12-ray radial firework. Each star:
     /// - SCATTERS along an evenly-fanned, seed-rotated direction, easing OUT so
-    ///   it snaps out then coasts, riding a small parabolic Kirby BOUNCE arc;
-    /// - SPINS ~[`NYAN_STAR_SPIN`] turns over its life (a cute tumble);
+    ///   it snaps out then coasts, riding a small parabolic BOUNCE arc;
     /// - POPS in (`smoothstep`) then shrinks at death (size bounce-in/out);
-    /// - is one solid [`NYAN_BANDS`] hue (the handful spans the spectrum).
+    /// - is one [`NYAN_BANDS`] hue (the handful spans the spectrum).
+    ///
+    /// ONE STAR SPECIES. The shape is [`push_twinkle_star`] — the exact 4-point
+    /// twinkle the typing starfield and the glide sparkles draw — so the burst
+    /// reads as the Nyan starfield FLARING at the landing rather than as a
+    /// second kind of star showing up. The rainbow lives in the star's COLOUR,
+    /// never in a bespoke geometry. (Owner, 2026-07-26: the previous chunky
+    /// spinning solid 5-point stars "are cute but they don't match the nyan
+    /// theme" — "unify on rainbows and sparkles".)
     ///
     /// The count is GRADUATED by jump distance ([`Starburst::stars`]): a short
     /// Option-B/F hop scatters ONE small star, a screen-crossing fling the full
-    /// [`Self::NYAN_BURST_STARS`]. FORKED by theme: DARK fills each star SOLID
-    /// into the additive GlowQuad `out` stream ([`fill_star_scanline`], the nova
-    /// scanline-fill idiom); LIGHT (additive light is invisible on white)
+    /// [`Self::NYAN_BURST_STARS`]. FORKED by theme: DARK draws the additive
+    /// twinkle into the GlowQuad `out` stream;
+    /// LIGHT (additive light is invisible on white)
     /// inverts each star to a DARKENED SATURATED source-over veil dot (the
     /// ribbon-rail recipe: hue mixed ~28% toward black, [`HaloMode::Over`],
     /// capped for legibility) in the `halos` stream. ADDITIVE to the ZOOM
@@ -9099,7 +9169,7 @@ impl CursorGlow {
         // budget governs the layers that ride along with ordinary typing.
         const BURST_COV_CAP: f32 = 118.0;
         let base_r = NYAN_STAR_R_FRAC * chf;
-        let arc = 0.5 * chf; // the Kirby bounce height
+        let arc = 0.5 * chf; // the landing bounce height
         for b in &self.nyan_bursts {
             let age = now.saturating_duration_since(b.born).as_secs_f32();
             let u = (age / b.life).clamp(0.0, 1.0);
@@ -9128,26 +9198,28 @@ impl CursorGlow {
                 let (dx, dy) = (ang.cos(), ang.sin());
                 // One solid hue per star; the handful spans the spectrum.
                 let hue = NYAN_BANDS[(i + (b.seed * 6.0) as usize) % NYAN_BANDS.len()];
-                let (d, cy_i, theta_i, scale) = if self.reduced_motion {
-                    // One static rest frame: final scattered offset, a fixed
-                    // rotation, full size — no scatter, arc, spin, or pulse.
-                    (b.reach, b.cy + dy * b.reach, i as f32 * 0.7, 1.0)
+                let (d, cy_i, scale) = if self.reduced_motion {
+                    // One static rest frame: final scattered offset, full size —
+                    // no scatter, arc, or pulse.
+                    (b.reach, b.cy + dy * b.reach, 1.0)
                 } else {
                     // SCATTER: ease OUT so the star snaps out then coasts.
                     let d = b.reach * (1.0 - (1.0 - u) * (1.0 - u));
-                    // Kirby BOUNCE: a parabolic vertical arc on top of the
-                    // scatter (rises, then settles).
+                    // BOUNCE: a parabolic vertical arc on top of the scatter
+                    // (rises, then settles).
                     let cy_i = b.cy + dy * d - arc * (PI * u).sin();
-                    // SPIN: a gentle tumble, not a firework whirl.
-                    let theta_i = i as f32 * 0.7 + NYAN_STAR_SPIN * TAU * u;
-                    // SIZE bounce-in (pop) then shrink at death.
+                    // SIZE bounce-in (pop) then shrink at death. (No SPIN: the
+                    // shared twinkle is an axis-aligned plus — rotating it would
+                    // just smear the arms, and a star that tumbles here but not
+                    // in the starfield is exactly the mismatch this unification
+                    // removed.)
                     let pop = smoothstep01(u / 0.18);
                     let die = if u > 0.6 {
                         ((1.0 - u) / 0.4).clamp(0.0, 1.0)
                     } else {
                         1.0
                     };
-                    (d, cy_i, theta_i, pop * die)
+                    (d, cy_i, pop * die)
                 };
                 let cx_i = b.cx + dx * d;
                 let r_i = base_r * scale;
@@ -9165,32 +9237,36 @@ impl CursorGlow {
                     push_halo_over(halos, geom, cx_i, cy_i, r_i, r_i, veil_capped, 255);
                     continue;
                 }
-                // DARK ARM: a solid additive rainbow 5-point star, scanline-
-                // filled at its live sub-cell position + rotation.
-                let premul = premul_rgb(hue, cov as u8);
-                fill_star_scanline(
+                // DARK ARM: THE SHARED TWINKLE, in this star's rainbow band hue.
+                // Same shape as the typing starfield and the glide sparkles —
+                // only the colour differs — so the landing reads as the Nyan
+                // starfield flaring, not as a second star species arriving.
+                if !push_twinkle_star(
                     out,
                     geom,
-                    cx_i,
-                    cy_i,
-                    r_i,
-                    NYAN_STAR_INNER_FRAC,
-                    theta_i,
-                    premul,
+                    cx_i.round() as i32,
+                    cy_i.round() as i32,
+                    (r_i.round() as i32).max(1),
+                    cov as u8,
+                    false,
+                    hue,
                     Self::MAX_QUADS,
-                );
+                ) {
+                    return;
+                }
             }
             // GLIDE LANDING SPARKLES (`sparkles > 0` — glide landings only;
-            // every discrete-JUMP burst carries 0, so the shipped jump
-            // starburst emits byte-identically). The owner: "sparkles aligned
+            // every discrete-JUMP burst carries 0). The owner: "sparkles aligned
             // with the stars that appear when I'm typing in nyan mode" — so
             // these are LITERALLY the typing starfield's 4-point twinkle plus
-            // (`push_twinkle_star`), not the Kirby 5-point star: same arms,
-            // same white/gold palette, same diagonal glint, same pulse sine.
+            // (`push_twinkle_star`): same arms, same white/gold palette, same
+            // diagonal glint, same pulse sine. The colour stars ABOVE now come
+            // through the very same call, so this is no longer the one aligned
+            // emitter — it is simply the WHITE/GOLD half of a single star kit.
             // Scattered on the burst's own even fan, offset HALF a step so they
             // interleave with the colour stars instead of hiding behind them.
             // LIGHT theme: skipped — additive white is invisible on white, and
-            // the Kirby veil dots already mark the landing.
+            // the light-theme veil dots already mark the landing.
             if b.sparkles > 0 && cfg.dark_theme {
                 let ns = b.sparkles as usize;
                 let arm = ((chf * 0.11) as i32).max(1);
@@ -9229,8 +9305,18 @@ impl CursorGlow {
                     }
                     // Every third sparkle is GOLD — the same accent ratio the
                     // starfield's gold gate produces at full spine.
-                    if !push_twinkle_star(out, geom, sx, sy, arm, scov, i % 3 == 0, Self::MAX_QUADS)
-                    {
+                    let sgold = i % 3 == 0;
+                    if !push_twinkle_star(
+                        out,
+                        geom,
+                        sx,
+                        sy,
+                        arm,
+                        scov,
+                        sgold,
+                        twinkle_rgb(sgold),
+                        Self::MAX_QUADS,
+                    ) {
                         return;
                     }
                 }
@@ -9249,7 +9335,7 @@ impl CursorGlow {
     /// light is invisible on white) inverts it to a DARKENED SATURATED rainbow
     /// source-over streak ([`push_rainbow_streak_over`], the ribbon-rail recipe)
     /// in `halos`. DISTINCT from the typing ribbon (grid-quantized, momentum-
-    /// driven) and the discrete jump ZOOM/Kirby stars (a single large delta).
+    /// driven) and the discrete jump ZOOM/burst stars (a single large delta).
     /// Reduced-motion draws ONE static frame (full length, fixed brightness, no
     /// retract/pulse). Load-shed honours [`Self::MAX_QUADS`].
     fn emit_nyan_glide_stars(
@@ -10033,7 +10119,17 @@ impl CursorGlow {
                     // Gold stars carry a faint diagonal glint — the classic
                     // four-point sparkle — kept dim so text stays legible.
                     // Shared with the glide LANDING via `push_twinkle_star`.
-                    if !push_twinkle_star(out, geom, sx, sy, a, star_cov, gold, Self::MAX_QUADS) {
+                    if !push_twinkle_star(
+                        out,
+                        geom,
+                        sx,
+                        sy,
+                        a,
+                        star_cov,
+                        gold,
+                        twinkle_rgb(gold),
+                        Self::MAX_QUADS,
+                    ) {
                         return;
                     }
                 }
@@ -11740,6 +11836,31 @@ fn push_halo_over(
 /// with the stars that appear when I'm typing in nyan mode"). Returns `false`
 /// when the quad budget ran out, at EXACTLY the two points the inlined original
 /// returned, so the ribbon starfield stays byte-identical.
+/// THE TWINKLE'S OWN PALETTE — the white/gold pair the typing starfield and the
+/// glide sparkles have always used. Hoisted out of [`push_twinkle_star`] when the
+/// star became colour-agnostic (the Nyan landing burst draws the SAME shape in a
+/// rainbow band hue), so those two call sites stay byte-identical.
+#[inline]
+const fn twinkle_rgb(gold: bool) -> u32 {
+    if gold { 0x00FF_E9A8 } else { 0x00FF_FFFF }
+}
+
+/// THE ONE STAR. A 4-point twinkle: a horizontal and a vertical arm crossing at
+/// `(sx, sy)`, plus — when `gold` — four dim diagonal glint dots. This is the
+/// only star shape Nyan draws anywhere: the typing starfield, the glide-landing
+/// sparkles, and the jump-landing burst all come through here, so a star is a
+/// star wherever it appears and only its COLOUR and SIZE change with context.
+///
+/// (It replaced a second, bespoke vocabulary — a chunky solid 5-point polygon
+/// scanline-filled at an arbitrary rotation — which gave the burst a star that
+/// matched nothing else on screen. Owner, 2026-07-26: "use the same star pattern
+/// as in the cursor trail … unify on rainbows and sparkles". Rainbow is carried
+/// by `color`, not by a separate shape.)
+#[allow(
+    clippy::too_many_arguments,
+    reason = "output + geometry + centre + arm + coverage + glint + colour + budget; \
+              the three call sites are the whole Nyan star kit and share this one shape"
+)]
 fn push_twinkle_star(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -11748,12 +11869,12 @@ fn push_twinkle_star(
     arm: i32,
     cov: u8,
     gold: bool,
+    color: u32,
     max_quads: usize,
 ) -> bool {
     if cov == 0 || arm < 1 {
         return true;
     }
-    let color = if gold { 0x00FF_E9A8 } else { 0x00FF_FFFF };
     let star = premul_rgb(color, cov);
     push_rect(out, geom, sx - arm, sy, 2 * arm + 1, 1, star); // horizontal arm
     if out.len() >= max_quads {
@@ -11872,96 +11993,6 @@ fn push_rect(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32
             color: premul,
         });
         yy = band_end;
-    }
-}
-
-/// Scanline-fill a SOLID chunky 5-point star (a 10-vertex polygon: five outer
-/// vertices at radius `r`, five inner at `inner_frac·r`, the whole thing rotated
-/// by `theta`, centred at `(cx, cy)`) into the additive [`GlowQuad`] `out`
-/// stream — the Kirby-star payload. For each pixel scanline in the star's
-/// vertical extent it computes the polygon's even-odd x-crossings and pushes one
-/// 1px-tall span [`push_rect`] per interior interval, so the star is genuinely
-/// solid at an ARBITRARY sub-cell position and rotation (the nova "solid shape →
-/// row-band chord slabs" idiom, in the same additive-light channel the burst
-/// uses — no FreeSprite atlas, no new output channel). Load-shed honours
-/// `max_quads`. Crossing buffer is a fixed stack array (a 5-point star's
-/// boundary is crossed by a horizontal line at most a handful of times).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "geometry + centre + radii + rotation + colour + budget; one call site"
-)]
-fn fill_star_scanline(
-    out: &mut Vec<GlowQuad>,
-    geom: Geom,
-    cx: f32,
-    cy: f32,
-    r: f32,
-    inner_frac: f32,
-    theta: f32,
-    premul: u32,
-    max_quads: usize,
-) {
-    if premul == 0 || r < 0.75 {
-        return;
-    }
-    use std::f32::consts::{PI, TAU};
-    let mut pts = [(0.0f32, 0.0f32); 10];
-    for k in 0..5 {
-        // Outer vertex points UP at k=0 (−π/2), then every fifth of a turn; the
-        // inner vertex sits half a step further round at the inner radius.
-        let ao = theta + k as f32 * (TAU / 5.0) - PI / 2.0;
-        let ai = ao + TAU / 10.0;
-        pts[2 * k] = (cx + ao.cos() * r, cy + ao.sin() * r);
-        pts[2 * k + 1] = (
-            cx + ai.cos() * r * inner_frac,
-            cy + ai.sin() * r * inner_frac,
-        );
-    }
-    let ymin = pts.iter().fold(f32::INFINITY, |m, p| m.min(p.1)).floor() as i32;
-    let ymax = pts.iter().fold(f32::NEG_INFINITY, |m, p| m.max(p.1)).ceil() as i32;
-    let mut yy = ymin;
-    while yy < ymax {
-        if out.len() >= max_quads {
-            return;
-        }
-        let yc = yy as f32 + 0.5;
-        let mut xs = [0.0f32; 12];
-        let mut nc = 0usize;
-        for e in 0..10 {
-            let (x0, y0) = pts[e];
-            let (x1, y1) = pts[(e + 1) % 10];
-            // Half-open crossing test (lower edge inclusive) avoids double-
-            // counting a vertex shared by two edges.
-            if (y0 <= yc && y1 > yc) || (y1 <= yc && y0 > yc) {
-                let t = (yc - y0) / (y1 - y0);
-                if nc < xs.len() {
-                    xs[nc] = x0 + t * (x1 - x0);
-                    nc += 1;
-                }
-            }
-        }
-        if nc >= 2 {
-            // Insertion-sort the crossings (nc is tiny), then fill between pairs.
-            for a in 1..nc {
-                let v = xs[a];
-                let mut b = a;
-                while b > 0 && xs[b - 1] > v {
-                    xs[b] = xs[b - 1];
-                    b -= 1;
-                }
-                xs[b] = v;
-            }
-            let mut s = 0;
-            while s + 1 < nc {
-                let xa = xs[s].round() as i32;
-                let xb = xs[s + 1].round() as i32;
-                if xb > xa {
-                    push_rect(out, geom, xa, yy, xb - xa, 1, premul);
-                }
-                s += 2;
-            }
-        }
-        yy += 1;
     }
 }
 
@@ -20040,7 +20071,7 @@ mod tests {
         );
 
         // A modest jump — a real jump (its ZOOM fires) that now, post the
-        // graduated Kirby-star change, ALSO earns feedback: at least ONE small
+        // graduated burst-star change, ALSO earns feedback: at least ONE small
         // star (the old 6-cell cliff that gave short jumps nothing is gone).
         let near = warm_jump(3, 5); // chebyshev-3 from (5, 8), >= MIN_DIST(2.0)
         assert!(
@@ -20109,6 +20140,119 @@ mod tests {
             glow.particles.is_empty(),
             "a cold program warp must not scatter terminus glitter"
         );
+    }
+
+    /// RESIZE STREAK (owner: "when I resize the window, the cursor moves, and
+    /// I'm expecting to see a smooth rainbow streak"): a settled resize arms
+    /// [`CursorGlow::note_reflow`], and the relayout leap that follows throws
+    /// the ZOOM streak even though typing momentum is stone cold — the hand
+    /// dragged the window edge, so the gesture is witnessed. This is the exact
+    /// counterpart of `cold_program_warp_mints_no_nyan_choreography`: same cold
+    /// spine, same move shape, opposite verdict, and the ONLY difference is the
+    /// hint.
+    #[test]
+    fn a_hinted_reflow_throws_the_zoom_streak_from_cold() {
+        let g = geom();
+        let c = cfg(GlowStyle::Nyan, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((0, 0)), t0, &c, g, &mut out);
+        assert_eq!(glow.nyan_disp, 0.0, "the spine must be cold for this law");
+        // The host committed a settled resize, then the reflow relocated the caret.
+        let t1 = t0 + Duration::from_millis(120);
+        glow.note_reflow(t1);
+        glow.tick(Some((3, 30)), t1, &c, g, &mut out);
+        assert_eq!(
+            glow.nyan_jumps.len(),
+            1,
+            "a reflow-hinted relayout leap must throw exactly one ZOOM streak"
+        );
+    }
+
+    /// …and the license is ONE gesture, ONE streak: the hint is consumed by the
+    /// move it pairs with, so a resize storm (or a mid-drag reflow train that
+    /// somehow reached the engine) can never surf a single stale hint into a
+    /// rainbow scribble.
+    #[test]
+    fn one_reflow_hint_licenses_exactly_one_streak() {
+        let g = geom();
+        let c = cfg(GlowStyle::Nyan, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((0, 0)), t0, &c, g, &mut out);
+        let mut t = t0 + Duration::from_millis(60);
+        glow.note_reflow(t);
+        // Five relayout-shaped leaps, ONE hint between them.
+        for &(cr, cc) in &[(3u16, 30u16), (0, 5), (4, 35), (1, 12), (5, 20)] {
+            t += Duration::from_millis(60);
+            glow.tick(Some((cr, cc)), t, &c, g, &mut out);
+        }
+        assert_eq!(
+            glow.nyan_jumps.len(),
+            1,
+            "one reflow hint must license exactly one streak, not one per reflow"
+        );
+    }
+
+    /// A STALE reflow hint is no license: the reflow's caret relocation is
+    /// observed on the next redraw, so the window is generous
+    /// ([`CursorGlow::REFLOW_HINT_FRESH`]) — but a hint older than that has
+    /// missed its move and must not license a later, unrelated warp.
+    #[test]
+    fn a_stale_reflow_hint_licenses_nothing() {
+        let g = geom();
+        let c = cfg(GlowStyle::Nyan, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((0, 0)), t0, &c, g, &mut out);
+        glow.note_reflow(t0);
+        let t1 = t0 + Duration::from_secs_f32(CursorGlow::REFLOW_HINT_FRESH + 0.05);
+        glow.tick(Some((3, 30)), t1, &c, g, &mut out);
+        assert!(
+            glow.nyan_jumps.is_empty(),
+            "a reflow hint past its freshness window must license no streak"
+        );
+    }
+
+    /// CROSS-GEOMETRY ORIGIN CLAMP: on a SHRINK the pre-reflow cell can sit
+    /// outside the new grid, and the streak's launch end is converted with THIS
+    /// tick's geometry. Both endpoints must land inside the effects box, or
+    /// `beam_clip` truncates the swoosh and it starts mid-air.
+    #[test]
+    fn a_reflow_streak_from_a_shrunk_grid_stays_inside_the_effects_box() {
+        let big = geom();
+        let c = cfg(GlowStyle::Nyan, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        // Sit near the far corner of the LARGE grid.
+        let (far_r, far_c) = ((big.rows - 1) as u16, (big.cols - 1) as u16);
+        glow.tick(Some((far_r, far_c)), t0, &c, big, &mut out);
+        // The window shrank hard; the caret was clamped to the new last row.
+        let small = Geom {
+            rows: 3,
+            cols: 10,
+            ..big
+        };
+        let t1 = t0 + Duration::from_millis(120);
+        glow.note_reflow(t1);
+        glow.tick(Some((2, 4)), t1, &c, small, &mut out);
+        let s = glow
+            .nyan_jumps
+            .first()
+            .expect("the shrink's relayout leap must still throw its streak");
+        let (l, r) = (small.fx_left() as f32, small.fx_right() as f32);
+        let (top, bot) = (small.fx_top() as f32, small.fx_bot() as f32);
+        for (label, x, y) in [("launch", s.x0, s.y0), ("landing", s.x1, s.y1)] {
+            assert!(
+                (l..=r).contains(&x) && (top..=bot).contains(&y),
+                "the {label} end ({x}, {y}) must sit inside the shrunk effects box \
+                 x∈[{l}, {r}] y∈[{top}, {bot}]"
+            );
+        }
     }
 
     /// The terminus dissolve requires a RECENT committed press, not just the
@@ -20298,13 +20442,13 @@ mod tests {
         );
     }
 
-    /// KIRBY STARS — the count GRADUATES with jump distance (owner: any
+    /// BURST STARS — the count GRADUATES with jump distance (owner: any
     /// qualifying word-jump gives feedback, the old 6-cell cliff is gone): a
     /// short Option-B/F hop (`dist == MIN_DIST`) scatters exactly ONE small
     /// star, a screen-crossing fling the full [`CursorGlow::NYAN_BURST_STARS`],
     /// and a sub-threshold move still nothing.
     #[test]
-    fn nyan_kirby_star_count_graduates_with_jump_distance() {
+    fn nyan_burst_star_count_graduates_with_jump_distance() {
         let g = geom();
         let born = Instant::now();
         let stars_for = |dist: f32| -> u8 {
@@ -20333,13 +20477,13 @@ mod tests {
         );
     }
 
-    /// KIRBY STARS — LIGHT-THEME fork (source-over, contrast-increasing,
+    /// BURST STARS — LIGHT-THEME fork (source-over, contrast-increasing,
     /// legible): on dark the stars fill SOLID additively into the GlowQuad
     /// stream; on light (additive is invisible on white) each star inverts to a
     /// DARKENED SATURATED source-over veil dot, capped for legibility, in the
     /// halo stream — and the additive stream stays empty.
     #[test]
-    fn nyan_kirby_stars_light_theme_forks_to_source_over() {
+    fn nyan_burst_stars_light_theme_forks_to_source_over() {
         let g = geom();
         let born = Instant::now();
         let mid = born + Duration::from_millis(150); // u≈0.36: stars popped-in

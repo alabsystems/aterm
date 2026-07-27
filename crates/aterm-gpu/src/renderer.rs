@@ -2713,7 +2713,8 @@ pub(crate) struct Offscreen {
     /// `Rgba8UnormSrgb` view aliasing the same texture, attached by the base
     /// bg/glyph/deco-over/cursor passes so fixed-function ALPHA_BLENDING composites
     /// in LINEAR light (matching the CPU linear `blend`). Storage stays sRGB-encoded,
-    /// so blit/readback (which use `view`) are unchanged — screenshot==glass holds.
+    /// so blit/readback (which use `view`) retain byte parity at the
+    /// application-owned source/destination boundary.
     view_srgb: wgpu::TextureView,
     /// The blit-source bind group (samples `tex` into the swapchain). Built ONCE
     /// when the offscreen is (re)created and reused every present.
@@ -11849,7 +11850,7 @@ impl GpuRenderer {
         // `add_sat`; sRGB on downlevel, so the add lands in linear (the accepted cosmetic
         // approximation — see the header DOWNLEVEL FALLBACK). Both views alias the SAME
         // texture (sRGB-encoded bytes), so the blit + readback (which use `view`) are
-        // unchanged — screenshot==glass holds.
+        // byte-identical at the application-owned source/destination boundary.
         let view = &off.view;
         let view_srgb = &off.view_srgb;
         let mut enc = self
