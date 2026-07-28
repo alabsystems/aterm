@@ -30,13 +30,31 @@ fn resolve_ctl() -> PathBuf {
     PathBuf::from("aterm-ctl")
 }
 
+#[derive(Debug)]
 struct Opts {
     socket: Option<String>,
     /// A saved REMOTE connection name to `dial` via the local host (`--dial`).
     dial: Option<String>,
     idle_ms: u64,
     timeout_ms: u64,
+    /// The prompt-ready regex for the best-effort settle confirm. `None` = the
+    /// built-in default; `Some("")` = idle-only (skip the confirm entirely).
+    ready: Option<String>,
     cmd: Vec<String>,
+}
+
+/// Resolve the prompt-ready pattern: `--ready` beats `$ATERM_DRIVE_READY`, which
+/// beats the built-in default.
+///
+/// The default ([`crate::claude_prompt_ready_pattern`]) matches a Claude input
+/// caret, which is only correct when the driven session IS Claude. Driving any
+/// other REPL/agent needs its own prompt, and driving a plain shell wants no
+/// pattern at all — so this is a knob, not a constant. It stays a BEST-EFFORT
+/// extra settle either way: a non-matching pattern costs a bounded wait, never
+/// a failed turn.
+fn resolve_ready(flag: Option<String>) -> String {
+    flag.or_else(|| std::env::var("ATERM_DRIVE_READY").ok())
+        .unwrap_or_else(|| crate::claude_prompt_ready_pattern().to_string())
 }
 
 fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
@@ -44,6 +62,7 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
     let mut dial = None;
     let mut idle_ms = 600u64;
     let mut timeout_ms = 180_000u64;
+    let mut ready = None;
     let mut cmd = Vec::new();
     let mut it = argv.into_iter().map(|a| a.to_string_lossy().into_owned());
     while let Some(a) = it.next() {
@@ -66,6 +85,13 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--timeout needs a millisecond integer")?;
             }
+            // An EMPTY value is meaningful (idle-only), so this takes the next
+            // argument verbatim rather than treating "" as "unset".
+            "--ready" => {
+                ready = Some(it.next().ok_or(
+                    "--ready needs a REGEX (use '' for idle-only, no prompt-ready confirm)",
+                )?);
+            }
             "-h" | "--help" | "help" => {
                 cmd = vec!["help".to_string()];
                 break;
@@ -82,13 +108,16 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
         dial,
         idle_ms,
         timeout_ms,
+        ready,
         cmd,
     })
 }
 
 /// Resolve the LOCAL host's control socket + capability token for a `--dial` drive.
 /// The socket comes from `--socket`/`$ATERM_CONTROL_SOCK`; the token from
-/// `$ATERM_CONTROL_TOKEN`, else the sibling token file (`<socket>.sock` -> `.token`).
+/// `$ATERM_CONTROL_TOKEN`, else the sibling token file located by the SHARED
+/// convention (`aterm_uds::latest::token_path_for_sock`) — `aterm-<pid>.token`
+/// for an instance socket, otherwise `aterm.token` in the socket's directory.
 fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
     let sock = opts
         .socket
@@ -102,8 +131,14 @@ fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            // Convention: the token file sits beside the socket (`.sock` -> `.token`).
-            let tok_path = sock.strip_suffix(".sock").map(|p| format!("{p}.token"))?;
+            // The SHARED convention, not a hand-rolled one: an instance socket
+            // (`aterm-<pid>.sock`) pairs with `aterm-<pid>.token`, everything
+            // else — including an explicit `$ATERM_CONTROL_SOCK` path — with the
+            // sibling `aterm.token`, resolved in the socket's own directory and
+            // through the `latest` alias. This used to derive `<stem>.token`,
+            // which the server never writes for a custom socket path, so
+            // `--dial` silently failed to authenticate where `aterm ctl` worked.
+            let tok_path = aterm_uds::latest::token_path_for_sock(&sock)?;
             std::fs::read_to_string(&tok_path)
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -111,7 +146,8 @@ fn resolve_local_endpoint(opts: &Opts) -> Result<(String, String), String> {
         .filter(|s| !s.is_empty())
         .ok_or(
             "could not resolve the LOCAL control token: set ATERM_CONTROL_TOKEN, or ensure the \
-             sibling <socket-with-.token> file is readable",
+             token file beside the socket is readable (`aterm-<pid>.token` for an instance \
+             socket, else `aterm.token` in the socket's directory)",
         )?;
     Ok((sock, token))
 }
@@ -175,7 +211,7 @@ fn run(opts: &Opts) -> Result<String, String> {
         let turn = Turn {
             idle: Duration::from_millis(opts.idle_ms),
             timeout: Duration::from_millis(opts.timeout_ms),
-            ..Turn::default()
+            ready_pattern: resolve_ready(opts.ready.clone()),
         };
         return turn
             .run(&mut client, &mut gov, text.as_bytes())
@@ -213,7 +249,7 @@ fn run(opts: &Opts) -> Result<String, String> {
             let turn = Turn {
                 idle: Duration::from_millis(opts.idle_ms),
                 timeout: Duration::from_millis(opts.timeout_ms),
-                ..Turn::default()
+                ready_pattern: resolve_ready(opts.ready.clone()),
             };
             turn.run(&mut client, &mut gov, text.as_bytes())
                 .map_err(|e| e.to_string())
@@ -250,5 +286,66 @@ fn run(opts: &Opts) -> Result<String, String> {
             "unknown command '{other}'. Valid: prompt | read | await | shot | help.\n  \
              Run `aterm-drive --help` for the full guide."
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prompt-ready pattern must be a KNOB, not a constant: the default only
+    /// matches a Claude input caret, so driving any other REPL — or a plain
+    /// shell, which wants no confirm at all — needs an override.
+    #[test]
+    fn ready_pattern_precedence_flag_beats_env_beats_default() {
+        let dflt = crate::claude_prompt_ready_pattern();
+
+        // Flag wins outright (no env read needed for this branch).
+        assert_eq!(resolve_ready(Some(r"^\$ ".to_string())), r"^\$ ");
+
+        // An EMPTY flag is meaningful — idle-only — and must NOT fall through
+        // to the default. This is the branch a naive `filter(|s| !s.is_empty())`
+        // would silently break.
+        assert_eq!(resolve_ready(Some(String::new())), "");
+
+        // No flag, no env -> the built-in default.
+        // (Guarded: another test in this process could have set the var.)
+        if std::env::var("ATERM_DRIVE_READY").is_err() {
+            assert_eq!(resolve_ready(None), dflt);
+        }
+    }
+
+    /// `--ready` takes its value verbatim, including an empty string, and a
+    /// missing value is a clear usage error rather than swallowing the command.
+    #[test]
+    fn ready_flag_parses_and_requires_a_value() {
+        let os = |v: &[&str]| -> Vec<std::ffi::OsString> {
+            v.iter().map(std::ffi::OsString::from).collect()
+        };
+
+        let o = parse(os(&["--ready", r"^> ", "prompt", "hi"])).expect("parses");
+        assert_eq!(o.ready.as_deref(), Some(r"^> "));
+        assert_eq!(o.cmd, vec!["prompt".to_string(), "hi".to_string()]);
+
+        let empty = parse(os(&["--ready", "", "read"])).expect("empty value is legal");
+        assert_eq!(empty.ready.as_deref(), Some(""), "'' means idle-only");
+
+        let err = parse(os(&["--ready"])).expect_err("a missing value is an error");
+        assert!(err.contains("--ready needs a REGEX"), "actionable: {err}");
+    }
+
+    /// Regression: the drive CLI must not re-derive the token path itself. The
+    /// shared helper is the single source of truth for the convention.
+    #[test]
+    fn token_path_uses_the_shared_convention_not_a_stem_swap() {
+        let p = aterm_uds::latest::token_path_for_sock("/tmp/run/c.sock").expect("resolves");
+        assert!(
+            p.ends_with("aterm.token"),
+            "an explicitly-named socket pairs with the SIBLING token, got {p:?}"
+        );
+        assert!(
+            !p.to_string_lossy().contains("c.token"),
+            "the old hand-rolled <stem>.token derivation is gone, got {p:?}"
+        );
     }
 }

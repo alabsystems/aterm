@@ -36,7 +36,7 @@ use aterm_spec::{interp, verify};
 /// Tier-0: proven at the committed `Buggy = 0`, caught at `Buggy = 1`.
 #[test]
 fn derived_streaming_search_proves_and_catches_unclamped_index() {
-    verify::prove_and_catch_tiered(
+    verify::prove_and_catch_scalar(
         &streaming_search_model(),
         "derived StreamingSearch spec (invalidation clamp)",
     );

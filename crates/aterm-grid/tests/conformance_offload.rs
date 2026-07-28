@@ -272,7 +272,7 @@ fn offload_window_spec_model_checked_in_trust() {
     // TIERED (VERIFY-1): interpreter prove-and-catch always; ty additionally
     // wherever installed (the build.rs gate runs the same ty check at compile
     // time on Trust machines; this keeps `cargo test` alone proving it too).
-    verify::prove_and_catch_tiered(
+    verify::prove_and_catch_scalar(
         &offload_window_model(),
         "scrollback-offload detach-window spec",
     );

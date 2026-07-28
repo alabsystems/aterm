@@ -47,20 +47,47 @@ impl Layout {
         self.prefix.join("bin")
     }
 
-    /// `bin/<tool>` — a single shim (concrete filename `bin/<tool>` on Unix,
-    /// `bin/<tool>.cmd` on Windows, via [`crate::platform::SHIM_SUFFIX`]). Callers MUST
-    /// gate the name through [`shim_allowed`].
+    /// `bin/<tool>` — a single shim. The concrete file name is [`ToolName::shim_file`]
+    /// (`bin/ay` on Unix, `bin/ay.cmd` on Windows).
+    ///
+    /// Taking a [`ToolName`] rather than a `&str` is what makes the [`shim_allowed`] gate
+    /// unskippable: there is no way to *name* a file in `bin/` without having gone through
+    /// [`ToolName::new`], so a sensitive name cannot reach the filesystem because one call
+    /// site among several forgot the deny-list.
     #[must_use]
-    pub fn shim(&self, tool: &str) -> PathBuf {
-        let mut name = String::from(tool);
-        name.push_str(crate::platform::SHIM_SUFFIX);
-        self.bin_dir().join(name)
+    pub fn shim(&self, tool: &ToolName) -> PathBuf {
+        self.bin_dir().join(tool.shim_file())
     }
 
     /// `channels/<name>/current` — the per-coherence-group active-set symlink (§10).
+    ///
+    /// **One symlink per CHANNEL, not per program.** Every released-tool install passes the
+    /// same config-resolved channel name (`[packages].channel`, default `stable`), and every
+    /// coherence-group member flips through it too, so activating `ny` overwrites the link
+    /// `ay` just wrote. It therefore answers "what did this channel activate LAST", which is
+    /// what `uninstall`'s dangling-link sweep needs and what a GC witness must never be built
+    /// on — see [`Layout::program_current`].
     #[must_use]
     pub fn channel_current(&self, channel: &str) -> PathBuf {
         self.prefix.join("channels").join(channel).join("current")
+    }
+
+    /// `store/<program>/current` — the PER-PROGRAM active-build symlink, pointing at
+    /// `store/<program>/<build>/`.
+    ///
+    /// This is the authority [`crate::gc::live_builds`] resolves. It exists because the
+    /// channel link above cannot answer "which build of *this* program is live": with N
+    /// programs on one channel it holds exactly one answer, so N−1 programs would have no
+    /// witness and GC would abstain on them forever, growing the store without bound.
+    ///
+    /// It lives INSIDE `store/<program>/` rather than beside the channel link on purpose:
+    /// there is then exactly one per program by construction (no channel can contest
+    /// another's claim about the same program), `uninstall`'s `remove_dir_all` of the program
+    /// tree takes it away with the builds it names, and it can never collide with a build dir
+    /// (`current` does not parse as a `u64`, so [`crate::ops::list_installed`] skips it).
+    #[must_use]
+    pub fn program_current(&self, program: &str) -> PathBuf {
+        self.prefix.join("store").join(program).join("current")
     }
 
     /// `staging/<program>/` — the per-program download + stage scratch.
@@ -160,7 +187,16 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
 /// inverse of a stage + [`mark_build_ready`]). Used to clean up a build that a transaction
 /// STAGED but then ABORTED without activating — leaving it complete-but-inactive would make
 /// `list_installed`/`decide` mis-read it as the active build on the next run. Best-effort.
-pub fn discard_build(build_dir: &Path) {
+///
+/// **`pub(crate)` deliberately.** This is an unconditional `remove_dir_all` with no notion of
+/// which build is live: handed to a caller that got its build number from a `read_dir` fold,
+/// it will happily delete the running toolchain — which is precisely how GC came to brick a
+/// prefix. Reclaim therefore goes through [`crate::gc::discard_superseded`], which demands a
+/// [`crate::gc::LiveBuild`] witness and refuses to delete it; making the raw form
+/// crate-private is what stops that call from being *writable* elsewhere. The remaining
+/// in-crate callers ([`crate::flow`], [`crate::sourcebuild`]) are the staged-but-ABORTED
+/// paths, where the build was never activated and so no witness can name it.
+pub(crate) fn discard_build(build_dir: &Path) {
     let _ = std::fs::remove_dir_all(build_dir);
     if let Some(marker) = ready_marker_path(build_dir) {
         let _ = std::fs::remove_file(marker);
@@ -331,6 +367,126 @@ pub fn shim_allowed(name: &str) -> bool {
     !SENSITIVE_SHIMS.contains(&lower.as_str())
 }
 
+/// A **logical** tool name — one entry of a manifest's `exposes` list. Never a file name.
+///
+/// One `String` used to carry three different things at once: the logical name, the `bin/`
+/// shim file (`<name><SHIM_SUFFIX>`), and the executable inside a build's `bin/`
+/// (`<name><EXE_SUFFIX>`). On Unix both suffixes are `""`, so all three coincide and every
+/// confusion between them is invisible; on Windows they are `.cmd` and `.exe` and the three
+/// are three distinct files. Three live defects came out of that conflation — a rollback
+/// probing `prior_dir/bin/<tool>` with no `.exe`, the same omission in the sysroot resolve
+/// check, and a prune guard comparing a logical name against the on-disk `ay.cmd` (so on
+/// Windows it never matched and the guard never fired) — plus nine hand-written
+/// `format!("{tool}{EXE_SUFFIX}")` re-derivations of the one rule.
+///
+/// So this type deliberately has **no `Deref<Target = str>` and no `Display`**:
+/// `Path::join(tool)` and `format!("{tool}")` do not compile, and the author must say which
+/// rendering they mean — [`shim_file`](Self::shim_file) or [`exe_file`](Self::exe_file).
+/// Choosing between those two is exactly the decision that was silently wrong at all three
+/// sites; making it unavoidable is the whole point of the type.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ToolName(String);
+
+/// `<name><suffix>` — the single rule behind both of [`ToolName`]'s renderings.
+///
+/// Split out from the two methods, and taking the suffix as a PARAMETER, purely so the rule
+/// is testable: `SHIM_SUFFIX` and `EXE_SUFFIX` are both `""` on Unix, so every assertion
+/// written against the methods degenerates to the identity on the hosts this repo is
+/// developed on and would hold for a wrong implementation too. The tests drive this with
+/// literal `.cmd`/`.exe`.
+///
+/// Built with `push_str`, not `format!`: the `format!` expansion embeds `fmt::Arguments`
+/// construction (with inlined `unsafe`) that the strict Trust gate cannot lower and fails
+/// closed on (see `lib.rs`). Byte-identical result.
+fn with_suffix(name: &str, suffix: &str) -> String {
+    let mut s = String::new();
+    s.push_str(name);
+    s.push_str(suffix);
+    s
+}
+
+/// The inverse of [`with_suffix`], and total: a name that does NOT carry the suffix is
+/// returned unchanged rather than rejected.
+///
+/// Totality is the load-bearing part. `strip_suffix("")` is `Some`, so on Unix this is the
+/// identity for every input; on Windows a `bin/` entry may legitimately be either `ay.cmd`
+/// (a shim this manager wrote) or `ay` (a hand-made file), and both must read back as the
+/// logical `ay` so that re-shimming REPLACES rather than writing `ay.cmd.cmd` beside it.
+fn without_suffix<'a>(name: &'a str, suffix: &str) -> &'a str {
+    name.strip_suffix(suffix).unwrap_or(name)
+}
+
+impl ToolName {
+    /// Admit `raw` as a tool name, or `None` when it fails [`shim_allowed`] — a sensitive
+    /// command (`sudo`/`ssh`/`git`/…) or a malformed name (empty, `.`/`..`, a path separator
+    /// or NUL).
+    ///
+    /// Running the deny-list HERE rather than at each call site is the second half of the
+    /// type's job: `install_shims`, the tombstone writer, the transaction rollback, the seed
+    /// "still installing" shims and the dev-link lane each used to repeat the check, and any
+    /// one of them forgetting it would have put a shadowing shim on the user's `PATH`.
+    #[must_use]
+    pub fn new(raw: &str) -> Option<Self> {
+        shim_allowed(raw).then(|| Self(raw.to_string()))
+    }
+
+    /// The `bin/` **shim** file name: `<tool><SHIM_SUFFIX>` — `ay` on Unix (a bare symlink),
+    /// `ay.cmd` on Windows (a batch wrapper).
+    #[must_use]
+    pub fn shim_file(&self) -> String {
+        with_suffix(&self.0, crate::platform::SHIM_SUFFIX)
+    }
+
+    /// The **executable** file name inside a build's `bin/`: `<tool><EXE_SUFFIX>` — `ay` on
+    /// Unix, `ay.exe` on Windows. This is what a shim FORWARDS to; it is never the shim's own
+    /// name, and on Windows conflating the two yields `bin/ay.cmd` pointing at `bin\ay.cmd`.
+    #[must_use]
+    pub fn exe_file(&self) -> String {
+        with_suffix(&self.0, crate::platform::EXE_SUFFIX)
+    }
+
+    /// Recover the logical name from a `bin/` directory entry, stripping the platform
+    /// [`crate::platform::SHIM_SUFFIX`] (so `ay.cmd` reads back as `ay` on Windows; on Unix
+    /// the suffix is `""` and `strip_suffix("")` is the identity, so the name is unchanged).
+    ///
+    /// Callers feed the result back through [`Layout::shim`] / `install_shims` /
+    /// `install_tombstone_shim`, which append the suffix again — returning the raw file name
+    /// would double it (`bin/ay.cmd.cmd`), writing tombstones and rollback shims BESIDE the
+    /// live shim instead of replacing it.
+    ///
+    /// `None` for a `bin/` entry that this manager could never have written (a name
+    /// [`shim_allowed`] refuses), which is the fail-closed direction for the one caller that
+    /// DELETES what it recognizes.
+    #[must_use]
+    pub fn from_shim_file(name: &str) -> Option<Self> {
+        Self::new(without_suffix(name, crate::platform::SHIM_SUFFIX))
+    }
+
+    /// The logical name, for reporting (`status.toml`, refusal lists, log lines). NOT for
+    /// building a path — use [`shim_file`](Self::shim_file) / [`exe_file`](Self::exe_file).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Split a manifest's raw `exposes` list into the names that may be shimmed and the ones
+/// refused. This is the ONE place a `Vec<String>` off the wire becomes [`ToolName`]s, so the
+/// refusal list stays honest (it reports the raw name the manifest actually asked for) while
+/// everything downstream of it holds the validated type. Order is preserved in both halves.
+#[must_use]
+pub fn split_exposed(exposes: &[String]) -> (Vec<ToolName>, Vec<String>) {
+    let mut tools = Vec::new();
+    let mut refused = Vec::new();
+    for raw in exposes {
+        match ToolName::new(raw) {
+            Some(t) => tools.push(t),
+            None => refused.push(raw.clone()),
+        }
+    }
+    (tools, refused)
+}
+
 /// Compose the child `PATH` for running a managed tool: the inherited `PATH` with the
 /// managed `bin_dir` **appended** — never prepended, so a pinned tool that calls a sibling
 /// by bare name resolves the pinned sibling, while system commands (`sudo`/`ssh`/…) on the
@@ -384,7 +540,7 @@ mod tests {
         assert_eq!(l.build_dir("ay", 18), PathBuf::from("/p/store/ay/18"));
         // The shim file name carries the concrete platform suffix (`.cmd` on Windows).
         assert_eq!(
-            l.shim("ay"),
+            l.shim(&ToolName::new("ay").unwrap()),
             PathBuf::from(format!("/p/bin/ay{}", crate::platform::SHIM_SUFFIX))
         );
         assert_eq!(
@@ -468,6 +624,82 @@ mod tests {
         for ok in ["ay", "ny", "trust-mc", "clean-certify"] {
             assert!(shim_allowed(ok), "{ok} should be allowed");
         }
+    }
+
+    #[test]
+    fn tool_name_admits_through_the_deny_list_and_renders_both_file_names() {
+        // Construction IS the deny-list check — a refused name has no ToolName at all, so it
+        // cannot be handed to `Layout::shim`, `install_shim`, or anything else that writes.
+        assert!(ToolName::new("sudo").is_none());
+        assert!(ToolName::new("../git").is_none());
+        assert!(ToolName::new("").is_none());
+        let ay = ToolName::new("ay").unwrap();
+        assert_eq!(ay.as_str(), "ay");
+        // The two renderings are the shim's own name and the binary it forwards to. They are
+        // the same string on Unix and different files on Windows; the point of the type is
+        // that a caller must pick one, not that they differ on the host that runs this test.
+        assert_eq!(
+            ay.shim_file(),
+            format!("ay{}", crate::platform::SHIM_SUFFIX)
+        );
+        assert_eq!(ay.exe_file(), format!("ay{}", crate::platform::EXE_SUFFIX));
+    }
+
+    #[test]
+    fn from_shim_file_round_trips_and_never_doubles_the_suffix() {
+        let ay = ToolName::new("ay").unwrap();
+        // The exact inverse of `shim_file` — this is what makes `bin/ay.cmd` read back as the
+        // logical `ay`, so re-shimming it replaces the live shim instead of writing
+        // `bin/ay.cmd.cmd` beside it.
+        assert_eq!(ToolName::from_shim_file(&ay.shim_file()), Some(ay.clone()));
+        assert_eq!(ToolName::from_shim_file("ay"), Some(ay));
+        // A `bin/` entry this manager could never have written is not recognized, so the
+        // one caller that DELETES what it recognizes leaves it alone.
+        assert_eq!(ToolName::from_shim_file("sudo"), None);
+    }
+
+    /// The two assertions above are, on Unix, `""`-suffixed identities: they hold for ANY
+    /// implementation, including the conflated `String` this type replaced. The defect the
+    /// type exists to close is a WINDOWS one (`.cmd` vs `.exe` vs the logical name), and no
+    /// macOS/Linux runner can reach it through `SHIM_SUFFIX`. So drive the rule directly.
+    #[test]
+    fn the_suffix_rule_round_trips_and_never_doubles_on_a_suffixed_platform() {
+        // Windows' real pair: a shim and the executable it forwards to are DIFFERENT files.
+        assert_eq!(with_suffix("ay", ".cmd"), "ay.cmd");
+        assert_eq!(with_suffix("ay", ".exe"), "ay.exe");
+        assert_ne!(with_suffix("ay", ".cmd"), with_suffix("ay", ".exe"));
+
+        // The round trip a `bin/` scan performs: file name -> logical -> file name.
+        assert_eq!(without_suffix(&with_suffix("ay", ".cmd"), ".cmd"), "ay");
+        // THE trap: strip first, or re-appending writes `bin/ay.cmd.cmd` BESIDE the live
+        // shim instead of replacing it — silently disabling nothing and tombstoning nothing.
+        assert_eq!(
+            with_suffix(&with_suffix("ay", ".cmd"), ".cmd"),
+            "ay.cmd.cmd"
+        );
+
+        // Total, not fallible: an unsuffixed entry reads back unchanged …
+        assert_eq!(without_suffix("ay", ".cmd"), "ay");
+        // … and the shim suffix is NOT the exe suffix, so a `.exe` in `bin/` keeps its name
+        // rather than being mistaken for a shim of `ay`.
+        assert_eq!(without_suffix("ay.exe", ".cmd"), "ay.exe");
+
+        // The empty suffix (Unix) is the identity in both directions — which is exactly why
+        // every assertion phrased in terms of `SHIM_SUFFIX` is vacuous here.
+        assert_eq!(with_suffix("ay", ""), "ay");
+        assert_eq!(without_suffix("ay", ""), "ay");
+    }
+
+    #[test]
+    fn split_exposed_keeps_the_raw_name_in_the_refusal_list() {
+        let raw = vec!["ay".to_string(), "sudo".to_string(), "trust-mc".to_string()];
+        let (tools, refused) = split_exposed(&raw);
+        assert_eq!(
+            tools.iter().map(ToolName::as_str).collect::<Vec<_>>(),
+            vec!["ay", "trust-mc"]
+        );
+        // Refusals are reported with the name the manifest actually asked for.
+        assert_eq!(refused, vec!["sudo".to_string()]);
     }
 
     #[test]

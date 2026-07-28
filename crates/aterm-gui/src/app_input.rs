@@ -1495,10 +1495,14 @@ impl App {
         if !rs.cfg.feline {
             return;
         }
+        // Same resolution order as the per-frame sync in `app_render`: an
+        // explicitly collected companion wins, otherwise this session's own
+        // kitty. Never `KittyLook::default()` — that is the one cat every
+        // session used to share.
         let look = self
             .kitty_log
             .companion_look()
-            .unwrap_or_default()
+            .unwrap_or_else(|| aterm_effects::kitty_registry::KittyLook::for_session(session))
             .normalized();
         // Displayed-trait bits mirror the word renderer's recorder exactly:
         // only the overlay accessories the hello actually draws are counted.
@@ -1545,9 +1549,23 @@ impl App {
             None
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
-            // A first-ever sighting is a genuine discovery — present that
-            // exact unlocked identity, like the render drain would.
-            ws.cursor_cat.on_collect(now, discovered.unwrap_or(look));
+            // TWO REASONS, TWO PRESENTATIONS (owner, 2026-07-26: "it's not that
+            // I need it to be locked so much as I don't want the kitty changing
+            // for no reason").
+            //
+            // * A first-ever sighting is a genuine discovery — a real reason to
+            //   swap. Present that exact unlocked identity, like the render
+            //   drain would.
+            // * Merely typing the word is NOT a reason. It used to run through
+            //   the same `on_collect`, which replaces `look` outright (the
+            //   two-path rule's path 2), so every typed `kitty` could re-skin
+            //   the companion out from under the session. `on_summon` gives the
+            //   identical appearance/hold WITHOUT touching the identity, so the
+            //   session's own kitty is the one that shows up.
+            match discovered {
+                Some(unlocked) => ws.cursor_cat.on_collect(now, unlocked),
+                None => ws.cursor_cat.on_summon(now, 1),
+            }
             // A no-echo prompt (password read) repaints nothing on its own —
             // one explicit wake lets the hello's first frame present (full
             // motion then owns the cadence; reduced motion arms its single
@@ -1555,6 +1573,104 @@ impl App {
             if let Some(w) = ws.os_window.as_ref() {
                 w.request_redraw();
             }
+        }
+    }
+
+    /// Promote the FRONT SESSION's own kitty into the durable kitty registry
+    /// and pin it as the companion (owner: "I like that there is a unique kitty
+    /// chosen per session and sticks with that session because that makes the
+    /// session kitty special … and if somebody really likes that kitty it goes
+    /// into the kitty registry"). The menu-bar item, the ⇧⌘P palette row, and
+    /// `aterm-ctl invoke FavouriteSessionKitty` all land here.
+    pub(crate) fn favourite_session_kitty(&mut self, wid: WindowId, now: std::time::Instant) {
+        use aterm_effects::kitty_registry::{
+            KittyLook, KittyMagic, KittyShownAs, KittySighting, KittyType,
+        };
+        // EFFECTS MASTER GATE, then the FELINE SUB-GATE — the exact pair
+        // `summon_typed_kitty` documents: nothing can draw ⇒ nothing may log,
+        // and `feline.enabled = false` means cats do not exist, so a synthetic
+        // row for a category the config can never produce would poison the
+        // ledger.
+        let Some(rs) = self.sparkle.as_ref() else {
+            return;
+        };
+        if !rs.cfg.feline {
+            return;
+        }
+        let Some(session) = self.focused_session_id(wid) else {
+            return;
+        };
+        // THE SESSION KITTY, deliberately not `companion_look()`. Once ANYTHING
+        // is collected the companion wins for every window (`app_render`), so
+        // favouriting "the cat I can see" could never promote a session kitty —
+        // on a used ledger it would only ever re-pin the cat that already won.
+        let look = KittyLook::for_session(session);
+        let enabled = self.kitty_log_enabled();
+        let sighting = KittySighting {
+            kitty_type: KittyType::HeadPeek,
+            magic: KittyMagic::None,
+            shown_as: KittyShownAs::Cat,
+            // No matched surface — a favourite is a button press, not a word —
+            // so "unknown" is the honest primary language rather than a
+            // borrowed chip from a scan that never happened.
+            langs: aterm_lexicon::LangSet::EMPTY,
+            // `for_session` never mints an accessory, so no overlay was drawn
+            // and no displayed-trait bit may be claimed.
+            traits: 0,
+            look,
+            ident: crate::kitty_summon::FAVOURITE_IDENT_TAG ^ self.kitty_summon_seq,
+        };
+        self.kitty_summon_seq = self.kitty_summon_seq.wrapping_add(1);
+        self.kitty_log
+            .favourite(&sighting, &rs.lexicon, now, enabled);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            // TWO REASONS, TWO PRESENTATIONS: a favourite IS a reason to change
+            // the identity, so it takes path 2 (`on_collect`) like a discovery
+            // hello, rather than the identity-preserving `on_summon`.
+            ws.cursor_cat.on_collect(now, look);
+            // A no-echo prompt repaints nothing on its own — one explicit wake
+            // lets the hello's first frame present.
+            if let Some(w) = ws.os_window.as_ref() {
+                w.request_redraw();
+            }
+        }
+    }
+
+    /// Deliver a typed-word reaction to the window's cursor companion.
+    ///
+    /// EXPRESSION ONLY. Neither family touches `look`, the flight lifetime, or
+    /// typing momentum — the session's kitty keeps its identity through every
+    /// reaction. The feline arm is handled by `summon_typed_kitty`'s
+    /// `on_summon` (which also wakes a hidden companion, because typing the
+    /// word must make a kitty appear); this adds the profanity wince, whose
+    /// screen-side twin is `word_decorations`'s `CurseCue`. A curse typed into
+    /// a NO-ECHO prompt never reaches that scanner, so the input path owes the
+    /// reaction independently.
+    fn react_typed_word(
+        &mut self,
+        wid: WindowId,
+        now: std::time::Instant,
+        hit: crate::kitty_summon::TypedHit,
+    ) {
+        // Same master + family gates the ambient sightings respect: with
+        // sparkle words or the feline family off, no cat machinery may move.
+        let Some(rs) = self.sparkle.as_ref() else {
+            return;
+        };
+        if !rs.cfg.feline {
+            return;
+        }
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        // `on_curse` is a no-op on a hidden companion by design — a curse is a
+        // reaction, never a summon. Only a redraw the reaction actually earned
+        // is requested.
+        if hit.profanity
+            && ws.cursor_cat.on_curse(now, 1)
+            && let Some(w) = ws.os_window.as_ref()
+        {
+            w.request_redraw();
         }
     }
 
@@ -2432,7 +2548,9 @@ impl App {
                             }
                         }
                     }
-                    if let Some(((ch, is_backspace), (cur, (cols, rows), no_echo))) = act.zip(sample) {
+                    if let Some(((ch, is_backspace), (cur, (cols, rows), no_echo))) =
+                        act.zip(sample)
+                    {
                         // Split panes predict too: the composed render path
                         // reconciles/paints the FOCUSED pane's guesses (see
                         // `redraw_compose`), and `sync_window` resets the
@@ -2458,14 +2576,12 @@ impl App {
                             } else {
                                 ws.predictor.set_mode(pmode);
                                 let _changed = match ch {
-                                    Some(c) => {
-                                        ws.predictor.predict_char_in_grid(
-                                            c,
-                                            (cur.row, cur.col),
-                                            (cols, rows),
-                                            now,
-                                        )
-                                    }
+                                    Some(c) => ws.predictor.predict_char_in_grid(
+                                        c,
+                                        (cur.row, cur.col),
+                                        (cols, rows),
+                                        now,
+                                    ),
                                     None if is_backspace => ws.predictor.predict_backspace(now),
                                     None => false,
                                 };
@@ -2703,37 +2819,60 @@ impl App {
                                 }
                             }
                         }
-                        match self.windows.get_mut(&wid) {
-                            Some(ws) if brk => {
+                        // The detector needs the compiled lexicon (multilingual
+                        // feline + profanity) while `windows` is borrowed mutably;
+                        // `Resolved::lexicon` is an `Arc`, so one refcount bump
+                        // splits the borrow without copying the vocabulary.
+                        let lexicon = self.sparkle.as_ref().map(|rs| rs.lexicon.clone());
+                        let opts = self
+                            .sparkle
+                            .as_ref()
+                            .map(|rs| rs.cfg.scan_opts())
+                            .unwrap_or_default();
+                        match (self.windows.get_mut(&wid), lexicon) {
+                            (Some(ws), _) if brk => {
                                 ws.kitty_summon.note_break();
-                                crate::kitty_summon::TypedSummon::None
+                                crate::kitty_summon::TypedHit::default()
                             }
-                            Some(ws) if backspace => {
+                            (Some(ws), _) if backspace => {
                                 ws.kitty_summon.note_backspace(session);
-                                crate::kitty_summon::TypedSummon::None
+                                crate::kitty_summon::TypedHit::default()
                             }
-                            Some(ws) => {
-                                let mut fired = crate::kitty_summon::TypedSummon::None;
+                            (Some(ws), Some(lx)) => {
+                                let mut fired = crate::kitty_summon::TypedHit::default();
                                 if let Some(c) = typed {
-                                    fired = ws.kitty_summon.note_char(input_now, session, c);
+                                    fired = ws
+                                        .kitty_summon
+                                        .note_char(input_now, session, c, &lx, &opts);
                                 }
                                 if let Some(t) = ime {
                                     for c in t.chars() {
-                                        // `max`: across one IME commit, a granted
-                                        // record outranks a cooldown-only cameo.
-                                        fired = fired
-                                            .max(ws.kitty_summon.note_char(input_now, session, c));
+                                        // `merge`: across one IME commit, a granted
+                                        // record outranks a cooldown-only cameo, and
+                                        // both family reactions are kept.
+                                        fired = fired.merge(
+                                            ws.kitty_summon
+                                                .note_char(input_now, session, c, &lx, &opts),
+                                        );
                                     }
                                 }
                                 fired
                             }
-                            None => crate::kitty_summon::TypedSummon::None,
+                            // Sparkle words off ⇒ no vocabulary, no reactions.
+                            _ => crate::kitty_summon::TypedHit::default(),
                         }
                     };
                     // The cameo is owed on EVERY completion; only the ledger row
                     // is rate-limited (see `kitty_summon`'s two-tier note).
-                    if summoned.shows_cameo() {
-                        self.summon_typed_kitty(wid, session, input_now, summoned.records());
+                    if summoned.summon.shows_cameo() {
+                        self.summon_typed_kitty(wid, session, input_now, summoned.summon.records());
+                    }
+                    // COMPANION REACTIONS (owner, 2026-07-26: "I want the cursor
+                    // kitty to react to `fuck` and `kitty` words. This must also
+                    // work multilingual"). Expression only — the session's kitty
+                    // never changes identity for a typed word.
+                    if summoned.feline || summoned.profanity {
+                        self.react_typed_word(wid, input_now, summoned);
                     }
                 }
                 outcome
@@ -5066,8 +5205,8 @@ impl App {
         mods: ModifiersState,
         ev: &KeyEvent,
     ) -> Option<crate::SearchRepeatAction> {
-        use crate::app_search::SearchEdit;
         use crate::SearchRepeatAction as Action;
+        use crate::app_search::SearchEdit;
 
         if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
             return None;
@@ -6475,12 +6614,14 @@ impl App {
                 .handoff_preverified
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cached.as_ref().filter(|entry| {
-                entry.build == attempt.target_build()
-                    && entry.commit == attempt.target_commit()
-                    && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
-            })
-            .map(|entry| entry.passed)
+            cached
+                .as_ref()
+                .filter(|entry| {
+                    entry.build == attempt.target_build()
+                        && entry.commit == attempt.target_commit()
+                        && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
+                })
+                .map(|entry| entry.passed)
         });
         if preverified == Some(false) {
             return Err(crate::UpdateHandoffStartError::failed(
@@ -6919,9 +7060,7 @@ impl App {
             let drained_for = {
                 let now = std::time::Instant::now();
                 self.pending_update_handoff.as_mut().map(|pending| {
-                    now.saturating_duration_since(
-                        *pending.commit_drain_started.get_or_insert(now),
-                    )
+                    now.saturating_duration_since(*pending.commit_drain_started.get_or_insert(now))
                 })
             };
             let drained_for = drained_for.unwrap_or(HANDOFF_INPUT_DRAIN_DEADLINE);
@@ -6929,8 +7068,7 @@ impl App {
             // iterated) and the elapsed floor.
             let input_dispatch_fenced =
                 input_drain_spins >= 1 && drained_for >= HANDOFF_INPUT_DISPATCH_FENCE;
-            let input_quiet =
-                !crate::platform::recent_user_input_event(HANDOFF_INPUT_QUIET_EPOCH);
+            let input_quiet = !crate::platform::recent_user_input_event(HANDOFF_INPUT_QUIET_EPOCH);
             let quiet_window_settled = input_quiet || drained_for >= HANDOFF_INPUT_QUIET_BUDGET;
             let egress_settled = self
                 .pending_update_handoff
@@ -7542,6 +7680,13 @@ impl App {
             MenuAction::ToggleMatrixRain => {
                 if let Some(wid) = self.frontmost_window {
                     self.toggle_matrix_rain(wid);
+                }
+            }
+            // Promote the front session's own kitty into the durable registry.
+            // No-op with no frontmost terminal (the item is greyed there).
+            MenuAction::FavouriteSessionKitty => {
+                if let Some(wid) = self.frontmost_window {
+                    self.favourite_session_kitty(wid, std::time::Instant::now());
                 }
             }
             MenuAction::ToggleSeriousMode => {
@@ -9209,7 +9354,9 @@ mod terminal_emacs_search_input_tests {
         app.terminal_emacs_search_pressed(wid, classic_key, false);
         app.apply_search_repeat_action(
             wid,
-            SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert("CLAUDE_CLASSIC".into())),
+            SearchRepeatAction::Edit(crate::app_search::SearchEdit::Insert(
+                "CLAUDE_CLASSIC".into(),
+            )),
         );
         assert_eq!(app.windows[&wid].search.as_ref().unwrap().current, 1);
         app.release_physical_press(wid, classic_key);
@@ -12142,7 +12289,10 @@ mod vi_dispatch_tests {
             base + 1,
             "a terminal that was not in vi must not decrement a live one"
         );
-        assert!(vi_any_active(), "the still-live copy-mode terminal holds the gate");
+        assert!(
+            vi_any_active(),
+            "the still-live copy-mode terminal holds the gate"
+        );
         super::vi_note_toggled(false);
         assert_eq!(VI_ACTIVE_TERMINALS.load(Ordering::Relaxed), base);
     }
@@ -12434,7 +12584,10 @@ mod typed_kitty_summon_tests {
         type_word(&mut app, wid, "ty");
         assert!(!app.windows[&wid].cursor_cat.is_active());
         assert_eq!(app.kitty_log.log().sightings, 0);
-        type_word(&mut app, wid, "kitty");
+        // The orphaned `ty` is still in the window, so the next word needs its
+        // delimiter: since 2026-07-26 completion is the lexicon's WORD-boundary
+        // match, not a substring suffix, so `tykitty` is not the word `kitty`.
+        type_word(&mut app, wid, " kitty");
         assert_eq!(
             app.kitty_log.log().sightings,
             1,
@@ -12555,6 +12708,188 @@ mod typed_kitty_summon_tests {
     }
 }
 
+/// FAVOURITE-THE-SESSION-KITTY App seams (owner: "I like that there is a unique
+/// kitty chosen per session … and if somebody really likes that kitty it goes
+/// into the kitty registry"). The ledger laws (composition transfer, the
+/// restart election, ring bypass) are proven in `kitty_log`; this module binds
+/// the App seam: WHICH cat is promoted, the two gates, and the surface wiring.
+///
+/// `dispatch_menu_action` takes an `&ActiveEventLoop` and is not
+/// headless-callable, so — exactly as the summon tests do — the action is
+/// called directly and `action_by_name` proves the surface reachability.
+#[cfg(test)]
+mod favourite_session_kitty_tests {
+    use crate::{App, WindowId};
+    use aterm_effects::kitty_registry::{KittyLook, glyph_key};
+
+    /// The promoted cat is THIS SESSION's own kitty — never `companion_look()`,
+    /// which on any non-empty ledger is whatever was last collected — and the
+    /// press presents it through the collection hello.
+    #[test]
+    fn favourite_promotes_the_session_kitty() {
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        let session = app
+            .front_terminal(wid)
+            .expect("headless front terminal")
+            .session;
+        let look = KittyLook::for_session(session);
+        let now = std::time::Instant::now();
+
+        // TRAP 3. Collect something ELSE first, so the App-global companion —
+        // which wins for EVERY window in `app_render` — is a different cat.
+        // Favouriting "what I can see" could then never promote a session
+        // kitty, which is exactly what the owner asked for.
+        let other = KittyLook {
+            variant: aterm_effects::cat_glyphs_gen::CatGlyphId::SpecWitch,
+            ..KittyLook::default()
+        }
+        .normalized();
+        assert_ne!(
+            other, look,
+            "the fixture must differ from the session kitty"
+        );
+        app.kitty_log.observe(
+            session,
+            [aterm_effects::kitty_registry::KittySighting {
+                kitty_type: aterm_effects::kitty_registry::KittyType::HeadPeek,
+                magic: aterm_effects::kitty_registry::KittyMagic::None,
+                shown_as: aterm_effects::kitty_registry::KittyShownAs::Cat,
+                langs: aterm_lexicon::LangSet::EMPTY,
+                traits: 0,
+                look: other,
+                ident: 0xFEED,
+            }],
+            aterm_lexicon::Lexicon::builtin(),
+            now,
+            true,
+        );
+        assert_eq!(
+            app.kitty_log.companion_look(),
+            Some(other),
+            "the collected companion is displayed everywhere until we favourite"
+        );
+
+        app.favourite_session_kitty(wid, now);
+
+        assert_eq!(
+            app.kitty_log.companion_look(),
+            Some(look),
+            "the session kitty is the one that got promoted, not the displayed cat"
+        );
+        let row = app
+            .kitty_log
+            .log()
+            .collectibles
+            .iter()
+            .find(|item| item.key == glyph_key(look.variant))
+            .expect("the session kitty's head is now a durable roster row")
+            .clone();
+        assert!(!row.favourite.is_empty(), "stamped as the user's pick");
+        assert_eq!(row.coat, look.coat, "wearing the pinned composition");
+        assert_eq!(row.iris, look.iris);
+
+        assert!(app.windows[&wid].cursor_cat.is_active());
+        let frame = app
+            .windows
+            .get_mut(&wid)
+            .expect("the window is live")
+            .cursor_cat
+            .static_frame(now);
+        assert!(
+            frame.collection_hello,
+            "a favourite IS a reason to change the identity, so it says hello"
+        );
+        assert_eq!(frame.look, look, "and the hello wears the promoted cat");
+    }
+
+    /// The two hard gates, in order. Neither may leave a trace: nothing can
+    /// draw ⇒ nothing may log, and `feline.enabled = false` means cats do not
+    /// exist, so a synthetic row for a category the config can never produce
+    /// ambiently would poison the ledger.
+    #[test]
+    fn favourite_respects_the_sparkle_master_and_feline_gates() {
+        let wid = WindowId(0);
+        let now = std::time::Instant::now();
+
+        // (a) SPARKLE MASTER unresolved.
+        let mut app = App::headless_for_test();
+        assert!(app.sparkle.is_none(), "headless default: not yet resolved");
+        app.favourite_session_kitty(wid, now);
+        assert_eq!(app.kitty_log.companion_look(), None, "master off: no pin");
+        assert_eq!(app.kitty_log.log().sightings, 0);
+        assert!(!app.windows[&wid].cursor_cat.is_active());
+
+        // (b) FELINE SUB-GATE off while the other families keep the master ON.
+        let mut app = App::headless_for_test();
+        app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
+            feline: Some(crate::app_config::SparkleFelineConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.sparkle_dirty = true;
+        app.recompute_sparkle();
+        assert!(
+            !app.sparkle
+                .as_ref()
+                .expect("the remaining families keep the sparkle master resolved ON")
+                .cfg
+                .feline
+        );
+        app.favourite_session_kitty(wid, now);
+        assert_eq!(app.kitty_log.companion_look(), None, "feline off: no pin");
+        assert_eq!(app.kitty_log.log().sightings, 0);
+        assert!(!app.windows[&wid].cursor_cat.is_active());
+    }
+
+    /// The whole menu/palette/`invoke` wiring in one assertion, plus the
+    /// checkmark that reports the pin back to the user.
+    #[test]
+    fn the_favourite_row_is_invoke_reachable_and_checks_once_pinned() {
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+
+        let before = app.palette_snapshot(wid);
+        assert_eq!(
+            before.action_by_name("FavouriteSessionKitty"),
+            Ok(crate::menu::MenuAction::FavouriteSessionKitty),
+            "the row must be reachable by `aterm-ctl invoke` over a front terminal"
+        );
+        // `controls_lines` is the same text `controls menu` prints, so this
+        // covers the introspection surface as well as the checkmark.
+        let row = |state: &crate::palette::PaletteState| {
+            state
+                .controls_lines()
+                .into_iter()
+                .find(|line| line.contains("action=FavouriteSessionKitty"))
+                .expect("the View menu contributes the row")
+        };
+        let listed = row(&before);
+        assert!(listed.contains("enabled=true"), "{listed}");
+        assert!(
+            listed.contains("checked=false"),
+            "nothing pinned yet: {listed}"
+        );
+        assert!(
+            !app.palette_live().session_kitty_favourited,
+            "and the live predicate agrees"
+        );
+
+        app.favourite_session_kitty(wid, std::time::Instant::now());
+
+        let listed = row(&app.palette_snapshot(wid));
+        assert!(
+            listed.contains("checked=true"),
+            "the row reports THIS session's kitty as the pin: {listed}"
+        );
+    }
+}
+
 /// FULL-NYAN SING-ALONG press-path seams. The detector's own laws (repeat
 /// arm, interleave/backspace never arm, the wind-down crossfade, session
 /// keying, the note ring) are proven in `aterm_effects::nyan_sing`; this
@@ -12634,11 +12969,32 @@ mod full_nyan_sing_seam_tests {
         ] {
             let mut app = App::headless_for_test();
             let wid = WindowId(0);
-            for _ in 0..SING_ARM_REPEATS {
-                app.input(wid, key('x'), Source::Human);
-            }
-            let now = std::time::Instant::now();
-            assert!(app.windows[&wid].nyan_sing.is_armed(now));
+            // The arm decays `SING_REPEAT_GAP` (250ms) after the LAST repeat —
+            // `is_armed(now)` is false once `now >= last + gap`, which is the product
+            // behaving correctly. But this drives the arm through `App::input`, which
+            // reads `Instant::now()` itself, so the sixteen repeats AND the sample
+            // below have to land inside one 250ms window of real time. A machine that
+            // deschedules this thread mid-loop legitimately un-arms it: observed
+            // failing under 2x-core spinners at load average 36. Re-arm instead of
+            // asserting a wall-clock window this test does not own — `note_char`
+            // re-anchors when `count >= SING_ARM_REPEATS`, so repeating is enough.
+            let now = 'arm: {
+                for attempt in 0..8 {
+                    for _ in 0..SING_ARM_REPEATS {
+                        app.input(wid, key('x'), Source::Human);
+                    }
+                    let sample = std::time::Instant::now();
+                    if app.windows[&wid].nyan_sing.is_armed(sample) {
+                        break 'arm sample;
+                    }
+                    assert!(
+                        attempt < 7,
+                        "sixteen repeats never armed the sing in 8 tries — that is a \
+                         regression, not scheduler noise"
+                    );
+                }
+                unreachable!("the bounded loop either breaks or asserts")
+            };
             app.input(wid, release, Source::Human);
             let after = std::time::Instant::now();
             assert!(
@@ -12661,7 +13017,9 @@ mod full_nyan_sing_seam_tests {
 mod find_field_key_tests {
     use crate::{App, WindowId, term_lock};
     use winit::event::{ElementState, KeyEvent};
-    use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr};
+    use winit::keyboard::{
+        Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+    };
 
     /// A pressed key event shaped like the platform's: `text` is what winit reports,
     /// INCLUDING the control strings it produces for ⎋ (`\u{1b}`), ⏎ (`\r`) and ⇥
@@ -12714,10 +13072,7 @@ mod find_field_key_tests {
         assert_eq!(query(&app, wid), Some(("abc".to_string(), 3)));
 
         app.on_key(wid, named(NamedKey::Escape));
-        assert!(
-            app.windows[&wid].search.is_none(),
-            "⎋ closed the find bar"
-        );
+        assert!(app.windows[&wid].search.is_none(), "⎋ closed the find bar");
         // And the cancelled query never became text: reopening starts empty.
         app.search_enter();
         assert_eq!(query(&app, wid), Some((String::new(), 0)));
@@ -12798,7 +13153,11 @@ mod find_field_key_tests {
         type_str(&mut app, wid, "two three");
         set_mods(&mut app, wid, ModifiersState::ALT);
         app.on_key(wid, named(NamedKey::ArrowLeft));
-        assert_eq!(query(&app, wid), Some(("one two three".to_string(), 8)), "⌥←");
+        assert_eq!(
+            query(&app, wid),
+            Some(("one two three".to_string(), 8)),
+            "⌥←"
+        );
         // ⌥⌫ eats that word; ⌘⌫ clears back to the start.
         app.on_key(wid, named(NamedKey::Backspace));
         assert_eq!(query(&app, wid), Some(("one three".to_string(), 4)), "⌥⌫");
@@ -12881,7 +13240,10 @@ mod find_field_key_tests {
         // chord — which is exactly why these arms match on `base_logical_key`.
         set_mods(&mut app, wid, ModifiersState::SUPER | ModifiersState::ALT);
         app.on_key(wid, press(Key::Character(SmolStr::new("c")), Some("ç")));
-        assert!(app.windows[&wid].search.as_ref().unwrap().case_sensitive, "⌥⌘C");
+        assert!(
+            app.windows[&wid].search.as_ref().unwrap().case_sensitive,
+            "⌥⌘C"
+        );
         app.on_key(wid, press(Key::Character(SmolStr::new("r")), Some("®")));
         assert!(app.windows[&wid].search.as_ref().unwrap().is_regex, "⌥⌘R");
 

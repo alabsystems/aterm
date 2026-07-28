@@ -4814,7 +4814,8 @@ impl App {
                 // without a revoked attempt, start the schedule over.
                 retry.build == build
                     && retry.dmg_sha256 == dmg_sha256
-                    && now.duration_since(retry.last_attempt) < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
+                    && now.duration_since(retry.last_attempt)
+                        < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
             })
             .map_or(0, |retry| retry.cycles);
         let delay = automatic_retry_delay(cycles, AutomaticRetryKind::ActivityRevoked)?;
@@ -7228,7 +7229,8 @@ mod tests {
             build: 77,
             dmg_sha256: [0xab; 32],
             cycles: MAX_ACTIVITY_REVOKED_CYCLES,
-            last_attempt: std::time::Instant::now() - crate::ACTIVITY_RETRY_BUDGET_REPLENISH
+            last_attempt: std::time::Instant::now()
+                - crate::ACTIVITY_RETRY_BUDGET_REPLENISH
                 - std::time::Duration::from_secs(1),
         });
         assert_eq!(

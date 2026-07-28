@@ -172,6 +172,10 @@ pub(crate) struct PaletteLive {
     /// else the config `enabled` bit) — the checkmark on Matrix Rain. False
     /// when no terminal is frontmost (the row is disabled there anyway).
     pub rain_on: bool,
+    /// The FRONT session's OWN kitty is the currently pinned favourite — the
+    /// checkmark on Favourite Session Kitty. False when no terminal is
+    /// frontmost (the row is disabled there anyway).
+    pub session_kitty_favourited: bool,
     /// Process-wide serious mode is active (checkmark on Serious Mode).
     pub serious_mode: bool,
     /// The window is full-screen (checkmark on Enter Full Screen).
@@ -414,6 +418,13 @@ impl PaletteState {
                 // the invoke fence refuses) instead of silently no-op'ing.
                 MenuAction::ToggleMatrixRain => {
                     row.checked = Some(live.rain_on);
+                    row.enabled = live.terminal_front;
+                }
+                // Per-session too: the checkmark answers "is THIS session's own
+                // kitty the pin?", and without a front terminal there is no
+                // session kitty to promote.
+                MenuAction::FavouriteSessionKitty => {
+                    row.checked = Some(live.session_kitty_favourited);
                     row.enabled = live.terminal_front;
                 }
                 MenuAction::Copy => row.enabled = live.has_selection,
@@ -1464,6 +1475,52 @@ mod tests {
         assert!(
             !rain.enabled,
             "no window: nothing to toggle, refuse honestly"
+        );
+    }
+
+    /// The View ▸ Favourite Session Kitty row reports whether the FRONT
+    /// session's own kitty is the current pin, and — like the rain toggle —
+    /// honestly disables wherever there is no front session to have one.
+    #[test]
+    fn favourite_row_checks_when_pinned_and_disables_without_a_terminal() {
+        let mut s = PaletteState::new();
+        s.resolve(&PaletteLive {
+            session_kitty_favourited: true,
+            terminal_front: true,
+            ..Default::default()
+        });
+        // (checked, enabled) for the row — PaletteRow is not `Copy`, and the
+        // two bits are the whole contract this test pins.
+        let row = |s: &PaletteState| {
+            s.rows
+                .iter()
+                .find(|r| r.action == MenuAction::FavouriteSessionKitty)
+                .map(|r| (r.checked, r.enabled))
+                .expect("View menu contributes Favourite Session Kitty")
+        };
+        assert_eq!(
+            row(&s),
+            (Some(true), true),
+            "terminal front: pinned and promotable"
+        );
+
+        s.resolve(&PaletteLive {
+            native_tab_active: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            row(&s),
+            (Some(false), false),
+            "native whole tab: no session, no session kitty"
+        );
+
+        // The windowless-app state (macOS keeps running with every window
+        // closed): not a native tab, but no terminal either.
+        s.resolve(&PaletteLive::default());
+        assert_eq!(
+            row(&s),
+            (Some(false), false),
+            "no window: nothing to promote, refuse honestly"
         );
     }
 

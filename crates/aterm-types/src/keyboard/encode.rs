@@ -11,7 +11,7 @@
 mod encode_legacy;
 
 use super::{Key, KeyEventType, KeyboardMode, Modifiers, NamedKey};
-use encode_legacy::{encode_character_legacy, encode_named_legacy};
+use encode_legacy::{ctrl_character, encode_character_legacy, encode_named_legacy};
 
 /// Encode a key press into terminal escape sequence bytes.
 ///
@@ -688,25 +688,31 @@ fn encode_xterm_other_keys(key: &Key, modifiers: Modifiers, mode: KeyboardMode) 
 
     let effective_mods =
         modifiers & (Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL | Modifiers::SUPER);
+    let code: u32 = match *key {
+        Key::Character(c) => c as u32,
+        Key::Named(NamedKey::Tab) => 9,
+        Key::Named(NamedKey::Enter) => 13,
+        Key::Named(NamedKey::Escape) => 27,
+        Key::Named(NamedKey::Backspace) => 127,
+        Key::Named(NamedKey::Space) => 32,
+        _ => return None,
+    };
+
+    // xterm's modifyOtherKeys decision is key-sensitive. In particular, level
+    // 1 preserves the established Shift/Ctrl encodings where they are
+    // unambiguous, and Backspace keeps its DECBKM/Ctrl toggle. Treating the
+    // levels as simply "Alt" and "any modifier" fabricates CSI packets for
+    // keys xterm sends through its legacy path (notably Alt+Backspace and
+    // Ctrl+Backspace). Keypad keys are excluded above because xterm classifies
+    // them under modifyKeypadKeys, never modifyOtherKeys.
     let apply = match level {
-        1 => effective_mods.contains(Modifiers::ALT),
-        2 => !effective_mods.is_empty(),
+        1 => xterm_modify_other_keys_level1_applies(key, effective_mods),
+        2 => xterm_modify_other_keys_level2_applies(key, effective_mods),
         _ => false,
     };
     if !apply {
         return None;
     }
-
-    let code: u32 = match *key {
-        Key::Character(c) => c as u32,
-        Key::Named(NamedKey::Tab) => 9,
-        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::NumpadEnter) => 13,
-        Key::Named(NamedKey::Escape) => 27,
-        Key::Named(NamedKey::Backspace) => 127,
-        Key::Named(NamedKey::Space) => 32,
-        Key::Named(NamedKey::NumpadEqual) => u32::from(b'='),
-        _ => return None,
-    };
 
     let mod_value = effective_mods.xterm_encoded();
     if mode.xterm_format_other_keys() {
@@ -727,6 +733,60 @@ fn encode_xterm_other_keys(key: &Key, modifiers: Modifiers, mode: KeyboardMode) 
         write_u32(&mut buf, code);
         buf.push(b'~');
         Some(buf)
+    }
+}
+
+/// xterm modifyOtherKeys level 1 (`mokUser`) preserves ordinary Shift-only and
+/// established Ctrl mappings, but reports otherwise ambiguous combinations.
+/// This is the projection of xterm `allowedCharModifiers` + `ModifyOtherKeys`
+/// onto aterm's layout-neutral [`Key`] representation.
+fn xterm_modify_other_keys_level1_applies(key: &Key, modifiers: Modifiers) -> bool {
+    if modifiers.is_empty() {
+        return false;
+    }
+    match key {
+        // xterm's mokUser switch explicitly excludes Backspace.
+        Key::Named(NamedKey::Backspace) => false,
+        // These predefined ordinary keys have no printable Shift/Ctrl fallback.
+        Key::Named(NamedKey::Enter | NamedKey::Tab | NamedKey::Escape) => true,
+        Key::Named(NamedKey::Space) => xterm_level1_character_applies(' ', modifiers),
+        Key::Character(c) => xterm_level1_character_applies(*c, modifiers),
+        Key::Named(_) => false,
+    }
+}
+
+fn xterm_level1_character_applies(c: char, modifiers: Modifiers) -> bool {
+    if modifiers.intersects(Modifiers::ALT | Modifiers::SUPER) {
+        return true;
+    }
+    if modifiers.contains(Modifiers::CTRL | Modifiers::SHIFT) {
+        return true;
+    }
+    if modifiers == Modifiers::CTRL {
+        // A traditional Ctrl mapping already has a unique legacy byte. If the
+        // character has no such mapping, CSI is needed to retain the modifier.
+        return ctrl_character(c).is_none();
+    }
+    false
+}
+
+fn xterm_modify_other_keys_level2_applies(key: &Key, modifiers: Modifiers) -> bool {
+    if modifiers.is_empty() {
+        return false;
+    }
+    match key {
+        Key::Named(NamedKey::Backspace) => !(modifiers & !Modifiers::CTRL).is_empty(),
+        Key::Named(NamedKey::Space) => true,
+        Key::Character(c) if modifiers == Modifiers::SHIFT => {
+            // xterm checks the shifted keysym. Shift-only characters below '@'
+            // remain ordinary text (`1` -> `!`, `=` -> `+`, `,` -> `<`, etc.);
+            // the ASCII control-input range '@'..DEL is escaped. Space is the
+            // one explicit exception and is represented by NamedKey::Space in
+            // the native/DOM mappings.
+            let shifted = shifted_character(*c, modifiers).unwrap_or(*c) as u32;
+            (u32::from(b'@')..=u32::from(0x7f_u8)).contains(&shifted)
+        }
+        _ => true,
     }
 }
 

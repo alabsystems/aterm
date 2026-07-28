@@ -464,17 +464,20 @@ fn install_installing_shims(layout: &Layout, c: &Companion) {
     // The bin dir must exist before writing a shim into it (the platform backend writes the
     // file but does not create its parent).
     let _ = crate::platform::ensure_private_dir(&layout.bin_dir());
-    for tool in &c.expose {
-        if !crate::store::shim_allowed(tool) {
+    for raw in &c.expose {
+        // Admission IS the deny-list check: a sensitive name has no `ToolName`, so it cannot
+        // be turned into a `bin/` path here at all.
+        let Some(tool) = crate::store::ToolName::new(raw) else {
             continue;
-        }
+        };
+        let shim = layout.shim(&tool);
         // If a real (forwarding) shim already exists, leave it — a rebuild keeps the old
         // tool runnable until the new build is ready.
-        if crate::platform::resolve_shim(&layout.shim(tool)).is_some() {
+        if crate::platform::resolve_shim(&shim).is_some() {
             continue;
         }
-        let msg = format!("atpkg: {tool} is still installing — run `aterm pkg status` to watch");
-        let _ = crate::platform::install_tombstone_shim(&layout.shim(tool), &msg);
+        let msg = format!("atpkg: {raw} is still installing — run `aterm pkg status` to watch");
+        let _ = crate::platform::install_tombstone_shim(&shim, &msg);
     }
 }
 

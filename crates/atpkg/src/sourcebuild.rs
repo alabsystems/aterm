@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::companions::{Companion, SeedPolicy};
-use crate::platform::{self, ensure_private_dir};
+use crate::platform::ensure_private_dir;
 use crate::store::Layout;
 
 /// The per-build provenance sidecar (`store/<program>/<build>.provenance`) — a sibling of
@@ -65,8 +65,13 @@ pub struct Installed {
     pub build: u64,
     /// The commit built.
     pub commit: String,
-    /// Exposed names that were refused a shim (sensitive/malformed) — surfaced, never silent.
-    pub refused_shims: Vec<String>,
+    // There is deliberately no `refused_shims` here, unlike `flow::InstallReport`. The
+    // released-tool lane admits an UNVERIFIED manifest's `exposes`, so a refusal is a normal
+    // outcome it must report. This lane's `expose` list comes from the in-tree companion
+    // ledger, which `companions.rs` check 6 already validates through `shim_allowed`, and
+    // `stage_and_activate` turns a refused name into a hard `Stage` error rather than staging
+    // a binary nobody can ever run. A refusal therefore cannot reach a successful install,
+    // and a field that is provably always empty is a claim the code does not make.
     /// Whether the build was reused (already complete + active for this commit).
     pub reused: bool,
 }
@@ -208,7 +213,7 @@ fn provenance_path(build_dir: &Path) -> PathBuf {
 /// the SAME commit is reused (no rebuild).
 ///
 /// The whole fetch → build → stage → mark-ready → activate → shim sequence runs under an
-/// exclusive per-program [`platform::file_lock`], so concurrent seed reconciles (first-run
+/// exclusive per-program [`crate::platform::file_lock`], so concurrent seed reconciles (first-run
 /// spawn + the 6h loop) cannot corrupt the shared build dir or channel flip.
 pub fn build_and_install(
     layout: &Layout,
@@ -324,7 +329,6 @@ pub fn build_and_install(
                 program: c.name.clone(),
                 build,
                 commit: c.commit.clone(),
-                refused_shims: Vec::new(),
                 reused: true,
             });
         }
@@ -612,26 +616,45 @@ fn stage_and_activate(
     }
 
     let mut bins: BTreeMap<String, String> = BTreeMap::new();
-    for tool in &c.expose {
-        let from = rel.join(format!("{tool}{}", platform::EXE_SUFFIX));
+    // The admitted names, carried to the shim install below. Collecting them HERE rather
+    // than re-splitting `c.expose` there is what keeps the two consistent: this loop already
+    // decided that a refused name aborts the build, so the shim pass cannot see a name this
+    // one let through, and there is no second, silently-different refusal outcome.
+    let mut tools: Vec<crate::store::ToolName> = Vec::new();
+    for raw in &c.expose {
+        // The ledger validator already gates every `expose` name through `shim_allowed`
+        // (companions.rs check 6), so this refusal is unreachable from a valid ledger. It is
+        // still an error rather than a skip: the ONLY purpose of staging a binary is the shim
+        // that name is refused, so silently copying it would grow the store with a tool no
+        // one can ever run.
+        let Some(tool) = crate::store::ToolName::new(raw) else {
+            crate::store::discard_build(build_dir);
+            return Err(SourceBuildError::Stage(format!(
+                "exposed name '{raw}' is refused a shim (sensitive/malformed)"
+            )));
+        };
+        // The executable's own file name (`<tool>.exe` on Windows) on BOTH sides of the copy
+        // — `exe_file` is the one place that suffix is appended.
+        let from = rel.join(tool.exe_file());
         if !from.is_file() {
             crate::store::discard_build(build_dir);
-            return Err(SourceBuildError::MissingBinary(tool.clone()));
+            return Err(SourceBuildError::MissingBinary(raw.clone()));
         }
-        let to = bin_out.join(format!("{tool}{}", platform::EXE_SUFFIX));
+        let to = bin_out.join(tool.exe_file());
         if let Err(e) = copy_exe(&from, &to) {
             crate::store::discard_build(build_dir);
             return Err(SourceBuildError::Stage(e.to_string()));
         }
         match crate::tree::sha256_file(&to) {
             Ok(sum) => {
-                bins.insert(tool.clone(), sum);
+                bins.insert(raw.clone(), sum);
             }
             Err(e) => {
                 crate::store::discard_build(build_dir);
                 return Err(SourceBuildError::Stage(e.to_string()));
             }
         }
+        tools.push(tool);
     }
 
     // Self-attest the staged tree (sidecar record; NOT a signature).
@@ -661,25 +684,29 @@ fn stage_and_activate(
         return Err(SourceBuildError::Stage(e.to_string()));
     }
 
-    // Atomic activation + PATH shims (allowlist-gated; refused names surfaced). A failure here
-    // must DISCARD the build — otherwise it is left complete-but-inactive/half-shimmed, which
-    // `build_is_complete`/`active_builds` would mis-read as installed and never retry.
+    // Atomic activation + PATH shims. A failure here must DISCARD the build — otherwise it is
+    // left complete-but-inactive/half-shimmed, which `build_is_complete`/`active_builds`
+    // would mis-read as installed and never retry.
+    //
+    // `install_tools` with the set the staging loop admitted, NOT `install_shims(&c.expose)`:
+    // the latter re-splits the raw list and hands back "refused" names, but this function
+    // already returned `Err` for every one of those, so that branch was unreachable and its
+    // `NOTE: refused shims` log could never print. Passing the admitted set says the same
+    // thing in the types instead of in a comment.
     if let Err(e) = crate::activate::activate_channel(layout, channel_for(c), build_dir) {
+        // The per-program witness half may have flipped before the channel half
+        // failed — undo whatever points at the build being discarded.
+        crate::activate::undo_activation(layout, channel_for(c), build_dir);
         crate::store::discard_build(build_dir);
         return Err(SourceBuildError::Stage(e.to_string()));
     }
-    let refused = match crate::activate::install_shims(layout, build_dir, &c.expose) {
-        Ok(r) => r,
-        Err(e) => {
-            crate::store::discard_build(build_dir);
-            return Err(SourceBuildError::Stage(e.to_string()));
-        }
-    };
-    if !refused.is_empty() {
-        log(&format!(
-            "NOTE: refused shims (sensitive names): {}",
-            refused.join(", ")
-        ));
+    if let Err(e) = crate::activate::install_tools(layout, build_dir, &tools) {
+        // Activation SUCCEEDED and some shims may already be written. Undo both
+        // before discarding, or the deleted tree stays named by both `current`
+        // links and half a shim set — a program on PATH that runs nothing.
+        crate::activate::undo_activation(layout, channel_for(c), build_dir);
+        crate::store::discard_build(build_dir);
+        return Err(SourceBuildError::Stage(e.to_string()));
     }
     log(&format!(
         "installed {} build {} ({} bin{}) — provenance=source",
@@ -693,7 +720,6 @@ fn stage_and_activate(
         program: c.name.clone(),
         build,
         commit: c.commit.clone(),
-        refused_shims: refused,
         reused: false,
     })
 }

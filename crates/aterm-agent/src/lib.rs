@@ -552,7 +552,8 @@ MENTAL MODEL
     hope or scrape for a spinner.
 
 USAGE
-    aterm-drive [--socket PATH] [--idle MS] [--timeout MS] <command> [text...]
+    aterm-drive [--socket PATH] [--idle MS] [--timeout MS] [--ready REGEX]
+                <command> [text...]
 
 COMMANDS
     prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
@@ -579,6 +580,12 @@ OPTIONS
     --idle MS       Quiescence window that counts as 'turn complete' (default 600).
                     Bigger = more certain the turn ended; smaller = snappier.
     --timeout MS    Give up after this long (default 180000).
+    --ready REGEX   The prompt-ready row pattern for the BEST-EFFORT settle confirm
+                    after idle. Default matches a Claude input caret, which is only
+                    right when the driven program IS Claude — point it at your own
+                    REPL's prompt otherwise, or pass '' for idle-only. Also settable
+                    as $ATERM_DRIVE_READY (the flag wins). A non-matching pattern
+                    costs a bounded extra wait, never a failed turn.
 
 WHICH `await` TO USE
     * Driving Claude / a TUI with an animated spinner → `prompt` (idle works: the

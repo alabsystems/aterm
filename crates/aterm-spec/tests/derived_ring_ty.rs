@@ -80,13 +80,41 @@ use aterm_spec::derive::{
 use aterm_spec::verify;
 use std::process::Command;
 
+/// The POLICY this file states for the FOUR function-valued models it drives
+/// (EvictFull, TierResidency, Recording, Coalesce): report the miss and keep
+/// going. For every other model here — all scalar — the interpreter tier
+/// discharges the obligation unconditionally and this is a no-op, since
+/// [`verify::NotRun`] is only reachable when a function-valued model meets a
+/// machine with no Trust `ty`.
+///
+/// Skipping rather than failing is deliberate. A hard require would make
+/// `cargo test -p aterm-spec --test derived_ring_ty` — the file you iterate on
+/// while editing a model — unrunnable without the Trust toolchain, and it would
+/// buy no coverage: each of the four has a toolchain-free Tier-1 conformance
+/// twin binding it to shipping code (`aterm-buffer`'s `conformance_evict_full`
+/// and `conformance_temporal`, `aterm-core`'s `conformance_recording` and
+/// `replay_corpus_probe`). What must never happen is the miss passing SILENTLY,
+/// which is exactly what dropping the old `Discharge::NotRun` with a bare
+/// statement did: now the `Result` makes stating a policy unskippable, and this
+/// line makes the chosen one visible in the test output.
+fn tier0_or_skip(discharge: Result<verify::Covered, verify::NotRun>) {
+    if let Err(verify::NotRun { model }) = discharge {
+        eprintln!(
+            "TIER-0 SKIPPED (this test is NOT a pass for it): `{model}` is function-valued and \
+             Trust `ty` is not installed — see the escalation notice above. Its Tier-1 \
+             conformance twin is unaffected."
+        );
+    }
+}
+
 /// TIERED Tier-0 check: the interpreter proves every invariant over the whole
 /// bounded reachable space (always), and `ty check` additionally proves the
 /// generated TLA+ wherever the binary is installed (see
 /// [`verify::check_model_tiered`]). Function-valued models (EvictFull) run on
-/// the `ty` tier only — the interpreter cannot evaluate them.
+/// the `ty` tier only — the interpreter cannot evaluate them, so with no `ty`
+/// they take [`tier0_or_skip`]'s skip-loudly path.
 fn assert_model_checks(m: &Model) {
-    verify::check_model_tiered(m, m.name);
+    tier0_or_skip(verify::check_model_tiered(m, m.name));
 }
 
 #[test]
@@ -111,9 +139,11 @@ fn derived_evict_full_spec_model_checks() {
 /// committed `Buggy=0`, and a COUNTEREXAMPLE found at `Buggy=1` — so the
 /// invariant is non-trivial AND genuinely catches the bug. TIERED: the
 /// interpreter always runs the whole protocol; `ty` additionally re-proves it
-/// wherever installed (see [`verify::prove_and_catch_tiered`]).
+/// wherever installed (see [`verify::prove_and_catch_tiered`]). The three
+/// function-valued models routed here (TierResidency, Recording, Coalesce) take
+/// [`tier0_or_skip`]'s skip-loudly path when `ty` is absent.
 fn assert_proves_and_catches(m: &Model) {
-    verify::prove_and_catch_tiered(m, m.name);
+    tier0_or_skip(verify::prove_and_catch_tiered(m, m.name));
 }
 
 #[test]

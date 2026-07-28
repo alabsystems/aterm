@@ -54,8 +54,23 @@ pub struct ManifestInputs<'a> {
     pub dmg_name: &'a str,
     /// Lowercase-hex SHA-256 of the DMG bytes (computed in-process, dmg.rs).
     pub dmg_sha256: &'a str,
-    /// "owner/repo" — feeds the informational-but-install.sh-load-bearing
-    /// `url` field (that script greps the URL straight out of the manifest).
+    /// "owner/repo" for the `url` field — this must be the **public update
+    /// channel** (`[workspace.metadata.aterm] update_channel`) whenever one is
+    /// configured, NOT the private publish repo.
+    ///
+    /// The same manifest bytes are attached to both the private release and the
+    /// mirrored public one, so this single string has to name the repository a
+    /// reader can actually fetch from. Naming the private repo produced a public
+    /// appcast whose `url` 404s for everyone without a credential.
+    ///
+    /// Nothing in the shipping trust path consumes it: the Rust client's
+    /// `Manifest` (crates/aterm-update/src/manifest.rs) has no `url` field at
+    /// all and downloads via the release's own asset API URL, and `install.sh`
+    /// reads `version`/`dmg`/`sha256`/`team_id`/`min_os` and likewise fetches by
+    /// asset id. (An older comment here claimed install.sh grepped this URL; it
+    /// does not, and has not for some time.) It is retained because it is part
+    /// of the frozen v0.25 manifest surface `emit` round-trips against, and
+    /// because it is what a human reading the appcast will click.
     pub repo_slug: &'a str,
     /// LSMinimumSystemVersion from the STAMPED bundle plist (spec §4).
     pub min_os: &'a str,

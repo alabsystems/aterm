@@ -241,7 +241,7 @@ pub struct Artifact {
     /// time (machine-local deps vendored in), so install just extracts + activates,
     /// needing NO rustup on the user side. `rustup-linked`: the bundle ships a
     /// dangling `toolchain` link the installer re-points at the user's rustup
-    /// nightly ([`crate::kani::relocate_sysroot`]). Signed (inside the manifest
+    /// nightly ([`crate::sysroot::relocate_sysroot`]). Signed (inside the manifest
     /// bytes), so the flag cannot be flipped by a repo-write adversary. Ignored for
     /// non-bundle kinds.
     #[serde(default = "default_reloc")]

@@ -182,10 +182,19 @@ notes    = "Both ß and ss surfaces enumerated (Swiss/keyboard-less typing uses 
 class    = "feline"
 lang     = "de"
 mode     = "forms"
-forms    = ["katze", "katzen", "kätzchen", "kater", "kätzin", "mieze", "miezekatze"]
+forms    = ["katze", "katzen", "kätzchen", "kätzin", "mieze", "miezekatze"]
+cjk      = false
+ambiguous= false
+notes    = "katze/katzen = cat/cats; kätzchen = kitten (umlaut diminutive); kätzin = she-cat; mieze/miezekatze = colloquial kitty. None of these collide with ordinary text in another language, so they load unconditionally (2026-07-27: the entry used to be ambiguous=true WHOLESALE because of 'kater' alone, which gated every safe German form behind an opt-in). Plural/diminutive are non-concatenative (umlaut) so forms mode."
+
+[[entry]]
+class    = "feline"
+lang     = "de"
+mode     = "forms"
+forms    = ["kater"]
 cjk      = false
 ambiguous= true
-notes    = "katze/katzen = cat/cats; kätzchen = kitten (umlaut diminutive); kater = tomcat BUT also means 'hangover' (and is an EN/NL surname) -> ambiguous; mieze/miezekatze = colloquial kitty. Plural/diminutive are non-concatenative (umlaut) so forms mode."
+notes    = "kater = tomcat BUT also German for 'hangover', and an EN/NL surname -> stays language-gated on its own so it cannot drag the rest of the German feline vocabulary down with it."
 
 # ===== Dutch (nl) =====
 [[entry]]
@@ -728,7 +737,16 @@ mode     = "forms"
 cjk      = true
 ambiguous= false
 forms    = ["猫","ねこ","ネコ","子猫","仔猫","こねこ","猫ちゃん","にゃんこ"]
-notes    = "猫=neko (cat). 子猫/仔猫/こねこ=kitten. 猫ちゃん, にゃんこ=affectionate 'kitty'. Whole compounds enumerated."
+notes    = "猫=neko (cat). 子猫/仔猫/こねこ=kitten. 猫ちゃん, にゃんこ=affectionate 'kitty'. Whole compounds enumerated. ROMAJI lives in its own cjk=false entry below — this one is matched by CJK maximal run and cannot hold latin surfaces."
+
+[[entry]]
+class    = "feline"
+lang     = "ja"
+mode     = "forms"
+forms    = ["neko", "koneko", "nyanko"]
+cjk      = false
+ambiguous= false
+notes    = "ROMAJI transliterations, added 2026-07-27. The kana/kanji entry above is cjk=true and matched by maximal run, so it could never match the latin text an ASCII keyboard actually produces — typing 'neko' matched nothing at all. Separate cjk=false entry so both scripts work. None of these are ordinary words in another listed language, so they load unconditionally."
 
 [[entry]]
 class    = "profanity"

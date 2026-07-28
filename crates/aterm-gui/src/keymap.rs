@@ -164,23 +164,28 @@ pub fn suppress_direct_send(preedit: &str) -> bool {
 /// Control-code codepoints are dropped (kitty suppresses text that begins with a
 /// control character); a commit of only control codes emits nothing.
 ///
-/// `REPORT_ALL_KEYS_AS_ESC` WITHOUT `REPORT_ASSOCIATED_TEXT`: deliberate
-/// divergence from strict kitty, which drops the text entirely (a bare `ESC[0u`
-/// carries no payload the app can read) and would silently EAT IME input; we keep
-/// the per-codepoint CSI-u delivery below so committed text is never lost.
+/// Kitty `REPORT_ALL_KEYS_AS_ESC` without `REPORT_ASSOCIATED_TEXT`: the commit is
+/// represented by one keyless event (`ESC[0u`). There is no protocol field in
+/// which to carry the committed text when the application opted out of associated
+/// text. Inventing one key event per Unicode codepoint is incorrect: an IME commit
+/// has no corresponding physical key, and those fabricated numeric CSI-u packets
+/// can be exposed as literal bracket-number text by a client that falls back while
+/// decoding input.
 #[must_use]
 pub fn encode_committed_text(text: &str, mode: KeyboardMode) -> Vec<u8> {
-    if mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
-        && mode.contains(KeyboardMode::REPORT_ASSOCIATED_TEXT)
-    {
+    if mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC) {
         let mut out = Vec::new();
         for c in text.chars().filter(|c| !c.is_control()) {
-            if out.is_empty() {
-                out.extend_from_slice(b"\x1b[0;1;");
-            } else {
-                out.push(b':');
+            if mode.contains(KeyboardMode::REPORT_ASSOCIATED_TEXT) {
+                if out.is_empty() {
+                    out.extend_from_slice(b"\x1b[0;1;");
+                } else {
+                    out.push(b':');
+                }
+                out.extend_from_slice((c as u32).to_string().as_bytes());
+            } else if out.is_empty() {
+                out.extend_from_slice(b"\x1b[0");
             }
-            out.extend_from_slice((c as u32).to_string().as_bytes());
         }
         if !out.is_empty() {
             out.push(b'u');
@@ -486,28 +491,20 @@ mod tests {
         );
     }
 
-    /// REPORT_ALL_KEYS_AS_ESC WITHOUT REPORT_ASSOCIATED_TEXT keeps the per-codepoint
-    /// CSI-u delivery (the documented deliberate divergence: strict kitty would drop
-    /// the text entirely — a payload-less `ESC[0u` — silently eating IME input).
+    /// REPORT_ALL_KEYS_AS_ESC without REPORT_ASSOCIATED_TEXT has no legal field in
+    /// which to carry the IME text. Emit Kitty's one keyless event rather than
+    /// fabricating a physical key identity for every Unicode codepoint.
     #[test]
-    fn commit_under_report_all_without_text_stays_per_codepoint() {
+    fn commit_under_report_all_without_text_is_one_keyless_event() {
         let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC;
-        let expected: Vec<u8> = ['日', '本']
-            .into_iter()
-            .flat_map(|c| {
-                keyboard::encode_key(&keyboard::Key::Character(c), Modifiers::empty(), mode)
-            })
-            .collect();
         assert_eq!(
             encode_committed_text("日本", mode),
-            expected,
-            "text is never lost when the app opted out of associated text"
+            b"\x1b[0u".to_vec(),
+            "one IME commit is one keyless event"
         );
-        // Concretely: the fabricated-key form (the divergence is per-codepoint keys,
-        // not silence).
-        assert_eq!(
-            encode_committed_text("日本", mode),
-            b"\x1b[26085u\x1b[26412u".to_vec()
+        assert!(
+            encode_committed_text("\u{8}\u{1b}", mode).is_empty(),
+            "an all-control commit remains silent"
         );
     }
 }

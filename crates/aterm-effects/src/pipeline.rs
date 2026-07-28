@@ -1171,7 +1171,10 @@ impl EffectsPipeline {
                     now,
                     &rs.cfg,
                     geom,
-                    cur,
+                    // The web pipeline draws no cursor companion, so no word is
+                    // ever answered by one — every feline occurrence keeps its
+                    // ambient peek.
+                    None,
                     Some(sel_view),
                     self.focused,
                     &mut self.deco_scratch,
@@ -1921,7 +1924,7 @@ mod tests {
     #[test]
     fn composer_toggle_model_proves_and_real_pipeline_conforms() {
         let model = composer_toggle_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
         let mut state = model.init_state();
         let mut pipeline = EffectsPipeline::new();
         for action in ["Key", "Enable", "Disable", "Enable", "TurnStart", "Key"] {

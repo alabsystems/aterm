@@ -188,6 +188,18 @@ pub(crate) struct KittyCollectible {
     pub(crate) first_seen: String,
     #[serde(default)]
     pub(crate) last_seen: String,
+    /// RFC3339 UTC of the moment the user FAVOURITED this cat — empty for an
+    /// ordinary automatic discovery (owner: "if somebody really likes that
+    /// kitty it goes into the kitty registry"). The greatest stamp in the
+    /// roster elects the companion, so an explicit pick survives restart and
+    /// later discoveries; the stamp also transfers composition ownership (see
+    /// [`collectible_owns_look`]), because the look the user pinned is the one
+    /// they liked, not the one first stumbled upon. Election by MAX is
+    /// commutative, so it merges across processes exactly like `last_seen`.
+    /// A pre-favourite rollback rewriting the sidecar drops the pin (never the
+    /// unlock) and the companion falls back to the latest-discovery rule.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) favourite: String,
     #[serde(default)]
     pub(crate) langs: Vec<String>,
 }
@@ -356,10 +368,21 @@ fn collectible_order(a: &KittyCollectible, b: &KittyCollectible) -> std::cmp::Or
     }
 }
 
-/// Whether `candidate` owns the earlier first-discovery composition. Equal or
-/// missing timestamps use the serialized look tuple as a deterministic tie
-/// break, making duplicate normalization independent of flush order.
-fn collectible_look_precedes(candidate: &KittyCollectible, current: &KittyCollectible) -> bool {
+/// Whether `candidate`'s composition wins over `current`'s for the same
+/// semantic key. An explicit favourite wins outright; otherwise the earlier
+/// first-discovery composition owns the row. Equal or missing timestamps use
+/// the serialized look tuple as a deterministic tie break, making duplicate
+/// normalization independent of flush order.
+fn collectible_owns_look(candidate: &KittyCollectible, current: &KittyCollectible) -> bool {
+    // An explicit favourite outranks the automatic first-discovery record, and
+    // between two favourites the LATER one is the user's current pick. Only
+    // unfavourited rows fall through to "earliest discovery owns the look".
+    match (candidate.favourite.as_str(), current.favourite.as_str()) {
+        (c, u) if c == u => {}
+        ("", _) => return false,
+        (_, "") => return true,
+        (c, u) => return c > u,
+    }
     let by_time = match (
         candidate.first_seen.is_empty(),
         current.first_seen.is_empty(),
@@ -559,7 +582,7 @@ impl KittyLog {
             .iter_mut()
             .find(|item| item.key == candidate.key)
         {
-            let candidate_owns_look = collectible_look_precedes(candidate, item);
+            let candidate_owns_look = collectible_owns_look(candidate, item);
             item.count = if additive {
                 item.count.saturating_add(candidate.count)
             } else {
@@ -567,6 +590,10 @@ impl KittyLog {
             };
             item.first_seen = min_ts(&item.first_seen, &candidate.first_seen);
             item.last_seen = max_ts(&item.last_seen, &candidate.last_seen);
+            // MAX, like `last_seen`: the pin is the user's LATEST pick, and a
+            // commutative fold is what makes two processes converge regardless
+            // of which one's flush lands first.
+            item.favourite = max_ts(&item.favourite, &candidate.favourite);
             for code in std::mem::take(&mut candidate.langs) {
                 if !item.langs.iter().any(|present| present == &code) {
                     item.langs.push(code);
@@ -635,6 +662,43 @@ impl KittyLog {
             }
         }
         discovered
+    }
+
+    /// Stamp an EXISTING roster row as the user's favourite and give it the
+    /// pinned composition. Row CREATION stays with [`Self::record_collectible`]
+    /// (which owns the roster cap): the caller records the sighting first, so a
+    /// brand-new head is already present here. A missing row (invalid key, or
+    /// the roster is full) fails closed — the ledger is observability, never a
+    /// place to force an entry in.
+    fn favourite_collectible(&mut self, look: KittyLook, now: &str) {
+        let look = look.normalized();
+        let key = glyph_key(look.variant);
+        let Some(item) = self.collectibles.iter_mut().find(|item| item.key == key) else {
+            return;
+        };
+        // The pinned composition replaces the first-discovery one: the cat the
+        // user pointed at is the cat they liked.
+        item.variant = key.to_string();
+        item.accessory = look.accessory.map(glyph_key).unwrap_or("").to_string();
+        item.coat = look.coat;
+        item.iris = look.iris;
+        item.age = age_key(look.age).to_string();
+        item.favourite = max_ts(&item.favourite, now);
+    }
+
+    /// The pinned companion: the roster row with the greatest favourite stamp
+    /// (the semantic key breaks a same-second tie deterministically across
+    /// processes, exactly as [`collectible_order`] does for discoveries).
+    fn favourite_look(&self) -> Option<KittyLook> {
+        self.collectibles
+            .iter()
+            .filter(|item| !item.favourite.is_empty())
+            .max_by(|a, b| {
+                a.favourite
+                    .cmp(&b.favourite)
+                    .then_with(|| a.key.cmp(&b.key))
+            })
+            .and_then(KittyCollectible::look)
     }
 
     /// Record ONE deduped sighting at RFC3339 stamp `now`. Language codes are
@@ -1376,12 +1440,16 @@ impl KittyLogHost {
             return;
         }
         self.mem = loaded;
-        self.companion = self
-            .mem
-            .collectibles
-            .iter()
-            .rev()
-            .find_map(KittyCollectible::look);
+        // THE RESTART ELECTION. An explicit pin is the strongest statement the
+        // user can make about which cat they want, so it outranks the
+        // chronologically-latest discovery it used to lose to.
+        self.companion = self.mem.favourite_look().or_else(|| {
+            self.mem
+                .collectibles
+                .iter()
+                .rev()
+                .find_map(KittyCollectible::look)
+        });
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -1435,7 +1503,13 @@ impl KittyLogHost {
             let stamp = now_rfc3339();
             if self.mem.record(&s, lexicon, &stamp) {
                 let look = s.look.normalized();
-                self.companion = Some(look);
+                // The hello still plays for a genuine discovery, but an
+                // explicit favourite is a stronger reason than stumbling on a
+                // new glyph: the pinned cat comes back once the newcomer's
+                // hello ends, rather than being silently displaced.
+                if self.mem.favourite_look().is_none() {
+                    self.companion = Some(look);
+                }
                 discovery = Some(look);
             }
             let _ = self.delta.record(&s, lexicon, &stamp);
@@ -1443,6 +1517,66 @@ impl KittyLogHost {
         }
         self.maybe_flush(now);
         discovery
+    }
+
+    /// Promote one look into the durable registry and PIN it as the companion
+    /// (owner: "if somebody really likes that kitty it goes into the kitty
+    /// registry").
+    ///
+    /// Deliberately NOT [`Self::observe`]:
+    /// * `KittyLog::record` reports "new" only for an unseen glyph KEY, so a
+    ///   favourite routed through it would silently no-op on any
+    ///   already-collected head — the common case on a used ledger.
+    /// * The `(session, ident)` dedupe ring exists to absorb re-observations of
+    ///   ONE on-screen episode and must never be able to swallow a button
+    ///   press, so it is bypassed by construction.
+    ///
+    /// `enabled = false` (`[sparkle_words.feline] log = false`) pins in memory
+    /// only — the same degradation Containment already documents: the session
+    /// keeps the cat it asked for, nothing is written.
+    pub(crate) fn favourite(
+        &mut self,
+        s: &KittySighting,
+        lexicon: &Lexicon,
+        now: Instant,
+        enabled: bool,
+    ) {
+        self.poll_initial_load();
+        let look = s.look.normalized();
+        // Unconditional: the press IS the reason to change the identity, and
+        // `record`'s "new key" answer cannot express that.
+        self.companion = Some(look);
+        if !enabled {
+            return;
+        }
+        // NO ring check. The `(session, ident)` ring absorbs re-observations of one
+        // on-screen episode; a button press is not an observation, and a user who
+        // clicks the same cat twice means it twice. Note also that `observe` keys the
+        // ring by the REAL session (:1500) while this path would key it by 0, so an
+        // entry recorded here could only ever match ANOTHER favourite — i.e. its sole
+        // possible effect was swallowing the press it must never swallow, at the cost
+        // of a ring slot that can never usefully match. Pinned by
+        // `a_favourite_is_never_absorbed_by_the_recount_ring`.
+        let stamp = now_rfc3339();
+        // Record first so a never-before-seen head exists as a roster row (that
+        // call, and only that call, owns the roster cap); then stamp the pin.
+        let _ = self.mem.record(s, lexicon, &stamp);
+        self.mem.favourite_collectible(look, &stamp);
+        let _ = self.delta.record(s, lexicon, &stamp);
+        self.delta.favourite_collectible(look, &stamp);
+        self.revision = self.revision.wrapping_add(1);
+        // A user's explicit pick is not observability: skip the debounce so
+        // quitting right after the click cannot lose it.
+        self.last_flush = None;
+        self.maybe_flush(now);
+    }
+
+    /// Whether `look` is the currently pinned favourite (the palette
+    /// checkmark). `&self` on purpose: `App::palette_live` is `&self` and
+    /// cannot poll the startup import — staleness is a non-issue because the
+    /// render loop polls every tick.
+    pub(crate) fn is_favourite(&self, look: KittyLook) -> bool {
+        self.mem.favourite_look() == Some(look.normalized())
     }
 
     /// Note `(session, ident)` in the dedupe ring. Returns `true` when the
@@ -2924,6 +3058,219 @@ mod tests {
         );
         host.flush_exit();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// A sighting carrying an EXPLICIT look — the shape the favourite path
+    /// mints (no matched surface, so no displayed-trait bits either).
+    fn look_sighting(ident: u64, look: KittyLook) -> KittySighting {
+        KittySighting {
+            look,
+            traits: 0,
+            ..sighting(ident)
+        }
+    }
+
+    /// A head glyph with a chosen coat — enough to tell two compositions of the
+    /// SAME collectible key apart.
+    fn coated(variant: CatGlyphId, coat: u8) -> KittyLook {
+        KittyLook {
+            variant,
+            coat,
+            ..KittyLook::default()
+        }
+        .normalized()
+    }
+
+    /// THE HEADLINE TRAP. `KittyLog::record` reports "new" only for an unseen
+    /// glyph KEY, so on any used ledger a favourite routed through `observe`
+    /// would silently no-op. The explicit pin must move the composition of an
+    /// ALREADY-collected head and become the companion.
+    #[test]
+    fn favourite_pins_an_already_collected_head() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let stumbled = coated(CatGlyphId::S100, 3);
+        let pinned = coated(CatGlyphId::S100, 9);
+        let now = Instant::now();
+
+        host.observe(4, [look_sighting(11, stumbled)], lex, now, true);
+        assert_eq!(host.companion_look(), Some(stumbled));
+
+        host.favourite(&look_sighting(12, pinned), lex, now, true);
+
+        assert_eq!(
+            host.companion_look(),
+            Some(pinned),
+            "the pin wins even though this glyph was already collected"
+        );
+        let rows: Vec<_> = host
+            .log()
+            .collectibles
+            .iter()
+            .filter(|item| item.key == glyph_key(CatGlyphId::S100))
+            .collect();
+        assert_eq!(rows.len(), 1, "a favourite re-stamps, it never duplicates");
+        assert_eq!(rows[0].coat, 9, "the pin takes composition ownership");
+        assert!(!rows[0].favourite.is_empty(), "and is stamped durably");
+    }
+
+    /// A later automatic discovery still earns its hello, but it must not steal
+    /// a pin the user made on purpose.
+    #[test]
+    fn a_later_discovery_does_not_steal_a_pinned_favourite() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let pinned = coated(CatGlyphId::S100, 5);
+        let newcomer = coated(CatGlyphId::SpecWitch, 12);
+        let now = Instant::now();
+
+        host.favourite(&look_sighting(21, pinned), lex, now, true);
+        let discovery = host.observe(4, [look_sighting(22, newcomer)], lex, now, true);
+
+        assert_eq!(
+            discovery,
+            Some(newcomer),
+            "a genuine unlock still reports itself, so its hello still plays"
+        );
+        assert_eq!(
+            host.companion_look(),
+            Some(pinned),
+            "…but the companion returns to the pin once that hello ends"
+        );
+    }
+
+    /// The merge law, proven in BOTH orders (the multi-process read-merge-write
+    /// core is order-independent): a favourite owns the composition against an
+    /// earlier unfavourited discovery, without rewriting chronology.
+    #[test]
+    fn the_favourite_wins_the_merge_against_an_earlier_discovery() {
+        let key = glyph_key(CatGlyphId::S100).to_string();
+        let stumbled = KittyCollectible {
+            key: key.clone(),
+            variant: key,
+            coat: 3,
+            age: age_key(KittyLook::default().age).to_string(),
+            count: 1,
+            first_seen: "2026-07-01T00:00:00Z".to_string(),
+            last_seen: "2026-07-01T00:00:00Z".to_string(),
+            ..KittyCollectible::default()
+        };
+        let pinned = KittyCollectible {
+            coat: 9,
+            first_seen: "2026-07-05T00:00:00Z".to_string(),
+            last_seen: "2026-07-05T00:00:00Z".to_string(),
+            favourite: "2026-07-05T00:00:00Z".to_string(),
+            ..stumbled.clone()
+        };
+        let merged = |first: &KittyCollectible, second: &KittyCollectible| {
+            let mut log = KittyLog {
+                collectibles: vec![first.clone()],
+                ..KittyLog::default()
+            };
+            log.merge_from(&KittyLog {
+                collectibles: vec![second.clone()],
+                ..KittyLog::default()
+            });
+            log.collectibles
+        };
+
+        for rows in [merged(&stumbled, &pinned), merged(&pinned, &stumbled)] {
+            assert_eq!(rows.len(), 1, "one semantic key, one row");
+            assert_eq!(
+                rows[0].coat, 9,
+                "the favourite owns the look, not the earliest discovery"
+            );
+            assert_eq!(rows[0].favourite, "2026-07-05T00:00:00Z");
+            assert_eq!(
+                rows[0].first_seen, "2026-07-01T00:00:00Z",
+                "the pin never rewrites when the cat was first met"
+            );
+        }
+    }
+
+    /// THE RESTART ELECTION. A pin must outrank the chronologically-latest
+    /// discovery the startup import used to elect unconditionally.
+    #[test]
+    fn a_favourite_survives_the_startup_import() {
+        let lex = Lexicon::builtin();
+        let p = tmp("favourite-restart");
+        let pinned = coated(CatGlyphId::S100, 7);
+        let later = coated(CatGlyphId::S101, 2);
+        // Keyed so the unfavourited newcomer ALSO sorts last on disk: without
+        // the favourite rule the startup election would hand it the companion.
+        assert!(glyph_key(CatGlyphId::S100) < glyph_key(CatGlyphId::S101));
+
+        // The injected pre-arm failure keeps the delta resident, so the durable
+        // write below is synchronous — this test pins the ELECTION, not the
+        // background writer's timing (which has its own proofs).
+        let mut host = KittyLogHost::load_with_writer_spawn(Some(p.clone()), |_| None);
+        let now = Instant::now();
+        host.favourite(&look_sighting(31, pinned), lex, now, true);
+        host.observe(4, [look_sighting(32, later)], lex, now, true);
+        assert!(
+            KittyLog::flush_merge(&p, &host.delta),
+            "the synchronous flush must land for the restart to mean anything"
+        );
+
+        let mut restarted = KittyLogHost::load(Some(p.clone()));
+        restarted.await_initial_load();
+        assert_eq!(
+            restarted.companion_look(),
+            Some(pinned),
+            "the pin outranks the chronologically latest discovery on restart"
+        );
+        restarted.flush_exit();
+        let _ = std::fs::remove_dir_all(p.parent().expect("scratch parent"));
+    }
+
+    /// The `(session, ident)` ring exists to absorb re-observations of ONE
+    /// on-screen episode. It must never be able to swallow a BUTTON PRESS, so
+    /// the favourite path bypasses it by construction — proven with a
+    /// deliberately REUSED ident, which `observe` would drop for `RING_TTL`.
+    #[test]
+    fn a_favourite_is_never_absorbed_by_the_recount_ring() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let look = coated(CatGlyphId::S100, 4);
+        let now = Instant::now();
+        let before = host.revision();
+
+        host.favourite(&look_sighting(77, look), lex, now, true);
+        host.favourite(&look_sighting(77, look), lex, now, true);
+
+        assert_eq!(
+            host.log().sightings,
+            2,
+            "the cat appeared again because the user asked again"
+        );
+        assert_eq!(
+            host.revision(),
+            before.wrapping_add(2),
+            "each press is its own change stamp"
+        );
+    }
+
+    /// Gate 4 (`[sparkle_words.feline] log = false`) closes the DURABLE tier
+    /// only. The session still gets the cat it asked for — the same degradation
+    /// Containment documents — but nothing is written.
+    #[test]
+    fn favourite_with_recording_off_is_memory_only() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let look = coated(CatGlyphId::S100, 6);
+
+        host.favourite(&look_sighting(88, look), lex, Instant::now(), false);
+
+        assert_eq!(
+            host.companion_look(),
+            Some(look),
+            "the pick still holds for this session"
+        );
+        assert_eq!(host.log().sightings, 0, "the ledger tier stayed closed");
+        assert!(
+            host.log().collectibles.is_empty(),
+            "and no roster row was minted"
+        );
     }
 
     /// TYPING-5 negative control: even when the one construction-time writer

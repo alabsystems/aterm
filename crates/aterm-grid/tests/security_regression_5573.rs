@@ -210,84 +210,127 @@ fn resize_one_row_doesnt_corrupt_others() {
 }
 
 // =========================================================================
-// Compile-fail verification (subprocess)
+// Compile-fail verification (against the REAL crate)
 // =========================================================================
 
-/// Verify that `Row::new` cannot be called without an `unsafe` block.
-///
-/// This is a compile-fail test: we write a small Rust program that calls
-/// `Row::new` in safe code and verify that `rustc` rejects it.
-#[test]
-fn row_new_rejects_safe_call() {
-    let status = std::process::Command::new("rustc")
-        .arg("--edition=2021")
-        .arg("--crate-type=lib")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                // Minimal program that tries to call Row::new without unsafe.
-                // We can't import aterm_grid in a subprocess, but we can verify
-                // the language-level property: calling an `unsafe fn` without
-                // an `unsafe` block is a compile error.
-                stdin.write_all(
-                    b"#![deny(unsafe_op_in_unsafe_fn)]\n\
-                      unsafe fn create() -> u8 { 0 }\n\
-                      fn main() { let _ = create(); }\n",
-                )?;
-            }
-            child.wait()
-        });
-
-    match status {
-        Ok(exit) => assert!(
-            !exit.success(),
-            "safe call to `unsafe fn` should be rejected by rustc"
-        ),
-        Err(e) => {
-            // rustc not in PATH is an environmental issue, not a test failure.
-            eprintln!("SKIP: rustc not available for compile-fail check: {e}");
-        }
+/// Locate the `deps/` directory holding this test binary — the same directory
+/// Cargo puts `libaterm_grid-<hash>.rlib` and every transitive dependency in.
+/// That is what lets the compile-fail probes below reference the REAL crate
+/// instead of a synthetic stand-in.
+fn deps_dir() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    // `target/<profile>/deps/<test>-<hash>`; some runners drop the test one level up.
+    if dir.ends_with("deps") {
+        Some(dir.to_path_buf())
+    } else {
+        Some(dir.join("deps"))
     }
 }
 
-/// Verify that `Row::resize` cannot be called without an `unsafe` block.
-///
-/// Same compile-fail approach: an `unsafe fn` called without `unsafe {}` is
-/// rejected by the compiler since Rust 2024 edition (and by the
-/// `unsafe_op_in_unsafe_fn` lint in earlier editions with `#![deny(...)]`).
-#[test]
-fn row_resize_rejects_safe_call() {
-    let status = std::process::Command::new("rustc")
+/// The newest `libaterm_grid-*.rlib` in `deps/` (there may be several hashes
+/// from older builds; the freshest matches this test binary).
+fn aterm_grid_rlib() -> Option<std::path::PathBuf> {
+    let dir = deps_dir()?;
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("libaterm_grid-") && name.ends_with(".rlib") {
+            let m = e.metadata().ok().and_then(|m| m.modified().ok())?;
+            if best.as_ref().is_none_or(|(t, _)| m > *t) {
+                best = Some((m, e.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Compile `src` against the real `aterm_grid` rlib. `Some(true)` = compiled,
+/// `Some(false)` = rejected, `None` = could not run the probe at all (no rustc,
+/// no rlib) — reported as a SKIP rather than a silent pass.
+fn probe_compiles(src: &str) -> Option<bool> {
+    let rlib = aterm_grid_rlib()?;
+    let deps = deps_dir()?;
+    let out = std::env::temp_dir().join(format!("aterm_grid_probe_{}", std::process::id()));
+    let mut child = std::process::Command::new("rustc")
         .arg("--edition=2021")
         .arg("--crate-type=lib")
+        .arg("--extern")
+        .arg(format!("aterm_grid={}", rlib.display()))
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()))
+        .arg("-o")
+        .arg(&out)
         .arg("-")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(
-                    b"unsafe fn resize() {}\n\
-                      fn caller() { resize(); }\n",
-                )?;
-            }
-            child.wait()
-        });
+        .ok()?;
+    {
+        use std::io::Write;
+        child.stdin.as_mut()?.write_all(src.as_bytes()).ok()?;
+    }
+    let status = child.wait().ok()?;
+    let _ = std::fs::remove_file(&out);
+    Some(status.success())
+}
 
-    match status {
-        Ok(exit) => assert!(
-            !exit.success(),
-            "safe call to `unsafe fn` should be rejected by rustc"
+/// POSITIVE CONTROL: the probe harness itself works — a coercion to an
+/// `unsafe fn` pointer of the real signature MUST compile. Without this, a
+/// broken harness (wrong rlib path, missing dep) would make every negative
+/// probe below "pass" for the wrong reason. That is exactly how the previous
+/// version of these tests went vacuous.
+#[test]
+fn compile_probe_harness_actually_reaches_aterm_grid() {
+    let src = "pub fn t() { let _: unsafe fn(u16, &mut aterm_grid::PageStore) -> aterm_grid::Row \
+               = aterm_grid::Row::new; }";
+    match probe_compiles(src) {
+        Some(true) => {}
+        Some(false) => panic!(
+            "the compile probe could not build a VALID reference to aterm_grid::Row::new — \
+             the harness is broken, so the compile-fail tests below prove nothing"
         ),
-        Err(e) => {
-            eprintln!("SKIP: rustc not available for compile-fail check: {e}");
-        }
+        None => eprintln!("SKIP: no rustc / no aterm_grid rlib for the compile probe"),
+    }
+}
+
+/// `Row::new` must not be callable from safe code.
+///
+/// REGRESSION: this test used to pipe a SYNTHETIC snippet to `rustc`
+/// (`unsafe fn create() -> u8 { 0 } fn main() { let _ = create(); }`) that never
+/// mentioned `Row` at all — it asserted that rustc rejects safe calls to unsafe
+/// fns, i.e. it tested the COMPILER, not aterm-grid. Making `Row::new` safe
+/// again — the #5573 use-after-free — would not have failed it.
+///
+/// A coercion to a SAFE fn pointer is the real assertion: it compiles if and
+/// only if `Row::new` is safe, and needs no constructible `PageStore`.
+#[test]
+fn row_new_rejects_safe_call() {
+    let src = "pub fn t() { let _: fn(u16, &mut aterm_grid::PageStore) -> aterm_grid::Row \
+               = aterm_grid::Row::new; }";
+    match probe_compiles(src) {
+        Some(false) => {}
+        Some(true) => panic!(
+            "aterm_grid::Row::new coerced to a SAFE fn pointer — it is no longer \
+             `unsafe fn`, reopening the #5573 page-backed use-after-free"
+        ),
+        None => eprintln!("SKIP: no rustc / no aterm_grid rlib for the compile-fail check"),
+    }
+}
+
+/// `Row::resize` must not be callable from safe code. Same reasoning as
+/// [`row_new_rejects_safe_call`]; this one also used a synthetic snippet.
+#[test]
+fn row_resize_rejects_safe_call() {
+    let src = "pub fn t() { let _: fn(&mut aterm_grid::Row, u16, &mut aterm_grid::PageStore) \
+               = aterm_grid::Row::resize; }";
+    match probe_compiles(src) {
+        Some(false) => {}
+        Some(true) => panic!(
+            "aterm_grid::Row::resize coerced to a SAFE fn pointer — it is no longer \
+             `unsafe fn`, reopening the #5573 page-backed use-after-free"
+        ),
+        None => eprintln!("SKIP: no rustc / no aterm_grid rlib for the compile-fail check"),
     }
 }

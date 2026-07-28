@@ -18,9 +18,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Appended to a tool name to form the concrete executable name.
+/// Appended to a tool name to form the concrete executable name. Applied ONLY by
+/// [`crate::store::ToolName::exe_file`]: here the two suffixes name two DIFFERENT files, so
+/// every hand-written append was a chance to build `bin/ay.cmd` when `bin\ay.exe` was meant.
 pub const EXE_SUFFIX: &str = ".exe";
 /// Appended to a tool name to form the concrete `bin/` shim filename (a batch wrapper).
+/// Applied ONLY by [`crate::store::ToolName::shim_file`] and stripped ONLY by
+/// [`crate::store::ToolName::from_shim_file`].
 pub const SHIM_SUFFIX: &str = ".cmd";
 
 /// The default install prefix: `%LOCALAPPDATA%\aterm\pkg` (per-user, ACL-private by
@@ -164,7 +168,7 @@ fn backslashed(p: &Path) -> std::ffi::OsString {
 /// Point `link` at directory `target` via a **junction** (`mklink /J`, no admin required).
 /// Not atomically swappable like a POSIX rename; any existing link is removed first, so
 /// there is a brief window where `link` is absent (acceptable — activation runs under the
-/// apply lock). Used for `channels/<ch>/current` and the Kani sysroot/toolchain dir links.
+/// apply lock). Used for `channels/<ch>/current` and the sysroot/toolchain dir links.
 /// Both paths are normalized to `\` separators first — `mklink` (unlike the Win32 API)
 /// rejects `/`-separated paths, reading path segments as switches.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {

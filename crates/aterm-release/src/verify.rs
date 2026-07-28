@@ -75,6 +75,31 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
     Ok(found)
 }
 
+/// Production scan for a PUBLIC UPDATE CHANNEL — a repository that DISTRIBUTES
+/// this cut but did not produce it.
+///
+/// Identical to [`scan_published`] with exactly one conjunct dropped: a mirrored
+/// release object's `target_commitish` is NOT bound to the manifest's claim
+/// commit. It cannot be. The channel is a different repository whose history does
+/// not contain the claim commit — `publish::create_mirror_draft` deliberately
+/// sends no `target_commitish` for that reason — so GitHub anchors the mirrored
+/// release at the channel's default branch (`main`).
+///
+/// Applying the private capability check here is what made `step_mirror` refuse
+/// its own completed flip on v0.6.0 and v0.7.0: the release was correctly live
+/// with the right bytes, and `release_target_matches("main", <40-hex claim>)` is
+/// false, so the cut wedged with the lease still held. It is also why
+/// `publish::validate_mirror_release_capability` exists and omits the field.
+///
+/// Everything else still holds, enforced inside [`scan_published_snapshot`]: the
+/// immutable release ID, the listing-row-to-snapshot binding, exact tag identity,
+/// `draft == false`, and the manifest version/build/commit identity. The bytes'
+/// authenticity never came from the release target — it comes from the manifest
+/// digest, the optional pinned signature, and codesign.
+pub fn scan_published_channel(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
+    scan_published_snapshot(slug, stop_early)
+}
+
 /// A scratch/rehearsal scan has no trustworthy origin tag namespace. It must
 /// therefore retain the current protocol's literal claim-SHA target invariant;
 /// symbolic historical targets are admitted only by `scan_published_in_repo`.
@@ -99,12 +124,40 @@ pub(crate) fn validate_unbound_published_target(published: &Published) -> Result
     )
 }
 
+/// Does one published row fall under the CURRENT protocol's remote-tag
+/// invariant — "`refs/tags/<tag>` resolves to exactly the commit this manifest
+/// claims"?
+///
+/// Retired two-component rows are not canonical tags and were never in scope.
+/// The pre-canonical dotted archive heads are out of scope too: several carry a
+/// LIGHTWEIGHT tag that was later moved onto the post-release merge descendant
+/// (`v0.5.10` → `0fbfb940`, `v0.5.11` → `3767f838`), so their manifest claim can
+/// never equal their tag ref. They stay in the exhaustive `ship status` / `yank`
+/// scan as accounting history; nothing can install them, because the client
+/// elects on the exact `aterm-appcast.toml` asset name and theirs was renamed.
+///
+/// [`ledger::LEDGER_FLOOR`] is the era boundary, closed at both ends:
+/// `ledger::next_build` refuses to MINT at or below it and
+/// `manifest_out::v025_check` refuses to WRITE at or below it, so no release
+/// this pipeline can cut is ever exempt. The row holding the client-facing exact
+/// asset name is bound unconditionally, which is why every `stop_early` scan
+/// keeps this check whatever build its manifest claims — those rows are built
+/// with `asset: MANIFEST_ASSET`, so for them this predicate reduces to today's
+/// condition exactly.
+///
+/// If a `stop_early == false` caller is ever added, this exemption travels with
+/// it. Today `run_status` is the only one.
+pub(crate) fn binds_remote_tag_identity(published: &Published) -> bool {
+    parse_canonical_tag(&published.tag).is_ok()
+        && (published.build > ledger::LEDGER_FLOOR
+            || published.asset == manifest_out::MANIFEST_ASSET)
+}
+
 /// Production scan for the origin channel. In addition to the immutable
-/// release-object closure, every canonical `vMAJOR.MINOR.PATCH` release is
-/// bound to its exact remote tag (annotated or legacy-lightweight). Retired
-/// two-component rows and the older dotted archive rows predate that invariant
-/// and remain accounting history only; several intentionally tag the
-/// post-release merge descendant.
+/// release-object closure, every release inside the current protocol's tag
+/// invariant is bound to its exact remote tag (annotated or
+/// legacy-lightweight) — see [`binds_remote_tag_identity`] for the two eras
+/// deliberately outside it.
 pub fn scan_published_in_repo(repo: &Path, slug: &str, stop_early: bool) -> Result<Vec<Published>> {
     let git = ledger::GitCli::new(repo);
     let found = scan_published_snapshot(slug, stop_early)?;
@@ -113,7 +166,7 @@ pub fn scan_published_in_repo(repo: &Path, slug: &str, stop_early: bool) -> Resu
         let commit = validate_published_identity(published)?
             .commit
             .expect("validated published identity has commit");
-        if parse_canonical_tag(&published.tag).is_ok() {
+        if binds_remote_tag_identity(published) {
             bindings.push((published.tag.as_str(), commit));
         }
     }

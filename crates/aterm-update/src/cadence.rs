@@ -290,7 +290,11 @@ mod tests {
     fn backoff_doubles_per_failure_and_caps() {
         let mut c = Cadence::new(BASE);
         c.failed();
-        assert_eq!(c.nominal(), BASE, "the first retry is still the base interval");
+        assert_eq!(
+            c.nominal(),
+            BASE,
+            "the first retry is still the base interval"
+        );
         c.failed();
         assert_eq!(c.nominal(), BASE * 2);
         c.failed();
@@ -382,7 +386,10 @@ mod tests {
         let mut seen_high = false;
         for b in 0..=u8::MAX {
             let d = jitter(BASE, b).as_millis() as u64;
-            assert!(d >= lo && d <= hi, "byte {b} produced {d}ms, outside {lo}..={hi}");
+            assert!(
+                d >= lo && d <= hi,
+                "byte {b} produced {d}ms, outside {lo}..={hi}"
+            );
             seen_low |= d < BASE.as_millis() as u64;
             seen_high |= d > BASE.as_millis() as u64;
         }
@@ -422,7 +429,10 @@ mod tests {
     fn identical_failures_collapse_after_the_first() {
         let mut log = FailureLog::default();
         let msg = "curl GET https://api.github.com/... failed (exit 6): could not resolve host";
-        assert!(matches!(log.failure(msg), LogAction::Warn(_)), "first is loud");
+        assert!(
+            matches!(log.failure(msg), LogAction::Warn(_)),
+            "first is loud"
+        );
         for _ in 0..47 {
             assert_eq!(
                 log.failure(msg),
@@ -435,7 +445,10 @@ mod tests {
     #[test]
     fn a_changed_failure_is_always_reported() {
         let mut log = FailureLog::default();
-        assert!(matches!(log.failure("could not resolve host"), LogAction::Warn(_)));
+        assert!(matches!(
+            log.failure("could not resolve host"),
+            LogAction::Warn(_)
+        ));
         assert_eq!(log.failure("could not resolve host"), LogAction::Suppress);
         // DNS failure → auth failure is genuinely new information.
         let LogAction::Warn(text) = log.failure("GitHub auth failed (HTTP 401)") else {

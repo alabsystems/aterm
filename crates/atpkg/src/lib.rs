@@ -8,11 +8,21 @@
 
 //! `atpkg` — the aterm toolchain package manager.
 //!
-//! **Phases 1–2 are present.** The signature anchor ([`sig`]) and discovery (the
-//! [`manifest`] schema parsers and [`discovery`] account resolution) are implemented;
-//! the remaining install/update machinery (the per-program store, tar-slip-safe
-//! staging, coherence-group apply) arrives in later phases. The anchor is a two-tier
-//! Ed25519 trust model that
+//! **The manager is complete and shipped.** The signature anchor ([`sig`]),
+//! discovery ([`manifest`] schema parsers + [`discovery`] account resolution), the
+//! per-program store, tar-slip-safe staging ([`extract`], [`install`]), the
+//! all-or-nothing coherence-group apply ([`apply`]), activation ([`activate`]),
+//! locking/pinning ([`lock`], [`pin`]), retention ([`gc`]) and the dev-link lane
+//! ([`linkmode`]) are all implemented and exercised. It ships as an argv0 alias on
+//! the one `aterm` binary, and the GUI drives `seed` once plus `update` on an
+//! interval.
+//!
+//! (This paragraph previously read "Phases 1–2 are present … the remaining
+//! install/update machinery arrives in later phases." That was left behind by the
+//! phases it describes and is no longer true — the modules it called future are
+//! listed above. Fix the sentence, not the reader's expectations, if it drifts again.)
+//!
+//! The anchor is a two-tier Ed25519 trust model that
 //! mirrors `aterm-update`'s notarization pin, but for cross-platform CLI tarballs
 //! where Apple notarization does not transfer (see
 //! `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §8/§13):
@@ -54,7 +64,6 @@ pub mod gate;
 pub mod gc;
 pub mod hooks;
 pub mod install;
-pub mod kani;
 pub mod linkmode;
 pub mod lock;
 pub mod manifest;
@@ -70,6 +79,7 @@ pub mod sig;
 pub mod sourcebuild;
 pub mod status;
 pub mod store;
+pub mod sysroot;
 pub mod tree;
 pub mod verify;
 
@@ -90,9 +100,6 @@ pub use flow::{
 pub use gate::{ApplyDecision, decide, is_yanked};
 pub use gc::{GcReport, reclaimable, run as run_gc};
 pub use install::{StageError, verify_and_stage};
-pub use kani::{
-    KaniError, nightly_components_ready, relocate_sysroot, wire_kani_link, write_toolchain_version,
-};
 pub use linkmode::{
     LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_checkout_checked,
     linked_programs, linked_programs_checked, refresh, unlink,
@@ -111,6 +118,7 @@ pub use sig::{
 };
 pub use status::{ProgramStatus, Status};
 pub use store::{Layout, default_prefix, shim_allowed, vet_prefix};
+pub use sysroot::{relocate_sysroot, write_toolchain_version};
 pub use tree::{sha256_file, tree_root};
 pub use verify::{VerifyOutcome, verify_all, verify_program};
 
@@ -118,7 +126,9 @@ pub use verify::{VerifyOutcome, verify_all, verify_program};
 // (keyless) lane, complementary to the signed `install --default-set` bootstrap.
 pub use companions::{Companion, Manifest as CompanionManifest, SeedPolicy};
 pub use seed::{Ledger as SeedLedger, SeedResult, SkipReason, reconcile_source};
-pub use sourcebuild::{Installed as SourceInstalled, Provenance, SourceBuildError, build_and_install};
+pub use sourcebuild::{
+    Installed as SourceInstalled, Provenance, SourceBuildError, build_and_install,
+};
 
 /// The base64 Ed25519 **root** public key this binary trusts, baked in at compile
 /// time from `ATERM_PKG_ROOTKEY`. Empty (the default when the env var is unset at

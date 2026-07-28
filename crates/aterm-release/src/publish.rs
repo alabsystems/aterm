@@ -289,7 +289,7 @@ fn channel_token_path() -> Option<PathBuf> {
 
 /// Read + canonicalize the release-org token. `None` when absent, so a machine
 /// without it keeps the previous behaviour (`gh auth`) and simply cannot mirror.
-fn channel_token() -> Option<String> {
+pub(crate) fn channel_token() -> Option<String> {
     let token = fs::read_to_string(channel_token_path()?).ok()?;
     let token = token.trim().to_string();
     (!token.is_empty() && !token.bytes().any(|b| b.is_ascii_control())).then_some(token)
@@ -302,8 +302,7 @@ fn channel_token() -> Option<String> {
 /// files and every remote call it makes is against the channel slug, so no private
 /// read can be mis-credentialed by the swap. A blanket process-wide swap would NOT
 /// be safe for a step that also reads the private release.
-static CHANNEL_CRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CHANNEL_CRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII scope: channel credential in force until dropped, including on the error
 /// paths — a `?` inside the scope must not leave the flag set for later private work.
@@ -4125,7 +4124,10 @@ impl CutCtx {
         }
         self.mirror_release_id = Some(id);
         if let Some(journal) = &mut self.journal {
-            if journal.mirror_release_id.is_some_and(|current| current != id) {
+            if journal
+                .mirror_release_id
+                .is_some_and(|current| current != id)
+            {
                 return Err(Error::new(
                     "journaled mirror release ID differs from the observed draft capability",
                 ));
@@ -5447,6 +5449,12 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         version: version.clone(),
         arm64_only: opts.arm64_only,
         recut,
+        // Only a REAL cut is compared against the public channel: a dry run
+        // uploads nothing and a rehearsal uploads to a scratch repo, so in
+        // neither case can the channel be expected to carry this version. This
+        // is the sole opt-out and it is structural — derived from the flags,
+        // never readable from the environment.
+        offline: !matches!(kind, CutKind::Real),
     };
     let gr = gates::run_all(&git, repo, &gate_opts)?;
     step(
@@ -5481,6 +5489,13 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             },
             gr.free_disk_gib,
         ),
+    );
+    step(
+        "",
+        &match gr.channel_version.as_deref() {
+            Some(v) => format!("public channel source agrees: carries {v}"),
+            None => "public channel source version: not checked (no channel/manifest)".to_string(),
+        },
     );
     if opts.gate {
         run_gate_script(repo)?;
@@ -6218,7 +6233,17 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         commit: &ctx.commit,
         dmg_name: &format!("aterm-{}.dmg", ctx.version),
         dmg_sha256: &dmg_sha,
-        repo_slug: &ctx.slug,
+        // The manifest's `url` must name the repository a reader can actually
+        // fetch from. These same bytes ride BOTH the private release and the
+        // mirrored public one, and only the public channel is readable without
+        // a credential — so the channel slug wins whenever one is configured,
+        // and we fall back to the publish slug only when there is no mirror
+        // (a legal configuration; see mirror::update_channel_slug).
+        repo_slug: &mirror::update_channel_slug(
+            &fs::read_to_string(ctx.repo.join("Cargo.toml"))
+                .map_err(|e| Error::new(format!("read Cargo.toml for manifest url: {e}")))?,
+        )?
+        .unwrap_or_else(|| ctx.slug.clone()),
         min_os: &min_os,
         team_id: &manifest_team_id(conf.as_ref()),
         pub_date: &bundle::epoch_to_rfc3339(unix_now()),
@@ -7899,6 +7924,13 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
     let after = release_object_by_id(&slug, release_id)?;
     validate_mirror_release_capability(after.as_ref(), release_id, &ctx.tag, false)?;
     prove_mirror_channel_head(ctx, &slug, release_id)?;
+    // Everything above ran through `gh`, i.e. WITH the release-org credential. That
+    // proves the release exists; it does NOT prove the thing this step's message
+    // claims and the whole mirror exists for — that a machine with no credential at
+    // all can read it. A private (or membership-restricted) mirror passes every
+    // authenticated proof above and is invisible to every real client, which is the
+    // silent never-updates failure the mirror was built to remove.
+    prove_channel_is_anonymously_readable(ctx, &slug)?;
     step(
         "mirror",
         &format!(
@@ -7907,6 +7939,106 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
             ctx.version, ctx.build
         ),
     );
+    Ok(())
+}
+
+/// Prove a CREDENTIAL-LESS client can actually read this channel's newest release
+/// and fetch its assets — the one property the authenticated proofs cannot see.
+///
+/// Deliberately uses `curl` rather than `gh`: `gh` always attaches a credential,
+/// so it can never answer this question. The request carries no `Authorization`
+/// header and the token-bearing environment variables are cleared for the child,
+/// so an ambient `GH_TOKEN`/`GITHUB_TOKEN` in the cutter's shell cannot make an
+/// unreadable channel look readable.
+///
+/// Fails CLOSED: a network failure here is reported as a failure to prove, not as
+/// proof. Better to refuse a cut than to publish a channel nobody can read.
+fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()> {
+    let url = format!("{GITHUB_API_ORIGIN}/repos/{slug}/releases/tags/{}", ctx.tag);
+    let out = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--location",
+            "--max-time",
+            "60",
+            "--header",
+            "Accept: application/vnd.github+json",
+            &url,
+        ])
+        // Strip every credential the child could otherwise pick up. curl does not
+        // read these itself, but clearing them keeps the intent explicit and
+        // survives someone later swapping curl for a helper that does.
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("NETRC")
+        .output()
+        .map_err(|error| Error::new(format!("spawn anonymous channel probe: {error}")))?;
+    if !out.status.success() {
+        return Err(Error::new(format!(
+            "the public channel {slug} is NOT readable without a credential: an \
+             unauthenticated GET of {url} failed ({}). Every authenticated check \
+             above passed, so the release exists — it is simply invisible to real \
+             installs, which is the silent never-updates state the mirror exists to \
+             prevent. Make {slug} public (or repoint \
+             `{table} {key}`), then `cargo ship cut --resume`.",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            table = mirror::CHANNEL_TABLE,
+            key = mirror::CHANNEL_KEY,
+        )));
+    }
+    // The release object is readable; prove the ASSET BYTES are too. A release can
+    // be listed while its asset download 404s (an upload that never completed), and
+    // the client fails on exactly that.
+    // Match against a whitespace-stripped copy so the check does not depend on
+    // GitHub's JSON formatting (it currently pretty-prints `"name": "x"`, but the
+    // compact form is equally valid and a formatting change must not turn this
+    // proof into a spurious cut failure). Keying on the `"name":"…"` PAIR rather
+    // than the bare asset name also keeps release-note prose — which routinely
+    // mentions the DMG filename — from masquerading as an uploaded asset.
+    let body: String = String::from_utf8_lossy(&out.stdout)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for name in mirror::required_asset_names(&ctx.version, ctx.signature_required) {
+        if !body.contains(&format!("\"name\":\"{name}\"")) {
+            return Err(Error::new(format!(
+                "the anonymous view of {slug} {} does not list the required asset \
+                 {name}; a credential-less client would not find it",
+                ctx.tag
+            )));
+        }
+    }
+    let dmg = mirror::dmg_asset_name(&ctx.version);
+    let dmg_url =
+        format!("https://github.com/{slug}/releases/download/{}/{dmg}", ctx.tag);
+    let head = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--location",
+            "--head",
+            "--max-time",
+            "60",
+            &dmg_url,
+        ])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("NETRC")
+        .output()
+        .map_err(|error| Error::new(format!("spawn anonymous asset probe: {error}")))?;
+    if !head.status.success() {
+        return Err(Error::new(format!(
+            "the public channel {slug} lists {dmg} but an unauthenticated fetch of \
+             {dmg_url} failed ({}); installs would elect this release and then be \
+             unable to download it",
+            String::from_utf8_lossy(&head.stderr).trim()
+        )));
+    }
     Ok(())
 }
 
@@ -7994,12 +8126,7 @@ fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIden
 /// authority already exists on the private repo, so a mismatch means something
 /// unexpected is holding our tag on the public channel and the safe move is to
 /// stop and let a human look.
-fn upload_mirror_asset(
-    ctx: &mut CutCtx,
-    slug: &str,
-    release_id: u64,
-    file: &Path,
-) -> Result<()> {
+fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Path) -> Result<()> {
     let name = file
         .file_name()
         .and_then(|name| name.to_str())
@@ -8126,7 +8253,14 @@ fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
     // `aterm-appcast.toml` only, greatest numeric tag wins regardless of REST
     // row order — and it downloads exactly the one manifest a real updater
     // would fetch.
-    let published = verify::scan_published(slug, true)?;
+    //
+    // The CHANNEL scan is the required one here, not `scan_published`. A mirrored
+    // release's `target_commitish` is the channel's default branch, because the
+    // claim commit does not exist in that repository at all (see
+    // `create_mirror_draft`, which sends no target for exactly this reason).
+    // Binding the private claim-SHA invariant to a channel object is what made
+    // this function refuse its own completed flip on v0.6.0 and v0.7.0.
+    let published = verify::scan_published_channel(slug, true)?;
     let head = verify::select_newest(&published).ok_or_else(|| {
         Error::new(format!(
             "public channel {slug} elects no release at all after mirroring v{} — installed \

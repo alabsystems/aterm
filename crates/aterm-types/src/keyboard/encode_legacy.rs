@@ -28,8 +28,30 @@ pub(super) fn encode_character_legacy(
     // `<[u8]>::to_vec` is a modeled std callee, so the artifact never fires.
     // Behavior-identical: both build a fresh heap `Vec<u8>` with the same
     // length, capacity, and bytes — the legacy encode tests pin the bytes.
+    // `Key::Character` carries the UNSHIFTED base, so a chord named after its
+    // SHIFTED glyph arrives here as the base plus SHIFT — Ctrl-`_` is
+    // `Ctrl+Shift+'-'`. `ctrl_character('-')` is None (the table holds `'_'`,
+    // not `'-'`), so the chord fell through to the plain-glyph path below and
+    // emitted a literal `_` instead of 0x1F: readline/emacs `undo` did nothing
+    // (owner, 2026-07-28: "does control-_ work as undo like in emacs now? it
+    // doesn't seem to work"). Its siblings only escaped the bug by accident —
+    // `Ctrl+Shift+'/'`, `'2'`, `'6'` all have their UNSHIFTED char in the table
+    // too, so the lookup hit before shift ever mattered.
+    //
+    // The shifted form is consulted ONLY as a fallback, never as a replacement:
+    // every chord that resolves today keeps its exact byte (notably
+    // `Ctrl+Shift+'/'` stays 0x1F rather than becoming `Ctrl-?` = 0x7F). On the
+    // US table `'-'` is the only key this newly resolves, which is precisely
+    // the reported gap.
+    let ctrl_base = ctrl_character(c).or_else(|| {
+        if modifiers.contains(Modifiers::SHIFT) {
+            super::shifted_character(c, modifiers).and_then(ctrl_character)
+        } else {
+            None
+        }
+    });
     if modifiers.contains(Modifiers::CTRL)
-        && let Some(ctrl_char) = ctrl_character(c)
+        && let Some(ctrl_char) = ctrl_base
     {
         if alt_sends_escape || meta_sends_escape {
             return [0x1b, ctrl_char].to_vec();
@@ -311,7 +333,7 @@ fn encode_numpad_named_legacy(
     })
 }
 
-fn ctrl_character(c: char) -> Option<u8> {
+pub(super) fn ctrl_character(c: char) -> Option<u8> {
     let c_upper = c.to_ascii_uppercase();
     if c_upper.is_ascii_uppercase() {
         // `c_upper` is 'A'..='Z' here, so `c_upper as u8` is 65..=90 and the

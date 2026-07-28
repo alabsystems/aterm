@@ -173,6 +173,31 @@ const WINCE_SETTLE: f32 = 0.16;
 const WINCE_RECOIL: f32 = 0.16;
 const WINCE_SQUASH: f32 = 0.11;
 const MAX_WINCE_CHAIN: u8 = 4;
+/// The wince TUMBLE (owner, 2026-07-26: "expression + pose" — the richer of the
+/// two reaction models). On top of the recoil the body rocks side to side, a
+/// decaying oscillation whose frequency rides the chain: one curse is a flinch,
+/// a string of them visibly knocks the cat about. The renderer's pose transform
+/// is a dest-rect scale + lead shift with no rotation, so the "tumble" is
+/// spelled as this lateral lead swing plus a counter-phase scale wobble.
+const WINCE_TUMBLE: f32 = 0.13;
+const WINCE_TUMBLE_FREQ: f32 = 3.1;
+const WINCE_TUMBLE_DECAY: f32 = 3.4;
+
+// A complete FELINE word (any language) makes an already-visible companion
+// light up: happy eyes plus a springing LEAP — it rises off its rest anchor,
+// stretches tall at the top of the hop, and settles back with the shared
+// landing bounce. Chains exactly like the wince, so `kitty kitty` reads as two
+// hops. Like every reaction this is expression on an EXISTING flight: it never
+// summons a hidden companion and never changes its identity.
+const DELIGHT_HOLD: f32 = 0.62;
+const DELIGHT_CHAIN_WINDOW: f32 = 0.9;
+const DELIGHT_ATTACK: f32 = 0.05;
+const DELIGHT_SETTLE: f32 = 0.2;
+/// Peak leap height as a fraction of cell height, added to the hover bob.
+const DELIGHT_LEAP: f32 = 0.42;
+/// Vertical stretch at the top of the hop (and the squash on the way out).
+const DELIGHT_STRETCH: f32 = 0.14;
+const MAX_DELIGHT_CHAIN: u8 = 4;
 
 // ── living-cartoon animation tuning ─────────────────────────────────────────
 // One eased "display momentum" spine drives every pose choice. It LAGS the raw
@@ -283,6 +308,11 @@ pub enum CatReaction {
     /// A complete profanity cue: squeezed eyes and a burst-scaled recoil.
     /// Repeated nearby cues increase the pose force and pulse count.
     Wince,
+    /// A complete FELINE word was typed (`kitty`, `gato`, `neko`, … — see
+    /// `aterm-gui`'s `kitty_summon`): happy eyes plus a springing leap.
+    /// The companion's own name delights it; repeated words build the chain
+    /// exactly like [`Self::Wince`] builds the recoil.
+    Delight,
     /// A newly unlocked collectible's guaranteed hello.
     Discovery,
 }
@@ -377,6 +407,7 @@ impl CatFrame {
             CatReaction::Startled => 2,
             CatReaction::Discovery => 3,
             CatReaction::Wince => 4,
+            CatReaction::Delight => 5,
         };
         let bob_q = ((self.bob * 512.0) as i64) as u64;
         // Quantize the pose so a change of lean / squash / stretch / blink
@@ -484,6 +515,12 @@ pub struct CursorCat {
     wince_last: Option<Instant>,
     /// Burst-scaled phrase strength/pulse count, bounded at four.
     wince_chain: u8,
+    /// First sample of the current feline-delight kick (the leap clock).
+    delight_at: Option<Instant>,
+    /// Last complete feline word in the current short phrase.
+    delight_last: Option<Instant>,
+    /// Burst-scaled hop strength, bounded at [`MAX_DELIGHT_CHAIN`].
+    delight_chain: u8,
     /// FULL-NYAN SING-ALONG drive 0..=1, synced by the host each frame
     /// ([`Self::set_singing`]) from the `nyan_sing` detector: 1.0 armed,
     /// crossfading through wind-down, 0.0 idle.
@@ -525,6 +562,9 @@ impl Default for CursorCat {
             wince_at: None,
             wince_last: None,
             wince_chain: 0,
+            delight_at: None,
+            delight_last: None,
+            delight_chain: 0,
             sing: 0.0,
             sing_beat: 0.0,
             rng: 0x2545_F491,
@@ -682,6 +722,42 @@ impl CursorCat {
         true
     }
 
+    /// Light up at one or more complete FELINE words (owner, 2026-07-26: "I
+    /// want the cursor kitty to react to `fuck` and `kitty` words"). The exact
+    /// twin of [`Self::on_curse`] with the opposite affect: happy eyes and a
+    /// springing leap instead of squeezed eyes and a recoil.
+    ///
+    /// This is expression on an already-present companion. It never summons a
+    /// hidden cat, never touches typing momentum or the flight lifetime, and —
+    /// the point of the 2026-07-26 change — never touches `look`. Typing the
+    /// companion's name delights it; it does not REPLACE it. Swapping the
+    /// sprite there was the "kitty changing for no reason" the owner rejected.
+    ///
+    /// Words close enough to belong to one phrase build a bounded chain, so
+    /// `kitty kitty` reads as two hops rather than one held pose. Returns
+    /// whether a live companion accepted the reaction, so a host that resolves
+    /// words after its current cat frame can request one follow-up draw.
+    pub fn on_delight(&mut self, now: Instant, hits: u8) -> bool {
+        if hits == 0 || !self.is_active() {
+            return false;
+        }
+        let chained = self.delight_last.is_some_and(|last| {
+            now.saturating_duration_since(last).as_secs_f32() < DELIGHT_CHAIN_WINDOW
+        });
+        self.delight_chain = if chained {
+            self.delight_chain
+                .saturating_add(hits)
+                .min(MAX_DELIGHT_CHAIN)
+        } else {
+            hits.min(MAX_DELIGHT_CHAIN)
+        };
+        self.delight_at = Some(now);
+        self.delight_last = Some(now);
+        self.reaction = CatReaction::Delight;
+        self.reaction_until = Some(now + Duration::from_secs_f32(DELIGHT_HOLD));
+        true
+    }
+
     /// Stamp one KILL chord (Ctrl-K/U/W, Alt-D, forward Delete, a word-
     /// backspace): erasing a SPAN un-earns momentum like a big backspace —
     /// twice the single-delete drain, the same ≈two-deletes escalation the
@@ -819,6 +895,52 @@ impl CursorCat {
         }
     }
 
+    /// Present the companion because a FELINE WORD WAS TYPED, wearing the
+    /// identity it already has.
+    ///
+    /// This is [`Self::on_collect`]'s lifecycle without its look replacement —
+    /// the distinction the owner drew on 2026-07-26: "I don't want the kitty
+    /// changing for no reason", and "I like that there is a unique kitty chosen
+    /// per session and sticks with that session because that makes the session
+    /// kitty special". Typing the companion's name is not a discovery; there is
+    /// no new collectible to present, so nothing about it justifies swapping
+    /// the sprite. A genuine first-ever sighting still goes through
+    /// `on_collect`, which legitimately shows off what it just unlocked.
+    ///
+    /// A hidden companion FADES IN (typing `kitty` must make a kitty appear —
+    /// that is the whole point of the gesture), and a visible one simply
+    /// delights in place: `CursorCat` enters `FadeIn` only from `Hidden`/
+    /// `FadeOut`, so `kittykittykitty` extends one appearance rather than
+    /// strobing it.
+    pub fn on_summon(&mut self, now: Instant, hits: u8) {
+        self.momentum.set_value(now, 1.0);
+        self.last = Some(now);
+        self.sustain = 0.0;
+        self.run_keys = 0;
+        self.exit = CatExit::Plain;
+        self.colors = None;
+        let waking = matches!(self.state, State::Hidden | State::FadeOut(_));
+        if waking {
+            // A summoned appearance is guaranteed visible for the same hold a
+            // discovery gets, so the cat cannot flicker straight back out at
+            // zero typing momentum.
+            self.discovery_until = Some(now + Duration::from_secs_f32(DISCOVERY_HOLD));
+            self.collection_hello = true;
+            self.collection_paused_at = None;
+            // A look parked by the mid-appearance latch lands on the wake —
+            // the fresh appearance is the first moment a swap cannot read as
+            // the cat morphing mid-air.
+            if let Some(pending) = self.pending_look.take() {
+                self.look = pending;
+            }
+            self.state = State::FadeIn(now);
+            self.flight = Some(now);
+        }
+        // The leap is the reaction either way; `on_delight` requires a live
+        // companion, which the wake above has just guaranteed.
+        self.on_delight(now, hits.max(1));
+    }
+
     /// Pause or resume a collection hello at the host's drawability boundary.
     /// Ordinary earned flights keep their existing focus behavior; only the
     /// one-shot discovery promise is frozen while it cannot be presented.
@@ -873,15 +995,48 @@ impl CursorCat {
         self.reaction
     }
 
-    /// The gentle airborne hover-bob (fraction of cell height) at `now`.
+    /// The gentle airborne hover-bob (fraction of cell height) at `now`, plus
+    /// the feline-delight LEAP when one is live.
     fn bob(&self, now: Instant) -> f32 {
-        match self.flight {
+        let hover = match self.flight {
             Some(t0) => {
                 let t = now.saturating_duration_since(t0).as_secs_f32();
                 (std::f32::consts::TAU * 1.4 * t).sin() * BOB_AMP
             }
             None => 0.0,
+        };
+        // NEGATIVE is up: `bob` is a signed fraction of cell height and the
+        // renderer subtracts it from the dest y, so the hop must push down the
+        // number line to rise on screen.
+        hover - self.delight_leap(now)
+    }
+
+    /// Normalized 0..1 progress through the delight hop, or 0 when none is
+    /// live. Shared by the leap offset and the stretch shaping so the apex of
+    /// the arc and the peak of the stretch are the same instant.
+    fn delight_arc(&self, now: Instant) -> f32 {
+        if !matches!(self.reaction, CatReaction::Delight) {
+            return 0.0;
         }
+        let Some(t0) = self.delight_at else {
+            return 0.0;
+        };
+        let elapsed = now.saturating_duration_since(t0).as_secs_f32();
+        (elapsed / DELIGHT_HOLD).clamp(0.0, 1.0)
+    }
+
+    /// The hop's height at `now` as a positive fraction of cell height: a half
+    /// sine over the hold, so the cat rises, hangs, and lands smoothly back on
+    /// its anchor. Scaled by the bounded phrase chain — a second `kitty`
+    /// inside the window hops higher than the first.
+    fn delight_leap(&self, now: Instant) -> f32 {
+        let arc = self.delight_arc(now);
+        if arc <= 0.0 || arc >= 1.0 {
+            return 0.0;
+        }
+        let chain = f32::from(self.delight_chain.max(1));
+        let strength = 1.0 + 0.16 * (chain - 1.0);
+        (std::f32::consts::PI * arc).sin() * DELIGHT_LEAP * strength
     }
 
     /// Advance the eased "display momentum" spine toward `target` (the live
@@ -1006,6 +1161,42 @@ impl CursorCat {
             lead = lead * (1.0 - env.min(1.0)) - WINCE_RECOIL * env;
             scale_y *= 1.0 - WINCE_SQUASH * env;
             scale_x *= 1.0 + WINCE_SQUASH * 0.7 * env;
+            // The TUMBLE: a decaying lateral rock on top of the recoil, its
+            // frequency riding the chain so a string of curses visibly knocks
+            // the cat about. Counter-phase scale wobble sells the roll that the
+            // rotation-free pose transform cannot express directly.
+            let swing = (-WINCE_TUMBLE_DECAY * elapsed).exp()
+                * (std::f32::consts::TAU * WINCE_TUMBLE_FREQ * f32::from(chain).sqrt() * elapsed)
+                    .sin();
+            lead += WINCE_TUMBLE * swing * attack * settle;
+            scale_x *= 1.0 + 0.05 * swing * attack * settle;
+            scale_y *= 1.0 - 0.05 * swing * attack * settle;
+        }
+        // FELINE-word delight: the springing leap. One smooth hop — rise,
+        // stretch tall at the apex, squash back on the way down — scaled by the
+        // bounded phrase chain. The vertical offset itself rides `bob` (see
+        // `delight_leap`); here only the body's stretch/squash is shaped, so the
+        // hop reads as a spring rather than a translated sticker.
+        if matches!(reaction, CatReaction::Delight) {
+            let elapsed = self
+                .delight_at
+                .map_or(0.0, |t0| now.saturating_duration_since(t0).as_secs_f32());
+            let attack = smoothstep(0.0, DELIGHT_ATTACK, elapsed);
+            let settle = self.reaction_until.map_or(1.0, |until| {
+                smoothstep(
+                    0.0,
+                    DELIGHT_SETTLE,
+                    until.saturating_duration_since(now).as_secs_f32(),
+                )
+            });
+            let arc = self.delight_arc(now);
+            let env = attack * settle;
+            // Stretch on the way up, squash through the landing.
+            let stretch = (std::f32::consts::PI * arc).sin() * env;
+            scale_y *= 1.0 + DELIGHT_STRETCH * stretch;
+            scale_x *= 1.0 - DELIGHT_STRETCH * 0.55 * stretch;
+            // A small forward lean into the hop — eagerness, not banking.
+            lead += 0.05 * stretch;
         }
         // SING-ALONG DANCE overlay (`crate::nyan_sing`): a beat-synced loop
         // over the banking spine — each beat lands as a squash bounce that
@@ -1028,6 +1219,9 @@ impl CursorCat {
             && matches!(reaction, CatReaction::Cruise | CatReaction::Discovery);
         let eyes = if matches!(reaction, CatReaction::Wince) {
             EyesFrame::Blink
+        } else if matches!(reaction, CatReaction::Delight) {
+            // Hearing its own name is the happiest the companion gets.
+            EyesFrame::Happy
         } else if !plain_face {
             EyesFrame::Open
         } else if self.sing > 0.33 || self.disp >= HAPPY_GATE {
@@ -2091,6 +2285,145 @@ mod tests {
         assert_eq!(frame.fp(), 0);
         assert!(!frame.collection_hello);
         assert!(!cat.is_active());
+    }
+
+    /// THE 2026-07-26 CONTRACT: typing a feline word must PRESENT the
+    /// companion without changing WHICH companion it is. Owner: "I don't want
+    /// the cursor kitty to change when I type kitty", and "I don't want the
+    /// kitty changing for no reason".
+    #[test]
+    fn on_summon_presents_without_ever_changing_the_look() {
+        let t = Instant::now();
+        let session_look = KittyLook::for_session(4242);
+        let mut cat = CursorCat::default();
+        cat.set_look(session_look);
+        assert!(!cat.is_active(), "starts hidden");
+
+        cat.on_summon(t, 1);
+        assert!(
+            cat.is_active(),
+            "typing the word makes a kitty appear (it was hidden)"
+        );
+        assert_eq!(
+            cat.frame(t).look,
+            session_look,
+            "the session's own kitty is the one that shows up"
+        );
+        assert_eq!(
+            cat.frame(t).reaction,
+            CatReaction::Delight,
+            "and it is delighted to hear its name"
+        );
+
+        // A second word inside the chain window must not re-skin it either.
+        cat.on_summon(t + Duration::from_millis(200), 1);
+        assert_eq!(
+            cat.frame(t + Duration::from_millis(200)).look,
+            session_look,
+            "repeat summons never swap the identity"
+        );
+    }
+
+    /// `on_collect` — a GENUINE discovery — still swaps, because unlocking a new
+    /// collectible is exactly the "reason" the owner's rule allows for.
+    #[test]
+    fn a_real_discovery_still_swaps_the_look() {
+        let t = Instant::now();
+        let mut cat = CursorCat::default();
+        cat.set_look(KittyLook::for_session(1));
+        let unlocked = KittyLook::for_session(999);
+        cat.on_collect(t, unlocked);
+        assert_eq!(
+            cat.frame(t).look,
+            unlocked.normalized(),
+            "a discovery presents the newly unlocked collectible"
+        );
+    }
+
+    /// Session kitties are UNIQUE per session and STABLE for that session's
+    /// life — the property that makes the session kitty special.
+    #[test]
+    fn session_kitties_are_unique_and_stable() {
+        let looks: Vec<KittyLook> = (0..64u64).map(KittyLook::for_session).collect();
+        for (i, look) in looks.iter().enumerate() {
+            assert_eq!(
+                *look,
+                KittyLook::for_session(i as u64),
+                "the same session always resolves to the same kitty"
+            );
+            assert_eq!(*look, look.normalized(), "session kitties are normalized");
+            assert!(
+                look.accessory.is_none(),
+                "accessories mark COLLECTED cats and are never minted for free"
+            );
+        }
+        let distinct: std::collections::HashSet<_> = looks
+            .iter()
+            .map(|l| (l.variant, l.coat, l.iris, l.age as u8))
+            .collect();
+        assert!(
+            distinct.len() >= 32,
+            "sessions get visibly different kitties, got {} distinct of 64",
+            distinct.len()
+        );
+        assert_ne!(
+            KittyLook::for_session(0),
+            KittyLook::default(),
+            "a session kitty is not the one shared default cat"
+        );
+    }
+
+    /// Both typed-word reactions are EXPRESSION on a live companion: they never
+    /// summon a hidden one, and `on_delight` never touches the identity.
+    #[test]
+    fn typed_word_reactions_are_bounded_expression() {
+        let t = Instant::now();
+        let mut hidden = CursorCat::default();
+        assert!(
+            !hidden.on_delight(t, 1),
+            "delight never summons a hidden companion"
+        );
+        assert!(
+            !hidden.on_curse(t, 1),
+            "a wince never summons a hidden companion"
+        );
+        assert!(!hidden.is_active());
+
+        let look = KittyLook::for_session(7);
+        let mut live = CursorCat::default();
+        live.set_look(look);
+        live.on_summon(t, 1);
+        assert!(live.on_curse(t + Duration::from_millis(10), 1));
+        let frame = live.frame(t + Duration::from_millis(10));
+        assert_eq!(frame.reaction, CatReaction::Wince);
+        assert_eq!(frame.look, look, "a wince never re-skins the companion");
+    }
+
+    /// The delight LEAP actually lifts the cat and returns it to its anchor —
+    /// the "expression + pose" model the owner picked over expression alone.
+    #[test]
+    fn delight_leaps_and_lands() {
+        let t = Instant::now();
+        let mut cat = CursorCat::default();
+        cat.set_look(KittyLook::for_session(11));
+        cat.on_summon(t, 1);
+        let rest = cat.frame(t).bob;
+        // Mid-hold is the apex of the half-sine arc.
+        let apex = cat
+            .frame(t + Duration::from_secs_f32(DELIGHT_HOLD / 2.0))
+            .bob;
+        assert!(
+            apex < rest - 0.2,
+            "the cat visibly leaps (bob is negative-up): rest {rest}, apex {apex}"
+        );
+        // Past the hold the leap has fully released.
+        let after = cat
+            .frame(t + Duration::from_secs_f32(DELIGHT_HOLD * 1.5))
+            .bob;
+        assert!(
+            after.abs() < 0.2,
+            "the hop lands back on the anchor, got {after}"
+        );
     }
 
     #[test]

@@ -1230,7 +1230,9 @@ mod park_reader_tests {
         super::reset_reader_latches(&session);
 
         assert!(
-            !session.reader_stop.load(std::sync::atomic::Ordering::Acquire),
+            !session
+                .reader_stop
+                .load(std::sync::atomic::Ordering::Acquire),
             "a fresh reader must not start already stopped"
         );
         // The observable consequence, not just the field value: the very next

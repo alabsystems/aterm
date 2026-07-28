@@ -166,6 +166,28 @@ impl App {
         outcome: crate::native_app::UpdateOutcome,
         open_details: bool,
     ) {
+        // Persist the apply-lane verdict into the updater's own health ledger and
+        // status file BEFORE any UI reaction. Until this existed the apply lane was
+        // invisible to `aterm-ctl update status`: a handoff could fail every single
+        // time for three releases while `health.toml` stayed all-zero and status
+        // said "up to date", because only the download lane was ever recorded.
+        //
+        // Only terminal verdicts are recorded. `Deferred`/`Blocked` mean "not yet,
+        // conditions were not met" — a normal, self-correcting state that would
+        // otherwise manufacture a failure streak every time the user happened to be
+        // typing.
+        let current_build = self.native_updater_service.snapshot().current_build;
+        match &outcome {
+            crate::native_app::UpdateOutcome::Failed { message } => {
+                aterm_update::record_apply_failure(current_build, message);
+            }
+            crate::native_app::UpdateOutcome::Accepted => {
+                aterm_update::record_apply_success(current_build);
+            }
+            crate::native_app::UpdateOutcome::InstalledNeedsRelaunch { .. }
+            | crate::native_app::UpdateOutcome::Deferred { .. }
+            | crate::native_app::UpdateOutcome::Blocked { .. } => {}
+        }
         match outcome {
             crate::native_app::UpdateOutcome::Accepted => {
                 aterm_log::info!("update apply ({source}): accepted");

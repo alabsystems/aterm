@@ -17,9 +17,13 @@ use std::process::Command;
 use aterm_types::fs_restricted::dir_safe_for_private_write;
 
 /// Appended to a tool name to form the concrete executable name. Empty on Unix.
+/// Applied ONLY by [`crate::store::ToolName::exe_file`] — that both suffixes are `""` here is
+/// precisely why appending either by hand went unnoticed until the Windows backend landed.
 pub const EXE_SUFFIX: &str = "";
 /// Appended to a tool name to form the concrete `bin/` shim filename. Empty on Unix
-/// (the shim is a bare symlink named `<tool>`).
+/// (the shim is a bare symlink named `<tool>`). Applied ONLY by
+/// [`crate::store::ToolName::shim_file`] and stripped ONLY by
+/// [`crate::store::ToolName::from_shim_file`].
 pub const SHIM_SUFFIX: &str = "";
 
 /// The default install prefix under `home`: `…/Library/Application Support/aterm/pkg`,
@@ -119,7 +123,7 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
 /// Atomically point `link` at `target`: create a sibling temp symlink and `rename(2)` it
 /// over `link`. `rename` is atomic on POSIX, so the swap has no window where `link` is
 /// missing or partially written — even if a previous `link` already existed. The
-/// directory-indirection primitive behind `channels/<ch>/current` and the Kani dir links.
+/// directory-indirection primitive behind `channels/<ch>/current` and the sysroot dir links.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     // `Path::file_name` / `OsStr::to_str` go via `call1`: std's INLINED `unsafe`
     // (the `from_utf8_unchecked` fast path, the `OsStr` byte-slice casts) is

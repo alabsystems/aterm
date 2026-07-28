@@ -383,9 +383,16 @@ where
         let shared = Arc::clone(&shared);
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
+            // A local EOF is a DIRECTIONAL statement ("I have no more request to
+            // send"), not "the conversation is over". A fatal error IS the latter.
+            // The teardown below is the only place that difference is observable.
+            let mut graceful = false;
             'up: loop {
                 match local_up.read(&mut buf) {
-                    Ok(0) => break 'up, // local EOF -> drain, then teardown
+                    Ok(0) => {
+                        graceful = true;
+                        break 'up; // local EOF -> half-close, drain, keep reading
+                    }
                     Ok(n) => {
                         let mut written = 0usize;
                         let mut g = shared.lock();
@@ -411,7 +418,10 @@ where
                         }
                     }
                     Err(e) if is_would_block(&e) => {}
-                    Err(e) if is_normal_close(&e) => break 'up,
+                    Err(e) if is_normal_close(&e) => {
+                        graceful = true;
+                        break 'up;
+                    }
                     Err(e) => {
                         let mut g = shared.lock();
                         if !g.done {
@@ -428,6 +438,12 @@ where
             // peer is already going away).
             let deadline = Instant::now() + RELAY_DRAIN_MAX;
             let mut g = shared.lock();
+            // Tell the peer THIS direction is finished, so it can stop waiting on
+            // more request bytes while still sending its response.
+            if graceful && !g.done {
+                g.conn.send_close_notify();
+                shared.cv.notify_all();
+            }
             while !g.done && (g.conn.wants_write() || g.inflight) {
                 let now = Instant::now();
                 if now >= deadline {
@@ -439,11 +455,26 @@ where
                     .unwrap_or_else(|p| p.into_inner())
                     .0;
             }
-            g.done = true;
+            // A graceful half-close must NOT mark the relay done: the download
+            // direction is still live and the peer's response may still be
+            // arriving. Marking it done here (and shutting the socket down BOTH
+            // ways below) truncated that response tail — a local proxy that
+            // finished sending its request killed the reply it was waiting for.
+            // Only a FATAL error ends both directions.
+            if !graceful {
+                g.done = true;
+            }
             drop(g);
             shared.cv.notify_all();
-            // Unblock the downloader's TCP read so it observes teardown.
-            let _ = tcp_up.shutdown(std::net::Shutdown::Both);
+            // Unblock the downloader's TCP read so it observes teardown — but on
+            // a graceful EOF close only OUR write half, leaving the peer free to
+            // keep sending. The downloader performs the final `Both` shutdown
+            // when the response genuinely ends.
+            let _ = tcp_up.shutdown(if graceful {
+                std::net::Shutdown::Write
+            } else {
+                std::net::Shutdown::Both
+            });
         })
     };
 
@@ -848,4 +879,82 @@ mod tests {
         );
         let _ = srv.join();
     }
+
+    /// A GRACEFUL local EOF is a half-close of ONE direction, not the end of the
+    /// conversation. The relay used to answer it with `Shutdown::Both`, so a
+    /// local service that finished writing its reply killed the still-live
+    /// request direction and any bytes the peer sent afterwards were lost.
+    ///
+    /// Deterministic by construction — every step is sequenced by a channel, so
+    /// there is no sleep and no timing assumption. The service closes its WRITE
+    /// half, announces that it has done so, and only THEN does the client send
+    /// the second request. Under the old `Shutdown::Both` that second request can
+    /// never arrive; with a directional half-close it must.
+    #[test]
+    fn graceful_local_eof_half_closes_without_killing_the_request_direction() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let pin = cert_fingerprint(TEST_CERT_DER);
+        let (svc_a, mut svc_b) = CtlStream::pair().unwrap();
+
+        const FIRST: &[u8] = b"first-request\n";
+        const REPLY: &[u8] = b"the-whole-reply\n";
+        const SECOND: &[u8] = b"second-request\n";
+
+        let (write_half_closed_tx, write_half_closed_rx) = std::sync::mpsc::channel();
+        let (second_seen_tx, second_seen_rx) = std::sync::mpsc::channel();
+
+        let service = std::thread::spawn(move || {
+            let mut first = vec![0u8; FIRST.len()];
+            svc_b.read_exact(&mut first).unwrap();
+            assert_eq!(first, FIRST, "the relay must deliver the first request");
+            svc_b.write_all(REPLY).unwrap();
+            svc_b.flush().unwrap();
+            // The uploader (local -> TLS) now observes EOF. This is the graceful
+            // half-close under test.
+            svc_b.shutdown(std::net::Shutdown::Write).unwrap();
+            write_half_closed_tx.send(()).unwrap();
+            // The request direction must still be alive.
+            let mut second = vec![0u8; SECOND.len()];
+            let outcome = svc_b.read_exact(&mut second).map(|()| second);
+            second_seen_tx.send(outcome.map_err(|e| e.kind())).unwrap();
+        });
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let transport = accept(tcp, scfg).unwrap();
+            let _ = relay(transport, svc_a);
+        });
+
+        let tcp = TcpStream::connect(addr).unwrap();
+        let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
+        client.stream().write_all(FIRST).unwrap();
+        client.stream().flush().unwrap();
+
+        let mut reply = vec![0u8; REPLY.len()];
+        client.stream().read_exact(&mut reply).unwrap();
+        assert_eq!(reply, REPLY, "the reply must survive intact");
+
+        // Sequenced: the half-close has definitely happened before this send.
+        write_half_closed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("service should announce its write-half close");
+        client.stream().write_all(SECOND).unwrap();
+        client.stream().flush().unwrap();
+
+        let seen = second_seen_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("service should report on the second request");
+        assert_eq!(
+            seen.as_deref(),
+            Ok(SECOND),
+            "a graceful local EOF must half-close only the response direction; \
+             the request direction stayed open and delivered the second request"
+        );
+
+        drop(client);
+        service.join().unwrap();
+        server.join().unwrap();
+    }
+
 }

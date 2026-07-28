@@ -1911,6 +1911,28 @@ pub(crate) struct UpdateConfig {
     /// stage-and-wait behavior (apply on click / next launch).
     /// `ATERM_NO_AUTO_APPLY` forces it off for one run.
     pub(crate) auto_apply: Option<bool>,
+    /// OPT IN to Apple Developer-ID + notarization enforcement for self-updates.
+    ///
+    /// Absent (the default) means the shipped posture: aterm's own releases are
+    /// ad-hoc signed with no Team ID, so the updater runs the structural
+    /// `codesign --verify` and never consults notarization. That is what lets an
+    /// unsigned dev or self-hosted build update at all, and it is deliberate —
+    /// authenticity in that tier comes from the channel plus the manifest SHA-256
+    /// (and the Ed25519 manifest signature when one is configured).
+    ///
+    /// Set it to a Team ID once you actually sign releases with a Developer ID and
+    /// the updater will additionally require every staged bundle to be signed by
+    /// that team AND accepted by Gatekeeper.
+    ///
+    /// ```toml
+    /// [update]
+    /// require_team_id = "ABCDE12345"
+    /// ```
+    ///
+    /// It can only TIGHTEN: a build that already has a Team ID compiled in ignores
+    /// this key entirely, so a config file can never downgrade a signed build's
+    /// trust anchor. See `aterm_update::set_required_team_id`.
+    pub(crate) require_team_id: Option<String>,
 }
 
 /// Whether a staged update applies immediately (config `update.auto_apply`,

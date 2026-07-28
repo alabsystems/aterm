@@ -607,6 +607,39 @@ fn xterm_modify_other_keys_level1_ctrl_char_falls_through() {
 }
 
 #[test]
+fn xterm_modify_other_keys_level1_preserves_backspace_legacy_forms() {
+    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Backspace), Modifiers::ALT, mode),
+        vec![0x1b, 0x7f],
+        "Alt+Backspace is not an xterm modifyOtherKeys packet"
+    );
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Backspace), Modifiers::CTRL, mode),
+        vec![0x08],
+        "Ctrl+Backspace keeps the DECBKM toggle"
+    );
+}
+
+#[test]
+fn xterm_modify_other_keys_level1_reports_only_ambiguous_ctrl_shift_chars() {
+    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL1;
+    assert_eq!(
+        encode_key(
+            &Key::Character('c'),
+            Modifiers::CTRL | Modifiers::SHIFT,
+            mode
+        ),
+        b"\x1b[27;6;99~"
+    );
+    assert_eq!(
+        encode_key(&Key::Character('1'), Modifiers::CTRL, mode),
+        b"\x1b[27;5;49~",
+        "Ctrl+1 has no traditional C0 mapping, so level 1 must retain Ctrl"
+    );
+}
+
+#[test]
 fn xterm_modify_other_keys_level2_ctrl_char() {
     // Level 2: any modifier triggers modifyOtherKeys encoding
     let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
@@ -621,6 +654,42 @@ fn xterm_modify_other_keys_level2_shift_char() {
     let result = encode_key(&Key::Character('a'), Modifiers::SHIFT, mode);
     // Default format: CSI 27;2;97 ~ (mod=2=shift, code=97='a')
     assert_eq!(result, b"\x1b[27;2;97~");
+}
+
+#[test]
+fn xterm_modify_other_keys_level2_preserves_unambiguous_shifted_text() {
+    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
+    assert_eq!(
+        encode_key(&Key::Character('1'), Modifiers::SHIFT, mode),
+        b"!",
+        "Shift+1 is ordinary shifted text, not a numeric CSI packet"
+    );
+    assert_eq!(
+        encode_key(&Key::Character('='), Modifiers::SHIFT, mode),
+        b"+"
+    );
+    assert_eq!(
+        encode_key(&Key::Character('é'), Modifiers::SHIFT, mode),
+        "é".as_bytes()
+    );
+    assert_eq!(
+        encode_key(&Key::Character('2'), Modifiers::SHIFT, mode),
+        b"\x1b[27;2;50~",
+        "Shift+2 produces '@', which is in xterm's control-input range"
+    );
+}
+
+#[test]
+fn xterm_modify_other_keys_level2_ctrl_backspace_uses_legacy_toggle() {
+    let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Backspace), Modifiers::CTRL, mode),
+        vec![0x08]
+    );
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Backspace), Modifiers::SHIFT, mode),
+        b"\x1b[27;2;127~"
+    );
 }
 
 #[test]
@@ -667,10 +736,16 @@ fn xterm_modify_other_keys_no_mods_falls_through() {
 }
 
 #[test]
-fn xterm_modify_other_keys_numpad_equal_preserves_character_behavior() {
+fn xterm_modify_other_keys_does_not_capture_keypad_keys() {
     let mode = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
-    let result = encode_key(&Key::Named(NamedKey::NumpadEqual), Modifiers::ALT, mode);
-    assert_eq!(result, b"\x1b[27;3;61~");
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::NumpadEqual), Modifiers::ALT, mode),
+        b"\x1b="
+    );
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::NumpadEnter), Modifiers::ALT, mode),
+        b"\x1b\r"
+    );
 }
 
 // =========================================================================

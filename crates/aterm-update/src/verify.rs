@@ -9,6 +9,66 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// Wall-clock ceiling for one verification helper.
+///
+/// Every helper here is an external process on the APPLY path, and the apply path
+/// runs at the very top of `main()` before the window exists — so a helper that
+/// never returns is a terminal that never starts. `spctl` is the one that makes
+/// this concrete rather than theoretical: Gatekeeper assessment can reach out to
+/// Apple's notarization service, and on a captive-portal / half-open network that
+/// call can hang far past any useful bound. `codesign` and `PlistBuddy` are local
+/// and finish in tens of milliseconds, but they share the ceiling because a hung
+/// child is a hung child.
+///
+/// 30s is far above any healthy run (a 48 MB universal binary verifies in ~1-2s)
+/// and far below "the user thinks the app is broken".
+const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often to poll for child exit while waiting.
+const HELPER_POLL: Duration = Duration::from_millis(25);
+
+/// Run a verification helper with a bounded wall clock, killing it on timeout.
+///
+/// Fails CLOSED like every other check here: a timeout is an `Err`, i.e. a
+/// rejection, never a pass. `what` names the helper for the error text.
+///
+/// The output of these helpers is a few hundred bytes at most, so collecting it
+/// after the child exits cannot deadlock on a full pipe. Do not reuse this for a
+/// child that streams volume.
+fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {what}: {e}"))?;
+    let deadline = Instant::now() + HELPER_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Reap it so the timed-out helper cannot linger as a zombie
+                    // holding the bundle open across the swap.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{what} did not finish within {}s; treating as a rejection",
+                        HELPER_TIMEOUT.as_secs()
+                    ));
+                }
+                std::thread::sleep(HELPER_POLL);
+            }
+            Err(e) => return Err(format!("wait for {what}: {e}")),
+        }
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| format!("collect {what} output: {e}"))
+}
 
 /// Full apply-/stage-time gate: structural codesign seal, Team-ID pin, and
 /// Gatekeeper/notarization acceptance. `expected_team` is [`crate::PINNED_TEAM_ID`].
@@ -44,11 +104,12 @@ pub fn verify_bundle_policy(app: &Path, expected_team: &str) -> Result<(), Strin
 /// signature seal is intact and nothing in the bundle changed since signing, but does
 /// not constrain the signer (an ad-hoc signature passes). The default-tier check.
 fn codesign_structural(app: &Path) -> Result<(), String> {
-    let out = Command::new("/usr/bin/codesign")
-        .args(["--verify", "--deep", "--strict", "--verbose=2"])
-        .arg(app)
-        .output()
-        .map_err(|e| format!("spawn codesign: {e}"))?;
+    let out = output_bounded(
+        Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict", "--verbose=2"])
+            .arg(app),
+        "codesign --verify (structural)",
+    )?;
     if out.status.success() {
         Ok(())
     } else {
@@ -70,11 +131,12 @@ fn codesign_structural(app: &Path) -> Result<(), String> {
 /// it after `verify_bundle` means it can't have been tampered post-signing.
 pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
     let plist = app.join("Contents/Info.plist");
-    let out = Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print :CFBundleVersion"])
-        .arg(&plist)
-        .output()
-        .map_err(|e| format!("spawn PlistBuddy: {e}"))?;
+    let out = output_bounded(
+        Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :CFBundleVersion"])
+            .arg(&plist),
+        "PlistBuddy CFBundleVersion",
+    )?;
     if !out.status.success() {
         return Err(format!(
             "read CFBundleVersion: {}",
@@ -92,11 +154,12 @@ pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
 /// small, valid UTF-8 value so process output cannot become an allocation surface.
 pub fn bundle_git_commit(app: &Path) -> Result<String, String> {
     let plist = app.join("Contents/Info.plist");
-    let out = Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print :ATermGitCommit"])
-        .arg(&plist)
-        .output()
-        .map_err(|e| format!("spawn PlistBuddy: {e}"))?;
+    let out = output_bounded(
+        Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :ATermGitCommit"])
+            .arg(&plist),
+        "PlistBuddy ATermGitCommit",
+    )?;
     if !out.status.success() {
         return Err(format!(
             "read ATermGitCommit: {}",
@@ -142,11 +205,12 @@ fn codesign_verify(app: &Path, expected_team: &str) -> Result<(), String> {
          and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
          and certificate leaf[subject.OU] = \"{expected_team}\""
     );
-    let out = Command::new("/usr/bin/codesign")
-        .args(["--verify", "--deep", "--strict", "--verbose=2", "-R", &req])
-        .arg(app)
-        .output()
-        .map_err(|e| format!("spawn codesign: {e}"))?;
+    let out = output_bounded(
+        Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict", "--verbose=2", "-R", &req])
+            .arg(app),
+        "codesign --verify (team-pinned)",
+    )?;
     if out.status.success() {
         Ok(())
     } else {
@@ -161,11 +225,12 @@ fn codesign_verify(app: &Path, expected_team: &str) -> Result<(), String> {
 /// descriptive output to **stderr**, hence the merge; we scan for the
 /// `TeamIdentifier=...` line. A `not set` value (ad-hoc / unsigned) is rejected.
 pub fn team_id(app: &Path) -> Result<String, String> {
-    let out = Command::new("/usr/bin/codesign")
-        .args(["-d", "--verbose=4"])
-        .arg(app)
-        .output()
-        .map_err(|e| format!("spawn codesign -d: {e}"))?;
+    let out = output_bounded(
+        Command::new("/usr/bin/codesign")
+            .args(["-d", "--verbose=4"])
+            .arg(app),
+        "codesign -d (team id)",
+    )?;
     // -dv prints to stderr regardless of success; combine both streams.
     let text = format!(
         "{}{}",
@@ -194,11 +259,12 @@ fn parse_team_id(text: &str) -> Result<String, String> {
 /// (`-t exec`, not the DMG-install `-t install`). Reads the stapled notarization
 /// ticket from the bundle, so it succeeds offline.
 fn spctl_assess(app: &Path) -> Result<(), String> {
-    let out = Command::new("/usr/sbin/spctl")
-        .args(["-a", "-t", "exec", "-vvv"])
-        .arg(app)
-        .output()
-        .map_err(|e| format!("spawn spctl: {e}"))?;
+    let out = output_bounded(
+        Command::new("/usr/sbin/spctl")
+            .args(["-a", "-t", "exec", "-vvv"])
+            .arg(app),
+        "spctl assessment",
+    )?;
     if out.status.success() {
         Ok(())
     } else {

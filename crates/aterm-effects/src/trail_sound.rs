@@ -2176,7 +2176,8 @@ impl TrailSynth {
         let u1 = 0.5 * (1.0 + sin01(self.bed.lfo1));
         let u2 = 0.5 * (1.0 + sin01(self.bed.lfo2));
 
-        let (m, side) = palette_for(self.bed_voice, self.bed_style).bed_sample(self, dt, lvl, u1, u2);
+        let (m, side) =
+            palette_for(self.bed_voice, self.bed_style).bed_sample(self, dt, lvl, u1, u2);
         // `side` widens beds slightly; kept tiny to stay mono-compatible.
         (m + side, m - side)
     }
@@ -3918,7 +3919,14 @@ impl Palette for MechPalette {
         }
     }
 
-    fn bed_sample(&self, _s: &mut TrailSynth, _dt: f32, _lvl: f32, _u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(
+        &self,
+        _s: &mut TrailSynth,
+        _dt: f32,
+        _lvl: f32,
+        _u1: f32,
+        _u2: f32,
+    ) -> (f32, f32) {
         // A keyboard has no weather: the mech bed is STRUCTURALLY silent
         // (exact zeros, not a quiet render), whatever `trail_sound_bed` says.
         (0.0, 0.0)

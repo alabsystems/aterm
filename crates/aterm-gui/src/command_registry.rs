@@ -150,6 +150,13 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // Same identity as the keybinding face (K::ToggleMatrixRain below):
         // one command, two faces, converging on the per-session toggle.
         M::ToggleMatrixRain => spec("effects.rain.toggle", S::Process, A::LocalUi, C::Any),
+        // Promotes the front session's kitty into the durable registry. Scoped
+        // to the View because the session kitty belongs to the focused leaf;
+        // `LocalUi` because the only durable write is the machine-owned toy
+        // ledger, not config.
+        M::FavouriteSessionKitty => {
+            spec("effects.kitty.favourite", S::View, A::LocalUi, C::Terminal)
+        }
         M::ToggleSeriousMode => spec(
             "effects.serious.toggle",
             S::Process,

@@ -1213,9 +1213,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match attempt() {
-                Err(error)
-                    if error.contains("is busy") && std::time::Instant::now() < deadline =>
-                {
+                Err(error) if error.contains("is busy") && std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 settled => return settled,
@@ -1543,7 +1541,8 @@ mod tests {
         };
         let canonical = "file:///tmp/draft.md";
         let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &current)).unwrap();
+        let initialized =
+            settle_busy(|| host.initialize(decision.clone(), &disk, &current)).unwrap();
         let original = fs::read(&initialized.path).unwrap();
 
         let conflict = host.inspect_open(canonical, b"external").unwrap();
@@ -1552,7 +1551,8 @@ mod tests {
             Some(RecoveryNotice::DiskConflict)
         ));
         let (other_store, _, external) = snapshots("external");
-        let preserved = settle_busy(|| host.initialize(conflict.clone(), &external, &external)).unwrap();
+        let preserved =
+            settle_busy(|| host.initialize(conflict.clone(), &external, &external)).unwrap();
         assert_eq!(
             fs::read(preserved.preserved_path.unwrap()).unwrap(),
             original

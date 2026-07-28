@@ -423,7 +423,8 @@ impl CursorRainbow {
             let ch = geom.ch as i32;
             let cx = geom.origin_x as i32 + cc as i32 * cw;
             let cy = geom.origin_y as i32 + cr as i32 * ch;
-            let arm_cov = (TWINKLE_ARM_COV * pop * shimmer * cfg.intensity).min(OVER_INK_COV_CAP) as u8;
+            let arm_cov =
+                (TWINKLE_ARM_COV * pop * shimmer * cfg.intensity).min(OVER_INK_COV_CAP) as u8;
             if arm_cov > 0 {
                 // Star-white arms on dark themes; the vivid live hue on light
                 // ones (additive white is invisible over a light background).

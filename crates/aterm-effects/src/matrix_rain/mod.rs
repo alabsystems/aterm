@@ -1395,7 +1395,8 @@ impl MatrixRain {
             self.last_emit_nonempty,
             vis,
             self.drain_ticks,
-            self.last_seq.map_or_else(|| "none".into(), |s| s.to_string()),
+            self.last_seq
+                .map_or_else(|| "none".into(), |s| s.to_string()),
             self.content_streak,
         )
     }
@@ -4456,7 +4457,7 @@ mod tests {
     #[test]
     fn composer_material_gate_model_proves_and_catches_draft_sampling() {
         let model = composer_material_gate_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     #[test]
@@ -4638,7 +4639,7 @@ mod tests {
     #[test]
     fn semantic_pulse_derived_model_proves_and_catches_overflow() {
         let model = semantic_pulse_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     #[test]
@@ -4795,7 +4796,7 @@ mod tests {
     #[test]
     fn rain_activity_credit_derived_model_proves_and_catches_overflow() {
         let m = rain_activity_credit_model();
-        aterm_spec::verify::prove_and_catch_tiered(&m, m.name);
+        aterm_spec::verify::prove_and_catch_scalar(&m, m.name);
     }
 
     /// Tier-1: drive the shipping classifier through the synchronized

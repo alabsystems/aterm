@@ -206,6 +206,17 @@ pub fn first_matching_row(
 struct ActivityClock {
     last_seq: u64,
     last_at: Option<Instant>,
+    /// Which GRID `last_seq` was read from. `content_seq` is a **per-grid**
+    /// counter, not a session clock: entering the alt screen installs a fresh
+    /// grid whose `content_gen` restarts at 1, and leaving restores the main
+    /// grid's stale-but-higher value. Comparing across a swap is comparing
+    /// incomparable numbers, so the buffer identity travels with the reading and
+    /// a flip is treated as a RESYNC rather than a comparison.
+    ///
+    /// Every other `content_seq` consumer already keys on this compound
+    /// (`subscribe.rs`'s GAP-on-flip, `control_query`'s poll cache,
+    /// `search_index`); the observation kernel was the one that did not.
+    alt: bool,
 }
 
 /// One armed watcher — the single watcher type, distinguished only by `spec`.
@@ -222,6 +233,17 @@ struct Watcher {
     /// advance, so an ALREADY-matching row latches at arm. Cleared after the first
     /// `observe`.
     fresh: bool,
+    /// Which GRID this watcher was armed against. `WatcherSpec::SeqAdvanced`'s
+    /// `after` is a per-grid `content_gen`, so it is only comparable against a
+    /// reading from the SAME buffer. Held privately here rather than in the
+    /// public spec so the enum's shape is unchanged.
+    ///
+    /// A buffer swap is itself an observable surface change, so crossing one
+    /// LATCHES rather than starving: without this, `await seq <main-n>` never
+    /// fires while a TUI is on the alt screen (the counter restarted at 1), and
+    /// on 1049-exit the restored high-water counter fires it with no content
+    /// change at all.
+    armed_alt: bool,
 }
 
 /// A bounded set of armed watchers plus the activity clock. Lives in
@@ -277,6 +299,14 @@ impl WatcherSet {
         self.clock.last_seq
     }
 
+    /// Which GRID [`seen_seq`](Self::seen_seq) was read from. The dirty-row gate
+    /// compares it so a 1049 swap counts as activity instead of being read as
+    /// "the counter went backwards, nothing happened".
+    #[must_use]
+    pub fn seen_alt(&self) -> bool {
+        self.clock.alt
+    }
+
     /// Whether a row scan would do work this batch: some un-latched `RowMatches`
     /// watcher is either fresh (just armed) or content advanced. The Terminal glue
     /// collects row text only when this holds.
@@ -314,6 +344,9 @@ impl WatcherSet {
             deadline,
             latched: None,
             fresh,
+            // The clock's grid identity IS the arming grid: `Terminal::watch`
+            // seeds it (`seed_seq_in`) immediately before arming.
+            armed_alt: self.clock.alt,
         });
         Some(id)
     }
@@ -339,6 +372,20 @@ impl WatcherSet {
         if self.clock.last_seq < seq {
             self.clock.last_seq = seq;
         }
+    }
+
+    /// [`seed_seq`](Self::seed_seq) with the ACTIVE-GRID identity. On a grid
+    /// change the baseline is SET, not raised — the monotone rule is only sound
+    /// WITHIN one buffer, and applying it across a swap is what pins the clock
+    /// at the main grid's high-water mark and starves every predicate for the
+    /// whole alt-screen lifetime.
+    pub fn seed_seq_in(&mut self, seq: u64, alt: bool) {
+        if alt != self.clock.alt {
+            self.clock.alt = alt;
+            self.clock.last_seq = seq;
+            return;
+        }
+        self.seed_seq(seq);
     }
 
     /// `true` iff an un-latched `BlockComplete` watcher is armed — gates the
@@ -380,9 +427,28 @@ impl WatcherSet {
         now: Instant,
         rows: &[Option<String>],
     ) -> bool {
-        let advanced = content_seq > self.clock.last_seq;
+        self.observe_in(content_seq, false, newest_block_complete, now, rows)
+    }
+
+    /// [`observe`](Self::observe) with the ACTIVE-GRID identity supplied — the
+    /// form the engine calls. A change of `alt` means the counter came from a
+    /// different grid, so it is a **resync**, never a comparison: activity is
+    /// stamped and the baseline is SET (not monotonically raised, which is what
+    /// would otherwise pin it at the main grid's high-water mark for the whole
+    /// alt-screen lifetime and starve every predicate).
+    pub fn observe_in(
+        &mut self,
+        content_seq: u64,
+        alt: bool,
+        newest_block_complete: bool,
+        now: Instant,
+        rows: &[Option<String>],
+    ) -> bool {
+        let flipped = alt != self.clock.alt;
+        let advanced = flipped || content_seq > self.clock.last_seq;
         if advanced {
             self.clock.last_seq = content_seq;
+            self.clock.alt = alt;
             self.clock.last_at = Some(now);
         }
         let mut latched_any = false;
@@ -396,7 +462,11 @@ impl WatcherSet {
             let mut new_deadline: Option<Instant> = None;
             match &w.spec {
                 WatcherSpec::SeqAdvanced { after } => {
-                    if content_seq > *after {
+                    // `after` is a per-grid counter. Only compare it against a
+                    // reading from the SAME grid; crossing a buffer swap is a
+                    // real surface change, so it latches on the identity change
+                    // rather than on an incomparable number.
+                    if alt != w.armed_alt || content_seq > *after {
                         new_latch = Some(Satisfaction {
                             seq: content_seq,
                             at: now,
@@ -491,7 +561,10 @@ impl super::Terminal {
             return;
         }
         let seq = self.content_seq();
-        let advanced = seq > self.watchers.seen_seq();
+        // The ACTIVE-GRID identity travels with the reading: `content_seq` is
+        // per-grid, so a 1049 swap makes the raw counter incomparable.
+        let alt = self.is_alternate_screen();
+        let advanced = alt != self.watchers.seen_alt() || seq > self.watchers.seen_seq();
         // Walk the command blocks ONLY when a BlockComplete watcher is armed.
         let newest_complete = self.watchers.has_block_complete()
             && self.all_blocks().last().is_some_and(|b| {
@@ -524,11 +597,13 @@ impl super::Terminal {
                 let mut s = slot.take().unwrap_or_default();
                 *slot = self.row_text_into(i, &mut s).then_some(s);
             }
-            self.watchers.observe(seq, newest_complete, now, &scratch);
+            self.watchers
+                .observe_in(seq, alt, newest_complete, now, &scratch);
             self.row_text_scratch = scratch;
         } else {
             // Gate closed: no row text needed this batch.
-            self.watchers.observe(seq, newest_complete, now, &[]);
+            self.watchers
+                .observe_in(seq, alt, newest_complete, now, &[]);
         }
     }
 
@@ -546,7 +621,7 @@ impl super::Terminal {
         // defaults to 0, which would otherwise look like a fresh content jump and
         // spuriously reset an `IdleFor` deadline).
         let seq = self.content_seq();
-        self.watchers.seed_seq(seq);
+        self.watchers.seed_seq_in(seq, self.is_alternate_screen());
         let id = self.watchers.arm(spec, now)?;
         if arm_eval {
             // Note the ordering: `seed_seq` above has already set the activity
@@ -635,6 +710,69 @@ mod tests {
 
     /// No row text: the scalar predicates do not read rows.
     const NO_ROWS: &[Option<String>] = &[];
+
+    /// THE ARM-TIME CONTRACT, at the level the bug actually lived.
+    ///
+    /// `await seq <n>` was edge-triggered for months: [`WatcherSet::arm`] set its
+    /// `fresh` flag from `spec.is_row()`, so only `RowMatches` was evaluated at arm
+    /// and `SeqAdvanced` waited for the NEXT unrelated batch — forever on a quiet
+    /// session. An agent that recorded a seq last turn and asked "did anything
+    /// change?" was told no while a screenful of output sat on the surface, and it
+    /// failed as a plausible `OK timeout` rather than an error.
+    ///
+    /// The predicate arithmetic was never wrong, so a `WatcherSet`-only test cannot
+    /// catch this: the defect was the WIRING. These two tests pin the wiring —
+    /// which predicates are level-triggered, and that `Terminal::watch` really
+    /// evaluates them before returning.
+    #[test]
+    fn needs_arm_eval_is_exactly_the_level_triggered_predicates() {
+        // Statements about the surface as it ALREADY is -> must latch at arm.
+        assert!(WatcherSpec::SeqAdvanced { after: 0 }.needs_arm_eval());
+        // ...and this is the assertion the old `is_row()` wiring failed.
+        assert!(
+            WatcherSpec::SeqAdvanced { after: 7 }.needs_arm_eval(),
+            "SeqAdvanced is level-triggered; arming must not wait for the next batch"
+        );
+        // Deliberately edge/deadline-triggered: idle is arm-relative, and
+        // BlockComplete latching at arm would fire `await block` on the PREVIOUS
+        // block.
+        assert!(
+            !WatcherSpec::IdleFor {
+                dur: Duration::from_millis(1)
+            }
+            .needs_arm_eval()
+        );
+        assert!(!WatcherSpec::BlockComplete.needs_arm_eval());
+    }
+
+    #[test]
+    fn watch_latches_an_already_advanced_seq_before_it_returns() {
+        let mut term = crate::terminal::Terminal::new(6, 20);
+        // Advance content_seq the way real output does, then STOP: no further batch
+        // will arrive. This is the quiet-session shape that hid the bug.
+        term.process(b"hello");
+        let seq = term.content_seq();
+        assert!(seq > 0, "feeding bytes must advance content_seq");
+
+        // Ask the question an agent asks between turns: "anything since 0?"
+        let id = term
+            .watch(WatcherSpec::SeqAdvanced { after: 0 }, t0())
+            .expect("watcher budget");
+        let latched = term
+            .watch_poll(id)
+            .expect("an ALREADY-advanced seq must latch at arm, with no new batch");
+        assert_eq!(latched.seq, seq);
+
+        // The converse must still hold, or we have traded a false negative for a
+        // false positive: nothing has happened since `seq`, so this stays pending.
+        let id2 = term
+            .watch(WatcherSpec::SeqAdvanced { after: seq }, t0())
+            .expect("watcher budget");
+        assert!(
+            term.watch_poll(id2).is_none(),
+            "arming at the current seq must NOT latch — nothing has changed yet"
+        );
+    }
 
     #[test]
     fn seq_advanced_latches_at_the_batch() {

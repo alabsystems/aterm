@@ -7,7 +7,7 @@
 //! bundle can be installed with NO rustup and NO Developer ID on the user side.
 //!
 //! This is the producer counterpart to the consumer's install-time
-//! [`crate::kani`] wiring. The design fixes relocation at PACK time, not install
+//! [`crate::sysroot`] wiring. The design fixes relocation at PACK time, not install
 //! time, for two hard reasons (audit: relocation-architecture):
 //!   1. install-time binary rewriting would mutate the tree AFTER the signed
 //!      `tree_root` was computed, breaking [`crate::install`]'s apply-time

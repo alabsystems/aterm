@@ -400,7 +400,11 @@ pub struct DecoConfig {
 
 impl DecoConfig {
     /// Scan options derived from the config (borrows the `ignore` set).
-    fn scan_opts(&self) -> ScanOptions<'_> {
+    ///
+    /// Public so the TYPED-word detector (`aterm-gui`'s `kitty_summon`) scans
+    /// with byte-identical gates to the screen scanner: one `allow_bare_cat` /
+    /// `cjk_single_char` / `ignore` policy, not two that can drift apart.
+    pub fn scan_opts(&self) -> ScanOptions<'_> {
         ScanOptions {
             allow_bare_cat: self.allow_bare_cat,
             cjk_single_char: self.cjk_single_char,
@@ -1013,10 +1017,16 @@ struct Occurrence {
     /// Quantized matched-word + neighboring-text + local-background palette.
     /// Computed only on damage-epoch rescan; copied into the bounded bake key.
     cat_colors: CatColorKey,
-    /// The prospective body footprint above the trigger row contains no
-    /// visible terminal glyphs. Opaque cats are emitted only on this clear
-    /// surface so work text never has to compete with fur for contrast.
+    /// A peek direction was resolved for the prospective body footprint —
+    /// i.e. at least one side of the trigger row is clear enough to host the
+    /// head (see [`cat_peek_plan`]). Cats draw [`FreeZ::UnderText`], so
+    /// neighbouring glyphs stay crisp on top of the fur; this only rejects the
+    /// genuine mush case where BOTH sides are a solid wall of text.
     cat_text_clear: bool,
+    /// The resolved head direction: `true` when the head peeks DOWN out from
+    /// under the word (the top-row case, and any row whose two rows above are
+    /// busier than the two below). `false` is the classic upward peek.
+    cat_peek_down: bool,
     /// The row carries a DEC double-width/height size (§5.7): the cat is
     /// suppressed there (NEAREST-stretch across DECDWL isn't worth the parity
     /// surface) — the v1 paw + ink take over.
@@ -1623,7 +1633,10 @@ fn scan_opts_fp(opts: &ScanOptions<'_>) -> u64 {
 fn scan_inputs_fp(lexicon: &Lexicon, opts: &ScanOptions<'_>) -> u64 {
     // `fold_u64` is this module's whole-scalar FNV-1a step, over the same prime
     // the gate fold above mixes bytes with.
-    let fp = fold_u64(scan_opts_fp(opts), std::ptr::from_ref(lexicon) as usize as u64);
+    let fp = fold_u64(
+        scan_opts_fp(opts),
+        std::ptr::from_ref(lexicon) as usize as u64,
+    );
     fold_u64(fp, lexicon.spaced_form_count() as u64)
 }
 
@@ -1729,6 +1742,26 @@ pub struct WordDecorations {
     /// v3 §1.1 fix #4: the resize-settle deadline — births before it (or on a
     /// rescan that itself changed cols) are born-settled.
     settle_until: Option<Instant>,
+    /// Whether the host currently CANNOT present this engine's window
+    /// (unfocused or deco-suspended). Synced by [`Self::set_presentable`].
+    ///
+    /// Stored inverted so `#[derive(Default)]` yields "presentable", which is
+    /// what a hostless/wasm build that never syncs must behave as.
+    away: bool,
+    /// Latched when presentability returns after an away span: the NEXT rescan's
+    /// births are spent (born-settled) rather than played. See
+    /// [`Self::set_presentable`] for the whole rationale.
+    spend_next_births: bool,
+    /// The last time a rare revisit was granted — the [`REVISIT_MIN_GAP`] clock.
+    /// `None` until the first one, so a fresh engine can grant immediately once
+    /// its first check period elapses.
+    last_revisit: Option<Instant>,
+    /// The next instant a revisit roll may be attempted at all.
+    next_revisit_check: Option<Instant>,
+    /// Monotonic count of attempted revisit rolls — the roll's ordinal. A
+    /// COUNTER, never a clock reading: the roll must be reproducible on replay,
+    /// so nothing about it may depend on wall-clock phase.
+    revisit_checks: u64,
     /// v3 §1.1: rescan sequence counter — episodes stamp `seen_seq` on adopt,
     /// so alignment's "old" set is exactly the not-yet-adopted episodes.
     rescan_seq: u64,
@@ -2025,6 +2058,115 @@ impl WordDecorations {
     /// disabled bonk knob drains-and-drops so no backlog crosses an enable).
     pub fn drain_curse_cues(&mut self) -> std::vec::Drain<'_, CurseCue> {
         self.curse_cues.drain(..)
+    }
+
+    /// Sync whether the host can PRESENT this engine's window right now
+    /// (focused and not deco-suspended — the same predicate the cursor
+    /// companion's `set_collection_presentable` takes).
+    ///
+    /// THE REFOCUS STORM (owner, 2026-07-26: "when I restore focus to a window,
+    /// I don't want all the kitties appearing again", and "kitties should
+    /// appear when the word FIRST appears").
+    ///
+    /// A window that is not presenting does not render, and the rescan lives on
+    /// the render path — so while you are away NOTHING is scanned. Every feline
+    /// word that arrived in the meantime is therefore genuinely NEW to the
+    /// engine on the first frame after you come back, and all of them are born
+    /// at once, each owed an entrance. The result is a crowd of cats announcing
+    /// text that scrolled by minutes ago.
+    ///
+    /// The existing `born_unfocused_entrance_never_replays_on_refocus` rule
+    /// does not cover this: it protects episodes whose clock was ALREADY
+    /// running, which requires that a rescan ran while unfocused. Here none did.
+    ///
+    /// Returning to presentable therefore latches `spend_next_births`: births in
+    /// the next rescan are born-settled — no entrance, no burst roll, settled
+    /// ink — exactly as if their peek had elapsed unwatched, which is what
+    /// "appear when the word FIRST appears" means for a word that first appeared
+    /// while nobody was looking. They stay eligible for a later [rare
+    /// revisit](Self::roll_revisit), so the screen is not permanently dead.
+    pub fn set_presentable(&mut self, now: Instant, presentable: bool) {
+        if self.away != presentable {
+            return; // no transition (`away` is the inverse of `presentable`)
+        }
+        self.away = !presentable;
+        if presentable {
+            self.spend_next_births = true;
+            // Do not let a revisit fire the instant focus lands — that would
+            // read as part of the very storm this suppresses.
+            self.next_revisit_check = Some(now + REVISIT_CHECK_PERIOD);
+        }
+    }
+
+    /// Attempt the rare-late-kitty roll, re-arming AT MOST ONE spent feline
+    /// episode. Returns the ident that was revisited, if any.
+    ///
+    /// Called once per tick; almost every call returns immediately on the
+    /// period gate, so the hot path cost is one `Instant` compare.
+    fn roll_revisit(&mut self, now: Instant, cfg: &DecoConfig) -> Option<u64> {
+        if cfg.reduced_motion || !cfg.feline || self.frozen_at.is_some() || self.away {
+            return None;
+        }
+        // Period gate first: this is the branch nearly every tick takes.
+        match self.next_revisit_check {
+            Some(at) if now < at => return None,
+            _ => {}
+        }
+        self.next_revisit_check = Some(now + REVISIT_CHECK_PERIOD);
+        self.revisit_checks = self.revisit_checks.wrapping_add(1);
+        if self
+            .last_revisit
+            .is_some_and(|at| now.saturating_duration_since(at) < REVISIT_MIN_GAP)
+        {
+            return None;
+        }
+        // Candidates: VISIBLE feline occurrences whose peek is spent. Ordered by
+        // the occurrence list (row-major) so the choice is reproducible.
+        let mut candidates = self.occ.iter().filter(|occ| {
+            occ.spec.graphic.is_some()
+                && occ.cat_text_clear
+                && self
+                    .persist
+                    .get(&occ.ident)
+                    .is_some_and(|ep| ep.peek_done || ep.born_settled || ep.born_done)
+        });
+        let first = candidates.next()?;
+        let count = 1 + candidates.count();
+        // One roll for WHETHER, one for WHICH — both deterministic in the check
+        // ordinal so a replay reproduces the same visit.
+        let draw = mix(first.ident ^ REVISIT_SALT ^ self.revisit_checks);
+        if draw % 100 >= REVISIT_CHANCE_PCT {
+            return None;
+        }
+        let pick = (mix(draw) % count as u64) as usize;
+        let ident = self
+            .occ
+            .iter()
+            .filter(|occ| {
+                occ.spec.graphic.is_some()
+                    && occ.cat_text_clear
+                    && self
+                        .persist
+                        .get(&occ.ident)
+                        .is_some_and(|ep| ep.peek_done || ep.born_settled || ep.born_done)
+            })
+            .nth(pick)
+            .map(|occ| occ.ident)?;
+        // Re-arm ONLY the peek axis. Burst/sweep stay spent — a revisit is a cat
+        // coming back to say hello, not the word's whole birth replayed.
+        let ep = self.persist.get_mut(&ident)?;
+        ep.peek_done = false;
+        ep.peek_started = false;
+        ep.peek_pause = None;
+        ep.peek_total = 0;
+        ep.shown_as = None;
+        ep.born_done = false;
+        ep.born_settled = false;
+        ep.phase_start = Some(now);
+        // The done-mark must go too, or the next rescan re-births it done.
+        self.done_marks.remove(&ep.seed);
+        self.last_revisit = Some(now);
+        Some(ident)
     }
 
     /// The versioned atlas paired with this frame's `free_sprites` output
@@ -3210,6 +3352,7 @@ impl WordDecorations {
                 ink_bg,
                 cat_colors,
                 cat_text_clear: true,
+                cat_peek_down: false,
                 dec_line,
                 inert,
                 spec,
@@ -3242,7 +3385,13 @@ impl WordDecorations {
         if cols_changed {
             self.settle_until = Some(now + Duration::from_millis(RESIZE_SETTLE_MS));
         }
-        let born_settled = cols_changed || self.settle_until.is_some_and(|t| now < t);
+        // A returning window spends this rescan's births exactly like a resize
+        // settle does (no entrance, no roll, settled ink) — see
+        // [`Self::set_presentable`]. Consumed here: only the FIRST rescan after
+        // coming back is suppressed, so ordinary typing right after refocus
+        // still earns its cats.
+        let returning = std::mem::take(&mut self.spend_next_births);
+        let born_settled = cols_changed || returning || self.settle_until.is_some_and(|t| now < t);
         if !born_settled {
             self.settle_until = None;
         }
@@ -3293,16 +3442,22 @@ impl WordDecorations {
         // the compatibility terminal-walk path keeps its historical behavior.
         if let Some(surface) = cat_surface {
             for occ in &mut out {
-                occ.cat_text_clear = occ.spec.graphic.is_none()
-                    || cat_footprint_text_clear(
-                        surface.cells,
-                        surface.geom,
-                        occ.row,
-                        occ.start_col,
-                        occ.end_col,
-                        occ.genome,
-                        surface.feline_magic,
-                    );
+                if occ.spec.graphic.is_none() {
+                    occ.cat_text_clear = true;
+                    occ.cat_peek_down = false;
+                    continue;
+                }
+                let plan = cat_peek_plan(
+                    surface.cells,
+                    surface.geom,
+                    occ.row,
+                    occ.start_col,
+                    occ.end_col,
+                    occ.genome,
+                    surface.feline_magic,
+                );
+                occ.cat_text_clear = plan.is_some();
+                occ.cat_peek_down = plan == Some(PeekDir::Down);
             }
         }
 
@@ -3613,9 +3768,16 @@ impl WordDecorations {
     /// light into `nova` (§6; premultiplied `0x00RRGGBB` row-band GlowQuads —
     /// the `nova_add` render channel).
     ///
-    /// `cursor` is the visible cursor cell `(row, col)` in pre-splice grid
-    /// coords — the §5.8 gaze target (a newest active nova center within 12
-    /// cells outranks it). The value is already in scope under the SAME
+    /// `companion_at` is the cursor cell `(row, col)` in pre-splice grid coords
+    /// WHEN the host is also drawing the cursor companion
+    /// ([`WordDecorations::nyan_cursor`]) into this same `free` stream this
+    /// frame — `None` whenever no companion is on glass. It exists because the
+    /// two cat features are otherwise blind to each other: typing a feline word
+    /// forces the companion up at the caret AND matches the echoed word right
+    /// there, so one keystroke drew TWO cats a couple of cells apart (the
+    /// owner's "2 cursor kitties"). The companion already answers that word, so
+    /// the ambient peek is suppressed for the occurrence under it — and for
+    /// that occurrence only. The value is already in scope under the SAME
     /// Terminal lock at the animated call site (`term.cursor()`, app_render);
     /// no new lock is taken. `sel` is the selection view read under the same
     /// lock (§6.4: ignition defers while the word is selected; active nova
@@ -3630,16 +3792,14 @@ impl WordDecorations {
     /// byte-identical to the pre-feature path.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the per-frame tick threads the clock, config, geometry, cursor cell, selection view, focus gate, and four output scratches through one call; a wrapper struct would relocate the list, not simplify it"
+        reason = "the per-frame tick threads the clock, config, geometry, companion cell, selection view, focus gate, and four output scratches through one call; a wrapper struct would relocate the list, not simplify it"
     )]
     pub fn tick(
         &mut self,
         now: Instant,
         cfg: &DecoConfig,
         geom: EffectGeom,
-        // Retained for API stability (v4 cats bake their own eyes — no live gaze
-        // tracks the cursor any more).
-        _cursor: Option<(u16, u16)>,
+        companion_at: Option<(u16, u16)>,
         sel: Option<SelView<'_>>,
         _focused: bool,
         out: &mut Vec<WordDecoration>,
@@ -3659,6 +3819,10 @@ impl WordDecorations {
         // loses only sound, never correctness.
         self.curse_cues.clear();
         self.cat_baker_ready = false;
+        // The rare late kitty: at most one spent episode is re-armed, gated by
+        // its own period + min-gap clocks so nearly every tick pays one compare.
+        // Runs BEFORE the emission pass so a granted revisit draws this frame.
+        self.roll_revisit(now, cfg);
         // v3 §1.1 fix #3: a frozen engine emits nothing and advances nothing
         // (defensive — hosts skip the tick while suspended; `thaw` restores).
         if self.frozen_at.is_some() {
@@ -3851,6 +4015,27 @@ impl WordDecorations {
                     // never resurrect a completed one-shot on focus loss.
                     if peek.peek_done {
                         break 'graphic; // Done: zero quads forever (duty pin)
+                    }
+                    // ONE CAT PER CARET: the companion the host is drawing at
+                    // this cell IS this word's cat — typing `kitty` summons it
+                    // (`CursorCat::on_collect`) at the very caret the echoed
+                    // word sits under, so without this the same keystroke put
+                    // two cats a couple of cells apart. Same span predicate as
+                    // the rescan's `at_live_cursor` (caret ON the token or in
+                    // the cell right after it). Suppression is per-occurrence
+                    // and graphic-only: every OTHER feline word on screen still
+                    // peeks, and this word's own ink/sparkle still plays.
+                    //
+                    // Gated here rather than inside `cat_eligible` so the arm
+                    // census and the Kitty Log stay untouched — `emit_cat` logs
+                    // a sighting only for sprites that actually landed, and the
+                    // typed word is already logged synthetically by the host.
+                    if companion_at.is_some_and(|(row, col)| {
+                        row == occ.row
+                            && col >= occ.start_col
+                            && col <= occ.end_col.saturating_add(1)
+                    }) {
+                        break 'graphic;
                     }
                     let eligible = cat_eligible(occ, cfg, geom);
                     let arm = peek.arm.unwrap_or_else(|| {
@@ -4056,8 +4241,7 @@ impl WordDecorations {
                             .persist
                             .get(&occ.ident)
                             .map_or(supernova::SuperTier::Nova, |e| e.burst_tier);
-                        let until =
-                            sv.start + Duration::from_millis(supernova::total_ms(tier));
+                        let until = sv.start + Duration::from_millis(supernova::total_ms(tier));
                         active_until = Some(active_until.map_or(until, |d: Instant| d.max(until)));
                         fp = fold_u64(fp, frame.wrapping_mul(0x9E37_79B1));
                         // §3.2 theme branch, per occurrence: additive white is
@@ -5413,12 +5597,14 @@ pub fn cat_rest_reveal(hart: u16) -> u16 {
 
 /// cat-art v4 eligibility gate: a matched feline word shows the authored peeking
 /// cat whenever it is wide enough (`word_px ≥ 0.8·ch`, so a 1-cell word takes
-/// no cat), the footprint text is clear, and the cell metrics clear the §5.7
-/// floors. TOP ROWS ARE ELIGIBLE: at `row < 2` the two-band head has no room to
-/// rise above, so [`emit_cat`] slides the dest DOWN into the viewport and the
-/// cat peeks in over the word from the top edge (this is what makes typing
-/// `kitty` at a fresh shell prompt show a kitty). Every ineligible case draws NO
-/// graphic — the word's ink is the graceful fallback (paws are retired).
+/// no cat), [`cat_peek_plan`] resolved a habitable side, and the cell metrics
+/// clear the §5.7 floors. TOP ROWS ARE ELIGIBLE: a row-0 word has no rows above,
+/// so the plan picks [`PeekDir::Down`] and the head slides out from UNDER the
+/// word rather than covering it. BUSY SURFACES ARE ELIGIBLE TOO: cats draw
+/// [`FreeZ::UnderText`], so a TUI prompt frame in the band costs legibility
+/// nothing — only a genuine text wall on BOTH sides is rejected. Every
+/// ineligible case draws NO graphic — the word's ink is the graceful fallback
+/// (paws are retired).
 fn cat_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
     if cfg.feline_style != FelineStyle::Cat
         || geom.cell_h < CAT_MIN_CELL_H
@@ -5816,21 +6002,39 @@ fn emit_cat(
         0
     };
     let row_top = i32::from(occ.row) * ch;
-    // v4 cats are the two-band peeking HEAD anchored with the chin slice at the
-    // word row's top edge. The head rises into the two rows ABOVE the word.
-    let rest_bottom = row_top + i32::from(g.chin);
-    let mut bottom = rest_bottom - lift + bounce;
-    let mut top = bottom - vh;
-    // Top-edge viewport clamp: at row 0/1 the head would rise above y=0 and clip
-    // off-screen (the old `row ≥ 2` gate simply hid the cat here — the reason
-    // typing `kitty` at a fresh prompt showed nothing). Instead slide the whole
-    // dest DOWN by exactly the overhang so `top = 0`: the full head stays
-    // visible, peeking in over the word from the terminal's top edge. Height is
-    // preserved (bottom shifts with top), so the rise/descend kinematics read
-    // identically — the cat just enters lower. Only engages when top < 0.
+    // v4 cats are the two-band peeking HEAD. UP (the authored pose) anchors the
+    // chin slice at the word row's TOP edge and rises into the two rows above.
+    // DOWN mirrors it about the word row: the chin tucks behind the row's
+    // BOTTOM edge and the head slides out from UNDER the word into the two rows
+    // below. Both reveal the art top-down (ears → eyes → muzzle) from a fixed
+    // anchor, so the entrance reads the same either way.
+    //
+    // 2026-07-26 (owner: "for the top line, have the kitty peek down under the
+    // word instead of over the word"): a top-row word has no rows above, and
+    // the previous fix slid the whole sprite DOWN into the viewport — which
+    // parked the head squarely on top of the line that summoned it. Direction
+    // is now chosen by [`cat_peek_plan`] at rescan, so row 0 peeks DOWN and
+    // never covers its own word.
+    let (mut top, mut bottom) = if occ.cat_peek_down {
+        let rest_top = row_top + ch - i32::from(g.chin);
+        let top = rest_top + lift - bounce;
+        (top, top + vh)
+    } else {
+        let rest_bottom = row_top + i32::from(g.chin);
+        let bottom = rest_bottom - lift + bounce;
+        (bottom - vh, bottom)
+    };
+    // Viewport clamps. `cat_peek_plan` only picks a side with room for the
+    // BODY, so these bind on the overshoot/bounce lift alone; sliding by the
+    // exact overhang preserves height, so the kinematics read identically.
+    let grid_h = i32::from(geom.rows) * ch;
     if top < 0 {
         bottom -= top;
         top = 0;
+    } else if bottom > grid_h {
+        let over = bottom - grid_h;
+        top -= over;
+        bottom -= over;
     }
     // Atlas y shown at dest `top`: the art's top edge lives at tile row 0 in
     // the free-overlay EXACT-SIZE tile (integer-translated bake, NEAREST 1:1).
@@ -6471,13 +6675,113 @@ fn cat_color_context_footprint(
     )
 }
 
-/// Whether the opaque body region above a trigger row is free of visible
-/// terminal glyphs. The small chin slice intentionally remains behind the
-/// matched word for the peeking pose, but may not cover neighboring text on
-/// that row; every full body cell must be clear.
-/// Degenerate geometry that would exceed the same 64-cell cold-path bound is
-/// conservatively treated as occupied.
-fn cat_footprint_text_clear(
+/// Which way the two-band head enters relative to its trigger word.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PeekDir {
+    /// The classic peek: the head rises into the two rows ABOVE the word and
+    /// looks over it, chin slice tucked behind the word row's top edge.
+    Up,
+    /// The mirrored peek: the head slides DOWN out from under the word into
+    /// the two rows BELOW it, chin slice tucked behind the word row's bottom
+    /// edge. This is what a top-row word gets — there is no room above, and
+    /// sliding the sprite down ON TOP of the line (the pre-2026-07-26
+    /// behaviour) buried the very word that summoned it.
+    Down,
+}
+
+// ───────── the rare late kitty (owner, 2026-07-26) ─────────
+//
+// "I like some uncommon probability that NEW kitties appear later. that's kinda
+// fun." A settled feline word — one whose peek is spent, including every word
+// that arrived while the window was away — may occasionally be revisited by a
+// fresh cat. Three properties keep it fun rather than noisy:
+//
+// * BOUNDED: exactly ONE episode is revisited per grant. The whole point of the
+//   refocus fix is that cats must not arrive in a crowd.
+// * RATE-LIMITED: `REVISIT_MIN_GAP` between grants, and rolls are only even
+//   attempted once per `REVISIT_CHECK_PERIOD`, so this costs nothing per frame.
+// * DETERMINISTIC: the roll is a hash of the candidate's ident and the check
+//   ordinal — no RNG state, reproducible in tests, and stable across a replay.
+
+/// Earliest spacing between two granted revisits.
+const REVISIT_MIN_GAP: Duration = Duration::from_secs(45);
+/// How often a roll is even attempted.
+const REVISIT_CHECK_PERIOD: Duration = Duration::from_secs(20);
+/// Grant probability per check, in percent. Deliberately low: at one check per
+/// 20 s this averages a visit roughly every few minutes of continuous viewing,
+/// which reads as a surprise rather than a cadence.
+const REVISIT_CHANCE_PCT: u64 = 8;
+/// Salt keeping the revisit roll independent of every other genome decision.
+const REVISIT_SALT: u64 = 0x5245_5649_5349_5400; // b"REVISIT\0"
+
+/// Occupancy ceiling for a candidate head band, as a fraction of sampled cells
+/// carrying a visible glyph.
+///
+/// The old rule was an absolute veto: ONE glyph anywhere in the two-row band
+/// (or beside the word on its own row) killed the cat. That is why typing
+/// `kitty` inside any TUI prompt box — Claude Code's `╭─╮ │ ╰─╯` frame being
+/// the case the owner hits every day — produced nothing at all, while the same
+/// word echoed onto a clear transcript line summoned a cat instantly.
+///
+/// The veto's stated rationale ("work text never has to compete with fur for
+/// contrast") does not survive contact with the renderer: cats are pushed as
+/// [`FreeZ::UnderText`] sprites, so every glyph in the band draws OVER the fur
+/// at full contrast. A partially busy band costs legibility nothing. What a
+/// solid wall of text does cost is the CAT — fur behind edge-to-edge glyphs
+/// reads as noise — so the ceiling rejects only that.
+const CAT_MAX_BAND_OCCUPANCY: f32 = 0.75;
+
+/// Fraction of the sampled cells in `[r0, r1] × [c0, c1]` carrying a visible
+/// glyph, or `None` when the span is degenerate or exceeds the 64-cell
+/// cold-path sampling bound.
+fn band_occupancy(
+    cells: &[Vec<RenderCell>],
+    r0: usize,
+    r1: usize,
+    c0: usize,
+    c1: usize,
+    skip_cols: Option<std::ops::RangeInclusive<usize>>,
+) -> Option<f32> {
+    const MAX_SAMPLES: usize = 64;
+    if r1 < r0 || c1 < c0 {
+        return None;
+    }
+    let width = c1.saturating_sub(c0).saturating_add(1);
+    let height = r1.saturating_sub(r0).saturating_add(1);
+    if width.saturating_mul(height) > MAX_SAMPLES {
+        return None;
+    }
+    let (mut sampled, mut occupied) = (0u32, 0u32);
+    for r in r0..=r1 {
+        for c in c0..=c1 {
+            if skip_cols.as_ref().is_some_and(|s| s.contains(&c)) {
+                continue;
+            }
+            sampled += 1;
+            if cells
+                .get(r)
+                .and_then(|line| line.get(c))
+                .is_some_and(|cell| cell.wide || (!cell.ch.is_whitespace() && cell.ch != '\0'))
+            {
+                occupied += 1;
+            }
+        }
+    }
+    (sampled > 0).then(|| occupied as f32 / sampled as f32)
+}
+
+/// Resolve the head's entry direction for one prospective cat, or `None` when
+/// neither side can host it.
+///
+/// Both candidate bands are scored by [`band_occupancy`] and the CLEARER side
+/// wins, with the word's own row folded into each score (the cells beside the
+/// word, which the chin slice tucks behind) so a cat prefers the side whose
+/// neighbouring text it disturbs least. Ties go to [`PeekDir::Up`] — the
+/// authored pose. A band that runs off the viewport is unavailable, which is
+/// what forces the top row to [`PeekDir::Down`] and the bottom row to
+/// [`PeekDir::Up`]; when both are available but both exceed
+/// [`CAT_MAX_BAND_OCCUPANCY`], the surface is a text wall and no cat draws.
+fn cat_peek_plan(
     cells: &[Vec<RenderCell>],
     geom: EffectGeom,
     row: u16,
@@ -6485,10 +6789,9 @@ fn cat_footprint_text_clear(
     end: u16,
     genome: Genome,
     feline_magic: bool,
-) -> bool {
-    const MAX_SAMPLES: usize = 64;
+) -> Option<PeekDir> {
     if geom.cell_w == 0 || geom.cell_h == 0 || cells.is_empty() {
-        return false;
+        return None;
     }
     let special = feline_magic
         .then(|| special_variant_v4(genome.magic))
@@ -6499,46 +6802,57 @@ fn cat_footprint_text_clear(
     let ch = i64::from(geom.cell_h);
     let x0 = i64::from(g.x);
     let x1 = (x0 + i64::from(g.w)).min(i64::from(geom.cols) * cw);
-    let trigger_top = i64::from(row) * ch;
-    let y0 = (trigger_top + i64::from(g.chin) - i64::from(g.hart)).max(0);
-    let y1 = trigger_top.min(i64::from(geom.rows) * ch);
-    if x1 <= x0 || y1 <= y0 {
-        return true;
+    if x1 <= x0 {
+        return None;
     }
     let c0 = usize::try_from(x0 / cw).unwrap_or(0);
     let c1 = usize::try_from((x1 - 1) / cw).unwrap_or(usize::MAX);
-    let r0 = usize::try_from(y0 / ch).unwrap_or(0);
-    let r1 = usize::try_from((y1 - 1) / ch).unwrap_or(usize::MAX);
-    let width = c1.saturating_sub(c0).saturating_add(1);
-    let height = r1.saturating_sub(r0).saturating_add(1);
-    if width.saturating_mul(height.saturating_add(1)) > MAX_SAMPLES {
-        return false;
-    }
-    for r in r0..=r1 {
-        for c in c0..=c1 {
-            if cells
-                .get(r)
-                .and_then(|line| line.get(c))
-                .is_some_and(|cell| cell.wide || (!cell.ch.is_whitespace() && cell.ch != '\0'))
-            {
-                return false;
-            }
-        }
+    // Rows the head body would occupy on each side. `body` is the head height
+    // above the chin slice — the part that lands on neighbouring rows.
+    let body = (i64::from(g.hart) - i64::from(g.chin)).max(0);
+    let band_rows = usize::try_from((body + ch - 1) / ch).unwrap_or(0);
+    if band_rows == 0 {
+        // A head with no body outside the word row disturbs nothing either way.
+        return Some(PeekDir::Up);
     }
     let trigger = usize::from(row);
-    for c in c0..=c1 {
-        if (usize::from(start)..=usize::from(end)).contains(&c) {
-            continue;
+    let rows = usize::from(geom.rows);
+    // The word's own row, excluding the word itself: shared by both scores.
+    let own = band_occupancy(
+        cells,
+        trigger,
+        trigger,
+        c0,
+        c1,
+        Some(usize::from(start)..=usize::from(end)),
+    );
+    let side = |lo: usize, hi: usize| -> Option<f32> {
+        let band = band_occupancy(cells, lo, hi, c0, c1, None)?;
+        // Fold the trigger row in at half weight: it is one row of a
+        // three-row silhouette and the chin slice is mostly behind the word.
+        Some(own.map_or(band, |o| (band * 2.0 + o) / 3.0))
+    };
+    let up = (trigger >= band_rows)
+        .then(|| side(trigger - band_rows, trigger - 1))
+        .flatten();
+    let down = (trigger + band_rows < rows)
+        .then(|| side(trigger + 1, trigger + band_rows))
+        .flatten();
+    match (up, down) {
+        (Some(u), Some(d)) => {
+            let (score, dir) = if d < u {
+                (d, PeekDir::Down)
+            } else {
+                (u, PeekDir::Up)
+            };
+            (score <= CAT_MAX_BAND_OCCUPANCY).then_some(dir)
         }
-        if cells
-            .get(trigger)
-            .and_then(|line| line.get(c))
-            .is_some_and(|cell| cell.wide || (!cell.ch.is_whitespace() && cell.ch != '\0'))
-        {
-            return false;
-        }
+        // Only one side exists (top/bottom row). Take it if it is habitable;
+        // the ceiling still rejects a solid wall.
+        (Some(u), None) => (u <= CAT_MAX_BAND_OCCUPANCY).then_some(PeekDir::Up),
+        (None, Some(d)) => (d <= CAT_MAX_BAND_OCCUPANCY).then_some(PeekDir::Down),
+        (None, None) => None,
     }
-    true
 }
 
 fn u32_to_rgb3(c: u32) -> [u8; 3] {
@@ -6746,6 +7060,7 @@ mod tests {
             ink_bg: [0; 3],
             cat_colors: CatColorKey::default(),
             cat_text_clear: true,
+            cat_peek_down: false,
             dec_line: false,
             inert: false,
             // Direct-built occurrences resolve their spec from the TEST cfg
@@ -7211,7 +7526,7 @@ mod tests {
     #[test]
     fn live_profanity_retype_model_proves_and_catches_unconditional_transfer() {
         let model = live_profanity_retype_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 
         // Negative controls pin both halves of the faulty policy. Merely
         // finding either counterexample would not prove the other regression
@@ -8090,6 +8405,36 @@ mod tests {
         blank.bg = dark;
         snap.cells[occupied_row].resize(occupied_col + 1, blank);
         snap.cells[occupied_row][occupied_col].ch = 'X';
+        // 2026-07-26: a SPARSE blocker no longer vetoes. Cats draw
+        // `FreeZ::UnderText`, so one glyph (or a TUI prompt frame) in the band
+        // costs legibility nothing — the head simply picks the clearer side.
+        // Only a wall on BOTH sides yields, which is what the fill below builds.
+        wd.rescan_from_cells_with_geom(
+            &snap.cells,
+            &snap.line_sizes,
+            rows,
+            cols,
+            &lex,
+            &c,
+            2,
+            now + Duration::from_millis(50),
+            geom,
+            rgb3_to_u32(dark),
+        );
+        assert!(
+            feline(&wd).cat_text_clear,
+            "one blocker cell keeps the cat — under-text fur never fights glyphs"
+        );
+        let trigger_row = usize::from(feline(&wd).row);
+        let walled: Vec<usize> = (trigger_row.saturating_sub(2)..=trigger_row + 2)
+            .filter(|r| *r != trigger_row && *r < snap.cells.len())
+            .collect();
+        for &r in &walled {
+            snap.cells[r].resize(cols, blank);
+            for cell in &mut snap.cells[r] {
+                cell.ch = 'X';
+            }
+        }
         wd.rescan_from_cells_with_geom(
             &snap.cells,
             &snap.line_sizes,
@@ -8109,9 +8454,14 @@ mod tests {
         );
         assert!(
             !feline(&wd).cat_text_clear && !cat_eligible(feline(&wd), &c, geom),
-            "opaque cats yield when fresh terminal text occupies their body footprint"
+            "opaque cats yield when text WALLS both candidate bands"
         );
 
+        for &r in &walled {
+            for cell in &mut snap.cells[r] {
+                cell.ch = ' ';
+            }
+        }
         snap.cells[occupied_row][occupied_col].ch = ' ';
         let mut fresh = WordDecorations::default();
         fresh.rescan_from_cells_with_geom(
@@ -8221,25 +8571,28 @@ mod tests {
         };
 
         let provisional_cells = body_cells(provisional.genome);
-        let (transferred, blocked_cell, expected_clear) = (0..10_000u64)
+        // Pick a genome whose body footprint differs from the provisional one,
+        // then WALL every cell in the symmetric difference. A single blocker no
+        // longer decides anything (see `CAT_MAX_BAND_OCCUPANCY`), so the fixture
+        // has to move real occupancy for the two plans to diverge.
+        let (transferred, blocked_cells) = (0..10_000u64)
             .find_map(|seed| {
                 let genome = Genome {
                     gkey: mix(seed),
                     magic: 1000,
                 };
                 let transferred_cells = body_cells(genome);
-                transferred_cells
+                let diff: Vec<(usize, usize)> = transferred_cells
                     .iter()
-                    .find(|cell| !provisional_cells.contains(cell))
-                    .copied()
-                    .map(|cell| (genome, cell, false))
-                    .or_else(|| {
+                    .filter(|cell| !provisional_cells.contains(cell))
+                    .chain(
                         provisional_cells
                             .iter()
-                            .find(|cell| !transferred_cells.contains(cell))
-                            .copied()
-                            .map(|cell| (genome, cell, true))
-                    })
+                            .filter(|cell| !transferred_cells.contains(cell)),
+                    )
+                    .copied()
+                    .collect();
+                (!diff.is_empty()).then_some((genome, diff))
             })
             .expect("fixture finds a transferred footprint distinct from the provisional one");
 
@@ -8247,31 +8600,24 @@ mod tests {
             moved.cells[usize::from(provisional.row)][usize::from(provisional.start_col)];
         blank.ch = ' ';
         blank.wide = false;
-        moved.cells[blocked_cell.0].resize(blocked_cell.1 + 1, blank);
-        moved.cells[blocked_cell.0][blocked_cell.1].ch = 'X';
-        let provisional_clear = cat_footprint_text_clear(
-            &moved.cells,
-            geom,
-            provisional.row,
-            provisional.start_col,
-            provisional.end_col,
-            provisional.genome,
-            c.feline_magic,
-        );
-        let transferred_clear = cat_footprint_text_clear(
-            &moved.cells,
-            geom,
-            provisional.row,
-            provisional.start_col,
-            provisional.end_col,
-            transferred,
-            c.feline_magic,
-        );
-        assert_ne!(
-            provisional_clear, transferred_clear,
-            "the blocker distinguishes provisional and transferred footprints"
-        );
-        assert_eq!(transferred_clear, expected_clear);
+        for &(r, col) in &blocked_cells {
+            if moved.cells[r].len() <= col {
+                moved.cells[r].resize(col + 1, blank);
+            }
+            moved.cells[r][col].ch = 'X';
+        }
+        let plan_for = |genome: Genome| {
+            cat_peek_plan(
+                &moved.cells,
+                geom,
+                provisional.row,
+                provisional.start_col,
+                provisional.end_col,
+                genome,
+                c.feline_magic,
+            )
+        };
+        let expected_clear = plan_for(transferred).is_some();
 
         wd.persist
             .get_mut(&original.ident)
@@ -10412,6 +10758,346 @@ mod tests {
         }
     }
 
+    /// Scan a terminal through the geometry-aware snapshot path and hand back
+    /// the engine plus the resolved feline occurrence.
+    fn scan_grid(
+        term: &mut Terminal,
+        rows: usize,
+        cols: usize,
+        c: &DecoConfig,
+        geom: EffectGeom,
+        now: Instant,
+    ) -> WordDecorations {
+        let lex = lex();
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        // Blank snapshot rows arrive TRIMMED (possibly empty) — take the bg
+        // from the first row that actually has a cell.
+        let bg = snap
+            .cells
+            .iter()
+            .find_map(|line| line.first())
+            .map_or(0, |cell| rgb3_to_u32(cell.bg));
+        let mut wd = WordDecorations::default();
+        wd.rescan_from_cells_with_geom(
+            &snap.cells,
+            &snap.line_sizes,
+            rows,
+            cols,
+            &lex,
+            c,
+            1,
+            now,
+            geom,
+            bg,
+        );
+        wd
+    }
+
+    /// THE OWNER'S 2026-07-26 REPORT: "when I type kitty I need a kitty to pop
+    /// up behind kitty! this didn't happen" — typing inside Claude Code's
+    /// prompt box produced NOTHING, while the same word echoed onto a clear
+    /// transcript line on Enter summoned a cat instantly.
+    ///
+    /// Root cause: the old `cat_footprint_text_clear` was an absolute veto —
+    /// ONE glyph in the two-row band above (or beside the word on its own row)
+    /// killed the cat. A TUI prompt frame puts `╭──╮` directly above the input
+    /// line and `│` on both sides of it, so the gate could never pass there.
+    ///
+    /// Cats draw `FreeZ::UnderText`, so the frame renders over the fur at full
+    /// contrast and nothing is lost by allowing this. The cat is owed.
+    #[test]
+    fn tui_prompt_box_frame_still_summons_a_cat() {
+        let (rows, cols) = (6usize, 20usize);
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        // Claude Code's prompt, faithfully: a boxed input line.
+        term.process(
+            "\r\n\r\n╭──────────────────╮\r\n│ kitty            │\r\n╰──────────────────╯"
+                .as_bytes(),
+        );
+        let mut wd = scan_grid(&mut term, rows, cols, &c, g, t0);
+        let occ = feline(&wd);
+        assert!(
+            occ.cat_text_clear && cat_eligible(occ, &c, g),
+            "a boxed prompt line is eligible — the frame draws OVER the fur"
+        );
+        let (cats, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(600), &c, g);
+        assert!(
+            !cats.is_empty(),
+            "typing `kitty` inside a TUI prompt box summons a cat"
+        );
+    }
+
+    /// THE TOP-LINE FIX (owner, 2026-07-26: "for the top line, have the kitty
+    /// peek down under the word instead of over the word").
+    ///
+    /// A row-0 word has no rows above it. The previous behaviour slid the whole
+    /// sprite DOWN into the viewport so the head landed squarely on top of the
+    /// line that summoned it. Now the plan resolves to `PeekDir::Down` and the
+    /// head slides out from UNDER the word — every emitted pixel sits strictly
+    /// below the word row, so the text it decorates is never covered.
+    #[test]
+    fn top_row_word_peeks_down_under_the_word_never_over_it() {
+        let (rows, cols) = (6usize, 20usize);
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"kitty"); // row 0 — nothing above it
+        let mut wd = scan_grid(&mut term, rows, cols, &c, g, t0);
+        let occ = feline(&wd);
+        assert_eq!(occ.row, 0, "fixture puts the word on the top row");
+        assert!(
+            occ.cat_peek_down,
+            "a top-row word has no band above — the head must peek DOWN"
+        );
+        let (cats, _, _) = tick_cat(&mut wd, t0 + Duration::from_millis(600), &c, g);
+        assert!(!cats.is_empty(), "the top-row cat draws");
+        let word_row_bottom = i32::from(g.cell_h);
+        for s in &cats {
+            assert!(
+                s.y >= word_row_bottom - i32::from(g.cell_h) / 2,
+                "no sprite pixel may bury the top-row word it decorates: \
+                 sprite y={} vs word row bottom {word_row_bottom}",
+                s.y
+            );
+        }
+    }
+
+    /// THE REFOCUS STORM (owner, 2026-07-26: "when I restore focus to a window,
+    /// I don't want all the kitties appearing again" / "kitties should appear
+    /// when the word FIRST appears").
+    ///
+    /// A non-presenting window never renders, so it never rescans: words that
+    /// arrive while you are away are genuinely NEW to the engine when you come
+    /// back, and every one of them was owed an entrance at the same instant.
+    /// Coming back must spend those births instead of playing them.
+    ///
+    /// This is NOT covered by `born_unfocused_entrance_never_replays_on_refocus`,
+    /// which protects episodes whose clock was already running — that requires a
+    /// rescan to have run while unfocused. Here none did, which is exactly why
+    /// the storm was reachable.
+    #[test]
+    fn words_arriving_while_away_never_storm_on_return() {
+        let (rows, cols) = (6usize, 20usize);
+        let c = cfg();
+        let g = geom20();
+        let lex = lex();
+        let t0 = Instant::now();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let mut wd = WordDecorations::default();
+
+        // Focused and idle: nothing on screen yet.
+        wd.set_presentable(t0, true);
+        wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
+
+        // The user leaves. The host stops presenting, so NO rescan runs while a
+        // build log full of feline words scrolls past.
+        wd.set_presentable(t0 + Duration::from_secs(1), false);
+        term.process(b"kitty\r\nkitty\r\nkitty\r\nkitty");
+
+        // …and comes back two minutes later. This is the first rescan since.
+        let back = t0 + Duration::from_secs(120);
+        wd.set_presentable(back, true);
+        wd.rescan(&term, rows, cols, &lex, &c, 2, back);
+        let felines = wd.occ.iter().filter(|o| o.spec.graphic.is_some()).count();
+        assert!(felines >= 3, "the fixture really does scan several cats");
+        let (cats, _, _) = tick_cat(&mut wd, back + Duration::from_millis(600), &c, g);
+        assert!(
+            cats.is_empty(),
+            "returning to a screen of feline words plays NO entrances, got {}",
+            cats.len()
+        );
+        for occ in wd.occ.iter().filter(|o| o.spec.graphic.is_some()) {
+            assert!(
+                wd.persist[&occ.ident].born_settled,
+                "each word that arrived while away is born spent"
+            );
+        }
+
+        // Only the FIRST rescan back is suppressed: typing right after refocus
+        // still earns its cat.
+        term.process(b"\r\nkitty");
+        let after = back + Duration::from_secs(1);
+        wd.rescan(&term, rows, cols, &lex, &c, 3, after);
+        let fresh = wd
+            .occ
+            .iter()
+            .filter(|o| o.spec.graphic.is_some())
+            .filter(|o| !wd.persist[&o.ident].born_settled)
+            .count();
+        assert_eq!(fresh, 1, "the newly typed word is armed normally");
+    }
+
+    /// THE RARE LATE KITTY (owner, 2026-07-26: "I like some uncommon
+    /// probability that NEW kitties appear later. that's kinda fun").
+    ///
+    /// A spent episode — including every word that arrived while away — may be
+    /// revisited, but the grant is bounded to ONE episode, rate-limited, and
+    /// deterministic in its check ordinal so a replay reproduces it.
+    #[test]
+    fn rare_revisit_is_bounded_rate_limited_and_deterministic() {
+        let (rows, cols) = (6usize, 20usize);
+        let c = cfg();
+        let lex = lex();
+        let t0 = Instant::now();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"kitty\r\nkitty\r\nkitty");
+
+        let build = |seed_gap: u64| {
+            let mut wd = WordDecorations::default();
+            wd.set_presentable(t0, true);
+            wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
+            // Spend every episode, as an away-birth or a completed peek would.
+            for ep in wd.persist.values_mut() {
+                ep.peek_done = true;
+            }
+            let mut grants = Vec::new();
+            let mut at = t0;
+            for _ in 0..seed_gap {
+                at += REVISIT_CHECK_PERIOD;
+                if let Some(id) = wd.roll_revisit(at, &c) {
+                    grants.push((at, id));
+                }
+            }
+            grants
+        };
+
+        let a = build(200);
+        let b = build(200);
+        assert_eq!(a, b, "the roll is deterministic in its check ordinal");
+        assert!(
+            !a.is_empty(),
+            "over 200 checks an uncommon visit does happen"
+        );
+        assert!(
+            a.len() < 60,
+            "…but stays UNCOMMON: {} grants in 200 checks",
+            a.len()
+        );
+        for pair in a.windows(2) {
+            let gap = pair[1].0.saturating_duration_since(pair[0].0);
+            assert!(
+                gap >= REVISIT_MIN_GAP,
+                "grants respect the min gap, got {gap:?}"
+            );
+        }
+    }
+
+    /// A revisit re-arms ONLY the peek axis, and only for a spent episode: a
+    /// cat coming back to say hello, never the word's whole birth replayed.
+    #[test]
+    fn revisit_rearms_the_peek_and_draws_again() {
+        let (rows, cols) = (6usize, 20usize);
+        let c = cfg();
+        let g = geom20();
+        let lex = lex();
+        let t0 = Instant::now();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\r\n\r\nnice kitty");
+        let mut wd = WordDecorations::default();
+        wd.set_presentable(t0, true);
+        wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
+        let ident = feline(&wd).ident;
+
+        // Let the peek run out: spent, drawing nothing.
+        let spent = t0 + Duration::from_secs(8);
+        let (cats, _, _) = tick_cat(&mut wd, spent, &c, g);
+        assert!(cats.is_empty(), "the one-shot is spent");
+        assert!(wd.persist[&ident].peek_done);
+
+        // Force a grant by rolling until one lands, then the cat draws again.
+        let mut at = spent;
+        let granted = (0..500)
+            .find_map(|_| {
+                at += REVISIT_CHECK_PERIOD;
+                wd.roll_revisit(at, &c)
+            })
+            .expect("a revisit is reachable");
+        assert_eq!(granted, ident, "the only candidate is the one revisited");
+        assert!(!wd.persist[&ident].peek_done, "the peek axis is re-armed");
+        let (cats, _, _) = tick_cat(&mut wd, at + Duration::from_millis(600), &c, g);
+        assert!(!cats.is_empty(), "the revisiting cat actually draws");
+    }
+
+    /// Reduced motion and a feline-family-off config never grant a revisit, and
+    /// neither does a window that is not presenting — a revisit must never be
+    /// part of the very storm the refocus fix suppresses.
+    #[test]
+    fn revisit_respects_every_gate() {
+        let (rows, cols) = (6usize, 20usize);
+        let lex = lex();
+        let t0 = Instant::now();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\r\n\r\nnice kitty");
+
+        let spin = |wd: &mut WordDecorations, cfg: &DecoConfig| {
+            let mut at = t0;
+            (0..200)
+                .filter_map(|_| {
+                    at += REVISIT_CHECK_PERIOD;
+                    wd.roll_revisit(at, cfg)
+                })
+                .count()
+        };
+
+        for (label, mutate) in [
+            (
+                "reduced motion",
+                (|c: &mut DecoConfig| c.reduced_motion = true) as fn(&mut DecoConfig),
+            ),
+            ("feline off", |c: &mut DecoConfig| c.feline = false),
+        ] {
+            let mut c = cfg();
+            mutate(&mut c);
+            let mut wd = WordDecorations::default();
+            wd.set_presentable(t0, true);
+            wd.rescan(&term, rows, cols, &lex, &cfg(), 1, t0);
+            for ep in wd.persist.values_mut() {
+                ep.peek_done = true;
+            }
+            assert_eq!(spin(&mut wd, &c), 0, "{label} grants nothing");
+        }
+
+        let c = cfg();
+        let mut away = WordDecorations::default();
+        away.set_presentable(t0, true);
+        away.rescan(&term, rows, cols, &lex, &c, 1, t0);
+        for ep in away.persist.values_mut() {
+            ep.peek_done = true;
+        }
+        away.set_presentable(t0, false);
+        assert_eq!(
+            spin(&mut away, &c),
+            0,
+            "a window nobody is looking at grants nothing"
+        );
+    }
+
+    /// The direction is CHOSEN, not fixed: with the rows above walled and the
+    /// rows below clear, an interior word flips to the downward peek rather
+    /// than vanishing (the pre-2026-07-26 behaviour).
+    #[test]
+    fn busy_band_above_flips_the_peek_downward() {
+        let (rows, cols) = (6usize, 20usize);
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"XXXXXXXXXXXXXXXXXXXX\r\nXXXXXXXXXXXXXXXXXXXX\r\nkitty");
+        let wd = scan_grid(&mut term, rows, cols, &c, g, t0);
+        let occ = feline(&wd);
+        assert_eq!(occ.row, 2);
+        assert!(
+            occ.cat_text_clear,
+            "a busy band above no longer erases the cat"
+        );
+        assert!(occ.cat_peek_down, "it takes the clear side instead");
+    }
+
     /// A feline occurrence with a hand-picked genome (`magic = 100` is outside
     /// every §3.5 window ⇒ an ordinary cat). Idents keyed off (row, start) so
     /// multi-cat tests get distinct gaze/idle identities.
@@ -10438,6 +11124,7 @@ mod tests {
             ink_bg: [0; 3],
             cat_colors: CatColorKey::default(),
             cat_text_clear: true,
+            cat_peek_down: false,
             dec_line: false,
             inert: false,
             spec: class_default_spec(Class::Feline, &cfg()),
@@ -10462,15 +11149,16 @@ mod tests {
         tick_cat_at(wd, now, cfg, geom, None, true)
     }
 
-    /// [`tick_cat`] with an explicit cursor cell + focus state (the §5.8 gaze
-    /// / §5.6 idle-life batteries). Returns the free-overlay sprite stream
-    /// (overlay Phase 4: the peeking cat + gaze dots ride `free_sprites`).
+    /// [`tick_cat`] with an explicit companion cell + focus state (the
+    /// one-cat-per-caret gate / §5.6 idle-life batteries). Returns the
+    /// free-overlay sprite stream (overlay Phase 4: the peeking cats ride
+    /// `free_sprites`).
     fn tick_cat_at(
         wd: &mut WordDecorations,
         now: Instant,
         cfg: &DecoConfig,
         geom: EffectGeom,
-        cursor: Option<(u16, u16)>,
+        companion_at: Option<(u16, u16)>,
         focused: bool,
     ) -> (Vec<FreeSprite>, Vec<WordDecoration>, u64) {
         let mut out = Vec::new();
@@ -10478,7 +11166,16 @@ mod tests {
         let mut fr = Vec::new();
         let mut nova = Vec::new();
         let fp = wd.tick(
-            now, cfg, geom, cursor, None, focused, &mut out, &mut ink, &mut fr, &mut nova,
+            now,
+            cfg,
+            geom,
+            companion_at,
+            None,
+            focused,
+            &mut out,
+            &mut ink,
+            &mut fr,
+            &mut nova,
         );
         (fr, out, fp)
     }
@@ -10533,6 +11230,210 @@ mod tests {
         assert!(
             !cats.is_empty(),
             "a kitty typed on the top prompt row visibly peeks in"
+        );
+    }
+
+    /// THE OWNER'S 2026-07-28 REPORT: "sometimes there are 2 cursor kitties
+    /// that have appeared. that is a bug."
+    ///
+    /// ONE keystroke fired TWO independent cat features at one screen spot.
+    /// Typing a feline word makes the host force the cursor companion visible
+    /// at the caret (the collection hello, which bypasses the trail config),
+    /// while the echoed word is simultaneously matched by the ambient scanner,
+    /// which peeks its OWN cat over that word — a couple of cells away, on the
+    /// same rows, for an overlapping ~3 s. Neither feature knew the other
+    /// existed: [`WordDecorations::tick`] and [`WordDecorations::nyan_cursor`]
+    /// simply append to the same `free` stream, and nothing in either reads the
+    /// other's placement. On a first-ever discovery the companion even adopts
+    /// the word-cat's own look, so the pair are literal twins.
+    ///
+    /// The companion IS this word's cat, so the ambient peek yields to it. The
+    /// scope of that yielding is pinned by its sibling test
+    /// ([`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`]).
+    #[test]
+    fn a_word_under_the_companion_never_peeks_a_second_cat() {
+        let lex = lex();
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
+        // `kitty` echoed at a prompt: row 3, cols 5..=9, caret parked one cell
+        // past its last — the shape the owner was looking at.
+        let mut term = Terminal::new(g.rows, g.cols);
+        term.process(b"\x1b[4;6Hkitty");
+        let caret = (3u16, 10u16);
+        assert_eq!(
+            (term.cursor().row, term.cursor().col),
+            caret,
+            "the caret parks one past the typed word"
+        );
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let bg = snap
+            .cells
+            .iter()
+            .find_map(|line| line.first())
+            .map_or(0, |cell| rgb3_to_u32(cell.bg));
+        let scan = || {
+            let mut wd = WordDecorations::default();
+            wd.rescan_from_cells_with_geom_at_cursor(
+                &snap.cells,
+                &snap.line_sizes,
+                rows,
+                cols,
+                &lex,
+                &c,
+                1,
+                t0,
+                g,
+                bg,
+                Some(caret),
+            );
+            let occ = feline(&wd);
+            assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
+            wd
+        };
+        // One host frame in `redraw_window` order: the engine tick, then the
+        // companion emission, sharing ONE free stream.
+        let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
+            let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
+            if let Some(cell) = companion {
+                wd.nyan_cursor(
+                    NyanCursorFrame {
+                        geom: g,
+                        cursor: cell,
+                        look: KittyLook::default(),
+                        colors: CatColorKey::default(),
+                        bob: 0.0,
+                        alpha: 255,
+                        pose: crate::nyan_cursor::CatPose::STILL,
+                        sing: 0.0,
+                        notes: [None; crate::nyan_sing::MAX_NOTES],
+                    },
+                    &mut free,
+                );
+            }
+            free
+        };
+        // The atlas bakes at most two tiles per frame, so settle both engines
+        // over a few mid-dwell frames: the assertion must read the EMISSION
+        // decision, never a transient bake budget.
+        let mut wd = scan();
+        let mut ctl = scan();
+        let (mut fixed, mut control) = (Vec::new(), Vec::new());
+        for k in 0..6u64 {
+            let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
+            fixed = frame(&mut wd, now, Some(caret));
+            control = frame(&mut ctl, now, None);
+        }
+
+        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
+            free.iter()
+                .filter(|s| matches!(s.z, FreeZ::UnderText))
+                .copied()
+                .collect()
+        };
+        // Control: with NO companion on glass the word peeks exactly as it
+        // always has — this is the loved ambient feature, still reachable.
+        assert_eq!(
+            ambient(&control).len(),
+            1,
+            "with no companion up the typed word peeks on its own"
+        );
+        assert_eq!(
+            fixed.len(),
+            1,
+            "the caret already has a companion — no second cat on the same word"
+        );
+        assert!(
+            matches!(fixed[0].z, FreeZ::OverText),
+            "the one cat at the caret is the companion itself"
+        );
+    }
+
+    /// The other half of the one-cat-per-caret rule: suppression is scoped to
+    /// the single occurrence under the companion. A feline word ELSEWHERE on
+    /// screen still peeks in the very same frame, byte-identical to the frame
+    /// with no companion at all.
+    #[test]
+    fn a_feline_word_away_from_the_caret_still_peeks_beside_the_companion() {
+        let lex = lex();
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
+        // Only the AWAY word this time; the caret sits on a bare prompt row.
+        let mut term = Terminal::new(g.rows, g.cols);
+        term.process(b"\x1b[6;1Hkitty\x1b[4;1H");
+        let caret = (3u16, 0u16);
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let bg = snap
+            .cells
+            .iter()
+            .find_map(|line| line.first())
+            .map_or(0, |cell| rgb3_to_u32(cell.bg));
+        let scan = || {
+            let mut wd = WordDecorations::default();
+            wd.rescan_from_cells_with_geom_at_cursor(
+                &snap.cells,
+                &snap.line_sizes,
+                rows,
+                cols,
+                &lex,
+                &c,
+                1,
+                t0,
+                g,
+                bg,
+                Some(caret),
+            );
+            wd
+        };
+        let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
+            let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
+            if let Some(cell) = companion {
+                wd.nyan_cursor(
+                    NyanCursorFrame {
+                        geom: g,
+                        cursor: cell,
+                        look: KittyLook::default(),
+                        colors: CatColorKey::default(),
+                        bob: 0.0,
+                        alpha: 255,
+                        pose: crate::nyan_cursor::CatPose::STILL,
+                        sing: 0.0,
+                        notes: [None; crate::nyan_sing::MAX_NOTES],
+                    },
+                    &mut free,
+                );
+            }
+            free
+        };
+        let mut wd = scan();
+        let mut ctl = scan();
+        let (mut with_companion, mut control) = (Vec::new(), Vec::new());
+        for k in 0..6u64 {
+            let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
+            with_companion = frame(&mut wd, now, Some(caret));
+            control = frame(&mut ctl, now, None);
+        }
+        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
+            free.iter()
+                .filter(|s| matches!(s.z, FreeZ::UnderText))
+                .copied()
+                .collect()
+        };
+        assert_eq!(ambient(&control).len(), 1, "the away kitty peeks");
+        assert_eq!(
+            ambient(&with_companion),
+            ambient(&control),
+            "a companion at the caret leaves every OTHER feline word alone"
+        );
+        assert_eq!(
+            with_companion.len(),
+            2,
+            "one away cat plus the companion — the intended pair"
         );
     }
 
@@ -10718,7 +11619,10 @@ mod tests {
         let mut template = snap.cells[3][0];
         template.ch = ' ';
         template.wide = false;
-        for r in [1usize, 2] {
+        // Both candidate bands must be walled: since 2026-07-26 a head whose
+        // upward band is occupied simply peeks DOWN instead, so occluding only
+        // rows 1-2 would relocate the cat rather than pause it.
+        for r in [1usize, 2, 4, 5] {
             snap.cells[r].resize(cols, template);
             for cell in &mut snap.cells[r] {
                 cell.ch = 'X';
@@ -10753,7 +11657,7 @@ mod tests {
         );
 
         // The rows clear again: the cat resumes mid-dwell and then finishes.
-        for r in [1usize, 2] {
+        for r in [1usize, 2, 4, 5] {
             for cell in &mut snap.cells[r] {
                 cell.ch = ' ';
             }
@@ -12885,6 +13789,7 @@ mod tests {
                     ink_bg: [0; 3],
                     cat_colors: CatColorKey::default(),
                     cat_text_clear: true,
+                    cat_peek_down: false,
                     dec_line: false,
                     inert: false,
                     spec: class_default_spec(Class::Profanity, &cfg_nova()),
@@ -12962,6 +13867,7 @@ mod tests {
                 ink_bg: [0; 3],
                 cat_colors: CatColorKey::default(),
                 cat_text_clear: true,
+                cat_peek_down: false,
                 dec_line: false,
                 inert: false,
                 spec: class_default_spec(Class::Profanity, &cfg_nova()),
@@ -13015,6 +13921,7 @@ mod tests {
                 ink_bg: [0; 3],
                 cat_colors: CatColorKey::default(),
                 cat_text_clear: true,
+                cat_peek_down: false,
                 dec_line,
                 inert: false,
                 spec: class_default_spec(Class::Profanity, &cfg_nova()),

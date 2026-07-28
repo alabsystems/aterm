@@ -682,10 +682,8 @@ mod tests {
     }
 
     fn support(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "aterm-tok-support-{}-{name}",
-            std::process::id()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("aterm-tok-support-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -731,14 +729,23 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn provision_refuses_a_malformed_value_without_echoing_it() {
         let dir = support("bad");
-        for bad in ["", "   ", "not a token", "tok\"en", "gh auth: not logged in"] {
+        for bad in [
+            "",
+            "   ",
+            "not a token",
+            "tok\"en",
+            "gh auth: not logged in",
+        ] {
             let err = provision(&dir, bad).expect_err("{bad:?} must be refused");
             assert!(
                 !err.contains(bad.trim()) || bad.trim().is_empty(),
@@ -804,7 +811,10 @@ mod tests {
         match d.resolved {
             Some(source) => {
                 assert_eq!(d.probes.last().map(|p| p.source), Some(source));
-                assert_eq!(d.probes.last().map(|p| &p.outcome), Some(&ProbeOutcome::Supplied));
+                assert_eq!(
+                    d.probes.last().map(|p| &p.outcome),
+                    Some(&ProbeOutcome::Supplied)
+                );
             }
             None => {
                 assert_eq!(d.probes.len(), 6, "an unprovisioned machine consults all 6");

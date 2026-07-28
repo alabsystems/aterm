@@ -564,7 +564,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Push,
         Session,
-        "subscribe @<sel>[,...] <streams> [since=][every-frame]: push DELTA/EVENT/GAP/BYTES; streams=screen,cursor,cells,bytes,events,sessions (sessions = instance lifecycle: `EVENT * session-created/exited <sid>` for sibling spawns/exits, no `ls` polling); add `timestamps` (alias `ts`) to prefix each wake with a `T <local> <t_us>` line (video's clock) so the stream is a timed frame source",
+        "subscribe @<sel>[,...] <streams> [since=][every-frame]: push DELTA/EVENT/GAP/BYTES; streams=screen,cursor,cells,bytes,events,sessions, at least one of them (a modifier-only list is `ERR usage`); sessions = instance lifecycle (`EVENT * session-created/exited <sid>` for sibling spawns/exits, no `ls` polling) and is OWNER-ONLY because it reports the whole roster, not just your targets — a scoped edge asking for it gets `ERR denied`; add `timestamps` (alias `ts`) INSIDE <streams> (`cells,ts`; trailing is `ERR unknown subscribe arg`) to prefix frames with `T <local|*> <t_us>` lines (video's clock) so the stream is a timed frame source — at most one per channel per wake, tagged `<local>` for session frames and `*` for `sessions` events, so the second token is not always numeric",
     ),
     // sessions, presence & capability — the OwnerOnly access declares the owner
     // gate IN the table (the dispatch reads it, no hardcoded verb list). `who`
@@ -729,20 +729,35 @@ pub fn framing_of(verb: &str, request: &str) -> Framing {
     }
     // `--json`/`json` read mode: the server wraps the body with `json_ok` = a
     // uniform `OK 1\n<body>` (Lines framing) for EVERY json-capable read verb. Verbs
-    // whose plain reply is Status-framed (`cursor`, `dims`) must therefore switch to
-    // Lines under the flag or the client reads only the `OK 1` header and silently
-    // drops the JSON body. Harmless for the already-Lines members (text/screen/…).
-    if matches!(
-        verb,
-        "text" | "screen" | "cursor" | "dims" | "blocks" | "edges" | "grants"
-    ) && req_no_sel
-        .split_whitespace()
-        .any(|t| t == "--json" || t == "json")
+    // whose plain reply is Status-framed (`cursor`, `dims`, `metrics`) must therefore
+    // switch to Lines under the flag or the client reads only the `OK 1` header and
+    // silently drops the JSON body. Harmless for the already-Lines members
+    // (text/screen/…).
+    if JSON_CAPABLE_VERBS.contains(&verb)
+        && req_no_sel
+            .split_whitespace()
+            .any(|t| t == "--json" || t == "json")
     {
         return Lines;
     }
     spec(verb).map_or(Status, |s| s.framing)
 }
+
+/// The verbs whose reply the server wraps in `json_ok` under `--json`/`json`, and
+/// which therefore switch to [`Framing::Lines`] under the flag.
+///
+/// This list MIRRORS the server's `json_ok` call sites (`aterm-gui`'s
+/// `cmd_*_json` helpers). It is the one framing input that is not derivable from
+/// [`VERBS`], because json-capability is a property of the server's handler, not
+/// of the verb row — so it is a hand-maintained duplicate, and duplicates drift.
+/// `metrics` was missing here while `cmd_metrics_json` happily wrote Lines, so
+/// `metrics --json` framed as Status and the client silently DROPPED the JSON
+/// body. Named and exported so `aterm-gui`'s
+/// `json_ok_sites_match_the_json_capable_verbs` test can bind the two ends
+/// together; add a verb here in the same change that adds its `_json` handler.
+pub const JSON_CAPABLE_VERBS: &[&str] = &[
+    "text", "screen", "cursor", "dims", "blocks", "edges", "grants", "metrics",
+];
 
 /// The generated per-verb catalog lines (`<name padded>  <help>`), in table order.
 /// The server's help catalog is its fixed header followed by these — so the
@@ -754,6 +769,36 @@ pub fn catalog_lines() -> impl Iterator<Item = String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every json-capable verb must be a REAL table row, and a `Read` one — a
+    /// typo or a removed verb would otherwise sit here silently doing nothing.
+    #[test]
+    fn json_capable_verbs_are_real_read_verbs() {
+        assert!(!JSON_CAPABLE_VERBS.is_empty(), "non-vacuity");
+        for v in JSON_CAPABLE_VERBS {
+            let s = spec(v).unwrap_or_else(|| panic!("json-capable {v:?} is not in VERBS"));
+            assert_eq!(s.op, Read, "json-capable {v:?} should be a Read verb");
+        }
+    }
+
+    /// The regression: `metrics --json` framed as Status while the server wrote
+    /// Lines, so the client consumed the `OK 1` header and dropped the JSON body.
+    #[test]
+    fn json_flag_switches_every_json_capable_verb_to_lines() {
+        for v in JSON_CAPABLE_VERBS {
+            for flag in ["--json", "json"] {
+                assert_eq!(
+                    framing_of(v, &format!("{v} {flag}")),
+                    Lines,
+                    "{v} {flag} must frame as Lines (the json_ok `OK 1\\n<body>` shape)"
+                );
+            }
+        }
+        // Negative control: WITHOUT the flag the verb keeps its table framing, so
+        // the test above is not passing for a trivial reason.
+        assert_eq!(framing_of("metrics", "metrics"), Status);
+        assert_eq!(framing_of("cursor", "cursor"), Status);
+    }
 
     #[test]
     fn table_has_no_duplicate_verbs() {

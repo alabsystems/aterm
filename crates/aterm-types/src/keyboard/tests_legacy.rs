@@ -44,6 +44,51 @@ fn legacy_encode_ctrl_a() {
     assert_eq!(result, vec![0x01]);
 }
 
+/// Regression (owner, 2026-07-28: "does control-_ work as undo like in emacs
+/// now? it doesn't seem to work"): Ctrl-`_` must emit US (0x1F), the byte
+/// readline and emacs bind to `undo`.
+///
+/// `Key::Character` carries the UNSHIFTED base, so the chord arrives as
+/// `Ctrl+Shift+'-'`. `ctrl_character` keys on `'_'`, never `'-'`, so the lookup
+/// missed and the chord fell through to the plain-glyph path — emitting a
+/// literal `_` (0x5F). Undo silently did nothing.
+///
+/// The sibling chords are asserted alongside it because they are the reason the
+/// gap survived this long: each has its UNSHIFTED character in the table too, so
+/// they resolved before shift ever mattered and made the area look covered.
+/// They also pin that the fallback is ADDITIVE — `Ctrl+Shift+'/'` must stay
+/// 0x1F, not silently become `Ctrl-?` (0x7F).
+#[test]
+fn legacy_encode_ctrl_underscore_is_us_for_emacs_undo() {
+    let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+    assert_eq!(
+        encode_key(&Key::Character('-'), ctrl_shift, KeyboardMode::empty()),
+        vec![0x1f],
+        "Ctrl-_ is US (0x1F) — the readline/emacs undo byte"
+    );
+
+    // Unchanged siblings: the fallback must not renegotiate any of these.
+    for (base, want, name) in [
+        ('/', 0x1f_u8, "Ctrl+Shift+/ stays US, not DEL"),
+        ('2', 0x00, "Ctrl+Shift+2 is NUL"),
+        ('6', 0x1e, "Ctrl+Shift+6 is RS"),
+    ] {
+        assert_eq!(
+            encode_key(&Key::Character(base), ctrl_shift, KeyboardMode::empty()),
+            vec![want],
+            "{name}"
+        );
+    }
+
+    // Without SHIFT there is no shifted glyph to fall back to, so `-` keeps its
+    // ordinary self — the fallback is reached only when the chord asks for it.
+    assert_eq!(
+        encode_key(&Key::Character('-'), Modifiers::CTRL, KeyboardMode::empty()),
+        vec![b'-'],
+        "plain Ctrl+- is untouched by the shifted fallback"
+    );
+}
+
 /// Regression (K-1 "Shift doesn't work"): SHIFT on a NON-letter must yield the
 /// shifted glyph in legacy mode. The old `to_ascii_uppercase` no-op'd on every
 /// digit/symbol, so Shift+2 emitted '2' instead of '@' and shifted symbols were

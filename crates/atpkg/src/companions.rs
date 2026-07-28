@@ -261,7 +261,9 @@ fn is_valid_program_id(s: &str) -> bool {
 /// Whether `s` is exactly `n` lowercase-hex characters.
 #[must_use]
 fn is_n_hex(s: &str, n: usize) -> bool {
-    s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == n
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[must_use]

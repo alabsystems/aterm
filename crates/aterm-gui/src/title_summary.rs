@@ -7092,7 +7092,10 @@ mod tests {
         coordinator.retries.remove(&session);
         coordinator.defer_observation(session, now);
         assert_eq!(
-            coordinator.retries.get(&session).map(|at| at.duration_since(now)),
+            coordinator
+                .retries
+                .get(&session)
+                .map(|at| at.duration_since(now)),
             Some(base),
             "the ladder restarts at the base delay after a successful observation"
         );

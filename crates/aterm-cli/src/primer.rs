@@ -76,6 +76,80 @@ pub(crate) fn primer_block() -> String {
     format!("{MARK_BEGIN}\n{PRIMER_BODY}\n{MARK_END}\n")
 }
 
+// ---------------------------------------------------------------------------
+// Managed SKILL files
+//
+// The primer is a marked BLOCK inside a file the user also owns. A skill is the
+// opposite shape: a WHOLE file that is entirely aterm's, in an agent-specific
+// skills directory. So it gets its own three-state model, and one extra state
+// the primer cannot have — `Foreign`, a file at our path with no marker, which
+// is the user's and is never touched.
+//
+// Compiled in, never artifact-supplied — the same rule as atpkg's shell hooks.
+// ---------------------------------------------------------------------------
+
+/// Every marker line any past or future managed skill begins with — the search
+/// key that identifies a file as OURS regardless of version.
+const SKILL_MARK_PREFIX: &str = "<!-- aterm skill";
+
+/// The `drive-aterm` skill: how one agent drives another aterm session over the
+/// control socket. Compiled in from the repo asset so the shipped binary is the
+/// single source of truth — there is no separate file to forget to update.
+const DRIVE_SKILL_BODY: &str = include_str!("../assets/drive-aterm-skill.md");
+
+/// One managed skill file: `dir_rel` is the agent-relative skills subdirectory,
+/// `body` the compiled-in content.
+struct SkillFile {
+    /// Path under `$HOME`, `/`-separated (joined per-platform by [`home_join`]).
+    path: &'static str,
+    /// The compiled-in file content.
+    body: &'static str,
+}
+
+/// The skills this build ships, per agent `name`. Only Claude Code defines a
+/// skills convention (`~/.claude/skills/<name>/SKILL.md`) today; the other agents
+/// in [`AGENT_FILES`] get the primer only. Extend here when they grow one.
+fn skills_for(agent: &str) -> &'static [SkillFile] {
+    match agent {
+        "claude" => &[SkillFile {
+            path: ".claude/skills/drive-aterm/SKILL.md",
+            body: DRIVE_SKILL_BODY,
+        }],
+        _ => &[],
+    }
+}
+
+/// The install state of one managed skill file.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SkillState {
+    /// No file at the path.
+    Absent,
+    /// Our file, byte-identical to this build's content.
+    Current,
+    /// Our file (marker present) but different — an older version or hand-edited.
+    Stale,
+    /// A file exists with NO aterm marker: the user's own skill of the same name.
+    /// Never overwritten — removing the marker is the documented way to opt out.
+    Foreign,
+}
+
+/// Classify existing `content` at a skill path against the compiled-in `body`.
+/// Pure, so every edge is unit-testable without touching the filesystem.
+#[must_use]
+pub(crate) fn skill_state(content: &str, body: &str) -> SkillState {
+    if content == body {
+        return SkillState::Current;
+    }
+    if content
+        .lines()
+        .any(|l| l.trim_start().starts_with(SKILL_MARK_PREFIX))
+    {
+        SkillState::Stale
+    } else {
+        SkillState::Foreign
+    }
+}
+
 /// One coding agent's global context file. `dir` doubles as the DETECTION signal:
 /// its existence means the agent is installed/in use on this machine, so a bare
 /// `aterm agents install` may write there. Paths are `/`-separated segments under
@@ -336,10 +410,25 @@ pub(crate) fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
                     FileSituation::File(Err(e)) => format!("ERROR: {e}"),
                 };
                 let _ = writeln!(out, "{:<9} ~/{:<28} {state}", a.name, a.file);
+                // Skills are whole managed FILES, listed under their agent so the
+                // status view stays one line per artifact.
+                for s in skills_for(a.name) {
+                    let path = home_join(home, s.path);
+                    let st = match std::fs::read_to_string(&path) {
+                        Err(_) => "absent".to_string(),
+                        Ok(c) => match skill_state(&c, s.body) {
+                            SkillState::Current => "installed".to_string(),
+                            SkillState::Stale => "stale (install updates it)".to_string(),
+                            SkillState::Foreign => "foreign — yours, left alone".to_string(),
+                            SkillState::Absent => "absent".to_string(),
+                        },
+                    };
+                    let _ = writeln!(out, "{:<9} ~/{:<28} {st}", "  skill", s.path);
+                }
             }
             out.push_str(
-                "\n`aterm agents install` installs/updates the primer for detected agents;\n\
-                 `aterm agents primer` prints the block for manual pasting.\n",
+                "\n`aterm agents install` installs/updates the primer AND the bundled skills\n\
+                 for detected agents; `aterm agents primer` prints the block for manual pasting.\n",
             );
             (out, 0)
         }
@@ -354,6 +443,9 @@ pub(crate) fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
             for a in agents {
                 let path = home_join(home, a.file);
                 let sit = situation(home, a);
+                // Captured BEFORE the match below consumes `sit` (its `File`
+                // arm moves the inner Result, which is not Copy).
+                let undetected = matches!(sit, FileSituation::NotDetected);
                 let verdict = match sit {
                     FileSituation::NotDetected if !forced => {
                         format!("skipped — no ~/{} (not detected; name it to force)", a.dir)
@@ -396,6 +488,43 @@ pub(crate) fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
                     }
                 };
                 let _ = writeln!(out, "{:<9} ~/{:<28} {verdict}", a.name, a.file);
+
+                // Bundled skills ride the SAME install: an agent that gets the
+                // primer gets the skills too. A skipped (undetected, unforced)
+                // agent skips its skills as well — never create `~/.claude` for
+                // someone who does not use Claude Code.
+                if undetected && !forced {
+                    continue;
+                }
+                for s in skills_for(a.name) {
+                    let sp = home_join(home, s.path);
+                    let existing = std::fs::read_to_string(&sp).ok();
+                    let state = existing
+                        .as_deref()
+                        .map_or(SkillState::Absent, |c| skill_state(c, s.body));
+                    let verdict = match state {
+                        SkillState::Current => "already installed".to_string(),
+                        // The user's own file at our path: never clobbered.
+                        SkillState::Foreign => {
+                            "skipped — not an aterm-managed file (yours)".to_string()
+                        }
+                        SkillState::Absent | SkillState::Stale => {
+                            let w = sp
+                                .parent()
+                                .map_or(Ok(()), std::fs::create_dir_all)
+                                .and_then(|()| std::fs::write(&sp, s.body));
+                            match w {
+                                Ok(()) if state == SkillState::Stale => "updated".to_string(),
+                                Ok(()) => "installed".to_string(),
+                                Err(e) => {
+                                    failed = true;
+                                    format!("ERROR: {e}")
+                                }
+                            }
+                        }
+                    };
+                    let _ = writeln!(out, "{:<9} ~/{:<28} {verdict}", "  skill", s.path);
+                }
             }
             (out, i32::from(failed))
         }
@@ -432,6 +561,29 @@ pub(crate) fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
                     },
                 };
                 let _ = writeln!(out, "{:<9} ~/{:<28} {verdict}", a.name, a.file);
+
+                // Symmetric uninstall: delete only files we still recognise as
+                // OURS. A `Foreign` file (marker removed) is the user's — and a
+                // `Stale` one is ours from an older build, so it does go.
+                for s in skills_for(a.name) {
+                    let sp = home_join(home, s.path);
+                    let verdict = match std::fs::read_to_string(&sp) {
+                        Err(_) => "nothing to remove".to_string(),
+                        Ok(c) => match skill_state(&c, s.body) {
+                            SkillState::Foreign => {
+                                "kept — not an aterm-managed file (yours)".to_string()
+                            }
+                            _ => match std::fs::remove_file(&sp) {
+                                Ok(()) => "removed".to_string(),
+                                Err(e) => {
+                                    failed = true;
+                                    format!("ERROR: {e}")
+                                }
+                            },
+                        },
+                    };
+                    let _ = writeln!(out, "{:<9} ~/{:<28} {verdict}", "  skill", s.path);
+                }
             }
             (out, i32::from(failed))
         }
@@ -604,5 +756,88 @@ mod tests {
         let (out, code) = agents_report(home.path(), &["primer".to_string()]);
         assert_eq!(code, 0);
         assert_eq!(out, primer_block());
+    }
+
+    // ---- bundled skill files -------------------------------------------------
+
+    /// The compiled-in skill must carry its marker, or every install would
+    /// classify it `Foreign` and refuse to write. This is the one property that
+    /// silently disables the whole feature if the asset is edited carelessly.
+    #[test]
+    fn bundled_skill_carries_its_managed_marker() {
+        assert!(
+            DRIVE_SKILL_BODY
+                .lines()
+                .any(|l| l.trim_start().starts_with(SKILL_MARK_PREFIX)),
+            "the shipped skill lost its `{SKILL_MARK_PREFIX}` marker line"
+        );
+        assert_eq!(
+            skill_state(DRIVE_SKILL_BODY, DRIVE_SKILL_BODY),
+            SkillState::Current,
+            "the shipped body must classify as Current against itself"
+        );
+    }
+
+    /// The skill must be a valid Claude Code skill: YAML frontmatter with a
+    /// `name:` and a `description:` (the fields the harness matches on).
+    #[test]
+    fn bundled_skill_has_usable_frontmatter() {
+        let mut lines = DRIVE_SKILL_BODY.lines();
+        assert_eq!(
+            lines.next().map(str::trim),
+            Some("---"),
+            "must open with frontmatter"
+        );
+        let head: Vec<&str> = DRIVE_SKILL_BODY.lines().take(12).collect();
+        assert!(
+            head.iter().any(|l| l.starts_with("name:")),
+            "frontmatter needs name:"
+        );
+        assert!(
+            head.iter().any(|l| l.starts_with("description:")),
+            "frontmatter needs description: (it is what triggers the skill)"
+        );
+    }
+
+    /// The skill states must be distinguishable — especially `Foreign`, which is
+    /// what stops aterm from clobbering a user's own same-named skill.
+    #[test]
+    fn skill_state_distinguishes_ours_from_the_users() {
+        let body = "---\nname: x\n---\n<!-- aterm skill v1 -->\nbody\n";
+        assert_eq!(skill_state(body, body), SkillState::Current);
+
+        // Our marker, different content -> ours, outdated -> safe to overwrite.
+        let older = "---\nname: x\n---\n<!-- aterm skill v0 -->\nold body\n";
+        assert_eq!(skill_state(older, body), SkillState::Stale);
+
+        // No marker at all -> the user's file. NEVER overwritten.
+        let theirs = "---\nname: x\n---\nmy own notes\n";
+        assert_eq!(skill_state(theirs, body), SkillState::Foreign);
+    }
+
+    /// Only Claude Code defines a skills convention today; the others must get
+    /// none, so `install` never fabricates a skills dir for an agent that has no
+    /// such concept.
+    #[test]
+    fn skills_are_registered_only_for_agents_that_have_them() {
+        assert_eq!(skills_for("claude").len(), 1);
+        for a in AGENT_FILES.iter().filter(|a| a.name != "claude") {
+            assert!(
+                skills_for(a.name).is_empty(),
+                "{} has no skills convention; shipping one would create a bogus dir",
+                a.name
+            );
+        }
+        // Every registered skill must live UNDER its agent's own config dir.
+        for a in AGENT_FILES {
+            for s in skills_for(a.name) {
+                assert!(
+                    s.path.starts_with(a.dir),
+                    "skill {} escapes {}'s config dir",
+                    s.path,
+                    a.name
+                );
+            }
+        }
     }
 }

@@ -1827,9 +1827,14 @@ fn drain_more_nonblocking_with_idle_wait(
     )
 }
 
-/// Shared gather body. `after_idle_gap` is a deterministic test seam invoked
-/// after the immediate probes are exhausted and immediately before an armed
-/// parser-idle wait; the shipping wrapper supplies an inlined no-op.
+/// Shared gather body. `before_gap_park` is a deterministic test seam invoked
+/// after the immediate probes are exhausted and immediately before the drain
+/// PARKS on a dry gap — either the armed parser-idle wait (parser idle) or the
+/// `BRIDGE_POLL_MS` bridge poll (parser busy). Exactly one of those two parks
+/// runs per dry gap, so the seam fires exactly once per gap on whichever path is
+/// taken. That is what lets a test inject a refill that PROVABLY lands inside
+/// the park, instead of racing a sleep against it. The shipping wrapper supplies
+/// an inlined no-op.
 fn drain_more_nonblocking_with_idle_wait_after_gap(
     master: i32,
     buf: &mut [u8],
@@ -1837,7 +1842,7 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
     wake_rd: i32,
     parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
     idle_wait_us: u32,
-    mut after_idle_gap: impl FnMut(),
+    mut before_gap_park: impl FnMut(),
 ) -> usize {
     /// One kernel tty output queue's worth — at/above this the writer saturated it.
     const SATURATED: usize = 1024;
@@ -1893,7 +1898,7 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
                     // Hysteresis: a µs-bounded wait for the refill instead of
                     // delivering a churn-sized batch (BATCH_BUDGET still caps
                     // the whole gather — it is re-checked per dry gap).
-                    after_idle_gap();
+                    before_gap_park();
                     match idle_refill_wait(master, wake_rd, idle_wait_us) {
                         BridgeWait::Refill => {
                             spins = 0;
@@ -1902,6 +1907,7 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
                         BridgeWait::Deliver => break,
                     }
                 }
+                before_gap_park();
                 match bridge_poll(master, wake_rd, BRIDGE_POLL_MS) {
                     BridgeWait::Refill => spins = 0,
                     BridgeWait::Deliver => break,
@@ -2146,44 +2152,72 @@ mod tests {
     /// bridge poll must be gathered into the SAME batch, not delivered as a
     /// partial. Also pins the idle-cutoff's sign: inverting `== 0` would
     /// deliver at the first dry gap and this test would see only chunk 1.
-    /// Scheduling-flake damped by retrying: a broken bridge NEVER continues,
-    /// so any passing attempt proves the mechanism.
+    /// DETERMINISTIC: the refill is injected FROM the drain's own dry-gap seam,
+    /// so it provably lands inside the bridge park. No sleep, no retry, no
+    /// scheduling assumption — a failure here is a real regression.
+    ///
+    /// This test used to race a 300 µs sleep against the 1 ms `BRIDGE_POLL_MS`
+    /// window and retry until one attempt happened to land, which failed a
+    /// full-workspace run. The seam existed already but fired only on the
+    /// parser-IDLE path; the busy-parser bridge park had none, which is why the
+    /// test had to guess. Firing it before both parks is the actual fix.
     #[test]
     fn drain_more_nonblocking_busy_parser_bridges_refill_into_same_batch() {
         use std::sync::atomic::AtomicUsize;
-        let mut ok = false;
-        for _ in 0..3 {
-            let mut m = [0i32; 2];
-            // SAFETY: valid 2-int out-array for pipe(2).
-            assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-            let (rd, wr) = (m[0], m[1]);
-            set_nonblocking(rd, true).expect("nonblock read end");
-            let chunk = [0xC3u8; 2048];
-            // SAFETY: bounded write to this test's live pipe end.
-            assert_eq!(
-                unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
-                chunk.len() as isize
-            );
-            let writer = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_micros(300));
-                // SAFETY: bounded write to the pipe end this thread owns.
-                unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) };
-                close_fd(wr);
-            });
-            let busy = AtomicUsize::new(1);
-            let mut buf = [0u8; 65_536];
-            let n = read(rd, &mut buf[..1024]);
-            assert!(n > 0);
-            let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, Some(&busy));
-            writer.join().unwrap();
-            close_fd(rd);
-            if filled == 2 * chunk.len() {
-                ok = true;
-                break;
-            }
-        }
+        let mut m = [0i32; 2];
+        // SAFETY: valid 2-int out-array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+        let (rd, wr) = (m[0], m[1]);
+        set_nonblocking(rd, true).expect("nonblock read end");
+        let chunk = [0xC3u8; 2048];
+        // SAFETY: bounded write to this test's live pipe end.
+        assert_eq!(
+            unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+            chunk.len() as isize
+        );
+
+        let busy = AtomicUsize::new(1); // parser busy ⇒ the bridge parks, not the idle wait
+        let mut buf = [0u8; 65_536];
+        let n = read(rd, &mut buf[..1024]);
+        assert!(n > 0);
+        let mut injected = false;
+        let filled = drain_more_nonblocking_with_idle_wait_after_gap(
+            rd,
+            &mut buf,
+            n as usize,
+            -1,
+            Some(&busy),
+            // 0 = the idle path's immediate-deliver cutoff, which returns BEFORE
+            // the seam. That is what keeps the idle-cutoff SIGN pinned: invert
+            // `== 0` and this busy parser takes the idle branch, breaks at the
+            // cutoff, and never fires the seam — caught by `injected` below.
+            0,
+            || {
+                // The drain has exhausted its probes and is about to park on a
+                // dry gap. Refill exactly here: a bridge that continues gathers
+                // it into THIS batch; a broken one has already delivered.
+                if injected {
+                    return;
+                }
+                injected = true;
+                // SAFETY: bounded write to this test's live pipe end.
+                assert_eq!(
+                    unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+                    chunk.len() as isize
+                );
+            },
+        );
+        close_fd(wr);
+        close_fd(rd);
         assert!(
-            ok,
+            injected,
+            "the drain must reach the BUSY-parser bridge park and fire the seam \
+             (a parser-busy drain that took the idle branch means the cutoff's \
+             sign is inverted)"
+        );
+        assert_eq!(
+            filled,
+            2 * chunk.len(),
             "a busy-parser bridge must continue the batch across a refill gap"
         );
     }

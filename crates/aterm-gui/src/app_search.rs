@@ -1294,11 +1294,7 @@ impl App {
         };
         if changed {
             self.search_recompute_in(wid);
-        } else if let Some(window) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.os_window.as_ref())
-        {
+        } else if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             window.request_redraw();
         }
     }
@@ -1646,7 +1642,11 @@ mod tests {
     fn field(query: &str) -> SearchState {
         let mut state = SearchState::default();
         state.set_query(query.to_string());
-        assert_eq!(state.cursor, query.len(), "typing parks the caret at the end");
+        assert_eq!(
+            state.cursor,
+            query.len(),
+            "typing parks the caret at the end"
+        );
         state
     }
 
@@ -1735,7 +1735,10 @@ mod tests {
         let mut s = field("éß");
         s.cursor = 1;
         assert!(s.edit(SearchEdit::Insert("x".into())));
-        assert_eq!(s.query, "xéß", "a mid-codepoint caret floors to the boundary");
+        assert_eq!(
+            s.query, "xéß",
+            "a mid-codepoint caret floors to the boundary"
+        );
         let mut s = field("é");
         s.cursor = 99;
         assert!(s.edit(SearchEdit::DeleteBack));

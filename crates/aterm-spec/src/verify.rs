@@ -45,9 +45,18 @@
 //! ## Caller idioms
 //!
 //! ```ignore
-//! // Derived-model obligation (interpreter always; ty additionally when installed):
-//! aterm_spec::verify::check_model_tiered(&m, "Thing Tier-0");
-//! aterm_spec::verify::prove_and_catch_tiered(&m, "Thing non-vacuity");
+//! // SCALAR derived model — the overwhelmingly common case (66 of the 70 in
+//! // tree, and every `ty_model!`-authored one). The interpreter always runs, so
+//! // coverage is unconditional and the returned [`Covered`] is a log line, not
+//! // a decision:
+//! aterm_spec::verify::check_scalar(&m, "Thing Tier-0");
+//! aterm_spec::verify::prove_and_catch_scalar(&m, "Thing non-vacuity");
+//!
+//! // FUNCTION-VALUED derived model — the interpreter cannot evaluate it, so
+//! // without `ty` the obligation does NOT run. The `_tiered` forms return
+//! // `Result<Covered, NotRun>` precisely so the caller must state a policy:
+//! match aterm_spec::verify::check_model_tiered(&m, "Thing Tier-0") { /* ... */ }
+//!
 //! let (ok, why) = aterm_spec::verify::validate_transition_tiered(&m, &overrides, &prev, &next, Some("Push"), "Thing conformance");
 //!
 //! // External-tool analysis (runs only where the tool exists):
@@ -321,18 +330,36 @@ pub fn ay_escalation(label: &str) -> Option<PathBuf> {
 // tiers check the SAME derived model; disagreement panics.
 // ---------------------------------------------------------------------------
 
-/// How a tiered obligation was discharged (for the caller's log line).
+/// How a tiered obligation WAS discharged — every variant is real coverage.
+///
+/// There is deliberately no "did not run" inhabitant: holding one of these is a
+/// claim that the obligation ran, and a caller that wants coverage must not be
+/// able to accept its absence by accident. The no-coverage case is [`NotRun`],
+/// the `Err` half of the `_tiered` functions' return type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Discharge {
+pub enum Covered {
     /// Interpreter BMC only (no `ty` installed) — still a real exhaustive check.
     Interpreter,
     /// Interpreter BMC AND the external `ty` binary agreed.
     InterpreterAndTy,
     /// Function-valued model: interpreter inapplicable, `ty` checked it.
     TyOnly,
-    /// Function-valued model AND no `ty`: the obligation did NOT run (reported
-    /// loudly; the only combination with no coverage, and it names itself).
-    NotRun,
+}
+
+/// The obligation did NOT run: a FUNCTION-VALUED model (which the in-process
+/// interpreter cannot evaluate) on a machine with no Trust `ty`.
+///
+/// This is the `Err` half rather than a `Covered` variant because `Result` is
+/// `#[must_use]`: an added call site cannot drop it with a bare statement, and a
+/// scalar model that later grows an `fn_vars` entry turns every one of its call
+/// sites into a compile error instead of a silent green. The `_tiered` functions
+/// have already printed the detailed notice by the time this is returned — the
+/// caller's job is to state a POLICY (skip loudly, or fail the gate), not to
+/// re-report the fact.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotRun {
+    /// The model whose obligation went unchecked (`Model::name`).
+    pub model: &'static str,
 }
 
 /// Run `ty check` on a derived model's generated spec + cfg; panics on failure
@@ -376,11 +403,13 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// and `ty check` additionally proves the generated TLA+ wherever installed
 /// (panics on failure or on tier disagreement). Function-valued models skip
 /// the interpreter (inapplicable by construction) and REQUIRE the `ty` tier;
-/// with no `ty` they report [`Discharge::NotRun`] loudly.
+/// with no `ty` they report [`NotRun`] loudly AND return it, so the caller has
+/// to state a policy. Scalar callers want [`check_scalar`], which discharges
+/// that obligation once rather than at every site.
 // Skip: a tiered verification DRIVER — shells out to `ty`, renders output,
 // and its asserts are deliberate harness aborts. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn check_model_tiered(m: &Model, label: &str) -> Discharge {
+pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
     let interp_ran = if m.fn_vars.is_empty() {
         match interp::bmc(m) {
             Ok(n) => eprintln!("{label}: {} proven over {n} states (interpreter).", m.name),
@@ -412,12 +441,12 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Discharge {
                 m.name
             );
             if interp_ran {
-                Discharge::InterpreterAndTy
+                Ok(Covered::InterpreterAndTy)
             } else {
-                Discharge::TyOnly
+                Ok(Covered::TyOnly)
             }
         }
-        None if interp_ran => Discharge::Interpreter,
+        None if interp_ran => Ok(Covered::Interpreter),
         None => {
             eprintln!(
                 "VERIFY ESCALATION TIER NOT RUN: `{label}` ({}) is a FUNCTION-VALUED model \
@@ -426,7 +455,7 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Discharge {
                  (in $HOME/trust/first-party/ty).",
                 m.name
             );
-            Discharge::NotRun
+            Err(NotRun { model: m.name })
         }
     }
 }
@@ -435,12 +464,13 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Discharge {
 /// invariant at `Buggy=0` and finds a counterexample at `Buggy=1` (panics
 /// otherwise), and `ty` additionally does the same wherever installed (panics
 /// on failure or tier disagreement). Function-valued models (`fn_vars`
-/// non-empty: Coalesce, Recording, TierResidency, …) skip the interpreter
-/// (inapplicable by construction) and REQUIRE the `ty` tier; with no `ty` they
-/// report [`Discharge::NotRun`] loudly.
+/// non-empty: EvictFull, TierResidency, Recording, Coalesce — the only four in
+/// tree) skip the interpreter (inapplicable by construction) and REQUIRE the
+/// `ty` tier; with no `ty` they report [`NotRun`] loudly AND return it. Scalar
+/// callers want [`prove_and_catch_scalar`].
 // Skip: same tiered-driver class as `check_model_tiered`.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Discharge {
+pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
     let interp_ran = if m.fn_vars.is_empty() {
         interp::prove_and_catch(m);
         true
@@ -479,12 +509,12 @@ pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Discharge {
                 if interp_ran { "additionally " } else { "" }
             );
             if interp_ran {
-                Discharge::InterpreterAndTy
+                Ok(Covered::InterpreterAndTy)
             } else {
-                Discharge::TyOnly
+                Ok(Covered::TyOnly)
             }
         }
-        None if interp_ran => Discharge::Interpreter,
+        None if interp_ran => Ok(Covered::Interpreter),
         None => {
             eprintln!(
                 "VERIFY ESCALATION TIER NOT RUN: `{label}` ({}) is a FUNCTION-VALUED model \
@@ -493,9 +523,59 @@ pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Discharge {
                  (in $HOME/trust/first-party/ty).",
                 m.name
             );
-            Discharge::NotRun
+            Err(NotRun { model: m.name })
         }
     }
+}
+
+/// Discharge a SCALAR model's Tier-0 obligation, asserting the scalar shape that
+/// makes the `_tiered` form's `Err` half unreachable: the interpreter runs for
+/// every model with no `fn_vars`, so coverage is unconditional and the returned
+/// [`Covered`] is a log line rather than a decision.
+///
+/// This states, ONCE, the assertion the ~21 scalar call sites used to make
+/// implicitly by dropping the old `Discharge` with a bare statement — the same
+/// guard [`deadlock_free_and_catches_tiered`] already writes out. Asserting the
+/// shape up front rather than unwrapping the result is what makes it
+/// machine-independent: a model that later grows an `fn_vars` entry fails here
+/// on every machine, instead of passing on developer boxes that happen to have
+/// `ty` installed and failing only on a fresh clone.
+// Skip: thin policy wrapper over `check_model_tiered` (same verification-tooling
+// tier); its assert is a deliberate harness abort.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn check_scalar(m: &Model, label: &str) -> Covered {
+    assert_scalar(m, label, "check_scalar");
+    match check_model_tiered(m, label) {
+        Ok(c) => c,
+        Err(n) => unreachable!("{label}: scalar model {} reported {n:?}", m.name),
+    }
+}
+
+/// Prove-and-catch a SCALAR model's obligation. See [`check_scalar`] for why the
+/// scalar shape is asserted rather than the result unwrapped.
+// Skip: same thin-policy-wrapper class as `check_scalar`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn prove_and_catch_scalar(m: &Model, label: &str) -> Covered {
+    assert_scalar(m, label, "prove_and_catch_scalar");
+    match prove_and_catch_tiered(m, label) {
+        Ok(c) => c,
+        Err(n) => unreachable!("{label}: scalar model {} reported {n:?}", m.name),
+    }
+}
+
+/// The shared precondition of the `_scalar` forms. `caller` names the function
+/// the site actually called, so the message says which one to stop using.
+// Skip: a build-tooling PRECONDITION — the panic is the deliberate
+// "this model can no longer be discharged unconditionally" abort.
+#[cfg_attr(trust_verify, trust::skip)]
+fn assert_scalar(m: &Model, label: &str, caller: &str) {
+    assert!(
+        m.fn_vars.is_empty(),
+        "{label}: {} is FUNCTION-VALUED, so `{caller}` cannot discharge it — the interpreter \
+         cannot evaluate it and the `ty` tier may be absent. Call the `_tiered` form and state a \
+         policy for the `NotRun` case.",
+        m.name
+    );
 }
 
 /// The machine-verified NEGATIVE-CONTROL criterion for `--strict-vacuity`'s
@@ -621,6 +701,10 @@ pub fn audit_dead_negative_controls(m: &Model, ty_reported_dead: &[&str]) -> Res
 /// violation — panics on failure or tier disagreement). `is_final` names the
 /// legitimate work-complete terminal states (the interpreter twin of the
 /// model's `Done` stutter self-loop).
+///
+/// Scalar-only (asserted), so like the `_scalar` forms it returns a [`Covered`]
+/// outright: the interpreter always runs, and there is no `NotRun` case to
+/// decide about.
 // Skip: a VERIFICATION-HARNESS driver — it shells out to `ty`, writes
 // temp spec/cfg files, and every `expect(..)` is a deliberate test-time
 // abort (a missing model checker MUST fail the run loudly). The lossy
@@ -630,11 +714,8 @@ pub fn deadlock_free_and_catches_tiered(
     m: &Model,
     is_final: impl Fn(&interp::State) -> bool,
     label: &str,
-) -> Discharge {
-    assert!(
-        m.fn_vars.is_empty(),
-        "{label}: deadlock_free_and_catches_tiered requires a scalar model"
-    );
+) -> Covered {
+    assert_scalar(m, label, "deadlock_free_and_catches_tiered");
     assert!(
         interp::find_deadlock(&interp::with_buggy(m, 0), &is_final).is_none(),
         "{label}: {} (Buggy=0) must be DEADLOCK-FREE (interpreter tier)",
@@ -700,9 +781,9 @@ pub fn deadlock_free_and_catches_tiered(
                 "{label}: {} additionally deadlock-checked by ty (free at Buggy=0, wedge at Buggy=1).",
                 m.name
             );
-            Discharge::InterpreterAndTy
+            Covered::InterpreterAndTy
         }
-        None => Discharge::Interpreter,
+        None => Covered::Interpreter,
     }
 }
 
@@ -844,6 +925,23 @@ mod tests {
     use super::*;
     use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
     use crate::ty_model;
+
+    /// A SCALAR model can never report [`NotRun`] — that is the fact
+    /// [`check_scalar`]/[`prove_and_catch_scalar`] convert into an unconditional
+    /// `Covered`, and the reason ~21 call sites are allowed to ignore the
+    /// toolchain's presence. Pinned here rather than reasoned about: if the
+    /// interpreter tier ever grew a bail-out, this goes red instead of those
+    /// sites quietly returning coverage they no longer have.
+    #[test]
+    fn a_scalar_model_can_never_report_not_run() {
+        let m = ring_model();
+        assert!(m.fn_vars.is_empty(), "the probe model must be scalar");
+        let d = check_model_tiered(&m, "scalar-discharge probe");
+        assert!(
+            matches!(d, Ok(Covered::Interpreter | Covered::InterpreterAndTy)),
+            "{d:?}"
+        );
+    }
 
     /// The four committed-dead `ConfigCatalogSnapshot` mutants are verified
     /// negative controls: dial present, fire at Buggy=1, caught at Buggy=1.

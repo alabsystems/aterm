@@ -1181,6 +1181,11 @@ impl App {
         // headless/unfocused capture arms nothing).
         let cpos = term.cursor();
         let cur = term.cursor_visible().then_some((cpos.row, cpos.col));
+        // ONE CAT PER CARET: exactly the predicate the companion emission below
+        // draws under. Told which cell the companion occupies, the engine drops
+        // the ambient peek for the word beneath it — a capture must show the
+        // same single cat the glass does, not the pre-fix pair.
+        let companion_at = cur.filter(|_| nyan_enabled && cat_frame.alpha > 0);
         // The same selection view the animated tick sees (§6.4 nova ignition
         // deferral / per-quad attenuation) — a capture must not ignite a nova
         // the window itself would defer.
@@ -1197,7 +1202,7 @@ impl App {
                 birth,
                 &cfg,
                 effect_geom,
-                cur,
+                companion_at,
                 Some(sel_view),
                 ws.focused,
                 &mut ws.deco_scratch,
@@ -1223,7 +1228,7 @@ impl App {
             now,
             &cfg,
             effect_geom,
-            cur,
+            companion_at,
             Some(sel_view),
             ws.focused,
             &mut ws.deco_scratch,

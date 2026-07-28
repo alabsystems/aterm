@@ -148,9 +148,27 @@ pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
         NukePart::Cap => {
             fill_path(&mut tile, &[&NUKE_CAP_DOME], white, NUKE_A, fit);
             fill_path(&mut tile, &[&NUKE_CAP_CURL], white, NUKE_A * 0.82, fit);
-            tile.disc(0.26 * wf, 0.30 * hf, (0.15 * hf).max(1.5), white, NUKE_A * 0.90);
-            tile.disc(0.52 * wf, 0.18 * hf, (0.17 * hf).max(1.5), white, NUKE_A * 0.90);
-            tile.disc(0.76 * wf, 0.32 * hf, (0.14 * hf).max(1.5), white, NUKE_A * 0.90);
+            tile.disc(
+                0.26 * wf,
+                0.30 * hf,
+                (0.15 * hf).max(1.5),
+                white,
+                NUKE_A * 0.90,
+            );
+            tile.disc(
+                0.52 * wf,
+                0.18 * hf,
+                (0.17 * hf).max(1.5),
+                white,
+                NUKE_A * 0.90,
+            );
+            tile.disc(
+                0.76 * wf,
+                0.32 * hf,
+                (0.14 * hf).max(1.5),
+                white,
+                NUKE_A * 0.90,
+            );
         }
         NukePart::Stem => {
             fill_path(&mut tile, &[&NUKE_STEM], white, NUKE_A, fit);
@@ -315,8 +333,14 @@ mod tests {
     /// is gone by `NUKE_TOTAL_MS` — nothing may outlive the detonation.
     #[test]
     fn parts_live_only_in_their_phase() {
-        assert!(nuke_draw(0, NukePart::Stem).is_none(), "stem before the flash");
-        assert!(nuke_draw(0, NukePart::Cap).is_none(), "cap before the flash");
+        assert!(
+            nuke_draw(0, NukePart::Stem).is_none(),
+            "stem before the flash"
+        );
+        assert!(
+            nuke_draw(0, NukePart::Cap).is_none(),
+            "cap before the flash"
+        );
         assert!(
             nuke_draw(FLASH_END_MS, NukePart::Stem).is_some(),
             "the stem must rise once the flash ends"
@@ -347,7 +371,9 @@ mod tests {
 
         for t in (0..NUKE_TOTAL_MS + 200).step_by(10) {
             for part in PARTS {
-                let Some(d) = nuke_draw(t, part) else { continue };
+                let Some(d) = nuke_draw(t, part) else {
+                    continue;
+                };
                 assert!(
                     d.sx.is_finite() && d.sy.is_finite() && d.dy_cells.is_finite(),
                     "{part:?} at {t}ms produced a non-finite transform"
@@ -357,7 +383,10 @@ mod tests {
                     "{part:?} at {t}ms had alpha {} outside 0..=1",
                     d.alpha
                 );
-                assert!(d.sx > 0.0 && d.sy > 0.0, "{part:?} at {t}ms scaled to nothing");
+                assert!(
+                    d.sx > 0.0 && d.sy > 0.0,
+                    "{part:?} at {t}ms scaled to nothing"
+                );
             }
         }
     }

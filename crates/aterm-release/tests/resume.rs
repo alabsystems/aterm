@@ -1906,6 +1906,57 @@ fn published_snapshot_preserves_symbolic_target_but_claim_capability_does_not() 
     verify::validate_unbound_published_target(&scratch).unwrap();
 }
 
+/// A MIRRORED channel head is valid with a default-branch target, and the private
+/// claim-SHA capability check must keep rejecting it.
+///
+/// This is the invariant `step_mirror` violated on v0.6.0 and v0.7.0. Both cuts
+/// created the public draft, uploaded the assets and flipped it live — correctly —
+/// and then `prove_mirror_channel_head` ran the PRIVATE scan over the channel and
+/// refused, because a mirrored release is anchored at the channel's default branch
+/// (`create_mirror_draft` sends no `target_commitish`: the claim commit does not
+/// exist in that repository). The releases were right; the cut wedged with the
+/// lease still held and needed a hand-edited journal to finish.
+///
+/// The first assertion is the negative control. It must stay: it is what stops
+/// someone "fixing" the channel case by relaxing the private capability check,
+/// which every scratch/rehearsal path depends on.
+#[test]
+fn a_mirrored_channel_head_is_valid_with_a_default_branch_target() {
+    let claim = "d".repeat(40);
+    let mirrored = publish::ReleaseObjectIdentity {
+        id: 360_201_027,
+        tag: "v0.7.0".into(),
+        draft: false,
+        target_commitish: "main".into(),
+    };
+
+    // NEGATIVE CONTROL — the private invariant still refuses this object.
+    let mut row = yank_published("v0.7.0", 1_785_125_098, None);
+    row.release_id = Some(mirrored.id);
+    row.release = Some(mirrored.clone());
+    row.tag = "v0.7.0".into();
+    assert!(
+        verify::validate_unbound_published_target(&row).is_err(),
+        "the private claim-SHA capability must keep rejecting a default-branch \
+         target — scratch and rehearsal scans depend on it"
+    );
+
+    // ...and the object itself is a perfectly good release: same id, same tag,
+    // published. Only the target differs, and on a channel it must.
+    publish::validate_release_object_snapshot(Some(&mirrored), &mirrored).unwrap();
+    assert!(
+        publish::validate_release_object_capability(
+            Some(&mirrored),
+            mirrored.id,
+            &mirrored.tag,
+            &claim,
+            false,
+        )
+        .is_err(),
+        "a claim SHA can never equal a channel's default branch name"
+    );
+}
+
 #[test]
 fn release_identity_parsers_do_not_lowercase_symbolic_targets() {
     let response =

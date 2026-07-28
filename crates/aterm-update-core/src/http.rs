@@ -180,7 +180,11 @@ fn curl_argv(args: &[&str], url: &str, authenticated: bool) -> Vec<String> {
     let mut v = Vec::with_capacity(args.len().min(32) + 7);
     v.push("-q".to_string());
     v.extend(args.iter().map(|s| (*s).to_string()));
-    v.extend(["-H", "User-Agent: aterm-update"].iter().map(|s| (*s).to_string()));
+    v.extend(
+        ["-H", "User-Agent: aterm-update"]
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
     if authenticated {
         v.extend(["--config", "-"].iter().map(|s| (*s).to_string()));
     }

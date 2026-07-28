@@ -6,7 +6,7 @@
 //!
 //! The design deliberately does **not** apply every member the same way (§16.4): a CLI
 //! tool flips immediately (a POSIX `bin/` symlink), `trust`/`trust-mc` need a sysroot
-//! relocation + `~/.kani` wiring gated on the named nightly (§10.1), and `aterm.app`
+//! relocation (§10.1), and `aterm.app`
 //! itself is **not** a tarball at all — it is a notarized DMG staged for the self-swap on
 //! next launch (the two-anchor gate, §16.2/§16.4), never the immediate symlink flip.
 //! [`strategy_for`] is that pure mapping; an unknown kind is **fail-closed** ([`Unknown`])
@@ -21,7 +21,7 @@ pub enum ApplyStrategy {
     /// exposed binary into `bin/` (§10). The immediate, tool path.
     Shim,
     /// A `trust`/`trust-mc` sysroot bundle: extract, relocate the (dangling) sysroot
-    /// toolchain link to the user's rustup toolchain, and atomically wire `~/.kani`, gated
+    /// toolchain link to its resolved toolchain, gated
     /// on the four-component nightly being installed (§10.1). Its `exposes` still shim.
     SysrootBundle,
     /// The `aterm.app` DMG: NOT extracted as a tarball — staged for the **notarized

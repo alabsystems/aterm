@@ -443,13 +443,56 @@ impl Floor {
 /// periodic loop doesn't re-download the same (up to 512 MB) DMG every interval when
 /// the newest release is a build we already proved unstageable (F17). Keyed by
 /// `(build_number, sha256)` so a re-published fix under the same build is retried.
+///
+/// # Why there is a retry budget and not a permanent memo
+///
+/// This memo used to be permanent for a given `(build, sha256)`: once recorded,
+/// the only escapes were a NEWER build or a re-publish under a different digest.
+/// That is right for a genuinely corrupt artifact and WRONG for everything else,
+/// because staging fails for plenty of transient reasons that say nothing about
+/// the bytes — a full disk, a `codesign`/`spctl` invocation that lost a race with
+/// Gatekeeper's cache, a DMG mount refused under memory pressure, a machine put
+/// to sleep mid-extract. One such blip permanently pinned that machine to its
+/// current build with no user-visible cause and no recovery short of deleting
+/// updater state by hand.
+///
+/// So the memo now carries an attempt count and a `retry_after` deadline, and it
+/// SUPPRESSES rather than FORBIDS: the same candidate is retried on a widening
+/// schedule ([`RETRY_BACKOFF_SECS`], capped at its last entry) instead of never.
+/// A corrupt artifact therefore costs one download per backoff period rather than
+/// one per check — the bandwidth F17 was protecting — while a transient failure
+/// heals on its own.
+///
+/// The crash-loop TRIAL marker (`Updates/trial.toml`) is a different use of this
+/// same type and deliberately keeps the old permanent semantics: poisoning an
+/// artifact that crashed on boot must be deterministic, so those paths call
+/// [`FailedMark::record`]/[`FailedMark::matches`] and never consult the deadline.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FailedMark {
     #[serde(default)]
     pub build_number: u64,
     #[serde(default)]
     pub sha256: String,
+    /// How many times this exact `(build_number, sha256)` has failed. Absent in
+    /// markers written before the retry budget existed ⇒ 0, which is treated as
+    /// "one failure" by [`FailedMark::next_attempt`] so an old file does not get
+    /// a longer backoff than a fresh one.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Unix seconds before which this candidate is skipped. Absent ⇒ 0, i.e. an
+    /// old permanent-style marker becomes immediately retryable, which is the
+    /// safe direction: the worst case is one extra download.
+    #[serde(default)]
+    pub retry_after: u64,
 }
+
+/// The widening retry schedule for a candidate that failed to stage, in seconds:
+/// 15 min, 1 h, 4 h, then 24 h forever. The first entry is already longer than
+/// the authenticated check interval (75 s), so a failing build cannot cost more
+/// than one download per 15 minutes even at its most aggressive; the 24 h ceiling
+/// bounds a permanently-corrupt artifact at one download a day, against the
+/// unbounded "never retry" this replaced.
+pub const RETRY_BACKOFF_SECS: [u64; 4] = [15 * 60, 60 * 60, 4 * 60 * 60, 24 * 60 * 60];
 
 impl FailedMark {
     /// Read the memo, or `None` if absent/unparseable.
@@ -458,13 +501,89 @@ impl FailedMark {
     }
 
     /// Whether this memo matches the given candidate (same build AND same DMG hash).
+    ///
+    /// Pure identity, with no notion of time — this is what the crash-loop TRIAL
+    /// marker wants. The download/stage memo must use [`FailedMark::suppresses`]
+    /// instead, or a transient failure becomes permanent.
     pub fn matches(&self, build_number: u64, sha256: &str) -> bool {
         self.build_number == build_number && self.sha256.eq_ignore_ascii_case(sha256)
     }
 
+    /// Whether this memo should SKIP the given candidate right now: it names the
+    /// same artifact AND its backoff deadline has not yet passed. Once the
+    /// deadline passes the candidate is retried (and, if it fails again, recorded
+    /// with the next-wider backoff).
+    ///
+    /// `now` is unix seconds. A marker with no `retry_after` (written before the
+    /// retry budget existed) never suppresses.
+    #[must_use]
+    pub fn suppresses(&self, build_number: u64, sha256: &str, now: u64) -> bool {
+        self.matches(build_number, sha256) && now < self.retry_after
+    }
+
+    /// Seconds until this memo stops suppressing, or 0 if it already has.
+    #[must_use]
+    pub fn retry_in_secs(&self, now: u64) -> u64 {
+        self.retry_after.saturating_sub(now)
+    }
+
+    /// The attempt count and backoff a fresh failure of `(build_number, sha256)`
+    /// should be recorded with, given this memo as the prior state. Pure, so the
+    /// widening schedule is unit-testable without a filesystem or a clock.
+    ///
+    /// A failure of a DIFFERENT artifact resets the budget — the previous one is
+    /// no longer the candidate and its history says nothing about this one.
+    #[must_use]
+    pub fn next_attempt(&self, build_number: u64, sha256: &str) -> u32 {
+        if self.matches(build_number, sha256) {
+            self.attempts.saturating_add(1).max(2)
+        } else {
+            1
+        }
+    }
+
+    /// The backoff for the `n`-th consecutive failure (1-based), saturating at the
+    /// last entry of [`RETRY_BACKOFF_SECS`].
+    #[must_use]
+    pub fn backoff_secs(attempts: u32) -> u64 {
+        let idx = (attempts.max(1) as usize - 1).min(RETRY_BACKOFF_SECS.len() - 1);
+        RETRY_BACKOFF_SECS[idx]
+    }
+
     /// Record `(build_number, sha256)` as the last failed candidate (best-effort).
+    ///
+    /// PERMANENT form — no backoff deadline is written, so [`Self::suppresses`]
+    /// never fires for it. This is the crash-loop TRIAL marker's semantics; the
+    /// download/stage memo wants [`Self::record_stage_failure`].
     pub fn record(path: &Path, build_number: u64, sha256: &str) {
         let _ = Self::record_required(path, build_number, sha256);
+    }
+
+    /// Record a download/stage failure of `(build_number, sha256)`, widening the
+    /// retry backoff when this is a repeat of the same artifact and resetting it
+    /// when the candidate changed. Best-effort: a memo we fail to persist only
+    /// costs a redundant download next cycle, never correctness.
+    ///
+    /// `now` is unix seconds, threaded in rather than read here so the widening
+    /// schedule is testable.
+    pub fn record_stage_failure(path: &Path, build_number: u64, sha256: &str, now: u64) {
+        let prior = Self::read(path).unwrap_or_default();
+        let attempts = prior.next_attempt(build_number, sha256);
+        let m = FailedMark {
+            build_number,
+            sha256: sha256.to_ascii_lowercase(),
+            attempts,
+            retry_after: now.saturating_add(Self::backoff_secs(attempts)),
+        };
+        let Ok(text) = toml::to_string(&m) else {
+            return;
+        };
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// Atomically record `(build_number, sha256)`, reporting persistence failure.
@@ -478,6 +597,9 @@ impl FailedMark {
         let m = FailedMark {
             build_number,
             sha256: sha256.to_ascii_lowercase(),
+            // No deadline: this form is the deterministic crash-loop poison.
+            attempts: 0,
+            retry_after: 0,
         };
         let text =
             toml::to_string(&m).map_err(|error| format!("serialize artifact marker: {error}"))?;
@@ -501,6 +623,106 @@ impl FailedMark {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression this budget exists for: a stage failure must SUPPRESS the
+    /// candidate for a while, then let it through again. The old marker had no
+    /// deadline and stranded the machine on its current build forever.
+    #[test]
+    fn a_stage_failure_suppresses_then_expires_instead_of_being_permanent() {
+        let root = std::env::temp_dir().join(format!("aterm-failedmark-ttl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("failed.toml");
+        const BUILD: u64 = 1785125098;
+        const SHA: &str = "62605231daafe06037584df32414f02120f0f040b2b20ba77bdaff214ba028d6";
+
+        FailedMark::record_stage_failure(&path, BUILD, SHA, 1_000);
+        let m = FailedMark::read(&path).expect("marker persisted");
+        assert_eq!(m.attempts, 1);
+        assert_eq!(m.retry_after, 1_000 + RETRY_BACKOFF_SECS[0]);
+
+        // Inside the window: skipped.
+        assert!(m.suppresses(BUILD, SHA, 1_000));
+        assert!(m.suppresses(BUILD, SHA, 1_000 + RETRY_BACKOFF_SECS[0] - 1));
+        // Past the window: retried. THIS is what the old permanent memo never did.
+        assert!(!m.suppresses(BUILD, SHA, 1_000 + RETRY_BACKOFF_SECS[0]));
+
+        // A different artifact is never suppressed by this memo.
+        assert!(!m.suppresses(BUILD + 1, SHA, 1_000));
+        assert!(!m.suppresses(BUILD, &"a".repeat(64), 1_000));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Repeats of the SAME artifact widen the backoff and saturate; a different
+    /// artifact resets it.
+    #[test]
+    fn the_retry_budget_widens_saturates_and_resets_on_a_new_artifact() {
+        let root =
+            std::env::temp_dir().join(format!("aterm-failedmark-widen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("failed.toml");
+        const SHA: &str = "deadbeef";
+
+        for (n, expected) in RETRY_BACKOFF_SECS.iter().enumerate() {
+            FailedMark::record_stage_failure(&path, 7, SHA, 0);
+            let m = FailedMark::read(&path).unwrap();
+            assert_eq!(m.attempts as usize, n + 1, "attempt {n} count");
+            assert_eq!(m.retry_after, *expected, "attempt {n} backoff");
+        }
+        // Saturated: one more failure keeps the ceiling, does not grow past it.
+        FailedMark::record_stage_failure(&path, 7, SHA, 0);
+        let m = FailedMark::read(&path).unwrap();
+        assert_eq!(m.retry_after, *RETRY_BACKOFF_SECS.last().unwrap());
+
+        // A different build resets to the first rung.
+        FailedMark::record_stage_failure(&path, 8, SHA, 0);
+        let m = FailedMark::read(&path).unwrap();
+        assert_eq!(m.attempts, 1);
+        assert_eq!(m.retry_after, RETRY_BACKOFF_SECS[0]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The crash-loop TRIAL marker keeps its deterministic permanent semantics:
+    /// `record` writes no deadline, so `suppresses` never fires and `matches`
+    /// still identifies the poisoned artifact exactly.
+    #[test]
+    fn the_permanent_record_form_keeps_crash_loop_poisoning_deterministic() {
+        let root =
+            std::env::temp_dir().join(format!("aterm-failedmark-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("trial.toml");
+
+        FailedMark::record(&path, 42, "ABCDEF");
+        let m = FailedMark::read(&path).unwrap();
+        assert_eq!(m.retry_after, 0);
+        assert!(m.matches(42, "abcdef"), "identity is case-insensitive");
+        assert!(
+            !m.suppresses(42, "abcdef", u64::MAX),
+            "a permanent poison marker must not participate in the retry budget"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A marker written before the retry budget existed has no `attempts` /
+    /// `retry_after` keys. It must parse, and must be immediately retryable
+    /// rather than inheriting the old forever-skip.
+    #[test]
+    fn a_pre_budget_marker_parses_and_becomes_retryable() {
+        let m: FailedMark = toml::from_str("build_number = 9\nsha256 = \"ff\"\n").unwrap();
+        assert_eq!(m.attempts, 0);
+        assert_eq!(m.retry_after, 0);
+        assert!(m.matches(9, "ff"));
+        assert!(!m.suppresses(9, "ff", 0), "old markers must not strand a machine");
+        // And the next failure of that same artifact starts at rung 2, not 1 —
+        // it is genuinely a repeat, so it should not get the shortest backoff.
+        assert_eq!(m.next_attempt(9, "ff"), 2);
+        assert_eq!(m.next_attempt(10, "ff"), 1);
+    }
 
     #[test]
     fn installed_receipt_is_exact_and_requires_sealed_bundle_identity() {

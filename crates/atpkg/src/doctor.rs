@@ -7,7 +7,7 @@
 //! Structural breakage (a broken bin shim, an active build whose store tree vanished, a
 //! fish-breaking stray `.sh`, a world-writable login-sourced dir) is a PROBLEM → nonzero
 //! exit. Everything advisory (bin not yet on PATH, a frozen-looking index, a foreign
-//! `~/.kani` link) stays a WARNING → exit 0. It reads no unverified index/manifest
+//! sysroot wiring) stays a WARNING → exit 0. It reads no unverified index/manifest
 //! (verify-before-parse): its freshness surface reads atpkg's OWN `status.toml` +
 //! the durable [`crate::sig::Floor`].
 
@@ -137,6 +137,64 @@ pub fn run_with(
     }
     println!("doctor: ok — {} program(s) active", active.len());
 
+    // (5b) LIVE-BUILD WITNESS. `gc` reclaims a program's superseded builds only when the
+    // authoritative `store/<program>/current` symlink and the derived `bin/` shim view name
+    // the SAME build; where they don't it abstains rather than guess (guessing is what
+    // deleted live trees). Abstention is silent by nature — the program simply accumulates
+    // builds forever — so this is the surface that makes it visible. A genuine disagreement
+    // is STRUCTURAL: whichever view is stale, some tool on PATH is running a build activation
+    // does not select. A merely-absent witness is not breakage, so it warns.
+    let live = crate::gc::live_builds(layout);
+    for d in live.diverged() {
+        match &d.reason {
+            crate::gc::Diverged::ChannelShimMismatch {
+                channel_says,
+                shims_say,
+            } => {
+                fails += 1;
+                eprintln!(
+                    "doctor: FAIL — {}: the channel selects build {channel_says} but its bin/ \
+                     shims run build {shims_say} (re-run `atpkg update {}`)",
+                    d.program, d.program
+                );
+            }
+            crate::gc::Diverged::ShimsDisagree { builds } => {
+                fails += 1;
+                eprintln!(
+                    "doctor: FAIL — {}: its bin/ shims are split across builds {} — one \
+                     program's tools must all point into one build (re-run `atpkg update {}`)",
+                    d.program,
+                    build_list(builds),
+                    d.program
+                );
+            }
+            crate::gc::Diverged::ChannelsDisagree { builds } => {
+                fails += 1;
+                eprintln!(
+                    "doctor: FAIL — {}: two channel `current` links select different builds \
+                     {} and it has no `store/{}/current` of its own to break the tie — run \
+                     `atpkg update {}` to write one",
+                    d.program,
+                    build_list(builds),
+                    d.program,
+                    d.program
+                );
+            }
+            crate::gc::Diverged::NoLiveWitness { shims_say } => {
+                println!(
+                    "doctor: warn — {}: build {shims_say} is on PATH but no `current` link \
+                     selects it, so gc keeps every superseded {} build. Run \
+                     `atpkg update {}` to re-activate it and clear this.",
+                    d.program, d.program, d.program
+                );
+            }
+        }
+    }
+    println!(
+        "doctor: ok — {} program(s) with a proven live build",
+        live.len()
+    );
+
     // (6) SHELL HOOKS + FISH-SAFETY.
     if let Some(home) = home {
         let aterm = home.join(".aterm");
@@ -205,40 +263,9 @@ pub fn run_with(
         crate::sig::Floor::new(layout.floor()).current()
     );
 
-    // (9) ~/.kani + RUSTUP + RELOCATABILITY.
-    if let Some(home) = home {
-        let kani = home.join(".kani");
-        if kani.is_dir() {
-            if let Ok(m) = std::fs::symlink_metadata(&kani)
-                && m.file_type().is_dir()
-                && !crate::platform::dir_meta_is_private(&m)
-            {
-                println!("doctor: warn — ~/.kani is group/other-writable");
-            }
-            let store = layout.prefix.join("store");
-            if let Ok(entries) = std::fs::read_dir(&kani) {
-                for e in entries.flatten() {
-                    let name = e.file_name();
-                    let Some(name) = name.to_str() else { continue };
-                    if !name.starts_with("kani-") {
-                        continue;
-                    }
-                    if let Ok(target) = std::fs::read_link(e.path())
-                        && !target.starts_with(&store)
-                    {
-                        println!(
-                            "doctor: warn — foreign ~/.kani entry {name} (atpkg did not create it)"
-                        );
-                    }
-                }
-            }
-            if !rustup_present() {
-                println!(
-                    "doctor: warn — rustup not found; a rustup-linked toolchain bundle needs it \
-                     (self-contained bundles are portable)"
-                );
-            }
-        }
+    // (9) RUSTUP + RELOCATABILITY.
+    if !rustup_present() {
+        println!("doctor: warn — rustup not found (self-contained bundles are portable)");
     }
 
     if fails == 0 {
@@ -248,6 +275,15 @@ pub fn run_with(
         println!("doctor: found {fails} problem(s)");
         false
     }
+}
+
+/// Render a divergence's contested build numbers for the report line.
+fn build_list(builds: &[u64]) -> String {
+    builds
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whole days since `updated_at` (RFC3339), or `None` if it cannot be parsed.
@@ -315,6 +351,10 @@ mod tests {
         Layout { prefix: p }
     }
 
+    fn tool(name: &str) -> crate::store::ToolName {
+        crate::store::ToolName::new(name).unwrap()
+    }
+
     fn synthetic_home(label: &str) -> PathBuf {
         let h = std::env::temp_dir().join(format!("atpkg-dhome-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&h);
@@ -324,13 +364,23 @@ mod tests {
         h
     }
 
-    fn install(layout: &Layout, program: &str, build: u64) {
+    /// The build tree alone — no shims, no channel. Split out so a test can construct the
+    /// half-wired states the witness checks are about.
+    fn install_build_tree(layout: &Layout, program: &str, build: u64) -> PathBuf {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         // The concrete executable the shim will forward to (`<program>.exe` on Windows) —
         // it must EXIST for the broken-shim scan (check 4) to see a healthy layout.
-        let exe = format!("{program}{}", crate::platform::EXE_SUFFIX);
-        std::fs::write(dir.join("bin").join(exe), b"#!/bin/true\n").unwrap();
+        std::fs::write(
+            dir.join("bin").join(tool(program).exe_file()),
+            b"#!/bin/true\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn install(layout: &Layout, program: &str, build: u64) {
+        let dir = install_build_tree(layout, program, build);
         install_shims(layout, &dir, &[program.to_string()]).unwrap();
         activate_channel(layout, "stable", &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
@@ -371,12 +421,9 @@ mod tests {
         install(&l, "ay", 18);
         // Add a shim pointing at a nonexistent target (a dangling symlink on Unix, a `.cmd`
         // forwarding to a missing exe on Windows) via the same primitive a real install uses.
-        crate::platform::install_shim(
-            &l.build_dir("ay", 99).join("bin"),
-            "ghost",
-            &l.shim("ghost"),
-        )
-        .unwrap();
+        let ghost = tool("ghost");
+        crate::platform::install_shim(&l.build_dir("ay", 99).join("bin"), &ghost, &l.shim(&ghost))
+            .unwrap();
         let home = synthetic_home("broken");
         assert!(
             !run_with(&l, Some(&home), None, 0, None, None),
@@ -397,7 +444,7 @@ mod tests {
         std::fs::write(
             l.build_dir("ay", 18)
                 .join("bin")
-                .join(format!("ay{}", crate::platform::EXE_SUFFIX)),
+                .join(tool("ay").exe_file()),
             b"#!/bin/true\n",
         )
         .unwrap();
@@ -422,6 +469,46 @@ mod tests {
         assert!(
             !run_with(&l, Some(&home), None, 0, None, None),
             "a fish-breaking stray .sh is structural"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A shim and the channel naming different builds is STRUCTURAL: something on PATH is
+    /// running a build the channel does not select, and `gc` has stopped reclaiming that
+    /// program entirely. Doctor is the only place that says so.
+    #[test]
+    fn a_shim_disagreeing_with_the_channel_is_structural() {
+        let l = layout("witness-mismatch");
+        install(&l, "ay", 19); // channel + shim both at 19
+        // Stage 18 COMPLETE on disk (so check 5 stays quiet) and re-point ONLY the shim.
+        let older = install_build_tree(&l, "ay", 18);
+        crate::store::mark_build_ready(&older).unwrap();
+        let ay = tool("ay");
+        crate::platform::install_shim(&older.join("bin"), &ay, &l.shim(&ay)).unwrap();
+        let home = synthetic_home("witness-mismatch");
+        assert!(
+            !run_with(&l, Some(&home), None, 0, None, None),
+            "channel says 19, shims say 18 — structural"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A program with no channel witness is not breakage — nothing is broken, gc just
+    /// abstains — so it warns and stays exit-0. It must still be SAID: the whole cost of
+    /// abstaining is that it is otherwise invisible.
+    #[test]
+    fn a_program_with_no_channel_witness_warns_but_exit_zero() {
+        let l = layout("witness-absent");
+        install_build_tree(&l, "ay", 18);
+        let dir = l.build_dir("ay", 18);
+        install_shims(&l, &dir, &["ay".to_string()]).unwrap(); // shimmed, never activated
+        crate::store::mark_build_ready(&dir).unwrap();
+        let home = synthetic_home("witness-absent");
+        assert!(
+            run_with(&l, Some(&home), None, 0, None, None),
+            "an un-witnessed program is advisory, not structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);

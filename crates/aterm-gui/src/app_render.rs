@@ -3965,7 +3965,11 @@ mod suggestion_paint_tests {
         let mut s = scratch(1);
         // Only one row exists; the tail would need a second.
         assert!(paint_suggestion(&mut s, "abcde", (0, 2), 4, blank()).is_some());
-        assert_eq!(s.cells.len(), 1, "no row was added — real output must not move");
+        assert_eq!(
+            s.cells.len(),
+            1,
+            "no row was added — real output must not move"
+        );
         assert_eq!(s.cells[0][2].ch, 'a');
         assert_eq!(s.cells[0][3].ch, 'b');
     }
@@ -4022,7 +4026,10 @@ mod suggestion_paint_tests {
         assert!(paint_suggestion(&mut s, "xyz", (0, 2), 4, blank()).is_some());
         assert_eq!(s.cells[0][2].ch, 'x');
         assert_eq!(s.cells[0][3].ch, 'y');
-        assert_eq!(s.cells[1][0].ch, 'ש', "the wrapped tail must not land on an RTL row");
+        assert_eq!(
+            s.cells[1][0].ch, 'ש',
+            "the wrapped tail must not land on an RTL row"
+        );
     }
 
     /// Under `fish` / `zsh-autosuggestions` the shell has ALREADY painted its
@@ -7512,9 +7519,21 @@ impl App {
             // and DROP the row probe (row_prev outliving the fenced frame
             // would diff pre-scroll against post-scroll content one frame
             // later — the same phantom-poof hole, delayed).
-            let scrolled_rows = ws
-                .poof_scrollback
-                .map_or(0, |prev| scrollback_lines.saturating_sub(prev));
+            //
+            // DETACH WINDOW (see `WindowState::poof_offload_in_flight`): a width
+            // reflow lends the tiered store to a worker, so this counter collapses
+            // on detach and spikes by the whole history on re-attach. Neither swing
+            // is a scroll. Compare only across two frames that BOTH sat outside the
+            // window; otherwise re-anchor silently.
+            let offload_in_flight = term.grid().reflow_offload_in_flight();
+            let comparable = !offload_in_flight && !ws.poof_offload_in_flight;
+            ws.poof_offload_in_flight = offload_in_flight;
+            let scrolled_rows = if comparable {
+                ws.poof_scrollback
+                    .map_or(0, |prev| scrollback_lines.saturating_sub(prev))
+            } else {
+                0
+            };
             if scrolled_rows > 0 {
                 let d = scrolled_rows.min(rows).min(u16::MAX as usize) as u16;
                 ws.cursor_glow.note_scroll(d);
@@ -7687,6 +7706,10 @@ impl App {
                     .set_cursor_style_override(Some(CursorStyle::SteadyBlock));
             }
             self.install_window_config_assets(id);
+            // Resolved BEFORE the mutable window borrow: the session kitty is a
+            // pure function of the focused pane's session id.
+            let front_session = self.focused_session_id(id).unwrap_or(0);
+            let collected_look = self.kitty_log.companion_look();
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
@@ -7725,15 +7748,32 @@ impl App {
             // the one body keeps the same latched look until the next wake.
             // Only `on_collect` below swaps mid-appearance, because the discovery
             // hello legitimately presents the newly unlocked collectible.
-            if let Some(look) = self.kitty_log.companion_look() {
-                ws.cursor_cat.set_look(look);
-            }
+            // THE SESSION KITTY (owner, 2026-07-26). An explicitly COLLECTED
+            // companion wins — the user picked it, and only a reason may change
+            // the kitty. With nothing collected the companion used to fall back
+            // to `KittyLook::default()`, so every session on a fresh install
+            // wore the identical cat; it now wears one derived from its own
+            // session id: unique per session, stable for the session's life,
+            // and free to restore because it is a pure function of the id.
+            let look = collected_look.unwrap_or_else(|| {
+                aterm_effects::kitty_registry::KittyLook::for_session(front_session)
+            });
+            ws.cursor_cat.set_look(look);
             // Full motion advances the fade/bob machine. Reduced motion samples
             // a collection hello as one opaque still; ordinary earned flights
             // remain hidden and the scheduler arms only its one erase deadline.
             let cat_presentable = win_focused && !deco_suspend;
             ws.cursor_cat
                 .set_collection_presentable(frame_started, cat_presentable);
+            // The word engine takes the SAME predicate. While a window is not
+            // presenting it never renders, so it never rescans — and every
+            // feline word that arrived meanwhile would otherwise be born at
+            // once on the first frame back, a crowd of cats announcing text
+            // that scrolled by minutes ago. Syncing this lets the engine spend
+            // those births instead (owner: "when I restore focus to a window,
+            // I don't want all the kitties appearing again").
+            ws.word_decos
+                .set_presentable(frame_started, cat_presentable);
             // FULL-NYAN SING-ALONG (`aterm_effects::nyan_sing`): resolve the
             // held-key celebration drive for this present. STYLE-GATED to
             // the Nyan trail (other styles read a hard 0). While any drive
@@ -7951,7 +7991,14 @@ impl App {
                         frame_started,
                         tick_cfg,
                         effect_geom,
-                        cur,
+                        // ONE CAT PER CARET: `nyan_alpha` (resolved above) is
+                        // this frame's companion decision, and the emission
+                        // below draws it at `cur`. Handing the engine the same
+                        // cell stops the ambient scanner peeking a SECOND cat
+                        // at the word the caret is sitting on — the two
+                        // features are otherwise blind to each other, so typing
+                        // `kitty` drew both at once.
+                        cur.filter(|_| nyan_alpha > 0),
                         Some(sel_view),
                         ws.focused,
                         &mut ws.deco_scratch,
@@ -10282,8 +10329,17 @@ impl App {
                         None
                     };
                     // Scroll translation + fenced-frame probe drop — the
-                    // single-pane path's twins (see the LOCK A capture there).
-                    let scrolled = ws.poof_scrollback.map_or(0, |p| sb.saturating_sub(p));
+                    // single-pane path's twins (see the LOCK A capture there),
+                    // including its DETACH-WINDOW guard: across a reflow offload
+                    // the counter swings by the whole history and means nothing.
+                    let pane_offload = term.grid().reflow_offload_in_flight();
+                    let comparable = !pane_offload && !ws.poof_offload_in_flight;
+                    ws.poof_offload_in_flight = pane_offload;
+                    let scrolled = if comparable {
+                        ws.poof_scrollback.map_or(0, |p| sb.saturating_sub(p))
+                    } else {
+                        0
+                    };
                     if scrolled > 0 {
                         let d = (scrolled.min(u16::MAX as usize) as u16).min(r.rows);
                         ws.cursor_glow.note_scroll(d);
@@ -12178,17 +12234,27 @@ impl App {
         if Some((rows, cols)) == self.windows.get(&wid).map(|ws| (ws.rows, ws.cols)) {
             return false;
         }
-        // NYAN RESIZE STREAK license. The relayout leap is a gesture the user's hand
-        // made, so it earns the rainbow ZOOM even from cold typing momentum — but
-        // only ONCE per gesture. `resize_live_drag` is set exactly around the
-        // interactive throttle (`on_resize_throttled`), so the leading edge and every
-        // ~20 Hz mid-drag step arm nothing and the drag stays quiet; the TRAILING
-        // settle (`flush_pending_resize`) and every out-of-band re-grid (the
-        // control-socket `resize` verb, a scale-factor or font-zoom change) run with
-        // the flag clear and arm the single streak. Read the flag BEFORE borrowing
-        // `ws`. Past the unchanged-geometry early-return above, so a no-op resize
-        // (the control-echo follow-up `Resized`, a same-size settle) licenses nothing.
-        let reflow_gesture = !self.resize_live_drag;
+        // RESIZE STREAK license — the relayout leap is a gesture the user's hand
+        // made, so it earns the streak even from cold typing momentum, but only
+        // ONCE per gesture. Granted when the gesture has ENDED, so a drag
+        // yields one streak on release instead of a rainbow scribble along the way.
+        //
+        // The test is "no interactive `Resized` for at least one throttle window",
+        // NOT `!resize_live_drag`. That flag brackets only `on_resize_throttled`,
+        // and a live drag fires a trailing settle every RESIZE_THROTTLE (~20 Hz)
+        // which lands a real reflow with the flag CLEAR — so keying on it licensed
+        // ~20 streaks per second for the entire drag. `last_resized_event_at` is
+        // the hand: mid-drag it is milliseconds old (no license), and the settle
+        // that follows the hand stopping is a full throttle window later (license).
+        //
+        // Out-of-band re-grids — the control-socket `resize` verb, a font-zoom or
+        // scale-factor change — carry a stale-or-absent stamp and so are licensed
+        // immediately, which is right: each is already one complete gesture.
+        let reflow_gesture = self.windows.get(&wid).is_none_or(|ws| {
+            ws.last_resized_event_at.is_none_or(|t| {
+                std::time::Instant::now().saturating_duration_since(t) >= crate::RESIZE_THROTTLE
+            })
+        });
         if let Some(ws) = self.windows.get_mut(&wid) {
             if reflow_gesture {
                 let now = std::time::Instant::now();
@@ -13170,7 +13236,11 @@ mod find_bar_splice_tests {
         app.splice_find_bar(wid);
         let ws = &app.windows[&wid];
         let hit = ws.find_bar_hit.as_ref().unwrap();
-        assert_eq!(hit.band, rows - band_rows..rows, "panel floated to the bottom");
+        assert_eq!(
+            hit.band,
+            rows - band_rows..rows,
+            "panel floated to the bottom"
+        );
         assert_eq!(hit.row, rows - band_rows + 1, "field row inside that band");
         assert!(ws.input_scratch.word_decorations.is_empty());
     }
@@ -13389,8 +13459,9 @@ mod find_bar_splice_tests {
             "bottom-floated panel draws an overline seam on its top edge"
         );
         assert!(
-            band.clone()
-                .all(|row| cells[row].iter().all(|c| c.underline == UnderlineStyle::None)),
+            band.clone().all(|row| cells[row]
+                .iter()
+                .all(|c| c.underline == UnderlineStyle::None)),
             "bottom-floated panel drops the underline seam"
         );
     }
@@ -13633,7 +13704,10 @@ mod find_bar_splice_tests {
         // the text-field behaviour, hit-tested through the recorded well geometry.
         let field = hit.field_cols.clone();
         let caret_col = u16::try_from(field.start + 3).unwrap();
-        assert!(app.find_bar_click(wid, row, caret_col), "well click consumed");
+        assert!(
+            app.find_bar_click(wid, row, caret_col),
+            "well click consumed"
+        );
         let s = app.windows.get(&wid).unwrap().search.as_ref().unwrap();
         assert_eq!(s.query, "target", "clicking the well never edits the text");
         assert_eq!(s.cursor, 3, "caret landed on the clicked character");
@@ -13642,7 +13716,10 @@ mod find_bar_splice_tests {
         // land one character short.
         app.search_edit_in(wid, crate::app_search::SearchEdit::MoveStart);
         let right_of_caret = u16::try_from(field.start + 4).unwrap();
-        assert!(app.find_bar_click(wid, row, right_of_caret), "well click consumed");
+        assert!(
+            app.find_bar_click(wid, row, right_of_caret),
+            "well click consumed"
+        );
         assert_eq!(
             app.windows[&wid].search.as_ref().unwrap().cursor,
             4,
@@ -13690,7 +13767,11 @@ mod find_bar_splice_tests {
             .expect("panel geometry");
         // Panel band ends on the TRUE frame bottom (`strip + term_bottom = rows`), so in
         // TERMINAL rows it is `rows - band_rows .. rows`, not one row high.
-        assert_eq!(hit.band, rows - band_rows..rows, "panel on the frame bottom");
+        assert_eq!(
+            hit.band,
+            rows - band_rows..rows,
+            "panel on the frame bottom"
+        );
         let field = field_row_text(&app, wid);
         assert!(
             field.contains("Find: ") && field.contains("hit"),
@@ -14212,8 +14293,7 @@ mod find_bar_splice_tests {
         // the below-grid press up into its band — so without the gate the click would be
         // taken as a panel click on the `Aa` column.
         assert_eq!(
-            hit.band.end,
-            rows,
+            hit.band.end, rows,
             "panel floated to the bottom (the clamp target)"
         );
         assert_eq!(
@@ -14661,7 +14741,7 @@ mod rain_host_tests {
     #[test]
     fn shell_execute_edge_model_proves_and_catches_level_refresh() {
         let model = shell_execute_edge_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     #[test]
@@ -14947,14 +15027,19 @@ mod find_panel_visual_tests {
             let ws = &app.windows[&wid];
             (ws.rows as usize, ws.cols as usize)
         };
-        let terminal = app.front_terminal(wid).expect("front terminal").term.clone();
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
         {
             let ws = app.windows.get_mut(&wid).unwrap();
             let mut term = term_lock(&terminal);
             term.cell_frame_into(&mut ws.input_scratch, rows, cols);
         }
         app.splice_find_bar(wid);
-        let Some(mut cpu) = aterm_render::Renderer::from_system(20.0, aterm_render::Theme::default())
+        let Some(mut cpu) =
+            aterm_render::Renderer::from_system(20.0, aterm_render::Theme::default())
         else {
             return false; // no system monospace font (headless CI) — skip.
         };
@@ -14967,7 +15052,11 @@ mod find_panel_visual_tests {
         }
         let path = dir.join(format!("{name}.png"));
         let file = std::fs::File::create(&path).expect("create png");
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width as u32, frame.height as u32);
+        let mut encoder = png::Encoder::new(
+            std::io::BufWriter::new(file),
+            frame.width as u32,
+            frame.height as u32,
+        );
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         encoder
@@ -14975,7 +15064,12 @@ mod find_panel_visual_tests {
             .expect("png header")
             .write_image_data(&rgb)
             .expect("png data");
-        eprintln!("wrote {} ({}x{})", path.display(), frame.width, frame.height);
+        eprintln!(
+            "wrote {} ({}x{})",
+            path.display(),
+            frame.width,
+            frame.height
+        );
         true
     }
 
@@ -14992,8 +15086,10 @@ mod find_panel_visual_tests {
     #[test]
     #[ignore = "visual capture: needs a system font; run with --ignored"]
     fn find_panel_visual_capture() {
-        let dir = std::env::var("FIND_PANEL_PNG_DIR")
-            .map_or_else(|_| std::env::temp_dir().join("find-panel"), std::path::PathBuf::from);
+        let dir = std::env::var("FIND_PANEL_PNG_DIR").map_or_else(
+            |_| std::env::temp_dir().join("find-panel"),
+            std::path::PathBuf::from,
+        );
         std::fs::create_dir_all(&dir).expect("output dir");
         let lines = [
             "alpha needle one",

@@ -211,11 +211,16 @@ fn unreadable_explanation(
     };
     // A token that was PRESENT and refused by our own chain ("chmod 600 it") is the
     // actionable case and must never be collapsed into "not configured".
-    let rejections = diagnosis.map(token::Diagnosis::rejections).unwrap_or_default();
+    let rejections = diagnosis
+        .map(token::Diagnosis::rejections)
+        .unwrap_or_default();
     let chain = if rejections.is_empty() {
         "no update token is provisioned".to_string()
     } else {
-        format!("a token is present but was refused: {}", rejections.join("; "))
+        format!(
+            "a token is present but was refused: {}",
+            rejections.join("; ")
+        )
     };
     format!(
         "aterm cannot read its release channel github.com/{}/{} (HTTP {code}) and {chain}, \
@@ -644,8 +649,13 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
                 }
                 Err(error) => error,
             };
-            let decision =
-                classify_list_error(&error, had_token, already_retried, source, diagnosis.as_ref());
+            let decision = classify_list_error(
+                &error,
+                had_token,
+                already_retried,
+                source,
+                diagnosis.as_ref(),
+            );
             match decision {
                 ListDecision::RetryAnonymous => {
                     already_retried = true;
@@ -680,11 +690,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
                     return Ok(None);
                 }
                 ListDecision::Failed(message) => {
-                    crate::health::Health::record_failure(
-                        &staging.health(),
-                        "network",
-                        &message,
-                    );
+                    crate::health::Health::record_failure(&staging.health(), "network", &message);
                     return Err(message);
                 }
             }
@@ -845,14 +851,22 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     // re-download the (up to 512 MB) DMG every interval; a re-publish under the same
     // build with a different sha256 (or any newer build) clears the memo (F17).
     if let Some(f) = crate::manifest::FailedMark::read(&staging.failed())
-        && f.matches(manifest.build_number, &manifest.sha256)
+        && f.suppresses(
+            manifest.build_number,
+            &manifest.sha256,
+            crate::install::unix_now_secs(),
+        )
     {
+        let retry_in = f.retry_in_secs(crate::install::unix_now_secs());
         crate::status::record(
             &staging,
             current_build,
             &format!(
-                "skipping build {} (previously failed to stage; re-publish to retry)",
-                manifest.build_number
+                "skipping build {} for another {}m (failed to stage {} time(s); retrying \
+                 automatically, or re-publish to retry now)",
+                manifest.build_number,
+                retry_in.div_ceil(60),
+                f.attempts.max(1),
             ),
         );
         return Ok(None);
@@ -927,11 +941,12 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     // Mount, extract, verify (codesign/team-id/spctl), publish the ready marker. On a
     // post-download stage failure (verification etc.) memoize this build+sha so we
     // don't re-download it next cycle, and reclaim the DMG (F17).
-    if let Err(e) = install::stage_from_dmg(&staging, &dmg, &manifest, PINNED_TEAM_ID) {
-        crate::manifest::FailedMark::record(
+    if let Err(e) = install::stage_from_dmg(&staging, &dmg, &manifest, crate::effective_team_id()) {
+        crate::manifest::FailedMark::record_stage_failure(
             &staging.failed(),
             manifest.build_number,
             &manifest.sha256,
+            crate::install::unix_now_secs(),
         );
         let _ = std::fs::remove_file(&dmg);
         crate::health::Health::record_failure(&staging.health(), "stage", &e);
@@ -1018,7 +1033,10 @@ mod tests {
             // wrong path when the real fault is a typo'd owner/repo.
             assert!(text.contains("PRIVATE"), "cause 1 missing: {text}");
             assert!(text.contains("does not exist"), "cause 2 missing: {text}");
-            assert!(text.contains("ATERM_UPDATE_OWNER"), "cause 3 missing: {text}");
+            assert!(
+                text.contains("ATERM_UPDATE_OWNER"),
+                "cause 3 missing: {text}"
+            );
             // The copy-pasteable fix for cause 1.
             assert!(text.contains(token::PROVISION_COMMAND), "{text}");
         }
@@ -1158,13 +1176,9 @@ mod tests {
                 "HTTP {code} with a token must be retried without it"
             );
             // …and after the retry, it is a plain failure with today's wording.
-            let ListDecision::Failed(text) = classify_list_error(
-                &HttpError::Unauthorized { code },
-                true,
-                true,
-                &source,
-                None,
-            ) else {
+            let ListDecision::Failed(text) =
+                classify_list_error(&HttpError::Unauthorized { code }, true, true, &source, None)
+            else {
                 panic!("the retry must not loop");
             };
             assert!(text.contains("rotate it"), "{text}");
@@ -1199,8 +1213,7 @@ mod tests {
         ];
         for error in &every_error {
             for already_retried in [false, true] {
-                let decision =
-                    classify_list_error(error, true, already_retried, &source, None);
+                let decision = classify_list_error(error, true, already_retried, &source, None);
                 assert!(
                     !matches!(decision, ListDecision::Blocked(_)),
                     "{error:?} (retried={already_retried}) must not read as an \
@@ -1250,7 +1263,10 @@ mod tests {
         // …and the healthy status says WHICH lane, so `aterm-ctl update status` can
         // answer "why is this Mac slow to update?" without anyone reading the log.
         let note = lane_note();
-        assert!(note.contains("anonymously") && note.contains("15-minute"), "{note}");
+        assert!(
+            note.contains("anonymously") && note.contains("15-minute"),
+            "{note}"
+        );
         assert!(
             note.contains("no update token provisioned"),
             "the healthy-but-slow status must name the remediable cause: {note}"

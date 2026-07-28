@@ -12,19 +12,24 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::Layout;
+use crate::store::ToolName;
 
 /// Resolve `tool` to the store path its `bin/<tool>` shim points at, if installed
 /// (`atpkg which`). Returns the raw symlink target (e.g.
 /// `…/store/<program>/<build>/bin/<tool>`), or `None` when there is no shim.
+///
+/// Takes a raw `&str` because this is a CLI query over user input; a name
+/// [`crate::store::shim_allowed`] refuses could never have been given a shim, so it correctly
+/// answers `None` without touching the filesystem.
 #[must_use]
 pub fn which(layout: &Layout, tool: &str) -> Option<PathBuf> {
-    crate::platform::resolve_shim(&layout.shim(tool))
+    crate::platform::resolve_shim(&layout.shim(&ToolName::new(tool)?))
 }
 
 /// Parse `(program, build)` out of a shim target like
 /// `…/store/<program>/<build>/bin/<tool>` — the component right after `store` and the
 /// numeric one after it. `None` if the path isn't a store shim target.
-// `pub(crate)` so `gc::discover_kani_pinned` reuses the exact same store-path parser.
+// `pub(crate)` so the GC scan reuses the exact same store-path parser.
 pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
     // `Path::iter` / `Iter::next` / `OsStr::to_str` go via `call1`: std's INLINED
     // `unsafe` (the `OsStr` byte-slice casts, the `from_utf8_unchecked` fast path)
@@ -48,12 +53,50 @@ pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
     Some((program, build))
 }
 
+/// Parse `(program, build)` out of a path that must lie INSIDE `prefix`'s store:
+/// `<prefix>/store/<program>/<build>[/…]`. `None` for anything else.
+///
+/// The ANCHORED counterpart of [`program_build_of_target`], and the one every predicate that
+/// DELETES must use. `program_build_of_target` searches for the first component named
+/// `store`, which is right for a target already known to be ours and wrong as a containment
+/// test: `/Users//x/src/store/ay/18/bin/ay` — a dev checkout, outside the prefix entirely —
+/// parses as `("ay", 18)` there. Stripping `<prefix>/store` instead means only paths that
+/// really are inside this managed store can answer, and `..` is rejected for free (a
+/// `ParentDir` component is not `Normal`, so a lexical escape cannot masquerade as a program
+/// name). A trailing path (`/bin/<tool>`) is allowed, because a shim target has one.
+pub(crate) fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
+    let rel = target.strip_prefix(prefix.join("store")).ok()?;
+    let mut comps = rel.components();
+    let (Some(std::path::Component::Normal(program)), Some(std::path::Component::Normal(build))) =
+        (comps.next(), comps.next())
+    else {
+        return None;
+    };
+    // `OsStr::to_str` goes via `call1`: std's INLINED `unsafe` (the `from_utf8_unchecked`
+    // fast path) is otherwise attributed to this function's spans as missing-SAFETY-comment
+    // refutations under the strict Trust gate (see `lib.rs`). Same call, same receiver.
+    let program = crate::call1(std::ffi::OsStr::to_str, program)?.to_string();
+    let build = crate::call1(std::ffi::OsStr::to_str, build)?
+        .parse::<u64>()
+        .ok()?;
+    Some((program, build))
+}
+
 /// The **ACTIVE** build of each program: the build its `bin/` shims currently point INTO
 /// (`store/<program>/<build>/bin/<tool>`). Unlike [`list_installed`] — which reports every
 /// COMPLETE build dir on disk, including one that was staged but never activated — this
 /// reflects what is actually live on `PATH`, so the update decision ([`crate::gate::decide`])
 /// never mistakes a merely-staged build for the running one (which would report "up to date"
 /// while the user keeps running the older active build).
+///
+/// **This is a DERIVED view and it is NOT a GC authority.** The fold below is last-write-wins
+/// over `read_dir` order, so when a program's shims disagree — the state a dropped tool used
+/// to leave behind, and that a shim-install loop failing partway still can — *which* build
+/// this reports depends on directory iteration order. That is harmless for the questions this
+/// answers ("is something newer staged?", "is this program installed?") and catastrophic for
+/// "what may I delete?": feeding an older build in as `current` classified the live tree as
+/// superseded. [`crate::gc::live_builds`] resolves the authoritative `store/<program>/current`
+/// link for that decision and requires this view to agree with it.
 #[must_use]
 pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
@@ -65,8 +108,9 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
             continue;
         };
         if let Some((program, build)) = program_build_of_target(&target) {
-            // A program's tools all point into the same active build; last write wins
-            // (they agree). BTreeMap keeps it deterministic.
+            // Last write wins. The tools of one program USUALLY agree, and where they do not
+            // the winner is `read_dir` order — see the doc comment: never make a destructive
+            // decision from this number.
             out.insert(program, build);
         }
     }
@@ -77,13 +121,15 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
 /// — the exact tool set a rollback must re-point (or drop). Reuses
 /// [`program_build_of_target`], so it matches only shims that actually resolve into this
 /// program's given build. Sorted for determinism. Empty if `bin/` is unreadable or nothing
-/// points into the build. Names are LOGICAL (the shim file name minus the platform
-/// [`crate::platform::SHIM_SUFFIX`], so `ay.cmd` reports as `ay` on Windows): callers feed
-/// them back through `Layout::shim`/`install_shims`/`install_tombstone_shim`, which append
-/// the suffix again — returning the raw file name would double it (`bin/ay.cmd.cmd`),
-/// writing tombstones/rollback shims BESIDE the live shim instead of replacing it.
+/// points into the build.
+///
+/// The result is [`ToolName`]s, not file names: a caller feeds them straight back through
+/// `Layout::shim` / `install_tools` / `install_tombstone_shim`, which re-append the platform
+/// suffix, and the reason to keep the type all the way through is that handing those the raw
+/// `bin/` entry would double it (`bin/ay.cmd.cmd`) — writing tombstones and rollback shims
+/// BESIDE the live shim instead of replacing it. [`ToolName::from_shim_file`] owns that strip.
 #[must_use]
-pub fn active_tools(layout: &Layout, program: &str, build: u64) -> Vec<String> {
+pub fn active_tools(layout: &Layout, program: &str, build: u64) -> Vec<ToolName> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
         return out;
@@ -100,13 +146,9 @@ pub fn active_tools(layout: &Layout, program: &str, build: u64) -> Vec<String> {
             && p == program
             && b == build
             && let Some(name) = e.file_name().to_str()
+            && let Some(tool) = ToolName::from_shim_file(name)
         {
-            // Strip the concrete shim suffix back off (`.cmd` on Windows; empty on Unix,
-            // where `strip_suffix("")` is the identity) — see the doc comment above.
-            let tool = name
-                .strip_suffix(crate::platform::SHIM_SUFFIX)
-                .unwrap_or(name);
-            out.push(tool.to_string());
+            out.push(tool);
         }
     }
     out.sort();
@@ -166,7 +208,7 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
 /// **Fail-closed:** each removal target is first confirmed to resolve *inside* the managed
 /// prefix (`store/<program>` for the tree, the prefix for shims/links); anything pointing
 /// outside is left untouched and reported, so a tampered symlink can never redirect a
-/// delete (§10.2). (`~/.kani` reversal for `trust` lands with Phase 5.)
+/// delete (§10.2).
 pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
     // Validate `program` as a single safe path component BEFORE building any filesystem
     // path: the lexical `starts_with` containment check below retains `..` tokens and so
@@ -237,6 +279,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn tool(name: &str) -> ToolName {
+        ToolName::new(name).unwrap()
+    }
+
     fn layout(label: &str) -> Layout {
         let p = std::env::temp_dir().join(format!("atpkg-ops-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
@@ -250,7 +296,12 @@ mod tests {
     fn install(layout: &Layout, program: &str, build: u64) -> PathBuf {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        std::fs::write(dir.join("bin").join(program), b"#!/bin/true\n").unwrap();
+        // The concrete executable the shim forwards to (`<program>.exe` on Windows).
+        std::fs::write(
+            dir.join("bin").join(tool(program).exe_file()),
+            b"#!/bin/true\n",
+        )
+        .unwrap();
         install_shims(layout, &dir, &[program.to_string()]).unwrap();
         activate_channel(layout, "stable", &dir).unwrap();
         // A real install marks the build complete as its last step (verify_and_stage).
@@ -279,6 +330,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// The anchored parser refuses a target that merely LOOKS like a store path. This is the
+    /// difference that matters to `prune_stale_shims`, which deletes files on the user's
+    /// PATH: a dev-link into a checkout that happens to contain `store/ay/18/` must not be
+    /// mistaken for one of ours.
+    #[test]
+    fn store_build_of_is_anchored_to_the_prefix() {
+        let prefix = Path::new("/p");
+        assert_eq!(
+            store_build_of(prefix, Path::new("/p/store/ay/18/bin/ay")),
+            Some(("ay".to_string(), 18))
+        );
+        // The build dir itself (no trailing path) parses too.
+        assert_eq!(
+            store_build_of(prefix, Path::new("/p/store/ay/18")),
+            Some(("ay".to_string(), 18))
+        );
+        // Outside the prefix — the unanchored `program_build_of_target` says yes to this one.
+        assert_eq!(
+            store_build_of(prefix, Path::new("/other/store/ay/18")),
+            None
+        );
+        assert_eq!(
+            program_build_of_target(Path::new("/other/store/ay/18")),
+            Some(("ay".to_string(), 18)),
+            "the unanchored parser is why the anchored one has to exist"
+        );
+        // Shapes the store never writes: no build, a non-numeric build, a `..` escape.
+        assert_eq!(store_build_of(prefix, Path::new("/p/store/ay")), None);
+        assert_eq!(store_build_of(prefix, Path::new("/p/store/ay/head")), None);
+        assert_eq!(store_build_of(prefix, Path::new("/p/store/../ay/18")), None);
+    }
+
     #[test]
     fn which_resolves_installed_shim() {
         let l = layout("which");
@@ -286,10 +369,7 @@ mod tests {
         // The shim forwards to the concrete executable (`bin/ay` Unix, `bin\ay.exe` Windows).
         assert_eq!(
             which(&l, "ay"),
-            Some(
-                dir.join("bin")
-                    .join(format!("ay{}", crate::platform::EXE_SUFFIX))
-            )
+            Some(dir.join("bin").join(tool("ay").exe_file()))
         );
         assert_eq!(which(&l, "nope"), None);
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -320,8 +400,8 @@ mod tests {
         let l = layout("active-tools");
         install(&l, "ay", 18);
         install(&l, "ny", 9);
-        assert_eq!(active_tools(&l, "ay", 18), vec!["ay".to_string()]);
-        assert_eq!(active_tools(&l, "ny", 9), vec!["ny".to_string()]);
+        assert_eq!(active_tools(&l, "ay", 18), vec![tool("ay")]);
+        assert_eq!(active_tools(&l, "ny", 9), vec![tool("ny")]);
         // A build no shim points into yields nothing.
         assert!(active_tools(&l, "ay", 17).is_empty());
         assert!(active_tools(&l, "nope", 1).is_empty());

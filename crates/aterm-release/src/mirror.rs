@@ -68,6 +68,65 @@ pub fn update_channel_slug(cargo_toml: &str) -> Result<Option<String>> {
     Ok(Some(raw))
 }
 
+/// What the public channel's own source tree says its version is, relative to
+/// the version being cut.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChannelVersion {
+    /// The channel's `[workspace.package] version` is exactly the cut version.
+    Agrees,
+    /// The channel has no readable workspace manifest — an empty repo, or a
+    /// source-less channel. There is nothing to disagree with, so this is not a
+    /// failure; the caller reports it and proceeds.
+    NoManifest,
+}
+
+/// Refuse a cut whose version the public channel's source does not carry.
+///
+/// This is the reconciliation the two-publisher model was missing. Source is
+/// published by `pub` (staging -> `alabsystems/<repo>` main + annotated tag) and
+/// binaries by `cargo ship cut`, and until this gate NOTHING compared the two.
+/// The observed consequence: `v0.6.0`'s tag came to rest on a tree still
+/// carrying `0.5.0`, and its appcast named a commit that does not exist in the
+/// public repository at all. A user who trusts the tag downloads source that
+/// cannot have produced the binary beside it.
+///
+/// So the ordering is now enforced, not merely documented: **promote the source
+/// first, then cut**. The gate runs pre-claim, so a mismatch costs seconds and
+/// burns no ledger number.
+///
+/// Deliberately an EQUALITY check, not `>=`. A channel ahead of the cut is just
+/// as broken as one behind — it means source for a version that has no binary,
+/// and it is the exact state a half-finished publish leaves behind.
+pub fn check_channel_version(
+    cut_version: &str,
+    channel_cargo_toml: &str,
+) -> Result<ChannelVersion> {
+    let trimmed = channel_cargo_toml.trim();
+    if trimmed.is_empty() {
+        return Ok(ChannelVersion::NoManifest);
+    }
+    // A missing/unparseable `[workspace.package] version` in a manifest that DOES
+    // exist is a real disagreement, not a skip: the channel is carrying something
+    // this cutter cannot reason about, and silently proceeding is what produced
+    // the drift in the first place.
+    let channel_version = crate::publish::workspace_version(channel_cargo_toml).map_err(|e| {
+        Error::new(format!(
+            "the public channel's Cargo.toml exists but its version is unreadable ({e}); \
+             refusing to cut against a channel whose version cannot be established"
+        ))
+    })?;
+    if channel_version == cut_version {
+        return Ok(ChannelVersion::Agrees);
+    }
+    Err(Error::new(format!(
+        "version disagreement: this cut is v{cut_version} but the public channel's source \
+         tree carries {channel_version}. Publish the source FIRST, then cut:\n    \
+         pub stage aterm && pub promote aterm\n\
+         Cutting now would tag a public tree whose version is not the one in the binary \
+         (that is exactly how v0.6.0's tag landed on 0.5.0 source)."
+    )))
+}
+
 /// Read one `key = "value"` string out of one line-oriented `[table]`.
 ///
 /// Same minimal shape as the sibling parser in `aterm-update-core/build.rs`
@@ -223,6 +282,72 @@ mod tests {
 
     const REAL_MANIFEST: &str = include_str!("../../../Cargo.toml");
 
+    /// The drift this gate exists to stop, in its exact observed form: the tag
+    /// `v0.6.0` came to rest on a public tree still carrying `0.5.0`.
+    #[test]
+    fn a_channel_behind_the_cut_is_refused_with_the_promote_remedy() {
+        let channel = "[workspace.package]\nversion = \"0.5.0\"\n";
+        let err = check_channel_version("0.6.0", channel).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("0.6.0") && msg.contains("0.5.0"), "{msg}");
+        // The refusal is only useful if it names the fix.
+        assert!(
+            msg.contains("pub stage aterm && pub promote aterm"),
+            "{msg}"
+        );
+    }
+
+    /// Equality, not `>=`. A channel AHEAD means source exists for a version with
+    /// no binary — the residue of a half-finished publish, and just as wrong.
+    #[test]
+    fn a_channel_ahead_of_the_cut_is_refused_too() {
+        let channel = "[workspace.package]\nversion = \"0.9.0\"\n";
+        assert!(check_channel_version("0.8.0", channel).is_err());
+    }
+
+    #[test]
+    fn agreement_is_exact_string_equality_of_the_workspace_version() {
+        let channel = "[workspace.package]\nversion = \"0.8.0\"\nedition = \"2024\"\n";
+        assert_eq!(
+            check_channel_version("0.8.0", channel).unwrap(),
+            ChannelVersion::Agrees
+        );
+    }
+
+    /// An EMPTY body is the only skip. Distinguishing this from "unreadable" is the
+    /// point: an empty channel legitimately has nothing to compare, whereas a
+    /// manifest we cannot parse is a channel whose version is unknown — and
+    /// proceeding on an unknown version is precisely the original bug.
+    #[test]
+    fn an_empty_channel_manifest_skips_but_an_unparseable_one_refuses() {
+        assert_eq!(
+            check_channel_version("0.8.0", "   \n\n").unwrap(),
+            ChannelVersion::NoManifest
+        );
+        assert!(
+            check_channel_version("0.8.0", "[workspace]\nmembers = []\n").is_err(),
+            "a real manifest with no [workspace.package] version must NOT be treated as absent"
+        );
+    }
+
+    /// The gate compares the channel against the version being cut, so it must read
+    /// the CHANNEL's manifest — not fall back to this repo's. Feeding it our own
+    /// manifest and a deliberately different version has to fail.
+    #[test]
+    fn the_gate_reads_the_channel_manifest_not_the_local_one() {
+        let ours = crate::publish::workspace_version(REAL_MANIFEST).unwrap();
+        let bumped = format!(
+            "{}99.0",
+            ours.trim_end_matches(|c: char| c.is_ascii_digit())
+        );
+        assert_ne!(bumped, ours);
+        assert!(check_channel_version(&bumped, REAL_MANIFEST).is_err());
+        assert_eq!(
+            check_channel_version(&ours, REAL_MANIFEST).unwrap(),
+            ChannelVersion::Agrees
+        );
+    }
+
     #[test]
     fn mirror_target_is_exactly_the_channel_clients_compiled_in() {
         // THE binding this whole design rests on. `aterm-update-core/build.rs`
@@ -269,19 +394,22 @@ mod tests {
 
     #[test]
     fn absent_key_means_no_mirror_but_a_present_bad_key_is_an_error() {
-        assert_eq!(update_channel_slug("[workspace]\nmembers = []\n").unwrap(), None);
+        assert_eq!(
+            update_channel_slug("[workspace]\nmembers = []\n").unwrap(),
+            None
+        );
         // Right key, wrong table — must not be picked up.
         assert_eq!(
             update_channel_slug("[workspace.metadata.atpkg]\nupdate_channel = \"a/b\"\n").unwrap(),
             None
         );
         for bad in [
-            "alabsystems",             // no repo segment
-            "alabsystems/aterm/extra", // three segments
-            "alabsystems/",            // empty repo
-            "/aterm",                  // empty owner
-            "alab systems/aterm",      // space
-            "alabsystems/../aterm",    // traversal shape
+            "alabsystems",                          // no repo segment
+            "alabsystems/aterm/extra",              // three segments
+            "alabsystems/",                         // empty repo
+            "/aterm",                               // empty owner
+            "alab systems/aterm",                   // space
+            "alabsystems/../aterm",                 // traversal shape
             "https://github.com/alabsystems/aterm", // a URL, not a slug
         ] {
             let doc = format!("[workspace.metadata.aterm]\nupdate_channel = \"{bad}\"\n");
@@ -312,7 +440,10 @@ update_channel = \"someone/else\"
         // Unsigned (Tier REPO, the default): appcast + version-bound DMG.
         assert_eq!(
             required_asset_names("0.5.0", false),
-            vec!["aterm-0.5.0.dmg".to_string(), "aterm-appcast.toml".to_string()]
+            vec![
+                "aterm-0.5.0.dmg".to_string(),
+                "aterm-appcast.toml".to_string()
+            ]
         );
         // Signed (Tier SIG): a pinned client REFUSES a head with no .sig.
         assert_eq!(
@@ -346,10 +477,19 @@ update_channel = \"someone/else\"
         // Every way a plausible-looking mirror silently never updates:
         let cases: Vec<(Vec<&str>, &str, bool, &str)> = vec![
             // no appcast at all -> the release is skipped by selection
-            (vec!["aterm-0.5.0.dmg"], "0.5.0", false, "aterm-appcast.toml"),
+            (
+                vec!["aterm-0.5.0.dmg"],
+                "0.5.0",
+                false,
+                "aterm-appcast.toml",
+            ),
             // two appcasts -> `unique_asset_index` refuses the release
             (
-                vec!["aterm-appcast.toml", "aterm-appcast.toml", "aterm-0.5.0.dmg"],
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-appcast.toml",
+                    "aterm-0.5.0.dmg",
+                ],
                 "0.5.0",
                 false,
                 "duplicated",
@@ -402,10 +542,16 @@ update_channel = \"someone/else\"
     fn mirror_plan_never_reissues_a_durable_post() {
         assert_eq!(mirror_plan(false, None), MirrorPlan::CreateDraft);
         assert_eq!(mirror_plan(false, Some(true)), MirrorPlan::ConvergeDraft);
-        assert_eq!(mirror_plan(false, Some(false)), MirrorPlan::ConvergePublished);
+        assert_eq!(
+            mirror_plan(false, Some(false)),
+            MirrorPlan::ConvergePublished
+        );
         // The whole point: intent issued + nothing visible is NOT a retry.
         assert_eq!(mirror_plan(true, None), MirrorPlan::AwaitVisibility);
         assert_eq!(mirror_plan(true, Some(true)), MirrorPlan::ConvergeDraft);
-        assert_eq!(mirror_plan(true, Some(false)), MirrorPlan::ConvergePublished);
+        assert_eq!(
+            mirror_plan(true, Some(false)),
+            MirrorPlan::ConvergePublished
+        );
     }
 }

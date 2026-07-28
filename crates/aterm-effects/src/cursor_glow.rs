@@ -2846,6 +2846,15 @@ impl CursorGlow {
         self.reflow_hint = Some(now);
     }
 
+    /// Whether a resize license is currently armed (see [`Self::reflow_hint`]).
+    /// Host-side conformance reads this to prove the "one gesture, one streak"
+    /// law at the seam where the license is GRANTED, without reaching into the
+    /// spawn classifier that consumes it.
+    #[must_use]
+    pub fn reflow_hint_armed(&self) -> bool {
+        self.reflow_hint.is_some()
+    }
+
     /// How many committed presses landed within the trailing `window`
     /// seconds — the press BUDGET consumed by the anti-stray gates (see
     /// [`Self::type_press_ring`]). Capacity-bounded by the ring; reads only.
@@ -5195,6 +5204,22 @@ impl CursorGlow {
         // beam along the jump vector — instead of per-cell sparks (which read as
         // disjoint row segments).
         let nyan = matches!(cfg.style, GlowStyle::Nyan);
+        // THE RESIZE LICENSE, consumed ONCE per spawn for EVERY style (owner,
+        // 2026-07-28: "all get"). `spawn` runs only on an observed move, and the
+        // first move after a settled resize IS the relayout relocation, so this
+        // pairs with the right one; one gesture therefore licenses exactly one
+        // streak no matter which style is drawing it.
+        //
+        // Two arms read it, because two styles refuse a cold relayout leap for
+        // their own reasons: Nyan's ZOOM is momentum-gated (the anti-stray law)
+        // and Phaser CLEARS its swept path on any row change ("the band belongs
+        // to typed letters only"). Every other style's jump path is already
+        // ungated and needs no license. It also suppresses the landing payload —
+        // a resize gets the BEAM ONLY.
+        let reflow_licensed = self
+            .reflow_hint
+            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::REFLOW_HINT_FRESH)
+            .is_some();
         // FAST-GLIDE RAINBOW SHOOTING STAR (owner: "some rainbow streak when the
         // cursor moves quickly, maybe like a star"). Keyed on cells/sec SPEED
         // (`glide_vel`), not distance, so it reads as FAST MOVEMENT rather than a
@@ -5411,12 +5436,7 @@ impl CursorGlow {
                         now.saturating_duration_since(*t).as_secs_f32() <= Self::RETURN_HINT_FRESH
                     })
                     .is_some()
-                || self
-                    .reflow_hint
-                    .take_if(|t| {
-                        now.saturating_duration_since(*t).as_secs_f32() <= Self::REFLOW_HINT_FRESH
-                    })
-                    .is_some())
+                || reflow_licensed)
         {
             // (`!navigation`: a Ctrl-A/E / Home/End scrub must NOT throw the
             // rainbow ZOOM across the line it skims — the audit caught a bare
@@ -5477,7 +5497,18 @@ impl CursorGlow {
                 oxf + (pc_c as f32 + 0.5) * cwf,
                 oyf + (pr_c as f32 + 0.5) * chf,
             );
-            self.emit_nyan_jump_landing(now, geom, dist, landing, terminus);
+            // …EXCEPT on a RESIZE, which gets the BEAM ONLY (owner, 2026-07-28:
+            // "no starburst"). What was asked for is a smooth rainbow streak
+            // following the cursor to its new home; a celebratory firework on
+            // every window drag is the opposite of that — resizing is a frequent,
+            // mundane gesture, not a deliberate leap worth congratulating, and
+            // the burst would fire on the settle of every drag all day. The wake
+            // streak IS the whole effect here. (The terminus dissolve goes with
+            // it: it feathers the ribbon end the jump abandoned, and a reflow has
+            // already rewritten those cells — the re-anchor snuff owns that.)
+            if !reflow_licensed {
+                self.emit_nyan_jump_landing(now, geom, dist, landing, terminus);
+            }
             // The hue still advances and the landing ring/particles below still
             // fire; only the per-cell spark path is skipped.
         } else if navigation {
@@ -5671,10 +5702,19 @@ impl CursorGlow {
             // (clearing + snuffing here was what broke the trail at every
             // wrap: fresh wrapped glyphs unlit, a hard cut on the old row).
             // Fire keeps its one-line discipline even on a wrap (below).
+            // A settled RESIZE is exempt too (owner, 2026-07-28: "all get"). The
+            // rule below exists because a phaser bar swept across a line the
+            // cursor merely LANDED on parks there decorating letters nobody
+            // typed. A relayout is the one row change where the sweep is the
+            // whole point: the cursor's home moved and the band is what shows
+            // you where it went. Narrow by construction — it rides the same
+            // one-shot license as every other style, so ordinary jumps keep the
+            // typed-letters-only discipline exactly as before.
             let phaser_wrap_follow = matches!(cfg.style, GlowStyle::Phaser) && typing;
             if matches!(cfg.style, GlowStyle::Fire | GlowStyle::Phaser)
                 && (dr_abs >= 1 || fire_back_leap)
                 && !phaser_wrap_follow
+                && !reflow_licensed
             {
                 /// Seconds an off-line flame gets to gutter out after the
                 /// cursor leaves it behind.
@@ -12586,7 +12626,13 @@ mod tests {
             spoken.extend(glow.drain_sound_cues().map(|c| c.kind));
 
             // Key 2's own echo.
-            glow.tick(Some(second), t0 + Duration::from_millis(40), &c, g, &mut out);
+            glow.tick(
+                Some(second),
+                t0 + Duration::from_millis(40),
+                &c,
+                g,
+                &mut out,
+            );
             spoken.extend(glow.drain_sound_cues().map(|c| c.kind));
 
             assert_eq!(
@@ -12595,7 +12641,11 @@ mod tests {
                 "{name}: two physical keys produced {} sounds: {spoken:?}",
                 spoken.len()
             );
-            assert_eq!(spoken[0], SoundKind::Typed, "{name}: key 1 clicks at the press");
+            assert_eq!(
+                spoken[0],
+                SoundKind::Typed,
+                "{name}: key 1 clicks at the press"
+            );
             assert_ne!(
                 spoken[1],
                 SoundKind::Typed,
@@ -13385,7 +13435,7 @@ mod tests {
     #[test]
     fn emberforge_thermal_model_proves_and_catches_heating_quench() {
         let model = emberforge_thermal_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     /// Tier-1 conformance: drive the REAL fire integrators frame by frame
@@ -16608,7 +16658,7 @@ mod tests {
     #[test]
     fn cursor_resident_cap_derived_model_proves_and_catches_missing_clamp() {
         let model = cursor_resident_cap_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     /// Tier 1: drive the shipping Water spawn path at full heat, where every move
@@ -17120,7 +17170,7 @@ mod tests {
     #[test]
     fn nyan_occupied_coverage_derived_model_proves_and_catches_regression() {
         let model = nyan_occupied_coverage_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     /// Tier 1: bind every modeled request to the exact helper used by the real
@@ -20168,6 +20218,86 @@ mod tests {
             1,
             "a reflow-hinted relayout leap must throw exactly one ZOOM streak"
         );
+        assert!(
+            glow.nyan_bursts.is_empty(),
+            "a resize gets the BEAM ONLY — no landing starburst"
+        );
+    }
+
+    /// NO STARBURST ON A RESIZE (owner, 2026-07-28: "no starburst"), and the
+    /// suppression is keyed on the LICENSE, not on the move: the SAME jump that
+    /// stays silent when a reflow paid for it still bursts when warm typing
+    /// momentum did. What was asked for is a streak following the cursor to its
+    /// new home, not a firework on every window drag.
+    #[test]
+    fn a_resize_streak_carries_no_starburst_but_a_warm_jump_still_does() {
+        let g = geom();
+        let c = cfg(GlowStyle::Nyan, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+
+        // WARM spine, no reflow hint: the identical leap keeps its celebration.
+        let mut warm = CursorGlow {
+            nyan_disp: 0.9,
+            ..Default::default()
+        };
+        warm.tick(Some((0, 0)), t0, &c, g, &mut out);
+        let t1 = t0 + Duration::from_millis(120);
+        warm.tick(Some((3, 30)), t1, &c, g, &mut out);
+        assert_eq!(warm.nyan_jumps.len(), 1, "a warm jump still zooms");
+        assert!(
+            !warm.nyan_bursts.is_empty(),
+            "a warm jump still bursts — the suppression must not leak to ordinary jumps"
+        );
+
+        // COLD spine + reflow license: same leap, streak only.
+        let mut cold = CursorGlow::default();
+        cold.tick(Some((0, 0)), t0, &c, g, &mut out);
+        cold.note_reflow(t1);
+        cold.tick(Some((3, 30)), t1, &c, g, &mut out);
+        assert_eq!(cold.nyan_jumps.len(), 1, "the resize still zooms");
+        assert!(
+            cold.nyan_bursts.is_empty(),
+            "a reflow-licensed zoom must not burst"
+        );
+    }
+
+    /// "ALL GET" (owner, 2026-07-28): the resize streak is not a Nyan privilege.
+    /// Nyan needed an explicit reflow LICENSE only because its ZOOM is the one
+    /// arm gated on typing momentum (the anti-stray law); every other style's
+    /// jump path is ungated, so a cold relayout leap already lays that style's
+    /// own streak. This pins the property for the whole built-in set, so a future
+    /// momentum gate on another style cannot silently make resize go dark there.
+    #[test]
+    fn every_style_lays_its_own_streak_on_a_cold_relayout_leap() {
+        let g = geom();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(120);
+        for style in [
+            GlowStyle::Lumen,
+            GlowStyle::Phaser,
+            GlowStyle::Nyan,
+            GlowStyle::Sparkle,
+            GlowStyle::Fire,
+            GlowStyle::Laser,
+            GlowStyle::Beam,
+            GlowStyle::Water,
+            GlowStyle::Comet,
+        ] {
+            let c = cfg(style, true);
+            let mut out = Vec::new();
+            let mut glow = CursorGlow::default();
+            glow.tick(Some((0, 0)), t0, &c, g, &mut out);
+            // The host arms the license for EVERY style (`apply_term_resize` is
+            // style-blind); only Nyan's gate reads it.
+            glow.note_reflow(t1);
+            glow.tick(Some((3, 30)), t1, &c, g, &mut out);
+            let laid = !glow.sparks.is_empty()
+                || !glow.nyan_jumps.is_empty()
+                || !glow.fire_meteors.is_empty()
+                || !glow.particles.is_empty();
+            assert!(laid, "{style:?}: a cold relayout leap must lay a streak");
+        }
     }
 
     /// …and the license is ONE gesture, ONE streak: the hint is consumed by the

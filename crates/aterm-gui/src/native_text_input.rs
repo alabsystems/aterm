@@ -431,9 +431,7 @@ fn next_word_boundary(text: &str, position: usize) -> usize {
     let after = &text[start..];
     let ws = after.len() - after.trim_start().len();
     let rest = &after[ws..];
-    let word = rest
-        .find(char::is_whitespace)
-        .unwrap_or(rest.len());
+    let word = rest.find(char::is_whitespace).unwrap_or(rest.len());
     nearest_boundary(text, start + ws + word)
 }
 
@@ -607,13 +605,25 @@ mod tests {
         input.set_selection(0, 0);
 
         input.move_word_right(false);
-        assert_eq!(input.selection().head, 5, "⌥→ must land at the END of 'hello'");
+        assert_eq!(
+            input.selection().head,
+            5,
+            "⌥→ must land at the END of 'hello'"
+        );
         input.move_word_right(false);
-        assert_eq!(input.selection().head, 11, "⌥→ must cross to the end of 'brave'");
+        assert_eq!(
+            input.selection().head,
+            11,
+            "⌥→ must cross to the end of 'brave'"
+        );
 
         // ROUND TRIP: back over the word we just crossed.
         input.move_word_left(false);
-        assert_eq!(input.selection().head, 6, "⌥← must land at the START of 'brave'");
+        assert_eq!(
+            input.selection().head,
+            6,
+            "⌥← must land at the START of 'brave'"
+        );
 
         // Clamped at both ends — no panic, no runaway.
         input.set_selection(0, 0);
@@ -627,7 +637,10 @@ mod tests {
         // `extend` grows the selection instead of collapsing it.
         input.set_selection(0, 0);
         input.move_word_right(true);
-        assert!(!input.selection().is_caret(), "shift-⌥→ must select, not just move");
+        assert!(
+            !input.selection().is_caret(),
+            "shift-⌥→ must select, not just move"
+        );
         assert_eq!(input.selection().head, 5);
     }
 

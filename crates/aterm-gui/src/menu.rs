@@ -234,6 +234,15 @@ pub enum MenuAction {
     /// no session to toggle. The palette row's checkmark mirrors the front
     /// session's effective state.
     ToggleMatrixRain,
+    /// Promote the FRONT SESSION's own kitty into the durable kitty registry and
+    /// pin it as the cursor companion (`App::favourite_session_kitty`). Owner:
+    /// "there is a unique kitty chosen per session … if somebody really likes
+    /// that kitty it goes into the kitty registry". Terminal-only
+    /// ([`requires_terminal_tab`]): a native whole tab has no session, hence no
+    /// session kitty. The palette row's checkmark reports whether THIS session's
+    /// kitty is the current pin. One-way: the pin is transferable, not
+    /// toggleable.
+    FavouriteSessionKitty,
     /// Toggle the process-wide serious-mode policy. While enabled it suppresses
     /// every audible and decorative effect without overwriting the underlying
     /// preferences; disabling it restores those requested settings exactly.
@@ -322,6 +331,7 @@ impl MenuAction {
             MenuAction::CopyCwd => 43,
             MenuAction::ToggleMatrixRain => 44,
             MenuAction::ToggleSeriousMode => 45,
+            MenuAction::FavouriteSessionKitty => 46,
         }
     }
 
@@ -372,6 +382,7 @@ impl MenuAction {
             43 => MenuAction::CopyCwd,
             44 => MenuAction::ToggleMatrixRain,
             45 => MenuAction::ToggleSeriousMode,
+            46 => MenuAction::FavouriteSessionKitty,
             _ => return None,
         })
     }
@@ -390,6 +401,9 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             // The rain toggle acts on the front SESSION; a native whole tab
             // has none, so the item greys out rather than dead-clicking.
             | MenuAction::ToggleMatrixRain
+            // The favourite promotes the front SESSION's own kitty — a native
+            // whole tab has no session, so it has no session kitty to pin.
+            | MenuAction::FavouriteSessionKitty
     )
 }
 
@@ -493,6 +507,10 @@ impl MenuAction {
             | MenuAction::SplitHorizontal
             // Runtime-only per-session visual toggle: nothing durable is written.
             | MenuAction::ToggleMatrixRain
+            // Writes ONLY the machine-owned toy ledger (`kitty-collectibles.toml`
+            // and its `kitty-log.toml` mirror) — never `aterm.toml`, no security
+            // knob, no capability escalation. That is why it is not `ConfigWrite`.
+            | MenuAction::FavouriteSessionKitty
             | MenuAction::Minimize
             | MenuAction::Zoom
             | MenuAction::NextTab
@@ -539,6 +557,7 @@ impl MenuAction {
             "SplitVertical" => Some(MenuAction::SplitVertical),
             "SplitHorizontal" => Some(MenuAction::SplitHorizontal),
             "ToggleMatrixRain" => Some(MenuAction::ToggleMatrixRain),
+            "FavouriteSessionKitty" => Some(MenuAction::FavouriteSessionKitty),
             "ToggleSeriousMode" => Some(MenuAction::ToggleSeriousMode),
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
             "OpenPalette" => Some(MenuAction::OpenPalette),
@@ -787,6 +806,12 @@ const VIEW_MENU: &[MenuEntry] = &[
     Item {
         label: "Matrix Rain",
         action: MenuAction::ToggleMatrixRain,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Favourite Session Kitty",
+        action: MenuAction::FavouriteSessionKitty,
         key: "",
         mods: MenuMods::None,
     },
@@ -1541,6 +1566,19 @@ mod macos {
             "",
             false,
         );
+        // Promote the front session's own kitty into the durable registry.
+        // Terminal-only, so `requires_terminal_tab` greys it over a native
+        // whole tab. No key-equivalent: a rare, one-way act, reachable from the
+        // menu bar and the ⇧⌘P palette (the cross-platform surface).
+        add_item(
+            mtm,
+            &view,
+            target,
+            "Favourite Session Kitty",
+            MenuAction::FavouriteSessionKitty,
+            "",
+            false,
+        );
         add_separator(mtm, &view);
         add_separator(mtm, &view);
         // The own-rendered, cross-platform command palette (⇧⌘P). A real menu key
@@ -1928,6 +1966,7 @@ mod tests {
         MenuAction::PrevTab,
         MenuAction::ToggleSeriousMode,
         MenuAction::ToggleMatrixRain,
+        MenuAction::FavouriteSessionKitty,
         MenuAction::ToggleSettings,
         MenuAction::OpenPalette,
         MenuAction::Help,
@@ -2223,6 +2262,8 @@ mod tests {
                     // Per-session rain acts on the front SESSION — no session
                     // under a native whole tab, so the item greys out there.
                     | MenuAction::ToggleMatrixRain
+                    // Same reason: no session ⇒ no session kitty to promote.
+                    | MenuAction::FavouriteSessionKitty
             );
             assert_eq!(
                 super::requires_terminal_tab(action),

@@ -16,7 +16,9 @@ use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
 use aterm_effects::cursor_glow::GlowStyle;
-use aterm_effects::trail_sound::{CHANNELS, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth};
+use aterm_effects::trail_sound::{
+    CHANNELS, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth,
+};
 
 const SR: u32 = 48_000;
 

@@ -51,7 +51,46 @@ impl Default for KittyLook {
     }
 }
 
+/// Salt keeping session-derived companion identities in their own genome
+/// namespace, away from the word renderer's position-bearing occurrence seeds
+/// (`b"sessKit\0"` as big-endian ASCII).
+const SESSION_LOOK_SALT: u64 = 0x7365_7373_4B69_7400;
+
 impl KittyLook {
+    /// THE SESSION KITTY (owner, 2026-07-26: "I like that there is a unique
+    /// kitty chosen per session and sticks with that session because that makes
+    /// the session kitty special").
+    ///
+    /// A deterministic identity derived from the session id: unique across
+    /// sessions, byte-stable for the whole life of one. Because it is a pure
+    /// function of the id there is nothing to persist, nothing to restore, and
+    /// a reattached session gets its own kitty back automatically.
+    ///
+    /// Before this existed the companion fell back to [`Self::default`]
+    /// whenever the Kitty Log held no collected identity — i.e. every session
+    /// on a fresh install wore the *same* cat, which is the opposite of
+    /// special. An explicitly collected companion still wins over this: the
+    /// user choosing a cat is a reason, and only reasons may change the kitty.
+    ///
+    /// The axes are decoded through the ordinary v4 genome so a session kitty
+    /// is drawn from exactly the same roster (head, coat, iris, age band) the
+    /// ambient word-cats roll from — no separate art path, no new bake keys.
+    #[must_use]
+    pub fn for_session(session: u64) -> Self {
+        let gkey = crate::genome::mix(session ^ SESSION_LOOK_SALT);
+        let (coat, iris) = crate::genome::cat_fills_v4(gkey);
+        Self {
+            variant: crate::genome::cat_variant_v4(gkey),
+            // Accessories stay the Kitty Log's business: a bow or crown marks a
+            // COLLECTED cat, so minting them for free here would devalue them.
+            accessory: None,
+            coat,
+            iris,
+            age: crate::genome::cat_age_v4(gkey),
+        }
+        .normalized()
+    }
+
     /// Clamp untrusted persisted indices and restore a renderable composition.
     /// An accessory can never be a base glyph: old/corrupt ledgers degrade to
     /// the default head instead of asking the baker to stretch an overlay into

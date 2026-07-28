@@ -559,7 +559,7 @@ fn verified_bundle_identity(app: &Path) -> Result<(u64, String), String> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("bundle path is not a non-symlink directory".to_string());
     }
-    verify::verify_bundle_policy(app, PINNED_TEAM_ID)
+    verify::verify_bundle_policy(app, crate::effective_team_id())
         .map_err(|error| format!("bundle policy: {error}"))?;
     let build =
         verify::bundle_build_number(app).map_err(|error| format!("sealed build: {error}"))?;
@@ -1583,9 +1583,22 @@ pub fn apply_staged_if_ready(
     let _ = std::fs::remove_dir_all(&retained);
     let receipt_restore_error =
         restore_installed_receipt(&staging, previous_receipt.as_ref()).err();
-    // Poison the build whose exec failed so the next check doesn't re-download +
-    // re-apply the same broken build forever (C1). We still hold `ready` here.
-    crate::manifest::FailedMark::record(&staging.failed(), ready.build_number, &ready.dmg_sha256);
+    // Suppress the build whose exec failed so the next check doesn't re-download +
+    // re-apply it every interval (C1). We still hold `ready` here.
+    //
+    // BUDGETED, not permanent: this is ONE failed `execve` after a successful
+    // rollback — the machine is sitting on its previous, working build. An exec
+    // can fail for reasons that are nothing to do with the artifact (ENOMEM, a
+    // transient text-file-busy, an unlucky moment during a Gatekeeper scan), and
+    // permanently refusing the only newer build on the channel would strand this
+    // machine with no user-visible cause. The crash-loop revert below is the case
+    // that stays permanent, because there the build PROVED itself bad.
+    crate::manifest::FailedMark::record_stage_failure(
+        &staging.failed(),
+        ready.build_number,
+        &ready.dmg_sha256,
+        unix_now_secs(),
+    );
     crate::manifest::FailedMark::clear(&staging.trial());
     crate::status::record(
         &staging,
@@ -1625,20 +1638,66 @@ fn check_boot_health(
         return None;
     }
     let b = bundle::resolve()?;
-    let verified_rollback =
-        match ensure_current_trial_receipt(staging, &b.app_root, current_build, current_commit) {
-            Ok(rollback) => rollback,
-            Err(error) => {
-                return Some(ApplyOutcome::Deferred(format!(
-                    "trial recovery proof: {error}"
-                )));
-            }
-        };
+    // COUNT THE LAUNCH FIRST. This used to run after the recovery proof below, so a
+    // trial whose proof failed every boot never advanced its attempt counter, never
+    // reached MAX_BOOT_ATTEMPTS, and therefore never reverted OR confirmed: the
+    // sentinel stayed armed forever and this function returned `Deferred` on every
+    // subsequent launch, which makes `apply_staged_if_ready` return early forever.
+    // The machine kept running (and kept downloading and staging updates) but could
+    // never apply another one, with nothing in the UI to say why. The attempt count
+    // must measure LAUNCHES OBSERVED, which is a fact about this boot, not a
+    // conclusion that depends on a proof that may itself be what is broken.
     if let Err(error) = sentinel.observe_launch(current_build) {
         return Some(ApplyOutcome::Deferred(format!(
             "trial launch observation: {error}"
         )));
     }
+    let verified_rollback =
+        match ensure_current_trial_receipt(staging, &b.app_root, current_build, current_commit) {
+            Ok(rollback) => rollback,
+            Err(error) => {
+                // Within budget: the proof may recover on a later boot (a transient
+                // read failure, a receipt being rewritten), so keep the trial armed.
+                if !sentinel.should_revert(current_build, MAX_BOOT_ATTEMPTS) {
+                    return Some(ApplyOutcome::Deferred(format!(
+                        "trial recovery proof: {error}"
+                    )));
+                }
+                // Budget exhausted AND the rollback is unprovable, so reverting is
+                // not available either. Staying armed is the strictly worse option:
+                // this build demonstrably BOOTS — we are executing its code, this
+                // many times in a row — and remaining armed only guarantees that no
+                // future update can ever apply. Disarm, keep running, and make the
+                // reason loud and durable instead of silently bricking the updater.
+                let disarm = sentinel.confirm();
+                crate::health::Health::record_apply_failure(
+                    &staging.health(),
+                    &format!(
+                        "trial recovery proof failed {MAX_BOOT_ATTEMPTS}x ({error}); disarmed \
+                         the boot sentinel to keep updates possible"
+                    ),
+                );
+                crate::status::record(
+                    staging,
+                    current_build,
+                    "recovered a wedged update trial (rollback unprovable); updates re-enabled",
+                );
+                crate::warn(&format!(
+                    "trial recovery proof failed {MAX_BOOT_ATTEMPTS} launches in a row \
+                     ({error}); the running build boots, so the boot sentinel was disarmed \
+                     rather than blocking every future update"
+                ));
+                if let Err(disarm_error) = disarm {
+                    // Could not even clear the sentinel: report it rather than
+                    // pretending the wedge is resolved.
+                    return Some(ApplyOutcome::Deferred(format!(
+                        "trial recovery proof: {error}; disarm also failed: {disarm_error}"
+                    )));
+                }
+                staging.retire_published();
+                return Some(ApplyOutcome::NotApplicable);
+            }
+        };
     if !sentinel.should_revert(current_build, MAX_BOOT_ATTEMPTS) {
         // An unconfirmed trial owns the fixed rollback path. Do not fall through
         // into another apply transaction that could overwrite its sole OLD copy.
@@ -1695,6 +1754,13 @@ fn revert_to_rollback(
     // Poison the crash-looping build so the next background check doesn't re-download +
     // re-apply it into another crash/revert loop (C1). Its DMG sha was recorded beside
     // the sentinel at arm time (we no longer hold `ready`); guard on the build match.
+    //
+    // PERMANENT on purpose (unlike the re-exec-failure path above): reaching here
+    // means the build was swapped in and then failed to confirm boot health
+    // MAX_BOOT_ATTEMPTS times in a row. That is the build proving itself bad on
+    // this machine, and re-applying it on a timer would just re-enter the
+    // crash/revert loop. The escape is a newer build or a re-publish under a
+    // different digest — both of which clear the memo by key.
     if let Some(t) = crate::manifest::FailedMark::read(&staging.trial())
         && t.build_number == current_build
     {
@@ -1917,6 +1983,16 @@ pub(crate) fn now_rfc3339() -> String {
         Ok(d) => format_rfc3339(d.as_secs()),
         Err(_) => String::new(),
     }
+}
+
+/// Unix seconds now, or 0 on a pre-epoch clock. Used for the stage-failure retry
+/// budget's deadlines. Zero is the safe fallback: it makes every deadline appear
+/// already passed, so a broken clock retries rather than suppresses forever.
+#[must_use]
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Seconds between two of our own RFC3339 instants (`later - earlier`), or

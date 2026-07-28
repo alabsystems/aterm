@@ -17,20 +17,22 @@
 //!    (anti-replay, §4.2);
 //! 5. select the artifact for the target triple (a missing triple is a clean skip, §6);
 //! 6. download → [`crate::install::verify_and_stage`] (sha256 → extract → tree_root);
-//! 7. [`crate::activate::activate_channel`] + [`crate::activate::install_shims`]; record.
+//! 7. [`crate::activate::activate_channel`] + the `bin/` shim install
+//!    ([`crate::activate::install_shims`], entered here through its already-admitted half
+//!    because the flow needs the admitted tool set for the bundle resolve check); record.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::activate::{activate_channel, install_shims, install_tombstone_shim};
+use crate::activate::{activate_channel, install_tombstone_shim, install_tools};
 use crate::apply::{Group, TxnOutcome, plan_groups, transact};
 use crate::gate::{ApplyDecision, decide};
 use crate::install::{StageError, verify_and_stage};
 use crate::manifest::{Channel, Index, parse_pkg};
 use crate::select::{Candidate, select_index};
 use crate::sig::verify_pkg;
-use crate::store::Layout;
+use crate::store::{Layout, ToolName};
 
 /// The network operations the install flow needs, abstracted so the orchestration is
 /// testable. The production impl wraps `aterm-update-core`'s `api_get`/`download_to`.
@@ -492,32 +494,27 @@ fn install_inner(
     verify_and_stage(artifact, &dl, &build_dir).map_err(FlowError::Stage)?;
     let _ = std::fs::remove_file(&dl); // reclaim the compressed asset
 
-    // 6b. Sysroot-bundle wiring BEFORE activation (self-contained = no-op; the
-    // rustup-linked policy re-points the toolchain link at the user's nightly).
+    // 6b. Sysroot-bundle wiring BEFORE activation (self-contained = no-op).
     if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {
-        apply_sysroot_bundle(layout, &artifact.reloc, &build_dir)?;
+        apply_sysroot_bundle(&artifact.reloc)?;
     }
 
-    // 7. Activate + shim.
+    // 7. Activate + shim. The raw manifest `exposes` is admitted ONCE here; `tools` is what
+    // actually got a shim and `refused` the sensitive/malformed names that did not.
     activate_channel(layout, channel, &build_dir)
         .map_err(|e| FlowError::Activate(e.to_string()))?;
-    let refused = install_shims(layout, &build_dir, &pkg.exposes)
-        .map_err(|e| FlowError::Activate(e.to_string()))?;
+    let (tools, refused) = crate::store::split_exposed(&pkg.exposes);
+    install_tools(layout, &build_dir, &tools).map_err(|e| FlowError::Activate(e.to_string()))?;
 
     // 7b. Fail-loud resolve check: an installed sysroot-bundle's compilers must
     // actually load. A dynamic-loader failure here aborts the install.
     if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {
-        bundle_resolve_check(&build_dir, &pkg.exposes)?;
+        bundle_resolve_check(&build_dir, &tools)?;
     }
     // NOTE: the shell.d hook refresh runs at the main.rs CLI edge (do_install / cmd_update),
     // NOT here — writing ~/.aterm from flow's synthetic-layout unit tests would pollute the
     // developer's real home (identical hermeticity reasoning as the GC-after-activate edge).
-    let shimmed: Vec<String> = pkg
-        .exposes
-        .iter()
-        .filter(|e| !refused.contains(e))
-        .cloned()
-        .collect();
+    let shimmed: Vec<String> = tools.iter().map(|t| t.as_str().to_string()).collect();
     Ok(InstallReport {
         program: program.to_string(),
         build: pinned,
@@ -534,8 +531,8 @@ fn install_inner(
 /// exposes, so a yanked/below-floor build's old working shims are actively disabled. The tool
 /// set is the program's live `bin/` shims (the exact "old working shims" to revoke); if the
 /// program is not installed there is nothing to disable. Best-effort per tool (a write failure
-/// on one shim never blocks the rest), and every name still passes `shim_allowed` inside
-/// [`install_tombstone_shim`], so a tombstone never shadows a sensitive name either.
+/// on one shim never blocks the rest); a tombstone can never shadow a sensitive name because
+/// `active_tools` hands back [`crate::store::ToolName`]s, which only exist for admitted names.
 fn install_tombstone_shims(layout: &Layout, program: &str, installed: Option<u64>) {
     if let Some(cur) = installed {
         for tool in crate::ops::active_tools(layout, program, cur) {
@@ -589,7 +586,12 @@ fn app_apply_gate_refused(
 struct Staged {
     build: u64,
     build_dir: PathBuf,
-    exposes: Vec<String>,
+    /// The tools that will actually be shimmed — the ADMITTED set, not the raw manifest list.
+    /// Holding [`ToolName`]s here rather than `Vec<String>` is what forces `rollback_member`
+    /// below to say `exe_file()` when it probes the prior build for a binary; it used to join
+    /// the bare name, so on Windows the probe missed `ay.exe` and the rollback dropped the
+    /// shim of a tool the prior build had all along.
+    exposes: Vec<ToolName>,
     /// The member's prior active build (`None` ⇒ a fresh install: rollback removes the shims).
     prior_build: Option<u64>,
     /// `Some(reloc_policy)` for a `sysroot-bundle` member (its pre-activation wiring +
@@ -1141,8 +1143,7 @@ pub fn rollback(
             ))
         })?;
     // 7. Re-point via the tested primitive (symlinks only; no tree mutation). reloc:None —
-    //    a rustup-linked sysroot-bundle rollback won't re-run kani wiring (a self-contained
-    //    bundle needs none); documented limitation, primary targets are shim programs.
+    //    a self-contained bundle needs no pre-activation wiring to re-run.
     let staged = Staged {
         build: current,
         build_dir: layout.build_dir(program, current),
@@ -1327,7 +1328,10 @@ fn stage_member(
     Some(Staged {
         build: pinned,
         build_dir,
-        exposes: pkg.exposes.clone(),
+        // Refused (sensitive/malformed) names are dropped here rather than at flip time —
+        // same outcome as before, one admission instead of one per flip/rollback pass. A
+        // group member's refusals are not a stage failure, matching `install`.
+        exposes: crate::store::split_exposed(&pkg.exposes).0,
         prior_build,
         reloc,
         tree_root: artifact.tree_root.clone(),
@@ -1343,14 +1347,31 @@ fn flip_member(layout: &Layout, channel: &str, program: &str, s: &Staged) -> boo
     // A sysroot-bundle member gets its pre-activation wiring before the flip; a
     // failure here aborts the group (the payload is staged but never activated).
     if let Some(reloc) = &s.reloc
-        && apply_sysroot_bundle(layout, reloc, &s.build_dir).is_err()
+        && apply_sysroot_bundle(reloc).is_err()
     {
         return false;
     }
     if activate_channel(layout, channel, &s.build_dir).is_err() {
-        return false; // atomic activate didn't flip — nothing to undo
+        // Each LINK is atomic, but `activate_channel` writes two of them and the
+        // per-program witness goes first: a failure in the channel half leaves
+        // `store/<program>/current` already naming the build the abort cleanup is
+        // about to delete. Point the witness back at the prior build (fresh
+        // install: remove it) so it keeps agreeing with the shims, which were
+        // never touched. If the failure was in the witness half instead, both
+        // repairs are no-ops — re-pointing writes what was already there, and
+        // removing a link that does not exist does nothing.
+        match s.prior_build {
+            Some(prior) => {
+                let _ = crate::activate::atomic_symlink(
+                    &layout.build_dir(program, prior),
+                    &layout.program_current(program),
+                );
+            }
+            None => crate::platform::remove_link(&layout.program_current(program)),
+        }
+        return false;
     }
-    if install_shims(layout, &s.build_dir, &s.exposes).is_err() {
+    if install_tools(layout, &s.build_dir, &s.exposes).is_err() {
         rollback_member(layout, channel, program, s);
         return false;
     }
@@ -1366,15 +1387,48 @@ fn flip_member(layout: &Layout, channel: &str, program: &str, s: &Staged) -> boo
 /// transaction — its `prior_build`. For a tool the prior build actually contains, the shim
 /// is re-pointed there; a tool the NEW build ADDED but the prior lacks has its shim REMOVED
 /// (re-pointing it would dangle). A fresh install (`prior_build == None`) removes the shims.
+///
+/// The "does the prior build contain it?" probe must name the EXECUTABLE
+/// ([`ToolName::exe_file`]), not the logical tool: it used to join the bare name, which on
+/// Windows never matched `ay.exe`, so every tool looked absent and the rollback deleted shims
+/// it should have re-pointed — leaving the user with no `PATH` entry at all after a failed
+/// update. The `shim_allowed` calls this loop used to make are gone because a `ToolName`
+/// cannot exist without them.
 fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
     match s.prior_build {
         Some(prior) if prior != s.build => {
             let prior_dir = layout.build_dir(program, prior);
-            for tool in &s.exposes {
-                if !crate::store::shim_allowed(tool) {
-                    continue;
+            // The restore set is the UNION of the new build's exposes and the prior
+            // build's actual `bin/` contents. `s.exposes` alone misses a tool the
+            // prior build shipped and the new one DROPPED: the new build's shim
+            // prune (`install_tools`) already deleted that tool's shim — same
+            // program, different build, exactly its job — so restoring only the new
+            // list would re-activate the prior build with part of its PATH surface
+            // silently missing. A sensitive name in the prior `bin/` never had a
+            // shim (`ToolName::new` refuses it) and drops out here the same way.
+            let mut restore: std::collections::BTreeSet<crate::store::ToolName> =
+                s.exposes.iter().cloned().collect();
+            if let Ok(entries) = std::fs::read_dir(prior_dir.join("bin")) {
+                for e in entries.flatten() {
+                    // Files only: a stray subdirectory in `bin/` is not a tool and
+                    // must not grow a shim.
+                    if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(name) = e.file_name().to_str() {
+                        // Total strip, same semantics as `ToolName::from_shim_file`:
+                        // on Unix `EXE_SUFFIX` is `""` and this is the identity.
+                        let logical = name
+                            .strip_suffix(crate::platform::EXE_SUFFIX)
+                            .unwrap_or(name);
+                        if let Some(tool) = crate::store::ToolName::new(logical) {
+                            restore.insert(tool);
+                        }
+                    }
                 }
-                let target = prior_dir.join("bin").join(tool);
+            }
+            for tool in &restore {
+                let target = prior_dir.join("bin").join(tool.exe_file());
                 if target.exists() {
                     let _ = crate::platform::install_shim(
                         &prior_dir.join("bin"),
@@ -1392,91 +1446,48 @@ fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
         Some(_) => { /* prior == new build: nothing meaningful to undo */ }
         None => {
             for tool in &s.exposes {
-                if crate::store::shim_allowed(tool) {
-                    let _ = std::fs::remove_file(layout.shim(tool));
-                }
+                let _ = std::fs::remove_file(layout.shim(tool));
             }
+            // A fresh install has no prior link to re-point, but `flip_member`'s
+            // `activate_channel` DID write `store/<program>/current` — and the abort
+            // cleanup is about to delete the build it names. Remove the link too
+            // (platform::remove_link — on Windows it is a junction that remove_file
+            // refuses), or the program is left with a permanently dangling witness
+            // link: harmless to GC (a broken own link means abstain), but a state no
+            // ordinary operation should ever leave behind.
+            crate::platform::remove_link(&layout.program_current(program));
         }
     }
 }
 
 /// Sysroot-bundle pre-activation wiring, dispatched on the signed `reloc` policy
 /// (§10.1). `self-contained` (the pack-time-relocated default) needs nothing — the
-/// payload already carries its dependencies. `rustup-linked` re-points the
-/// bundle's dangling `toolchain` link at the user's rustup nightly and wires
-/// `~/.kani`, gated on the four required components. An unknown policy fails
-/// closed.
-fn apply_sysroot_bundle(layout: &Layout, reloc: &str, build_dir: &Path) -> Result<(), FlowError> {
+/// payload already carries its dependencies, which is the only policy the trust
+/// toolchain ships. Every other policy fails closed.
+fn apply_sysroot_bundle(reloc: &str) -> Result<(), FlowError> {
     match reloc {
         "self-contained" => Ok(()),
-        "rustup-linked" => wire_rustup_linked(layout, build_dir),
         other => Err(FlowError::UnsupportedKind(format!("reloc={other}"))),
     }
 }
 
-/// The `rustup-linked` bundle path: the smaller bundle that reuses the user's own
-/// rustup nightly instead of vendoring the compiler libs. Reads the (newline-free)
-/// nightly version the bundle shipped, confirms the user's rustup toolchain exists
-/// WITH the four required components, then re-points the toolchain link + wires
-/// `~/.kani` via the hardened [`crate::kani`] helpers. Fail-loud when rustup or a
-/// component is missing (never a silent partial install).
-fn wire_rustup_linked(layout: &Layout, build_dir: &Path) -> Result<(), FlowError> {
-    let version = std::fs::read_to_string(build_dir.join("rust-toolchain-version"))
-        .map_err(|_| {
-            FlowError::Activate("rustup-linked bundle is missing rust-toolchain-version".into())
-        })?
-        .trim()
-        .to_string();
-    let home = aterm_types::dirs::home_dir().ok_or_else(|| {
-        FlowError::Activate("cannot locate the home directory — needed to find ~/.rustup".into())
-    })?;
-    let rustup_tc = home.join(".rustup/toolchains").join(&version);
-    if !rustup_tc.is_dir() {
-        return Err(FlowError::Activate(format!(
-            "rustup-linked bundle needs the nightly '{version}' at ~/.rustup/toolchains/{version}, \
-             which is not installed — install it (rustup toolchain install {version}) or publish a \
-             self-contained bundle"
-        )));
-    }
-    let out = std::process::Command::new("rustup")
-        .args(["component", "list", "--installed", "--toolchain", &version])
-        .output()
-        .map_err(|e| FlowError::Activate(format!("rustup component list failed: {e}")))?;
-    if !out.status.success() {
-        return Err(FlowError::Activate(
-            "rustup component list --installed failed".into(),
-        ));
-    }
-    let installed: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if let Err(missing) = crate::kani::nightly_components_ready(&installed) {
-        return Err(FlowError::Activate(format!(
-            "nightly '{version}' is missing required component(s): {} — add them (rustup component \
-             add --toolchain {version} {})",
-            missing.join(", "),
-            missing.join(" ")
-        )));
-    }
-    crate::kani::relocate_sysroot(build_dir, &rustup_tc, &version)
-        .map_err(|e| FlowError::Activate(format!("relocate_sysroot: {e}")))?;
-    crate::kani::wire_kani_link(&home.join(".kani"), &version, build_dir, &layout.prefix)
-        .map_err(|e| FlowError::Activate(format!("~/.kani wiring: {e}")))
-}
-
-/// Run the fail-loud [`crate::kani::resolve_check`] over every exposed binary a
+/// Run the fail-loud [`crate::sysroot::resolve_check`] over every exposed binary a
 /// bundle ships, so a toolchain whose dynamic loader can't resolve its libraries
 /// aborts the apply instead of being reported as a successful install.
-fn bundle_resolve_check(build_dir: &Path, exposes: &[String]) -> Result<(), FlowError> {
+///
+/// Takes the ADMITTED tool set: a name refused a shim is not reachable from `PATH`, so
+/// whether its loader resolves is not a property of the install. It also names the binary via
+/// [`ToolName::exe_file`] rather than joining the bare tool — the same omission
+/// `rollback_member` had, harmless in practice (a PE starts with `MZ`, which fails
+/// [`crate::relocate::is_native_object`], and the bundle backend errors on Windows anyway) but
+/// not worth leaving as the one site that still spells the rule by hand.
+fn bundle_resolve_check(build_dir: &Path, exposes: &[ToolName]) -> Result<(), FlowError> {
     for tool in exposes {
-        let bin = build_dir.join("bin").join(tool);
+        let bin = build_dir.join("bin").join(tool.exe_file());
         // Only native objects (the compilers that link dylibs) have libraries to
         // resolve; a wrapper script has none, so skip it.
         if bin.is_file() && crate::relocate::is_native_object(&bin) {
-            crate::kani::resolve_check(&bin).map_err(FlowError::Activate)?;
+            crate::sysroot::resolve_check(&bin).map_err(FlowError::Activate)?;
         }
     }
     Ok(())
@@ -1675,12 +1686,19 @@ mod tests {
         }
     }
 
+    fn tool(name: &str) -> ToolName {
+        ToolName::new(name).unwrap()
+    }
+
+    /// `bin/<name>` for a name the test knows is admissible.
+    fn shim_of(layout: &Layout, name: &str) -> PathBuf {
+        layout.shim(&tool(name))
+    }
+
     /// The concrete executable path a `tool` shim forwards to inside `build_dir`
     /// (`bin/<tool>` on Unix, `bin\<tool>.exe` on Windows) — what `ops::which` returns.
-    fn tool_bin(build_dir: &Path, tool: &str) -> PathBuf {
-        build_dir
-            .join("bin")
-            .join(format!("{tool}{}", crate::platform::EXE_SUFFIX))
+    fn tool_bin(build_dir: &Path, name: &str) -> PathBuf {
+        build_dir.join("bin").join(tool(name).exe_file())
     }
 
     // THE capstone: `ay` installs end-to-end from a synthetic SIGNED release — index verified
@@ -1788,7 +1806,7 @@ mod tests {
         let layout = layout(&dir);
         seed_build(&layout, "ay", 17, true); // ay@17 active + shimmed
         // A LIVE forwarding shim (a symlink on Unix, a forwarding `.cmd` on Windows).
-        assert!(crate::platform::resolve_shim(&layout.shim("ay")).is_some());
+        assert!(crate::platform::resolve_shim(&shim_of(&layout, "ay")).is_some());
         // Index pins ay=18 but yanks ay@18 → decide() == Tombstone for the installed ay@17.
         let fake = rollback_index(0, &["ay@18"]);
         let req = InstallRequest {
@@ -1802,7 +1820,7 @@ mod tests {
             matches!(err, FlowError::Tombstoned(ref p) if p == "ay"),
             "got {err:?}"
         );
-        let shim = layout.shim("ay");
+        let shim = shim_of(&layout, "ay");
         assert!(
             std::fs::symlink_metadata(&shim)
                 .unwrap()
@@ -2186,9 +2204,13 @@ mod tests {
     fn seed_build(layout: &Layout, program: &str, build: u64, activate: bool) {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        std::fs::write(dir.join("bin").join(program), b"#!/bin/true\n").unwrap();
+        std::fs::write(
+            dir.join("bin").join(tool(program).exe_file()),
+            b"#!/bin/true\n",
+        )
+        .unwrap();
         if activate {
-            install_shims(layout, &dir, &[program.to_string()]).unwrap();
+            crate::activate::install_shims(layout, &dir, &[program.to_string()]).unwrap();
             activate_channel(layout, "stable", &dir).unwrap();
         }
         crate::store::mark_build_ready(&dir).unwrap();
@@ -2356,7 +2378,7 @@ mod tests {
         // §7 (step 21): the tombstoned member's OLD working shim is not merely reported — it is
         // actively DISABLED. bin/ay flips from the live symlink into ay@17 to an executable
         // failing tombstone script that exits nonzero.
-        let shim = layout.shim("ay");
+        let shim = shim_of(&layout, "ay");
         let meta = std::fs::symlink_metadata(&shim).unwrap();
         assert!(
             meta.file_type().is_file(),
@@ -2952,6 +2974,126 @@ mod tests {
         assert!(
             matches!(err, FlowError::NoIndex),
             "wrong root refuses the dir index"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A build dir with the given executables, created directly in the store (the
+    /// flip/rollback tests below need on-disk shape, not a signed archive).
+    fn bare_build(l: &Layout, program: &str, build: u64, bins: &[&str]) -> PathBuf {
+        let dir = l.build_dir(program, build);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        for b in bins {
+            std::fs::write(tool_bin(&dir, b), b"#!/bin/true\n").unwrap();
+        }
+        dir
+    }
+
+    /// ROLLBACK RESTORES THE PRIOR BUILD'S WHOLE SURFACE. A tool the prior build shipped
+    /// and the new build DROPPED has no shim by rollback time — the new build's
+    /// `install_tools` prune deleted it (same program, different build: exactly its job) —
+    /// so a rollback iterating only the NEW exposes list re-activates the prior build with
+    /// that tool missing from PATH. The restore set is the union with the prior `bin/`.
+    #[test]
+    fn rollback_restores_a_tool_the_new_build_dropped() {
+        let dir = scratch("rb-union");
+        let l = layout(&dir);
+        let b18 = bare_build(&l, "ay", 18, &["ay", "aylint"]);
+        let b19 = bare_build(&l, "ay", 19, &["ay"]);
+        // 18 live with both tools, then the flip to 19 prunes aylint's stale shim.
+        activate_channel(&l, "stable", &b18).unwrap();
+        install_tools(&l, &b18, &[tool("ay"), tool("aylint")]).unwrap();
+        activate_channel(&l, "stable", &b19).unwrap();
+        install_tools(&l, &b19, &[tool("ay")]).unwrap();
+        assert!(
+            crate::platform::resolve_shim(&l.shim(&tool("aylint"))).is_none(),
+            "fixture: the prune removed the dropped tool's shim"
+        );
+
+        let staged = Staged {
+            build: 19,
+            build_dir: b19,
+            exposes: vec![tool("ay")],
+            prior_build: Some(18),
+            reloc: None,
+            tree_root: String::new(),
+        };
+        rollback_member(&l, "stable", "ay", &staged);
+
+        for t in ["ay", "aylint"] {
+            let target = crate::platform::resolve_shim(&l.shim(&tool(t)))
+                .unwrap_or_else(|| panic!("{t}'s shim is restored by the rollback"));
+            assert!(
+                target.starts_with(&b18),
+                "{t} points into the prior build: {}",
+                target.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FAILED FLIP RESTORES THE WITNESS. `activate_channel` writes the per-program link
+    /// before the channel link; when the channel half fails, `flip_member` points the
+    /// witness back at the prior build — the shims were never touched, so witness and
+    /// shims keep agreeing — instead of leaving it naming the build the abort cleanup
+    /// deletes (a broken own link makes GC abstain on the program until the next
+    /// successful activation).
+    #[test]
+    fn a_failed_flip_points_the_witness_back_at_the_prior_build() {
+        let dir = scratch("flip-witness");
+        let l = layout(&dir);
+        let b18 = bare_build(&l, "ay", 18, &["ay"]);
+        let b19 = bare_build(&l, "ay", 19, &["ay"]);
+        activate_channel(&l, "stable", &b18).unwrap();
+        install_tools(&l, &b18, &[tool("ay")]).unwrap();
+        // Make the CHANNEL half fail strictly after the witness half: a regular FILE where
+        // the channel DIRECTORY must go, so `ensure_private_dir(channels/beta)` errs.
+        std::fs::create_dir_all(l.prefix.join("channels")).unwrap();
+        std::fs::write(l.prefix.join("channels").join("beta"), b"not a dir").unwrap();
+
+        let staged = Staged {
+            build: 19,
+            build_dir: b19,
+            exposes: vec![tool("ay")],
+            prior_build: Some(18),
+            reloc: None,
+            tree_root: String::new(),
+        };
+        assert!(
+            !flip_member(&l, "beta", "ay", &staged),
+            "the flip must report failure"
+        );
+        assert_eq!(
+            std::fs::read_link(l.program_current("ay")).expect("witness link survives"),
+            b18,
+            "the witness points back at the prior build, agreeing with the untouched shims"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fresh-install variant of the failed flip: no prior build exists, so the repair
+    /// REMOVES the witness link the flip wrote — the abort cleanup deletes the build it
+    /// named, and a program that was never installed must not keep a (dangling) witness.
+    #[test]
+    fn a_failed_fresh_install_flip_removes_the_witness_link() {
+        let dir = scratch("flip-fresh");
+        let l = layout(&dir);
+        let b19 = bare_build(&l, "ay", 19, &["ay"]);
+        std::fs::create_dir_all(l.prefix.join("channels")).unwrap();
+        std::fs::write(l.prefix.join("channels").join("beta"), b"not a dir").unwrap();
+
+        let staged = Staged {
+            build: 19,
+            build_dir: b19,
+            exposes: vec![tool("ay")],
+            prior_build: None,
+            reloc: None,
+            tree_root: String::new(),
+        };
+        assert!(!flip_member(&l, "beta", "ay", &staged));
+        assert!(
+            std::fs::symlink_metadata(l.program_current("ay")).is_err(),
+            "no witness link survives a failed fresh install"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

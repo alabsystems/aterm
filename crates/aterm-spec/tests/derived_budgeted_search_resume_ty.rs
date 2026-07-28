@@ -13,7 +13,7 @@ use aterm_spec::{interp, verify};
 
 #[test]
 fn budgeted_search_resume_proves_and_catches_stale_continuation() {
-    verify::prove_and_catch_tiered(
+    verify::prove_and_catch_scalar(
         &budgeted_search_resume_model(),
         "derived BudgetedSearchResume spec (identity/reset/delta-drain lifecycle)",
     );

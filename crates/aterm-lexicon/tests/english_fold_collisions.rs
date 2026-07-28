@@ -65,12 +65,17 @@ fn no_unambiguous_surface_is_an_ordinary_english_word() {
 fn typing_pick_is_silent_all_the_way_through() {
     let lex = aterm_lexicon::Lexicon::builtin();
     let opts = aterm_lexicon::ScanOptions::default();
-    for prefix in ["p", "pi", "pic", "pick", "picks", "picking", "picture", "picnic"] {
+    for prefix in [
+        "p", "pi", "pic", "pick", "picks", "picking", "picture", "picnic",
+    ] {
         assert!(
             lex.scan(prefix, &opts).is_empty(),
             "{prefix:?} classifies — typing `pick` fires a cue mid-word"
         );
     }
     // Non-vacuous: the real expletive still fires.
-    assert!(!lex.scan("fuck", &opts).is_empty(), "the gate must not be vacuous");
+    assert!(
+        !lex.scan("fuck", &opts).is_empty(),
+        "the gate must not be vacuous"
+    );
 }

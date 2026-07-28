@@ -21,6 +21,7 @@ use std::process::Command;
 
 use crate::changelog;
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
+use crate::mirror;
 
 /// Free-disk floor for a cut. A universal release build carries two full
 /// `--release` target trees (Trust arm64 + rustup x86_64, both with
@@ -46,6 +47,19 @@ pub struct GateOpts {
     /// the earlier wedged cut, so the changelog gate judges THAT section — the
     /// fresh `[Unreleased]` scaffold above it is legitimately empty.
     pub recut: bool,
+    /// This cut publishes nowhere the real channel can be compared against —
+    /// `--dry-run` (no uploads at all) or `--rehearse OWNER/REPO` (uploads to a
+    /// scratch repo). The channel-version gate is inapplicable then, because the
+    /// public channel is not the destination and cannot be expected to carry
+    /// this version.
+    ///
+    /// This is DERIVED FROM THE CLI FLAGS, never from the environment. It
+    /// replaces the former `ATERM_SKIP_CHANNEL_VERSION_GATE` env opt-out, which
+    /// violated the repo rule that verification is default-on and fail-closed
+    /// with no ambient skip switches: an exported variable would silently
+    /// disable the gate for a REAL cut, which is precisely the failure that
+    /// shipped the mismatched v0.6.0 tag.
+    pub offline: bool,
 }
 
 /// What the gates learned — everything the cut transcript's `gates` lines
@@ -65,6 +79,10 @@ pub struct GateReport {
     pub universal: bool,
     /// Free disk in GiB at gate time.
     pub free_disk_gib: u64,
+    /// `Some(version)` when the public update channel's source tree was read and
+    /// carries exactly this version; `None` when there is no channel configured,
+    /// no manifest on it yet, or the gate was explicitly skipped.
+    pub channel_version: Option<String>,
 }
 
 /// Run every gate, in the transcript's order, first failure wins. Cheap and
@@ -95,6 +113,9 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
         true
     };
     let free_disk_gib = disk_gate(repo)?;
+    // Last, because it is the only gate that talks to the public channel: the cheap
+    // local refusals should all have fired before we spend a network round trip.
+    let channel_version = channel_version_gate(repo, &opts.version, opts.offline)?;
     Ok(GateReport {
         head_short: head.chars().take(8).collect(),
         changelog_entries: cl.entries,
@@ -102,7 +123,105 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
         trust_rustc,
         universal,
         free_disk_gib,
+        channel_version,
     })
+}
+
+/// Prove the public channel's source tree already carries the version being cut.
+///
+/// The pure comparison is [`mirror::check_channel_version`]; this is only its I/O
+/// shell — resolve the channel slug from the local manifest, read that channel's
+/// `Cargo.toml` at `main`, hand both to the pure function.
+///
+/// `Ok(None)` when there is nothing to check: no `update_channel` configured, or
+/// the channel carries no workspace manifest. `Ok(Some(version))` on agreement.
+///
+/// Fetch failures fail CLOSED. An unreachable channel is indistinguishable from a
+/// channel that disagrees, and the whole purpose of the gate is to stop guessing
+/// about the channel's contents. Cutting anyway is the behaviour that shipped the
+/// mismatched v0.6.0 tag. `offline` (from `--dry-run` / `--rehearse`, never from
+/// the environment) is the ONLY opt-out, and it cannot apply to a real cut.
+///
+/// In particular a bare 404 is NOT taken as "no manifest": GitHub returns 404 for an
+/// unauthorized repository as well as a missing file, so an absent channel token
+/// would otherwise disable this gate silently. The 404 path probes the repository
+/// itself and only skips when the repository is demonstrably readable.
+pub fn channel_version_gate(
+    repo: &Path,
+    version: &str,
+    offline: bool,
+) -> Result<Option<String>> {
+    let local = fs::read_to_string(repo.join("Cargo.toml"))
+        .map_err(|e| Error::new(format!("cannot read workspace Cargo.toml: {e}")))?;
+    let Some(slug) = mirror::update_channel_slug(&local)? else {
+        return Ok(None);
+    };
+    if offline {
+        return Ok(None);
+    }
+
+    let out = channel_api(&format!("repos/{slug}/contents/Cargo.toml?ref=main"))?;
+
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !is_not_found(&err) {
+            return Err(Error::new(format!(
+                "cannot read Cargo.toml from the public channel {slug}: {}",
+                err.trim()
+            )));
+        }
+        // A 404 is AMBIGUOUS and must not be trusted as "no manifest". GitHub also
+        // answers 404 for a repository the credential cannot read, precisely so it
+        // leaks nothing — so a missing or wrong channel token would otherwise make
+        // this gate silently skip itself, which is the opposite of failing closed.
+        // Distinguish the two by asking whether the REPO is readable at all.
+        let probe = channel_api(&format!("repos/{slug}"))?;
+        if !probe.status.success() {
+            return Err(Error::new(format!(
+                "the public channel {slug} is not readable with the available credential, so \
+                 this cut cannot confirm the channel carries v{version}. GitHub answers 404 \
+                 for both \"no such file\" and \"not authorized\", so treating this as \
+                 \"nothing to compare\" would silently disable the check. Provide \
+                 ~/.secrets/gh_access_token_alabsystems. There is no env opt-out: a \
+                 cut that must not consult the channel is a --dry-run or a \
+                 --rehearse, both of which set this gate aside explicitly."
+            )));
+        }
+        // Repo readable, file absent: the genuine empty-channel/first-publish case.
+        return Ok(None);
+    }
+
+    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    match mirror::check_channel_version(version, &body)? {
+        mirror::ChannelVersion::Agrees => Ok(Some(version.to_string())),
+        mirror::ChannelVersion::NoManifest => Ok(None),
+    }
+}
+
+/// One `gh api` call against the public channel, credentialed for the release org.
+///
+/// The channel is a DIFFERENT org than the dev remote, and `gh auth`'s account is
+/// the dev one, which cannot read it. The token goes in the environment, never in
+/// argv, so it cannot surface in a process listing or a transcript.
+fn channel_api(path: &str) -> Result<std::process::Output> {
+    let mut command = Command::new("gh");
+    command
+        .arg("api")
+        .arg(path)
+        .args(["-H", "Accept: application/vnd.github.raw"]);
+    if let Some(token) = crate::publish::channel_token() {
+        command.env("GH_TOKEN", token);
+    }
+    command
+        .output()
+        .map_err(|e| Error::new(format!("cannot run gh to read the public channel: {e}")))
+}
+
+/// Does this `gh` stderr report a 404? `gh` prints `gh: Not Found (HTTP 404)` plus
+/// the JSON body, so either spelling is enough — and both are matched because the
+/// caller does NOT act on the answer alone (see the repo probe above).
+fn is_not_found(stderr: &str) -> bool {
+    stderr.contains("404") || stderr.contains("Not Found")
 }
 
 /// Prove the committed Cargo.lock already resolves the workspace without any

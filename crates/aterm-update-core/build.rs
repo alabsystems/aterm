@@ -44,10 +44,14 @@ fn main() {
         .join("Cargo.toml");
     let workspace_text = std::fs::read_to_string(&workspace_manifest).unwrap_or_default();
 
-    let channel = table_string(&workspace_text, "workspace.metadata.aterm", "update_channel")
-        .and_then(|slug| {
-            split_owner_repo(&slug).map(|(owner, repo)| (owner.to_string(), repo.to_string()))
-        });
+    let channel = table_string(
+        &workspace_text,
+        "workspace.metadata.aterm",
+        "update_channel",
+    )
+    .and_then(|slug| {
+        split_owner_repo(&slug).map(|(owner, repo)| (owner.to_string(), repo.to_string()))
+    });
 
     let url = std::env::var("CARGO_PKG_REPOSITORY").unwrap_or_default();
     // The SOURCE/publish repo, derived from `repository` alone and NEVER from

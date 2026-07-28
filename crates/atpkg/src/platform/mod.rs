@@ -14,7 +14,7 @@
 //!
 //! * **Activation** — the `channels/<ch>/current` indirection is a directory
 //!   **junction** (`mklink /J`, no admin required, unlike a symlink), not a POSIX
-//!   symlink. [`atomic_symlink`] creates it (used for `current` and the Kani
+//!   symlink. [`atomic_symlink`] creates it (used for `current` and the sysroot
 //!   sysroot/toolchain dir links).
 //! * **Bin shims** — a `bin/<tool>.cmd` batch wrapper (`@"<target>.exe" %*`), not a
 //!   symlink into the store. [`install_shim`] writes it, [`install_tombstone_shim`]
@@ -69,17 +69,24 @@ pub fn file_lock(path: &Path) -> io::Result<FileLock> {
     FileLock::acquire(path)
 }
 
-/// Install a `bin/<tool>` shim pointing at `tool` inside a build's `bin/` directory
-/// (`build_bin_dir`). The concrete executable name gets [`EXE_SUFFIX`] appended
-/// (`tool` on Unix, `tool.exe` on Windows); `shim` is the concrete shim path
-/// (`bin/<tool>` on Unix, `bin/<tool>.cmd` on Windows — see [`crate::store::Layout::shim`]).
+/// Install a `bin/` shim for `tool` pointing at that tool's executable inside a build's
+/// `bin/` directory (`build_bin_dir`). `shim` is the concrete shim path — build it with
+/// [`crate::store::Layout::shim`], never by joining the tool name yourself.
+///
+/// Both renderings of the name are needed here and they are DIFFERENT files on Windows: the
+/// shim is `bin/<tool>.cmd` ([`crate::store::ToolName::shim_file`], supplied by the caller as
+/// `shim`) and its target is `<build>/bin/<tool>.exe`
+/// ([`crate::store::ToolName::exe_file`], derived here). Taking a `ToolName` rather than a
+/// `&str` is what keeps that pair from collapsing into one string again.
 ///
 /// * **Unix**: a symlink `shim -> build_bin_dir/<tool>` (atomic temp-symlink + rename).
 /// * **Windows**: a `bin/<tool>.cmd` batch wrapper invoking `build_bin_dir\<tool>.exe`.
-pub fn install_shim(build_bin_dir: &Path, tool: &str, shim: &Path) -> io::Result<()> {
-    let mut exe = String::from(tool);
-    exe.push_str(EXE_SUFFIX);
-    install_shim_to(shim, &build_bin_dir.join(exe))
+pub fn install_shim(
+    build_bin_dir: &Path,
+    tool: &crate::store::ToolName,
+    shim: &Path,
+) -> io::Result<()> {
+    install_shim_to(shim, &build_bin_dir.join(tool.exe_file()))
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,53 @@
 use std::ffi::OsString;
 use std::path::Path;
 
+/// The token filename that authenticates the socket named `sock_name`: a
+/// per-instance socket (`aterm-<pid>.sock`) pairs with its per-instance
+/// `aterm-<pid>.token`; **everything else** — notably an EXPLICIT custom
+/// `$ATERM_CONTROL_SOCK` path and the fixed `latest` alias — falls back to the
+/// sibling `aterm.token`.
+///
+/// Mirrors `aterm_types::control_socket::token_name_for_sock` (and, through it,
+/// `instance_pid`); kept local so this crate stays dependency-free, exactly as
+/// `is_instance_sock_name` mirrors the `.sock` shape. `aterm-ctl` resolves the
+/// token through the canonical copy, so the two MUST agree — pinned by
+/// `uds_token_name_mirror_matches_aterm_types` in `aterm-ctl`, the one crate
+/// that depends on both.
+///
+/// Load-bearing: hand-rolling `<stem>.token` instead (the bug this replaced)
+/// derives `/tmp/c.token` for `/tmp/c.sock`, which the server never writes, so
+/// a `--dial` drive against a custom socket failed to authenticate.
+/// Note the pid round-trip: the canonical rule parses the digits to a `u32` and
+/// re-formats, so `aterm-01.sock` pairs with `aterm-1.token` (NOT
+/// `aterm-01.token`) and an out-of-range pid falls through to the sibling name.
+/// Mirroring by string slicing alone silently drifts on both — the cross-check
+/// test caught exactly that.
+#[must_use]
+pub fn token_name_for_sock(sock_name: &str) -> String {
+    let pid = sock_name
+        .strip_prefix("aterm-")
+        .and_then(|s| s.strip_suffix(".sock"))
+        // Digits only: keep `u32::parse`'s `+` tolerance from matching odd names.
+        .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|d| d.parse::<u32>().ok());
+    match pid {
+        Some(pid) => format!("aterm-{pid}.token"),
+        None => "aterm.token".to_string(),
+    }
+}
+
+/// The absolute path of the token file authenticating the socket at `sock` —
+/// [`token_name_for_sock`] resolved in the socket's OWN directory, after
+/// following the `latest` alias ([`target_name`]) so a flagless client reads the
+/// pointed-at instance's token rather than the alias's.
+#[must_use]
+pub fn token_path_for_sock(sock: &str) -> Option<std::path::PathBuf> {
+    let p = Path::new(sock);
+    let dir = p.parent()?;
+    let name = target_name(p).unwrap_or(p.file_name()?.to_os_string());
+    Some(dir.join(token_name_for_sock(&name.to_string_lossy())))
+}
+
 /// Atomically (re)point the `latest` alias at this instance's socket: write
 /// the RELATIVE sock filename under `<target>.lnk`, then rename over `link`,
 /// so a client never observes a missing alias and the newest instance always

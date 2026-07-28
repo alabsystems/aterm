@@ -251,7 +251,7 @@ fn model_consts_match_driver() {
 /// keeps `cargo test -p aterm-search` alone proving it too).
 #[test]
 fn streaming_search_spec_model_checked_in_trust() {
-    verify::prove_and_catch_tiered(
+    verify::prove_and_catch_scalar(
         &streaming_search_model(),
         "streaming-search derived spec (Tier-0 backstop)",
     );

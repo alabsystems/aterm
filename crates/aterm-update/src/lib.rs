@@ -31,8 +31,16 @@
 //!   running app stages a new release within ~a minute of publish; an app that is
 //!   started stages within seconds of start.
 //! * **Applying** happens either at the top of the next `main()` (always works), or
-//!   in-session through the seamless handoff (which, as of 2026-07-24, has never
-//!   been observed to complete on a real machine — see `docs/RFC-proof-carrying-dsu.md`).
+//!   in-session through the seamless overlap handoff. The in-session lane is
+//!   FIELD-PROVEN ACROSS A REAL VERSION BOUNDARY as of 2026-07-28: a released
+//!   `v0.6.0` bundle (build 1785122258), installed from the public channel and
+//!   launched cold, staged and applied `v0.7.0` (build 1785125098) in-session,
+//!   carrying one live PTY across the exec — `overlap handoff: exact adoption
+//!   proof for 1 PTY(s) written` then `committing exact readerless handoff to
+//!   child`, ~56 s from launch. This supersedes the earlier "never observed to
+//!   complete on a real machine" note, which was written 2026-07-24 and was
+//!   already stale by 2026-07-25 (same-binary QA-seam proof); see
+//!   `docs/RFC-proof-carrying-dsu.md`.
 //!
 //! Composing those: a machine that never runs aterm is never updated, but it also
 //! never *needs* to be — and the first launch after a release stages it, so the
@@ -171,6 +179,60 @@ pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 /// owner's Developer-ID build) to additionally require the swapped bundle be
 /// Developer-ID signed by this team.
 pub const PINNED_TEAM_ID: &str = aterm_update_core::compile_time_pin!("ATERM_EXPECTED_TEAM_ID");
+
+/// Runtime RAISE of the Tier-APPLE anchor, from `[update] require_team_id` in the
+/// GUI config. Set once, early in `main`, by [`set_required_team_id`].
+static REQUIRED_TEAM_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Opt IN to Developer-ID + notarization enforcement at RUNTIME, without a rebuild.
+///
+/// # Why this exists, and why it can only tighten
+///
+/// aterm ships ad-hoc signed with no Team ID, so [`PINNED_TEAM_ID`] is empty and
+/// [`verify::verify_bundle_policy`] runs the structural `codesign --verify` only —
+/// notarization is never consulted. That is the deliberate default and it is what
+/// makes an unsigned dev/self-hosted build updatable at all.
+///
+/// The gap it left was that the STRICTER posture was only reachable by rebuilding
+/// with `ATERM_EXPECTED_TEAM_ID` baked in. Once there is a Developer ID to require,
+/// requiring it should be a setting, not a compile.
+///
+/// This is deliberately ONE-WAY: it can install a team requirement where there was
+/// none, and it can never remove or replace one that was compiled in. A config file
+/// (or anything that can write one) must not be able to downgrade a shipped build's
+/// trust anchor — that would turn a settings file into a verification bypass, which
+/// is the opposite of what a "protection setting" is for. Concretely:
+///
+/// * compiled pin non-empty ⇒ the compiled pin always wins, this call is ignored;
+/// * compiled pin empty + `Some(team)` ⇒ that team is now required;
+/// * compiled pin empty + `None`/blank ⇒ unchanged (structural-only, the default).
+///
+/// Idempotent-by-`OnceLock`: only the first call takes effect, so a later config
+/// reload cannot loosen the anchor mid-session either.
+pub fn set_required_team_id(team: Option<&str>) {
+    if !PINNED_TEAM_ID.is_empty() {
+        return;
+    }
+    let Some(team) = team.map(str::trim).filter(|t| !t.is_empty()) else {
+        return;
+    };
+    let _ = REQUIRED_TEAM_ID.set(team.to_string());
+}
+
+/// The Team ID verification must actually satisfy: the compiled-in pin when there
+/// is one, otherwise whatever [`set_required_team_id`] installed, otherwise empty
+/// (structural-only Tier REPO — the shipped default).
+///
+/// Every bundle-verification call site reads this rather than [`PINNED_TEAM_ID`]
+/// directly, so the runtime opt-in cannot be accidentally bypassed by a call site
+/// that forgot about it.
+#[must_use]
+pub fn effective_team_id() -> &'static str {
+    if !PINNED_TEAM_ID.is_empty() {
+        return PINNED_TEAM_ID;
+    }
+    REQUIRED_TEAM_ID.get().map_or("", String::as_str)
+}
 
 /// The base64 Ed25519 **public key** for the OPTIONAL Tier SIG anchor (the Apple-free
 /// signed channel), baked in from `ATERM_UPDATE_PUBKEY` at build time. Empty (the
@@ -326,6 +388,52 @@ pub fn preverify_staged_for_handoff(
     Ok(())
 }
 
+/// Record that a staged build FAILED to become the running build, so the failure
+/// is durable and visible to `aterm-ctl update status` instead of living only in
+/// the GUI's in-memory `auto_apply_manual_only` latch and a log line.
+///
+/// The apply lane is the GUI's (the handoff protocol needs the event loop, the
+/// session registry and the PTY readers), but the LEDGER is this crate's, so the
+/// GUI reports outcomes here rather than reaching into `Updates/` itself.
+///
+/// `reason` should be the typed outcome — `ChildDied`, `AdoptionMismatch`,
+/// `ActivityRevoked`, `TimedOut`, `PreparationFailed`, `re-exec failed` — because
+/// which one it is decides whether the answer is "your machine was too busy" or
+/// "these two builds cannot hand off to each other".
+///
+/// Best-effort by construction: observability must never be able to block or fail
+/// an update.
+#[cfg(target_os = "macos")]
+pub fn record_apply_failure(current_build: u64, reason: &str) {
+    let Some(staging) = paths::Staging::resolve() else {
+        return;
+    };
+    health::Health::record_apply_failure(&staging.health(), reason);
+    status::record(
+        &staging,
+        current_build,
+        &format!("staged build did not apply: {reason}"),
+    );
+}
+
+/// Record that an apply SUCCEEDED — the staged build is the running build now.
+/// Clears the apply streak only; acquisition streaks are the check lane's.
+#[cfg(target_os = "macos")]
+pub fn record_apply_success(_current_build: u64) {
+    let Some(staging) = paths::Staging::resolve() else {
+        return;
+    };
+    health::Health::record_apply_success(&staging.health());
+}
+
+/// Non-macOS: no apply lane exists, so there is nothing to record.
+#[cfg(not(target_os = "macos"))]
+pub fn record_apply_failure(_current_build: u64, _reason: &str) {}
+
+/// Non-macOS counterpart to [`record_apply_success`].
+#[cfg(not(target_os = "macos"))]
+pub fn record_apply_success(_current_build: u64) {}
+
 /// Non-macOS no-op: there is no `.app` bundle to swap.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
@@ -396,7 +504,7 @@ pub fn confirm_boot_health_exact(_current_build: u64, _current_commit: &str) -> 
 #[must_use]
 pub fn installed_build_number() -> Option<u64> {
     let installed = bundle::resolve()?;
-    verify::verify_bundle_policy(&installed.app_root, PINNED_TEAM_ID).ok()?;
+    verify::verify_bundle_policy(&installed.app_root, effective_team_id()).ok()?;
     verify::bundle_build_number(&installed.app_root).ok()
 }
 
@@ -427,7 +535,7 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
     // Info.plist values are only codesign-sealed evidence after the complete
     // configured policy gate succeeds. This runs on the updater facts worker,
     // never the event loop, so fail-closed verification adds no input latency.
-    verify::verify_bundle_policy(&installed.app_root, PINNED_TEAM_ID).ok()?;
+    verify::verify_bundle_policy(&installed.app_root, effective_team_id()).ok()?;
     let build_number = verify::bundle_build_number(&installed.app_root).ok()?;
     let git_commit = verify::bundle_git_commit(&installed.app_root).ok()?;
     let receipt = paths::Staging::resolve()
@@ -742,8 +850,15 @@ pub struct UpdateStatus {
     /// (0 = healthy).
     pub failing_checks: u32,
     /// Class of the MOST RECENT failure: `"network"` / `"pipeline"` / `"manifest"` /
-    /// `"stage"` / `""`.
+    /// `"stage"` / `"apply"` / `""`.
     pub failing_kind: String,
+    /// Consecutive APPLY-lane failures: a verified build staged but never became
+    /// the running build. Broken out of `failing_checks` because it answers a
+    /// different question — "can this machine download an update?" versus "can it
+    /// actually move to it?" — and because an all-zero acquisition score beside a
+    /// non-zero value here is precisely the state that read green for three
+    /// releases while every seamless handoff failed.
+    pub failing_applies: u32,
     /// RFC3339 UTC start of the current unhealthy period (empty if healthy).
     pub failing_since: String,
     /// Whether the ledger's `pipeline` streak crossed [`PERSISTENT_AFTER`] — the
@@ -792,6 +907,7 @@ impl UpdateStatus {
             updated_at: String::new(),
             failing_checks: 0,
             failing_kind: String::new(),
+            failing_applies: 0,
             failing_since: String::new(),
             failing_persistent: false,
             rescues: 0,
@@ -1035,6 +1151,7 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         failing_checks: h.total_failures(),
         failing_persistent: h.is_persistent(),
         failing_kind: h.kind,
+        failing_applies: h.apply_failures,
         failing_since: h.failing_since,
         // The rescue lane is gone (v0.26); the protocol field stays, pinned to 0.
         rescues: 0,
@@ -1504,5 +1621,43 @@ mod commit_match_tests {
             "4e91d33",
             "4e91d3334041788ad92f5b6568cb648cb25805d6"
         ));
+    }
+}
+
+#[cfg(test)]
+mod team_pin_tests {
+    /// The runtime opt-in must be ONE-WAY. With an empty compiled pin the default
+    /// is structural-only (which is what lets aterm's own ad-hoc-signed releases
+    /// update at all), a blank setting changes nothing, and a real Team ID raises
+    /// the bar. Crucially, nothing here can ever LOWER a compiled-in pin — a
+    /// settings file must not be a verification bypass.
+    #[test]
+    fn the_runtime_team_requirement_can_only_tighten() {
+        // These builds are ad-hoc: no Team ID is baked in, which is precisely why
+        // the shipped updater applies unnotarized bundles.
+        assert!(
+            super::PINNED_TEAM_ID.is_empty(),
+            "aterm ships ad-hoc; a non-empty compiled pin changes this test's meaning"
+        );
+        assert_eq!(super::effective_team_id(), "", "default is structural-only");
+
+        // Blank/absent settings are inert.
+        super::set_required_team_id(None);
+        super::set_required_team_id(Some("   "));
+        assert_eq!(super::effective_team_id(), "");
+
+        // A real value raises the anchor.
+        super::set_required_team_id(Some("ABCDE12345"));
+        assert_eq!(super::effective_team_id(), "ABCDE12345");
+
+        // And it cannot subsequently be loosened or swapped mid-session.
+        super::set_required_team_id(None);
+        super::set_required_team_id(Some(""));
+        super::set_required_team_id(Some("ZZZZZ99999"));
+        assert_eq!(
+            super::effective_team_id(),
+            "ABCDE12345",
+            "a later call must not relax or replace an installed requirement"
+        );
     }
 }

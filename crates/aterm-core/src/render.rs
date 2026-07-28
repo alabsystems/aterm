@@ -581,6 +581,18 @@ pub struct LineSizeSpan {
     pub line_size: LineSize,
 }
 
+impl LineSizeSpan {
+    /// A run covering `start_col..end_col` (half-open) at `line_size`.
+    #[must_use]
+    pub const fn new(start_col: usize, end_col: usize, line_size: LineSize) -> Self {
+        Self {
+            start_col,
+            end_col,
+            line_size,
+        }
+    }
+}
+
 /// Everything a renderer reads from a `&Terminal` for one frame, snapshotted into
 /// plain owned data — the engine emits it via [`crate::terminal::Terminal::cell_frame_into`].
 ///

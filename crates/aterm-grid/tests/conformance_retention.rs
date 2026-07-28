@@ -147,7 +147,7 @@ fn run_lockstep(n: usize) -> Vec<(BTreeMap<&'static str, i64>, BTreeMap<&'static
 /// duplicates it in the test suite so `cargo test` alone also proves it).
 #[test]
 fn retention_limit_spec_model_checked_in_trust() {
-    verify::prove_and_catch_tiered(&retention_limit_model(), "unified retention limit spec");
+    verify::prove_and_catch_scalar(&retention_limit_model(), "unified retention limit spec");
 }
 
 /// Tier 1: every bounded Scroll run (0..=MAX_PRODUCED steps), driven on the

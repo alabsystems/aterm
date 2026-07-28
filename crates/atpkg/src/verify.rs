@@ -63,8 +63,8 @@ pub enum VerifyOutcome {
         /// The IO error string.
         error: String,
     },
-    /// A `rustup-linked` sysroot bundle: the sanctioned install-time `~/.kani` wiring
-    /// ([`crate::kani::relocate_sysroot`]) adds a `toolchain` SYMLINK inside the build tree
+    /// A relocated sysroot bundle: the sanctioned install-time toolchain wiring
+    /// ([`crate::sysroot::relocate_sysroot`]) adds a `toolchain` SYMLINK inside the build tree
     /// AFTER the signed root was captured over the pristine payload, so the on-disk tree
     /// intentionally differs from the recorded root and cannot be tree-attested. Informational
     /// (exit 0), NOT a failure. Full tree-attestation is available with the default
@@ -130,7 +130,7 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
     }
     let build_dir = layout.build_dir(program, build);
     // A rustup-linked sysroot bundle carries a sanctioned `toolchain` SYMLINK from the
-    // install-time ~/.kani wiring (added AFTER the signed root was captured), which
+    // install-time toolchain wiring (added AFTER the signed root was captured), which
     // `tree::tree_root` cannot walk. This is not drift or tampering — report it as such
     // rather than a false Unreadable failure. (Self-contained bundles have no such symlink
     // and get the full strict attestation below.)

@@ -1891,7 +1891,9 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
                     .filter(|layout| layout.covers_exact_seamless_ids(&expected_ids))?;
                 Some((layout, digest))
             })
-            .map_or((None, None), |(layout, digest)| (Some(layout), Some(digest)))
+            .map_or((None, None), |(layout, digest)| {
+                (Some(layout), Some(digest))
+            })
     };
     // Both direct old exec and one-channel overlap require the legacy global
     // layout to join exactly to the authenticated PTY identities. Only the
@@ -3036,7 +3038,8 @@ cols = 20
                 Some([8; 32]),
                 HandoffTarget::own(),
                 &[],
-            ).is_none(),
+            )
+            .is_none(),
             "absent env → None"
         );
         unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", "not-a-number") };
@@ -3047,7 +3050,8 @@ cols = 20
                 Some([8; 32]),
                 HandoffTarget::own(),
                 &[],
-            ).is_none(),
+            )
+            .is_none(),
             "garbage → None"
         );
         assert!(
@@ -3062,7 +3066,8 @@ cols = 20
                 Some([8; 32]),
                 HandoffTarget::own(),
                 &[],
-            ).is_none(),
+            )
+            .is_none(),
             "stdio refused"
         );
         // A real PTY master: the is_tty backstop must refuse it (a confused
@@ -3087,7 +3092,8 @@ cols = 20
                 Some([8; 32]),
                 HandoffTarget::own(),
                 &[],
-            ).is_none(),
+            )
+            .is_none(),
             "a tty is refused"
         );
         aterm_pty::close_fd(m);
@@ -3118,7 +3124,7 @@ cols = 20
             HandoffTarget::own(),
             &[],
         )
-            .expect("a live pipe fd is adopted");
+        .expect("a live pipe fd is adopted");
         assert!(
             std::env::var_os("ATERM_HANDOFF_READY_FD").is_none(),
             "cleared on read"
@@ -3505,10 +3511,8 @@ cols = 20
         layout_wire_override: Option<&dyn Fn(&str) -> String>,
         meta_wire_override: Option<&dyn Fn(&str) -> String>,
     ) -> StagedHandoff {
-        let scratch = std::env::temp_dir().join(format!(
-            "aterm-handoff-e2e-{label}-{}",
-            std::process::id()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("aterm-handoff-e2e-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).expect("scratch");
         // SAFETY: every caller holds ENV_LOCK for its whole body.
@@ -3584,7 +3588,8 @@ cols = 20
         let layout = exact_legacy_layout(&ids);
         let layout_wire = layout.to_toml().expect("serialize layout");
         let layout_wire = layout_wire_override.map_or(layout_wire.clone(), |f| f(&layout_wire));
-        let layout_path = std::path::Path::new(&outgoing.manifest_path).with_extension("layout.toml");
+        let layout_path =
+            std::path::Path::new(&outgoing.manifest_path).with_extension("layout.toml");
         std::fs::write(&layout_path, layout_wire.as_bytes()).expect("layout sidecar");
         let parent_layout_digest = layout_wire_digest(&layout_wire).expect("parent layout digest");
 
@@ -3605,7 +3610,10 @@ cols = 20
             for rec in &mut published.sessions {
                 let carry = rec.screen.as_mut().expect("every session carries a screen");
                 let next = f(&carry.meta);
-                assert_ne!(next, carry.meta, "the override must actually change the meta");
+                assert_ne!(
+                    next, carry.meta,
+                    "the override must actually change the meta"
+                );
                 carry.meta = next.clone();
                 mutated.push((rec.local_id, next));
             }
@@ -3767,14 +3775,19 @@ cols = 20
         let mut wire = [0u8; READY_WIRE_LEN];
         // SAFETY: bounded read into a live fixed buffer from our own pipe.
         let read = unsafe { libc::read(ready_read, wire.as_mut_ptr().cast(), wire.len()) };
-        assert_eq!(read, READY_WIRE_LEN as isize, "the whole proof wire arrives");
+        assert_eq!(
+            read, READY_WIRE_LEN as isize,
+            "the whole proof wire arrives"
+        );
         assert_eq!(
             AdoptionProof::from_wire(&wire),
             Some(staged.expected),
             "the parent recognizes the proof it was waiting for"
         );
         assert!(
-            staged.expected.commit_wire_matches(&staged.expected.to_commit_wire()),
+            staged
+                .expected
+                .commit_wire_matches(&staged.expected.to_commit_wire()),
             "the exact Commit the parent would send is the one the child accepts"
         );
         assert_ne!(
@@ -3904,7 +3917,11 @@ cols = 20
             )),
         );
         let (proof, _ready, adopted) = child_proof().expect("the child adopts and proves");
-        assert_eq!(adopted.len(), 2, "both sessions adopt across the meta boundary");
+        assert_eq!(
+            adopted.len(),
+            2,
+            "both sessions adopt across the meta boundary"
+        );
         assert_eq!(
             proof, staged.expected,
             "hashing the CARRIED META BYTES makes the two sides agree across a \
@@ -4176,7 +4193,11 @@ mod f4_adoption_proof_asymmetry {
         let layout = realistic_layout();
         let wire = layout.to_toml().expect("parent serializes its live layout");
         let parent = layout_digest(&layout).expect("parent digest");
-        assert_eq!(parent, wire_digest(&wire), "parent digest == digest of wire");
+        assert_eq!(
+            parent,
+            wire_digest(&wire),
+            "parent digest == digest of wire"
+        );
         let child = child_digest_of_wire(&wire).expect("child parses the parent wire");
         assert_eq!(
             parent, child,
@@ -4250,7 +4271,10 @@ mod f4_adoption_proof_asymmetry {
                 "schema-1 parent",
                 modern.replacen("schema = 2", "schema = 1", 1),
             ),
-            ("pre-zoomed parent", modern.replacen("zoomed = false\n", "", 1)),
+            (
+                "pre-zoomed parent",
+                modern.replacen("zoomed = false\n", "", 1),
+            ),
         ] {
             let parsed = RestoreManifest::from_toml(&wire).expect("parses");
             let reserialized = parsed.to_toml().expect("reserialize");
@@ -4296,7 +4320,10 @@ mod f4_adoption_proof_asymmetry {
         let meta = parse_checkpoint_meta(&carry, false).expect("child parses meta");
         let rebuilt = meta.into_checkpoint(cp.grid.clone(), None);
         let child = screen_digest_refs(vec![(0, &rebuilt)]).expect("child screen digest");
-        assert_eq!(parent, child, "same-build screen round trip is a fixed point");
+        assert_eq!(
+            parent, child,
+            "same-build screen round trip is a fixed point"
+        );
     }
 
     /// CROSS-VERSION BREAK #3 — the screen half, `CheckpointMeta` drift.

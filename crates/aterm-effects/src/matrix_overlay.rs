@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn external_rain_freshness_model_proves_and_catches_stale_refocus() {
         let model = external_rain_freshness_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     /// Tier-1 bind: drive the shipping adapter through the model's exact

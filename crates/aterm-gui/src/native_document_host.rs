@@ -906,7 +906,7 @@ fn resolve_atomic_target(
     // std-provided root before enforcing the no-symlink capability rule; this
     // keeps test/private temporary files usable without following arbitrary
     // caller-controlled aliases.
-    let normalized = normalize_process_temp_root(logical_path);
+    let normalized = normalize_process_temp_root(logical_path)?;
     // Bind the complete caller spelling before resolution, then collect it again
     // after canonicalization. This rejects a component inserted, removed, or
     // replaced during admission rather than silently converting it into mutable
@@ -959,12 +959,40 @@ fn canonical_target_path(path: &Path) -> Result<PathBuf, DocumentHostError> {
     }
 }
 
-fn normalize_process_temp_root(path: &Path) -> PathBuf {
+/// Rewrite the std-provided process temporary root to its canonical spelling.
+///
+/// This is NOT cosmetic. macOS reports `$TMPDIR` as `/var/folders/…` while `/var` is a
+/// compatibility symlink to `private/var`, so *every* path under the temporary root
+/// begins with a symlink component. `resolve_atomic_target` enforces the no-symlink
+/// capability rule on the very next line, which makes this rewrite the only reason a
+/// temporary-root document is admissible at all.
+///
+/// It therefore must not degrade silently. `fs::canonicalize` is a syscall and can fail
+/// transiently — `EMFILE` on a loaded machine is the realistic one, and this crate's
+/// test binary runs ~2500 tests in one process. Swallowing that error returned the
+/// UN-normalized path, whose `/var` component the immediately-following
+/// `logical_symlink_bindings` check then rejected as
+/// [`DocumentHostError::SymlinkComponent`] — reporting a capability violation against a
+/// component the caller never wrote, for what was really an I/O failure. Worse, it is
+/// load-dependent, so it presents as an unreproducible flake rather than a bug.
+///
+/// Propagate the true cause instead. A caller that legitimately cannot canonicalize its
+/// own temporary root has an I/O problem and deserves to be told which one.
+fn normalize_process_temp_root(path: &Path) -> Result<PathBuf, DocumentHostError> {
     let temporary = std::env::temp_dir();
     let Ok(suffix) = path.strip_prefix(&temporary) else {
-        return path.to_path_buf();
+        // Not under the temporary root: nothing to normalize, and no symlink exemption
+        // is being claimed on this path's behalf.
+        return Ok(path.to_path_buf());
     };
-    fs::canonicalize(&temporary).map_or_else(|_| path.to_path_buf(), |root| root.join(suffix))
+    let root = fs::canonicalize(&temporary).map_err(|error| DocumentHostError::Io {
+        stage: AtomicSaveStage::Preflight,
+        message: format!(
+            "could not canonicalize the process temporary root {}: {error}",
+            temporary.display()
+        ),
+    })?;
+    Ok(root.join(suffix))
 }
 
 fn reject_symlink_components(path: &Path) -> Result<(), DocumentHostError> {
@@ -1295,6 +1323,72 @@ pub(crate) fn commit_atomic_bytes(
     commit_atomic_bytes_with_seed(baseline, bytes, next_temporary_seed())
 }
 
+fn write_lock_busy() -> String {
+    "save target is busy; retry Save after the other writer finishes".to_string()
+}
+
+/// Bounded contention budget for the sibling write lock.
+///
+/// `flock(2)` binds to the OPEN FILE DESCRIPTION, not the process: "file descriptors
+/// duplicated through dup(2) or fork(2) do not result in multiple instances of a lock,
+/// but rather multiple references to a single lock". A peer that forks while a save
+/// holds this lock hands the child a reference the saver's own `File::drop` cannot
+/// release, so the lock stays held for the child's whole fork->exec window even with
+/// `O_CLOEXEC` set. Measured on this machine over 200 rounds: 0.27 ms mean / 1.24 ms
+/// worst idle, 0.30 ms mean / 0.59 ms worst under load. Refusing a save for a window
+/// that short is wrong.
+///
+/// The budget is deliberately SMALL, for two non-optional reasons:
+///
+///  1. This is NOT reached only from the `aterm-native-document` worker.
+///     `App::settings_commit_value` (app_settings.rs:998) calls `prefs::save_prefs_edits`
+///     SYNCHRONOUSLY on the event-loop thread, and the config worker writes the same
+///     `aterm.toml` from another thread — so contention here is real, and every
+///     millisecond is a dropped frame on a keypress. 25 ms is ~1.5 frames and ~20x the
+///     worst measured fork window.
+///  2. `held_save_lock_returns_busy_and_retry_commits` asserts
+///     `started.elapsed() < Duration::from_secs(1)` around a whole commit. That is an
+///     absolute wall-clock deadline, and this repo has been bitten twice by such
+///     deadlines crossing under full-suite load. 25 ms spends 2.5% of it.
+///
+/// MITIGATION for a proven hazard, NOT a proven cure for the
+/// `repeated_save_during_inflight_checkpoint_persists_the_latest_sequence` flake: the
+/// on-disk forensics narrow that failure to five exits and cannot distinguish them.
+const WRITE_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Take the sibling write lock, riding out a transient holder for at most `budget`.
+/// The first attempt happens before any sleep, so an uncontended save is unchanged.
+///
+/// Retries `WouldBlock` ONLY. `ENOTSUP` (a volume refusing advisory locks), `EBADF` and
+/// `EINVAL` never clear by waiting, and burning the budget on them would only make a
+/// permanent refusal slow. `WouldBlock` is not spurious here: std compiles `try_lock`
+/// to `flock(fd, LOCK_EX|LOCK_NB)` on Apple and maps only EAGAIN/EWOULDBLOCK onto it,
+/// whose one documented cause is a genuine conflicting lock.
+fn acquire_write_lock_within(lock_file: &File, budget: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut backoff = std::time::Duration::from_millis(1);
+    loop {
+        match lock_file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!("could not acquire save lock: {error}"));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(write_lock_busy());
+                }
+                std::thread::sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(8));
+            }
+        }
+    }
+}
+
+fn acquire_write_lock(lock_file: &File) -> Result<(), String> {
+    acquire_write_lock_within(lock_file, WRITE_LOCK_RETRY_BUDGET)
+}
+
 fn commit_atomic_bytes_with_seed(
     baseline: &AtomicFileBaseline,
     bytes: &[u8],
@@ -1326,15 +1420,7 @@ fn commit_atomic_bytes_with_seed(
         Ok(file) => file,
         Err(message) => return atomic_failed(AtomicSaveStage::Preflight, message),
     };
-    if let Err(error) = lock_file.try_lock() {
-        let message = match error {
-            std::fs::TryLockError::WouldBlock => {
-                "save target is busy; retry Save after the other writer finishes".to_string()
-            }
-            std::fs::TryLockError::Error(error) => {
-                format!("could not acquire save lock: {error}")
-            }
-        };
+    if let Err(message) = acquire_write_lock(&lock_file) {
         return atomic_failed(AtomicSaveStage::Preflight, message);
     }
 
@@ -1797,6 +1883,66 @@ mod tests {
     }
 
     #[test]
+    /// A holder that never releases is still refused, and the loop really ran.
+    /// Deliberately NO absolute wall-clock upper bound: that assertion class is the one
+    /// full-suite load has already crossed twice in this crate, and the sub-second
+    /// refusal contract is already owned by `held_save_lock_returns_busy_and_retry_commits`.
+    #[test]
+    fn a_persistent_save_lock_holder_is_refused_after_the_bounded_budget() {
+        let path = unique_file("persistent-save-lock", b"before");
+        let lock_path = path.parent().unwrap().join(format!(
+            ".{}.aterm-write.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let held = open_write_lock(&lock_path).unwrap();
+        held.lock().unwrap();
+        let probe = open_write_lock(&lock_path).unwrap();
+
+        let budget = std::time::Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        let message = acquire_write_lock_within(&probe, budget).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(message.contains("busy") && message.contains("retry Save"));
+        // A regression to a single `try_lock` returns in microseconds and fails here.
+        assert!(
+            elapsed >= budget,
+            "budget must actually be spent, got {elapsed:?}"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The actual regression: a holder that releases INSIDE the budget is ridden out
+    /// instead of refusing the save. Budget is 30s against a 20ms hold (1500x headroom)
+    /// so no scheduler stall can turn this into a false FAIL; the bounded-refusal half
+    /// is pinned deterministically by the test above.
+    #[test]
+    fn a_transient_save_lock_holder_is_ridden_out_instead_of_refusing_the_save() {
+        let path = unique_file("transient-save-lock", b"before");
+        let lock_path = path.parent().unwrap().join(format!(
+            ".{}.aterm-write.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        // Stands in for a forked child holding an inherited reference to this OFD.
+        let held = open_write_lock(&lock_path).unwrap();
+        held.lock().unwrap();
+        let probe = open_write_lock(&lock_path).unwrap();
+
+        let (entered, saw_entry) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            acquire_write_lock_within(&probe, std::time::Duration::from_secs(30))
+        });
+        saw_entry.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(held);
+
+        // Before the retry loop this was Err("…busy…"); with it, Ok.
+        assert!(waiter.join().unwrap().is_ok());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     fn held_save_lock_returns_busy_and_retry_commits() {
         let path = unique_file("held-save-lock", b"before");
         let contents = read_atomic_file(&path, DEFAULT_DOCUMENT_LIMIT, false).unwrap();
@@ -1825,6 +1971,41 @@ mod tests {
         ));
         assert_eq!(fs::read(&path).unwrap(), b"after");
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Every document under `$TMPDIR` on macOS begins with a symlink component
+    /// (`/var` -> `private/var`), so `normalize_process_temp_root` is the ONLY reason
+    /// such a path clears the no-symlink capability rule. Pin that it does — if the
+    /// rewrite ever stops happening, this fails with `SymlinkComponent` instead of
+    /// surfacing whatever actually went wrong.
+    #[test]
+    fn temporary_root_document_resolves_despite_the_var_compatibility_symlink() {
+        let path = unique_file("temp-root-normalize", b"body");
+        let target = resolve_atomic_target(&path, false)
+            .expect("a document under the process temporary root must be admissible");
+        // The rewrite happened: the resolved target carries the canonical root, and the
+        // caller's original spelling is preserved for consumers that must echo it back.
+        let canonical_root = fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(
+            target.target_path().starts_with(&canonical_root),
+            "target {:?} must sit under the canonical temp root {:?}",
+            target.target_path(),
+            canonical_root
+        );
+        assert_eq!(target.logical_path(), path.as_path());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A path OUTSIDE the temporary root claims no symlink exemption, so it must pass
+    /// through the rewrite untouched rather than acquiring one.
+    #[test]
+    fn paths_outside_the_temporary_root_are_not_rewritten() {
+        let outside = PathBuf::from("/usr/share/aterm-does-not-exist/doc.md");
+        assert_eq!(
+            normalize_process_temp_root(&outside).unwrap(),
+            outside,
+            "a non-temporary path must be returned verbatim"
+        );
     }
 
     #[cfg(unix)]

@@ -42,11 +42,15 @@ use aterm_spec::verify;
 
 /// A `Buggy`-convention model: the invariant must be PROVEN at the committed
 /// `Buggy = 0`, and a COUNTEREXAMPLE found at `Buggy = 1`. TIERED (see
-/// [`verify::prove_and_catch_tiered`]): the in-process interpreter always runs
+/// [`verify::prove_and_catch_scalar`]): the in-process interpreter always runs
 /// the whole protocol; `ty` additionally re-proves it wherever installed.
-/// Mirrors `tests/derived_ring_ty.rs::assert_proves_and_catches`.
+/// Mirrors `tests/derived_ring_ty.rs::assert_proves_and_catches` — except that
+/// every model here is `ty_model!`-authored, and the macro emits
+/// `fn_vars: vec![]`, so no model in this file can ever be function-valued. That
+/// is why the `_scalar` form is right here while the ring file needs the
+/// `_tiered` one plus a skip policy.
 fn assert_proves_and_catches(m: &Model) {
-    verify::prove_and_catch_tiered(m, m.name);
+    verify::prove_and_catch_scalar(m, m.name);
 }
 
 /// Bug 3 — the glyph-atlas height accumulator (`build_kind`'s `occupied_height()`

@@ -174,7 +174,8 @@ fn new_v026_keys_are_present_but_invisible_to_v025() {
         text.contains(
             "https://github.com/alabsystems/aterm/releases/download/v0.2.0/aterm-0.2.0.dmg"
         ),
-        "install.sh greps this exact URL out of the manifest:\n{text}"
+        "the url field is built from the caller's slug verbatim (the cut passes \
+         the PUBLIC channel slug so the mirrored appcast is fetchable):\n{text}"
     );
     v025::Manifest::parse(&text).expect("unknown keys must be ignored (no deny_unknown_fields)");
 }

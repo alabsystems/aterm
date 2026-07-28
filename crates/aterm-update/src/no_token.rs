@@ -132,8 +132,7 @@ pub(crate) fn clear() {
 /// carry a credential.
 pub(crate) fn announce_unreadable(staging: &Staging, current_build: u64, explanation: &str) {
     crate::status::record(staging, current_build, explanation);
-    *last_explanation().lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(explanation.to_string());
+    *last_explanation().lock().unwrap_or_else(|e| e.into_inner()) = Some(explanation.to_string());
 
     let first = !STRANDED.swap(true, Ordering::Relaxed);
     let mut last = last_warned().lock().unwrap_or_else(|e| e.into_inner());

@@ -4101,11 +4101,7 @@ impl SessionPool {
                 // block behind a wedged reader. Losing the race merely leaves the
                 // mirror conservative — the same fail-safe direction it already has,
                 // and no worse than not having attempted it.
-                let was_vi = p
-                    .session
-                    .term
-                    .try_lock()
-                    .is_ok_and(|t| t.vi_is_active());
+                let was_vi = p.session.term.try_lock().is_ok_and(|t| t.vi_is_active());
                 crate::app_input::vi_note_terminal_gone(was_vi);
                 self.sessions.remove(&id);
                 return true;
@@ -4562,8 +4558,7 @@ impl PresentRetry {
             // binds "an autonomous retry is never immediate/past", and a `WaitUntil`
             // armed at exactly `now` is a needless edge for that invariant to defend.
             // 1 ms removes ~94% of the floor and keeps the property intact.
-            const RECONFIGURE_FAST_RETRY: std::time::Duration =
-                std::time::Duration::from_millis(1);
+            const RECONFIGURE_FAST_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
             let delay = if self.autonomous_retries == 0
                 && reason == metrics::PresentDropReason::GpuReconfigured
             {
@@ -5080,6 +5075,23 @@ struct WindowState {
     /// engine's same-row + stable-prefix/suffix guards). `None` until the
     /// first probe-eligible frame.
     poof_scrollback: Option<usize>,
+    /// Whether LAST frame observed an open scrollback DETACH window
+    /// (`Grid::reflow_offload_in_flight`). A width reflow hands the tiered store
+    /// to a worker thread, so `scrollback_lines()` COLLAPSES on detach and SPIKES
+    /// by the whole history when the worker re-attaches — a bookkeeping swing of
+    /// tens of thousands of lines that is not a scroll and that no PTY caused.
+    ///
+    /// Diffing across that boundary made `scrolled_rows` saturate, which called
+    /// `note_scroll` with a full screen height and slammed the trail engines'
+    /// remembered cursor cell to row 0; the next observed move then read as a
+    /// full-screen jump. Cold typing momentum used to swallow the result, but a
+    /// resize-licensed streak (`note_reflow`) would have drawn it as a rainbow
+    /// beam across the whole window, out of nowhere.
+    ///
+    /// So the counter is only COMPARABLE between two frames that both sat
+    /// outside a detach window; otherwise the baseline is re-anchored and no
+    /// scroll is reported. `false` until the first probe-eligible frame.
+    poof_offload_in_flight: bool,
     /// Last-seen `Terminal::repaint_blink_epoch` for the focused pane — the
     /// REPAINT-BLINK edge detector, read under the SAME LOCK A as the poof
     /// probe (zero new lock acquisitions). An advance means the attached app
@@ -5219,6 +5231,19 @@ struct WindowState {
     last_resize_at: Option<Instant>,
     pending_resize: Option<PhysicalSize<u32>>,
     next_resize_settle: Option<Instant>,
+    /// Clock of the most recent interactive `WindowEvent::Resized`, i.e. the last
+    /// moment the user's hand was demonstrably still dragging. This — NOT
+    /// "am I inside the throttle's leading edge" — is what tells the trail's
+    /// resize license that a gesture has ENDED.
+    ///
+    /// The distinction is load-bearing. `resize_live_drag` brackets only
+    /// `on_resize_throttled`, so it is clear during the trailing settle; but a
+    /// live drag fires a settle every `RESIZE_THROTTLE` (~20 Hz), each landing a
+    /// real reflow with the flag clear. Licensing on "is a settle" therefore
+    /// grants ~20 streaks/second for the whole drag — the rainbow scribble the
+    /// settle-only design existed to prevent. Licensing on "no `Resized` for at
+    /// least one throttle window" grants exactly one, when the hand stops.
+    last_resized_event_at: Option<Instant>,
     /// A live window-drag tick resized ONLY this window's ACTIVE tab (perf: a big
     /// drag would otherwise reflow every hidden tab's scrollback per throttle tick,
     /// cost scaling with tab count though only one tab is visible). `true` means a
@@ -6114,6 +6139,7 @@ impl WindowState {
             poof_row_above_buf: Vec::new(),
             poof_row_below_buf: Vec::new(),
             poof_scrollback: None,
+            poof_offload_in_flight: false,
             blink_epoch_seen: 0,
             last_blink_at: None,
             blink_reseed: false,
@@ -6147,6 +6173,7 @@ impl WindowState {
             last_resize_at: None,
             pending_resize: None,
             next_resize_settle: None,
+            last_resized_event_at: None,
             panes_stale: false,
             win_px: None,
             last_present_at: None,
@@ -8403,6 +8430,19 @@ impl App {
             // bookkeeping and must not erase a live terminal animation.
             ws.cursor_glow.reset();
             ws.cursor_trail.reset();
+            // The SCROLL ANCHOR belongs to the old terminal for exactly the same
+            // reason. Two panes carry independent histories, so diffing the new
+            // pane's `scrollback_lines()` against the old pane's total reports a
+            // scroll that never happened — and on a deep-history pane it
+            // SATURATES, which is a full-screen `note_scroll`. Today that lands
+            // harmlessly because the `reset()` above just nulled the engines'
+            // remembered cell, so the translation has nothing to move; that is an
+            // accident of ordering, not an invariant, and it stops being harmless
+            // the moment anything reads the anchor before the engines re-seed.
+            // Re-anchor on the next frame instead (`None` reports no scroll and
+            // then records the new pane's true total).
+            ws.poof_scrollback = None;
+            ws.poof_offload_in_flight = false;
             ws.last_blink_at = None;
             ws.blink_reseed = true;
             // PHOSPHOR rain: a RETAINED engine now watches a DIFFERENT grid
@@ -8468,8 +8508,9 @@ impl App {
                 ws.predictor.reset_session();
             }
             if let Some(front_content::FrontContent::Terminal { session, .. }) = ws.front_content {
-                ws.predictor
-                    .restore_link_estimate(link_estimates.get(&session).copied().unwrap_or_default());
+                ws.predictor.restore_link_estimate(
+                    link_estimates.get(&session).copied().unwrap_or_default(),
+                );
             }
         } else {
             ws.predictor.reset();
@@ -12943,6 +12984,11 @@ impl ApplicationHandler<Wake> for App {
                 // cheap; the remainder is absorbed into theme-bg bands at present.
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.win_px = Some(size);
+                    // The hand is demonstrably still on the window edge RIGHT NOW.
+                    // The trail's resize license reads this to tell a mid-drag
+                    // settle (one every ~50 ms, all with `resize_live_drag` clear)
+                    // from the settle that follows the hand STOPPING.
+                    ws.last_resized_event_at = Some(std::time::Instant::now());
                 }
                 self.sync_surface_to_window(wid);
                 // Throttle interactive resizes so a big-scrollback width drag reflows at
@@ -13845,6 +13891,29 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .as_ref()
             .map(|u| (u.owner.as_deref(), u.repo.as_deref()))
             .unwrap_or((None, None));
+        // OPT IN to Developer-ID + notarization enforcement (`[update]
+        // require_team_id`). Installed here, before the first check can run, so it
+        // gates STAGING: a bundle that does not satisfy the requirement is never
+        // staged, and therefore never reaches the boot-apply path either.
+        //
+        // Boundary worth knowing: the apply-at-top-of-`main` re-verification runs
+        // before any config is read, so it re-checks against the COMPILED pin only.
+        // That is a TOCTOU re-check of an artifact stage-time policy already
+        // admitted, not the primary gate — but it does mean this setting tightens
+        // what can be staged rather than retroactively re-judging something already
+        // staged under a looser setting. Changing it does not invalidate an
+        // already-staged build; the honest way to re-judge one is to clear
+        // `Updates/staged`.
+        //
+        // The call can only ever ADD a requirement — a build with a Team ID
+        // compiled in ignores it entirely (`aterm_update::set_required_team_id`),
+        // so this can never become a way to weaken a signed build.
+        aterm_update::set_required_team_id(
+            config
+                .update
+                .as_ref()
+                .and_then(|u| u.require_team_id.as_deref()),
+        );
         // Self-healing surfacing: the check thread reports ledger threshold events
         // (persistent pipeline failure) through this hook; the main thread shows
         // them as an OS notification (`Wake::UpdateHealth`), so a broken update
@@ -17329,6 +17398,56 @@ mod multi_window_tests {
         );
         let _ = new_sid;
         assert!(app.structural_invariants_ok());
+    }
+
+    /// RESIZE STREAK LICENSE — one gesture, one streak, and the discriminator is
+    /// the HAND, not the code path.
+    ///
+    /// A live drag fires a trailing settle every `RESIZE_THROTTLE` (~20 Hz), and
+    /// every one of those lands a real reflow with `resize_live_drag` CLEAR. So
+    /// licensing the streak on "this is a settle" grants ~20 per second for the
+    /// whole drag — the rainbow scribble the settle-only design existed to stop.
+    /// The license therefore keys on `last_resized_event_at`: mid-drag it is
+    /// milliseconds old and grants nothing; a full throttle window of silence
+    /// means the hand let go.
+    ///
+    /// Drives `apply_term_resize` directly at both ages, since that is where the
+    /// predicate lives and what every resize path funnels through.
+    #[test]
+    fn the_resize_license_is_granted_when_the_hand_stops_not_on_every_settle() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        // MID-DRAG: an interactive `Resized` landed just now, so the settle that
+        // follows it immediately is a continuation, not the end of the gesture.
+        app.windows.get_mut(&wid).unwrap().last_resized_event_at = Some(Instant::now());
+        assert!(
+            app.apply_term_resize(wid, 30, 100),
+            "the geometry still applies mid-drag — only the LICENSE is withheld"
+        );
+        assert!(
+            !app.windows[&wid].cursor_glow.reflow_hint_armed(),
+            "a mid-drag settle must NOT license a streak (else ~20/sec of scribble)"
+        );
+
+        // HAND STOPPED: the last interactive event is a full throttle window old.
+        app.windows.get_mut(&wid).unwrap().last_resized_event_at =
+            Some(Instant::now() - crate::RESIZE_THROTTLE - std::time::Duration::from_millis(5));
+        assert!(app.apply_term_resize(wid, 32, 104), "geometry applies");
+        assert!(
+            app.windows[&wid].cursor_glow.reflow_hint_armed(),
+            "the settle after the hand stops licenses exactly one streak"
+        );
+
+        // OUT-OF-BAND (control-socket `resize`, font zoom, scale change): no
+        // interactive stamp at all — already one complete gesture, licensed.
+        let mut fresh = App::headless_for_test();
+        assert!(fresh.windows[&wid].last_resized_event_at.is_none());
+        assert!(fresh.apply_term_resize(wid, 28, 90), "geometry applies");
+        assert!(
+            fresh.windows[&wid].cursor_glow.reflow_hint_armed(),
+            "an out-of-band re-grid is its own gesture and is licensed"
+        );
     }
 
     /// Live window-drag scope (perf #28): a mid-drag reflow (`resize_live_drag`)
@@ -25249,7 +25368,7 @@ mod rain_deadline_tests {
     #[test]
     fn rain_front_scheduler_model_proves_and_catches_native_wake_regression() {
         let model = rain_front_scheduler_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     /// A faithful mirror of the host's rain arm pass (`about_to_wait`
@@ -25551,7 +25670,7 @@ mod headless_video_tests {
     #[test]
     fn video_controller_attempt_ledger_model_proves_and_catches_release_duplication() {
         let model = video_controller_attempt_ledger_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     /// Tier-1 conformance binds the attempted-character bookkeeping model to the
@@ -25713,7 +25832,7 @@ mod headless_video_tests {
     #[test]
     fn headless_video_lifecycle_model_proves_and_catches_glass_fallback() {
         let model = headless_video_lifecycle_model();
-        aterm_spec::verify::prove_and_catch_tiered(&model, model.name);
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
     /// CONFORMANCE: the real begin decision (`video_capture_mode`) and the real

@@ -188,13 +188,24 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     }
     let plus = if v.truncated { "+" } else { "" };
     let (candidates, fg, bold) = if v.regex_error {
-        (vec!["bad regex".to_string(), "re!".to_string()], c.warn, true)
+        (
+            vec!["bad regex".to_string(), "re!".to_string()],
+            c.warn,
+            true,
+        )
     } else if v.total == 0 {
         // `+` is the same "…and history was deeper than the index" marker the count
         // form uses, so the honest qualifier survives at every width.
         (
             vec![
-                format!("no matches{}", if v.truncated { " (partial history)" } else { "" }),
+                format!(
+                    "no matches{}",
+                    if v.truncated {
+                        " (partial history)"
+                    } else {
+                        ""
+                    }
+                ),
                 format!("no matches{plus}"),
                 format!("0 hits{plus}"),
             ],
@@ -300,12 +311,9 @@ pub(crate) fn find_bar_paint(
         let row = &mut rows[field_row];
         write_str(row, cols, LEFT_PAD, PROMPT, c.value, c.bar_bg, true);
         let scroll = paint_well(row, v, &c, field_cols.clone());
-        for (start, segs) in [
-            layout.indicators.as_ref(),
-            layout.status.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
+        for (start, segs) in [layout.indicators.as_ref(), layout.status.as_ref()]
+            .into_iter()
+            .flatten()
         {
             write_segs(row, cols, *start, segs, c.bar_bg);
         }
@@ -705,7 +713,10 @@ mod tests {
             "caret at the end pins the well to the tail"
         );
         let (shown, _) = well(&end);
-        assert!(shown.starts_with(SCROLL_LEFT), "clipped head marked: {shown}");
+        assert!(
+            shown.starts_with(SCROLL_LEFT),
+            "clipped head marked: {shown}"
+        );
 
         let head = paint(
             &FindBarView {
@@ -717,7 +728,10 @@ mod tests {
         assert_eq!(head.field_scroll, 0, "^A scrolls the well back to the head");
         let (shown, caret) = well(&head);
         assert_eq!(caret, head.field_cols.start);
-        assert!(shown.ends_with(SCROLL_RIGHT), "clipped tail marked: {shown}");
+        assert!(
+            shown.ends_with(SCROLL_RIGHT),
+            "clipped tail marked: {shown}"
+        );
 
         let mid = paint(
             &FindBarView {
@@ -764,7 +778,10 @@ mod tests {
             s.contains("no matches") || s.contains("0 hits"),
             "the answer survives, in whatever form fits: {s}"
         );
-        assert!(narrow.field_cols.len() >= MIN_FIELD, "and so does the field");
+        assert!(
+            narrow.field_cols.len() >= MIN_FIELD,
+            "and so does the field"
+        );
         // Wider: both fit.
         let roomy = paint(&view("zzz"), 90);
         assert!(roomy.case_cols.is_some());
@@ -849,7 +866,10 @@ mod tests {
         assert!(s.contains("⌥⌘R regex"), "{s}");
         assert!(s.contains("⏎ accept"), "{s}");
         assert!(s.contains("esc cancel"), "{s}");
-        assert!(!s.contains('⎋'), "the unrenderable escape glyph is gone: {s}");
+        assert!(
+            !s.contains('⎋'),
+            "the unrenderable escape glyph is gone: {s}"
+        );
     }
 
     /// An ACTIVE toggle reverses (ink and ground swap) at the SAME width, so its state

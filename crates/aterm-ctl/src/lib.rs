@@ -133,6 +133,13 @@
 //!   ANY instance — the server relays an unknown-but-published sid to its
 //!   hosting sibling.
 //!
+//!   `ls`/`instances` are answered CLIENT-side, but they still honour
+//!   `--sock`/`--pid`, which SCOPE the listing to the addressed instance. That
+//!   matters for isolation: an automated caller that launched its own instance
+//!   under a private `$ATERM_CONTROL_SOCK` gets back only that instance, never
+//!   the user's real terminals. A scoped listing that finds nothing says so
+//!   distinctly instead of degrading to "no live instances".
+//!
 //! For `text`, `search`, `modes`, `selection`, `chrome`, and `controls` the
 //! response is `"OK <n>\n"` followed by `<n>` data lines, and those data lines are
 //! what gets printed.
@@ -288,6 +295,11 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
+
+    Both HONOUR --sock/--pid, which SCOPE the listing to the addressed
+    instance instead of the whole fleet. Use that to keep an automated
+    caller's own instance isolated from the user's real terminals. A
+    scoped listing that finds nothing reports that distinctly (exit 1).
 ";
 
 /// The verbs a completion script offers as the FIRST argument: every protocol
@@ -674,13 +686,58 @@ fn same_socket_path(a: &str, b: &str) -> bool {
     }
 }
 
-fn run_discovery(verb: &str) -> io::Result<ExitCode> {
+/// The instances discovery will report on, honouring an explicit `--sock`/`--pid`.
+///
+/// * `--pid P` — the single instance `P`, filtered out of the normal enumeration
+///   (so it still benefits from graph-entry discovery of explicit-socket instances).
+/// * `--sock S` — ONLY the instance at `S`. Its pid comes from the filename when
+///   that encodes one (`aterm-<pid>.sock`); an explicitly-named socket does not,
+///   so it falls back to the `0` placeholder this module already uses for a graph
+///   entry with no `pid` line (see `control_socket::graph_entry_pid`).
+/// * neither — every live instance, as before.
+///
+/// Returns `Err(message)` when the caller named an instance that is not live, so
+/// the flags fail LOUDLY instead of silently widening to the whole fleet.
+fn discovery_targets(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<(u32, String)>, String> {
+    if let Some(s) = sock {
+        // Trust the caller's explicit socket: an instance may be perfectly live
+        // without a graph entry in the default dir (a custom `$ATERM_CONTROL_SOCK`
+        // that has not registered a session yet), so do NOT require enumeration
+        // to know about it. `run_discovery` skips it if it does not answer.
+        let name = Path::new(s)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let p = control_socket::instance_pid(&name).unwrap_or(0);
+        return Ok(vec![(p, s.to_string())]);
+    }
+    if let Some(want) = pid {
+        let hit: Vec<(u32, String)> = live_instances().into_iter().filter(|(p, _)| *p == want).collect();
+        if hit.is_empty() {
+            return Err(format!(
+                "no live aterm instance with pid {want} (run `aterm-ctl instances` to list them)"
+            ));
+        }
+        return Ok(hit);
+    }
+    Ok(live_instances())
+}
+
+fn run_discovery(verb: &str, sock: Option<&str>, pid: Option<u32>) -> io::Result<ExitCode> {
     let self_sid = env::var(SELF_SID_ENV).ok();
     let self_sock = self_instance_sock(self_sid.as_deref());
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut any = false;
-    for (pid, sock) in live_instances() {
+    let targets = match discovery_targets(sock, pid) {
+        Ok(t) => t,
+        Err(msg) => {
+            eprintln!("aterm-ctl: {msg}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let scoped = sock.is_some() || pid.is_some();
+    for (pid, sock) in targets {
         let Some(sessions) = query_lines(&sock, "sessions") else {
             continue; // unreachable/dead instance — skip, keep discovering
         };
@@ -706,7 +763,16 @@ fn run_discovery(verb: &str) -> io::Result<ExitCode> {
         }
     }
     if !any {
-        eprintln!("aterm-ctl: no live aterm instances found");
+        // Distinguish "the fleet is empty" from "the instance YOU named did not
+        // answer" — the scoped case must never read as a fleet-wide result.
+        if scoped {
+            eprintln!(
+                "aterm-ctl: the addressed instance did not answer \
+                 (wrong --sock/--pid, not running, or a different user)"
+            );
+        } else {
+            eprintln!("aterm-ctl: no live aterm instances found");
+        }
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
@@ -943,10 +1009,15 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     // The cross-terminal discovery verbs are answered by THIS CLIENT — they
     // enumerate EVERY live instance's socket, so no single server connection
     // could answer them. Anything else is one framed request to one socket.
+    //
+    // `--sock`/`--pid` SCOPE the enumeration (they used to be silently ignored,
+    // which is the footgun this closes: an agent that launched an isolated
+    // instance under its own `$XDG_RUNTIME_DIR` and then ran `--sock <that> ls`
+    // was handed the USER'S REAL terminals and could go on to drive them).
     if request_parts.first().map(String::as_str) == Some("instances")
         || request_parts.first().map(String::as_str) == Some("ls")
     {
-        return run_discovery(&request_parts[0]);
+        return run_discovery(&request_parts[0], sock.as_deref(), pid);
     }
 
     let path = resolve_path(
@@ -2562,5 +2633,120 @@ mod tests {
         let e = unknown_shell_error();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
         assert!(e.to_string().contains("unknown shell"), "got {e}");
+    }
+
+    /// `aterm-uds` keeps a std-only MIRROR of the token-filename rule so it can
+    /// stay dependency-free (`aterm-agent`'s `--dial` path reads the token
+    /// through it, and `aterm-agent` does not depend on `aterm-types`). This
+    /// crate is the only one that depends on BOTH, so the agreement is pinned
+    /// here. A drift means a `--dial` drive authenticates against a file the
+    /// server never wrote — the exact bug the mirror replaced.
+    #[test]
+    fn uds_token_name_mirror_matches_aterm_types() {
+        let cases = [
+            // per-instance sockets -> per-instance tokens
+            "aterm-1.sock",
+            "aterm-42.sock",
+            "aterm-4294967295.sock",
+            // the `latest` alias and every non-instance shape -> sibling token
+            "aterm.sock",
+            "c.sock",
+            "control.sock",
+            "aterm-.sock",
+            "aterm-abc.sock",
+            "aterm-1x.sock",
+            // pid ROUND-TRIPS through u32: leading zeros normalize, and a pid
+            // past u32::MAX falls through to the sibling name. Slicing-only
+            // mirrors drift on both.
+            "aterm-01.sock",
+            "aterm-007.sock",
+            "aterm-99999999999.sock",
+            "aterm-+1.sock",
+            "aterm-1.socket",
+            "aterm-1",
+            "",
+        ];
+        for name in cases {
+            assert_eq!(
+                aterm_uds::latest::token_name_for_sock(name),
+                control_socket::token_name_for_sock(name),
+                "token-name mirror drifted for {name:?}"
+            );
+        }
+    }
+
+    /// REGRESSION: `ls`/`instances` are client-answered, and they used to
+    /// SILENTLY IGNORE `--sock`/`--pid` and enumerate the whole fleet. An agent
+    /// that launched an isolated instance under a private socket and then ran
+    /// `--sock <that> ls` was handed the USER'S REAL terminals — and, acting on
+    /// that list, could drive them. `--sock` must scope to exactly one target.
+    #[test]
+    fn discovery_scopes_to_an_explicit_socket() {
+        let t = discovery_targets(Some("/tmp/private-run/c.sock"), None)
+            .expect("an explicit socket is always a valid target");
+        assert_eq!(
+            t,
+            vec![(0, "/tmp/private-run/c.sock".to_string())],
+            "exactly the addressed socket, and NEVER the ambient fleet"
+        );
+    }
+
+    /// An explicit socket whose filename DOES encode a pid reports it, so the
+    /// `<pid> …` line shape is preserved; a custom name falls back to the `0`
+    /// placeholder this module already uses for a pid-less graph entry.
+    #[test]
+    fn discovery_reads_the_pid_from_an_instance_socket_name() {
+        let named = discovery_targets(Some("/tmp/run/aterm-4242.sock"), None).expect("valid");
+        assert_eq!(named, vec![(4242, "/tmp/run/aterm-4242.sock".to_string())]);
+
+        let custom = discovery_targets(Some("/tmp/run/weird.sock"), None).expect("valid");
+        assert_eq!(custom[0].0, 0, "no pid in the name -> 0 placeholder");
+
+        // Leading zeros normalize through u32, matching `instance_pid`.
+        let zeros = discovery_targets(Some("/tmp/run/aterm-007.sock"), None).expect("valid");
+        assert_eq!(zeros[0].0, 7);
+    }
+
+    /// `--pid` for an instance that is not live must fail LOUDLY. Silently
+    /// widening to the fleet is the exact hazard this closes.
+    #[test]
+    fn discovery_pid_miss_is_an_error_not_a_fleet_listing() {
+        // A pid that cannot be live (0 is never a real instance pid here).
+        let err = discovery_targets(None, Some(0));
+        match err {
+            Err(msg) => assert!(
+                msg.contains("no live aterm instance with pid 0"),
+                "actionable message, got {msg:?}"
+            ),
+            Ok(list) => assert!(
+                list.is_empty(),
+                "a --pid miss must never return other instances, got {list:?}"
+            ),
+        }
+    }
+
+    /// Unscoped discovery is unchanged — the whole fleet, as before.
+    #[test]
+    fn discovery_unscoped_is_the_whole_fleet() {
+        // Equality with `live_instances()` is the property; both may be empty on
+        // a machine with no aterm running, which is still a valid agreement.
+        assert_eq!(
+            discovery_targets(None, None).expect("unscoped never errors"),
+            live_instances()
+        );
+    }
+
+    /// The mirror must resolve in the socket's OWN directory — the concrete
+    /// regression: an explicit `$ATERM_CONTROL_SOCK` path like `/tmp/c.sock`
+    /// pairs with `/tmp/aterm.token`, NEVER the hand-rolled `/tmp/c.token`.
+    #[test]
+    fn uds_token_path_resolves_in_the_socket_dir() {
+        let p = aterm_uds::latest::token_path_for_sock("/tmp/run/c.sock")
+            .expect("a socket path with a parent resolves");
+        assert_eq!(p, Path::new("/tmp/run/aterm.token"));
+
+        let inst = aterm_uds::latest::token_path_for_sock("/tmp/run/aterm-77.sock")
+            .expect("instance socket resolves");
+        assert_eq!(inst, Path::new("/tmp/run/aterm-77.token"));
     }
 }

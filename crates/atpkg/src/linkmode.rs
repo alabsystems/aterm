@@ -165,16 +165,17 @@ pub fn link(
         let Some(name) = bin_tool_name(rel) else {
             continue;
         };
-        if !crate::store::shim_allowed(name) {
-            // SECURITY: the sensitive-name deny-list is honored for dev links too.
+        // SECURITY: the sensitive-name deny-list is honored for dev links too — here by the
+        // only constructor that can produce a name `Layout::shim` will accept.
+        let Some(tool) = crate::store::ToolName::new(name) else {
             refused.push(name.to_string());
             continue;
-        }
+        };
         let src = checkout.join(rel);
         if !src.is_file() {
             continue; // a not-yet-built bin is simply skipped (refresh picks it up later)
         }
-        crate::platform::install_shim_to(&layout.shim(name), &src)
+        crate::platform::install_shim_to(&layout.shim(&tool), &src)
             .map_err(|e| LinkError::Io(e.to_string()))?;
         linked.push(name.to_string());
     }
@@ -207,7 +208,13 @@ pub fn unlink(layout: &Layout, program: &str) -> Result<(), LinkError> {
         let Some(name) = bin_tool_name(Path::new(rel)) else {
             continue;
         };
-        let link = layout.shim(name);
+        // A name `link` refused was never given a shim, so there is nothing here to remove —
+        // and this is why `link` and `unlink` must derive names identically (see
+        // `bin_tool_name`): the admission is now part of that derivation.
+        let Some(tool) = crate::store::ToolName::new(name) else {
+            continue;
+        };
+        let link = layout.shim(&tool);
         // Only remove a link STILL pointing into the checkout — never nuke a re-installed
         // store shim that happens to share the name. `resolve_shim` reads the forward
         // target cross-platform (symlink target on Unix, the `.cmd` target on Windows) —
@@ -430,6 +437,11 @@ mod tests {
         Layout { prefix: p }
     }
 
+    /// `bin/<name>` for a name the test knows is admissible.
+    fn shim_of(layout: &Layout, name: &str) -> PathBuf {
+        layout.shim(&crate::store::ToolName::new(name).unwrap())
+    }
+
     /// A fake checkout with `target/release/<bins>`.
     fn checkout(label: &str, bins: &[&str]) -> PathBuf {
         let d = std::env::temp_dir().join(format!("atpkg-checkout-{label}-{}", std::process::id()));
@@ -454,7 +466,7 @@ mod tests {
         // Shims point INTO the checkout; marker exists 0600; is_linked true. resolve_shim
         // reads the forward target cross-platform (a `.cmd` is not read_link-able).
         assert_eq!(
-            crate::platform::resolve_shim(&l.shim("ay")).unwrap(),
+            crate::platform::resolve_shim(&shim_of(&l, "ay")).unwrap(),
             co.join("target/release/ay")
         );
         assert!(is_linked(&l, "ay"));
@@ -470,8 +482,14 @@ mod tests {
 
         unlink(&l, "ay").unwrap();
         assert!(!is_linked(&l, "ay"));
-        assert!(fs::symlink_metadata(l.shim("ay")).is_err(), "shim removed");
-        assert!(fs::symlink_metadata(l.shim("ny")).is_err(), "shim removed");
+        assert!(
+            fs::symlink_metadata(shim_of(&l, "ay")).is_err(),
+            "shim removed"
+        );
+        assert!(
+            fs::symlink_metadata(shim_of(&l, "ny")).is_err(),
+            "shim removed"
+        );
         let _ = fs::remove_dir_all(&l.prefix);
         let _ = fs::remove_dir_all(&co);
     }
@@ -487,11 +505,17 @@ mod tests {
         let out = link(&l, "ay", &co, &bins).unwrap();
         assert_eq!(out.linked, vec!["ay".to_string()]);
         assert_eq!(out.refused, vec!["git".to_string()]);
+        // `l.shim("git")` does not exist to be written: `ToolName::new("git")` is `None`, so
+        // the path is spelled by hand here to assert nothing landed at it.
+        assert!(crate::store::ToolName::new("git").is_none());
         assert!(
-            fs::symlink_metadata(l.shim("git")).is_err(),
+            fs::symlink_metadata(
+                l.bin_dir()
+                    .join(format!("git{}", crate::platform::SHIM_SUFFIX))
+            )
+            .is_err(),
             "sensitive name never shimmed"
         );
-        assert!(!crate::store::shim_allowed("git"));
         let _ = fs::remove_dir_all(&l.prefix);
         let _ = fs::remove_dir_all(&co);
     }
@@ -507,11 +531,11 @@ mod tests {
         let store_target = l.build_dir("ay", 18).join("bin/ay");
         fs::create_dir_all(store_target.parent().unwrap()).unwrap();
         fs::write(&store_target, b"#!/bin/true\n").unwrap();
-        crate::platform::install_shim_to(&l.shim("ay"), &store_target).unwrap();
+        crate::platform::install_shim_to(&shim_of(&l, "ay"), &store_target).unwrap();
         unlink(&l, "ay").unwrap();
         // The store shim survived — unlink only removes links into the checkout.
         assert_eq!(
-            crate::platform::resolve_shim(&l.shim("ay")).unwrap(),
+            crate::platform::resolve_shim(&shim_of(&l, "ay")).unwrap(),
             store_target
         );
         let _ = fs::remove_dir_all(&l.prefix);
@@ -555,7 +579,7 @@ mod tests {
             "refresh picks up the new bin"
         );
         assert_eq!(
-            crate::platform::resolve_shim(&l.shim("ny")).unwrap(),
+            crate::platform::resolve_shim(&shim_of(&l, "ny")).unwrap(),
             co.join("target/release/ny")
         );
         let _ = fs::remove_dir_all(&l.prefix);
@@ -584,7 +608,7 @@ mod tests {
         let error = link(&l, "ay", &co, &bins).unwrap_err();
         assert!(error.to_string().contains("limit is"), "{error}");
         assert!(
-            crate::platform::resolve_shim(&l.shim("ay")).is_none(),
+            crate::platform::resolve_shim(&shim_of(&l, "ay")).is_none(),
             "an unrecordable request must not mutate shims"
         );
         let _ = fs::remove_dir_all(&l.prefix);

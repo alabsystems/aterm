@@ -102,9 +102,9 @@ fn genuinely_ambiguous_surfaces_stay_gated() {
 fn ordinary_chinese_does_not_detonate() {
     let lx = shipped();
     for text in [
-        "我操作电脑",       // I operate the computer
-        "我操心这件事",     // I worry about this
-        "我操控这个系统",   // I control this system
+        "我操作电脑",     // I operate the computer
+        "我操心这件事",   // I worry about this
+        "我操控这个系统", // I control this system
     ] {
         assert!(
             !has_profanity(&lx, text),

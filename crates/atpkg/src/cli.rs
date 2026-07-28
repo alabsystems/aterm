@@ -148,7 +148,7 @@ fn status() {
 
 /// `atpkg doctor` — the full health surface (§15): trust root, PATH wiring, broken-symlink
 /// scan, active-build store integrity, shell.d hooks + fish-safety, disk headroom, index
-/// freshness, and `~/.kani`/rustup state. No network, no mutation. Structural breakage exits
+/// freshness, and rustup state. No network, no mutation. Structural breakage exits
 /// nonzero; advisory warnings stay exit-0.
 fn doctor() -> ExitCode {
     let Some(layout) = layout() else {
@@ -396,20 +396,34 @@ fn cmd_uninstall(program: Option<&String>) -> ExitCode {
     }
 }
 
-/// The user's `~/.kani` home, for GC pinned-set discovery. `None` if the home directory
-/// can't be resolved. Platform-aware (`%USERPROFILE%` on Windows), not a raw `$HOME` read.
-fn kani_home() -> Option<std::path::PathBuf> {
-    aterm_types::dirs::home_dir().map(|h| h.join(".kani"))
+/// Name the programs a GC pass ABSTAINED on, or print nothing when it abstained on none.
+///
+/// Abstention must not read as "there was nothing to do". A program whose two views disagree
+/// is skipped and its superseded builds stay on disk *forever* — a pass that skipped every
+/// program otherwise reports the reassuring "nothing to reclaim", with no hint that `doctor`
+/// knows exactly why. Naming them is the difference between a silent unbounded-growth bug and
+/// a diagnosable one, which is why it is a shared helper rather than a line inside `cmd_gc`:
+/// every verb that runs a GC pass owes the same disclosure.
+fn print_gc_abstentions(verb: &str, report: &crate::gc::GcReport) {
+    if report.diverged.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = report.diverged.iter().map(|d| d.program.as_str()).collect();
+    println!(
+        "atpkg {verb}: skipped {} program(s) with no proven live build ({}) — \
+         run `atpkg doctor` for the reason",
+        names.len(),
+        names.join(", ")
+    );
 }
 
-/// `atpkg gc` — reclaim superseded store builds (keep current + one rollback + every
-/// `~/.kani`-pinned build). No network.
+/// `atpkg gc` — reclaim superseded store builds (per program: keep the live build plus one
+/// rollback target, discard the rest). No network.
 fn cmd_gc() -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
-    let kani = kani_home().unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
-    let report = crate::gc::run(&layout, &kani);
+    let report = crate::gc::run(&layout);
     if report.reclaimed.is_empty() {
         println!("atpkg gc: nothing to reclaim");
     } else {
@@ -424,6 +438,7 @@ fn cmd_gc() -> ExitCode {
             );
         }
     }
+    print_gc_abstentions("gc", &report);
     ExitCode::SUCCESS
 }
 
@@ -722,13 +737,18 @@ fn do_install(
                 outcome,
             );
             // Reclaim superseded builds after a real activation (best-effort; never fails the
-            // install). Runs at the CLI edge — not inside flow.rs — so flow's unit tests stay
-            // hermetic w.r.t. the developer's real ~/.kani. Satisfies "GC after every
+            // install). Runs at the CLI edge — not inside flow.rs — so flow's unit tests
+            // stay hermetic w.r.t. the developer's real store. Satisfies "GC after every
             // successful activate".
-            if !r.already_current
-                && let Some(k) = kani_home()
-            {
-                let _ = crate::gc::run(layout, &k);
+            //
+            // The report is dropped ON PURPOSE here, unlike in the prefix-wide verbs. This
+            // pass sweeps the whole store, but the program THIS verb just activated is
+            // freshly linked and freshly shimmed, so it is witnessed; any abstention is about
+            // some other program the user did not ask about. Repeating that on every single
+            // install is how a warning becomes wallpaper — `atpkg gc` and `atpkg doctor` are
+            // the verbs whose job is to say it.
+            if !r.already_current {
+                let _ = crate::gc::run(layout);
             }
             // Refresh the interactive-shell PATH hook (append-not-prepend, §16). At the CLI
             // edge — not inside flow.rs — so flow's synthetic-layout tests never write the
@@ -1008,10 +1028,11 @@ fn cmd_update_all() -> ExitCode {
         failures += install_default_set(&layout, &*fetcher, &effective_root_key(), cfg, now_unix());
     }
     // Reclaim superseded builds once after the whole channel apply (all group activations
-    // done). Best-effort; never fails the update.
-    if let Some(k) = kani_home() {
-        let _ = crate::gc::run(&layout, &k);
-    }
+    // done). Best-effort; never fails the update. This verb sweeps the WHOLE prefix, so an
+    // abstention here is about a program it did try to keep current — reported, or the disk
+    // grows after every update with nothing on screen ever mentioning it.
+    let report = crate::gc::run(&layout);
+    print_gc_abstentions("update", &report);
     // Refresh the interactive-shell PATH hook at the CLI edge (§16), best-effort.
     crate::hooks::refresh(&layout);
     if failures == 0 {
@@ -1358,10 +1379,11 @@ fn cmd_install_default_set() -> ExitCode {
     reconcile_links(&layout, cfg);
     let fetcher = resolve_fetcher(&layout);
     let failures = install_default_set(&layout, &*fetcher, &effective_root_key(), cfg, now_unix());
-    // GC + shell-hook refresh once at the CLI edge (the cmd_update_all precedent).
-    if let Some(k) = kani_home() {
-        let _ = crate::gc::run(&layout, &k);
-    }
+    // GC + shell-hook refresh once at the CLI edge (the cmd_update_all precedent) — including
+    // its disclosure of what the pass abstained on, for the same reason: this verb walks the
+    // whole prefix, so a skip here is not about a program the user never mentioned.
+    let report = crate::gc::run(&layout);
+    print_gc_abstentions("install-default-set", &report);
     crate::hooks::refresh(&layout);
     if failures == 0 {
         println!("atpkg: default set complete");
@@ -1729,7 +1751,11 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
             Match { build } => {
                 println!("atpkg: {name} build {build} OK (matches signed tree_root)")
             }
-            SourceBuilt { build, commit, intact } => {
+            SourceBuilt {
+                build,
+                commit,
+                intact,
+            } => {
                 if *intact {
                     println!(
                         "atpkg: {name} build {build} OK (SOURCE-BUILT from {}, lower-assurance: \
@@ -1746,7 +1772,7 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
             }
             WiredSysroot { build } => println!(
                 "atpkg: {name} build {build} OK (rustup-linked sysroot bundle; verified at install, \
-                 not tree-attestable after ~/.kani wiring — use the self-contained bundle for full \
+                 not tree-attestable after install-time wiring — use a self-contained bundle for full \
                  attestation)"
             ),
             Drift { build, .. } => {
@@ -2483,7 +2509,10 @@ mod tests {
             "the hand-made link's checkout is untouched"
         );
         assert_eq!(
-            crate::platform::resolve_shim(&layout.shim("ay")).unwrap(),
+            crate::platform::resolve_shim(
+                &layout.shim(&crate::store::ToolName::new("ay").unwrap())
+            )
+            .unwrap(),
             std::path::absolute(&hand)
                 .unwrap()
                 .join("target/release/ay"),

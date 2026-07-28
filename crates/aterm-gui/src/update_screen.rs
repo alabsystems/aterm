@@ -831,6 +831,7 @@ mod tests {
             updated_at: String::new(),
             failing_checks: 0,
             failing_kind: String::new(),
+            failing_applies: 0,
             failing_since: String::new(),
             failing_persistent: false,
             rescues: 0,

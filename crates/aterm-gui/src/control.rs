@@ -48,7 +48,7 @@ use crate::input::{
     Egress, EgressMode, InputEvent, InputOutcome, ScrollIntent, Source, seam_egress,
 };
 use crate::session_store::Store;
-use crate::subscribe::{self, Streams, Subscribers};
+use crate::subscribe::{self, InstanceStreams, PushOptions, Requested, Subscribers};
 use crate::{SessionCtx, Wake, term_lock};
 
 /// Read-only screen introspection serializers (the SACRED AI-reads-the-screen
@@ -556,10 +556,17 @@ fn cmd_help() -> String {
     // Fixed protocol HEADER (framing / cross-session / targeting rule / seeing
     // modes), then the per-verb catalog GENERATED from the one VERBS table in
     // aterm-types — so the catalog can never drift from the table (it IS the table).
-    let header = r#"# Framing: every reply is a STATUS line ("OK …" / "ERR …") OR raw CONTENT lines. Content
+    // The `--json` verb list is GENERATED from `JSON_CAPABLE_VERBS`, not retyped.
+    // It was a FIFTH hand-maintained replica of that set (beside `framing_of`, the
+    // emitter match, the `json_unsupported` allowlist, and a test's private copy),
+    // and it had already drifted: `metrics` gained a `--json` form and this
+    // sentence never learned about it. A generated sentence cannot drift.
+    let json_verbs = aterm_types::control_verbs::JSON_CAPABLE_VERBS.join("/");
+    let header = &format!(
+        r#"# Framing: every reply is a STATUS line ("OK …" / "ERR …") OR raw CONTENT lines. Content
 # verbs prefix "OK <count>" then <count> lines; aterm-ctl prints the content and consumes
 # the OK line, so an EMPTY content reply means NO DATA — it is never an error (errors are
-# always "ERR …"). Add "--json" to text/screen/cursor/dims/blocks/edges/grants for
+# always "ERR …"). Add "--json" to {json_verbs} for
 # structured output; a read verb without a json form answers "ERR json: not supported".
 # Cross-session: prefix a verb with "@<selector>" (e.g. "@s-ab12 text"). Same-user only;
 # the per-launch token is auto-discovered by aterm-ctl. A sid hosted by ANOTHER same-user
@@ -593,7 +600,8 @@ fn cmd_help() -> String {
 # Local documents require an absolute file: URI. The host canonicalizes it, rejects remote
 # authorities/non-files/oversize/non-UTF-8 input, and grants only that exact file.
 #
-"#;
+"#
+    );
     let mut body = String::from(header);
     for line in aterm_types::control_verbs::catalog_lines() {
         body.push_str(&line);
@@ -722,8 +730,8 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         aterm_update::commit_matches(crate::build_info::GIT_COMMIT, staged_commit);
     let mut out = format!(
         "OK enabled={} current_build={} commit={} staged_build={} staged_version={} \
-         staged_commit={} staged_is_same_commit={} relaunch_ready={} failing={} rescues={} \
-         persistent={} outcome={:?}\n",
+         staged_commit={} staged_is_same_commit={} relaunch_ready={} failing={} \
+         failing_applies={} rescues={} persistent={} outcome={:?}\n",
         st.enabled,
         st.current_build,
         crate::build_info::GIT_COMMIT,
@@ -733,6 +741,11 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         staged_is_same_commit,
         relaunch_ready,
         failing,
+        // Broken out of `failing=` on purpose: the acquisition streaks and the
+        // apply streak answer different questions, and a line reading
+        // `failing=0 failing_applies=7` is the exact state that used to be
+        // indistinguishable from a healthy updater.
+        st.failing_applies,
         st.rescues,
         st.is_failing_persistently(),
         st.outcome
@@ -2883,15 +2896,23 @@ fn read_exact_authenticated(reader: &mut impl Read, payload: &mut [u8]) -> std::
 /// mode by running the subscriber push loop (which never returns to the poll loop).
 ///
 /// Grammar: `subscribe @<sel>[,<sel>...] <streams> [since=<seq>]` where `<streams>`
-/// is a comma/space list ⊆ {screen,cursor,events}. Each `@<sel>` is resolved + gated
-/// EXACTLY like a read verb: `@.`/self is always allowed; a cross-session target
-/// needs `ReadScreen` authorization through [`resolve_target`] +
+/// is a comma/space list ⊆ {screen,cursor,events,cells,bytes,sessions} plus the
+/// `timestamps`/`ts` modifier.
+///
+/// TWO authority checks, because the request names streams at two different SCOPES.
+/// The per-TARGET streams are gated once per `@<sel>`, exactly like a read verb:
+/// `@.`/self resolves through the active handle; every target (self included, for a
+/// scoped Edge) needs `ReadScreen` authorization through [`resolve_target`] +
 /// [`cross_session_authorized`] (Owner reaches same-uid siblings; a scoped Edge needs
-/// a `decide_edge` grant against the TARGET's table+nonce). FAIL-CLOSED: a malformed
-/// line, an unknown session, or ANY target that fails the gate writes a single
-/// `ERR ...` and the connection is closed without entering push mode (no partial
-/// subscription). On full success it writes `OK subscribe <n>\n` and hands the socket
-/// to [`subscribe::push_loop`].
+/// a `decide_edge` grant against the TARGET's table+nonce). The INSTANCE-scoped
+/// `sessions` stream is gated ONCE, before the loop: it reports the whole live-session
+/// roster, which no per-target grant covers, so it is Owner-only.
+///
+/// FAIL-CLOSED throughout: a malformed line, a stream list naming no frame source, an
+/// unknown session, a non-Owner asking for `sessions`, or ANY target that fails the
+/// gate writes a single `ERR ...` and the connection is closed without entering push
+/// mode (no partial subscription). On full success it writes `OK subscribe <n>\n` and
+/// hands the socket to [`subscribe::push_loop`].
 /// Write an error line and flush, swallowing the I/O result. Returns `()` so it
 /// can be used as `return write_err(writer, b"ERR ...\n");` in a `-> ()` fn.
 fn write_err<W: Write>(writer: &mut W, msg: &[u8]) {
@@ -2939,7 +2960,7 @@ fn run_subscribe<W: Write>(
                 return;
             }
         }
-    } else if Streams::parse(first).is_some() {
+    } else if Requested::parse(first).is_some() {
         ("@.", first)
     } else {
         let _ =
@@ -2978,12 +2999,34 @@ fn run_subscribe<W: Write>(
         }
     }
 
-    let Some(streams) = Streams::parse(stream_tok) else {
+    let Some(req) = Requested::parse(stream_tok) else {
         let _ = writer
-            .write_all(b"ERR usage: streams are a subset of screen,cursor,events,cells,bytes,sessions,timestamps(ts)\n");
+            .write_all(b"ERR usage: streams are a subset of screen,cursor,events,cells,bytes,sessions,timestamps(ts) and must name at least one frame source\n");
         let _ = writer.flush();
         return;
     };
+
+    // INSTANCE-SCOPED authority, decided ONCE for the connection — deliberately NOT
+    // inside the per-selector loop below. That loop proves `ReadScreen` against each
+    // target the client named, which is all a per-target edge can ever speak for; the
+    // `sessions` stream instead diffs the WHOLE live-session roster, so it would leak
+    // the existence + opaque sid of siblings the subscriber never named and could not
+    // have named. Owner already holds that view through the `sessions`/`who` verbs, so
+    // Owner keeps it and everyone else is REFUSED here — a hard `ERR denied` rather
+    // than a silently-empty stream, because a push-only connection that never pushes
+    // is indistinguishable from a hang, and fail-closed matches the rest of the
+    // surface. (`InstanceStreams::authorize` re-applies the same rule as a type-level
+    // invariant, so a future caller that forgets this refusal still cannot grant it.)
+    if req.instance.sessions && !matches!(scope, Scope::Owner) {
+        log_denial(
+            AUDIT_SUBSYSTEM,
+            "subscribe -> sessions",
+            aterm_containment::mode_or_containment(),
+            "the sessions stream is instance-wide; only Owner holds instance authority",
+        );
+        return write_err(writer, b"ERR denied\n");
+    }
+    let instance = InstanceStreams::authorize(req.instance, scope);
 
     // The connection's own session tuple, resolved like every other request so a
     // self `subscribe` (`@.`) follows the active tab the same way a self read does.
@@ -3095,11 +3138,15 @@ fn run_subscribe<W: Write>(
         subscribers,
         store,
         &targets,
-        streams,
-        since,
-        since_turn,
-        since_block,
-        non_coalesced,
+        req.targets,
+        instance,
+        PushOptions {
+            since,
+            since_turn,
+            since_block,
+            non_coalesced,
+            timestamps: req.timestamps,
+        },
         writer,
     );
 }
@@ -6411,12 +6458,30 @@ mod tests {
     #[test]
     fn every_dispatched_verb_is_in_the_table() {
         let src = include_str!("control.rs");
-        // The dispatch match body: from `match verb {` to the file's `required_op`.
+        // The dispatch match body. ANCHOR ON `let resp = match verb {` — the
+        // ROUTER's match, closing with `};` because it is a let-binding.
+        //
+        // REGRESSION (this test was vacuous): the anchor used to be the bare
+        // `    match verb {`, whose FIRST occurrence in this file is
+        // `escalated_op`'s match (~line 411), not the router (~line 3841). The
+        // scrape therefore walked a handful of already-classified escalation
+        // arms and never saw the dispatch table at all, so a router arm missing
+        // from `VERBS` would have sailed straight through. Keep both the anchor
+        // and the `\n    };\n` terminator exact.
         let body = src
-            .split_once("    match verb {")
-            .and_then(|(_, r)| r.split_once("\n    }\n"))
+            .split_once("    let resp = match verb {")
+            .and_then(|(_, r)| r.split_once("\n    };\n"))
             .map(|(m, _)| m)
             .expect("dispatch match body");
+        // Non-vacuity: the router body must actually contain known dispatch arms.
+        // Without this, a future anchor drift silently empties the scrape again.
+        for sentinel in ["\"text\" =>", "\"screen\" =>", "\"cursor\" =>"] {
+            assert!(
+                body.contains(sentinel),
+                "dispatch scrape lost its anchor — {sentinel} not found in the \
+                 scraped body (the router match moved or was renamed)"
+            );
+        }
         let known = |t: &str| aterm_types::control_verbs::spec(t).is_some();
         // Verbs matched via `"x" if …` / `"x" =>` / `"x" | "y"` arms. Sub-forms like
         // `image read` / `cast frames` are matched on their base verb (image/cast),
@@ -6440,6 +6505,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// SINGLE SOURCE OF TRUTH, part 1c: every `cmd_<verb>_json` handler the
+    /// server defines must have its verb listed in
+    /// [`aterm_types::control_verbs::JSON_CAPABLE_VERBS`], and vice versa.
+    ///
+    /// json-capability is the ONE framing input that cannot be derived from the
+    /// verb table — it is a property of the server's handler, not of the row — so
+    /// the list is a hand-maintained duplicate, and duplicates drift. `metrics`
+    /// drifted: `cmd_metrics_json` wrote the `json_ok` `OK 1\n<body>` (Lines)
+    /// shape while the table still framed `metrics --json` as Status, so the
+    /// client consumed the header and SILENTLY DROPPED the JSON body. This test
+    /// is what binds the two ends.
+    ///
+    /// Scrapes handler NAMES rather than `json_ok` call sites: a name is a stable
+    /// contract (`cmd_<verb>_json`), while a call site can sit behind a helper.
+    /// Irregular names declare their verb in `IRREGULAR` below.
+    #[test]
+    fn json_ok_sites_match_the_json_capable_verbs() {
+        // Handlers whose name does not literally contain their verb.
+        const IRREGULAR: &[(&str, &str)] = &[
+            ("cmd_screen_styled_json", "screen"),
+            // `edges`/`grants` are aliases served by ONE handler.
+            ("cmd_edges_json", "edges"),
+        ];
+        // `*_json` helpers that are serializers, not verb handlers.
+        const NOT_HANDLERS: &[&str] = &[
+            "serialize_dims_json",
+            "styled_image_json",
+            "write_styled_cell_json",
+        ];
+
+        let sources = [
+            include_str!("control_query.rs"),
+            include_str!("control_session.rs"),
+            include_str!("control_selection.rs"),
+        ];
+        let mut found: Vec<String> = Vec::new();
+        for src in sources {
+            for line in src.lines() {
+                let Some(rest) = line.split_once("fn ").map(|(_, r)| r) else {
+                    continue;
+                };
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || *c == '_' || c.is_ascii_digit())
+                    .collect();
+                if name.ends_with("_json") && !NOT_HANDLERS.contains(&name.as_str()) {
+                    found.push(name);
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        assert!(
+            found.len() >= 6,
+            "scrape found only {found:?} — the `fn <name>_json` shape moved and this              guard went vacuous"
+        );
+
+        for name in &found {
+            let verb = IRREGULAR
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| (*v).to_string())
+                .unwrap_or_else(|| {
+                    name.trim_start_matches("cmd_")
+                        .trim_end_matches("_json")
+                        .to_string()
+                });
+            assert!(
+                aterm_types::control_verbs::JSON_CAPABLE_VERBS.contains(&verb.as_str()),
+                "handler {name} serves verb {verb:?}, which is NOT in JSON_CAPABLE_VERBS \u{2014}                  `{verb} --json` will frame as Status and the client will drop the body"
+            );
+        }
+
+        // …and nothing is listed that no handler serves (a stale entry would make
+        // a Status-framed verb claim Lines under --json).
+        for v in aterm_types::control_verbs::JSON_CAPABLE_VERBS {
+            let served = *v == "grants" // alias of `edges`
+                || found.iter().any(|n| {
+                    IRREGULAR.iter().any(|(hn, hv)| hn == n && hv == v)
+                        || n.trim_start_matches("cmd_").trim_end_matches("_json") == *v
+                });
+            assert!(
+                served,
+                "JSON_CAPABLE_VERBS lists {v:?} but no `*_json` handler serves it"
+            );
+        }
+    }
+
+    /// The `--json` sentence in the help header must NAME every json-capable
+    /// verb. It was a fifth hand-maintained replica of that set and had already
+    /// drifted (`metrics` was missing), so it is now generated — this pins that.
+    #[test]
+    fn help_header_names_every_json_capable_verb() {
+        let help = cmd_help();
+        for v in aterm_types::control_verbs::JSON_CAPABLE_VERBS {
+            assert!(
+                help.contains(v),
+                "help header omits json-capable verb {v:?} — the --json sentence drifted"
+            );
+        }
+        assert!(
+            help.contains("metrics"),
+            "non-vacuity: the regression verb must appear"
+        );
     }
 
     /// SINGLE SOURCE OF TRUTH, part 1b: some verbs are INTERCEPTED in the serve
@@ -8445,7 +8616,17 @@ mod tests {
         let mut s = s.try_clone().expect("clone client end");
         s.set_read_timeout(Some(std::time::Duration::from_millis(200)))
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // FAILURE bound, not a wait: the loop returns the moment `pred` matches, so a
+        // generous deadline costs a passing test nothing and only decides how long a
+        // genuine hang takes to report. It must clear the SLOWEST push path by a wide
+        // margin — the `sessions` stream surfaces a sibling registration on the bounded
+        // 250ms instance-diff tick, and that tick is a background thread. The old 3s
+        // (12 ticks) looked generous but is not: under a saturated machine the whole
+        // suite stretches ~2x and the tick thread is not scheduled inside the window,
+        // so `owner_subscription_keeps_the_instance_sessions_stream` failed having read
+        // only its initial DELTA. Scheduling starvation is unbounded in principle;
+        // pick a deadline no realistic load can cross.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut buf = [0u8; 8192];
         while !pred(&acc) && std::time::Instant::now() < deadline {
             match s.read(&mut buf) {
@@ -8587,6 +8768,114 @@ mod tests {
             0,
             "no registration on denial"
         );
+    }
+
+    /// AUTHORITY SCOPE (audit 4.4): the `sessions` stream is INSTANCE-wide — it diffs
+    /// the store's whole live roster — so a per-target `ReadScreen` grant cannot buy
+    /// it. An Edge that legitimately authorizes `subscribe` against its own session
+    /// (the positive control below) is still refused `sessions`, which proves the
+    /// denial comes from the instance gate and not incidentally from the target loop.
+    /// The refusal is hard (`ERR denied`), not a silently-empty stream: a push-only
+    /// connection that never pushes is indistinguishable from a hang.
+    #[test]
+    fn sessions_stream_is_denied_to_a_scoped_edge_that_may_read_its_target() {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let active = active_for(&h);
+        let registry = subscribe::new_registry();
+
+        // A ReadScreen edge granted ON this very session: the per-target gate passes.
+        let tok = {
+            let mut edges = h.ctx.edges.lock().unwrap();
+            edges.grant(h.sid.clone(), h.sid.clone(), Op::ReadScreen, h.nonce)
+        };
+        let scope = Scope::Edge(tok);
+        assert!(
+            cross_session_authorized(scope, "subscribe", &h.ctx),
+            "positive control: this edge DOES authorize subscribe on its target",
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        run_subscribe(
+            "subscribe @. screen,sessions",
+            &active,
+            &store,
+            &registry,
+            scope,
+            &mut out,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "ERR denied\n",
+            "the instance-wide sessions stream needs Owner, not a per-target grant",
+        );
+        assert_eq!(
+            registry.lock().unwrap().watched_sessions(),
+            0,
+            "no registration on denial"
+        );
+    }
+
+    /// The other half of audit 4.4: Owner KEEPS the `sessions` stream (it already
+    /// reads the roster through the `sessions`/`who` verbs), and the stream really
+    /// reports a SIBLING the subscriber never named — `@.` watches session 0 while
+    /// the `EVENT *` line announces a session registered afterwards. End-to-end
+    /// through `run_subscribe` + the push loop, so it also pins that the narrowing
+    /// did not sever the wire path.
+    #[test]
+    fn owner_subscription_keeps_the_instance_sessions_stream() {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let active = active_for(&h);
+        let registry = subscribe::new_registry();
+
+        let (client, server) = CtlStream::pair().unwrap();
+        let (store_t, active_t, reg_t) = (store.clone(), active.clone(), registry.clone());
+        let join = std::thread::spawn(move || {
+            let mut w = server;
+            run_subscribe(
+                "subscribe @. screen,sessions",
+                &active_t,
+                &store_t,
+                &reg_t,
+                Scope::Owner,
+                &mut w,
+            );
+        });
+        // Wait for the IMMEDIATE catch-up frame, not just the ack: the ack is written
+        // by `run_subscribe` BEFORE it enters the push loop, whereas the roster
+        // watermark is seeded inside the loop. Registering the sibling on the ack
+        // alone races the seed — the sibling can land in the baseline and then it is
+        // correctly never announced.
+        let acc = read_until(&client, String::new(), |s| s.contains("DELTA 0 seq="));
+        assert!(acc.contains("OK subscribe 1\n"), "subscribe ack: {acc:?}");
+        assert!(acc.contains("DELTA 0 seq="), "catch-up frame: {acc:?}");
+
+        // A sibling spawns. It is NOT a subscribe target and fires no notify, so the
+        // instance diff surfaces it on the bounded 250ms tick — which is exactly the
+        // roster read that a per-target grant could never authorize.
+        let sib = registered_session(2, -1, b"");
+        store.write().unwrap().register(sib.clone());
+        let seen = read_until(&client, acc, |s| s.contains("session-created"));
+        assert!(
+            seen.contains(&format!("EVENT * session-created {}\n", sib.sid.as_str())),
+            "Owner sees the sibling spawn: {seen:?}"
+        );
+
+        // Tear down: drop the client so the loop's next write fails and it returns.
+        drop(client);
+        for _ in 0..40 {
+            crate::term_lock(&h.term).process(b"x");
+            registry.lock().unwrap().notify(0);
+            if join.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        join.join()
+            .expect("push loop ends cleanly on a dead client");
     }
 
     /// REGRESSION (capability escape): a SELF (`@.`) subscribe must re-verify the edge

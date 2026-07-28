@@ -114,12 +114,19 @@ WHAT IT IS
   brief, and why the agent's CLAUDE*/CODEX_*/... env vars were stripped. Outside aterm
   the block tells the agent to ignore itself, so installing it is harmless everywhere.
 
+  It ALSO installs the bundled SKILLS: whole files aterm ships and owns, written into
+  the agent's own skills directory (today `~/.claude/skills/drive-aterm/SKILL.md` for
+  Claude Code — how to drive ANOTHER aterm session over the control socket). The skill
+  content is compiled into the binary, so it updates with aterm and there is no second
+  copy to drift.
+
 KEY USAGE
-  aterm agents               status: each agent, its context file, installed/stale/absent
-  aterm agents install       install/update the block for every DETECTED agent
-                             (its config dir exists); undetected agents are skipped
+  aterm agents               status: each agent, its context file + skills,
+                             installed/stale/absent/foreign
+  aterm agents install       install/update the block AND the bundled skills for every
+                             DETECTED agent (its config dir exists); others are skipped
   aterm agents install codex force one agent by name (creates the file if needed)
-  aterm agents remove        remove exactly the managed block, everywhere
+  aterm agents remove        remove exactly the managed block, and aterm-owned skills
   aterm agents primer        print the block — paste into any project AGENTS.md/CLAUDE.md
 
 WHEN TO REACH FOR IT
@@ -135,7 +142,13 @@ GOTCHAS
   * A bare `install` skips undetected agents (no config dir = not in use) — name an
     agent explicitly to force it.
   * The primer is intentionally 3 lines: detection, `aterm help`, env hygiene. Depth
-    lives HERE, behind `aterm help`, not in the agent's context file."#,
+    lives HERE, behind `aterm help`, not in the agent's context file.
+  * SKILLS are whole managed FILES, not blocks, so they carry an `<!-- aterm skill ... -->`
+    marker instead. A file at that path WITHOUT the marker is yours: aterm reports it
+    `foreign` and never writes or deletes it. Deleting the marker line is therefore the
+    supported way to fork a shipped skill and keep your version.
+  * Only Claude Code defines a skills convention today, so only `claude` gets one; the
+    other agents receive the primer alone (aterm never fabricates a skills dir)."#,
         ),
     },
     Topic {

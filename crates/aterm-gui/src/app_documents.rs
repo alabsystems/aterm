@@ -2810,6 +2810,20 @@ mod tests {
     use crate::native_editor::Minibuffer;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
+    /// Upper bound for "refused without blocking".
+    ///
+    /// The property these guards defend is that opening a special file (a FIFO with
+    /// no writer) or contending a held lock REFUSES rather than parking the UI
+    /// thread. A genuine failure of that property blocks FOREVER, so any finite
+    /// bound catches it and the exact value only decides how fast the report comes.
+    ///
+    /// It must therefore be immune to machine load, not tuned to a fast machine: a
+    /// saturated host stretches this suite ~2x, and a bound picked for an idle one
+    /// turns a correctness guard into a flake. (Measured: the same class of tight
+    /// deadline in `control.rs`'s `read_until` failed exactly this way.) One second
+    /// looked generous and was not; this does not, and is.
+    const REFUSES_WITHOUT_BLOCKING: std::time::Duration = std::time::Duration::from_secs(30);
+
     fn file_uri(path: &std::path::Path) -> String {
         format!("file://{}", path.to_string_lossy().replace(' ', "%20"))
     }
@@ -3029,7 +3043,7 @@ mod tests {
         let error = app
             .ensure_and_open_config_editor_path_in_window(WindowId(0), &config)
             .expect_err("Manual must refuse a special recovery-journal target");
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < REFUSES_WITHOUT_BLOCKING);
         assert!(error.contains("recovery journal"), "{error}");
         assert!(app.active_native_view(WindowId(0)).is_none());
         let _ = fs::remove_dir_all(dir);
@@ -3070,7 +3084,7 @@ mod tests {
         let error = app
             .ensure_and_open_config_editor_path_in_window(WindowId(0), &config)
             .expect_err("held journal lock must report busy");
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < REFUSES_WITHOUT_BLOCKING);
         assert!(error.contains("busy"), "{error}");
         assert!(error.contains("retry opening Manual"), "{error}");
         assert!(app.active_native_view(WindowId(0)).is_none());
@@ -3590,7 +3604,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = app.save_document_checkpoint(document, view).unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < REFUSES_WITHOUT_BLOCKING);
         assert!(error.contains("busy"), "{error}");
         assert!(error.contains("retry Save"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), b"");
@@ -5418,7 +5432,27 @@ mod tests {
         )
         .unwrap();
 
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap();
+        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
+            // NOT decoration. When this replay fails, the panic used to read only
+            // `called Result::unwrap() on an Err value`, which names neither the stage
+            // nor the cause — and this call is the ONE fallible step in these tests, so
+            // an intermittent failure here left nothing to diagnose. On-disk forensics
+            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
+            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
+            // before any temp file existed (fixture dir mtime still equal to the
+            // rename's ctime). That narrows the failure to the FIVE exits between those
+            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
+            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
+            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
+            // canonicalize the process temporary root" / TargetRetargeted /
+            // SymlinkComponent), `observe_file` ("target changed while it was being
+            // observed"), or `detect_version_conflict` ("File changed on disk"). A
+            // bounded WouldBlock retry has since been added for the proven
+            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
+            // for THIS flake. Surface the message so the next occurrence names its own
+            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            panic!("inflight replay save failed: {error}");
+        });
 
         assert_eq!(app.document_store.dirty(document), Some(true));
         assert_eq!(fs::read_to_string(&path).unwrap(), "saved base\n");
@@ -5474,7 +5508,27 @@ mod tests {
             Some(latest.seq)
         );
 
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap();
+        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
+            // NOT decoration. When this replay fails, the panic used to read only
+            // `called Result::unwrap() on an Err value`, which names neither the stage
+            // nor the cause — and this call is the ONE fallible step in these tests, so
+            // an intermittent failure here left nothing to diagnose. On-disk forensics
+            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
+            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
+            // before any temp file existed (fixture dir mtime still equal to the
+            // rename's ctime). That narrows the failure to the FIVE exits between those
+            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
+            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
+            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
+            // canonicalize the process temporary root" / TargetRetargeted /
+            // SymlinkComponent), `observe_file` ("target changed while it was being
+            // observed"), or `detect_version_conflict` ("File changed on disk"). A
+            // bounded WouldBlock retry has since been added for the proven
+            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
+            // for THIS flake. Surface the message so the next occurrence names its own
+            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            panic!("inflight replay save failed: {error}");
+        });
 
         assert!(!app.native_documents.inflight.contains(&document));
         assert!(!app.native_documents.pending_saves.contains_key(&document));
@@ -5531,7 +5585,27 @@ mod tests {
         );
         assert_eq!(app.document_store.view_count(document), Some(1));
 
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap();
+        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
+            // NOT decoration. When this replay fails, the panic used to read only
+            // `called Result::unwrap() on an Err value`, which names neither the stage
+            // nor the cause — and this call is the ONE fallible step in these tests, so
+            // an intermittent failure here left nothing to diagnose. On-disk forensics
+            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
+            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
+            // before any temp file existed (fixture dir mtime still equal to the
+            // rename's ctime). That narrows the failure to the FIVE exits between those
+            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
+            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
+            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
+            // canonicalize the process temporary root" / TargetRetargeted /
+            // SymlinkComponent), `observe_file` ("target changed while it was being
+            // observed"), or `detect_version_conflict` ("File changed on disk"). A
+            // bounded WouldBlock retry has since been added for the proven
+            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
+            // for THIS flake. Surface the message so the next occurrence names its own
+            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            panic!("inflight replay save failed: {error}");
+        });
 
         assert_eq!(app.document_store.view_count(document), Some(1));
         assert_eq!(
@@ -5811,7 +5885,27 @@ mod tests {
         assert!(!buggy.check_invariant("SettledCoversLatestRequest", &dropped));
         assert!(!buggy.check_invariant("WaitingCloseHasCompletionPump", &dropped));
 
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap();
+        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
+            // NOT decoration. When this replay fails, the panic used to read only
+            // `called Result::unwrap() on an Err value`, which names neither the stage
+            // nor the cause — and this call is the ONE fallible step in these tests, so
+            // an intermittent failure here left nothing to diagnose. On-disk forensics
+            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
+            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
+            // before any temp file existed (fixture dir mtime still equal to the
+            // rename's ctime). That narrows the failure to the FIVE exits between those
+            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
+            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
+            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
+            // canonicalize the process temporary root" / TargetRetargeted /
+            // SymlinkComponent), `observe_file` ("target changed while it was being
+            // observed"), or `detect_version_conflict` ("File changed on disk"). A
+            // bounded WouldBlock retry has since been added for the proven
+            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
+            // for THIS flake. Surface the message so the next occurrence names its own
+            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            panic!("inflight replay save failed: {error}");
+        });
         controller.target = controller.requested;
         controller.settled = true;
         let after = project(&model, &app, document, controller);
@@ -5858,7 +5952,27 @@ mod tests {
 
         assert!(!app.prepare_quit_document_shutdown_inner(true).unwrap());
         assert!(app.native_documents.pending_saves.contains_key(&document));
-        finish_inflight_save_for_test(&mut app, document, view, first).unwrap();
+        finish_inflight_save_for_test(&mut app, document, view, first).unwrap_or_else(|error| {
+            // NOT decoration. When this replay fails, the panic used to read only
+            // `called Result::unwrap() on an Err value`, which names neither the stage
+            // nor the cause — and this call is the ONE fallible step in these tests, so
+            // an intermittent failure here left nothing to diagnose. On-disk forensics
+            // of four leaked fixtures showed the replay reaching `open_write_lock`'s
+            // `set_permissions` (lock ctime 89-280ms after its mtime) and then failing
+            // before any temp file existed (fixture dir mtime still equal to the
+            // rename's ctime). That narrows the failure to the FIVE exits between those
+            // two points in `commit_atomic_bytes_with_seed` and CANNOT distinguish
+            // them: `try_lock` WouldBlock ("busy"), `try_lock` Error ("could not
+            // acquire save lock"), the post-lock `validate_atomic_target` ("could not
+            // canonicalize the process temporary root" / TargetRetargeted /
+            // SymlinkComponent), `observe_file` ("target changed while it was being
+            // observed"), or `detect_version_conflict` ("File changed on disk"). A
+            // bounded WouldBlock retry has since been added for the proven
+            // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
+            // for THIS flake. Surface the message so the next occurrence names its own
+            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            panic!("inflight replay save failed: {error}");
+        });
 
         assert_eq!(app.take_ready_document_shutdowns().unwrap(), (true, vec![]));
         assert!(!app.native_documents.pending_saves.contains_key(&document));

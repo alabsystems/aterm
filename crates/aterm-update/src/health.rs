@@ -22,25 +22,40 @@
 //!   fault.
 //! * `stage` — the artifact downloaded but failed verification/staging (also
 //!   memoized by `FailedMark`).
+//! * `apply` — a VERIFIED, STAGED build failed to become the running build: the
+//!   seamless in-session handoff was refused/revoked/mismatched, the child died,
+//!   or the swap+re-exec failed. This is the class that used to be missing (see
+//!   SCOPE below); it is recorded by [`Health::record_apply_failure`] from the
+//!   GUI's apply lane, and it is deliberately NOT cleared by a healthy download
+//!   check — only by an apply that actually succeeds
+//!   ([`Health::record_apply_success`]). A check succeeding says nothing about
+//!   whether applying works, and conflating the two is exactly how a 100%-failing
+//!   apply lane read green.
 //!
 //! The streaks are PER-CLASS (each cleared only by a fully healthy check), so an
 //! interleaved network blip cannot reset a pipeline streak and suppress the
 //! escalation. (An on-disk ledger from a pre-v0.26 build may carry the retired
 //! rescue-path counters; unknown keys parse fine and are dropped on the next write.)
 //!
-//! # SCOPE — this ledger covers the CHECK/DOWNLOAD/STAGE lane ONLY
+//! # SCOPE — the apply lane is now covered too (2026-07-28)
 //!
-//! Every class above is a failure to *acquire and stage* an update. **Nothing here
-//! observes whether a staged update is ever successfully APPLIED.** That gap is not
-//! hypothetical: through 2026-07 the owner's machine carried an all-zero
+//! This ledger used to cover the CHECK/DOWNLOAD/STAGE lane ONLY, and said so. The
+//! gap was not hypothetical: through 2026-07 this machine carried an all-zero
 //! `health.toml` — a perfect score — while the seamless apply/handoff lane failed
 //! 100% of the time across three releases and every update had to wait for a cold
 //! launch. Downloading and staging really were healthy; the ledger was telling the
-//! truth about the only thing it measures, and the dashboard still read green on a
+//! truth about the only thing it measured, and the dashboard read green on a
 //! half-broken updater.
 //!
-//! So do NOT read "health is clean" as "the updater works". If you extend this
-//! ledger, an apply/handoff failure class is the missing one.
+//! The `apply` class closes it. Two rules keep it honest:
+//!
+//! 1. **A healthy CHECK does not clear it.** [`Health::record_success`] resets the
+//!    acquisition streaks and leaves `apply_failures` alone, because "I can see
+//!    and download the release" is not evidence that applying it works. Only
+//!    [`Health::record_apply_success`] clears it.
+//! 2. **It counts toward [`Health::is_persistent`].** A staged build that will not
+//!    apply strands the machine exactly as surely as one that will not download,
+//!    so it escalates to the same loud notification rather than sitting in a file.
 
 use aterm_update_core::FileLock;
 use serde::{Deserialize, Serialize};
@@ -77,6 +92,12 @@ pub struct Health {
     /// Consecutive `stage`-class failures (downloaded but failed to verify/stage).
     #[serde(default)]
     pub stage_failures: u32,
+    /// Consecutive `apply`-class failures: a verified, staged build that did not
+    /// become the running build (handoff refused/revoked/mismatched, child died,
+    /// swap or re-exec failed). Cleared ONLY by a successful apply, never by a
+    /// healthy download check — see the module SCOPE note.
+    #[serde(default)]
+    pub apply_failures: u32,
     /// Class of the MOST RECENT failure (`""` when healthy).
     #[serde(default)]
     pub kind: String,
@@ -89,6 +110,16 @@ pub struct Health {
     /// The most recent failure's error text (truncated), for `update status`.
     #[serde(default)]
     pub last_error: String,
+    /// The most recent APPLY-lane failure's reason, kept separately from
+    /// [`Self::last_error`].
+    ///
+    /// The two lanes interleave: a handoff can fail at 12:00 and a network blip
+    /// land at 12:01, and a single `last_error` would leave the surviving apply
+    /// streak described by an unrelated DNS message. Keeping the apply reason
+    /// apart lets [`Self::record_success`] restore an honest `kind`/`last_error`
+    /// when it clears the acquisition streaks and the apply streak survives.
+    #[serde(default)]
+    pub last_apply_error: String,
 }
 
 impl Health {
@@ -108,14 +139,22 @@ impl Health {
             .saturating_add(self.pipeline_failures)
             .saturating_add(self.manifest_failures)
             .saturating_add(self.stage_failures)
+            .saturating_add(self.apply_failures)
     }
 
-    /// Whether the ledger shows a PERSISTENT pipeline failure — releases visible,
-    /// downloads impossible for [`PERSISTENT_AFTER`]+ checks: the surface-it-loudly
-    /// state. Per-class streaks mean an interleaved network blip cannot reset this.
+    /// Whether the ledger shows a PERSISTENT failure of a lane that strands the
+    /// machine: either `pipeline` (releases visible, downloads impossible) or
+    /// `apply` (a verified build staged but never able to become the running
+    /// build) for [`PERSISTENT_AFTER`]+ consecutive attempts. Both are the
+    /// surface-it-loudly state; per-class streaks mean an interleaved network blip
+    /// cannot reset either.
+    ///
+    /// `apply` is included because the user-visible symptom is identical — the
+    /// machine does not move to the new version — and leaving it out is what let a
+    /// 100%-failing handoff lane report healthy for three releases.
     #[must_use]
     pub fn is_persistent(&self) -> bool {
-        self.pipeline_failures >= PERSISTENT_AFTER
+        self.pipeline_failures >= PERSISTENT_AFTER || self.apply_failures >= PERSISTENT_AFTER
     }
 
     /// Record one failed check of `kind` (`network` / `pipeline` / `manifest` /
@@ -135,6 +174,7 @@ impl Health {
             "pipeline" => h.pipeline_failures = h.pipeline_failures.saturating_add(1),
             "manifest" => h.manifest_failures = h.manifest_failures.saturating_add(1),
             "stage" => h.stage_failures = h.stage_failures.saturating_add(1),
+            "apply" => h.apply_failures = h.apply_failures.saturating_add(1),
             _ => {}
         }
         h.kind = kind.to_string();
@@ -148,7 +188,14 @@ impl Health {
         h
     }
 
-    /// Record a fully-healthy check: every failure streak clears.
+    /// Record a fully-healthy CHECK: every ACQUISITION streak clears.
+    ///
+    /// `apply_failures` deliberately survives. A check proves the machine can see,
+    /// fetch, verify and stage a release; it proves nothing about whether that
+    /// staged build can be made to run, which is a different lane with different
+    /// failure modes. Clearing it here would recreate the exact blindness this
+    /// class was added to remove — every 75 s check would wipe the evidence that
+    /// the handoff never completes. Use [`Self::record_apply_success`] for that.
     pub fn record_success(path: &Path) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
@@ -162,14 +209,64 @@ impl Health {
         {
             return h;
         }
+        let apply_streak_survives = h.apply_failures;
         h.network_failures = 0;
         h.pipeline_failures = 0;
         h.manifest_failures = 0;
         h.stage_failures = 0;
-        h.kind = String::new();
-        h.failing_since = String::new();
-        h.last_failure_at = String::new();
-        h.last_error = String::new();
+        h.apply_failures = apply_streak_survives;
+        if apply_streak_survives == 0 {
+            h.kind = String::new();
+            h.failing_since = String::new();
+            h.last_failure_at = String::new();
+            h.last_error = String::new();
+        } else {
+            // The acquisition streaks cleared but the machine still cannot APPLY.
+            // Re-describe the ledger in terms of the failure that is actually
+            // still standing, or `update status` would report the apply streak
+            // under whatever transient network message happened to land last.
+            h.kind = "apply".to_string();
+            h.last_error = h.last_apply_error.clone();
+        }
+        h.write(path);
+        h
+    }
+
+    /// Record that a staged build FAILED to become the running build. `reason` is
+    /// the typed handoff/apply outcome (e.g. `ChildDied`, `AdoptionMismatch`,
+    /// `ActivityRevoked`, `re-exec failed`), stored for `update status`.
+    pub fn record_apply_failure(path: &Path, reason: &str) -> Self {
+        let mut h = Self::record_failure(path, "apply", reason);
+        // Mirror the reason into the apply-owned slot so a later acquisition-lane
+        // failure cannot overwrite the description of a still-standing apply streak.
+        let _lock = Self::lock(path);
+        h = Self::read(path);
+        h.last_apply_error = reason.chars().take(400).collect();
+        h.write(path);
+        h
+    }
+
+    /// Record that an apply actually succeeded — the staged build is now the
+    /// running build. Clears the `apply` streak only; the acquisition streaks are
+    /// owned by [`Self::record_success`].
+    pub fn record_apply_success(path: &Path) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        if h.apply_failures == 0 {
+            return h;
+        }
+        h.apply_failures = 0;
+        h.last_apply_error = String::new();
+        if h.total_failures() == 0 {
+            h.kind = String::new();
+            h.failing_since = String::new();
+            h.last_failure_at = String::new();
+            h.last_error = String::new();
+        } else if h.kind == "apply" {
+            // Acquisition failures are still standing; stop describing the ledger
+            // by the apply failure that just resolved.
+            h.kind = String::new();
+        }
         h.write(path);
         h
     }
@@ -217,6 +314,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("health.toml")
+    }
+
+    /// THE regression this class exists for. Through 2026-07 the apply lane failed
+    /// 100% of the time while the ledger read all-zero, because only the download
+    /// lane was recorded and every healthy check cleared everything. Assert the two
+    /// halves of the fix: apply failures are recorded, and a healthy CHECK does not
+    /// erase them.
+    #[test]
+    fn a_healthy_check_never_clears_the_apply_streak() {
+        let p = tmp("apply-survives-check");
+        Health::record_apply_failure(&p, "AdoptionMismatch");
+        Health::record_apply_failure(&p, "ActivityRevoked");
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, 2);
+        assert_eq!(h.kind, "apply");
+        assert_eq!(h.last_error, "ActivityRevoked");
+
+        // A perfectly healthy download check comes in. It must clear the
+        // acquisition streaks and LEAVE the apply streak alone — otherwise the
+        // 75 s cadence wipes the evidence before anyone can read it.
+        Health::record_failure(&p, "network", "dns");
+        Health::record_success(&p);
+        let h = Health::read(&p);
+        assert_eq!(h.network_failures, 0, "acquisition streak clears");
+        assert_eq!(
+            h.apply_failures, 2,
+            "a healthy check must NOT vouch for the apply lane"
+        );
+        assert_eq!(h.kind, "apply", "the standing failure is still the apply one");
+        assert_eq!(
+            h.last_error, "ActivityRevoked",
+            "the standing streak must be described by ITS reason, not the network blip"
+        );
+
+        // Only a real apply success clears it.
+        Health::record_apply_success(&p);
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, 0);
+        assert_eq!(h.total_failures(), 0);
+        assert!(h.kind.is_empty(), "fully healthy ledger reports no class");
+    }
+
+    /// A stranded apply lane must escalate as loudly as a stranded download lane:
+    /// the user-visible symptom (machine does not move to the new version) is the
+    /// same, so it drives the same persistent-failure notification.
+    #[test]
+    fn a_persistent_apply_streak_is_surfaced_like_a_persistent_pipeline_streak() {
+        let p = tmp("apply-persistent");
+        for _ in 0..PERSISTENT_AFTER {
+            Health::record_apply_failure(&p, "ChildDied");
+        }
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, PERSISTENT_AFTER);
+        assert!(
+            h.is_persistent(),
+            "a staged build that never applies must escalate, not sit in a file"
+        );
+        // And a healthy check does not silence it.
+        Health::record_success(&p);
+        assert!(Health::read(&p).is_persistent());
     }
 
     #[test]

@@ -848,6 +848,25 @@ mod tests {
         );
     }
 
+    /// An IME commit has no physical key identity. Under Kitty report-all,
+    /// preserve it as one keyless event; never leak one decimal CSI-u key report
+    /// per Unicode codepoint into the PTY.
+    #[cfg(unix)]
+    #[test]
+    fn ime_commit_report_all_is_one_keyless_event_at_the_pty_seam() {
+        let term = term_with(&[b"\x1b[>8u"]);
+        assert_eq!(
+            egress_bytes(&term, &InputEvent::Text("日本".to_string())),
+            b"\x1b[0u"
+        );
+
+        let with_text = term_with(&[b"\x1b[>24u"]);
+        assert_eq!(
+            egress_bytes(&with_text, &InputEvent::Text("日本".to_string())),
+            b"\x1b[0;1;26085:26412u"
+        );
+    }
+
     /// Compile-time witness: every `InputEvent` variant is enumerated here with NO
     /// wildcard arm, so adding a variant breaks THIS match and forces the author to also
     /// add a representative to the `events` matrix in `bytes_human_eq_controller` (a
