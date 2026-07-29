@@ -11,7 +11,7 @@ use super::types::{BiDiConfig, BiDiMode, ScrollbackBackend, TerminalConfig};
 /// Builder for `TerminalConfig` with fluent API.
 ///
 /// Provides a convenient way to construct a [`TerminalConfig`] without
-/// specifying all 19 fields directly. Unset fields use their defaults.
+/// specifying every field directly. Unset fields use their defaults.
 ///
 /// # Example
 ///
@@ -84,6 +84,20 @@ impl ConfigBuilder {
     #[must_use]
     pub fn default_background(mut self, color: Rgb) -> Self {
         self.config.default_background = color;
+        self
+    }
+
+    /// Set the selection background, or `None` for renderer theme fallback.
+    #[must_use]
+    pub fn selection_background(mut self, color: Option<Rgb>) -> Self {
+        self.config.selection_background = color;
+        self
+    }
+
+    /// Set the selected-text foreground, or `None` for renderer contrast logic.
+    #[must_use]
+    pub fn selection_foreground(mut self, color: Option<Rgb>) -> Self {
+        self.config.selection_foreground = color;
         self
     }
 

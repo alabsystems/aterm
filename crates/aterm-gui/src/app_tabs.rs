@@ -3433,9 +3433,9 @@ impl App {
                 // re-point the global handle, not just the per-window mirror, so a
                 // control verb can't keep driving the just-closed pane's session.
                 self.resync_active_or_window(wid);
-                // Pane-space changed: transient sparkle reset per the v3 §1.1
-                // reset table (keeps done_marks — collapsed-away words never
-                // replay their one-shots when the layout heals).
+                // A pane CLOSED: retire its effect state (episodes, done marks,
+                // parked grid) so a departed pane leaves nothing resident. The
+                // surviving panes keep theirs — the collapse only resizes them.
                 self.reset_pane_space_decorations(wid);
                 false
             }
@@ -5037,8 +5037,13 @@ mod session_chrome_app_tests {
 
         let started = Instant::now();
         app.refresh_window_tabs(wid);
+        // A real regression takes the parser mutex and blocks FOREVER behind the guard
+        // this test holds, so ANY finite bound catches it and tightness buys nothing.
+        // 100ms measured the scheduler, not the lock discipline: the sibling 1s bound
+        // on this same property in app_documents.rs already crossed under full-suite
+        // load (cb8c0cff), and this was ten times tighter.
         assert!(
-            started.elapsed() < Duration::from_millis(100),
+            started.elapsed() < Duration::from_secs(5),
             "chrome refresh blocked behind the terminal parser mutex"
         );
         assert_eq!(

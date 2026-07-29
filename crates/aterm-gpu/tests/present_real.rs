@@ -227,8 +227,8 @@ fn present_real_theorem_text_and_scissored_present() {
         fh as u32,
         false,
     );
-    // Non-vacuity: the two presented frames really differ (the scissored
-    // second present repainted the changed rows).
+    // Non-vacuity: the two swapchain frames submitted through the WSI present
+    // path really differ (the scissored second present repainted the changed rows).
     let (f1, f2) = (&take_a.frames[0], &take_a.frames[1]);
     assert!(
         f1.rgba != f2.rgba,
@@ -385,6 +385,53 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     old_frame_viewport.insert("presented", 1);
     assert!(!model.check_invariant("PresentCoversSurface", &old_frame_viewport));
     assert!(!model.check_invariant("RemainderUsesLiveBackground", &old_frame_viewport));
+}
+
+/// A one-shot exact-destination capture can run during an active video without
+/// consuming, decimating, or otherwise perturbing the recorder. Both copies are
+/// appended after the final presentation pass in the same encoder, so their
+/// harvested bytes must be identical.
+#[test]
+fn one_shot_presented_snapshot_is_independent_from_video() {
+    let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
+        return;
+    };
+    gpu.set_bloom(true);
+    gpu.set_sdr_glow_boost(0.25);
+    let (rows, cols) = (5usize, 24usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"$ exact destination snapshot");
+    let mut input = term.cell_frame(rows, cols);
+    let (cw, ch) = gpu.cell_size();
+    add_fire_stack(&mut input, cw, ch);
+    let (fw, fh) = gpu.frame_size(rows, cols);
+    let destination = (fw as u32 + 5, fh as u32 + 3);
+    let mut win = aterm_gpu::WindowGpu::new();
+
+    gpu.video_begin_standin_for_test(&mut win, destination.0, destination.1, opts(false))
+        .expect("video tap");
+    gpu.presented_snapshot_begin_standin_for_test(&mut win, destination.0, destination.1)
+        .expect("one-shot tap");
+    gpu.present_swapchain_standin_for_test(&mut win, &input, false, None, None, destination);
+    gpu.video_after_present(&mut win, 77);
+    gpu.presented_snapshot_after_present(&mut win, 77)
+        .expect("one-shot post-present");
+    gpu.presented_snapshot_finish(&mut win)
+        .expect("one-shot finish");
+    let snapshot = gpu
+        .presented_snapshot_take(&mut win)
+        .expect("one-shot take");
+    let video = gpu.video_finish(&mut win).expect("video take");
+
+    assert_eq!(video.dropped, 0);
+    assert_eq!(video.decimated, 0);
+    assert_eq!(video.frames.len(), 1);
+    assert_eq!((snapshot.w, snapshot.h), destination);
+    assert_eq!(snapshot.t_us, 77);
+    assert_eq!(
+        snapshot.rgba, video.frames[0].rgba,
+        "the independent taps must observe the same final destination"
+    );
 }
 
 /// The theorem over the FULL FIRE STACK at full res with the GPU bloom ON and

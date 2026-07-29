@@ -135,36 +135,11 @@ impl App {
     fn palette_row_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
         let window = self.windows.get(&wid)?;
         let palette = window.palette()?;
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid);
-        let pad_top = self.win_pad_top(wid);
-        let panel_rows = window.overlay_rows();
+        let transform = self.overlay_coordinate_transform(wid)?;
         let (frame_x, frame_y) = self.window_to_frame(wid, x, y);
-        let native = self.active_native_view(wid).is_some();
-        let (scale, local_x, local_y, font_px) = if native {
-            let scale = window.scale.max(f64::EPSILON);
-            (
-                scale,
-                (frame_x - pad as f64) / scale,
-                (frame_y - self.native_content_origin_y(wid) as f64) / scale,
-                13.0,
-            )
-        } else {
-            (
-                1.0,
-                frame_x - pad as f64,
-                frame_y - (pad_top + self.win_head(wid)) as f64,
-                self.win_font_px(wid),
-            )
-        };
-        let geom = crate::settings::SettingsGeom {
-            cw: cw as f32 / scale as f32,
-            ch: ch as f32 / scale as f32,
-            font_px,
-            cols: window.cols as usize,
-            panel_rows,
-        };
-        crate::palette::palette_row_hit(palette, &geom, local_x as f32, local_y as f32)
+        let local_x = (frame_x - transform.origin_x) / f64::from(transform.scale);
+        let local_y = (frame_y - transform.origin_y) / f64::from(transform.scale);
+        crate::palette::palette_row_hit(palette, &transform.geom, local_x as f32, local_y as f32)
     }
 
     /// Keep the OS cursor aligned with the palette's current row hover. The existing
@@ -813,10 +788,13 @@ impl App {
     /// by the compositor. Press and drag must share this seam or the colour wheel
     /// visibly jumps as soon as the pointer moves.
     fn settings_card_point(&self, wid: WindowId, x: f64, y: f64) -> (f32, f32) {
+        let Some(transform) = self.overlay_coordinate_transform(wid) else {
+            return (-1.0, -1.0);
+        };
         let (x, y) = self.window_to_frame(wid, x, y);
         (
-            (x - self.win_pad(wid) as f64) as f32,
-            (y - self.win_pad_top(wid) as f64 - self.win_head(wid) as f64) as f32,
+            ((x - transform.origin_x) / f64::from(transform.scale)) as f32,
+            ((y - transform.origin_y) / f64::from(transform.scale)) as f32,
         )
     }
 
@@ -827,16 +805,20 @@ impl App {
     fn settings_card_point_if_inside(&self, wid: WindowId, x: f64, y: f64) -> Option<(f32, f32)> {
         let ws = self.windows.get(&wid)?;
         ws.settings()?;
-        let (cw, ch) = self.win_cell_size(wid);
+        let transform = self.overlay_coordinate_transform(wid)?;
         let (origin_x, origin_y) = self.frame_origin(wid);
-        let left = origin_x.saturating_add(self.win_pad(wid) as i64) as f64;
-        let top = origin_y
-            .saturating_add(self.win_pad_top(wid) as i64)
-            .saturating_add(self.win_head(wid) as i64) as f64;
-        let right = left + f64::from(ws.cols) * cw.max(1) as f64;
-        let bottom = top + ws.settings_panel_rows() as f64 * ch.max(1) as f64;
-        (x >= left && x < right && y >= top && y < bottom)
-            .then_some(((x - left) as f32, (y - top) as f32))
+        let left = origin_x as f64 + transform.origin_x;
+        let top = origin_y as f64 + transform.origin_y;
+        let right =
+            left + f64::from(ws.cols) * f64::from(transform.geom.cw) * f64::from(transform.scale);
+        let bottom = top
+            + ws.settings_panel_rows() as f64
+                * f64::from(transform.geom.ch)
+                * f64::from(transform.scale);
+        (x >= left && x < right && y >= top && y < bottom).then_some((
+            ((x - left) / f64::from(transform.scale)) as f32,
+            ((y - top) / f64::from(transform.scale)) as f32,
+        ))
     }
 
     /// While window `wid`'s Settings overlay is open, map pixel `(x, y)` to the CONTROL
@@ -1961,11 +1943,8 @@ impl App {
         // can never target the formerly focused leaf.
         if pressed
             && button == WinitMouseButton::Left
-            && self.active_tab_has_native(wid)
-            && self
-                .windows
-                .get(&wid)
-                .is_none_or(|window| window.tab_set.active().is_none_or(|tab| tab.root.len() > 1))
+            && self.active_visible_content_route(wid)
+                == Some(crate::VisibleContentRoute::Heterogeneous)
         {
             let (px, py) = self
                 .windows

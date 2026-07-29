@@ -259,6 +259,19 @@ pub struct TerminalCheckpoint {
     /// Main-grid body: `serialize_lines(grid.checkpoint_lines())`
     /// (scrollback-then-visible).
     pub grid: Vec<u8>,
+    /// How many of `grid`'s leading line records are SCROLLBACK rather than
+    /// visible rows. `grid` therefore holds `history_lines + rows` records.
+    ///
+    /// Carried explicitly rather than inferred from the blob because the consumer
+    /// must bound its allocation from the AUTHENTICATED meta before it decodes any
+    /// bytes — a length taken from the untrusted payload itself could authorize an
+    /// arbitrary allocation. `0` is the visible-only projection, which is what
+    /// every producer before this field emitted, so it is also the safe default
+    /// for a checkpoint arriving without it.
+    ///
+    /// The ALTERNATE grid always carries `0`: the live alt screen keeps no
+    /// scrollback, and `restore_grid` rebuilds it with a zero-length ring.
+    pub history_lines: u32,
     /// Main-grid cursor/region/wrap/tab projection.
     pub cursor: GridCursorRepr,
     /// Alt-grid body, if an alt grid exists.
@@ -307,31 +320,56 @@ impl Terminal {
     /// not turn an update click into work proportional to an arbitrarily deep history.
     #[must_use]
     pub fn checkpoint_visible(&self) -> Option<TerminalCheckpoint> {
+        self.checkpoint_carry(0)
+    }
+
+    /// The seamless-handoff projection: the visible screen plus at most
+    /// `max_history` lines of the most recent scrollback.
+    ///
+    /// `max_history == 0` is [`Self::checkpoint_visible`] — what the overlap
+    /// handoff carried before this existed, and the reason an in-session update
+    /// left every tab with a single screen of history. A positive bound keeps the
+    /// capture cost `O((rows + max_history) × cols)` while preserving history the
+    /// user can actually scroll back to.
+    ///
+    /// Restore needs no counterpart: `restore_grid` already reads the last `rows`
+    /// lines as the visible grid and pushes everything before them into an
+    /// unlimited scrollback.
+    #[must_use]
+    pub fn checkpoint_carry(&self, max_history: usize) -> Option<TerminalCheckpoint> {
         self.parser_is_ground()
-            .then(|| self.checkpoint_with_scrollback(false))
+            .then(|| self.checkpoint_bounded(max_history))
     }
 
     fn checkpoint_with_scrollback(&self, include_scrollback: bool) -> TerminalCheckpoint {
+        // `bounded(MAX)` is exactly the full history and `bounded(0)` exactly the
+        // visible screen, so one parameter expresses every mode and the main and
+        // alt grids can never drift apart in what they capture.
+        self.checkpoint_bounded(if include_scrollback { usize::MAX } else { 0 })
+    }
+
+    fn checkpoint_bounded(&self, max_history: usize) -> TerminalCheckpoint {
         debug_assert!(
             self.parser_is_ground(),
             "checkpoint() requires parser_is_ground() (B.3.3)"
         );
 
-        let grid_lines = if include_scrollback {
-            self.grid.checkpoint_lines()
-        } else {
-            self.grid.checkpoint_visible_lines()
-        };
+        let grid_lines = self.grid.checkpoint_lines_bounded(max_history);
+        // How many of those records are history, as the consumer must be told.
+        // Derived from the produced vector rather than from `max_history` so it is
+        // exact when the ring holds fewer lines than the bound allows.
+        let history_lines =
+            u32::try_from(grid_lines.len().saturating_sub(usize::from(self.grid.rows())))
+                .unwrap_or(u32::MAX);
         let grid_bytes = serialize_lines(&grid_lines);
         let cursor = GridCursorRepr::capture(&self.grid);
 
         let (alt_grid, alt_cursor) = match &self.alt_grid {
             Some(alt) => (
-                Some(serialize_lines(&if include_scrollback {
-                    alt.checkpoint_lines()
-                } else {
-                    alt.checkpoint_visible_lines()
-                })),
+                // The live alternate screen keeps no scrollback, so this is the
+                // visible rows whatever the bound; going through the same accessor
+                // keeps that true by construction rather than by comment.
+                Some(serialize_lines(&alt.checkpoint_lines_bounded(max_history))),
                 Some(GridCursorRepr::capture(alt)),
             ),
             None => (None, None),
@@ -341,6 +379,7 @@ impl Terminal {
             rows: self.grid.rows(),
             cols: self.grid.cols(),
             grid: grid_bytes,
+            history_lines,
             cursor,
             alt_grid,
             alt_cursor,
@@ -479,6 +518,17 @@ pub struct CheckpointMeta {
     pub rows: u16,
     /// Grid cols.
     pub cols: u16,
+    /// How many leading records of the main grid blob are SCROLLBACK rather than
+    /// visible rows (see `TerminalCheckpoint::history_lines`).
+    ///
+    /// `#[serde(default)]` on purpose: every producer before this field existed
+    /// emitted a visible-only blob, and `0` is exactly that. A checkpoint arriving
+    /// without the key is therefore read correctly rather than rejected — which is
+    /// the whole compatibility story, because in a handoff the PARENT is always
+    /// the OLDER build and the CHILD the newer one, so the consumer is the side
+    /// that has to accept both shapes.
+    #[serde(default)]
+    pub history_lines: u32,
     /// Main-grid cursor/region/wrap/tab projection.
     pub cursor: GridCursorRepr,
     /// Alt-grid cursor projection, if an alt grid exists.
@@ -539,6 +589,7 @@ impl CheckpointMeta {
             rows,
             cols,
             grid: _,     // sidecar blob, not meta
+            history_lines,
             alt_grid: _, // sidecar blob, not meta
             cursor,
             alt_cursor,
@@ -562,6 +613,7 @@ impl CheckpointMeta {
             cursor: cursor.clone(),
             alt_cursor: alt_cursor.clone(),
             saved_cursor_main: *saved_cursor_main,
+            history_lines: *history_lines,
             saved_cursor_alt: *saved_cursor_alt,
             modes: *modes,
             style_fg_bits: style.fg.0,
@@ -592,6 +644,7 @@ impl CheckpointMeta {
             rows: self.rows,
             cols: self.cols,
             grid,
+            history_lines: self.history_lines,
             cursor: self.cursor,
             alt_grid,
             alt_cursor,

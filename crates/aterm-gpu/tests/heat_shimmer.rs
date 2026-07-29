@@ -21,8 +21,9 @@
 //     the control-socket `image` source), the copyable-SWAPCHAIN video tap,
 //     and the VIRTUAL present (81cbf35c) all carry the shimmer, and the two
 //     tap arms agree byte-for-byte with the phase pinned;
-//   * SCISSOR HONESTY — a scissored shimmer present equals a fresh full
-//     render at the same pinned phase (present == introspection).
+//   * SCISSOR HONESTY — a scissored application-present encoder source equals
+//     a fresh full render at the same pinned phase, preserving app-boundary
+//     present/introspection parity.
 //
 // The pass's ONE wall-clock term (the rising phase — the documented
 // bloom-class exception, like the SDR crown envelope) is pinned via
@@ -365,9 +366,9 @@ fn shimmer_reaches_all_three_introspection_paths() {
 }
 
 /// SCISSOR HONESTY (the bloom's scissor law extended): with the phase pinned,
-/// a SCISSORED shimmer present (one keystroke, the comet moves) is
-/// byte-identical to a fresh full render of the same input — screen ==
-/// introspection on the incremental path too.
+/// a SCISSORED shimmer application-present encoder source (one keystroke, the
+/// comet moves) is byte-identical to a fresh full render of the same input,
+/// preserving app-boundary present/introspection parity on the incremental path.
 #[test]
 fn shimmer_scissored_present_matches_fresh_render() {
     let Some(mut gpu) = gpu_or_skip() else { return };

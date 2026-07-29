@@ -130,7 +130,7 @@ pub const CALLBACK_REGISTRY: &[CallbackInfo] = &[
     CallbackInfo {
         name: "color_change",
         setter: "set_color_change_callback",
-        event: "OSC dynamic color set/reset (fg/bg/cursor/palette/selection)",
+        event: "OSC color set/reset/dynamic (fg/bg/cursor/palette/selection)",
         signature: "FnMut(u8, Rgb, ColorChangeOp)",
         category: CallbackCategory::Ui,
         thread_safe: true,

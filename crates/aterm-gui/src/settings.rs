@@ -2354,6 +2354,7 @@ pub(crate) fn flat_rows_before(
 /// Device-pixel geometry for the retired frosted-card painter. It remains compiled for
 /// compatibility snapshots and hit-test tests; production native Settings does not use
 /// this terminal-grid geometry.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct SettingsGeom {
     pub cw: f32,
     pub ch: f32,

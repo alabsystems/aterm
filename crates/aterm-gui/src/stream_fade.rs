@@ -731,6 +731,68 @@ mod tests {
         assert_ne!(f2[2], f2_raw[2], "the new line must tint");
     }
 
+    /// SPARSE-ROW CONTRACT: the engine emits only materialized prefixes. An
+    /// empty first row therefore cannot define the frame width or hide new ink
+    /// on a later row.
+    #[test]
+    fn empty_first_row_does_not_hide_later_sparse_output() {
+        let t0 = Instant::now();
+        let mut sf = StreamFade::default();
+        let mut baseline = vec![Vec::new(), Vec::new()];
+        assert!(!sf.update(&mut baseline, 8, VIEW, true, FADE_MS, t0));
+
+        let raw = vec![
+            Vec::new(),
+            vec![
+                cell(' ', [220, 220, 220], [10, 10, 30]),
+                cell('X', [220, 220, 220], [10, 10, 30]),
+            ],
+        ];
+        let mut frame = raw.clone();
+        assert!(
+            sf.update(
+                &mut frame,
+                8,
+                VIEW,
+                true,
+                FADE_MS,
+                t0 + Duration::from_millis(5),
+            ),
+            "new materialized cells on a later sparse row must fade"
+        );
+        assert!(frame[0].is_empty(), "the sparse top row stays sparse");
+        assert_ne!(frame[1], raw[1], "the later row was actually tinted");
+    }
+
+    /// A cell erased back into an implicit sparse tail has a changed logical
+    /// fingerprint but no current `RenderCell` to tint. The age-map pass must
+    /// retire that slot instead of indexing past the shortened row.
+    #[test]
+    fn materialized_cell_disappearing_into_sparse_tail_never_panics() {
+        let t0 = Instant::now();
+        let mut sf = StreamFade::default();
+        let mut baseline = vec![vec![cell('X', [220, 220, 220], [10, 10, 30])]];
+        assert!(!sf.update(&mut baseline, 8, VIEW, true, FADE_MS, t0));
+
+        let mut erased = vec![Vec::new()];
+        assert!(
+            !sf.update(
+                &mut erased,
+                8,
+                VIEW,
+                true,
+                FADE_MS,
+                t0 + Duration::from_millis(5),
+            ),
+            "an absent logical cell has no glyph bytes to tint"
+        );
+        assert!(erased[0].is_empty());
+        assert!(
+            !sf.is_active(t0 + Duration::from_millis(5)),
+            "the absent slot is retired rather than arming pointless frames"
+        );
+    }
+
     /// VIEW CHANGES re-baseline: a tab switch / alt-screen exit / scrollback
     /// return shows settled content — byte-exact, nothing fades.
     #[test]

@@ -93,6 +93,7 @@ use callbacks::{
     TITLE_STACK_MAX_DEPTH, WindowCallback,
 };
 pub use callbacks::{ColorChangeOp, ColorTarget};
+pub use colors_api::ColorPaletteMut;
 #[cfg(feature = "sixel")]
 use grouped_state::SixelState;
 use grouped_state::{

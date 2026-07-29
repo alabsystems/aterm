@@ -198,8 +198,8 @@ pub(crate) struct Config {
     /// offscreen/readback source of truth is untouched, and with this off the
     /// present is byte-identical to pre-M3 (the `HdrPresentGate` proof +
     /// aterm-gpu's `hdr_gate` suite). Hot-reloadable: turning it OFF kills
-    /// the >1.0 emission immediately; turning it ON applies to windows opened
-    /// afterwards (an existing 8-bit swapchain is never re-formatted live).
+    /// the >1.0 emission immediately; turning it ON lets an existing f16-capable
+    /// Windows surface upgrade when the live output HDR probe admits it.
     /// See [`Config::hdr_glow_or_default`].
     pub(crate) hdr_glow: Option<bool>,
     /// SDR glow-boost strength (0..=1): how much additive crown the cursor glow
@@ -330,13 +330,13 @@ pub(crate) struct Config {
     /// and Linux forwards the choice to winit's system-decoration theme.
     pub(crate) window_theme: Option<String>,
     /// GPU-present COLOUR SPACE (M3 phase A): the colour space the window's
-    /// CAMetalLayer is TAGGED with at surface attach — i.e. how ColorSync
-    /// INTERPRETS the swapchain's sRGB-encoded bytes on glass. `"srgb"` (the
-    /// default) is the honest tag: theme colours render as authored and ColorSync
-    /// performs the one sRGB→panel mapping. `"display-p3"` reproduces the legacy
-    /// UNTAGGED look on a wide-gamut Mac (the bytes are read as P3 coordinates —
-    /// oversaturated but familiar). Interpretation only: the rendered/readback
-    /// BYTES are identical either way (the parity/readback suites pin this).
+    /// CAMetalLayer is TAGGED with at surface attach — aterm's declared
+    /// interpretation of the submitted sRGB-encoded bytes. `"srgb"` (the
+    /// default) requests one sRGB→display mapping. `"display-p3"` reproduces the
+    /// legacy UNTAGGED look on a wide-gamut Mac (the bytes are read as P3
+    /// coordinates — oversaturated but familiar). Compositor colour management
+    /// and display output are unobserved; the rendered/readback BYTES remain
+    /// identical either way (the parity/readback suites pin this).
     /// Maps to [`WindowColorspace`] via [`Config::window_colorspace_or_default`];
     /// unknown values warn and fall back to `srgb`. Hot-reloadable; inert off
     /// macOS and on the CPU (softbuffer) present path.
@@ -1418,7 +1418,7 @@ pub(crate) fn open_regular_theme_file(path: &std::path::Path) -> Result<std::fs:
 ///
 /// `Invalid` is intentionally distinct from `BuiltIn`: a bad authored sprite
 /// fails closed (the cursor companion is disabled) and remains diagnosable.  It
-/// can never silently turn into the built-in homage on glass while Settings says
+/// can never silently turn into the built-in homage in app-rendered output while Settings says
 /// the custom value is active.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum NyanSpriteAsset {
@@ -4568,6 +4568,20 @@ impl Config {
                 }
             }
         }
+        // Selected-text foreground is dynamic OSC 19 state too. Mirror the
+        // renderer knob into TerminalConfig so OSC 19 query/119/RIS and newly
+        // spawned sessions share one configured baseline with the pixels.
+        if let Some(s) = &self.selection_foreground {
+            match parse_hex_color(s) {
+                Some(rgb) => {
+                    tc.selection_foreground = Some(rgb);
+                    any = true;
+                }
+                None => {
+                    eprintln!("aterm-gui: config selection_foreground: expected #RRGGBB, got {s:?}")
+                }
+            }
+        }
         // Indexed palette (engine `custom_palette`; also resolved into RenderCell).
         // Explicit overrides layer ON TOP of the theme's ANSI palette (if a theme set
         // one); without a theme this starts empty — byte-identical to before.
@@ -4694,6 +4708,8 @@ impl Config {
         };
         tc.default_foreground = rgb(theme.fg);
         tc.default_background = rgb(theme.bg);
+        tc.cursor_color = Some(rgb(theme.cursor));
+        tc.selection_background = Some(rgb(theme.selection));
         tc
     }
 }
@@ -5810,6 +5826,14 @@ impl App {
         self.backend.set_adjust_underline(upos, uthick);
         self.backend
             .set_underline_skip_descenders(self.render_knobs.underline_skip_descenders);
+        // A combined opacity + font/geometry reload reaches this repin path
+        // instead of `apply_render_knob`. End a windowed macOS swapchain tap before the
+        // newly translucent renderer can present a frame whose compositor-owned
+        // backdrop is absent from the raw recording.
+        let _ = self.video_abort_translucent_swapchain(
+            self.render_knobs.background_opacity,
+            cfg!(target_os = "macos"),
+        );
         self.backend
             .set_background_opacity(self.render_knobs.background_opacity);
         if !self.backend.is_gpu() {
@@ -5870,6 +5894,10 @@ impl App {
         // Re-apply every configured shaping/typography/render/font setting. In
         // particular line_height lands before the re-grid below.
         self.pin_backend_render_config_core();
+        // Replacing WindowGpu below destroys any swapchain/virtual tap. End the
+        // recording while that tap and its reply/output-dir ownership are still
+        // coherent instead of leaving a deadline-backed zombie.
+        let _ = self.video_abort_backend_rebuild();
         // The atlas/face changed, so every window's offscreen + dirty-gate are stale.
         // Reset the per-window GPU caches (the swapchain stays valid — same device) and
         // the introspection scratch, and force a repaint. NOTE: the swapchains and OS
@@ -5880,12 +5908,17 @@ impl App {
                 PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
             ) = &mut ws.present
             {
-                // M3 phase B: the per-screen EDR headroom survives the cache
-                // reset — it is OS state keyed to the window's monitor, not a
-                // render cache (re-queried only on real monitor changes).
+                // M3 phase B + capture colour: per-screen EDR headroom,
+                // reference-white scaling, and the compositor's colour-space
+                // tag survive the cache reset. They are surface/monitor state,
+                // not render caches.
                 let edr = window_gpu.edr_max();
+                let sdr_white_scale = window_gpu.sdr_white_scale();
+                let capture_color_space = window_gpu.capture_color_space();
                 *window_gpu = aterm_gpu::WindowGpu::new();
                 window_gpu.set_edr_max(edr);
+                window_gpu.set_sdr_white_scale(sdr_white_scale);
+                window_gpu.set_capture_color_space(capture_color_space);
             }
             ws.last_present = None;
             // Headless has no winit redraw edge to acknowledge: image capture
@@ -5989,6 +6022,10 @@ impl App {
                 self.backend.set_underline_skip_descenders(v);
             }
             KnobChange::BackgroundOpacity(v) => {
+                // The recording was admitted while the client was opaque. Abort
+                // it before this live renderer change can append a translucent
+                // raw layer under the recording's original opaque admission.
+                let _ = self.video_abort_translucent_swapchain(v, cfg!(target_os = "macos"));
                 self.backend.set_background_opacity(v);
                 // M5 TRUE VIBRANCY: on the GPU backend the translucent present path
                 // IS wired (PostMultiplied swapchain + NSVisualEffectView), so a
@@ -7050,18 +7087,34 @@ impl App {
         if new_colorspace != self.window_colorspace {
             self.window_colorspace = new_colorspace;
             let apprt = &self.apprt;
-            for ws in self.windows.values() {
-                if let (Some(w), Some(PresentTarget::Gpu { gpu_surface, .. })) =
-                    (ws.os_window.as_ref(), ws.present.as_ref())
-                {
-                    apprt.window_set_surface_colorspace(
-                        w,
-                        crate::platform::resolve_surface_colorspace(
-                            new_colorspace,
-                            gpu_surface.is_hdr(),
-                        ),
-                    );
-                }
+            for ws in self.windows.values_mut() {
+                let Some(w) = ws.os_window.as_ref() else {
+                    continue;
+                };
+                let Some(PresentTarget::Gpu {
+                    gpu_surface,
+                    window_gpu,
+                }) = ws.present.as_mut()
+                else {
+                    continue;
+                };
+                let surface_colorspace = crate::platform::resolve_surface_colorspace(
+                    new_colorspace,
+                    gpu_surface.is_hdr(),
+                );
+                let effective_colorspace =
+                    apprt.window_set_surface_colorspace(w, surface_colorspace);
+                // Keep capture's explicit source metadata in the same update as
+                // the compositor tag. A P3 retag without this write would turn
+                // the next unprofiled PNG into mislabeled wide-gamut bytes. A
+                // failed retag leaves the old platform tag in effect, so retain
+                // the prior known metadata rather than claiming the request won.
+                let previous_capture_space = window_gpu.capture_color_space();
+                let capture_space = crate::platform::capture_space_after_surface_tag(
+                    effective_colorspace,
+                    previous_capture_space,
+                );
+                window_gpu.set_capture_color_space(capture_space);
             }
         }
 
@@ -7069,9 +7122,10 @@ impl App {
         // aurora pass off on the NEXT present of every window (the plan follows
         // `hdr_glow` per frame — proven safe on a still-f16 swapchain, whose blit
         // keeps linear-decoding with the grid clamped at reference white).
-        // Turning it ON affects windows opened afterwards: an existing 8-bit
-        // swapchain is never re-formatted live, and the plan keeps every HDR arm
-        // off for it (the exhaustive hdr_gate law).
+        // Turning it ON also admits an existing f16-capable Windows SDR surface
+        // to the renderer's throttled output-HDR probe; configure+scRGB tag must
+        // both succeed before the next present can use the HDR arms (the
+        // exhaustive hdr_gate law).
         // Heat-shimmer hot-reload gate, resolved BEFORE the `&mut` backend
         // borrow below: skipped while the load-shed latch holds the shimmer
         // off — the latch transition (app_render) restores the configured
@@ -7193,7 +7247,7 @@ impl App {
         // override set at launch stays in force across a config reload rather than
         // being clobbered by the reloaded config `font_family`.
         // A rejected configured family is not a request to swap to a built-in
-        // face. Keep the last admitted family/face on glass and surface the exact
+        // face. Keep the last admitted family/face in the app-render artifact and surface the exact
         // admission failure above. A later valid edit advances normally.
         let effective_family = requested_effective_family;
         let family_changed = effective_family != self.font_family;
@@ -10533,8 +10587,8 @@ mod split_theme_tests {
         assert_eq!(c.resolve_theme_name(Appearance::Light), None);
     }
 
-    /// The engine config (palette + default bg) also tracks the split, so the live
-    /// switch re-colours cells, not just the chrome.
+    /// The engine config (palette + default/cursor colors) also tracks the split,
+    /// so a live switch recolors cells and the OSC-reset cursor, not just chrome.
     #[test]
     fn applied_terminal_config_tracks_split() {
         let c = cfg(r#"theme = "dark:Dracula,light:GitHub Light""#);
@@ -10544,10 +10598,49 @@ mod split_theme_tests {
             dark.default_background, light.default_background,
             "the engine default background must differ between the two sides"
         );
+        assert_ne!(
+            dark.cursor_color, light.cursor_color,
+            "the engine cursor baseline must differ between the two sides"
+        );
+        assert_ne!(
+            dark.selection_background, light.selection_background,
+            "the engine selection baseline must differ between the two sides"
+        );
         // Light side's engine default bg is GitHub Light's white.
         assert_eq!(
             light.default_background,
             aterm_types::Rgb::new(0xff, 0xff, 0xff)
+        );
+        assert_eq!(
+            light.cursor_color,
+            Some({
+                let cursor = c.theme_for(Appearance::Light).cursor;
+                aterm_types::Rgb::new(
+                    ((cursor >> 16) & 0xff) as u8,
+                    ((cursor >> 8) & 0xff) as u8,
+                    (cursor & 0xff) as u8,
+                )
+            }),
+            "GitHub Light's cursor is the engine's OSC 112 reset baseline"
+        );
+        let selection = c.theme_for(Appearance::Light).selection;
+        assert_eq!(
+            light.selection_background,
+            Some(aterm_types::Rgb::new(
+                ((selection >> 16) & 0xff) as u8,
+                ((selection >> 8) & 0xff) as u8,
+                (selection & 0xff) as u8,
+            )),
+            "GitHub Light's selection is the engine's OSC 117 reset baseline"
+        );
+    }
+
+    #[test]
+    fn applied_terminal_config_preserves_selected_text_override() {
+        let c = cfg("selection_foreground = \"#123456\"");
+        assert_eq!(
+            c.applied_terminal_config().selection_foreground,
+            Some(aterm_types::Rgb::new(0x12, 0x34, 0x56))
         );
     }
 }

@@ -574,12 +574,15 @@ pub fn connect_and_relay(
     Ok(())
 }
 
-/// Pump bytes both ways between two connected streams until EITHER closes. One
-/// direction runs on a spawned thread; the other on the caller's. When either
-/// direction ends, BOTH halves of BOTH sockets are shut down so the paired pump's
-/// reader — which may be parked on a CLONE of the same local socket (where a mere
-/// `Shutdown::Write` would NOT deliver EOF) — always unblocks. This is what keeps
-/// a half-open teardown from leaking the worker thread + its fds.
+/// Pump bytes both ways between two connected streams, preserving graceful
+/// half-close order. EOF after a child response becomes `Shutdown::Write` on
+/// the original client only after every preceding byte was copied + flushed;
+/// client EOF then becomes `Shutdown::Write` on the child. This matters for
+/// guarded artifact replies: the original client's explicit post-response ACK
+/// must travel client → child after the complete child → client response, rather
+/// than a first EOF tearing down the opposite direction.
+///
+/// A real copy error still shuts both sockets down to unblock the paired pump.
 fn relay_bidirectional(client: &CtlStream, child: &CtlStream) -> std::io::Result<()> {
     let mut c2s_r = client.try_clone()?;
     let mut c2s_w = child.try_clone()?;
@@ -589,14 +592,28 @@ fn relay_bidirectional(client: &CtlStream, child: &CtlStream) -> std::io::Result
     let w_child = child.try_clone()?;
     // child -> client on a worker; client -> child here.
     let worker = std::thread::spawn(move || {
-        let _ = copy_until_eof(&mut s2c_r, &mut s2c_w);
-        let _ = w_client.shutdown(std::net::Shutdown::Both);
-        let _ = w_child.shutdown(std::net::Shutdown::Both);
+        match copy_until_eof(&mut s2c_r, &mut s2c_w) {
+            Ok(()) => {
+                let _ = w_client.shutdown(std::net::Shutdown::Write);
+            }
+            Err(_) => {
+                let _ = w_client.shutdown(std::net::Shutdown::Both);
+                let _ = w_child.shutdown(std::net::Shutdown::Both);
+            }
+        }
     });
-    let _ = copy_until_eof(&mut c2s_r, &mut c2s_w);
+    match copy_until_eof(&mut c2s_r, &mut c2s_w) {
+        Ok(()) => {
+            let _ = child.shutdown(std::net::Shutdown::Write);
+        }
+        Err(_) => {
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            let _ = child.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    let _ = worker.join();
     let _ = client.shutdown(std::net::Shutdown::Both);
     let _ = child.shutdown(std::net::Shutdown::Both);
-    let _ = worker.join();
     Ok(())
 }
 
@@ -840,6 +857,85 @@ mod tests {
         let _ = relay.join();
         let _ = child.join();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_proxy_hop_preserves_guard_until_original_client_ack() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (mut original, relay_client) = CtlStream::pair().unwrap();
+        let (relay_child, mut child) = CtlStream::pair().unwrap();
+        original
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let relay =
+            std::thread::spawn(move || relay_bidirectional(&relay_client, &relay_child).unwrap());
+        let child_alive = std::sync::Arc::clone(&alive);
+        let service = std::thread::spawn(move || {
+            let _guard = Guard(child_alive);
+            let mut reader = BufReader::new(child.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert_eq!(request, "image shot.png\n");
+            child.write_all(b"OK 1 1 /remote/shot.png\n").unwrap();
+            child
+                .write_all(b"ACK-CHALLENGE 00112233445566778899aabbccddeeff\n")
+                .unwrap();
+            child.flush().unwrap();
+
+            let mut ack = String::new();
+            reader.read_line(&mut ack).unwrap();
+            assert_eq!(
+                ack.trim_end(),
+                "ACK 00112233445566778899aabbccddeeff"
+            );
+            let _ = child.shutdown(std::net::Shutdown::Both);
+        });
+
+        original.write_all(b"image shot.png\n").unwrap();
+        original.flush().unwrap();
+        let mut reader = BufReader::new(original.try_clone().unwrap());
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        assert_eq!(response, "OK 1 1 /remote/shot.png\n");
+        let mut challenge = String::new();
+        reader.read_line(&mut challenge).unwrap();
+        assert_eq!(
+            challenge,
+            "ACK-CHALLENGE 00112233445566778899aabbccddeeff\n"
+        );
+        assert!(
+            alive.load(std::sync::atomic::Ordering::Acquire),
+            "relay buffering/flushing the response cannot release the child guard"
+        );
+
+        original
+            .write_all(
+                format!(
+                    "{}{}\n",
+                    aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX,
+                    "00112233445566778899aabbccddeeff"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        original.flush().unwrap();
+        service.join().unwrap();
+        assert!(
+            !alive.load(std::sync::atomic::Ordering::Acquire),
+            "the original client's ACK crosses the proxy before guard release"
+        );
+        let _ = original.shutdown(std::net::Shutdown::Both);
+        drop(reader);
+        drop(original);
+        relay.join().unwrap();
     }
 
     /// F1 (revised): edge-token secrets round-trip through the 0600 file, the file

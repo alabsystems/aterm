@@ -340,7 +340,7 @@ impl EventWakeKind {
     }
 }
 
-/// Typed failure labels from the on-glass present seam. Besides making the
+/// Typed failure labels from the application-present seam. Besides making the
 /// metric actionable, the retry scheduler uses `autonomous_retry` to park
 /// conditions that should wait for an external surface/window stimulus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -63,26 +63,28 @@
 //! * `send <text>`     — write `<text>` to the PTY (trailing literal `\n` ⇒ CR).
 //! * `key <name>`      — send a named key (`enter`, `tab`, `up`, …) to the PTY.
 //! * `image [path]`    — render aterm's own client frame to a PNG, including
-//!   compiled native-app surfaces; print `OK <w> <h> <path>`. This is a re-render
-//!   through the same renderer and composition rules the window present uses, so
-//!   it carries no native OS chrome, works headless, and never needs OS
+//!   compiled native-app surfaces; print `OK <w> <h> <path>`. It yields the
+//!   current application-render artifact — a re-render through the same
+//!   renderer and composition rules the application present uses. So it
+//!   has no native OS chrome, works headless, and never needs OS
 //!   screen-capture permission. It includes the cursor blink phase /
 //!   unfocused-hollow override (headless sessions are deterministic); use `cursor`
 //!   for phase-independent state.
 //! * `window [<target>] [path]` — capture a full-window artifact to a PNG; print
 //!   `OK <w> <h> <path>`. `<target>` selects which window: omitted/`front` = the
 //!   front terminal window WITH native platform chrome (titlebar, traffic lights,
-//!   unified toolbar, full-width tab strip); `prefs`/`settings` = the native
-//!   Settings tab in that same window. How the chrome is obtained differs by
-//!   platform: macOS photographs the real composited window via CoreGraphics,
-//!   while Windows stitches chrome around a `PrintWindow` client capture. Either
-//!   way it does not observe compositor selection, colour management, scanout,
-//!   occlusion, or photons. A first token that is a known target keyword always
-//!   selects that window — to write to a file literally named `prefs`/`front`, give
-//!   a target first (e.g. `window front prefs`). It requires an attached OS window;
-//!   macOS also needs Screen Recording permission (a clear `ERR` explains how to
-//!   grant it if missing). A missing target, headless instance, or unsupported
-//!   platform gets a clear `ERR`.
+//!   unified toolbar, full-width tab strip) AND the terminal content;
+//!   `prefs`/`settings` = the native Settings tab in that same window. How the
+//!   chrome is obtained differs by platform: macOS photographs the real composited
+//!   window via CoreGraphics, while Windows stitches chrome around a `PrintWindow`
+//!   client capture taken from the exact client destination from a successful
+//!   application present. Either way it does not observe compositor selection,
+//!   colour management, scanout, occlusion, or photons. A first token that is a known
+//!   target keyword always selects that window — to write to a file literally named
+//!   `prefs`/`front`, give a target first (e.g. `window front prefs`). It requires
+//!   an attached OS window; macOS also needs Screen Recording permission (a clear
+//!   `ERR` explains how to grant it if missing). A missing target, headless
+//!   instance, or unsupported platform gets a clear `ERR`.
 //! * `controls <target>` — dump a GUI surface's controls as text. For
 //!   `prefs`/`settings`, compatibility `field key=… label=… value=… effective=…`
 //!   rows describe only setting controls on the current native route; the following
@@ -1537,6 +1539,57 @@ fn send_request(mut stream: &CtlStream, token: Option<&str>, request: &str) -> i
     stream.flush()
 }
 
+/// Confirm that a guarded artifact response was consumed in full. The server
+/// releases its exact path/handle retention only after receiving this frame.
+///
+/// Servers predating the acknowledgement trailer leave the persistent socket
+/// open after the ordinary response. Bound the optional trailer read so a new
+/// client remains compatible with them. A new server writes the response and
+/// challenge in one flush; if a relay delays that trailer past this bound, the
+/// client safely falls back to close and the server's failed-ACK quarantine.
+const ARTIFACT_ACK_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+fn acknowledge_artifact_reply(
+    mut stream: &CtlStream,
+    reader: &mut BufReader<&CtlStream>,
+    verb: &str,
+    request: &str,
+) -> io::Result<()> {
+    if !aterm_types::control_verbs::artifact_reply_requires_ack(verb, request) {
+        return Ok(());
+    }
+    stream.set_read_timeout(Some(ARTIFACT_ACK_PROBE_TIMEOUT))?;
+    let mut challenge = String::new();
+    match read_bounded_line(reader, &mut challenge) {
+        Ok(0) => return Ok(()),
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
+    let challenge = challenge.trim_end_matches(['\r', '\n']);
+    let Some(nonce) = challenge
+        .strip_prefix(aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX)
+        .filter(|nonce| aterm_types::control_verbs::valid_artifact_ack_nonce(nonce))
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server sent a malformed artifact acknowledgement challenge",
+        ));
+    };
+    stream.write_all(aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX.as_bytes())?;
+    stream.write_all(nonce.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
 /// Write `"aterm-ctl: <msg>\n"` to stderr — the manual form of the previous
 /// `eprintln!("aterm-ctl: {msg}")`, byte-identical on success. (On a broken
 /// stderr this propagates the error instead of panicking; either way the
@@ -1598,15 +1651,19 @@ fn copy_body<R: io::Read, W: Write>(reader: &mut R, out: &mut W, nbytes: u64) ->
     io::copy(&mut reader.take(nbytes), out)
 }
 
-/// Stream up to `count` payload lines from `reader` to stdout, normalizing
-/// line endings while preserving each row's content verbatim.
+/// Stream exactly `count` payload lines from `reader` to stdout, normalizing
+/// line endings while preserving each row's content verbatim. Early EOF is an
+/// error so a guarded artifact reply is never acknowledged while truncated.
 fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result<()> {
     let stdout = stdout_handle();
     let mut out = stdout.lock();
     for _ in 0..count {
         let mut line = String::new();
         if read_bounded_line(reader, &mut line)? == 0 {
-            break; // server hung up early; print what we have.
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server hung up before the complete line-framed response",
+            ));
         }
         // Normalize the line ending; preserve the row's content verbatim.
         let line = line.strip_suffix('\n').unwrap_or(&line);
@@ -1615,6 +1672,90 @@ fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result
         out.write_all(b"\n")?;
     }
     Ok(())
+}
+
+/// Guarded line replies are currently `video frames`, whose server-side maximum
+/// is 64 short metadata/path rows. Read the complete wire frame before ACK so
+/// acknowledgement never depends on a potentially backpressured stdout pipe.
+/// The aggregate cap also prevents a compromised/skewed server from turning
+/// that small handoff buffer into an unbounded allocation.
+const MAX_GUARDED_ARTIFACT_LINES: usize = 64;
+const MAX_GUARDED_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+
+fn read_guarded_payload(
+    reader: &mut BufReader<&CtlStream>,
+    count: usize,
+) -> io::Result<Vec<String>> {
+    if count > MAX_GUARDED_ARTIFACT_LINES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guarded artifact response exceeds its 64-line bound",
+        ));
+    }
+    let mut total = 0_usize;
+    let mut lines = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut line = String::new();
+        if read_bounded_line(reader, &mut line)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server hung up before the complete guarded artifact response",
+            ));
+        }
+        total = total.checked_add(line.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guarded artifact response size overflow",
+            )
+        })?;
+        if total > MAX_GUARDED_ARTIFACT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guarded artifact response exceeds its 4 MiB bound",
+            ));
+        }
+        let line = line.strip_suffix('\n').unwrap_or(&line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        lines.push(line.to_string());
+    }
+    Ok(lines)
+}
+
+fn print_guarded_payload(lines: &[String]) -> io::Result<()> {
+    let stdout = stdout_handle();
+    let mut out = stdout.lock();
+    for line in lines {
+        out.write_all(line.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+enum GuardedArtifactOutput {
+    Status,
+    Lines(Vec<String>),
+}
+
+/// Consume a complete guarded frame and acknowledge it before returning any
+/// material to the user-output path. This ordering makes server handoff
+/// independent of stdout backpressure or a suspended downstream process.
+fn receive_guarded_artifact_reply(
+    stream: &CtlStream,
+    reader: &mut BufReader<&CtlStream>,
+    verb: &str,
+    request: &str,
+    status_line: &str,
+    tail: &str,
+) -> io::Result<GuardedArtifactOutput> {
+    if streams_payload(verb, request) {
+        let count = stream_count(tail).ok_or_else(|| malformed_header_error(status_line))?;
+        let lines = read_guarded_payload(reader, count)?;
+        acknowledge_artifact_reply(stream, reader, verb, request)?;
+        Ok(GuardedArtifactOutput::Lines(lines))
+    } else {
+        acknowledge_artifact_reply(stream, reader, verb, request)?;
+        Ok(GuardedArtifactOutput::Status)
+    }
 }
 
 /// Connect to `path`, AUTHENTICATE, send `request`, and print the response for
@@ -1749,7 +1890,41 @@ fn exchange(
             stderr_line(&msg)?;
             return Ok(ExitCode::FAILURE);
         }
+        drop(out);
+        acknowledge_artifact_reply(&stream, &mut reader, verb, frame_request)?;
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // A guarded response is first consumed completely from the socket, then
+    // causally acknowledged, and only then copied to user-facing stdout. This
+    // keeps a blocked/suspended stdout consumer from exhausting the server's ACK
+    // window even though the client has already received the complete frame.
+    if aterm_types::control_verbs::artifact_reply_requires_ack(verb, frame_request) {
+        match receive_guarded_artifact_reply(
+            &stream,
+            &mut reader,
+            verb,
+            frame_request,
+            status_line,
+            tail,
+        )? {
+            GuardedArtifactOutput::Lines(lines) => {
+                if lines.is_empty() {
+                    let mut msg = String::from(status_line);
+                    msg.push_str(" (");
+                    msg.push_str(verb);
+                    msg.push_str(": no results)");
+                    stderr_line(&msg)?;
+                }
+                print_guarded_payload(&lines)?;
+            }
+            GuardedArtifactOutput::Status => print_stdout_line(status_line)?,
+        }
+        return if timed_out {
+            Ok(ExitCode::from(EXIT_TIMEOUT))
+        } else {
+            Ok(ExitCode::SUCCESS)
+        };
     }
 
     if streams_payload(verb, frame_request) {
@@ -1790,6 +1965,7 @@ fn exchange(
         print_stdout_line(status_line)?;
     }
 
+    acknowledge_artifact_reply(&stream, &mut reader, verb, frame_request)?;
     if timed_out {
         Ok(ExitCode::from(EXIT_TIMEOUT))
     } else {
@@ -2192,6 +2368,77 @@ mod tests {
         assert!(streams_payload("image", "@s-abc image read\n"));
         assert!(!streams_payload("image", "image shot.png\n"));
         assert!(!streams_payload("image", "@s-abc image shot.png\n"));
+    }
+
+    #[test]
+    fn guarded_artifact_ack_echoes_only_the_server_nonce() {
+        let (client, mut server) = CtlStream::pair().unwrap();
+        server
+            .write_all(b"ACK-CHALLENGE 00112233445566778899aabbccddeeff\n")
+            .unwrap();
+        server.flush().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&server).read_line(&mut line).unwrap();
+            line
+        });
+        let mut reader = BufReader::new(&client);
+        acknowledge_artifact_reply(&client, &mut reader, "image", "image shot.png").unwrap();
+        assert_eq!(
+            peer.join().unwrap(),
+            "ACK 00112233445566778899aabbccddeeff\n"
+        );
+    }
+
+    #[test]
+    fn guarded_artifact_reply_accepts_a_legacy_server_without_hanging() {
+        let (client, _legacy_server) = CtlStream::pair().unwrap();
+        let mut reader = BufReader::new(&client);
+        acknowledge_artifact_reply(&client, &mut reader, "image", "image shot.png")
+            .expect("an absent optional challenge is a bounded legacy fallback");
+    }
+
+    #[test]
+    fn guarded_payload_ack_precedes_the_user_output_handoff() {
+        let (client, mut server) = CtlStream::pair().unwrap();
+        let (acked_tx, acked_rx) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            server
+                .write_all(
+                    b"OK 1\nframe n=1 /private/frame.png\n\
+                      ACK-CHALLENGE 00112233445566778899aabbccddeeff\n",
+                )
+                .unwrap();
+            server.flush().unwrap();
+            let mut ack = String::new();
+            BufReader::new(&server).read_line(&mut ack).unwrap();
+            assert_eq!(ack, "ACK 00112233445566778899aabbccddeeff\n");
+            acked_tx.send(()).unwrap();
+        });
+
+        let mut reader = BufReader::new(&client);
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let status = status.trim_end();
+        let output = receive_guarded_artifact_reply(
+            &client,
+            &mut reader,
+            "video",
+            "video frames count=1",
+            status,
+            "1",
+        )
+        .unwrap();
+        acked_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("wire ACK must complete before the caller can block on stdout");
+        match output {
+            GuardedArtifactOutput::Lines(lines) => {
+                assert_eq!(lines, ["frame n=1 /private/frame.png"]);
+            }
+            GuardedArtifactOutput::Status => panic!("video frames must retain its payload"),
+        }
+        peer.join().unwrap();
     }
 
     /// The socket is line-delimited (`read_line`, one verb per line). An argument

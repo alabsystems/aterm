@@ -12,4 +12,4 @@ mod storage;
 
 pub use crate::{GridCursorState, GridPresentationState};
 pub use storage::GridStorage;
-pub(crate) use storage::UNLIMITED_RING_SCROLLBACK;
+pub(crate) use storage::{PendingScrollbackSettings, UNLIMITED_RING_SCROLLBACK};

@@ -384,8 +384,19 @@ impl AppRt for AppRtWindows {
     /// INTENTIONAL no-op on Windows: the swapchain colour space (scRGB for the HDR
     /// EDR present) is tagged in the renderer via wgpu `as_hal` at surface creation
     /// (`aterm-gpu`), not through this window-level seam — the CAMetalLayer tag this
-    /// method models is a macOS concept. Documented rather than silently empty.
-    fn window_set_surface_colorspace(&self, _window: &Window, _cs: SurfaceColorspace) {}
+    /// method models is a macOS concept. Report the effective source coordinates:
+    /// the renderer already confirmed scRGB before exposing an HDR surface;
+    /// Windows has no Display-P3 tag here, so that request remains ordinary sRGB.
+    fn window_set_surface_colorspace(
+        &self,
+        _window: &Window,
+        cs: SurfaceColorspace,
+    ) -> Option<SurfaceColorspace> {
+        Some(match cs {
+            SurfaceColorspace::DisplayP3 => SurfaceColorspace::Srgb,
+            SurfaceColorspace::Srgb | SurfaceColorspace::ExtendedLinearSrgb => cs,
+        })
+    }
 
     /// Install / update / remove the DWM **system backdrop** (`DWMWA_SYSTEMBACKDROP_TYPE`):
     /// `background_material` maps to Mica (`UnderWindow`) / Mica-Alt (`Sidebar`) /
@@ -542,10 +553,11 @@ impl AppRt for AppRtWindows {
 /// `PrintWindow(PW_RENDERFULLCONTENT)`. This is the robust capture: it renders the
 /// window itself (so it works even occluded / off-screen, unlike a screen grab) and
 /// `PW_RENDERFULLCONTENT` pulls in the DirectComposition GPU surface. Returns
-/// `(rgba, width, height)`; serves the Windows `window` introspection verb, which is
-/// how the native on-glass look is verified. (The rounded-corner clip and Mica
-/// backdrop are DWM *composition* effects seen against the desktop, so they show in a
-/// full-screen grab, not in this window-local render — documented, not a bug.)
+/// `(rgba, width, height)`; serves the Windows `window` introspection verb for the
+/// ordinary `background_material = "none"` case. This is explicitly window-local,
+/// square, and opaque: DWM's rounded-corner clip and Mica/Acrylic backdrop exist only
+/// in compositor output. The caller therefore refuses non-`none` materials instead of
+/// mislabeling this bitmap as the native on-glass result.
 pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32), String> {
     let hwnd = hwnd_of(window).ok_or_else(|| "no window to capture (headless)".to_string())?;
     // SAFETY: hand-rolled GDI capture. Every created GDI object (mem DC, bitmap) is

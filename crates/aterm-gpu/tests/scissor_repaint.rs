@@ -458,6 +458,53 @@ fn gpu_scissor_one_cell_change_preserves_other_rows() {
     );
 }
 
+/// Selection foreground/background changes recolor combining-mark ink without
+/// changing the grid or selection span. The shared damage set must include the
+/// selected row's predecessor because ordinary glyph rasters may overhang
+/// upward into it; otherwise the GPU scissor preserves stale accent pixels.
+#[test]
+fn gpu_selection_color_scissor_covers_upward_combining_ink() {
+    let Some(mut gpu) = fresh_gpu() else { return };
+    let mut win = aterm_gpu::WindowGpu::new();
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+
+    term.process(b"\x1b[?25l");
+    term.process("\x1b[4;1HA\u{0302} selected text".as_bytes());
+    term.process(
+        b"\x1b]17;rgb:20/30/40\x1b\\\
+          \x1b]19;rgb:d0/e0/f0\x1b\\",
+    );
+    {
+        let selection = term.text_selection_mut();
+        selection.start_selection(3, 0, SelectionSide::Left, SelectionType::Simple);
+        selection.update_selection(3, 10, SelectionSide::Right);
+        selection.complete_selection();
+    }
+
+    let first = term.cell_frame(ROWS, COLS);
+    let _ = gpu.present_input_readback(&mut win, &first);
+    assert_eq!(gpu.full_repaints(), 1, "first frame must repaint fully");
+
+    // Stationary span, live OSC colors only: this must remain an optimized
+    // scissored update while matching a fresh full render byte-for-byte.
+    term.process(
+        b"\x1b]17;rgb:60/20/70\x1b\\\
+          \x1b]19;rgb:f8/a0/40\x1b\\",
+    );
+    let changed = term.cell_frame(ROWS, COLS);
+    let scissor_before = gpu.scissor_taken();
+    let got = gpu.present_input_readback(&mut win, &changed).pixels;
+    assert!(
+        gpu.scissor_taken() > scissor_before,
+        "stationary selection color change must take the scissor path"
+    );
+    assert_eq!(
+        got,
+        fresh_render(&changed, true, None),
+        "selection-color scissor left stale upward combining-mark ink"
+    );
+}
+
 /// A theme change re-themes the selection band / idle cursor / padding — pixels
 /// that are NOT cell content, so the dirty-row diff alone would leave them stale
 /// on an idle GPU pane. `WindowGpu::invalidate_present` (called by the gpu-web

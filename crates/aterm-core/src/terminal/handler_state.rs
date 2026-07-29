@@ -634,6 +634,12 @@ impl CursorStateHandler<'_> {
             _ => return, // Invalid parameter, ignore
         };
 
-        self.modes.bidi_direction = new_direction;
+        if self.modes.bidi_direction != new_direction {
+            self.modes.bidi_direction = new_direction;
+            // Direction is applied at render-snapshot time to already-stored
+            // cells, so the narrow cursor-state handler invalidates the full
+            // presented grid directly.
+            self.grid.damage_mut().mark_full();
+        }
     }
 }

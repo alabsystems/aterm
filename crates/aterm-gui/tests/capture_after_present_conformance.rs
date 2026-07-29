@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for native screenshot present ordering.
+//! Tier-1 conformance for native screenshot present ordering and pixel-source
+//! provenance.
 //!
 //! The shipping pure decision is exhausted over every reachable one-based attempt
 //! and both present outcomes. The complete bounded production loop is also driven
 //! over its outcome lattice and projected action-by-action onto the derived model.
+//! For full-window capture, OS pixels own chrome only; the client source is the
+//! exact serial-bound successful PRESENT destination (swapchain/softbuffer), with
+//! physical size and client-origin validation before stitch. A semantic offscreen
+//! rerender is not equivalent authority.
 
 use aterm_gui::{
     CaptureAfterPresentDecision, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, NativeCaptureSourceDecision,
@@ -267,8 +272,11 @@ fn source_decision_code(decision: NativeCaptureSourceDecision) -> i64 {
 
 #[derive(Clone, Copy, Debug)]
 struct SourceInputs {
+    /// Exact destination is bound to the successful presentation serial.
     frame_presented: bool,
+    /// Conjunction of physical dimensions and client-origin validation.
     geometry_valid: bool,
+    /// The untrusted OS client photograph happens to look current.
     os_client_current: bool,
 }
 
@@ -287,15 +295,14 @@ fn source_after(
 ) -> State {
     let mut state = before.clone();
     let stitch = decision == NativeCaptureSourceDecision::StitchRenderer;
-    let renderer_bound = stitch && input.frame_presented && input.geometry_valid;
+    // Keep the model's historical field name for trace compatibility. This is
+    // destination authority, not a fresh semantic renderer invocation.
+    let present_destination_bound = stitch && input.frame_presented && input.geometry_valid;
     state.insert("decision", source_decision_code(decision));
-    state.insert("renderer_bound", bit(renderer_bound));
+    state.insert("renderer_bound", bit(present_destination_bound));
     state.insert("captured", bit(stitch));
     state.insert("failed", bit(!stitch));
-    state.insert(
-        "stale_capture",
-        bit(stitch && !renderer_bound && !input.os_client_current),
-    );
+    state.insert("stale_capture", bit(stitch && !present_destination_bound));
     state
 }
 
@@ -317,7 +324,7 @@ fn shipping_native_capture_source_conforms_over_provenance_lattice() {
                 assert_eq!(
                     model.successors("Decide", &before).as_slice(),
                     std::slice::from_ref(&after),
-                    "shipping source decision diverged for {input:?}: {decision:?}",
+                    "serial-bound destination decision diverged for {input:?}: {decision:?}",
                 );
                 assert_eq!(admits(&model, &before, &after), Some("Decide"));
                 for invariant in &model.invariants {
@@ -337,10 +344,14 @@ fn shipping_native_capture_source_conforms_over_provenance_lattice() {
 #[test]
 fn compositor_only_capture_negative_control_is_rejected() {
     let model = native_capture_source_model();
+    // Strong negative control: both a current-looking OS client region and
+    // validated geometry are present, but no successful present serial binds
+    // those pixels to the actual swapchain/softbuffer destination. A semantic
+    // offscreen rerender has the same missing-authority shape.
     let input = SourceInputs {
         frame_presented: false,
-        geometry_valid: false,
-        os_client_current: false,
+        geometry_valid: true,
+        os_client_current: true,
     };
     let before = source_before(&model, input);
     let forged = source_after(&before, input, NativeCaptureSourceDecision::StitchRenderer);
@@ -350,6 +361,7 @@ fn compositor_only_capture_negative_control_is_rejected() {
         model
             .invariants
             .iter()
-            .any(|invariant| !model.check_invariant(invariant.name, &forged))
+            .any(|invariant| !model.check_invariant(invariant.name, &forged)),
+        "current-looking or offscreen client pixels cannot replace the exact present destination"
     );
 }

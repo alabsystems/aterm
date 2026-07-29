@@ -481,13 +481,14 @@ struct Watch {
     /// DELTA. The `visible` bit matches the poll `cursor` verb's `<visible>` field.
     last_cursor: (u16, u16, bool, &'static str),
     /// A cheap fingerprint of the RENDER state that changes the styled output
-    /// WITHOUT bumping `content_seq`: the dynamic default fg/bg, the cursor colour,
-    /// DECSCNM reverse-video, cursor visibility, and the 256-entry palette. A recolor
-    /// (OSC 4/10/11/12/104), a DECSCNM flip, or a DECTCEM toggle mark full damage but
-    /// no content change, so a seq-gated `cells`/`screen` subscriber would show stale
-    /// colours until the next glyph write. When this signature changes at an unchanged
-    /// seq we re-emit the content frame (no GAP — the delta cursor is still valid).
-    /// Seeded to the live signature at subscription so only later changes push.
+    /// WITHOUT bumping `content_seq`: dynamic/palette colors, DECSCNM, and the
+    /// cursor + selection overlays (including their geometry). Recolor, selection,
+    /// and pure caret changes mark damage but do not advance the content sequence,
+    /// so a seq-gated `cells` subscriber would otherwise retain stale colors or
+    /// rectangles until the next glyph write. When this signature changes at an
+    /// unchanged seq we re-emit the content frame (no GAP — the delta cursor is
+    /// still valid). Seeded to the live signature at subscription so only later
+    /// changes push.
     last_render_sig: u64,
     /// The id of the highest block we have already reported `block-complete` for,
     /// so re-scanning completed blocks on each wake never double-emits. `None`
@@ -690,7 +691,8 @@ fn frame_cursor(sid: &str, seq: u64, row: u16, col: u16, visible: bool, style: &
 
 /// A cheap fingerprint of the RENDER state that changes the styled output without
 /// advancing `content_seq` (see [`Watch::last_render_sig`]): DECTCEM visibility,
-/// DECSCNM reverse-video, the dynamic default fg/bg + cursor colour, and the full
+/// cursor position/style, DECSCNM reverse-video, the dynamic default fg/bg +
+/// cursor/selection colours, the side-adjusted selection kind/range, and the full
 /// 256-entry palette. Bounded (256 palette reads + a few dynamics per wake), and
 /// only computed for a `screen`/`cells` subscriber — negligible next to the grid
 /// gather this lets us SKIP when nothing changed. (Note: `palette_color` scans the
@@ -704,6 +706,18 @@ fn render_sig(t: &Terminal) -> u64 {
     };
     mix(u8::from(t.cursor_visible()));
     mix(u8::from(t.reverse_video()));
+    let cursor = t.cursor();
+    for byte in cursor.row.to_le_bytes() {
+        mix(byte);
+    }
+    for byte in cursor.col.to_le_bytes() {
+        mix(byte);
+    }
+    for byte in crate::control::cursor_style_name(t.cursor_style()).bytes() {
+        mix(byte);
+    }
+    // Delimit the variable-length style name from the next field.
+    mix(0);
     for c in [t.default_foreground(), t.default_background()] {
         mix(c.r);
         mix(c.g);
@@ -715,6 +729,45 @@ fn render_sig(t: &Terminal) -> u64 {
             mix(c.r);
             mix(c.g);
             mix(c.b);
+        }
+        None => mix(0),
+    }
+    for color in [t.selection_background(), t.selection_foreground()] {
+        match color {
+            Some(c) => {
+                mix(1);
+                mix(c.r);
+                mix(c.g);
+                mix(c.b);
+            }
+            None => mix(0),
+        }
+    }
+    let selection = t.text_selection();
+    match selection.project_range(t.cols().saturating_sub(1)) {
+        Some(projected) => {
+            mix(1);
+            let kind = match selection.selection_type() {
+                aterm_core::selection::SelectionType::Simple => 0,
+                aterm_core::selection::SelectionType::Block => 1,
+                aterm_core::selection::SelectionType::Semantic => 2,
+                aterm_core::selection::SelectionType::Lines => 3,
+                _ => u8::MAX,
+            };
+            mix(kind);
+            mix(u8::from(projected.is_block));
+            for byte in projected.start_row.to_le_bytes() {
+                mix(byte);
+            }
+            for byte in projected.start_col.to_le_bytes() {
+                mix(byte);
+            }
+            for byte in projected.end_row.to_le_bytes() {
+                mix(byte);
+            }
+            for byte in projected.end_col.to_le_bytes() {
+                mix(byte);
+            }
         }
         None => mix(0),
     }
@@ -998,11 +1051,12 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
         //     gather. A 250ms liveness TIMEOUT (`woke == false`) never re-emits.
         let last_seq = watch.last_sent_seq;
         let last_render = watch.last_render_sig;
-        // The render signature only drives the `screen`/`cells` re-emit on a recolor /
-        // DECSCNM flip; the `cursor` stream sources everything it emits from `cur`
-        // (incl. the DECTCEM visible bit), so a CURSOR-ONLY subscriber must NOT compute
-        // it — else it pays the palette hash under the lock every wake AND spuriously
-        // re-emits an unchanged caret on any recolor. Gate on screen||cells.
+        // The render signature only drives the `screen`/`cells` re-emit on a
+        // recolor, selection, DECSCNM, or styled-frame cursor change; the `cursor`
+        // stream sources everything it emits from `cur` (incl. DECTCEM), so a
+        // CURSOR-ONLY subscriber must NOT compute it — else it pays the palette
+        // hash under the lock every wake AND spuriously re-emits an unchanged
+        // caret on unrelated render state. Gate on screen||cells.
         let wants_render = streams.screen || streams.cells;
         let alt_flip_before = |alt: bool| alt != watch.last_alt;
         let (seq, alt, cur, sig, rows, styled) = {
@@ -1024,9 +1078,10 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
                     crate::control::cursor_style_name(t.cursor_style()),
                 )
             });
-            // A render-state change (recolor / DECSCNM / DECTCEM) mutates the styled
-            // output at an UNCHANGED seq, so fold it into content_change alongside the
-            // alt-swap resync so `cells`/`screen` re-gather and push it.
+            // A render-state change (recolor / selection / cursor / DECSCNM)
+            // mutates the styled output at an UNCHANGED seq, so fold it into
+            // content_change alongside the alt-swap resync so `cells`/`screen`
+            // re-gather and push it.
             let render_changed = sig != last_render;
             let content_change = seq != last_seq || alt_flip_before(alt) || render_changed;
             // `every-frame` re-emits `cells` on an UNCHANGED seq for animation
@@ -1075,10 +1130,10 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
             watch.last_alt = alt;
             emit(&mut out, seq);
         } else if seq > watch.last_sent_seq || render_changed {
-            // Forward content advance, OR a same-seq RENDER change (recolor / DECSCNM /
-            // DECTCEM) that mutated the styled output: emit a fresh full frame. No GAP
-            // for a render-only change — the client's seq cursor is still valid, only
-            // the resolved colours/visibility moved.
+            // Forward content advance, OR a same-seq RENDER change (recolor /
+            // selection / cursor / DECSCNM) that mutated the styled output: emit
+            // a fresh full frame. No GAP for a render-only change — the client's
+            // seq cursor is still valid, only presentation state moved.
             watch.last_sent_seq = seq;
             watch.last_alt = alt;
             emit(&mut out, seq);
@@ -1223,9 +1278,10 @@ pub fn push_loop<W: Write>(
             // Seed to a sentinel so the FIRST content/cursor wake always emits the
             // caret (a fresh subscriber has no prior cursor); real positions differ.
             last_cursor: (u16::MAX, u16::MAX, false, ""),
-            // Seed the render signature to the LIVE value so a subscriber does not
-            // spuriously resync on its first wake; a genuine recolor/DECSCNM/DECTCEM
-            // after this flips it. Only meaningful for a content-bearing subscription.
+            // Seed the render signature to the LIVE value so a subscriber does
+            // not spuriously resync on its first wake; a later recolor,
+            // selection/cursor change, or DECSCNM flip changes it. Only
+            // meaningful for a content-bearing subscription.
             last_render_sig: if streams.wants_content() {
                 render_sig(&crate::term_lock(term))
             } else {
@@ -1475,6 +1531,28 @@ fn prune_closed(store: &Store, watches: &mut Vec<Watch>) -> Vec<Closing> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn test_watch(term: Arc<Mutex<Terminal>>) -> Watch {
+        Watch {
+            local_id: 1,
+            term,
+            last_sent_seq: 0,
+            last_alt: false,
+            last_cursor: (u16::MAX, u16::MAX, false, ""),
+            last_render_sig: 0,
+            last_block_id: None,
+            turns: Arc::new(Mutex::new(TurnLedger::default())),
+            timeline: Arc::new(Mutex::new(
+                crate::session_timeline::SessionTimeline::default(),
+            )),
+            last_timeline_id: None,
+            last_turn_id: None,
+            last_title: None,
+            last_bell: 0,
+            byte_sub: None,
+            non_coalesced: false,
+        }
+    }
 
     /// A subscriber registered for a session is woken by a notify on that session,
     /// and NOT by a notify on an unrelated session.
@@ -1953,6 +2031,159 @@ mod tests {
         assert!(
             wake_text(&mut w, streams, true).contains("cells "),
             "a DECSCNM flip re-emits a cells DELTA at the unchanged seq"
+        );
+    }
+
+    /// Text selection mutates render state without advancing `content_seq`.
+    /// A coalesced cells-only subscriber must still receive the typed,
+    /// side-adjusted selection (including a sparse blank tail), and clearing it
+    /// must remove the old rectangle at the same sequence.
+    #[test]
+    fn selection_only_change_reemits_cells_on_unchanged_seq() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let term = Arc::new(Mutex::new(Terminal::new(2, 8)));
+        crate::term_lock(&term).process(b"x");
+        let streams = TargetStreams {
+            cells: true,
+            ..Default::default()
+        };
+        let mut watch = test_watch(term.clone());
+        assert!(
+            wake_text(&mut watch, streams, true).contains(" cells "),
+            "first wake establishes the cells/render watermarks"
+        );
+        let seq = crate::term_lock(&term).content_seq();
+
+        {
+            let mut t = crate::term_lock(&term);
+            let sel = t.text_selection_mut();
+            sel.start_selection(0, 6, SelectionSide::Left, SelectionType::Block);
+            sel.update_selection(1, 7, SelectionSide::Right);
+            sel.complete_selection();
+        }
+        assert_eq!(
+            crate::term_lock(&term).content_seq(),
+            seq,
+            "selection-only mutation must remain a render-only negative control"
+        );
+        let selected = wake_text(&mut watch, streams, true);
+        assert!(
+            selected.contains(" cells ")
+                && selected.contains(
+                    "\"selection\":{\"start_row\":0,\"start_col\":6,\"end_row\":1,\
+                     \"end_col\":7,\"kind\":\"block\",\"is_block\":true}"
+                ),
+            "selection-only sparse-tail change must push typed CELLS: {selected:?}"
+        );
+        assert!(
+            frames_for_watch(&mut watch, streams, true).is_empty(),
+            "unchanged selection must not defeat coalescing"
+        );
+
+        crate::term_lock(&term).text_selection_mut().clear();
+        assert_eq!(crate::term_lock(&term).content_seq(), seq);
+        let cleared = wake_text(&mut watch, streams, true);
+        assert!(
+            cleared.contains(" cells ") && cleared.contains("\"selection\":null"),
+            "selection clear must remove the stale rectangle at the same seq: {cleared:?}"
+        );
+    }
+
+    /// OSC 17/19 recolor a stationary selection without a grid write. Both the
+    /// render signature and the pushed payload must carry those changes.
+    #[test]
+    fn selection_recolor_reemits_cells_on_unchanged_seq() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let term = Arc::new(Mutex::new(Terminal::new(2, 8)));
+        {
+            let mut t = crate::term_lock(&term);
+            t.process(b"x");
+            let sel = t.text_selection_mut();
+            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(0, 7, SelectionSide::Right);
+            sel.complete_selection();
+        }
+        let streams = TargetStreams {
+            cells: true,
+            ..Default::default()
+        };
+        let mut watch = test_watch(term.clone());
+        assert!(wake_text(&mut watch, streams, true).contains(" cells "));
+        let seq = crate::term_lock(&term).content_seq();
+
+        crate::term_lock(&term).process(b"\x1b]17;rgb:12/34/56\x07");
+        assert_eq!(
+            crate::term_lock(&term).content_seq(),
+            seq,
+            "OSC 17 is render-only"
+        );
+        let background = wake_text(&mut watch, streams, true);
+        assert!(
+            background.contains(" cells ") && background.contains("\"selection_bg\":\"123456\""),
+            "OSC 17 must push the new selection fill: {background:?}"
+        );
+
+        crate::term_lock(&term).process(b"\x1b]19;rgb:fe/dc/ba\x07");
+        assert_eq!(
+            crate::term_lock(&term).content_seq(),
+            seq,
+            "OSC 19 is render-only"
+        );
+        let foreground = wake_text(&mut watch, streams, true);
+        assert!(
+            foreground.contains(" cells ") && foreground.contains("\"selection_fg\":\"fedcba\""),
+            "OSC 19 must push the new selected-text ink: {foreground:?}"
+        );
+    }
+
+    /// A styled CELLS frame contains its own cursor object. Therefore a cells-only
+    /// subscriber (without the separate `cursor` stream) must refresh on pure
+    /// position/style/color changes at an unchanged content sequence.
+    #[test]
+    fn cursor_only_change_reemits_cells_on_unchanged_seq() {
+        let term = Arc::new(Mutex::new(Terminal::new(12, 16)));
+        crate::term_lock(&term).process(b"x");
+        let streams = TargetStreams {
+            cells: true,
+            ..Default::default()
+        };
+        let mut watch = test_watch(term.clone());
+        assert!(wake_text(&mut watch, streams, true).contains(" cells "));
+        let seq = crate::term_lock(&term).content_seq();
+
+        crate::term_lock(&term).process(b"\x1b[10;5H");
+        assert_eq!(
+            crate::term_lock(&term).content_seq(),
+            seq,
+            "pure cursor move is render-only"
+        );
+        let moved = wake_text(&mut watch, streams, true);
+        assert!(
+            moved.contains(" cells ")
+                && moved.contains("\"cursor\":{\"row\":9,\"col\":4,\"visible\":true"),
+            "cells-only watcher must receive the moved cursor: {moved:?}"
+        );
+
+        crate::term_lock(&term).process(b"\x1b[6 q");
+        assert_eq!(crate::term_lock(&term).content_seq(), seq);
+        let shaped = wake_text(&mut watch, streams, true);
+        assert!(
+            shaped.contains(" cells ") && shaped.contains("\"style\":\"steady_bar\""),
+            "cells-only watcher must receive DECSCUSR: {shaped:?}"
+        );
+
+        crate::term_lock(&term).process(b"\x1b]12;rgb:ab/cd/ef\x07");
+        assert_eq!(crate::term_lock(&term).content_seq(), seq);
+        let colored = wake_text(&mut watch, streams, true);
+        assert!(
+            colored.contains(" cells ") && colored.contains("\"color\":\"abcdef\""),
+            "cells-only watcher must receive OSC 12 cursor color: {colored:?}"
+        );
+        assert!(
+            frames_for_watch(&mut watch, streams, true).is_empty(),
+            "unchanged cursor overlay must remain coalesced"
         );
     }
 
@@ -2502,7 +2733,15 @@ mod tests {
         let feeder = {
             let fan = fan.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(40));
+                // Wait on the FACT, not a timer. The tee must land after push_loop
+                // has subscribed (a burst teed earlier has no queue) but before its
+                // single 250ms wait expires — a 40ms sleep raced both edges: a
+                // descheduled feeder tees too late, a descheduled push_loop has not
+                // subscribed yet. `subscriber_count` makes the ordering explicit and
+                // removes the window entirely.
+                while fan.subscriber_count() == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 fan.tee(&Arc::from(&b"tail-bytes"[..]));
             })
         };
@@ -2608,7 +2847,15 @@ mod tests {
         let feeder = {
             let fan = fan.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(40));
+                // Wait on the FACT, not a timer. The tee must land after push_loop
+                // has subscribed (a burst teed earlier has no queue) but before its
+                // single 250ms wait expires — a 40ms sleep raced both edges: a
+                // descheduled feeder tees too late, a descheduled push_loop has not
+                // subscribed yet. `subscriber_count` makes the ordering explicit and
+                // removes the window entirely.
+                while fan.subscriber_count() == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 fan.tee(&Arc::from(&b"last"[..]));
             })
         };

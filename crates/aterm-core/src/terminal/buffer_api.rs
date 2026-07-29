@@ -56,34 +56,14 @@ impl Terminal {
         budget: usize,
     ) -> Result<(), aterm_scrollback::ScrollbackError> {
         let mut first_err = None;
-        // Retained-set size before enforcement: a shrink means lines were really
-        // evicted, so the content-keyed search index must be invalidated (below).
-        let main_before = self.grid.scrollback_lines();
-        if let Some(scrollback) = self.grid.scrollback_mut() {
-            if let Err(e) = scrollback.set_memory_budget(budget) {
-                first_err = Some(e);
-            }
-        }
-        // Budget enforcement may evict scrollback lines; clamp display_offset
-        // to maintain the invariant display_offset <= scrollback_lines() (#7233).
-        self.grid.clamp_display_offset();
-        // An eviction changed the retained/indexed set: bump content_gen so the
-        // content_gen-keyed search index does not keep returning absolute rows
-        // below the advanced oldest_absolute_row() — the same invalidation the
-        // ring-shrink `set_scrollback_line_limit` path performs. clamp_display_offset
-        // is deliberately viewport-only and does NOT bump content_gen (#7233).
-        if self.grid.scrollback_lines() != main_before {
-            self.grid.mark_content_full();
+        // The Grid-level setter also persists a request while the tiered store
+        // is detached for off-thread reflow, then reconciles it on re-attach.
+        if let Err(e) = self.grid.set_scrollback_memory_budget(budget) {
+            first_err = Some(e);
         }
         if let Some(ref mut alt) = self.alt_grid {
-            let alt_before = alt.scrollback_lines();
-            if let Some(scrollback) = alt.scrollback_mut() {
-                if let Err(e) = scrollback.set_memory_budget(budget) {
-                    first_err.get_or_insert(e);
-                }
-            }
-            if alt.scrollback_lines() != alt_before {
-                alt.mark_content_full();
+            if let Err(e) = alt.set_scrollback_memory_budget(budget) {
+                first_err.get_or_insert(e);
             }
         }
         match first_err {

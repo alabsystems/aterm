@@ -8,12 +8,13 @@
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme};
+use std::sync::Arc;
 
-/// Encode a solid-colour `w`×`h` PNG (opaque RGBA).
-fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+/// Encode a solid-colour `w`×`h` RGBA PNG.
+fn solid_rgba_png(w: u32, h: u32, rgba_pixel: [u8; 4]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for _ in 0..(w * h) {
-        rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        rgba.extend_from_slice(&rgba_pixel);
     }
     let mut out = Vec::new();
     {
@@ -24,6 +25,11 @@ fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
         writer.write_image_data(&rgba).expect("png data");
     }
     out
+}
+
+/// Encode a solid-colour `w`×`h` opaque RGBA PNG.
+fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    solid_rgba_png(w, h, [rgb[0], rgb[1], rgb[2], 255])
 }
 
 /// Build an OSC 1337 `File=` sequence for `payload` with the given args.
@@ -116,6 +122,154 @@ fn image_cell_skips_its_glyph() {
             );
         }
     }
+}
+
+#[test]
+fn negative_z_images_composite_before_base_and_combining_glyphs() {
+    // CPU-only z-order pin (runs even when no GPU adapter is available). For
+    // both opaque and semitransparent Kitty z<0 tiles, image-over-cell-bg then
+    // glyph must equal a no-image oracle whose cell bg is that exact composite.
+    let Some(mut r) = Renderer::from_system(18.0, Theme::default()) else {
+        eprintln!("SKIP: no system monospace font found");
+        return;
+    };
+    r.debug_block_on_lazy_fallbacks();
+    r.set_text_blending(aterm_render::TextBlending::Linear);
+    let (cw, ch) = r.cell_size();
+    let (rows, cols) = (3usize, 6usize);
+    let cell_bg = [20, 45, 75];
+    let image_rgb = [220, 35, 130];
+    let cell_bg_u32 =
+        (u32::from(cell_bg[0]) << 16) | (u32::from(cell_bg[1]) << 8) | u32::from(cell_bg[2]);
+    let image_rgb_u32 =
+        (u32::from(image_rgb[0]) << 16) | (u32::from(image_rgb[1]) << 8) | u32::from(image_rgb[2]);
+
+    for alpha in [255u8, 128] {
+        let image = Arc::new(aterm_core::grid::extra::ImageData {
+            bytes: solid_rgba_png(
+                cw as u32,
+                ch as u32,
+                [image_rgb[0], image_rgb[1], image_rgb[2], alpha],
+            ),
+            format: aterm_core::grid::extra::ImageFormat::Png,
+            cols: 1,
+            rows: 1,
+            z_index: -1,
+        });
+        let composited = aterm_render::blend_rgb(cell_bg_u32, image_rgb_u32, alpha);
+        let composited_bg = [
+            ((composited >> 16) & 0xff) as u8,
+            ((composited >> 8) & 0xff) as u8,
+            (composited & 0xff) as u8,
+        ];
+        let make_input = |text: &str, with_image: bool| {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            term.set_cell_pixel_size(cw as u16, ch as u16);
+            term.process(format!("\x1b[97m{text}").as_bytes());
+            let mut input = term.cell_frame(rows, cols);
+            input.cells[0][0].bg = if with_image { cell_bg } else { composited_bg };
+            if with_image {
+                input.images[0].push((
+                    0,
+                    aterm_core::grid::extra::ImageRef {
+                        image: image.clone(),
+                        cell_row: 0,
+                        cell_col: 0,
+                    },
+                ));
+            }
+            input
+        };
+
+        let accented = r.render_input(&make_input("e\u{301}", true));
+        let accented_oracle = r.render_input(&make_input("e\u{301}", false));
+        assert_eq!(
+            accented.pixels, accented_oracle.pixels,
+            "alpha={alpha}: z<0 image must paint before base+combining glyphs"
+        );
+
+        let bare = r.render_input(&make_input("e", true));
+        assert_ne!(
+            accented.pixels, bare.pixels,
+            "alpha={alpha}: the NFD acute must remain visible over a z<0 image"
+        );
+    }
+}
+
+#[test]
+fn kitty_extreme_negative_z_sits_below_non_default_cell_backgrounds() {
+    let Some(mut renderer) = Renderer::from_system(18.0, Theme::default()) else {
+        eprintln!("SKIP: no system monospace font found");
+        return;
+    };
+    let (cw, ch) = renderer.cell_size();
+    let (rows, cols) = (2usize, 4usize);
+    let frame_default_bg = [1, 2, 3];
+    let default_bg = [3, 7, 11];
+    let explicit_bg = [18, 52, 86];
+    let image_rgb = [210, 30, 90];
+
+    let make_input = |z_index: i32, image_cols: &[usize]| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let mut input = term.cell_frame(rows, cols);
+        input.cursor_visible = false;
+        input.default_bg = aterm_render::rgb_to_u32(frame_default_bg);
+        input.default_bg_spans = vec![
+            vec![aterm_render::DefaultBgSpan::new(
+                0,
+                2,
+                aterm_render::rgb_to_u32(default_bg),
+            )],
+            Vec::new(),
+        ];
+        input.cells[0].resize(cols, term.implicit_blank_render_cell());
+        for cell in &mut input.cells[0] {
+            cell.ch = ' ';
+            cell.bg = default_bg;
+        }
+        input.cells[0][0].bg = explicit_bg;
+        let image = Arc::new(aterm_core::grid::extra::ImageData {
+            bytes: solid_png(cw as u32, ch as u32, image_rgb),
+            format: aterm_core::grid::extra::ImageFormat::Png,
+            cols: 1,
+            rows: 1,
+            z_index,
+        });
+        for &col in image_cols {
+            input.images[0].push((
+                col,
+                aterm_core::grid::extra::ImageRef {
+                    image: Arc::clone(&image),
+                    cell_row: 0,
+                    cell_col: 0,
+                },
+            ));
+        }
+        input
+    };
+    let sample = |frame: &aterm_render::Frame, col: usize| {
+        frame.pixels[(ch / 2) * frame.width + col * cw + cw / 2] & 0x00ff_ffff
+    };
+
+    let threshold = aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD;
+    let at_threshold = renderer.render_input(&make_input(threshold, &[0]));
+    assert_eq!(
+        sample(&at_threshold, 0),
+        aterm_render::rgb_to_u32(image_rgb),
+        "z == INT32_MIN/2 remains above a non-default cell background"
+    );
+
+    let below_threshold = renderer.render_input(&make_input(threshold - 1, &[0, 1]));
+    assert_eq!(
+        sample(&below_threshold, 0),
+        aterm_render::rgb_to_u32(explicit_bg),
+        "z < INT32_MIN/2 is hidden by a non-default cell background"
+    );
+    assert_eq!(
+        sample(&below_threshold, 1),
+        aterm_render::rgb_to_u32(image_rgb),
+        "the deepest tier remains visible through a default-background cell"
+    );
 }
 
 /// Minimal CRC-32 (the PNG/IEEE 802.3 variant), table-free — tests only.

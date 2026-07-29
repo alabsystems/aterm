@@ -200,6 +200,10 @@ pub struct TerminalConfig {
     /// Can be queried/modified via OSC 21 selection_background.
     pub selection_background: Option<Rgb>,
 
+    /// Selection foreground color override (None uses renderer contrast logic).
+    /// Can be queried/modified via OSC 19 or OSC 21 `selection_foreground`.
+    pub selection_foreground: Option<Rgb>,
+
     /// Custom color palette (if any).
     /// When `None`, uses the default xterm 256-color palette.
     pub custom_palette: Option<ColorPalette>,
@@ -259,7 +263,8 @@ pub struct TerminalConfig {
     ///
     /// Gates `OSC 4;N;spec` and `OSC 21;N=spec` (numeric-index) SET requests.
     /// Query operations are always allowed; OSC 21 named-slot sets
-    /// (`foreground`, `background`, `cursor`, `selection_background`) are
+    /// (`foreground`, `background`, `cursor`, `selection_background`,
+    /// `selection_foreground`) are
     /// unaffected — those go through dynamic-color callbacks, not the
     /// indexed palette.
     ///
@@ -330,6 +335,7 @@ impl Default for TerminalConfig {
             default_foreground: aterm_types::DEFAULT_FOREGROUND,
             default_background: aterm_types::DEFAULT_BACKGROUND,
             selection_background: None,
+            selection_foreground: None,
             custom_palette: None,
             // Behavior
             scrollback_limit: Some(aterm_scrollback::DEFAULT_LINE_LIMIT),
@@ -398,6 +404,7 @@ impl TerminalConfig {
         if self.default_foreground != other.default_foreground
             || self.default_background != other.default_background
             || self.selection_background != other.selection_background
+            || self.selection_foreground != other.selection_foreground
             || self.custom_palette != other.custom_palette
         {
             changes.push(ConfigChange::Colors);

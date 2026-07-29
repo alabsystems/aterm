@@ -236,11 +236,11 @@ impl Health {
     /// the typed handoff/apply outcome (e.g. `ChildDied`, `AdoptionMismatch`,
     /// `ActivityRevoked`, `re-exec failed`), stored for `update status`.
     pub fn record_apply_failure(path: &Path, reason: &str) -> Self {
-        let mut h = Self::record_failure(path, "apply", reason);
+        Self::record_failure(path, "apply", reason);
         // Mirror the reason into the apply-owned slot so a later acquisition-lane
         // failure cannot overwrite the description of a still-standing apply streak.
         let _lock = Self::lock(path);
-        h = Self::read(path);
+        let mut h = Self::read(path);
         h.last_apply_error = reason.chars().take(400).collect();
         h.write(path);
         h

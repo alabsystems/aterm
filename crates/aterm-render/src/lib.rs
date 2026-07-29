@@ -26,6 +26,12 @@ use aterm_core::grid::LineSize;
 // for the same reason: the PER-COLUMN DEC line-size seam a composed (split-pane)
 // row needs, which the row-level `RenderInput::line_sizes` cannot express.
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, LineSizeSpan};
+// Per-pane live default backgrounds: a composed row's cells can belong to panes
+// with DIFFERENT OSC 11 / DECSCNM defaults, so "is this cell the default bg?" —
+// the opacity rule, the deepest Kitty image tier, the cursor/trail fallbacks —
+// is a PER-COLUMN question. Re-exported because the callers that must agree on
+// the answer live in other crates (the GPU backend, the parity tests).
+pub use aterm_core::render::DefaultBgSpan;
 // A-3: the CPU renderer no longer borrows `&Terminal` — it consumes only the
 // engine-built `RenderInput`. `Terminal` is imported solely in the test module
 // (which builds terminals + calls `Terminal::cell_frame` to feed the renderer).
@@ -218,8 +224,8 @@ impl Default for Theme {
 // the trait this CPU renderer implements (see `impl Rasterizer for Renderer`).
 pub use aterm_render_api::{
     CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, Frame, GlowQuad, HaloMode,
-    InkCell, RainHalo, Rasterizer, RenderInput, RenderView, SceneAtlas, SpriteQuad, TrailCell,
-    WordDecoration,
+    InkCell, RainHalo, Rasterizer, RenderInput, RenderView, SceneAtlas, SelectionClip, SpriteQuad,
+    TrailCell, WordDecoration,
 };
 
 /// Which glyph source a [`GlyphKey`] rasterizes from.
@@ -1040,6 +1046,10 @@ pub struct Renderer {
     /// index instead of an O(|break_cols|) `contains()` scan (which is O(cols^2) per
     /// row when a selection makes `break_cols` ~cols long). Mirrors `shapeable_scratch`.
     break_mask_scratch: Vec<bool>,
+    /// Reused per-row "start a fresh shaping run before this column" mask.
+    /// Unlike `break_mask_scratch`, a boundary does not make its column
+    /// unshapeable: the first cell of a right pane may begin a ligature.
+    run_boundary_scratch: Vec<bool>,
     /// Reused per-row glyph-plan buffer for [`row_glyph_plan`], taken/returned via
     /// `mem::take` so each dirty row's plan reuses one allocation instead of a fresh
     /// `Vec<ColumnGlyph>` per row per frame. Mirrors `shapeable_scratch`.
@@ -4510,6 +4520,7 @@ impl Renderer {
             admitted_sources_sealed: false,
             shapeable_scratch: Vec::new(),
             break_mask_scratch: Vec::new(),
+            run_boundary_scratch: Vec::new(),
             glyph_plan_scratch: Vec::new(),
             shape_run_scratch: String::new(),
             shape_chars_scratch: Vec::new(),
@@ -7000,6 +7011,47 @@ impl Renderer {
         }
     }
 
+    /// Resolve the selection background for ONE terminal snapshot: the frame's
+    /// LIVE colour (OSC 17 / OSC 21 `selection=`, OSC 117 reset) when the engine
+    /// resolved one, else the configured policy.
+    ///
+    /// `COLOR_UNSET` — every producer that predates live selection colours, and
+    /// every frame where the terminal never set one — delegates WHOLE to
+    /// [`Self::effective_selection_bg`], so the focused/unfocused theming path is
+    /// byte-identical to before. With a live colour the same unfocused rule
+    /// applies to IT: an explicit inactive override still wins, and the derived
+    /// dim is derived from the live pair (selection over the frame's live bg)
+    /// rather than the static theme.
+    #[inline]
+    fn frame_selection_bg(&self, input: &RenderInput) -> u32 {
+        if input.selection_bg == aterm_core::render::COLOR_UNSET {
+            return self.effective_selection_bg();
+        }
+        let active = input.selection_bg & 0x00ff_ffff;
+        if self.selection_inactive {
+            self.selection_inactive_bg
+                .unwrap_or_else(|| derive_inactive_selection_bg(active, self.frame_bg(input)))
+        } else {
+            active
+        }
+    }
+
+    /// Resolve selected-text ink for one snapshot. OSC 19 (and OSC 21
+    /// `selection_foreground=`) is TERMINAL-owned state and therefore takes
+    /// precedence over the renderer's host setting: [`COLOR_DYNAMIC`] asks for the
+    /// automatic WCAG contrast floor (`None`), a concrete colour forces that ink,
+    /// and `COLOR_UNSET` preserves the existing explicit/automatic host policy.
+    ///
+    /// [`COLOR_DYNAMIC`]: aterm_core::render::COLOR_DYNAMIC
+    #[inline]
+    fn frame_selection_fg(&self, input: &RenderInput) -> Option<u32> {
+        match input.selection_fg {
+            aterm_core::render::COLOR_DYNAMIC => None,
+            aterm_core::render::COLOR_UNSET => self.selection_fg,
+            color => Some(color & 0x00ff_ffff),
+        }
+    }
+
     /// The current interior padding (px per edge). `0` is the historical no-pad
     /// behavior. See the `pad` field; the GPU mirror reads this to stay identical.
     pub fn pad(&self) -> usize {
@@ -7697,6 +7749,11 @@ impl Renderer {
                 self.break_mask_scratch[bc] = true;
             }
         }
+        // Pane seams are RUN boundaries, not break columns: a shaped run may not
+        // cross from one pane's DEC run into the next (their glyphs are placed and
+        // scaled independently), but the first cell of the right pane must still
+        // be free to ligate with its own neighbours.
+        ligature_run_boundaries_into(input, r, &mut self.run_boundary_scratch);
         let procedural_on = self.procedural;
         // Index form (not `iter_mut`) so the body can read `self.break_mask_scratch`
         // and write `self.shapeable_scratch` as disjoint field borrows.
@@ -7773,6 +7830,7 @@ impl Renderer {
             cells,
             cols,
             &self.shapeable_scratch,
+            &self.run_boundary_scratch,
             min_run,
             style_of,
             |run, run_chars, style| {
@@ -9020,8 +9078,10 @@ impl Renderer {
     }
 
     /// This frame's effective cursor colour: the host-resolved LIVE cursor colour
-    /// (OSC 12 / OSC 112) when set, else the configured theme cursor. `COLOR_UNSET` →
-    /// the theme cursor, byte-identical to before.
+    /// (OSC 12 / the OSC 112 reset baseline, or the live OSC 10 foreground while
+    /// OSC 21 reports `cursor=` as dynamic) when set, else the configured theme
+    /// cursor. `COLOR_UNSET` is retained for raw producers and falls back to the
+    /// theme cursor, byte-identical to before.
     #[inline]
     fn frame_cursor(&self, input: &RenderInput) -> u32 {
         if input.cursor_color == aterm_core::render::COLOR_UNSET {
@@ -9268,8 +9328,11 @@ impl Renderer {
     /// * **A — backgrounds.** Per row: the damaged path's full-width band clear
     ///   (`band_bg: Some`, [`Self::fill_band_bg`] plus the top/bottom pad-strip
     ///   reset at the grid edges — the CPU twin of the GPU's band-edge strip
-    ///   quads), then [`Self::render_row_bg`]. The full path passes `None`: its
-    ///   once-over bg fill already covers band and pads.
+    ///   quads), then [`Self::render_row_bg`], then Kitty's deepest image tier
+    ///   and the explicit/selected cell backgrounds that cover it
+    ///   ([`Self::render_row_images_below_bg`], a no-op on every ordinary row).
+    ///   The full path passes `None`: its once-over bg fill already covers band
+    ///   and pads.
     /// * **B1 — per-row sprites.** [`Self::draw_sprites_for_row`] stamps rain
     ///   and cat quads, each in its own band.
     /// * **B2 — under-text FREE sprites.** Row-spanning rects stamped over the
@@ -9289,7 +9352,8 @@ impl Renderer {
     ///   [`Self::draw_fire_patch`]: the per-pixel FIRE FIELD patches in the
     ///   same z-slot (Add then Over within the stream), the GPU's
     ///   fire-after-glow_under order.
-    /// * **C — foreground.** [`Self::render_row_fg`] (glyphs/images/deco).
+    /// * **C — foreground.** [`Self::render_row_fg`] (ordinary z<0 images,
+    ///   glyphs, z>=0 images, decorations).
     ///
     /// OVER-TEXT free sprites are NOT a phase here: over-text means over
     /// everything except the cursor (the GPU `FreeOver` slot — after the wdeco
@@ -9341,6 +9405,7 @@ impl Renderer {
             }
             let ctx = self.row_ctx(input, r);
             self.render_row_bg(pixels, w, h, input, &ctx);
+            self.render_row_images_below_bg(ic, pixels, w, h, input, r, &ctx);
         }
         // Phase B1 — legacy per-row sprites (single-band, byte-identical slot).
         // Build the RAIN row-bucket CSR ONCE per frame (O(N)), then index each
@@ -9466,8 +9531,6 @@ struct RowCtx<'a> {
     row: usize,
     /// Top pixel of the row band (`grid_top + r·cell_h`).
     y0: usize,
-    /// Live-screen selection row for viewport row `r` (`r - display_offset`).
-    sel_row: i32,
     /// On-screen cell advance (doubled on DECDWL/DECDHL rows). Governs EVERY
     /// column only when `uniform`; on a mixed row it is the row-level fallback
     /// and each column's real advance comes from [`Renderer::mixed_cell_place`].
@@ -9480,8 +9543,18 @@ struct RowCtx<'a> {
     /// nothing but a hoisted, perfectly-predicted branch.
     uniform: bool,
     sel_bg: u32,
+    /// Selected-text ink for THIS frame ([`Renderer::frame_selection_fg`]):
+    /// the terminal's live OSC 19 value when it set one, else the host policy.
+    /// `None` is the automatic WCAG contrast floor.
+    sel_fg: Option<u32>,
     bg_t: u32,
+    /// The frame-wide live default background. A row with NO pane provenance
+    /// (`default_bg_spans[row]` empty — every single-pane frame) resolves every
+    /// cell against this hoisted value; a composed row asks per column.
     frame_bg: u32,
+    /// Whether this row carries per-pane default backgrounds at all, so the
+    /// hot bg loop pays one hoisted branch instead of a per-cell span search.
+    uniform_default_bg: bool,
 }
 
 /// Where composite column `col` of a MIXED row lands in pixels — everything the
@@ -9593,9 +9666,6 @@ impl Renderer {
         // decorations, images and the cursor all shift together; the freed border
         // is the theme bg the buffer starts filled with.
         let y0 = self.grid_top() + r * self.cell_h;
-        // Selection rows are live-screen coords; the viewport may be scrolled
-        // back, so viewport row r shows live row (r - display_offset).
-        let sel_row = r as i32 - input.display_offset;
         // DEC line size (DECDWL/DECDHL): `cw` is the on-screen cell advance,
         // `scale`/`anchor_y` drive the glyph's NEAREST enlargement + clip.
         let line_size = input
@@ -9636,17 +9706,22 @@ impl Renderer {
         // slice on a fire_halo-free frame → byte-identical to before.
         let fire_halo_row =
             u16::try_from(r).map_or(&[][..], |row| fire_halo_row_slice(&input.fire_halo, row));
-        // Selected cells take the (active or inactive-while-unfocused) selection bg.
-        let sel_bg = self.effective_selection_bg();
-        // Background-opacity: ONLY cells whose bg resolved to the frame's
-        // DEFAULT bg carry the transmittance byte (SGR-colored bg cells and the
-        // selection band stay opaque so text keeps contrast — Ghostty/iTerm
-        // semantics). Colors are fully resolved upstream, so "is default" is
-        // decided by comparing against the frame default; an SGR bg that
-        // resolves to the exact default color is indistinguishable and treated
-        // the same. `bg_t == 0` (opacity 1.0) is byte-identical to before.
+        // Selected cells take the (active or inactive-while-unfocused) selection
+        // bg — the terminal's LIVE OSC 17/21 colour when it set one, else the
+        // configured theme policy. Selected-text ink follows the same rule.
+        let sel_bg = self.frame_selection_bg(input);
+        let sel_fg = self.frame_selection_fg(input);
+        // Background-opacity: ONLY cells whose bg resolved to the DEFAULT bg
+        // carry the transmittance byte (SGR-colored bg cells and the selection
+        // band stay opaque so text keeps contrast — Ghostty/iTerm semantics).
+        // Colors are fully resolved upstream, so "is default" is decided by
+        // comparing against the default of the pane that OWNS the cell (a
+        // composed row can carry several); an SGR bg that resolves to that exact
+        // color is indistinguishable and treated the same. `bg_t == 0` (opacity
+        // 1.0) is byte-identical to before.
         let bg_t = self.bg_transmittance();
         let frame_bg = self.frame_bg(input);
+        let uniform_default_bg = default_bg_spans(input, r).is_empty();
         RowCtx {
             cells,
             ink_row,
@@ -9654,14 +9729,29 @@ impl Renderer {
             fire_halo_row,
             row: r,
             y0,
-            sel_row,
             cw,
             scale,
             anchor_y,
             uniform,
             sel_bg,
+            sel_fg,
             bg_t,
             frame_bg,
+            uniform_default_bg,
+        }
+    }
+
+    /// The live default background governing cell (`row`, `col`) of this frame:
+    /// the hoisted frame scalar on a row with no pane provenance (every
+    /// single-pane frame — byte-identical to the pre-span renderer), the owning
+    /// pane's value on a composed one. `ctx.frame_bg`/`ctx.uniform_default_bg`
+    /// are the per-row hoist of exactly this decision.
+    #[inline]
+    fn cell_default_bg(&self, input: &RenderInput, ctx: &RowCtx<'_>, col: usize) -> u32 {
+        if ctx.uniform_default_bg {
+            ctx.frame_bg
+        } else {
+            resolved_default_bg_at(input, ctx.row, col, self.theme.bg)
         }
     }
 
@@ -9677,27 +9767,28 @@ impl Renderer {
         ctx: &RowCtx<'_>,
     ) {
         let cols = input.cols;
-        let selection = &input.selection;
         let RowCtx {
             cells,
             row,
             y0,
-            sel_row,
             cw,
             uniform,
             sel_bg,
             bg_t,
-            frame_bg,
             ..
         } = *ctx;
         for (c, cell) in cells.iter().take(cols).enumerate() {
             // A lead cell is wide iff the NEXT cell is its continuation.
             let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
-            let bg = if selection.contains_cell(sel_row, c as u16, is_wide_lead, cell.wide) {
+            let bg = if input.selection_contains_cell(row, c, is_wide_lead, cell.wide) {
                 sel_bg
             } else {
                 let cell_bg = rgb_to_u32(cell.bg);
-                if bg_t != 0 && cell_bg == frame_bg {
+                // "Default bg" is asked of the pane that owns this cell, not of
+                // the composed frame: two panes on one row can hold different
+                // OSC 11 / DECSCNM defaults, and a translucent window must let
+                // BOTH show glass rather than only the frame-scalar one.
+                if bg_t != 0 && cell_bg == self.cell_default_bg(input, ctx, c) {
                     cell_bg | (bg_t << 24)
                 } else {
                     cell_bg
@@ -9715,6 +9806,160 @@ impl Renderer {
                 let p = self.mixed_cell_place(input, row, c, y0);
                 if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
                     self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, bg);
+                }
+            }
+        }
+
+        // A grid row is a sparse PREFIX: columns after `cells.len()` are
+        // implicit blank cells, not absent screen geometry. The framebuffer
+        // clear already paints their frame-wide default background, so preserve
+        // the sparse fast path unless a selection reaches the omitted tail or a
+        // pane-local default differs from that clear. Crucially, this fills only
+        // background geometry; glyph/combining/deco iteration stays materialized.
+        let materialized = cells.len().min(cols);
+        if materialized >= cols {
+            return;
+        }
+        let selection_reaches_tail = input
+            .selection_row_span(row)
+            .is_some_and(|(_, end)| usize::from(end) >= materialized);
+        // `uniform_default_bg` is the per-row hoist of "this row carries no pane
+        // provenance", so its negation is exactly "some column here can resolve
+        // to a default other than the frame clear".
+        if !selection_reaches_tail && ctx.uniform_default_bg {
+            return;
+        }
+        for c in materialized..cols {
+            let bg = if input.selection_contains_cell(row, c, false, false) {
+                sel_bg
+            } else {
+                let default_bg = self.cell_default_bg(input, ctx, c);
+                if default_bg == ctx.frame_bg {
+                    continue;
+                }
+                default_bg | (bg_t << 24)
+            };
+            // Same placement seam as the materialized loop: hoisted arithmetic
+            // when uniform, the owning pane's run box when mixed.
+            if uniform {
+                self.fill_rect(pixels, w, h, self.pad + c * cw, y0, cw, self.cell_h, bg);
+            } else {
+                let p = self.mixed_cell_place(input, row, c, y0);
+                if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
+                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, bg);
+                }
+            }
+        }
+    }
+
+    /// Kitty's DEEPEST image tier: a placement whose z is below
+    /// [`KITTY_IMAGE_BELOW_BG_Z_THRESHOLD`] shows through the terminal's DEFAULT
+    /// background, but is hidden by a selected cell and by any cell carrying a
+    /// non-default background.
+    ///
+    /// [`Self::render_row_bg`] has already painted every cell background, so this
+    /// stamps the deepest tiles over it and then repaints ONLY the backgrounds
+    /// the protocol says cover them. That order keeps the base clear visible
+    /// under transparent image pixels without a second full-row background
+    /// stream, and mirrors the GPU's `image_below_bg` → `image_bg_cover` streams
+    /// exactly. "Default" is the OWNING PANE's live default (the composed-frame
+    /// rule `render_row_bg` uses for opacity), so a split whose panes disagree
+    /// about their background layers each pane's images correctly.
+    ///
+    /// Rows without such a placement — every ordinary frame, image-bearing or
+    /// not — return before touching a pixel, so the common paths are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn render_row_images_below_bg(
+        &self,
+        ic: &mut ImageCache,
+        pixels: &mut [u32],
+        w: usize,
+        h: usize,
+        input: &RenderInput,
+        r: usize,
+        ctx: &RowCtx<'_>,
+    ) {
+        let row_images = input.images.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        if !row_images
+            .iter()
+            .any(|(_, image)| kitty_image_is_below_non_default_bg(image.image.z_index))
+        {
+            return;
+        }
+        let cols = input.cols;
+        let pad_x = self.pad;
+        let RowCtx {
+            cells,
+            y0,
+            cw,
+            uniform,
+            sel_bg,
+            ..
+        } = *ctx;
+        // Default background clear < deepest image. Placement follows the same
+        // uniform/mixed seam as every other pass (`blit_image_cell`'s `x_clip` is
+        // the owning run's right edge on a composed row, the frame width on a
+        // uniform one — byte-identical there).
+        for &(c, ref image) in row_images {
+            if c >= cols || !kitty_image_is_below_non_default_bg(image.image.z_index) {
+                continue;
+            }
+            if uniform {
+                self.blit_image_cell(ic, pixels, w, h, pad_x + c * cw, y0, image, w);
+            } else {
+                let p = self.mixed_cell_place(input, r, c, y0);
+                if p.x < p.hi {
+                    self.blit_image_cell(ic, pixels, w, h, p.x, y0, image, p.hi);
+                }
+            }
+        }
+        // Deepest image < selection band and non-default cell backgrounds. A cell
+        // bg EQUAL to its pane's resolved default is deliberately treated as
+        // default (indistinguishable from it — the opacity contract's rule).
+        for (c, cell) in cells.iter().take(cols).enumerate() {
+            if !image_below_non_default_bg_covers(row_images, c) {
+                continue;
+            }
+            let is_wide_lead = cells.get(c + 1).is_some_and(|next| next.wide);
+            let cell_bg = rgb_to_u32(cell.bg);
+            let cover = if input.selection_contains_cell(r, c, is_wide_lead, cell.wide) {
+                sel_bg
+            } else if cell_bg != self.cell_default_bg(input, ctx, c) {
+                cell_bg
+            } else {
+                continue;
+            };
+            if uniform {
+                self.fill_rect(pixels, w, h, pad_x + c * cw, y0, cw, self.cell_h, cover);
+            } else {
+                let p = self.mixed_cell_place(input, r, c, y0);
+                if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
+                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, cover);
+                }
+            }
+        }
+
+        // Image placements are sparse independently of cells, so a deepest
+        // Kitty tile may legitimately occupy an unmaterialized blank tail.
+        // Selection is still above that tier: repaint selected omitted cells
+        // after the image, just as the materialized loop above does. An
+        // unselected implicit blank is its pane's default and intentionally
+        // contributes no cover.
+        let materialized = cells.len().min(cols);
+        for &(c, ref image) in row_images {
+            if c < materialized
+                || c >= cols
+                || !kitty_image_is_below_non_default_bg(image.image.z_index)
+                || !input.selection_contains_cell(r, c, false, false)
+            {
+                continue;
+            }
+            if uniform {
+                self.fill_rect(pixels, w, h, pad_x + c * cw, y0, cw, self.cell_h, sel_bg);
+            } else {
+                let p = self.mixed_cell_place(input, r, c, y0);
+                if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
+                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, sel_bg);
                 }
             }
         }
@@ -9741,6 +9986,7 @@ impl Renderer {
     ) {
         let ctx = self.row_ctx(input, r);
         self.render_row_bg(pixels, w, h, input, &ctx);
+        self.render_row_images_below_bg(ic, pixels, w, h, input, r, &ctx);
         // Dead path (kept as the split's executable equivalence pin): build a
         // one-row rain index slice inline so the fast-path signature is honored.
         let rain_row: Vec<u32> = input
@@ -9755,10 +10001,10 @@ impl Renderer {
         self.render_row_fg(ic, pixels, w, h, input, r, &ctx);
     }
 
-    /// Passes 1b/2/3 of one row — everything AFTER pass 1c: inline-image
-    /// resolution, glyph + combining-mark blits, inline-image tiles, line
-    /// decorations and undercurls. The row's bg (and any under-text sprite)
-    /// is assumed already laid. Pass 1c itself
+    /// Passes 1b/2/3 of one row — everything AFTER pass 1c: behind-text
+    /// inline-image tiles, glyph + combining-mark blits, over-text inline-image
+    /// tiles, line decorations and undercurls. The row's bg (and every
+    /// under-text layer) is assumed already laid. Pass 1c itself
     /// ([`Self::draw_sprites_for_row`]) is owned by the caller — the phase
     /// runner slots the free-sprite phases between it and this half.
     #[allow(clippy::too_many_arguments)]
@@ -9773,7 +10019,6 @@ impl Renderer {
         ctx: &RowCtx<'_>,
     ) {
         let cols = input.cols;
-        let selection = &input.selection;
         let pad_x = self.pad;
         let RowCtx {
             cells,
@@ -9781,19 +10026,21 @@ impl Renderer {
             char_fg_row,
             fire_halo_row,
             y0,
-            sel_row,
             cw,
             scale,
             anchor_y,
             uniform,
             sel_bg,
+            sel_fg,
             ..
         } = *ctx;
-        // Inline images for THIS row (iTerm2 OSC 1337 `File=`), resolved HERE for
-        // pass 2's image-vs-glyph precedence check (a covered cell skips its own
-        // glyph). The tiles themselves stamp in pass 2b, AFTER the glyphs — the
-        // GPU stream slot — so a glyph spilling into a covered cell from an
-        // UNCOVERED neighbour sits UNDER the tile on both backends.
+        // Inline images for THIS row (iTerm2 OSC 1337 `File=` and Kitty
+        // graphics), resolved HERE for pass 2's image-vs-glyph precedence check
+        // (a covered cell skips its own glyph). Kitty's ordinary z<0 tiles stamp
+        // in pass 1b BELOW, before the glyphs; the extreme below-background tier
+        // was already stamped in Phase A; z>=0 tiles stamp in pass 2b AFTER the
+        // glyphs — the GPU stream slot — so a glyph spilling into a covered cell
+        // from an UNCOVERED neighbour sits UNDER the tile on both backends.
         let row_images = input.images.get(r).map(Vec::as_slice).unwrap_or(&[]);
         // Ligature plan for this row: which columns a programming ligature owns
         // (drawn as a shaped `mono_gid` glyph) vs the ordinary per-cell path. The
@@ -9813,6 +10060,28 @@ impl Renderer {
         self.row_glyph_plan(input, r, &break_cols, &mut plan);
         // `break_cols`'s last reader (row_glyph_plan) is done; return it to its home.
         self.ligature_break_scratch = break_cols;
+        // Pass 1b: ordinary Kitty NEGATIVE-z tiles are BACKGROUND layers. Stamp
+        // the `threshold..=-1` tier after every row background / sprite /
+        // under-glyph effect the phase runner laid, and before any glyph or
+        // combining mark below — the GPU's slot for the same stream. Tiles
+        // strictly below the threshold were already stamped in Phase A
+        // ([`Self::render_row_images_below_bg`]) and MUST NOT stamp twice.
+        for &(c, ref image) in row_images {
+            if image.image.z_index >= 0
+                || kitty_image_is_below_non_default_bg(image.image.z_index)
+                || c >= cols
+            {
+                continue;
+            }
+            if uniform {
+                self.blit_image_cell(ic, pixels, w, h, pad_x + c * cw, y0, image, w);
+            } else {
+                let p = self.mixed_cell_place(input, r, c, y0);
+                if p.x < p.hi {
+                    self.blit_image_cell(ic, pixels, w, h, p.x, y0, image, p.hi);
+                }
+            }
+        }
         // Pass 2: blit each glyph in the cell's foreground over the fills.
         // Wide continuation columns carry no glyph of their own. An image-covered
         // cell skips its glyph entirely (the image owns the cell) — this is the
@@ -9885,9 +10154,9 @@ impl Renderer {
                 let key = shade_phase_key(key, x, y0);
                 // Selected cells floor their glyph fg against the selection bg so
                 // colour-on-selection stays legible (GPU mirrors this identically).
-                let selected = selection.contains_cell(
-                    sel_row,
-                    c as u16,
+                let selected = input.selection_contains_cell(
+                    r,
+                    c,
                     cells.get(c + 1).is_some_and(|n| n.wide),
                     cell.wide,
                 );
@@ -9899,7 +10168,7 @@ impl Renderer {
                 // is still floored for selection / min-contrast legibility
                 // BEFORE it paints.
                 let fg = effective_glyph_fg(
-                    self.selection_fg,
+                    sel_fg,
                     self.min_contrast,
                     base_fg,
                     rgb_to_u32(cell.bg),
@@ -9975,20 +10244,21 @@ impl Renderer {
                 }
             }
         }
-        // Pass 2b: inline images OVER the glyphs, UNDER the line decorations —
-        // the GPU's stream slot exactly (glyphs → colour-emoji → inline images →
+        // Pass 2b: z>=0 inline images OVER the glyphs, UNDER the line decorations
+        // — the GPU's stream slot exactly (glyphs → colour-emoji → over-images →
         // deco, `emit_base_pre`). Pass 2 already skipped a covered cell's OWN
         // glyph (precedence), but a glyph spilling in from an UNCOVERED cell — a
         // wide glyph's half in a covered continuation column, a neighbour's
         // bearing overhang — must sit UNDER the tile, as the GPU has always
         // stacked it (this used to stamp BEFORE the glyphs, a verified CPU/GPU
         // z-divergence on exactly those spill pixels). The bg still shows
-        // through transparent image pixels: pass 1 filled it first. Empty (and
-        // so a no-op) for every image-free row, keeping the text path
+        // through transparent image pixels: pass 1 filled it first. NEGATIVE-z
+        // tiles already stamped in pass 1b (or Phase A) and must not stamp again.
+        // Empty (and so a no-op) for every image-free row, keeping the text path
         // byte-identical.
         if !row_images.is_empty() {
             for &(c, ref image) in row_images {
-                if c >= cols {
+                if image.image.z_index < 0 || c >= cols {
                     continue;
                 }
                 if uniform {
@@ -10069,9 +10339,9 @@ impl Renderer {
             // selected cells get the selection floor against the painted band,
             // unselected ones the per-cell minimum-contrast floor (off by
             // default → byte-identical). GPU mirrors via the same functions.
-            let selected = selection.contains_cell(sel_row, c as u16, is_wide_lead, cell.wide);
+            let selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
             let ucolor = effective_deco_color(
-                self.selection_fg,
+                sel_fg,
                 self.min_contrast,
                 cell.underline_color.map(rgb_to_u32),
                 base_fg,
@@ -10125,7 +10395,7 @@ impl Renderer {
             // Strike/overline follow the SAME shared floor as the glyph fg (W5b),
             // fed the ink/char_fg-substituted base_fg (parity with the GPU).
             let fgc = effective_glyph_fg(
-                self.selection_fg,
+                sel_fg,
                 self.min_contrast,
                 base_fg,
                 rgb_to_u32(cell.bg),
@@ -10166,9 +10436,9 @@ impl Renderer {
                 };
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
                 let dw = if is_wide_lead { 2 * cw } else { cw };
-                let selected = selection.contains_cell(sel_row, c as u16, is_wide_lead, cell.wide);
+                let selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
                 let ucolor = effective_deco_color(
-                    self.selection_fg,
+                    sel_fg,
                     self.min_contrast,
                     cell.underline_color.map(rgb_to_u32),
                     rgb_to_u32(cell.fg),
@@ -10412,7 +10682,6 @@ impl Renderer {
         }
         let (rows, cols) = (input.rows, input.cols);
         let bg_t = self.bg_transmittance();
-        let frame_bg = self.frame_bg(input);
         let grid_w = cols * self.cell_w;
         for t in &input.cursor_trail {
             if t.row >= rows || t.col >= cols {
@@ -10452,15 +10721,18 @@ impl Renderer {
             // Blend the resolved trail colour over THIS cell's own background at
             // the cell's coverage, then fill the cell with the result — a comet
             // segment that fades into the background as `alpha` decays. Phase C
-            // re-lays the glyph ink over it.
+            // re-lays the glyph ink over it. The default the cell is compared
+            // against (and falls back to) is its OWNING PANE's live default, the
+            // same per-column rule the bg fill uses for opacity.
+            let default_bg = resolved_default_bg_at(input, t.row, t.col, self.theme.bg);
             let cell_bg = input
                 .cells
                 .get(t.row)
                 .and_then(|r| r.get(t.col))
-                .map_or(self.theme.bg, |c| rgb_to_u32(c.bg));
+                .map_or(default_bg, |c| rgb_to_u32(c.bg));
             let mut color = blend(cell_bg, input.cursor_trail_color, t.alpha);
             // Default-bg cells keep the window's translucency (see doc above).
-            if bg_t != 0 && cell_bg == frame_bg {
+            if bg_t != 0 && cell_bg == default_bg {
                 color |= bg_t << 24;
             }
             self.fill_rect(pixels, w, h, x0, y0, cw, self.cell_h, color);
@@ -11130,12 +11402,7 @@ impl Renderer {
                 let row_cells = &input.cells[row];
                 let is_wide_lead = row_cells.get(col + 1).is_some_and(|n| n.wide);
                 let cell_wide = row_cells.get(col).is_some_and(|n| n.wide);
-                if input.selection.contains_cell(
-                    row as i32 - input.display_offset,
-                    col as u16,
-                    is_wide_lead,
-                    cell_wide,
-                ) {
+                if input.selection_contains_cell(row, col, is_wide_lead, cell_wide) {
                     continue;
                 }
             }
@@ -11248,19 +11515,20 @@ impl Renderer {
             // the bg can't vanish. Off (`min <= 1`, the default) it is exactly
             // `frame_cursor`. The cut-out below composites over THIS fill, so
             // the pair stays consistent. GPU mirrors via `floor_cursor_fill`.
-            let cursor_cell_bg = input.cells[cr]
-                .get(cc)
-                .map_or_else(|| self.frame_bg(input), |cell| rgb_to_u32(cell.bg));
-            // The typing-reactive rainbow cursor overrides the BLOCK fill only (the
-            // host resolved the evolving colour); it is STILL floored against the cell
-            // bg (the cut-out glyph colour), so the glyph keeps its contrast. Bar /
-            // underline cursors once ignored the override — no longer: the fill
-            // paints EVERY cursor shape, block, bar, underline, and the BOLT
-            // (laser lightning cursor) alike. The old block-only gate left a
-            // TUI's bar cursor theme green until the shape returned (the owner's
-            // "green flash" opening Claude); per-style hosts gate which fill is
-            // Some, so at most one arrives and every shape may wear it. GPU twin
-            // mirrors this exactly.
+            // A missing cell falls back to the default of the pane the cursor
+            // sits in, not to the composed frame scalar (they differ on a split
+            // whose panes carry different OSC 11 / DECSCNM defaults).
+            let cursor_cell_bg = input.cells[cr].get(cc).map_or_else(
+                || resolved_default_bg_at(input, cr, cc, self.theme.bg),
+                |cell| rgb_to_u32(cell.bg),
+            );
+            // The host-resolved override paints EVERY cursor shape — block,
+            // hollow, bar, underline, and Bolt — and is still floored against
+            // the cell bg so block cut-out glyphs retain contrast. This avoids
+            // flashing the theme cursor when a TUI temporarily selects a bar
+            // (the owner's "green flash" opening Claude, back when a block-only
+            // gate held the theme colour until the shape returned). Per-style
+            // hosts gate which fill is Some, and the GPU mirrors this exactly.
             let base_fill = match input.cursor_fill_override {
                 Some(fill) => fill,
                 None => self.frame_cursor(input),
@@ -12466,12 +12734,71 @@ fn row_spans(input: &RenderInput, r: usize) -> &[LineSizeSpan] {
         .map_or(&[][..], Vec::as_slice)
 }
 
+/// Row `r`'s per-pane live-default backgrounds, or an EMPTY slice when the row
+/// carries none — the [`row_spans`] regime for the OTHER per-column channel a
+/// composed row can hold, with the same short-vector tolerance (hand-built
+/// snapshots that predate the field stay well-formed).
+fn default_bg_spans(input: &RenderInput, r: usize) -> &[DefaultBgSpan] {
+    input
+        .default_bg_spans
+        .get(r)
+        .map_or(&[][..], Vec::as_slice)
+}
+
+/// The live default background governing viewport cell (`row`, `col`), resolved
+/// against the renderer's configured theme.
+///
+/// [`RenderInput::default_bg_at`] picks the owning pane's provenance in a
+/// composed split frame and falls back to the frame scalar for ordinary rows and
+/// divider gaps; this final step turns a `COLOR_UNSET` producer value into
+/// `theme_bg`. BOTH backends call this one function, so the opacity rule, the
+/// deepest Kitty image tier, the cursor fallback and the trail fallback cannot
+/// disagree about what "default background" means for a cell.
+#[must_use]
+#[inline]
+pub fn resolved_default_bg_at(input: &RenderInput, row: usize, col: usize, theme_bg: u32) -> u32 {
+    let bg = input.default_bg_at(row, col);
+    if bg == aterm_core::render::COLOR_UNSET {
+        theme_bg
+    } else {
+        bg
+    }
+}
+
+/// Kitty graphics z-index boundary for the below-cell-background tier.
+///
+/// Negative values at or above this threshold draw above cell backgrounds but
+/// below text. Values strictly below it also draw below cells carrying a
+/// non-default background. This is `INT32_MIN / 2` from the Kitty protocol.
+pub const KITTY_IMAGE_BELOW_BG_Z_THRESHOLD: i32 = i32::MIN / 2;
+
+/// Whether a Kitty image belongs to the DEEPEST z tier — below non-default cell
+/// backgrounds as well as below text. Shared with the GPU instance builder so
+/// the two backends put a placement in the same stream.
+#[must_use]
+#[inline]
+pub const fn kitty_image_is_below_non_default_bg(z_index: i32) -> bool {
+    z_index < KITTY_IMAGE_BELOW_BG_Z_THRESHOLD
+}
+
+/// Whether `col` carries a placement of Kitty's deepest tier. The sparse list is
+/// sorted by column (see [`cluster_for`]), so the background-cover pass stays
+/// logarithmic per cell.
+fn image_below_non_default_bg_covers(
+    row_images: &[(usize, aterm_core::grid::extra::ImageRef)],
+    col: usize,
+) -> bool {
+    row_images
+        .binary_search_by_key(&col, |(c, _)| *c)
+        .is_ok_and(|i| kitty_image_is_below_non_default_bg(row_images[i].1.image.z_index))
+}
+
 /// Whether row `r`'s render-relevant inputs differ between two frames: the
 /// resolved cells, the sparse cluster / combining-mark lists, the DEC line size
 /// (row-level AND the per-column runs a composed row carries), or the row's
 /// inline-image placements. (Display-offset is frame-global and
 /// gates the whole damaged path; the selection is diffed separately per row via
-/// [`selection_row_span`], so neither is re-checked here.) Equality here is
+/// [`RenderInput::selection_row_span`], so neither is re-checked here.) Equality here is
 /// exact, so an unchanged row is provably safe to reuse from the cache.
 ///
 /// The image comparison matters now that BOTH renderers draw image PIXELS (the
@@ -12500,12 +12827,18 @@ fn row_differs(a: &RenderInput, b: &RenderInput, r: usize) -> bool {
 /// clusters, combining, `line_sizes` and images all equal, so without this the
 /// row would be judged unchanged, reused from the cache, and NEVER repainted at
 /// its new size.
+///
+/// The DEFAULT-BG span clause is load-bearing for the same reason: a pane whose
+/// OSC 11 / DECSCNM default changed leaves every cell byte-equal (the cells hold
+/// RESOLVED colours only where they were written), while the opacity rule, the
+/// deepest image tier and the cursor/trail fallbacks all key on that default.
 fn row_differs_shifted(a: &RenderInput, ra: usize, b: &RenderInput, rb: usize) -> bool {
     a.cells[ra] != b.cells[rb]
         || a.clusters[ra] != b.clusters[rb]
         || a.combining[ra] != b.combining[rb]
         || a.line_sizes[ra] != b.line_sizes[rb]
         || row_spans(a, ra) != row_spans(b, rb)
+        || default_bg_spans(a, ra) != default_bg_spans(b, rb)
         || a.images[ra] != b.images[rb]
 }
 
@@ -12516,56 +12849,17 @@ fn mark(dirty: &mut [bool], r: usize) {
     }
 }
 
-/// The inclusive column span `sel` selects on live-screen row `sel_row`, or
-/// `None` when the row has no selected cell — a CONTENT-INDEPENDENT mirror of
-/// `TextSelection::contains`'s per-row column set (which is always a single
-/// contiguous range), built on the same public side-adjusted bounds so the two
-/// cannot disagree. `u16::MAX` as the high bound means "through end of row"
-/// (matching `contains`'s unbounded tail on non-final rows). Two frames whose
-/// spans are EQUAL on a row select the identical cell set there, so with equal
-/// content the row renders byte-identically — the soundness basis for
-/// [`compute_dirty_rows`]'s per-row selection diff. (Wide-cell snapping in
-/// `contains_cell` reads neighbouring cells, but that is a function of span +
-/// content, and content changes are caught by [`row_differs`].)
-fn selection_row_span(
-    sel: &aterm_core::selection::TextSelection,
-    sel_row: i32,
-) -> Option<(u16, u16)> {
-    use aterm_core::selection::SelectionType;
-    if !sel.has_selection() {
-        return None;
-    }
-    match sel.selection_type() {
-        // Lines: whole rows between the NORMALIZED (unadjusted) anchors — exactly
-        // `contains`'s Lines arm, which ignores columns and side adjustment.
-        SelectionType::Lines => {
-            let (start_row, _, end_row, _) = sel.normalized_bounds();
-            (sel_row >= start_row && sel_row <= end_row).then_some((0, u16::MAX))
-        }
-        // Block: the same rectangle on every covered row. `side_adjusted_bounds`
-        // is what `contains` min/maxes; block anchors are pre-normalized so the
-        // min/max here is a no-op kept for faithfulness.
-        SelectionType::Block => {
-            let (start_row, start_col, end_row, end_col) = sel.side_adjusted_bounds()?;
-            (sel_row >= start_row.min(end_row) && sel_row <= start_row.max(end_row))
-                .then_some((start_col.min(end_col), start_col.max(end_col)))
-        }
-        // Simple / Semantic (and future variants): linear containment. `None`
-        // from `side_adjusted_bounds` is the empty-after-adjustment selection,
-        // for which `contains` is false everywhere.
-        _ => {
-            let (start_row, start_col, end_row, end_col) = sel.side_adjusted_bounds()?;
-            if sel_row < start_row || sel_row > end_row {
-                return None;
-            }
-            let lo = if sel_row == start_row { start_col } else { 0 };
-            let hi = if sel_row == end_row {
-                end_col
-            } else {
-                u16::MAX
-            };
-            Some((lo, hi))
-        }
+/// Mark a row whose SELECTED-cell rendering changed, together with the row
+/// immediately above it. Glyph and combining-mark rasters are allowed to
+/// overshoot ABOVE their logical cell band (`row_scale` clips downward only), so
+/// repainting `r` alone would let the CPU touch pixels the GPU's row scissor
+/// preserves from the previous frame. The predecessor makes both damaged paths
+/// cover that ink — the conservative direction (an extra row costs a repaint;
+/// missing one leaves a stale band).
+fn mark_selection_row(dirty: &mut [bool], r: usize) {
+    mark(dirty, r);
+    if r > 0 {
+        mark(dirty, r - 1);
     }
 }
 
@@ -13117,26 +13411,44 @@ pub fn compute_dirty_rows(
             any_dirty = true;
         }
     }
-    // Selection: mark exactly the rows whose SELECTED-COLUMN SPAN moved between
-    // the frames. Every selection-dependent pixel in a row — the per-cell
-    // highlight bg (`contains_cell`), the selection fg / contrast floors, the
-    // ligature break columns, the additive-sparkle freeze — is a pure function of
-    // (that row's span, that row's content), and content diffs are already caught
-    // by `row_differs` above; so equal spans render byte-identically and only the
-    // span-changed rows (typically the 1-2 rows at a drag's endpoint) repaint,
+    // Selection: mark the rows whose SELECTED-COLUMN SPAN moved between the
+    // frames, plus each one's PREDECESSOR for upward glyph-ink overshoot
+    // (`mark_selection_row`). Every selection-dependent pixel in a row — the
+    // per-cell highlight bg (`contains_cell`), the selection fg / contrast
+    // floors, the ligature break columns, the additive-sparkle freeze — is a
+    // pure function of (that row's span, that row's content), and content diffs
+    // are already caught by `row_differs` above; so equal spans render
+    // byte-identically and only the narrow band at a drag's endpoints repaints,
     // instead of the whole screen per pointer move.
     //
     // Selection rows are LIVE-SCREEN coords, so each frame maps through its
     // OWN offset (audit E5: the anchor precheck admits offset-shifted frames;
     // an offset shift moves the live↔viewport mapping even when the selection
     // bytes are equal, so it re-runs this diff too).
-    if prev_input.selection != input.selection || prev_input.display_offset != input.display_offset
+    if prev_input.selection != input.selection
+        || prev_input.selection_clip != input.selection_clip
+        || prev_input.display_offset != input.display_offset
     {
-        for (r, d) in dirty.iter_mut().enumerate() {
-            if selection_row_span(&prev_input.selection, r as i32 - prev_input.display_offset)
-                != selection_row_span(&input.selection, r as i32 - input.display_offset)
-            {
-                *d = true;
+        for r in 0..rows {
+            if prev_input.selection_row_span(r) != input.selection_row_span(r) {
+                mark_selection_row(dirty, r);
+                any_dirty = true;
+            }
+        }
+    }
+    // OSC 17 / OSC 19 (and their OSC 117/119 resets, and OSC 21) can recolour the
+    // selection while the selected RANGE itself is stationary — `row_differs` and
+    // the span diff above both see nothing. Repaint precisely the rows carrying
+    // selected cells in either snapshot; with no selection at all this marks
+    // nothing, so a colour set BEFORE the next drag still gate-hits.
+    if prev_input.selection_bg != input.selection_bg
+        || prev_input.selection_fg != input.selection_fg
+    {
+        for r in 0..rows {
+            let previous = prev_input.selection_row_span(r);
+            let current = input.selection_row_span(r);
+            if previous.is_some() || current.is_some() {
+                mark_selection_row(dirty, r);
                 any_dirty = true;
             }
         }
@@ -13162,7 +13474,11 @@ pub fn compute_dirty_rows(
                 // A LIVE cursor-colour change (OSC 12 / OSC 112 reset) repaints the
                 // cursor IN PLACE even on a steady, non-moving cursor — the cursor row
                 // is already marked dirty just below, so this only un-gates the frame.
-                || prev_input.cursor_color != input.cursor_color));
+                || prev_input.cursor_color != input.cursor_color
+                // Host-owned animated cursor fills (the typing-reactive rainbow,
+                // the BOLT) are rendered content too: a colour-only step on a
+                // stationary cursor must not gate-hit, or the animation freezes.
+                || prev_input.cursor_fill_override != input.cursor_fill_override));
     if prev_shown {
         mark(dirty, prev_input.cursor_row);
     }
@@ -13879,18 +14195,15 @@ fn ligature_break_cols_into(
         cols.push(input.cursor_col);
     }
     // Break on selection so no shaped run spans a selection-highlight boundary.
-    // Selection rows are live-screen coords (viewport row r shows live row
-    // r - display_offset), matching `render_row`'s per-cell selection fill.
+    // Frame coords go through the ONE predicate `render_row`'s per-cell fill
+    // uses, so the viewport projection and the pane clip cannot drift apart.
     if input.selection.has_selection() {
         let n = input.cols.min(input.cells.get(r).map_or(0, Vec::len));
         let row_cells = &input.cells[r];
-        let sel_row = r as i32 - input.display_offset;
         let selected = |c: usize| {
             let cell = &row_cells[c];
             let is_wide_lead = row_cells.get(c + 1).is_some_and(|next| next.wide);
-            input
-                .selection
-                .contains_cell(sel_row, c as u16, is_wide_lead, cell.wide)
+            input.selection_contains_cell(r, c, is_wide_lead, cell.wide)
         };
         let mut prev = false;
         for c in 0..n {
@@ -13901,6 +14214,24 @@ fn ligature_break_cols_into(
                 cols.push(c);
             }
             prev = sel;
+        }
+    }
+}
+
+/// Columns of row `r` that START a fresh shaping run: the first column of every
+/// per-pane DEC line-size run after the leftmost ([`LineSizeSpan::start_col`]).
+///
+/// A boundary is NOT a break column. Excluding the cell would stop a right pane
+/// that begins with `=>` from ligating at all; what must not happen is a single
+/// shaped run spanning two panes, whose glyphs are placed and scaled
+/// independently. A uniform row (every single-pane frame) yields an all-`false`
+/// mask, which `plan_row_runs` treats exactly as the pre-span renderer did.
+fn ligature_run_boundaries_into(input: &RenderInput, r: usize, boundaries: &mut Vec<bool>) {
+    boundaries.clear();
+    boundaries.resize(input.cols, false);
+    for span in row_spans(input, r) {
+        if span.start_col > 0 && span.start_col < input.cols {
+            boundaries[span.start_col] = true;
         }
     }
 }
@@ -16722,11 +17053,12 @@ mod tests {
         }
     }
 
-    /// A selection change takes the per-row damage path and marks EXACTLY the rows
-    /// whose selected-column span moved — a drag extending a Simple selection onto
-    /// one more row repaints the drag-endpoint rows, not the whole screen. (The
-    /// default cursor sits at row 0 and is marked whenever shown, so rows 1..3 are
-    /// marked ONLY by the selection diff under test.)
+    /// A selection change takes the per-row damage path and marks the rows whose
+    /// selected-column span moved PLUS each one's predecessor (upward glyph ink)
+    /// — a drag extending a Simple selection onto one more row repaints a narrow
+    /// endpoint band, not the whole screen. (The default cursor sits at row 0 and
+    /// is marked whenever shown, so rows 1..3 are marked ONLY by the selection
+    /// diff under test.)
     #[test]
     fn compute_dirty_rows_selection_drag_marks_only_span_changed_rows() {
         use aterm_core::selection::{SelectionSide, SelectionType};
@@ -16749,10 +17081,214 @@ mod tests {
             panic!("a selection-only change must take the row-damage path, not FullRepaint");
         };
         // Row 1's span changed (2..=5 → 2..=end-of-row) and row 2 gained a span.
+        assert!(
+            dirty[0],
+            "row 1's change also repaints its upward-ink predecessor"
+        );
         assert!(dirty[1], "the drag-start row's span changed → dirty");
         assert!(dirty[2], "the newly selected row must be dirty");
         assert!(!dirty[3], "a row untouched by the drag must NOT repaint");
         assert!(d.any_dirty && !d.is_gate_hit());
+    }
+
+    /// A LIVE selection recolour (OSC 17 / OSC 19, or the OSC 21 pair) leaves the
+    /// selected RANGE stationary, so neither the content diff nor the span diff
+    /// sees it: the colour clause must repaint every selected row (and its
+    /// upward-ink predecessor). With NO selection on screen there is nothing to
+    /// recolour, so the same change stays a gate hit.
+    #[test]
+    fn compute_dirty_rows_clip_only_move_repaints_old_and_new_selection_spans() {
+        use aterm_core::render::SelectionClip;
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let mut term = Terminal::new(4, 8);
+        let mut prev = term.cell_frame(4, 8);
+        let mut selection = aterm_core::selection::TextSelection::new();
+        selection.start_selection(1, 0, SelectionSide::Left, SelectionType::Simple);
+        selection.update_selection(2, 7, SelectionSide::Right);
+        selection.complete_selection();
+        prev.selection = selection;
+        prev.selection_clip = Some(SelectionClip::new(1, 3, 0, 3));
+        let mut cur = prev.clone();
+        cur.selection_clip = Some(SelectionClip::new(1, 3, 4, 8));
+
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(decision) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("a clip-only selection move must use row damage");
+        };
+        assert!(
+            dirty[0],
+            "the predecessor of the first clipped row repaints glyph overshoot"
+        );
+        assert!(
+            dirty[1] && dirty[2],
+            "both rows whose old/new clipped column spans differ must repaint"
+        );
+        assert!(!dirty[3], "a row outside both clips stays cached");
+        assert!(decision.any_dirty && !decision.is_gate_hit());
+    }
+
+    #[test]
+    fn compute_dirty_rows_clip_crossing_wide_lead_repaints() {
+        use aterm_core::render::SelectionClip;
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let mut term = Terminal::new(3, 8);
+        let mut prev = term.cell_frame(3, 8);
+        // Column 4 is the lead because column 5 is its continuation.
+        prev.cells[1].resize(8, term.implicit_blank_render_cell());
+        prev.cells[1][5].wide = true;
+        let mut selection = aterm_core::selection::TextSelection::new();
+        selection.start_selection(1, 5, SelectionSide::Left, SelectionType::Block);
+        selection.update_selection(1, 5, SelectionSide::Right);
+        selection.complete_selection();
+        prev.selection = selection;
+        prev.selection_clip = Some(SelectionClip::new(1, 2, 4, 6));
+        let mut cur = prev.clone();
+        cur.selection_clip = Some(SelectionClip::new(1, 2, 5, 6));
+
+        assert!(prev.selection_contains_cell(1, 4, true, false));
+        assert!(
+            !cur.selection_contains_cell(1, 4, true, false),
+            "negative-control precondition: the moved clip removes the snapped lead"
+        );
+
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(decision) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("a clip-only wide-selection change must use row damage");
+        };
+        assert!(
+            dirty[0] && dirty[1],
+            "the changed row and upward-glyph predecessor must repaint"
+        );
+        assert!(!dirty[2], "an unrelated row stays cached");
+        assert!(decision.any_dirty && !decision.is_gate_hit());
+    }
+
+    #[test]
+    fn compute_dirty_rows_selection_color_change_covers_upward_glyph_spill() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let mut term = Terminal::new(4, 8);
+        let mut prev = term.cell_frame(4, 8);
+        let mut selection = aterm_core::selection::TextSelection::new();
+        selection.start_selection(1, 2, SelectionSide::Left, SelectionType::Simple);
+        selection.update_selection(2, 4, SelectionSide::Right);
+        selection.complete_selection();
+        prev.selection = selection;
+        let mut cur = prev.clone();
+        cur.selection_bg = 0x0011_2233;
+        cur.selection_fg = 0x00aa_bbcc;
+
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(d) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("selection-colour changes must stay on the row-damage path");
+        };
+        assert!(
+            dirty[0],
+            "the predecessor of a selected row must repaint upward glyph ink"
+        );
+        assert!(dirty[1] && dirty[2], "every selected row must repaint");
+        assert!(!dirty[3], "an unselected row after the range stays cached");
+        assert!(d.any_dirty && !d.is_gate_hit());
+
+        let mut no_selection_prev = term.cell_frame(4, 8);
+        let mut no_selection_cur = no_selection_prev.clone();
+        no_selection_prev.selection_bg = 0x0001_0203;
+        no_selection_cur.selection_bg = 0x0004_0506;
+        let mut empty_dirty = Vec::new();
+        let DirtyDecision::Rows(empty) = compute_dirty_rows(
+            &no_selection_prev,
+            &no_selection_cur,
+            false,
+            None,
+            false,
+            None,
+            16,
+            &mut empty_dirty,
+        ) else {
+            panic!("an unused selection colour is not a full-repaint event");
+        };
+        assert!(
+            empty_dirty.iter().all(|dirty| !dirty),
+            "no selected pixels exist to repaint"
+        );
+        assert!(empty.is_gate_hit());
+    }
+
+    /// Damage tracking sees the two per-column channels a COMPOSED row carries:
+    /// a pane-local DEC line size (row-local, unless it is DECDHL — whose 2×
+    /// glyph spans two bands and forces the full path), and a pane-local live
+    /// default background (row-local, since the window padding still follows the
+    /// frame scalar). A stationary cursor whose host-owned FILL override
+    /// re-colours is rendered content too, so it must not gate-hit.
+    #[test]
+    fn damage_tracks_pane_local_channels_and_stationary_cursor_fill() {
+        let mut term = Terminal::new(4, 8);
+        let mut prev = term.cell_frame(4, 8);
+        prev.cursor_visible = false;
+        let mut cur = prev.clone();
+        prev.line_size_spans = vec![Vec::new(); 4];
+        cur.line_size_spans = prev.line_size_spans.clone();
+        prev.line_size_spans[2].push(LineSizeSpan::new(0, 4, LineSize::SingleWidth));
+        cur.line_size_spans[2].push(LineSizeSpan::new(0, 4, LineSize::DoubleWidth));
+
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(decision) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("double-width remains row-local and must use row damage");
+        };
+        assert!(decision.any_dirty);
+        assert!(dirty[2], "a changed pane-local DEC mode dirties its row");
+
+        cur.line_size_spans[2][0].line_size = LineSize::DoubleHeightTop;
+        assert_eq!(
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty),
+            DirtyDecision::FullRepaint,
+            "a pane-local DECDHL segment has the same cross-row hazard as a full row"
+        );
+
+        let mut bg_prev = term.cell_frame(4, 8);
+        bg_prev.cursor_visible = false;
+        bg_prev.default_bg_spans = vec![Vec::new(); 4];
+        bg_prev.default_bg_spans[2].push(DefaultBgSpan::new(0, 4, 0x0011_2233));
+        let mut bg_cur = bg_prev.clone();
+        bg_cur.default_bg_spans[2][0].default_bg = 0x0044_5566;
+        let DirtyDecision::Rows(decision) =
+            compute_dirty_rows(&bg_prev, &bg_cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("pane-local default changes do not recolor the window padding");
+        };
+        assert!(decision.any_dirty);
+        assert_eq!(
+            dirty,
+            vec![false, false, true, false],
+            "only the composed row carrying changed pane provenance repaints"
+        );
+
+        let mut fill_prev = term.cell_frame(4, 8);
+        fill_prev.cursor_visible = true;
+        fill_prev.cursor_style = CursorStyle::SteadyBlock;
+        fill_prev.cursor_row = 2;
+        fill_prev.cursor_col = 3;
+        fill_prev.cursor_fill_override = Some(0x0011_2233);
+        let mut fill_cur = fill_prev.clone();
+        fill_cur.cursor_fill_override = Some(0x00AA_BBCC);
+        let DirtyDecision::Rows(decision) = compute_dirty_rows(
+            &fill_prev, &fill_cur, false, None, false, None, 16, &mut dirty,
+        ) else {
+            panic!("a stationary cursor colour change is row-local");
+        };
+        assert!(decision.cursor_changed);
+        assert!(dirty[2], "a stationary cursor override repaints its row");
+        assert!(!decision.is_gate_hit());
     }
 
     /// A Block selection's column growth changes the span on EVERY covered row, so
@@ -20479,6 +21015,55 @@ mod tests {
         );
     }
 
+    /// On a COMPOSED row the opacity rule follows the OWNING PANE's live default,
+    /// not the frame scalar (which serves the padding/divider gaps): a cell whose
+    /// bg equals its pane's default is glass, and one equal to the frame scalar
+    /// instead — a DIFFERENT colour here — is opaque like any SGR bg.
+    #[test]
+    fn background_opacity_follows_pane_default_bg_span() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        let (cw, ch) = r.cell_size();
+        let frame_scalar = 0x0022_3344;
+        let mut term = Terminal::new(1, 4);
+        term.process(b"\x1b[?25l");
+        let mut input = term.cell_frame(1, 4);
+        let mut blank = term.implicit_blank_render_cell();
+        blank.ch = ' ';
+        blank.bg = [
+            (Theme::default().bg >> 16) as u8,
+            (Theme::default().bg >> 8) as u8,
+            Theme::default().bg as u8,
+        ];
+        input.cells[0].resize(4, blank);
+        // The row came from a split pane whose OSC 11 / DECSCNM default differs
+        // from the composed frame scalar.
+        input.default_bg = frame_scalar;
+        input.default_bg_spans = vec![vec![DefaultBgSpan::new(0, 4, Theme::default().bg)]];
+        let mut frame_scalar_cell = blank;
+        frame_scalar_cell.bg = [
+            (frame_scalar >> 16) as u8,
+            (frame_scalar >> 8) as u8,
+            frame_scalar as u8,
+        ];
+        input.cells[0][0] = frame_scalar_cell;
+
+        r.set_background_opacity(0.5);
+        let frame = r.render_input(&input);
+        let t = 255 - (0.5f32 * 255.0).round() as u32;
+        assert!(
+            cell_pixels(&frame, 3, 0, cw, ch)
+                .all(|p| p >> 24 == t && p & 0x00ff_ffff == Theme::default().bg),
+            "a cell equal to its PANE's default must carry the transmittance byte"
+        );
+        assert!(
+            cell_pixels(&frame, 0, 0, cw, ch).all(|p| p == frame_scalar),
+            "a cell equal to the frame scalar is not this pane's default → opaque"
+        );
+    }
+
     /// Glyph foreground pixels stay OPAQUE under background opacity: full-
     /// coverage glyph pixels have transmittance 0 even inside a translucent
     /// default-bg cell (only bg-only pixels carry the alpha).
@@ -20595,6 +21180,45 @@ mod tests {
         // Back to focused: the active colour again, ignoring the inactive override.
         r.set_selection_inactive(false);
         assert_eq!(r.effective_selection_bg(), theme.selection);
+
+        // A terminal-owned OSC 17 value replaces the active theme colour, and the
+        // derived inactive band follows THAT live value over the frame's live
+        // background — while an explicit inactive override still wins. OSC 19 ink
+        // likewise outranks the host's static selectionForeground.
+        let mut input = RenderInput::empty();
+        input.default_bg = 0x00e0_d0c0;
+        input.selection_bg = 0x0060_4020;
+        input.selection_fg = 0x0012_3456;
+        assert_eq!(r.frame_selection_bg(&input), input.selection_bg);
+        assert_eq!(r.frame_selection_fg(&input), Some(input.selection_fg));
+        r.set_selection_fg(Some(0x00ab_cdef));
+        input.selection_fg = aterm_core::render::COLOR_DYNAMIC;
+        assert_eq!(
+            r.frame_selection_fg(&input),
+            None,
+            "an engine-requested dynamic foreground overrides the renderer setting"
+        );
+        input.selection_fg = aterm_core::render::COLOR_UNSET;
+        assert_eq!(
+            r.frame_selection_fg(&input),
+            Some(0x00ab_cdef),
+            "an unresolved producer still delegates to the renderer setting"
+        );
+        input.selection_bg = aterm_core::render::COLOR_UNSET;
+        assert_eq!(
+            r.frame_selection_bg(&input),
+            r.effective_selection_bg(),
+            "an unresolved producer still delegates to the configured policy"
+        );
+        input.selection_bg = 0x0060_4020;
+        r.set_selection_inactive(true);
+        r.set_selection_inactive_bg(None);
+        assert_eq!(
+            r.frame_selection_bg(&input),
+            derive_inactive_selection_bg(input.selection_bg, input.default_bg)
+        );
+        r.set_selection_inactive_bg(Some(custom));
+        assert_eq!(r.frame_selection_bg(&input), custom);
     }
 
     /// The color-emoji font bytes are interned: injecting the SAME blob twice

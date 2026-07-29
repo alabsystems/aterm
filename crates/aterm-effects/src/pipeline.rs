@@ -36,7 +36,9 @@ use web_time::Instant;
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
-use aterm_render::{GlowQuad, InkCell, RainHalo, SpriteQuad, TrailCell, WordDecoration};
+use aterm_render::{
+    GlowQuad, InkCell, RainHalo, SpriteQuad, TrailCell, WordDecoration, theme_is_dark,
+};
 
 use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, NYAN_WAKE_PERSIST};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
@@ -75,8 +77,17 @@ pub struct EffectsPipeline {
 
     glow: CursorGlow,
     glow_cfg: GlowConfig,
+    /// `true` when the host left glow color unset, so the wake follows the
+    /// frame's live OSC 12 / OSC 112 cursor instead of a pinned color.
+    glow_color_from_cursor: bool,
+    /// The accent follows the live cursor only when both color and accent were
+    /// left automatic; an explicit accent always stays fixed.
+    glow_accent_from_cursor: bool,
     trail: CursorTrail,
     trail_cfg: TrailConfig,
+    /// Automatic opaque-comet color provenance, retained across frames so
+    /// OSC 12 / OSC 112 and live theme changes can recolor an existing trail.
+    trail_color_from_cursor: bool,
     /// Typing-cadence heat → comet ignition intensity. The embedder feeds it via
     /// [`Self::note_keystroke`]; `apply` reads it each frame to ignite the comet.
     typing_cadence: TypingCadence,
@@ -187,6 +198,8 @@ impl EffectsPipeline {
                 pack: None,
                 wake_persist_s: NYAN_WAKE_PERSIST,
             },
+            glow_color_from_cursor: true,
+            glow_accent_from_cursor: true,
             trail: CursorTrail::default(),
             trail_cfg: TrailConfig {
                 enabled: false,
@@ -196,6 +209,7 @@ impl EffectsPipeline {
                 intensity: 0.0,
                 warmth: 0.0,
             },
+            trail_color_from_cursor: true,
             typing_cadence: TypingCadence::default(),
             pending_keys: 0,
             decos: WordDecorations::default(),
@@ -460,8 +474,9 @@ impl EffectsPipeline {
     /// `style` ∈ lumen|phaser|nyan|sparkle|fire|laser|beam|water|comet
     /// (unknown → lumen; `rainbow` is a back-compat alias for the Nyan banded
     /// ribbon — the old laser-like sweep it used to name is the explicit
-    /// `phaser`); `color`/`accent` `None` derive from `theme_cursor` exactly
-    /// like the native `glow_config` (accent = color brightened 1.5×);
+    /// `phaser`); `color = None` uses the native style default (Laser/Beam/
+    /// Sparkle/Comet have canonical hues; other styles derive from
+    /// `theme_cursor`) and `accent = None` brightens that color 1.5×;
     /// `duration_ms` clamps 30..=2000, `length` 1..=512, `intensity` 0..=1,
     /// `radius` 0..=2.
     #[allow(
@@ -481,9 +496,24 @@ impl EffectsPipeline {
         ring: bool,
         theme_cursor: u32,
     ) {
-        let color = color.unwrap_or(theme_cursor) & 0x00FF_FFFF;
-        let accent = accent.map_or_else(|| brighten(color, 1.5), |a| a & 0x00FF_FFFF);
+        use crate::cursor_glow::{
+            BEAM_DEFAULT_COLOR, COMET_DEFAULT_COLOR, LASER_DEFAULT_COLOR, SPARKLE_DEFAULT_COLOR,
+        };
+
+        let color_from_cursor = color.is_none();
+        let accent_from_cursor = color_from_cursor && accent.is_none();
         let resolved = GlowStyle::parse(style);
+        let default_color = match resolved {
+            GlowStyle::Laser => LASER_DEFAULT_COLOR,
+            GlowStyle::Beam => BEAM_DEFAULT_COLOR,
+            GlowStyle::Comet => COMET_DEFAULT_COLOR,
+            GlowStyle::Sparkle => SPARKLE_DEFAULT_COLOR,
+            _ => theme_cursor,
+        };
+        let color = color.unwrap_or(default_color) & 0x00FF_FFFF;
+        let accent = accent.map_or_else(|| brighten(color, 1.5), |a| a & 0x00FF_FFFF);
+        self.glow_color_from_cursor = color_from_cursor;
+        self.glow_accent_from_cursor = accent_from_cursor;
         self.glow_cfg = GlowConfig {
             dark_theme: true,
             enabled,
@@ -566,6 +596,7 @@ impl EffectsPipeline {
         color: Option<u32>,
         theme_cursor: u32,
     ) {
+        self.trail_color_from_cursor = color.is_none();
         self.trail_cfg = TrailConfig {
             enabled,
             duration: Duration::from_millis(duration_ms.clamp(30, 2000)),
@@ -1014,6 +1045,30 @@ impl EffectsPipeline {
         let cur = input
             .cursor_visible
             .then_some((input.cursor_row as u16, input.cursor_col as u16));
+        // Fire/Water/Vapor choose additive-vs-contrast treatment from the
+        // background actually presented by this frame, not the construction
+        // default. Web hosts stamp live OSC 11 + DECSCNM here before `apply`.
+        // An older/custom host may leave the field unset; preserve the legacy
+        // dark-ground behavior in that case rather than interpreting the
+        // sentinel's high byte as a real color.
+        self.glow_cfg.dark_theme =
+            input.default_bg == aterm_core::render::COLOR_UNSET || theme_is_dark(input.default_bg);
+        // Match the native cursor-wake rule: automatic colors follow the live
+        // cursor sampled into this coherent frame. Explicit colors/accents stay
+        // fixed, and Laser remains electric in its configured/default hue
+        // rather than inheriting arbitrary shell OSC 12 colors.
+        if input.cursor_color != aterm_core::render::COLOR_UNSET {
+            let live = input.cursor_color & 0x00FF_FFFF;
+            if self.glow_color_from_cursor && !matches!(self.glow_cfg.style, GlowStyle::Laser) {
+                self.glow_cfg.color = live;
+                if self.glow_accent_from_cursor {
+                    self.glow_cfg.accent = brighten(live, 1.5);
+                }
+            }
+            if self.trail_color_from_cursor {
+                self.trail_cfg.color = live;
+            }
+        }
 
         // Straggler keystrokes (noted after the last `advance`): flush them at
         // the current instant so a host that renders without advancing first
@@ -1312,6 +1367,172 @@ mod tests {
 
     const SYNTHWAVE: &str = include_str!("../assets/trail-packs/synthwave.toml");
 
+    fn stamp_effective_terminal_background(term: &Terminal, input: &mut RenderInput) {
+        let color = if term.modes().reverse_video() {
+            term.default_foreground()
+        } else {
+            term.default_background()
+        };
+        input.default_bg = aterm_render::rgb_to_u32([color.r, color.g, color.b]);
+    }
+
+    #[test]
+    fn glow_polarity_tracks_live_osc11_and_decscnm_background() {
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "fire",
+            None,
+            None,
+            400,
+            24,
+            1.0,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        let mut term = Terminal::new(2, 8);
+
+        term.process(b"\x1b]11;rgb:ff/ff/ff\x07");
+        let mut input = term.cell_frame(2, 8);
+        stamp_effective_terminal_background(&term, &mut input);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            !pipeline.glow_cfg.dark_theme,
+            "a live light OSC 11 ground selects the light-theme treatment"
+        );
+
+        term.process(b"\x1b]10;rgb:ee/ee/ee\x07\x1b]11;rgb:01/02/03\x07\x1b[?5h");
+        term.cell_frame_into(&mut input, 2, 8);
+        stamp_effective_terminal_background(&term, &mut input);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            !pipeline.glow_cfg.dark_theme,
+            "DECSCNM makes the live foreground the effective light ground"
+        );
+
+        term.process(b"\x1b[?5l");
+        term.cell_frame_into(&mut input, 2, 8);
+        stamp_effective_terminal_background(&term, &mut input);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            pipeline.glow_cfg.dark_theme,
+            "leaving DECSCNM restores the dark OSC 11 ground"
+        );
+
+        input.default_bg = aterm_core::render::COLOR_UNSET;
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            pipeline.glow_cfg.dark_theme,
+            "an unstamped legacy host retains the dark-ground fallback"
+        );
+    }
+
+    fn stamp_cursor_color(term: &Terminal, input: &mut RenderInput, fallback: u32) {
+        input.cursor_color = term.cursor_color().map_or(fallback, |color| {
+            aterm_render::rgb_to_u32([color.r, color.g, color.b])
+        });
+    }
+
+    #[test]
+    fn automatic_wake_colors_follow_osc12_resets_and_theme_baselines() {
+        let theme_cursor = 0x0011_2233;
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            400,
+            24,
+            1.0,
+            0.9,
+            true,
+            theme_cursor,
+        );
+        pipeline.set_cursor_trail(true, 400, 24, None, theme_cursor);
+        let mut term = Terminal::new(2, 8);
+        term.set_default_cursor_color(Some(aterm_core::terminal::Rgb::new(0x11, 0x22, 0x33)));
+
+        term.process(b"\x1b]12;rgb:aa/00/11\x07");
+        let mut input = term.cell_frame(2, 8);
+        stamp_cursor_color(&term, &mut input, theme_cursor);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(pipeline.glow_cfg.color, 0x00AA_0011);
+        assert_eq!(pipeline.glow_cfg.accent, brighten(0x00AA_0011, 1.5));
+        assert_eq!(input.cursor_trail_color, 0x00AA_0011);
+
+        term.process(b"\x1b]112\x07");
+        term.cell_frame_into(&mut input, 2, 8);
+        stamp_cursor_color(&term, &mut input, theme_cursor);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(pipeline.glow_cfg.color, theme_cursor);
+        assert_eq!(input.cursor_trail_color, theme_cursor);
+
+        let new_theme_cursor = 0x0044_5566;
+        term.set_default_cursor_color(Some(aterm_core::terminal::Rgb::new(0x44, 0x55, 0x66)));
+        term.cell_frame_into(&mut input, 2, 8);
+        stamp_cursor_color(&term, &mut input, new_theme_cursor);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            pipeline.glow_cfg.color, new_theme_cursor,
+            "an automatic wake follows a live theme change without reconfiguration"
+        );
+        assert_eq!(input.cursor_trail_color, new_theme_cursor);
+    }
+
+    #[test]
+    fn explicit_wake_colors_and_laser_ignore_live_cursor_recolors() {
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "lumen",
+            Some(0x0001_0203),
+            None,
+            400,
+            24,
+            1.0,
+            0.9,
+            true,
+            0x0011_2233,
+        );
+        pipeline.set_cursor_trail(true, 400, 24, Some(0x0004_0506), 0x0011_2233);
+        let mut term = Terminal::new(2, 8);
+        term.process(b"\x1b]12;rgb:aa/bb/cc\x07");
+        let mut input = term.cell_frame(2, 8);
+        stamp_cursor_color(&term, &mut input, 0x0011_2233);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(pipeline.glow_cfg.color, 0x0001_0203);
+        assert_eq!(pipeline.glow_cfg.accent, brighten(0x0001_0203, 1.5));
+        assert_eq!(input.cursor_trail_color, 0x0004_0506);
+
+        pipeline.set_cursor_glow(
+            true,
+            "laser",
+            None,
+            None,
+            400,
+            24,
+            1.0,
+            0.9,
+            true,
+            0x0011_2233,
+        );
+        pipeline.set_cursor_trail(true, 400, 24, None, 0x0011_2233);
+        term.cell_frame_into(&mut input, 2, 8);
+        stamp_cursor_color(&term, &mut input, 0x0011_2233);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            pipeline.glow_cfg.color,
+            crate::cursor_glow::LASER_DEFAULT_COLOR,
+            "Laser keeps its canonical storm-violet default hue"
+        );
+        assert_eq!(
+            input.cursor_trail_color, 0x00AA_BBCC,
+            "an independently enabled automatic opaque trail still follows OSC 12"
+        );
+    }
+
     /// The web FFI `set_cursor_trail_pack`: a valid pack arms `GlowStyle::Custom`
     /// with resolved params; a malformed pack RETURNS diagnostics and LEAVES the
     /// prior pack intact (the silent-drop gap this closes); `None` clears it.
@@ -1586,6 +1807,7 @@ mod tests {
             col: 0,
             strength: 128,
         });
+        input.cursor_fill_override = Some(0x00FE_DCBA);
         let fp = p.apply(&mut term, &mut input, 10, 19);
         assert_eq!(fp, 0, "all-off apply is the identity fingerprint");
         assert!(input.fire_patch.is_empty(), "stale fire_patch cleared");
@@ -1593,6 +1815,10 @@ mod tests {
         assert!(input.glow_under.is_empty(), "stale glow_under cleared");
         assert!(input.char_fg.is_empty(), "stale char_fg cleared");
         assert!(input.fire_halo.is_empty(), "stale fire_halo cleared");
+        assert_eq!(
+            input.cursor_fill_override, None,
+            "all-off apply clears a stale forge cursor fill"
+        );
 
         // An enabled NON-fire style ticks the glow but emits no fire streams.
         p.set_cursor_glow(
@@ -1616,6 +1842,10 @@ mod tests {
             assert!(input.glow_under.is_empty(), "lumen never emits glow_under");
             assert!(input.char_fg.is_empty(), "lumen never emits char_fg");
             assert!(input.fire_halo.is_empty(), "lumen never emits fire_halo");
+            assert_eq!(
+                input.cursor_fill_override, None,
+                "a non-fire style never inherits the forge cursor fill"
+            );
         }
     }
 
@@ -1889,6 +2119,57 @@ mod tests {
             relit |= !input.cursor_glow_add.is_empty();
         }
         assert!(relit, "refocus restores the light");
+    }
+
+    /// The embedded hosts use this pipeline as their sole overlay producer, so
+    /// Fire's warm-metal cursor body must ride the same RenderInput field as it
+    /// does in the native GUI. A live style toggle must scrub it immediately.
+    #[test]
+    fn fire_forge_cursor_fill_is_spliced_and_cleared_on_toggle() {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_glow(
+            true,
+            "fire",
+            None,
+            None,
+            400,
+            24,
+            1.0,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            input.cursor_fill_override,
+            p.glow.forge_fill(),
+            "Fire publishes its warm-metal cursor fill"
+        );
+        assert!(
+            input.cursor_fill_override.is_some(),
+            "Fire's cold forge fill is deliberately still visible"
+        );
+
+        p.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            400,
+            24,
+            1.0,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        term.cell_frame_into(&mut input, 6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            input.cursor_fill_override, None,
+            "switching away from Fire clears the reused frame's fill"
+        );
     }
 
     fn composer_toggle_model() -> aterm_spec::derive::Model {

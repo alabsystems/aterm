@@ -18,12 +18,15 @@ mod format_plan;
 
 // M3 phase B: the EDR present gate's pure decision functions, re-exported so the
 // Tier-1 exhaustive enumeration (tests/hdr_gate.rs) drives the SHIPPING policy.
-pub use format_plan::{HdrPlan, hdr_present_plan, hdr_swapchain_wants_f16};
+pub use format_plan::{
+    HdrPlan, HdrReconfigurePlan, hdr_live_upgrade_wants_f16, hdr_present_plan,
+    hdr_reconfigure_plan, hdr_swapchain_wants_f16,
+};
 mod renderer;
 pub use renderer::{
     DropOverlay, GpuRenderer, GpuSurface, PresentCrop, SurfacePresentFailure, TrayQuad, WindowGpu,
 };
-/// VIDEO introspection: presented-frame capture (see `video_tap`).
+/// VIDEO introspection: submitted-destination-frame capture (see `video_tap`).
 pub mod video_tap;
 // TRUST_NATIVE_TLA Phase 2: the GPU-free slice-precondition decision (the real
 // `GpuEncode.tla` `NeverSliceEmpty` gate `InstanceBuf::upload` uses), re-exported so
@@ -34,7 +37,7 @@ pub use renderer::should_slice;
 ///
 /// The `instance` and `adapter` are KEPT (not dropped after device creation) so a
 /// window surface can be created on the SAME instance/adapter later — the GPU
-/// on-glass present path (`GpuRenderer::create_window_surface`) blits the
+/// application-present path (`GpuRenderer::create_window_surface`) blits the
 /// offscreen frame straight into a swapchain instead of reading it back to CPU.
 pub struct GpuContext {
     pub device: wgpu::Device,
@@ -184,7 +187,7 @@ impl GpuContext {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self, String> {
         // This instance must OUTLIVE device creation: it is kept on `GpuContext`
-        // so a window surface can be created from it for the on-glass present
+        // so a window surface can be created from it for the application-present
         // path. `new_without_display_handle()` (no `OwnedDisplayHandle`) is still
         // surface-capable on Metal — the platform doesn't use the display handle
         // (it's only required for GLES/Wayland presentation), so the headless
@@ -392,9 +395,9 @@ impl GpuContext {
     ///
     /// Infallible wrapper over [`Self::try_read_back`]: a readback failure
     /// (device lost mid-frame — TDR, driver update) degrades to a black frame
-    /// instead of panicking, so an in-process caller (e.g. the control-socket
-    /// snapshot/image verbs) can't take down the whole terminal on a transient
-    /// GPU condition.
+    /// instead of panicking for historical renderer-oracle/probe callers. Durable
+    /// artifact APIs must call the fallible path and report capture failure rather
+    /// than publishing this best-effort sentinel as real pixels.
     pub fn read_back(&self, texture: &wgpu::Texture, width: u32, height: u32) -> Frame {
         self.try_read_back(texture, width, height)
             .unwrap_or_else(|e| {

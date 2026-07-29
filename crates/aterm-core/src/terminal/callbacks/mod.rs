@@ -50,7 +50,7 @@ pub enum ColorTarget {
     Palette,
     /// Selection background color (OSC 17 / OSC 21).
     SelectionBackground,
-    /// Selection foreground color (OSC 19).
+    /// Selection foreground color (OSC 19 / OSC 21).
     SelectionForeground,
 }
 
@@ -83,7 +83,8 @@ impl ColorTarget {
     }
 }
 
-/// Callback type for dynamic color changes (OSC 10/11/12, OSC 110/111/112).
+/// Callback type for explicit, reset, and dynamic color changes (OSC 4, 10-21,
+/// 104, 110-112, 117, and 119).
 pub(super) type ColorChangeCallback = Box<dyn FnMut(ColorTarget, Rgb, ColorChangeOp) + Send>;
 
 /// Callback type for dynamic color queries (OSC 10/11/12 with `?`).

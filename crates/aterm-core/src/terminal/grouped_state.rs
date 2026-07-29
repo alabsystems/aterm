@@ -59,7 +59,7 @@ impl MarksState {
 /// Per the Kitty color stack protocol, push/pop must save and restore
 /// the full set of dynamic colors — not just the 256-color palette.
 /// This bundles palette, default foreground/background, cursor color,
-/// and selection background into a single stack entry.
+/// and both selection colors into a single stack entry.
 #[derive(Debug, Clone)]
 pub(super) struct ColorStackEntry {
     /// The 256-color palette snapshot.
@@ -72,12 +72,14 @@ pub(super) struct ColorStackEntry {
     pub(super) cursor_color: Option<Rgb>,
     /// Selection background color (OSC 21). `None` = renderer default.
     pub(super) selection_background: Option<Rgb>,
+    /// Selection foreground color (OSC 19). `None` = renderer default.
+    pub(super) selection_foreground: Option<Rgb>,
 }
 
 /// Grouped state for terminal color management.
 ///
 /// Bundles the 256-color palette, default foreground/background colors,
-/// cursor color, selection background, and the color stack used by
+/// cursor color, selection foreground/background, and the color stack used by
 /// Kitty's OSC 30001/30101 push/pop protocol. Accessed from OSC handlers
 /// (handler_osc.rs), SGR resolution (handler_sgr.rs), config API, and
 /// the public colors API.
@@ -95,11 +97,18 @@ pub(super) struct ColorState {
     /// OSC 110 resets `default_foreground` to this value (not the hardcoded
     /// constant). Updated whenever the host applies a new theme (#7443).
     pub(super) configured_foreground: Rgb,
+    /// Whether a host setter/config or an OSC mutation made the foreground
+    /// authoritative for render snapshots. A pristine `Terminal::new` retains
+    /// the historical renderer-theme fallback until one of those boundaries.
+    pub(super) frame_foreground_authoritative: bool,
     /// Theme-configured background color, set by `apply_config`.
     ///
     /// OSC 111 resets `default_background` to this value (not the hardcoded
     /// constant). Updated whenever the host applies a new theme (#7443).
     pub(super) configured_background: Rgb,
+    /// Whether a host setter/config or an OSC mutation made the background
+    /// authoritative for render snapshots.
+    pub(super) frame_background_authoritative: bool,
     /// Theme-configured palette, set by `apply_config` when the theme
     /// provides `custom_palette`.
     ///
@@ -108,10 +117,32 @@ pub(super) struct ColorState {
     /// foreground/background. `None` means no theme palette was configured,
     /// so resets fall back to xterm defaults.
     pub(super) configured_palette: Option<ColorPalette>,
+    /// Theme-configured cursor color, set by `apply_config`.
+    ///
+    /// OSC 112 and RIS restore this value. `None` means the configured
+    /// fallback is the live default foreground.
+    pub(super) configured_cursor: Option<Rgb>,
+    /// Whether a host setter/config or an OSC mutation made the cursor policy
+    /// authoritative for render snapshots. This is distinct from
+    /// `cursor_color.is_some()`: OSC 21 `cursor=` deliberately selects an
+    /// authoritative dynamic foreground fallback.
+    pub(super) frame_cursor_authoritative: bool,
     /// Cursor color (OSC 12, reset via OSC 112). None = use foreground.
     pub(super) cursor_color: Option<Rgb>,
+    /// Host-configured selection background.
+    ///
+    /// OSC 117 and RIS restore this value, preserving the same reset-to-theme
+    /// contract as the configured foreground/background/cursor colors.
+    pub(super) configured_selection_background: Option<Rgb>,
     /// Selection background color (OSC 21). None = renderer default.
     pub(super) selection_background: Option<Rgb>,
+    /// Host-configured selection foreground.
+    ///
+    /// OSC 119 and RIS restore this value, mirroring the configured selection
+    /// background. `None` delegates selected-text contrast to the renderer.
+    pub(super) configured_selection_foreground: Option<Rgb>,
+    /// Selection foreground color (OSC 19). None = renderer default.
+    pub(super) selection_foreground: Option<Rgb>,
     /// Host style policy (W5f): SGR 1 promotes indexed 0–7 to bright 8–15.
     /// Config-level (like `configured_*`), so `reset()` leaves it alone.
     pub(super) bold_is_bright: bool,
@@ -136,10 +167,17 @@ impl ColorState {
             default_foreground: DEFAULT_FOREGROUND,
             default_background: DEFAULT_BACKGROUND,
             configured_foreground: DEFAULT_FOREGROUND,
+            frame_foreground_authoritative: false,
             configured_background: DEFAULT_BACKGROUND,
+            frame_background_authoritative: false,
             configured_palette: None,
+            configured_cursor: None,
+            frame_cursor_authoritative: false,
             cursor_color: None,
+            configured_selection_background: None,
             selection_background: None,
+            configured_selection_foreground: None,
+            selection_foreground: None,
             bold_is_bright: true,
             faint_opacity: aterm_types::DIM_FACTOR,
             change_callback: None,
@@ -167,8 +205,9 @@ impl ColorState {
         // reset — standard xterm semantics (reset-to-configured, not reset-to-current).
         self.default_foreground = self.configured_foreground;
         self.default_background = self.configured_background;
-        self.cursor_color = None;
-        self.selection_background = None;
+        self.cursor_color = self.configured_cursor;
+        self.selection_background = self.configured_selection_background;
+        self.selection_foreground = self.configured_selection_foreground;
     }
 }
 

@@ -6735,6 +6735,14 @@ impl App {
                 "input or PTY output arrived before automatic reader park",
             ));
         }
+        // How much of the capture window must remain before a session is willing to
+        // serialize scrollback as well as its visible screen. Half the budget: the
+        // visible screen is mandatory and cheap, history is optional and priced per
+        // line, so once the window is half gone every remaining session drops to
+        // visible-only rather than risking the deadline for a bonus. This is what
+        // makes carrying history safe to enable by default — the failure mode is
+        // "less scrollback", never "the update did not apply".
+        const HANDOFF_HISTORY_COMFORT: std::time::Duration = std::time::Duration::from_millis(10);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
         if !self.park_all_readers(deadline) {
             self.rollback_overlap(None, &live);
@@ -6788,14 +6796,29 @@ impl App {
                 capture_failed = Some("a terminal parser was mid-sequence during handoff capture");
                 break;
             }
-            // Reject decoded allocation dimensions BEFORE checkpoint_visible()
-            // serializes rows. Conservatively reserve main+alt because querying
-            // the copied checkpoint to discover alt presence is exactly the
-            // potentially expensive work this admission must precede.
+            // SCROLLBACK IS BEST-EFFORT AND MUST NEVER COST THE HANDOFF.
+            //
+            // Carrying history is what stops an in-session update truncating every
+            // tab to one screen, but it is strictly a bonus: the visible screen is
+            // what adoption actually requires. So the depth is chosen per session
+            // against the REMAINING time, and collapses to zero once the window is
+            // more than half spent. Failing the handoff to protect scrollback would
+            // trade the whole update for the thing the update was carrying.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let history = if remaining >= HANDOFF_HISTORY_COMFORT {
+                crate::seamless::max_handoff_history_lines()
+            } else {
+                0
+            };
+            // Reject decoded allocation dimensions BEFORE the checkpoint serializes
+            // anything. Conservatively reserve main+alt because querying the copied
+            // checkpoint to discover alt presence is exactly the potentially
+            // expensive work this admission must precede.
             let per_grid = crate::seamless::admit_checkpoint_dimensions(
                 &mut capture_cells,
                 terminal.rows(),
                 terminal.cols(),
+                history,
                 true,
             );
             capture_budget = per_grid
@@ -6806,7 +6829,7 @@ impl App {
                 capture_failed = Some("aggregate visible-screen capture exceeded its memory cap");
                 break;
             }
-            let Some(checkpoint) = terminal.checkpoint_visible() else {
+            let Some(checkpoint) = terminal.checkpoint_carry(history as usize) else {
                 capture_failed = Some("a terminal parser left Ground during handoff capture");
                 break;
             };
@@ -7974,7 +7997,11 @@ mod handoff_process_group_tests {
     }
 
     fn assert_process_group_gone(leader: i32, descendant: i32, message: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // Waits for launchd to REAP an orphaned descendant — work this process does not
+        // control and cannot hurry. The old wait also busy-spun on `yield_now()` at
+        // 100% CPU, delaying the very reaping it waited for. A real regression leaves
+        // the descendant alive indefinitely, so this is a failure bound.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let group_gone = unsafe { libc::kill(-leader, 0) } != 0
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
@@ -7992,7 +8019,9 @@ mod handoff_process_group_tests {
                 }
                 panic!("{message}");
             }
-            std::thread::yield_now();
+            // sleep, not yield_now(): yielding keeps this thread RUNNABLE, so on an
+            // oversubscribed box it competes with the very work it is waiting for.
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -11493,6 +11522,13 @@ mod smooth_scroll_tests {
         let wid = WindowId(0);
         let term = seed_history(&app, wid);
         // Already at the live bottom; a downward notch has nowhere to go.
+        // Captured BEFORE the action on purpose. `scroll_wheel_animated` touches the
+        // pill with its own internal `Instant::now()`, so sampling `now` after it
+        // opened a ~1.2s window that a deschedule could cross. `is_active` is
+        // monotone-decreasing in `now` and the touch lands at t >= `before`, so
+        // asserting with `before` is true by construction whenever a touch happened —
+        // and still false when none did, which is the property under test.
+        let before = std::time::Instant::now();
         app.scroll_wheel_animated(wid, &term, -3);
         let ws = app.windows.get(&wid).unwrap();
         assert!(
@@ -11505,7 +11541,7 @@ mod smooth_scroll_tests {
             "the bounce is display-only — the engine stays parked at the edge"
         );
         assert!(
-            ws.scroll_pill.is_active(std::time::Instant::now(), true),
+            ws.scroll_pill.is_active(before, true),
             "the pill still wakes to show the edge"
         );
     }
@@ -12919,19 +12955,45 @@ mod full_nyan_sing_seam_tests {
     fn held_key_arms_through_the_press_path_and_screen_bytes_never_do() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        for i in 0..SING_ARM_REPEATS {
-            let now = std::time::Instant::now();
-            assert!(
-                !app.windows[&wid].nyan_sing.is_armed(now),
-                "no arm before repeat {SING_ARM_REPEATS} (i={i})"
-            );
-            app.input(wid, key('a'), Source::Human);
-        }
-        let now = std::time::Instant::now();
-        assert!(
-            app.windows[&wid].nyan_sing.is_armed(now),
-            "the configured at-cadence repeat arms through the press path"
-        );
+        // Same implicit window as `backspace_and_enter_release_the_hold_gracefully`
+        // below, and STRICTLY WORSE: that one only needed the final sample inside
+        // `SING_REPEAT_GAP` (250ms) of the last repeat, while this needs all sixteen
+        // inter-key gaps under it too — `note_char` resets `count` to 1 whenever a gap
+        // exceeds it (nyan_sing.rs:171-193). `App::input` reads `Instant::now()`
+        // internally (:1960), so a single mid-loop deschedule un-arms it legitimately
+        // and the assertion then reports a product regression that did not happen.
+        // Re-arm instead; `note_char` re-anchors at `count >= SING_ARM_REPEATS`.
+        let now = 'arm: {
+            for attempt in 0..8 {
+                // The "not before repeat 16" claim is only meaningful on a burst that
+                // actually stayed inside the cadence, so it is checked on the burst
+                // that ends up arming — the retry below discards descheduled runs.
+                for i in 0..SING_ARM_REPEATS {
+                    if i == 0 {
+                        assert!(
+                            !app.windows[&wid]
+                                .nyan_sing
+                                .is_armed(std::time::Instant::now()),
+                            "no arm before the burst begins (attempt={attempt})"
+                        );
+                    }
+                    app.input(wid, key('a'), Source::Human);
+                }
+                let sample = std::time::Instant::now();
+                if app.windows[&wid].nyan_sing.is_armed(sample) {
+                    break 'arm sample;
+                }
+                assert!(
+                    attempt < 7,
+                    "sixteen at-cadence repeats never armed through the press path in \
+                     8 tries — that is a regression, not scheduler noise"
+                );
+                // A partially-armed run must not leak into the next attempt's
+                // "no arm before the burst" check.
+                app = App::headless_for_test();
+            }
+            unreachable!("the bounded loop either breaks or asserts")
+        };
         assert_eq!(app.windows[&wid].nyan_sing.drive(now), 1.0);
 
         // TYPED PROVENANCE: `cat` of a repeated character floods the SCREEN,

@@ -317,15 +317,15 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Invalidate all cached BiDi resolutions (no-op here: BiDi reordering lives
-    /// in the `aterm-bidi` crate, reached through the off-by-default `bidi` feature
-    /// — see `bidi_reorder.rs`; this handler keeps no resolution cache to clear).
+    /// Invalidate the render-time BiDi projection of every stored row.
+    ///
+    /// The handler keeps no resolution cache, but mode/direction changes can
+    /// reorder existing cells on the next snapshot. Full damage is therefore
+    /// the observable invalidation consumed by damage-keyed frontends.
     #[inline]
-    #[allow(
-        clippy::unused_self,
-        reason = "no-op stub mirrors the &mut self signature of the real bidi method"
-    )]
-    pub(super) fn invalidate_bidi_all(&mut self) {}
+    pub(super) fn invalidate_bidi_all(&mut self) {
+        self.grid.damage_mut().mark_full();
+    }
 
     /// Perform a line feed, honoring DECLRMM left/right margins (#7687).
     ///

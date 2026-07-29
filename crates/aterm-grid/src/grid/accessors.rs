@@ -533,6 +533,53 @@ impl Grid {
         scrollback: impl Into<aterm_scrollback::ScrollbackStorage>,
     ) {
         self.storage.attach_scrollback(scrollback);
+        if !self.storage.scrollback_detached_for_reflow {
+            return;
+        }
+
+        // A reset/recovery path installed a replacement while the old worker
+        // is still unresolved. Untouched settings follow that authoritative
+        // replacement; dirty host requests remain authoritative and are
+        // enforced immediately (the snapshot stays live for last-writer-wins
+        // updates until finish/abort consumes it).
+        let replacement_line_limit = self
+            .storage
+            .scrollback
+            .as_ref()
+            .and_then(aterm_scrollback::ScrollbackStorage::line_limit)
+            .map(|limit| limit.saturating_add(self.storage.max_scrollback));
+        let replacement_memory_budget = self
+            .storage
+            .scrollback
+            .as_ref()
+            .map(aterm_scrollback::ScrollbackStorage::memory_budget);
+        debug_assert!(self.storage.pending_scrollback_settings.is_some());
+        if let Some(settings) = self.storage.pending_scrollback_settings.as_mut() {
+            if !settings.line_limit_changed {
+                settings.line_limit = replacement_line_limit;
+            }
+            if !settings.memory_budget_changed
+                && let Some(budget) = replacement_memory_budget
+            {
+                settings.memory_budget = budget;
+            }
+        }
+        let settings = self.storage.pending_scrollback_settings;
+        if let Some(settings) = settings {
+            if settings.memory_budget_changed
+                && let Err(error) = self.set_scrollback_memory_budget(settings.memory_budget)
+            {
+                aterm_log::warn!(
+                    "replacement scrollback could not fully enforce deferred memory budget: {error}"
+                );
+            }
+            if settings.line_limit_changed {
+                self.set_scrollback_line_limit(settings.line_limit);
+            }
+        }
+        // The replacement is authoritative now; do not leave window output
+        // staged indefinitely while the original worker is slow or dead.
+        self.drain_lazy_buffer();
     }
 
     /// Get the scrollback line limit.
@@ -540,6 +587,14 @@ impl Grid {
     #[inline]
     pub fn scrollback_line_limit(&self) -> Option<usize> {
         self.storage.scrollback_line_limit()
+    }
+
+    /// Get the effective tiered-store memory budget, including a change
+    /// deferred while the store is detached for off-thread reflow.
+    #[must_use]
+    #[inline]
+    pub fn scrollback_memory_budget(&self) -> Option<usize> {
+        self.storage.scrollback_memory_budget()
     }
 
     /// Set the retained scrollback line limit (`None` = unlimited).
@@ -567,7 +622,26 @@ impl Grid {
     /// lines scroll off) and a shrink evicts the OLDEST lines immediately,
     /// mirroring the store's `set_line_limit` truncation semantics.
     pub fn set_scrollback_line_limit(&mut self, limit: Option<usize>) {
-        if self.storage.scrollback.is_some() || self.storage.scrollback_detached_for_reflow {
+        // The worker owns the store during an off-thread reflow. Keep the
+        // newest request in the detach snapshot so the getter is truthful and
+        // re-attach can replay it. If another path has already attached a
+        // replacement store, apply below as well; replaying the same latest
+        // value when the stale worker result arrives is harmless.
+        if self.storage.scrollback_detached_for_reflow {
+            debug_assert!(
+                self.storage.pending_scrollback_settings.is_some(),
+                "detached scrollback must retain its settings snapshot"
+            );
+            if let Some(settings) = self.storage.pending_scrollback_settings.as_mut() {
+                settings.line_limit = limit;
+                settings.line_limit_changed = true;
+            }
+            if self.storage.scrollback.is_none() {
+                return;
+            }
+        }
+
+        if self.storage.scrollback.is_some() {
             // Retained-set size before the truncation (the lazy-buffer drain
             // below only MOVES staged lines into the store, so a change here
             // means lines were really evicted).
@@ -579,18 +653,13 @@ impl Grid {
             let store_limit = limit.map(|l| l.saturating_sub(ring_cap));
             // Drain staged lazy lines first (via scrollback_mut) so the store's
             // truncation sees the full history — the historical Terminal path.
-            // While the store is out for an off-thread reflow this is a no-op
-            // (the pre-existing behavior); the ring must NOT be re-capped then.
             if let Some(sb) = self.scrollback_mut() {
                 sb.set_line_limit(store_limit);
             }
             // `limit < ring cap`: the ring alone must not retain more than the
-            // total — re-cap it (skipped while detached for reflow: the ring
-            // is holding the only live copy of recent history then).
+            // total — re-cap it.
             if let Some(l) = limit
                 && l < ring_cap
-                && !(self.storage.scrollback_detached_for_reflow
-                    && self.storage.scrollback.is_none())
             {
                 self.storage.max_scrollback = l;
                 let excess = self.storage.ring_buffer_scrollback().saturating_sub(l);
@@ -617,6 +686,58 @@ impl Grid {
         if excess > 0 {
             self.evict_oldest_ring_scrollback(excess);
         }
+    }
+
+    /// Set the tiered scrollback store's byte budget.
+    ///
+    /// While the store is detached for off-thread reflow, records the newest
+    /// request and reports success; re-attach applies it before staged output
+    /// is drained. Ring-only grids have no byte-budgeted store, so this is a
+    /// no-op there.
+    pub fn set_scrollback_memory_budget(
+        &mut self,
+        budget: usize,
+    ) -> Result<(), aterm_scrollback::ScrollbackError> {
+        let budget = budget.max(1);
+        if self.storage.scrollback_detached_for_reflow {
+            debug_assert!(
+                self.storage.pending_scrollback_settings.is_some(),
+                "detached scrollback must retain its settings snapshot"
+            );
+            if let Some(settings) = self.storage.pending_scrollback_settings.as_mut() {
+                settings.memory_budget = budget;
+                settings.memory_budget_changed = true;
+            }
+            if self.storage.scrollback.is_none() {
+                return Ok(());
+            }
+        }
+
+        let before = self.scrollback_lines();
+        let mut result = match self.storage.scrollback.as_mut() {
+            Some(scrollback) => scrollback.set_memory_budget(budget),
+            None => Ok(()),
+        };
+        // Preserve the historical `scrollback_mut` contract: callers setting a
+        // budget also settle staged history. Do it AFTER installing the new
+        // budget so a raise cannot evict those rows against the stale lower cap.
+        if self.storage.scrollback.is_some() {
+            self.drain_lazy_buffer();
+            // `drain_lazy_buffer` enforces internally but cannot return its
+            // error. Re-run the idempotent setter so this API still reports an
+            // enforcement failure caused specifically by newly drained rows.
+            if let Some(scrollback) = self.storage.scrollback.as_mut() {
+                let after_drain = scrollback.set_memory_budget(budget);
+                if result.is_ok() {
+                    result = after_drain;
+                }
+            }
+        }
+        self.clamp_display_offset();
+        if self.scrollback_lines() != before {
+            self.storage.mark_content_full();
+        }
+        result
     }
 
     /// Monotonic count of history lines LOST to non-user-requested truncation

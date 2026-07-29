@@ -46,33 +46,56 @@ const MAX_HANDOFF_AGGREGATE_GRID_BYTES: u64 = 256 * 1024 * 1024;
 // decoded allocation separately from encoded bytes, before `restore_grid`
 // constructs any `Cell` vectors. Alt-screen checkpoints consume a second grid.
 const MAX_HANDOFF_GRID_CELLS: u64 = 32 * 1024;
+/// Maximum scrollback lines a handoff checkpoint may carry, per session.
+///
+/// The wire used to be defined as "exactly `rows` line records", which is why an
+/// in-session update left every tab with a single screen of history. Carrying
+/// history is therefore a WIRE change, and this constant is its ceiling: the
+/// consumer bounds its allocation from the authenticated meta before decoding a
+/// byte, so an untrusted `history_lines` above this is rejected outright rather
+/// than believed.
+///
+/// 256 rather than the full 1000-line ring: `dimension_grid_cap` prices a line
+/// generously (512 bytes per cell plus 16 KiB framing) precisely so a hostile
+/// meta cannot authorize a huge decode, and that generosity multiplies against
+/// every carried line. 256 takes a typical tab from ~50 lines of retained
+/// history to ~300 — a real improvement — while keeping the per-grid ceiling in
+/// the same order of magnitude it already had. The producer additionally
+/// degrades to fewer lines, or none, under deadline pressure, so this is an upper
+/// bound and never a requirement.
+const MAX_HANDOFF_HISTORY_LINES: u32 = 256;
+
+/// The producer's per-session history target. Same value as the wire ceiling —
+/// the ceiling is what the CONSUMER will tolerate, this is what the PRODUCER
+/// aims for, and keeping them equal means a healthy capture carries the maximum
+/// the protocol allows.
+#[must_use]
+pub(crate) fn max_handoff_history_lines() -> u32 {
+    MAX_HANDOFF_HISTORY_LINES
+}
 const MAX_HANDOFF_AGGREGATE_GRID_CELLS: u64 = 128 * 1024;
 const READY_WIRE_MAGIC: &[u8; 4] = b"ASR1";
 const COMMIT_WIRE_MAGIC: &[u8; 4] = b"ASC1";
 pub(crate) const READY_WIRE_LEN: usize = 4 + 4 + 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HandoffProtocolShape {
-    DirectLegacy,
-    OverlapLegacy,
-    OverlapModern,
-}
-
-fn handoff_protocol_shape(
+/// Whether an env set is the ONE legal handoff shape: manifest + fds + nonce +
+/// layout + ready + commit, all present.
+///
+/// This used to answer with a three-variant `HandoffProtocolShape` whose other
+/// two variants described the v0.52/v0.53 bridge. When that bridge was deleted
+/// from `take_incoming`, leaving the variants here made the two functions
+/// DISAGREE: a legacy-shaped env set was still judged recognizable authority
+/// (so its descriptors were preserved for the exec image) and was then refused
+/// on arrival. One notion of "a legal handoff", in one place, is the point.
+fn handoff_is_modern_overlap(
     manifest: bool,
     fds: bool,
     nonce: bool,
     layout: bool,
     ready: bool,
     commit: bool,
-) -> Option<HandoffProtocolShape> {
-    let base = manifest && fds && nonce;
-    match (base, layout, ready, commit) {
-        (true, false, false, false) => Some(HandoffProtocolShape::DirectLegacy),
-        (true, false, true, false) => Some(HandoffProtocolShape::OverlapLegacy),
-        (true, true, true, true) => Some(HandoffProtocolShape::OverlapModern),
-        _ => None,
-    }
+) -> bool {
+    manifest && fds && nonce && layout && ready && commit
 }
 
 /// Exact, attempt-bound proof of the PTYs the incoming process really adopted.
@@ -257,6 +280,7 @@ fn screen_digest_refs(mut screens: Vec<(u64, &TerminalCheckpoint)>) -> Option<[u
             &mut aggregate_cells,
             checkpoint.rows,
             checkpoint.cols,
+            checkpoint.history_lines,
             checkpoint.alt_grid.is_some(),
         )? != cap
         {
@@ -264,11 +288,18 @@ fn screen_digest_refs(mut screens: Vec<(u64, &TerminalCheckpoint)>) -> Option<[u
         }
         if !checkpoint.parser_ground
             || checkpoint.alt_grid.is_some() != checkpoint.alt_cursor.is_some()
-            || !checkpoint_grid_is_canonical(&checkpoint.grid, checkpoint.rows, checkpoint.cols)
+            || !checkpoint_grid_is_canonical(
+                &checkpoint.grid,
+                checkpoint.rows,
+                checkpoint.cols,
+                checkpoint.history_lines,
+            )
             || u64::try_from(checkpoint.grid.len()).ok()? > cap
             || checkpoint.alt_grid.as_ref().is_some_and(|alt| {
                 u64::try_from(alt.len()).is_ok_and(|len| len > cap)
-                    || !checkpoint_grid_is_canonical(alt, checkpoint.rows, checkpoint.cols)
+                    // The alt screen keeps no scrollback: it is always exactly
+                    // `rows` records, whatever the main grid carried.
+                    || !checkpoint_grid_is_canonical(alt, checkpoint.rows, checkpoint.cols, 0)
             })
         {
             return None;
@@ -414,13 +445,6 @@ fn take_regular_capped(
     result
 }
 
-fn take_legacy_layout_capped() -> Option<crate::restore::RestoreManifest> {
-    let path = crate::restore::manifest_path()?;
-    let parent = path.parent()?;
-    take_regular_capped(&path, parent, MAX_HANDOFF_LAYOUT_BYTES)
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|wire| crate::restore::RestoreManifest::from_toml(&wire))
-}
 
 fn take_grid_capped(
     path: &std::path::Path,
@@ -478,8 +502,8 @@ fn checkpoint_meta_is_bounded(meta: &CheckpointMeta) -> bool {
             .is_none_or(|cwd| cwd.len() <= 8 * 1024 && !cwd.contains('\0'))
 }
 
-fn parse_checkpoint_meta(carry: &ScreenCarry, legacy_bridge: bool) -> Option<CheckpointMeta> {
-    if !legacy_bridge {
+fn parse_checkpoint_meta(carry: &ScreenCarry) -> Option<CheckpointMeta> {
+    {
         if carry.schema != ScreenCarry::SCHEMA {
             return None;
         }
@@ -507,31 +531,30 @@ fn parse_checkpoint_meta(carry: &ScreenCarry, legacy_bridge: bool) -> Option<Che
         if !REQUIRED.iter().all(|key| object.contains_key(*key)) {
             return None;
         }
-        return serde_json::from_value(value).ok();
+        serde_json::from_value(value).ok()
     }
-    // The one-release old-parent bridge remains tolerant of its additive v0
-    // carry, but rejects unknown future schemas.
-    if carry.schema > ScreenCarry::SCHEMA {
-        return None;
-    }
-    serde_json::from_str(&carry.meta).ok()
 }
 
-fn dimension_grid_cap(rows: u16, cols: u16) -> Option<u64> {
+fn dimension_grid_cap(rows: u16, cols: u16, history: u32) -> Option<u64> {
     if rows == 0
         || cols == 0
         || rows > aterm_core::grid::MAX_GRID_ROWS
         || cols > aterm_core::grid::MAX_GRID_COLS
+        || history > MAX_HANDOFF_HISTORY_LINES
     {
         return None;
     }
+    // A carried checkpoint holds `history + rows` records, so the budget must be
+    // priced over all of them. `history` is already bounded above, so this cannot
+    // be inflated by a hostile meta.
+    let rows = u64::from(rows).checked_add(u64::from(history))?;
     // Visible-only checkpoints contain exactly `rows` line-codec records. The
     // cap scales with cells plus bounded per-line framing/attribute overhead,
     // then has a protocol-wide ceiling so a maximum-dimension hostile meta can
     // never authorize a multi-gigabyte startup allocation.
-    let cells = u64::from(rows).checked_mul(u64::from(cols))?;
+    let cells = rows.checked_mul(u64::from(cols))?;
     let cell_budget = cells.checked_mul(512)?;
-    let line_budget = u64::from(rows).checked_mul(16 * 1024)?;
+    let line_budget = rows.checked_mul(16 * 1024)?;
     Some(
         64_u64
             .checked_mul(1024)?
@@ -543,7 +566,7 @@ fn dimension_grid_cap(rows: u16, cols: u16) -> Option<u64> {
 
 fn checkpoint_grid_cap(meta: &CheckpointMeta) -> Option<u64> {
     checkpoint_meta_is_bounded(meta).then_some(())?;
-    dimension_grid_cap(meta.rows, meta.cols)
+    dimension_grid_cap(meta.rows, meta.cols, meta.history_lines)
 }
 
 /// One dimension/allocation admission seam shared by UI pre-capture,
@@ -553,14 +576,24 @@ pub(crate) fn admit_checkpoint_dimensions(
     used_cells: &mut u64,
     rows: u16,
     cols: u16,
+    history: u32,
     has_alt: bool,
 ) -> Option<u64> {
-    let cap = dimension_grid_cap(rows, cols)?;
+    let cap = dimension_grid_cap(rows, cols, history)?;
+    // The VISIBLE grid keeps its original per-grid ceiling: that bound exists to
+    // refuse an absurd screen geometry and has nothing to do with history.
     let cells = u64::from(rows).checked_mul(u64::from(cols))?;
     if cells > MAX_HANDOFF_GRID_CELLS {
         return None;
     }
-    let cost = cells.checked_mul(if has_alt { 2 } else { 1 })?;
+    // Carried history is priced on top, bounded separately by
+    // MAX_HANDOFF_HISTORY_LINES (already enforced in `dimension_grid_cap`).
+    let history_cells = u64::from(history).checked_mul(u64::from(cols))?;
+    // The alt grid never carries history (the live alt screen keeps no
+    // scrollback), so it costs one visible grid, not one carried grid.
+    let cost = cells
+        .checked_add(history_cells)?
+        .checked_add(if has_alt { cells } else { 0 })?;
     let next = used_cells.checked_add(cost)?;
     if next > MAX_HANDOFF_AGGREGATE_GRID_CELLS {
         return None;
@@ -569,7 +602,7 @@ pub(crate) fn admit_checkpoint_dimensions(
     Some(cap)
 }
 
-fn checkpoint_grid_is_canonical(bytes: &[u8], rows: u16, cols: u16) -> bool {
+fn checkpoint_grid_is_canonical(bytes: &[u8], rows: u16, cols: u16, history: u32) -> bool {
     // A materialized grid cell holds at most one 256-byte grapheme unit. Bound
     // content and full record framing from the authenticated column count before
     // the decoder allocates any line payload or sidecars.
@@ -577,42 +610,34 @@ fn checkpoint_grid_is_canonical(bytes: &[u8], rows: u16, cols: u16) -> bool {
     let record_cap = 16usize
         .saturating_mul(1024)
         .saturating_add(usize::from(cols).saturating_mul(512));
+    // A carried checkpoint is `history` scrollback records followed by exactly
+    // `rows` visible records. `history` is bounded by the caller's meta check, so
+    // this total can never be inflated by the payload itself.
+    if history > MAX_HANDOFF_HISTORY_LINES {
+        return false;
+    }
+    let Some(expected) = usize::from(rows).checked_add(history as usize) else {
+        return false;
+    };
     let Some(lines) = aterm_core::scrollback::deserialize_lines_strict(
         bytes,
-        usize::from(rows),
+        expected,
         usize::from(cols),
         content_cap,
         record_cap,
     ) else {
         return false;
     };
-    lines.len() == usize::from(rows)
-        && aterm_core::scrollback::serialize_lines(&lines).as_slice() == bytes
+    lines.len() == expected && aterm_core::scrollback::serialize_lines(&lines).as_slice() == bytes
 }
 
 fn normalize_incoming_checkpoint_grid(
     bytes: Vec<u8>,
     rows: u16,
     cols: u16,
-    legacy_v052_screen: bool,
+    history: u32,
 ) -> Option<Vec<u8>> {
-    if legacy_v052_screen {
-        // v0.52 serialized `history ++ Grid::row(0..rows)`, but Grid::row was
-        // display-offset-aware and the meta omitted display_offset. With any
-        // history, an unscrolled and a scrolled producer can emit an ambiguous
-        // payload whose missing live-bottom rows are unrecoverable. A declared
-        // line count equal to rows proves there was no history, which in turn
-        // proves display_offset == 0. This is the only sound hot-bridge witness.
-        let declared = bytes
-            .get(..4)
-            .and_then(|prefix| <[u8; 4]>::try_from(prefix).ok())
-            .map(u32::from_le_bytes)
-            .and_then(|count| usize::try_from(count).ok())?;
-        if declared != usize::from(rows) {
-            return None;
-        }
-    }
-    checkpoint_grid_is_canonical(&bytes, rows, cols).then_some(bytes)
+    checkpoint_grid_is_canonical(&bytes, rows, cols, history).then_some(bytes)
 }
 
 /// Validate the volatile fd channel as an exact bijection before any inherited
@@ -793,18 +818,19 @@ pub(crate) fn write_outgoing(
             &mut aggregate_cells,
             cp.rows,
             cp.cols,
+            cp.history_lines,
             cp.alt_grid.is_some(),
         );
         if !cp.parser_ground
             || admitted_cap.is_none()
             || checkpoint_grid_cap(&checkpoint_meta)
                 .is_none_or(|cap| u64::try_from(cp.grid.len()).map_or(true, |len| len > cap))
-            || !checkpoint_grid_is_canonical(&cp.grid, cp.rows, cp.cols)
+            || !checkpoint_grid_is_canonical(&cp.grid, cp.rows, cp.cols, cp.history_lines)
             || cp.alt_grid.is_some() != cp.alt_cursor.is_some()
             || cp.alt_grid.as_ref().is_some_and(|alt| {
                 u64::try_from(alt.len()).map_or(true, |len| {
                     len > checkpoint_grid_cap(&checkpoint_meta).unwrap_or(0)
-                }) || !checkpoint_grid_is_canonical(alt, cp.rows, cp.cols)
+                }) || !checkpoint_grid_is_canonical(alt, cp.rows, cp.cols, 0)
             })
         {
             for path in written_blobs {
@@ -947,7 +973,6 @@ pub(crate) struct IncomingHandoff {
     /// Exact manifest/fd identity set claimed by the authenticated outgoing
     /// process. Retained for the one-release legacy one-channel bridge: the new
     /// child signals an old parent only when its ACTUAL adopted pool equals this.
-    pub expected: Option<Vec<(u64, i32, i32)>>,
     /// Attempt-bound layout sidecar consumed from the same private nonce prefix.
     pub layout: Option<crate::restore::RestoreManifest>,
     /// [`layout_wire_digest`] over the EXACT sidecar bytes this process read —
@@ -960,10 +985,6 @@ pub(crate) struct IncomingHandoff {
     /// [`screen_wire_digest`] over the EXACT carried meta/grid bytes, for the
     /// same reason.
     pub screen_digest: Option<[u8; 32]>,
-    /// True only for the one-release v0.52/v0.53 bridge: a ready channel was
-    /// present, the v2 Commit and layout envs were genuinely absent, and the
-    /// old global restore slot covered the exact authenticated PTY id set.
-    pub legacy_layout_bridge: bool,
 }
 
 #[cfg(unix)]
@@ -1222,7 +1243,10 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
             authority_valid = false;
         }
     }
-    let protocol_shape = handoff_protocol_shape(
+    // A partial or legacy-shaped env set is now unrecognizable authority, so its
+    // descriptors are closed here rather than carried to an exec image that would
+    // refuse them anyway.
+    let modern = handoff_is_modern_overlap(
         manifest_present,
         fds_present,
         nonce_present,
@@ -1230,12 +1254,10 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
         ready_present,
         commit_present,
     );
-    if recognizable && protocol_shape.is_none() {
+    if recognizable && !modern {
         authority_valid = false;
     }
-    if (protocol_shape == Some(HandoffProtocolShape::OverlapModern)) != parent_pid.is_some()
-        || (parent_present && parent_pid.is_none())
-    {
+    if modern != parent_pid.is_some() || (parent_present && parent_pid.is_none()) {
         authority_valid = false;
     }
     fds.sort_unstable();
@@ -1435,54 +1457,8 @@ impl ReadySignal {
         write_wire(&self.fd, &proof.to_wire())
     }
 
-    /// v0.52/v0.53 compatibility: their parent waits for one byte and has no
-    /// Commit channel. Call only after the child independently proved its actual
-    /// adopted set exactly equals the authenticated outgoing set.
-    #[must_use]
-    pub(crate) fn signal_legacy(self) -> bool {
-        use std::os::fd::AsRawFd as _;
-        let byte = [1u8];
-        loop {
-            // SAFETY: one-byte write from a live fixed buffer to the private pipe.
-            let wrote = unsafe { libc::write(self.fd.as_raw_fd(), byte.as_ptr().cast(), 1) };
-            if wrote == 1 {
-                return true;
-            }
-            if wrote < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                continue;
-            }
-            return false;
-        }
-    }
 }
 
-/// One-release v0.52 one-channel activation bridge. The old parent has no
-/// Commit channel, so a single byte is irreversible authority: emit it only
-/// after exact authenticated adoption and a strictly newer child build. Reader
-/// resources are already prepared behind `gate`; release is infallible and
-/// happens only after the byte was written successfully.
-#[cfg(unix)]
-pub(crate) fn activate_legacy_bridge(
-    ready: ReadySignal,
-    gate: &crate::spawn::DeferredReaderGate,
-    mut actual: Vec<(u64, i32, i32)>,
-    mut expected: Vec<(u64, i32, i32)>,
-    child_build: u64,
-    parent_build: Option<u64>,
-    debug_override: bool,
-) -> bool {
-    actual.sort_unstable();
-    expected.sort_unstable();
-    let activation_proved =
-        debug_override || parent_build.is_some_and(|parent_build| child_build > parent_build);
-    if !activation_proved || actual != expected || !ready.signal_legacy() {
-        return false;
-    }
-    gate.release();
-    true
-}
 
 #[cfg(unix)]
 pub(crate) struct CommitReceiver {
@@ -1857,23 +1833,18 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
     // only an old parent has neither the v2 Commit nor layout env. The legacy
     // bridge may consume the old global restore slot, but only after joining it
     // to this authenticated manifest's exact terminal-id set.
-    let legacy_protocol = !commit_env_present && layout_path.is_none();
-    let modern_protocol = commit_env_present && ready_env_present && layout_path.is_some();
-    if !legacy_protocol && !modern_protocol {
+    // MODERN OVERLAP ONLY. The v0.52/v0.53 bridge that used to sit beside this —
+    // a parent with neither a Commit channel nor an attempt-bound layout sidecar,
+    // reading the mutable GLOBAL restore slot and signalling with one unproven
+    // byte — is gone. It existed for parents in the retired two-component
+    // lineage, and those builds cannot elect a `vMAJOR.MINOR.PATCH` release, so
+    // no such parent can ever hand off to this binary. Keeping it meant every
+    // incoming handoff carried a second, weaker acceptance path whose layout was
+    // never committed to by the peer.
+    if !(commit_env_present && ready_env_present && layout_path.is_some()) {
         return IncomingHandoff::default();
     }
-    let (layout, layout_digest) = if legacy_protocol {
-        // The legacy bridge reads the mutable global restore slot, not an
-        // attempt-bound sidecar, so there is no parent-written wire to commit
-        // to. It signals with `signal_legacy` — ONE byte, no proof compared by
-        // anyone — so this digest is only ever a `ReadySignal` field that is
-        // never hashed against a peer. Deriving it locally is therefore sound
-        // here, and only here.
-        let layout = take_legacy_layout_capped()
-            .filter(|layout| legacy_layout_is_exact(Some(layout), &expected_ids));
-        let digest = layout.as_ref().and_then(layout_digest);
-        (layout, digest)
-    } else {
+    let (layout, layout_digest) = {
         layout_path
             .and_then(|layout_path| {
                 let layout_path = std::path::Path::new(&layout_path);
@@ -1901,7 +1872,6 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
     if layout.is_none() {
         return IncomingHandoff::default();
     }
-    let legacy_layout_bridge = legacy_protocol && ready_env_present;
     let manifest_path = std::path::Path::new(&path);
     let Some(manifest_stem) = manifest_path.file_stem().and_then(|stem| stem.to_str()) else {
         return IncomingHandoff::default();
@@ -1930,13 +1900,13 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
             // offset, so a history-bearing payload cannot prove live-bottom state.
             // Alt meta/blob presence must agree.
             let sc = rec.screen.as_ref()?;
-            let meta = parse_checkpoint_meta(sc, legacy_protocol)?;
-            let legacy_v052_screen = legacy_protocol && sc.schema == 0;
+            let meta = parse_checkpoint_meta(sc)?;
             let grid_cap = checkpoint_grid_cap(&meta)?;
             if admit_checkpoint_dimensions(
                 &mut used_grid_cells,
                 meta.rows,
                 meta.cols,
+                meta.history_lines,
                 meta.alt_cursor.is_some(),
             )? != grid_cap
             {
@@ -1949,8 +1919,12 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
             }
             let wire_cap = grid_cap;
             let grid = take_grid_capped(&grid_path, &dir, wire_cap, &mut remaining_grid_bytes)?;
-            let grid =
-                normalize_incoming_checkpoint_grid(grid, meta.rows, meta.cols, legacy_v052_screen)?;
+            let grid = normalize_incoming_checkpoint_grid(
+                grid,
+                meta.rows,
+                meta.cols,
+                meta.history_lines,
+                )?;
             let alt_grid = match (&meta.alt_cursor, sc.alt_grid_file.as_deref()) {
                 (None, None) => None,
                 (Some(_), Some(encoded_path)) => {
@@ -1961,12 +1935,13 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
                     }
                     let bytes =
                         take_grid_capped(&alt_path, &dir, wire_cap, &mut remaining_grid_bytes)?;
+                    // The alt screen never carries history.
                     Some(normalize_incoming_checkpoint_grid(
                         bytes,
                         meta.rows,
                         meta.cols,
-                        legacy_v052_screen,
-                    )?)
+                        0,
+                        )?)
                 }
                 _ => return None,
             };
@@ -2027,21 +2002,12 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
         adopted,
         window: manifest.window,
         nonce: Some(env_nonce),
-        expected: Some(expected),
         layout,
         layout_digest,
         screen_digest: Some(screen_digest),
-        legacy_layout_bridge,
     }
 }
 
-#[must_use]
-fn legacy_layout_is_exact(
-    layout: Option<&crate::restore::RestoreManifest>,
-    expected_ids: &[u64],
-) -> bool {
-    layout.is_some_and(|layout| layout.covers_exact_seamless_ids(expected_ids))
-}
 
 #[cfg(test)]
 mod tests {
@@ -2134,7 +2100,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_shape_table_accepts_only_three_exact_forms() {
+    fn protocol_shape_table_accepts_exactly_one_form() {
         for bits in 0u8..64 {
             let manifest = bits & 1 != 0;
             let fds = bits & 2 != 0;
@@ -2142,13 +2108,11 @@ mod tests {
             let layout = bits & 8 != 0;
             let ready = bits & 16 != 0;
             let commit = bits & 32 != 0;
-            let got = handoff_protocol_shape(manifest, fds, nonce, layout, ready, commit);
-            let expected = match (manifest, fds, nonce, layout, ready, commit) {
-                (true, true, true, false, false, false) => Some(HandoffProtocolShape::DirectLegacy),
-                (true, true, true, false, true, false) => Some(HandoffProtocolShape::OverlapLegacy),
-                (true, true, true, true, true, true) => Some(HandoffProtocolShape::OverlapModern),
-                _ => None,
-            };
+            let got = handoff_is_modern_overlap(manifest, fds, nonce, layout, ready, commit);
+            let expected = matches!(
+                (manifest, fds, nonce, layout, ready, commit),
+                (true, true, true, true, true, true)
+            );
             assert_eq!(got, expected, "shape bits {bits:06b}");
         }
     }
@@ -2156,107 +2120,87 @@ mod tests {
     // Immutable bytes emitted by v0.52's `serialize_lines`. Plain lines use its
     // v3 record form: version, flags, LE content length, content, no attrs, zero
     // links. Screen metadata in that release had no `schema` field.
-    const V052_NO_HISTORY_GRID_FIXTURE: &[u8] = &[
-        2, 0, 0, 0, 3, 0, 9, 0, 0, 0, b'v', b'i', b's', b'i', b'b', b'l', b'e', b'-', b'0', 0, 0,
-        0, 3, 0, 9, 0, 0, 0, b'v', b'i', b's', b'i', b'b', b'l', b'e', b'-', b'1', 0, 0, 0,
-    ];
-    const V052_SCROLLBACK_GRID_FIXTURE: &[u8] = &[
-        4, 0, 0, 0, 3, 0, 9, 0, 0, 0, b'h', b'i', b's', b't', b'o', b'r', b'y', b'-', b'0', 0, 0,
-        0, 3, 0, 9, 0, 0, 0, b'h', b'i', b's', b't', b'o', b'r', b'y', b'-', b'1', 0, 0, 0, 3, 0,
-        9, 0, 0, 0, b'v', b'i', b's', b'i', b'b', b'l', b'e', b'-', b'0', 0, 0, 0, 3, 0, 9, 0, 0,
-        0, b'v', b'i', b's', b'i', b'b', b'l', b'e', b'-', b'1', 0, 0, 0,
-    ];
     // Actual v0.52 producer semantics at display_offset=1: it first serialized
     // all history, then `Grid::row(r)` appended the scrolled viewport
     // (`history-1`, `visible-0`) instead of the live (`visible-0`, `visible-1`).
-    const V052_SCROLLED_PRODUCER_GRID_FIXTURE: &[u8] = &[
-        4, 0, 0, 0, 3, 0, 9, 0, 0, 0, b'h', b'i', b's', b't', b'o', b'r', b'y', b'-', b'0', 0, 0,
-        0, 3, 0, 9, 0, 0, 0, b'h', b'i', b's', b't', b'o', b'r', b'y', b'-', b'1', 0, 0, 0, 3, 0,
-        9, 0, 0, 0, b'h', b'i', b's', b't', b'o', b'r', b'y', b'-', b'1', 0, 0, 0, 3, 0, 9, 0, 0,
-        0, b'v', b'i', b's', b'i', b'b', b'l', b'e', b'-', b'0', 0, 0, 0,
-    ];
     // Captured from v0.52's CheckpointMeta serializer for a terminal widened to
     // 24 columns, given a custom stop at column 22, then narrowed to 20 before
     // `visible-v052`. It has neither later saved-cursor field; the enclosing
     // ScreenCarry also had no schema key. The four retained off-width entries
     // are the real resize semantics the compatibility parser must preserve.
-    const V052_CHECKPOINT_META_FIXTURE: &str = r#"{"alt_cursor":null,"charset":{"g0":"Ascii","g1":"Ascii","g1_96":null,"g2":"Ascii","g2_96":null,"g3":"Ascii","g3_96":null,"gl":"G0","gr":"G2","single_shift":"None"},"cols":20,"current_working_directory":null,"cursor":{"cursor_col":12,"cursor_row":0,"margin_left":0,"margin_right":19,"pending_wrap":false,"scroll_bottom":1,"scroll_top":0,"tab_stops":[false,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false,true,false]},"kitty_keyboard":{"alt_saved_flags":null,"alt_sp":0,"alt_stack":[0,0,0,0,0,0,0,0],"flags":0,"main_saved_flags":null,"main_sp":0,"main_stack":[0,0,0,0,0,0,0,0]},"modes":{"allow_notifications":false,"allow_osc52_query":false,"allow_osc52_set":false,"allow_palette_reconfigure":false,"allow_session_memory":false,"allow_window_ops":false,"alt_send_escape":true,"alternate_screen":false,"alternate_scroll":false,"ambiguous_width_double":false,"application_cursor_keys":false,"application_keypad":false,"auto_wrap":true,"backarrow_sends_bs":false,"bidi_arrow_swap":true,"bidi_autodetection":false,"bidi_box_mirroring":false,"bidi_direction":"Auto","bidi_mode":"Implicit","bracketed_paste":false,"color_scheme":"Dark","column_mode_132":false,"cursor_blink":false,"cursor_style":"BlinkingBlock","cursor_visible":true,"deccolm_enable":false,"decncsm":false,"focus_reporting":false,"grapheme_cluster_mode":false,"in_band_size_reports":false,"insert_mode":false,"kitty_keyboard_enabled":true,"left_right_margin_mode":false,"meta_send_escape":false,"mode_1045":false,"mouse_encoding":"X10","mouse_mode":"None","new_line_mode":false,"origin_mode":false,"report_color_scheme":false,"require_shell_integration_nonce":false,"reverse_video":false,"reverse_wraparound":false,"sixel_display_mode":false,"special_modifiers":true,"stream_attribute_extent":true,"synchronized_output":false,"vt52_mode":false,"vt_level":"VT420"},"rows":2,"secure_keyboard_entry":false,"style_bg_bits":4278190080,"style_fg_bits":4294967295,"style_flag_bits":0,"style_protected":false,"taskbar_progress":null,"xterm_keyboard":{"format_other_keys":0,"modify_other_keys":0}}"#;
 
-    fn actual_v052_manifest_fixture(grid_path: &std::path::Path) -> String {
-        let grid_path = grid_path
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        format!(
-            r#"schema = 1
-
-[[sessions]]
-local_id = 0
-sid = "s-v052-fixture"
-state = "alive"
-title = "legacy shell"
-
-[sessions.screen]
-meta = '''{V052_CHECKPOINT_META_FIXTURE}'''
-grid_file = "{grid_path}"
-
-[window]
-rows = 2
-cols = 20
-"#,
-        )
-    }
 
     #[test]
-    fn actual_v052_no_history_is_the_only_sound_legacy_screen_witness() {
-        let no_history =
-            normalize_incoming_checkpoint_grid(V052_NO_HISTORY_GRID_FIXTURE.to_vec(), 2, 20, true)
-                .expect("zero history proves v0.52 display_offset was zero");
-        let lines = aterm_core::scrollback::deserialize_lines_strict(
-            &no_history,
-            2,
-            20,
-            20 * 256,
-            16 * 1024 + 20 * 512,
-        )
-        .expect("projected modern-visible wire");
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].as_str(), Some("visible-0"));
-        assert_eq!(lines[1].as_str(), Some("visible-1"));
+    fn a_carried_checkpoint_round_trips_its_scrollback_and_bounds_it() {
+        use aterm_core::terminal::Terminal;
 
-        assert!(
-            normalize_incoming_checkpoint_grid(V052_SCROLLBACK_GRID_FIXTURE.to_vec(), 2, 20, true,)
-                .is_none(),
-            "any v0.52 history is ambiguous because display_offset was omitted"
+        // A terminal with far more history than any bound would carry.
+        let mut t = Terminal::new(4, 20);
+        for i in 0..400 {
+            t.process(format!("line{i}\r\n").as_bytes());
+        }
+
+        // Visible-only is the old behaviour and must still be expressible.
+        let visible = t.checkpoint_visible().expect("Ground");
+        assert_eq!(visible.history_lines, 0);
+        assert!(checkpoint_grid_is_canonical(&visible.grid, 4, 20, 0));
+
+        // A carried checkpoint declares its history and validates against it.
+        let carried = t
+            .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
+            .expect("Ground");
+        assert_eq!(
+            carried.history_lines, MAX_HANDOFF_HISTORY_LINES,
+            "a deep ring fills the bound exactly"
         );
         assert!(
-            normalize_incoming_checkpoint_grid(
-                V052_SCROLLED_PRODUCER_GRID_FIXTURE.to_vec(),
-                2,
-                20,
-                true,
-            )
-            .is_none(),
-            "the genuine scrolled producer shape can never hot-adopt"
+            checkpoint_grid_is_canonical(
+                &carried.grid,
+                carried.rows,
+                carried.cols,
+                carried.history_lines
+            ),
+            "the consumer must accept the shape the producer emits"
         );
-        let mut trailing = V052_NO_HISTORY_GRID_FIXTURE.to_vec();
-        trailing.push(0);
+        // ...and rejects it when told the wrong history count, so the declared
+        // length is genuinely load-bearing rather than decorative.
+        assert!(!checkpoint_grid_is_canonical(
+            &carried.grid,
+            carried.rows,
+            carried.cols,
+            0
+        ));
+
+        // The bound is a real ceiling: a hostile meta cannot exceed it.
         assert!(
-            normalize_incoming_checkpoint_grid(trailing, 2, 20, true).is_none(),
-            "legacy trailing bytes are not silently ignored"
+            dimension_grid_cap(4, 20, MAX_HANDOFF_HISTORY_LINES + 1).is_none(),
+            "history beyond the ceiling is refused before any decode"
         );
-        let over_count = u32::MAX.to_le_bytes().to_vec();
-        assert!(
-            normalize_incoming_checkpoint_grid(over_count, 2, 20, true).is_none(),
-            "legacy declared line count must equal rows exactly"
-        );
-        let mut malformed = V052_NO_HISTORY_GRID_FIXTURE.to_vec();
-        malformed[6] = u8::MAX;
-        assert!(
-            normalize_incoming_checkpoint_grid(malformed, 2, 20, true).is_none(),
-            "malformed old records fail closed"
+
+        // A shallow ring carries only what it has, not the whole bound.
+        let mut small = Terminal::new(4, 20);
+        small.process(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n");
+        let shallow = small
+            .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
+            .expect("Ground");
+        assert!(shallow.history_lines < MAX_HANDOFF_HISTORY_LINES);
+        assert!(checkpoint_grid_is_canonical(
+            &shallow.grid,
+            shallow.rows,
+            shallow.cols,
+            shallow.history_lines
+        ));
+
+        // THE POINT: restoring a carried checkpoint really does bring history back.
+        let restored =
+            Terminal::from_checkpoint(&carried, aterm_core::terminal::HostBindings::none());
+        assert_eq!(
+            restored.grid().scrollback_lines(),
+            MAX_HANDOFF_HISTORY_LINES as usize,
+            "a seamless update must not truncate the tab to one screen"
         );
     }
+
 
     #[test]
     fn modern_wide_narrow_checkpoint_preserves_full_tab_vector_and_rejects_bad_lengths() {
@@ -2275,7 +2219,7 @@ cols = 20
             grid_file: "unused-in-parser-test".to_string(),
             alt_grid_file: None,
         };
-        let parsed = parse_checkpoint_meta(&carry, false).expect("modern strict meta");
+        let parsed = parse_checkpoint_meta(&carry).expect("modern strict meta");
         let rebuilt_checkpoint = parsed.into_checkpoint(checkpoint.grid.clone(), None);
         let mut restored = aterm_core::terminal::Terminal::from_checkpoint(
             &rebuilt_checkpoint,
@@ -2301,161 +2245,25 @@ cols = 20
         );
     }
 
-    #[test]
-    #[cfg(unix)]
-    fn actual_v052_schema0_manifest_accepts_no_history_and_refuses_scrolled_ack() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let _restore_xdg = RestoreVar::new("XDG_RUNTIME_DIR");
-        let _restore_home = RestoreVar::new("HOME");
-        let _restore_manifest = RestoreVar::new(ENV_MANIFEST);
-        let _restore_fds = RestoreVar::new(ENV_FDS);
-        let _restore_nonce = RestoreVar::new(ENV_NONCE);
-        let _restore_layout = RestoreVar::new(ENV_LAYOUT);
-        let _restore_ready = RestoreVar::new(ENV_READY_FD);
-        let _restore_commit = RestoreVar::new(ENV_COMMIT_FD);
-        let _restore_parent = RestoreVar::new(ENV_PARENT_PID);
-        let scratch =
-            std::env::temp_dir().join(format!("aterm-v052-schema0-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir(&scratch).expect("legacy scratch");
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", &scratch);
-            std::env::set_var("HOME", &scratch);
-            std::env::remove_var(ENV_LAYOUT);
-            std::env::remove_var(ENV_COMMIT_FD);
-            std::env::remove_var(ENV_PARENT_PID);
-        }
-        let dir = crate::control_auth::socket_dir().expect("private control dir");
-        std::fs::create_dir_all(&dir).expect("control dir");
-
-        for (label, grid_wire, should_adopt) in [
-            ("no-history", V052_NO_HISTORY_GRID_FIXTURE, true),
-            (
-                "scrolled-producer",
-                V052_SCROLLED_PRODUCER_GRID_FIXTURE,
-                false,
-            ),
-        ] {
-            let (mut master, mut slave) = (0i32, 0i32);
-            assert_eq!(
-                unsafe {
-                    libc::openpty(
-                        &mut master,
-                        &mut slave,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    )
-                },
-                0,
-                "legacy PTY: {label}"
-            );
-            crate::restore::write(&exact_legacy_layout(&[0])).expect("exact legacy layout");
-            let nonce = random_nonce();
-            let manifest_path = dir.join(format!("seamless-{}-{nonce}.toml", std::process::id()));
-            let stem = manifest_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .expect("manifest stem");
-            let grid_path = manifest_path.with_file_name(format!("{stem}.s0.grid"));
-            let toml = actual_v052_manifest_fixture(&grid_path);
-            assert!(
-                !toml.contains("[sessions.screen]\nschema"),
-                "actual v0.52 ScreenCarry fixture has no schema field"
-            );
-            std::fs::write(&manifest_path, format!("{nonce}\n{toml}"))
-                .expect("v0.52 manifest fixture");
-            std::fs::write(&grid_path, grid_wire).expect("v0.52 grid fixture");
-
-            let mut ready_pipe = [0i32; 2];
-            assert_eq!(
-                unsafe { libc::pipe(ready_pipe.as_mut_ptr()) },
-                0,
-                "ready pipe"
-            );
-            unsafe {
-                std::env::set_var(ENV_MANIFEST, &manifest_path);
-                std::env::set_var(ENV_NONCE, &nonce);
-                std::env::set_var(ENV_FDS, format!("0={master}:4242"));
-                std::env::set_var(ENV_READY_FD, ready_pipe[1].to_string());
-            }
-            let incoming = take_incoming();
-            assert_eq!(
-                incoming.adopted.len(),
-                usize::from(should_adopt),
-                "schema0 adoption verdict: {label}"
-            );
-            let adopted_fds = incoming
-                .adopted
-                .iter()
-                .map(|adopted| adopted.master)
-                .collect::<Vec<_>>();
-            let ready = take_ready_fd(
-                incoming.nonce.clone(),
-                incoming.layout_digest,
-                incoming.screen_digest,
-                HandoffTarget::own(),
-                &adopted_fds,
-            );
-            assert_eq!(ready.is_some(), should_adopt, "ready proof shape: {label}");
-            drop(ready);
-            let mut ack = [0u8; 1];
-            assert_eq!(
-                unsafe { libc::read(ready_pipe[0], ack.as_mut_ptr().cast(), 1) },
-                0,
-                "no bridge ACK is emitted before the later exact adoption proof: {label}"
-            );
-            if should_adopt {
-                assert!(incoming.legacy_layout_bridge);
-                let checkpoint = incoming.adopted[0]
-                    .checkpoint
-                    .as_ref()
-                    .expect("schema0 checkpoint");
-                assert_eq!(checkpoint.grid.as_slice(), V052_NO_HISTORY_GRID_FIXTURE);
-                assert_eq!(checkpoint.cursor.tab_stops.len(), 24);
-                assert!(checkpoint.cursor.tab_stops[22]);
-                let mut restored = aterm_core::terminal::Terminal::from_checkpoint(
-                    checkpoint,
-                    aterm_core::terminal::HostBindings::none(),
-                );
-                restored.resize(2, 24);
-                restored.process(b"\x1b[1;18H\t");
-                assert_eq!(
-                    restored.cursor().col,
-                    22,
-                    "actual v0.52 wide->narrow carry restores its off-width custom stop"
-                );
-                aterm_pty::close_fd(master);
-            } else {
-                assert!(
-                    unsafe { libc::fcntl(master, libc::F_GETFD) } < 0,
-                    "rejected scrolled candidate closes its duplicate before ACK"
-                );
-            }
-            aterm_pty::close_fd(ready_pipe[0]);
-            aterm_pty::close_fd(slave);
-        }
-        let _ = std::fs::remove_dir_all(&scratch);
-    }
 
     #[test]
     fn decoded_cell_budget_accepts_exact_max_and_rejects_max_plus_one() {
         let mut used = 0;
         assert!(
-            admit_checkpoint_dimensions(&mut used, 256, 128, false).is_some(),
+            admit_checkpoint_dimensions(&mut used, 256, 128, 0, false).is_some(),
             "256×128 is the exact per-grid cell ceiling"
         );
         assert_eq!(used, MAX_HANDOFF_GRID_CELLS);
         let before = used;
         assert!(
-            admit_checkpoint_dimensions(&mut used, 257, 128, false).is_none(),
+            admit_checkpoint_dimensions(&mut used, 257, 128, 0, false).is_none(),
             "one row beyond the per-grid ceiling is rejected before capture"
         );
         assert_eq!(used, before, "failed admission is transactional");
 
         let mut aggregate = MAX_HANDOFF_AGGREGATE_GRID_CELLS;
         assert!(
-            admit_checkpoint_dimensions(&mut aggregate, 1, 1, false).is_none(),
+            admit_checkpoint_dimensions(&mut aggregate, 1, 1, 0, false).is_none(),
             "aggregate max+1 cell is rejected"
         );
         assert_eq!(aggregate, MAX_HANDOFF_AGGREGATE_GRID_CELLS);
@@ -2465,7 +2273,7 @@ cols = 20
     fn max_admitted_visible_capture_meets_release_park_budget() {
         let (rows, cols) = (256u16, 128u16);
         let mut used = 0;
-        assert!(admit_checkpoint_dimensions(&mut used, rows, cols, false).is_some());
+        assert!(admit_checkpoint_dimensions(&mut used, rows, cols, 0, false).is_some());
         let mut terminal = aterm_core::terminal::Terminal::new(rows, cols);
         let mut input = Vec::new();
         input.reserve_exact(usize::from(rows) * usize::from(cols) * 6);
@@ -2741,264 +2549,7 @@ cols = 20
         }
     }
 
-    #[test]
-    fn write_then_take_roundtrips_a_single_session() {
-        // Serialize against the other env-touching test for the WHOLE body; a
-        // poisoned lock (that test failed) still gives us the mutual exclusion
-        // we need, so swallow the poison.
-        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        // Declared AFTER the lock guard so the restore runs BEFORE the lock is
-        // released — on the happy path and on any failed assert's unwind.
-        let _restore_xdg = RestoreVar::new("XDG_RUNTIME_DIR");
-        let _restore_home = RestoreVar::new("HOME");
-        // Isolate the control dir to a scratch 0700 so we don't touch the real one.
-        let tmp = std::env::temp_dir().join(format!("aterm-seamless-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        // A tty fd to satisfy the is_tty backstop: open a real pty master.
-        let (mut m, mut s) = (0i32, 0i32);
-        // SAFETY: valid out-params; openpty fills them on success.
-        let rc = unsafe {
-            libc::openpty(
-                &mut m,
-                &mut s,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty");
 
-        let manifest = SessionHandoff {
-            schema: SessionHandoff::SCHEMA,
-            window: Some(WindowCarry {
-                rows: 24,
-                cols: 80,
-                outer_x: Some(120),
-                outer_y: Some(64),
-            }),
-            sessions: vec![SessionRecord {
-                local_id: 0,
-                sid: "s-abc123".to_string(),
-                parent: None,
-                state: "alive".to_string(),
-                title: "zsh".to_string(),
-                screen: None,
-                user_title: None,
-                description: None,
-                icon: None,
-            }],
-        };
-        let fds = HandoffFds {
-            entries: vec![(0, m, 4242)],
-        };
-
-        // SCREEN CARRY: a real engine checkpoint (styled text + scrollback +
-        // cursor) must survive the write→take round-trip byte-exactly — this is
-        // the "post-update window shows the exact pre-update screen" contract.
-        let source_cp = {
-            let mut t = aterm_core::terminal::Terminal::new(24, 80);
-            t.process(b"\x1b[1;38;5;202mprompt\x1b[0m $ typed-before-update");
-            for i in 0..30 {
-                t.process(format!("\r\nline{i}").as_bytes());
-            }
-            t.checkpoint_visible()
-                .expect("parser is at a command boundary")
-        };
-        let screens = vec![(0u64, source_cp.clone())];
-
-        // Point socket_dir at our scratch via the documented override env.
-        // SAFETY: mutation is serialized by ENV_LOCK (held for this whole test).
-        // Readers elsewhere in the process may still observe the scratch value —
-        // acceptable: no non-seamless test depends on ATERM_SEAMLESS_*, and
-        // XDG_RUNTIME_DIR is restored by `_restore_xdg` on every exit path.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &tmp) };
-        unsafe { std::env::set_var("HOME", &tmp) };
-        let dir = crate::control_auth::socket_dir().expect("scratch control dir");
-        std::fs::create_dir_all(&dir).ok();
-        crate::restore::write(&exact_legacy_layout(&[0])).expect("legacy layout");
-
-        let OutgoingHandoff {
-            manifest_path: path,
-            nonce,
-            fds_wire: wire,
-            ..
-        } = write_outgoing(&manifest, &fds, &screens, manifest.window).expect("write handoff");
-        // SAFETY: mutation serialized by ENV_LOCK (see above); `take_incoming`
-        // clears these three vars again before this test releases the lock.
-        unsafe {
-            std::env::set_var(ENV_MANIFEST, &path);
-            std::env::set_var(ENV_NONCE, &nonce);
-            std::env::set_var(ENV_FDS, &wire);
-        }
-        let incoming = take_incoming();
-        let adopted = incoming.adopted;
-        assert_eq!(adopted.len(), 1, "the one session is adopted");
-        assert_eq!(adopted[0].master, m, "the live master fd is handed through");
-        assert_eq!(adopted[0].pid, 4242);
-        assert_eq!(
-            adopted[0].sid.as_str(),
-            "s-abc123",
-            "SID preserved across the swap"
-        );
-        // The screen carry round-trips byte-exactly (grid blobs via sidecar
-        // files, scalars via the manifest meta) and hydrates to the same
-        // checkpoint the outgoing engine captured.
-        assert_eq!(
-            adopted[0].checkpoint.as_ref(),
-            Some(&source_cp),
-            "the engine checkpoint survives the handoff byte-exactly"
-        );
-        assert_eq!(
-            incoming.window, manifest.window,
-            "the window frame carry survives"
-        );
-        // Every sidecar blob is consumed (single-use, like the manifest).
-        let dir = crate::control_auth::socket_dir().expect("scratch control dir");
-        let stray_blobs = std::fs::read_dir(&dir)
-            .map(|rd| {
-                rd.filter_map(Result::ok)
-                    .filter(|e| e.file_name().to_string_lossy().contains(".s0."))
-                    .count()
-            })
-            .unwrap_or(0);
-        assert_eq!(stray_blobs, 0, "screen sidecar blobs consumed on take");
-        // Env is cleared + file consumed (single-use): a second take yields nothing.
-        assert!(std::env::var(ENV_MANIFEST).is_err(), "env cleared");
-        assert!(!std::path::Path::new(&path).exists(), "manifest consumed");
-        // XDG_RUNTIME_DIR is restored (not removed) by `_restore_xdg` when this
-        // scope ends — including on any failed assert above.
-        for fd in [m, s] {
-            unsafe { libc::close(fd) };
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// MULTI-SESSION handoff: three live shells (non-contiguous `local_id`s, out of tree
-    /// order) all round-trip — each adopted with its OWN fd/pid/sid/local_id and screen
-    /// carry, none lost, none cross-wired. This is the core of the multi-window seamless
-    /// update: `local_id` is the bridge the incoming layout uses to place each shell back
-    /// into its original pane.
-    #[test]
-    fn write_then_take_roundtrips_multiple_sessions() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let _restore_xdg = RestoreVar::new("XDG_RUNTIME_DIR");
-        let _restore_home = RestoreVar::new("HOME");
-        let tmp = std::env::temp_dir().join(format!("aterm-seamless-multi-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-
-        // Three real pty masters (the is_tty backstop must pass for each).
-        let mut masters = [0i32; 3];
-        let mut slaves = [0i32; 3];
-        for k in 0..3 {
-            // SAFETY: valid out-params; openpty fills them on success.
-            let rc = unsafe {
-                libc::openpty(
-                    &mut masters[k],
-                    &mut slaves[k],
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(rc, 0, "openpty {k}");
-        }
-        // Non-contiguous ids, deliberately NOT in ascending fd order, to prove the join
-        // is by `local_id` (not position): session (id=7) → master[0], (id=2) → master[1],
-        // (id=9) → master[2].
-        let ids = [7u64, 2, 9];
-        let pids = [4242, 4243, 4244];
-        let sids = ["s-seven", "s-two", "s-nine"];
-        let manifest = SessionHandoff {
-            schema: SessionHandoff::SCHEMA,
-            window: Some(WindowCarry {
-                rows: 40,
-                cols: 120,
-                outer_x: Some(10),
-                outer_y: Some(20),
-            }),
-            sessions: (0..3)
-                .map(|k| SessionRecord {
-                    local_id: ids[k],
-                    sid: sids[k].to_string(),
-                    parent: None,
-                    state: "alive".to_string(),
-                    title: format!("shell{k}"),
-                    screen: None,
-                    user_title: None,
-                    description: None,
-                    icon: None,
-                })
-                .collect(),
-        };
-        let fds = HandoffFds {
-            entries: (0..3).map(|k| (ids[k], masters[k], pids[k])).collect(),
-        };
-        // Each session carries a DISTINCT screen so a cross-wire would be caught.
-        let screens: Vec<(u64, _)> = (0..3)
-            .map(|k| {
-                let mut t = aterm_core::terminal::Terminal::new(24, 80);
-                t.process(format!("session {} screen \x1b[1mcontent\x1b[0m", ids[k]).as_bytes());
-                (
-                    ids[k],
-                    t.checkpoint_visible()
-                        .expect("parser is at a command boundary"),
-                )
-            })
-            .collect();
-
-        // SAFETY: mutation serialized by ENV_LOCK (held for the whole test).
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &tmp) };
-        unsafe { std::env::set_var("HOME", &tmp) };
-        let dir = crate::control_auth::socket_dir().expect("scratch control dir");
-        std::fs::create_dir_all(&dir).ok();
-        crate::restore::write(&exact_legacy_layout(&ids)).expect("legacy layout");
-
-        let OutgoingHandoff {
-            manifest_path: path,
-            nonce,
-            fds_wire: wire,
-            ..
-        } = write_outgoing(&manifest, &fds, &screens, manifest.window).expect("write handoff");
-        // SAFETY: mutation serialized by ENV_LOCK; take_incoming clears these again.
-        unsafe {
-            std::env::set_var(ENV_MANIFEST, &path);
-            std::env::set_var(ENV_NONCE, &nonce);
-            std::env::set_var(ENV_FDS, &wire);
-        }
-        let incoming = take_incoming();
-        let adopted = incoming.adopted;
-        assert_eq!(adopted.len(), 3, "all three sessions adopt, none lost");
-        // Each id maps to its OWN master/pid/sid/screen — verified by local_id lookup so
-        // order can't paper over a cross-wire.
-        for k in 0..3 {
-            let a = adopted
-                .iter()
-                .find(|a| a.local_id == ids[k])
-                .unwrap_or_else(|| panic!("session id {} adopted", ids[k]));
-            assert_eq!(
-                a.master, masters[k],
-                "id {} keeps its own master fd",
-                ids[k]
-            );
-            assert_eq!(a.pid, pids[k], "id {} keeps its own pid", ids[k]);
-            assert_eq!(a.sid.as_str(), sids[k], "id {} keeps its own sid", ids[k]);
-            assert_eq!(
-                a.checkpoint.as_ref(),
-                Some(&screens[k].1),
-                "id {} keeps its own screen (no cross-wire)",
-                ids[k]
-            );
-        }
-        assert_eq!(incoming.window, manifest.window, "window frame survives");
-
-        for k in 0..3 {
-            unsafe {
-                libc::close(masters[k]);
-                libc::close(slaves[k]);
-            }
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
 
     #[test]
     fn nonce_mismatch_and_missing_env_fail_closed() {
@@ -3146,134 +2697,6 @@ cols = 20
         aterm_pty::close_fd(rd);
     }
 
-    #[test]
-    #[cfg(unix)]
-    fn v052_one_channel_bridge_requires_exact_newer_authenticated_adoption() {
-        use std::os::fd::FromRawFd as _;
-
-        let (mut master, mut slave) = (0i32, 0i32);
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            },
-            0,
-            "authenticated PTY fixture"
-        );
-        let actual = vec![(7_u64, master, 4242_i32)];
-        let expected = actual.clone();
-        assert!(legacy_layout_is_exact(
-            Some(&exact_legacy_layout(&[7])),
-            &[7]
-        ));
-        assert!(
-            !legacy_layout_is_exact(None, &[7]),
-            "missing layout refused"
-        );
-        assert!(
-            !legacy_layout_is_exact(Some(&exact_legacy_layout(&[8])), &[7]),
-            "subset/mismatched legacy layout refused"
-        );
-
-        let make_ready = || {
-            let mut pipe = [0i32; 2];
-            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "ready pipe");
-            // SAFETY: fresh write end, solely transferred to ReadySignal.
-            let write = unsafe { std::os::fd::OwnedFd::from_raw_fd(pipe[1]) };
-            (
-                pipe[0],
-                ReadySignal::for_test(write, "legacy-v052", [3; 32], [4; 32]),
-            )
-        };
-
-        let (ready_read, ready) = make_ready();
-        let gate = crate::spawn::DeferredReaderGate::closed();
-        assert!(activate_legacy_bridge(
-            ready,
-            &gate,
-            actual.clone(),
-            expected.clone(),
-            53,
-            Some(52),
-            false,
-        ));
-        assert!(
-            gate.is_released(),
-            "prepared readers release after ACK only"
-        );
-        let mut byte = [0u8; 1];
-        assert_eq!(
-            unsafe { libc::read(ready_read, byte.as_mut_ptr().cast(), 1) },
-            1
-        );
-        assert_eq!(byte[0], 1, "legacy parent receives exactly one ACK byte");
-        assert_eq!(
-            unsafe { libc::read(ready_read, byte.as_mut_ptr().cast(), 1) },
-            0,
-            "ReadySignal is consumed after its one byte"
-        );
-        aterm_pty::close_fd(ready_read);
-
-        for (case, rejected_actual, rejected_expected, child, parent) in [
-            ("subset", Vec::new(), expected.clone(), 53, Some(52)),
-            (
-                "identity mismatch",
-                actual.clone(),
-                vec![(7, master, 9999)],
-                53,
-                Some(52),
-            ),
-            ("not newer", actual.clone(), expected.clone(), 52, Some(52)),
-        ] {
-            let (ready_read, ready) = make_ready();
-            let gate = crate::spawn::DeferredReaderGate::closed();
-            assert!(
-                !activate_legacy_bridge(
-                    ready,
-                    &gate,
-                    rejected_actual,
-                    rejected_expected,
-                    child,
-                    parent,
-                    false,
-                ),
-                "{case} must refuse activation"
-            );
-            assert!(!gate.is_released(), "{case} keeps readers prepared/closed");
-            assert_eq!(
-                unsafe { libc::read(ready_read, byte.as_mut_ptr().cast(), 1) },
-                0,
-                "{case} emits no irreversible legacy ACK"
-            );
-            assert!(
-                unsafe { libc::fcntl(master, libc::F_GETFD) } >= 0,
-                "{case} does not close or consume the parent's PTY authority"
-            );
-            aterm_pty::close_fd(ready_read);
-        }
-
-        // A post-admission byte still traverses the same PTY, proving every
-        // rejected bridge left kernel data ownership untouched.
-        assert_eq!(unsafe { libc::write(slave, b"x".as_ptr().cast(), 1) }, 1);
-        let mut pollfd = libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 100) }, 1);
-        assert_eq!(
-            unsafe { libc::read(master, byte.as_mut_ptr().cast(), 1) },
-            1
-        );
-        assert_eq!(byte[0], b'x');
-        aterm_pty::close_fd(master);
-        aterm_pty::close_fd(slave);
-    }
 
     /// Rollback hygiene: `discard_outgoing` retires exactly THIS attempt's
     /// artifacts (manifest + sidecars named by our pid + the nonce) and leaves
@@ -3360,13 +2783,19 @@ cols = 20
             let watcher = watcher.spawn().expect("spawn commit watcher fixture");
             std::fs::write(&marker, watcher.id().to_string()).expect("publish watcher pid");
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            // Waits on a re-exec of the whole debug TEST BINARY. 2s barely covers its
+            // startup on an idle box, and the wait busy-spun on `yield_now()` — pinning a
+            // core and starving the very child it waited for. A genuine failure never
+            // produces the marker at all, so the bound is a failure bound.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while !ready.exists() {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "watcher did not arm parent-liveness detection"
                 );
-                std::thread::yield_now();
+                // sleep, not yield_now(): yielding keeps this thread RUNNABLE, so on an
+                // oversubscribed box it competes with the very work it is waiting for.
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
             // Deliberately do not wait: exiting this launcher is the parent-death
             // cut. The watcher inherited BOTH pipe ends, so EOF alone cannot help.
@@ -3460,7 +2889,9 @@ cols = 20
                 unsafe { libc::kill(watcher, libc::SIGKILL) };
                 panic!("leaked commit writer hid direct-parent death past 3 seconds");
             }
-            std::thread::yield_now();
+            // sleep, not yield_now(): yielding keeps this thread RUNNABLE, so on an
+            // oversubscribed box it competes with the very work it is waiting for.
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         std::fs::remove_dir_all(&scratch).expect("remove parent-death scratch");
     }
@@ -4317,7 +3748,7 @@ mod f4_adoption_proof_asymmetry {
             grid_file: "unused".to_string(),
             alt_grid_file: None,
         };
-        let meta = parse_checkpoint_meta(&carry, false).expect("child parses meta");
+        let meta = parse_checkpoint_meta(&carry).expect("child parses meta");
         let rebuilt = meta.into_checkpoint(cp.grid.clone(), None);
         let child = screen_digest_refs(vec![(0, &rebuilt)]).expect("child screen digest");
         assert_eq!(
@@ -4350,7 +3781,7 @@ mod f4_adoption_proof_asymmetry {
             grid_file: "unused".to_string(),
             alt_grid_file: None,
         };
-        let parsed = parse_checkpoint_meta(&carry, false).expect("child parses (no deny_unknown)");
+        let parsed = parse_checkpoint_meta(&carry).expect("child parses (no deny_unknown)");
         let child_meta = serde_json::to_string(&parsed).expect("child reserializes");
         assert_ne!(
             newer_parent_meta, child_meta,
@@ -4392,7 +3823,7 @@ mod f4_adoption_proof_asymmetry {
             alt_grid_file: None,
         };
         assert!(
-            parse_checkpoint_meta(&carry, false).is_none(),
+            parse_checkpoint_meta(&carry).is_none(),
             "a single missing REQUIRED key destroys the whole adoption"
         );
     }

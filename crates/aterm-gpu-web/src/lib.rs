@@ -276,6 +276,22 @@ struct GpuDisplayRowCache {
     cells: Vec<(String, bool)>,
 }
 
+/// Keep the engine's implicit cells and OSC 110/111/112/117 reset baselines
+/// aligned with the renderer theme. Sparse row tails and live selection colours
+/// come from `Terminal`, so changing only the CPU/GPU renderer theme would be
+/// overwritten on the next frame refill.
+fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u32, selection: u32) {
+    let rgb = |color: u32| Rgb {
+        r: ((color >> 16) & 0xff) as u8,
+        g: ((color >> 8) & 0xff) as u8,
+        b: (color & 0xff) as u8,
+    };
+    term.set_default_foreground(rgb(fg));
+    term.set_default_background(rgb(bg));
+    term.set_default_cursor_color(Some(rgb(cursor)));
+    term.set_default_selection_background(Some(rgb(selection)));
+}
+
 /// The GPU half of the terminal, populated by [`AtermGpuTerminal::init`].
 struct GpuState {
     renderer: GpuRenderer,
@@ -297,6 +313,15 @@ fn webgl_present_result(result: Result<(), SurfacePresentFailure>) -> Result<(),
 }
 
 impl AtermGpuTerminal {
+    /// Refill every engine-owned frame channel. `cell_frame_into` includes the
+    /// live implicit background and cursor colour, so sparse tails, OSC
+    /// 10/11/12 resets, and DECSCNM remain one coherent terminal snapshot.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn refill_frame_scratch(&mut self) {
+        self.term
+            .cell_frame_into(&mut self.frame_scratch, self.rows, self.cols);
+    }
+
     /// Read one `(grapheme, is_wide)` display cell through the single-slot row
     /// cache, refreshing it from [`display_row_grapheme_cells`] only on a
     /// `(content_gen, display_offset, row)` change. Collapses a host's per-cell
@@ -376,6 +401,7 @@ impl AtermGpuTerminal {
         // at the render frame boundary (see scrollback_tiers_api).
         let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
+        apply_terminal_theme_colors(&mut term, fg, bg, cursor, selection);
         // Poll-drain surface for OSC 9/99/777 (a web host has no callback
         // thread); authorization keeps the engine's fail-closed default.
         let notifications = notifications_api::wire_notification_queue(&mut term);
@@ -746,11 +772,11 @@ impl AtermGpuTerminal {
         self.term.grid().cursor().row
     }
 
-    /// The LIVE application cursor colour (OSC 12) as packed `0x00RRGGBB`, or
-    /// `undefined` while unset / after an OSC 112 reset — i.e. the host/theme
-    /// default applies. Read per frame so glow/trail colour derivation can
-    /// follow app-driven cursor-colour changes (the renderer already draws
-    /// the cursor itself with this colour). Mirrors aterm-wasm.
+    /// The dedicated LIVE application cursor colour (OSC 12) as packed
+    /// `0x00RRGGBB`, or `undefined` after OSC 21 `cursor=` selected dynamic
+    /// foreground-following behavior (and in a raw unconfigured core). OSC 112
+    /// restores the host-configured cursor baseline. Read per frame so
+    /// glow/trail colour derivation can follow app-driven cursor changes.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
     pub fn cursor_color(&self) -> Option<u32> {
         self.term
@@ -872,6 +898,7 @@ impl AtermGpuTerminal {
             cursor,
             selection,
         };
+        apply_terminal_theme_colors(&mut self.term, fg, bg, cursor, selection);
         self.theme = theme;
         self.cpu.set_theme(theme);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -887,6 +914,12 @@ impl AtermGpuTerminal {
     /// or `undefined` for the WCAG contrast-floor default. Set on both the CPU
     /// fallback face and the live GPU renderer; forces a full present (appearance).
     pub fn set_selection_fg(&mut self, fg: Option<u32>) {
+        self.term
+            .set_default_selection_foreground(fg.map(|color| Rgb {
+                r: ((color >> 16) & 0xff) as u8,
+                g: ((color >> 8) & 0xff) as u8,
+                b: (color & 0xff) as u8,
+            }));
         self.cpu.set_selection_fg(fg);
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.renderer.set_selection_fg(fg);
@@ -942,7 +975,7 @@ impl AtermGpuTerminal {
             gpu.renderer.set_head(head as usize);
             let (w, h) = gpu.renderer.frame_size(self.rows, self.cols);
             gpu.renderer
-                .resize_surface(&mut gpu.surface, w as u32, h as u32);
+                .resize_surface(&mut gpu.win, &mut gpu.surface, w as u32, h as u32);
             gpu.win.invalidate_present();
         }
     }
@@ -1102,7 +1135,7 @@ impl AtermGpuTerminal {
         if let Some(gpu) = self.gpu.as_mut() {
             let (w, h) = gpu.renderer.frame_size(self.rows, self.cols);
             gpu.renderer
-                .resize_surface(&mut gpu.surface, w as u32, h as u32);
+                .resize_surface(&mut gpu.win, &mut gpu.surface, w as u32, h as u32);
         }
     }
 
@@ -2313,12 +2346,11 @@ impl AtermGpuTerminal {
         // global-budget share, then promote one bounded staged batch — LZ4
         // lives HERE, never on the ingest path (SCROLL-1).
         self.drain_compress_backlog_on_render();
-        let (rows, cols) = (self.rows, self.cols);
         // Refill the kept scratch in place rather than allocating a fresh snapshot
         // each rAF frame; `term`, `frame_scratch`, and `gpu` are disjoint fields, so
         // the fill borrow ends before the `gpu` borrow below.
-        self.term
-            .cell_frame_into(&mut self.frame_scratch, rows, cols);
+        self.refill_frame_scratch();
+        let rows = self.rows;
         // Fill the overlay channels (aurora/trail/sparkle) for the host-advanced
         // instant; with every effect off this only clears the channels a reused
         // scratch may carry — byte-identical to the pre-effects present.
@@ -2363,11 +2395,12 @@ impl AtermGpuTerminal {
         self.pump_reflow_on_render_tick();
         // Same frame-boundary scrollback maintenance as `render`.
         self.drain_compress_backlog_on_render();
-        let (rows, cols) = (self.rows, self.cols);
-        // Same kept-scratch refill as `render`: `cell_frame_into` fully overwrites
-        // the buffer, so sharing one scratch across both paths is correct.
-        self.term
-            .cell_frame_into(&mut self.frame_scratch, rows, cols);
+        // Same kept-scratch refill as `render`: it replaces the engine-owned
+        // channels and stamps live colours; the effects + scroll passes below
+        // replace the host-owned fields this web host uses. Sharing one scratch
+        // across both paths is therefore safe.
+        self.refill_frame_scratch();
+        let rows = self.rows;
         // Same effects application as `render` (the e2e pixel-compare path must
         // carry the same overlays the canvas present does).
         let (cw, ch) = self.cpu.cell_size();
@@ -2441,6 +2474,7 @@ impl AtermGpuTerminal {
         // measure the shipped engine shape.
         let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
+        apply_terminal_theme_colors(&mut term, theme.fg, theme.bg, theme.cursor, theme.selection);
         // Same notification wiring as `new` (fail-closed until authorized).
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let rows = term.grid().rows() as usize;
@@ -2486,6 +2520,150 @@ impl AtermGpuTerminal {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_theme_colors_are_the_dynamic_color_reset_baseline() {
+        let mut term = Terminal::new(2, 4);
+        apply_terminal_theme_colors(
+            &mut term,
+            0x0011_2233,
+            0x0044_5566,
+            0x0077_8899,
+            0x000A_0B0C,
+        );
+        term.process(b"\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\");
+        term.process(b"\x1b]11;rgb:dddd/eeee/ffff\x1b\\");
+        term.process(b"\x1b]12;rgb:1111/2222/3333\x1b\\");
+        term.process(b"\x1b]17;rgb:0101/0202/0303\x1b\\");
+        term.process(b"\x1b]19;rgb:0404/0505/0606\x1b\\");
+        assert_eq!(term.default_foreground(), Rgb::new(0xaa, 0xbb, 0xcc));
+        assert_eq!(term.default_background(), Rgb::new(0xdd, 0xee, 0xff));
+        assert_eq!(
+            term.selection_background(),
+            Some(Rgb::new(0x01, 0x02, 0x03))
+        );
+        assert_eq!(
+            term.selection_foreground(),
+            Some(Rgb::new(0x04, 0x05, 0x06))
+        );
+
+        term.process(b"\x1b]110\x07\x1b]111\x07\x1b]112\x07\x1b]117\x07\x1b]119\x07");
+        assert_eq!(term.default_foreground(), Rgb::new(0x11, 0x22, 0x33));
+        assert_eq!(term.default_background(), Rgb::new(0x44, 0x55, 0x66));
+        assert_eq!(term.cursor_color(), Some(Rgb::new(0x77, 0x88, 0x99)));
+        assert_eq!(
+            term.selection_background(),
+            Some(Rgb::new(0x0a, 0x0b, 0x0c))
+        );
+        assert_eq!(term.selection_foreground(), None);
+    }
+
+    #[test]
+    fn frame_scratch_tracks_live_sparse_blank_and_cursor_colors() {
+        let Some(mut t) = AtermGpuTerminal::new_from_system(3, 8, 16.0) else {
+            return;
+        };
+        t.set_default_foreground(0x11, 0x22, 0x33);
+        t.set_default_background(0x44, 0x55, 0x66);
+        t.set_selection_fg(Some(0x0012_3456));
+        t.process(b"X");
+
+        t.refill_frame_scratch();
+        assert!(
+            t.frame_scratch.cells[0].len() < t.cols,
+            "the regression requires an unmaterialized sparse row tail"
+        );
+        assert_eq!(t.frame_scratch.default_bg, 0x0044_5566);
+        assert_eq!(t.frame_scratch.cells[0][0].bg, [0x44, 0x55, 0x66]);
+        assert_eq!(
+            t.frame_scratch.cursor_color, t.theme_cursor,
+            "the configured OSC 12 baseline matches the host theme"
+        );
+        assert_eq!(t.frame_scratch.selection_bg, Theme::default().selection);
+        assert_eq!(t.frame_scratch.selection_fg, 0x0012_3456);
+
+        t.process(b"\x1b]11;rgb:7777/8888/9999\x1b\\");
+        t.process(b"\x1b]12;rgb:aaaa/bbbb/cccc\x1b\\");
+        t.process(b"\x1b]17;rgb:0101/0202/0303\x1b\\");
+        t.process(b"\x1b]19;rgb:0404/0505/0606\x1b\\");
+        t.refill_frame_scratch();
+        assert_eq!(t.frame_scratch.default_bg, 0x0077_8899);
+        assert_eq!(t.frame_scratch.cells[0][0].bg, [0x77, 0x88, 0x99]);
+        assert_eq!(t.frame_scratch.cursor_color, 0x00aa_bbcc);
+        assert_eq!(t.frame_scratch.selection_bg, 0x0001_0203);
+        assert_eq!(t.frame_scratch.selection_fg, 0x0004_0506);
+
+        t.process(b"\x1b[?5h");
+        t.refill_frame_scratch();
+        assert_eq!(
+            t.frame_scratch.default_bg, 0x0011_2233,
+            "DECSCNM makes the live default foreground the effective blank background"
+        );
+        assert_eq!(t.frame_scratch.cells[0][0].bg, [0x11, 0x22, 0x33]);
+
+        t.process(b"\x1b]111\x07\x1b]112\x07\x1b]117\x07\x1b]119\x07\x1b[?5l");
+        t.refill_frame_scratch();
+        assert_eq!(
+            t.frame_scratch.default_bg, 0x0044_5566,
+            "OSC 111 restores the configured background"
+        );
+        assert_eq!(
+            t.frame_scratch.cursor_color, t.theme_cursor,
+            "OSC 112 restores the host-configured cursor baseline"
+        );
+        assert_eq!(t.frame_scratch.selection_bg, Theme::default().selection);
+        assert_eq!(t.frame_scratch.selection_fg, 0x0012_3456);
+
+        t.process(b"\x1b]21;cursor=\x07\x1b]10;#DEADBE\x07");
+        t.refill_frame_scratch();
+        assert_eq!(t.term.cursor_color(), None);
+        assert_eq!(
+            t.frame_scratch.cursor_color, 0x00DE_ADBE,
+            "OSC 21 cursor= makes the embedded cursor follow live OSC 10"
+        );
+        t.process(b"\x1b]10;#1234AB\x07");
+        t.refill_frame_scratch();
+        assert_eq!(
+            t.frame_scratch.cursor_color, 0x0012_34AB,
+            "a later OSC 10 recolors the still-dynamic cursor"
+        );
+    }
+
+    #[test]
+    fn dynamic_cursor_osc10_changes_gpu_web_input_pixels() {
+        let Some(mut t) = AtermGpuTerminal::new_from_system(2, 4, 16.0) else {
+            return;
+        };
+        t.process(b"\x1b]21;cursor=\x07\x1b]10;#21C365\x07\x1b[2 q");
+        t.refill_frame_scratch();
+        assert_eq!(t.term.cursor_color(), None);
+        assert_eq!(t.frame_scratch.cursor_color, 0x0021_C365);
+        let (cw, ch) = t.cpu.cell_size();
+        let frame = t.cpu.render_input(&t.frame_scratch);
+        assert_eq!(
+            frame
+                .pixels
+                .iter()
+                .filter(|&&pixel| pixel == 0x0021_C365)
+                .count(),
+            cw * ch,
+            "the gpu-web RenderInput paints the dynamic OSC 10 cursor color"
+        );
+
+        t.process(b"\x1b]10;#BADA55\x07");
+        t.refill_frame_scratch();
+        assert_eq!(t.frame_scratch.cursor_color, 0x00BA_DA55);
+        let frame = t.cpu.render_input(&t.frame_scratch);
+        assert_eq!(
+            frame
+                .pixels
+                .iter()
+                .filter(|&&pixel| pixel == 0x00BA_DA55)
+                .count(),
+            cw * ch,
+            "changing OSC 10 changes gpu-web cursor pixels while the cursor slot stays dynamic"
+        );
+    }
 
     #[test]
     fn webgl_present_result_propagates_every_surface_failure() {
@@ -2726,8 +2904,7 @@ mod tests {
     /// refill the kept snapshot, apply the effects pipeline onto it, then
     /// refresh the spill-band export from the same snapshot.
     fn fill_frame(t: &mut AtermGpuTerminal) {
-        let (rows, cols) = (t.rows, t.cols);
-        t.term.cell_frame_into(&mut t.frame_scratch, rows, cols);
+        t.refill_frame_scratch();
         let (cw, ch) = t.cpu.cell_size();
         t.effects.apply(&mut t.term, &mut t.frame_scratch, cw, ch);
         t.spill.update(&t.cpu, &t.frame_scratch);

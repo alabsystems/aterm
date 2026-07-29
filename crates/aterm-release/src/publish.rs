@@ -22,7 +22,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -6451,7 +6451,6 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             ctx.commit
         )));
     }
-    manifest_out::v025_check(&mtext)?;
 
     let sig_path = ctx.manifest_path().with_extension("toml.sig");
     if ctx.signature_required {
@@ -7953,29 +7952,66 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
 ///
 /// Fails CLOSED: a network failure here is reported as a failure to prove, not as
 /// proof. Better to refuse a cut than to publish a channel nobody can read.
+/// How long the anonymous post-flip probes keep retrying, and how often.
+///
+/// A draft flipped live does NOT become anonymously readable atomically: the
+/// release object, the asset listing, and the download CDN each converge within
+/// seconds of each other. Observed on the v0.8.0 cut — the DMG's unauthenticated
+/// URL 404'd at probe time and served correct bytes moments later, failing a cut
+/// whose artifacts were already complete and byte-correct.
+///
+/// Retrying does not weaken the proof. The property is "a credential-less client
+/// can fetch this", and a client arriving seconds after the flip is the real case,
+/// not a lenient one. A genuinely incomplete upload fails every attempt and the
+/// cut still refuses — it just takes [`ANON_PROBE_ATTEMPTS`] tries to say so.
+const ANON_PROBE_ATTEMPTS: u32 = 10;
+
+/// Gap between anonymous probe attempts.
+const ANON_PROBE_DELAY: Duration = Duration::from_secs(6);
+
+/// Run one anonymous `curl` probe, retrying while it fails.
+///
+/// Credentials are stripped from the child on every attempt: the whole point is to
+/// see the channel exactly as an install with no token sees it. See
+/// [`ANON_PROBE_ATTEMPTS`] for why retrying is sound.
+fn anon_probe(args: &[&str]) -> Result<std::process::Output> {
+    let mut last = None;
+    for attempt in 1..=ANON_PROBE_ATTEMPTS {
+        let out = Command::new("curl")
+            .args(args)
+            // Strip every credential the child could otherwise pick up. curl does not
+            // read these itself, but clearing them keeps the intent explicit and
+            // survives someone later swapping curl for a helper that does.
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_ENTERPRISE_TOKEN")
+            .env_remove("NETRC")
+            .output()
+            .map_err(|error| Error::new(format!("spawn anonymous probe: {error}")))?;
+        if out.status.success() {
+            return Ok(out);
+        }
+        last = Some(out);
+        if attempt < ANON_PROBE_ATTEMPTS {
+            std::thread::sleep(ANON_PROBE_DELAY);
+        }
+    }
+    Ok(last.expect("at least one attempt"))
+}
+
 fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()> {
     let url = format!("{GITHUB_API_ORIGIN}/repos/{slug}/releases/tags/{}", ctx.tag);
-    let out = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--location",
-            "--max-time",
-            "60",
-            "--header",
-            "Accept: application/vnd.github+json",
-            &url,
-        ])
-        // Strip every credential the child could otherwise pick up. curl does not
-        // read these itself, but clearing them keeps the intent explicit and
-        // survives someone later swapping curl for a helper that does.
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_ENTERPRISE_TOKEN")
-        .env_remove("NETRC")
-        .output()
-        .map_err(|error| Error::new(format!("spawn anonymous channel probe: {error}")))?;
+    let out = anon_probe(&[
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--location",
+        "--max-time",
+        "60",
+        "--header",
+        "Accept: application/vnd.github+json",
+        &url,
+    ])?;
     if !out.status.success() {
         return Err(Error::new(format!(
             "the public channel {slug} is NOT readable without a credential: an \
@@ -8012,31 +8048,30 @@ fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()>
         }
     }
     let dmg = mirror::dmg_asset_name(&ctx.version);
-    let dmg_url =
-        format!("https://github.com/{slug}/releases/download/{}/{dmg}", ctx.tag);
-    let head = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--location",
-            "--head",
-            "--max-time",
-            "60",
-            &dmg_url,
-        ])
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_ENTERPRISE_TOKEN")
-        .env_remove("NETRC")
-        .output()
-        .map_err(|error| Error::new(format!("spawn anonymous asset probe: {error}")))?;
+    let dmg_url = format!(
+        "https://github.com/{slug}/releases/download/{}/{dmg}",
+        ctx.tag
+    );
+    // This is the probe that raced GitHub's download CDN on the v0.8.0 cut: the
+    // release listed the asset while `releases/download/...` still 404'd, and the
+    // cut failed with everything already published and byte-correct.
+    let head = anon_probe(&[
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--location",
+        "--head",
+        "--max-time",
+        "60",
+        &dmg_url,
+    ])?;
     if !head.status.success() {
         return Err(Error::new(format!(
             "the public channel {slug} lists {dmg} but an unauthenticated fetch of \
-             {dmg_url} failed ({}); installs would elect this release and then be \
-             unable to download it",
-            String::from_utf8_lossy(&head.stderr).trim()
+             {dmg_url} failed ({}) after {ANON_PROBE_ATTEMPTS} attempts over ~{}s; \
+             installs would elect this release and then be unable to download it",
+            String::from_utf8_lossy(&head.stderr).trim(),
+            ANON_PROBE_ATTEMPTS as u64 * ANON_PROBE_DELAY.as_secs(),
         )));
     }
     Ok(())

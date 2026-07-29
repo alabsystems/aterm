@@ -8,26 +8,39 @@
 //
 // The offload detaches the tiered store, rewraps it OFF the lock on a worker, then
 // re-attaches. While detached, concurrent steps interleave in ALL orderings:
-//   Produce  — the PTY reader scrolls a line off (environment)
-//   Erase    — an ED3 / `clear` lands (environment)
-//   Reattach — the worker finishes and re-attaches (clean completion)
-//   Abort    — the worker DIED; `abort_reflow_offload` recovers to a bounded state
-//              (window output discarded BY DESIGN — loss is accepted on abort, the
-//              alternative is a permanently wedged grid; see audit #5)
+//   Produce          — the PTY reader scrolls a line off (environment)
+//   Erase            — an ED3 / `clear` lands (environment)
+//   SetLine*         — a host changes the total line limit; the newest request wins
+//   SetBudget*       — a host changes the byte budget; the newest request wins
+//   AttachReplacement — reset/recovery installs an authoritative replacement store
+//   Reattach         — the worker finishes and re-attaches (clean completion)
+//   Abort            — the worker DIED; `abort_reflow_offload` recovers to a bounded
+//                      state (window output discarded BY DESIGN when no replacement
+//                      exists — loss is accepted on abort, rather than wedging)
 //
 // Invariants (found by the adversarial audit; L1 history-integrity class):
-//   NoLoss            (bug B): on a CLEAN completion, every line produced during the
-//                     window is SAFE — still staged (`retained`) or relocated into the
-//                     re-attached tiered store (`relocated`, the shadow counter for the
-//                     opaque store lane the real `drain_lazy_buffer` moves lines into).
-//                     `slack` = W while the window is open or after an abort, 0 after a
-//                     clean Reattach — so the invariant is exact at clean completion
-//                     and honestly waived mid-window/abort.
+//   NoLoss            (bug B): on a clean Reattach OR replacement-backed Abort,
+//                     every line produced during the window is SAFE — still staged
+//                     (`retained`) or relocated into the authoritative tiered store
+//                     (`relocated`, the shadow counter for the opaque store lane the
+//                     real `drain_lazy_buffer` moves lines into). `slack` = W while
+//                     the window is open or after a backend-less Abort, 0 after a
+//                     clean Reattach/replacement Abort — exact whenever a backend can
+//                     preserve output, honestly waived only when the worker/store died.
 //   ErasedStaysErased (bug C): an erase during the window is never resurrected.
+//   PendingIffUnresolved: the detach-time settings snapshot exists for exactly the
+//                        unresolved window and is consumed by Reattach/Abort.
+//   Latest*Observable: getters expose the newest deferred request, including the
+//                     nested `None` (encoded as line value 0 = unlimited).
+//   Applied*Latest: once a backend is attached, dirty settings are applied
+//                  immediately and remain latest-writer-wins. An untouched snapshot
+//                  adopts a replacement backend's baseline instead.
+//   RingBounded: a backend-less Abort applies a newest LOW finite total to the
+//                surviving ring, but a raise/unlimited request never expands it.
 //
-// `Buggy=0` is the shipped fix; `Buggy=1` reintroduces bugs B + C (must be CAUGHT —
-// the gate also requires the Buggy=1 counterexample, so the invariants can't go
-// vacuous).
+// `Buggy=0` is the shipped fix; `Buggy=1` reintroduces bugs B + C, stale deferred
+// settings, and replacement-Abort staged-output loss (must be CAUGHT — the gate
+// also requires a Buggy=1 counterexample, so the invariants can't go vacuous).
 
 /// The detach window as a bounded state machine (see file comment above).
 fn offload_window_model() -> Model {
@@ -35,6 +48,13 @@ fn offload_window_model() -> Model {
         ScrollbackOffloadWindow {
             const W = 3;         // bounded lines that scroll off during the window
             const Buggy = 0;     // 0 = shipped fix; 1 = pre-fix bugs B + C
+            const RingCap = 8;   // construction-bounded emergency ring
+            const LineLow = 5;   // finite total below RingCap
+            const LineHigh = 20; // finite total above RingCap
+            const BudgetLow = 2; // bounded budget codes (MiB in Tier-1)
+            const BudgetHigh = 3;
+            const ReplacementBudget = 4;
+            const InitialBudget = 8;
             var detached = 1;    // store detached for the off-thread reflow (window open)
             var produced = 0;    // lines that scrolled off during the window
             var retained = 0;    // ... of those, kept (staged to lazy_buffer)
@@ -47,6 +67,18 @@ fn offload_window_model() -> Model {
             var aborted = 0;     // closed via Abort (worker death) — loss accepted
             var resurrected = 0; // erased history came back after the window (bug C)
             var slack = 3;       // = W while loss is excusable; 0 after clean Reattach
+            var pending = 1;     // detach settings snapshot exists iff unresolved
+            var backend = 0;     // a replacement or reflowed store is attached
+            var replacement = 0; // the attached backend came from reset/recovery
+            var ring_limit = 8;  // surviving hot-ring cap (never exceeds RingCap)
+            var line_latest = 0; // newest effective total; 0 encodes unlimited
+            var line_observed = 0; // public getter projection
+            var line_applied = 0;  // effective total installed on attached backend
+            var line_dirty = 0;  // host changed the detach-time line snapshot
+            var budget_latest = 8; // newest effective budget code
+            var budget_observed = 8; // public getter projection; 0 = no backend
+            var budget_applied = 0; // budget installed on attached backend
+            var budget_dirty = 0; // host changed the detach-time budget snapshot
 
             // PTY output scrolls a line off during the window. Fixed: stage to the
             // lazy buffer (retained++). Buggy B: drop it once the ring is full.
@@ -66,36 +98,158 @@ fn offload_window_model() -> Model {
                 retained = 0;
             }
 
+            // Deferred line-limit changes are nested state: 0 is an explicit
+            // unlimited request, not "no request". Setters keep the newest value.
+            // If a replacement is already attached, apply immediately; a LOW total
+            // also tightens the hot ring, while raises never grow it back.
+            action SetLineLow when (detached > 0 && done <= 0) {
+                line_latest = LineLow;
+                line_observed = if Buggy > 0 { line_observed } else { LineLow };
+                line_applied = if backend > 0 {
+                    if Buggy > 0 { line_applied } else { LineLow }
+                } else { line_applied };
+                ring_limit = if backend > 0 { LineLow } else { ring_limit };
+                line_dirty = 1;
+            }
+
+            action SetLineHigh when (detached > 0 && done <= 0) {
+                line_latest = LineHigh;
+                line_observed = if Buggy > 0 { line_observed } else { LineHigh };
+                line_applied = if backend > 0 {
+                    if Buggy > 0 { line_applied } else { LineHigh }
+                } else { line_applied };
+                line_dirty = 1;
+            }
+
+            action SetLineUnlimited when (detached > 0 && done <= 0) {
+                line_latest = 0;
+                line_observed = if Buggy > 0 { line_observed } else { 0 };
+                line_applied = if backend > 0 {
+                    if Buggy > 0 { line_applied } else { 0 }
+                } else { line_applied };
+                line_dirty = 1;
+            }
+
+            action SetBudgetLow when (detached > 0 && done <= 0) {
+                budget_latest = BudgetLow;
+                budget_observed = if Buggy > 0 { budget_observed } else { BudgetLow };
+                budget_applied = if backend > 0 {
+                    if Buggy > 0 { budget_applied } else { BudgetLow }
+                } else { budget_applied };
+                budget_dirty = 1;
+            }
+
+            action SetBudgetHigh when (detached > 0 && done <= 0) {
+                budget_latest = BudgetHigh;
+                budget_observed = if Buggy > 0 { budget_observed } else { BudgetHigh };
+                budget_applied = if backend > 0 {
+                    if Buggy > 0 { budget_applied } else { BudgetHigh }
+                } else { budget_applied };
+                budget_dirty = 1;
+            }
+
+            // A replacement store becomes authoritative immediately. Untouched
+            // settings adopt its finite total / budget baseline; dirty host
+            // requests remain authoritative and are applied to it immediately.
+            // The pending snapshot remains live so setters after replacement still
+            // replace earlier values until the stale worker resolves. Attaching
+            // also drains every line staged so far into the replacement backend.
+            action AttachReplacement when (
+                detached > 0 && done <= 0 && replacement <= 0
+            ) {
+                backend = 1;
+                replacement = 1;
+                relocated = relocated + retained;
+                retained = 0;
+                line_latest = if line_dirty > 0 { line_latest } else { LineHigh };
+                line_observed = if line_dirty > 0 { line_latest } else { LineHigh };
+                line_applied = if line_dirty > 0 { line_latest } else { LineHigh };
+                ring_limit = if (
+                    line_dirty > 0 && line_latest > 0 &&
+                    line_latest <= RingCap - 1
+                ) { line_latest } else { ring_limit };
+                budget_latest = if budget_dirty > 0 {
+                    budget_latest
+                } else { ReplacementBudget };
+                budget_observed = if budget_dirty > 0 {
+                    budget_latest
+                } else { ReplacementBudget };
+                budget_applied = if budget_dirty > 0 {
+                    budget_latest
+                } else { ReplacementBudget };
+            }
+
             // Worker finishes; re-attach applies the fix logic. Fixed: an erase during
             // the window drops the stale pre-erase store — nothing resurrects. Buggy C:
             // re-attaches the pre-erase store even though it was cleared. Clean
-            // completion drops `slack` to 0, arming NoLoss exactly here.
+            // completion drops `slack` to 0, arming NoLoss exactly here. The newest
+            // pending settings are installed before staged output drains, then the
+            // snapshot/dirty bits are consumed.
             action Reattach when (detached > 0 && done <= 0) {
                 detached = 0;
                 done = 1;
                 resurrected = if Buggy > 0 { cleared } else { 0 };
                 slack = 0;
+                pending = 0;
+                backend = 1;
+                line_observed = line_latest;
+                line_applied = line_latest;
+                ring_limit = if (
+                    line_dirty > 0 && line_latest > 0 &&
+                    line_latest <= ring_limit - 1
+                ) { line_latest } else { ring_limit };
+                line_dirty = 0;
+                budget_observed = budget_latest;
+                budget_applied = budget_latest;
+                budget_dirty = 0;
             }
 
             // Worker died; `abort_reflow_offload` recovers to a bounded state. Window
             // output is discarded BY DESIGN (retained = 0) and nothing re-attaches
-            // (no resurrection possible). `slack` stays W: loss is excused on abort.
+            // when no replacement exists (no resurrection possible). A replacement
+            // stays authoritative, receives both newest settings, and drains any
+            // rows staged after it attached — so replacement-backed Abort is a
+            // LOSSLESS close (`slack = 0`). Without one, a newest LOW finite total
+            // tightens the surviving ring; high/unlimited requests cannot expand
+            // it, and the backend-only budget is discarded. Either branch consumes
+            // the pending snapshot exactly once.
             action Abort when (detached > 0 && done <= 0) {
                 detached = 0;
                 done = 1;
                 aborted = 1;
+                relocated = if replacement > 0 {
+                    if Buggy > 0 { relocated } else { relocated + retained }
+                } else { relocated };
                 retained = 0;
                 resurrected = 0;
-                slack = 3;
+                slack = if replacement > 0 { 0 } else { 3 };
+                pending = 0;
+                backend = replacement;
+                ring_limit = if (
+                    replacement <= 0 && line_dirty > 0 && line_latest > 0 &&
+                    line_latest <= ring_limit - 1
+                ) { line_latest } else { ring_limit };
+                line_observed = if replacement > 0 {
+                    line_latest
+                } else {
+                    if (
+                        line_dirty > 0 && line_latest > 0 &&
+                        line_latest <= ring_limit - 1
+                    ) { line_latest } else { ring_limit }
+                };
+                line_applied = if replacement > 0 { line_latest } else { 0 };
+                line_dirty = 0;
+                budget_observed = if replacement > 0 { budget_latest } else { 0 };
+                budget_applied = if replacement > 0 { budget_latest } else { 0 };
+                budget_dirty = 0;
             }
 
             // A produced line is accounted for while staged (`retained`) OR after the
             // re-attach drain relocated it into the tiered store (`relocated`). The
-            // hand actions never write `relocated` (it stays 0, so this reads exactly
-            // as the historical `produced <= retained + slack`); the DERIVED Reattach
-            // of the full-verbatim real body performs the conserving transfer
-            // `relocated' = relocated + retained, retained' = 0` — the discard bug
-            // (clearing the lazy buffer instead of draining it) breaks the sum.
+            // AttachReplacement and replacement-backed Abort conservingly transfer
+            // staged rows (`relocated' = relocated + retained, retained' = 0`);
+            // Reattach may leave safe rows staged or drain them in the full-verbatim
+            // production body. A discard in place of that transfer breaks the sum.
             invariant NoLoss: produced <= retained + relocated + slack;
             invariant ErasedStaysErased: resurrected <= 0;
             // The window CLOSES: detached and done are never both set. This is the
@@ -104,6 +258,27 @@ fn offload_window_model() -> Model {
             // extraction RFC's Tier-A target: a wedged `abort_reflow_offload` derives
             // an Abort action with no `detached' = 0` update, and ty fails the BUILD.
             invariant WindowCloses: detached + done <= 1;
+            invariant PendingIffUnresolved: pending == detached;
+            invariant DirtyOnlyWhilePending:
+                line_dirty + budget_dirty <= pending + pending;
+            invariant LatestLineObservable:
+                line_observed == if (pending > 0 || backend > 0) {
+                    line_latest
+                } else { ring_limit };
+            invariant LatestBudgetObservable:
+                budget_observed == if (pending > 0 || backend > 0) {
+                    budget_latest
+                } else { 0 };
+            invariant AppliedLineLatest:
+                line_applied == if backend > 0 { line_latest } else { 0 };
+            invariant AppliedBudgetLatest:
+                budget_applied == if backend > 0 { budget_latest } else { 0 };
+            invariant ReplacementHasBackend: replacement <= backend;
+            invariant RingBounded: ring_limit > 0 && ring_limit <= RingCap;
+            invariant SettingsBounded:
+                line_latest <= LineHigh && line_observed <= LineHigh &&
+                line_applied <= LineHigh && budget_latest <= InitialBudget &&
+                budget_observed <= InitialBudget && budget_applied <= InitialBudget;
         }
     }
 }

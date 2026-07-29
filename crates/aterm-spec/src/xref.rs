@@ -308,8 +308,49 @@ pub fn model_registry() -> Vec<Model> {
         native_update_disk_transaction_model(),
         exact_profanity_completion_model(),
         settings_page_scroll_model(),
+        // Fixed-path snapshot publication is generation fenced: once a newer
+        // request begins, an overtaken encoder cannot publish stale payload or
+        // its completion marker. Tier-1 binds the real path-generation fence in
+        // aterm-gui/src/app_introspect.rs.
+        snapshot_generation_commit_model(),
+        // A video request owns its pre-created private directory from admission
+        // through recording/export. All abort paths clean it, success transfers
+        // it to publication, and the recording/export slots never overlap.
+        // Tier-1 binds the real GUI lifecycle and process-wide export permit.
+        video_recording_lifecycle_model(),
+        // Per-process media retention prefers an exact lease observation over
+        // numeric PID liveness; only a legacy namespace without a lease may use
+        // the PID fallback. Tier-1 binds the GUI's full lease×PID decision.
+        exact_instance_retention_model(),
+        // Confined artifact I/O retains the original inside object across
+        // ancestor swaps and validates its identity again before replying.
+        // Tier-1 binds GUI/media read and write transactions.
+        anchored_artifact_transaction_model(),
+        // Capture publication continues past worker enqueue: exact handles are
+        // retained and revalidated through the control socket's complete reply
+        // and a fresh causal nonce challenge/echo. ACK-error/half-closed clients
+        // and partial write failures retain the guard in a central quarantine
+        // until its abstract 30-second expiry; only a valid echo releases
+        // immediately.
+        artifact_reply_publication_model(),
+        // `video frames` readers share a bounded refcount. Final validation arms
+        // one capability-bound last-release sweep; acquisition is fail-closed
+        // from the last-release decision through sweep completion.
+        artifact_reader_lease_model(),
         capture_after_present_model(),
         native_capture_source_model(),
+        // Presented destination capture: one-shot serial-bound lifecycle plus
+        // the streaming staging-slot reuse/drop and sequence-ordered harvested
+        // store disciplines. Shipping pure transition gates and Tier-1 negative
+        // controls live in aterm-gpu.
+        presented_frame_tap_model(),
+        video_tap_slot_model(),
+        // HDR reconfigure/live-validation lifecycle: an f16 DX12 swapchain
+        // remains HDR only after its scRGB re-tag/check succeeds; failure
+        // atomically selects SDR and reconciles capture metadata. Tier-1 lives
+        // in aterm-gpu/tests/hdr_gate.rs.
+        hdr_reconfigure_retag_model(),
+        layout_coordinate_reset_model(),
         semantic_prewarm_generation_model(),
         semantic_prewarm_handshake_model(),
         semantic_prewarm_request_swap_model(),

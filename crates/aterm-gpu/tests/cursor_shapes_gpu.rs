@@ -47,9 +47,13 @@ fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
 /// fg (0xD0D0D0) sit ~200 LSB from the cursor green, so the flat-fill shape-count
 /// assertions (underline/bar/hollow) still count exactly the same pixels.
 fn near_cursor(p: u32) -> bool {
-    (rr(p) - rr(CURSOR)).abs() <= 2
-        && (gg(p) - gg(CURSOR)).abs() <= 2
-        && (bb(p) - bb(CURSOR)).abs() <= 2
+    near_color(p, CURSOR)
+}
+
+fn near_color(p: u32, color: u32) -> bool {
+    (rr(p) - rr(color)).abs() <= 2
+        && (gg(p) - gg(color)).abs() <= 2
+        && (bb(p) - bb(color)).abs() <= 2
 }
 
 /// All (x, y) positions whose pixel is the cursor colour (within 1 LSB).
@@ -189,6 +193,55 @@ fn gpu_bar_cursor_matches_cpu() {
         pos.iter().all(|&(x, y)| x < t && y < ch),
         "bar: cursor pixels outside the left strip"
     );
+}
+
+#[test]
+fn gpu_steady_bar_fill_override_matches_cpu_without_theme_flash() {
+    let Some((mut cpu, mut gpu)) = renderers() else {
+        return;
+    };
+    const OVERRIDE: u32 = 0x00FE_017F;
+    let (cw, ch) = cpu.cell_size();
+    let mut term = term_with(b"\x1b[6 q"); // steady bar over a real glyph
+    let mut input = term.cell_frame(2, 4);
+    input.cursor_fill_override = Some(OVERRIDE);
+
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "steady-bar override CPU/GPU output diverges by {delta} > 8"
+    );
+
+    let rects = aterm_render::cursor_rects(CursorStyle::SteadyBar, 0, 0, cw, ch);
+    let area: usize = rects.iter().map(|&[_, _, w, h]| w * h).sum();
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        assert_eq!(
+            frame
+                .pixels
+                .iter()
+                .filter(|&&pixel| near_color(pixel, OVERRIDE))
+                .count(),
+            area,
+            "{name}: every steady-bar pixel must use the host override"
+        );
+        assert!(
+            cursor_positions(frame).is_empty(),
+            "{name}: theme cursor colour must not flash through the override"
+        );
+        for &[x, y, w, h] in &rects {
+            for py in y..y + h {
+                for px in x..x + w {
+                    assert!(
+                        near_color(frame.pixels[py * frame.width + px], OVERRIDE),
+                        "{name}: steady-bar override missing at ({px},{py})"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

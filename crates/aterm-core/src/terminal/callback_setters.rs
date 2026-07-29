@@ -331,7 +331,7 @@ impl Terminal {
     /// The callback receives:
     /// - `target: ColorTarget` — which color changed (foreground, background, cursor, etc.)
     /// - `color: Rgb` — the new color value
-    /// - `op: ColorChangeOp` — whether the color was set or reset
+    /// - `op: ColorChangeOp` — whether the color was set, reset, or made dynamic
     ///
     /// # Example
     ///

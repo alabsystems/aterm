@@ -74,17 +74,43 @@ pub(crate) fn classify(facts: AdmissionFacts) -> AdmissionDecision {
     if !facts.native_state_certified {
         return AdmissionDecision::Block(AdmissionBlock::NativeStateUncertified);
     }
-    // A probe failure is not evidence of an idle shell. Fail closed even when a
-    // handoff was prepared: the final readiness edge must be based on one complete,
-    // internally consistent observation of the session set.
-    if facts.unknown_foregrounds > 0 {
-        return AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown);
-    }
+    // THE UNKNOWN-FOREGROUND PROBE GATES THE COLD LANE ONLY.
+    //
+    // That probe answers exactly one question: would replacing the app KILL
+    // something the user is running? It belongs to the cold lane, which quits the
+    // process and closes every PTY, hanging up whatever was in the foreground. The
+    // seamless lane signals nothing — it parks readers, dups the PTY masters,
+    // spawns the successor, and the shell keeps running undisturbed on the far end
+    // of the same pty throughout. An unprobeable foreground is not a hazard it can
+    // realize.
+    //
+    // Checking it first made one unprobeable PTY veto BOTH lanes. `foreground_pgrp`
+    // is a bare `tcgetpgrp` (quit_safety.rs) and ANY error counts as unknown, so an
+    // exited shell in a still-open tab or an orphaned pty was enough to block every
+    // automatic update — and, because a Block becomes
+    // `UpdateHandoffStartError::failed`, to latch automatic apply off for that
+    // build. "Fail closed" was the right instinct aimed at the wrong lane: refusing
+    // the LOSSLESS path because the DESTRUCTIVE path's precondition is unproven
+    // buys no safety and costs the update.
+    //
+    // The incoherence check above deliberately stays ahead of seamless: that one is
+    // not a hazard test but a "this fact set is not real" test, and no lane should
+    // act on it. There is also no fallthrough risk — a seamless attempt that later
+    // fails does not re-enter this classifier and pick up the cold lane; it goes to
+    // the manual-only path.
+    // An INCOHERENT observation still fails closed for every lane, seamless
+    // included: more foreground jobs than PTYs means the fact set does not
+    // describe any real session state, and no decision should be taken on it.
     if facts.foreground_jobs > facts.live_ptys {
         return AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless);
     }
     if facts.seamless_capable {
         return AdmissionDecision::Apply(ApplyLane::Seamless);
+    }
+    // A probe failure is not evidence of an idle shell, and everything past this
+    // point is destructive. Fail closed.
+    if facts.unknown_foregrounds > 0 {
+        return AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown);
     }
     // A cold replacement is destructive even for an idle shell. It is admitted only
     // when there is literally no PTY/session to lose; inconsistent job facts fail closed.
@@ -169,8 +195,10 @@ mod tests {
                 unknown_foregrounds: 1,
                 ..facts()
             }),
-            AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown),
-            "a handoff cannot turn an unknown foreground probe into proof"
+            AdmissionDecision::Apply(ApplyLane::Seamless),
+            "an unprobeable foreground must not veto the LOSSLESS lane: seamless \
+             signals nothing, so a foreground job is not a hazard it can realize. \
+             Blocking here made one orphaned pty disable automatic update entirely."
         );
         assert_eq!(
             classify(AdmissionFacts {

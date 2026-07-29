@@ -2000,7 +2000,10 @@ mod tests {
         let started = std::time::Instant::now();
         wake(wr);
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(20),
+            // A genuine failure blocks FOREVER on a full pipe with no reader, so any
+            // finite bound catches it. 20ms sits inside one scheduler quantum and was
+            // measuring preemption, not the never-blocks property.
+            started.elapsed() < std::time::Duration::from_secs(5),
             "a redundant wake against a full pipe must return promptly"
         );
         close_fd(rd);
@@ -2024,12 +2027,22 @@ mod tests {
         let (wake_rd, wake_wr) = make_wake_pipe().expect("wake pipe");
 
         let (tx, rx) = mpsc::channel();
+        // Publish entry so the negative below cannot pass merely because the thread
+        // was never scheduled: a 200ms `recv_timeout` is well inside a scheduling
+        // delay on a loaded box, and without this a `read_or_wake` that busy-returned
+        // immediately would still look like "stayed parked".
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_entered = entered.clone();
         let h = std::thread::spawn(move || {
             let mut buf = [0u8; 16];
+            reader_entered.store(true, std::sync::atomic::Ordering::SeqCst);
             let out = read_or_wake(master_rd, &mut buf, wake_rd);
             tx.send(matches!(out, ReadOutcome::Wake)).unwrap();
             close_fd(wake_rd);
         });
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
 
         // Neither fd is ready ⇒ the reader must stay parked (not busy-return).
         assert!(
@@ -2074,7 +2087,12 @@ mod tests {
         assert_eq!(filled, 4, "must gather the whole burst");
         assert_eq!(&buf[..4], b"echo");
         assert!(
-            t0.elapsed() < std::time::Duration::from_millis(50),
+            // Failure bound only: the regressed path parks (unbounded), so any finite
+            // deadline discriminates. 50ms sits inside a single scheduler quantum on a
+            // loaded box and was measuring preemption, not the latency property. The
+            // structural assertions beside this one (byte counts, wake-byte
+            // preservation) are what actually prove the behaviour.
+            t0.elapsed() < std::time::Duration::from_secs(2),
             "interactive drain must return on the first quiet read, not spin/park"
         );
         close_fd(rd);
@@ -2446,7 +2464,12 @@ mod tests {
         );
         assert_eq!(filled, payload.len(), "keeps the drained burst");
         assert!(
-            t0.elapsed() < std::time::Duration::from_millis(50),
+            // Failure bound only: the regressed path parks (unbounded), so any finite
+            // deadline discriminates. 50ms sits inside a single scheduler quantum on a
+            // loaded box and was measuring preemption, not the latency property. The
+            // structural assertions beside this one (byte counts, wake-byte
+            // preservation) are what actually prove the behaviour.
+            t0.elapsed() < std::time::Duration::from_secs(2),
             "a queued wake must deliver promptly, not park the full idle wait"
         );
         let mut b = [0u8; 4];
@@ -2490,10 +2513,19 @@ mod tests {
         assert!(n > 0);
         let t0 = std::time::Instant::now();
         let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, Some(&busy));
+        // Sample BEFORE the join: the join waits on a thread that sleeps 300us, so
+        // reading `elapsed` after it folded another thread's scheduling into the
+        // number this assertion is about.
+        let drain_elapsed = t0.elapsed();
         closer.join().unwrap();
         assert_eq!(filled, chunk.len(), "keeps what was drained before HUP");
         assert!(
-            t0.elapsed() < std::time::Duration::from_millis(50),
+            // Failure bound only: the regressed path parks (unbounded), so any finite
+            // deadline discriminates. 50ms sits inside a single scheduler quantum on a
+            // loaded box and was measuring preemption, not the latency property. The
+            // structural assertions beside this one (byte counts, wake-byte
+            // preservation) are what actually prove the behaviour.
+            drain_elapsed < std::time::Duration::from_secs(2),
             "a dead producer must deliver promptly, not stall the batch"
         );
         close_fd(rd);
@@ -2521,7 +2553,18 @@ mod tests {
         }
         // Drain the whole pipe from a helper thread after a beat, so the parked
         // writer has room for the retry.
+        // The drainer's sleep alone used to be what made the writer park FIRST. If the
+        // main thread is descheduled before its write, the drain lands first, the
+        // write never parks, and the park-through-EAGAIN property under test simply
+        // does not run — a vacuous pass. Gate the drain on the writer announcing
+        // itself, and keep a short sleep as slack for the gap between the flag and
+        // the actual park.
+        let about_to_write = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drainer_gate = about_to_write.clone();
         let h = std::thread::spawn(move || {
+            while !drainer_gate.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
             std::thread::sleep(Duration::from_millis(50));
             let mut sink_buf = [0u8; 65_536];
             set_nonblocking(rd, true).expect("nonblock read end");
@@ -2533,6 +2576,7 @@ mod tests {
             }
             rd // keep rd open until after the writer completes
         });
+        about_to_write.store(true, std::sync::atomic::Ordering::SeqCst);
         let wrote = write_some_blocking(wr, b"parked-frame").expect("must not surface WouldBlock");
         assert!(
             wrote > 0,
@@ -2560,7 +2604,18 @@ mod tests {
                 break;
             }
         }
+        // The drainer's sleep alone used to be what made the writer park FIRST. If the
+        // main thread is descheduled before its write, the drain lands first, the
+        // write never parks, and the park-through-EAGAIN property under test simply
+        // does not run — a vacuous pass. Gate the drain on the writer announcing
+        // itself, and keep a short sleep as slack for the gap between the flag and
+        // the actual park.
+        let about_to_write = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drainer_gate = about_to_write.clone();
         let h = std::thread::spawn(move || {
+            while !drainer_gate.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
             std::thread::sleep(Duration::from_millis(50));
             let mut sink_buf = [0u8; 65_536];
             set_nonblocking(rd, true).expect("nonblock read end");
@@ -2572,6 +2627,7 @@ mod tests {
             }
             rd
         });
+        about_to_write.store(true, std::sync::atomic::Ordering::SeqCst);
         let wrote = write_some_count_blocking(wr, b"spill-chunk");
         assert!(
             wrote > 0,

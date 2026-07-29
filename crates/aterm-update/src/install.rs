@@ -15,7 +15,7 @@ use aterm_update_core::{FileLock, Sentinel, ensure_private_dir, same_volume};
 use crate::manifest::{Manifest, Ready};
 use crate::paths::Staging;
 use crate::sys::rename_swap;
-use crate::{ApplyOutcome, PINNED_TEAM_ID, bundle, verify};
+use crate::{ApplyOutcome, bundle, verify};
 
 /// A freshly-swapped build is auto-reverted after this many consecutive launches
 /// that observe the boot sentinel still unconfirmed (a crash loop). `arm` records
@@ -549,10 +549,8 @@ fn checked_bundle_exchange(a: &Path, b: &Path, operation: &str) -> Result<(), St
     rename_swap(a, b).map_err(|error| format!("{operation} failed: {error}"))
 }
 
-/// Bridge process-crash cuts created by the pre-fixed-path v0.53 updater. That
-/// implementation could leave OLD either at staged_app (same volume) or a
-/// `aterm.app.new-*` install sibling. Under apply_lock, migrate only a verified,
-/// strictly older bundle on the installed volume to the fixed recovery name.
+/// Read a bundle's SEALED identity (build + commit), refusing anything that is
+/// not a plain directory carrying an intact, policy-satisfying signature.
 fn verified_bundle_identity(app: &Path) -> Result<(u64, String), String> {
     let metadata =
         std::fs::symlink_metadata(app).map_err(|error| format!("bundle metadata: {error}"))?;
@@ -612,64 +610,14 @@ fn ensure_fixed_rollback(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("inspect fixed rollback: {error}")),
     }
-    let mut candidates = vec![staging.staged_app.clone()];
-    if let Some(parent) = installed.parent()
-        && let Ok(entries) = std::fs::read_dir(parent)
-    {
-        let mut legacy = entries
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("aterm.app.new-")
-            })
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        legacy.sort();
-        candidates.extend(legacy);
-    }
-    let mut verified = candidates
-        .into_iter()
-        .filter_map(|candidate| {
-            validate_fixed_rollback(&candidate, installed, current_build)
-                .ok()
-                .map(|(build, _)| (build, candidate))
-        })
-        .collect::<Vec<_>>();
-    // A legacy crash can leave more than one signed predecessor. Recover the
-    // nearest (highest) sealed predecessor; path order makes equal-build choice
-    // deterministic, with staged_app naturally winning only when identities tie.
-    verified.sort_by(|(build_a, path_a), (build_b, path_b)| {
-        build_b.cmp(build_a).then_with(|| path_a.cmp(path_b))
-    });
-    for (candidate_build, candidate) in verified {
-        if let Err(error) = std::fs::rename(&candidate, &fixed) {
-            crate::warn(&format!(
-                "could not migrate verified legacy rollback {}: {error}",
-                candidate.display()
-            ));
-            continue;
-        }
-        let (fixed_build, _) = match validate_fixed_rollback(&fixed, installed, current_build) {
-            Ok(identity) => identity,
-            Err(error) => {
-                let _ = std::fs::rename(&fixed, &candidate);
-                return Err(format!(
-                    "migrated rollback failed fixed-path recheck: {error}"
-                ));
-            }
-        };
-        if fixed_build != candidate_build {
-            let _ = std::fs::rename(&fixed, &candidate);
-            return Err("migrated rollback identity changed during rename".to_string());
-        }
-        return Ok(VerifiedRollback {
-            path: fixed,
-            build: fixed_build,
-        });
-    }
-    Err("fixed rollback missing and no verified legacy rollback was recoverable".to_string())
+    // No fixed rollback, and nowhere else to look. The pre-fixed-path v0.53
+    // updater could leave OLD at `staged_app` or at an `aterm.app.new-*` install
+    // sibling, and this used to scan both and migrate the nearest verified
+    // predecessor onto the fixed name. The modern swap is one atomic
+    // `renamex_np(RENAME_SWAP)` that always leaves OLD at the fixed path, so
+    // neither shape can occur, and the builds that produced them are in the
+    // retired lineage and cannot reach this one.
+    Err("fixed rollback missing".to_string())
 }
 
 fn recover_prepared_stage(rollback: &Path, staging: &Staging) {
@@ -1316,7 +1264,6 @@ pub fn apply_staged_if_ready(
     }
     // Under the lock no other swap is in flight, so it is safe to clear orphaned
     // transient swap copies from a previously interrupted/completed swap.
-    sweep_swap_leftovers(&b.app_root);
     // Re-read under the lock and act. A stage in flight may continue downloading
     // under stage_lock, but its final publication takes this same apply_lock. Apply
     // retirement touches only ready+staged_app, never that producer's scratch.
@@ -1838,7 +1785,6 @@ fn confirm_health_under_apply_lock_with_proof(
     // Successful disarm is the cleanup boundary. Before it, every branch above
     // preserves fixed rollback, trial, receipt, and staged orphan intact.
     let _ = remove_path_no_follow(&rollback_path(app_root));
-    sweep_swap_leftovers(app_root);
     // A ready marker means a newer publisher now owns staged_app. Only reclaim the
     // swapped-out orphan when no published generation exists.
     if !staging.ready.exists() {
@@ -1925,29 +1871,6 @@ fn restore_rollback(rollback: &Path, installed: &Path) -> Result<(), String> {
     checked_bundle_exchange(rollback, installed, "atomic rollback restore")
 }
 
-/// Remove transient swap copies (`aterm.app.new-*`) left in the install parent by
-/// a completed or interrupted swap. Called only while holding the apply lock (no
-/// concurrent swap can be mid-flight) or from the post-re-exec guard. Never
-/// touches the live bundle.
-fn sweep_swap_leftovers(app_root: &Path) {
-    let Some(parent) = app_root.parent() else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path == *app_root {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("aterm.app.new-") {
-            let _ = std::fs::remove_dir_all(&path);
-        }
-    }
-}
 
 /// 16 CSPRNG bytes, hex-encoded (32 chars), for the single-use re-exec nonce (F9).
 /// Unguessable so an attacker can't preset a matching env var. Minted through

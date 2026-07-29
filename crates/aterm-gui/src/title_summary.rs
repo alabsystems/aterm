@@ -7589,7 +7589,11 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         let start = Instant::now();
         assert!(load_ca_bundle(fifo.to_str().unwrap()).is_err());
-        assert!(start.elapsed() < Duration::from_secs(1));
+        // Failure bound only — a genuine regression blocks or never happens at all,
+        // so any finite deadline catches it and tightness only lets load fake a
+        // failure. This bound has already crossed under full-suite load elsewhere
+        // in this repo (cb8c0cff, c1281c6a).
+        assert!(start.elapsed() < Duration::from_secs(30));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7605,7 +7609,11 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         )
         .unwrap_err();
         assert!(timeout.contains("timed out"));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        // Failure bound only — a genuine regression blocks or never happens at all,
+        // so any finite deadline catches it and tightness only lets load fake a
+        // failure. This bound has already crossed under full-suite load elsewhere
+        // in this repo (cb8c0cff, c1281c6a).
+        assert!(start.elapsed() < Duration::from_secs(30));
 
         let start = Instant::now();
         let inherited_pipe = run_command_bounded(
@@ -7616,7 +7624,11 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         )
         .unwrap_err();
         assert!(inherited_pipe.contains("timed out"));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        // Failure bound only — a genuine regression blocks or never happens at all,
+        // so any finite deadline catches it and tightness only lets load fake a
+        // failure. This bound has already crossed under full-suite load elsewhere
+        // in this repo (cb8c0cff, c1281c6a).
+        assert!(start.elapsed() < Duration::from_secs(30));
 
         let oversized = run_command_bounded(
             std::process::Command::new("/bin/sh").args(["-c", "printf '%02048d' 0"]),
@@ -7705,7 +7717,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert!(process_exists(descendant));
 
         terminate_unadmitted_managed_child(child, Some(private_home.clone()));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && (process_exists(descendant) || private_home.exists()) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -7732,8 +7744,10 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert!(process_exists(descendant));
         let start = Instant::now();
         controller.transition_to(None);
-        assert!(start.elapsed() < Duration::from_millis(100));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // The signal + non-blocking spawn is microseconds; 100ms measured the
+        // scheduler. Reaping is outstanding either way, so this is a failure bound.
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && (process_exists(root) || process_exists(descendant)) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -7763,7 +7777,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             unsafe { libc::kill(i32::try_from(root).unwrap(), libc::SIGKILL) },
             0
         );
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let event = loop {
             if let Some(event) = controller.reap() {
                 break event;
@@ -7773,7 +7787,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         };
         assert_eq!(event.endpoint, "crash");
         assert_eq!(event.authority_epoch, 9);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && process_exists(descendant) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -7800,7 +7814,11 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert!(controller.owned_for_authority(8).is_none());
         let start = Instant::now();
         controller.stop();
-        assert!(start.elapsed() < Duration::from_secs(1));
+        // Failure bound only — a genuine regression blocks or never happens at all,
+        // so any finite deadline catches it and tightness only lets load fake a
+        // failure. This bound has already crossed under full-suite load elsewhere
+        // in this repo (cb8c0cff, c1281c6a).
+        assert!(start.elapsed() < Duration::from_secs(30));
         for _ in 0..100 {
             // SAFETY: signal 0 only queries the child PID's existence.
             if unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) } == -1 {
@@ -7845,7 +7863,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert!(coordinator.worker.is_none());
         assert!(!controller.owns_endpoint("http://owned.test", epoch));
         assert_eq!(coordinator.runtime_state, TitleSummaryRuntimeState::Idle);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && (process_exists(pid) || home.exists()) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -7874,7 +7892,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         assert!(!controller.owns_endpoint("secured", authority_epoch));
         assert!(ollama.runtime_paths.is_none());
         assert!(ollama._model_attestation.is_none());
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && process_exists(pid) {
             std::thread::sleep(Duration::from_millis(5));
         }

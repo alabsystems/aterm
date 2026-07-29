@@ -113,6 +113,40 @@ pub struct RenderCell {
 }
 
 impl Terminal {
+    /// Resolve the render-ready cell represented by an UNMATERIALIZED grid
+    /// column.
+    ///
+    /// Grid rows are sparse: a missing tail is the terminal's implicit
+    /// [`Cell::EMPTY`], not a request to inherit the last stored cell's SGR.
+    /// Hosts use this value when padding a snapshot row to its declared width
+    /// (split composition, web/wasm snapshots, control queries). Resolving it
+    /// here keeps every host on the same live palette/default-color/DECSCNM path
+    /// as materialized cells.
+    #[must_use]
+    pub fn implicit_blank_render_cell(&self) -> RenderCell {
+        let (fg, bg) = super::color_resolve::resolve_colors(
+            &Cell::EMPTY,
+            None,
+            self.color_palette(),
+            self.default_foreground(),
+            self.default_background(),
+            self.modes().reverse_video(),
+        );
+        RenderCell {
+            ch: ' ',
+            fg: [fg.r, fg.g, fg.b],
+            bg: [bg.r, bg.g, bg.b],
+            wide: false,
+            emoji_presentation: false,
+            bold: false,
+            italic: false,
+            underline: UnderlineStyle::None,
+            strikethrough: false,
+            overline: false,
+            underline_color: None,
+        }
+    }
+
     /// Resolve a visible row into render-ready cells, one per stored column.
     ///
     /// Each returned [`RenderCell`] has its foreground/background fully
@@ -652,7 +686,9 @@ impl Terminal {
     /// `aterm-render` / `aterm-gpu` consume only the value and never touch core
     /// internals. The per-frame, allocation-reusing path is
     /// [`cell_frame_into`](Self::cell_frame_into); this wrapper allocates then
-    /// delegates, so the two produce byte-identical snapshots.
+    /// delegates, so the two produce byte-identical snapshots. Live default
+    /// background and cursor colors are resolved here with the cells, including
+    /// OSC resets, dynamic cursor fallback, and DECSCNM.
     ///
     /// `&mut self` because the snapshot is stamped with
     /// [`damage_epoch`](Self::damage_epoch) (which latches), not because the fill
@@ -675,7 +711,9 @@ impl Terminal {
     /// inner Vec is `clear()`ed + refilled by the matching `*_row_into` accessor. So
     /// when the grid dimensions are stable (the common case: same window, frame
     /// after frame) NEITHER the outer Vecs NOR the inner per-row Vecs reallocate.
-    /// `line_sizes` is `.clear()`ed (its elements are `Copy`, no inner allocation).
+    /// `line_sizes` is `.clear()`ed (its elements are `Copy`, no inner allocation);
+    /// pane-local `line_size_spans` and `default_bg_spans` rows are cleared in
+    /// place because an engine snapshot is never a composed split frame.
     /// The data is byte-for-byte identical to what [`cell_frame`](Self::cell_frame)
     /// produces.
     ///
@@ -761,6 +799,22 @@ impl Terminal {
                     crate::grid::Row::line_size,
                 )
         }));
+        // `scratch` is also reused by the GUI's split compositor. A subsequent
+        // direct terminal snapshot must not inherit pane-local DEC geometry from
+        // that composed frame. Preserve each inner Vec's capacity while resetting
+        // the semantic row count and contents.
+        scratch.line_size_spans.resize_with(rows, Vec::new);
+        for spans in &mut scratch.line_size_spans {
+            spans.clear();
+        }
+        scratch.default_bg_spans.resize_with(rows, Vec::new);
+        for spans in &mut scratch.default_bg_spans {
+            spans.clear();
+        }
+        // Like the pane spans above, the selection clip belongs to a composed
+        // frame, never to the terminal snapshot itself. A direct single-pane
+        // extraction restores the historical unbounded selection predicate.
+        scratch.selection_clip = None;
 
         let cur = self.cursor();
         scratch.cursor_row = cur.row as usize;
@@ -779,6 +833,45 @@ impl Terminal {
         // `clone_from` reuses the destination's existing allocation where the
         // selection's owned data permits, instead of dropping + reallocating.
         scratch.selection.clone_from(self.text_selection());
+        let pack = |color: aterm_types::Rgb| {
+            (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+        };
+        scratch.selection_bg = self
+            .selection_background()
+            .map_or(crate::render::COLOR_UNSET, pack);
+        scratch.selection_fg = self
+            .selection_foreground()
+            .map_or(crate::render::COLOR_DYNAMIC, pack);
+        // These colors describe the terminal snapshot itself, not host
+        // presentation policy. Stamp them at the same extraction boundary as
+        // the sparse cells so every direct `cell_frame*` consumer sees one
+        // coherent OSC/DECSCNM state. In particular, an unmaterialized row tail
+        // is `Cell::EMPTY`: its effective background follows OSC 11 and swaps
+        // with the live foreground under DECSCNM. A dynamic cursor (OSC 21
+        // `cursor=`) follows the live OSC 10 foreground.
+        let reverse_video = self.modes().reverse_video();
+        if self.color.frame_background_authoritative || reverse_video {
+            let implicit_blank = self.implicit_blank_render_cell();
+            scratch.default_bg = (u32::from(implicit_blank.bg[0]) << 16)
+                | (u32::from(implicit_blank.bg[1]) << 8)
+                | u32::from(implicit_blank.bg[2]);
+        } else {
+            // Preserve the standalone-renderer compatibility contract for a
+            // pristine, unconfigured `Terminal::new`: its VT-spec black is not
+            // a host theme decision. Any host/OSC background or DECSCNM state
+            // above makes the terminal authoritative.
+            scratch.default_bg = crate::render::COLOR_UNSET;
+        }
+        if self.color.frame_cursor_authoritative
+            || (self.color.cursor_color.is_none() && self.color.frame_foreground_authoritative)
+        {
+            scratch.cursor_color = pack(
+                self.cursor_color()
+                    .unwrap_or_else(|| self.default_foreground()),
+            );
+        } else {
+            scratch.cursor_color = crate::render::COLOR_UNSET;
+        }
 
         // Stamp the snapshot with the engine's monotone damage epoch (A-3 seq).
         // O(1), and idempotent within a damage session, so reading it here is free
@@ -813,6 +906,201 @@ mod tests {
     fn render_row_out_of_range_is_empty() {
         let term = Terminal::new(2, 4);
         assert!(term.render_row(99).is_empty());
+    }
+
+    #[test]
+    fn cell_frame_into_clears_compositor_pane_spans() {
+        let mut term = Terminal::new(2, 8);
+        let mut scratch = crate::render::RenderInput::empty();
+        scratch.line_size_spans = vec![
+            vec![crate::render::LineSizeSpan::new(
+                0,
+                4,
+                crate::grid::LineSize::DoubleWidth,
+            )],
+            vec![crate::render::LineSizeSpan::new(
+                5,
+                8,
+                crate::grid::LineSize::DoubleHeightTop,
+            )],
+            vec![crate::render::LineSizeSpan::new(
+                0,
+                8,
+                crate::grid::LineSize::DoubleHeightBottom,
+            )],
+        ];
+        scratch.default_bg_spans = vec![
+            vec![crate::render::DefaultBgSpan::new(0, 4, 0x0011_2233)],
+            vec![crate::render::DefaultBgSpan::new(5, 8, 0x0044_5566)],
+            vec![crate::render::DefaultBgSpan::new(0, 8, 0x0077_8899)],
+        ];
+        scratch.selection_clip = Some(crate::render::SelectionClip::new(0, 2, 5, 8));
+
+        term.cell_frame_into(&mut scratch, 2, 8);
+
+        assert_eq!(scratch.line_size_spans.len(), 2);
+        assert!(
+            scratch.line_size_spans.iter().all(Vec::is_empty),
+            "a direct terminal snapshot must not inherit split-compositor spans"
+        );
+        assert_eq!(scratch.default_bg_spans.len(), 2);
+        assert!(
+            scratch.default_bg_spans.iter().all(Vec::is_empty),
+            "a direct terminal snapshot must not inherit split default provenance"
+        );
+        assert_eq!(
+            scratch.selection_clip, None,
+            "a direct terminal snapshot must not inherit a split selection clip"
+        );
+    }
+
+    #[test]
+    fn cell_frame_into_tracks_live_selection_colors_and_resets() {
+        let mut term = Terminal::new(2, 8);
+        let configured_bg = aterm_types::Rgb::new(0x10, 0x20, 0x30);
+        let configured_fg = aterm_types::Rgb::new(0x40, 0x50, 0x60);
+        term.set_default_selection_background(Some(configured_bg));
+        term.set_default_selection_foreground(Some(configured_fg));
+        let mut scratch = crate::render::RenderInput::empty();
+
+        term.process(b"\x1b]17;rgb:aaaa/bbbb/cccc\x1b\\");
+        term.process(b"\x1b]19;rgb:1111/2222/3333\x1b\\");
+        term.cell_frame_into(&mut scratch, 2, 8);
+        assert_eq!(scratch.selection_bg, 0x00aa_bbcc);
+        assert_eq!(scratch.selection_fg, 0x0011_2233);
+
+        term.process(b"\x1b]117\x07\x1b]119\x07");
+        term.cell_frame_into(&mut scratch, 2, 8);
+        assert_eq!(scratch.selection_bg, 0x0010_2030);
+        assert_eq!(scratch.selection_fg, 0x0040_5060);
+    }
+
+    #[test]
+    fn cell_frame_owns_live_sparse_background_and_cursor_colors() {
+        let packed = |color: aterm_types::Rgb| {
+            (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+        };
+        let mut pristine = Terminal::new(2, 8);
+        let initial = pristine.cell_frame(2, 8);
+        assert_eq!(
+            initial.default_bg,
+            crate::render::COLOR_UNSET,
+            "an unconfigured raw terminal preserves the renderer-theme fallback",
+        );
+        assert_eq!(
+            initial.cursor_color,
+            crate::render::COLOR_UNSET,
+            "an unconfigured raw terminal preserves the renderer cursor fallback",
+        );
+        pristine.process(b"\x1b[?5h");
+        assert_eq!(
+            pristine.cell_frame(2, 8).default_bg,
+            packed(aterm_types::DEFAULT_FOREGROUND),
+            "DECSCNM alone makes even the raw terminal's effective blank authoritative",
+        );
+
+        let mut protocol_only = Terminal::new(2, 8);
+        protocol_only.process(b"\x1b]11;rgb:12/34/56\x1b\\\x1b]12;rgb:de/ad/be\x1b\\");
+        let protocol_live = protocol_only.cell_frame(2, 8);
+        assert_eq!(protocol_live.default_bg, 0x0012_3456);
+        assert_eq!(protocol_live.cursor_color, 0x00de_adbe);
+        protocol_only.process(b"\x1b]111\x07\x1b]112\x07");
+        let protocol_reset = protocol_only.cell_frame(2, 8);
+        assert_eq!(
+            protocol_reset.default_bg,
+            packed(aterm_types::DEFAULT_BACKGROUND),
+            "OSC 111 exposes the raw terminal's configured black reset baseline",
+        );
+        assert_eq!(
+            protocol_reset.cursor_color,
+            packed(aterm_types::DEFAULT_FOREGROUND),
+            "OSC 112 restores the raw terminal's dynamic foreground cursor baseline",
+        );
+
+        let mut term = Terminal::new(2, 8);
+        let configured_fg = aterm_types::Rgb::new(0x11, 0x22, 0x33);
+        let configured_bg = aterm_types::Rgb::new(0x44, 0x55, 0x66);
+        let configured_cursor = aterm_types::Rgb::new(0x77, 0x88, 0x99);
+        term.set_default_foreground(configured_fg);
+        term.set_default_background(configured_bg);
+        term.set_default_cursor_color(Some(configured_cursor));
+
+        let configured = term.cell_frame(2, 8);
+        assert_eq!(configured.default_bg, 0x0044_5566);
+        assert_eq!(configured.cursor_color, 0x0077_8899);
+        assert!(
+            configured.cells.iter().all(Vec::is_empty),
+            "the color contract must cover genuinely sparse rows, not only painted cells",
+        );
+
+        term.process(
+            b"\x1b]10;rgb:aa/bb/cc\x1b\\\
+              \x1b]11;rgb:12/34/56\x1b\\\
+              \x1b]12;rgb:de/ad/be\x1b\\",
+        );
+        let live = term.cell_frame(2, 8);
+        assert_eq!(live.default_bg, 0x0012_3456);
+        assert_eq!(live.cursor_color, 0x00de_adbe);
+
+        // Negative control for the kept-scratch path: extraction must overwrite
+        // stale host values rather than accidentally preserving a prior frame.
+        let mut scratch = crate::render::RenderInput::empty();
+        scratch.default_bg = 0x0001_0203;
+        scratch.cursor_color = 0x0004_0506;
+        term.process(b"\x1b[?5h"); // DECSCNM reverse video.
+        term.cell_frame_into(&mut scratch, 2, 8);
+        assert_eq!(
+            scratch.default_bg, 0x00aa_bbcc,
+            "DECSCNM makes the live default foreground the implicit blank background",
+        );
+        assert_eq!(
+            scratch.cursor_color, 0x00de_adbe,
+            "DECSCNM does not replace an explicit OSC 12 cursor color",
+        );
+
+        // An empty OSC 21 cursor value selects dynamic behavior. Its frame color
+        // must follow a later OSC 10 update without any host-side restamping.
+        term.process(b"\x1b]21;cursor=\x1b\\\x1b]10;rgb:fe/01/7f\x1b\\");
+        let dynamic = term.cell_frame(2, 8);
+        assert_eq!(dynamic.default_bg, 0x00fe_017f);
+        assert_eq!(dynamic.cursor_color, 0x00fe_017f);
+
+        // Reset every live input to its host-configured baseline and leave
+        // DECSCNM. This distinguishes reset semantics from hard-coded theme
+        // literals inside a consumer.
+        term.process(b"\x1b[?5l\x1b]110\x07\x1b]111\x07\x1b]112\x07");
+        term.cell_frame_into(&mut scratch, 2, 8);
+        assert_eq!(scratch.default_bg, 0x0044_5566);
+        assert_eq!(scratch.cursor_color, 0x0077_8899);
+    }
+
+    #[test]
+    fn implicit_blank_uses_live_defaults_and_decscnm() {
+        let mut term = Terminal::new(2, 8);
+        let fg = aterm_types::Rgb::new(0x12, 0x34, 0x56);
+        let bg = aterm_types::Rgb::new(0xA1, 0xB2, 0xC3);
+        term.set_default_foreground(fg);
+        term.set_default_background(bg);
+
+        let normal = term.implicit_blank_render_cell();
+        assert_eq!(normal.ch, ' ');
+        assert_eq!(normal.fg, [fg.r, fg.g, fg.b]);
+        assert_eq!(normal.bg, [bg.r, bg.g, bg.b]);
+        assert!(!normal.wide);
+        assert_eq!(normal.underline, UnderlineStyle::None);
+
+        term.process(b"\x1b[?5h"); // DECSCNM reverse video.
+        let reversed = term.implicit_blank_render_cell();
+        assert_eq!(
+            reversed.fg,
+            [bg.r, bg.g, bg.b],
+            "DECSCNM swaps the implicit blank's live foreground"
+        );
+        assert_eq!(
+            reversed.bg,
+            [fg.r, fg.g, fg.b],
+            "DECSCNM swaps the implicit blank's live background"
+        );
     }
 
     #[test]

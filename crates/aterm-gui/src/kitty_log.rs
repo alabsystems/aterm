@@ -1396,23 +1396,30 @@ impl KittyLogHost {
 
     #[cfg(test)]
     fn await_initial_load(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while self
+        // BLOCKS, deliberately, with no clock. This used to spin on `yield_now()`
+        // to a 1s deadline and then SILENTLY FALL THROUGH — which is the dangerous
+        // direction. The startup ledger is delivered by a freshly spawned thread
+        // whose first act is an flock plus two file opens and two TOML parses; on a
+        // loaded box that can miss 1s, and the waiter's own spin starved the very
+        // worker it waited for. Callers then saw an EMPTY log and asserted against
+        // it: the symlink/FIFO guards assert `(0, 0)` to prove startup did not
+        // follow a planted ledger, so a regression that DID follow it still reported
+        // `(0, 0)` and passed green.
+        //
+        // A blocking receive is finite by construction: `initial` is a
+        // `sync_channel(1)` written exactly once, and the sender is dropped when the
+        // worker moves on — so this resolves with either the ledger or
+        // `Err(Disconnected)`. There is no window left to cross.
+        let received = self
             .writer
-            .as_ref()
-            .is_some_and(|writer| writer.initial.is_some())
-            && Instant::now() < deadline
-        {
-            self.poll_initial_load();
-            if self
-                .writer
-                .as_ref()
-                .is_some_and(|writer| writer.initial.is_some())
-            {
-                std::thread::yield_now();
-            }
+            .as_mut()
+            .and_then(|writer| writer.initial.take())
+            .map(|receiver| receiver.recv());
+        match received {
+            Some(Ok(loaded)) => self.absorb_initial(loaded),
+            // Worker gone without sending: nothing to import, same as before.
+            Some(Err(_)) | None => {}
         }
-        self.poll_initial_load();
     }
 
     /// Import the worker's one-shot startup ledger without waiting. The worker
@@ -1434,7 +1441,15 @@ impl KittyLogHost {
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
             }
         });
-        let Some(mut loaded) = loaded else { return };
+        let Some(loaded) = loaded else { return };
+        self.absorb_initial(loaded);
+    }
+
+    /// Merge one startup ledger in and re-run the restart election. Shared by the
+    /// non-blocking render-path poll and the blocking test wait, so the two cannot
+    /// drift.
+    fn absorb_initial(&mut self, loaded: KittyLog) {
+        let mut loaded = loaded;
         loaded.merge_from(&self.mem);
         if loaded == self.mem {
             return;
@@ -3513,7 +3528,8 @@ mod tests {
         host.observe(7, [sighting(11)], lex, t0, true);
         assert!(host.delta.is_empty(), "the normal queue accepted batch one");
         pending_rx
-            .recv_timeout(Duration::from_secs(1))
+            // Failure bound: the worker that never takes batch one never sends at all.
+            .recv_timeout(Duration::from_secs(60))
             .expect("the worker owns batch one before the queue is refilled");
         host.observe(8, [sighting(22)], lex, t0 + FLUSH_DEBOUNCE, true);
         assert!(host.delta.is_empty(), "the normal queue accepted batch two");

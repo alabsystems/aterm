@@ -12,8 +12,9 @@
 //! accessibility attributes (see `apply_to_ns_view`).
 //!
 //! The text format is byte-identical to the SIGUSR1 `.txt` snapshot — both go
-//! through [`push_visible_row`] — so "what an AI sees", "what a screen reader
-//! reads", and "what is on the glass" never diverge.
+//! through [`push_visible_row`] — so the AI text snapshot and screen reader
+//! consume the same visible-cell projection. This is semantic parity with the
+//! app-render input; it does not assert compositor or scanout state.
 
 use aterm_core::terminal::RenderCell;
 

@@ -10,7 +10,9 @@
 // gpu_matches_cpu suite.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{Renderer, Theme, floor_cursor_fill, floor_min_contrast_fg, underline_rects};
+use aterm_render::{
+    DefaultBgSpan, Renderer, Theme, floor_cursor_fill, floor_min_contrast_fg, underline_rects,
+};
 
 fn renderer() -> Option<Renderer> {
     Renderer::from_system(18.0, Theme::default())
@@ -57,6 +59,41 @@ fn block_cursor_near_bg_is_floored_visible() {
                 f.pixels[y * f.width + x],
                 expected,
                 "floored cursor fill at ({x},{y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn sparse_block_cursor_uses_its_pane_default_for_contrast() {
+    let Some(mut renderer) = renderer() else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = renderer.cell_size();
+    let (rows, cols) = (2usize, 8usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[2 q\x1b[1;8H");
+    let mut input = term.cell_frame(rows, cols);
+    assert!(
+        input.cells[0].get(7).is_none(),
+        "fixture requires an unmaterialized cursor cell"
+    );
+
+    let pane_bg = 0x0024_4668;
+    input.default_bg = 0x0012_3456;
+    input.default_bg_spans = vec![vec![DefaultBgSpan::new(4, cols, pane_bg)], Vec::new()];
+    input.cursor_color = pane_bg;
+    renderer.set_minimum_contrast(4.5);
+
+    let expected = floor_cursor_fill(pane_bg, pane_bg, 4.5);
+    let frame = renderer.render_input(&input);
+    for y in 0..ch {
+        for x in 7 * cw..8 * cw {
+            assert_eq!(
+                frame.pixels[y * frame.width + x],
+                expected,
+                "sparse cursor must be floored against its pane default at ({x},{y})"
             );
         }
     }

@@ -32,7 +32,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -831,6 +831,10 @@ pub struct ImageReq {
     /// retained leaf/raster identity are known; the control worker reads it only
     /// after the image reply, so existing image reply payloads remain unchanged.
     pub frame_metadata: Arc<std::sync::OnceLock<ImageFrameMetadata>>,
+    /// Linearizes a control-thread timeout against the final artifact-name
+    /// publication. If timeout wins, the encode worker may finish its private
+    /// temporary bytes but cannot make the requested path observable.
+    pub cancel: CaptureCancellation,
     /// Channel the main thread (via the encode worker) replies on: the rendered
     /// `(width, height, png?)` — `png` is `Some` only in `--bytes` mode (else the
     /// PNG is ON DISK at the confined path), `Ok((0, 0, None))` when no window
@@ -838,10 +842,352 @@ pub struct ImageReq {
     pub reply: Sender<ImageReply>,
 }
 
+const CAPTURE_CANCEL_LIVE: u8 = 0;
+const CAPTURE_CANCELLED: u8 = 1;
+const CAPTURE_COMMIT_AUTHORIZED: u8 = 2;
+
+/// One-shot cancellation/publication election for `image` and `window`.
+///
+/// The encode worker calls [`Self::authorize_commit`] immediately before the
+/// handle-relative final-name operation. The control worker calls
+/// [`Self::cancel`] when its bounded wait expires. Exactly one can win.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CaptureCancellation(Arc<AtomicU8>);
+
+impl CaptureCancellation {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true only when cancellation won before publication authority.
+    #[must_use]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "Cancel",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    pub(crate) fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                CAPTURE_CANCEL_LIVE,
+                CAPTURE_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[must_use]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == CAPTURE_CANCELLED
+    }
+
+    /// Returns true only for the single worker that wins the irrevocable
+    /// final-name publication boundary.
+    #[must_use]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "AuthorizeCommit",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    pub(crate) fn authorize_commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                CAPTURE_CANCEL_LIVE,
+                CAPTURE_COMMIT_AUTHORIZED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// Behavior implemented by an exact artifact guard carried to the socket edge.
+/// `prepare_write` revalidates the names an OK response is about to certify;
+/// it also crosses irrevocable publication ownership before any OK bytes can
+/// become visible. The guard itself remains live through write, flush, and the
+/// client's explicit post-response acknowledgement.
+pub(crate) trait WireRetention: Send {
+    fn prepare_write(&mut self) -> Result<(), String>;
+}
+
+/// Type-erased ownership that remains live until a control reply is completely
+/// consumed and explicitly acknowledged. Concrete guards retain and revalidate
+/// exact file/directory handles.
+pub(crate) struct ReplyRetention {
+    guard: Option<Box<dyn WireRetention>>,
+    phase: ReplyRetentionPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyRetentionPhase {
+    Queued,
+    Prepared,
+    Classified,
+}
+
+impl ReplyRetention {
+    pub(crate) fn new(guard: impl WireRetention + 'static) -> Self {
+        Self {
+            guard: Some(Box::new(guard)),
+            phase: ReplyRetentionPhase::Queued,
+        }
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "PrepareWire",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    pub(crate) fn prepare_write(&mut self) -> Result<(), String> {
+        let result = self
+            .guard
+            .as_mut()
+            .expect("live reply retention owns its guard")
+            .prepare_write();
+        if result.is_ok() {
+            self.phase = ReplyRetentionPhase::Prepared;
+        }
+        result
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "AcknowledgePeer",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    fn acknowledge_peer_anchor(&mut self) {
+        self.phase = ReplyRetentionPhase::Classified;
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "AcknowledgeFailed",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    fn acknowledge_failed_anchor(&mut self) {
+        self.phase = ReplyRetentionPhase::Classified;
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "PrepareFailed",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    fn prepare_failed_anchor(&mut self) {
+        self.phase = ReplyRetentionPhase::Classified;
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "WriteFailed",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    fn write_failed_anchor(&mut self) {
+        self.phase = ReplyRetentionPhase::Classified;
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "AbortQueued",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    fn abort_queued_anchor(&self) {}
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "ReleaseGuard",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    fn release_guard_anchor(&self) {}
+}
+
+impl Drop for ReplyRetention {
+    fn drop(&mut self) {
+        if self.phase == ReplyRetentionPhase::Queued {
+            self.abort_queued_anchor();
+            self.phase = ReplyRetentionPhase::Classified;
+        }
+        // Fire the refinement anchor only after the concrete handle/name guard
+        // has actually dropped. A Drop body normally runs before its fields,
+        // which would attach ReleaseGuard to a no-op and leave the real release
+        // invisible to Tier-1 conformance.
+        drop(self.guard.take());
+        self.release_guard_anchor();
+    }
+}
+
+/// A value coupled to exact artifact handles that certify any paths it names.
+pub(crate) struct Retained<T> {
+    pub(crate) value: T,
+    pub(crate) retention: Option<ReplyRetention>,
+}
+
+impl<T> Retained<T> {
+    pub(crate) fn plain(value: T) -> Self {
+        Self {
+            value,
+            retention: None,
+        }
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "QueueGuard",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    pub(crate) fn guarded(value: T, retention: ReplyRetention) -> Self {
+        Self {
+            value,
+            retention: Some(retention),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (T, Option<ReplyRetention>) {
+        (self.value, self.retention)
+    }
+}
+
+impl<T> std::ops::Deref for Retained<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Retained<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Retained")
+            .field("value", &self.value)
+            .field("has_guard", &self.retention.is_some())
+            .finish()
+    }
+}
+
+impl<T: PartialEq> PartialEq for Retained<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<T: Eq> Eq for Retained<T> {}
+
+impl PartialEq<&str> for Retained<String> {
+    fn eq(&self, other: &&str) -> bool {
+        self.value == *other
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for Retained<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(formatter)
+    }
+}
+
+/// One ordinary RPC response plus any artifact handles that must span its
+/// explicit consume acknowledgement. Most replies are plain strings; capture
+/// replies attach retention.
+pub(crate) struct ControlReply {
+    body: String,
+    retention: Option<ReplyRetention>,
+}
+
+impl ControlReply {
+    pub(crate) fn guarded(body: String, retention: Option<ReplyRetention>) -> Self {
+        Self { body, retention }
+    }
+
+    fn into_body_retaining(self, slot: &mut Option<ReplyRetention>) -> String {
+        let Self { body, retention } = self;
+        *slot = retention;
+        body
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_retention_for_test(&mut self) -> Result<(), String> {
+        self.retention
+            .as_mut()
+            .map_or_else(|| Ok(()), ReplyRetention::prepare_write)
+    }
+}
+
+impl From<String> for ControlReply {
+    fn from(body: String) -> Self {
+        Self {
+            body,
+            retention: None,
+        }
+    }
+}
+
+impl From<&str> for ControlReply {
+    fn from(body: &str) -> Self {
+        body.to_string().into()
+    }
+}
+
+impl std::ops::Deref for ControlReply {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.body
+    }
+}
+
+impl std::fmt::Debug for ControlReply {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlReply")
+            .field("body", &self.body)
+            .field("has_guard", &self.retention.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq<&str> for ControlReply {
+    fn eq(&self, other: &&str) -> bool {
+        self.body == *other
+    }
+}
+
 /// The `image` reply payload: `(width, height, Some(png-bytes))` in `--bytes` mode,
 /// `(width, height, None)` when the PNG was written to the confined file, or
 /// `(0, 0, None)` when no window displays the target.
-pub type ImageReply = Result<(u32, u32, Option<Vec<u8>>), String>;
+pub type ImageReply = Result<Retained<(u32, u32, Option<Vec<u8>>)>, String>;
+pub(crate) type WindowReply = Result<Retained<(u32, u32)>, String>;
 
 /// One retained leaf contributing pixels to an `image --meta` capture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1807,8 +2153,11 @@ fn cmd_dial_token(rest: &str) -> String {
 ///
 /// Bare `dial`, `dial-list`, and `dial-token` are NORMAL-response verbs handled in
 /// [`handle`]; only `dial <name>` takes over the connection (like a proxy forward,
-/// but across the network). The remote's listener authenticates its own local
-/// control socket, so the raw drive token never crosses the wire.
+/// but across the network). A trailing verb is a convenient one-shot form used
+/// by `aterm-ctl`; bare dial remains the persistent transport used by
+/// `aterm-agent`/`aterm-drive`. The remote's listener authenticates its own local
+/// control socket, so the raw drive token never crosses the wire. Artifact path
+/// replies name the REMOTE host; use `image --bytes` when pixels must cross back.
 fn try_net_dial<R: Read>(
     line: &str,
     scope: Scope,
@@ -1841,7 +2190,7 @@ fn try_net_dial<R: Read>(
         return true;
     }
     // The authenticated request loop uses a short liveness-poll timeout. The relay
-    // owns this socket until remote EOF, so restore ordinary blocking I/O first.
+    // owns both directions, so restore ordinary blocking I/O.
     if client.set_read_timeout(None).is_err() {
         reply("ERR dial timeout setup\n");
         return true;
@@ -1849,10 +2198,12 @@ fn try_net_dial<R: Read>(
     // Prebuffer = the one-shot verb line (if any) FOLLOWED by any bytes the client
     // already pipelined after the dial line, so ordering on the remote is preserved.
     let mut pre: Vec<u8> = Vec::new();
-    if let Some(v) = verb_tail {
-        pre.extend_from_slice(v.as_bytes());
+    if let Some(verb_tail) = verb_tail {
+        pre.extend_from_slice(verb_tail.as_bytes());
         pre.push(b'\n');
     }
+    // Pipelined bytes also carry binary bodies and a very fast post-response
+    // artifact ACK, so the relay must forward whatever BufReader already ate.
     pre.extend_from_slice(&crate::proxy::drain_buffered(reader));
     if let Err(e) = crate::net_connections::dial_relay(name, client, &pre) {
         reply(&format!("ERR dial {e}\n"));
@@ -1900,10 +2251,17 @@ fn dispatch_app_verb(
     proxy: &EventLoopProxy<Wake>,
     sock_dir: &std::path::Path,
     active_term: Option<&Arc<Mutex<Terminal>>>,
-) -> Option<String> {
+) -> Option<ControlReply> {
     let response = match verb {
-        "window" => control_media::cmd_window(proxy, rest, sock_dir),
-        "video" => control_media::cmd_video(proxy, rest, sock_dir, matches!(scope, Scope::Owner)),
+        "window" => return Some(control_media::cmd_window(proxy, rest, sock_dir)),
+        "video" => {
+            return Some(control_media::cmd_video(
+                proxy,
+                rest,
+                sock_dir,
+                matches!(scope, Scope::Owner),
+            ));
+        }
         "chrome" => control_media::cmd_chrome(proxy),
         "panes" => control_media::cmd_panes(proxy, None),
         "controls" => control_media::cmd_controls(proxy, rest),
@@ -1919,7 +2277,7 @@ fn dispatch_app_verb(
         "metrics" => control_query::cmd_metrics(active_term, rest),
         _ => return None,
     };
-    Some(response)
+    Some(response.into())
 }
 
 fn selector_is_live(store: &Store, selector: &Selector) -> bool {
@@ -1962,19 +2320,19 @@ fn dispatch_before_session(
     proxy: &EventLoopProxy<Wake>,
     queue: &ImageQueue,
     sock_dir: &std::path::Path,
-) -> Option<String> {
+) -> Option<ControlReply> {
     use aterm_types::control_verbs::{Access, Target};
 
     let (selector, verb, rest) = request_head(line);
     if let Some(error) = retired_bottom_hud_verb_error(verb) {
-        return Some(error.to_string());
+        return Some(error.into());
     }
     let Some(spec) = aterm_types::control_verbs::spec(verb) else {
-        return Some("ERR unknown verb (try: help)\n".to_string());
+        return Some("ERR unknown verb (try: help)\n".into());
     };
 
     if spec.access == Access::AnyScopeMeta {
-        return dispatch_meta_verb(verb, rest, scope, proxy);
+        return dispatch_meta_verb(verb, rest, scope, proxy).map(Into::into);
     }
 
     // Fleet reads and connection-management metadata remain useful when the
@@ -1983,7 +2341,7 @@ fn dispatch_before_session(
     // typed no-terminal error when no live context exists.
     if spec.access == Access::OwnerOnly {
         if !matches!(selector, None | Some(Selector::SelfTok)) || !matches!(scope, Scope::Owner) {
-            return Some("ERR denied\n".to_string());
+            return Some("ERR denied\n".into());
         }
         return match verb {
             "sessions" => Some(control_session::cmd_sessions_store(store)),
@@ -1991,7 +2349,8 @@ fn dispatch_before_session(
             "dial-list" => Some(cmd_dial_list()),
             "dial-token" => Some(cmd_dial_token(rest)),
             _ => None,
-        };
+        }
+        .map(Into::into);
     }
 
     let principal = if matches!(scope, Scope::Owner) {
@@ -2015,14 +2374,17 @@ fn dispatch_before_session(
             principal,
         )
     {
-        return Some(match route {
-            Ok(event) => control_input::input_reply_to_str(post_input_reply(
-                proxy,
-                Op::WriteInput,
-                vec![event],
-            )),
-            Err(error) => error.to_string(),
-        });
+        return Some(
+            match route {
+                Ok(event) => control_input::input_reply_to_str(post_input_reply(
+                    proxy,
+                    Op::WriteInput,
+                    vec![event],
+                )),
+                Err(error) => error.to_string(),
+            }
+            .into(),
+        );
     }
 
     // A native tab app owns a real framebuffer but deliberately has no active
@@ -2045,7 +2407,7 @@ fn dispatch_before_session(
         .as_ref()
         .is_none_or(|selector| selector_is_live(store, selector));
     if !explicit_live {
-        return Some("ERR no such session\n".to_string());
+        return Some("ERR no such session\n".into());
     }
     match native_control_decision(
         resolve_active(active).is_some(),
@@ -2054,9 +2416,9 @@ fn dispatch_before_session(
         NativeControlTarget::App,
     ) {
         NativeControlDecision::WithoutSession => {}
-        NativeControlDecision::Denied => return Some("ERR denied\n".to_string()),
+        NativeControlDecision::Denied => return Some("ERR denied\n".into()),
         NativeControlDecision::NoSuchSession => {
-            return Some("ERR no such session\n".to_string());
+            return Some("ERR no such session\n".into());
         }
         NativeControlDecision::ResolveSession | NativeControlDecision::NoActiveTerminal => {
             return None;
@@ -2106,7 +2468,7 @@ fn dispatch_request(
     proxy: &EventLoopProxy<Wake>,
     queue: &ImageQueue,
     sock_dir: &std::path::Path,
-) -> String {
+) -> ControlReply {
     if let Some(response) = dispatch_before_session(
         line,
         active,
@@ -2142,11 +2504,11 @@ fn dispatch_request(
         },
     ) {
         NativeControlDecision::ResolveSession => {}
-        NativeControlDecision::Denied => return "ERR denied\n".to_string(),
-        NativeControlDecision::NoActiveTerminal => return NO_ACTIVE_TERMINAL.to_string(),
-        NativeControlDecision::NoSuchSession => return "ERR no such session\n".to_string(),
+        NativeControlDecision::Denied => return "ERR denied\n".into(),
+        NativeControlDecision::NoActiveTerminal => return NO_ACTIVE_TERMINAL.into(),
+        NativeControlDecision::NoSuchSession => return "ERR no such session\n".into(),
         NativeControlDecision::WithoutSession => {
-            return "ERR invalid control target\n".to_string();
+            return "ERR invalid control target\n".into();
         }
     }
     // Capture the FRONT tab's id before `active_target` is consumed: an explicit
@@ -2164,9 +2526,11 @@ fn dispatch_request(
             "ERR no such session\n".to_string()
         } else {
             NO_ACTIVE_TERMINAL.to_string()
-        };
+        }
+        .into();
     };
-    handle(
+    let mut retention = None;
+    let body = handle(
         line,
         &term,
         master,
@@ -2179,7 +2543,9 @@ fn dispatch_request(
         sock_dir,
         subscribers,
         front_active_session,
-    )
+        &mut retention,
+    );
+    ControlReply::guarded(body, retention)
 }
 
 /// Serve one connection: AUTHENTICATE the first line against the capability
@@ -2197,6 +2563,273 @@ fn dispatch_request(
 enum ServeDisposition {
     Close,
     Subscribe { line: String, scope: Scope },
+}
+
+struct PendingArtifactAck {
+    retention: ReplyRetention,
+    nonce: String,
+}
+
+/// A complete guarded response gets this long to finish its client handoff.
+/// A valid nonce acknowledgement releases the exact handles immediately. Any
+/// timeout, early request-half close, legacy client, or partial wire failure
+/// transfers them to the process-global quarantine for this *additional* grace
+/// interval, so a failed ACK can never become an immediate same-name race.
+const ARTIFACT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const ARTIFACT_FAILURE_QUARANTINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct QuarantinedArtifactReply {
+    until: std::time::Instant,
+    _retention: ReplyRetention,
+}
+
+struct ArtifactReplyQuarantine {
+    entries: std::sync::Mutex<Vec<QuarantinedArtifactReply>>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactReplyPublication",
+        action = "AdvanceQuarantine",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+    )
+)]
+fn advance_artifact_quarantine_anchor() {}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactReplyPublication",
+        action = "ExpireQuarantine",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+    )
+)]
+fn expire_artifact_quarantine_anchor() {}
+
+fn artifact_reply_quarantine() -> &'static ArtifactReplyQuarantine {
+    static QUARANTINE: std::sync::OnceLock<ArtifactReplyQuarantine> = std::sync::OnceLock::new();
+    QUARANTINE.get_or_init(|| {
+        let quarantine = ArtifactReplyQuarantine {
+            entries: std::sync::Mutex::new(Vec::new()),
+            changed: std::sync::Condvar::new(),
+        };
+        // One reaper handles every failed handoff. If the OS refuses the single
+        // helper thread, queued guards intentionally remain retained forever:
+        // fail-closed availability loss is safer than releasing an advertised
+        // path before its bounded compatibility handoff.
+        let _ = std::thread::Builder::new()
+            .name("aterm-artifact-quarantine".into())
+            .spawn(artifact_reply_quarantine_reaper);
+        quarantine
+    })
+}
+
+fn artifact_reply_quarantine_reaper() {
+    let quarantine = artifact_reply_quarantine();
+    loop {
+        let mut entries = quarantine
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while entries.is_empty() {
+            entries = quarantine
+                .changed
+                .wait(entries)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let now = std::time::Instant::now();
+        let next = entries
+            .iter()
+            .map(|entry| entry.until)
+            .min()
+            .expect("non-empty quarantine has a deadline");
+        if next > now {
+            let (next_entries, _) = quarantine
+                .changed
+                .wait_timeout(entries, next.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(next_entries);
+            continue;
+        }
+        let mut expired = Vec::new();
+        let mut index = 0;
+        while index < entries.len() {
+            if entries[index].until <= now {
+                advance_artifact_quarantine_anchor();
+                expire_artifact_quarantine_anchor();
+                expired.push(entries.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        drop(entries);
+        // Exact filesystem/OS locks are released outside the queue mutex.
+        drop(expired);
+    }
+}
+
+fn quarantine_artifact_reply_until(retention: ReplyRetention, until: std::time::Instant) {
+    let quarantine = artifact_reply_quarantine();
+    let mut entries = quarantine
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    entries.push(QuarantinedArtifactReply {
+        until,
+        _retention: retention,
+    });
+    quarantine.changed.notify_one();
+}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactReplyPublication",
+        action = "WriteWire",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+    )
+)]
+fn write_control_reply(
+    writer: &mut impl Write,
+    mut reply: ControlReply,
+) -> std::io::Result<Option<PendingArtifactAck>> {
+    // Mint the causal challenge BEFORE fallible wire preparation. Video
+    // preparation can publish its durable marker; entropy failure must therefore
+    // remain an invisible, abortable ERR rather than occur after that boundary.
+    let mut nonce = if reply.retention.is_some() {
+        match aterm_uds::rand::hex_token::<16>() {
+            Ok(nonce) => Some(nonce),
+            Err(error) => {
+                reply.body = format!("ERR artifact acknowledgement setup failed: {error}\n");
+                reply.retention = None;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(retention) = reply.retention.as_mut()
+        && let Err(error) = retention.prepare_write()
+    {
+        // The original OK names an identity the retained handles can no longer
+        // certify. Drop/abort that publication before writing a path-free ERR.
+        retention.prepare_failed_anchor();
+        reply.body = format!("ERR artifact reply validation failed: {error}\n");
+        reply.retention = None;
+        nonce = None;
+    }
+    // `reply` remains in scope through the complete write + flush; guarded
+    // retention is then returned to the explicit ACK waiter.
+    let write = (|| {
+        writer.write_all(reply.body.as_bytes())?;
+        if let Some(nonce) = nonce.as_deref() {
+            writer.write_all(
+                aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX.as_bytes(),
+            )?;
+            writer.write_all(nonce.as_bytes())?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()
+    })();
+    if let Err(error) = write {
+        if let Some(mut retention) = reply.retention.take() {
+            retention.write_failed_anchor();
+            quarantine_artifact_reply_until(
+                retention,
+                std::time::Instant::now() + ARTIFACT_FAILURE_QUARANTINE,
+            );
+        }
+        return Err(error);
+    }
+    Ok(reply
+        .retention
+        .take()
+        .zip(nonce)
+        .map(|(retention, nonce)| PendingArtifactAck { retention, nonce }))
+}
+
+/// Guarded artifact replies are one-shot at the connection level. After writing
+/// the complete ordinary response frame, retain every exact identity until the
+/// server then appends an unpredictable `ACK-CHALLENGE <nonce>` trailer. The
+/// shipping client can echo `ACK <nonce>` only after consuming the full framed
+/// response and trailer; a pre-pipelined ACK cannot guess the challenge.
+///
+/// Any non-matching line, EOF, timeout, or I/O failure is an explicit failed-ACK
+/// outcome transferred to quarantine, never a successful consume
+/// acknowledgement or another dispatched verb. In particular, request-half EOF
+/// cannot masquerade as ACK: a client may half-close immediately after its
+/// request while still waiting to read the response. Transparent local/TLS
+/// relays carry the ACK as ordinary reverse-direction traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtifactAckOutcome {
+    PeerAcknowledged,
+    AcknowledgementQuarantined,
+}
+
+fn await_guarded_reply_close(
+    stream: &CtlStream,
+    reader: &mut impl BufRead,
+    pending: PendingArtifactAck,
+) -> ArtifactAckOutcome {
+    await_guarded_reply_close_with_quarantine(stream, reader, pending, ARTIFACT_FAILURE_QUARANTINE)
+}
+
+fn await_guarded_reply_close_with_quarantine(
+    stream: &CtlStream,
+    reader: &mut impl BufRead,
+    pending: PendingArtifactAck,
+    failure_quarantine: std::time::Duration,
+) -> ArtifactAckOutcome {
+    let PendingArtifactAck {
+        mut retention,
+        nonce,
+    } = pending;
+    let expected = format!(
+        "{}{nonce}",
+        aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX
+    );
+    let deadline = std::time::Instant::now() + ARTIFACT_ACK_TIMEOUT;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline
+            || stream
+                .set_read_timeout(Some(deadline.saturating_duration_since(now)))
+                .is_err()
+        {
+            retention.acknowledge_failed_anchor();
+            quarantine_artifact_reply_until(
+                retention,
+                std::time::Instant::now() + failure_quarantine,
+            );
+            return ArtifactAckOutcome::AcknowledgementQuarantined;
+        }
+        match read_request_line(reader) {
+            Some(line) if line == expected => {
+                retention.acknowledge_peer_anchor();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                drop(retention);
+                return ArtifactAckOutcome::PeerAcknowledged;
+            }
+            Some(_) => {
+                retention.acknowledge_failed_anchor();
+                quarantine_artifact_reply_until(
+                    retention,
+                    std::time::Instant::now() + failure_quarantine,
+                );
+                return ArtifactAckOutcome::AcknowledgementQuarantined;
+            }
+            None => {
+                retention.acknowledge_failed_anchor();
+                quarantine_artifact_reply_until(
+                    retention,
+                    std::time::Instant::now() + failure_quarantine,
+                );
+                return ArtifactAckOutcome::AcknowledgementQuarantined;
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2368,10 +3001,14 @@ fn serve_borrowed(
                 queue,
                 sock_dir,
             );
-            if writer.write_all(resp.as_bytes()).is_err() {
-                return ServeDisposition::Close;
+            match write_control_reply(&mut writer, resp) {
+                Ok(Some(retention)) => {
+                    await_guarded_reply_close(stream, &mut reader, retention);
+                    return ServeDisposition::Close;
+                }
+                Ok(None) => {}
+                Err(_) => return ServeDisposition::Close,
             }
-            let _ = writer.flush();
         }
     }
 
@@ -2428,10 +3065,14 @@ fn serve_borrowed(
             sock_dir,
         );
         // A dead client (broken pipe) must not crash the app — just drop it.
-        if writer.write_all(resp.as_bytes()).is_err() {
-            break;
+        match write_control_reply(&mut writer, resp) {
+            Ok(Some(retention)) => {
+                await_guarded_reply_close(stream, &mut reader, retention);
+                return ServeDisposition::Close;
+            }
+            Ok(None) => {}
+            Err(_) => break,
         }
-        let _ = writer.flush();
     }
     ServeDisposition::Close
 }
@@ -3620,6 +4261,9 @@ fn handle(
     // already resolved it, so naming it here costs nothing and lets an explicit
     // `@<sid>` for that tab take the App input seam (see `front_routed_input`).
     front_active_session: Option<u64>,
+    // Artifact verbs park their exact-handle guard here: it must outlive this
+    // `String` body all the way to the socket write and the client's ACK.
+    reply_retention: &mut Option<ReplyRetention>,
 ) -> String {
     // Tolerate CRLF clients; the protocol itself is bare-LF terminated.
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -4066,23 +4710,28 @@ fn handle(
         // not platform-compositor visibility or scanout.
         "image" => {
             control_media::cmd_image(proxy, queue, rest, sock_dir, is_cross.then_some(session))
+                .into_body_retaining(reply_retention)
         }
-        // `window` captures the FRONT window's ENTIRE on-screen pixels (OS chrome +
-        // content) to a PNG. APP-LEVEL verb: it acts on the resolved instance's
+        // `window` captures a full FRONT-window artifact (platform chrome stitched
+        // around the exact submitted client destination) to a PNG. It does not
+        // claim compositor visibility or scanout. APP-LEVEL verb: it acts on the resolved instance's
         // FRONT window (the `@<sid>` ROUTES to the instance — cross-instance via the
         // client relay — it does not pick a specific session's pixels; `image` is the
         // per-session pixel verb). One rule for every app-level verb below: the
         // selector selects WHERE it runs; the verb acts on that instance's front
         // window. So `@peer window` screenshots the PEER's window. Auth is enforced
         // upstream (the cross-session gate) before we get here.
-        "window" => control_media::cmd_window(proxy, rest, sock_dir),
+        "window" => {
+            control_media::cmd_window(proxy, rest, sock_dir).into_body_retaining(reply_retention)
+        }
         // `video <seconds> [full] [keys] [pace]`: record the front window's GPU
         // swapchain-destination frames submitted with application present calls into
         // a PNG sequence + index.json. An AI can inspect renderer smoothness/flashes
         // and correlate pre-routing input attempts with later submitted frames; the
         // tap does not observe compositor selection or scanout. `keys` is owner-only
         // (enforced inside); its samples are not PTY-delivery or glyph receipts.
-        "video" => control_media::cmd_video(proxy, rest, sock_dir, matches!(scope, Scope::Owner)),
+        "video" => control_media::cmd_video(proxy, rest, sock_dir, matches!(scope, Scope::Owner))
+            .into_body_retaining(reply_retention),
         // `chrome`: the resolved instance's front window native UI (app-level; `@<sid>`
         // routes to the instance, per the rule above — `@peer chrome` reads the peer's).
         "chrome" => control_media::cmd_chrome(proxy),
@@ -4433,6 +5082,359 @@ mod tests {
         assert!(!front_routed(false, Some(7), 7));
         assert!(!front_routed(false, None, 7));
     }
+
+    struct WireProbe {
+        alive: Arc<AtomicBool>,
+        prepared: Arc<AtomicBool>,
+        fail_prepare: bool,
+    }
+
+    impl WireRetention for WireProbe {
+        fn prepare_write(&mut self) -> Result<(), String> {
+            self.prepared.store(true, Ordering::Release);
+            if self.fail_prepare {
+                Err("injected identity replacement".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for WireProbe {
+        fn drop(&mut self) {
+            self.alive.store(false, Ordering::Release);
+        }
+    }
+
+    struct GuardCheckingWriter {
+        alive: Arc<AtomicBool>,
+        prepared: Arc<AtomicBool>,
+        expect_alive: bool,
+        bytes: Vec<u8>,
+        flushed: bool,
+    }
+
+    impl Write for GuardCheckingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            assert_eq!(
+                self.alive.load(Ordering::Acquire),
+                self.expect_alive,
+                "artifact guard lifetime at socket write"
+            );
+            assert!(
+                self.prepared.load(Ordering::Acquire),
+                "wire identity validation must precede write"
+            );
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            assert_eq!(
+                self.alive.load(Ordering::Acquire),
+                self.expect_alive,
+                "artifact guard lifetime at socket flush"
+            );
+            self.flushed = true;
+            Ok(())
+        }
+    }
+
+    struct FailAfterFirstWrite {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FailAfterFirstWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.bytes.is_empty() {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected challenge write failure",
+                ))
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn artifact_guard_spans_actual_reply_write_and_flush() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let reply = ControlReply::guarded(
+            "OK 1 1 /private/artifact.png\n".to_string(),
+            Some(ReplyRetention::new(WireProbe {
+                alive: Arc::clone(&alive),
+                prepared: Arc::clone(&prepared),
+                fail_prepare: false,
+            })),
+        );
+        let mut writer = GuardCheckingWriter {
+            alive: Arc::clone(&alive),
+            prepared,
+            expect_alive: true,
+            bytes: Vec::new(),
+            flushed: false,
+        };
+
+        let mut pending = write_control_reply(&mut writer, reply)
+            .expect("wire write succeeds")
+            .expect("guarded reply returns its retention");
+
+        assert!(writer.flushed);
+        let wire = String::from_utf8(writer.bytes).unwrap();
+        assert!(wire.starts_with("OK 1 1 /private/artifact.png\nACK-CHALLENGE "));
+        let nonce = wire
+            .lines()
+            .nth(1)
+            .and_then(|line| {
+                line.strip_prefix(aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX)
+            })
+            .unwrap();
+        assert!(aterm_types::control_verbs::valid_artifact_ack_nonce(nonce));
+        assert!(
+            alive.load(Ordering::Acquire),
+            "exact handles remain live after write and flush until client acknowledgement"
+        );
+        pending.retention.acknowledge_peer_anchor();
+        drop(pending);
+        assert!(
+            !alive.load(Ordering::Acquire),
+            "client acknowledgement releases the exact handles"
+        );
+    }
+
+    #[test]
+    fn partial_wire_failure_transfers_the_guard_to_quarantine() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let reply = ControlReply::guarded(
+            "OK 1 1 /private/artifact.png\n".to_string(),
+            Some(ReplyRetention::new(WireProbe {
+                alive: Arc::clone(&alive),
+                prepared,
+                fail_prepare: false,
+            })),
+        );
+        let mut writer = FailAfterFirstWrite { bytes: Vec::new() };
+
+        let error = match write_control_reply(&mut writer, reply) {
+            Err(error) => error,
+            Ok(_) => panic!("challenge write must fail after the complete ordinary body"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(writer.bytes, b"OK 1 1 /private/artifact.png\n");
+        assert!(
+            alive.load(Ordering::Acquire),
+            "a full path may already be visible, so write failure must quarantine its guard"
+        );
+    }
+
+    #[test]
+    fn guarded_reply_releases_only_after_explicit_peer_ack() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let (mut client, server) = CtlStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let server_alive = Arc::clone(&alive);
+        let server_prepared = Arc::clone(&prepared);
+        let worker = std::thread::spawn(move || {
+            let reply = ControlReply::guarded(
+                "OK 1 1 /private/artifact.png\n".to_string(),
+                Some(ReplyRetention::new(WireProbe {
+                    alive: server_alive,
+                    prepared: server_prepared,
+                    fail_prepare: false,
+                })),
+            );
+            let mut writer = &server;
+            let pending = write_control_reply(&mut writer, reply)
+                .unwrap()
+                .expect("guarded response");
+            let mut reader = BufReader::new(&server);
+            await_guarded_reply_close_with_quarantine(
+                &server,
+                &mut reader,
+                pending,
+                std::time::Duration::from_millis(40),
+            )
+        });
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        assert_eq!(response, "OK 1 1 /private/artifact.png\n");
+        let mut challenge = String::new();
+        reader.read_line(&mut challenge).unwrap();
+        let nonce = challenge
+            .trim_end()
+            .strip_prefix(aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX)
+            .unwrap();
+        assert!(aterm_types::control_verbs::valid_artifact_ack_nonce(nonce));
+        assert!(
+            alive.load(Ordering::Acquire),
+            "reading the response does not silently release its exact guard"
+        );
+        client
+            .write_all(
+                format!(
+                    "{}{nonce}\n",
+                    aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        client.flush().unwrap();
+        assert_eq!(worker.join().unwrap(), ArtifactAckOutcome::PeerAcknowledged);
+        assert!(
+            !alive.load(Ordering::Acquire),
+            "the exact ACK transition releases the guard"
+        );
+    }
+
+    #[test]
+    fn pre_pipelined_ack_guess_is_failed_and_quarantined() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let (mut client, server) = CtlStream::pair().unwrap();
+        // This guess exists before the server creates its nonce and therefore
+        // cannot causally acknowledge the response it has not read.
+        client.write_all(b"ACK artifact\n").unwrap();
+        client.flush().unwrap();
+        let server_alive = Arc::clone(&alive);
+        let worker = std::thread::spawn(move || {
+            let reply = ControlReply::guarded(
+                "OK 1 1 /private/artifact.png\n".to_string(),
+                Some(ReplyRetention::new(WireProbe {
+                    alive: server_alive,
+                    prepared,
+                    fail_prepare: false,
+                })),
+            );
+            let mut writer = &server;
+            let pending = write_control_reply(&mut writer, reply)
+                .unwrap()
+                .expect("guarded response");
+            let mut reader = BufReader::new(&server);
+            await_guarded_reply_close_with_quarantine(
+                &server,
+                &mut reader,
+                pending,
+                std::time::Duration::from_secs(1),
+            )
+        });
+
+        let mut reader = BufReader::new(&client);
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        assert_eq!(response, "OK 1 1 /private/artifact.png\n");
+        let mut challenge = String::new();
+        reader.read_line(&mut challenge).unwrap();
+        assert!(challenge.starts_with(aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX));
+        assert_eq!(
+            worker.join().unwrap(),
+            ArtifactAckOutcome::AcknowledgementQuarantined
+        );
+        assert!(
+            alive.load(Ordering::Acquire),
+            "a pre-challenge guess must retain the exact guard in quarantine"
+        );
+    }
+
+    #[test]
+    fn eager_request_half_close_is_ack_failure_not_peer_ack() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let (client, server) = CtlStream::pair().unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let server_alive = Arc::clone(&alive);
+        let worker = std::thread::spawn(move || {
+            let reply = ControlReply::guarded(
+                "OK 1 1 /private/artifact.png\n".to_string(),
+                Some(ReplyRetention::new(WireProbe {
+                    alive: server_alive,
+                    prepared,
+                    fail_prepare: false,
+                })),
+            );
+            let mut writer = &server;
+            let pending = write_control_reply(&mut writer, reply)
+                .unwrap()
+                .expect("guarded response");
+            let mut reader = BufReader::new(&server);
+            await_guarded_reply_close_with_quarantine(
+                &server,
+                &mut reader,
+                pending,
+                std::time::Duration::from_millis(40),
+            )
+        });
+
+        let mut reader = BufReader::new(&client);
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        assert_eq!(response, "OK 1 1 /private/artifact.png\n");
+        let mut challenge = String::new();
+        reader.read_line(&mut challenge).unwrap();
+        assert!(challenge.starts_with(aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX));
+        assert_eq!(
+            worker.join().unwrap(),
+            ArtifactAckOutcome::AcknowledgementQuarantined,
+            "request EOF is never accepted as proof the response was consumed"
+        );
+        assert!(
+            alive.load(Ordering::Acquire),
+            "an abandoned/invalid ACK path transfers the exact guard to quarantine"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while alive.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !alive.load(Ordering::Acquire),
+            "the quarantine reaper releases the guard only after its grace interval"
+        );
+    }
+
+    #[test]
+    fn wire_edge_identity_failure_replaces_ok_and_aborts_guard() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let reply = ControlReply::guarded(
+            "OK stale-path\n".to_string(),
+            Some(ReplyRetention::new(WireProbe {
+                alive: Arc::clone(&alive),
+                prepared: Arc::clone(&prepared),
+                fail_prepare: true,
+            })),
+        );
+        let mut writer = GuardCheckingWriter {
+            alive: Arc::clone(&alive),
+            prepared,
+            expect_alive: false,
+            bytes: Vec::new(),
+            flushed: false,
+        };
+
+        let retention = write_control_reply(&mut writer, reply).expect("path-free ERR is writable");
+
+        let body = String::from_utf8(writer.bytes).unwrap();
+        assert!(body.starts_with("ERR artifact reply validation failed:"));
+        assert!(!body.contains("stale-path"));
+        assert!(!alive.load(Ordering::Acquire));
+        assert!(
+            retention.is_none(),
+            "a path-free validation error carries no stale guard"
+        );
+    }
+
     #[test]
     fn removed_bottom_hud_verbs_are_unadvertised_stable_tombstones() {
         assert_eq!(
@@ -6534,6 +7536,9 @@ mod tests {
         const NOT_HANDLERS: &[&str] = &[
             "serialize_dims_json",
             "styled_image_json",
+            // Sub-object of the styled frame (`screen`/`cells`), like the two
+            // above — there is no `styled_selection` verb.
+            "styled_selection_json",
             "write_styled_cell_json",
         ];
 
@@ -8638,20 +9643,6 @@ mod tests {
         acc
     }
 
-    /// Read whatever bytes arrive within a short window (for the NEGATIVE assertion
-    /// that nothing was pushed). Returns the accumulated text (possibly empty).
-    fn read_quiet(s: &CtlStream) -> String {
-        use std::io::Read;
-        let mut s = s.try_clone().expect("clone client end");
-        s.set_read_timeout(Some(std::time::Duration::from_millis(300)))
-            .unwrap();
-        let mut buf = [0u8; 8192];
-        match s.read(&mut buf) {
-            Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).into_owned(),
-            _ => String::new(),
-        }
-    }
-
     /// (a) SELF subscribe to `screen`: a write to the term pushes a sid-tagged DELTA
     /// carrying the live text; a subsequent PURE viewport scroll (which never bumps
     /// `content_seq`) pushes NOTHING. End-to-end through `run_subscribe` (auth +
@@ -8702,10 +9693,25 @@ mod tests {
         // though we notify (a coalesced/spurious wake reads unchanged content).
         crate::term_lock(&h.term).scroll_display(1);
         registry.lock().unwrap().notify(0);
-        let none = read_quiet(&client);
+        // POSITIVE-BY-PROXY, deliberately. `read_quiet` is a single 300ms read that
+        // returns "" on timeout, so asserting silence directly passes whenever the
+        // push thread simply did not run inside the window — and a regression that
+        // DID push a scroll-derived delta would pass with it. Instead, follow the
+        // scroll with a KNOWN content change and require that the very next DELTA is
+        // that change. If the scroll had pushed one it would arrive first and fail
+        // this, and the wait for `after-scroll` cannot be satisfied by a starved
+        // thread, so load turns into a timeout rather than a false pass.
+        crate::term_lock(&h.term).process(b"after-scroll");
+        registry.lock().unwrap().notify(0);
+        let next = read_until(&client, String::new(), |s| s.contains("after-scroll"));
+        let first_delta = next
+            .split("DELTA ")
+            .nth(1)
+            .expect("a delta must follow the content change");
         assert!(
-            !none.contains("DELTA"),
-            "viewport scroll pushes no delta: {none:?}"
+            first_delta.contains("after-scroll"),
+            "the first delta after a pure viewport scroll must be the CONTENT change, \
+             not a scroll-derived one: {next:?}"
         );
 
         // Drop the client: the loop's next write fails and it returns (deregister).

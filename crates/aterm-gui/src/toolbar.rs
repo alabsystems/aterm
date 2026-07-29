@@ -82,6 +82,8 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 #[cfg(target_os = "macos")]
+pub(crate) use macos::native_strip_container;
+#[cfg(target_os = "macos")]
 pub use macos::{
     ToolbarHandle, install_window_toolbar, read_tab_chrome, read_tab_menus, set_active_tab_color,
     set_strip_dark, set_update_available, set_window_tabs,
@@ -902,6 +904,16 @@ mod macos {
         /// that used to sit left of it is RETIRED — the update affordance lives in the
         /// VERSION menu now; see `crate::menu::update_version_menu`.)
         _plus: Retained<ChromeButton>,
+    }
+
+    /// The live custom-view subtree AppKit places in the unified titlebar.
+    ///
+    /// Full-window capture uses this only to locate the public titlebar-container
+    /// ancestor shared with the standard traffic-light buttons. The returned view
+    /// remains owned by `ToolbarHandle`; cloning the retain lets the capture stay
+    /// valid while AppKit draws that subtree into a transparent bitmap.
+    pub(crate) fn native_strip_container(handle: &ToolbarHandle) -> Retained<NSView> {
+        handle.container.clone()
     }
 
     // SAFETY: `ToolbarHandle` is only ever created, read, and dropped on the main

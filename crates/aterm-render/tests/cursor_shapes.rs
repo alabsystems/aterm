@@ -108,6 +108,46 @@ fn bar_cursor_fills_only_left_strip() {
 }
 
 #[test]
+fn fill_override_recolors_a_steady_bar_without_theme_flash() {
+    let Some(mut r) = renderer() else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    const OVERRIDE: u32 = 0x00FE_017F;
+    let (cw, ch) = r.cell_size();
+    let mut term = term_with(b"\x1b[6 q"); // DECSCUSR 6 = steady bar
+    let mut input = term.cell_frame(2, 4);
+    input.cursor_fill_override = Some(OVERRIDE);
+    let frame = r.render_input(&input);
+    let rects = cursor_rects(CursorStyle::SteadyBar, 0, 0, cw, ch);
+    let area: usize = rects.iter().map(|&[_, _, w, h]| w * h).sum();
+    assert_eq!(
+        frame
+            .pixels
+            .iter()
+            .filter(|&&pixel| pixel == OVERRIDE)
+            .count(),
+        area,
+        "every steady-bar pixel must use the host override"
+    );
+    assert!(
+        cursor_positions(&frame).is_empty(),
+        "the theme cursor colour must not flash through a non-block override"
+    );
+    for [x, y, w, h] in rects {
+        for py in y..y + h {
+            for px in x..x + w {
+                assert_eq!(
+                    frame.pixels[py * frame.width + px],
+                    OVERRIDE,
+                    "steady-bar override missing at ({px},{py})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn hollow_block_draws_outline_but_not_center() {
     let Some(mut r) = renderer() else {
         eprintln!("SKIP: no system monospace font");

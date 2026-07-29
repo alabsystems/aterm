@@ -158,6 +158,7 @@ const HELP_TAIL: &str = concat!(
     "CONFIG:  ~/.config/aterm/aterm.toml  (live settings reload; launch/session settings disclose their timing; precedence env > config > default)\n",
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
+    "              selection_foreground,\n",
     "              palette [array of #RRGGBB], window_theme, tab_strip_rows.\n",
     "  Window/Tabs descriptive_titles, title_summary_provider, title_summary_model,\n",
     "              title_summary_endpoint, title_summary_token_file,\n",
@@ -233,7 +234,7 @@ const STARTER_CONFIG: &str = "\
 # window_padding_top = 2.0         # tighter TOP-edge override (0..=window_padding; the titlebar band supplies the rest)
 # bold_is_bright = true            # SGR bold promotes ANSI 0-7 to bright 8-15
 # faint_opacity = 0.5              # SGR dim: fg fraction kept, blended toward the bg
-# scrollback_lines = 100000        # history lines kept (tiered store; default 100k, 0 = unlimited)
+# scrollback_lines = 100000        # total history across ring + tiered store (default 100k, 0 = unlimited)
 # tab_strip_rows = 1               # in-grid tab bar (Linux has no native toolbar)
 
 # --- smart titles (window + tabs) ---------------------------------------------

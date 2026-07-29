@@ -41,7 +41,7 @@ pub const ALIAS_TABLE: &[AliasEntry] = &[
     },
     AliasEntry {
         alias: "OSC 21 set named",
-        expansion: "OSC 21;<name>=<value> where name in {foreground, background, cursor, selection_background}",
+        expansion: "OSC 21;<name>=<value> where name in {foreground, background, cursor, selection_background, selection_foreground}",
     },
     AliasEntry {
         alias: "OSC 21 set indexed",

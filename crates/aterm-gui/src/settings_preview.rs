@@ -1824,6 +1824,7 @@ fn build_terminal_specimen_input(
         default_background: packed_rgb(theme.bg),
         cursor_color: Some(packed_rgb(theme.cursor)),
         selection_background: Some(packed_rgb(theme.selection)),
+        selection_foreground: spec.appearance.selection_foreground.map(packed_rgb),
         bold_is_bright: spec.appearance.bold_is_bright,
         faint_opacity: spec.appearance.faint_opacity,
         cursor_style: match spec.cursor.style {

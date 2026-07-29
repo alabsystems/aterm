@@ -19,7 +19,8 @@
 
 // The 7 introspection models are iterated via `harness::instances()`, not named here.
 use aterm_spec::derive::{
-    Model, aa_edge_hardening_model, active_handle_model, asymmetric_pad_layout_model,
+    Model, aa_edge_hardening_model, active_handle_model, anchored_artifact_transaction_model,
+    artifact_reader_lease_model, artifact_reply_publication_model, asymmetric_pad_layout_model,
     capture_after_present_model, channel_bind_model, chrome_face_gate_model,
     closed_recovery_ledgers_model, coalesce_model, composite_accessibility_route_model,
     config_catalog_snapshot_model, config_file_commit_cas_model, contrast_floor_model,
@@ -28,19 +29,20 @@ use aterm_spec::derive::{
     damage_to_present_model, deco_band_containment_model, deco_phase_model, done_mark_lru_model,
     dsu_quiescence_model, effect_phase_lock_model, effect_present_rebase_model,
     emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
-    exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
-    fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
-    focus_modifier_cache_model, gpu_loss_recovery_model, gpu_loss_route_model,
+    exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
+    fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
+    flash_limiter_model, focus_modifier_cache_model, gpu_loss_recovery_model, gpu_loss_route_model,
     grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
-    hyperlink_scheme_cap_model, idle_deadline_model, ignition_reservation_lifecycle_model,
-    ignition_reservation_rekey_model, inject_floor_model, input_release_pairing_model,
-    kernel_model, key_injectivity_model, kitty_collectibles_model, kitty_flush_worker_model,
-    kitty_sidecar_durability_model, ligature_gate_model, manual_config_completion_model,
-    manual_config_diagnostics_lane_model, manual_config_handoff_model,
-    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
-    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
-    native_config_observation_handoff_model, native_config_transaction_model,
-    native_control_routing_model, native_document_publication_model, native_draft_journal_model,
+    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
+    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
+    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
+    kitty_flush_worker_model, kitty_sidecar_durability_model, layout_coordinate_reset_model,
+    ligature_gate_model, manual_config_completion_model, manual_config_diagnostics_lane_model,
+    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
+    motion_policy_model, native_async_delivery_model, native_capture_source_model,
+    native_close_plan_model, native_config_observation_handoff_model,
+    native_config_transaction_model, native_control_routing_model,
+    native_document_publication_model, native_draft_journal_model,
     native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
     native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
     native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
@@ -55,26 +57,29 @@ use aterm_spec::derive::{
     nyan_idle_twinkle_model, nyan_jump_burst_lifecycle_model, nyan_sing_detector_model,
     nyan_terminus_admission_model, one_shot_peek_model, pad_absorption_model, pane_tree_model,
     per_window_metrics_model, predictive_echo_visibility_model, present_retry_model,
-    presentation_gate_model, proxy_forward_model, rain_band_containment_model, rain_ignition_model,
-    rain_lifecycle_model, read_image_seq_model, recording_model, recovery_redraw_model,
-    release_channel_floor_model, release_channel_single_head_model,
-    release_durable_post_intent_model, release_historical_recovery_model,
-    release_journal_prefix_model, release_key_epoch_transition_model,
-    release_published_identity_model, release_publisher_fence_model,
-    release_yank_successor_first_model, restore_manifest_single_use_model, ring_model,
-    scroll_glide_model, scrollback_maintenance_lane_model, seamless_nonce_model,
-    self_governor_model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
+    presentation_gate_model, presented_frame_tap_model, proxy_forward_model,
+    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model, read_image_seq_model,
+    recording_model, recovery_redraw_model, release_channel_floor_model,
+    release_channel_single_head_model, release_durable_post_intent_model,
+    release_historical_recovery_model, release_journal_prefix_model,
+    release_key_epoch_transition_model, release_published_identity_model,
+    release_publisher_fence_model, release_yank_successor_first_model,
+    restore_manifest_single_use_model, ring_model, scroll_glide_model,
+    scrollback_maintenance_lane_model, seamless_nonce_model, self_governor_model,
+    semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
     semantic_prewarm_request_swap_model, serious_mode_intent_queue_model, serious_mode_model,
     session_chrome_expiry_model, session_pool_model, settings_page_scroll_model, shade_phase_model,
-    shared_budget_model, snapshot_model, sparkle_identity_model, sparkle_persist_capacity_model,
-    sparkle_reflow_cardinality_model, sparkle_retype_rearm_model, spawn_locale_model,
-    stream_fade_gate_model, strike_selection_model, styled_run_face_model, subscribe_model,
-    surface_coverage_model, tab_nav_model, tab_stop_handoff_model, tab_strip_model,
-    text_blend_gate_model, tier_residency_model, title_summary_managed_endpoint_model,
-    title_summary_model, title_summary_observation_scheduler_model, title_summary_runtime_model,
+    shared_budget_model, snapshot_generation_commit_model, snapshot_model, sparkle_identity_model,
+    sparkle_persist_capacity_model, sparkle_reflow_cardinality_model, sparkle_retype_rearm_model,
+    spawn_locale_model, stream_fade_gate_model, strike_selection_model, styled_run_face_model,
+    subscribe_model, surface_coverage_model, tab_nav_model, tab_stop_handoff_model,
+    tab_strip_model, text_blend_gate_model, tier_residency_model,
+    title_summary_managed_endpoint_model, title_summary_model,
+    title_summary_observation_scheduler_model, title_summary_runtime_model,
     title_summary_socket_owner_retry_model, top_anchored_scroll_history_model,
     trail_audio_lifecycle_model, trail_audio_start_latency_model, transact_model,
-    vf_axis_clamp_model, vf_nudge_gate_model, vibrancy_contrast_model, visible_pad_crop_model,
+    vf_axis_clamp_model, vf_nudge_gate_model, vibrancy_contrast_model,
+    video_recording_lifecycle_model, video_tap_slot_model, visible_pad_crop_model,
     watcher_failure_recovery_model, watcher_latch_model, wide_center_model, window_routing_model,
 };
 use aterm_spec::verify;
@@ -616,6 +621,17 @@ fn derived_presentation_gate_proves_and_catches_text_colored_as_emoji() {
 #[test]
 fn derived_hdr_present_gate_proves_and_catches_hdr_without_optin() {
     assert_proves_and_catches(&hdr_present_gate_model());
+}
+
+/// M3 reconfigure lifecycle: an f16 swapchain recreated by resize, a live alpha
+/// change, or Outdated/Lost recovery — or checked after a same-size Windows HDR
+/// toggle — stays f16 only if its scRGB re-tag/validation succeeds. Failure
+/// atomically falls back to SDR and updates capture metadata to match. Buggy=1
+/// preserves the old untagged f16 surface/linear-capture claim, so the model
+/// must produce a counterexample.
+#[test]
+fn derived_hdr_reconfigure_retag_proves_and_catches_ignored_failure() {
+    assert_proves_and_catches(&hdr_reconfigure_retag_model());
 }
 
 /// W11 (MotionPolicy — reduced-motion totality): over the whole
@@ -1613,15 +1629,663 @@ fn derived_capture_after_present_proves_and_catches_stale_pixels() {
     assert!(!buggy.check_invariant("NoStaleCapture", &stale));
 }
 
-/// A WindowServer photograph is not native-content authority: even after a
-/// successful present it may be one compositor interval old. The current renderer
-/// frame must be presented, geometry-validated, and stitched under OS-owned chrome.
+/// A pre-created video directory remains privately owned through the pending,
+/// recording, and exporting phases. Every non-success terminal path removes it;
+/// success alone transfers it to a published artifact. Recording and exporting
+/// use disjoint slots, so an exporter blocks a second start.
+#[test]
+fn derived_video_recording_lifecycle_proves_cleanup_and_serialization() {
+    let model = video_recording_lifecycle_model();
+    assert_proves_and_catches(&model);
+
+    let reserved = model.successors("Reserve", &model.init_state())[0].clone();
+    assert_eq!(reserved["phase"], 1);
+    assert_eq!(reserved["recording_slot"], 1);
+    assert_eq!(reserved["private_dirs"], 1);
+    assert_eq!(reserved["published"], 0);
+
+    let recording = model.successors("BeginHeadless", &reserved)[0].clone();
+    assert_eq!(recording["phase"], 2);
+    assert_eq!(recording["mode"], 2);
+    assert_eq!(recording["timer"], 1);
+    assert!(model.check_invariant("OffscreenOnlyWithoutGlass", &recording));
+    assert!(model.check_invariant("OffscreenTimerExact", &recording));
+    assert_eq!(
+        model.successors("Reserve", &recording).len(),
+        0,
+        "a live recording refuses a second reservation"
+    );
+
+    let ticked = model.successors("Tick", &recording)[0].clone();
+    let exporting = model.successors("BeginExport", &ticked)[0].clone();
+    assert_eq!(exporting["phase"], 3);
+    assert_eq!(exporting["mode"], 0);
+    assert_eq!(exporting["timer"], 0);
+    assert_eq!(exporting["recording_slot"], 0);
+    assert_eq!(exporting["export_permit"], 1);
+    assert_eq!(exporting["private_dirs"], 1);
+    assert_eq!(
+        model.successors("Reserve", &exporting).len(),
+        0,
+        "the process-wide export permit blocks a second capture"
+    );
+    assert_eq!(
+        model.successors("PublishSuccess", &exporting).len(),
+        0,
+        "publication must first win the live-to-authorized CAS"
+    );
+
+    let authorized = model.successors("AuthorizeCommit", &exporting)[0].clone();
+    assert_eq!(authorized["cancel_state"], 2);
+    assert_eq!(
+        model.successors("CancelLive", &authorized).len(),
+        0,
+        "late cancellation cannot change an authorized commit to cancelled"
+    );
+    let late_cancel = model.successors("CancelAfterAuthorization", &authorized)[0].clone();
+    assert_eq!(late_cancel["cancel_state"], 2);
+    assert_eq!(late_cancel["late_cancel"], 1);
+    assert_eq!(late_cancel["phase"], 3);
+    assert_eq!(late_cancel["export_permit"], 1);
+    assert_eq!(late_cancel["private_dirs"], 1);
+    assert!(model.check_invariant("LateCancellationCannotRevoke", &late_cancel));
+
+    let published = model.successors("PublishSuccess", &late_cancel)[0].clone();
+    assert_eq!(published["phase"], 0);
+    assert_eq!(published["active"], 0);
+    assert_eq!(published["private_dirs"], 0);
+    assert_eq!(published["published"], 1);
+    assert_eq!(published["cancel_state"], 2);
+    assert!(model.check_invariant("PublishedOnlyAfterOwnershipTransfer", &published));
+
+    // A live transition to translucent glass aborts the raw tap and cleans its
+    // unpublished directory before another frame can be accepted.
+    let glass = model.successors("AttachGlass", &model.init_state())[0].clone();
+    let reserved = model.successors("Reserve", &glass)[0].clone();
+    let tap = model.successors("BeginOnGlass", &reserved)[0].clone();
+    assert_eq!(tap["mode"], 1);
+    assert_eq!(tap["timer"], 0);
+    let aborted = model.successors("MakeTapTranslucent", &tap)[0].clone();
+    assert_eq!(aborted["phase"], 0);
+    assert_eq!(aborted["private_dirs"], 0);
+    assert_eq!(aborted["translucent"], 1);
+    assert!(model.check_invariant("NoTranslucentTap", &aborted));
+
+    // Each failure boundary is explicit and owns the same cleanup obligation.
+    let reserved = model.successors("Reserve", &model.init_state())[0].clone();
+    let rejected = model.successors("RejectBegin", &reserved)[0].clone();
+    assert_eq!((rejected["phase"], rejected["private_dirs"]), (0, 0));
+
+    let reserved = model.successors("Reserve", &model.init_state())[0].clone();
+    let recording = model.successors("BeginHeadless", &reserved)[0].clone();
+    let cancelled = model.successors("CancelLive", &recording)[0].clone();
+    assert_eq!((cancelled["active"], cancelled["private_dirs"]), (0, 0));
+    assert_eq!(cancelled["cancel_state"], 1);
+    assert_eq!(
+        model.successors("AuthorizeCommit", &cancelled).len(),
+        0,
+        "a cancelled lifecycle cannot later authorize publication"
+    );
+
+    let reserved = model.successors("Reserve", &model.init_state())[0].clone();
+    let recording = model.successors("BeginHeadless", &reserved)[0].clone();
+    let exporting = model.successors("BeginExport", &recording)[0].clone();
+    let failed = model.successors("Fail", &exporting)[0].clone();
+    assert_eq!((failed["export_permit"], failed["private_dirs"]), (0, 0));
+
+    let reserved = model.successors("Reserve", &model.init_state())[0].clone();
+    let recording = model.successors("BeginHeadless", &reserved)[0].clone();
+    let owner_lost = model.successors("OwnerLost", &recording)[0].clone();
+    assert_eq!(
+        (owner_lost["recording_slot"], owner_lost["private_dirs"]),
+        (0, 0)
+    );
+
+    // Buggy cleanup strands the pre-created directory after no lifecycle owns
+    // it. This is a transition-derived negative control, not a fabricated state.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let reserved = buggy.successors("Reserve", &buggy.init_state())[0].clone();
+    let leaked = buggy.successors("BuggyStrandPrivateDirOnCleanup", &reserved)[0].clone();
+    assert_eq!((leaked["phase"], leaked["private_dirs"]), (0, 1));
+    assert!(!buggy.check_invariant("PrivateDirectoryOwnedByLifecycle", &leaked));
+
+    // A windowed offscreen fallback lies about the capture source.
+    let glass = buggy.successors("AttachGlass", &buggy.init_state())[0].clone();
+    let reserved = buggy.successors("Reserve", &glass)[0].clone();
+    let dishonest = buggy.successors("BuggyBeginOnGlassOffscreen", &reserved)[0].clone();
+    assert!(!buggy.check_invariant("OffscreenOnlyWithoutGlass", &dishonest));
+
+    // The opacity mutant retains a live swapchain tap after its admission
+    // assumption has become false.
+    let glass = buggy.successors("AttachGlass", &buggy.init_state())[0].clone();
+    let reserved = buggy.successors("Reserve", &glass)[0].clone();
+    let tap = buggy.successors("BeginOnGlass", &reserved)[0].clone();
+    let translucent_tap = buggy.successors("BuggyRetainTapWhenTranslucent", &tap)[0].clone();
+    assert_eq!(translucent_tap["phase"], 2);
+    assert_eq!(translucent_tap["mode"], 1);
+    assert_eq!(translucent_tap["translucent"], 1);
+    assert!(!buggy.check_invariant("NoTranslucentTap", &translucent_tap));
+
+    // Publication without the CAS authorization creates a completion artifact
+    // that cancellation was still entitled to revoke.
+    let reserved = buggy.successors("Reserve", &buggy.init_state())[0].clone();
+    let recording = buggy.successors("BeginHeadless", &reserved)[0].clone();
+    let exporting = buggy.successors("BeginExport", &recording)[0].clone();
+    let unauthorized = buggy.successors("BuggyPublishWithoutAuthorization", &exporting)[0].clone();
+    assert_eq!(unauthorized["published"], 1);
+    assert_eq!(unauthorized["cancel_state"], 0);
+    assert!(!buggy.check_invariant("PublishedOnlyAfterOwnershipTransfer", &unauthorized));
+    assert!(!buggy.check_invariant("CommitAuthorizationScope", &unauthorized));
+
+    // Starting again during export overlaps both concrete ownership slots and
+    // produces two privately owned lifecycle directories.
+    let reserved = buggy.successors("Reserve", &buggy.init_state())[0].clone();
+    let recording = buggy.successors("BeginHeadless", &reserved)[0].clone();
+    let exporting = buggy.successors("BeginExport", &recording)[0].clone();
+    let overlapped = buggy.successors("BuggyStartSecondWhileExporting", &exporting)[0].clone();
+    assert_eq!(overlapped["recording_slot"], 1);
+    assert_eq!(overlapped["export_permit"], 1);
+    assert_eq!(overlapped["active"], 2);
+    assert_eq!(overlapped["private_dirs"], 2);
+    assert!(!buggy.check_invariant("RecordingExportSerialized", &overlapped));
+    assert!(!buggy.check_invariant("AtMostOneActiveLifecycle", &overlapped));
+}
+
+/// Retention is an exact lease decision. PID liveness is consulted only for
+/// lease-less legacy namespaces; it cannot override a held, free, or malformed
+/// lease observation.
+#[test]
+fn derived_exact_instance_retention_covers_the_lease_pid_matrix() {
+    let model = exact_instance_retention_model();
+    assert_proves_and_catches(&model);
+
+    // (selector from MissingLegacy, lease code, pid_alive, decision)
+    // decision: 1 Keep, 2 Remove.
+    for (selector, expected_lease, pid_alive, expected_decision) in [
+        (None, 0, 0, 2),
+        (None, 0, 1, 1),
+        (Some("SelectHeld"), 1, 0, 1),
+        (Some("SelectHeld"), 1, 1, 1),
+        (Some("SelectFree"), 2, 0, 2),
+        (Some("SelectFree"), 2, 1, 2),
+        (Some("SelectMalformed"), 3, 0, 1),
+        (Some("SelectMalformed"), 3, 1, 1),
+    ] {
+        let mut state = model.init_state();
+        if let Some(action) = selector {
+            state = model.successors(action, &state)[0].clone();
+        }
+        if pid_alive == 1 {
+            state = model.successors("ObservePidAlive", &state)[0].clone();
+        }
+        let decided = model.successors("Decide", &state)[0].clone();
+        assert_eq!(decided["lease"], expected_lease);
+        assert_eq!(decided["pid_alive"], pid_alive);
+        assert_eq!(
+            decided["decision"], expected_decision,
+            "lease={expected_lease} pid_alive={pid_alive}"
+        );
+        for invariant in [
+            "HeldNeverRemoved",
+            "MalformedNeverRemoved",
+            "FreeAlwaysRemoved",
+            "MissingAloneUsesPidFallback",
+        ] {
+            assert!(
+                model.check_invariant(invariant, &decided),
+                "{invariant}: lease={expected_lease} pid_alive={pid_alive}"
+            );
+        }
+    }
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+    // A held exact-instance lease is live authority even if the PID probe says
+    // dead; removing it is the destructive false-stale decision.
+    let held = buggy.successors("SelectHeld", &buggy.init_state())[0].clone();
+    let removed_held = buggy.successors("Decide", &held)[0].clone();
+    assert_eq!(removed_held["decision"], 2);
+    assert!(!buggy.check_invariant("HeldNeverRemoved", &removed_held));
+
+    // Malformed lease metadata fails closed. It cannot be reclassified as free.
+    let malformed = buggy.successors("SelectMalformed", &buggy.init_state())[0].clone();
+    let removed_malformed = buggy.successors("Decide", &malformed)[0].clone();
+    assert_eq!(removed_malformed["decision"], 2);
+    assert!(!buggy.check_invariant("MalformedNeverRemoved", &removed_malformed));
+
+    // A freely lockable exact lease proves the old instance is gone. A reused,
+    // live numeric PID must not retain that stale namespace.
+    let free = buggy.successors("SelectFree", &buggy.init_state())[0].clone();
+    let reused_pid = buggy.successors("ObservePidAlive", &free)[0].clone();
+    let wrongly_kept = buggy.successors("Decide", &reused_pid)[0].clone();
+    assert_eq!(wrongly_kept["decision"], 1);
+    assert!(!buggy.check_invariant("FreeAlwaysRemoved", &wrongly_kept));
+}
+
+/// Confined artifact operations retain the original inside object. An ancestor
+/// swap can make reply-time validation fail, but cannot redirect the operation
+/// or certify the replacement object.
+#[test]
+fn derived_anchored_artifact_transaction_proves_handle_and_reply_identity() {
+    let model = anchored_artifact_transaction_model();
+    assert_proves_and_catches(&model);
+
+    let pinned = model.successors("ConfinePin", &model.init_state())[0].clone();
+    assert_eq!(pinned["phase"], 1);
+    assert_eq!(pinned["pinned"], 1);
+    assert_eq!(pinned["path_identity"], 1);
+
+    let read = model.successors("ReadPinned", &pinned)[0].clone();
+    assert_eq!((read["operation"], read["effect_target"]), (1, 1));
+    let read_reply = model.successors("ValidateReply", &read)[0].clone();
+    assert_eq!(read_reply["reply"], 1);
+    assert_eq!(read_reply["certified_identity"], 1);
+    assert!(model.check_invariant("SuccessfulReplyCertifiesOriginal", &read_reply));
+
+    let pinned = model.successors("ConfinePin", &model.init_state())[0].clone();
+    let write = model.successors("WritePinned", &pinned)[0].clone();
+    assert_eq!((write["operation"], write["effect_target"]), (2, 1));
+    let write_reply = model.successors("ValidateReply", &write)[0].clone();
+    assert_eq!(write_reply["reply"], 1);
+    assert_eq!(write_reply["certified_identity"], 1);
+
+    // If the ancestor is replaced before I/O, a retained handle still targets
+    // the original object, while reply-time identity validation fails closed.
+    let pinned = model.successors("ConfinePin", &model.init_state())[0].clone();
+    let swapped = model.successors("SwapAncestor", &pinned)[0].clone();
+    let anchored_read = model.successors("ReadPinned", &swapped)[0].clone();
+    assert_eq!(anchored_read["effect_target"], 1);
+    let rejected = model.successors("ValidateReply", &anchored_read)[0].clone();
+    assert_eq!(rejected["reply"], 2);
+    assert_eq!(rejected["certified_identity"], 0);
+    assert!(model.check_invariant("AnchoredAccessNeverOutside", &rejected));
+    assert!(model.check_invariant("SwappedPathNeverCertified", &rejected));
+
+    // The same validation catches a swap in the operation-to-reply interval.
+    let pinned = model.successors("ConfinePin", &model.init_state())[0].clone();
+    let anchored_write = model.successors("WritePinned", &pinned)[0].clone();
+    let swapped = model.successors("SwapAncestor", &anchored_write)[0].clone();
+    let rejected = model.successors("ValidateReply", &swapped)[0].clone();
+    assert_eq!(rejected["effect_target"], 1);
+    assert_eq!(rejected["reply"], 2);
+
+    // A swap may also be rejected before any read/write is attempted.
+    let pinned = model.successors("ConfinePin", &model.init_state())[0].clone();
+    let swapped = model.successors("SwapAncestor", &pinned)[0].clone();
+    let rejected = model.successors("ValidateReply", &swapped)[0].clone();
+    assert_eq!(rejected["operation"], 0);
+    assert_eq!(rejected["effect_target"], 0);
+    assert_eq!(rejected["reply"], 2);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+    let pinned = buggy.successors("ConfinePin", &buggy.init_state())[0].clone();
+    let swapped = buggy.successors("SwapAncestor", &pinned)[0].clone();
+    let outside_read = buggy.successors("BuggyReresolveRead", &swapped)[0].clone();
+    assert_eq!(
+        (outside_read["operation"], outside_read["effect_target"]),
+        (1, 2)
+    );
+    assert!(!buggy.check_invariant("AnchoredAccessNeverOutside", &outside_read));
+
+    let pinned = buggy.successors("ConfinePin", &buggy.init_state())[0].clone();
+    let swapped = buggy.successors("SwapAncestor", &pinned)[0].clone();
+    let outside_write = buggy.successors("BuggyReresolveWrite", &swapped)[0].clone();
+    assert_eq!(
+        (outside_write["operation"], outside_write["effect_target"]),
+        (2, 2)
+    );
+    assert!(!buggy.check_invariant("AnchoredAccessNeverOutside", &outside_write));
+
+    // Even an operation that safely used the original pin cannot issue a
+    // success reply certifying the path's swapped replacement identity.
+    let pinned = buggy.successors("ConfinePin", &buggy.init_state())[0].clone();
+    let read = buggy.successors("ReadPinned", &pinned)[0].clone();
+    let swapped = buggy.successors("SwapAncestor", &read)[0].clone();
+    let false_reply = buggy.successors("BuggyCertifySwapped", &swapped)[0].clone();
+    assert_eq!(false_reply["reply"], 1);
+    assert_eq!(false_reply["certified_identity"], 2);
+    assert!(!buggy.check_invariant("SuccessfulReplyCertifiesOriginal", &false_reply));
+    assert!(!buggy.check_invariant("SwappedPathNeverCertified", &false_reply));
+}
+
+#[test]
+fn derived_artifact_reply_publication_requires_ack_or_quarantine_expiry() {
+    let model = artifact_reply_publication_model();
+    assert_proves_and_catches(&model);
+    let negative_controls = [
+        "BuggyAcceptPreChallengeAck",
+        "BuggyDropBeforeWrite",
+        "BuggyPruneLeased",
+        "BuggyPublishAfterCancel",
+        "BuggyReleaseQuarantineEarly",
+        "BuggyReleaseWithoutAck",
+    ];
+    assert_eq!(
+        verify::audit_dead_negative_controls(&model, &negative_controls),
+        Ok(negative_controls.len()),
+        "every artifact publication mutant must fire and fail independently"
+    );
+
+    let mut acknowledged = model.init_state();
+    for action in [
+        "AuthorizeCommit",
+        "QueueGuard",
+        "PrepareWire",
+        "WriteWire",
+        "AcknowledgePeer",
+        "ReleaseGuard",
+    ] {
+        assert!(
+            model.fire(action, &mut acknowledged),
+            "{action} must be reachable"
+        );
+    }
+    assert_eq!(acknowledged["phase"], 10);
+    assert_eq!(
+        (
+            acknowledged["reply"],
+            acknowledged["challenge"],
+            acknowledged["ack"],
+            acknowledged["ack_failed"],
+            acknowledged["guard"],
+        ),
+        (1, 1, 1, 0, 0)
+    );
+    assert!(model.check_invariant("ImmediateReleaseRequiresValidAck", &acknowledged));
+
+    let mut rejected_ack = model.init_state();
+    for action in [
+        "AuthorizeCommit",
+        "QueueGuard",
+        "PrepareWire",
+        "WriteWire",
+        "AcknowledgeFailed",
+    ] {
+        assert!(
+            model.fire(action, &mut rejected_ack),
+            "{action} must be reachable"
+        );
+    }
+    assert_eq!(
+        (
+            rejected_ack["phase"],
+            rejected_ack["ack"],
+            rejected_ack["ack_failed"],
+            rejected_ack["quarantine"],
+            rejected_ack["quarantine_age"],
+            rejected_ack["guard"],
+        ),
+        (7, 0, 1, 1, 0, 1)
+    );
+    assert!(
+        !model.action_enabled("ReleaseGuard", &rejected_ack),
+        "ACK failure cannot release before quarantine expires"
+    );
+    assert!(model.fire("AdvanceQuarantine", &mut rejected_ack));
+    assert!(model.fire("ExpireQuarantine", &mut rejected_ack));
+    assert_eq!(
+        (
+            rejected_ack["phase"],
+            rejected_ack["expired"],
+            rejected_ack["guard"],
+        ),
+        (8, 1, 1)
+    );
+    assert!(model.fire("ReleaseGuard", &mut rejected_ack));
+    assert_eq!(rejected_ack["phase"], 11);
+    assert!(model.check_invariant("QuarantineReleaseRequiresExpiry", &rejected_ack));
+
+    let mut aborted = model.init_state();
+    for action in [
+        "AuthorizeCommit",
+        "QueueGuard",
+        "PrepareFailed",
+        "ReleaseGuard",
+    ] {
+        assert!(
+            model.fire(action, &mut aborted),
+            "{action} must be reachable"
+        );
+    }
+    assert_eq!(
+        (
+            aborted["phase"],
+            aborted["artifact"],
+            aborted["committed"],
+            aborted["guard"],
+        ),
+        (12, 0, 0, 0)
+    );
+    assert!(model.check_invariant("AbortReleaseRemovesUncommittedArtifact", &aborted));
+
+    let mut write_failed = model.init_state();
+    for action in [
+        "AuthorizeCommit",
+        "QueueGuard",
+        "PrepareWire",
+        "WriteFailed",
+    ] {
+        assert!(
+            model.fire(action, &mut write_failed),
+            "{action} must be reachable"
+        );
+    }
+    assert_eq!(
+        (
+            write_failed["phase"],
+            write_failed["artifact"],
+            write_failed["committed"],
+            write_failed["reply"],
+            write_failed["write_error"],
+            write_failed["quarantine"],
+            write_failed["guard"],
+        ),
+        (7, 1, 1, 0, 1, 1, 1)
+    );
+    assert!(!model.action_enabled("ReleaseGuard", &write_failed));
+    assert!(model.fire("AdvanceQuarantine", &mut write_failed));
+    assert!(model.fire("ExpireQuarantine", &mut write_failed));
+    assert!(model.fire("ReleaseGuard", &mut write_failed));
+    assert_eq!(write_failed["phase"], 11);
+    assert!(model.check_invariant("QuarantineReleaseRequiresExpiry", &write_failed));
+
+    let authorized = model.successors("AuthorizeCommit", &model.init_state())[0].clone();
+    let queued = model.successors("QueueGuard", &authorized)[0].clone();
+    let swept = model.successors("RetentionSweep", &queued)[0].clone();
+    assert_eq!(swept["artifact"], 1);
+    assert_eq!(swept["guard"], 1);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let authorized = buggy.successors("AuthorizeCommit", &buggy.init_state())[0].clone();
+    let queued = buggy.successors("QueueGuard", &authorized)[0].clone();
+    let prepared = buggy.successors("PrepareWire", &queued)[0].clone();
+    let written = buggy.successors("WriteWire", &prepared)[0].clone();
+    let silent_release = buggy.successors("BuggyReleaseWithoutAck", &written)[0].clone();
+    assert_eq!(
+        (
+            silent_release["phase"],
+            silent_release["ack"],
+            silent_release["ack_failed"],
+            silent_release["guard"],
+        ),
+        (10, 0, 0, 0)
+    );
+    assert!(
+        !buggy.check_invariant("ImmediateReleaseRequiresValidAck", &silent_release),
+        "negative control: only a valid nonce ACK permits immediate release"
+    );
+
+    let prechallenge_ack = buggy.successors("BuggyAcceptPreChallengeAck", &prepared)[0].clone();
+    assert_eq!(
+        (
+            prechallenge_ack["phase"],
+            prechallenge_ack["reply"],
+            prechallenge_ack["challenge"],
+            prechallenge_ack["ack"],
+        ),
+        (6, 0, 0, 1)
+    );
+    assert!(
+        !buggy.check_invariant("SuccessfulAckRequiresCausalChallenge", &prechallenge_ack),
+        "negative control: a pre-pipelined ACK cannot count before the nonce challenge"
+    );
+
+    let quarantined = buggy.successors("AcknowledgeFailed", &written)[0].clone();
+    let early_release = buggy.successors("BuggyReleaseQuarantineEarly", &quarantined)[0].clone();
+    assert_eq!(
+        (
+            early_release["phase"],
+            early_release["expired"],
+            early_release["quarantine_age"],
+            early_release["guard"],
+        ),
+        (11, 0, 0, 0)
+    );
+    assert!(
+        !buggy.check_invariant("QuarantineReleaseRequiresExpiry", &early_release),
+        "negative control: failed/half-closed clients retain the guard for the full quarantine"
+    );
+
+    let pruned = buggy.successors("BuggyPruneLeased", &queued)[0].clone();
+    assert_eq!(pruned["artifact"], 0);
+    assert!(
+        !buggy.check_invariant("LeasedArtifactSurvivesRetention", &pruned),
+        "negative control: pruning a leased queued artifact violates the model"
+    );
+
+    let mut cancelled = model.init_state();
+    assert!(model.fire("Cancel", &mut cancelled));
+    assert_eq!((cancelled["artifact"], cancelled["reply"]), (0, 0));
+    assert!(model.check_invariant("CancelledPublishesNothing", &cancelled));
+}
+
+#[test]
+fn derived_artifact_reader_lease_sweeps_only_after_final_release() {
+    let model = artifact_reader_lease_model();
+    assert_proves_and_catches(&model);
+    let negative_controls = ["BuggyAcquireDuringSweep", "BuggyStartSweepEarly"];
+    assert_eq!(
+        verify::audit_dead_negative_controls(&model, &negative_controls),
+        Ok(negative_controls.len()),
+        "both refcount/sweep ordering mutants must fire and fail independently"
+    );
+
+    let mut state = model.init_state();
+    assert!(model.fire("Acquire", &mut state));
+    assert!(model.fire("Acquire", &mut state));
+    assert!(model.fire("Arm", &mut state));
+    assert_eq!((state["readers"], state["armed"]), (2, 1));
+
+    assert!(model.fire("Release", &mut state));
+    assert_eq!(
+        (state["readers"], state["pending"], state["sweeping"]),
+        (1, 0, 0),
+        "the first of two readers cannot start the convergence sweep"
+    );
+    assert!(!model.action_enabled("StartSweep", &state));
+
+    assert!(model.fire("Release", &mut state));
+    assert_eq!(
+        (state["readers"], state["pending"], state["sweeping"]),
+        (0, 1, 0),
+        "the final release schedules exactly one capability-bound sweep"
+    );
+    assert!(model.fire("RejectAcquireWhileSweeping", &mut state));
+    assert_eq!(state["readers"], 0);
+    assert!(model.fire("StartSweep", &mut state));
+    assert_eq!((state["pending"], state["sweeping"]), (0, 1));
+    assert!(model.fire("RejectAcquireWhileSweeping", &mut state));
+    assert_eq!(state["readers"], 0);
+    assert!(model.fire("FinishSweep", &mut state));
+    assert_eq!(
+        (
+            state["readers"],
+            state["armed"],
+            state["pending"],
+            state["sweeping"],
+            state["swept"],
+        ),
+        (0, 0, 0, 0, 1)
+    );
+    assert!(model.fire("Acquire", &mut state));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let acquired = buggy.successors("Acquire", &buggy.init_state())[0].clone();
+    let armed = buggy.successors("Arm", &acquired)[0].clone();
+    let early = buggy.successors("BuggyStartSweepEarly", &armed)[0].clone();
+    assert!(
+        !buggy.check_invariant("MaintenanceExcludesReaders", &early),
+        "negative control: maintenance cannot begin with a live reader"
+    );
+
+    let mut pending = model.init_state();
+    assert!(model.fire("Acquire", &mut pending));
+    assert!(model.fire("Arm", &mut pending));
+    assert!(model.fire("Release", &mut pending));
+    let pending = aterm_spec::interp::with_buggy(&model, 1)
+        .successors("BuggyAcquireDuringSweep", &pending)[0]
+        .clone();
+    assert!(
+        !buggy.check_invariant("MaintenanceExcludesReaders", &pending),
+        "negative control: a new reader cannot enter the last-release/sweep interval"
+    );
+}
+
+/// Beginning a newer fixed-path snapshot invalidates the old generation before
+/// it can publish a completion marker. The mutant lets the overtaken worker
+/// certify generation-one payload after generation two is current.
+#[test]
+fn derived_snapshot_generation_commit_proves_and_catches_stale_publish() {
+    let model = snapshot_generation_commit_model();
+    assert_proves_and_catches(&model);
+
+    let committed = model.successors("CommitCurrent", &model.init_state())[0].clone();
+    assert_eq!(committed["payload"], 1);
+    assert_eq!(committed["done"], 1);
+
+    let superseded = model.successors("BeginNew", &committed)[0].clone();
+    assert_eq!(superseded["latest"], 2);
+    assert_eq!(superseded["done"], 0);
+
+    let stale_completion = model.successors("CommitOld", &superseded)[0].clone();
+    assert_eq!(stale_completion["payload"], 1);
+    assert_eq!(stale_completion["done"], 0);
+    assert!(model.check_invariant("CommittedPayloadIsCurrent", &stale_completion));
+
+    let selected = model.successors("SelectCurrent", &stale_completion)[0].clone();
+    let current = model.successors("CommitCurrent", &selected)[0].clone();
+    assert_eq!(current["payload"], 2);
+    assert_eq!(current["done"], 1);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let committed = buggy.successors("CommitCurrent", &buggy.init_state())[0].clone();
+    let superseded = buggy.successors("BeginNew", &committed)[0].clone();
+    let stale_publish = buggy.successors("CommitOld", &superseded)[0].clone();
+    assert_eq!(stale_publish["latest"], 2);
+    assert_eq!(stale_publish["payload"], 1);
+    assert_eq!(stale_publish["done"], 1);
+    assert!(!buggy.check_invariant("CommittedPayloadIsCurrent", &stale_publish));
+}
+
+/// A WindowServer photograph is not native-content authority, and neither is a
+/// semantic offscreen rerender made after the barrier. The client source must be
+/// the exact serial-bound successful PRESENT destination. Its physical size and
+/// client-origin offset must both validate before it is stitched under OS chrome.
+///
+/// Model field `renderer_bound` and decision code 1 retain their historical
+/// names for trace compatibility; they mean destination-bound here.
 #[test]
 fn derived_native_capture_source_proves_and_catches_stale_compositor_pixels() {
     let model = native_capture_source_model();
     assert_proves_and_catches(&model);
 
     let presented = model.successors("MarkFramePresented", &model.init_state())[0].clone();
+    let missing_origin = model.successors("Decide", &presented)[0].clone();
+    assert_eq!(
+        missing_origin["decision"], 2,
+        "a serial-bound destination without validated size/client origin fails closed"
+    );
     let validated = model.successors("ValidateGeometry", &presented)[0].clone();
     let captured = model.successors("Decide", &validated)[0].clone();
     assert_eq!(captured["decision"], 1);
@@ -1629,17 +2293,174 @@ fn derived_native_capture_source_proves_and_catches_stale_compositor_pixels() {
     assert_eq!(captured["captured"], 1);
     assert_eq!(captured["stale_capture"], 0);
 
-    let failed = model.successors("Decide", &model.init_state())[0].clone();
+    let geometry_only = model.successors("ValidateGeometry", &model.init_state())[0].clone();
+    let failed = model.successors("Decide", &geometry_only)[0].clone();
     assert_eq!(failed["decision"], 2);
     assert_eq!(failed["captured"], 0);
     assert_eq!(failed["failed"], 1);
 
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let stale = buggy.successors("Decide", &buggy.init_state())[0].clone();
+    let coincidentally_current =
+        buggy.successors("PromoteOsClient", &buggy.init_state())[0].clone();
+    let stale = buggy.successors("Decide", &coincidentally_current)[0].clone();
     assert_eq!(stale["captured"], 1);
     assert_eq!(stale["renderer_bound"], 0);
+    assert_eq!(
+        stale["stale_capture"], 1,
+        "even current-looking OS/offscreen pixels lack destination provenance"
+    );
     assert!(!buggy.check_invariant("NoStaleCapture", &stale));
     assert!(!buggy.check_invariant("CaptureUsesRenderer", &stale));
+}
+
+/// One-shot destination capture must cross every async ownership phase before
+/// publishing pixels; validation/map failures terminate as errors. The mutant
+/// publishes a frame from the failed-map edge.
+#[test]
+fn derived_presented_frame_tap_proves_and_catches_fail_open_map() {
+    let model = presented_frame_tap_model();
+    assert_proves_and_catches(&model);
+
+    let pending = model.successors("EnqueueValid", &model.init_state())[0].clone();
+    assert_eq!(pending["phase"], 1);
+    let in_flight = model.successors("StartMap", &pending)[0].clone();
+    assert_eq!(in_flight["phase"], 2);
+    let complete = model.successors("CompleteMap", &in_flight)[0].clone();
+    assert_eq!(complete["phase"], 3);
+    assert_eq!(complete["mapped"], 1);
+    assert_eq!(complete["result"], 1);
+
+    let rejected = model.successors("RejectEnqueue", &model.init_state())[0].clone();
+    assert_eq!(rejected["phase"], 3);
+    assert_eq!(rejected["result"], 2);
+    assert_eq!(rejected["accepted"], 0);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let pending = buggy.successors("EnqueueValid", &buggy.init_state())[0].clone();
+    let in_flight = buggy.successors("StartMap", &pending)[0].clone();
+    let fail_open = buggy.successors("MapError", &in_flight)[0].clone();
+    assert_eq!(fail_open["result"], 1);
+    assert_eq!(fail_open["mapped"], 0);
+    assert!(!buggy.check_invariant("SuccessRequiresMappedCopy", &fail_open));
+}
+
+/// Every streaming staging slot is reusable after either map outcome, while an
+/// accepted present with impossible metadata increments the honest drop count
+/// without reserving a slot. Out-of-order callback arrival 3,1,2 is sorted and
+/// the bounded store retains tail 2,3. The mutant leaks the failed slot, silently
+/// loses invalid-metadata opportunities, and appends/evicts in callback order.
+#[test]
+fn derived_video_tap_slot_proves_and_catches_lifecycle_and_ordering_mutants() {
+    let model = video_tap_slot_model();
+    assert_proves_and_catches(&model);
+
+    let pending = model.successors("Enqueue", &model.init_state())[0].clone();
+    let in_flight = model.successors("StartMap", &pending)[0].clone();
+    let free = model.successors("MapOk", &in_flight)[0].clone();
+    assert_eq!(free["phase"], 0);
+    assert_eq!(free["dropped"], 0);
+
+    let failed = model.successors("MapError", &in_flight)[0].clone();
+    assert_eq!(failed["phase"], 0);
+    assert_eq!(failed["dropped"], 1);
+    assert_eq!(failed["last_error"], 1);
+
+    let invalid = model.successors("RejectInvalidMetadata", &model.init_state())[0].clone();
+    assert_eq!(invalid["phase"], 0);
+    assert_eq!(invalid["invalid"], 1);
+    assert_eq!(invalid["dropped"], 1);
+
+    let aborted = model.successors("Abort", &pending)[0].clone();
+    assert_eq!(aborted["phase"], 0);
+    assert_eq!(aborted["dropped"], 1);
+
+    let three = model.successors("HarvestThree", &model.init_state())[0].clone();
+    assert_eq!(three["store_first"], 3);
+    let one = model.successors("HarvestOne", &three)[0].clone();
+    assert_eq!(one["store_first"], 1);
+    assert_eq!(one["store_second"], 3);
+    let two = model.successors("HarvestTwo", &one)[0].clone();
+    assert_eq!(two["store_first"], 2);
+    assert_eq!(two["store_second"], 3);
+    assert_eq!(two["evicted"], 1);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let pending = buggy.successors("Enqueue", &buggy.init_state())[0].clone();
+    let in_flight = buggy.successors("StartMap", &pending)[0].clone();
+    let leaked = buggy.successors("MapError", &in_flight)[0].clone();
+    assert_eq!(leaked["phase"], 2);
+    assert!(!buggy.check_invariant("ErrorResolutionFreesSlot", &leaked));
+
+    let silent = buggy.successors("RejectInvalidMetadata", &buggy.init_state())[0].clone();
+    assert_eq!(silent["invalid"], 1);
+    assert_eq!(silent["dropped"], 0);
+    assert!(!buggy.check_invariant("InvalidMetadataIsCounted", &silent));
+
+    let three = buggy.successors("HarvestThree", &buggy.init_state())[0].clone();
+    let callback_ordered = buggy.successors("HarvestOne", &three)[0].clone();
+    assert_eq!(callback_ordered["store_first"], 3);
+    assert_eq!(callback_ordered["store_second"], 1);
+    assert!(!buggy.check_invariant("HarvestedStoreSorted", &callback_ordered));
+    let wrong_tail = buggy.successors("HarvestTwo", &callback_ordered)[0].clone();
+    assert_eq!(wrong_tail["store_first"], 1);
+    assert_eq!(wrong_tail["store_second"], 2);
+    assert!(!buggy.check_invariant("BudgetKeepsNewestTail", &wrong_tail));
+}
+
+/// Every capture lifecycle model must participate in the global spec-link,
+/// strict-vacuity, and source-anchor closure.
+#[test]
+fn capture_tap_models_are_registered_for_global_verification() {
+    let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
+        .into_iter()
+        .map(|model| model.name)
+        .collect();
+    for expected in [
+        "SnapshotGenerationCommit",
+        "VideoRecordingLifecycle",
+        "ExactInstanceRetention",
+        "AnchoredArtifactTransaction",
+        "ArtifactReplyPublication",
+        "ArtifactReaderLease",
+        "PresentedFrameTap",
+        "VideoTapSlot",
+    ] {
+        assert!(
+            registered.contains(expected),
+            "{expected} must resolve through the global spec↔source registry"
+        );
+    }
+}
+
+/// A focused leaf can change cell coordinates without changing the coarse
+/// single/composed class (divider drag, zoom transition, or focus move). The
+/// retained cursor-effect state must be reset before that frame is eligible to
+/// present. The mutant keeps the old coordinate binding.
+#[test]
+fn derived_layout_coordinate_reset_proves_and_catches_stale_trail() {
+    let model = layout_coordinate_reset_model();
+    assert_proves_and_catches(&model);
+
+    let charged = model.successors("Charge", &model.init_state())[0].clone();
+    assert_eq!(charged["charged"], 1);
+    assert_eq!(charged["bound_coordinate"], charged["coordinate"]);
+
+    let moved = model.successors("ChangeCoordinate", &charged)[0].clone();
+    assert_eq!(moved["prepared"], 0);
+    assert_ne!(moved["bound_coordinate"], moved["coordinate"]);
+
+    let prepared = model.successors("Prepare", &moved)[0].clone();
+    assert_eq!(prepared["prepared"], 1);
+    assert_eq!(prepared["charged"], 0);
+    assert_eq!(prepared["bound_coordinate"], prepared["coordinate"]);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let charged = buggy.successors("Charge", &buggy.init_state())[0].clone();
+    let moved = buggy.successors("ChangeCoordinate", &charged)[0].clone();
+    let stale = buggy.successors("Prepare", &moved)[0].clone();
+    assert_eq!(stale["charged"], 1);
+    assert_ne!(stale["bound_coordinate"], stale["coordinate"]);
+    assert!(!buggy.check_invariant("PreparedEffectsMatchCoordinate", &stale));
 }
 
 /// A reload may leave one old prewarm already running, but its completed result

@@ -352,6 +352,29 @@ const MAX_AUTOMATIC_UPDATE_CYCLES: u8 = 3;
 /// being wrong is bounded and the backoff below keeps it from thrashing.
 const MAX_ACTIVITY_REVOKED_CYCLES: u8 = 8;
 
+/// Physical handoff failures get a SMALL budget on a LONG leash — not the zero
+/// they used to get.
+///
+/// The old policy was "never repeat a physical failure from a timer", and the
+/// reasoning was sound as far as it went: a returned handoff really did park
+/// readers, spawn a child and checkpoint sessions, so repeating it is not free.
+/// What that reasoning missed is that `TimedOut` is classified physical, and the
+/// handoff deadline (15 s, `app_input.rs`) has to cover an entire cold boot of the
+/// old image, a blocking `flock`, re-verification, the bundle swap, a second exec,
+/// a boot of the NEW image, PTY adoption and a full repaint. Measured on the
+/// author's machine: 4.52 s — comfortable, until the page cache is cold or
+/// `codesign` is not warm. So the commonest physical failure is ENVIRONMENTAL and
+/// transient, and the penalty for hitting it once was permanent: automatic
+/// in-session apply disabled for that build until a new one shipped, with the
+/// staged update sitting there applying only on the next relaunch. That is the
+/// exact symptom this whole feature exists to remove.
+///
+/// Two retries, spaced in tens of minutes, is the compromise: a slow moment gets
+/// another chance at a calmer one, while a STRUCTURAL failure (two builds whose
+/// adoption proof genuinely cannot agree) still converges to manual-only quickly
+/// and stops costing round trips.
+const MAX_PHYSICAL_FAILURE_CYCLES: u8 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutomaticRetryKind {
     PreflightBlocked,
@@ -365,17 +388,15 @@ enum AutomaticRetryKind {
     PhysicalFailure,
 }
 
-/// A bounded retry plan for cheap ordering/preflight races and for lossless
-/// activity-revoked overlap returns. GENUINE physical handoff failures (child
-/// died, proof mismatch, safety loss) never call this helper with a retry-able
-/// kind: they become manual-only immediately.
+/// A bounded retry plan for cheap ordering/preflight races, for lossless
+/// activity-revoked overlap returns, and — on a deliberately short budget and long
+/// leash — for physical handoff failures, most of which are a missed deadline
+/// rather than a broken pair of builds (see [`MAX_PHYSICAL_FAILURE_CYCLES`]).
 #[must_use]
 fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::time::Duration> {
-    if kind == AutomaticRetryKind::PhysicalFailure {
-        return None;
-    }
     let budget = match kind {
         AutomaticRetryKind::ActivityRevoked => MAX_ACTIVITY_REVOKED_CYCLES,
+        AutomaticRetryKind::PhysicalFailure => MAX_PHYSICAL_FAILURE_CYCLES,
         _ => MAX_AUTOMATIC_UPDATE_CYCLES,
     };
     if cycles >= budget {
@@ -397,8 +418,14 @@ fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::ti
         (AutomaticRetryKind::ActivityRevoked, 6) => 600,
         (AutomaticRetryKind::ActivityRevoked, _) => 900,
         // Kept explicit so this helper stays fail-closed if the early return above is
-        // ever refactored. A physical handoff failure must never mint a timer retry.
-        (AutomaticRetryKind::PhysicalFailure, _) => return None,
+        // Tens of minutes, not seconds. A physical retry costs a real
+        // park/spawn/paint round trip, and the failure it is recovering from is a
+        // missed deadline — so wait long enough that the machine is plausibly in a
+        // different state (page cache warm, codesign warm, load down) rather than
+        // re-running the same losing race immediately. The budget above stops this
+        // after two.
+        (AutomaticRetryKind::PhysicalFailure, 0) => 600,
+        (AutomaticRetryKind::PhysicalFailure, _) => 1800,
     };
     Some(std::time::Duration::from_secs(seconds))
 }
@@ -4162,11 +4189,17 @@ impl App {
             .is_some_and(|manual| manual.retry_at.is_some_and(|at| now >= at));
         if lapsed {
             aterm_log::info!(
-                "update apply: the activity-revoked manual-only latch lapsed; \
-                 automatic apply is eligible again"
+                "update apply: the manual-only latch lapsed; automatic apply is \
+                 eligible again"
             );
             self.auto_apply_manual_only = None;
             self.auto_overlap_retry = None;
+            // `auto_apply_physical_retry` is deliberately NOT cleared. It is the
+            // budget deciding how many physical retries remain, and since a
+            // physical latch now lapses too, clearing it here would hand out fresh
+            // budget on every lapse and turn a bounded retry into a permanent
+            // ten-minute loop. Its own replenish window is what forgives an
+            // artifact eventually.
         }
         lapsed
     }
@@ -4463,19 +4496,60 @@ impl App {
                 }
             }
             (AttemptDisposition::ManualOnly, UpdateOutcome::Failed { message }) => {
-                // A returned physical handoff can park/read/checkpoint sessions. Never
-                // repeat it from a timer: retain the manual menu affordance with zero
-                // further wake cost.
+                // A returned physical handoff can park/read/checkpoint sessions, so it
+                // is retried rarely and only twice — but it IS retried. `retry_at:
+                // None` here used to be a permanent latch (`arm` answers
+                // `SuppressManualOnly` forever, and `lapse_expired_auto_apply_manual_only`
+                // only clears latches that carry a deadline), which meant a single
+                // missed 15 s handoff deadline disabled automatic in-session apply for
+                // that build outright.
                 self.auto_apply_intent = None;
+                // The cycle count must live OUTSIDE the latch: the latch is cleared
+                // when it lapses, so counting inside it would reset the budget on
+                // every lapse and turn "two tries" into an unbounded loop.
+                // `intent.attempts` is equally unusable — a lapse arms a fresh
+                // intent at 0. Keyed by (build, dmg) with the same replenish window
+                // as the activity budget, so a different artifact starts clean and a
+                // long quiet stretch forgives an old failure.
+                let now = std::time::Instant::now();
+                let cycles = self
+                    .auto_apply_physical_retry
+                    .filter(|retry| {
+                        retry.build == intent.build
+                            && retry.dmg_sha256 == intent.dmg_sha256
+                            && now.duration_since(retry.last_attempt)
+                                < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
+                    })
+                    .map_or(0, |retry| retry.cycles);
+                self.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
+                    build: intent.build,
+                    dmg_sha256: intent.dmg_sha256,
+                    cycles: cycles.saturating_add(1),
+                    last_attempt: now,
+                });
+                let retry_at = automatic_retry_delay(cycles, AutomaticRetryKind::PhysicalFailure)
+                    .map(|delay| now + delay);
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                     build: intent.build,
                     dmg_sha256: intent.dmg_sha256,
-                    retry_at: None,
+                    retry_at,
                 });
-                debug_assert_eq!(
-                    automatic_retry_delay(intent.attempts, AutomaticRetryKind::PhysicalFailure),
-                    None
-                );
+                if let Some(at) = retry_at {
+                    aterm_log::info!(
+                        "update auto-apply: physical handoff failure on build {} \
+                         (attempt {}); automatic apply is latched off until the retry \
+                         window in ~{}s, then eligible again",
+                        intent.build,
+                        intent.attempts,
+                        at.saturating_duration_since(std::time::Instant::now()).as_secs()
+                    );
+                } else {
+                    aterm_log::warn!(
+                        "update auto-apply: physical handoff failure on build {} \
+                         exhausted its retry budget; manual apply only",
+                        intent.build
+                    );
+                }
                 self.surface_update_apply_outcome(
                     "automatic · manual retry required",
                     UpdateOutcome::Failed { message },
@@ -6924,8 +6998,31 @@ mod tests {
             automatic_retry_delay(u8::MAX, AutomaticRetryKind::PreflightBlocked),
             None
         );
+        // Physical failures get a SHORT budget on a LONG leash — not the zero they
+        // used to get. `TimedOut` is classified physical while the handoff deadline
+        // must cover a whole cold boot + swap + re-exec + repaint, so the commonest
+        // physical failure is a missed deadline, and permanently retiring automatic
+        // apply for it stranded the staged build until the next relaunch.
+        assert_eq!(
+            automatic_retry_delay(0, AutomaticRetryKind::PhysicalFailure),
+            Some(std::time::Duration::from_secs(600)),
+            "the first physical failure earns one retry, ten minutes out"
+        );
         assert_eq!(
             automatic_retry_delay(1, AutomaticRetryKind::PhysicalFailure),
+            Some(std::time::Duration::from_secs(1800)),
+            "the second waits half an hour"
+        );
+        // ...and then it really does stop, so a structurally-incompatible pair of
+        // builds converges to manual-only instead of costing a park/spawn/paint
+        // round trip forever.
+        assert_eq!(
+            automatic_retry_delay(MAX_PHYSICAL_FAILURE_CYCLES, AutomaticRetryKind::PhysicalFailure),
+            None,
+            "the budget is spent"
+        );
+        assert_eq!(
+            automatic_retry_delay(u8::MAX, AutomaticRetryKind::PhysicalFailure),
             None
         );
     }
@@ -7083,13 +7180,68 @@ mod tests {
             ),
             None
         );
-        for cycles in 0..=MAX_ACTIVITY_REVOKED_CYCLES {
+        // A physical failure gets a far smaller budget than activity revocation —
+        // it is not free to repeat — but it is no longer zero, and it is spent
+        // strictly sooner than the activity budget at every cycle.
+        for cycles in 0..MAX_PHYSICAL_FAILURE_CYCLES {
+            assert!(
+                automatic_retry_delay(cycles, AutomaticRetryKind::PhysicalFailure).is_some(),
+                "physical cycle {cycles} is inside the budget"
+            );
+        }
+        for cycles in MAX_PHYSICAL_FAILURE_CYCLES..=MAX_ACTIVITY_REVOKED_CYCLES {
             assert_eq!(
                 automatic_retry_delay(cycles, AutomaticRetryKind::PhysicalFailure),
                 None,
-                "a genuine physical failure must never mint a timer retry"
+                "a spent physical budget must never mint another timer retry"
             );
         }
+        assert!(
+            MAX_PHYSICAL_FAILURE_CYCLES < MAX_ACTIVITY_REVOKED_CYCLES,
+            "a lossless revocation must always be retried more readily than a \
+             physical failure"
+        );
+    }
+
+    /// The physical-failure budget must survive a latch LAPSE, or "two tries" is
+    /// an unbounded ten-minute loop.
+    ///
+    /// This is the trap the fix walked into: the obvious place to keep the count
+    /// is `auto_apply_manual_only`, but that struct is cleared the moment the
+    /// latch lapses, and `AutoApplyIntent::attempts` resets to 0 when a fresh
+    /// intent is armed. Only a counter that outlives BOTH converges. Guard it
+    /// directly: lapsing must not restore budget.
+    #[test]
+    fn a_lapsing_physical_latch_does_not_replenish_its_own_budget() {
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
+            build,
+            dmg_sha256: [0xab; 32],
+            cycles: MAX_PHYSICAL_FAILURE_CYCLES,
+            last_attempt: std::time::Instant::now(),
+        });
+        // An already-expired latch, i.e. one that lapses on this very call.
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        });
+
+        assert!(app.lapse_expired_auto_apply_manual_only(), "latch lapsed");
+        assert!(app.auto_apply_manual_only.is_none());
+        let retained = app
+            .auto_apply_physical_retry
+            .expect("the physical budget must OUTLIVE the latch it gated");
+        assert_eq!(
+            retained.cycles, MAX_PHYSICAL_FAILURE_CYCLES,
+            "lapsing must not hand back spent physical budget"
+        );
+        assert_eq!(
+            automatic_retry_delay(retained.cycles, AutomaticRetryKind::PhysicalFailure),
+            None,
+            "a spent budget stays spent across a lapse"
+        );
     }
 
     /// The App-side budget consumer: each activity-revoked completion for one

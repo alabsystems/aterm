@@ -46,7 +46,7 @@ use serde::Deserialize;
 use aterm_update_core::{HttpError, token};
 
 use crate::manifest::{Manifest, Ready};
-use crate::{PINNED_TEAM_ID, PINNED_UPDATE_PUBKEY, Source, bundle, install, paths::Staging, sig};
+use crate::{PINNED_UPDATE_PUBKEY, Source, bundle, install, paths::Staging, sig};
 
 /// Which credential lane the last COMPLETED releases-LIST request used. Read by the
 /// background loop to pick a check cadence the lane's rate-limit budget can afford

@@ -50,7 +50,7 @@ impl TerminalHandler<'_> {
             1 => self.set_title(params, true, false),
             2 => self.set_title(params, false, true),
             4 => self.handle_osc_4(cap, params),
-            19 => self.handle_osc_19(params),
+            19 => self.handle_osc_19(cap, params),
             7 => self.handle_osc_7(params),
             8 => self.handle_osc_8(params),
             // OSC 9: simple desktop notification (Terminal / ConEmu style).

@@ -943,6 +943,13 @@ fn alignment_edge(
 /// regardless of owner lifetime or later reuse of the same numeric identity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct IgnitionReservation {
+    /// Which bound pane requested it (0 for an unbound, window-wide engine).
+    /// The rolling-window SAFETY count is over every pane — one window, one
+    /// eye — but a pending slot may only be cancelled by the pane that owns
+    /// it: every other pane's episodes live in a parked persist map this side
+    /// of the binding cannot see, and pruning against the wrong map would
+    /// cancel a queued nova that is still perfectly alive.
+    pane: u64,
     owner: u64,
     start: Instant,
     center: (i32, i32),
@@ -1810,6 +1817,105 @@ pub struct WordDecorations {
     coupling: Vec<(u16, u8)>,
     /// Resident distance-sort scratch for the nearest-16 coupling selection.
     dist_scratch: Vec<(u64, u16)>,
+    /// PANE BINDING (2026-07-28) — the episode/grid state of every pane this
+    /// window shows EXCEPT the one currently bound, whose state lives in the
+    /// live fields above. See [`WordDecorations::bind_pane`].
+    parked: HashMap<u64, ParkedPane>,
+    /// Which pane's state the live fields currently hold; `None` for a host
+    /// that never binds (the single-pane path), which is what makes binding
+    /// opt-in and the unbound engine byte-identical to the pre-binding one.
+    bound: Option<u64>,
+    /// The bound pane's grid origin in WINDOW pixels. Ignition centers are
+    /// shifted by it so the §6.4 flash limiter compares every pane's flashes
+    /// in ONE coordinate space — the "window-wide" claim it is modeled on.
+    pane_px: (i32, i32),
+    /// Whether the host brackets its frames with
+    /// [`begin_host_frame`](WordDecorations::begin_host_frame). Latched on the
+    /// first call: the two-bake budget is a per-FRAME budget, so a host that
+    /// ticks several panes per frame must not multiply it, while a host that
+    /// never brackets keeps the historical one-prologue-per-tick behaviour.
+    host_brackets_frames: bool,
+}
+
+/// One pane's episode + grid state while another pane is bound.
+///
+/// Panes in one window share ONE `WordDecorations` so they share ONE cat
+/// atlas, ONE flash limiter and ONE supernova mutex: the two safety budgets
+/// are window-wide claims (§6.4 WCAG 2.3.1, §3.2 burst mutex) and must not
+/// multiply with the pane count. Everything that is grid-shaped or
+/// episode-scoped parks here instead; binding `mem::swap`s it in and out, so
+/// none of the engine body's `self.<field>` reads change.
+#[derive(Default)]
+struct ParkedPane {
+    occ: Vec<Occurrence>,
+    last_epoch: u64,
+    have_scanned: bool,
+    cols: u16,
+    frame: u64,
+    active_until: Option<Instant>,
+    scan_row_occupied: Vec<bool>,
+    /// Parked even though sharing it would be CORRECT (it keys on row text
+    /// plus an inputs fingerprint): `ScanMemo::fit`'s `gen_cap = 2·rows` would
+    /// thrash between panes of different heights. ~2 KB at 24×40.
+    scan_memo: ScanMemo,
+    ink_base_fg: Vec<[u8; 3]>,
+    ink_cols: Vec<u16>,
+    persist: HashMap<u64, Episode>,
+    seed_ordinals: HashMap<u64, u64>,
+    done_marks: DoneMarkLru,
+    frozen_at: Option<Instant>,
+    settle_until: Option<Instant>,
+    away: bool,
+    spend_next_births: bool,
+    last_revisit: Option<Instant>,
+    next_revisit_check: Option<Instant>,
+    revisit_checks: u64,
+    rescan_seq: u64,
+    pending: Vec<PendingBirth>,
+    align_old: Vec<(u64, Episode)>,
+}
+
+impl ParkedPane {
+    /// A pane the engine has never driven. `away: true` (NOT `Default`, which
+    /// is presentable) is load-bearing: the host's immediately-following
+    /// `set_presentable(now, true)` must see a real transition, or
+    /// `spend_next_births` never latches and a pane split onto a screenful of
+    /// feline words births the whole backlog at once — the exact storm
+    /// [`WordDecorations::set_presentable`] exists to prevent.
+    fn fresh() -> Self {
+        Self {
+            away: true,
+            ..Self::default()
+        }
+    }
+
+    /// Exchange this parked state with the engine's live fields. Three words
+    /// per `Vec`/`HashMap`; nothing is cloned and nothing reallocates.
+    fn swap(&mut self, wd: &mut WordDecorations) {
+        std::mem::swap(&mut self.occ, &mut wd.occ);
+        std::mem::swap(&mut self.last_epoch, &mut wd.last_epoch);
+        std::mem::swap(&mut self.have_scanned, &mut wd.have_scanned);
+        std::mem::swap(&mut self.cols, &mut wd.cols);
+        std::mem::swap(&mut self.frame, &mut wd.frame);
+        std::mem::swap(&mut self.active_until, &mut wd.active_until);
+        std::mem::swap(&mut self.scan_row_occupied, &mut wd.scan_row_occupied);
+        std::mem::swap(&mut self.scan_memo, &mut wd.scan_memo);
+        std::mem::swap(&mut self.ink_base_fg, &mut wd.ink_base_fg);
+        std::mem::swap(&mut self.ink_cols, &mut wd.ink_cols);
+        std::mem::swap(&mut self.persist, &mut wd.persist);
+        std::mem::swap(&mut self.seed_ordinals, &mut wd.seed_ordinals);
+        std::mem::swap(&mut self.done_marks, &mut wd.done_marks);
+        std::mem::swap(&mut self.frozen_at, &mut wd.frozen_at);
+        std::mem::swap(&mut self.settle_until, &mut wd.settle_until);
+        std::mem::swap(&mut self.away, &mut wd.away);
+        std::mem::swap(&mut self.spend_next_births, &mut wd.spend_next_births);
+        std::mem::swap(&mut self.last_revisit, &mut wd.last_revisit);
+        std::mem::swap(&mut self.next_revisit_check, &mut wd.next_revisit_check);
+        std::mem::swap(&mut self.revisit_checks, &mut wd.revisit_checks);
+        std::mem::swap(&mut self.rescan_seq, &mut wd.rescan_seq);
+        std::mem::swap(&mut self.pending, &mut wd.pending);
+        std::mem::swap(&mut self.align_old, &mut wd.align_old);
+    }
 }
 
 impl WordDecorations {
@@ -1916,6 +2022,18 @@ impl WordDecorations {
     /// per-occurrence state while KEEPING the `done_marks` set, so the next
     /// rescan re-enters finished words as born-done instead of replaying.
     pub fn reset(&mut self) {
+        self.with_each_pane(Self::reset_bound);
+    }
+
+    /// [`reset`](Self::reset) for the state currently in the LIVE fields alone —
+    /// the bound pane, or the whole window when nothing is bound. Parked
+    /// siblings are untouched.
+    ///
+    /// This is the right reset whenever the thing being retired is one pane:
+    /// folding over every parked pane there would let closing the focused pane
+    /// wipe the cats out of the panes that are still on screen, which is the
+    /// blanket-reset behaviour the owner's ruling retired.
+    fn reset_bound(&mut self) {
         // Flush pass: marks written before persist.clear() (design §1.1).
         let marks = &mut self.done_marks;
         for (ident, ep) in &self.persist {
@@ -1926,12 +2044,100 @@ impl WordDecorations {
         self.reset_transient_state();
     }
 
+    /// Bind `key`'s state into the live fields, recording the pane's grid
+    /// origin in WINDOW pixels (`px_origin`) for the shared flash limiter.
+    ///
+    /// Owner ruling, 2026-07-28: "sparkle effects and toys are NOT SINGLE PANE
+    /// ONLY". Every visible pane drives this one engine in turn, so each needs
+    /// its own damage epoch, column count, episode map, done marks and rescan
+    /// sequence — otherwise pane B inherits pane A's spent one-shots, alternating
+    /// widths pin `born_settled` forever, and the `REKEY_MAX_SEQ_GAP` window
+    /// closes after the first pane of every frame.
+    pub fn bind_pane(&mut self, key: u64, px_origin: (i32, i32)) {
+        self.pane_px = px_origin;
+        match self.bound {
+            Some(cur) if cur == key => return,
+            Some(cur) => {
+                let mut slot = ParkedPane::default();
+                slot.swap(self);
+                self.parked.insert(cur, slot);
+            }
+            None => {
+                // The live fields hold WINDOW-wide state: one pane covering the
+                // whole grid, whose every word has just moved somewhere else.
+                // Retire exactly that, exactly as the v3 §1.1 reset table's
+                // "pane-space change → transient reset" rule always did. NOT
+                // `reset()`: the parked panes are already correctly scoped, and
+                // wiping them here would kill the cats in panes that never moved.
+                self.reset_bound();
+            }
+        }
+        let mut slot = self.parked.remove(&key).unwrap_or_else(ParkedPane::fresh);
+        slot.swap(self);
+        self.bound = Some(key);
+    }
+
+    /// Open a host FRAME, before any pane's [`tick`](Self::tick).
+    ///
+    /// The `MAX_BAKES_PER_FRAME` budget and the baker's LRU clock are per
+    /// PRESENTED FRAME, not per tick: a window compositing N panes bakes at
+    /// most two tiles in total, into the one shared atlas. Latches
+    /// `host_brackets_frames`, so a host that never calls this keeps the
+    /// historical one-prologue-per-tick behaviour unchanged.
+    pub fn begin_host_frame(&mut self) {
+        self.host_brackets_frames = true;
+        self.cat_baker_ready = false;
+    }
+
+    /// Drop parked state for panes this window no longer shows, and unbind the
+    /// live state if its own pane is gone (its episodes describe a grid that
+    /// no longer exists). Hosts call this once per frame off the layout they
+    /// are about to compose.
+    pub fn retain_panes(&mut self, keep: impl Fn(u64) -> bool) {
+        self.parked.retain(|k, _| keep(*k));
+        if let Some(cur) = self.bound
+            && !keep(cur)
+        {
+            self.bound = None;
+            // With no pane bound the honest grid origin is the window's own:
+            // a stale offset would place the next host's ignition centers in a
+            // coordinate space nothing else on the glass shares.
+            self.pane_px = (0, 0);
+            // ONLY the departed pane's state (it is the one in the live fields).
+            // Its still-visible siblings are parked and keep their episodes —
+            // closing one pane must not blank the cats in the rest.
+            self.reset_bound();
+        }
+    }
+
+    /// Run `f` with EVERY pane's state bound in turn — the currently bound (or
+    /// unbound-window) state first, then each parked pane — restoring the
+    /// original binding afterwards. The fold behind `reset`/`hard_reset`.
+    fn with_each_pane(&mut self, mut f: impl FnMut(&mut Self)) {
+        f(self);
+        if self.parked.is_empty() {
+            return;
+        }
+        let keys: Vec<u64> = self.parked.keys().copied().collect();
+        for key in keys {
+            let Some(mut slot) = self.parked.remove(&key) else {
+                continue;
+            };
+            slot.swap(self);
+            f(self);
+            slot.swap(self);
+            self.parked.insert(key, slot);
+        }
+    }
+
     /// HARD reset (v3 §1.1 reset table: master toggle, config reload / lexicon
     /// rebuild, web knob setters): clears episodes AND `done_marks` — a fresh
     /// start is user intent, so everything replays.
     pub fn hard_reset(&mut self) {
-        self.done_marks.clear();
-        self.reset_transient_state();
+        self.with_each_pane(|wd| {
+            wd.done_marks.clear();
+            wd.reset_transient_state();
+        });
     }
 
     /// The shared body of [`reset`](Self::reset) / [`hard_reset`](Self::hard_reset):
@@ -3818,7 +4024,12 @@ impl WordDecorations {
         // typed one-shots live on the episode latch, so an undrained frame
         // loses only sound, never correctness.
         self.curse_cues.clear();
-        self.cat_baker_ready = false;
+        if !self.host_brackets_frames {
+            // No host frame bracket: one baker prologue per tick, exactly as
+            // before pane binding existed. A bracketing host resets it once per
+            // PRESENTED frame instead, so N panes share the two-bake budget.
+            self.cat_baker_ready = false;
+        }
         // The rare late kitty: at most one spent episode is re-armed, gated by
         // its own period + min-gap clocks so nearly every tick pays one compare.
         // Runs BEFORE the emission pass so a granted revisit draws this frame.
@@ -3841,10 +4052,16 @@ impl WordDecorations {
         // baker always bakes exact-size tiles (steady-state a no-op compare;
         // set BEFORE the frame prologue).
         self.cat_baker.set_free_tiles(true);
-        // Per-tick baker prologue: LRU clock + bake budget; a cell-metric change
-        // wholesale-clears + version-bumps here (§5.5).
-        self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
-        self.cat_baker_ready = true;
+        // Per-FRAME baker prologue: LRU clock + bake budget; a cell-metric
+        // change wholesale-clears + version-bumps here (§5.5). Guarded like
+        // `nyan_cursor`'s, so a window compositing N panes runs it once and the
+        // panes share one two-bake budget (one window, one atlas, one cell
+        // size). Unbracketed hosts clear the flag at tick start, which is the
+        // historical one-prologue-per-tick behaviour verbatim.
+        if !self.cat_baker_ready {
+            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+            self.cat_baker_ready = true;
+        }
         // v3 §1.1/§1.2 episode prepass: arm freezing (Cat vs Paw stored at
         // the first emission decision) and the per-axis one-shot flags
         // (peek/burst/sweep started/done) — the done-mark write condition.
@@ -4825,6 +5042,7 @@ impl WordDecorations {
     /// live episode cardinality rather than historical output volume.
     fn prune_ignitions(&mut self, now: Instant) {
         let persist = &self.persist;
+        let bound = self.bound.unwrap_or(0);
         self.ignitions.retain(|reservation| {
             if reservation.start + IGNITION_WINDOW <= now {
                 return false;
@@ -4832,11 +5050,20 @@ impl WordDecorations {
             if reservation.start <= now {
                 return true;
             }
+            // Another pane's pending slot: its owning episode is parked out of
+            // reach, so "absent from persist" says nothing about it. Retaining
+            // is both correct (the nova is still queued) and safe (the slot
+            // expires with the rolling window like any other).
+            if reservation.pane != bound {
+                return true;
+            }
             persist.get(&reservation.owner).is_some_and(|episode| {
                 !episode.nova_done && episode.nova_start == Some(reservation.start)
             })
         });
-        debug_assert!(self.ignitions.len() <= MAX_IGNITION_RESERVATIONS);
+        debug_assert!(
+            self.ignitions.iter().filter(|r| r.pane == bound).count() <= MAX_IGNITION_RESERVATIONS
+        );
     }
 
     /// v3 §3.2 supernova prepass (runs BEFORE the classic nova prepass): for
@@ -4934,9 +5161,15 @@ impl WordDecorations {
                     continue;
                 }
                 // The flash limiter charges a supernova as a FULL ignition.
-                let Some(start) =
-                    grant_ignition(&mut self.ignitions, occ.ident, now, (cx, cy), 2.0 * r_max)
-                else {
+                let Some(start) = grant_pane_ignition(
+                    &mut self.ignitions,
+                    self.bound.unwrap_or(0),
+                    self.pane_px,
+                    occ.ident,
+                    now,
+                    (cx, cy),
+                    2.0 * r_max,
+                ) else {
                     continue;
                 };
                 ep.nova_start = Some(start);
@@ -5064,9 +5297,15 @@ impl WordDecorations {
                     }
                     continue;
                 }
-                let Some(start) =
-                    grant_ignition(&mut self.ignitions, occ.ident, now, (cx, cy), 2.0 * r_max)
-                else {
+                let Some(start) = grant_pane_ignition(
+                    &mut self.ignitions,
+                    self.bound.unwrap_or(0),
+                    self.pane_px,
+                    occ.ident,
+                    now,
+                    (cx, cy),
+                    2.0 * r_max,
+                ) else {
                     continue;
                 };
                 ep.nova_start = Some(start);
@@ -5142,8 +5381,42 @@ impl WordDecorations {
     /// drops to a pure wait. Cheap (no config / no scan): reads the deadline
     /// last computed by `tick`.
     pub fn is_active(&self, now: Instant) -> bool {
+        // Every visible pane animates, so every pane's deadline counts: a cat
+        // rising in an unfocused pane must keep the frame cadence armed, or it
+        // renders one frame and freezes until the next terminal write.
         self.active_until.is_some_and(|d| now < d)
+            || self
+                .parked
+                .values()
+                .any(|p| p.active_until.is_some_and(|d| now < d))
     }
+}
+
+/// Request a §6.4 flash slot for `pane`, whose grid origin sits at `pane_px`
+/// in WINDOW pixels.
+///
+/// The limiter is window-wide (WCAG 2.3.1: at most two flashes per rolling
+/// second, tightening to one when their regions overlap), so its overlap test
+/// only means "these two flashes are in the same place" when every pane's
+/// centers live in ONE coordinate space — hence the shift. Split out as a free
+/// function so the caller keeps its disjoint `&mut persist` borrow.
+fn grant_pane_ignition(
+    igns: &mut Vec<IgnitionReservation>,
+    pane: u64,
+    pane_px: (i32, i32),
+    owner: u64,
+    now: Instant,
+    center: (i32, i32),
+    overlap_dist: f32,
+) -> Option<Instant> {
+    grant_ignition(
+        igns,
+        pane,
+        owner,
+        now,
+        (center.0 + pane_px.0, center.1 + pane_px.1),
+        overlap_dist,
+    )
 }
 
 /// §6.4 window-wide ignition limiter: the earliest slot ≥ `now` admitting a
@@ -5157,14 +5430,22 @@ impl WordDecorations {
 /// those are intentionally distinct reservations. The hard cap fails closed
 /// (`None`) rather than discarding rolling-window safety history. Modeled as the
 /// `FlashLimiter` and `IgnitionReservationLifecycle` ty specs.
+///
+/// `center` is in WINDOW pixels: every pane's ignitions are counted here, so
+/// the overlap test only means "the same place on the glass" when they share
+/// one coordinate space (see [`grant_pane_ignition`]).
 fn grant_ignition(
     igns: &mut Vec<IgnitionReservation>,
+    pane: u64,
     owner: u64,
     now: Instant,
     center: (i32, i32),
     overlap_dist: f32,
 ) -> Option<Instant> {
-    if igns.len() >= MAX_IGNITION_RESERVATIONS {
+    // A MEMORY bound, counted per pane (each pane holds its own live-episode
+    // cardinality). The SAFETY bound is the rolling-window count below, which
+    // stays over every pane's reservations.
+    if igns.iter().filter(|r| r.pane == pane).count() >= MAX_IGNITION_RESERVATIONS {
         return None;
     }
     let mut slot = now;
@@ -5190,6 +5471,7 @@ fn grant_ignition(
         let cap = if overlap { 1 } else { 2 };
         if count < cap {
             igns.push(IgnitionReservation {
+                pane,
                 owner,
                 start: slot,
                 center,
@@ -13041,7 +13323,7 @@ mod tests {
 
     fn reserve_overlapping(wd: &mut WordDecorations, owner: u64, now: Instant) -> Instant {
         wd.persist.insert(owner, reservation_episode(owner, now));
-        let start = grant_ignition(&mut wd.ignitions, owner, now, (100, 100), 88.0)
+        let start = grant_ignition(&mut wd.ignitions, 0, owner, now, (100, 100), 88.0)
             .expect("a live owner must fit the structural reservation cap");
         wd.persist
             .get_mut(&owner)
@@ -13200,7 +13482,7 @@ mod tests {
         // The first overlapping flash occupies t0, so the episode under test
         // receives a delayed t1 slot.
         assert_eq!(reserve_overlapping(&mut wd, blocker, t0), t0);
-        let original_start = grant_ignition(&mut wd.ignitions, old_owner, t0, (100, 100), 88.0)
+        let original_start = grant_ignition(&mut wd.ignitions, 0, old_owner, t0, (100, 100), 88.0)
             .expect("live target fits structural cap");
         assert_eq!(original_start, t1);
         wd.persist
@@ -13387,12 +13669,13 @@ mod tests {
         let t1 = t0 + IGNITION_WINDOW;
         let mut ignitions = Vec::new();
         assert_eq!(
-            grant_ignition(&mut ignitions, 7, t0, (100, 100), 88.0),
+            grant_ignition(&mut ignitions, 0, 7, t0, (100, 100), 88.0),
             Some(t0)
         );
         assert_eq!(
             grant_ignition(
                 &mut ignitions,
+                0,
                 7,
                 t0 + Duration::from_millis(100),
                 (100, 100),
@@ -13424,10 +13707,10 @@ mod tests {
         let m = aterm_spec::derive::flash_limiter_model();
         let mut st = m.init_state();
         let mut igns = Vec::new();
-        let a = grant_ignition(&mut igns, 1, t0, (100, 100), 88.0).expect("capacity");
+        let a = grant_ignition(&mut igns, 0, 1, t0, (100, 100), 88.0).expect("capacity");
         assert_eq!(a, t0, "an empty window grants immediately");
         assert!(m.fire("Ignite", &mut st), "the model admits ignition 1");
-        let b = grant_ignition(&mut igns, 2, t0, (900, 100), 88.0).expect("capacity");
+        let b = grant_ignition(&mut igns, 0, 2, t0, (900, 100), 88.0).expect("capacity");
         assert_eq!(b, t0, "two disjoint ignitions fit one rolling second");
         assert!(m.fire("Ignite", &mut st), "the model admits ignition 2");
         assert!(m.check_invariant("IgnitionBound", &st));
@@ -13440,6 +13723,7 @@ mod tests {
         );
         let c = grant_ignition(
             &mut igns,
+            0,
             3,
             t0 + Duration::from_millis(200),
             (100, 700),
@@ -13477,7 +13761,7 @@ mod tests {
         }
         let mut st = mo.init_state();
         let mut igns = Vec::new();
-        let a = grant_ignition(&mut igns, 1, t0, (100, 100), 88.0).expect("capacity");
+        let a = grant_ignition(&mut igns, 0, 1, t0, (100, 100), 88.0).expect("capacity");
         assert_eq!(a, t0);
         assert!(mo.fire("Ignite", &mut st));
         assert!(
@@ -13487,7 +13771,7 @@ mod tests {
         // 50 px < 2·R_max = 88 px: the real limiter pushes the overlapping
         // second ignition a FULL window out even though the plain 2/s cap
         // had room — the §6.4 item 2 tightening.
-        let b = grant_ignition(&mut igns, 2, t0, (150, 100), 88.0).expect("capacity");
+        let b = grant_ignition(&mut igns, 0, 2, t0, (150, 100), 88.0).expect("capacity");
         assert_eq!(
             b,
             t0 + IGNITION_WINDOW,
@@ -13533,8 +13817,8 @@ mod tests {
         let mut igns = Vec::new();
         // Centers 50 px apart (genuinely overlapping regions), but the blind
         // limiter never sees it: BOTH ignite at t0 — the strobe.
-        let a = grant_ignition(&mut igns, 1, t0, (100, 100), 0.0).expect("capacity");
-        let b = grant_ignition(&mut igns, 2, t0, (150, 100), 0.0).expect("capacity");
+        let a = grant_ignition(&mut igns, 0, 1, t0, (100, 100), 0.0).expect("capacity");
+        let b = grant_ignition(&mut igns, 0, 2, t0, (150, 100), 0.0).expect("capacity");
         assert_eq!(
             (a, b),
             (t0, t0),
@@ -16223,6 +16507,321 @@ mod tests {
             0,
             "reset() must drop pending cues with the state"
         );
+    }
+
+    /// PANE BINDING (owner ruling, 2026-07-28: "sparkle effects and toys are
+    /// NOT SINGLE PANE ONLY"). Every visible pane drives ONE engine in turn,
+    /// so each pane needs its own grid + episode state while the two safety
+    /// budgets (the §6.4 flash limiter, the §3.2 supernova mutex) stay shared.
+    mod pane_binding {
+        use super::*;
+
+        /// Scan `text` into the CURRENTLY BOUND pane at the given grid size.
+        fn rescan_pane(
+            wd: &mut WordDecorations,
+            text: &str,
+            rows: usize,
+            cols: usize,
+            c: &DecoConfig,
+            epoch: u64,
+            now: Instant,
+        ) {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            term.process(text.as_bytes());
+            let mut snap = aterm_core::render::RenderInput::default();
+            term.cell_frame_into(&mut snap, rows, cols);
+            let bg = snap
+                .cells
+                .iter()
+                .find_map(|line| line.first())
+                .map_or(0, |cell| rgb3_to_u32(cell.bg));
+            let geom = EffectGeom {
+                cell_w: 10,
+                cell_h: 20,
+                rows: rows as u16,
+                cols: cols as u16,
+            };
+            wd.rescan_from_cells_with_geom(
+                &snap.cells,
+                &snap.line_sizes,
+                rows,
+                cols,
+                &lex(),
+                c,
+                epoch,
+                now,
+                geom,
+                bg,
+            );
+        }
+
+        /// The feline episode of the bound pane, if it has one.
+        fn feline_episode(wd: &WordDecorations) -> Option<&Episode> {
+            let ident = wd
+                .occ
+                .iter()
+                .find(|o| o.class == Class::Feline)
+                .map(|o| o.ident)?;
+            wd.persist.get(&ident)
+        }
+
+        /// T9 — failure mode (a). `last_epoch` is per pane, so a pane that has
+        /// never scanned still asks for its first scan after a sibling scanned
+        /// at the same epoch, and a pane that HAS scanned is not re-scanned
+        /// merely because a sibling was.
+        #[test]
+        fn bound_panes_keep_independent_damage_epochs() {
+            let c = cfg();
+            let t0 = Instant::now();
+            let mut wd = WordDecorations::default();
+            wd.bind_pane(1, (0, 0));
+            assert!(wd.needs_rescan(1), "a pane's first frame always scans");
+            rescan_pane(&mut wd, "\r\nhello kitty friend\r\n", 6, 20, &c, 1, t0);
+            assert!(!wd.needs_rescan(1), "and not twice at the same epoch");
+
+            wd.bind_pane(2, (0, 0));
+            assert!(
+                wd.needs_rescan(1),
+                "pane 2 has scanned NOTHING — a shared last_epoch would starve \
+                 it of its first scan for as long as pane 1 stays quiet"
+            );
+            rescan_pane(&mut wd, "\r\nhello kitty friend\r\n", 6, 20, &c, 1, t0);
+
+            wd.bind_pane(1, (0, 0));
+            assert!(
+                !wd.needs_rescan(1),
+                "pane 1's own epoch survived pane 2's scan"
+            );
+        }
+
+        /// T10 — failure mode (b), the one that would have shipped FLAT INK
+        /// forever in exactly the layout this change targets: one engine driven
+        /// at alternating pane widths sees `cols_changed` on every rescan, so
+        /// `settle_until` re-arms forever and no birth is ever played.
+        #[test]
+        fn unequal_pane_widths_do_not_pin_born_settled() {
+            let c = cfg();
+            let t0 = Instant::now();
+            let mut wd = WordDecorations::default();
+            let text = "\r\nhello kitty friend\r\n";
+            for round in 0..4u64 {
+                wd.bind_pane(1, (0, 0));
+                rescan_pane(&mut wd, text, 6, 40, &c, round + 1, t0);
+                wd.bind_pane(2, (400, 0));
+                rescan_pane(&mut wd, text, 6, 39, &c, round + 1, t0);
+            }
+            wd.bind_pane(1, (0, 0));
+            assert!(
+                wd.settle_until.is_none(),
+                "pane 1's width never changed — the resize-settle window must \
+                 be shut, not re-armed by its sibling's different width"
+            );
+            let ep = feline_episode(&wd).expect("pane 1 has a feline episode");
+            assert!(
+                !ep.born_settled,
+                "a stable pane still PLAYS its entrance in a split"
+            );
+        }
+
+        /// T11 — failure mode (c). The same word at the same column in two
+        /// panes is two different sightings: pane 2 births its own episode at
+        /// its own instant instead of adopting (and inheriting the spent
+        /// one-shots of) pane 1's.
+        #[test]
+        fn identical_words_in_two_panes_each_get_their_own_cat() {
+            let c = cfg();
+            let t0 = Instant::now();
+            let t1 = t0 + Duration::from_millis(400);
+            let text = "\r\nhello kitty friend\r\n";
+            let mut wd = WordDecorations::default();
+
+            wd.bind_pane(1, (0, 0));
+            rescan_pane(&mut wd, text, 6, 20, &c, 1, t0);
+            assert_eq!(
+                feline_episode(&wd).expect("pane 1 birth").appeared,
+                t0,
+                "pane 1's cat is born when pane 1 first saw the word"
+            );
+
+            wd.bind_pane(2, (200, 0));
+            rescan_pane(&mut wd, text, 6, 20, &c, 1, t1);
+            assert_eq!(
+                feline_episode(&wd).expect("pane 2 birth").appeared,
+                t1,
+                "pane 2's identical word is its OWN birth — a shared persist map \
+                 would hand it pane 1's already-running (or already-spent) episode"
+            );
+
+            wd.bind_pane(1, (0, 0));
+            assert_eq!(
+                feline_episode(&wd).expect("pane 1 survives").appeared,
+                t0,
+                "and pane 1's episode is untouched by its sibling"
+            );
+        }
+
+        /// T12 — failure mode (d), the subtlest: alignment's "recent" window is
+        /// `REKEY_MAX_SEQ_GAP = 2` RESCANS. A shared counter advances once per
+        /// pane per frame, so at three panes the window closes inside a single
+        /// frame and every word looks stale to its own next scan.
+        #[test]
+        fn pane_ticks_do_not_inflate_rescan_seq() {
+            let c = cfg();
+            let t0 = Instant::now();
+            let text = "\r\nhello kitty friend\r\n";
+            let mut wd = WordDecorations::default();
+            for pane in 1..=3u64 {
+                wd.bind_pane(pane, (0, 0));
+                rescan_pane(&mut wd, text, 6, 20, &c, 1, t0);
+            }
+            wd.bind_pane(1, (0, 0));
+            assert_eq!(
+                wd.rescan_seq, 1,
+                "one pane, one scan, one sequence step — siblings must not \
+                 consume pane 1's REKEY_MAX_SEQ_GAP budget"
+            );
+        }
+
+        /// T13 — failure mode (e). `MAX_BAKES_PER_FRAME` and the baker's LRU
+        /// clock are per PRESENTED FRAME. One `begin_host_frame` per frame is
+        /// what keeps a four-pane window at two bakes instead of eight, into
+        /// the ONE atlas every pane's sprites address.
+        #[test]
+        fn one_host_frame_bakes_at_most_two_tiles_across_panes() {
+            let c = cfg();
+            let g = geom20();
+            let t0 = Instant::now();
+            let mut wd = WordDecorations::default();
+            for pane in 1..=3u64 {
+                wd.bind_pane(pane, (i32::try_from(pane).expect("small") * 200, 0));
+                rescan_pane(&mut wd, "\r\nhello kitty friend\r\n", 6, 20, &c, 1, t0);
+            }
+            let t1 = t0 + Duration::from_millis(600);
+            wd.begin_host_frame();
+            let clock0 = wd.cat_baker.frame_clock();
+            let mut cats = 0usize;
+            for pane in 1..=3u64 {
+                wd.bind_pane(pane, (i32::try_from(pane).expect("small") * 200, 0));
+                let (free, _, _) = tick_cat(&mut wd, t1, &c, g);
+                cats += free.len();
+            }
+            assert!(cats > 0, "non-vacuous: the panes really did emit cats");
+            assert_eq!(
+                wd.cat_baker.frame_clock(),
+                clock0 + 1,
+                "ONE baker prologue — so ONE bake budget — for the whole frame"
+            );
+        }
+
+        /// T14 — failure mode (f), and the accessibility claim this whole
+        /// design exists to protect: the §6.4 flash limiter is WINDOW-wide
+        /// (WCAG 2.3.1). Two panes flashing at the same PANE-LOCAL spot are two
+        /// flashes in two different places, so they must not overlap-tighten
+        /// each other into a cap of one — and a third flash in the same rolling
+        /// second is still deferred, across panes.
+        #[test]
+        fn flash_limiter_stays_window_wide_across_panes() {
+            let t0 = Instant::now();
+            let mut wd = WordDecorations::default();
+            let grant = |wd: &mut WordDecorations, owner: u64| {
+                grant_pane_ignition(
+                    &mut wd.ignitions,
+                    wd.bound.unwrap_or(0),
+                    wd.pane_px,
+                    owner,
+                    t0,
+                    (100, 100),
+                    88.0,
+                )
+            };
+            wd.bind_pane(1, (0, 0));
+            let a = grant(&mut wd, 11).expect("capacity");
+            wd.bind_pane(2, (400, 0));
+            let b = grant(&mut wd, 22).expect("capacity");
+            assert_eq!(
+                (a, b),
+                (t0, t0),
+                "same pane-local centre, DIFFERENT panes — the overlap test \
+                 must compare window pixels or it tightens the cap to one"
+            );
+            wd.bind_pane(3, (800, 0));
+            let c = grant(&mut wd, 33).expect("capacity");
+            assert_eq!(
+                c,
+                t0 + IGNITION_WINDOW,
+                "and the rolling-second cap of two is counted over ALL panes"
+            );
+        }
+
+        /// T16 — the cross-pane cancellation. `prune_ignitions` cancels a
+        /// FUTURE slot whose owner is absent from `persist`; every other pane's
+        /// episodes are parked out of that map, so without the pane label one
+        /// pane's tick silently cancels its sibling's queued nova.
+        #[test]
+        fn a_panes_pending_ignition_survives_another_panes_tick() {
+            let t0 = Instant::now();
+            let mut wd = WordDecorations::default();
+            wd.bind_pane(1, (0, 0));
+            for (owner, cx) in [(1u64, 100i32), (2, 900), (3, 1700)] {
+                grant_pane_ignition(
+                    &mut wd.ignitions,
+                    wd.bound.unwrap_or(0),
+                    wd.pane_px,
+                    owner,
+                    t0,
+                    (cx, 100),
+                    0.0,
+                );
+            }
+            let pending = wd
+                .ignitions
+                .iter()
+                .find(|r| r.start > t0)
+                .map(|r| r.start)
+                .expect("the third grant is deferred past the rolling window");
+
+            wd.bind_pane(2, (400, 0));
+            wd.prune_ignitions(t0 + Duration::from_millis(10));
+            assert!(
+                wd.ignitions
+                    .iter()
+                    .any(|r| r.pane == 1 && r.start == pending),
+                "pane 2's tick must not cancel pane 1's queued nova"
+            );
+        }
+
+        /// A pane the window stops showing takes its state with it, and the
+        /// live binding is dropped when its own pane is the one that vanished.
+        #[test]
+        fn retain_panes_evicts_departed_panes() {
+            let c = cfg();
+            let t0 = Instant::now();
+            let mut wd = WordDecorations::default();
+            for pane in 1..=3u64 {
+                wd.bind_pane(pane, (0, 0));
+                rescan_pane(&mut wd, "\r\nhello kitty friend\r\n", 6, 20, &c, 1, t0);
+            }
+            wd.retain_panes(|s| s == 1);
+            assert_eq!(
+                wd.parked.keys().copied().collect::<Vec<_>>(),
+                vec![1],
+                "pane 2's parked state left with pane 2"
+            );
+            assert_eq!(wd.bound, None, "and pane 3's live binding with it");
+            assert!(wd.occ.is_empty(), "a departed pane leaves no occurrences");
+            // The SURVIVOR is untouched. Retiring the pane that left must not
+            // fold over the panes that stayed: closing the focused pane of a
+            // split would otherwise blank the cats in every other pane.
+            wd.bind_pane(1, (0, 0));
+            assert!(
+                feline_episode(&wd).is_some(),
+                "the still-visible pane kept its episodes"
+            );
+            assert!(
+                !wd.needs_rescan(1),
+                "and its scan — a survivor is not re-scanned because a sibling closed"
+            );
+        }
     }
 }
 

@@ -89,19 +89,8 @@ impl App {
     fn about_geom(&self, wid: crate::WindowId) -> Option<(crate::settings::SettingsGeom, f32)> {
         let ws = self.windows.get(&wid)?;
         ws.about()?;
-        let panel_rows = ws.overlay_rows();
-        if panel_rows == 0 {
-            return None;
-        }
-        let (cw, ch) = self.win_cell_size(wid);
-        let geom = crate::settings::SettingsGeom {
-            cw: cw as f32,
-            ch: ch as f32,
-            font_px: self.win_font_px(wid),
-            cols: ws.cols as usize,
-            panel_rows,
-        };
-        Some((geom, ws.scale as f32))
+        let transform = self.overlay_coordinate_transform(wid)?;
+        Some((transform.geom, transform.scale))
     }
 
     /// Window-px → tray-px: strip the leading remainder bands (window→frame, W1),
@@ -109,11 +98,14 @@ impl App {
     /// plus chrome headroom (the card is composited at
     /// `(pad, pad_top + head)`) — like every other pointer consumer.
     fn about_tray_xy(&self, wid: crate::WindowId, x: f64, y: f64) -> (f32, f32) {
-        let pad = self.win_pad(wid) as f32;
-        let pad_top = self.win_pad_top(wid) as f32;
-        let head = self.win_head(wid) as f32;
+        let Some(transform) = self.overlay_coordinate_transform(wid) else {
+            return (-1.0, -1.0);
+        };
         let (x, y) = self.window_to_frame(wid, x, y);
-        (x as f32 - pad, y as f32 - pad_top - head)
+        (
+            ((x - transform.origin_x) / f64::from(transform.scale)) as f32,
+            ((y - transform.origin_y) / f64::from(transform.scale)) as f32,
+        )
     }
 
     /// A left PRESS while the dialog is front: the close dot / OK close it, and

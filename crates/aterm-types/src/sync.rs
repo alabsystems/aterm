@@ -476,7 +476,11 @@ mod tests {
             }
         }
         assert!(*guard);
-        assert!(start.elapsed() < Duration::from_millis(500));
+        // The `wait_for` above already panics on the real failure (never notified).
+        // This only added a second, tighter clock over a thread spawn + a 10ms sleep
+        // that overshoots badly under load — it discriminated nothing the timeout did
+        // not already discriminate.
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

@@ -30,8 +30,20 @@ fn read_image_encodes_the_rendered_screen_as_valid_png() {
 
     // round-trips: decodes back to the exact rendered dimensions
     let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
-    let reader = decoder.read_info().expect("decode header");
+    let mut reader = decoder.read_info().expect("decode header");
     let info = reader.info();
     assert_eq!(info.width as usize, frame.width);
     assert_eq!(info.height as usize, frame.height);
+    assert_eq!(
+        info.color_type,
+        png::ColorType::Rgba,
+        "read_image retains framebuffer alpha"
+    );
+    let mut decoded = vec![0; reader.output_buffer_size()];
+    let output = reader.next_frame(&mut decoded).expect("decode pixels");
+    assert_eq!(
+        &decoded[..output.buffer_size()],
+        frame.rgba_bytes().as_slice(),
+        "PNG pixels are the exact 0xTTRRGGBB → RGBA projection"
+    );
 }

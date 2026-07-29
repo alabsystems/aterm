@@ -98,6 +98,12 @@ fn test_diff_colors() {
     let changes = config1.diff(&config2);
     assert!(changes.contains(&ConfigChange::Colors));
     assert_eq!(changes.len(), 1);
+
+    let selections = TerminalConfig::builder()
+        .selection_background(Some(Rgb::new(0x11, 0x22, 0x33)))
+        .selection_foreground(Some(Rgb::new(0x44, 0x55, 0x66)))
+        .build();
+    assert_eq!(config1.diff(&selections), vec![ConfigChange::Colors]);
 }
 
 #[test]

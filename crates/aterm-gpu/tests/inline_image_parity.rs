@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Inline-image (iTerm2 OSC 1337 File=) precedence parity: an image-covered cell
-// SKIPS its glyph on BOTH the CPU and GPU paths. This is the no-regression gate
-// for the image feature — the two renderers must agree on the image-vs-glyph
-// (and image-vs-emoji) precedence rule even though only the CPU draws the image
-// PIXELS today (the GPU pixel pass is tracked separately).
-//
-// The CPU already composites the real image pixels (covered by aterm-render's
-// `inline_image.rs`); here we assert the GPU does not draw the underlying glyph
-// where an image sits, and that a text-only frame stays within the usual CPU/GPU
-// antialiasing tolerance (the image plumbing is inert for image-free content).
+// Inline-image (iTerm2 OSC 1337 / Kitty) pixel and precedence parity. Both
+// renderers composite the real image pixels: Kitty z<0 tiles sit after
+// backgrounds/underlayers but before base+combining glyphs, while z>=0 tiles
+// retain the traditional over-text slot before line decorations.
 //
 // Gated: no GPU or no system font -> the test no-ops.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, Theme};
+use std::sync::Arc;
 
 fn rr(p: u32) -> i32 {
     ((p >> 16) & 0xff) as i32
@@ -37,11 +32,11 @@ fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
     m
 }
 
-/// Solid-colour `w`×`h` opaque RGBA PNG.
-fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+/// Solid-colour `w`×`h` RGBA PNG.
+fn solid_rgba_png(w: u32, h: u32, rgba_pixel: [u8; 4]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for _ in 0..(w * h) {
-        rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        rgba.extend_from_slice(&rgba_pixel);
     }
     let mut out = Vec::new();
     {
@@ -52,6 +47,11 @@ fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
         writer.write_image_data(&rgba).expect("png data");
     }
     out
+}
+
+/// Solid-colour `w`×`h` opaque RGBA PNG.
+fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    solid_rgba_png(w, h, [rgb[0], rgb[1], rgb[2], 255])
 }
 
 fn osc_1337_file(args: &str, payload: &[u8]) -> Vec<u8> {
@@ -192,6 +192,418 @@ fn gpu_skips_emoji_under_image_like_cpu() {
     let gpu_red = red_emoji(&cell_pixels(&gpu_frame, cw, ch, 0, 0));
     assert_eq!(cpu_red, 0, "CPU must not draw the emoji under the image");
     assert_eq!(gpu_red, 0, "GPU must not draw the emoji under the image");
+}
+
+#[test]
+fn combining_mark_draws_over_negative_z_image_on_cpu_and_gpu() {
+    // A Kitty z<0 placement is explicitly BEHIND text. Use an OPAQUE tile so
+    // this catches both suppression and painter-order regressions: if either
+    // backend emits the tile after glyphs, the image erases the base and accent.
+    let theme = Theme::default();
+    let px = 18.0;
+    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU/font available: {e}");
+            return;
+        }
+    };
+    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    // Make the solid-image-background oracle exact: glyph coverage blends
+    // directly over the framebuffer, without the corrected-alpha remap's
+    // separate home-cell-bg operand.
+    cpu.set_text_blending(aterm_render::TextBlending::Linear);
+    gpu.set_text_blending(aterm_render::TextBlending::Linear);
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (3usize, 6usize);
+    let image_rgb = [12, 30, 90];
+    let image = Arc::new(aterm_core::grid::extra::ImageData {
+        bytes: solid_png(cw as u32, ch as u32, image_rgb),
+        format: aterm_core::grid::extra::ImageFormat::Png,
+        cols: 1,
+        rows: 1,
+        z_index: -1,
+    });
+
+    let make_input = |text: &str, with_image: bool| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.set_cell_pixel_size(cw as u16, ch as u16);
+        term.process(format!("\x1b[97m{text}").as_bytes());
+        let mut input = term.cell_frame(rows, cols);
+        if with_image {
+            // Install the same reference a Kitty z=-1 placement contributes,
+            // without asking the protocol handler to replace the text cell.
+            input.images[0].push((
+                0,
+                aterm_core::grid::extra::ImageRef {
+                    image: image.clone(),
+                    cell_row: 0,
+                    cell_col: 0,
+                },
+            ));
+        } else {
+            // Oracle for correct under-text compositing: an opaque image first
+            // leaves exactly this solid cell background for the glyph pass.
+            input.cells[0][0].bg = image_rgb;
+        }
+        input
+    };
+    let render = |input: &aterm_render::RenderInput,
+                  cpu: &mut Renderer,
+                  gpu: &mut aterm_gpu::GpuRenderer|
+     -> (Frame, Frame) {
+        if input.image_at(0, 0).is_some() {
+            assert_eq!(
+                input.image_at(0, 0).map(|image| image.image.z_index),
+                Some(-1),
+                "fixture must place a behind-text image"
+            );
+            assert!(
+                !input.image_hides_glyph_at(0, 0),
+                "negative z must leave text visible"
+            );
+        }
+        let cpu_frame = cpu.render_input(input);
+        let mut win = aterm_gpu::WindowGpu::new();
+        let gpu_frame = gpu.render_input(&mut win, input, None);
+        (cpu_frame, gpu_frame)
+    };
+
+    let accented_input = make_input("e\u{301}", true);
+    assert_eq!(
+        accented_input.combining_at(0, 0),
+        Some(&['\u{301}'][..]),
+        "fixture must retain the NFD acute as a combining overlay"
+    );
+    let bare_input = make_input("e", true);
+    let accented_oracle = make_input("e\u{301}", false);
+    let bare_oracle = make_input("e", false);
+
+    let (cpu_accented, gpu_accented) = render(&accented_input, &mut cpu, &mut gpu);
+    let (cpu_bare, gpu_bare) = render(&bare_input, &mut cpu, &mut gpu);
+    let (cpu_accented_oracle, gpu_accented_oracle) = render(&accented_oracle, &mut cpu, &mut gpu);
+    let (cpu_bare_oracle, gpu_bare_oracle) = render(&bare_oracle, &mut cpu, &mut gpu);
+
+    assert_eq!(
+        cpu_accented.pixels, cpu_accented_oracle.pixels,
+        "CPU must stamp an opaque z<0 tile before the base glyph and NFD mark"
+    );
+    assert_eq!(
+        cpu_bare.pixels, cpu_bare_oracle.pixels,
+        "CPU must stamp an opaque z<0 tile before the base glyph"
+    );
+    let gpu_accent_oracle_delta = max_channel_delta(&gpu_accented, &gpu_accented_oracle);
+    assert!(
+        gpu_accent_oracle_delta <= 8,
+        "GPU z<0 accented output differs from the under-image oracle by \
+         {gpu_accent_oracle_delta} > 8"
+    );
+    let gpu_bare_oracle_delta = max_channel_delta(&gpu_bare, &gpu_bare_oracle);
+    assert!(
+        gpu_bare_oracle_delta <= 8,
+        "GPU z<0 base output differs from the under-image oracle by \
+         {gpu_bare_oracle_delta} > 8"
+    );
+
+    assert_ne!(
+        cell_pixels(&cpu_accented, cw, ch, 0, 0),
+        cell_pixels(&cpu_bare, cw, ch, 0, 0),
+        "CPU must paint the NFD acute over an opaque z<0 image"
+    );
+    assert_ne!(
+        cell_pixels(&gpu_accented, cw, ch, 0, 0),
+        cell_pixels(&gpu_bare, cw, ch, 0, 0),
+        "GPU must paint the NFD acute over an opaque z<0 image"
+    );
+
+    let delta = max_channel_delta(&cpu_accented, &gpu_accented);
+    assert!(
+        delta <= 8,
+        "NFD combining mark over an opaque z<0 image diverges CPU/GPU by {delta} > 8"
+    );
+}
+
+#[test]
+fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
+    // Alpha makes ordering non-commutative. The correct result (image over cell
+    // bg/underlayers, then glyph) must match a no-image oracle whose cell bg is
+    // that exact source-over composite. A live `glow_under` deliberately forces
+    // the GPU's A1/A2/A3 additive split, guarding the A3-open gate for an
+    // under-image stream. The former buggy order (glyph, then image) cannot
+    // match this oracle on glyph pixels.
+    let theme = Theme::default();
+    let px = 18.0;
+    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU/font available: {e}");
+            return;
+        }
+    };
+    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    cpu.set_text_blending(aterm_render::TextBlending::Linear);
+    gpu.set_text_blending(aterm_render::TextBlending::Linear);
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (3usize, 6usize);
+    let cell_bg = [20, 45, 75];
+    let glow = 0x0010_2008;
+    let image_rgb = [220, 35, 130];
+    let alpha = 128;
+    let cell_bg_u32 =
+        (u32::from(cell_bg[0]) << 16) | (u32::from(cell_bg[1]) << 8) | u32::from(cell_bg[2]);
+    let lit_bg = aterm_render::add_sat(cell_bg_u32, glow);
+    let lit_bg_rgb = [
+        ((lit_bg >> 16) & 0xff) as u8,
+        ((lit_bg >> 8) & 0xff) as u8,
+        (lit_bg & 0xff) as u8,
+    ];
+    let blended = aterm_render::blend_rgb(
+        lit_bg,
+        (u32::from(image_rgb[0]) << 16) | (u32::from(image_rgb[1]) << 8) | u32::from(image_rgb[2]),
+        alpha,
+    );
+    let blended_bg = [
+        ((blended >> 16) & 0xff) as u8,
+        ((blended >> 8) & 0xff) as u8,
+        (blended & 0xff) as u8,
+    ];
+    let image = Arc::new(aterm_core::grid::extra::ImageData {
+        bytes: solid_rgba_png(
+            cw as u32,
+            ch as u32,
+            [image_rgb[0], image_rgb[1], image_rgb[2], alpha],
+        ),
+        format: aterm_core::grid::extra::ImageFormat::Png,
+        cols: 1,
+        rows: 1,
+        z_index: -1,
+    });
+
+    let make_input = |bg: [u8; 3], with_image: bool| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.set_cell_pixel_size(cw as u16, ch as u16);
+        term.process(b"M");
+        let mut input = term.cell_frame(rows, cols);
+        input.cells[0][0].fg = [255, 255, 255];
+        input.cells[0][0].bg = bg;
+        if with_image {
+            input.glow_under.push(aterm_render::GlowQuad {
+                row: 0,
+                x: 0,
+                y: 0,
+                w: cw as u16,
+                h: ch as u16,
+                color: glow,
+            });
+            input.images[0].push((
+                0,
+                aterm_core::grid::extra::ImageRef {
+                    image: image.clone(),
+                    cell_row: 0,
+                    cell_col: 0,
+                },
+            ));
+        }
+        input
+    };
+    let image_input = make_input(cell_bg, true);
+    let oracle_input = make_input(blended_bg, false);
+    // Pre-composite the underlayer into the cell bg: this is the framebuffer
+    // state immediately before the old, wrong glyph-then-image order.
+    let text_on_lit_bg = make_input(lit_bg_rgb, false);
+
+    let cpu_image = cpu.render_input(&image_input);
+    let cpu_oracle = cpu.render_input(&oracle_input);
+    let cpu_text_first = cpu.render_input(&text_on_lit_bg);
+    assert_eq!(
+        cpu_image.pixels, cpu_oracle.pixels,
+        "CPU must alpha-composite a z<0 image before drawing text"
+    );
+
+    // Negative control: show that this fixture distinguishes painter order.
+    let cpu_wrong_order: Vec<u32> = cpu_text_first
+        .pixels
+        .iter()
+        .map(|&p| {
+            aterm_render::blend_rgb(
+                p,
+                (u32::from(image_rgb[0]) << 16)
+                    | (u32::from(image_rgb[1]) << 8)
+                    | u32::from(image_rgb[2]),
+                alpha,
+            )
+        })
+        .collect();
+    assert_ne!(
+        cell_pixels(&cpu_oracle, cw, ch, 0, 0),
+        cell_pixels(
+            &Frame {
+                width: cpu_text_first.width,
+                height: cpu_text_first.height,
+                pixels: cpu_wrong_order,
+            },
+            cw,
+            ch,
+            0,
+            0,
+        ),
+        "fixture must distinguish image-before-text from image-after-text"
+    );
+
+    let mut image_win = aterm_gpu::WindowGpu::new();
+    let gpu_image = gpu.render_input(&mut image_win, &image_input, None);
+    let mut oracle_win = aterm_gpu::WindowGpu::new();
+    let gpu_oracle = gpu.render_input(&mut oracle_win, &oracle_input, None);
+    let gpu_oracle_delta = max_channel_delta(&gpu_image, &gpu_oracle);
+    assert!(
+        gpu_oracle_delta <= 8,
+        "GPU semitransparent z<0 output differs from the under-image oracle by \
+         {gpu_oracle_delta} > 8"
+    );
+    let parity_delta = max_channel_delta(&cpu_image, &gpu_image);
+    assert!(
+        parity_delta <= 8,
+        "semitransparent z<0 CPU/GPU output diverges by {parity_delta} > 8"
+    );
+}
+
+#[test]
+fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU/font available: {e}");
+            return;
+        }
+    };
+    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (2usize, 4usize);
+    let frame_default_bg = [1, 2, 3];
+    let default_bg = [3, 7, 11];
+    let explicit_bg = [18, 52, 86];
+    let image_rgb = [210, 30, 90];
+
+    let make_input = |z_index: i32| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let mut input = term.cell_frame(rows, cols);
+        input.cursor_visible = false;
+        input.default_bg = aterm_render::rgb_to_u32(frame_default_bg);
+        input.default_bg_spans = vec![
+            vec![aterm_render::DefaultBgSpan::new(
+                0,
+                2,
+                aterm_render::rgb_to_u32(default_bg),
+            )],
+            Vec::new(),
+        ];
+        input.cells[0].resize(cols, term.implicit_blank_render_cell());
+        for cell in &mut input.cells[0] {
+            cell.ch = ' ';
+            cell.bg = default_bg;
+        }
+        input.cells[0][0].bg = explicit_bg;
+        let image = Arc::new(aterm_core::grid::extra::ImageData {
+            bytes: solid_png(cw as u32, ch as u32, image_rgb),
+            format: aterm_core::grid::extra::ImageFormat::Png,
+            cols: 1,
+            rows: 1,
+            z_index,
+        });
+        for col in 0..=1 {
+            input.images[0].push((
+                col,
+                aterm_core::grid::extra::ImageRef {
+                    image: Arc::clone(&image),
+                    cell_row: 0,
+                    cell_col: 0,
+                },
+            ));
+        }
+        input
+    };
+    let render = |input: &aterm_render::RenderInput,
+                  cpu: &mut Renderer,
+                  gpu: &mut aterm_gpu::GpuRenderer|
+     -> (Frame, Frame) {
+        let cpu_frame = cpu.render_input(input);
+        let mut win = aterm_gpu::WindowGpu::new();
+        let gpu_frame = gpu.render_input(&mut win, input, None);
+        (cpu_frame, gpu_frame)
+    };
+    let sample = |frame: &Frame, col: usize| {
+        frame.pixels[(ch / 2) * frame.width + col * cw + cw / 2] & 0x00ff_ffff
+    };
+    let assert_near = |actual: u32, expected: u32, message: &str| {
+        let delta = (rr(actual) - rr(expected))
+            .abs()
+            .max((gg(actual) - gg(expected)).abs())
+            .max((bb(actual) - bb(expected)).abs());
+        assert!(
+            delta <= 8,
+            "{message}: actual=#{actual:06x}, expected=#{expected:06x}, delta={delta}"
+        );
+    };
+
+    let threshold = aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD;
+    let (cpu_at, gpu_at) = render(&make_input(threshold), &mut cpu, &mut gpu);
+    assert_eq!(
+        sample(&cpu_at, 0),
+        aterm_render::rgb_to_u32(image_rgb),
+        "z == INT32_MIN/2 remains above a non-default cell background"
+    );
+    assert_near(
+        sample(&gpu_at, 0),
+        aterm_render::rgb_to_u32(image_rgb),
+        "GPU z == INT32_MIN/2 remains above a non-default cell background",
+    );
+    let at_delta = max_channel_delta(&cpu_at, &gpu_at);
+    assert!(
+        at_delta <= 8,
+        "z == INT32_MIN/2 CPU/GPU output diverges by {at_delta} > 8"
+    );
+
+    let (cpu_below, gpu_below) = render(&make_input(threshold - 1), &mut cpu, &mut gpu);
+    assert_eq!(
+        sample(&cpu_below, 0),
+        aterm_render::rgb_to_u32(explicit_bg),
+        "z < INT32_MIN/2 is hidden by a non-default cell background"
+    );
+    assert_eq!(
+        sample(&cpu_below, 1),
+        aterm_render::rgb_to_u32(image_rgb),
+        "z < INT32_MIN/2 remains visible through a default-background cell"
+    );
+    assert_near(
+        sample(&gpu_below, 0),
+        aterm_render::rgb_to_u32(explicit_bg),
+        "GPU deepest tier is hidden by a non-default cell background",
+    );
+    assert_near(
+        sample(&gpu_below, 1),
+        aterm_render::rgb_to_u32(image_rgb),
+        "GPU deepest tier remains visible through a default-background cell",
+    );
+    let below_delta = max_channel_delta(&cpu_below, &gpu_below);
+    assert!(
+        below_delta <= 8,
+        "z < INT32_MIN/2 CPU/GPU output diverges by {below_delta} > 8"
+    );
 }
 
 #[test]

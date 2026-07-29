@@ -163,8 +163,8 @@ fn gpu_matches_cpu() {
 /// renderers, the GPU and CPU frames have the same (grown) dimensions and the
 /// grid lands on the same pixels within the antialiasing tolerance, and the
 /// theme-bg border matches exactly. This locks the GPU `encode_frame` pad mirror
-/// to the CPU `render_row` inset — so the on-glass present and the `image`
-/// introspection (both padded) stay pixel-faithful on the GPU backend too.
+/// to the CPU `render_row` inset, so the application-present source and `image`
+/// capture stay pixel-faithful at the app-owned boundary.
 #[test]
 fn gpu_matches_cpu_with_padding() {
     let theme = Theme::default();
@@ -238,6 +238,234 @@ fn gpu_matches_cpu_with_padding() {
             "CPU left padding col not bg at y={y}"
         );
     }
+}
+
+/// A composed split row carries one DEC line-size span per pane. Its geometry
+/// must be resolved per cell: the left pane can be double-width while the right
+/// remains single-width, and the next row can invert that arrangement. Cells in
+/// the clipped-away logical half of each double-width pane must not reappear in
+/// the neighbour.
+#[test]
+fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU/font available: {e}");
+            return;
+        }
+    };
+    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    let (rows, cols) = (2usize, 17usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    // Row 0: visible red cell in the left pane, a magenta poison cell in
+    // its clipped-away logical half, and a green cell in the right pane.
+    // Row 1 reverses pane widths and puts the poison cell in the right pane's
+    // clipped-away half. Cursor hidden so the fixture is pure pane geometry.
+    term.process(
+        b"\x1b[?25l\
+\x1b[1;1H\x1b[48;2;190;20;20m \x1b[0m\
+\x1b[1;7H\x1b[48;2;255;0;255m \x1b[0m\
+\x1b[1;10H\x1b[48;2;20;180;40m \x1b[0m\
+\x1b[2;1H\x1b[48;2;20;170;190m \x1b[0m\
+\x1b[2;10H\x1b[48;2;30;60;210m \x1b[0m\
+\x1b[2;14H\x1b[48;2;255;0;255m \x1b[0m",
+    );
+    let mut input = term.cell_frame(rows, cols);
+    input.line_sizes.fill(LineSize::SingleWidth);
+    input.line_size_spans.resize_with(rows, Vec::new);
+    input.line_size_spans[0] = vec![
+        LineSizeSpan::new(0, 8, LineSize::DoubleWidth),
+        LineSizeSpan::new(9, 17, LineSize::SingleWidth),
+    ];
+    input.line_size_spans[1] = vec![
+        LineSizeSpan::new(0, 8, LineSize::SingleWidth),
+        LineSizeSpan::new(9, 17, LineSize::DoubleWidth),
+    ];
+
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (cw, ch) = cpu.cell_size();
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    assert_eq!(
+        (gpu_frame.width, gpu_frame.height),
+        (cpu_frame.width, cpu_frame.height),
+        "mixed-pane dimensions differ"
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "mixed pane-local DEC geometry diverges: max delta {delta} > 8"
+    );
+
+    let mostly = |row: usize, col: usize, pred: fn(u32) -> bool| {
+        let pixels = cell_pixels(&gpu_frame, cw, ch, row, col);
+        pixels.iter().filter(|&&p| pred(p)).count() > pixels.len() * 3 / 4
+    };
+    let red = |p| rr(p) > 140 && gg(p) < 70 && bb(p) < 70;
+    let green = |p| gg(p) > 130 && rr(p) < 80 && bb(p) < 90;
+    let cyan = |p| bb(p) > 130 && gg(p) > 120 && rr(p) < 80;
+    let blue = |p| bb(p) > 150 && rr(p) < 80 && gg(p) < 100;
+    assert!(
+        mostly(0, 0, red) && mostly(0, 1, red),
+        "left double-width cell did not expand across two physical cells"
+    );
+    assert!(
+        mostly(0, 9, green) && !mostly(0, 10, green),
+        "right single-width pane inherited the left pane's DEC width"
+    );
+    assert!(
+        mostly(1, 0, cyan) && !mostly(1, 1, cyan),
+        "left single-width pane inherited the right pane's DEC width"
+    );
+    assert!(
+        mostly(1, 9, blue) && mostly(1, 10, blue),
+        "right double-width cell did not expand inside its own pane"
+    );
+    assert!(
+        !gpu_frame
+            .pixels
+            .iter()
+            .any(|&p| rr(p) > 230 && gg(p) < 30 && bb(p) > 230),
+        "a clipped-away double-width source cell leaked into the composite"
+    );
+}
+
+/// An odd-width pane can expose only half of its final DEC double-width logical
+/// cell. Curly underlines still paint that visible remainder, while the hard
+/// pane clip keeps the wave out of the divider.
+#[test]
+fn gpu_matches_cpu_for_partial_double_width_pane_undercurl() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU/font available: {e}");
+            return;
+        }
+    };
+    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    let (rows, cols) = (1usize, 15usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    // Logical col 3 starts at physical col 6 in the double-width pane. The
+    // pane ends at physical col 7, leaving exactly one base-cell of its 2×
+    // undercurl visible.
+    term.process(b"\x1b[?25l\x1b[1;4H\x1b[4:3;58;2;255;255;255m \x1b[0m");
+    let mut input = term.cell_frame(rows, cols);
+    input.line_sizes.fill(LineSize::SingleWidth);
+    input.line_size_spans.resize_with(rows, Vec::new);
+    input.line_size_spans[0] = vec![
+        LineSizeSpan::new(0, 7, LineSize::DoubleWidth),
+        LineSizeSpan::new(8, 15, LineSize::SingleWidth),
+    ];
+
+    let (cw, ch) = cpu.cell_size();
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "partial pane undercurl GPU/CPU pixels diverge: max delta {delta} > 8"
+    );
+    for (label, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        assert!(
+            non_bg_count(&cell_pixels(frame, cw, ch, 0, 6)) > 0,
+            "{label} dropped the visible half-cell undercurl"
+        );
+        assert!(
+            cell_pixels(frame, cw, ch, 0, 7)
+                .iter()
+                .all(|&p| dist(p, BG) <= 1),
+            "{label} undercurl crossed into the divider"
+        );
+    }
+}
+
+/// Italic ink is allowed to overhang its home cell, but never its pane. Keep a
+/// one-column divider between two single-width spans and prove the shared pane
+/// clip removes the synthetic-italic `f` bearing on both backends.
+#[test]
+fn gpu_matches_cpu_and_clips_italic_ink_at_pane_edge() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP: no GPU/font available: {e}");
+            return;
+        }
+    };
+    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    let (rows, cols) = (1usize, 17usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[?25l\x1b[1;8H\x1b[3;97mf\x1b[0m");
+    let mut unclipped = term.cell_frame(rows, cols);
+    unclipped.line_sizes.fill(LineSize::SingleWidth);
+    let mut clipped = unclipped.clone();
+    clipped.line_size_spans.resize_with(rows, Vec::new);
+    clipped.line_size_spans[0] = vec![
+        LineSizeSpan::new(0, 8, LineSize::SingleWidth),
+        LineSizeSpan::new(9, 17, LineSize::SingleWidth),
+    ];
+
+    let (cw, ch) = cpu.cell_size();
+    let no_span = cpu.render_input(&unclipped);
+    let cpu_frame = cpu.render_input(&clipped);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &clipped, None);
+    assert_eq!(
+        (gpu_frame.width, gpu_frame.height),
+        (cpu_frame.width, cpu_frame.height),
+        "italic pane-edge dimensions differ"
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "italic pane-edge GPU/CPU pixels diverge: max delta {delta} > 8"
+    );
+
+    let divider_x = 8 * cw;
+    let divider = |frame: &Frame| {
+        (0..ch)
+            .flat_map(|y| {
+                (divider_x..divider_x + cw).map(move |x| frame.pixels[y * frame.width + x])
+            })
+            .collect::<Vec<_>>()
+    };
+    let unclipped_divider = divider(&no_span);
+    assert!(
+        unclipped_divider.iter().any(|&p| dist(p, BG) > 24),
+        "negative control: italic fixture has no natural pane-edge overhang"
+    );
+    assert!(
+        divider(&cpu_frame).iter().all(|&p| dist(p, BG) <= 1),
+        "CPU italic ink crossed the pane boundary"
+    );
+    assert!(
+        divider(&gpu_frame).iter().all(|&p| dist(p, BG) <= 1),
+        "GPU italic ink crossed the pane boundary"
+    );
 }
 
 /// W12 mixed-DPI: two windows on different-scale displays are BOTH pixel-correct
@@ -342,7 +570,8 @@ fn gpu_matches_cpu_mixed_dpi_activate_px() {
 }
 
 /// GPU/CPU parity holds after DYNAMIC color changes (OSC 4 palette remap + OSC
-/// 10/11 default fg/bg). The other parity tests render a STATIC theme; this gates
+/// 10/11 default fg/bg + OSC 17/19 selection bg/fg). The other parity tests render
+/// a STATIC theme; this gates
 /// the runtime-recolor path — a program changing the palette/defaults mid-session.
 /// Color resolution happens once in aterm-core's `cell_frame`, so both renderers
 /// consume the SAME recolored `RenderInput`; a divergence here would mean the GPU
@@ -351,6 +580,8 @@ fn gpu_matches_cpu_mixed_dpi_activate_px() {
 /// vacuously by both backends rendering the original colours.
 #[test]
 fn gpu_matches_cpu_after_dynamic_osc_colors() {
+    use aterm_core::selection::{SelectionSide, SelectionType};
+
     let theme = Theme::default();
     let px = 18.0;
 
@@ -380,8 +611,14 @@ fn gpu_matches_cpu_after_dynamic_osc_colors() {
     term.process(b"\x1b]4;1;rgb:00/ff/00\x07");
     term.process(b"\x1b]10;rgb:ff/00/ff\x07");
     term.process(b"\x1b]11;rgb:00/00/80\x07");
+    term.process(b"\x1b]17;rgb:12/34/56\x07");
+    term.process(b"\x1b]19;rgb:fe/cd/32\x07");
     // 'A' uses SGR 31 (palette[1], now green); 'B' uses the recolored defaults.
-    term.process(b"\x1b[31mA\x1b[0mB\r\n");
+    term.process(b"\x1b[31mA\x1b[0mB\r\nX");
+    let selection = term.text_selection_mut();
+    selection.start_selection(1, 0, SelectionSide::Left, SelectionType::Simple);
+    selection.update_selection(1, 0, SelectionSide::Right);
+    selection.complete_selection();
 
     let (cw, ch) = cpu.cell_size();
     let input = term.cell_frame(rows, cols);
@@ -434,6 +671,24 @@ fn gpu_matches_cpu_after_dynamic_osc_colors() {
     assert!(
         b.iter().any(|&p| rr(p) > 120 && bb(p) > 120 && gg(p) < 110),
         "OSC10 default-fg not applied: no magenta glyph in cell (0,1)"
+    );
+    // OSC 17/19 — a stationary selection carries the live terminal-owned band
+    // and ink colours into both renderer paths.
+    let selected = cell_pixels(&gpu_frame, cw, ch, 1, 0);
+    let live_selection_bg = selected
+        .iter()
+        .filter(|&&p| rr(p) == 0x12 && gg(p) == 0x34 && bb(p) == 0x56)
+        .count();
+    assert!(
+        live_selection_bg > selected.len() / 3,
+        "OSC17 selection bg did not reach GPU pixels ({live_selection_bg}/{})",
+        selected.len()
+    );
+    assert!(
+        selected
+            .iter()
+            .any(|&p| rr(p) > 220 && gg(p) > 160 && bb(p) < 100),
+        "OSC19 selected-text foreground did not reach GPU pixels"
     );
 }
 
@@ -1686,6 +1941,19 @@ fn cursor_trail_gpu_matches_cpu() {
     let (mut term, rows, cols) = demo_term();
     let (cw, ch) = cpu.cell_size();
     let mut input = term.cell_frame(rows, cols);
+    assert!(
+        input.cells[5].get(6).is_none(),
+        "regression requires a trail cell in an unmaterialized sparse tail"
+    );
+    // Deliberately diverge both from `theme.bg` and from the frame scalar:
+    // sparse trail cells must blend over their owning pane's live
+    // OSC-11/DECSCNM-resolved background. CPU/GPU parity alone would miss both
+    // paths making the same stale-scalar mistake, so the exact oracle below is
+    // required.
+    input.default_bg = 0x0012_3456;
+    let pane_default_bg = 0x0024_4668;
+    input.default_bg_spans.resize_with(rows, Vec::new);
+    input.default_bg_spans[5].push(aterm_render::DefaultBgSpan::new(0, cols, pane_default_bg));
     // A comet across the empty bottom row (row 5): faint tail → bright head.
     input.cursor_trail = vec![
         aterm_render_api::TrailCell {
@@ -1705,6 +1973,7 @@ fn cursor_trail_gpu_matches_cpu() {
         },
     ];
     input.cursor_trail_color = 0x0050_FA7B; // Dracula green
+    let expected_head = aterm_render::blend_rgb(pane_default_bg, input.cursor_trail_color, 200);
     let cpu_frame = cpu.render_input(&input);
     let gpu_frame = gpu.render_input(&mut win, &input, None);
 
@@ -1731,6 +2000,13 @@ fn cursor_trail_gpu_matches_cpu() {
             greenish > head.len() / 2,
             "{label}: bright trail head (5,6) is not a green tint ({greenish}/{})",
             head.len()
+        );
+        assert!(
+            head.iter()
+                .all(|&pixel| pixel & 0x00ff_ffff == expected_head),
+            "{label}: sparse trail head must blend over pane default \
+             {pane_default_bg:#08x}, not frame scalar {:#08x}",
+            input.default_bg,
         );
         let head_g = head.iter().map(|&p| gg(p)).max().unwrap();
         let tail = cell_pixels(f, cw, ch, 5, 4);
@@ -2080,6 +2356,36 @@ fn minimum_contrast_floored_cells_gpu_match_cpu() {
             "{name}: SGR 8 concealed cell must stay hidden under the floor"
         );
     }
+
+    // Sparse cursor fallback in a composed pane: the cursor cell is not
+    // materialized, so its contrast operand must be the owning pane's default,
+    // not the unrelated frame scalar used for padding/divider gaps.
+    let mut sparse = Terminal::new(rows as u16, cols as u16);
+    sparse.process(b"\x1b[2 q\x1b[1;8H");
+    let mut sparse_input = sparse.cell_frame(rows, cols);
+    assert!(
+        sparse_input.cells[0].get(7).is_none(),
+        "fixture requires an unmaterialized cursor cell"
+    );
+    let pane_bg = 0x0024_4668;
+    sparse_input.default_bg = 0x0012_3456;
+    sparse_input.default_bg_spans = vec![
+        vec![aterm_render::DefaultBgSpan::new(4, cols, pane_bg)],
+        Vec::new(),
+    ];
+    sparse_input.cursor_color = pane_bg;
+    let expected_cursor = aterm_render::floor_cursor_fill(pane_bg, pane_bg, 4.5);
+    let cpu_sparse = cpu.render_input(&sparse_input);
+    let mut sparse_win = aterm_gpu::WindowGpu::new();
+    let gpu_sparse = gpu.render_input(&mut sparse_win, &sparse_input, None);
+    for (name, frame) in [("CPU", &cpu_sparse), ("GPU", &gpu_sparse)] {
+        assert!(
+            cell_pixels(frame, cw, ch, 0, 7)
+                .iter()
+                .all(|&p| dist(p, expected_cursor) <= 3),
+            "{name}: sparse cursor must be floored against its pane default"
+        );
+    }
 }
 
 /// Background + cursor OPACITY parity (Ghostty-style translucency): with the
@@ -2117,7 +2423,7 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
     // in the neighbour-cell overflow — unrelated to opacity — so the baseline
     // avoids it; the translucent path below has no cut-out and is compared ON
     // a glyph.)
-    let term_at = |cursor_seq: &[u8]| {
+    let input_at = |cursor_seq: &[u8]| {
         let mut term = Terminal::new(rows as u16, cols as u16);
         // Seed the ENGINE default bg to the theme bg (the production contract)
         // so WRITTEN default-bg cells resolve to the colour the renderers
@@ -2131,12 +2437,25 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
         // default bg.
         term.process(b"\x1b[48;2;0;0;128m \x1b[0mAB");
         term.process(cursor_seq);
-        term
+        let blank = term.implicit_blank_render_cell();
+        let mut input = term.cell_frame(rows, cols);
+        for row in &mut input.cells {
+            row.resize(cols, blank);
+        }
+        input
     };
-    let input_blank = term_at(b"\x1b[1;6H").cell_frame(rows, cols);
+    let mut input_blank = input_at(b"\x1b[1;6H");
     // Frame B: the SAME grid with the cursor ON the 'A' glyph — the
     // translucent-cursor-over-text case (glyph shows through on both paths).
-    let input_glyph = term_at(b"\x1b[1;2H").cell_frame(rows, cols);
+    let mut input_glyph = input_at(b"\x1b[1;2H");
+    // A composed pane's OSC-11 provenance differs from the frame scalar used
+    // for padding. The cell grid still resolves default cells to `BG`, so the
+    // opacity classifier must consult the pane span; comparing to the scalar
+    // would incorrectly make every default cell opaque on both backends.
+    for input in [&mut input_blank, &mut input_glyph] {
+        input.default_bg = 0x0022_3344;
+        input.default_bg_spans = vec![vec![aterm_render::DefaultBgSpan::new(0, cols, BG)]; rows];
+    }
     let (cw, ch) = cpu.cell_size();
 
     // Baseline (defaults): parity holds and the 1.0 setters are byte-identical.
@@ -2586,232 +2905,5 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
     assert!(
         any_down,
         "non-vacuity: a NEGATIVE frac (overscroll bounce) must move GPU pixels DOWN"
-    );
-}
-/// A composed split row carries one DEC line-size span per pane. Its geometry
-/// must be resolved per cell: the left pane can be double-width while the right
-/// remains single-width, and the next row can invert that arrangement. Cells in
-/// the clipped-away logical half of each double-width pane must not reappear in
-/// the neighbour.
-#[test]
-fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
-    let theme = Theme::default();
-    let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
-
-    let (rows, cols) = (2usize, 17usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    // Row 0: visible red cell in the left pane, a magenta poison cell in
-    // its clipped-away logical half, and a green cell in the right pane.
-    // Row 1 reverses pane widths and puts the poison cell in the right pane's
-    // clipped-away half. Cursor hidden so the fixture is pure pane geometry.
-    term.process(
-        b"\x1b[?25l\
-\x1b[1;1H\x1b[48;2;190;20;20m \x1b[0m\
-\x1b[1;7H\x1b[48;2;255;0;255m \x1b[0m\
-\x1b[1;10H\x1b[48;2;20;180;40m \x1b[0m\
-\x1b[2;1H\x1b[48;2;20;170;190m \x1b[0m\
-\x1b[2;10H\x1b[48;2;30;60;210m \x1b[0m\
-\x1b[2;14H\x1b[48;2;255;0;255m \x1b[0m",
-    );
-    let mut input = term.cell_frame(rows, cols);
-    input.line_sizes.fill(LineSize::SingleWidth);
-    input.line_size_spans.resize_with(rows, Vec::new);
-    input.line_size_spans[0] = vec![
-        LineSizeSpan::new(0, 8, LineSize::DoubleWidth),
-        LineSizeSpan::new(9, 17, LineSize::SingleWidth),
-    ];
-    input.line_size_spans[1] = vec![
-        LineSizeSpan::new(0, 8, LineSize::SingleWidth),
-        LineSizeSpan::new(9, 17, LineSize::DoubleWidth),
-    ];
-
-    let mut win = aterm_gpu::WindowGpu::new();
-    let (cw, ch) = cpu.cell_size();
-    let cpu_frame = cpu.render_input(&input);
-    let gpu_frame = gpu.render_input(&mut win, &input, None);
-    assert_eq!(
-        (gpu_frame.width, gpu_frame.height),
-        (cpu_frame.width, cpu_frame.height),
-        "mixed-pane dimensions differ"
-    );
-    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
-    assert!(
-        delta <= 8,
-        "mixed pane-local DEC geometry diverges: max delta {delta} > 8"
-    );
-
-    let mostly = |row: usize, col: usize, pred: fn(u32) -> bool| {
-        let pixels = cell_pixels(&gpu_frame, cw, ch, row, col);
-        pixels.iter().filter(|&&p| pred(p)).count() > pixels.len() * 3 / 4
-    };
-    let red = |p| rr(p) > 140 && gg(p) < 70 && bb(p) < 70;
-    let green = |p| gg(p) > 130 && rr(p) < 80 && bb(p) < 90;
-    let cyan = |p| bb(p) > 130 && gg(p) > 120 && rr(p) < 80;
-    let blue = |p| bb(p) > 150 && rr(p) < 80 && gg(p) < 100;
-    assert!(
-        mostly(0, 0, red) && mostly(0, 1, red),
-        "left double-width cell did not expand across two physical cells"
-    );
-    assert!(
-        mostly(0, 9, green) && !mostly(0, 10, green),
-        "right single-width pane inherited the left pane's DEC width"
-    );
-    assert!(
-        mostly(1, 0, cyan) && !mostly(1, 1, cyan),
-        "left single-width pane inherited the right pane's DEC width"
-    );
-    assert!(
-        mostly(1, 9, blue) && mostly(1, 10, blue),
-        "right double-width cell did not expand inside its own pane"
-    );
-    assert!(
-        !gpu_frame
-            .pixels
-            .iter()
-            .any(|&p| rr(p) > 230 && gg(p) < 30 && bb(p) > 230),
-        "a clipped-away double-width source cell leaked into the composite"
-    );
-}
-
-/// An odd-width pane can expose only half of its final DEC double-width logical
-/// cell. Curly underlines still paint that visible remainder, while the hard
-/// pane clip keeps the wave out of the divider.
-#[test]
-fn gpu_matches_cpu_for_partial_double_width_pane_undercurl() {
-    let theme = Theme::default();
-    let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
-
-    let (rows, cols) = (1usize, 15usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    // Logical col 3 starts at physical col 6 in the double-width pane. The
-    // pane ends at physical col 7, leaving exactly one base-cell of its 2×
-    // undercurl visible.
-    term.process(b"\x1b[?25l\x1b[1;4H\x1b[4:3;58;2;255;255;255m \x1b[0m");
-    let mut input = term.cell_frame(rows, cols);
-    input.line_sizes.fill(LineSize::SingleWidth);
-    input.line_size_spans.resize_with(rows, Vec::new);
-    input.line_size_spans[0] = vec![
-        LineSizeSpan::new(0, 7, LineSize::DoubleWidth),
-        LineSizeSpan::new(8, 15, LineSize::SingleWidth),
-    ];
-
-    let (cw, ch) = cpu.cell_size();
-    let cpu_frame = cpu.render_input(&input);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let gpu_frame = gpu.render_input(&mut win, &input, None);
-    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
-    assert!(
-        delta <= 8,
-        "partial pane undercurl GPU/CPU pixels diverge: max delta {delta} > 8"
-    );
-    for (label, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
-        assert!(
-            non_bg_count(&cell_pixels(frame, cw, ch, 0, 6)) > 0,
-            "{label} dropped the visible half-cell undercurl"
-        );
-        assert!(
-            cell_pixels(frame, cw, ch, 0, 7)
-                .iter()
-                .all(|&p| dist(p, BG) <= 1),
-            "{label} undercurl crossed into the divider"
-        );
-    }
-}
-
-/// Italic ink is allowed to overhang its home cell, but never its pane. Keep a
-/// one-column divider between two single-width spans and prove the shared pane
-/// clip removes the synthetic-italic `f` bearing on both backends.
-#[test]
-fn gpu_matches_cpu_and_clips_italic_ink_at_pane_edge() {
-    let theme = Theme::default();
-    let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
-    cpu.debug_block_on_lazy_fallbacks();
-    gpu.debug_block_on_lazy_fallbacks();
-
-    let (rows, cols) = (1usize, 17usize);
-    let mut term = Terminal::new(rows as u16, cols as u16);
-    term.process(b"\x1b[?25l\x1b[1;8H\x1b[3;97mf\x1b[0m");
-    let mut unclipped = term.cell_frame(rows, cols);
-    unclipped.line_sizes.fill(LineSize::SingleWidth);
-    let mut clipped = unclipped.clone();
-    clipped.line_size_spans.resize_with(rows, Vec::new);
-    clipped.line_size_spans[0] = vec![
-        LineSizeSpan::new(0, 8, LineSize::SingleWidth),
-        LineSizeSpan::new(9, 17, LineSize::SingleWidth),
-    ];
-
-    let (cw, ch) = cpu.cell_size();
-    let no_span = cpu.render_input(&unclipped);
-    let cpu_frame = cpu.render_input(&clipped);
-    let mut win = aterm_gpu::WindowGpu::new();
-    let gpu_frame = gpu.render_input(&mut win, &clipped, None);
-    assert_eq!(
-        (gpu_frame.width, gpu_frame.height),
-        (cpu_frame.width, cpu_frame.height),
-        "italic pane-edge dimensions differ"
-    );
-    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
-    assert!(
-        delta <= 8,
-        "italic pane-edge GPU/CPU pixels diverge: max delta {delta} > 8"
-    );
-
-    let divider_x = 8 * cw;
-    let divider = |frame: &Frame| {
-        (0..ch)
-            .flat_map(|y| {
-                (divider_x..divider_x + cw).map(move |x| frame.pixels[y * frame.width + x])
-            })
-            .collect::<Vec<_>>()
-    };
-    let unclipped_divider = divider(&no_span);
-    assert!(
-        unclipped_divider.iter().any(|&p| dist(p, BG) > 24),
-        "negative control: italic fixture has no natural pane-edge overhang"
-    );
-    assert!(
-        divider(&cpu_frame).iter().all(|&p| dist(p, BG) <= 1),
-        "CPU italic ink crossed the pane boundary"
-    );
-    assert!(
-        divider(&gpu_frame).iter().all(|&p| dist(p, BG) <= 1),
-        "GPU italic ink crossed the pane boundary"
     );
 }

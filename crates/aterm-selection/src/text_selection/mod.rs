@@ -434,6 +434,19 @@ impl TextSelection {
         true
     }
 
+    /// Translate both anchor rows into a presentation coordinate space.
+    ///
+    /// This is for composition-only offsets such as prepending window chrome or
+    /// placing a pane inside a larger frame. Unlike [`Self::adjust_for_scroll`],
+    /// it does not apply terminal-history bounds or clear the selection: state,
+    /// selection type, columns, and anchor sides are preserved. Each row uses
+    /// saturating addition so even an untrusted or degenerate offset cannot
+    /// overflow.
+    pub fn translate_rows_for_presentation(&mut self, delta: i32) {
+        self.start.row = self.start.row.saturating_add(delta);
+        self.end.row = self.end.row.saturating_add(delta);
+    }
+
     /// Re-anchor selection endpoints across a logical row insertion before a
     /// protected footer.
     ///
@@ -494,8 +507,8 @@ impl TextSelection {
     ///   the cell is selected if either column `col` or `col + 1` (the
     ///   continuation cell) falls within the block bounds.
     /// - If `is_wide_continuation` is true (cell at `col` is the right half of
-    ///   a double-width character), the cell is selected if the preceding cell
-    ///   (`col - 1`) falls within the block bounds.
+    ///   a double-width character), the cell is selected when either its own
+    ///   column or the preceding lead (`col - 1`) falls within the block bounds.
     ///
     /// For non-block selections, this behaves identically to [`Self::contains`].
     pub fn contains_cell(
@@ -506,8 +519,9 @@ impl TextSelection {
         is_wide_continuation: bool,
     ) -> bool {
         if self.selection_type == SelectionType::Block {
-            if is_wide_continuation && col > 0 {
-                return self.contains(row, col.saturating_sub(1));
+            if is_wide_continuation {
+                return self.contains(row, col)
+                    || (col > 0 && self.contains(row, col.saturating_sub(1)));
             }
             if is_wide {
                 return self.contains(row, col) || self.contains(row, col.saturating_add(1));

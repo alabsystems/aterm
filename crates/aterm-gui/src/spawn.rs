@@ -943,9 +943,20 @@ mod deferred_reader_gate_tests {
         let stop = Arc::new(AtomicBool::new(false));
         let waiter_stop = stop.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        // The negative below is only meaningful once the waiter is PROVABLY parked.
+        // Without this handshake a 20ms `recv_timeout` is shorter than a single
+        // scheduling delay on a loaded box, so the assertion passed whenever the
+        // thread had not been scheduled at all — i.e. it passed vacuously, and a
+        // regression that activated before Commit would have passed with it.
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter_parked = parked.clone();
         let join = std::thread::spawn(move || {
+            waiter_parked.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = tx.send(waiter.wait_until_released(&waiter_stop));
         });
+        while !parked.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
         assert!(
             rx.recv_timeout(std::time::Duration::from_millis(20))
                 .is_err(),
@@ -954,7 +965,9 @@ mod deferred_reader_gate_tests {
         gate.release();
         gate.release();
         assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(1)),
+            // Failure bound: a gate that never releases never sends. 1s covered a
+            // condvar wake plus a thread's first schedule on a 40-thread box.
+            rx.recv_timeout(std::time::Duration::from_secs(60)),
             Ok(true),
             "release is idempotent and requires no resource acquisition"
         );
@@ -1203,9 +1216,16 @@ mod park_reader_tests {
             panic!("injected PTY reader failure");
         }));
 
+        // 1s had to cover thread creation, first scheduling, a panic unwind and a
+        // panic-hook write to stderr — a process-global lock contended by every one
+        // of the ~2500 tests in this binary. Crossing it makes `park_reader` return
+        // false because it TIMED OUT, not because it detected the panic, so the
+        // assertion below still passes and the property under test never runs.
+        // A genuine failure returns true (authorizing a handoff it must refuse), so
+        // the deadline is a failure bound only and costs a passing run nothing.
         assert!(!park_reader(
             &mut session,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
         ));
         assert!(session.reader_join.is_none());
     }
@@ -2921,14 +2941,14 @@ mod kitty_transfer_tests {
     }
 
     /// SCROLL-1 — a fresh live session attaches a tiered scrollback STORE (not the bare
-    /// 10k ring), and the resolved `scrollback_limit` actually drives it — the setting
-    /// that was a silent no-op while `grid.scrollback` stayed `None`. Covers the default
-    /// (100k), a finite cap, and `0` ⇒ unlimited (line limit `None`).
+    /// 10k ring), and the resolved total `scrollback_limit` actually drives ring + store
+    /// — the setting that was a silent no-op while `grid.scrollback` stayed `None`.
+    /// Covers the default (100k), a finite cap, and `0` ⇒ unlimited (line limit `None`).
     #[test]
     fn live_session_attaches_tiered_scrollback_driven_by_config() {
         use aterm_core::config::TerminalConfig;
-        // No config: the store is present with the advertised 100k default
-        // (`aterm_scrollback::DEFAULT_LINE_LIMIT`).
+        // No config: the store is present and the unified ring + store total is
+        // the advertised default (`aterm_scrollback::DEFAULT_LINE_LIMIT`).
         let t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark);
         assert!(
             t.scrollback().is_some(),
@@ -2937,7 +2957,7 @@ mod kitty_transfer_tests {
         assert_eq!(
             t.grid().scrollback_line_limit(),
             Some(100_000),
-            "the default store honors the 100k line limit"
+            "the default ring + store total honors the 100k line limit"
         );
         // A finite config limit reaches the store (was a no-op with scrollback = None).
         let tc = TerminalConfig {

@@ -12822,7 +12822,11 @@ fn compact_about_support(about: &AboutState) -> UiNode {
             "Interface",
             "Native semantic tab app".to_string(),
         ),
-        row("capture", "Capture", "WYSIWYG exact pixels".to_string()),
+        row(
+            "capture",
+            "Capture",
+            "Exact app-render pixels".to_string(),
+        ),
         row(
             "accessibility",
             "Accessibility",

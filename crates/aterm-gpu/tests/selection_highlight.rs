@@ -11,7 +11,7 @@
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
-use aterm_render::{Frame, Renderer, Theme};
+use aterm_render::{Frame, Renderer, SelectionClip, Theme};
 
 fn rr(p: u32) -> i32 {
     ((p >> 16) & 0xff) as i32
@@ -79,7 +79,10 @@ fn selection_highlight_gpu_matches_cpu() {
 
     let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
-    let input = term.cell_frame(rows, cols);
+    let mut input = term.cell_frame(rows, cols);
+    // This phase exercises the raw renderer setting: an unresolved producer
+    // delegates selected-text policy to the configured renderer.
+    input.selection_fg = aterm_core::render::COLOR_UNSET;
     let cpu_frame = cpu.render_input(&input);
     let gpu_frame = gpu.render_input(&mut win, &input, None);
 
@@ -132,6 +135,159 @@ fn selection_highlight_gpu_matches_cpu() {
 }
 
 #[test]
+fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("SKIP: no GPU/font available: {error}");
+            return;
+        }
+    };
+    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (2usize, 8usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"x");
+    let sel = term.text_selection_mut();
+    sel.start_selection(0, 4, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(0, 6, SelectionSide::Right);
+    sel.complete_selection();
+
+    let mut input = term.cell_frame(rows, cols);
+    input.cursor_visible = false;
+    assert_eq!(
+        input.cells[0].len(),
+        1,
+        "fixture requires cols 4..=6 to be omitted sparse-tail cells"
+    );
+    let image = std::sync::Arc::new(aterm_core::grid::extra::ImageData {
+        bytes: vec![240, 20, 80, 255],
+        format: aterm_core::grid::extra::ImageFormat::RawRgba8 {
+            width: 1,
+            height: 1,
+        },
+        cols: 1,
+        rows: 1,
+        z_index: aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD - 1,
+    });
+    input.images[0].push((
+        5,
+        aterm_core::grid::extra::ImageRef {
+            image,
+            cell_row: 0,
+            cell_col: 0,
+        },
+    ));
+
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "sparse selection CPU/GPU output diverges by {delta} > 8"
+    );
+
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        for col in 4..=6 {
+            let pixels = cell_pixels(frame, cw, ch, 0, col);
+            assert_eq!(
+                pixels
+                    .iter()
+                    .filter(|&&pixel| near(pixel, theme.selection, 2))
+                    .count(),
+                pixels.len(),
+                "{name}: selected implicit blank col {col} must be entirely selection-filled"
+            );
+        }
+        assert_eq!(
+            cell_pixels(frame, cw, ch, 0, 5)
+                .iter()
+                .filter(|&&pixel| near(pixel, 0x00f0_1450, 2))
+                .count(),
+            0,
+            "{name}: selection must cover the deepest image in an omitted cell"
+        );
+        let untouched = cell_pixels(frame, cw, ch, 0, 7);
+        assert_eq!(
+            untouched
+                .iter()
+                .filter(|&&pixel| near(pixel, theme.bg, 2))
+                .count(),
+            untouched.len(),
+            "{name}: unselected omitted cell remains the frame default"
+        );
+    }
+}
+
+#[test]
+fn multiline_selection_clip_matches_cpu_and_never_tints_sibling_cells() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
+        Ok(gpu) => gpu,
+        Err(error) => {
+            eprintln!("SKIP: no GPU/font available: {error}");
+            return;
+        }
+    };
+    let Some(mut cpu) = Renderer::from_system(px, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = cpu.cell_size();
+    let (rows, cols) = (3usize, 9usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    let selection = term.text_selection_mut();
+    selection.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
+    selection.update_selection(2, 7, SelectionSide::Right);
+    selection.complete_selection();
+
+    let mut input = term.cell_frame(rows, cols);
+    input.cursor_visible = false;
+    input.selection_bg = 0x0021_4365;
+    input.selection_clip = Some(SelectionClip::new(0, rows, 5, cols));
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "clipped multiline selection CPU/GPU output diverges by {delta} > 8"
+    );
+
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        for (row, col) in [(0, 5), (0, 8), (1, 5), (1, 8), (2, 5), (2, 7)] {
+            let pixels = cell_pixels(frame, cw, ch, row, col);
+            assert_eq!(
+                pixels
+                    .iter()
+                    .filter(|&&pixel| near(pixel, input.selection_bg, 2))
+                    .count(),
+                pixels.len(),
+                "{name}: selected focused-pane cell ({row},{col}) must be highlighted"
+            );
+        }
+        for (row, col) in [(0, 4), (1, 0), (1, 4), (2, 4), (2, 8)] {
+            let pixels = cell_pixels(frame, cw, ch, row, col);
+            assert_eq!(
+                pixels
+                    .iter()
+                    .filter(|&&pixel| near(pixel, theme.bg, 2))
+                    .count(),
+                pixels.len(),
+                "{name}: sibling/divider cell ({row},{col}) must stay at frame background"
+            );
+        }
+    }
+}
+
+#[test]
 fn inactive_selection_bg_gpu_matches_cpu() {
     // When the pane is UNFOCUSED, selected cells must paint with the (derived or
     // explicit) INACTIVE selection bg instead of the active `Theme::selection`, on
@@ -154,6 +310,7 @@ fn inactive_selection_bg_gpu_matches_cpu() {
 
     let (rows, cols) = (4usize, 10usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b]17;rgb:60/40/20\x07");
     term.process(b"hello\r\nworld");
     let sel = term.text_selection_mut();
     sel.start_selection(0, 1, SelectionSide::Left, SelectionType::Simple);
@@ -162,13 +319,17 @@ fn inactive_selection_bg_gpu_matches_cpu() {
 
     let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
-    let input = term.cell_frame(rows, cols);
+    let mut input = term.cell_frame(rows, cols);
+    input.default_bg = 0x00e0_d0c0;
 
-    // The derived inactive bg the renderer will paint (single source of truth).
-    let inactive_bg = aterm_render::derive_inactive_selection_bg(theme.selection, theme.bg);
+    // The derived inactive bg follows terminal-owned OSC 17 and the frame's
+    // live default background, not the renderer's stale static theme.
+    assert_eq!(input.selection_bg, 0x0060_4020);
+    let inactive_bg =
+        aterm_render::derive_inactive_selection_bg(input.selection_bg, input.default_bg);
     // It must DIFFER from the active selection — otherwise this test proves nothing.
     assert!(
-        !near(inactive_bg, theme.selection, 8),
+        !near(inactive_bg, input.selection_bg, 8),
         "derived inactive bg must visibly differ from the active selection"
     );
 
@@ -187,7 +348,7 @@ fn inactive_selection_bg_gpu_matches_cpu() {
         let n_inactive = sel_px.iter().filter(|&&p| near(p, inactive_bg, 8)).count();
         let n_active = sel_px
             .iter()
-            .filter(|&&p| near(p, theme.selection, 8))
+            .filter(|&&p| near(p, input.selection_bg, 8))
             .count();
         assert!(
             n_inactive > sel_px.len() / 2,
@@ -214,7 +375,7 @@ fn inactive_selection_bg_gpu_matches_cpu() {
         let sel_px = cell_pixels(f, cw, ch, 0, 2);
         let n_active = sel_px
             .iter()
-            .filter(|&&p| near(p, theme.selection, 8))
+            .filter(|&&p| near(p, input.selection_bg, 8))
             .count();
         assert!(
             n_active > sel_px.len() / 2,
@@ -257,7 +418,13 @@ fn selection_fg_override_gpu_matches_cpu() {
 
     let mut win = aterm_gpu::WindowGpu::new();
     let (cw, ch) = cpu.cell_size();
-    let input = term.cell_frame(rows, cols);
+    let mut input = term.cell_frame(rows, cols);
+    // This first phase intentionally exercises the renderer-owned host
+    // override. A terminal snapshot with no live selection foreground now
+    // carries COLOR_DYNAMIC, which correctly requests automatic contrast and
+    // suppresses stale host state; COLOR_UNSET is the explicit delegation
+    // sentinel for raw/non-terminal producers.
+    input.selection_fg = aterm_core::render::COLOR_UNSET;
     let cpu_frame = cpu.render_input(&input);
     let gpu_frame = gpu.render_input(&mut win, &input, None);
 
@@ -273,5 +440,41 @@ fn selection_fg_override_gpu_matches_cpu() {
     assert!(
         hits > 0,
         "selected glyph should paint the selectionForeground override (hits={hits})"
+    );
+
+    // An engine-owned dynamic value is different from an unresolved producer:
+    // OSC 21 `key=` must suppress the stale static renderer override and select
+    // automatic contrast on both backends.
+    term.process(b"\x1b]21;selection_foreground=\x1b\\");
+    let dynamic_input = term.cell_frame(rows, cols);
+    assert_eq!(
+        dynamic_input.selection_fg,
+        aterm_core::render::COLOR_DYNAMIC
+    );
+    let cpu_dynamic = cpu.render_input(&dynamic_input);
+    let gpu_dynamic = gpu.render_input(&mut win, &dynamic_input, None);
+    let dynamic_delta = max_channel_delta(&cpu_dynamic, &gpu_dynamic);
+    assert!(
+        dynamic_delta <= 8,
+        "dynamic selection fg: GPU/CPU diverge, max per-channel delta {dynamic_delta} > 8"
+    );
+    let dynamic_px = cell_pixels(&cpu_dynamic, cw, ch, 0, 1);
+    let stale_hits = dynamic_px.iter().filter(|&&p| near(p, sel_fg, 40)).count();
+    assert_eq!(
+        stale_hits, 0,
+        "OSC 21 dynamic foreground must not reuse the static renderer override"
+    );
+    let automatic_fg = aterm_render::floor_selection_fg(theme.fg, theme.selection);
+    let automatic_hits = dynamic_px
+        .iter()
+        .filter(|&&p| near(p, automatic_fg, 40))
+        .count();
+    assert!(
+        automatic_hits > 0,
+        "OSC 21 dynamic foreground must positively paint the automatic contrast colour"
+    );
+    assert_ne!(
+        cpu_dynamic.pixels, cpu_frame.pixels,
+        "explicit renderer foreground and engine-requested automatic contrast must be distinct"
     );
 }

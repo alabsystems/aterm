@@ -545,14 +545,17 @@ pub struct FireHaloCell {
     pub strength: u8,
 }
 
-/// Sentinel for [`RenderInput::default_bg`] / [`RenderInput::cursor_color`] meaning
-/// "the host did not resolve a live colour for this frame — fall back to the
-/// renderer's configured theme." Real frame colours are `0x00RRGGBB` (high byte
-/// always 0), so a set high byte is unambiguously "unset". Lets every render path that
-/// doesn't fill these fields (headless, the composed-pane scratch, tests) stay
-/// byte-identical to the pre-OSC-11/12 behaviour while the windowed redraw fills them
-/// with live values.
+/// Sentinel for unresolved live frame colors, meaning "the producer did not
+/// choose a value — fall back to the renderer's configured theme." Real frame
+/// colors are `0x00RRGGBB` (high byte always 0), so a set high byte is
+/// unambiguously metadata rather than a color.
 pub const COLOR_UNSET: u32 = 0xFF00_0000;
+
+/// Sentinel for an explicitly dynamic selected-text foreground. Unlike
+/// [`COLOR_UNSET`], this says the terminal chose automatic contrast for this
+/// frame (for example `OSC 21;selection_foreground=`), so a renderer must not
+/// reintroduce its static configured foreground.
+pub const COLOR_DYNAMIC: u32 = 0xFE00_0000;
 
 /// One run of columns in a COMPOSED row that carries its own DEC line size.
 ///
@@ -590,6 +593,90 @@ impl LineSizeSpan {
             end_col,
             line_size,
         }
+    }
+}
+
+/// One pane-local live default-background interval inside a composed
+/// [`RenderInput`] row.
+///
+/// A single terminal snapshot uses [`RenderInput::default_bg`] for every cell.
+/// A split window can compose panes whose OSC 11 / OSC 111 / DECSCNM state
+/// resolves to different defaults, so `start_col..end_col` records the source
+/// pane's default for that physical composite interval. Rows without spans, gaps
+/// between valid spans (for example a divider), and malformed/out-of-range spans
+/// fall back to the scalar `default_bg`.
+///
+/// Producers must keep each row's spans sorted by `start_col`, non-overlapping,
+/// and clipped to [`RenderInput::cols`]; [`RenderInput::default_bg_at`] still
+/// validates containment defensively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultBgSpan {
+    /// First physical composite column owned by this pane.
+    pub start_col: usize,
+    /// One past the pane's last physical composite column.
+    pub end_col: usize,
+    /// Pane-resolved live default background (`0x00RRGGBB` or `COLOR_UNSET`).
+    pub default_bg: u32,
+}
+
+impl DefaultBgSpan {
+    /// Construct a pane-local live default-background interval.
+    #[must_use]
+    pub const fn new(start_col: usize, end_col: usize, default_bg: u32) -> Self {
+        Self {
+            start_col,
+            end_col,
+            default_bg,
+        }
+    }
+}
+
+/// Optional frame-space bounds for a composed text selection.
+///
+/// A terminal selection is expressed in that terminal's own logical row/column
+/// coordinates. When the host projects the focused terminal into a split-pane
+/// frame, a multi-row selection's interior rows would otherwise span the whole
+/// composed window, including dividers and sibling panes. This half-open
+/// rectangle is the renderer-visible authority that confines those predicates to
+/// the pane which supplied the selection.
+///
+/// `RenderInput::selection_clip == None` preserves the historical single-terminal
+/// behavior exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SelectionClip {
+    /// First included frame row.
+    pub row_start: usize,
+    /// One past the last included frame row.
+    pub row_end: usize,
+    /// First included frame column.
+    pub col_start: usize,
+    /// One past the last included frame column.
+    pub col_end: usize,
+}
+
+impl SelectionClip {
+    /// Construct a half-open frame-space selection rectangle.
+    #[must_use]
+    pub const fn new(row_start: usize, row_end: usize, col_start: usize, col_end: usize) -> Self {
+        Self {
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+        }
+    }
+
+    /// Whether one frame-space cell lies inside this rectangle.
+    #[must_use]
+    #[inline]
+    pub const fn contains(self, row: usize, col: usize) -> bool {
+        row >= self.row_start && row < self.row_end && col >= self.col_start && col < self.col_end
+    }
+
+    /// Shift the rectangle down when host chrome is prepended to a frame.
+    pub fn translate_rows_down(&mut self, rows: usize) {
+        self.row_start = self.row_start.saturating_add(rows);
+        self.row_end = self.row_end.saturating_add(rows);
     }
 }
 
@@ -639,8 +726,10 @@ pub struct RenderInput {
     pub cursor_trail: Vec<TrailCell>,
     /// The fully-resolved trail colour (`0x00RRGGBB`) to blend over each trail
     /// cell's background. The host resolves it (config `cursor_trail_color`, else
-    /// the theme cursor colour) so the renderer needs no theme knowledge for the
-    /// trail. Only consulted when `cursor_trail` is non-empty.
+    /// the effective live cursor: OSC 12/configured baseline, or live OSC 10
+    /// foreground while OSC 21 `cursor=` is dynamic) so the renderer needs no
+    /// terminal/theme knowledge for the trail. Only consulted when `cursor_trail`
+    /// is non-empty.
     pub cursor_trail_color: u32,
     /// Additive LIGHT quads for the "LUMEN WAKE" cursor aurora (comet of emitted
     /// light, bloom crown, landing ring, sparks). Premultiplied + saturating-added
@@ -691,12 +780,12 @@ pub struct RenderInput {
     /// animation; the engine leaves it untouched. EMPTY in the common case →
     /// byte-identical to the pre-fire render path.
     pub fire_patch: Vec<FirePatch>,
-    /// The rainbow-cursor BLOCK FILL override (`0x00RRGGBB`), or `None` for the ordinary
-    /// themed cursor. When `Some` AND the cursor is a BLOCK, the renderer fills the block
-    /// with this colour (still run through `floor_cursor_fill` so the cut-out glyph keeps
-    /// its contrast) instead of the theme/OSC-12 cursor colour — the typing-reactive
-    /// rainbow cursor. Host-owned animation (see `cursor_rainbow`); `None` is
-    /// byte-identical to the ordinary cursor path. Ignored for bar/underline cursors.
+    /// Host-resolved cursor FILL override (`0x00RRGGBB`), or `None` for the ordinary
+    /// theme/OSC-12 cursor colour. The override applies to the live cursor shape:
+    /// block, hollow, bar, underline, and Bolt all use it. Block glyph cut-outs and
+    /// every other shape still run through `floor_cursor_fill`, so cursor contrast
+    /// remains intact. Host-owned animation (rainbow, forge, phaser, or lightning);
+    /// `None` is byte-identical to the ordinary cursor path.
     pub cursor_fill_override: Option<u32>,
     /// The "sparkle word" decorations for this frame: small sprites stamped over
     /// cells of matched profanity / feline words. Host-owned (the windowed
@@ -875,6 +964,23 @@ pub struct RenderInput {
     pub fx_clip: Option<(u16, u16, u16, u16)>,
     /// A clone of the active text selection, for per-cell highlighting.
     pub selection: TextSelection,
+    /// Optional half-open FRAME-space rectangle that confines
+    /// [`selection`](Self::selection). Split composition uses it to prevent the
+    /// focused pane's multi-row selection from tinting a divider or sibling pane.
+    /// `None` is the historical single-terminal path with no additional clip.
+    pub selection_clip: Option<SelectionClip>,
+    /// The terminal's LIVE selection-background colour (`0x00RRGGBB`) for this
+    /// frame, including OSC 17/21 changes and OSC 117/RIS resets. `COLOR_UNSET`
+    /// delegates to the renderer's configured selection theme. Kept separate
+    /// from [`selection`](Self::selection) because a colour-only OSC mutation
+    /// must invalidate cached pixels even when the selected cell range is
+    /// unchanged.
+    pub selection_bg: u32,
+    /// The terminal's LIVE selected-text foreground (`0x00RRGGBB`) for this
+    /// frame, including OSC 19/21 changes and OSC 119/RIS resets.
+    /// [`COLOR_UNSET`] delegates to the renderer's configured policy;
+    /// [`COLOR_DYNAMIC`] explicitly selects the automatic WCAG contrast floor.
+    pub selection_fg: u32,
     /// Per-row, sparse emoji grapheme-cluster strings (`term.cluster_row(r)`):
     /// `(col, cluster)` for cells whose combining marks form a ZWJ / skin-tone /
     /// keycap sequence. The renderer shapes each to a single colour glyph; cells
@@ -906,6 +1012,13 @@ pub struct RenderInput {
     /// actually disagree — see [`LineSizeSpan`] and [`Self::line_size_run_at`].
     /// When non-empty for a row, the runs partition `0..cols` in ascending order.
     pub line_size_spans: Vec<Vec<LineSizeSpan>>,
+    /// Pane-local live default-background intervals for composed split rows.
+    /// Empty/missing rows use [`default_bg`](Self::default_bg) for every column,
+    /// preserving the historical single-terminal path. A non-empty row carries
+    /// one [`DefaultBgSpan`] per pane so background opacity, deepest Kitty image
+    /// layering, cursor fallback, and trail fallback classify cells against the
+    /// default of the pane that supplied them rather than one window-wide scalar.
+    pub default_bg_spans: Vec<Vec<DefaultBgSpan>>,
     /// Per-row, sparse inline-image placements (`term.images_row(r)`):
     /// `(col, ImageRef)` for every cell covered by an iTerm2 OSC 1337 `File=`
     /// image. The renderer decodes each image once (keyed by the `Arc` inside the
@@ -914,19 +1027,25 @@ pub struct RenderInput {
     /// frame with no images is byte-identical to the pre-image path.
     pub images: Vec<Vec<(usize, aterm_grid::ImageRef)>>,
     /// The LIVE default background colour (`0x00RRGGBB`) for this frame: the engine's
-    /// dynamic default-bg already folded with DECSCNM reverse-video, resolved by the
-    /// host. The renderer paints the window PADDING band and the base clear from this
+    /// dynamic default-bg already folded with DECSCNM reverse-video, resolved by
+    /// [`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into).
+    /// `COLOR_UNSET` is retained only for a pristine, unconfigured `Terminal::new`
+    /// so standalone renderers preserve their historical theme fallback; host
+    /// configuration, an OSC mutation/reset, or DECSCNM makes this authoritative.
+    /// The renderer paints the window PADDING band and the base clear from this
     /// (not the static config theme), so OSC 11 (set default bg) / OSC 111 (reset) and
     /// DECSCNM (DECSET ?5) reach the frame border too, matching the grid interior
     /// (which resolves per-cell from the same live value). Equals the configured bg
     /// until a program changes it, so the default path is byte-identical.
     pub default_bg: u32,
-    /// The LIVE cursor colour (`0x00RRGGBB`) for this frame: the engine's OSC 12 cursor
-    /// colour if a program set one, else the host's configured theme cursor colour (the
-    /// host resolves the fallback so the renderer needs no theme
-    /// knowledge). The renderer fills the block/bar/underline cursor
-    /// from this, so OSC 12 / OSC 112 (reset) actually reach the screen. The damage
-    /// gate that un-gates a cursor-colour-only change (which dirties no cell) lives in
+    /// The LIVE cursor colour (`0x00RRGGBB`) for this frame: an explicit OSC 12
+    /// value/configured OSC 112 baseline, or the live OSC 10 foreground while OSC 21
+    /// `cursor=` selects dynamic behavior. The terminal snapshot resolves that policy
+    /// after host configuration or an OSC color boundary; `COLOR_UNSET` preserves
+    /// the renderer-theme cursor for a pristine, unconfigured `Terminal::new`.
+    /// The renderer fills the
+    /// block/bar/underline cursor from this. The damage gate that un-gates a
+    /// cursor-colour-only change (which dirties no cell) lives in
     /// `aterm_render::compute_dirty_rows` (folded into `cursor_changed`); it is also
     /// compared in this type's `PartialEq` for whole-snapshot equality / test parity.
     pub cursor_color: u32,
@@ -992,10 +1111,14 @@ impl Clone for RenderInput {
             grid_bot_row: self.grid_bot_row,
             fx_clip: self.fx_clip,
             selection: self.selection.clone(),
+            selection_clip: self.selection_clip,
+            selection_bg: self.selection_bg,
+            selection_fg: self.selection_fg,
             clusters: self.clusters.clone(),
             combining: self.combining.clone(),
             line_sizes: self.line_sizes.clone(),
             line_size_spans: self.line_size_spans.clone(),
+            default_bg_spans: self.default_bg_spans.clone(),
             images: self.images.clone(),
             default_bg: self.default_bg,
             cursor_color: self.cursor_color,
@@ -1053,10 +1176,14 @@ impl Clone for RenderInput {
         self.grid_bot_row = source.grid_bot_row;
         self.fx_clip = source.fx_clip;
         self.selection.clone_from(&source.selection);
+        self.selection_clip = source.selection_clip;
+        self.selection_bg = source.selection_bg;
+        self.selection_fg = source.selection_fg;
         self.clusters.clone_from(&source.clusters);
         self.combining.clone_from(&source.combining);
         self.line_sizes.clone_from(&source.line_sizes);
         self.line_size_spans.clone_from(&source.line_size_spans);
+        self.default_bg_spans.clone_from(&source.default_bg_spans);
         self.images.clone_from(&source.images);
         self.default_bg = source.default_bg;
         self.cursor_color = source.cursor_color;
@@ -1094,6 +1221,7 @@ impl PartialEq for RenderInput {
             && self.glow_halo == other.glow_halo
             && self.glow_under == other.glow_under
             && self.fire_patch == other.fire_patch
+            && self.cursor_fill_override == other.cursor_fill_override
             && self.word_decorations == other.word_decorations
             && self.ink == other.ink
             && self.char_fg == other.char_fg
@@ -1111,10 +1239,14 @@ impl PartialEq for RenderInput {
             && self.rain_add == other.rain_add
             && self.display_offset == other.display_offset
             && self.selection == other.selection
+            && self.selection_clip == other.selection_clip
+            && self.selection_bg == other.selection_bg
+            && self.selection_fg == other.selection_fg
             && self.clusters == other.clusters
             && self.combining == other.combining
             && self.line_sizes == other.line_sizes
             && self.line_size_spans == other.line_size_spans
+            && self.default_bg_spans == other.default_bg_spans
             && self.images == other.images
             && self.default_bg == other.default_bg
             && self.cursor_color == other.cursor_color
@@ -1146,7 +1278,10 @@ impl RenderInput {
     /// An empty 0×0 snapshot with no allocations — the seed for a persistent
     /// scratch buffer that [`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into)
     /// refills in place each frame (C-1). Cursor scalars default to off/origin and
-    /// `snapshot_seq` to 0; the first `cell_frame_into` overwrites every field.
+    /// `snapshot_seq` to 0. `cell_frame_into` overwrites the engine-owned grid,
+    /// cursor (including its live colour), live implicit background, selection
+    /// (including its live colours), and snapshot metadata; hosts must stamp or
+    /// clear their own overlay and presentation-transform fields on each frame.
     #[must_use]
     pub fn empty() -> Self {
         RenderInput {
@@ -1184,16 +1319,130 @@ impl RenderInput {
             grid_bot_row: 0,
             fx_clip: None,
             selection: TextSelection::new(),
+            selection_clip: None,
+            selection_bg: COLOR_UNSET,
+            selection_fg: COLOR_UNSET,
             clusters: Vec::new(),
             combining: Vec::new(),
             line_sizes: Vec::new(),
             line_size_spans: Vec::new(),
+            default_bg_spans: Vec::new(),
             images: Vec::new(),
             default_bg: COLOR_UNSET,
             cursor_color: COLOR_UNSET,
             snapshot_seq: 0,
             input_hot: false,
         }
+    }
+
+    /// Whether a frame-space cell is selected after applying both the terminal's
+    /// logical selection and any host composition clip.
+    ///
+    /// This is the single renderer predicate: CPU and GPU callers pass the frame
+    /// row/column they are about to paint, and this method performs the viewport
+    /// (`display_offset`) projection before consulting [`TextSelection`].
+    #[must_use]
+    #[inline]
+    pub fn selection_contains_cell(
+        &self,
+        frame_row: usize,
+        frame_col: usize,
+        is_wide: bool,
+        is_wide_continuation: bool,
+    ) -> bool {
+        if self
+            .selection_clip
+            .is_some_and(|clip| !clip.contains(frame_row, frame_col))
+        {
+            return false;
+        }
+        let selection_row = i32::try_from(frame_row)
+            .unwrap_or(i32::MAX)
+            .saturating_sub(self.display_offset);
+        let Ok(selection_col) = u16::try_from(frame_col) else {
+            return false;
+        };
+        self.selection
+            .contains_cell(selection_row, selection_col, is_wide, is_wide_continuation)
+    }
+
+    /// The inclusive selected column span on one FRAME row after applying the
+    /// viewport projection and optional split-composition clip.
+    ///
+    /// The span is content-independent and conservatively covers
+    /// [`TextSelection`]'s row predicates. Block selections expand one column on
+    /// each side before clipping, because a wide lead/continuation can snap one
+    /// adjacent cell into the painted selection. Renderers use it both for
+    /// row-scoped damage and to skip sparse implicit tails on rows the selection
+    /// cannot reach.
+    #[must_use]
+    pub fn selection_row_span(&self, frame_row: usize) -> Option<(u16, u16)> {
+        use crate::selection::SelectionType;
+
+        if !self.selection.has_selection() {
+            return None;
+        }
+        let selection_row = i32::try_from(frame_row)
+            .unwrap_or(i32::MAX)
+            .saturating_sub(self.display_offset);
+        let (mut lo, mut hi) = match self.selection.selection_type() {
+            SelectionType::Lines => {
+                let (start_row, _, end_row, _) = self.selection.normalized_bounds();
+                if selection_row < start_row || selection_row > end_row {
+                    return None;
+                }
+                (0, u16::MAX)
+            }
+            SelectionType::Block => {
+                let (start_row, start_col, end_row, end_col) =
+                    self.selection.side_adjusted_bounds()?;
+                if selection_row < start_row.min(end_row) || selection_row > start_row.max(end_row)
+                {
+                    return None;
+                }
+                (
+                    start_col.min(end_col).saturating_sub(1),
+                    start_col.max(end_col).saturating_add(1),
+                )
+            }
+            _ => {
+                let (start_row, start_col, end_row, end_col) =
+                    self.selection.side_adjusted_bounds()?;
+                if selection_row < start_row || selection_row > end_row {
+                    return None;
+                }
+                (
+                    if selection_row == start_row {
+                        start_col
+                    } else {
+                        0
+                    },
+                    if selection_row == end_row {
+                        end_col
+                    } else {
+                        u16::MAX
+                    },
+                )
+            }
+        };
+
+        if let Some(clip) = self.selection_clip {
+            if frame_row < clip.row_start
+                || frame_row >= clip.row_end
+                || clip.col_start >= clip.col_end
+            {
+                return None;
+            }
+            let clip_lo = u16::try_from(clip.col_start).ok()?;
+            let clip_hi_exclusive = clip.col_end.min(usize::from(u16::MAX).saturating_add(1));
+            if clip_hi_exclusive == 0 {
+                return None;
+            }
+            let clip_hi = u16::try_from(clip_hi_exclusive - 1).unwrap_or(u16::MAX);
+            lo = lo.max(clip_lo);
+            hi = hi.min(clip_hi);
+        }
+        (lo <= hi).then_some((lo, hi))
     }
 
     /// Drop every host-owned VISUAL BLING layer, leaving only the terminal cell content
@@ -1215,6 +1464,7 @@ impl RenderInput {
         self.glow_halo.clear();
         self.glow_under.clear();
         self.fire_patch.clear();
+        self.cursor_fill_override = None;
         self.word_decorations.clear();
         self.ink.clear();
         self.char_fg.clear();
@@ -1255,6 +1505,30 @@ impl RenderInput {
         row.binary_search_by_key(&col, |(c, _)| *c)
             .ok()
             .map(|i| row[i].1.as_ref())
+    }
+
+    /// The live default background governing viewport cell `(row, col)`.
+    ///
+    /// Composed split frames can carry one sorted [`DefaultBgSpan`] per pane.
+    /// Missing/empty rows, divider gaps, and malformed spans fall back to the
+    /// historical frame-wide [`default_bg`](Self::default_bg). The returned
+    /// value remains `COLOR_UNSET` when that is what the producer supplied;
+    /// renderers resolve that sentinel against their configured theme.
+    #[must_use]
+    pub fn default_bg_at(&self, row: usize, col: usize) -> u32 {
+        let Some(spans) = self.default_bg_spans.get(row) else {
+            return self.default_bg;
+        };
+        let i = spans.partition_point(|span| span.end_col <= col);
+        spans
+            .get(i)
+            .filter(|span| {
+                span.start_col < span.end_col
+                    && span.end_col <= self.cols
+                    && span.start_col <= col
+                    && col < span.end_col
+            })
+            .map_or(self.default_bg, |span| span.default_bg)
     }
 
     /// The inline-image reference covering viewport cell `(row, col)`, if any.
@@ -1538,6 +1812,195 @@ mod z_index_tests {
         assert_eq!(input.image_at(0, 100).map(|r| r.image.z_index), Some(2));
         assert!(input.image_at(0, 0).is_none(), "col 0 has no image");
         assert!(input.image_hides_glyph_at(0, 100), "z=2 image hides glyph");
+    }
+}
+
+#[cfg(test)]
+mod line_size_span_tests {
+    use super::{LineSizeSpan, RenderInput};
+    use crate::grid::LineSize;
+
+    #[test]
+    fn spans_are_render_content_and_survive_both_clone_paths() {
+        let mut source = RenderInput::empty();
+        source.rows = 1;
+        source.cols = 9;
+        source.line_sizes = vec![LineSize::SingleWidth];
+        source.line_size_spans = vec![vec![
+            LineSizeSpan::new(0, 4, LineSize::DoubleWidth),
+            LineSizeSpan::new(5, 9, LineSize::SingleWidth),
+        ]];
+
+        let cloned = source.clone();
+        assert_eq!(cloned.line_size_spans, source.line_size_spans);
+        assert_eq!(cloned, source);
+
+        let mut reused = RenderInput::empty();
+        reused.line_size_spans = vec![vec![LineSizeSpan::new(0, 99, LineSize::DoubleHeightBottom)]];
+        reused.clone_from(&source);
+        assert_eq!(reused.line_size_spans, source.line_size_spans);
+        assert_eq!(reused, source);
+
+        let mut changed = source.clone();
+        changed.line_size_spans[0][0].line_size = LineSize::SingleWidth;
+        assert_ne!(
+            changed, source,
+            "pane-local DEC geometry changes rendered pixels"
+        );
+    }
+
+    #[test]
+    fn cursor_fill_override_is_content_cloned_and_cleared_with_overlays() {
+        let mut source = RenderInput::empty();
+        source.cursor_fill_override = Some(0x0012_3456);
+
+        let mut reused = RenderInput::empty();
+        reused.clone_from(&source);
+        assert_eq!(reused.cursor_fill_override, source.cursor_fill_override);
+        assert_eq!(reused, source);
+
+        let bare = RenderInput::empty();
+        assert_ne!(
+            source, bare,
+            "a stationary cursor fill color changes rendered content"
+        );
+
+        source.clear_overlays();
+        assert_eq!(source.cursor_fill_override, None);
+        assert_eq!(source, bare);
+    }
+}
+
+#[cfg(test)]
+mod default_bg_span_tests {
+    use super::{DefaultBgSpan, RenderInput, SelectionClip};
+
+    #[test]
+    fn lookup_uses_owning_pane_and_falls_back_for_gaps_or_malformed_spans() {
+        let mut input = RenderInput::empty();
+        input.rows = 2;
+        input.cols = 10;
+        input.default_bg = 0x0001_0203;
+        input.default_bg_spans = vec![
+            vec![
+                DefaultBgSpan::new(0, 4, 0x0011_2233),
+                DefaultBgSpan::new(5, 10, 0x0044_5566),
+            ],
+            vec![DefaultBgSpan::new(2, 99, 0x0077_8899)],
+        ];
+
+        assert_eq!(input.default_bg_at(0, 0), 0x0011_2233);
+        assert_eq!(input.default_bg_at(0, 3), 0x0011_2233);
+        assert_eq!(
+            input.default_bg_at(0, 4),
+            input.default_bg,
+            "divider gap inherits the frame scalar"
+        );
+        assert_eq!(input.default_bg_at(0, 5), 0x0044_5566);
+        assert_eq!(input.default_bg_at(0, 9), 0x0044_5566);
+        assert_eq!(
+            input.default_bg_at(1, 2),
+            input.default_bg,
+            "out-of-bounds producer spans fail closed to the scalar"
+        );
+        assert_eq!(
+            input.default_bg_at(99, 0),
+            input.default_bg,
+            "missing rows retain the historical scalar path"
+        );
+    }
+
+    #[test]
+    fn spans_are_render_content_and_survive_both_clone_paths() {
+        let mut source = RenderInput::empty();
+        source.rows = 1;
+        source.cols = 8;
+        source.selection_bg = 0x0001_0203;
+        source.selection_fg = 0x0004_0506;
+        source.selection_clip = Some(SelectionClip::new(0, 1, 4, 8));
+        source.default_bg_spans = vec![vec![
+            DefaultBgSpan::new(0, 4, 0x0011_2233),
+            DefaultBgSpan::new(4, 8, 0x0044_5566),
+        ]];
+
+        let cloned = source.clone();
+        assert_eq!(cloned.default_bg_spans, source.default_bg_spans);
+        assert_eq!(cloned.selection_bg, source.selection_bg);
+        assert_eq!(cloned.selection_fg, source.selection_fg);
+        assert_eq!(cloned.selection_clip, source.selection_clip);
+        assert_eq!(cloned, source);
+
+        let mut reused = RenderInput::empty();
+        reused.default_bg_spans = vec![vec![DefaultBgSpan::new(0, 99, 0x00aa_bbcc)]];
+        reused.clone_from(&source);
+        assert_eq!(reused.default_bg_spans, source.default_bg_spans);
+        assert_eq!(reused.selection_bg, source.selection_bg);
+        assert_eq!(reused.selection_fg, source.selection_fg);
+        assert_eq!(reused.selection_clip, source.selection_clip);
+        assert_eq!(reused, source);
+
+        let mut changed = source.clone();
+        changed.default_bg_spans[0][0].default_bg ^= 0x0001_0101;
+        assert_ne!(
+            changed, source,
+            "pane-local default provenance changes rendered pixels"
+        );
+
+        let mut changed = source.clone();
+        changed.selection_bg ^= 0x0001_0101;
+        assert_ne!(changed, source, "live selection bg changes rendered pixels");
+
+        let mut changed = source.clone();
+        changed.selection_fg ^= 0x0001_0101;
+        assert_ne!(changed, source, "live selection fg changes rendered pixels");
+
+        let mut changed = source.clone();
+        changed.selection_clip = Some(SelectionClip::new(0, 1, 5, 8));
+        assert_ne!(
+            changed, source,
+            "split selection bounds change rendered pixels"
+        );
+    }
+}
+
+#[cfg(test)]
+mod selection_clip_tests {
+    use super::{RenderInput, SelectionClip};
+    use crate::selection::{SelectionSide, SelectionType};
+
+    #[test]
+    fn multiline_selection_is_confined_to_its_frame_rectangle() {
+        let mut input = RenderInput::empty();
+        input.rows = 5;
+        input.cols = 14;
+        input
+            .selection
+            .start_selection(1, 7, SelectionSide::Left, SelectionType::Simple);
+        input.selection.update_selection(3, 8, SelectionSide::Right);
+        input.selection.complete_selection();
+        input.selection_clip = Some(SelectionClip::new(1, 4, 6, 11));
+
+        assert!(input.selection_contains_cell(1, 7, false, false));
+        assert!(input.selection_contains_cell(2, 6, false, false));
+        assert!(input.selection_contains_cell(2, 10, false, false));
+        assert!(input.selection_contains_cell(3, 8, false, false));
+
+        assert!(
+            !input.selection_contains_cell(2, 5, true, false),
+            "wide-cell snapping may not escape through the clip's left edge"
+        );
+        assert!(
+            !input.selection_contains_cell(2, 11, false, true),
+            "a wide continuation may not escape through the clip's right edge"
+        );
+        assert!(
+            !input.selection_contains_cell(0, 7, false, false),
+            "rows above the focused pane stay unselected"
+        );
+        assert!(
+            !input.selection_contains_cell(4, 7, false, false),
+            "rows below the focused pane stay unselected"
+        );
     }
 }
 

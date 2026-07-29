@@ -10,7 +10,7 @@
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{Terminal, TerminalBuilder};
-use aterm_render::{Frame, Renderer, Theme};
+use aterm_render::{Frame, Renderer, SelectionClip, Theme};
 
 fn r(p: u32) -> i32 {
     ((p >> 16) & 0xff) as i32
@@ -82,6 +82,145 @@ fn selected_cells_get_selection_background() {
         fg_drawn,
         "selected cell (0,2) should keep its foreground glyph"
     );
+}
+
+#[test]
+fn osc_selection_background_and_foreground_reach_selected_pixels() {
+    let Some(mut rend) = renderer() else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = rend.cell_size();
+    let mut term = selected_term();
+    term.process(b"\x1b]17;rgb:12/34/56\x07\x1b]19;rgb:fe/cd/32\x07");
+    let input = term.cell_frame(4, 10);
+    assert_eq!(input.selection_bg, 0x0012_3456);
+    assert_eq!(input.selection_fg, 0x00fe_cd32);
+
+    let frame = rend.render_input(&input);
+    let pixels = cell_pixels(&frame, cw, ch, 0, 2);
+    assert!(
+        count_eq(&pixels, 0x0012_3456) > pixels.len() / 3,
+        "OSC 17 must replace the static theme selection fill"
+    );
+    assert!(
+        pixels
+            .iter()
+            .any(|&p| r(p) > 220 && g(p) > 160 && b(p) < 100),
+        "OSC 19 must replace selected-text ink"
+    );
+    assert_eq!(
+        count_eq(&pixels, Theme::default().selection),
+        0,
+        "the old theme selection colour must not leak through"
+    );
+}
+
+#[test]
+fn selected_sparse_tail_paints_implicit_blanks_and_covers_deepest_image() {
+    let Some(mut rend) = renderer() else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = rend.cell_size();
+    let (rows, cols) = (2usize, 8usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"x");
+    let sel = term.text_selection_mut();
+    sel.start_selection(0, 4, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(0, 6, SelectionSide::Right);
+    sel.complete_selection();
+
+    let mut input = term.cell_frame(rows, cols);
+    input.cursor_visible = false;
+    assert_eq!(
+        input.cells[0].len(),
+        1,
+        "fixture requires cols 4..=6 to be omitted sparse-tail cells"
+    );
+    let image = std::sync::Arc::new(aterm_core::grid::extra::ImageData {
+        bytes: vec![240, 20, 80, 255],
+        format: aterm_core::grid::extra::ImageFormat::RawRgba8 {
+            width: 1,
+            height: 1,
+        },
+        cols: 1,
+        rows: 1,
+        z_index: aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD - 1,
+    });
+    input.images[0].push((
+        5,
+        aterm_core::grid::extra::ImageRef {
+            image,
+            cell_row: 0,
+            cell_col: 0,
+        },
+    ));
+
+    let frame = rend.render_input(&input);
+    let selection = Theme::default().selection;
+    for col in 4..=6 {
+        assert!(
+            input.cells[0].get(col).is_none(),
+            "col {col} must remain unmaterialized"
+        );
+        let pixels = cell_pixels(&frame, cw, ch, 0, col);
+        assert_eq!(
+            count_eq(&pixels, selection),
+            pixels.len(),
+            "selected implicit blank col {col} must be entirely selection-filled"
+        );
+    }
+    assert_eq!(
+        count_eq(&cell_pixels(&frame, cw, ch, 0, 5), 0x00f0_1450),
+        0,
+        "selection must cover a deepest-tier image in an omitted cell"
+    );
+    let untouched = cell_pixels(&frame, cw, ch, 0, 7);
+    assert_eq!(
+        count_eq(&untouched, Theme::default().bg),
+        untouched.len(),
+        "an unselected omitted cell remains the frame default background"
+    );
+}
+
+#[test]
+fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
+    let Some(mut rend) = renderer() else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = rend.cell_size();
+    let (rows, cols) = (3usize, 9usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    let selection = term.text_selection_mut();
+    selection.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
+    selection.update_selection(2, 7, SelectionSide::Right);
+    selection.complete_selection();
+
+    let mut input = term.cell_frame(rows, cols);
+    input.cursor_visible = false;
+    input.selection_bg = 0x0021_4365;
+    input.selection_clip = Some(SelectionClip::new(0, rows, 5, cols));
+    let frame = rend.render_input(&input);
+
+    for (row, col) in [(0, 5), (0, 8), (1, 5), (1, 8), (2, 5), (2, 7)] {
+        let pixels = cell_pixels(&frame, cw, ch, row, col);
+        assert_eq!(
+            count_eq(&pixels, input.selection_bg),
+            pixels.len(),
+            "focused-pane selected cell ({row},{col}) must be fully highlighted"
+        );
+    }
+    for (row, col) in [(0, 4), (1, 0), (1, 4), (2, 4), (2, 8)] {
+        let pixels = cell_pixels(&frame, cw, ch, row, col);
+        assert_eq!(
+            count_eq(&pixels, Theme::default().bg),
+            pixels.len(),
+            "sibling/divider cell ({row},{col}) must not receive selection tint"
+        );
+        assert_eq!(count_eq(&pixels, input.selection_bg), 0);
+    }
 }
 
 #[test]

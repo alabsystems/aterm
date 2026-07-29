@@ -45,6 +45,7 @@
 use aterm_scrollback::{Line, ScrollbackStorage};
 
 use super::Grid;
+use super::state::PendingScrollbackSettings;
 use crate::Damage;
 
 /// The off-screen scrollback of a grid, detached and awaiting off-thread rewrap
@@ -375,6 +376,20 @@ impl Grid {
         let prev_offset = self.storage.display_offset; // bug D: reader's scroll pos pre-resize
         let clear_gen = self.storage.scrollback_clear_gen; // bug C: erase generation at detach
         let lazy_lines: Vec<Line> = self.storage.lazy_buffer.drain_all().collect();
+        // Keep the store's effective settings observable while the worker owns
+        // it. Mutators update this snapshot and mark the corresponding dirty
+        // bit; re-attach replays only values that actually changed.
+        let pending_settings = PendingScrollbackSettings {
+            line_limit: self.storage.scrollback_line_limit(),
+            memory_budget: self
+                .storage
+                .scrollback
+                .as_ref()
+                .expect("scrollback.is_none() early-returned above")
+                .memory_budget(),
+            line_limit_changed: false,
+            memory_budget_changed: false,
+        };
         let store = self
             .storage
             .scrollback
@@ -390,6 +405,7 @@ impl Grid {
         // the plain path): from here until re-attach, scroll-off keeps being staged
         // to the lazy buffer instead of dropped (audit bug B).
         self.storage.scrollback_detached_for_reflow = true;
+        self.storage.pending_scrollback_settings = Some(pending_settings);
 
         Some(PendingScrollbackReflow {
             store,
@@ -418,6 +434,7 @@ impl Grid {
         if self.storage.scrollback.is_some() {
             // A terminal reset re-created the tiered store during the reflow; don't
             // clobber it (would corrupt history ordering). The reflowed store drops.
+            self.reconcile_pending_scrollback_settings();
             return;
         }
 
@@ -428,6 +445,7 @@ impl Grid {
             let mut store = reflowed.store;
             let _ = store.clear();
             self.storage.scrollback = Some(store);
+            self.reconcile_pending_scrollback_settings();
             self.drain_lazy_buffer(); // post-erase window output (erase cleared the pre-erase lazy)
             self.storage.display_offset = 0; // an erase resets the scroll position
             self.storage.damage = Damage::Full;
@@ -436,6 +454,7 @@ impl Grid {
         }
 
         self.storage.scrollback = Some(reflowed.store);
+        self.reconcile_pending_scrollback_settings();
         // Audit bug B: flush the lines that scrolled off during the window (staged in
         // the lazy buffer) into the store AFTER the reflowed old history — yielding
         // the documented order [old history | window output | live ring].
@@ -452,6 +471,28 @@ impl Grid {
         }
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
+    }
+
+    /// Replay scrollback settings changed while the tiered store was detached.
+    ///
+    /// The byte budget is applied first so draining staged window output cannot
+    /// evict against a stale, lower budget. A line-limit setter may itself drain
+    /// that staged output before truncating the unified ring+store retained set.
+    fn reconcile_pending_scrollback_settings(&mut self) {
+        let Some(settings) = self.storage.pending_scrollback_settings.take() else {
+            return;
+        };
+        if settings.memory_budget_changed
+            && self.storage.scrollback.is_some()
+            && let Err(error) = self.set_scrollback_memory_budget(settings.memory_budget)
+        {
+            aterm_log::warn!(
+                "re-attached scrollback could not fully enforce deferred memory budget: {error}"
+            );
+        }
+        if settings.line_limit_changed {
+            self.set_scrollback_line_limit(settings.line_limit);
+        }
     }
 
     /// True while a detach window is open: the tiered store is out for an
@@ -480,11 +521,31 @@ impl Grid {
             return;
         }
         self.storage.scrollback_detached_for_reflow = false;
-        // Fall back to ring-only scrollback: the tiered store is gone, so the lazy
-        // buffer's window output can no longer be tiered — discard it (bounded)
-        // rather than let it sit un-drainable. The pre-window history was already
-        // lost with the worker; this only stops the leak + permanent wedge.
-        self.storage.lazy_buffer.clear();
+        if self.storage.scrollback.is_some() {
+            // A reset/recovery path installed a replacement store before the
+            // failed worker was noticed. It is authoritative: replay the newest
+            // settings and preserve window output by draining into it.
+            self.reconcile_pending_scrollback_settings();
+            self.drain_lazy_buffer();
+        } else {
+            // Fall back to ring-only scrollback: the tiered store is gone, so
+            // the lazy buffer's window output can no longer be tiered — discard
+            // it (bounded) rather than leave it un-drainable.
+            self.storage.lazy_buffer.clear();
+
+            // A LOWER requested total still tightens the surviving ring. Never
+            // expand this emergency fallback for a higher/unlimited request:
+            // abort exists to recover to the construction-bounded ring after
+            // the worker (and its long-term store) was lost. A byte budget has
+            // no backend here and is intentionally discarded.
+            if let Some(settings) = self.storage.pending_scrollback_settings.take()
+                && settings.line_limit_changed
+                && let Some(limit) = settings.line_limit
+                && limit < self.storage.max_scrollback
+            {
+                self.set_scrollback_line_limit(Some(limit));
+            }
+        }
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
     }
@@ -587,6 +648,354 @@ mod tests {
                 ReflowStep::Done(done) => return (done, steps),
             }
         }
+    }
+
+    #[test]
+    fn detached_settings_apply_on_normal_reattach() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        g.set_scrollback_line_limit(Some(200));
+        g.set_scrollback_memory_budget(7_000_000)
+            .expect("initial budget");
+        for i in 0..400 {
+            logical_line(&mut g, &format!("H{i}"));
+        }
+        assert!(g.storage.pending_scrollback_settings.is_none());
+
+        let job = g
+            .resize_offloading_scrollback(rows, 20)
+            .expect("tiered store detaches");
+        assert!(
+            g.storage.pending_scrollback_settings.is_some(),
+            "settings snapshot exists exactly while detach is unresolved"
+        );
+        assert_eq!(
+            g.scrollback_line_limit(),
+            Some(200),
+            "detach keeps the effective total observable"
+        );
+        assert_eq!(g.scrollback_memory_budget(), Some(7_000_000));
+
+        g.set_scrollback_line_limit(Some(40));
+        g.set_scrollback_memory_budget(4_000_000)
+            .expect("detached mutation is deferred");
+        assert_eq!(g.scrollback_line_limit(), Some(40));
+        assert_eq!(g.scrollback_memory_budget(), Some(4_000_000));
+        assert!(g.scrollback().is_none(), "the worker still owns the store");
+
+        g.reattach_reflowed_scrollback(job.reflow());
+        assert!(
+            g.storage.pending_scrollback_settings.is_none(),
+            "reattach consumes the snapshot exactly once"
+        );
+        let store = g.scrollback().expect("store re-attached");
+        assert_eq!(g.scrollback_line_limit(), Some(40));
+        assert_eq!(
+            store.line_limit(),
+            Some(32),
+            "raw store share is total 40 minus the fixed 8-line ring"
+        );
+        assert_eq!(store.memory_budget(), 4_000_000);
+        assert!(
+            g.scrollback_lines() <= 40,
+            "deferred shrink enforces the unified total immediately"
+        );
+        g.assert_invariants();
+    }
+
+    #[test]
+    fn detached_unlimited_limit_round_trips_on_reattach() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        g.set_scrollback_line_limit(Some(40));
+        for i in 0..100 {
+            logical_line(&mut g, &format!("U{i}"));
+        }
+
+        let job = g
+            .resize_offloading_scrollback(rows, 20)
+            .expect("tiered store detaches");
+        g.set_scrollback_line_limit(None);
+        assert_eq!(
+            g.scrollback_line_limit(),
+            None,
+            "nested pending state must distinguish unlimited from no mutation"
+        );
+
+        g.reattach_reflowed_scrollback(job.reflow());
+        assert!(g.storage.pending_scrollback_settings.is_none());
+        assert_eq!(g.scrollback_line_limit(), None);
+        assert_eq!(
+            g.scrollback().expect("store re-attached").line_limit(),
+            None,
+            "unlimited reaches the raw store"
+        );
+        g.assert_invariants();
+    }
+
+    #[test]
+    fn detached_settings_survive_clear_before_reattach() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        logical_line(&mut g, "PRE_CLEAR_ONLY");
+        for i in 0..200 {
+            logical_line(&mut g, &format!("C{i}"));
+        }
+
+        let job = g
+            .resize_offloading_scrollback(rows, 20)
+            .expect("tiered store detaches");
+        g.set_scrollback_line_limit(Some(25));
+        g.set_scrollback_memory_budget(3_000_000)
+            .expect("detached mutation is deferred");
+        g.erase_scrollback();
+        for i in 0..30 {
+            logical_line(&mut g, &format!("POST_CLEAR_{i}"));
+        }
+
+        g.reattach_reflowed_scrollback(job.reflow());
+        let store = g.scrollback().expect("cleared store re-attached");
+        assert_eq!(g.scrollback_line_limit(), Some(25));
+        assert_eq!(store.line_limit(), Some(17));
+        assert_eq!(store.memory_budget(), 3_000_000);
+        let history = (0..g.scrollback_lines())
+            .filter_map(|i| g.get_history_line(i))
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(
+            history.contains("POST_CLEAR_"),
+            "output produced after clear survives the detach window"
+        );
+        assert!(
+            !history.contains("PRE_CLEAR_ONLY"),
+            "clear during reflow must not resurrect pre-clear history"
+        );
+        assert!(g.storage.pending_scrollback_settings.is_none());
+        g.assert_invariants();
+    }
+
+    #[test]
+    fn detached_settings_apply_to_replacement_store_race() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        for i in 0..200 {
+            logical_line(&mut g, &format!("R{i}"));
+        }
+
+        let job = g
+            .resize_offloading_scrollback(rows, 20)
+            .expect("tiered store detaches");
+        g.set_scrollback_line_limit(Some(30));
+        g.set_scrollback_memory_budget(2_000_000)
+            .expect("detached mutation is deferred");
+        g.erase_scrollback();
+        let mut replacement: ScrollbackStorage = Scrollback::new(64, 512, 6_000_000).into();
+        replacement
+            .push_line(Line::from("REPLACEMENT_STORE_ONLY"))
+            .expect("seed replacement");
+        g.attach_scrollback(replacement);
+        assert_eq!(
+            g.scrollback_line_limit(),
+            Some(30),
+            "dirty settings apply as soon as the replacement attaches"
+        );
+        assert_eq!(g.scrollback_memory_budget(), Some(2_000_000));
+
+        // A newer mutation after replacement attach must win over both the
+        // original request and the stale worker's settings.
+        g.set_scrollback_line_limit(Some(35));
+        g.set_scrollback_memory_budget(1_500_000)
+            .expect("latest replacement budget");
+
+        g.reattach_reflowed_scrollback(job.reflow());
+        let store = g.scrollback().expect("replacement store remains attached");
+        assert!(
+            (0..store.line_count()).any(|i| {
+                store
+                    .get_line(i)
+                    .ok()
+                    .flatten()
+                    .and_then(|line| line.as_str().map(|text| text == "REPLACEMENT_STORE_ONLY"))
+                    .unwrap_or(false)
+            }),
+            "the stale worker store must not clobber replacement content"
+        );
+        assert_eq!(g.scrollback_line_limit(), Some(35));
+        assert_eq!(store.line_limit(), Some(27));
+        assert_eq!(store.memory_budget(), 1_500_000);
+        assert!(g.storage.pending_scrollback_settings.is_none());
+        g.assert_invariants();
+    }
+
+    #[test]
+    fn clean_detach_snapshot_adopts_replacement_store_settings() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        for i in 0..100 {
+            logical_line(&mut g, &format!("B{i}"));
+        }
+        let job = g
+            .resize_offloading_scrollback(rows, 20)
+            .expect("tiered store detaches");
+        g.erase_scrollback();
+
+        let mut replacement: ScrollbackStorage = Scrollback::new(64, 512, 2_500_000).into();
+        replacement.set_line_limit(Some(12));
+        replacement
+            .push_line(Line::from("NEW_BASELINE"))
+            .expect("seed replacement");
+        g.attach_scrollback(replacement);
+        assert_eq!(
+            g.scrollback_line_limit(),
+            Some(20),
+            "clean snapshot follows replacement raw 12 + ring 8"
+        );
+        assert_eq!(g.scrollback_memory_budget(), Some(2_500_000));
+
+        g.reattach_reflowed_scrollback(job.reflow());
+        let store = g.scrollback().expect("replacement remains authoritative");
+        assert_eq!(g.scrollback_line_limit(), Some(20));
+        assert_eq!(store.line_limit(), Some(12));
+        assert_eq!(store.memory_budget(), 2_500_000);
+        assert!(g.storage.pending_scrollback_settings.is_none());
+        g.assert_invariants();
+    }
+
+    #[test]
+    fn detached_line_limit_applies_to_ring_after_abort() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        for i in 0..200 {
+            logical_line(&mut g, &format!("A{i}"));
+        }
+
+        let job = g
+            .resize_offloading_scrollback(rows, 20)
+            .expect("tiered store detaches");
+        g.set_scrollback_line_limit(Some(5));
+        g.set_scrollback_memory_budget(1_000_000)
+            .expect("detached mutation is deferred");
+        drop(job);
+        g.abort_reflow_offload();
+
+        assert!(g.storage.pending_scrollback_settings.is_none());
+        assert!(g.scrollback().is_none(), "the failed worker lost its store");
+        assert_eq!(
+            g.scrollback_memory_budget(),
+            None,
+            "a byte budget has no backend after abort"
+        );
+        assert_eq!(
+            g.scrollback_line_limit(),
+            Some(5),
+            "the requested total still caps the surviving ring"
+        );
+        for i in 0..100 {
+            logical_line(&mut g, &format!("P{i}"));
+        }
+        assert_eq!(g.scrollback_lines(), 5);
+        g.assert_invariants();
+    }
+
+    #[test]
+    fn abort_never_expands_fallback_ring_for_raise_or_unlimited() {
+        for requested in [Some(100), None] {
+            let (rows, cols) = (10u16, 40u16);
+            let mut g = tiered_grid(rows, cols, 8);
+            for i in 0..100 {
+                logical_line(&mut g, &format!("E{i}"));
+            }
+            let job = g
+                .resize_offloading_scrollback(rows, 20)
+                .expect("tiered store detaches");
+            g.set_scrollback_line_limit(requested);
+            drop(job);
+            g.abort_reflow_offload();
+
+            assert_eq!(
+                g.scrollback_line_limit(),
+                Some(8),
+                "emergency ring stays construction-bounded for request {requested:?}"
+            );
+            assert!(g.storage.pending_scrollback_settings.is_none());
+            for i in 0..100 {
+                logical_line(&mut g, &format!("F{i}"));
+            }
+            assert_eq!(g.scrollback_lines(), 8);
+            g.assert_invariants();
+        }
+    }
+
+    #[test]
+    fn abort_preserves_staged_output_when_replacement_store_exists() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        for i in 0..100 {
+            logical_line(&mut g, &format!("OLD{i}"));
+        }
+        let job = g
+            .resize_offloading_scrollback(rows, 20)
+            .expect("tiered store detaches");
+        g.erase_scrollback();
+        g.set_scrollback_line_limit(Some(100));
+        g.set_scrollback_memory_budget(2_000_000)
+            .expect("defer replacement budget");
+
+        let mut replacement: ScrollbackStorage = Scrollback::new(64, 512, 6_000_000).into();
+        replacement
+            .push_line(Line::from("ABORT_REPLACEMENT_BASE"))
+            .expect("seed replacement");
+        g.attach_scrollback(replacement);
+        g.set_compress_offload_active(true);
+        for i in 0..30 {
+            logical_line(&mut g, &format!("WINDOW_AFTER_REPLACEMENT_{i}"));
+        }
+        assert!(
+            g.lazy_backlog_len() > 0,
+            "precondition: replacement-window rows are staged"
+        );
+
+        drop(job);
+        g.abort_reflow_offload();
+        assert!(!g.reflow_offload_in_flight());
+        assert_eq!(g.lazy_backlog_len(), 0, "abort drains into replacement");
+        assert!(g.storage.pending_scrollback_settings.is_none());
+        assert_eq!(g.scrollback_line_limit(), Some(100));
+        assert_eq!(g.scrollback_memory_budget(), Some(2_000_000));
+        let history = (0..g.scrollback_lines())
+            .filter_map(|i| g.get_history_line(i))
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(history.contains("ABORT_REPLACEMENT_BASE"));
+        assert!(
+            history.contains("WINDOW_AFTER_REPLACEMENT_"),
+            "abort must preserve rows staged after replacement attach"
+        );
+        g.assert_invariants();
+    }
+
+    #[test]
+    fn attached_memory_budget_settles_lazy_rows_under_new_budget() {
+        let (rows, cols) = (10u16, 40u16);
+        let mut g = tiered_grid(rows, cols, 8);
+        g.set_compress_offload_active(true);
+        for i in 0..100 {
+            logical_line(&mut g, &format!("M{i}"));
+        }
+        assert!(g.lazy_backlog_len() > 0, "precondition: rows are staged");
+        let before = g.scrollback_lines();
+
+        g.set_scrollback_memory_budget(4_000_000)
+            .expect("new budget enforces after staged rows are drained");
+
+        assert_eq!(g.lazy_backlog_len(), 0);
+        assert_eq!(g.scrollback_memory_budget(), Some(4_000_000));
+        assert_eq!(
+            g.scrollback_lines(),
+            before,
+            "a generous budget moves staged rows without losing history"
+        );
+        g.assert_invariants();
     }
 
     /// Measurement harness for the per-line rewrap cost — the number the wasm

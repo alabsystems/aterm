@@ -44,12 +44,16 @@ impl GridStorage {
     /// ONE TOTAL retention count (audit E1): tiered grids report the store's
     /// limit PLUS the ring cap — the inverse of the unified split
     /// `Grid::set_scrollback_line_limit` applies — so a set/get round-trips
-    /// the same number. An unlimited store reads as `None`; so does a store
-    /// temporarily detached for an off-thread reflow (its limit is
-    /// unobservable then, the pre-existing behavior). Ring-only grids have
-    /// no store — the ring cap IS retention.
+    /// the same number. During an off-thread reflow the store's detach-time
+    /// value (or the newest deferred mutation) remains observable. Ring-only
+    /// grids have no store — the ring cap IS retention.
     #[must_use]
     pub fn scrollback_line_limit(&self) -> Option<usize> {
+        if self.scrollback_detached_for_reflow
+            && let Some(settings) = self.pending_scrollback_settings
+        {
+            return settings.line_limit;
+        }
         if self.scrollback.is_some() || self.scrollback_detached_for_reflow {
             return self
                 .scrollback
@@ -60,6 +64,20 @@ impl GridStorage {
                 .map(|store_limit| store_limit.saturating_add(self.max_scrollback));
         }
         (self.max_scrollback < super::UNLIMITED_RING_SCROLLBACK).then_some(self.max_scrollback)
+    }
+
+    /// Effective tiered-store byte budget, including a mutation deferred while
+    /// the store is detached for off-thread reflow.
+    #[must_use]
+    pub fn scrollback_memory_budget(&self) -> Option<usize> {
+        if self.scrollback_detached_for_reflow
+            && let Some(settings) = self.pending_scrollback_settings
+        {
+            return Some(settings.memory_budget);
+        }
+        self.scrollback
+            .as_ref()
+            .map(ScrollbackStorage::memory_budget)
     }
 
     /// True when evicted ring rows must be STAGED for tiered retention

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// ON-GLASS BLIT coverage — the present-path fullscreen-triangle blit (`vs_blit` +
-// `fs_blit`) that copies the offscreen frame into the swapchain.
+// APPLICATION BLIT coverage — the present-path fullscreen-triangle blit
+// (`vs_blit` + `fs_blit`) that copies the offscreen frame into the swapchain
+// destination.
 //
 // The real `GpuRenderer::present_input` does NOT re-render into the window; it
 // BLITS the single-source-of-truth offscreen `Rgba8Unorm` texture into the
 // swapchain with a fullscreen triangle, sampled NEAREST. Two contracts:
-//   * `BlitUniform.flag == 0` (the normal present): the swapchain pixels are
-//     BYTE-IDENTICAL to the offscreen frame — a HARD invariant, since headless
-//     introspection reads the offscreen and on-screen must equal it.
+//   * `BlitUniform.flag == 0` (the normal application blit): the destination
+//     bytes are BYTE-IDENTICAL to the offscreen frame at the app-owned encoder
+//     boundary.
 //   * `BlitUniform.flag != 0` (the visual-bell flash): RGB is inverted
 //     (`1.0 - rgb`), the GPU twin of the CPU softbuffer `px ^ 0x00ffffff`.
 //
@@ -19,6 +20,7 @@
 // readable headless, so it drives the EXACT same blit pipeline + `fs_blit` shader
 // + `blit_sampler` (NEAREST) + `BlitUniform` against a readable `Rgba8Unorm`
 // target via the test-only `blit_to_offscreen_for_test`, and reads that back.
+// This stand-in test does not execute `present()`, WSI, compositor, or scanout.
 //
 // Gated: no GPU or no system font => the test no-ops (returns).
 
@@ -84,7 +86,7 @@ fn representative_input() -> RenderInput {
 /// PASSTHROUGH (invert = false): the blit output must be BYTE-IDENTICAL to the
 /// offscreen source for EVERY pixel. This is the hard "blit is byte-exact"
 /// invariant — NEAREST sampling at 1:1, no interpolation smear, no colour-space
-/// drift. A single mismatch is a real present-path bug, not a tolerance miss.
+/// drift. A single mismatch is an application blit-path bug, not a tolerance miss.
 #[test]
 fn blit_passthrough_is_byte_identical() {
     let Some(mut gpu) = fresh_gpu() else { return };

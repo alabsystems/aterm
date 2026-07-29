@@ -35,8 +35,12 @@
 //! differential suites.
 
 use aterm_core::terminal::Terminal;
-use aterm_gpu::{GpuRenderer, WindowGpu, hdr_present_plan, hdr_swapchain_wants_f16};
+use aterm_gpu::{
+    GpuRenderer, HdrReconfigurePlan, WindowGpu, hdr_live_upgrade_wants_f16, hdr_present_plan,
+    hdr_reconfigure_plan, hdr_swapchain_wants_f16,
+};
 use aterm_render::{GlowQuad, RenderInput, hdr, premul_rgb};
+use aterm_spec::derive::hdr_reconfigure_retag_model;
 
 /// Iterate every (hdr_glow, supports_f16, glow_nonempty) tuple over {false,true}^3.
 fn all_inputs() -> impl Iterator<Item = (bool, bool, bool)> {
@@ -103,6 +107,345 @@ fn hdr_gate_exhaustive_attach_present_chain() {
     }
 }
 
+/// Tier-1 lifecycle conformance for an f16 surface rebuilt by any live
+/// reconfiguration or checked after a same-size Windows HDR-state change. Drive
+/// the genuine shipping policy, project its result onto the derived model, and
+/// require the exact modeled successor for both re-tag outcomes.
+#[test]
+fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
+    let model = hdr_reconfigure_retag_model();
+    let initial = model.init_state();
+    let mut downgrade_fallbacks = 0usize;
+
+    for retagged in [false, true] {
+        let action = if retagged {
+            "RetagSucceeds"
+        } else {
+            "RetagFails"
+        };
+        assert!(
+            model.action_enabled(action, &initial),
+            "{action} must be enabled for the initial confirmed-HDR surface"
+        );
+        let successors = model.successors(action, &initial);
+        assert_eq!(
+            successors.len(),
+            1,
+            "{action} must have one deterministic modeled successor"
+        );
+        let modeled = &successors[0];
+
+        let plan = hdr_reconfigure_plan(true, retagged);
+        let (is_f16, capture_linear) = match plan {
+            HdrReconfigurePlan::KeepHdr => (1, 1),
+            HdrReconfigurePlan::FallbackToSdr => {
+                downgrade_fallbacks += 1;
+                (0, 0)
+            }
+            HdrReconfigurePlan::KeepSdr => {
+                panic!("an existing f16 surface cannot take the KeepSdr arm")
+            }
+        };
+        assert_eq!(modeled["stage"], 2);
+        assert_eq!(modeled["retagged"], if retagged { 1 } else { 0 });
+        assert_eq!(modeled["is_f16"], is_f16);
+        assert_eq!(modeled["capture_linear"], capture_linear);
+        for invariant in [
+            "FailedRetagFallsBackAtomically",
+            "ResolvedF16RequiresSuccessfulRetag",
+            "AwaitingUpgradeIsSdr",
+            "CaptureMatchesSurfaceEncoding",
+            "ValuesBounded",
+        ] {
+            assert!(
+                model.check_invariant(invariant, modeled),
+                "{action} shipping projection violated {invariant}: {modeled:?}"
+            );
+        }
+    }
+    assert_eq!(
+        downgrade_fallbacks, 1,
+        "exactly the failed f16 re-tag must select SDR fallback"
+    );
+
+    // Symmetric live HDR-on recovery starts from the retained capable SDR
+    // surface. After the output probe admits an attempt, configure+tag has the
+    // same two shipping policy outcomes as every other f16 recreation.
+    let sdr = model
+        .successors("EnterSdrFallback", &initial)
+        .into_iter()
+        .next()
+        .expect("the model must expose an eligible SDR fallback");
+    assert_eq!(sdr["stage"], 1);
+    assert_eq!(sdr["is_f16"], 0);
+    assert_eq!(sdr["capture_linear"], 0);
+    let mut upgrade_fallbacks = 0usize;
+    for retagged in [false, true] {
+        let action = if retagged {
+            "UpgradeSucceeds"
+        } else {
+            "UpgradeFails"
+        };
+        assert!(model.action_enabled(action, &sdr));
+        let modeled = model
+            .successors(action, &sdr)
+            .into_iter()
+            .next()
+            .expect("upgrade action must have one successor");
+        let plan = hdr_reconfigure_plan(true, retagged);
+        let (is_f16, capture_linear) = match plan {
+            HdrReconfigurePlan::KeepHdr => (1, 1),
+            HdrReconfigurePlan::FallbackToSdr => {
+                upgrade_fallbacks += 1;
+                (0, 0)
+            }
+            HdrReconfigurePlan::KeepSdr => {
+                panic!("an admitted f16 upgrade cannot take the KeepSdr arm")
+            }
+        };
+        assert_eq!(modeled["stage"], 2);
+        assert_eq!(modeled["retagged"], if retagged { 1 } else { 0 });
+        assert_eq!(modeled["is_f16"], is_f16);
+        assert_eq!(modeled["capture_linear"], capture_linear);
+        for invariant in [
+            "FailedRetagFallsBackAtomically",
+            "ResolvedF16RequiresSuccessfulRetag",
+            "AwaitingUpgradeIsSdr",
+            "CaptureMatchesSurfaceEncoding",
+            "ValuesBounded",
+        ] {
+            assert!(
+                model.check_invariant(invariant, &modeled),
+                "{action} shipping projection violated {invariant}: {modeled:?}"
+            );
+        }
+    }
+    assert_eq!(
+        upgrade_fallbacks, 1,
+        "a failed upgrade tag must restore exactly one SDR fallback"
+    );
+
+    // SDR reconfigures never become HDR merely because a meaningless re-tag
+    // boolean is true.
+    for retagged in [false, true] {
+        assert_eq!(
+            hdr_reconfigure_plan(false, retagged),
+            HdrReconfigurePlan::KeepSdr
+        );
+    }
+
+    // NEGATIVE CONTROL: the pre-fix live reconfigure ignored `false` and kept
+    // both f16 and linear capture metadata. That state is neither the model
+    // successor nor invariant-safe.
+    let mut ignored_failure = initial.clone();
+    ignored_failure.insert("stage", 2);
+    ignored_failure.insert("retagged", 0);
+    ignored_failure.insert("is_f16", 1);
+    ignored_failure.insert("capture_linear", 1);
+    assert!(
+        !model
+            .successors("RetagFails", &initial)
+            .contains(&ignored_failure),
+        "old ignore-failure transition must not conform"
+    );
+    assert!(
+        !model.check_invariant("FailedRetagFallsBackAtomically", &ignored_failure),
+        "negative control must violate the atomic fallback law"
+    );
+    assert!(
+        !model.check_invariant("ResolvedF16RequiresSuccessfulRetag", &ignored_failure),
+        "negative control must expose untagged f16"
+    );
+
+    // NEGATIVE CONTROL: an HDR-on upgrade configured f16 but its subsequent tag
+    // failed, while the old path left that plausible f16 surface live. Capture
+    // stayed honestly SDR, exposing both the format/tag and metadata mismatch.
+    let mut failed_upgrade = sdr.clone();
+    failed_upgrade.insert("stage", 2);
+    failed_upgrade.insert("retagged", 0);
+    failed_upgrade.insert("is_f16", 1);
+    failed_upgrade.insert("capture_linear", 0);
+    assert!(
+        !model
+            .successors("UpgradeFails", &sdr)
+            .contains(&failed_upgrade),
+        "failed upgrade must not leave an untagged f16 surface"
+    );
+    assert!(
+        !model.check_invariant("FailedRetagFallsBackAtomically", &failed_upgrade),
+        "failed-upgrade negative control must violate atomic SDR fallback"
+    );
+    assert!(
+        !model.check_invariant("CaptureMatchesSurfaceEncoding", &failed_upgrade),
+        "failed-upgrade negative control must expose metadata/format mismatch"
+    );
+}
+
+/// The live-upgrade admission gate retains raw f16 support independently of the
+/// attach-time opt-in, then requires the CURRENT opt-in and CURRENT Windows
+/// output state. Enumerate the complete boolean domain and pin the hot-reload
+/// case that an attach-frozen `hdr_capable` bit lost.
+#[test]
+fn hdr_live_upgrade_gate_is_complete_and_hot_reloadable() {
+    let mut admitted = 0usize;
+    for (hdr_glow, supports_f16, output_hdr_enabled) in all_inputs() {
+        let got = hdr_live_upgrade_wants_f16(hdr_glow, supports_f16, output_hdr_enabled);
+        let expected = hdr_glow && supports_f16 && output_hdr_enabled;
+        assert_eq!(
+            got, expected,
+            "upgrade gate drifted for ({hdr_glow},{supports_f16},{output_hdr_enabled})"
+        );
+        admitted += usize::from(got);
+    }
+    assert_eq!(admitted, 1, "only the all-true upgrade tuple is admitted");
+
+    let supports_f16 = true;
+    assert!(
+        !hdr_live_upgrade_wants_f16(false, supports_f16, true),
+        "live opt-out must suppress an SDR upgrade"
+    );
+    assert!(
+        hdr_live_upgrade_wants_f16(true, supports_f16, true),
+        "turning the live opt-in on must use retained raw f16 support"
+    );
+
+    // NEGATIVE CONTROL: freezing opt-in+support together at attach while opt-in
+    // was false permanently rejects the same capable surface after hot reload.
+    let old_attach_frozen_capable = hdr_swapchain_wants_f16(false, supports_f16);
+    assert!(!old_attach_frozen_capable);
+    assert!(
+        old_attach_frozen_capable != hdr_live_upgrade_wants_f16(true, supports_f16, true),
+        "the test must distinguish the old attach-frozen policy"
+    );
+}
+
+/// Bind the generic reconfigure policy above to every existing-surface call
+/// site. Initial attach configures a fresh local `surface` and has its own
+/// immediate tag/fallback gate; once a `GpuSurface` is live, direct
+/// `surf.surface.configure` is permitted only inside the shared transaction.
+/// Present also performs exactly one bounded reconciliation for same-size
+/// Windows HDR toggles in either direction, which need not produce a surface
+/// lifecycle event.
+///
+/// This intentionally scans source rather than mocking wgpu: the regression was
+/// a call-site omission, and neither CI nor non-Windows unit tests can force the
+/// DX12 swapchain recreation that clears the colour-space tag.
+#[test]
+fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
+    let source = include_str!("../src/renderer.rs");
+
+    let resize = source
+        .split_once("    pub fn resize_surface(")
+        .expect("resize_surface must remain present")
+        .1
+        .split_once("    fn configure_surface_retagging_scrgb(")
+        .expect("shared reconfigure helper must follow resize_surface")
+        .0;
+    assert_eq!(
+        resize
+            .matches("self.configure_surface_retagging_scrgb(")
+            .count(),
+        1,
+        "resize must route exactly once through the shared HDR recovery"
+    );
+    assert!(
+        !resize.contains("surf.surface.configure("),
+        "resize must not bypass the shared HDR recovery"
+    );
+
+    let helper = source
+        .split_once("    fn configure_surface_retagging_scrgb(")
+        .expect("shared reconfigure helper must remain present")
+        .1
+        .split_once("    fn tag_swapchain_scrgb(")
+        .expect("platform tag helper must follow shared reconfigure helper")
+        .0;
+    assert_eq!(
+        helper.matches("surf.surface.configure(").count(),
+        2,
+        "shared transaction must configure once, plus exactly one SDR fallback"
+    );
+    assert!(
+        helper.contains("hdr_reconfigure_plan(was_hdr, scrgb_retagged)"),
+        "shared transaction must drive the model-bound shipping policy"
+    );
+    assert!(
+        helper.contains("win.apply_hdr_reconfigure_plan(plan)"),
+        "shared transaction must reconcile capture/HDR metadata"
+    );
+    assert_eq!(
+        helper
+            .matches("self.finish_surface_color_space_recovery(")
+            .count(),
+        2,
+        "post-configure and same-size live validation must share one recovery decision"
+    );
+
+    let reconcile = source
+        .split_once("    fn reconcile_live_hdr_state_if_due(")
+        .expect("live HDR-state reconciliation must remain present")
+        .1
+        .split_once("    /// Whether this surface's containing Windows output")
+        .expect("side-effect-free output probe must follow reconciliation")
+        .0;
+    assert!(
+        reconcile.contains("self.hdr_glow && surf.supports_f16"),
+        "SDR polling must follow the current opt-in plus retained raw capability"
+    );
+    assert!(
+        reconcile.contains("hdr_live_upgrade_wants_f16("),
+        "the upgrade attempt must pass the exhaustive shipping gate"
+    );
+    let probe = reconcile
+        .find("Self::surface_output_hdr_enabled(&surf.surface)")
+        .expect("SDR upgrade must probe output HDR state");
+    let select_f16 = reconcile
+        .find("surf.config.format = wgpu::TextureFormat::Rgba16Float")
+        .expect("admitted upgrade must select f16");
+    let configure = reconcile
+        .find("self.configure_surface_retagging_scrgb(")
+        .expect("admitted upgrade must use shared configure recovery");
+    assert!(
+        probe < select_f16 && select_f16 < configure,
+        "probe must precede f16 selection, which must precede shared configure+tag"
+    );
+
+    let present = source
+        .split_once("    fn present_input_with_crop(")
+        .expect("present_input_with_crop must remain present")
+        .1
+        .split_once("    fn present_to_view(")
+        .expect("present_to_view must follow present_input_with_crop")
+        .0;
+    assert_eq!(
+        present
+            .matches("self.configure_surface_retagging_scrgb(")
+            .count(),
+        2,
+        "live alpha changes and Outdated/Lost recovery must share HDR recovery"
+    );
+    assert_eq!(
+        present
+            .matches("self.reconcile_live_hdr_state_if_due(win, surf);")
+            .count(),
+        1,
+        "present must reconcile same-size system HDR changes before acquisition"
+    );
+    assert!(
+        !present.contains("surf.surface.configure("),
+        "present recovery paths must not configure the surface directly"
+    );
+
+    let runtime = source
+        .split_once("#[cfg(test)]\nmod tests {")
+        .map_or(source, |(runtime, _)| runtime);
+    assert_eq!(
+        runtime.matches("surf.surface.configure(").count(),
+        2,
+        "no live-surface configure may escape the shared transaction"
+    );
+}
+
 /// A tiny glow-bearing frame: an all-background grid with a row of
 /// premultiplied LUMEN quads (the glow_parity construction), cursor hidden so
 /// the pixels are exactly bg + aurora.
@@ -146,7 +489,8 @@ fn gpu(px: f32) -> Option<GpuRenderer> {
 /// the blit stream (no aurora pass) never leaves [0, 1] — and every channel
 /// equals `aterm_render::hdr::hdr_grid_encode` of the SDR readback byte within
 /// f16 quantization, so the EDR grid is exactly the linear reading of the SDR
-/// frame (identical on glass at reference white).
+/// frame in the app-owned EDR destination encoding at reference white. The
+/// compositor transform is unobserved.
 #[test]
 fn gpu_hdr_blit_grid_clamped_and_linear() {
     let Some(mut gpu) = gpu(18.0) else { return };

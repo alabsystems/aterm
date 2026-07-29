@@ -212,6 +212,44 @@ fn test_adjust_for_scroll_noop_when_no_selection() {
 }
 
 #[test]
+fn test_translate_rows_for_presentation_preserves_selection_semantics() {
+    let mut sel = TextSelection::new();
+    sel.start_selection(7, 19, SelectionSide::Right, SelectionType::Semantic);
+    sel.update_selection(-3, 2, SelectionSide::Left);
+    sel.complete_selection();
+
+    sel.translate_rows_for_presentation(11);
+
+    assert_eq!(sel.start().row, 18);
+    assert_eq!(sel.end().row, 8);
+    assert_eq!(sel.start().col, 19);
+    assert_eq!(sel.end().col, 2);
+    assert_eq!(sel.start().side, SelectionSide::Right);
+    assert_eq!(sel.end().side, SelectionSide::Left);
+    assert_eq!(sel.selection_type(), SelectionType::Semantic);
+    assert_eq!(sel.state(), SelectionState::Complete);
+}
+
+#[test]
+fn test_translate_rows_for_presentation_saturates_at_i32_boundaries() {
+    let mut upper = TextSelection::new();
+    upper.start_selection(i32::MAX - 1, 3, SelectionSide::Left, SelectionType::Block);
+    upper.update_selection(i32::MAX, 9, SelectionSide::Right);
+    upper.translate_rows_for_presentation(2);
+    assert_eq!(upper.start().row, i32::MAX);
+    assert_eq!(upper.end().row, i32::MAX);
+    assert_eq!((upper.start().col, upper.end().col), (3, 9));
+
+    let mut lower = TextSelection::new();
+    lower.start_selection(i32::MIN + 1, 4, SelectionSide::Right, SelectionType::Lines);
+    lower.update_selection(i32::MIN, 10, SelectionSide::Left);
+    lower.translate_rows_for_presentation(-2);
+    assert_eq!(lower.start().row, i32::MIN);
+    assert_eq!(lower.end().row, i32::MIN);
+    assert_eq!((lower.start().col, lower.end().col), (4, 10));
+}
+
+#[test]
 fn test_adjust_for_scroll_large_delta_no_overflow() {
     // Regression: i32::MAX delta (region scroll sentinel) with negative row
     // must not panic from arithmetic overflow.
@@ -757,6 +795,10 @@ fn test_contains_cell_block_wide_char_start_at_left_boundary() {
     assert!(
         sel.contains_cell(1, 4, true, false),
         "wide char at col 4 should be selected (continuation at col 5 is in block)"
+    );
+    assert!(
+        sel.contains_cell(1, 5, false, true),
+        "the continuation already inside the block must stay selected too"
     );
 
     // Wide char at col 3: col 3 outside, col 4 also outside -> not selected.

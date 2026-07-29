@@ -140,6 +140,58 @@ pub fn hdr_present_plan(hdr_glow: bool, swapchain_is_f16: bool, glow_nonempty: b
     }
 }
 
+/// RECONFIGURE: what to do after configuring an already-live swapchain.
+///
+/// DX12 recreates the underlying swapchain during every `Surface::configure`
+/// (resize, live composite-alpha change, and Outdated/Lost recovery), which
+/// resets its DXGI colour space. Windows can also disable system HDR without
+/// forcing any such reconfigure. In both cases an f16 surface is still a valid
+/// HDR target only when scRGB was successfully re-tagged/validated. Failure must
+/// atomically fall back to the surface's retained SDR format; keeping f16 would
+/// hand linear pixels to DWM's gamma-2.2 default while capture continued to
+/// claim extended-linear-sRGB.
+///
+/// This is the shipping decision bound to
+/// `aterm_spec::derive::hdr_reconfigure_retag_model` by `tests/hdr_gate.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdrReconfigurePlan {
+    /// The surface was already SDR; reconfiguring does not change its colour space.
+    KeepSdr,
+    /// The f16 swapchain was successfully re-tagged scRGB.
+    KeepHdr,
+    /// Re-tagging the recreated f16 swapchain failed; configure the retained
+    /// non-sRGB 8-bit format before another present.
+    FallbackToSdr,
+}
+
+/// Resolve the post-reconfigure surface encoding from the ACTUAL current format
+/// and the result of re-establishing scRGB on the recreated swapchain.
+#[must_use]
+pub fn hdr_reconfigure_plan(swapchain_is_f16: bool, scrgb_retagged: bool) -> HdrReconfigurePlan {
+    match (swapchain_is_f16, scrgb_retagged) {
+        (false, _) => HdrReconfigurePlan::KeepSdr,
+        (true, true) => HdrReconfigurePlan::KeepHdr,
+        (true, false) => HdrReconfigurePlan::FallbackToSdr,
+    }
+}
+
+/// LIVE SDR→HDR: is an f16 upgrade attempt admitted on this present?
+///
+/// `supports_f16` is the raw attach-time surface capability, deliberately not
+/// frozen to the then-current opt-in: a config hot reload can turn `hdr_glow`
+/// on later. `output_hdr_enabled` is the throttled, side-effect-free Windows
+/// containing-output probe. Only their conjunction may recreate the live SDR
+/// swapchain as f16; the subsequent scRGB tag is still resolved through
+/// [`hdr_reconfigure_plan`] and falls back atomically on a race/failure.
+#[must_use]
+pub fn hdr_live_upgrade_wants_f16(
+    hdr_glow: bool,
+    supports_f16: bool,
+    output_hdr_enabled: bool,
+) -> bool {
+    hdr_glow && supports_f16 && output_hdr_enabled
+}
+
 /// PRESENT (SDR twin): run the swapchain-side SDR glow-boost pass this present?
 /// True iff the swapchain is NOT the f16 EDR target (the two boost passes are
 /// mutually exclusive by construction — same instances, different clamp math),

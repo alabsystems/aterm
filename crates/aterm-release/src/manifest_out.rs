@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_update_core::Manifest;
 
-use crate::ledger::{Error, LEDGER_FLOOR, Result};
+use crate::ledger::{Error, Result};
 
 /// The manifest's exact asset name. Load-bearing on the CLIENT side: the
 /// updater's release-selection rule is "newest non-draft release carrying
@@ -115,9 +115,15 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
 }
 
 /// Serialize + prove the bytes BEFORE they can ship: the emitted text must
-/// round-trip through the shared `Manifest::parse` back to the exact value,
-/// AND parse under the vendored v0.25 struct (the frozen fleet parser) with
-/// every v0.25-load-bearing field intact. Returns the proven bytes.
+/// round-trip through the shared `Manifest::parse` back to the exact value.
+/// Returns the proven bytes.
+///
+/// This used to ALSO parse the bytes under a struct vendored verbatim from
+/// v0.25, standing in for binaries already on users' machines. That bridge is
+/// gone: the two-component lineage it protected (v0.25-v0.61) is retired and
+/// cannot elect a `vMAJOR.MINOR.PATCH` release at all, so the check constrained
+/// the emitter on behalf of clients that could never install the result. The
+/// client-side round-trip above is the real gate.
 pub fn emit(m: &Manifest) -> Result<String> {
     let text = m.to_toml().map_err(Error::new)?;
     // Round-trip through the CLIENT's parser (the same type the v0.26 updater
@@ -135,7 +141,6 @@ pub fn emit(m: &Manifest) -> Result<String> {
                 .to_string(),
         ));
     }
-    v025_check(&text)?;
     Ok(text)
 }
 
@@ -148,54 +153,6 @@ pub fn write(out_dir: &Path, m: &Manifest) -> Result<PathBuf> {
     std::fs::write(&path, &text)
         .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
     Ok(path)
-}
-
-/// The v0.25 bridge proof, run at publish time on the REAL bytes (spec §7
-/// step 4): parse under the vendored v0.25 struct and assert every hard gate
-/// the deployed fleet enforces — schema ≤ 1, the required field set non-empty,
-/// and `build_number` strictly above the last v0.25-published build. The same
-/// vendored struct is independently exercised in tests/bridge_v025.rs.
-pub fn v025_check(text: &str) -> Result<()> {
-    let m = v025::Manifest::parse(text).map_err(|e| {
-        Error::new(format!(
-            "emitted manifest is REJECTED by the frozen v0.25 parser — the deployed \
-             fleet could not stage this release: {e}"
-        ))
-    })?;
-    if m.version.is_empty() || m.dmg.is_empty() || m.sha256.is_empty() {
-        return Err(Error::new(
-            "v0.25 bridge check: a required field (version/dmg/sha256) is empty".to_string(),
-        ));
-    }
-    if m.build_number <= LEDGER_FLOOR {
-        return Err(Error::new(format!(
-            "v0.25 bridge check: build_number {} is not above the v0.25 floor \
-             {LEDGER_FLOOR} — deployed clients would refuse to stage it",
-            m.build_number
-        )));
-    }
-    // Field-for-field agreement between the two parsers on every key BOTH
-    // understand: a divergence here means the same bytes read differently on
-    // an updated client vs the deployed fleet — exactly the bridge bug this
-    // release must be structurally unable to ship.
-    let shared = Manifest::parse(text)
-        .map_err(|e| Error::new(format!("v0.25 bridge check: shared parse failed: {e}")))?;
-    let agree = m.schema == shared.schema
-        && m.version == shared.version
-        && m.build_number == shared.build_number
-        && m.commit == shared.commit
-        && m.sha256 == shared.sha256
-        && m.dmg == shared.dmg
-        && m.min_build == shared.min_build
-        && m.changelog == shared.changelog;
-    if !agree {
-        return Err(Error::new(
-            "v0.25 bridge check: the frozen v0.25 parser and the shared type read \
-             the SAME bytes differently — refusing to publish"
-                .to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Read one `<key>K</key><string>V</string>` value out of plist XML — the
@@ -220,45 +177,4 @@ pub fn plist_string(plist: &str, key: &str) -> Option<String> {
             .replace("&gt;", ">")
             .replace("&amp;", "&"),
     )
-}
-
-/// The EXACT `Manifest` the deployed v0.25 fleet parses releases with —
-/// vendored verbatim from v0.25's `crates/aterm-update/src/manifest.rs`
-/// (struct + `SUPPORTED_SCHEMA` + `parse` only; the local-marker types are
-/// irrelevant to the wire format). DO NOT "sync" this with the shared type:
-/// its whole value is being FROZEN — it stands in for binaries already on
-/// users' machines, which no commit can update.
-pub mod v025 {
-    use serde::Deserialize;
-
-    pub const SUPPORTED_SCHEMA: u32 = 1;
-
-    #[derive(Debug, Clone, Deserialize)]
-    pub struct Manifest {
-        #[serde(default)]
-        pub schema: u32,
-        pub version: String,
-        pub build_number: u64,
-        #[serde(default)]
-        pub commit: Option<String>,
-        pub sha256: String,
-        pub dmg: String,
-        #[serde(default)]
-        pub min_build: Option<u64>,
-        #[serde(default)]
-        pub changelog: Option<String>,
-    }
-
-    impl Manifest {
-        pub fn parse(text: &str) -> Result<Self, String> {
-            let m: Manifest = toml::from_str(text).map_err(|e| format!("parse manifest: {e}"))?;
-            if m.schema > SUPPORTED_SCHEMA {
-                return Err(format!(
-                    "manifest schema {} is newer than supported ({SUPPORTED_SCHEMA}); upgrade aterm",
-                    m.schema
-                ));
-            }
-            Ok(m)
-        }
-    }
 }

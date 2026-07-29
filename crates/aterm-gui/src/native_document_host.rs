@@ -1857,7 +1857,10 @@ mod tests {
                 message,
             } if message.contains("regular non-link")
         ));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
+        // bound catches it and only the report latency changes. 1s is the bound this
+        // repo has already watched cross under full-suite load (cb8c0cff).
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
         assert_eq!(fs::read(&path).unwrap(), b"before");
 
         fs::remove_file(&lock_path).unwrap();
@@ -1961,7 +1964,10 @@ mod tests {
                 message,
             } if message.contains("busy") && message.contains("retry Save")
         ));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
+        // bound catches it and only the report latency changes. 1s is the bound this
+        // repo has already watched cross under full-suite load (cb8c0cff).
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
         assert_eq!(fs::read(&path).unwrap(), b"before");
 
         drop(held);

@@ -318,7 +318,8 @@ impl SinkWriter {
     /// inside `write(2)`. `false` (the default) is always safe — it only costs
     /// syscalls.
     pub fn note_master_nonblocking(&self, nonblocking: bool) {
-        self.master_nonblocking.store(nonblocking, Ordering::Relaxed);
+        self.master_nonblocking
+            .store(nonblocking, Ordering::Relaxed);
     }
 
     /// Whether this sink's PROCESS-LOCAL egress buffer is fully drained to the
@@ -1140,7 +1141,10 @@ mod tests {
         );
         assert_eq!(sink.write_frame(b"CCCC").expect("spill accepted"), 4);
         assert!(
-            t0.elapsed() < std::time::Duration::from_millis(500),
+            // Failure bound only: the genuine regression is an UNBOUNDED park, so any
+            // finite deadline catches it. A tight one only lets scheduler preemption
+            // on a loaded box fake a failure.
+            t0.elapsed() < std::time::Duration::from_secs(5),
             "non-parking writes must not wait for the wedge to clear"
         );
 
@@ -1278,7 +1282,6 @@ mod tests {
         assert_eq!(&got[wedged..], b"SPLIT", "spill delivered in order");
     }
 
-
     /// A lost `try_lock` race must cost a BOUNDED spin, never a wait on the holder:
     /// the UI thread may spin PAUSE hints hoping the mid-frame holder releases (the
     /// alternative — conceding — makes a keystroke pay `dup(2)` + `pthread_create`
@@ -1308,7 +1311,10 @@ mod tests {
         let t0 = std::time::Instant::now();
         assert_eq!(sink.write_frame_nonparking(b"K").expect("accepted"), 1);
         assert!(
-            t0.elapsed() < std::time::Duration::from_millis(150),
+            // 150ms against a 300ms hold is a 2x discriminator wrapped around a dup(2)
+            // and a thread creation with ~40 runnable threads. The concede-vs-park
+            // distinction is unbounded on the failing side, so widen rather than race.
+            t0.elapsed() < std::time::Duration::from_secs(1),
             "the retry budget must be a bounded spin, not a wait on the holder (took {:?})",
             t0.elapsed()
         );

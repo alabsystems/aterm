@@ -7,7 +7,7 @@
 //! This module contains handlers for color-related OSC sequences:
 //! - OSC 4: Color palette manipulation
 //! - OSC 10/11/12: Default foreground/background/cursor colors
-//! - OSC 19: Selection foreground color callback
+//! - OSC 19: Selection foreground color
 //! - OSC 21: Extended color queries (kitty protocol)
 //! - OSC 104: Reset indexed colors
 //! - OSC 30001/30101: Kitty color stack push/pop
@@ -79,6 +79,16 @@ impl DynamicColorSlot {
             Self::Cursor => super::ColorTarget::Cursor,
         }
     }
+}
+
+/// OSC 21 queries distinguish a concrete color, a known field whose value is
+/// dynamic/undefined, and an unknown field. Kitty assigns different wire
+/// responses to all three (`rgb:...`, empty, and `?`, respectively).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Osc21QueryValue {
+    Color(Rgb),
+    Undefined,
+    Unknown,
 }
 
 impl TerminalHandler<'_> {
@@ -282,10 +292,16 @@ impl TerminalHandler<'_> {
 
     /// Handle OSC 19 - selection foreground color.
     ///
-    /// aterm-core does not yet persist selection foreground as part of the
-    /// terminal theme model, but the host callback surface needs to observe the
-    /// color value for aTerm.app's callback migration.
-    pub(super) fn handle_osc_19(&mut self, params: &[&[u8]]) {
+    /// Set format: `OSC 19 ; color-spec ST`.
+    /// Query format: `OSC 19 ; ? ST`; the response uses the request's BEL/ST
+    /// terminator, matching xterm's dynamic-color query contract. When no
+    /// explicit selection foreground is active, report the default foreground
+    /// as the single-color protocol fallback for the renderer's automatic mode.
+    pub(super) fn handle_osc_19(
+        &mut self,
+        cap: &super::response_capability::ResponseCapability,
+        params: &[&[u8]],
+    ) {
         let Some(spec_bytes) = params.get(1) else {
             return;
         };
@@ -293,9 +309,21 @@ impl TerminalHandler<'_> {
             return;
         };
         if spec == "?" {
+            let color = self
+                .color
+                .selection_foreground
+                .unwrap_or(self.color.default_foreground);
+            let st = if self.transient.last_osc_bel_terminated {
+                "\x07"
+            } else {
+                "\x1b\\"
+            };
+            let response = format!("\x1b]19;{}{}", ColorPalette::format_color_spec(color), st,);
+            self.send_response(cap, response.as_bytes());
             return;
         }
         if let Some(color) = ColorPalette::parse_color_spec(spec) {
+            self.color.selection_foreground = Some(color);
             self.fire_color_change_callback(
                 super::ColorTarget::SelectionForeground,
                 color,
@@ -309,9 +337,13 @@ impl TerminalHandler<'_> {
     /// Format: `OSC 21 ; key=value ; key=value ST`
     ///
     /// Keys can be named colors (`foreground`, `background`, `cursor`,
-    /// `selection_background`) or indexed palette entries (`0-255`).
+    /// `selection_background`, `selection_foreground`) or indexed palette
+    /// entries (`0-255`).
     ///
-    /// Query format: `key=?` responds with `key=rgb:RRRR/GGGG/BBBB`.
+    /// Query format: `key=?` responds with `key=rgb:RRRR/GGGG/BBBB`,
+    /// `key=` for a known dynamic/undefined value, or `key=?` for an
+    /// unrecognized key. An empty value selects dynamic behavior where
+    /// supported; a bare key resets it to the host-configured default.
     pub(super) fn handle_osc_21(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -333,6 +365,10 @@ impl TerminalHandler<'_> {
                 continue;
             };
             let Some((raw_key, raw_value)) = pair.split_once('=') else {
+                let key = pair.trim();
+                if !key.is_empty() {
+                    self.osc_21_reset_color(key);
+                }
                 continue;
             };
 
@@ -352,10 +388,19 @@ impl TerminalHandler<'_> {
                 if !self.palette_rate_limit_consume_one() {
                     continue;
                 }
-                if let Some(color) = self.osc_21_query_color(key) {
-                    let spec = ColorPalette::format_color_spec(color);
-                    query_pairs.push(format!("{key}={spec}"));
+                match self.osc_21_query_color(key) {
+                    Osc21QueryValue::Color(color) => {
+                        let spec = ColorPalette::format_color_spec(color);
+                        query_pairs.push(format!("{key}={spec}"));
+                    }
+                    Osc21QueryValue::Undefined => query_pairs.push(format!("{key}=")),
+                    Osc21QueryValue::Unknown => query_pairs.push(format!("{key}=?")),
                 }
+                continue;
+            }
+
+            if value.is_empty() {
+                self.osc_21_set_dynamic_color(key);
                 continue;
             }
 
@@ -376,25 +421,107 @@ impl TerminalHandler<'_> {
         }
     }
 
-    fn osc_21_query_color(&mut self, key: &str) -> Option<Rgb> {
+    fn osc_21_query_color(&mut self, key: &str) -> Osc21QueryValue {
         if let Some(slot) = DynamicColorSlot::from_name(key) {
             // Consult host query_callback for dynamic colors, matching
             // OSC 10/11/12 behavior. The host may override the reported
             // color (e.g., when the UI layer uses a different theme).
             let palette_color = self.get_dynamic_color(slot);
-            let color = self
+            if let Some(color) = self
                 .color
                 .query_callback
                 .as_mut()
                 .and_then(|cb| cb(slot.color_target()))
-                .unwrap_or(palette_color);
-            return Some(color);
+            {
+                return Osc21QueryValue::Color(color);
+            }
+            // Unlike OSC 12's legacy single-color query, OSC 21 can faithfully
+            // report a dynamic cursor as undefined. A host query override above
+            // wins because it describes the color the host actually renders.
+            if slot == DynamicColorSlot::Cursor && self.color.cursor_color.is_none() {
+                return Osc21QueryValue::Undefined;
+            }
+            return Osc21QueryValue::Color(palette_color);
         }
         if key.eq_ignore_ascii_case("selection_background") {
-            return self.color.selection_background;
+            return self
+                .color
+                .selection_background
+                .map_or(Osc21QueryValue::Undefined, Osc21QueryValue::Color);
         }
-        let index = key.parse::<u8>().ok()?;
-        Some(self.color.palette.get(index))
+        if key.eq_ignore_ascii_case("selection_foreground") {
+            return self
+                .color
+                .selection_foreground
+                .map_or(Osc21QueryValue::Undefined, Osc21QueryValue::Color);
+        }
+        let Ok(index) = key.parse::<u8>() else {
+            return Osc21QueryValue::Unknown;
+        };
+        Osc21QueryValue::Color(self.color.palette.get(index))
+    }
+
+    /// Select a dynamic/undefined value for the OSC 21 fields that support it.
+    /// Foreground, background, and indexed palette entries have no dynamic
+    /// representation in the core and therefore ignore an empty value.
+    fn osc_21_set_dynamic_color(&mut self, key: &str) {
+        if key.eq_ignore_ascii_case("cursor") {
+            self.color.cursor_color = None;
+            self.fire_color_change_callback(
+                super::ColorTarget::Cursor,
+                self.color.default_foreground,
+                super::ColorChangeOp::Dynamic,
+            );
+            return;
+        }
+        if key.eq_ignore_ascii_case("selection_background") {
+            self.color.selection_background = None;
+            self.fire_color_change_callback(
+                super::ColorTarget::SelectionBackground,
+                self.color.default_background,
+                super::ColorChangeOp::Dynamic,
+            );
+            return;
+        }
+        if key.eq_ignore_ascii_case("selection_foreground") {
+            self.color.selection_foreground = None;
+            self.fire_color_change_callback(
+                super::ColorTarget::SelectionForeground,
+                self.color.default_foreground,
+                super::ColorChangeOp::Dynamic,
+            );
+        }
+    }
+
+    /// Reset a bare OSC 21 key to the same host-configured baseline as its
+    /// dedicated reset sequence (OSC 104/110-112/117/119).
+    fn osc_21_reset_color(&mut self, key: &str) {
+        if let Some(slot) = DynamicColorSlot::from_name(key) {
+            self.reset_dynamic_color_slot(slot);
+            return;
+        }
+        if key.eq_ignore_ascii_case("selection_background") {
+            self.reset_selection_background();
+            return;
+        }
+        if key.eq_ignore_ascii_case("selection_foreground") {
+            self.reset_selection_foreground();
+            return;
+        }
+        let Ok(index) = key.parse::<u8>() else {
+            return;
+        };
+        let color = if let Some(ref configured) = self.color.configured_palette {
+            configured.get(index)
+        } else {
+            ColorPalette::new().get(index)
+        };
+        self.color.palette.set(index, color);
+        self.fire_color_change_callback(
+            super::ColorTarget::Palette,
+            color,
+            super::ColorChangeOp::Reset,
+        );
     }
 
     fn osc_21_set_color(&mut self, key: &str, color: Rgb) {
@@ -412,6 +539,15 @@ impl TerminalHandler<'_> {
             self.color.selection_background = Some(color);
             self.fire_color_change_callback(
                 super::ColorTarget::SelectionBackground,
+                color,
+                super::ColorChangeOp::Set,
+            );
+            return;
+        }
+        if key.eq_ignore_ascii_case("selection_foreground") {
+            self.color.selection_foreground = Some(color);
+            self.fire_color_change_callback(
+                super::ColorTarget::SelectionForeground,
                 color,
                 super::ColorChangeOp::Set,
             );
@@ -487,8 +623,8 @@ impl TerminalHandler<'_> {
     /// maximum depth of 16 entries; if full, the oldest entry is discarded.
     ///
     /// Per the Kitty protocol, all dynamic colors are saved: the 256-color
-    /// palette, default foreground/background, cursor color, and selection
-    /// background.
+    /// palette, default foreground/background, cursor, selection background,
+    /// and selection foreground.
     pub(super) fn handle_osc_30001(&mut self) {
         use super::callbacks::COLOR_STACK_MAX_DEPTH;
         use super::grouped_state::ColorStackEntry;
@@ -505,14 +641,15 @@ impl TerminalHandler<'_> {
             default_background: self.color.default_background,
             cursor_color: self.color.cursor_color,
             selection_background: self.color.selection_background,
+            selection_foreground: self.color.selection_foreground,
         });
     }
 
     /// Handle OSC 30101 - Pop color stack (Kitty protocol).
     ///
-    /// Pops the most recently pushed color state from the stack and
-    /// restores all dynamic colors: palette, default foreground/background,
-    /// cursor color, and selection background. If the stack is empty,
+    /// Pops the most recently pushed color state from the stack and restores
+    /// all dynamic colors: palette, default foreground/background, cursor,
+    /// selection background, and selection foreground. If the stack is empty,
     /// does nothing (no-op).
     pub(super) fn handle_osc_30101(&mut self) {
         if let Some(entry) = self.color.stack.pop_back() {
@@ -521,6 +658,7 @@ impl TerminalHandler<'_> {
             self.color.default_background = entry.default_background;
             self.color.cursor_color = entry.cursor_color;
             self.color.selection_background = entry.selection_background;
+            self.color.selection_foreground = entry.selection_foreground;
 
             // Notify UI that palette was bulk-restored from stack.
             self.fire_color_change_callback(
@@ -539,18 +677,26 @@ impl TerminalHandler<'_> {
                 entry.default_background,
                 super::ColorChangeOp::Set,
             );
-            // Notify UI that cursor color was restored (#7469).
-            // Without this, the cursor keeps the pre-pop color until the next
-            // explicit OSC 12, because the UI layer never learns the value changed.
-            let cursor_color = entry.cursor_color.unwrap_or(entry.default_foreground);
-            self.fire_color_change_callback(
-                super::ColorTarget::Cursor,
-                cursor_color,
-                super::ColorChangeOp::Set,
-            );
+            // Notify UI that cursor color was restored (#7469). Preserve the
+            // distinction between an explicit cursor and the saved dynamic
+            // state: reporting a dynamic cursor as `Set(foreground)` freezes
+            // callback-driven renderers on that transient foreground.
+            if let Some(cursor_color) = entry.cursor_color {
+                self.fire_color_change_callback(
+                    super::ColorTarget::Cursor,
+                    cursor_color,
+                    super::ColorChangeOp::Set,
+                );
+            } else {
+                self.fire_color_change_callback(
+                    super::ColorTarget::Cursor,
+                    self.color.default_foreground,
+                    super::ColorChangeOp::Dynamic,
+                );
+            }
             // Notify UI that selection background was restored (#7469).
-            // When the popped entry has None for selection_background, fire a
-            // Reset so the UI stops using a stale custom color.
+            // A saved None is dynamic—not a reset to today's configured
+            // baseline—so callback consumers can keep following live colors.
             if let Some(sel_bg) = entry.selection_background {
                 self.fire_color_change_callback(
                     super::ColorTarget::SelectionBackground,
@@ -560,8 +706,24 @@ impl TerminalHandler<'_> {
             } else {
                 self.fire_color_change_callback(
                     super::ColorTarget::SelectionBackground,
-                    Rgb { r: 0, g: 0, b: 0 },
-                    super::ColorChangeOp::Reset,
+                    self.color.default_background,
+                    super::ColorChangeOp::Dynamic,
+                );
+            }
+            // Selection foreground is an independent dynamic color (OSC 19).
+            // Restore it alongside the selection background so a color-stack
+            // round trip cannot leave the renderer on the post-push value.
+            if let Some(sel_fg) = entry.selection_foreground {
+                self.fire_color_change_callback(
+                    super::ColorTarget::SelectionForeground,
+                    sel_fg,
+                    super::ColorChangeOp::Set,
+                );
+            } else {
+                self.fire_color_change_callback(
+                    super::ColorTarget::SelectionForeground,
+                    self.color.default_foreground,
+                    super::ColorChangeOp::Dynamic,
                 );
             }
         }
@@ -616,10 +778,14 @@ impl TerminalHandler<'_> {
     /// Clears the custom selection background, reverting to the terminal's
     /// default selection appearance. (#7555)
     pub(super) fn reset_selection_background(&mut self) {
-        self.color.selection_background = None;
+        self.color.selection_background = self.color.configured_selection_background;
+        let color = self
+            .color
+            .selection_background
+            .unwrap_or(self.color.default_background);
         self.fire_color_change_callback(
             super::ColorTarget::SelectionBackground,
-            Rgb { r: 0, g: 0, b: 0 },
+            color,
             super::ColorChangeOp::Reset,
         );
     }
@@ -629,9 +795,14 @@ impl TerminalHandler<'_> {
     /// Clears the custom selection foreground, reverting to the terminal's
     /// default selection appearance.
     pub(super) fn reset_selection_foreground(&mut self) {
+        self.color.selection_foreground = self.color.configured_selection_foreground;
+        let color = self
+            .color
+            .selection_foreground
+            .unwrap_or(self.color.default_foreground);
         self.fire_color_change_callback(
             super::ColorTarget::SelectionForeground,
-            Rgb { r: 0, g: 0, b: 0 },
+            color,
             super::ColorChangeOp::Reset,
         );
     }
@@ -668,9 +839,8 @@ impl TerminalHandler<'_> {
     /// Reset a dynamic color to its theme-configured default and fire the
     /// change callback.
     ///
-    /// Uses `configured_foreground`/`configured_background` (set by
-    /// `apply_config`) instead of hardcoded constants, so OSC 110/111/112
-    /// resets honor the active theme (#7443).
+    /// Uses the `configured_*` baselines (set by `apply_config`) instead of
+    /// hardcoded constants, so OSC 110/111/112 resets honor the active theme.
     fn reset_dynamic_color_slot(&mut self, slot: DynamicColorSlot) {
         let color = match slot {
             DynamicColorSlot::Foreground => {
@@ -684,8 +854,10 @@ impl TerminalHandler<'_> {
                 bg
             }
             DynamicColorSlot::Cursor => {
-                self.color.cursor_color = None;
-                self.color.default_foreground
+                self.color.cursor_color = self.color.configured_cursor;
+                self.color
+                    .configured_cursor
+                    .unwrap_or(self.color.default_foreground)
             }
         };
         self.fire_color_change_callback(slot.color_target(), color, super::ColorChangeOp::Reset);
@@ -698,6 +870,24 @@ impl TerminalHandler<'_> {
         color: Rgb,
         op: super::ColorChangeOp,
     ) {
+        // Crossing an OSC color mutation/reset boundary makes the affected
+        // terminal color authoritative for owned render snapshots. Before any
+        // host configuration or OSC mutation, `Terminal::new` deliberately
+        // leaves these channels unset so a standalone renderer can retain its
+        // historical theme fallback. Cursor-dynamic policy is independent of
+        // `cursor_color.is_some()`, hence its own flag.
+        match target {
+            super::ColorTarget::Foreground => {
+                self.color.frame_foreground_authoritative = true;
+            }
+            super::ColorTarget::Background => {
+                self.color.frame_background_authoritative = true;
+            }
+            super::ColorTarget::Cursor => {
+                self.color.frame_cursor_authoritative = true;
+            }
+            _ => {}
+        }
         // Any color SET/RESET (default fg/bg/cursor, an ANSI palette index, the
         // selection bg, an OSC 104 reset) recolors already-painted cells WITHOUT
         // changing their content — so mark full grid damage, exactly like DECSCNM
@@ -974,6 +1164,306 @@ mod osc_color_response_cap_tests {
             term.damage_epoch(),
             e1 + 1,
             "shape change advances damage_epoch"
+        );
+    }
+
+    /// OSC 19 is a real dynamic color, not merely a transient callback event:
+    /// persist it for render snapshots, answer xterm-style queries with the
+    /// request terminator, and clear it through OSC 119.
+    #[test]
+    fn osc_19_selection_foreground_set_query_and_reset_are_stateful() {
+        let mut term = Terminal::new(4, 8);
+        term.take_damage();
+        let before = term.damage_epoch();
+        let foreground = aterm_types::Rgb::new(0x11, 0x22, 0x33);
+
+        term.process(b"\x1b]19;rgb:11/22/33\x1b\\");
+        assert_eq!(term.selection_foreground(), Some(foreground));
+        assert!(
+            term.has_damage(),
+            "OSC 19 SET must repaint a live selection"
+        );
+        assert!(
+            term.damage_epoch() > before,
+            "OSC 19 SET advances the frontend redraw key"
+        );
+
+        // Dynamic-color queries echo the request terminator (BEL here).
+        term.process(b"\x1b]19;?\x07");
+        let expected = format!(
+            "\x1b]19;{}\x07",
+            aterm_types::ColorPalette::format_color_spec(foreground),
+        )
+        .into_bytes();
+        assert_eq!(term.take_response(), Some(expected));
+
+        term.take_damage();
+        term.process(b"\x1b]119\x1b\\");
+        assert_eq!(term.selection_foreground(), None);
+        assert!(
+            term.has_damage(),
+            "OSC 119 RESET must repaint a live selection"
+        );
+    }
+
+    #[test]
+    fn osc_21_selection_foreground_set_and_query_share_osc_19_state() {
+        let mut term = Terminal::new(4, 8);
+        let foreground = aterm_types::Rgb::new(0x12, 0x34, 0x56);
+
+        term.process(b"\x1b]21;selection_foreground=rgb:12/34/56\x07");
+        assert_eq!(term.selection_foreground(), Some(foreground));
+
+        term.process(b"\x1b]21;selection_foreground=?\x07");
+        let expected = format!(
+            "\x1b]21;selection_foreground={}\x07",
+            aterm_types::ColorPalette::format_color_spec(foreground),
+        )
+        .into_bytes();
+        assert_eq!(term.take_response(), Some(expected));
+    }
+
+    /// Kitty OSC 21 has three distinct query results: concrete, known but
+    /// dynamic/undefined, and unknown. In particular, a fresh terminal's
+    /// selection/cursor fields must be echoed as empty rather than omitted.
+    #[test]
+    fn osc_21_queries_report_undefined_and_unknown_fields() {
+        let mut term = Terminal::new(4, 8);
+
+        term.process(
+            b"\x1b]21;selection_background=?;selection_foreground=?;\
+              cursor=?;not_a_color=?\x1b\\",
+        );
+        assert_eq!(
+            term.take_response(),
+            Some(
+                b"\x1b]21;selection_background=;selection_foreground=;\
+                  cursor=;not_a_color=?\x1b\\"
+                    .to_vec()
+            ),
+        );
+    }
+
+    /// A host query callback remains authoritative even when the core cursor
+    /// state is dynamic: OSC 21 reports the explicit color the host renders.
+    #[test]
+    fn osc_21_dynamic_cursor_query_honors_host_override() {
+        let mut term = Terminal::new(4, 8);
+        let host_cursor = aterm_types::Rgb::new(0x21, 0x43, 0x65);
+        term.set_color_query_callback(move |target| {
+            (target == crate::terminal::ColorTarget::Cursor).then_some(host_cursor)
+        });
+
+        term.process(b"\x1b]21;cursor=?\x1b\\");
+        let expected = format!(
+            "\x1b]21;cursor={}\x1b\\",
+            aterm_types::ColorPalette::format_color_spec(host_cursor),
+        )
+        .into_bytes();
+        assert_eq!(term.take_response(), Some(expected));
+    }
+
+    /// Empty OSC 21 values select dynamic behavior, while bare keys reset to
+    /// the host-configured baseline. These are intentionally different when a
+    /// theme supplies explicit cursor/selection colors.
+    #[test]
+    fn osc_21_empty_values_are_dynamic_and_bare_keys_reset() {
+        use std::sync::{Arc, Mutex};
+
+        let mut term = Terminal::new(4, 8);
+        let configured_cursor = aterm_types::Rgb::new(0x10, 0x20, 0x30);
+        let configured_bg = aterm_types::Rgb::new(0x40, 0x50, 0x60);
+        let configured_fg = aterm_types::Rgb::new(0x70, 0x80, 0x90);
+        let mut config = crate::config::TerminalConfig::default();
+        config.cursor_color = Some(configured_cursor);
+        config.selection_background = Some(configured_bg);
+        config.selection_foreground = Some(configured_fg);
+        term.apply_config(&config);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        term.set_color_change_callback(move |target, color, op| {
+            callback_events
+                .lock()
+                .expect("callback event lock")
+                .push((target, color, op));
+        });
+
+        term.process(
+            b"\x1b]21;cursor=rgb:aa/bb/cc;\
+              selection_background=rgb:bb/cc/dd;\
+              selection_foreground=rgb:cc/dd/ee\x1b\\",
+        );
+        events.lock().expect("callback event lock").clear();
+        term.process(
+            b"\x1b]21;cursor=;selection_background=;\
+              selection_foreground=\x1b\\",
+        );
+        assert_eq!(term.cursor_color(), None);
+        assert_eq!(term.selection_background(), None);
+        assert_eq!(term.selection_foreground(), None);
+        {
+            let events = events.lock().expect("callback event lock");
+            assert_eq!(events.len(), 3);
+            assert!(
+                events
+                    .iter()
+                    .all(|(_, _, op)| *op == crate::terminal::ColorChangeOp::Dynamic),
+                "empty values must remain distinguishable from configured resets"
+            );
+        }
+        assert_eq!(
+            term.cell_frame(4, 8).selection_fg,
+            crate::render::COLOR_DYNAMIC,
+            "the frame must preserve an explicit automatic foreground instead of delegating to a stale renderer setting",
+        );
+
+        events.lock().expect("callback event lock").clear();
+        term.process(
+            b"\x1b]21;cursor;selection_background;\
+              selection_foreground\x1b\\",
+        );
+        assert_eq!(term.cursor_color(), Some(configured_cursor));
+        assert_eq!(term.selection_background(), Some(configured_bg));
+        assert_eq!(term.selection_foreground(), Some(configured_fg));
+        let events = events.lock().expect("callback event lock");
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|(_, _, op)| *op == crate::terminal::ColorChangeOp::Reset),
+            "bare keys must report configured Reset rather than Dynamic"
+        );
+    }
+
+    /// A bare numeric key is the OSC 21 spelling of an indexed-color reset,
+    /// not a SET. Like OSC 104 it remains available under the default policy
+    /// that blocks palette reconfiguration.
+    #[test]
+    fn osc_21_bare_numeric_key_resets_without_set_permission() {
+        let mut term = Terminal::new(4, 8);
+        let default = term.palette_color_components(42);
+
+        // Seed a changed value through a host-side config, avoiding the
+        // fail-closed wire SET gate that this reset must not inherit.
+        let mut palette = aterm_types::ColorPalette::new();
+        palette.set(42, aterm_types::Rgb::new(0xaa, 0xbb, 0xcc));
+        let mut config = crate::config::TerminalConfig::default();
+        config.custom_palette = Some(palette);
+        term.apply_config(&config);
+        assert_eq!(term.palette_color_components(42), (0xaa, 0xbb, 0xcc));
+
+        // With a configured palette, bare reset returns to that host baseline.
+        term.modes_mut().allow_palette_reconfigure = true;
+        term.process(b"\x1b]21;42=rgb:01/02/03\x1b\\");
+        assert_eq!(term.palette_color_components(42), (0x01, 0x02, 0x03));
+        term.modes_mut().allow_palette_reconfigure = false;
+        term.process(b"\x1b]21;42\x1b\\");
+        assert_eq!(term.palette_color_components(42), (0xaa, 0xbb, 0xcc));
+
+        // Removing the host palette makes the next bare reset return to the
+        // built-in value, still without granting SET permission.
+        config.custom_palette = None;
+        term.apply_config(&config);
+        term.modes_mut().allow_palette_reconfigure = true;
+        term.process(b"\x1b]21;42=rgb:04/05/06\x1b\\");
+        assert_eq!(term.palette_color_components(42), (0x04, 0x05, 0x06));
+        term.modes_mut().allow_palette_reconfigure = false;
+        term.process(b"\x1b]21;42\x1b\\");
+        assert_eq!(term.palette_color_components(42), default);
+    }
+
+    /// Color-stack pop must preserve a saved dynamic cursor as dynamic. The
+    /// callback receives Dynamic rather than an explicit Set(foreground), which
+    /// would freeze a host renderer on the transient foreground value.
+    #[test]
+    fn color_stack_pop_reports_dynamic_cursor_as_dynamic() {
+        use std::sync::{Arc, Mutex};
+
+        let mut term = Terminal::new(4, 8);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        term.set_color_change_callback(move |target, color, op| {
+            callback_events
+                .lock()
+                .expect("callback event lock")
+                .push((target, color, op));
+        });
+
+        term.process(
+            b"\x1b]30001\x1b\\\
+              \x1b]12;rgb:aa/bb/cc\x1b\\",
+        );
+        events.lock().expect("callback event lock").clear();
+        term.process(b"\x1b]30101\x1b\\");
+
+        assert_eq!(term.cursor_color(), None);
+        let events = events.lock().expect("callback event lock");
+        assert!(
+            events.iter().any(|&(target, color, op)| {
+                target == crate::terminal::ColorTarget::Cursor
+                    && color == term.default_foreground()
+                    && op == crate::terminal::ColorChangeOp::Dynamic
+            }),
+            "restoring a saved dynamic cursor must preserve Dynamic for callback consumers",
+        );
+    }
+
+    /// Kitty's color stack snapshots the complete selection palette. Restoring
+    /// only the background leaves selected glyph ink on a post-push value.
+    #[test]
+    fn color_stack_round_trip_restores_both_selection_colors() {
+        let mut term = Terminal::new(4, 8);
+        let saved_bg = aterm_types::Rgb::new(0x10, 0x20, 0x30);
+        let saved_fg = aterm_types::Rgb::new(0x40, 0x50, 0x60);
+
+        term.process(
+            b"\x1b]17;rgb:10/20/30\x1b\\\
+              \x1b]19;rgb:40/50/60\x1b\\\
+              \x1b]30001\x1b\\\
+              \x1b]17;rgb:a0/b0/c0\x1b\\\
+              \x1b]19;rgb:d0/e0/f0\x1b\\\
+              \x1b]30101\x1b\\",
+        );
+
+        assert_eq!(term.selection_background(), Some(saved_bg));
+        assert_eq!(term.selection_foreground(), Some(saved_fg));
+    }
+
+    /// Both selection-color resets follow their configured theme baselines (the
+    /// OSC 110/111/112/104 convention).
+    #[test]
+    fn selection_color_resets_and_ris_restore_host_baselines() {
+        let mut term = Terminal::new(4, 8);
+        let configured_bg = aterm_types::Rgb::new(0x21, 0x32, 0x43);
+        let configured_fg = aterm_types::Rgb::new(0x54, 0x65, 0x76);
+        let mut config = crate::config::TerminalConfig::default();
+        config.selection_background = Some(configured_bg);
+        config.selection_foreground = Some(configured_fg);
+        term.apply_config(&config);
+
+        term.process(
+            b"\x1b]17;rgb:aa/bb/cc\x1b\\\
+              \x1b]19;rgb:dd/ee/ff\x1b\\\
+              \x1b]117\x1b\\\
+              \x1b]119\x1b\\",
+        );
+        assert_eq!(term.selection_background(), Some(configured_bg));
+        assert_eq!(term.selection_foreground(), Some(configured_fg));
+
+        term.process(
+            b"\x1b]17;rgb:aa/bb/cc\x1b\\\
+              \x1b]19;rgb:dd/ee/ff\x1b\\\
+              \x1bc",
+        );
+        assert_eq!(
+            term.selection_background(),
+            Some(configured_bg),
+            "RIS restores the configured selection background"
+        );
+        assert_eq!(
+            term.selection_foreground(),
+            Some(configured_fg),
+            "RIS restores configured selected-text ink"
         );
     }
 }

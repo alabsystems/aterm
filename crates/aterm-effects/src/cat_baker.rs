@@ -196,6 +196,15 @@ impl CatBaker {
         self.version
     }
 
+    /// The LRU / bake-budget frame clock, advanced once per
+    /// [`begin_frame`](CatBaker::begin_frame). Diagnostic: it is how a host
+    /// that ticks several panes into ONE presented frame proves the two-bake
+    /// budget stayed per-FRAME instead of multiplying with the pane count.
+    #[doc(hidden)]
+    pub fn frame_clock(&self) -> u64 {
+        self.clock
+    }
+
     /// The published atlas snapshot, rebuilt lazily after any bake. `None`
     /// until the first bake (and after [`CatBaker::clear`]) — cat-free frames
     /// carry no atlas (byte-identical off).

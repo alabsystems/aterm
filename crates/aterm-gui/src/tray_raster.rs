@@ -2492,6 +2492,68 @@ pub(crate) fn rasterize_tray_pixels(
     )
 }
 
+/// Composite one retained straight-alpha RGBA surface over another in the same
+/// linear-light source-over space as tray primitive rasterization.
+///
+/// Origins are device-pixel coordinates in one shared window space. The
+/// destination storage is reused in place; malformed dimensions fail closed
+/// without changing it.
+pub(crate) fn composite_rgba_surface(
+    destination: &mut Vec<u8>,
+    destination_size: (u32, u32),
+    destination_origin: (u32, u32),
+    source: &[u8],
+    source_size: (u32, u32),
+    source_origin: (u32, u32),
+) -> bool {
+    let byte_len = |(width, height): (u32, u32)| {
+        usize::try_from(
+            u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(4),
+        )
+        .ok()
+    };
+    if byte_len(destination_size) != Some(destination.len())
+        || byte_len(source_size) != Some(source.len())
+    {
+        return false;
+    }
+
+    let (destination_width, destination_height) = destination_size;
+    let mut canvas = Canvas {
+        origin_x: destination_origin.0.min(i32::MAX as u32) as i32,
+        origin_y: destination_origin.1.min(i32::MAX as u32) as i32,
+        w: destination_width,
+        h: destination_height,
+        px: std::mem::take(destination),
+        glyphs: std::collections::HashMap::new(),
+        clip: Vec::new(),
+    };
+    let (source_width, source_height) = source_size;
+    let source_x = source_origin.0.min(i32::MAX as u32) as i32;
+    let source_y = source_origin.1.min(i32::MAX as u32) as i32;
+    for row in 0..source_height {
+        for col in 0..source_width {
+            let index =
+                usize::try_from((u64::from(row) * u64::from(source_width) + u64::from(col)) * 4)
+                    .unwrap_or(usize::MAX);
+            let Some(pixel) = source.get(index..index.saturating_add(4)) else {
+                *destination = canvas.px;
+                return false;
+            };
+            canvas.blend(
+                source_x.saturating_add(col.min(i32::MAX as u32) as i32),
+                source_y.saturating_add(row.min(i32::MAX as u32) as i32),
+                [pixel[0], pixel[1], pixel[2], pixel[3]],
+                1.0,
+            );
+        }
+    }
+    *destination = canvas.px;
+    true
+}
+
 /// Rasterize only `region` of a full retained tray. Coordinates passed to every
 /// primitive remain global device coordinates; only storage and scan bounds are
 /// tiled. The returned bytes are tightly packed `region.width × region.height`.

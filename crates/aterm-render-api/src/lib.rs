@@ -22,10 +22,15 @@ use aterm_core::terminal::CursorStyle;
 // site is unchanged; this crate now consumes the value, never `&Terminal`.
 pub use aterm_core::render::{
     CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, InkCell,
-    RainHalo, RenderInput, SceneAtlas, SpriteQuad, TrailCell, WordDecoration,
+    RainHalo, RenderInput, SceneAtlas, SelectionClip, SpriteQuad, TrailCell, WordDecoration,
 };
 
-/// An RGBA (here: packed `0x00RRGGBB`, opaque) framebuffer, row-major.
+/// A row-major RGBA framebuffer packed as `0xTTRRGGBB`.
+///
+/// The top byte is *transmittance*, not alpha: `TT = 0` is opaque and
+/// `TT = 255` is fully transparent. Byte-oriented RGBA consumers therefore use
+/// `alpha = 255 - TT`; [`Frame::rgba_bytes`] and [`Frame::to_png`] perform that
+/// conversion.
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub width: usize,
@@ -34,7 +39,8 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The framebuffer as tightly-packed RGB bytes (3 per pixel, row-major).
+    /// The framebuffer as tightly packed RGB bytes (3 per pixel, row-major),
+    /// intentionally discarding the packed transmittance byte.
     #[must_use]
     pub fn rgb_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.pixels.len() * 3);
@@ -46,18 +52,40 @@ impl Frame {
         out
     }
 
+    /// The framebuffer as tightly packed straight-alpha RGBA bytes (4 per
+    /// pixel, row-major).
+    ///
+    /// Packed frame pixels store transmittance in their top byte, so the output
+    /// alpha is `255 - transmittance`.
+    #[must_use]
+    pub fn rgba_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.pixels.len() * 4);
+        for &p in &self.pixels {
+            out.push((p >> 16) as u8);
+            out.push((p >> 8) as u8);
+            out.push(p as u8);
+            out.push(255 - (p >> 24) as u8);
+        }
+        out
+    }
+
     /// Encode the rendered screen as a PNG — this is `read_image` (ATERM_DESIGN
     /// §8): an intelligence reads the ACTUAL rendered pixels, not the engine's
-    /// idea of the grid. Headless; no display needed.
+    /// idea of the grid. Translucent framebuffer pixels retain their converted
+    /// alpha in the RGBA output. Headless; no display needed.
     #[must_use]
     pub fn to_png(&self) -> Vec<u8> {
         let mut out = Vec::new();
         {
             let mut enc = png::Encoder::new(&mut out, self.width as u32, self.height as u32);
-            enc.set_color(png::ColorType::Rgb);
+            enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
+            // Frame RGB is canonical non-linear sRGB. Emit the sRGB chunk so
+            // wide-gamut/HDR viewers never have to guess how `image` bytes
+            // should be interpreted.
+            enc.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
             let mut w = enc.write_header().expect("png header");
-            w.write_image_data(&self.rgb_bytes()).expect("png data");
+            w.write_image_data(&self.rgba_bytes()).expect("png data");
         }
         out
     }
@@ -110,8 +138,9 @@ impl RenderView<'_> {
         }
     }
 
-    /// The packed `0x00RRGGBB` pixels, row-major — borrowed in the `Borrowed`
-    /// case (no copy), borrowed from the owned `Frame` otherwise.
+    /// The packed `0xTTRRGGBB` pixels, row-major — borrowed in the `Borrowed`
+    /// case (no copy), borrowed from the owned `Frame` otherwise. `TT` is
+    /// transmittance (`0` opaque, `255` transparent), matching [`Frame`].
     #[must_use]
     pub fn pixels(&self) -> &[u32] {
         match self {
@@ -157,4 +186,50 @@ pub trait Rasterizer {
     /// Override the rendered cursor style regardless of DECSCUSR (e.g.
     /// `HollowBlock` while the window is unfocused); `None` clears the override.
     fn set_cursor_style_override(&mut self, style: Option<CursorStyle>);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Frame;
+
+    fn alpha_fixture() -> Frame {
+        Frame {
+            width: 3,
+            height: 1,
+            pixels: vec![0x0011_2233, 0x7f44_5566, 0xff77_8899],
+        }
+    }
+
+    #[test]
+    fn rgba_bytes_inverts_packed_transmittance() {
+        assert_eq!(
+            alpha_fixture().rgba_bytes(),
+            [
+                0x11, 0x22, 0x33, 0xff, // opaque
+                0x44, 0x55, 0x66, 0x80, // half-transmittance
+                0x77, 0x88, 0x99, 0x00, // fully transparent
+            ]
+        );
+    }
+
+    #[test]
+    fn png_preserves_converted_frame_alpha() {
+        let frame = alpha_fixture();
+        let png = frame.to_png();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+            .read_info()
+            .expect("decode header");
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        assert_eq!(
+            reader.info().srgb,
+            Some(png::SrgbRenderingIntent::Perceptual),
+            "renderer PNGs carry explicit sRGB metadata"
+        );
+        let mut decoded = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut decoded).expect("decode pixels");
+        assert_eq!(
+            &decoded[..info.buffer_size()],
+            frame.rgba_bytes().as_slice()
+        );
+    }
 }

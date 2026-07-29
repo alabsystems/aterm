@@ -845,7 +845,11 @@ mod tests {
             "the cut-off must be the wall-clock watchdog (~300ms), not an instant reject ({elapsed:?})"
         );
         assert!(
-            elapsed < Duration::from_secs(3),
+            // Upper bound over a SLEEP-POLLED background watchdog (WD_STEP 50ms to a
+            // 300ms deadline) — the tick-vs-deadline shape of cb8c0cff. Without the
+            // watchdog the dial hangs for the whole handshake timeout, so a wide
+            // bound still fails loudly on 'runs unbounded'.
+            elapsed < Duration::from_secs(30),
             "the wall-clock deadline must bound the dribble, not run unbounded ({elapsed:?})"
         );
         let _ = dribbler.join();
@@ -902,7 +906,11 @@ mod tests {
             "the cut-off must be the wall-clock watchdog (~300ms), not an instant reject ({elapsed:?})"
         );
         assert!(
-            elapsed < Duration::from_secs(3),
+            // Upper bound over a SLEEP-POLLED background watchdog (WD_STEP 50ms to a
+            // 300ms deadline) — the tick-vs-deadline shape of cb8c0cff. Without the
+            // watchdog the dial hangs for the whole handshake timeout, so a wide
+            // bound still fails loudly on 'runs unbounded'.
+            elapsed < Duration::from_secs(30),
             "the wall-clock deadline must bound the dribble, not run unbounded ({elapsed:?})"
         );
         let _ = server.join();

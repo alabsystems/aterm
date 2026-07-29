@@ -302,7 +302,8 @@ impl App {
         // paint, pointer hit testing, accessibility, and capture.  In
         // particular that path resolves the window's Retina scale and content
         // padding; rebuilding here from physical split bounds made inspection
-        // report a 216px wide sidebar while the glass showed the 64px rail.
+        // report a 216px wide sidebar while the retained app-render artifact
+        // used the 64px rail.
         if self
             .active_native_view(wid)
             .is_some_and(|(_, active_view)| active_view == view)
@@ -355,9 +356,9 @@ impl App {
         // view, but it still has an exact retained semantic/raster artifact. Use
         // that artifact whenever its retained view identity and device geometry
         // still match the visible plan. Its model stamp may legitimately be stale:
-        // after a reducer mutation but before present, the retained artifact is
-        // precisely what remains on glass. Recompiling through the generic
-        // inactive layout path would describe neither its on-glass split bounds
+        // after a reducer mutation but before present, it is precisely the
+        // retained app-present artifact. Recompiling through the generic
+        // inactive layout path would describe neither its retained split bounds
         // nor the font/theme inputs that produced its retained pixels.
         if let Some((compiled, stamp, model_current)) = self.retained_visible_native_ui(wid, view) {
             return Ok(InspectedView {
@@ -610,7 +611,7 @@ fn semantic_input(
     }
 }
 
-fn semantic_text_lines(compiled: &CompiledUi) -> Vec<String> {
+pub(crate) fn semantic_text_lines(compiled: &CompiledUi) -> Vec<String> {
     let mut lines = compiled
         .semantics
         .iter()
@@ -1530,10 +1531,10 @@ mod tests {
             window.cols = u16::try_from(medium_columns).unwrap();
         }
         assert!(app.prepare_native_input_scratch(wid));
-        let glass = app.cached_native_ui(wid).unwrap().compiled.clone();
+        let retained_compilation = app.cached_native_ui(wid).unwrap().compiled.clone();
         let inspected = app.compile_view(view).unwrap();
         assert_eq!(inspected.source, InspectionCompileSource::Staged);
-        assert_eq!(glass, inspected.compiled);
+        assert_eq!(retained_compilation, inspected.compiled);
         assert!(
             (760.0..1_040.0).contains(&inspected.compiled.bounds.width),
             "medium-width bounds: {:?}",
@@ -1566,11 +1567,11 @@ mod tests {
         assert!(tree[1].contains("source=staged"));
         assert_eq!(
             &tree[2..],
-            semantic_tree_lines(&glass),
-            "control geometry and semantics are the staged glass compilation"
+            semantic_tree_lines(&retained_compilation),
+            "control geometry and semantics are the staged app-render compilation"
         );
 
-        // Background views cannot claim glass parity. Their deterministic
+        // Background views cannot claim retained-artifact parity. Their deterministic
         // fallback is deliberately labeled in the wire projection.
         assert!(
             app.windows
@@ -1629,8 +1630,9 @@ mod tests {
         )));
 
         // Advance the native reducer without presenting another composite. The
-        // old retained raster is still exactly what glass shows, so Audit must
-        // keep describing it and explicitly report that the model has moved on.
+        // old retained raster is still exactly the retained app-present artifact,
+        // so Audit must keep describing it and explicitly report that the model
+        // has moved on.
         let outcome = app
             .native_runtime
             .dispatch(

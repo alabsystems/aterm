@@ -2862,6 +2862,101 @@ pub fn hdr_present_gate_model() -> Model {
     }
 }
 
+/// HDR RECONFIGURE RE-TAG (M3 lifecycle completion) — reconfiguring an f16
+/// DX12 surface for resize, a live composite-alpha change, or Outdated/Lost
+/// recovery recreates its swapchain and clears the DXGI colour-space tag.
+/// Windows may also disable HDR without forcing any of those surface events, so
+/// the same decision follows a bounded live validation. The surface may remain
+/// f16 only when re-establishing/confirming scRGB succeeds. Otherwise the
+/// transition atomically selects the retained SDR format and changes capture
+/// metadata from extended-linear to sRGB before another present.
+///
+/// Scalar projection `<<stage, retagged, is_f16, capture_linear>>`: stage 0 is a
+/// confirmed f16/scRGB surface. `RetagSucceeds` preserves that pairing;
+/// `RetagFails` performs the required two-field fallback.
+/// `EnterSdrFallback -> UpgradeSucceeds/UpgradeFails` models the symmetric
+/// same-size Windows HDR-on path from a retained eligible SDR surface.
+/// `Buggy=1` recreates both defects: ignore a failed live re-tag, or leave the
+/// attempted upgrade f16 after its tag fails.
+///
+/// Tier-1 is `aterm-gpu/tests/hdr_gate.rs`: it drives the shipping
+/// `hdr_reconfigure_plan`, projects both concrete outcomes onto these variables,
+/// checks the real transitions against this model, and includes the old
+/// ignore-failure policy as a negative control.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn hdr_reconfigure_retag_model() -> Model {
+    crate::ty_model! {
+        HdrReconfigureRetag {
+            const Buggy = 0;
+            // 0 confirmed HDR, 1 retained eligible SDR, 2 recovery resolved.
+            var stage = 0;
+            var retagged = 0;
+            var is_f16 = 1;
+            var capture_linear = 1;
+
+            action RetagSucceeds when (stage == 0) {
+                stage = 2;
+                retagged = 1;
+                is_f16 = 1;
+                capture_linear = 1;
+            }
+
+            action RetagFails when (stage == 0) {
+                stage = 2;
+                retagged = 0;
+                is_f16 = if Buggy == 1 { 1 } else { 0 };
+                capture_linear = if Buggy == 1 { 1 } else { 0 };
+            }
+
+            action EnterSdrFallback when (stage == 0) {
+                stage = 1;
+                retagged = 0;
+                is_f16 = 0;
+                capture_linear = 0;
+            }
+
+            action UpgradeSucceeds when (stage == 1) {
+                stage = 2;
+                retagged = 1;
+                is_f16 = 1;
+                capture_linear = 1;
+            }
+
+            action UpgradeFails when (stage == 1) {
+                stage = 2;
+                retagged = 0;
+                is_f16 = if Buggy == 1 { 1 } else { 0 };
+                capture_linear = 0;
+            }
+
+            invariant FailedRetagFallsBackAtomically:
+                if stage == 2 && retagged == 0 {
+                    is_f16 == 0 && capture_linear == 0
+                } else {
+                    is_f16 <= 1
+                };
+            invariant ResolvedF16RequiresSuccessfulRetag:
+                if stage == 2 && is_f16 == 1 {
+                    retagged == 1
+                } else {
+                    retagged <= 1
+                };
+            invariant AwaitingUpgradeIsSdr:
+                if stage == 1 {
+                    is_f16 == 0 && capture_linear == 0
+                } else {
+                    stage == 0 || stage == 2
+                };
+            invariant CaptureMatchesSurfaceEncoding:
+                capture_linear == is_f16;
+            invariant ValuesBounded:
+                stage <= 2 && retagged <= 1 &&
+                is_f16 <= 1 && capture_linear <= 1;
+        }
+    }
+}
+
 /// CHROME FACE GATE — chrome typography to grid standard: which face draws a
 /// chrome (tray/overlay) glyph. The real decision is aterm-gui's pure
 /// `tray_raster::select_chrome_face`; the Tier-1 binding is that module's
@@ -23843,6 +23938,937 @@ pub fn settings_page_scroll_model() -> Model {
     }
 }
 
+/// VIDEO recording and publication are one serialized, fail-closed lifecycle.
+///
+/// The control thread pre-creates a private, server-named directory before the
+/// event-loop request is armed. `recording_slot` owns that request through the
+/// pending/recording phases; `BeginExport` atomically hands ownership to the
+/// process-wide `export_permit`. Success transfers the directory from private
+/// ownership to a published artifact, while rejection, cancellation, encode
+/// failure, owner loss, and a live opacity transition all remove it.
+///
+/// Mode is honest about the presentation source: a swapchain tap requires
+/// glass, an offscreen present-real recording requires no glass, and only the
+/// latter owns a pacing timer. A translucent transition aborts a live tap before
+/// another frame can be accepted.
+///
+/// `Buggy=1` exposes independently reachable historical failure classes:
+/// cleanup may strand the private directory, a windowed request may take the
+/// headless arm, and a second recording may acquire ownership while the first is
+/// still exporting. It also exposes publication without winning the cancellation
+/// CAS and retention of a tap after the glass becomes translucent. Tier-0
+/// exercises each mutant directly in addition to the exhaustive prove-and-catch
+/// check.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn video_recording_lifecycle_model() -> Model {
+    crate::ty_model! {
+        VideoRecordingLifecycle {
+            const Buggy = 0;
+            // 0 Idle, 1 Reserved/pending, 2 Recording, 3 Exporting.
+            var phase = 0;
+            var glass = 0;
+            // 0 None, 1 SwapchainTap, 2 OffscreenPresentReal.
+            var mode = 0;
+            var timer = 0;
+            var translucent = 0;
+            // The pending/recording side and exporting side of the serialized
+            // lifecycle. They must never overlap.
+            var recording_slot = 0;
+            var export_permit = 0;
+            var active = 0;
+            // Private, server-owned directories for the current lifecycle.
+            var private_dirs = 0;
+            // The current lifecycle completed its atomic publication.
+            var published = 0;
+            // Publication CAS: 0 Live, 1 Cancelled, 2 CommitAuthorized.
+            var cancel_state = 0;
+            // A bounded witness that cancellation lost to commit authorization.
+            var late_cancel = 0;
+
+            action AttachGlass when (phase == 0) { glass = 1; }
+            action DetachGlass when (phase == 0) { glass = 0; }
+            action MakeOpaque when (phase == 0 && translucent == 1) {
+                translucent = 0;
+            }
+            action Reserve when (
+                phase == 0 && recording_slot == 0 &&
+                export_permit == 0 && active == 0
+            ) {
+                phase = 1;
+                mode = 0;
+                timer = 0;
+                recording_slot = 1;
+                active = 1;
+                private_dirs = 1;
+                published = 0;
+                cancel_state = 0;
+                late_cancel = 0;
+            }
+            action BeginOnGlass when (
+                phase == 1 && glass == 1 && translucent == 0
+            ) {
+                phase = 2;
+                mode = 1;
+                timer = 0;
+            }
+            action BeginHeadless when (phase == 1 && glass == 0) {
+                phase = 2;
+                mode = 2;
+                timer = 1;
+            }
+            action BuggyBeginOnGlassOffscreen when (
+                Buggy == 1 && phase == 1 && glass == 1
+            ) {
+                phase = 2;
+                mode = 2;
+                timer = 1;
+            }
+            action Tick when (phase == 2 && mode == 2 && timer == 1) {
+                timer = 1;
+            }
+            action BeginExport when (phase == 2) {
+                phase = 3;
+                mode = 0;
+                timer = 0;
+                recording_slot = 0;
+                export_permit = 1;
+            }
+            action AuthorizeCommit when (
+                phase == 3 && cancel_state == 0
+            ) {
+                cancel_state = 2;
+            }
+            action CancelAfterAuthorization when (
+                phase == 3 && cancel_state == 2 && late_cancel == 0
+            ) {
+                cancel_state = 2;
+                late_cancel = 1;
+            }
+            action PublishSuccess when (
+                phase == 3 && cancel_state == 2
+            ) {
+                phase = 0;
+                mode = 0;
+                timer = 0;
+                export_permit = 0;
+                active = 0;
+                private_dirs = 0;
+                published = 1;
+                late_cancel = 0;
+            }
+            action BuggyPublishWithoutAuthorization when (
+                Buggy == 1 && phase == 3 && cancel_state == 0
+            ) {
+                phase = 0;
+                mode = 0;
+                timer = 0;
+                export_permit = 0;
+                active = 0;
+                private_dirs = 0;
+                published = 1;
+                late_cancel = 0;
+            }
+            action RejectBegin when (phase == 1) {
+                phase = 0;
+                mode = 0;
+                timer = 0;
+                recording_slot = 0;
+                active = 0;
+                private_dirs = 0;
+                published = 0;
+                cancel_state = 1;
+                late_cancel = 0;
+            }
+            action CancelLive when (phase > 0 && cancel_state == 0) {
+                phase = 0;
+                mode = 0;
+                timer = 0;
+                recording_slot = 0;
+                export_permit = 0;
+                active = 0;
+                private_dirs = 0;
+                published = 0;
+                cancel_state = 1;
+                late_cancel = 0;
+            }
+            action Fail when (phase > 0) {
+                phase = 0;
+                mode = 0;
+                timer = 0;
+                recording_slot = 0;
+                export_permit = 0;
+                active = 0;
+                private_dirs = 0;
+                published = 0;
+                cancel_state = 1;
+                late_cancel = 0;
+            }
+            action OwnerLost when (phase > 0) {
+                phase = 0;
+                mode = 0;
+                timer = 0;
+                recording_slot = 0;
+                export_permit = 0;
+                active = 0;
+                private_dirs = 0;
+                published = 0;
+                cancel_state = 1;
+                late_cancel = 0;
+            }
+            // Why: the mutant must be its OWN action, not a `Buggy` arm inside a
+            // live one — the strict-vacuity audit removes the dead set and
+            // requires the remaining Buggy=1 baseline to be safe, so an inline
+            // arm would make every dead action uncreditable as a negative control.
+            action BuggyStrandPrivateDirOnCleanup when (
+                Buggy == 1 && phase > 0
+            ) {
+                phase = 0;
+                mode = 0;
+                timer = 0;
+                recording_slot = 0;
+                export_permit = 0;
+                active = 0;
+                private_dirs = 1;
+                published = 0;
+                cancel_state = 1;
+                late_cancel = 0;
+            }
+            action MakeTapTranslucent when (
+                phase == 2 && mode == 1 && translucent == 0
+            ) {
+                translucent = 1;
+                phase = 0;
+                mode = 0;
+                timer = 0;
+                recording_slot = 0;
+                active = 0;
+                private_dirs = 0;
+                published = 0;
+                cancel_state = 1;
+                late_cancel = 0;
+            }
+            action BuggyRetainTapWhenTranslucent when (
+                Buggy == 1 && phase == 2 && mode == 1 && translucent == 0
+            ) {
+                translucent = 1;
+            }
+            action BuggyStartSecondWhileExporting when (
+                Buggy == 1 && phase == 3 && export_permit == 1
+            ) {
+                recording_slot = 1;
+                active = 2;
+                private_dirs = 2;
+            }
+
+            invariant Bounds:
+                phase <= 3 && glass <= 1 && mode <= 2 && timer <= 1 &&
+                translucent <= 1 && recording_slot <= 1 &&
+                export_permit <= 1 && active <= 2 && private_dirs <= 2 &&
+                published <= 1 && cancel_state <= 2 && late_cancel <= 1;
+            invariant ModeMatchesRecordingPhase:
+                if phase == 2 { mode > 0 } else { mode == 0 };
+            invariant OffscreenOnlyWithoutGlass:
+                (if mode == 2 { glass } else { 0 }) == 0;
+            invariant TapOnlyOnGlass:
+                (if mode == 1 { glass } else { 1 }) == 1;
+            invariant NoTranslucentTap:
+                (if mode == 1 { translucent } else { 0 }) == 0;
+            invariant OffscreenTimerExact:
+                if phase == 2 && mode == 2 { timer == 1 } else { timer == 0 };
+            invariant RecordingExportSerialized:
+                recording_slot + export_permit <= 1;
+            invariant ActiveAccounting:
+                active == recording_slot + export_permit;
+            invariant AtMostOneActiveLifecycle:
+                active <= 1 && private_dirs <= 1;
+            invariant PrivateDirectoryOwnedByLifecycle:
+                if phase > 0 { private_dirs == 1 } else { private_dirs == 0 };
+            invariant CancelledOwnsNothing:
+                if cancel_state == 1 {
+                    phase == 0 && active == 0 && private_dirs == 0 &&
+                    recording_slot == 0 && export_permit == 0 &&
+                    published == 0
+                } else {
+                    cancel_state == 0 || cancel_state == 2
+                };
+            invariant CommitAuthorizationScope:
+                if cancel_state == 2 {
+                    (phase == 3 && published == 0) ||
+                    (phase == 0 && published == 1)
+                } else {
+                    published == 0
+                };
+            invariant LateCancellationCannotRevoke:
+                if late_cancel == 1 {
+                    cancel_state == 2 && phase == 3 && export_permit == 1
+                } else {
+                    late_cancel == 0
+                };
+            invariant SlotMatchesPhase:
+                if phase == 1 || phase == 2 {
+                    recording_slot == 1 && export_permit == 0
+                } else if phase == 3 {
+                    recording_slot == 0 && export_permit == 1
+                } else {
+                    recording_slot == 0 && export_permit == 0
+                };
+            invariant PublishedOnlyAfterOwnershipTransfer:
+                if published == 1 {
+                    phase == 0 && active == 0 && private_dirs == 0 &&
+                    recording_slot == 0 && export_permit == 0 &&
+                    cancel_state == 2
+                } else {
+                    published == 0
+                };
+        }
+    }
+}
+
+/// Retention of per-process capture namespaces is decided by the exact instance
+/// lease, not merely by PID liveness.
+///
+/// Lease state `0` is a legacy namespace with no lease file, `1` is a lock held
+/// by a live exact process instance, `2` is a well-formed but freely lockable
+/// stale instance, and `3` is malformed/untrusted lease metadata. A held lease
+/// and malformed metadata fail closed to KEEP. A free lease is exact proof of
+/// staleness and is removed even if its recorded PID has since been reused.
+/// Only the missing-legacy case falls back to the coarse PID probe.
+///
+/// `Buggy=1` independently recreates removal of held/malformed namespaces and
+/// the PID-reuse leak that keeps a free lease when the numeric PID is alive.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn exact_instance_retention_model() -> Model {
+    crate::ty_model! {
+        ExactInstanceRetention {
+            const Buggy = 0;
+            // 0 MissingLegacy, 1 Held, 2 Free, 3 Malformed.
+            var lease = 0;
+            var pid_alive = 0;
+            // 0 Pending, 1 Keep, 2 Remove.
+            var decision = 0;
+
+            action SelectHeld when (decision == 0) { lease = 1; }
+            action SelectFree when (decision == 0) { lease = 2; }
+            action SelectMalformed when (decision == 0) { lease = 3; }
+            action ObservePidAlive when (
+                decision == 0 && pid_alive == 0
+            ) {
+                pid_alive = 1;
+            }
+            action Decide when (decision == 0) {
+                decision = if lease == 0 {
+                    if pid_alive == 1 { 1 } else { 2 }
+                } else if lease == 1 {
+                    if Buggy == 1 { 2 } else { 1 }
+                } else if lease == 2 {
+                    if Buggy == 1 && pid_alive == 1 { 1 } else { 2 }
+                } else {
+                    if Buggy == 1 { 2 } else { 1 }
+                };
+            }
+
+            invariant Bounds:
+                lease <= 3 && pid_alive <= 1 && decision <= 2;
+            invariant HeldNeverRemoved:
+                if lease == 1 { decision <= 1 } else { decision <= 2 };
+            invariant MalformedNeverRemoved:
+                if lease == 3 { decision <= 1 } else { decision <= 2 };
+            invariant FreeAlwaysRemoved:
+                if lease == 2 && decision > 0 {
+                    decision == 2
+                } else {
+                    decision <= 2
+                };
+            invariant MissingAloneUsesPidFallback:
+                if lease == 0 && decision > 0 {
+                    if pid_alive == 1 { decision == 1 } else { decision == 2 }
+                } else {
+                    decision <= 2
+                };
+        }
+    }
+}
+
+/// A confined artifact operation is a retained-handle transaction, not a path
+/// string that may be resolved again after an attacker swaps an ancestor.
+///
+/// `ConfinePin` retains the original inside object and its identity. Reads and
+/// writes target that pinned object even when the path's ancestor is swapped.
+/// `ValidateReply` then compares the reply-time path identity with the pin:
+/// unchanged identity may be certified; a swap fails closed, whether it happened
+/// before the operation or in the operation-to-reply interval.
+///
+/// `Buggy=1` exposes both forbidden TOCTOU classes: re-resolving a swapped path
+/// can read/write the outside object, and reply construction can certify the
+/// swapped identity despite having pinned a different object.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn anchored_artifact_transaction_model() -> Model {
+    crate::ty_model! {
+        AnchoredArtifactTransaction {
+            const Buggy = 0;
+            // 0 Unconfined, 1 Pinned, 2 Operated, 3 Replied.
+            var phase = 0;
+            var pinned = 0;
+            var swapped = 0;
+            // 0 None, 1 OriginalInside, 2 SwappedOutside.
+            var path_identity = 0;
+            // 0 None, 1 Read, 2 Write.
+            var operation = 0;
+            // 0 None/fail-closed, 1 OriginalInside, 2 Outside.
+            var effect_target = 0;
+            var validated = 0;
+            // 0 Pending, 1 Success, 2 FailClosed.
+            var reply = 0;
+            // 0 None, 1 OriginalInside, 2 SwappedOutside.
+            var certified_identity = 0;
+
+            action ConfinePin when (phase == 0) {
+                phase = 1;
+                pinned = 1;
+                swapped = 0;
+                path_identity = 1;
+                operation = 0;
+                effect_target = 0;
+                validated = 0;
+                reply = 0;
+                certified_identity = 0;
+            }
+            action SwapAncestor when (
+                phase > 0 && phase <= 2 && swapped == 0
+            ) {
+                swapped = 1;
+                path_identity = 2;
+            }
+            action ReadPinned when (phase == 1 && pinned == 1) {
+                phase = 2;
+                operation = 1;
+                effect_target = 1;
+            }
+            action WritePinned when (phase == 1 && pinned == 1) {
+                phase = 2;
+                operation = 2;
+                effect_target = 1;
+            }
+            action ValidateReply when (
+                (phase == 1 && swapped == 1) || phase == 2
+            ) {
+                phase = 3;
+                validated = 1;
+                reply = if swapped == 1 { 2 } else { 1 };
+                certified_identity = if swapped == 1 { 0 } else { 1 };
+            }
+            action BuggyReresolveRead when (
+                Buggy == 1 && phase == 1 && swapped == 1
+            ) {
+                phase = 2;
+                operation = 1;
+                effect_target = 2;
+            }
+            action BuggyReresolveWrite when (
+                Buggy == 1 && phase == 1 && swapped == 1
+            ) {
+                phase = 2;
+                operation = 2;
+                effect_target = 2;
+            }
+            action BuggyCertifySwapped when (
+                Buggy == 1 && phase == 2 && swapped == 1
+            ) {
+                phase = 3;
+                validated = 1;
+                reply = 1;
+                certified_identity = 2;
+            }
+
+            invariant Bounds:
+                phase <= 3 && pinned <= 1 && swapped <= 1 &&
+                path_identity <= 2 && operation <= 2 &&
+                effect_target <= 2 && validated <= 1 && reply <= 2 &&
+                certified_identity <= 2;
+            invariant ActiveTransactionIsPinned:
+                if phase > 0 { pinned == 1 } else { pinned == 0 };
+            invariant PathIdentityTracksAncestor:
+                if phase > 0 {
+                    if swapped == 1 {
+                        path_identity == 2
+                    } else {
+                        path_identity == 1
+                    }
+                } else {
+                    path_identity == 0
+                };
+            invariant OperationRequiresPinnedObject:
+                if operation > 0 {
+                    pinned == 1 && phase > 1 && effect_target > 0
+                } else {
+                    effect_target == 0
+                };
+            invariant AnchoredAccessNeverOutside:
+                effect_target <= 1;
+            invariant CompletedReplyWasValidated:
+                if phase == 3 {
+                    validated == 1 && reply > 0
+                } else {
+                    validated == 0 && reply == 0 && certified_identity == 0
+                };
+            invariant FailedReplyCertifiesNothing:
+                if reply == 2 { certified_identity == 0 } else { reply <= 1 };
+            invariant SuccessfulReplyCertifiesOriginal:
+                if reply == 1 {
+                    operation > 0 && effect_target == 1 &&
+                    path_identity == 1 && swapped == 0 &&
+                    certified_identity == 1
+                } else {
+                    reply == 0 || reply == 2
+                };
+            invariant SwappedPathNeverCertified:
+                if swapped == 1 {
+                    reply == 0 || (reply == 2 && certified_identity == 0)
+                } else {
+                    certified_identity <= 1
+                };
+        }
+    }
+}
+
+/// A filesystem artifact reply is a transaction that spans two threads, the
+/// complete control-socket write, and a nonce-bound peer acknowledgement. Timeout
+/// cancellation and final-name authorization have one winner. A successful
+/// worker queues exact handles; the socket thread revalidates them before any OK
+/// byte, then writes and flushes the complete frame plus a fresh nonce challenge.
+/// Only the matching post-challenge echo permits immediate release. A failed or
+/// abandoned ACK enters an additional central nonblocking quarantine; its two
+/// bounded ticks abstract the shipping 30-second delay, and the guard survives
+/// until explicit expiry. A partial `write_all` failure enters the same
+/// quarantine because path bytes may already be visible even though the complete
+/// frame receipt guarantee was never established. A pre-wire abort remains the
+/// only direct cleanup path because it removes an unpublished artifact.
+///
+/// `Buggy=1` exposes six independently audited failures: publishing after timeout
+/// won, dropping a queued handle before the reply reaches the wire, pruning a
+/// leased artifact, releasing without a valid ACK, accepting a pre-pipelined ACK
+/// before the server's causal challenge, or releasing quarantine before expiry.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn artifact_reply_publication_model() -> Model {
+    crate::ty_model! {
+        ArtifactReplyPublication {
+            const QuarantineDelay = 1;
+            const Buggy = 0;
+            // 0 Live, 1 Cancelled, 2 Authorized, 3 Queued,
+            // 4 WirePrepared, 5 WireWritten, 6 PeerAcked,
+            // 7 Quarantined, 8 QuarantineExpired, 9 AbortPending,
+            // 10 ReleasedAfterAck, 11 ReleasedAfterQuarantine,
+            // 12 ReleasedAbort.
+            var phase = 0;
+            var artifact = 0;
+            var guard = 0;
+            var committed = 0;
+            var reply = 0;
+            var challenge = 0;
+            var ack = 0;
+            var ack_failed = 0;
+            var write_error = 0;
+            var quarantine = 0;
+            var quarantine_age = 0;
+            var expired = 0;
+
+            action Cancel when (phase == 0) {
+                phase = 1;
+            }
+            action AuthorizeCommit when (phase == 0) {
+                phase = 2;
+                artifact = 1;
+                guard = 1;
+            }
+            action AbortAuthorized when (
+                phase == 2 && artifact == 1 && guard == 1
+            ) {
+                phase = 9;
+            }
+            action QueueGuard when (phase == 2 && artifact == 1 && guard == 1) {
+                phase = 3;
+            }
+            action AbortQueued when (
+                phase == 3 && artifact == 1 && guard == 1
+            ) {
+                phase = 9;
+            }
+            action PrepareWire when (phase == 3 && guard == 1) {
+                phase = 4;
+                committed = 1;
+            }
+            action PrepareFailed when (
+                phase == 3 && artifact == 1 && guard == 1
+            ) {
+                phase = 9;
+            }
+            action WriteWire when (phase == 4 && guard == 1 && committed == 1) {
+                phase = 5;
+                reply = 1;
+                challenge = 1;
+            }
+            action WriteFailed when (
+                phase == 4 && artifact == 1 && guard == 1 && committed == 1
+            ) {
+                phase = 7;
+                write_error = 1;
+                quarantine = 1;
+                quarantine_age = 0;
+            }
+            action AcknowledgePeer when (
+                phase == 5 && artifact == 1 && guard == 1 &&
+                committed == 1 && reply == 1 && challenge == 1
+            ) {
+                phase = 6;
+                ack = 1;
+            }
+            action AcknowledgeFailed when (
+                phase == 5 && artifact == 1 && guard == 1 &&
+                committed == 1 && reply == 1 && challenge == 1
+            ) {
+                phase = 7;
+                ack_failed = 1;
+                quarantine = 1;
+                quarantine_age = 0;
+            }
+            action AdvanceQuarantine when (
+                phase == 7 && quarantine == 1 &&
+                quarantine_age <= QuarantineDelay - 1
+            ) {
+                quarantine_age = quarantine_age + 1;
+            }
+            action ExpireQuarantine when (
+                phase == 7 && quarantine == 1 &&
+                quarantine_age == QuarantineDelay
+            ) {
+                phase = 8;
+                quarantine = 0;
+                expired = 1;
+            }
+            action ReleaseGuard when (
+                guard == 1 && (phase == 6 || phase == 8 || phase == 9)
+            ) {
+                artifact = if phase == 9 { 0 } else { artifact };
+                phase = if phase == 6 {
+                    10
+                } else {
+                    if phase == 8 { 11 } else { 12 }
+                };
+                guard = 0;
+            }
+            action RetentionSweep when (
+                phase > 1 && phase <= 9 && artifact == 1 && guard == 1
+            ) {
+                artifact = 1;
+            }
+            action BuggyPublishAfterCancel when (Buggy == 1 && phase == 1) {
+                artifact = 1;
+                committed = 1;
+            }
+            action BuggyDropBeforeWrite when (
+                Buggy == 1 && phase == 3 && guard == 1
+            ) {
+                guard = 0;
+            }
+            action BuggyPruneLeased when (
+                Buggy == 1 && phase > 1 && phase <= 9 &&
+                artifact == 1 && guard == 1
+            ) {
+                artifact = 0;
+            }
+            action BuggyReleaseWithoutAck when (
+                Buggy == 1 && phase == 5 && guard == 1
+            ) {
+                phase = 10;
+                guard = 0;
+            }
+            action BuggyAcceptPreChallengeAck when (
+                Buggy == 1 && phase == 4 && artifact == 1 &&
+                guard == 1 && committed == 1 && challenge == 0
+            ) {
+                phase = 6;
+                ack = 1;
+            }
+            action BuggyReleaseQuarantineEarly when (
+                Buggy == 1 && phase == 7 && quarantine == 1 &&
+                quarantine_age <= QuarantineDelay - 1 && guard == 1
+            ) {
+                phase = 11;
+                guard = 0;
+                quarantine = 0;
+            }
+
+            invariant Bounds:
+                phase <= 12 && artifact <= 1 && guard <= 1 &&
+                committed <= 1 && reply <= 1 &&
+                challenge <= 1 && ack <= 1 && ack_failed <= 1 &&
+                write_error <= 1 && quarantine <= 1 &&
+                quarantine_age <= QuarantineDelay && expired <= 1 &&
+                ack + ack_failed <= 1 &&
+                ack_failed + write_error <= 1;
+            invariant CancelledPublishesNothing:
+                if phase == 1 {
+                    artifact == 0 && guard == 0 && committed == 0 &&
+                    reply == 0 && challenge == 0 &&
+                    ack == 0 && ack_failed == 0 && write_error == 0 &&
+                    quarantine == 0 &&
+                    quarantine_age == 0 && expired == 0
+                } else {
+                    artifact <= 1
+                };
+            invariant OwnedThroughClassifiedExitRetainsGuard:
+                if phase > 1 && phase <= 9 { guard == 1 } else { guard <= 1 };
+            invariant LeasedArtifactSurvivesRetention:
+                if phase > 1 && phase <= 11 {
+                    artifact == 1
+                } else {
+                    if phase == 12 { artifact == 0 } else { artifact <= 1 }
+                };
+            invariant CommitRequiresWirePreparation:
+                if committed == 1 {
+                    (phase > 3 && phase <= 8) ||
+                    phase == 10 || phase == 11
+                } else {
+                    phase <= 3 || phase == 9 || phase == 12
+                };
+            invariant ReplyRequiresCommittedArtifact:
+                if reply == 1 {
+                    (phase == 5 || phase == 6 || phase == 7 ||
+                    phase == 8 || phase == 10 || phase == 11) &&
+                    artifact == 1 && committed == 1 && challenge == 1
+                } else {
+                    phase <= 4 || phase == 7 || phase == 8 ||
+                    phase == 9 || phase == 11 || phase == 12
+                };
+            invariant ChallengeRequiresCompleteWire:
+                if challenge == 1 {
+                    reply == 1 &&
+                    (phase == 5 || phase == 6 || phase == 7 ||
+                    phase == 8 || phase == 10 || phase == 11)
+                } else {
+                    challenge == 0
+                };
+            invariant SuccessfulAckRequiresCausalChallenge:
+                if ack == 1 {
+                    challenge == 1 && reply == 1 && committed == 1 &&
+                    artifact == 1 && (phase == 6 || phase == 10)
+                } else {
+                    ack == 0
+                };
+            invariant AckFailureEntersQuarantine:
+                if ack_failed == 1 {
+                    challenge == 1 && reply == 1 && committed == 1 &&
+                    artifact == 1 &&
+                    (phase == 7 || phase == 8 || phase == 11)
+                } else {
+                    ack_failed == 0
+                };
+            invariant WriteFailureEntersQuarantine:
+                if write_error == 1 {
+                    reply == 0 && challenge == 0 && committed == 1 &&
+                    artifact == 1 &&
+                    (phase == 7 || phase == 8 || phase == 11)
+                } else {
+                    write_error == 0
+                };
+            invariant QuarantineRetainsClassifiedGuard:
+                if quarantine == 1 {
+                    phase == 7 && guard == 1 && artifact == 1 &&
+                    expired == 0 && ack_failed + write_error == 1
+                } else {
+                    quarantine == 0
+                };
+            invariant QuarantineAgeMatchesPhase:
+                if phase == 7 {
+                    quarantine_age <= QuarantineDelay
+                } else {
+                    if phase == 8 || phase == 11 {
+                        quarantine_age == QuarantineDelay
+                    } else {
+                        quarantine_age == 0
+                    }
+                };
+            invariant QuarantineExpiryIsCausal:
+                if expired == 1 {
+                    (phase == 8 || phase == 11) &&
+                    quarantine == 0 &&
+                    quarantine_age == QuarantineDelay &&
+                    ack_failed + write_error == 1
+                } else {
+                    phase <= 7 || phase == 9 ||
+                    phase == 10 || phase == 12
+                };
+            invariant ImmediateReleaseRequiresValidAck:
+                if phase == 10 {
+                    guard == 0 && reply == 1 && committed == 1 &&
+                    artifact == 1 && challenge == 1 &&
+                    ack == 1 && ack_failed == 0 && write_error == 0 &&
+                    quarantine == 0 && expired == 0 &&
+                    quarantine_age == 0
+                } else {
+                    phase <= 9 || phase > 10
+                };
+            invariant QuarantineReleaseRequiresExpiry:
+                if phase == 11 {
+                    guard == 0 && artifact == 1 && committed == 1 &&
+                    ack == 0 && ack_failed + write_error == 1 &&
+                    quarantine == 0 && expired == 1 &&
+                    quarantine_age == QuarantineDelay
+                } else {
+                    phase <= 10 || phase > 11
+                };
+            invariant AbortReleaseRemovesUncommittedArtifact:
+                if phase == 12 {
+                    guard == 0 && artifact == 0 && committed == 0 &&
+                    reply == 0 && challenge == 0 &&
+                    ack == 0 && ack_failed == 0 && write_error == 0 &&
+                    quarantine == 0 &&
+                    quarantine_age == 0 && expired == 0
+                } else {
+                    phase <= 11
+                };
+        }
+    }
+}
+
+/// Refcounted `video frames` retention is a separate bounded lifecycle from
+/// publication. Multiple readers may share one exact recording. Final identity
+/// validation arms one capability-bound convergence sweep. A non-final release
+/// cannot start maintenance; the last release schedules it, new acquisitions
+/// fail closed while that schedule/sweep is live, and only completion reopens
+/// acquisition.
+///
+/// `pending` is the abstract seam between the last count decrement and
+/// `StartSweep`. Shipping code performs both under one registry mutex, so no
+/// acquisition can observe the seam. Keeping it explicit makes the ordering
+/// obligation checkable instead of hiding it inside one large action.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn artifact_reader_lease_model() -> Model {
+    crate::ty_model! {
+        ArtifactReaderLease {
+            const Cap = 2;
+            const Buggy = 0;
+            var readers = 0;
+            var armed = 0;
+            var pending = 0;
+            var sweeping = 0;
+            var swept = 0;
+
+            action Acquire when (
+                readers <= Cap - 1 && pending == 0 && sweeping == 0
+            ) {
+                readers = readers + 1;
+            }
+            action Arm when (
+                readers > 0 && pending == 0 && sweeping == 0
+            ) {
+                armed = 1;
+            }
+            action Release when (readers > 0) {
+                pending = if readers == 1 && armed == 1 { 1 } else { pending };
+                readers = readers - 1;
+            }
+            action StartSweep when (
+                readers == 0 && armed == 1 && pending == 1 && sweeping == 0
+            ) {
+                pending = 0;
+                sweeping = 1;
+            }
+            action RejectAcquireWhileSweeping when (
+                pending + sweeping > 0
+            ) {
+                readers = readers;
+            }
+            action FinishSweep when (
+                readers == 0 && armed == 1 && pending == 0 && sweeping == 1
+            ) {
+                armed = 0;
+                sweeping = 0;
+                swept = 1;
+            }
+            action BuggyStartSweepEarly when (
+                Buggy == 1 && readers > 0 && armed == 1 &&
+                pending == 0 && sweeping == 0
+            ) {
+                sweeping = 1;
+            }
+            action BuggyAcquireDuringSweep when (
+                Buggy == 1 && pending + sweeping > 0 &&
+                readers <= Cap - 1
+            ) {
+                readers = readers + 1;
+            }
+
+            invariant Bounds:
+                readers <= Cap && armed <= 1 && pending <= 1 &&
+                sweeping <= 1 && swept <= 1;
+            invariant OneMaintenancePhase:
+                pending + sweeping <= 1;
+            invariant MaintenanceExcludesReaders:
+                if pending + sweeping > 0 { readers == 0 } else { readers <= Cap };
+            invariant MaintenanceRequiresArm:
+                if pending + sweeping > 0 { armed == 1 } else { armed <= 1 };
+            invariant ArmedLastReleaseSchedulesSweep:
+                if readers == 0 && armed == 1 {
+                    pending + sweeping == 1
+                } else {
+                    pending + sweeping <= 1
+                };
+            invariant FinishedSweepReopensIdle:
+                if swept == 1 && readers == 0 &&
+                    pending == 0 && sweeping == 0 {
+                    armed == 0
+                } else {
+                    armed <= 1
+                };
+        }
+    }
+}
+
+/// Fixed-path snapshot publication is a generation-fenced transaction. Beginning
+/// generation two invalidates generation one's completion marker before the new
+/// request returns; an overtaken worker may finish encoding privately, but it may
+/// not publish either its stale payload or a marker certifying that payload.
+///
+/// `Buggy=1` recreates the stale-worker race by allowing generation one's commit
+/// after generation two has begun. The resulting marker certifies payload one as
+/// current even though the path's latest generation is two.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn snapshot_generation_commit_model() -> Model {
+    crate::ty_model! {
+        SnapshotGenerationCommit {
+            const Buggy = 0;
+            var latest = 1;
+            var job = 1;
+            var payload = 0;
+            var done = 0;
+            action BeginNew when (latest == 1) {
+                latest = 2;
+                done = 0;
+            }
+            action CommitOld when (latest == 2 && job == 1) {
+                payload = if Buggy == 1 { 1 } else { payload };
+                done = if Buggy == 1 { 1 } else { 0 };
+            }
+            action SelectCurrent when (latest == 2 && job == 1) { job = 2; }
+            action CommitCurrent when (job == latest) {
+                payload = job;
+                done = 1;
+            }
+            invariant Bounds:
+                latest <= 2 && job <= 2 && payload <= 2 && done <= 1;
+            invariant CommittedPayloadIsCurrent:
+                (if done == 1 { payload } else { latest }) == latest;
+        }
+    }
+}
+
 /// A native control mutation may stage pixels before the compositor accepts a
 /// present. Screenshot capture is authorized only after that present succeeds.
 /// A capture makes at most `AttemptLimit` present attempts and then fails closed;
@@ -23930,11 +24956,25 @@ pub fn capture_after_present_model() -> Model {
 }
 
 /// A platform window photograph may lag a successful native present by one
-/// compositor interval. Full-window introspection therefore uses the OS image only
-/// for platform chrome and binds the client region to the exact presented semantic
-/// renderer frame after validating physical-pixel geometry. `Buggy=1` recreates the
-/// historical shortcut: accept the platform photograph even when that renderer
-/// provenance is unavailable, allowing stale client pixels to escape.
+/// compositor interval. Full-window introspection therefore uses the OS image
+/// only for platform chrome. Client authority is the exact physical destination
+/// consumed by the serial-bound successful PRESENT — the swapchain image or
+/// softbuffer surface — never a later offscreen rerender of equivalent semantic
+/// state. Before those destination pixels are stitched under the chrome, both
+/// their physical dimensions and their client-origin offset in the photograph
+/// must validate.
+///
+/// The state/action names `frame_presented`, `renderer_bound`,
+/// `MarkFramePresented`, and decision code `1` (`StitchRenderer`) are retained
+/// for generated-trace and Tier-1 compatibility. Here, "renderer bound" means
+/// *present-destination bound*. `geometry_valid` is the conjunction of size and
+/// client-origin validation. `os_client_current` records only that the
+/// untrusted photograph happens to look current; coincidence never grants
+/// authority.
+///
+/// `Buggy=1` recreates the historical shortcut: accept an unbound client source
+/// (a platform client photograph or semantic offscreen rerender) without the
+/// exact destination/geometry provenance.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_capture_source_model() -> Model {
@@ -23944,8 +24984,10 @@ pub fn native_capture_source_model() -> Model {
             var frame_presented = 0;
             var geometry_valid = 0;
             var os_client_current = 0;
-            // 0 Pending, 1 StitchRenderer, 2 FailClosed.
+            // 0 Pending, 1 StitchRenderer (legacy name: stitch the exact
+            // successful PRESENT destination), 2 FailClosed.
             var decision = 0;
+            // Legacy trace field name; 1 means exact present-destination bound.
             var renderer_bound = 0;
             var captured = 0;
             var failed = 0;
@@ -23984,8 +25026,7 @@ pub fn native_capture_source_model() -> Model {
                 ) { 1 } else { 0 };
                 stale_capture = if (
                     Buggy == 1 &&
-                    frame_presented + geometry_valid <= 1 &&
-                    os_client_current == 0
+                    frame_presented + geometry_valid <= 1
                 ) { 1 } else { stale_capture };
             }
             invariant NoStaleCapture: stale_capture == 0;
@@ -24011,6 +25052,247 @@ pub fn native_capture_source_model() -> Model {
                 os_client_current <= 1 && decision <= 2 &&
                 renderer_bound <= 1 && captured <= 1 && failed <= 1 &&
                 stale_capture <= 1;
+        }
+    }
+}
+
+/// The one-shot presented-destination tap owns exactly one staging buffer. A
+/// validated destination copy advances `Armed -> Pending`; the serial-bound
+/// successful-present hook advances `Pending -> InFlight`; and only a successful
+/// map/conversion produces a frame. Geometry/metadata rejection and every async
+/// completion failure terminate explicitly with an error.
+///
+/// `Buggy=1` recreates a fail-open map callback by publishing a frame result from
+/// the error transition without any successful mapping.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn presented_frame_tap_model() -> Model {
+    crate::ty_model! {
+        PresentedFrameTap {
+            const Buggy = 0;
+            // 0 Armed, 1 Pending, 2 InFlight, 3 Complete.
+            var phase = 0;
+            var accepted = 0;
+            var mapped = 0;
+            // 0 None, 1 Frame, 2 Error.
+            var result = 0;
+            action EnqueueValid when (phase == 0) {
+                phase = 1;
+                accepted = 1;
+                mapped = 0;
+                result = 0;
+            }
+            action RejectEnqueue when (phase == 0) {
+                phase = 3;
+                accepted = 0;
+                mapped = 0;
+                result = 2;
+            }
+            action StartMap when (phase == 1) {
+                phase = 2;
+            }
+            action CompleteMap when (phase == 2) {
+                phase = 3;
+                mapped = 1;
+                result = 1;
+            }
+            action MapError when (phase == 2) {
+                phase = 3;
+                mapped = 0;
+                result = if Buggy == 1 { 1 } else { 2 };
+            }
+            invariant SuccessRequiresMappedCopy:
+                if result == 1 {
+                    phase == 3 && accepted == 1 && mapped == 1
+                } else {
+                    mapped == 0
+                };
+            invariant ReservedPhaseRequiresAcceptedCopy:
+                if phase > 0 && phase <= 2 {
+                    accepted == 1 && result == 0
+                } else {
+                    phase == 0 || phase == 3
+                };
+            invariant TerminalPhaseHasResult:
+                if phase == 3 { result > 0 } else { result == 0 };
+            invariant ResultOnlyAtTerminal:
+                if result > 0 { phase == 3 } else { phase <= 2 };
+            invariant ValuesBounded:
+                phase <= 3 && accepted <= 1 && mapped <= 1 && result <= 2;
+        }
+    }
+}
+
+/// One staging slot in the streaming video tap cycles
+/// `Free -> Pending -> InFlight -> Free`. Map errors and finalization aborts
+/// release the reserved slot while counting one loss. Invalid live colour
+/// metadata never reserves a slot and counts one loss only after the fps gate
+/// accepted that sampling opportunity (decimation is outside this transition).
+/// The bounded harvested-store projection then drives callback arrival
+/// `3,1,2`: insertion must publish sorted `1,2,3`, and a two-frame budget must
+/// evict the lowest sequence and retain tail `2,3`.
+///
+/// `Buggy=1` recreates all three fail-open classes: a failed map leaks the slot
+/// in `InFlight`, invalid metadata is silently discarded without incrementing
+/// the honest `dropped` count, and callback-order append produces `3,1` then
+/// evicts the wrong head to retain `1,2`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn video_tap_slot_model() -> Model {
+    crate::ty_model! {
+        VideoTapSlot {
+            const Buggy = 0;
+            const MaxDrops = 2;
+            // 0 Free, 1 Pending, 2 InFlight.
+            var phase = 0;
+            var dropped = 0;
+            // Bounded one-shot witness that invalid metadata was rejected.
+            var invalid = 0;
+            // The immediately preceding slot resolution was an error/abort.
+            var last_error = 0;
+            // Bounded two-frame harvested store under callback arrival 3,1,2.
+            var harvest_phase = 0;
+            var store_first = 0;
+            var store_second = 0;
+            var evicted = 0;
+            action Enqueue when (phase == 0) {
+                phase = 1;
+                last_error = 0;
+            }
+            action StartMap when (phase == 1) {
+                phase = 2;
+            }
+            action MapOk when (phase == 2) {
+                phase = 0;
+                last_error = 0;
+            }
+            action MapError when (phase == 2 && dropped <= MaxDrops - 1) {
+                phase = if Buggy == 1 { 2 } else { 0 };
+                dropped = dropped + 1;
+                last_error = 1;
+            }
+            action Abort when (phase > 0 && dropped <= MaxDrops - 1) {
+                phase = 0;
+                dropped = dropped + 1;
+                last_error = 1;
+            }
+            action RejectInvalidMetadata when (
+                invalid == 0 && dropped <= MaxDrops - 1
+            ) {
+                invalid = 1;
+                dropped = if Buggy == 1 { dropped } else { dropped + 1 };
+            }
+            action HarvestThree when (harvest_phase == 0) {
+                harvest_phase = 1;
+                store_first = 3;
+                store_second = 0;
+                evicted = 0;
+            }
+            action HarvestOne when (harvest_phase == 1) {
+                harvest_phase = 2;
+                store_first = if Buggy == 1 { 3 } else { 1 };
+                store_second = if Buggy == 1 { 1 } else { 3 };
+                evicted = 0;
+            }
+            action HarvestTwo when (harvest_phase == 2) {
+                harvest_phase = 3;
+                store_first = if Buggy == 1 { 1 } else { 2 };
+                store_second = if Buggy == 1 { 2 } else { 3 };
+                evicted = 1;
+            }
+            invariant ErrorResolutionFreesSlot:
+                if last_error == 1 { phase == 0 } else { phase <= 2 };
+            invariant ReservedSlotHasNoResolvedError:
+                if phase > 0 { last_error == 0 } else { phase == 0 };
+            invariant InvalidMetadataIsCounted: invalid <= dropped;
+            invariant DropCountBounded: dropped <= MaxDrops;
+            invariant HarvestedStoreSorted:
+                if harvest_phase > 1 {
+                    store_first <= store_second
+                } else {
+                    store_first <= 3
+                };
+            invariant BudgetKeepsNewestTail:
+                if harvest_phase == 3 {
+                    store_first == 2 && store_second == 3
+                } else {
+                    harvest_phase <= 2
+                };
+            invariant EvictionMatchesOverflow:
+                if harvest_phase == 3 { evicted == 1 } else { evicted == 0 };
+            invariant ValuesBounded:
+                phase <= 2 && invalid <= 1 && last_error <= 1 &&
+                harvest_phase <= 3 && store_first <= 3 &&
+                store_second <= 3 && evicted <= 1;
+        }
+    }
+}
+
+/// Cursor trails, predictive ghosts, fades, and rain occupancy are retained in
+/// window-local renderer coordinates. Before a frame may present after the
+/// focused visible leaf moves, resizes, changes identity, enters/leaves zoom, or
+/// changes physical surface/DPI metrics, every charged coordinate-bound effect
+/// must be reset and rebound to the new space.
+///
+/// `Buggy=1` reproduces the former composed/single boolean-only gate: a
+/// same-class geometry change leaves the charged effect bound to the old
+/// coordinate space.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn layout_coordinate_reset_model() -> Model {
+    crate::ty_model! {
+        LayoutCoordinateReset {
+            const Buggy = 0;
+            const MaxCoordinate = 2;
+            var coordinate = 0;
+            var bound_coordinate = 0;
+            var charged = 0;
+            // A coordinate mutation must pass Prepare before another Present.
+            var prepared = 1;
+            var stale_present = 0;
+            action Charge when (prepared == 1) {
+                charged = 1;
+                bound_coordinate = coordinate;
+            }
+            action ChangeCoordinate when (prepared == 1) {
+                coordinate = if coordinate <= MaxCoordinate - 1 {
+                    coordinate + 1
+                } else {
+                    0
+                };
+                prepared = 0;
+            }
+            action Prepare when (prepared == 0) {
+                charged = if Buggy == 1 { charged } else { 0 };
+                bound_coordinate = if Buggy == 1 {
+                    bound_coordinate
+                } else {
+                    coordinate
+                };
+                prepared = 1;
+            }
+            action Present when (prepared == 1) {
+                stale_present = if charged == 1 {
+                    if bound_coordinate == coordinate {
+                        stale_present
+                    } else {
+                        1
+                    }
+                } else {
+                    stale_present
+                };
+            }
+            invariant NoStaleCoordinatePresent: stale_present == 0;
+            invariant PreparedEffectsMatchCoordinate:
+                if prepared == 1 && charged == 1 {
+                    bound_coordinate == coordinate
+                } else {
+                    0 == 0
+                };
+            invariant CoordinateBounded:
+                coordinate <= MaxCoordinate && bound_coordinate <= MaxCoordinate;
+            invariant ValuesBounded:
+                charged <= 1 && prepared <= 1 && stale_present <= 1;
         }
     }
 }

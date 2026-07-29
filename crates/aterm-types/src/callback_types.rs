@@ -96,18 +96,25 @@ pub enum ColorChangeOp {
     Set,
     /// The sequence reset the color to its default value.
     Reset,
+    /// The sequence selected a dynamic/automatic color rather than a fixed
+    /// value (OSC 21 `key=`).
+    Dynamic,
 }
 
-/// Callback type for dynamic color changes (OSC 10/11/12, OSC 110/111/112).
+/// Callback type for color changes (OSC 4, 10-21, 104, 110-112, 117, and 119).
 ///
-/// Called when the terminal's default foreground, background, or cursor color
-/// changes via escape sequences. The `u8` parameter indicates which color changed:
+/// Called when a terminal color changes via escape sequences. The `u8`
+/// parameter indicates which color changed:
 /// - `0`: foreground (OSC 10, OSC 110 reset)
 /// - `1`: background (OSC 11, OSC 111 reset)
 /// - `2`: cursor (OSC 12, OSC 112 reset)
+/// - `3`: indexed palette (OSC 4 / OSC 104)
+/// - `4`: selection background (OSC 17 / OSC 21 / OSC 117)
+/// - `5`: selection foreground (OSC 19 / OSC 21 / OSC 119)
 ///
 /// The `Rgb` parameter is the resulting color value. `ColorChangeOp` tells the
-/// consumer whether the sequence set an explicit value or reset back to default.
+/// consumer whether the sequence set an explicit value, reset to the configured
+/// default, or selected dynamic/automatic behavior.
 pub type ColorChangeCallback = Box<dyn FnMut(u8, Rgb, ColorChangeOp) + Send>;
 
 /// Callback type for advanced desktop notifications (OSC 99 - kitty protocol).

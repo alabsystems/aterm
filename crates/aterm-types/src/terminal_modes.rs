@@ -257,9 +257,9 @@ pub struct TerminalModes {
     /// (`OSC 4;N;spec` or `OSC 21;N=spec`) are silently ignored. Query
     /// operations (`OSC 4;N;?` / `OSC 21;N=?`) are always allowed — they
     /// reveal only what the terminal already reported at startup. Named-slot
-    /// OSC 21 keys (foreground, background, cursor, selection_background) are
-    /// also unaffected; those go through `set_dynamic_color`, which has its
-    /// own semantics.
+    /// OSC 21 keys (foreground, background, cursor, selection_background,
+    /// selection_foreground) are also unaffected; those go through the named
+    /// dynamic-color path, which has its own semantics.
     ///
     /// **Default: `false` (fail-closed, #7937).** Hosts that ship a themeable
     /// palette and want programs to recolor the 256-entry index must opt in

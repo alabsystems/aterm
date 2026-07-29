@@ -25,6 +25,26 @@ use super::GridCursorState;
 /// clamped to `MAX_GRID_ROWS`, so this headroom keeps that sum overflow-free.
 pub(crate) const UNLIMITED_RING_SCROLLBACK: usize = usize::MAX - crate::MAX_GRID_ROWS as usize;
 
+/// Effective tiered-scrollback settings captured while its store is detached
+/// for off-thread reflow.
+///
+/// The values keep getters truthful during the detach window. The `changed`
+/// bits distinguish an untouched snapshot from a host mutation that must be
+/// replayed when the store returns (or, for a line limit, onto the ring after
+/// an aborted reflow).
+///
+/// A deferred raise changes the surviving store when it re-attaches; it cannot
+/// resurrect history the worker already evicted under the detach-time limit or
+/// budget, matching an ordinary raise after an eviction. The worker therefore
+/// remains bounded by the settings it detached with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingScrollbackSettings {
+    pub(crate) line_limit: Option<usize>,
+    pub(crate) memory_budget: usize,
+    pub(crate) line_limit_changed: bool,
+    pub(crate) memory_budget_changed: bool,
+}
+
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct GridStorage {
@@ -62,6 +82,9 @@ pub struct GridStorage {
     /// though `scrollback` is `None`, so output produced during the reflow window
     /// is not silently dropped from history.
     pub(crate) scrollback_detached_for_reflow: bool,
+    /// Settings snapshot for the detached tiered store, plus mutations that
+    /// arrived while the worker owned it. `None` outside a detach window.
+    pub(crate) pending_scrollback_settings: Option<PendingScrollbackSettings>,
     /// THRU-5: true when an off-thread compression worker is attached to this
     /// session (set once at session setup). While true, the reader-thread ingest
     /// path does NOT drain the lazy buffer inline on `should_drain` — it lets the
@@ -173,6 +196,7 @@ impl GridStorage {
             scrollback: None,
             lazy_buffer: LazyBuffer::new(),
             scrollback_detached_for_reflow: false,
+            pending_scrollback_settings: None,
             compress_offload_active: false,
             flood_truncated_lines: 0,
             ring_byte_watermark: None,

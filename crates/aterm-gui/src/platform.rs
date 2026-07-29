@@ -71,12 +71,18 @@ pub(crate) trait AppRt {
     /// M3 (colour-managed present): tag the window's GPU swapchain layer (the
     /// CAMetalLayer wgpu attached at surface creation) with an EXPLICIT colour
     /// space, so ColorSync INTERPRETS the presented sRGB-encoded bytes instead of
-    /// stretching them to the panel's native (P3) primaries. Interpretation only —
-    /// the bytes on glass and the readback/introspection path are untouched.
-    /// Called AFTER the wgpu surface exists (the layer is created there). No-op
-    /// off macOS, and when no CAMetalLayer is attached (the CPU softbuffer path,
-    /// which keeps its device-RGB match via [`Self::window_set_appearance`]).
-    fn window_set_surface_colorspace(&self, window: &Window, cs: SurfaceColorspace);
+    /// stretching them to the panel's native (P3) primaries. Interpretation only:
+    /// the application-provided swapchain bytes and readback are untouched; the
+    /// resulting compositor colour transform is outside our observation boundary.
+    /// Called AFTER the wgpu surface exists (the layer is created there).
+    /// Returns the colour space actually in effect, or `None` when it cannot be
+    /// established; capture must retain prior known metadata or refuse rather
+    /// than assuming a best-effort tag succeeded.
+    fn window_set_surface_colorspace(
+        &self,
+        window: &Window,
+        cs: SurfaceColorspace,
+    ) -> Option<SurfaceColorspace>;
 
     /// M5 TRUE VIBRANCY: install / update / remove the window-level
     /// `NSVisualEffectView` blurred backdrop and flip the window + CAMetalLayer to
@@ -275,6 +281,27 @@ impl SurfaceColorspace {
             Self::ExtendedLinearSrgb => "kCGColorSpaceExtendedLinearSRGB",
         }
     }
+
+    /// The colour coordinates actually consumed by the platform compositor,
+    /// frozen into GPU capture metadata after the platform confirms the tag.
+    pub(crate) fn gpu_capture_space(self) -> aterm_gpu::video_tap::CaptureColorSpace {
+        match self {
+            Self::ExtendedLinearSrgb => aterm_gpu::video_tap::CaptureColorSpace::ExtendedLinearSrgb,
+            Self::DisplayP3 => aterm_gpu::video_tap::CaptureColorSpace::DisplayP3,
+            Self::Srgb => aterm_gpu::video_tap::CaptureColorSpace::Srgb,
+        }
+    }
+}
+
+/// Resolve capture metadata from a platform tagging attempt. At initial attach
+/// callers pass `Unknown`; on a failed hot retag they pass the previously known
+/// effective space because the layer keeps its old tag.
+#[must_use]
+pub(crate) fn capture_space_after_surface_tag(
+    effective: Option<SurfaceColorspace>,
+    previous: aterm_gpu::video_tap::CaptureColorSpace,
+) -> aterm_gpu::video_tap::CaptureColorSpace {
+    effective.map_or(previous, SurfaceColorspace::gpu_capture_space)
 }
 
 /// The layer tag for a just-attached (or re-tagged) GPU window: an HDR
@@ -442,8 +469,12 @@ impl AppRt for AppRtMacOS {
     /// Tag the CAMetalLayer wgpu attached to this window's NSView with the named
     /// colour space (see [`layer_colorspace`]). Best-effort like the other chrome
     /// methods: no AppKit window / no metal layer → a silent no-op.
-    fn window_set_surface_colorspace(&self, window: &Window, cs: SurfaceColorspace) {
-        layer_colorspace::set(window, cs.cg_name());
+    fn window_set_surface_colorspace(
+        &self,
+        window: &Window,
+        cs: SurfaceColorspace,
+    ) -> Option<SurfaceColorspace> {
+        layer_colorspace::set(window, cs.cg_name()).then_some(cs)
     }
 
     /// Install / update / remove the window-level `NSVisualEffectView` and flip the
@@ -824,7 +855,16 @@ impl AppRt for AppRtLinux {
     /// directly; explicit surface colour management there (`VK_EXT_swapchain_
     /// colorspace` / Wayland `color-management-v1`) is deferred with the rest of
     /// the native chrome work. Documented rather than silently empty.
-    fn window_set_surface_colorspace(&self, _window: &Window, _cs: SurfaceColorspace) {}
+    fn window_set_surface_colorspace(
+        &self,
+        _window: &Window,
+        cs: SurfaceColorspace,
+    ) -> Option<SurfaceColorspace> {
+        match cs {
+            SurfaceColorspace::Srgb | SurfaceColorspace::DisplayP3 => Some(SurfaceColorspace::Srgb),
+            SurfaceColorspace::ExtendedLinearSrgb => None,
+        }
+    }
 
     /// INTENTIONAL no-op: the `NSVisualEffectView` behind-window blur is an AppKit
     /// concept. The Linux analogue is winit `set_transparent` / `set_blur` plus a
@@ -1142,12 +1182,13 @@ mod layer_colorspace {
     /// to the named CG colour space. Best-effort: any missing link in the chain
     /// (no AppKit handle, no layer, unknown name) is a silent no-op — the layer
     /// then keeps its previous tag (untagged = the legacy panel-native read).
-    pub(crate) fn set(window: &Window, cg_name: &str) {
+    #[must_use]
+    pub(crate) fn set(window: &Window, cg_name: &str) -> bool {
         let Ok(handle) = window.window_handle() else {
-            return;
+            return false;
         };
         let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
+            return false;
         };
         // SAFETY: `ns_view` points at this window's live NSView (winit owns it
         // for the window's lifetime); borrowed on the main thread (this is only
@@ -1158,15 +1199,16 @@ mod layer_colorspace {
         unsafe {
             let view = h.ns_view.as_ptr() as *mut AnyObject;
             let Some(layer) = find_metal_layer(view) else {
-                return;
+                return false;
             };
             let name = NSString::from_str(cg_name);
             let cs = CGColorSpaceCreateWithName(&*name as *const NSString as *const c_void);
             if cs.is_null() {
-                return;
+                return false;
             }
             let _: () = msg_send![layer, setColorspace: cs];
             CGColorSpaceRelease(cs);
+            true
         }
     }
 
@@ -1442,7 +1484,7 @@ mod vibrancy {
 /// everywhere (the macOS impl consumes it; the strings are stable CG ABI).
 #[cfg(test)]
 mod surface_colorspace_tests {
-    use super::{SurfaceColorspace, resolve_surface_colorspace};
+    use super::{SurfaceColorspace, capture_space_after_surface_tag, resolve_surface_colorspace};
     use crate::app_config::WindowColorspace;
 
     #[test]
@@ -1484,6 +1526,47 @@ mod surface_colorspace_tests {
                 "{cfg:?}: an SDR swapchain follows the config"
             );
         }
+    }
+
+    #[test]
+    fn gpu_capture_metadata_matches_the_effective_platform_tag() {
+        use aterm_gpu::video_tap::CaptureColorSpace;
+
+        assert_eq!(
+            SurfaceColorspace::Srgb.gpu_capture_space(),
+            CaptureColorSpace::Srgb
+        );
+        assert_eq!(
+            SurfaceColorspace::ExtendedLinearSrgb.gpu_capture_space(),
+            CaptureColorSpace::ExtendedLinearSrgb
+        );
+        assert_eq!(
+            SurfaceColorspace::DisplayP3.gpu_capture_space(),
+            CaptureColorSpace::DisplayP3
+        );
+    }
+
+    #[test]
+    fn failed_surface_tag_never_claims_the_requested_space() {
+        use aterm_gpu::video_tap::CaptureColorSpace;
+
+        assert_eq!(
+            capture_space_after_surface_tag(None, CaptureColorSpace::Unknown),
+            CaptureColorSpace::Unknown,
+            "initial best-effort failure must make exact capture refuse"
+        );
+        assert_eq!(
+            capture_space_after_surface_tag(None, CaptureColorSpace::Srgb),
+            CaptureColorSpace::Srgb,
+            "failed hot retag leaves the prior compositor tag in effect"
+        );
+        assert_eq!(
+            capture_space_after_surface_tag(
+                Some(SurfaceColorspace::DisplayP3),
+                CaptureColorSpace::Srgb,
+            ),
+            CaptureColorSpace::DisplayP3
+        );
     }
 }
 

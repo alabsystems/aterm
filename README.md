@@ -158,7 +158,8 @@ From another shell, inspect and drive its active session:
 ```sh
 aterm ctl text                  # plain visible rows
 aterm ctl screen                # lossless styled-grid JSON
-aterm ctl image frame.png       # a rendered PNG; reply gives the confined path
+aterm ctl image frame.png       # a rendered PNG; reply gives a path on this server
+aterm ctl image --bytes         # inline base64 PNG for dial/remote transport
 aterm ctl turn 'git status'     # type, submit, settle, and return the screen
 aterm ctl metrics               # live render and latency counters
 ```

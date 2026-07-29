@@ -7,7 +7,6 @@
 //! Extracted from mod.rs to reduce file size.
 
 use super::Terminal;
-use crate::scrollback::ScrollbackStorage;
 
 impl Terminal {
     // =========================================================================
@@ -49,10 +48,12 @@ impl Terminal {
     ///
     /// - **Cursor**: style, blink, color, visibility
     /// - **Font**: descriptor (family, size, weight, italic)
-    /// - **Colors**: foreground, background, palette
+    /// - **Colors**: foreground, background, cursor, selection background/
+    ///   foreground, palette
     /// - **Modes**: auto-wrap, focus reporting, bracketed paste
     /// - **Text policy**: ambiguous width, style attributes, BiDi projection
-    /// - **Performance**: memory budget and synchronized-output timeout
+    /// - **Performance**: memory budget, total scrollback line limit, and
+    ///   synchronized-output timeout
     #[allow(
         clippy::too_many_lines,
         reason = "flat field-by-field config application"
@@ -64,6 +65,11 @@ impl Terminal {
         use crate::config::ConfigChange;
 
         let mut changes = Vec::new();
+        // Render-time configuration can change the pixels of already-stored
+        // cells without writing the grid. Fold every such change into one
+        // damage decision at the end so damage-keyed frontends cannot retain
+        // an old frame after a config reload.
+        let mut visual_repaint = false;
 
         // Cursor style. apply_config is host configuration (not an app escape), so it
         // also persists the DEFAULT — otherwise a config-set cursor would revert to
@@ -80,11 +86,15 @@ impl Terminal {
             changes.push(ConfigChange::CursorBlink);
         }
 
-        // Cursor color
+        // Cursor color. Always retain the host baseline so OSC 112/RIS restore
+        // the configured theme cursor instead of silently falling back to fg.
         if self.color.cursor_color != config.cursor_color {
             self.color.cursor_color = config.cursor_color;
             changes.push(ConfigChange::CursorColor);
+            visual_repaint = true;
         }
+        self.color.configured_cursor = config.cursor_color;
+        self.color.frame_cursor_authoritative = true;
 
         // Cursor visibility
         if self.modes.cursor_visible != config.cursor_visible {
@@ -106,6 +116,7 @@ impl Terminal {
         // Always update configured defaults so OSC 110/111 reset to theme
         // colors, not hardcoded constants (#7443).
         self.color.configured_foreground = config.default_foreground;
+        self.color.frame_foreground_authoritative = true;
 
         // Default background
         let bg_changed = self.color.default_background != config.default_background;
@@ -115,12 +126,21 @@ impl Terminal {
         // Always update configured defaults so OSC 110/111 reset to theme
         // colors, not hardcoded constants (#7443).
         self.color.configured_background = config.default_background;
+        self.color.frame_background_authoritative = true;
 
         // Selection background
         let sel_bg_changed = self.color.selection_background != config.selection_background;
         if sel_bg_changed {
             self.color.selection_background = config.selection_background;
         }
+        // OSC 117/RIS reset selection highlighting to the host theme, not an
+        // unrelated hardcoded/default-background color.
+        self.color.configured_selection_background = config.selection_background;
+        let sel_fg_changed = self.color.selection_foreground != config.selection_foreground;
+        if sel_fg_changed {
+            self.color.selection_foreground = config.selection_foreground;
+        }
+        self.color.configured_selection_foreground = config.selection_foreground;
 
         // Custom palette
         // Always update configured_palette so OSC 104 resets to theme
@@ -146,14 +166,9 @@ impl Terminal {
             false
         };
 
-        if fg_changed || bg_changed || sel_bg_changed || palette_changed {
+        if fg_changed || bg_changed || sel_bg_changed || sel_fg_changed || palette_changed {
             changes.push(ConfigChange::Colors);
-            // A config-driven recolor (theme/palette reload) repaints already-drawn
-            // cells without changing their content, so mark full grid damage — else
-            // `damage_epoch` doesn't advance and the frontend's redraw early-out
-            // swallows a `[palette]`-only reload (whose GPU theme tuple is unchanged),
-            // leaving the screen in the old colors until the next grid write.
-            self.grid.damage_mut().mark_full();
+            visual_repaint = true;
         }
 
         // Auto-wrap mode
@@ -226,14 +241,13 @@ impl Terminal {
             self.color.bold_is_bright = config.bold_is_bright;
             self.color.faint_opacity = new_faint;
             changes.push(ConfigChange::StylePolicy);
-            self.grid.damage_mut().mark_full();
+            visual_repaint = true;
         }
 
         // Memory budget
         let current_budget = self
-            .grid
-            .scrollback()
-            .map(ScrollbackStorage::memory_budget)
+            .main_grid()
+            .scrollback_memory_budget()
             .unwrap_or(config.memory_budget);
         if current_budget != config.memory_budget {
             if let Err(e) = self.set_memory_budget(config.memory_budget) {
@@ -256,9 +270,6 @@ impl Terminal {
             // Note: bidi_box_mirroring, bidi_autodetection, bidi_arrow_swap are
             // escape-sequence-only modes (DEC ?2500, ?2501, ?1243) with no config equivalent
             self.invalidate_bidi_all();
-            // BiDi is also a render-time projection of existing cells. Force a
-            // frame so static RTL text is reordered immediately after reload.
-            self.grid.damage_mut().mark_full();
             changes.push(ConfigChange::BiDi);
         }
 
@@ -280,6 +291,13 @@ impl Terminal {
             changes.push(ConfigChange::SyncTimeout);
         }
 
+        if visual_repaint {
+            // A config-driven recolor/policy change repaints already-drawn cells
+            // without changing their content. Advance full-grid damage so a
+            // frontend keyed by `damage_epoch` cannot swallow the reload.
+            self.grid.damage_mut().mark_full();
+        }
+
         changes
     }
 }
@@ -288,6 +306,7 @@ impl Terminal {
 mod tests {
     use super::*;
     use crate::config::{BiDiMode, ConfigChange, TerminalConfig};
+    use crate::terminal::{Rgb, TerminalBuilder};
 
     fn clean_terminal_with_defaults() -> (Terminal, TerminalConfig) {
         let mut terminal = Terminal::new(4, 16);
@@ -340,22 +359,18 @@ mod tests {
         const AMBIGUOUS: &str = "\u{00B7}"; // MIDDLE DOT, East Asian Width=A
         let (mut terminal, mut config) = clean_terminal_with_defaults();
         config.ambiguous_width_double = true;
-        assert!(
-            terminal
-                .apply_config(&config)
-                .contains(&ConfigChange::AmbiguousWidth)
-        );
+        assert!(terminal
+            .apply_config(&config)
+            .contains(&ConfigChange::AmbiguousWidth));
         terminal.process(AMBIGUOUS.as_bytes());
         assert!(terminal.grid().cell(0, 0).unwrap().is_wide());
         assert!(terminal.grid().is_wide_continuation_at(0, 1));
         terminal.take_damage();
 
         config.ambiguous_width_double = false;
-        assert!(
-            terminal
-                .apply_config(&config)
-                .contains(&ConfigChange::AmbiguousWidth)
-        );
+        assert!(terminal
+            .apply_config(&config)
+            .contains(&ConfigChange::AmbiguousWidth));
         assert!(
             !terminal.has_damage(),
             "policy reload must not pretend it reflowed existing geometry"
@@ -396,5 +411,175 @@ mod tests {
             .map(|cell| cell.ch)
             .collect();
         assert_eq!(logical, vec!['\u{05D0}', '\u{05D1}', '\u{05D2}']);
+    }
+
+    fn settle(term: &mut Terminal) -> u64 {
+        term.take_damage();
+        assert!(!term.has_damage());
+        term.damage_epoch()
+    }
+
+    #[test]
+    fn cursor_color_only_reload_marks_visual_damage() {
+        let mut term = Terminal::new(2, 8);
+        let before = settle(&mut term);
+        let mut config = TerminalConfig::default();
+        config.cursor_color = Some(Rgb::new(0x12, 0x34, 0x56));
+
+        let changes = term.apply_config(&config);
+
+        assert!(changes.contains(&ConfigChange::CursorColor));
+        assert!(term.has_damage(), "an idle cursor must be recolored now");
+        assert!(term.damage_epoch() > before);
+    }
+
+    #[test]
+    fn style_policy_reload_repaints_preexisting_cells() {
+        let mut term = Terminal::new(2, 8);
+        term.process(b"\x1b[1;33mB\x1b[0m \x1b[2mD");
+        let before_cells = term.render_row(0);
+        let before_epoch = settle(&mut term);
+        let mut config = TerminalConfig::default();
+        config.bold_is_bright = false;
+        config.faint_opacity = 1.0;
+
+        let changes = term.apply_config(&config);
+        let after_cells = term.render_row(0);
+
+        assert!(changes.contains(&ConfigChange::StylePolicy));
+        assert_ne!(after_cells[0].fg, before_cells[0].fg);
+        assert_ne!(after_cells[2].fg, before_cells[2].fg);
+        assert!(term.has_damage());
+        assert!(term.damage_epoch() > before_epoch);
+    }
+
+    #[test]
+    fn bidi_config_reload_marks_existing_rows_for_repaint() {
+        let mut term = Terminal::new(2, 8);
+        term.process("\u{05D0}\u{05D1}\u{05D2}".as_bytes());
+        let before = settle(&mut term);
+        let mut config = TerminalConfig::default();
+        config.bidi.direction = aterm_types::ParagraphDirection::Ltr;
+
+        let changes = term.apply_config(&config);
+
+        assert!(changes.contains(&ConfigChange::BiDi));
+        assert!(term.has_damage());
+        assert!(term.damage_epoch() > before);
+    }
+
+    #[test]
+    fn config_reload_during_reflow_survives_terminal_reset() {
+        let mut term = TerminalBuilder::new()
+            .size(6, 40)
+            .tiered_scrollback_defaults()
+            .build();
+        for i in 0..200 {
+            term.process(format!("line-{i}\r\n").as_bytes());
+        }
+        let initial_budget = term
+            .main_grid()
+            .scrollback_memory_budget()
+            .expect("tiered store budget");
+        let job = term
+            .resize_offloading_scrollback(6, 20)
+            .expect("width change detaches tiered store");
+
+        let config = TerminalConfig {
+            memory_budget: initial_budget.saturating_sub(1_000_000).max(1),
+            scrollback_limit: None,
+            ..TerminalConfig::default()
+        };
+        let changes = term.apply_config(&config);
+        assert!(changes.contains(&ConfigChange::MemoryBudget));
+        assert!(
+            changes.contains(&ConfigChange::ScrollbackLimit),
+            "detached finite limit must not be mistaken for unlimited"
+        );
+        assert_eq!(
+            term.main_grid().scrollback_memory_budget(),
+            Some(config.memory_budget)
+        );
+        assert_eq!(term.scrollback_line_limit(), None);
+        let changes = term.apply_config(&config);
+        assert!(
+            !changes.contains(&ConfigChange::MemoryBudget),
+            "pending budget makes an identical reload a no-op"
+        );
+        assert!(
+            !changes.contains(&ConfigChange::ScrollbackLimit),
+            "pending unlimited value makes an identical reload a no-op"
+        );
+
+        // RIS/host reset erases scrollback while the worker owns the old store.
+        // It must neither resurrect old history nor discard host settings.
+        term.reset();
+        term.finish_resize_offload(job.reflow());
+
+        assert_eq!(term.main_grid().scrollback_lines(), 0);
+        assert_eq!(term.scrollback_line_limit(), None);
+        assert_eq!(
+            term.scrollback()
+                .expect("cleared store re-attached")
+                .memory_budget(),
+            config.memory_budget
+        );
+
+        // A second identical reload must be a true no-op after reconciliation.
+        let changes = term.apply_config(&config);
+        assert!(!changes.contains(&ConfigChange::MemoryBudget));
+        assert!(!changes.contains(&ConfigChange::ScrollbackLimit));
+    }
+
+    #[test]
+    fn config_reload_during_reflow_targets_saved_primary_under_alt_screen() {
+        let mut term = TerminalBuilder::new()
+            .size(6, 40)
+            .tiered_scrollback_defaults()
+            .build();
+        for i in 0..100 {
+            term.process(format!("main-{i}\r\n").as_bytes());
+        }
+        term.process(b"\x1b[?1049h");
+        let initial_budget = term
+            .main_grid()
+            .scrollback_memory_budget()
+            .expect("saved primary has tiered scrollback");
+        let job = term
+            .resize_offloading_scrollback(6, 20)
+            .expect("saved primary store detaches");
+
+        let config = TerminalConfig {
+            memory_budget: initial_budget.saturating_sub(2_000_000).max(1),
+            scrollback_limit: Some(50),
+            ..TerminalConfig::default()
+        };
+        let changes = term.apply_config(&config);
+        assert!(changes.contains(&ConfigChange::MemoryBudget));
+        assert!(changes.contains(&ConfigChange::ScrollbackLimit));
+        assert_eq!(
+            term.main_grid().scrollback_memory_budget(),
+            Some(config.memory_budget)
+        );
+        assert_eq!(term.scrollback_line_limit(), Some(50));
+
+        let changes = term.apply_config(&config);
+        assert!(!changes.contains(&ConfigChange::MemoryBudget));
+        assert!(!changes.contains(&ConfigChange::ScrollbackLimit));
+
+        term.finish_resize_offload(job.reflow());
+        assert_eq!(
+            term.main_grid().scrollback_memory_budget(),
+            Some(config.memory_budget)
+        );
+        assert_eq!(term.scrollback_line_limit(), Some(50));
+        term.process(b"\x1b[?1049l");
+        assert_eq!(term.scrollback_line_limit(), Some(50));
+        assert_eq!(
+            term.scrollback()
+                .expect("primary store restored")
+                .memory_budget(),
+            config.memory_budget
+        );
     }
 }

@@ -65,6 +65,47 @@ impl Grid {
         lines
     }
 
+    /// Project the visible rows preceded by at most `max_history` lines of the
+    /// MOST RECENT scrollback, in the same dense scrollback-then-visible layout
+    /// [`Self::checkpoint_lines`] produces.
+    ///
+    /// This is the seamless-handoff projection.
+    /// [`Self::checkpoint_visible_lines`] bounded the cost by carrying no history
+    /// at all, which meant every in-session update truncated every tab to a single
+    /// screen — seamless for the shell, lossy for the human reading it. Carrying
+    /// the *whole* ring is the opposite failure: work proportional to an arbitrary
+    /// history inside a parked-reader window measured in milliseconds.
+    ///
+    /// Cost is `O((rows + max_history) × cols)` regardless of how deep the ring
+    /// goes. The restore split is unaffected: `restore_grid` reads the LAST `rows`
+    /// lines as the visible grid and everything before them as history, so
+    /// trimming from the FRONT is always sound.
+    ///
+    /// Returns the same thing as [`Self::checkpoint_visible_lines`] when
+    /// `max_history == 0`, and as [`Self::checkpoint_lines`] when `max_history`
+    /// meets or exceeds [`Self::scrollback_lines`].
+    #[must_use]
+    pub fn checkpoint_lines_bounded(&self, max_history: usize) -> Vec<Line> {
+        let scrollback_count = self.scrollback_lines();
+        let keep = scrollback_count.min(max_history);
+        // History is indexed oldest (0) → newest, so the newest `keep` lines are
+        // the tail. Skipping the head is what makes the bound cheap: the skipped
+        // indices are never fetched, so a cold/compressed block is never touched.
+        let first = scrollback_count - keep;
+        let mut lines = Vec::with_capacity(keep + self.rows() as usize);
+        for idx in first..scrollback_count {
+            match self.try_get_history_line(idx) {
+                Ok(Some(cow)) => lines.push(cow.into_owned()),
+                // Same dense-slot posture as `checkpoint_lines`: a corrupt or
+                // racily-shrunk slot becomes an empty line so the visible split
+                // stays exact.
+                Ok(None) | Err(_) => lines.push(Line::new()),
+            }
+        }
+        lines.extend(self.checkpoint_visible_lines());
+        lines
+    }
+
     /// Project only the visible grid rows, excluding scrollback.
     ///
     /// Seamless process handoff uses this bounded projection while PTY readers are

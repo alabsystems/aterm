@@ -563,11 +563,14 @@ pub fn font_advertises_feature(rb_bytes: &[u8], tag: [u8; 4]) -> bool {
 /// Build the per-column glyph plan for one row of `cells`.
 ///
 /// `shapeable[c]` is whether column `c` may join a run (computed by the caller
-/// from [`cell_is_shapeable`] PLUS any per-frame break columns — cursor /
-/// selection / `CursorDisabled` ligature mode). `style_of(c)` returns the cell's
-/// SGR style bits so a style change BREAKS the run. `shape(run, chars, style)`
-/// shapes a coalesced run (the caller caches it) and returns a [`ShapedRun`], or
-/// `None` if it did not ligate. The result is one [`ColumnGlyph`] per column:
+/// from [`cell_is_shapeable`] PLUS any per-frame exclusion columns — cursor /
+/// selection / `CursorDisabled` ligature mode). `run_boundary_before[c]` starts
+/// a fresh run at `c` without excluding that cell; pane boundaries need this
+/// distinction so a right pane beginning with `=>` can still ligate.
+/// `style_of(c)` returns the cell's SGR style bits so a style change BREAKS the
+/// run. `shape(run, chars, style)` shapes a coalesced run (the caller caches it)
+/// and returns a [`ShapedRun`], or `None` if it did not ligate. The result is one
+/// [`ColumnGlyph`] per column:
 /// `Ligated` for cells inside a 1:1 ligated run, `LigatedSlice` for cells of a
 /// collapsed (Cascadia N:1) run, `PerCell` everywhere else.
 ///
@@ -578,6 +581,7 @@ pub fn plan_row_runs<S, F, R>(
     cells: &[RenderCell],
     cols: usize,
     shapeable: &[bool],
+    run_boundary_before: &[bool],
     min_run: usize,
     style_of: S,
     mut shape: F,
@@ -616,7 +620,11 @@ pub fn plan_row_runs<S, F, R>(
         let start = c;
         run.clear();
         run_chars.clear();
-        while c < n && shapeable.get(c).copied().unwrap_or(false) && style_of(c) == style {
+        while c < n
+            && shapeable.get(c).copied().unwrap_or(false)
+            && style_of(c) == style
+            && (c == start || !run_boundary_before.get(c).copied().unwrap_or(false))
+        {
             if let Some(cell) = cells.get(c) {
                 run.push(cell.ch);
                 run_chars.push(cell.ch);
@@ -848,6 +856,7 @@ mod tests {
             &cells,
             cells.len(),
             &shapeable,
+            &[],
             2,
             |_c| StyleBits::REGULAR,
             shape,
@@ -868,6 +877,39 @@ mod tests {
         );
         assert_eq!(out[3], ColumnGlyph::Ligated(900));
         assert_eq!(out[4], ColumnGlyph::Ligated(901));
+    }
+
+    /// A pane edge is a boundary BETWEEN runs, not a request to exclude the
+    /// right-hand endpoint. The right pane may legitimately begin with a
+    /// programming ligature; its first `=` must remain shapeable with `>`.
+    #[test]
+    fn run_boundary_preserves_right_pane_initial_ligature() {
+        let cells = [cell('x'), cell('x'), cell('='), cell('>')];
+        let shapeable = vec![true; cells.len()];
+        let run_boundary_before = [false, false, true, false];
+        let shape = |run: &str, chars: &[char], _style: StyleBits| -> Option<ShapedRun> {
+            (run == "=>" && chars.len() == 2)
+                .then(|| ShapedRun::PerColumn(vec![Some(910), Some(911)].into_boxed_slice()))
+        };
+        let mut out = Vec::new();
+        let (mut run, mut run_chars) = (String::new(), Vec::new());
+        plan_row_runs(
+            &cells,
+            cells.len(),
+            &shapeable,
+            &run_boundary_before,
+            2,
+            |_c| StyleBits::REGULAR,
+            shape,
+            &mut run,
+            &mut run_chars,
+            &mut out,
+        );
+
+        assert_eq!(out[0], ColumnGlyph::PerCell);
+        assert_eq!(out[1], ColumnGlyph::PerCell);
+        assert_eq!(out[2], ColumnGlyph::Ligated(910));
+        assert_eq!(out[3], ColumnGlyph::Ligated(911));
     }
 
     /// M4 — the amended gate accepts the two grid-mappable forms and its
@@ -950,6 +992,7 @@ mod tests {
             &cells,
             cells.len(),
             &shapeable,
+            &[],
             2,
             |_c| StyleBits::REGULAR,
             shape,

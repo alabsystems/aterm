@@ -244,8 +244,12 @@ const RELAY_DRAIN_MAX: Duration = Duration::from_secs(5);
 /// blocking I/O while holding the lock.
 struct RelayState<C> {
     conn: C,
-    /// Relay teardown: set once by whichever direction finishes first.
+    /// Fatal teardown, or graceful teardown after both half-closes complete.
     done: bool,
+    /// Local request/input EOF has been encrypted, drained, and half-closed.
+    upload_done: bool,
+    /// Peer response/output EOF has been decrypted and flushed locally.
+    download_done: bool,
     /// The writer thread holds TLS bytes it extracted from `conn` but has not yet
     /// pushed to the socket — the uploader's final drain must wait for them too.
     inflight: bool,
@@ -277,7 +281,8 @@ impl<C> RelayShared<C> {
 }
 
 /// Full-duplex relay between an authenticated TLS stream and a local `CtlStream`
-/// (the control socket), until either side closes. This is the network analog of
+/// (the control socket), until both graceful half-closes complete (or a fatal
+/// error tears both directions down). This is the network analog of
 /// `proxy.rs`'s local splice: the listener bridges the verified remote driver to
 /// its own control socket; the dialer bridges its local control client to the
 /// remote.
@@ -326,6 +331,8 @@ where
         state: Mutex::new(RelayState {
             conn,
             done: false,
+            upload_done: false,
+            download_done: false,
             inflight: false,
             err: None,
         }),
@@ -460,8 +467,13 @@ where
             // arriving. Marking it done here (and shutting the socket down BOTH
             // ways below) truncated that response tail — a local proxy that
             // finished sending its request killed the reply it was waiting for.
-            // Only a FATAL error ends both directions.
-            if !graceful {
+            // The relay ends only once BOTH half-closes have landed; a FATAL
+            // error (or teardown already under way) ends both at once.
+            let half_close = graceful && !g.done;
+            if half_close {
+                g.upload_done = true;
+                g.done = g.download_done;
+            } else {
                 g.done = true;
             }
             drop(g);
@@ -470,7 +482,7 @@ where
             // a graceful EOF close only OUR write half, leaving the peer free to
             // keep sending. The downloader performs the final `Both` shutdown
             // when the response genuinely ends.
-            let _ = tcp_up.shutdown(if graceful {
+            let _ = tcp_up.shutdown(if half_close {
                 std::net::Shutdown::Write
             } else {
                 std::net::Shutdown::Both
@@ -482,6 +494,7 @@ where
     // holds no lock; ingest + decrypt hold it only for buffer work.
     let mut tls_in = [0u8; 16 * 1024];
     let mut plain: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut fatal_down = false;
     'down: loop {
         let n = match tcp_down.read(&mut tls_in) {
             Ok(0) => break, // TCP EOF (with or without close_notify)
@@ -491,7 +504,9 @@ where
                 let mut g = shared.lock();
                 if !g.done {
                     g.record_err(e);
+                    g.done = true;
                 }
+                fatal_down = true;
                 break;
             }
         };
@@ -514,11 +529,15 @@ where
                             io::ErrorKind::InvalidData,
                             "TLS ingest made no progress",
                         ));
+                        g.done = true;
+                        fatal_down = true;
                         break 'down;
                     }
                 }
                 if let Err(e) = g.conn.process_new_packets() {
                     g.record_err(io_err(e));
+                    g.done = true;
+                    fatal_down = true;
                     break 'down;
                 }
             }
@@ -537,6 +556,8 @@ where
                     }
                     Err(e) => {
                         g.record_err(e);
+                        g.done = true;
+                        fatal_down = true;
                         break 'down;
                     }
                 }
@@ -552,22 +573,47 @@ where
                 .write_all(&plain)
                 .and_then(|()| local_down.flush())
         {
-            shared.lock().record_err(e);
+            let mut g = shared.lock();
+            g.record_err(e);
+            g.done = true;
+            fatal_down = true;
             break;
         }
         if clean_eof {
             break;
         }
     }
+    let graceful = {
+        let mut g = shared.lock();
+        if fatal_down || g.done {
+            g.done = true;
+            false
+        } else {
+            g.download_done = true;
+            g.done = g.upload_done;
+            true
+        }
+    };
+    shared.cv.notify_all();
+    // A graceful peer EOF is delivered to the local application's response
+    // half only after every plaintext byte above was written and flushed. Its
+    // eventual request-half EOF lets the uploader finish the reverse ACK.
+    let _ = local_down.shutdown(if graceful {
+        std::net::Shutdown::Write
+    } else {
+        std::net::Shutdown::Both
+    });
+    if !graceful {
+        let _ = tcp_down.shutdown(std::net::Shutdown::Both);
+    }
+    let _ = up.join();
     {
         let mut g = shared.lock();
         g.done = true;
     }
     shared.cv.notify_all();
-    // Unblock the writer's socket write and the uploader's local read.
     let _ = tcp_down.shutdown(std::net::Shutdown::Both);
     let _ = local_down.shutdown(std::net::Shutdown::Both);
-    let _ = up.join();
     let _ = wr.join();
 
     match shared.lock().err.take() {
@@ -779,6 +825,158 @@ mod tests {
     }
 
     #[test]
+    fn relay_early_request_close_delivers_guarded_reply_but_not_late_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let pin = cert_fingerprint(TEST_CERT_DER);
+        let (svc_a, mut svc_b) = CtlStream::pair().unwrap();
+        let mut response = (0..(128 * 1024))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        const NONCE: &[u8] = b"00112233445566778899aabbccddeeff";
+        response.extend_from_slice(b"\nACK-CHALLENGE ");
+        response.extend_from_slice(NONCE);
+        response.push(b'\n');
+        let expected_response = response.clone();
+        let (ack_attempted_tx, ack_attempted_rx) = std::sync::mpsc::channel();
+
+        let service = std::thread::spawn(move || {
+            let mut request = Vec::new();
+            svc_b.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"one-shot request\n");
+            svc_b.write_all(&response).unwrap();
+            svc_b.flush().unwrap();
+            ack_attempted_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let mut reverse = Vec::new();
+            svc_b.read_to_end(&mut reverse).unwrap();
+            assert!(
+                reverse.is_empty(),
+                "an ACK written after the downstream close_notify must not reach upstream"
+            );
+            svc_b.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let transport = accept(tcp, scfg).unwrap();
+            relay(transport, svc_a).unwrap();
+        });
+
+        let tcp = TcpStream::connect(addr).unwrap();
+        let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
+        client.stream().write_all(b"one-shot request\n").unwrap();
+        client.stream().flush().unwrap();
+        // Directional request EOF must not tear down the still-live response
+        // direction. The peer service writes only after observing this EOF.
+        client.stream().conn.send_close_notify();
+        client.stream().flush().unwrap();
+        client
+            .stream()
+            .sock
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+
+        let mut got = vec![0; expected_response.len()];
+        client.stream().read_exact(&mut got).unwrap();
+        assert_eq!(
+            got, expected_response,
+            "every response byte must survive request-first half-close"
+        );
+        let mut late_ack = b"ACK ".to_vec();
+        late_ack.extend_from_slice(NONCE);
+        late_ack.push(b'\n');
+        let _ = client.stream().write_all(&late_ack);
+        let _ = client.stream().flush();
+        ack_attempted_tx.send(()).unwrap();
+
+        service.join().unwrap();
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn relay_round_trips_guarded_artifact_ack_before_request_half_close() {
+        const REQUEST: &[u8] = b"image guarded-demo.png\n";
+        const BODY: &[u8] = b"OK /tmp/aterm/images/guarded-demo.png\n";
+        const NONCE: &[u8] = b"fedcba98765432100123456789abcdef";
+
+        let mut guarded_reply = BODY.to_vec();
+        guarded_reply.extend_from_slice(b"ACK-CHALLENGE ");
+        guarded_reply.extend_from_slice(NONCE);
+        guarded_reply.push(b'\n');
+        let expected_reply = guarded_reply.clone();
+
+        let mut expected_ack = b"ACK ".to_vec();
+        expected_ack.extend_from_slice(NONCE);
+        expected_ack.push(b'\n');
+        let client_ack = expected_ack.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let pin = cert_fingerprint(TEST_CERT_DER);
+        let (svc_a, mut svc_b) = CtlStream::pair().unwrap();
+        svc_b
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        let service = std::thread::spawn(move || {
+            let mut request = vec![0; REQUEST.len()];
+            svc_b.read_exact(&mut request).unwrap();
+            assert_eq!(request, REQUEST);
+
+            svc_b.write_all(&guarded_reply).unwrap();
+            svc_b.flush().unwrap();
+
+            let mut ack = vec![0; expected_ack.len()];
+            svc_b.read_exact(&mut ack).unwrap();
+            assert_eq!(
+                ack, expected_ack,
+                "the exact nonce ACK must reach the guarded upstream reply"
+            );
+            svc_b.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let transport = accept(tcp, scfg).unwrap();
+            relay(transport, svc_a).unwrap();
+        });
+
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
+        client.stream().write_all(REQUEST).unwrap();
+        client.stream().flush().unwrap();
+
+        let mut got = vec![0; expected_reply.len()];
+        client.stream().read_exact(&mut got).unwrap();
+        assert_eq!(
+            got, expected_reply,
+            "ordinary body and challenge trailer must arrive together and intact"
+        );
+
+        client.stream().write_all(&client_ack).unwrap();
+        client.stream().flush().unwrap();
+        // A one-shot client may half-close only after its causal ACK is on the
+        // wire; TLS close_notify cannot be followed by more application data.
+        client.stream().conn.send_close_notify();
+        client.stream().flush().unwrap();
+        client
+            .stream()
+            .sock
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+
+        let mut tail = Vec::new();
+        client.stream().read_to_end(&mut tail).unwrap();
+        assert!(tail.is_empty());
+        service.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn relay_round_trips_are_not_paced_by_a_poll_interval() {
         // Regression: the relay used to drive both directions with 20 ms
         // mutex+sleep polls, so every request/echo round-trip paid ~20-40 ms of
@@ -956,5 +1154,4 @@ mod tests {
         service.join().unwrap();
         server.join().unwrap();
     }
-
 }

@@ -300,6 +300,33 @@ mod tests {
     }
 
     #[test]
+    fn scp_direction_change_reorders_and_damages_an_existing_row() {
+        let mut term = Terminal::new(2, 12);
+        // Mixed strong LTR/RTL runs make the paragraph base direction
+        // observable; a lone Hebrew run reverses identically under both bases.
+        term.process("abc \u{05D0}\u{05D1}\u{05D2}".as_bytes());
+        term.process(b"\x1b[2 k");
+        let rtl: Vec<char> = term.cell_frame(2, 12).cells[0]
+            .iter()
+            .take(7)
+            .map(|cell| cell.ch)
+            .collect();
+        term.take_damage();
+        let before = term.damage_epoch();
+
+        term.process(b"\x1b[1 k");
+        let ltr: Vec<char> = term.cell_frame(2, 12).cells[0]
+            .iter()
+            .take(7)
+            .map(|cell| cell.ch)
+            .collect();
+
+        assert_ne!(ltr, rtl, "SCP must reproject the already-stored row");
+        assert!(term.has_damage());
+        assert!(term.damage_epoch() > before);
+    }
+
+    #[test]
     fn cell_frame_leaves_ascii_row_in_logical_order() {
         let mut term = Terminal::new(4, 8);
         term.process(b"abc");

@@ -6,8 +6,9 @@
 //! semantic tree. This module
 //! maps [`crate::settings::SettingsState`] into an [`accesskit::TreeUpdate`] that
 //! `accesskit_winit` fans out to the OS
-//! accessibility APIs (UIA on Windows, AT-SPI on Linux, NSAccessibility on macOS) — so a
-//! screen reader, an AI, and the on-glass view can never disagree.
+//! accessibility APIs (UIA on Windows, AT-SPI on Linux, NSAccessibility on macOS), so a
+//! screen reader and an AI consume the same semantic model that feeds the app-rendered
+//! view.
 //!
 //! This module is the PURE mapping (model → `TreeUpdate`); it is unit-tested without any
 //! window/adapter. The `accesskit_winit::Adapter` that attaches this to a live window and

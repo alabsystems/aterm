@@ -38,7 +38,8 @@
 // (a hard invariant). The blit fragment can invert RGB for the visual bell.
 //
 // The common frame is ONE fused render pass on the sRGB view, in CPU draw order:
-// bg → glyph → colour-emoji → inline-image → line-deco → undercurl →
+// bg/underlayers → z<0 inline-image → glyph → colour-emoji →
+// z>=0 inline-image → line-deco → undercurl →
 // sparkle-paw → cursor (block fill / cut-out glyph / shapes). It SPLITS only when an additive
 // stream is non-empty — sRGB(base) | view(glow) | sRGB(sparkle-paw) | view(sparkle-add)
 // | sRGB(cursor) — the additive streams attach the offscreen's DEFAULT `view` (plain
@@ -678,7 +679,7 @@ fn fs_sprite_over(in: GlyphVsOut) -> @location(0) vec4<f32> {
 
 "#;
 
-/// On-glass blit: a fullscreen triangle generated from `@builtin(vertex_index)`
+/// Application-present blit: a fullscreen triangle generated from `@builtin(vertex_index)`
 /// (3 verts, no vertex buffer) samples the offscreen frame with NEAREST (1:1,
 /// no smear) and writes it straight to the swapchain. When `invert.flag != 0`
 /// the RGB is inverted (`1.0 - rgb`) for the visual-bell flash — the GPU twin of
@@ -1595,6 +1596,21 @@ fn present_blit_uniform(
 pub struct GpuSurface {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    /// A supported non-sRGB 8-bit format retained when an HDR surface is
+    /// created. DX12 surface reconfiguration recreates the swapchain and can
+    /// fail to re-establish scRGB (for example after Windows HDR is disabled);
+    /// this lets any live reconfigure fall back atomically without guessing
+    /// capabilities after the f16 swapchain has already lost its tag.
+    sdr_format: wgpu::TextureFormat,
+    /// Raw f16 capability advertised by this surface at attach, independent of
+    /// the then-current HDR-glow opt-in. Retained across SDR fallback and config
+    /// hot reload so a later Windows HDR-on + live opt-in can restore f16.
+    supports_f16: bool,
+    /// Last instant at which the output HDR state/scRGB tag was probed. Windows
+    /// can toggle HDR without changing window size or guaranteeing an
+    /// Outdated/Lost acquire, so bounded present-time probing cannot rely on
+    /// `Surface::configure` being called first.
+    last_hdr_probe: Option<std::time::Instant>,
     /// M5 true vibrancy: whether this surface offers `CompositeAlphaMode::PostMultiplied`
     /// (the non-opaque composite the translucent present needs). Captured from the
     /// surface caps at attach so [`GpuRenderer::present_input`] can flip the swapchain
@@ -1615,13 +1631,25 @@ pub struct GpuSurface {
 
 impl GpuSurface {
     /// M3 phase B: whether this swapchain is the EDR (`Rgba16Float`
-    /// extended-linear) target — i.e. `hdr_glow` was on AND the surface offered
-    /// the format at attach. The frontend uses it to pick the layer's colour-
-    /// space tag (extended-linear-sRGB vs the config `window_colorspace`) and to
-    /// know the per-window EDR headroom is worth (re)querying.
+    /// extended-linear) target. This can change live on Windows as system HDR
+    /// toggles; the frontend uses the current value to know whether per-window
+    /// EDR headroom is worth (re)querying.
     #[must_use]
     pub fn is_hdr(&self) -> bool {
         self.config.format == wgpu::TextureFormat::Rgba16Float
+    }
+}
+
+/// Live scRGB support is cheap to re-check but still crosses into DXGI, so an
+/// animated HDR window samples it at the same bounded cadence as GUI EDR
+/// headroom. A dormant window checks before its first later present.
+const HDR_COLOR_SPACE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[must_use]
+fn hdr_color_space_probe_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= HDR_COLOR_SPACE_PROBE_INTERVAL,
     }
 }
 
@@ -2060,6 +2088,10 @@ pub struct WindowGpu {
     // swapchain-only glow/chrome passes every offscreen readback misses — into
     // a counted-drop ring. See `video_tap`.
     pub(crate) video: Option<crate::video_tap::VideoTap>,
+    // One-shot exact presented-destination snapshot. Independent from `video`:
+    // both taps may copy the same post-pass destination in the same encoder,
+    // while neither consumes or changes the other's lifecycle/state.
+    pub(crate) presented_snapshot: Option<crate::video_tap::PresentedFrameTap>,
     // The per-frame inline-image texture (every distinct visible image stacked)
     // and its bind group. `None` until the first image frame; rebuilt when the
     // set of visible images changes, reused otherwise. PER-WINDOW. Cleared to
@@ -2108,6 +2140,13 @@ pub struct WindowGpu {
     // Windows EDR present so content isn't dim. `Default` 0.0 is clamped to 1.0 at
     // present (never set / macOS / SDR ⇒ no scaling, byte-identical).
     pub(crate) sdr_white_scale: f32,
+    // Colour-space tag the platform compositor applies to this window's
+    // presented texture. Unlike the texture format, this distinguishes an
+    // 8-bit sRGB surface from macOS's legacy Display-P3 interpretation. Each
+    // presented snapshot/video copy freezes the live value into its staging
+    // slot so asynchronous harvest can explicitly transform that exact source
+    // encoding to ordinary sRGB RGBA8.
+    pub(crate) capture_color_space: crate::video_tap::CaptureColorSpace,
     // M1b sub-row scroll: a scratch texture the size of the offscreen, used to
     // stage the grid-band pixel shift (an in-place overlapping texture copy is UB,
     // so the band is copied here then back, shifted). `None` until the first
@@ -2203,7 +2242,56 @@ impl WindowGpu {
     /// (`SDRwhite_nits / 80`). Clamped to `>= 1.0` so an unset/degenerate value can
     /// never darken the grid; `1.0` means no scaling (macOS / SDR).
     pub fn set_sdr_white_scale(&mut self, v: f32) {
-        self.sdr_white_scale = v.max(1.0);
+        self.sdr_white_scale = if v.is_finite() { v.max(1.0) } else { 1.0 };
+    }
+
+    /// Record the colour-space tag the platform compositor uses for this
+    /// window's presented texture. Capture taps snapshot this metadata for each
+    /// enqueued present; it does not alter live presentation.
+    pub fn set_capture_color_space(&mut self, color_space: crate::video_tap::CaptureColorSpace) {
+        self.capture_color_space = color_space;
+    }
+
+    /// The captured presentation colour space. Real surfaces replace the
+    /// default during attach with the platform-confirmed tag (or `Unknown`).
+    #[must_use]
+    pub fn capture_color_space(&self) -> crate::video_tap::CaptureColorSpace {
+        self.capture_color_space
+    }
+
+    /// Reconcile per-window HDR/capture metadata with an actual surface
+    /// reconfiguration decision. A successful/no-op reconfigure preserves the
+    /// platform-confirmed tag. An f16 re-tag failure is different: the renderer
+    /// immediately reconfigures the retained 8-bit format, whose Windows
+    /// compositor interpretation is ordinary sRGB, so no later present may
+    /// retain extended-linear capture metadata or an scRGB white multiplier.
+    fn apply_hdr_reconfigure_plan(&mut self, plan: crate::format_plan::HdrReconfigurePlan) {
+        if plan == crate::format_plan::HdrReconfigurePlan::FallbackToSdr {
+            self.capture_color_space = crate::video_tap::CaptureColorSpace::Srgb;
+            self.sdr_white_scale = 1.0;
+            self.edr_max = 0.0;
+        }
+    }
+
+    /// Promote metadata only after an SDR surface has been configured f16 and
+    /// successfully tagged scRGB. Headroom/reference-white values are reset to
+    /// safe inert defaults until the frontend's next monitor query; no frame may
+    /// inherit stale values from the previous HDR epoch.
+    fn apply_hdr_surface_upgrade(&mut self) {
+        self.capture_color_space = crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb;
+        self.sdr_white_scale = 1.0;
+        self.edr_max = 0.0;
+    }
+
+    /// The sanitized scRGB reference-white multiplier used by presentation and
+    /// capture (`1.0` on macOS/SDR).
+    #[must_use]
+    pub fn sdr_white_scale(&self) -> f32 {
+        if self.sdr_white_scale.is_finite() {
+            self.sdr_white_scale.max(1.0)
+        } else {
+            1.0
+        }
     }
 
     /// The recorded raw EDR maximum ([`Self::set_edr_max`]; `0.0` = never set).
@@ -2498,7 +2586,7 @@ pub struct GpuRenderer {
     /// Test pin for the phase ([`GpuRenderer::set_shimmer_phase_for_test`]):
     /// `Some` replaces the wall clock so readbacks/arms are deterministic.
     shimmer_phase_pin: Option<f32>,
-    // On-glass blit (the offscreen frame -> swapchain), built once and reused.
+    // Application-present blit (the offscreen frame -> swapchain), built once and reused.
     blit_shader: wgpu::ShaderModule,
     blit_bgl: wgpu::BindGroupLayout,
     blit_layout: wgpu::PipelineLayout,
@@ -2730,7 +2818,7 @@ pub(crate) struct Offscreen {
 
 /// The SDR-bloom PRESENT compositing target (see [`WindowGpu::present_offscreen`]).
 /// A copy of the clean `offscreen` with the additive comet HALO composited over it,
-/// which the on-glass blit (and the readback helpers) sample INSTEAD of `offscreen`
+/// which the application-present blit (and the readback helpers) sample INSTEAD of `offscreen`
 /// on a bloom present. Kept OFF the scissor path so `offscreen` never carries the
 /// halo — the incremental dirty set stays proportional to real content change. Its
 /// `blit_bind` is the drop-in replacement blit source (same layout/sampler/uniform
@@ -2765,7 +2853,7 @@ pub(crate) struct ShimmerScratch {
 }
 
 /// HEADLESS PRESENT-REAL (see [`WindowGpu::virtual_target`]): the persistent
-/// offscreen texture a glass-less window's recording presents into via
+/// offscreen texture a windowless target's recording presents into via
 /// [`GpuRenderer::present_virtual`] — the virtual twin of the swapchain
 /// texture, with the same `RENDER_ATTACHMENT | COPY_SRC` usage a copyable
 /// swapchain configures so the UNCHANGED [`crate::video_tap::VideoTap`] copies
@@ -2779,8 +2867,8 @@ pub(crate) struct VirtualTarget {
 
 /// The format the virtual present target (and its tap) uses: the SDR default a
 /// real swapchain gets (`pick_surface_format`'s first choice on every major
-/// backend), so the virtual arm exercises the same blit pipeline / uniform
-/// bytes as a real on-glass present. EDR/f16 virtual swapchains are explicitly
+/// backend), so the virtual arm exercises the same application blit/uniform
+/// bytes as a real swapchain destination. EDR/f16 virtual swapchains are explicitly
 /// out of scope v1 (the recording's `format` field discloses this).
 const VIRTUAL_PRESENT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
@@ -2822,12 +2910,24 @@ pub(crate) struct BloomTarget {
 struct Instances {
     keys: BTreeSet<GlyphKey>,
     bg: Vec<BgInstance>,
+    /// Kitty images below the protocol's `INT32_MIN / 2` boundary. Drawn after
+    /// the default frame/background reset but before `image_bg_cover`, so they
+    /// remain visible through default-background cells and disappear beneath
+    /// selected/non-default cell backgrounds.
+    image_below_bg: Vec<GlyphInstance>,
+    /// Selected/non-default cell backgrounds covering `image_below_bg`.
+    /// Contains only cells occupied by that deepest image tier; drawing it after
+    /// the image implements Kitty's third z layer without duplicating the whole
+    /// background stream.
+    image_bg_cover: Vec<BgInstance>,
+    /// Ordinary Kitty negative-z inline-image tiles (threshold..=-1). Drawn
+    /// after every background / under-text layer and before glyphs, so opaque
+    /// and translucent image pixels are behind base glyphs and combining marks.
+    image_under: Vec<GlyphInstance>,
     /// Inline-image (iTerm2 OSC 1337) cell tiles: one quad per image-covered cell
-    /// sampling its tile of the per-frame image texture. Drawn AFTER the colour
-    /// glyphs (the image owns the cell, so no glyph competes) and BEFORE the
-    /// decorations/cursor — over the cell bg, alpha-blended, exactly like the CPU
-    /// `blit_image_cell` straight-alpha-over composite. Empty (and so a no-op) for
-    /// every image-free frame, keeping the text path byte-identical.
+    /// sampling its tile of the per-frame image texture. This stream contains
+    /// only z>=0 tiles and is drawn AFTER the colour glyphs (the image owns its
+    /// cell) and BEFORE decorations/cursor. Empty for an image-free frame.
     image: Vec<GlyphInstance>,
     glyph: Vec<GlyphInstance>,
     /// EMBERFORGE GLYPH CONTRAST-HALO: the dark warm dilation ring around every
@@ -2959,6 +3059,9 @@ impl Instances {
     fn clear(&mut self) {
         self.keys.clear();
         self.bg.clear();
+        self.image_below_bg.clear();
+        self.image_bg_cover.clear();
+        self.image_under.clear();
         self.image.clear();
         self.glyph.clear();
         self.glyph_halo.clear();
@@ -2992,6 +3095,9 @@ impl Instances {
 /// Field order/labels mirror the instance vecs built in `encode_frame`.
 struct VertexBuffers {
     bg: VertexBuffer,
+    image_below_bg: VertexBuffer,
+    image_bg_cover: VertexBuffer,
+    image_under: VertexBuffer,
     image: VertexBuffer,
     glyph: VertexBuffer,
     glyph_halo: VertexBuffer,
@@ -3031,6 +3137,12 @@ impl VertexBuffers {
     fn new(device: &wgpu::Device) -> Self {
         Self {
             bg: VertexBuffer::new(device, "aterm-gpu bg instances"),
+            image_below_bg: VertexBuffer::new(
+                device,
+                "aterm-gpu below-cell-background image instances",
+            ),
+            image_bg_cover: VertexBuffer::new(device, "aterm-gpu image background-cover instances"),
+            image_under: VertexBuffer::new(device, "aterm-gpu behind-text image instances"),
             image: VertexBuffer::new(device, "aterm-gpu image instances"),
             glyph: VertexBuffer::new(device, "aterm-gpu glyph instances"),
             glyph_halo: VertexBuffer::new(device, "aterm-gpu glyph contrast-halo instances"),
@@ -3981,7 +4093,7 @@ fn build_cell_pipelines(
     )
 }
 
-/// Build the format-independent on-glass blit infrastructure: the blit shader,
+/// Build the format-independent application-present blit infrastructure: the blit shader,
 /// its bind-group layout (texture + sampler + invert uniform), the pipeline
 /// layout, the NEAREST blit sampler, and the invert uniform buffer. The blit
 /// pipeline itself depends on the swapchain format, so it is built lazily per
@@ -4404,7 +4516,7 @@ impl GpuRenderer {
     /// Forward of the inner CPU rasterizer's
     /// [`fallback_parse_pending`](Renderer::fallback_parse_pending): true while
     /// a background fallback-face parse is in flight (provisional `.notdef`
-    /// cells may be on glass). The frontend re-arms a redraw while pending and
+    /// cells may remain in the app-present artifact). The frontend re-arms a redraw while pending and
     /// invalidates the window's present cache once it lands — the per-window
     /// damage diff cannot see the CPU renderer's `font_epoch`.
     pub fn fallback_parse_pending(&mut self) -> bool {
@@ -5734,8 +5846,9 @@ impl GpuRenderer {
         self.sdr_glow_boost = strength;
     }
 
-    /// VIDEO introspection: start recording this window's presented frames
-    /// with the client's [`crate::video_tap::CaptureOpts`]. Errs plainly where
+    /// VIDEO introspection: start recording this window's swapchain frames
+    /// submitted through the WSI present path; compositor visibility/scanout
+    /// remain unobserved. Uses the client's [`crate::video_tap::CaptureOpts`]. Errs plainly where
     /// the backend's surface offers no `COPY_SRC` (the tap never degrades to a
     /// lookalike capture). See [`crate::video_tap`].
     pub fn video_begin(
@@ -5752,6 +5865,8 @@ impl GpuRenderer {
             surf.config.width,
             surf.config.height,
             surf.config.format,
+            win.capture_color_space,
+            win.sdr_white_scale(),
             opts,
         )?;
         win.video = Some(tap);
@@ -5780,16 +5895,24 @@ impl GpuRenderer {
     ) -> Result<(), String> {
         let w = self.clamp_fb_dim(w.max(1));
         let h = self.clamp_fb_dim(h.max(1));
-        let tap =
-            crate::video_tap::VideoTap::new(&self.ctx.device, w, h, VIRTUAL_PRESENT_FORMAT, opts)?;
+        let tap = crate::video_tap::VideoTap::new(
+            &self.ctx.device,
+            w,
+            h,
+            VIRTUAL_PRESENT_FORMAT,
+            crate::video_tap::CaptureColorSpace::Srgb,
+            1.0,
+            opts,
+        )?;
         win.virtual_target = Some(self.make_virtual_target(w, h));
         win.video = Some(tap);
         Ok(())
     }
 
-    /// VIDEO introspection post-present hook: stamp the just-presented frame
-    /// with the caller's same-clock time and harvest completed copies
-    /// (non-blocking). No-op when not recording.
+    /// VIDEO introspection post-submit hook: stamp the frame just submitted to
+    /// the WSI present path with the caller's same-clock time and harvest
+    /// completed copies (non-blocking). Compositor visibility and scanout are
+    /// not observed. No-op when not recording.
     pub fn video_after_present(&self, win: &mut WindowGpu, t_us: u64) {
         if let Some(tap) = win.video.as_mut() {
             tap.after_present(&self.ctx.device, t_us);
@@ -5808,6 +5931,74 @@ impl GpuRenderer {
         win.video.as_ref().map(|t| (t.frames_so_far(), t.resized()))
     }
 
+    /// Arm a one-shot copy of this window's next successfully presented
+    /// destination. The tap reads the post-blit/post-crown texture itself; it is
+    /// independent from an active video recorder and refuses surfaces that do
+    /// not expose `COPY_SRC` rather than returning an offscreen lookalike.
+    pub fn presented_snapshot_begin(
+        &self,
+        win: &mut WindowGpu,
+        surface: &GpuSurface,
+    ) -> Result<(), String> {
+        if win.presented_snapshot.is_some() {
+            return Err("presented snapshot: capture already armed".to_string());
+        }
+        if !surface.copyable {
+            return Err(
+                "presented snapshot: surface not copyable on this backend (no COPY_SRC)"
+                    .to_string(),
+            );
+        }
+        win.presented_snapshot = Some(crate::video_tap::PresentedFrameTap::new(
+            &self.ctx.device,
+            surface.config.width,
+            surface.config.height,
+            surface.config.format,
+            win.capture_color_space,
+            win.sdr_white_scale(),
+        )?);
+        Ok(())
+    }
+
+    /// Post-present half of [`Self::presented_snapshot_begin`]. Call only after
+    /// the present that advanced the frontend's successful-present serial.
+    /// Starts the staging-buffer map and polls non-blockingly.
+    pub fn presented_snapshot_after_present(
+        &self,
+        win: &mut WindowGpu,
+        t_us: u64,
+    ) -> Result<(), String> {
+        let tap = win
+            .presented_snapshot
+            .as_mut()
+            .ok_or_else(|| "presented snapshot: no capture is armed".to_string())?;
+        tap.after_present(&self.ctx.device, t_us)
+    }
+
+    /// Complete the one-shot map, blocking only after the explicit capture has
+    /// left the present hot path. The captured frame remains in `win` until
+    /// [`Self::presented_snapshot_take`] transfers it to the caller.
+    pub fn presented_snapshot_finish(&self, win: &mut WindowGpu) -> Result<(), String> {
+        let tap = win
+            .presented_snapshot
+            .as_mut()
+            .ok_or_else(|| "presented snapshot: no capture is armed".to_string())?;
+        tap.finish(&self.ctx.device)
+    }
+
+    /// Take the completed exact destination as straight RGBA8. This consumes the
+    /// one-shot state even when it contains a terminal capture error, so a caller
+    /// can immediately arm a clean retry.
+    pub fn presented_snapshot_take(
+        &self,
+        win: &mut WindowGpu,
+    ) -> Result<crate::video_tap::CapturedFrame, String> {
+        win.presented_snapshot
+            .take()
+            .ok_or_else(|| "presented snapshot: no capture is armed".to_string())?
+            .take()
+    }
+
     /// Render a [`RenderInput`] snapshot (built by the engine via
     /// [`aterm_core::terminal::Terminal::cell_frame_into`]) on the GPU and read it
     /// back — no `&Terminal` borrow, so the frontend renders after dropping the
@@ -5820,6 +6011,35 @@ impl GpuRenderer {
         input: &RenderInput,
         tray: Option<TrayQuad<'_>>,
     ) -> Frame {
+        let (texture, width, height) = self.render_input_target(win, input, tray);
+        self.ctx.read_back(&texture, width, height)
+    }
+
+    /// Fallible explicit-capture twin of [`Self::render_input`].
+    ///
+    /// Artifact-producing callers (`image` and SIGUSR1 snapshots) must use this
+    /// path: a device-loss/map failure is a capture failure, not a valid black
+    /// framebuffer. The infallible method remains for renderer-oracle/test callers
+    /// whose historical best-effort contract deliberately survives device loss.
+    pub fn try_render_input(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        tray: Option<TrayQuad<'_>>,
+    ) -> Result<Frame, String> {
+        let (texture, width, height) = self.render_input_target(win, input, tray);
+        self.ctx.try_read_back(&texture, width, height)
+    }
+
+    /// Encode the route-neutral capture frame and return its resident texture and
+    /// exact clamped dimensions. Keeping this shared prevents the fallible artifact
+    /// path from drifting from the best-effort renderer-oracle path.
+    fn render_input_target(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        tray: Option<TrayQuad<'_>>,
+    ) -> (wgpu::Texture, u32, u32) {
         // FULL repaint (Clear + all rows) — the snapshot / readback / oracle path.
         // It overwrites the offscreen with this (possibly unrelated) input, so it
         // invalidates the scissored present sequence's prior-frame tracking: a
@@ -5849,18 +6069,18 @@ impl GpuRenderer {
         if self.shimmer_live(input) {
             self.shimmer_offscreen_in_place(win, input);
         }
-        // Bake the settings card INTO the offscreen before readback, so the
-        // introspection (snapshot / image) sees exactly what `present_input` blits.
+        // M1b sub-row scroll: shift the terminal-content grid band of the offscreen
+        // by the SIGNED `scroll_frac_px` (up for a glide, down for an overscroll
+        // bounce) before adding frontend chrome, matching the CPU path's
+        // render-then-composite ordering. A no-op at frac 0 / no band remains
+        // byte-identical to the pre-M1b readback.
+        self.shift_offscreen_band(win, input);
+        // Bake the pinned settings/native/card tray INTO the translated offscreen
+        // before readback, so introspection and on-glass presents share the same
+        // chrome-invariant ordering.
         if let Some(t) = tray {
             self.draw_tray_into_offscreen(win, t);
         }
-        // M1b sub-row scroll: shift the terminal-content grid band of the offscreen
-        // by the SIGNED `scroll_frac_px` (up for a glide, down for an overscroll
-        // bounce) BEFORE the readback, so the oracle/introspection frame is the SAME
-        // pixel-shifted frame the CPU present translate produces (the CPU==GPU parity
-        // contract for a fractional-scroll frame). A no-op at frac 0 / no band ⇒
-        // byte-identical to the pre-M1b readback.
-        self.shift_offscreen_band(win, input);
         // The freshly rendered target is resident on `win.offscreen`.
         let tex = win
             .offscreen
@@ -5868,7 +6088,7 @@ impl GpuRenderer {
             .expect("encode_frame sets offscreen")
             .tex
             .clone();
-        self.ctx.read_back(&tex, w, h)
+        (tex, w, h)
     }
 
     /// M1b SUB-ROW SCROLL — the GPU twin of the CPU present translate
@@ -6049,6 +6269,11 @@ impl GpuRenderer {
             let caps = surface.get_capabilities(&self.ctx.adapter);
             let supports_f16 = caps.formats.contains(&wgpu::TextureFormat::Rgba16Float);
             if crate::format_plan::hdr_swapchain_wants_f16(self.hdr_glow, supports_f16) {
+                // Retain a proven-supported SDR escape format BEFORE configuring
+                // f16. A later DX12 resize recreates the swapchain and can fail
+                // to restore scRGB; fallback must not discover after the fact
+                // that its only candidate was the same untagged f16 format.
+                let sdr_format = Self::pick_surface_format(&caps)?;
                 let format = wgpu::TextureFormat::Rgba16Float;
                 self.ensure_blit_pipeline(format);
                 let post_mult = Self::caps_support_post_multiplied(&caps);
@@ -6076,7 +6301,9 @@ impl GpuRenderer {
                 // (extended-linear) — which succeeds iff Windows HDR is ON for this
                 // output. If not (SDR mode, or a non-DX12 backend) fall through to the
                 // SDR pick below so the EDR present is never shown washed-out. Off
-                // Windows this always succeeds (macOS/Metal auto-sets EDR for f16).
+                // Windows this succeeds only on macOS (Metal auto-enables EDR for
+                // f16); Linux falls back until it has explicit compositor colour
+                // management.
                 if Self::tag_swapchain_scrgb(&surface) {
                     if std::env::var_os("ATERM_VERBOSE").is_some() {
                         eprintln!(
@@ -6087,6 +6314,9 @@ impl GpuRenderer {
                     return Ok(GpuSurface {
                         surface,
                         config,
+                        sdr_format,
+                        supports_f16: true,
+                        last_hdr_probe: Some(std::time::Instant::now()),
                         post_mult,
                         copyable,
                     });
@@ -6164,6 +6394,9 @@ impl GpuRenderer {
         Ok(GpuSurface {
             surface,
             config,
+            sdr_format: format,
+            supports_f16: caps.formats.contains(&wgpu::TextureFormat::Rgba16Float),
+            last_hdr_probe: Some(std::time::Instant::now()),
             post_mult,
             copyable,
         })
@@ -6207,6 +6440,11 @@ impl GpuRenderer {
         Ok(GpuSurface {
             surface,
             config,
+            sdr_format: format,
+            // The web surface path deliberately has no platform HDR colour-space
+            // negotiation; do not manufacture a native live-upgrade probe here.
+            supports_f16: false,
+            last_hdr_probe: None,
             post_mult,
             copyable,
         })
@@ -6214,8 +6452,11 @@ impl GpuRenderer {
 
     /// Pick a NON-sRGB swapchain format: `Bgra8Unorm` if offered (the macOS/Metal
     /// native), else `Rgba8Unorm`, else the first non-`*Srgb` format the surface
-    /// supports. Errs only if the surface offers *exclusively* sRGB formats (it
-    /// won't on Metal), since presenting through one would gamma-shift the colours.
+    /// supports, excluding `Rgba16Float` because this is also the retained
+    /// fail-safe format used when an HDR swapchain cannot be re-tagged after a
+    /// reconfigure. Errs if the surface offers no non-sRGB SDR format, since
+    /// presenting through an `*Srgb` format would gamma-shift the colours and an
+    /// untagged f16 format would reinterpret linear pixels as gamma-2.2.
     /// Choose a TEAR-FREE present mode that also keeps animations (the cursor aurora)
     /// SMOOTH. Prefer `Mailbox` — newest-frame-wins, tear-free AND low-latency, the
     /// best of both — else `Fifo` (plain vsync: tear-free, +~1 refresh of latency).
@@ -6338,7 +6579,7 @@ impl GpuRenderer {
         caps.formats
             .iter()
             .copied()
-            .find(|f| !f.is_srgb())
+            .find(|f| !f.is_srgb() && *f != wgpu::TextureFormat::Rgba16Float)
             .ok_or_else(|| "surface offers no non-sRGB format".to_string())
     }
 
@@ -6374,7 +6615,17 @@ impl GpuRenderer {
     /// `max_texture_dimension_2d`; `surface.configure` would then hit wgpu's default
     /// uncaptured-error handler and abort the process. Clamping the swapchain (blit
     /// DESTINATION) with the SAME helper as the offscreen (blit SOURCE) keeps them 1:1.
-    pub fn resize_surface(&self, surf: &mut GpuSurface, width: u32, height: u32) {
+    ///
+    /// On DX12, `configure` recreates the swapchain and clears its scRGB colour
+    /// space. The shared reconfiguration seam re-tags that new swapchain or
+    /// atomically falls back to SDR before another present.
+    pub fn resize_surface(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        width: u32,
+        height: u32,
+    ) {
         let w = self.clamp_fb_dim(width);
         let h = self.clamp_fb_dim(height);
         // Idempotent: the control-echo follow-up `Resized` (and any resize event that
@@ -6387,21 +6638,170 @@ impl GpuRenderer {
         }
         surf.config.width = w;
         surf.config.height = h;
-        self.configure_surface_retagging_scrgb(surf);
+        self.configure_surface_retagging_scrgb(win, surf, "resize");
     }
 
-    /// Configure an existing surface, preserving the invariant that an f16
-    /// swapchain stays scRGB-tagged.
+    /// Configure an EXISTING surface while preserving the invariant that f16
+    /// means a compositor-confirmed scRGB swapchain.
     ///
     /// DX12 rebuilds its swapchain on EVERY `Surface::configure`, not just a
     /// resize, and each rebuild reverts to the DXGI gamma-2.2 default colour
-    /// space. Any call site that reconfigures a live surface must therefore
-    /// re-tag, or an EDR (f16) present silently washes out with >1.0 clipped by
-    /// DWM. No-op on SDR swapchains and off DX12.
-    fn configure_surface_retagging_scrgb(&self, surf: &mut GpuSurface) {
+    /// space — an EDR (f16) present then silently washes out with >1.0 clipped
+    /// by DWM. Live composite-alpha/usage changes and Outdated/Lost recovery
+    /// therefore need the exact same re-tag-or-fallback transaction as a resize,
+    /// so every such call site routes through here; `tests/hdr_gate.rs`
+    /// source-scans that closure by this name.
+    ///
+    /// The re-tag is a TRANSACTION, not a best-effort: an f16 swapchain that
+    /// cannot be re-tagged scRGB is atomically reconfigured to the retained
+    /// proven-SDR format before another present, because a lost tag means DWM
+    /// reads the linear pixels as gamma-2.2 while capture still claims
+    /// extended-linear sRGB. No-op on SDR swapchains and off DX12.
+    fn configure_surface_retagging_scrgb(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        reason: &'static str,
+    ) {
+        let was_hdr = surf.is_hdr();
         surf.surface.configure(&self.ctx.device, &surf.config);
-        if surf.config.format == wgpu::TextureFormat::Rgba16Float {
-            let _ = Self::tag_swapchain_scrgb(&surf.surface);
+        // A reconfigure rebuilds the DX12 swapchain, which reverts to the DXGI
+        // gamma-2.2 default colour space. Re-tag scRGB so an EDR (f16) present
+        // stays correct; SDR swapchains never attempt the HDR platform call.
+        let scrgb_retagged = was_hdr && Self::tag_swapchain_scrgb(&surf.surface);
+        self.finish_surface_color_space_recovery(
+            win,
+            surf,
+            was_hdr,
+            scrgb_retagged,
+            reason,
+            std::time::Instant::now(),
+        );
+    }
+
+    /// Complete the model-bound half of either a post-configure re-tag or a
+    /// same-swapchain live HDR-state revalidation. A failed f16 check performs
+    /// the sole SDR fallback configure and reconciles metadata only afterward.
+    fn finish_surface_color_space_recovery(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        was_hdr: bool,
+        scrgb_retagged: bool,
+        reason: &'static str,
+        validated_at: std::time::Instant,
+    ) {
+        let plan = crate::format_plan::hdr_reconfigure_plan(was_hdr, scrgb_retagged);
+        if plan == crate::format_plan::HdrReconfigurePlan::FallbackToSdr {
+            debug_assert_ne!(
+                surf.sdr_format,
+                wgpu::TextureFormat::Rgba16Float,
+                "the retained fallback must be an SDR format"
+            );
+            self.ensure_blit_pipeline(surf.sdr_format);
+            surf.config.format = surf.sdr_format;
+            surf.surface.configure(&self.ctx.device, &surf.config);
+            // Deliberately NO `tag_swapchain_scrgb` follow-up: this configure IS
+            // the SDR escape, and an 8-bit swapchain must keep the DXGI
+            // gamma-2.2 default so DWM reads it as ordinary sRGB.
+            self.cached_surface_format = Some(surf.sdr_format);
+            if std::env::var_os("ATERM_VERBOSE").is_some() {
+                eprintln!(
+                    "aterm-gpu: scRGB re-tag failed after {reason}; fell back to {:?}",
+                    surf.sdr_format
+                );
+            }
+        }
+        win.apply_hdr_reconfigure_plan(plan);
+        surf.last_hdr_probe = Some(validated_at);
+    }
+
+    /// Revalidate/restore the opted-in f16 path even when no resize, alpha
+    /// change, or acquire error forced `Surface::configure`.
+    ///
+    /// Windows does not guarantee a same-size system HDR toggle in either
+    /// direction produces an Outdated/Lost texture. A live f16 surface re-checks
+    /// and falls back on HDR-off. An opted-in f16-capable SDR fallback probes the
+    /// output first, then configures f16 and tags it only after HDR-on; any race
+    /// or tag failure returns to SDR before acquisition. The interval bounds COM
+    /// traffic, and non-Windows SDR surfaces never poll this Windows lifecycle.
+    fn reconcile_live_hdr_state_if_due(&mut self, win: &mut WindowGpu, surf: &mut GpuSurface) {
+        if !cfg!(windows) {
+            return;
+        }
+        if !surf.is_hdr() && !(self.hdr_glow && surf.supports_f16) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if !hdr_color_space_probe_due(surf.last_hdr_probe, now) {
+            return;
+        }
+        if surf.is_hdr() {
+            let scrgb_retagged = Self::tag_swapchain_scrgb(&surf.surface);
+            self.finish_surface_color_space_recovery(
+                win,
+                surf,
+                true,
+                scrgb_retagged,
+                "live HDR-state revalidation",
+                now,
+            );
+            return;
+        }
+
+        // SDR→HDR is Windows-only: macOS takes f16 at initial attach whenever it
+        // is capable, while Linux/web have no explicit compositor HDR protocol.
+        let output_hdr_enabled = Self::surface_output_hdr_enabled(&surf.surface);
+        if !crate::format_plan::hdr_live_upgrade_wants_f16(
+            self.hdr_glow,
+            surf.supports_f16,
+            output_hdr_enabled,
+        ) {
+            surf.last_hdr_probe = Some(now);
+            return;
+        }
+        self.ensure_blit_pipeline(wgpu::TextureFormat::Rgba16Float);
+        surf.config.format = wgpu::TextureFormat::Rgba16Float;
+        self.configure_surface_retagging_scrgb(win, surf, "live HDR-state upgrade");
+        if surf.is_hdr() {
+            // The shared transaction only preserves metadata on KeepHdr because
+            // every ordinary reconfigure was already HDR. This path crossed from
+            // SDR, so publish the new encoding only after configure+tag succeeded.
+            win.apply_hdr_surface_upgrade();
+        }
+    }
+
+    /// Whether this surface's containing Windows output currently advertises
+    /// the HDR10 desktop colour space. Probe-only: unlike
+    /// [`Self::tag_swapchain_scrgb`], this never changes the swapchain tag, so it
+    /// is safe to call on the retained 8-bit SDR surface before deciding whether
+    /// an f16 reconfigure is warranted.
+    #[cfg(not(windows))]
+    fn surface_output_hdr_enabled(_surface: &wgpu::Surface) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn surface_output_hdr_enabled(surface: &wgpu::Surface) -> bool {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
+        use windows::core::Interface as _;
+
+        // SAFETY: the hal-surface guard borrows the live surface only for this
+        // scope. COM handles are result-checked and reference-counted; none
+        // escape. A non-DX12 backend returns `None` and fails safely to SDR.
+        unsafe {
+            let Some(hal_surf) = surface.as_hal::<wgpu::hal::api::Dx12>() else {
+                return false;
+            };
+            let Some(sc) = hal_surf.swap_chain() else {
+                return false;
+            };
+            sc.GetContainingOutput()
+                .ok()
+                .and_then(|output| output.cast::<IDXGIOutput6>().ok())
+                .and_then(|output| output.GetDesc1().ok())
+                .is_some_and(|desc| desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
         }
     }
 
@@ -6414,22 +6814,26 @@ impl GpuRenderer {
     /// Returns whether scRGB is SUPPORTED + was set — which is exactly "Windows HDR
     /// is ON for this output". Fail-safe: a non-DX12 backend (Vulkan), any COM
     /// error, or HDR-off returns `false` on Windows so the caller keeps the SDR
-    /// swapchain; off Windows it returns `true` (macOS/Metal auto-sets EDR for an
-    /// f16 layer, so the existing behavior is preserved).
-    #[cfg(not(windows))]
+    /// swapchain. macOS/Metal auto-enables EDR for an f16 CAMetalLayer, so that
+    /// platform returns `true`; other non-Windows platforms return `false`
+    /// until their compositor colour-management path is implemented.
+    #[cfg(target_os = "macos")]
     fn tag_swapchain_scrgb(_surface: &wgpu::Surface) -> bool {
         true
     }
 
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    fn tag_swapchain_scrgb(_surface: &wgpu::Surface) -> bool {
+        false
+    }
+
     #[cfg(windows)]
     fn tag_swapchain_scrgb(surface: &wgpu::Surface) -> bool {
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
-        };
-        use windows::Win32::Graphics::Dxgi::{
-            DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, IDXGIOutput6,
-        };
-        use windows::core::Interface as _;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+        if !Self::surface_output_hdr_enabled(surface) {
+            return false;
+        }
         // SAFETY: the hal-surface guard borrows the live surface for this scope
         // only; we read its `IDXGISwapChain3` and issue result-checked COM calls,
         // then drop the guard. `as_hal::<Dx12>` yields `None` on any non-DX12 backend
@@ -6441,24 +6845,10 @@ impl GpuRenderer {
             let Some(sc) = hal_surf.swap_chain() else {
                 return false;
             };
-            // GATE ON WINDOWS HDR ACTUALLY BEING ON for this output. `CheckColorSpaceSupport`
-            // alone is too loose: AMD/Intel report scRGB PRESENT-support even on an SDR
-            // desktop, so tagging + presenting the f16 EDR swapchain there hands DWM
-            // extended-linear data on an sRGB pipeline — the grid renders washed-out / colour-
-            // cast (the "yellow text" bug on the 780M). The containing output's CURRENT colour
-            // space is the canonical HDR-toggle signal: HDR10 (G2084 P2020) when Windows HDR is
-            // on, sRGB (G22 P709) when off. Require it before taking the EDR path; any query
-            // failure (unusual multi-GPU / remoting) fails SAFE to the correct 8-bit present.
-            let hdr_on = sc
-                .GetContainingOutput()
-                .ok()
-                .and_then(|o| o.cast::<IDXGIOutput6>().ok())
-                .and_then(|o6| o6.GetDesc1().ok())
-                .map(|d| d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
-                .unwrap_or(false);
-            if !hdr_on {
-                return false;
-            }
+            // `surface_output_hdr_enabled` already gated on the containing
+            // output's CURRENT HDR10 colour space. `CheckColorSpaceSupport`
+            // alone is too loose: AMD/Intel can advertise scRGB present support
+            // while the desktop is still SDR.
             let cs = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
             let supported = matches!(
                 sc.CheckColorSpaceSupport(cs),
@@ -6569,8 +6959,9 @@ impl GpuRenderer {
             // Re-tag: `swapchain_usage_for` flips when a recording arms/disarms,
             // so arming `video` on an EDR window reconfigures the DX12 swapchain
             // and would otherwise drop scRGB mid-session.
-            self.configure_surface_retagging_scrgb(surf);
+            self.configure_surface_retagging_scrgb(win, surf, "composite-alpha/usage change");
         }
+        self.reconcile_live_hdr_state_if_due(win, surf);
 
         // Acquire the next swapchain texture BEFORE any compose work, so a dropped
         // acquire leaves the window's offscreen/scissor state untouched (the retry
@@ -6589,7 +6980,7 @@ impl GpuRenderer {
         let frame = match surf.surface.get_current_texture() {
             C::Success(f) | C::Suboptimal(f) => f,
             C::Outdated | C::Lost => {
-                self.configure_surface_retagging_scrgb(surf);
+                self.configure_surface_retagging_scrgb(win, surf, "surface loss recovery");
                 // DROPPED: config no longer matches (common on a fresh window whose
                 // CAMetalLayer is not yet composited). Reconfigured; retry next redraw.
                 return Err(SurfacePresentFailure::Reconfigured);
@@ -6631,15 +7022,16 @@ impl GpuRenderer {
     /// view + texture + `(w, h)` + format + composite mode) so the swapchain arm
     /// and the headless [`Self::present_virtual`] arm share ONE body — the
     /// present-real theorem's "byte parity by construction" seam. Encodes the
-    /// offscreen frame (scissored dirty-row repaint), composites bloom/tray,
-    /// shifts the sub-row scroll band, runs the letterbox blit + the EDR-aurora /
+    /// offscreen frame (scissored dirty-row repaint), composites bloom, shifts
+    /// the sub-row scroll band, composites pinned tray chrome, then runs the
+    /// letterbox blit + the EDR-aurora /
     /// SDR-crown pass into `dest.view`, appends the VIDEO tap's copy of
     /// `dest.tex` to the SAME encoder, and submits. The caller owns
     /// acquire/alpha-mode/`present()` (swapchain) or the virtual target
     /// (headless).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the common glass/headless encoder needs the existing frame effects, source crop, and typed destination"
+        reason = "the common application-present/headless encoder needs the existing frame effects, source crop, and typed destination"
     )]
     fn present_to_view(
         &mut self,
@@ -6694,8 +7086,8 @@ impl GpuRenderer {
         // AFTER the halo so it refracts the finished frame.
         let shimmer_present = self.shimmer_live(input);
         let fx_present = bloom_glow_present || shimmer_present;
-        // The tray / sub-row-scroll frames MUTATE the offscreen in place (card
-        // composite, grid-band shift) and are already forced to a Full repaint, so
+        // The tray / sub-row-scroll frames MUTATE the offscreen in place (grid-band
+        // shift, then card composite) and are already forced to a Full repaint, so
         // the offscreen is not reused as a scissor base. On those frames composite
         // the comet halo IN PLACE into the offscreen — BEFORE the tray/shift, so the
         // halo sits under the chrome and rides the scroll exactly as the pre-change
@@ -6717,22 +7109,21 @@ impl GpuRenderer {
             }
         }
 
-        // Composite the settings card INTO the offscreen (the single source of
-        // truth) so the on-glass blit below shows exactly what `render_input` reads
-        // back. A `None` tray drops any resident overlay and draws nothing.
+        // M1b sub-row scroll: shift the terminal-content grid band by the SIGNED
+        // `frac` (up for a glide residual, down for an overscroll bounce) on the
+        // terminal-only offscreen BEFORE frontend chrome is composited. The CPU
+        // path translates its renderer frame before `composite_tray_at`; matching
+        // that order keeps Settings, native surfaces, notices, and badges pinned.
+        // `prev_frac` is stamped so next frame's full-repaint gate fires once.
+        self.shift_offscreen_band(win, input);
+        win.prev_frac = frac;
+
+        // Composite frontend chrome INTO the already-translated offscreen (the
+        // single source of truth). A `None` tray drops any resident overlay.
         match tray {
             Some(t) => self.draw_tray_into_offscreen(win, t),
             None => win.tray_overlay = None,
         }
-
-        // M1b sub-row scroll: shift the terminal-content grid band by the SIGNED
-        // `frac` (up for a glide residual, down for an overscroll bounce) on the
-        // offscreen AFTER the tray composite (chrome stays pinned), so the blit
-        // below — and any concurrent readback (screen == introspection) — presents
-        // the pixel-shifted frame the CPU translate produces. `prev_frac` is stamped
-        // so next frame's full-repaint gate (above) fires exactly once after motion.
-        self.shift_offscreen_band(win, input);
-        win.prev_frac = frac;
 
         // HOT PATH: the offscreen is a CLEAN base+aurora scissor base; composite the
         // comet halo over a throwaway copy of it (`present_offscreen`) which the blit
@@ -7090,11 +7481,31 @@ impl GpuRenderer {
         // encoder after the pass closed, so it captures precisely what present()
         // ships (or, on the virtual arm, precisely what it WOULD have shipped —
         // the tap still copies the exact bytes of the texture it is aimed at; the
-        // recording's `mode` label discloses whether that texture reached
-        // photons). One `Option` branch when off; counted-drop when the ring is
-        // saturated (never blocks). See `video_tap`.
+        // recording's `mode` label distinguishes a real swapchain destination
+        // from the virtual target. Neither arm observes compositor selection,
+        // scanout, or photons). One `Option` branch when off; counted-drop when
+        // the ring is saturated (never blocks). See `video_tap`.
+        let capture_color_space = win.capture_color_space();
+        let capture_sdr_white_scale = win.sdr_white_scale();
         if let Some(tap) = win.video.as_mut() {
-            tap.enqueue_copy(&mut enc, dest.tex);
+            tap.enqueue_copy(
+                &mut enc,
+                dest.tex,
+                capture_color_space,
+                capture_sdr_white_scale,
+            );
+        }
+        // Independent one-shot capture: append a second copy when armed. It
+        // deliberately neither borrows nor consumes the video tap, so a still
+        // snapshot taken during recording observes the same exact destination
+        // without perturbing the recording's ring, counters, or fps gate.
+        if let Some(tap) = win.presented_snapshot.as_mut() {
+            tap.enqueue_copy(
+                &mut enc,
+                dest.tex,
+                capture_color_space,
+                capture_sdr_white_scale,
+            );
         }
         self.ctx.queue.submit([enc.finish()]);
 
@@ -8466,9 +8877,39 @@ impl GpuRenderer {
         h: u32,
         opts: crate::video_tap::CaptureOpts,
     ) -> Result<(), String> {
-        let tap =
-            crate::video_tap::VideoTap::new(&self.ctx.device, w, h, VIRTUAL_PRESENT_FORMAT, opts)?;
+        let tap = crate::video_tap::VideoTap::new(
+            &self.ctx.device,
+            w,
+            h,
+            VIRTUAL_PRESENT_FORMAT,
+            crate::video_tap::CaptureColorSpace::Srgb,
+            1.0,
+            opts,
+        )?;
         win.video = Some(tap);
+        Ok(())
+    }
+
+    /// TEST HELPER: arm the independent one-shot destination tap for
+    /// [`Self::present_swapchain_standin_for_test`] without a real surface.
+    #[doc(hidden)]
+    pub fn presented_snapshot_begin_standin_for_test(
+        &self,
+        win: &mut WindowGpu,
+        w: u32,
+        h: u32,
+    ) -> Result<(), String> {
+        if win.presented_snapshot.is_some() {
+            return Err("presented snapshot: capture already armed".to_string());
+        }
+        win.presented_snapshot = Some(crate::video_tap::PresentedFrameTap::new(
+            &self.ctx.device,
+            w.max(1),
+            h.max(1),
+            VIRTUAL_PRESENT_FORMAT,
+            crate::video_tap::CaptureColorSpace::Srgb,
+            1.0,
+        )?);
         Ok(())
     }
 
@@ -9617,7 +10058,7 @@ impl GpuRenderer {
         // `(pad, grid_top)`. With `pad == 0` this is byte-identical to before (the
         // `+ pad` terms drop out). Keeping the GPU and CPU pad in lockstep
         // preserves CPU/GPU parity AND the image-vs-window parity within the GPU
-        // backend (the offscreen `render_input` and the on-glass `present_input`
+        // backend (the offscreen `render_input` and the application-present `present_input`
         // both run this encode).
         let pad = self.cpu.pad();
         // Chrome headroom (px above the padded grid), also from the CPU renderer:
@@ -9942,12 +10383,9 @@ impl GpuRenderer {
         let color_bind = &color_res.bind;
         let deco_bind = self.deco_atlas.as_ref().map(|d| &d.bind);
 
-        // Selection highlight, exactly the CPU rule: selection rows are
-        // live-screen coords, viewport row r shows live row (r - display_offset),
-        // and a selected cell's bg fill becomes the theme selection colour.
-        let selection = &input.selection;
-        let display_offset = input.display_offset;
-
+        // Selection highlight, exactly the CPU rule:
+        // `RenderInput::selection_contains_cell` maps each frame cell through
+        // the viewport offset and optional pane clip.
         // Instances. BG: one opaque quad per cell. GLYPH: one alpha quad per
         // drawable glyph — including the block-cursor cell's own (its full quad
         // stays in the fg pass, exactly like the CPU base pass). These push into
@@ -10025,15 +10463,37 @@ impl GpuRenderer {
             c[3] = bg_alpha;
             c
         };
-        // The selection band colour for THIS frame — active when focused, the dimmer
-        // inactive bg when unfocused. Read off the CPU face (the single source of
-        // truth) so the GPU band matches the CPU pixel-for-pixel. Captured once so
-        // the per-cell selection-fg floor below doesn't borrow self inside the loop
-        // (where self.cpu is borrowed for glyph-key resolution).
-        let theme_selection = self.cpu.effective_selection_bg();
-        // Explicit selectionForeground override (read off the CPU face — the single
-        // source of truth — so GPU/CPU selected-glyph colour stays identical).
-        let selection_fg = self.cpu.selection_fg();
+        // The selection band colour for THIS frame. Terminal-owned OSC 17/21
+        // state wins over the static renderer theme; with none in force the CPU
+        // face stays the single source of truth (`effective_selection_bg`), so
+        // every frame without a live selection colour is byte-identical to
+        // before. A LIVE colour re-runs that same active/inactive policy against
+        // the terminal's value — an unfocused pane still applies its explicit
+        // inactive colour or derives the dim band from the live selection/default
+        // backgrounds. Mirrors the CPU `frame_selection_bg` policy.
+        // Captured once so the per-cell selection-fg floor below doesn't borrow
+        // self inside the loop (where self.cpu is borrowed for glyph-key resolution).
+        let theme_selection = if input.selection_bg == aterm_core::render::COLOR_UNSET {
+            self.cpu.effective_selection_bg()
+        } else {
+            let active_selection = input.selection_bg & 0x00ff_ffff;
+            if self.cpu.selection_inactive() {
+                self.cpu.selection_inactive_bg().unwrap_or_else(|| {
+                    aterm_render::derive_inactive_selection_bg(active_selection, frame_bg)
+                })
+            } else {
+                active_selection
+            }
+        };
+        // OSC 19 selected-text ink likewise wins over the host's static
+        // selectionForeground. UNSET delegates to that configured
+        // explicit/automatic policy; DYNAMIC explicitly selects the automatic
+        // contrast floor.
+        let selection_fg = match input.selection_fg {
+            aterm_core::render::COLOR_DYNAMIC => None,
+            aterm_core::render::COLOR_UNSET => self.cpu.selection_fg(),
+            color => Some(color & 0x00ff_ffff),
+        };
         // Per-cell minimum-contrast floor (read off the CPU face — the single
         // source of truth; `<= 1.0` = off and the floor returns the raw fg,
         // keeping the disabled path byte-identical). Matches the CPU seam.
@@ -10043,20 +10503,19 @@ impl GpuRenderer {
         // off, it is exactly `frame_cursor`. The SAME value feeds the block
         // fill, the non-block cursor quads, and the cut-out remap operand —
         // the shared `floor_cursor_fill`, so CPU/GPU derive one pixel.
-        // The typing-reactive rainbow cursor overrides the BLOCK fill only (mirrors the
-        // CPU `draw_cursor`): the host's evolving colour, still floored against the cell
-        // CPU twin (draw_cursor): the fill override paints EVERY cursor shape —
-        // block, bar, underline, and the BOLT (laser lightning cursor) alike. The
-        // old block-only gate left a TUI's bar cursor theme green (the owner's
-        // "green flash" opening Claude); per-style hosts already gate which fill
-        // is Some, so at most one arrives and every shape may wear it.
+        // CPU twin (`draw_cursor`): the host-resolved override paints EVERY
+        // cursor shape — block, hollow, bar, underline, and Bolt — and remains
+        // floored against the cell bg. This avoids flashing the theme cursor
+        // when a TUI temporarily selects a bar; per-style hosts gate which fill
+        // is Some, and at most one arrives.
         let base_cursor = match input.cursor_fill_override {
             Some(fill) => fill,
             None => frame_cursor,
         };
+        let cursor_default_bg = aterm_render::resolved_default_bg_at(input, cr, cc, self.theme.bg);
         let cursor_fill = aterm_render::floor_cursor_fill(
             base_cursor,
-            cursor_cell.map_or(frame_bg, |cell| aterm_render::rgb_to_u32(cell.bg)),
+            cursor_cell.map_or(cursor_default_bg, |cell| aterm_render::rgb_to_u32(cell.bg)),
             min_contrast,
         );
         // SCISSORED PATH ONLY: when the dirty band touches the grid's FIRST/LAST
@@ -10093,7 +10552,6 @@ impl GpuRenderer {
             // `grid_top`). Saturating: an oversized grid's off-screen rows land at
             // u16::MAX (clipped) rather than wrapping into view — see `sat_pos_u16`.
             let y0u = sat_pos_u16(grid_top + r * ch);
-            let sel_row = r as i32 - display_offset;
             // DEC line size (DECDWL/DECDHL): the cell advance, glyph NEAREST
             // enlargement and dest-row clip come from the SAME helpers the CPU
             // blit uses, so the quads reproduce it exactly.
@@ -10183,7 +10641,10 @@ impl GpuRenderer {
                 let x0u = sat_pos_u16(pad + cx);
                 // A lead cell is wide iff the NEXT cell is its continuation.
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
-                let color = if selection.contains_cell(sel_row, c as u16, is_wide_lead, cell.wide) {
+                let selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
+                let cell_bg = aterm_render::rgb_to_u32(cell.bg);
+                let default_bg = aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg);
+                let color = if selected {
                     // The active/inactive selection band colour captured above.
                     rgb4_u32(theme_selection)
                 } else {
@@ -10191,7 +10652,7 @@ impl GpuRenderer {
                     // frame DEFAULT bg carries the alpha; SGR-colored bg cells
                     // stay opaque (the CPU render_row pass-1 rule, verbatim).
                     let mut c = rgb4(cell.bg);
-                    if bg_alpha != 255 && aterm_render::rgb_to_u32(cell.bg) == frame_bg {
+                    if bg_alpha != 255 && cell_bg == default_bg {
                         c[3] = bg_alpha;
                     }
                     c
@@ -10211,10 +10672,92 @@ impl GpuRenderer {
                         (sat_pos_u16(sx), sw as u16)
                     }
                 };
-                bg_inst.push(BgInstance {
+                let instance = BgInstance {
                     rect: [bx, y0u, bw, ch as u16],
                     color,
-                });
+                };
+                bg_inst.push(instance);
+                // Kitty's deepest z tier sits below selected cells and cells
+                // carrying a non-default background, but above the default
+                // frame clear. Repaint only those covering backgrounds after
+                // the image stream; default-bg cells intentionally contribute
+                // no cover and let the image remain visible.
+                if input.image_at(r, c).is_some_and(|image| {
+                    aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index)
+                }) && (selected || cell_bg != default_bg)
+                {
+                    self.inst.image_bg_cover.push(instance);
+                }
+            }
+            // A row is a sparse PREFIX. Its omitted tail still owns logical
+            // cells, but the frame clear already paints their scalar default
+            // background. Emit quads only where selection reaches that tail or
+            // a pane-local default differs from the clear; glyph/combining
+            // instance generation remains materialized. The selected-image arm
+            // also preserves Kitty's `deepest image < selection` ordering for
+            // an image extra living in an otherwise unmaterialized cell.
+            let materialized = cells.len().min(cols);
+            let has_pane_defaults = input
+                .default_bg_spans
+                .get(r)
+                .is_some_and(|spans| !spans.is_empty());
+            let selection_reaches_tail = input
+                .selection_row_span(r)
+                .is_some_and(|(_, end)| usize::from(end) >= materialized);
+            if materialized < cols && (selection_reaches_tail || has_pane_defaults) {
+                for c in materialized..cols {
+                    // The SAME per-column placement + run-clip seam as the
+                    // materialized bg loop above, so a tail quad cannot spill
+                    // out of its own pane's box on a mixed DEC line-size row.
+                    let (cx, ccw, run) = if row_uniform {
+                        (c * rcw, rcw, None)
+                    } else {
+                        let (x, cw_run, x0, x1) = aterm_render::cell_x_run(input, r, c, cw);
+                        (x, cw_run, Some((pad + x0, pad + x1)))
+                    };
+                    if clip_cols && pad + cx >= w as usize + ccw {
+                        if row_uniform {
+                            break;
+                        }
+                        continue;
+                    }
+                    // An unmaterialized cell holds no wide lead or continuation.
+                    let selected = input.selection_contains_cell(r, c, false, false);
+                    let default_bg =
+                        aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg);
+                    let color = if selected {
+                        rgb4_u32(theme_selection)
+                    } else if default_bg != frame_bg {
+                        // This cell's bg IS its pane default, so it carries the
+                        // background-opacity alpha under pass-1's default-bg rule.
+                        let mut color = rgb4_u32(default_bg);
+                        color[3] = bg_alpha;
+                        color
+                    } else {
+                        continue;
+                    };
+                    let (bx, bw) = match run {
+                        None => (sat_pos_u16(pad + cx), ccw as u16),
+                        Some((rx0, rx1)) => {
+                            let Some((sx, sw)) = clip_x_span(pad + cx, ccw, rx0, rx1) else {
+                                continue;
+                            };
+                            (sat_pos_u16(sx), sw as u16)
+                        }
+                    };
+                    let instance = BgInstance {
+                        rect: [bx, y0u, bw, ch as u16],
+                        color,
+                    };
+                    bg_inst.push(instance);
+                    if selected
+                        && input.image_at(r, c).is_some_and(|image| {
+                            aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index)
+                        })
+                    {
+                        self.inst.image_bg_cover.push(instance);
+                    }
+                }
             }
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 // Same per-column placement as the bg loop above (uniform rows keep
@@ -10389,9 +10932,9 @@ impl GpuRenderer {
                         .at(c as u16)
                         .unwrap_or_else(|| aterm_render::rgb_to_u32(cell.fg)),
                 };
-                let cell_selected = selection.contains_cell(
-                    sel_row,
-                    c as u16,
+                let cell_selected = input.selection_contains_cell(
+                    r,
+                    c,
                     cells.get(c + 1).is_some_and(|n| n.wide),
                     cell.wide,
                 );
@@ -10544,7 +11087,6 @@ impl GpuRenderer {
             // loop: uniform rows keep `c · rcw` and an unclipped quad, mixed rows
             // centre the mark in ITS RUN's cell and clip to the run box.
             let row_uniform = aterm_render::row_is_uniform(input, r);
-            let sel_row = r as i32 - display_offset;
             // Fresh lockstep ink + char_fg walks for this loop's own column
             // scan: combining marks FOLLOW ink — and the EMBERFORGE char_fg
             // recolour (ink wins when both govern a cell) — their base_fg is
@@ -10571,9 +11113,12 @@ impl GpuRenderer {
                     }
                     continue; // a mixed row's runs are not monotone in x — see the base loop
                 }
-                // Image-covered cells skip their combining overlay too (the CPU
-                // overlays marks only inside the non-image glyph path).
-                if cell.wide || input.cluster_at(r, c).is_some() || input.image_at(r, c).is_some() {
+                // Only an image at/above text suppresses its combining overlay.
+                // A Kitty z<0 image is a background layer, so the decomposed
+                // mark must paint over it exactly like the base glyph and the
+                // CPU renderer do.
+                if cell.wide || input.cluster_at(r, c).is_some() || input.image_hides_glyph_at(r, c)
+                {
                     continue;
                 }
                 let Some(marks) = input.combining_at(r, c) else {
@@ -10589,9 +11134,9 @@ impl GpuRenderer {
                         .at(c as u16)
                         .unwrap_or_else(|| aterm_render::rgb_to_u32(cell.fg)),
                 };
-                let cell_selected = selection.contains_cell(
-                    sel_row,
-                    c as u16,
+                let cell_selected = input.selection_contains_cell(
+                    r,
+                    c,
                     cells.get(c + 1).is_some_and(|n| n.wide),
                     cell.wide,
                 );
@@ -10660,20 +11205,23 @@ impl GpuRenderer {
                 }
             }
         }
-        // Inline images (iTerm2 OSC 1337 `File=`): one quad per image-covered
-        // cell, sampling that cell's tile of the per-frame image texture. Built
-        // ONLY when `image_plane` was populated this frame (an image-free frame
-        // leaves the stream empty → zero image draws, byte-identical text path).
+        // Inline images (iTerm2 OSC 1337 / Kitty): one quad per image-covered
+        // cell, sampling that cell's tile of the per-frame image texture.
+        // Partition by all three Kitty z tiers:
+        //   z < INT32_MIN/2  -> `image_below_bg`
+        //   INT32_MIN/2..=-1 -> `image_under`
+        //   z >= 0           -> `image`
+        // The first stream is covered afterward by `image_bg_cover` on selected
+        // and non-default-background cells. All stay empty on an image-free frame.
         // Geometry MIRRORS the CPU `render_one_row` Pass 1b EXACTLY: the tile's
         // dest box is `cell_w × cell_h` (the image is NEVER DEC-scaled — the CPU
         // `blit_image_cell` blits a natural-size tile), but it is positioned at the
-        // ROW cell advance `c * rcw` (so on a DECDWL/DECDHL row, tiles are spaced
+        // pane-local cell advance (so on a DECDWL/DECDHL span, tiles are spaced
         // by `2*cell_w` with bg gaps between them, just like the CPU). The UV is
         // the cell's `(cell_col, cell_row)` tile inside the image's footprint
         // region of the stacked texture — NEAREST-sampled, so each texel maps to
         // the CPU's 1:1 per-cell copy (the parity gate).
         if let Some(plane) = win.image_plane.as_ref() {
-            let image_inst = &mut self.inst.image;
             let (pw, ph) = (plane.w as f32, plane.h as f32);
             for (r, row_images) in input.images.iter().enumerate().take(vis_rows) {
                 if !row_active(r) || row_images.is_empty() {
@@ -10750,6 +11298,14 @@ impl GpuRenderer {
                         tile_w as f32 / pw,
                         tile_h as f32 / ph,
                     ];
+                    let image_inst =
+                        if aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index) {
+                            &mut self.inst.image_below_bg
+                        } else if image.image.z_index < 0 {
+                            &mut self.inst.image_under
+                        } else {
+                            &mut self.inst.image
+                        };
                     image_inst.push(GlyphInstance {
                         rect,
                         uv,
@@ -10765,7 +11321,8 @@ impl GpuRenderer {
         // cell, exactly as the CPU paints the block cursor last. The in-rect
         // glyph slice is then re-drawn over it (cut-out) from
         // cursor_glyph/color_inst. W4: the fill is `cur_block_w` wide — BOTH
-        // cells of a wide lead — matching the CPU's widened `cursor_rects`.
+        // cells of a wide lead, intersected with its pane — matching the CPU's
+        // widened and span-clipped `cursor_rects`.
         // (Pushed into the cleared persistent `cursor_block` stream: an empty
         // stream == the old `Vec::new()`, a single push == the old one-elem vec.)
         // (`row_active(cr)` is always true here in the scissored path — the cursor
@@ -10880,12 +11437,7 @@ impl GpuRenderer {
                         .at(c as u16)
                         .unwrap_or_else(|| aterm_render::rgb_to_u32(cell.fg)),
                 };
-                let cell_selected = selection.contains_cell(
-                    r as i32 - display_offset,
-                    c as u16,
-                    is_wide_lead,
-                    cell.wide,
-                );
+                let cell_selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
                 let ucolor = rgb4_u32(aterm_render::effective_deco_color(
                     selection_fg,
                     min_contrast,
@@ -11076,10 +11628,12 @@ impl GpuRenderer {
                 if tx + tcw > bound {
                     continue;
                 }
+                let default_bg =
+                    aterm_render::resolved_default_bg_at(input, t.row, t.col, self.theme.bg);
                 let cell_bg = rendered
                     .get(t.row)
                     .and_then(|r| r.get(t.col))
-                    .map_or(self.theme.bg, |c| aterm_render::rgb_to_u32(c.bg));
+                    .map_or(default_bg, |c| aterm_render::rgb_to_u32(c.bg));
                 let color = aterm_render::blend_rgb(cell_bg, trail_color, t.alpha);
                 let mut c4 = rgb4_u32(color);
                 // Vibrancy: a bed cell over the frame's DEFAULT bg carries the
@@ -11088,7 +11642,7 @@ impl GpuRenderer {
                 // in the glass; SGR-coloured cells stay opaque. Byte-identical
                 // at opacity 1.0 (`bg_alpha == 255`), matching the CPU's
                 // transmittance carry in `draw_trail`.
-                if bg_alpha != 255 && cell_bg == frame_bg {
+                if bg_alpha != 255 && cell_bg == default_bg {
                     c4[3] = bg_alpha;
                 }
                 self.inst.trail.push(BgInstance {
@@ -11305,29 +11859,40 @@ impl GpuRenderer {
                     let row_cells = &input.cells[row];
                     let is_wide_lead = row_cells.get(col + 1).is_some_and(|n| n.wide);
                     let cell_wide = row_cells.get(col).is_some_and(|n| n.wide);
-                    if input.selection.contains_cell(
-                        row as i32 - input.display_offset,
-                        col as u16,
-                        is_wide_lead,
-                        cell_wide,
-                    ) {
+                    if input.selection_contains_cell(row, col, is_wide_lead, cell_wide) {
                         continue;
                     }
                 }
-                let rcw = aterm_render::row_cell_w(input.line_sizes[row], cw);
+                // Per-column DEC line-size seam (see the base-glyph loop): a
+                // decoration belongs to ONE pane's run, so on a mixed row its
+                // origin, advance and pixel box come from that run.
+                let (deco_x, rcw, run) = if aterm_render::row_is_uniform(input, row) {
+                    let rcw = aterm_render::row_cell_w(input.line_sizes[row], cw);
+                    (col * rcw, rcw, None)
+                } else {
+                    let (x, cw_run, x0, x1) = aterm_render::cell_x_run(input, row, col, cw);
+                    (x, cw_run, Some((pad + x0, pad + x1)))
+                };
                 let idx = deco_sprite_index(d.glyph);
-                let rect = [
-                    pad as f32 + (col * rcw) as f32 + f32::from(d.dx),
+                let mut rect = [
+                    (pad + deco_x) as f32 + f32::from(d.dx),
                     grid_top as f32 + (row * ch) as f32 + f32::from(d.dy),
                     rcw as f32,
                     ch as f32,
                 ];
-                let uv = [
+                let mut uv = [
                     (idx * cw) as f32 / datlas_w as f32,
                     0.0,
                     cw as f32 / datlas_w as f32,
                     1.0,
                 ];
+                // Mixed row: crop the sprite to the run's pixel box (never widen),
+                // so a double-width pane's decoration cannot paint into its
+                // neighbour. `clip_textured_quad_x` carries the uv with the rect,
+                // which is the texel-stable NEAREST crop the CPU mask also takes.
+                if !clip_textured_quad_x(&mut rect, &mut uv, run) {
+                    continue;
+                }
                 let color = [
                     (d.color >> 16) as u8,
                     (d.color >> 8) as u8,
@@ -11555,6 +12120,21 @@ impl GpuRenderer {
             .vbufs
             .bg
             .upload(device, queue, bytemuck::cast_slice(&self.inst.bg));
+        let image_below_bg_buf = self.vbufs.image_below_bg.upload(
+            device,
+            queue,
+            bytemuck::cast_slice(&self.inst.image_below_bg),
+        );
+        let image_bg_cover_buf = self.vbufs.image_bg_cover.upload(
+            device,
+            queue,
+            bytemuck::cast_slice(&self.inst.image_bg_cover),
+        );
+        let image_under_buf = self.vbufs.image_under.upload(
+            device,
+            queue,
+            bytemuck::cast_slice(&self.inst.image_under),
+        );
         let image_buf =
             self.vbufs
                 .image
@@ -11983,6 +12563,33 @@ impl GpuRenderer {
                     &self.bg_pipeline,
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
+                // Kitty's deepest image tier: the pass clear / dirty-band reset
+                // and ordinary cell backgrounds above establish the default
+                // canvas first. Draw z < INT32_MIN/2 now, then repaint only
+                // selected/non-default backgrounds over it. The resulting stack
+                // is default bg < deepest image < explicit bg < under-text art.
+                if let Some(plane) = win.image_plane.as_ref() {
+                    draw_stream!(
+                        $p,
+                        $cp,
+                        $ca,
+                        image_below_bg_buf,
+                        self.inst.image_below_bg,
+                        Pipe::Color,
+                        &self.color_glyph_pipeline,
+                        Some((Atlas::Image, &plane.bind))
+                    );
+                }
+                draw_stream!(
+                    $p,
+                    $cp,
+                    $ca,
+                    image_bg_cover_buf,
+                    self.inst.image_bg_cover,
+                    Pipe::Bg,
+                    &self.bg_pipeline,
+                    None::<(Atlas, &wgpu::BindGroup)>
+                );
                 // PHOSPHOR rain sprites, before the cats and glyphs, so cats
                 // walk on rain by construction. Same src-over
                 // pipeline; the RAIN atlas bind group carries the NEAREST
@@ -12090,6 +12697,23 @@ impl GpuRenderer {
         }
         macro_rules! emit_base_fg {
             ($p:ident, $cp:ident, $ca:ident) => {
+                // Kitty z<0 images are background layers: draw them after every
+                // base background / under-text sprite and the optional
+                // glow-under/fire interpose pass, but BEFORE glyph halos, base
+                // glyphs, colour glyphs, and combining marks. The same image
+                // texture and source-over pipeline serve both z partitions.
+                if let Some(plane) = win.image_plane.as_ref() {
+                    draw_stream!(
+                        $p,
+                        $cp,
+                        $ca,
+                        image_under_buf,
+                        self.inst.image_under,
+                        Pipe::Color,
+                        &self.color_glyph_pipeline,
+                        Some((Atlas::Image, &plane.bind))
+                    );
+                }
                 // EMBERFORGE CONTRAST-HALO: the dark warm dilation ring around
                 // every fire-engulfed glyph, drawn FIRST in the fg half — OVER
                 // the flame body the glow_under/fire Unorm pass just laid down,
@@ -12109,9 +12733,9 @@ impl GpuRenderer {
                     &self.deco_over_pipeline,
                     Some((Atlas::Mono, atlas_bind))
                 );
-                // glyph / colour-emoji / inline-image / line-deco / undercurl
-                // — all OVER or REPLACE, composited in linear light on the
-                // sRGB view.
+                // glyph / colour-emoji / z>=0 inline-image / line-deco /
+                // undercurl — all OVER or REPLACE, composited in linear light
+                // on the sRGB view.
                 draw_stream!(
                     $p,
                     $cp,
@@ -12461,6 +13085,7 @@ impl GpuRenderer {
         enabled[G_BASE_FG] = glyph_buf.is_some()
             || glyph_halo_buf.is_some()
             || color_buf.is_some()
+            || (win.image_plane.is_some() && image_under_buf.is_some())
             || (win.image_plane.is_some() && image_buf.is_some())
             || deco_buf.is_some()
             || (deco_bind.is_some() && curl_buf.is_some());
@@ -12537,6 +13162,9 @@ impl GpuRenderer {
         // scissored path this is ~proportional to the dirty-row count, not the
         // screen — the headline win.
         self.last_instances = self.inst.bg.len()
+            + self.inst.image_below_bg.len()
+            + self.inst.image_bg_cover.len()
+            + self.inst.image_under.len()
             + self.inst.image.len()
             + self.inst.glyph.len()
             + self.inst.color.len()
@@ -12591,6 +13219,40 @@ fn clip_x_span(x: usize, w: usize, x0: usize, x1: usize) -> Option<(usize, usize
         return None;
     }
     Some((lo, hi - lo))
+}
+
+/// [`clip_x_span`] for a TEXTURED quad: intersect it with an optional horizontal
+/// pane clip while carrying its source mapping, returning whether anything
+/// survives. The sprite streams that are not glyphs (word decorations) cannot go
+/// through `Scale`/`glyph_quad`, but they need the exact same hard split
+/// boundary. Integer pane edges make this a texel-stable crop under the NEAREST
+/// samplers those streams use. `None` (a uniform row) leaves the quad untouched.
+#[inline]
+fn clip_textured_quad_x(
+    rect: &mut [f32; 4],
+    uv: &mut [f32; 4],
+    clip_x: Option<(usize, usize)>,
+) -> bool {
+    let Some((clip_x0, clip_x1)) = clip_x else {
+        return rect[2] > 0.0;
+    };
+    let old_x = rect[0];
+    let old_w = rect[2];
+    if old_w <= 0.0 {
+        return false;
+    }
+    let x0 = old_x.max(clip_x0 as f32);
+    let x1 = (old_x + old_w).min(clip_x1 as f32);
+    if x1 <= x0 {
+        return false;
+    }
+    let left = (x0 - old_x) / old_w;
+    let kept = (x1 - x0) / old_w;
+    uv[0] += uv[2] * left;
+    uv[2] *= kept;
+    rect[0] = x0;
+    rect[2] = x1 - x0;
+    true
 }
 
 /// IEEE 754 binary16 → f32, exact (every half value is representable in f32).
@@ -14384,6 +15046,61 @@ ab\r\n",
         assert_eq!(gpu.tray_uploads(), 3, "a recreate must always upload");
     }
 
+    /// M1b + tray ordering: fractional terminal scrolling moves only the grid
+    /// band. A settings/native/badge tray is frontend chrome and must remain at
+    /// its absolute device-pixel rectangle, matching the CPU path (which
+    /// translates the renderer frame before compositing the tray).
+    #[test]
+    fn fractional_scroll_keeps_tray_pixels_pinned() {
+        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP: no GPU/font available: {e}");
+                return;
+            }
+        };
+        let (rows, cols) = (6usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
+        let mut input = term.cell_frame(rows, cols);
+        input.grid_top_row = 1;
+        input.grid_bot_row = rows - 1;
+        let (cw, ch) = gpu.cell_size();
+        let grid_top = gpu.cpu.grid_top();
+        let (pw, ph) = ((cw * 3) as u32, ch.saturating_sub(4).max(4) as u32);
+        let (dx, dy) = (cw as u32, (grid_top + ch * 2 + 2) as u32);
+        let magenta: Vec<u8> = [220, 30, 180, 255].repeat((pw * ph) as usize);
+        let tray = || TrayQuad {
+            rgba: &magenta,
+            pw,
+            ph,
+            dx,
+            dy,
+        };
+
+        input.scroll_frac_px = 0;
+        let mut zero_win = WindowGpu::new();
+        let zero = gpu.render_input(&mut zero_win, &input, Some(tray()));
+        input.scroll_frac_px = 3;
+        let mut shifted_win = WindowGpu::new();
+        let shifted = gpu.render_input(&mut shifted_win, &input, Some(tray()));
+        assert_eq!((zero.width, zero.height), (shifted.width, shifted.height));
+
+        for y in dy as usize..(dy + ph) as usize {
+            let x0 = y * zero.width + dx as usize;
+            let x1 = x0 + pw as usize;
+            assert_eq!(
+                &shifted.pixels[x0..x1],
+                &zero.pixels[x0..x1],
+                "tray row {y} moved with the terminal scroll band"
+            );
+        }
+        assert_ne!(
+            shifted.pixels, zero.pixels,
+            "negative control: terminal pixels outside the pinned tray must move"
+        );
+    }
+
     /// M5 true vibrancy: the swapchain composite-alpha choice is opacity- AND
     /// caps-aware. Solid (>= 1.0, or non-finite) is ALWAYS `Opaque` — the
     /// byte-identical default; translucent goes `PostMultiplied` ONLY where the
@@ -14407,7 +15124,7 @@ ab\r\n",
 
     /// M5: `with_translucency` sets the blit's translucent flag and threads the
     /// remainder-band alpha, while the solid default leaves the flag clear so the
-    /// present forces on-glass alpha to 1.0 (byte-identical).
+    /// application present forces destination alpha to 1.0 (byte-identical).
     #[test]
     fn blit_translucency_sets_flag_and_band_alpha() {
         use super::BlitUniform;
@@ -14421,6 +15138,78 @@ ab\r\n",
         // uniform stays `Pod` + upload-compatible, and the WGSL `Blit` struct matches
         // byte-for-byte (the CPU/GPU parity test guards that).
         assert_eq!(std::mem::size_of::<BlitUniform>(), 96);
+    }
+
+    /// A failed f16 re-tag changes more than the surface format: capture's live
+    /// source metadata and Windows' scRGB reference-white scale must change in
+    /// the same transition. Successful/no-HDR reconfigures preserve the
+    /// platform-confirmed metadata they did not replace.
+    #[test]
+    fn hdr_reconfigure_fallback_reconciles_window_capture_metadata_atomically() {
+        use crate::format_plan::HdrReconfigurePlan;
+        use crate::video_tap::CaptureColorSpace;
+
+        let mut hdr = WindowGpu::new();
+        hdr.set_capture_color_space(CaptureColorSpace::ExtendedLinearSrgb);
+        hdr.set_sdr_white_scale(2.5);
+        hdr.set_edr_max(3.0);
+        hdr.apply_hdr_reconfigure_plan(HdrReconfigurePlan::KeepHdr);
+        assert_eq!(
+            hdr.capture_color_space(),
+            CaptureColorSpace::ExtendedLinearSrgb
+        );
+        assert_eq!(hdr.sdr_white_scale(), 2.5);
+        assert_eq!(hdr.edr_max(), 3.0);
+
+        hdr.apply_hdr_reconfigure_plan(HdrReconfigurePlan::FallbackToSdr);
+        assert_eq!(hdr.capture_color_space(), CaptureColorSpace::Srgb);
+        assert_eq!(hdr.sdr_white_scale(), 1.0);
+        assert_eq!(hdr.edr_max(), 0.0);
+
+        let mut p3 = WindowGpu::new();
+        p3.set_capture_color_space(CaptureColorSpace::DisplayP3);
+        p3.apply_hdr_reconfigure_plan(HdrReconfigurePlan::KeepSdr);
+        assert_eq!(
+            p3.capture_color_space(),
+            CaptureColorSpace::DisplayP3,
+            "an ordinary SDR reconfigure must preserve a confirmed macOS P3 tag"
+        );
+    }
+
+    /// SDR→HDR metadata changes only after f16+scRGB succeeds and starts each
+    /// new HDR epoch from safe headroom/reference-white defaults.
+    #[test]
+    fn hdr_upgrade_publishes_linear_capture_metadata_with_safe_defaults() {
+        use crate::video_tap::CaptureColorSpace;
+
+        let mut win = WindowGpu::new();
+        win.set_capture_color_space(CaptureColorSpace::Srgb);
+        win.set_sdr_white_scale(3.0);
+        win.set_edr_max(4.0);
+        win.apply_hdr_surface_upgrade();
+        assert_eq!(
+            win.capture_color_space(),
+            CaptureColorSpace::ExtendedLinearSrgb
+        );
+        assert_eq!(win.sdr_white_scale(), 1.0);
+        assert_eq!(win.edr_max(), 0.0);
+    }
+
+    /// Same-size Windows HDR toggles have no guaranteed surface event, so live
+    /// f16 presents periodically re-check scRGB support. The gate must check an
+    /// unvalidated/dormant surface immediately while bounding an animated
+    /// window's DXGI calls to one per interval.
+    #[test]
+    fn hdr_state_probe_is_immediate_then_throttled() {
+        let now = std::time::Instant::now();
+        assert!(hdr_color_space_probe_due(None, now));
+        assert!(!hdr_color_space_probe_due(Some(now), now));
+
+        let just_before = now + HDR_COLOR_SPACE_PROBE_INTERVAL - std::time::Duration::from_nanos(1);
+        assert!(!hdr_color_space_probe_due(Some(now), just_before));
+
+        let due = now + HDR_COLOR_SPACE_PROBE_INTERVAL;
+        assert!(hdr_color_space_probe_due(Some(now), due));
     }
 }
 

@@ -416,7 +416,14 @@ fn admission_before(model: &Model, facts: AdmissionFacts) -> State {
     if facts.live_ptys > 0 || facts.foreground_jobs > 0 {
         state = model.successors("ObserveForegroundJob", &state)[0].clone();
     }
-    if !facts.native_state_certified || facts.unknown_foregrounds > 0 {
+    // `unknown_foregrounds` used to be folded in here, which encoded the old
+    // policy: an unprobeable foreground made the whole native state "unsafe" and
+    // blocked every lane, seamless included. It is not a native-state fact — it is
+    // a fact about whether a DESTRUCTIVE replacement would hang up a running job,
+    // which only the cold lane can do. It now enters the model through
+    // `ObserveForegroundJob` (already fired whenever `live_ptys > 0`, and the
+    // matrix below never generates `unknown_foregrounds > live_ptys`).
+    if !facts.native_state_certified {
         state = model.successors("ObserveUnsafeNativeState", &state)[0].clone();
     }
     if !facts.seamless_capable {
@@ -457,11 +464,15 @@ fn admission_action(decision: AdmissionDecision) -> &'static str {
         AdmissionDecision::Apply(ApplyLane::Seamless) => "ClassifySeamless",
         AdmissionDecision::Apply(ApplyLane::Cold) => "ClassifyCold",
         AdmissionDecision::Block(AdmissionBlock::UnverifiedStage) => "BlockUnverifiedArtifact",
-        AdmissionDecision::Block(AdmissionBlock::NativeStateUncertified)
-        | AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown) => {
+        AdmissionDecision::Block(AdmissionBlock::NativeStateUncertified) => {
             "BlockUnsafeNativeState"
         }
-        AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless) => {
+        // An unprobeable foreground now blocks for the same REASON as
+        // `LivePtysNeedSeamless` — there is something on a PTY that a destructive
+        // swap could hang up, and the lossless lane is unavailable — so it refines
+        // the same model action. It is no longer a native-state certification fact.
+        AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown)
+        | AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless) => {
             "BlockForegroundWithoutSeamless"
         }
     }

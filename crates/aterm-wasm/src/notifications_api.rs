@@ -237,7 +237,12 @@ mod tests {
         let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
             return;
         };
-        assert_eq!(t.cursor_color(), None, "no app override at start");
+        let theme_cursor = t.theme_cursor;
+        assert_eq!(
+            t.cursor_color(),
+            Some(theme_cursor),
+            "the host-configured cursor baseline is live at start"
+        );
         t.process(b"\x1b]12;#ff8800\x07");
         assert_eq!(
             t.cursor_color(),
@@ -247,8 +252,8 @@ mod tests {
         t.process(b"\x1b]112\x07");
         assert_eq!(
             t.cursor_color(),
-            None,
-            "OSC 112 resets to the host/theme default"
+            Some(theme_cursor),
+            "OSC 112 restores the host-configured cursor baseline"
         );
     }
 }

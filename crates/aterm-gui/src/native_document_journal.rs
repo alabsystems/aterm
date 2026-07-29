@@ -1286,7 +1286,10 @@ mod tests {
         let error = read_journal_image(&oversized).expect_err("oversized journal is rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains(&MAX_JOURNAL_BYTES.to_string()));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
+        // bound catches it and only the report latency changes. 1s is the bound this
+        // repo has already watched cross under full-suite load (cb8c0cff).
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1300,7 +1303,10 @@ mod tests {
         make_fifo(&path);
         let started = std::time::Instant::now();
         let fifo_error = host.inspect_open(canonical, b"disk").unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
+        // bound catches it and only the report latency changes. 1s is the bound this
+        // repo has already watched cross under full-suite load (cb8c0cff).
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
         assert!(fifo_error.contains("regular non-link"), "{fifo_error}");
 
         fs::remove_file(&path).unwrap();
@@ -1332,7 +1338,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = host.initialize(decision, &disk, &disk).unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
+        // bound catches it and only the report latency changes. 1s is the bound this
+        // repo has already watched cross under full-suite load (cb8c0cff).
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
         assert!(error.contains("journal lock"), "{error}");
         assert!(fs::symlink_metadata(&lock).unwrap().file_type().is_fifo());
         let _ = fs::remove_dir_all(root);
@@ -1351,7 +1360,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = host.initialize(decision.clone(), &disk, &disk).unwrap_err();
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
+        // bound catches it and only the report latency changes. 1s is the bound this
+        // repo has already watched cross under full-suite load (cb8c0cff).
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
         assert!(error.contains("busy"), "{error}");
         assert!(error.contains("retry"), "{error}");
 
@@ -1464,7 +1476,10 @@ mod tests {
             JournalAppendResult::Failed { message, .. }
                 if message.contains("regular non-link")
         ));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Refuses-without-BLOCKING: a genuine failure parks FOREVER, so any finite
+        // bound catches it and only the report latency changes. 1s is the bound this
+        // repo has already watched cross under full-suite load (cb8c0cff).
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
         assert!(
             fs::symlink_metadata(&initialized.path)
                 .unwrap()

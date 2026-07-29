@@ -473,7 +473,7 @@ impl App {
         // Reuse the exact human/semantic-action host path.  The old direct
         // runtime dispatch threw away `InvalidateOwnPresentation` and
         // `RepaintSelf`, leaving the model on the requested route while the
-        // retained on-glass tray still showed the previous page.
+        // retained app-render tray still held the previous page.
         if self.dispatch_native_view_event(wid, view, action).is_err() {
             return false;
         }
@@ -1081,16 +1081,10 @@ impl App {
     /// the SAME cell/font/row numbers `splice_settings_panel` paints with, consumed by
     /// the menu placement + mouse hit-test paths. `None` when the overlay is closed.
     pub(crate) fn settings_geom_front(&self) -> Option<crate::settings::SettingsGeom> {
-        let ws = self.settings_host()?;
-        ws.settings()?;
-        let (cw, ch) = self.cell_size();
-        Some(crate::settings::SettingsGeom {
-            cw: cw as f32,
-            ch: ch as f32,
-            font_px: self.font_px,
-            cols: ws.cols as usize,
-            panel_rows: ws.settings_panel_rows(),
-        })
+        let wid = self.frontmost_window?;
+        self.windows.get(&wid)?.settings()?;
+        self.overlay_coordinate_transform(wid)
+            .map(|transform| transform.geom)
     }
 
     /// The open menu's on-screen option-row count (its scroll window), from the SAME

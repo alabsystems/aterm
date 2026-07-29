@@ -18,6 +18,7 @@ use aterm_core::search::{
     DEFAULT_MAX_CACHED_LINES, SearchDirection as EngineSearchDirection, SearchMatch,
     SearchOptionsError, SearchResults, TerminalSearch, max_cached_for_retained,
 };
+use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{RenderCell, Terminal, UnderlineStyle};
 use aterm_search::MAX_SEARCH_MATCHES;
 use winit::event_loop::EventLoopProxy;
@@ -108,10 +109,12 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let row = t.render_row_at_screen(r);
     let (fg, bg) = match row.get(c) {
         Some(cell) => (cell.fg, cell.bg),
-        // a blank in-grid cell: the terminal's default colors
+        // A blank in-grid cell is the engine's implicit `Cell::EMPTY`.
+        // Resolve it through the same live palette/default/reverse-video path
+        // as a materialized cell; raw defaults alone are wrong under DECSCNM.
         None => {
-            let (dfg, dbg) = (t.default_foreground(), t.default_background());
-            ([dfg.r, dfg.g, dfg.b], [dbg.r, dbg.g, dbg.b])
+            let blank = t.implicit_blank_render_cell();
+            (blank.fg, blank.bg)
         }
     };
     // Combining-aware grapheme for THIS cell, via the same core extraction the
@@ -1729,6 +1732,21 @@ struct StyledCellSnap {
     hyperlink_id: Option<String>,
 }
 
+/// Side-adjusted selection geometry for the styled control frame.
+///
+/// The old frame serialized only `TextSelection::normalized_bounds()`. That lost
+/// both the selection kind (a block and a linear selection can share the same
+/// endpoints but paint different cells) and the anchors' half-cell sides. Store
+/// the renderer-equivalent `TextSelection::project_range` result instead.
+struct StyledSelectionSnap {
+    start_row: i32,
+    start_col: u16,
+    end_row: i32,
+    end_col: u16,
+    kind: &'static str,
+    is_block: bool,
+}
+
 /// Everything the styled JSON frame serializes, copied out of the [`Terminal`]
 /// under ONE lock acquisition — the internal-consistency contract: seq, cursor,
 /// cells, images, selection, and line sizes all describe the same instant.
@@ -1743,43 +1761,76 @@ pub(crate) struct StyledFrameSnapshot {
     cursor_col: u16,
     cursor_visible: bool,
     cursor_style: &'static str,
+    /// OSC 12 cursor colour, or `None` for the renderer/theme default.
+    cursor_color: Option<[u8; 3]>,
     /// `rows × cols` cells, blank-padded to the full grid width (no trim).
     cells: Vec<Vec<StyledCellSnap>>,
     line_sizes: Vec<&'static str>,
-    /// The selection object (or `null`), pre-rendered — a single tiny `format!`.
-    selection_json: String,
+    /// Renderer-equivalent selected range (or `None`).
+    selection: Option<StyledSelectionSnap>,
+    /// OSC 17 selection fill, or `None` for the renderer/theme default.
+    selection_bg: Option<[u8; 3]>,
+    /// OSC 19 selected-text ink, or `None` for automatic contrast.
+    selection_fg: Option<[u8; 3]>,
     /// Distinct inline images as `Arc` clones; base64 happens at serialize time.
     images: Vec<(usize, usize, std::sync::Arc<ImageData>)>,
 }
 
+/// Stable wire name for one selection kind.
+fn selection_type_name(kind: SelectionType) -> &'static str {
+    match kind {
+        SelectionType::Simple => "simple",
+        SelectionType::Block => "block",
+        SelectionType::Semantic => "semantic",
+        SelectionType::Lines => "lines",
+        // `SelectionType` is non-exhaustive. A future kind must remain linear
+        // until the selection engine exposes different projection semantics.
+        _ => "linear",
+    }
+}
+
+/// Serialize one optional RGB policy as a JSON string. Fixed colors use the same
+/// lowercase `rrggbb` form as per-cell colors; the fallback token names the
+/// renderer policy rather than inventing a color the terminal does not own.
+fn styled_optional_rgb(color: Option<[u8; 3]>, fallback: &str) -> String {
+    color.map_or_else(
+        || format!("\"{fallback}\""),
+        |[r, g, b]| format!("\"{r:02x}{g:02x}{b:02x}\""),
+    )
+}
+
+/// Serialize renderer-equivalent selection geometry while preserving the four
+/// historical coordinate keys first for additive wire compatibility.
+fn styled_selection_json(selection: Option<&StyledSelectionSnap>) -> String {
+    selection.map_or_else(
+        || "null".to_string(),
+        |sel| {
+            format!(
+                "{{\"start_row\":{},\"start_col\":{},\"end_row\":{},\"end_col\":{},\
+                 \"kind\":\"{}\",\"is_block\":{}}}",
+                sel.start_row, sel.start_col, sel.end_row, sel.end_col, sel.kind, sel.is_block,
+            )
+        },
+    )
+}
+
 /// Gather the styled frame's raw material. Called with the `Terminal` lock HELD
 /// (one acquisition covers every field). The blank-tail fallback mirrors
-/// [`cmd_cell`] exactly: rows are padded to the FULL grid width with
-/// default-coloured blanks (NO `trim_end`, unlike `text`) — the lossless
-/// `dims.rows × dims.cols` contract.
+/// [`cmd_cell`] exactly: rows are padded to the FULL grid width with the
+/// terminal's effective implicit blank (live defaults with DECSCNM folded in;
+/// NO `trim_end`, unlike `text`) — the lossless `dims.rows × dims.cols`
+/// contract.
 pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
     let rows = t.rows() as usize;
     let cols = t.cols() as usize;
-    let (dfg, dbg) = (t.default_foreground(), t.default_background());
-    let blank = RenderCell {
-        ch: ' ',
-        fg: [dfg.r, dfg.g, dfg.b],
-        bg: [dbg.r, dbg.g, dbg.b],
-        wide: false,
-        emoji_presentation: false,
-        bold: false,
-        italic: false,
-        underline: UnderlineStyle::None,
-        strikethrough: false,
-        overline: false,
-        underline_color: None,
-    };
+    let blank = t.implicit_blank_render_cell();
     let mut cells: Vec<Vec<StyledCellSnap>> = Vec::with_capacity(rows);
     let mut line_sizes: Vec<&'static str> = Vec::with_capacity(rows);
     for r in 0..rows {
         // LIVE frame (offset-INDEPENDENT): colours+attrs from `render_row_at_screen`,
-        // glyph from the live `cell_grapheme`, wide from the SAME rendered cell, and
-        // the offset-blind `hyperlink_at` — so all four reads share one live frame and
+        // glyph from the live `cell_grapheme`, wide-lead from the live raw grid flag
+        // (`RenderCell::wide` means the RIGHT-HALF continuation), and the
+        // offset-blind `hyperlink_at` — so all four reads share one live frame and
         // never stitch a scrolled-back row's colours onto a live glyph.
         let rendered = t.render_row_at_screen(r);
         let mut row_cells: Vec<StyledCellSnap> = Vec::with_capacity(cols);
@@ -1788,7 +1839,7 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
             row_cells.push(StyledCellSnap {
                 cell: rc.unwrap_or(blank),
                 glyph: t.cell_grapheme(r, c).unwrap_or_default(),
-                wide_lead: rc.is_some_and(|rc| rc.wide),
+                wide_lead: cell_attrs(t.grid(), r, c).contains(CellFlags::WIDE),
                 hyperlink: t.hyperlink_at(r as u16, c as u16).map(str::to_string),
                 hyperlink_id: t.hyperlink_id_at(r as u16, c as u16).map(str::to_string),
             });
@@ -1797,14 +1848,20 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
         line_sizes.push(line_size_name(row_line_size(t, r))); // F2: DEC double-width/height
     }
     // F3: text selection highlight (a human/peer-initiated selection a watcher
-    // would otherwise miss); `null` when nothing is selected.
+    // would otherwise miss). `project_range` applies the SAME half-cell side
+    // adjustment and line expansion as the renderer; the explicit kind preserves
+    // block-vs-linear geometry when endpoints happen to match.
     let sel = t.text_selection();
-    let selection_json = if sel.is_empty() {
-        "null".to_string()
-    } else {
-        let (sr, sc, er, ec) = sel.normalized_bounds();
-        format!("{{\"start_row\":{sr},\"start_col\":{sc},\"end_row\":{er},\"end_col\":{ec}}}")
-    };
+    let selection = sel
+        .project_range(t.cols().saturating_sub(1))
+        .map(|projected| StyledSelectionSnap {
+            start_row: projected.start_row,
+            start_col: projected.start_col,
+            end_row: projected.end_row,
+            end_col: projected.end_col,
+            kind: selection_type_name(sel.selection_type()),
+            is_block: projected.is_block,
+        });
     let cur = t.cursor();
     StyledFrameSnapshot {
         seq: t.content_seq(),
@@ -1814,9 +1871,16 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
         cursor_col: cur.col,
         cursor_visible: t.cursor_visible(),
         cursor_style: cursor_style_name(t.cursor_style()),
+        cursor_color: t.cursor_color().map(|color| [color.r, color.g, color.b]),
         cells,
         line_sizes,
-        selection_json,
+        selection,
+        selection_bg: t
+            .selection_background()
+            .map(|color| [color.r, color.g, color.b]),
+        selection_fg: t
+            .selection_foreground()
+            .map(|color| [color.r, color.g, color.b]),
         // F1: distinct inline images at their anchors — `Arc` clones only; the
         // (up to multi-MiB per image) base64 encode is deferred off the lock.
         images: distinct_images(t),
@@ -1824,8 +1888,8 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
 }
 
 /// Serialize a gathered [`StyledFrameSnapshot`] to the single-line JSON frame.
-/// Lock-free by construction (the snapshot owns everything it reads); the wire
-/// format is byte-identical to the historical under-lock serializer.
+/// Lock-free by construction (the snapshot owns everything it reads); all
+/// payload-affecting terminal state was captured under the earlier single lock.
 pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
     use std::fmt::Write as _;
     // ONE buffer for the whole frame. The retired shape built a `String` per
@@ -1866,11 +1930,19 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
         .map(|(ar, ac, img)| styled_image_json(*ar, *ac, img))
         .collect::<Vec<_>>()
         .join(",");
+    // Live OVERLAY state (OSC 12/17/19): render-time colour policy a watcher
+    // cannot derive from the cells, so the frame names the policy explicitly
+    // rather than letting a consumer invent a gray.
+    let cursor_color = styled_optional_rgb(snap.cursor_color, "default");
+    let selection_json = styled_selection_json(snap.selection.as_ref());
+    let selection_bg = styled_optional_rgb(snap.selection_bg, "default");
+    let selection_fg = styled_optional_rgb(snap.selection_fg, "dynamic");
     let _ = write!(
         out,
         "{{\"seq\":{},\"dims\":{{\"rows\":{},\"cols\":{}}},\
-         \"cursor\":{{\"row\":{},\"col\":{},\"visible\":{},{}}},\
-         \"rows\":[{rows_json}],\"line_sizes\":[{line_sizes_json}],\"selection\":{},\
+         \"cursor\":{{\"row\":{},\"col\":{},\"visible\":{},{},\"color\":{cursor_color}}},\
+         \"rows\":[{rows_json}],\"line_sizes\":[{line_sizes_json}],\"selection\":{selection_json},\
+         \"selection_bg\":{selection_bg},\"selection_fg\":{selection_fg},\
          \"images\":[{images_json}]}}",
         snap.seq,
         snap.rows,
@@ -1879,7 +1951,6 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
         snap.cursor_col,
         snap.cursor_visible,
         json_str_field("style", snap.cursor_style),
-        snap.selection_json,
     );
     out
 }
@@ -1941,14 +2012,18 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         grid_top_row: _,   // OMITTED: M1b grid/chrome partition, display-only
         grid_bot_row: _,   // OMITTED: M1b grid/chrome partition, display-only
         fx_clip: _, // OMITTED: focused-pane present-time post-fx clip box (split-pane audit), display-only
-        selection: _, // frame "selection" (F3)
-        clusters: _, // folded into per-cell "glyph" (cell_grapheme)
-        combining: _, // folded into per-cell "glyph" (cell_grapheme)
-        line_sizes: _, // frame "line_sizes" (F2)
+        selection: _, // frame "selection" kind + projected geometry (F3)
+        selection_clip: _, // OMITTED: host-only split composition bounds; engine styled frames have none
+        selection_bg: _, // frame "selection_bg" (OSC 17 fixed RGB, else the "default" policy token)
+        selection_fg: _, // frame "selection_fg" (OSC 19 fixed RGB, else the "dynamic" auto-contrast token)
+        clusters: _,     // folded into per-cell "glyph" (cell_grapheme)
+        combining: _,    // folded into per-cell "glyph" (cell_grapheme)
+        line_sizes: _,   // frame "line_sizes" (F2)
         line_size_spans: _, // OMITTED: compose-time per-pane refinement of `line_sizes`. This frame is extracted from ONE Terminal, whose rows are uniform, so it is always empty here; the split-pane composite is not the styled-frame source.
-        images: _,          // frame "images" (F1)
-        default_bg: _, // OMITTED: host-resolved live default-bg for the padding band, not per-cell content (cells carry their own bg)
-        cursor_color: _, // OMITTED: host-resolved live cursor colour, host-owned
+        default_bg_spans: _, // OMITTED: compose-time per-pane refinement of `default_bg`, empty for a single-Terminal frame; each cell already carries its own resolved bg.
+        images: _,           // frame "images" (F1)
+        default_bg: _, // OMITTED: engine-resolved live default-bg for padding, not per-cell content (cells carry their own bg)
+        cursor_color: _, // frame "cursor.color" (fixed RGB or "default")
         snapshot_seq: _, // frame "seq" (the engine content version stamp)
         input_hot: _, // OMITTED: present-time bloom-defer latency hint, display-only (not cell content)
     } = ri;
@@ -2073,7 +2148,10 @@ mod tests {
 
     use aterm_core::terminal::Terminal;
 
-    use super::{cmd_search, serialize_dims, serialize_dims_json};
+    use super::{
+        cmd_cell, cmd_search, gather_styled_frame, serialize_dims, serialize_dims_json,
+        styled_frame_payload,
+    };
     use crate::term_lock;
 
     #[test]
@@ -2101,6 +2179,223 @@ mod tests {
             term.lock().unwrap().process(format!("{l}\r\n").as_bytes());
         }
         term
+    }
+
+    /// Sparse tail cells must report the same effective defaults as a
+    /// materialized cell. In particular DECSCNM swaps those defaults for both
+    /// the one-cell verb and the full styled frame; using the raw OSC values as
+    /// the fallback would disagree with the pixels on glass.
+    #[test]
+    fn sparse_blank_queries_fold_live_defaults_and_decscnm() {
+        let term = Arc::new(Mutex::new(Terminal::new(2, 8)));
+        {
+            let mut t = term_lock(&term);
+            t.process(b"\x1b]10;rgb:11/22/33\x07");
+            t.process(b"\x1b]11;rgb:44/55/66\x07");
+            t.process(b"X");
+            assert!(
+                t.render_row_at_screen(0).get(7).is_none(),
+                "negative control: column 7 is an implicit sparse-tail cell"
+            );
+        }
+
+        let normal = cmd_cell(&term, "0 7");
+        assert!(
+            normal.contains("112233 445566"),
+            "normal implicit blank uses live OSC defaults: {normal:?}"
+        );
+        {
+            let t = term_lock(&term);
+            let snap = gather_styled_frame(&t);
+            assert_eq!(snap.cells[0][0].cell.fg, [0x11, 0x22, 0x33]);
+            assert_eq!(snap.cells[0][0].cell.bg, [0x44, 0x55, 0x66]);
+            assert_eq!(snap.cells[0][7].cell.fg, snap.cells[0][0].cell.fg);
+            assert_eq!(
+                snap.cells[0][7].cell.bg, snap.cells[0][0].cell.bg,
+                "materialized and implicit default-colour cells agree"
+            );
+        }
+
+        term_lock(&term).process(b"\x1b[?5h");
+        let reversed = cmd_cell(&term, "0 7");
+        assert!(
+            reversed.contains("445566 112233"),
+            "DECSCNM swaps the implicit blank exactly like painted cells: {reversed:?}"
+        );
+        {
+            let t = term_lock(&term);
+            let snap = gather_styled_frame(&t);
+            assert_eq!(snap.cells[0][0].cell.fg, [0x44, 0x55, 0x66]);
+            assert_eq!(snap.cells[0][0].cell.bg, [0x11, 0x22, 0x33]);
+            assert_eq!(snap.cells[0][7].cell.fg, snap.cells[0][0].cell.fg);
+            assert_eq!(snap.cells[0][7].cell.bg, snap.cells[0][0].cell.bg);
+        }
+    }
+
+    /// OSC 110/111 restore the configured defaults for an implicit tail too;
+    /// the query path must not retain either a prior dynamic colour or a
+    /// reverse-video fold after the mode is reset.
+    #[test]
+    fn sparse_blank_queries_follow_dynamic_color_reset() {
+        let term = Arc::new(Mutex::new(Terminal::new(2, 8)));
+        let configured = {
+            let t = term_lock(&term);
+            (t.default_foreground(), t.default_background())
+        };
+        {
+            let mut t = term_lock(&term);
+            t.process(b"\x1b]10;rgb:11/22/33\x07");
+            t.process(b"\x1b]11;rgb:44/55/66\x07");
+            t.process(b"\x1b[?5h");
+            t.process(b"\x1b[?5l");
+            t.process(b"\x1b]110\x07\x1b]111\x07");
+            let snap = gather_styled_frame(&t);
+            assert_eq!(
+                snap.cells[0][7].cell.fg,
+                [configured.0.r, configured.0.g, configured.0.b]
+            );
+            assert_eq!(
+                snap.cells[0][7].cell.bg,
+                [configured.1.r, configured.1.g, configured.1.b]
+            );
+        }
+    }
+
+    #[test]
+    fn styled_frame_distinguishes_wide_lead_from_continuation() {
+        let mut term = Terminal::new(2, 8);
+        term.process("界".as_bytes());
+        let snap = gather_styled_frame(&term);
+
+        assert_eq!(snap.cells[0][0].glyph, "界");
+        assert!(
+            snap.cells[0][0].wide_lead,
+            "the raw WIDE flag belongs to the glyph's lead cell"
+        );
+        assert!(
+            !snap.cells[0][0].cell.wide,
+            "RenderCell::wide is not the lead marker"
+        );
+        assert!(
+            !snap.cells[0][1].wide_lead,
+            "the continuation must not duplicate the lead marker"
+        );
+        assert!(
+            snap.cells[0][1].cell.wide,
+            "the resolved continuation retains its right-half marker"
+        );
+    }
+
+    /// A block selection and a linear selection can have byte-identical raw
+    /// endpoints while painting radically different cells. The styled frame must
+    /// preserve the kind, and its coordinates must be the side-adjusted projection
+    /// used by the renderer rather than the raw anchors.
+    #[test]
+    fn styled_frame_selection_is_typed_and_side_adjusted() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let mut simple = Terminal::new(3, 10);
+        {
+            let sel = simple.text_selection_mut();
+            sel.start_selection(0, 1, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(2, 4, SelectionSide::Right);
+            sel.complete_selection();
+        }
+        let simple_frame = styled_frame_payload(&simple);
+        assert!(
+            simple_frame.contains(
+                "\"selection\":{\"start_row\":0,\"start_col\":1,\"end_row\":2,\
+                 \"end_col\":4,\"kind\":\"simple\",\"is_block\":false}"
+            ),
+            "linear selection kind/geometry must survive: {simple_frame}"
+        );
+
+        let mut block = Terminal::new(3, 10);
+        {
+            let sel = block.text_selection_mut();
+            sel.start_selection(0, 1, SelectionSide::Left, SelectionType::Block);
+            sel.update_selection(2, 4, SelectionSide::Right);
+            sel.complete_selection();
+        }
+        let block_frame = styled_frame_payload(&block);
+        assert!(
+            block_frame.contains(
+                "\"selection\":{\"start_row\":0,\"start_col\":1,\"end_row\":2,\
+                 \"end_col\":4,\"kind\":\"block\",\"is_block\":true}"
+            ),
+            "rectangular selection kind must not collapse into linear: {block_frame}"
+        );
+        assert_ne!(
+            simple_frame, block_frame,
+            "negative control: identical raw endpoints with different paint geometry"
+        );
+
+        let mut sided = Terminal::new(2, 10);
+        {
+            let sel = sided.text_selection_mut();
+            sel.start_selection(0, 1, SelectionSide::Right, SelectionType::Simple);
+            sel.update_selection(0, 5, SelectionSide::Left);
+            sel.complete_selection();
+        }
+        let sided_frame = styled_frame_payload(&sided);
+        assert!(
+            sided_frame.contains(
+                "\"selection\":{\"start_row\":0,\"start_col\":2,\"end_row\":0,\
+                 \"end_col\":4,\"kind\":\"simple\",\"is_block\":false}"
+            ),
+            "half-cell sides must project to the renderer's 2..=4 range: {sided_frame}"
+        );
+        assert!(
+            !sided_frame.contains(
+                "\"selection\":{\"start_row\":0,\"start_col\":1,\"end_row\":0,\
+                 \"end_col\":5"
+            ),
+            "negative control: raw one-cell-too-wide bounds must not leak"
+        );
+    }
+
+    /// OSC 17/19 and OSC 12 are live render state, not properties of a cell.
+    /// Carry their fixed/dynamic policies explicitly so a styled-frame consumer
+    /// can reproduce the selection and cursor overlays instead of inventing gray.
+    #[test]
+    fn styled_frame_carries_live_selection_and_cursor_colors() {
+        let mut term = Terminal::new(2, 8);
+        let defaults = styled_frame_payload(&term);
+        assert!(
+            defaults.contains("\"cursor\":{")
+                && defaults.contains("\"color\":\"default\"")
+                && defaults.contains("\"selection_bg\":\"default\"")
+                && defaults.contains("\"selection_fg\":\"dynamic\""),
+            "default/dynamic overlay policies must be explicit: {defaults}"
+        );
+
+        term.process(
+            b"\x1b]12;rgb:ab/cd/ef\x07\
+              \x1b]17;rgb:12/34/56\x07\
+              \x1b]19;rgb:fe/dc/ba\x07",
+        );
+        let fixed = styled_frame_payload(&term);
+        assert!(
+            fixed.contains("\"color\":\"abcdef\""),
+            "OSC 12 cursor color lost: {fixed}"
+        );
+        assert!(
+            fixed.contains("\"selection_bg\":\"123456\""),
+            "OSC 17 selection background lost: {fixed}"
+        );
+        assert!(
+            fixed.contains("\"selection_fg\":\"fedcba\""),
+            "OSC 19 selection foreground lost: {fixed}"
+        );
+
+        term.process(b"\x1b]112\x07\x1b]117\x07\x1b]119\x07");
+        let reset = styled_frame_payload(&term);
+        assert!(
+            reset.contains("\"color\":\"default\"")
+                && reset.contains("\"selection_bg\":\"default\"")
+                && reset.contains("\"selection_fg\":\"dynamic\""),
+            "OSC 112/117/119 reset policies must survive: {reset}"
+        );
     }
 
     /// P1.0c: a repeat query on unchanged content (the cache-hit path, no

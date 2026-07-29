@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 // Only the unix SIGUSR1 mask setup needs raw pointers.
 #[cfg(unix)]
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,8 @@ mod app_settings;
 mod app_tabs;
 mod app_update_screen;
 mod app_window;
+#[cfg(test)]
+mod artifact_transaction_conformance;
 mod bench_knobs;
 mod build_badge;
 mod build_info;
@@ -92,7 +94,10 @@ mod crash_signal;
 mod explorer_win;
 #[cfg(windows)]
 mod hdr_win;
+#[cfg(test)]
+mod instance_retention_conformance;
 mod palette;
+mod pinned_dir;
 /// The native Windows application-runtime (DWM chrome): `AppRt` peer of `AppRtMacOS`.
 #[cfg(windows)]
 mod platform_win;
@@ -1560,7 +1565,7 @@ enum Wake {
     /// dims reply then happen on the encode worker (post-write, FIFO).
     Control,
     /// VIDEO introspection (`video` verb): start recording the frontmost
-    /// window's PRESENTED frames for `dur_ms`, then dump a PNG sequence +
+    /// window's present-path frames for `dur_ms`, then dump a PNG sequence +
     /// index.json into the pre-created server-named `dir` and answer `reply`.
     /// `keys` opts into the same-clock keystroke log (owner connections only —
     /// enforced at dispatch); `pace` keeps redraws flowing so frame-cadence gaps
@@ -1578,8 +1583,9 @@ enum Wake {
         pace: bool,
         fps: Option<u32>,
         budget_bytes: usize,
-        dir: std::path::PathBuf,
-        reply: std::sync::mpsc::Sender<String>,
+        dir: crate::control_auth::ConfinedVideoDir,
+        cancel: VideoCancellation,
+        reply: std::sync::mpsc::Sender<control::Retained<String>>,
     },
     /// `video status` — observe the in-flight recording (if any) without touching
     /// it: mode, elapsed vs requested duration, frames captured so far, and
@@ -2010,13 +2016,14 @@ enum Wake {
         hovering: bool,
         reply: std::sync::mpsc::Sender<bool>,
     },
-    /// The `window` introspection verb wants the frontmost window's ENTIRE
-    /// on-screen pixels — the native OS chrome (titlebar, traffic lights, the
-    /// unified toolbar, the full-width tab strip) AS WELL AS the terminal content
-    /// — captured to a PNG. Terminal-tab `image` can rasterize its framebuffer;
-    /// windowed-native `image` and this verb both reach the window's `NSWindow`
-    /// and `CGWindowListCreateImage` its real composited pixels, which ONLY the
-    /// main thread may do (AppKit + the window number are main-thread state). The
+    /// The `window` introspection verb produces a full-window artifact: native OS
+    /// chrome (titlebar, traffic lights, unified toolbar, and tab strip) stitched
+    /// around the exact client destination from a successful application present.
+    /// It does not claim compositor visibility or scanout, and translucent/material
+    /// client content is refused rather than guessed. Terminal-tab `image` can
+    /// rasterize its framebuffer; only the main thread may access the `NSWindow`
+    /// and platform chrome photograph (AppKit + window number are main-thread
+    /// state). The
     /// control thread builds the one-shot `reply` channel, posts this, and BLOCKS;
     /// the main thread photographs the pixels, and the encode worker writes the
     /// CONFINED `path` then replies `Ok((w, h))` (the PNG's pixel dims) or an
@@ -2026,7 +2033,8 @@ enum Wake {
     /// replies with the off-macOS error string.
     CaptureWindow {
         path: control_auth::ConfinedImage,
-        reply: std::sync::mpsc::Sender<Result<(u32, u32), String>>,
+        cancel: control::CaptureCancellation,
+        reply: std::sync::mpsc::Sender<control::WindowReply>,
     },
     /// Capture the front window after an auxiliary target has been opened, to a confined
     /// PNG for compatibility verbs such as `window prefs`. Settings/About/Update are
@@ -2039,7 +2047,8 @@ enum Wake {
     CaptureAuxWindow {
         target: app_introspect::AuxTarget,
         path: control_auth::ConfinedImage,
-        reply: std::sync::mpsc::Sender<Result<(u32, u32), String>>,
+        cancel: control::CaptureCancellation,
+        reply: std::sync::mpsc::Sender<control::WindowReply>,
     },
     /// Read the native Settings tab's current route and compiled semantic controls as
     /// text for the compatibility `controls prefs` introspection verb. This works
@@ -2320,6 +2329,13 @@ enum Backend {
     Gpu(GpuBackend),
 }
 
+/// Artifact policy at the renderer boundary. GPU probes/oracles retain their
+/// historical best-effort `Frame` API, while durable `image`/snapshot callers
+/// preserve a device/map failure as `Err` instead of publishing black pixels.
+fn require_explicit_capture_readback(captured: Result<Frame, String>) -> Result<Frame, String> {
+    captured.map_err(|error| format!("GPU capture readback failed: {error}"))
+}
+
 /// GPU renderer plus the frontend's VISIBLE top-padding authority.
 ///
 /// The renderer intentionally allocates a legacy `2 * pad` vertical frame even
@@ -2508,7 +2524,7 @@ fn project_visible_pad_crop(
 }
 
 /// Translate the effect streams whose coordinates are already WINDOW-absolute.
-/// Grid-relative streams (trail, scene/cat/free/rain sprites, nova/rain light)
+/// Grid-relative streams (trail, cat/free/rain sprites, nova/rain light)
 /// follow the renderer's compensated `grid_top` automatically. The translated
 /// streams do not, so the GPU source shift must be applied before encode and
 /// reversed immediately afterward. Returns `false` without mutation when any
@@ -3235,6 +3251,7 @@ impl Backend {
     /// offscreen REUSE across snapshot/`image` calls — the pixels are identical
     /// regardless. It is SEPARATE from any window's on-glass present `window_gpu`,
     /// so a snapshot never disturbs a window's scissor/dirty-gate caches.
+    #[cfg(test)]
     fn render_input(
         &mut self,
         gpu_scratch: &mut aterm_gpu::WindowGpu,
@@ -3244,6 +3261,20 @@ impl Backend {
         // on the CPU after readback, gated on `!is_gpu()`).
         tray: Option<aterm_gpu::TrayQuad<'_>>,
     ) -> Frame {
+        self.render_input_for_destination(gpu_scratch, input, tray, None)
+            .expect("test capture readback")
+    }
+
+    /// [`Self::render_input`] with the exact on-glass destination height. GPU
+    /// top-crop parity depends on the row-fit remainder, so window capture must
+    /// configure the readback with the same height the successful present used.
+    fn render_input_for_destination(
+        &mut self,
+        gpu_scratch: &mut aterm_gpu::WindowGpu,
+        input: &mut RenderInput,
+        tray: Option<aterm_gpu::TrayQuad<'_>>,
+        destination_height: Option<usize>,
+    ) -> Result<Frame, String> {
         let pad = self.pad();
         let pad_top = self.pad_top();
         match self {
@@ -3251,12 +3282,13 @@ impl Backend {
                 let _ = tray;
                 let mut frame = r.render_input(input);
                 crop_visible_frame(&mut frame, 0, pad, pad_top);
-                frame
+                Ok(frame)
             }
             Backend::Gpu(g) => {
                 let (_, raw_height) = g.frame_size(input.rows, input.cols);
                 let visible_height = visible_frame_height(raw_height, pad, pad_top);
-                let crop_top = g.configure_visible_y(raw_height, visible_height);
+                let crop_top =
+                    g.configure_visible_y(raw_height, destination_height.unwrap_or(visible_height));
                 let tray = tray.map(|mut tray| {
                     tray.dy = tray
                         .dy
@@ -3266,7 +3298,7 @@ impl Backend {
                 let shift = i32::try_from(crop_top).ok();
                 let effects_shifted =
                     shift.is_some_and(|shift| try_shift_window_absolute_effects_y(input, shift));
-                let mut frame = g.render_input(gpu_scratch, input, tray);
+                let captured = g.try_render_input(gpu_scratch, input, tray);
                 if effects_shifted {
                     let restored = try_shift_window_absolute_effects_y(
                         input,
@@ -3274,8 +3306,9 @@ impl Backend {
                     );
                     debug_assert!(restored, "valid effect shift must be reversible");
                 }
+                let mut frame = require_explicit_capture_readback(captured)?;
                 crop_visible_frame(&mut frame, crop_top, pad, pad_top);
-                frame
+                Ok(frame)
             }
         }
     }
@@ -3540,6 +3573,7 @@ impl BackendSlot {
         self.ready().unsupported_user_feature_tags()
     }
 
+    #[cfg(test)]
     fn render_input(
         &mut self,
         gpu_scratch: &mut aterm_gpu::WindowGpu,
@@ -3547,6 +3581,17 @@ impl BackendSlot {
         tray: Option<aterm_gpu::TrayQuad<'_>>,
     ) -> Frame {
         self.ready_mut().render_input(gpu_scratch, input, tray)
+    }
+
+    fn render_input_for_destination(
+        &mut self,
+        gpu_scratch: &mut aterm_gpu::WindowGpu,
+        input: &mut RenderInput,
+        tray: Option<aterm_gpu::TrayQuad<'_>>,
+        destination_height: Option<usize>,
+    ) -> Result<Frame, String> {
+        self.ready_mut()
+            .render_input_for_destination(gpu_scratch, input, tray, destination_height)
     }
 
     fn is_gpu(&self) -> bool {
@@ -4125,6 +4170,77 @@ impl SessionPool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct WindowId(u64);
 
+/// The one paint/capture route selected from the canonical zoom-aware visible
+/// leaf plan.
+///
+/// Root membership is deliberately absent from this type. A mixed split whose
+/// focused pane is zoomed has one visible leaf: it is a terminal or native
+/// route, not a heterogeneous route merely because a hidden sibling has a
+/// different content kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisibleContentRoute {
+    /// Every visible leaf is terminal content. `composed` remains true for a
+    /// zoomed terminal split: that one visible pane still uses the composed
+    /// split coordinate space and capture path.
+    Terminal { composed: bool },
+    /// Exactly one native leaf fills the visible content bounds.
+    Native {
+        instance: tab_model::AppInstanceId,
+        view: tab_model::ViewId,
+    },
+    /// Multiple leaves are visible and at least one is native. This includes a
+    /// multi-native layout because it uses the same retained leaf compositor.
+    Heterogeneous,
+}
+
+impl VisibleContentRoute {
+    /// Whether the route paints in a composed pane coordinate space.
+    pub(crate) const fn is_composed(self) -> bool {
+        matches!(
+            self,
+            Self::Terminal { composed: true } | Self::Heterogeneous
+        )
+    }
+
+    /// Whether native pixels are present in the visible plan.
+    pub(crate) const fn has_visible_native(self) -> bool {
+        matches!(self, Self::Native { .. } | Self::Heterogeneous)
+    }
+}
+
+/// Exact identity and focused-cell geometry of the coordinate space used by a
+/// window's next visible route. Cursor trails, predictive ghosts, stream fades,
+/// and rain occupancy retain positions in this space, so any key change must
+/// reset them before another frame can present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutCoordinateSpaceKey {
+    route: VisibleContentRoute,
+    focused: tab_model::ViewId,
+    zoomed: bool,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    cell_width: usize,
+    cell_height: usize,
+    pad: usize,
+    pad_top: usize,
+    head: usize,
+    scale: u64,
+    surface_width: u32,
+    surface_height: u32,
+}
+
+/// Shared paint/hit-test transform for host modal overlays.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverlayCoordinateTransform {
+    pub(crate) geom: crate::settings::SettingsGeom,
+    pub(crate) scale: f32,
+    /// Device-pixel origin inside the renderer frame.
+    pub(crate) origin_x: f64,
+    pub(crate) origin_y: f64,
+}
+
 /// PHOSPHOR: resolve the `seed = 0` "derive per window at enable" sentinel
 /// into a stable per-window seed (logical window ids are monotonic and never
 /// reused, so the field is stable for the window's whole life — never
@@ -4153,21 +4269,92 @@ enum CloseOutcome {
     Stay,
 }
 
+const TRANSLUCENT_CAPTURE_ERROR: &str = "full-window artifact is unavailable for a translucent \
+client because the compositor/backdrop pixels are not renderer-owned; use `image` for raw \
+application-rendered pixels or set background_opacity = 1";
+
+/// Fail closed when an artifact copies a raw presented client layer but the OS
+/// compositor supplies pixels behind its alpha. Returning the raw layer as a
+/// `window`/swapchain video would otherwise look plausible while omitting the
+/// live desktop/vibrancy backdrop. `compositor_blends_client` is false for
+/// headless present-real and for platforms whose aterm client remains opaque.
+fn raw_present_capture_guard(
+    background_opacity: f32,
+    compositor_blends_client: bool,
+) -> Result<(), &'static str> {
+    if compositor_blends_client && aterm_render::vibrancy::is_translucent(background_opacity) {
+        Err(TRANSLUCENT_CAPTURE_ERROR)
+    } else {
+        Ok(())
+    }
+}
+
+/// Full-window capture is incomplete only when this exact window really uses
+/// the GPU swapchain whose alpha the platform compositor blends. A configured
+/// translucent opacity on the CPU/softbuffer fallback remains solid and must
+/// not be rejected.
+fn window_capture_translucency_guard(
+    background_opacity: f32,
+    platform_blends_client: bool,
+    backend_is_gpu: bool,
+    has_gpu_surface: bool,
+) -> Result<(), &'static str> {
+    raw_present_capture_guard(
+        background_opacity,
+        platform_blends_client && backend_is_gpu && has_gpu_surface,
+    )
+}
+
+const MATERIAL_CAPTURE_ERROR: &str = "window capture cannot include the compositor-owned \
+Mica/Acrylic backdrop; use `image` for raw application-rendered pixels or set \
+background_material = \"none\"";
+
+/// Fail closed when a platform's window-local capture API omits a configured
+/// compositor material. Windows `PrintWindow` is intentionally window-local:
+/// it cannot photograph DWM's Mica/Acrylic backdrop. Platforms whose capture
+/// includes compositor materials pass `captures_compositor_material = true`.
+fn window_capture_material_guard(
+    background_material: app_config::BackgroundMaterial,
+    captures_compositor_material: bool,
+) -> Result<(), &'static str> {
+    if background_material != app_config::BackgroundMaterial::None && !captures_compositor_material
+    {
+        Err(MATERIAL_CAPTURE_ERROR)
+    } else {
+        Ok(())
+    }
+}
+
+/// A post-present tap that reports resize/format stop is already terminal.
+/// Finalize immediately even when the original duration deadline is still in
+/// the future; a stopped ring can never mint another frame.
+fn video_post_present_should_finalize(
+    deadline_reached: bool,
+    resized_or_format_stopped: bool,
+) -> bool {
+    deadline_reached || resized_or_format_stopped
+}
+
+fn video_initial_next_frame(mode: VideoMode, pace: bool, now: Instant) -> Option<Instant> {
+    (mode == VideoMode::OffscreenPresentReal || pace).then_some(now)
+}
+
 /// HOW a `video` recording observes its window — the recording's HONESTY label,
 /// decided once at begin by [`video_capture_mode`] (the pure law) and disclosed
 /// verbatim in index.json's `meta.mode`. The contract, pinned both ways by the
-/// mode-honesty tests: the offscreen arm engages ONLY when no glass exists; a
-/// windowed GPU target NEVER takes it (its tap copies the actually-presented
-/// swapchain bytes and nothing else).
+/// mode-honesty tests: the offscreen arm engages ONLY when no OS window exists; a
+/// windowed GPU target NEVER takes it (its tap copies the exact bytes submitted
+/// through the swapchain present path and nothing else).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VideoMode {
-    /// The window presents on glass: the tap copies the exact swapchain bytes
-    /// handed to `present()` (photons follow by <= 1 vsync).
+    /// The window has a swapchain: the tap copies the exact bytes handed to
+    /// `present()`. Submission return is observed; compositor visibility and
+    /// scanout are not.
     SwapchainTap,
-    /// The window is GLASS-LESS: the SAME redraw path presents into the
+    /// The window has no OS presentation target: the SAME redraw path presents into the
     /// persistent virtual target ([`aterm_gpu::GpuRenderer::present_virtual`])
-    /// and the tap copies its exact bytes — what the screen WOULD have shown;
-    /// nothing reached photons, and the label says so.
+    /// and the tap copies its exact bytes. No OS presentation target exists, and the
+    /// label says so.
     OffscreenPresentReal,
 }
 
@@ -4184,10 +4371,10 @@ impl VideoMode {
     pub(crate) fn stamp_semantics(self) -> &'static str {
         match self {
             VideoMode::SwapchainTap => {
-                "CPU time frame.present() returned; photons follow by <= 1 vsync"
+                "CPU time frame.present() returned; submitted to WSI present; compositor visibility and scanout not observed"
             }
             VideoMode::OffscreenPresentReal => {
-                "CPU time the offscreen compose was submitted; headless - nothing reached glass"
+                "CPU time the offscreen compose was submitted; headless - no OS presentation target existed"
             }
         }
     }
@@ -4198,7 +4385,7 @@ impl VideoMode {
 /// records through the swapchain tap; NO glass + the GPU backend records
 /// through the offscreen present-real loop; everything else refuses plainly.
 /// A windowed target NEVER falls back to the offscreen arm — an occluded or
-/// CPU-presented window must not be conflated with "what glass would show"
+/// CPU-presented window must not be conflated with a headless virtual target
 /// (the honesty contract `video_tap.rs` documents).
 fn video_capture_mode(
     has_glass: bool,
@@ -4210,6 +4397,191 @@ fn video_capture_mode(
         (false, _, true) => Ok(VideoMode::OffscreenPresentReal),
         (true, _, true) => Err("window has no GPU surface (CPU backend unsupported)"),
         (_, _, false) => Err("GPU backend required"),
+    }
+}
+
+fn video_capture_translucency_guard(
+    mode: VideoMode,
+    background_opacity: f32,
+    compositor_blends_client: bool,
+) -> Result<VideoMode, &'static str> {
+    raw_present_capture_guard(
+        background_opacity,
+        compositor_blends_client && mode == VideoMode::SwapchainTap,
+    )
+    .map(|()| mode)
+}
+
+#[must_use]
+fn video_capture_opacity_requires_abort(
+    mode: VideoMode,
+    background_opacity: f32,
+    compositor_blends_client: bool,
+) -> bool {
+    video_capture_translucency_guard(mode, background_opacity, compositor_blends_client).is_err()
+}
+
+fn fail_video_request(
+    reply: &std::sync::mpsc::Sender<control::Retained<String>>,
+    dir: crate::control_auth::ConfinedVideoDir,
+    message: impl std::fmt::Display,
+) {
+    let cleanup = dir.abort().err().map_or_else(String::new, |error| {
+        format!("; recording dir cleanup failed: {error}")
+    });
+    let _ = reply.send(control::Retained::plain(format!(
+        "ERR video: {message}{cleanup}\n"
+    )));
+}
+
+#[derive(Default)]
+struct VideoExportInner {
+    busy: bool,
+    cancel: Option<VideoCancellation>,
+}
+
+const VIDEO_CANCEL_LIVE: u8 = 0;
+const VIDEO_CANCELLED: u8 = 1;
+const VIDEO_COMMIT_AUTHORIZED: u8 = 2;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VideoCancellation(Arc<AtomicU8>);
+
+impl VideoCancellation {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "ArtifactReplyPublication",
+            action = "Cancel",
+            project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
+        )
+    )]
+    pub(crate) fn cancel(&self) -> bool {
+        // Cancellation and publication linearize against the SAME live state.
+        // Once the worker has authorized commit, shutdown/timeout waits for that
+        // complete artifact instead of pretending it can still revoke rename.
+        self.0
+            .compare_exchange(
+                VIDEO_CANCEL_LIVE,
+                VIDEO_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[must_use]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == VIDEO_CANCELLED
+    }
+
+    /// Irrevocable publication boundary, called immediately before the atomic
+    /// index rename. Returns false when timeout/shutdown cancellation won first.
+    #[must_use]
+    pub(crate) fn authorize_commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                VIDEO_CANCEL_LIVE,
+                VIDEO_COMMIT_AUTHORIZED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// Process-local ownership and shutdown acknowledgement for the one-shot video
+/// encoder. Recording and export are one serialized lifecycle: a new capture
+/// cannot arm while the preceding bounded frame store is still being written,
+/// and graceful shutdown waits until cancellation has removed every partial
+/// artifact.
+#[derive(Default)]
+pub(crate) struct VideoExportState {
+    inner: std::sync::Mutex<VideoExportInner>,
+    idle: std::sync::Condvar,
+}
+
+pub(crate) struct VideoExportPermit {
+    state: Arc<VideoExportState>,
+}
+
+impl VideoExportState {
+    fn try_begin(self: &Arc<Self>, cancel: VideoCancellation) -> Option<VideoExportPermit> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.busy {
+            return None;
+        }
+        inner.busy = true;
+        inner.cancel = Some(cancel);
+        Some(VideoExportPermit {
+            state: Arc::clone(self),
+        })
+    }
+
+    #[must_use]
+    fn is_busy(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .busy
+    }
+
+    fn cancel(&self) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cancel) = inner.cancel.as_ref() {
+            let _ = cancel.cancel();
+        }
+    }
+
+    /// Wait for the export permit to be dropped by success, failure, panic, or
+    /// cancellation. Used only after the event loop has stopped, never on a live
+    /// render turn.
+    #[must_use]
+    fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while inner.busy {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, result) = self
+                .idle
+                .wait_timeout(inner, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner = next;
+            if result.timed_out() && inner.busy {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for VideoExportPermit {
+    fn drop(&mut self) {
+        let mut inner = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.busy = false;
+        inner.cancel = None;
+        self.state.idle.notify_all();
     }
 }
 
@@ -4229,7 +4601,6 @@ struct VideoRec {
     key_log: Vec<(u64, char)>,
     /// Keep redraws flowing so the recording captures the render cadence rather
     /// than an idle screen's (correct) silence.
-    pace: bool,
     /// The recording's honesty label (see [`VideoMode`]), decided at begin and
     /// carried verbatim into index.json's `meta.mode`.
     mode: VideoMode,
@@ -4247,10 +4618,13 @@ struct VideoRec {
     /// idle-zero law).
     next_frame: Option<Instant>,
     /// The pre-created server-named recording dir (see `confine_video_dir`).
-    dir: std::path::PathBuf,
+    dir: crate::control_auth::ConfinedVideoDir,
+    /// Request-lifetime cancellation shared with the blocking control handler,
+    /// the export worker, and graceful application shutdown.
+    cancel: VideoCancellation,
     /// Control-thread reply channel; answered by the encode worker after
     /// index.json (the completion marker) is on disk.
-    reply: std::sync::mpsc::Sender<String>,
+    reply: std::sync::mpsc::Sender<control::Retained<String>>,
 }
 
 /// Visit the character-shaped ATTEMPTS represented by one controller input
@@ -4389,6 +4763,21 @@ enum PresentTarget {
         /// virtual render target + the video tap for the recording's lifetime.
         window_gpu: aterm_gpu::WindowGpu,
     },
+}
+
+/// One exact client-area destination captured from the same successful surface
+/// transaction as a `window` introspection barrier. Pixels are tightly-packed
+/// straight RGBA8 at the raw swapchain/softbuffer dimensions—after remainder
+/// bands, tray, bell, overlay, and GPU present-only colour/glow passes.
+///
+/// This is intentionally distinct from [`aterm_render::Frame`]: a Frame is the
+/// route-neutral semantic framebuffer read by `image`, while this value is the
+/// platform-client layer spliced beneath OS-owned window chrome by `window`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PresentedClientFrame {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
 }
 
 /// P3: the rasterized overlay card (Settings panel, About dialog, or Palette) for one
@@ -4980,12 +5369,32 @@ struct WindowState {
     /// Whether the LAST presented frame composed multiple panes. A change in this
     /// (single-pane ⇄ split) relocates the cursor between coordinate spaces, so the
     /// cursor animators are reset on the transition to avoid a spurious one-frame
-    /// comet/glow streak. `None` until the first present.
+    /// comet/glow streak. `None` until the first present. Coarse next to
+    /// `last_layout_coordinate_space`, which also catches same-class moves.
     last_composed: Option<bool>,
+    /// Exact visible-route coordinate identity. Unlike `last_composed`, this
+    /// detects same-class moves: divider drags, zoom/unzoom, focused-leaf
+    /// changes, and window resizes.
+    last_layout_coordinate_space: Option<LayoutCoordinateSpaceKey>,
     /// Reusable scratch for this frame's aurora light quads, copied into
     /// `input_scratch.cursor_glow_add` before the present (resident → no per-frame
     /// alloc while animating).
     glow_scratch: Vec<aterm_render::GlowQuad>,
+    /// Whether `glow_scratch` / `cursor_glow` / `trail_scratch` and the two
+    /// scalar fields below describe the last composed cursor-effect tick for
+    /// this window.  Windowed/recording captures reuse that state without
+    /// advancing an animation clock; a single/native transition clears it.
+    composed_cursor_effect_valid: bool,
+    /// Terminal session that produced the retained composed tick.  A focus
+    /// switch before the next present must not relocate the old pane's light
+    /// into the new focused pane.
+    composed_cursor_effect_session: Option<u64>,
+    /// Fire-style active cursor fill paired with the retained composed streams.
+    /// The per-window focus override is folded only at projection time so an
+    /// inactive capture lawfully gets the neutral hollow-cursor fill.
+    composed_cursor_fill: Option<u32>,
+    /// Fully resolved cadence-comet colour paired with the retained stream.
+    composed_cursor_trail_color: u32,
     /// Cadence-comet MOTION-TRAIL animation state: the directional comet of fading
     /// [`aterm_render::TrailCell`]s the cursor sweeps along its path (brightest at the
     /// head, capped under the readability ceiling so it never washes out glyphs). The
@@ -5133,6 +5542,19 @@ struct WindowState {
     /// design §6.3), copied into `input_scratch.nova_add` (resident → no
     /// per-frame alloc while novas animate).
     nova_scratch: Vec<aterm_render::GlowQuad>,
+    /// PANE-LOCAL sparkle output while composing a split frame: one pane's
+    /// tick emits here, the `translate_*_into_pane` helpers shift it into
+    /// window coords, and it is APPENDED to the four `*_scratch` accumulators
+    /// above — which both render paths then splice identically.
+    pane_deco: Vec<aterm_render::WordDecoration>,
+    pane_ink: Vec<aterm_render::InkCell>,
+    pane_free: Vec<aterm_core::render::FreeSprite>,
+    pane_nova: Vec<aterm_render::GlowQuad>,
+    /// Per-pane grid snapshot for the sparkle rescan on a composed frame.
+    /// DEDICATED rather than sharing `pane_scratch`: compose pass 1 extracts
+    /// the focused pane's rain occupancy into that one and pass 2 re-extracts
+    /// every pane for the blit, so a third user would tear one of them.
+    deco_pane_cells: RenderInput,
     /// The PHOSPHOR rain engine — built LAZILY at the first enabled tick (a
     /// default-off config never constructs it: the zero-cost pin) and dropped
     /// on master-off / layout-space change. `set_config` on hot reload keeps
@@ -5279,12 +5701,39 @@ struct WindowState {
     /// animation tick. `redraw_window` stamps `last_present_at` only when this is set,
     /// then clears it — so aurora-only presents don't poison the output-coalescing cap.
     content_pending: bool,
-    /// Monotonic witness for real compositor submissions. Introspection samples
+    /// Monotonic witness for completed application present submissions. Introspection samples
     /// this before a synchronous native redraw and authorizes OS-window capture
     /// only when the value advances; a dropped drawable therefore cannot expose
     /// the previous frame. Unlike `last_present_at`, this advances for native,
     /// heterogeneous, effect-only, and terminal presents alike.
     capture_present_serial: u64,
+    /// Visual-bell state of the frame authorized by
+    /// [`Self::capture_present_serial`]. This is committed only from
+    /// `finalize_successful_present`; a staged frame whose surface transaction
+    /// drops must not make a later `image` invert pixels that never reached a
+    /// successful application-present commit.
+    capture_present_invert: bool,
+    /// Frontend accent overlay of the frame authorized by
+    /// [`Self::capture_present_serial`]. Like `capture_present_invert`, this is
+    /// success-committed rather than sampled from the live animation clock at
+    /// capture time.
+    capture_present_overlay: Option<crate::app_render::OverlayGlow>,
+    /// One-shot request armed only by the full-OS `window` verb. The CPU
+    /// presenter copies its final raw softbuffer while this is true; GPU uses a
+    /// sibling one-shot destination tap on [`aterm_gpu::WindowGpu`]. Ordinary
+    /// presents pay one branch and retain no client framebuffer.
+    capture_client_requested: bool,
+    /// Exact CPU destination produced by the most recent requested successful
+    /// surface transaction. Cleared before every capture attempt; failures
+    /// never publish staged bytes. GPU captures are drained directly from the
+    /// per-window tap and do not use this slot.
+    capture_present_client: Option<PresentedClientFrame>,
+    /// Per-visible-terminal engine snapshot sequence numbers that fed the
+    /// currently staged `input_scratch`, in canonical paint order. A windowed
+    /// capture reads this only after its synchronous present serial advances,
+    /// making the vector provenance for that successful frame rather than for
+    /// an earlier or dropped layout.
+    capture_leaf_snapshot_seqs: Vec<u64>,
     /// Leading edge of the newest output burst that has not yet seeded a sparkle
     /// rescan. Headless has no present loop, so its first `image` capture consumes
     /// this to reconstruct the birth tick before sampling the effect at capture
@@ -5358,6 +5807,13 @@ struct WindowState {
     /// (and empty) on the single-pane path, which fills `input_scratch` directly.
     /// Disjoint from `input_scratch` so the compose loop can borrow both at once.
     pane_scratch: RenderInput,
+    /// Persistent focused-pane snapshot for pure split/zoom composition. The
+    /// compositor extracts this grid under the same terminal lock as the cursor
+    /// state that advances the composed effect engines, then reuses it after the
+    /// repaint decision. Keeping a separate resident buffer prevents a PTY write
+    /// between the old probe/extract locks from pairing A effects with B cells,
+    /// without adding a steady-state allocation.
+    composed_focus_scratch: RenderInput,
     /// One cache per stable canonical leaf. Entries are pruned against the
     /// visible plan after each heterogeneous compose, so closed views cannot
     /// retain textures or semantic trees.
@@ -5542,6 +5998,11 @@ struct WindowState {
     /// overlay is open), composited over the framebuffer at present/capture time. `None`
     /// when closed, card-renderer off, or not yet built. See [`SettingsCard`].
     settings_card: Option<SettingsCard>,
+    /// Native/heterogeneous route raster after the selected global paint-only
+    /// card is folded over the route-owned full native layer. This preserves
+    /// the one-tray backend contract without hiding badge/notice/level-up
+    /// visuals behind `settings_card`.
+    route_card: Option<SettingsCard>,
     /// The rasterized top-right BUILD/VERSION badge (paint-only, non-interactive), in its
     /// OWN slot so it never gates the mouse the way `settings_card`'s modal does. The
     /// composite prefers the modal (`settings_card.as_ref().or(badge_card.as_ref())`), so
@@ -5588,6 +6049,18 @@ impl WindowState {
             .filter(|mirror| mirror.session == session)
     }
 
+    /// One backend tray surface in final paint priority. Native/mixed routes
+    /// may precompose their full native layer with the selected global card;
+    /// terminal routes use the established modal/level/notice/badge fallback.
+    fn present_card(&self) -> Option<&SettingsCard> {
+        self.route_card
+            .as_ref()
+            .or(self.settings_card.as_ref())
+            .or(self.level_up_card.as_ref())
+            .or(self.notice_card.as_ref())
+            .or(self.badge_card.as_ref())
+    }
+
     // ---- PRESENT-LIVENESS PROTOCOL (the "settings black screen" honesty class) ----
     //
     // The three DISCRETE present-lifecycle effects on this window's present-tracking
@@ -5597,15 +6070,17 @@ impl WindowState {
     // protocol gates `abort_reflow_offload`/`reattach_reflowed_scrollback`; present now
     // gates these). The enclosing SELECTION of which effect fires (the
     // `self.windows.get_mut(&id)` lookup, the `present_input_scratch` outcome test, the
-    // `std::mem::take(&mut ws.content_pending)` gate) stays inline in `redraw_window`;
-    // these methods carry only the projected writes on `WindowState`.
+    // `std::mem::take(&mut ws.content_pending)` gate) lives in the shared
+    // successful-present finalizer; these methods carry only the projected writes on
+    // `WindowState`.
     // MEMORY: settings-black-screen-present-drop (the Part-A drop-path un-stamp is the
     // shipped fix aed5a06c), trust-liveness-gap (items 8/30, the present-real gate).
 
     /// REQUEST — stamp the repaint DECISION: record the `RepaintKey` of the frame this
     /// redraw is about to present, BEFORE the drawable outcome is known. The stamp is
     /// OPTIMISTIC (pre-outcome); the honesty invariant `present-real` proves is that a
-    /// present recorded as a success really reached glass. Shared by the single-pane
+    /// success completed the application-owned present path. It does not observe
+    /// compositor visibility or scanout. Shared by the single-pane
     /// (`redraw_window`) and composed (`redraw_compose`) paths. Model: `stamped_ok' = 1`.
     #[cfg_attr(
         test,
@@ -5631,28 +6106,35 @@ impl WindowState {
         self.last_present = None;
     }
 
-    /// DISPLAY — the real-present fall-through: reached only when the present was REAL
-    /// (the drop path returned above), so the frame displayed. Stamp the present clock
-    /// and clear the keystroke-echo pacing bypass. Model: `displayed' = 1`.
-    fn on_present_displayed(&mut self) {
-        let now = std::time::Instant::now();
-        self.last_present_at = Some(now);
-        self.present_retry.on_presented();
+    /// CONTENT DISPLAY — the real-present fall-through for a frame that carried
+    /// terminal content. Stamp only the content-pacing clock and clear the
+    /// keystroke-echo bypass. Successful effect-only, native, and heterogeneous
+    /// frames intentionally skip this method so they cannot delay the next PTY
+    /// echo; they acknowledge the present through [`Self::on_present_succeeded`]
+    /// instead. Model: `displayed' = 1`.
+    fn on_content_presented(&mut self, presented_at: Instant) {
+        self.last_present_at = Some(presented_at);
         // Retire the keystroke pacing bypass only once its echo window has ELAPSED —
         // not on the first content present, which under concurrent output is a spew
         // frame that has nothing to do with the keystroke (see the arming site in
         // `App::input`). Fails open: the deadline always expires, so a key that never
         // echoes cannot hold the bypass.
-        if self.input_hot_until.is_none_or(|until| now >= until) {
+        if self
+            .input_hot_until
+            .is_none_or(|until| presented_at >= until)
+        {
             self.input_hot = false;
             self.input_hot_until = None;
         }
     }
 
-    /// Record any frame that genuinely reached the platform present seam. Kept
-    /// separate from `on_present_displayed`, whose clock is intentionally gated
-    /// to content frames for terminal output pacing.
-    fn on_capture_presented(&mut self) {
+    /// SUCCESS — record any frame that genuinely reached the platform present
+    /// seam, regardless of whether it carried terminal content. A successful
+    /// effect-only, native, or heterogeneous frame is sufficient to acknowledge
+    /// a retry episode and authorize a fresh OS-window capture. Kept separate
+    /// from [`Self::on_content_presented`], whose pacing clock is content-gated.
+    fn on_present_succeeded(&mut self) {
+        self.present_retry.on_presented();
         self.capture_present_serial = self.capture_present_serial.wrapping_add(1);
     }
 
@@ -5665,8 +6147,15 @@ impl WindowState {
     /// ([`crate::App::settings_row_at`]) — so on a short window the band the panel paints
     /// is exactly the band selection scrolls and clicks map into (they can't diverge).
     fn settings_panel_rows(&self) -> usize {
+        self.settings_panel_rows_with_available(self.input_scratch.cells.len())
+    }
+
+    /// Route-owned variant of [`Self::settings_panel_rows`]. Native trays are
+    /// content-height surfaces placed below the tab strip, so their modal
+    /// layout must not reuse a previously spliced frame height.
+    fn settings_panel_rows_with_available(&self, available: usize) -> usize {
         self.settings().map_or(0, |s| {
-            crate::settings::wanted_rows(&s.fields).min(self.input_scratch.cells.len())
+            crate::settings::wanted_rows(&s.fields).min(available)
         })
     }
 
@@ -5678,14 +6167,12 @@ impl WindowState {
     /// `fade_wake` (stream-fade presents on unfocused windows too — its own arm) and
     /// the PHOSPHOR rain (its own cadence + arm).
     ///
-    /// SPLIT-PANE layouts consult ONLY the engines the compose path actually
-    /// ticks (glow + trail): the cursor-body treatments (rainbow/droplet/comet/
-    /// phaser/beamrod/fireball), the cat, and the sparkle words are single-pane
-    /// and are neither ticked nor drawn by `redraw_compose` — their `is_active`
-    /// latches (rainbow energy, a cat mid-flight) would otherwise arm a PERMANENT
-    /// 60fps wake train re-composing frames the RepaintKey early-outs, for as
-    /// long as the split persists (the audit's 0%-idle break). Their latched
-    /// state is untouched; the next single-pane frame ticks them normally.
+    /// The CURSOR-BODY treatments (rainbow/droplet/comet/phaser/beamrod/
+    /// fireball) are the one set a split layout still excludes, because
+    /// `redraw_compose` does not tick them: their `is_active` latches would arm
+    /// a PERMANENT 60 fps wake train re-composing frames the RepaintKey
+    /// early-outs (the audit's 0%-idle break). Their latched state is
+    /// untouched; the next single-pane frame ticks them normally.
     fn cursor_fx_active(&self, now: Instant, animate_cursor_cat: bool) -> bool {
         // Every engine below paints TERMINAL content. Native/empty fronts may
         // deliberately retain latched animation state so a terminal episode can
@@ -5694,9 +6181,6 @@ impl WindowState {
         // capability-bearing mirror rather than inferring from compatibility tabs.
         if self.front_terminal().is_none() {
             return false;
-        }
-        if self.is_split() {
-            return self.cursor_glow.is_active() || self.cursor_trail.is_active();
         }
         self.cursor_glow.is_active()
             || self.cursor_dependents_need_frame_cadence(now, animate_cursor_cat)
@@ -5711,15 +6195,19 @@ impl WindowState {
             return false;
         }
         self.cursor_trail.is_active()
+            // The companion and the sparkle-word engine animate in EVERY
+            // visible pane (owner ruling, 2026-07-28), and `redraw_compose`
+            // ticks them there, so a split must keep their cadence armed —
+            // without it a correct emitter renders one frame and freezes.
+            || (animate_cursor_cat && self.cursor_cat.is_active())
+            || self.word_decos.is_active(now)
             || (!self.is_split()
                 && (self.cursor_rainbow.is_active()
                     || self.cursor_droplet.is_active()
                     || self.cursor_beamrod.is_active()
                     || self.cursor_fireball.is_active()
                     || self.cursor_comet.is_active()
-                    || self.cursor_phaser.is_active()
-                    || (animate_cursor_cat && self.cursor_cat.is_active())
-                    || self.word_decos.is_active(now)))
+                    || self.cursor_phaser.is_active()))
     }
 
     /// Whether the 60 fps terminal-effects lane needs another frame. This is the
@@ -5729,8 +6217,7 @@ impl WindowState {
     /// it may run unfocused, but it still cannot schedule over native content.
     fn terminal_effect_frame_active(&self, now: Instant, animate_cursor_cat: bool) -> bool {
         self.front_terminal().is_some()
-            && (self.fade_shown
-                || self.stream_fade.is_active(now)
+            && ((!self.is_split() && (self.fade_shown || self.stream_fade.is_active(now)))
                 || (self.focused && self.cursor_fx_active(now, animate_cursor_cat)))
     }
 
@@ -5740,6 +6227,9 @@ impl WindowState {
     /// neither advance nor own an event-loop wake while it is invisible.
     fn matrix_rain_frame_period(&self) -> Option<Duration> {
         self.front_terminal()?;
+        if self.is_split() {
+            return None;
+        }
         self.matrix_rain
             .as_ref()
             .filter(|engine| engine.is_active())
@@ -5753,7 +6243,11 @@ impl WindowState {
         now: Instant,
         animate_cursor_cat: bool,
     ) -> Option<Instant> {
-        if self.front_terminal().is_some() && self.focused && !animate_cursor_cat {
+        if self.front_terminal().is_some()
+            && !self.is_split()
+            && self.focused
+            && !animate_cursor_cat
+        {
             self.cursor_cat.static_deadline(now)
         } else {
             None
@@ -5828,10 +6322,16 @@ impl WindowState {
         self.level_up_card = None;
     }
 
-    /// Whether this window's ACTIVE tab is a multi-pane split — the layout whose
-    /// frames go through `redraw_compose` (single-pane frames take the original
-    /// path). Shared by [`Self::cursor_fx_active`] and the `about_to_wait`
-    /// cadence fold so the wake set and the compose tick set can never drift.
+    /// Whether this window's canonical ACTIVE tab paints as a multi-pane split —
+    /// the layout whose frames go through `redraw_compose` (single-pane frames
+    /// take the original path). Shared by [`Self::cursor_fx_active`] and the
+    /// `about_to_wait` cadence fold so the wake set and the compositor's tick
+    /// set can never drift.
+    ///
+    /// CONTENT-AGNOSTIC: the canonical root is authoritative, NOT the
+    /// terminal-only `layouts` compatibility projection — a heterogeneous tab
+    /// has no faithful entry there, yet it still uses the composed
+    /// cursor-effect subset.
     ///
     /// ZOOM-AWARE (split-pane audit): a ZOOMED tab composes to exactly ONE
     /// full-window rect at `(0, 0)` — `compute_layout` returns the focused
@@ -5840,10 +6340,13 @@ impl WindowState {
     /// frames take the ORIGINAL single-pane path: matrix rain, selection,
     /// vi copy-mode, the scroll pill, and the stream fade all stay live in a
     /// zoomed pane instead of silently vanishing behind a `tree.len()` gate.
+    /// `Tab::zoomed` is kept in lockstep with the projection's `is_zoomed()`
+    /// (`App::sync_tab_model_from_layout`), so the two spellings of the gate
+    /// agree on terminal-only tabs.
     fn is_split(&self) -> bool {
-        self.layouts
-            .get(self.tabs.active)
-            .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
+        self.tab_set
+            .active()
+            .is_some_and(|tab| tab.root.len() > 1 && !tab.zoomed)
     }
 
     /// The Settings overlay for this window, if it is the OPEN variant. The accessor shim
@@ -5946,13 +6449,21 @@ impl WindowState {
     /// Dispatches through the [`crate::overlay::OverlayModel`] trait (exhaustive — a missing
     /// variant is a compile error), preserving the min-with-available-rows clamp.
     fn overlay_rows(&self) -> usize {
-        let avail = self.input_scratch.cells.len();
+        self.overlay_rows_with_available(self.input_scratch.cells.len())
+    }
+
+    /// Resolve the active overlay height against the exact surface that will
+    /// rasterize it. Terminal callers use the composed-frame height; native
+    /// callers pass the content-row height below the tab strip.
+    fn overlay_rows_with_available(&self, available: usize) -> usize {
         match &self.overlay {
             // Settings clamps against the panel-rows single source (C2), which already
             // mins with the composed height — identical to `wanted_rows(..).min(avail)`.
             #[cfg(test)]
-            Some(crate::overlay::Overlay::Settings(_)) => self.settings_panel_rows(),
-            Some(o) => o.model().wanted_rows(avail),
+            Some(crate::overlay::Overlay::Settings(_)) => {
+                self.settings_panel_rows_with_available(available)
+            }
+            Some(o) => o.model().wanted_rows(available),
             None => 0,
         }
     }
@@ -6148,12 +6659,22 @@ impl WindowState {
             suggest: aterm_suggest::Ghost::new(aterm_suggest::Engine::default()),
             sugg_shown: false,
             last_composed: None,
+            last_layout_coordinate_space: None,
             glow_scratch: Vec::new(),
+            composed_cursor_effect_valid: false,
+            composed_cursor_effect_session: None,
+            composed_cursor_fill: None,
+            composed_cursor_trail_color: 0,
             word_decos: crate::word_decorations::WordDecorations::default(),
             deco_scratch: Vec::new(),
             ink_scratch: Vec::new(),
             free_scratch: Vec::new(),
             nova_scratch: Vec::new(),
+            pane_deco: Vec::new(),
+            pane_ink: Vec::new(),
+            pane_free: Vec::new(),
+            pane_nova: Vec::new(),
+            deco_pane_cells: RenderInput::empty(),
             matrix_rain: None,
             rain_scratch: Vec::new(),
             rain_add_scratch: Vec::new(),
@@ -6179,6 +6700,11 @@ impl WindowState {
             last_present_at: None,
             content_pending: false,
             capture_present_serial: 0,
+            capture_present_invert: false,
+            capture_present_overlay: None,
+            capture_client_requested: false,
+            capture_present_client: None,
+            capture_leaf_snapshot_seqs: Vec::new(),
             pending_deco_birth: None,
             redraw_pending: false,
             present_retry: PresentRetry::default(),
@@ -6194,6 +6720,7 @@ impl WindowState {
             input_scratch: RenderInput::empty(),
             pred_row_scratch: Vec::new(),
             pane_scratch: RenderInput::empty(),
+            composed_focus_scratch: RenderInput::empty(),
             leaf_render_cache: std::collections::BTreeMap::new(),
             tab_segments: Vec::new(),
             last_strip_fp: None,
@@ -6227,6 +6754,7 @@ impl WindowState {
             native_a11y_published: None,
             native_ui_compiled: None,
             settings_card: None,
+            route_card: None,
             badge_card: None,
             notice_card: None,
             level_up_card: None,
@@ -6253,12 +6781,22 @@ fn active_terminal_projection<'a>(
         .flatten()
 }
 
-fn active_tab_contains_session(
+/// Whether the active tab actually presents `session` in its zoom-aware
+/// visible topology. A zoomed split presents only its focused leaf; the other
+/// root leaves remain owned and running, but are off-screen.
+fn active_tab_displays_session(
     ws: &WindowState,
     views: &tab_model::ViewStore,
     session: u64,
 ) -> bool {
     ws.tab_set.active().is_some_and(|tab| {
+        if tab.zoomed && tab.root.len() > 1 {
+            return views
+                .get(tab.focus)
+                .copied()
+                .and_then(tab_model::View::terminal_session)
+                == Some(session);
+        }
         tab.root.leaves().into_iter().any(|view| {
             views
                 .get(view)
@@ -6318,8 +6856,16 @@ struct AutoApplyManualOnly {
     dmg_sha256: [u8; 32],
     /// When this latch may LAPSE back into automatic apply.
     ///
-    /// A GENUINE failure (child died, proof mismatch, native safety loss) sets
-    /// `None` — sticky, exactly as before: repeating it would only fail again.
+    /// A GENUINE failure (child died, proof mismatch, native safety loss) now
+    /// sets a deadline too, but on a much shorter budget
+    /// (`MAX_PHYSICAL_FAILURE_CYCLES`, tens of minutes apart) and only until that
+    /// budget is spent, after which it is `None` and sticky. `None` used to be
+    /// unconditional for these, and because `TimedOut` is classified physical
+    /// while the handoff deadline has to cover an entire cold boot + bundle swap
+    /// + re-exec + repaint, one slow moment permanently retired automatic
+    /// in-session apply for that build. The budget lives on
+    /// `auto_apply_physical_retry`, NOT in this struct, because this struct is
+    /// cleared when the latch lapses.
     /// An ACTIVITY-shaped exhaustion sets a deadline instead. Activity
     /// revocation is fully rolled back and says nothing about the artifact; it
     /// only says the terminal was busy, which on the machine this feature
@@ -7098,6 +7644,10 @@ struct App {
     /// One at a time; finalized by the post-present hook when the deadline
     /// passes (or by the `new_events` timer sweep if the screen goes idle).
     video_rec: Option<VideoRec>,
+    /// Exactly one finalized VIDEO dump may own the one-shot encoder. This
+    /// closes the recording→export gap where repeated requests could otherwise
+    /// spawn unbounded concurrent PNG workers and leave a partial dump on exit.
+    video_export: Arc<VideoExportState>,
     /// Shared optional pointer to the frontmost window's focused terminal capability,
     /// kept in sync by `sync_active_session` so control follows tab/view focus. Its
     /// payload is `None` for native focus or no front window; the cheap handle itself
@@ -7130,7 +7680,7 @@ struct App {
     /// Introspection-only per-window GPU state for the snapshot / `image` readback
     /// path ([`Backend::render_input`]). The GPU readback renders into an offscreen
     /// it owns; this is that offscreen's home, kept SEPARATE from any window's
-    /// on-glass present `window_gpu` so a snapshot/`image` never perturbs a
+    /// application-present `window_gpu` so a snapshot/`image` never perturbs a
     /// window's scissor/dirty-gate caches. Inert on the CPU backend. Reset to a
     /// fresh `WindowGpu` whenever the GPU device is rebuilt ([`Self::rebuild_backend`]),
     /// since the old offscreen lived on the now-dropped device.
@@ -7287,7 +7837,6 @@ struct App {
     handoff_reader_gate: Option<crate::spawn::DeferredReaderGate>,
     /// Authenticated expected set for the v0.52/v0.53 one-channel parent bridge.
     /// `Some` only when READY exists but COMMIT does not.
-    handoff_legacy_expected: Option<Vec<(u64, i32, i32)>>,
     handoff_legacy_parent_build: Option<u64>,
     /// Incoming overlap child is readerless and must not structurally mutate or
     /// quit between ProofReady and Commit. Cleared only by legacy success or the
@@ -7590,6 +8139,15 @@ struct App {
     auto_apply_manual_only: Option<AutoApplyManualOnly>,
     /// Bounded activity-revoked overlap re-attempt budget; see [`AutoOverlapRetry`].
     auto_overlap_retry: Option<AutoOverlapRetry>,
+    /// Physical-handoff-failure retry budget for one exact artifact, keyed by
+    /// (build, dmg) exactly like [`AutoOverlapRetry`] and reusing its shape.
+    ///
+    /// Kept SEPARATE from `auto_apply_manual_only` on purpose: the latch is
+    /// cleared when it lapses, so a counter stored inside it would reset on every
+    /// lapse and the "two tries then stop" budget would become an unbounded
+    /// ten-minute retry loop. This field deliberately survives
+    /// `lapse_expired_auto_apply_manual_only`, so the budget actually converges.
+    auto_apply_physical_retry: Option<AutoOverlapRetry>,
     /// PRE-PARK staged-candidate verification (seamless seam 1, hoisted 2026-07).
     ///
     /// `codesign --deep --strict` over the whole staged `.app` plus two
@@ -7668,6 +8226,12 @@ struct App {
     /// The soft shed envelope's value at the moment of the last latch flip, so
     /// a mid-fade flip continues from where it was instead of jumping.
     perf_env_at_flip: f32,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        let _ = self.video_abort_app_shutdown();
+    }
 }
 
 impl App {
@@ -7798,7 +8362,6 @@ impl App {
         self.handoff_degraded = true;
         self.handoff_ready.take();
         self.handoff_commit.take();
-        self.handoff_legacy_expected.take();
         if let Some(gate) = self.handoff_reader_gate.take() {
             self.stop_prepared_handoff_readers(&gate);
         }
@@ -8031,8 +8594,20 @@ impl App {
         {
             window.request_redraw();
         }
+        if rec.cancel.is_cancelled() {
+            fail_video_request(&rec.reply, rec.dir, "recording request was cancelled");
+            return;
+        }
         match take {
             Some(take) => {
+                let Some(permit) = self.video_export.try_begin(rec.cancel.clone()) else {
+                    fail_video_request(
+                        &rec.reply,
+                        rec.dir,
+                        "the preceding recording is still exporting",
+                    );
+                    return;
+                };
                 self.submit_encode_job(crate::app_introspect::EncodeJob::VideoDump {
                     take,
                     mode: rec.mode,
@@ -8040,12 +8615,16 @@ impl App {
                     started_us: rec.started_us,
                     dir: rec.dir,
                     reply: rec.reply,
+                    cancel: rec.cancel,
+                    permit,
                 });
             }
             None => {
-                let _ = rec
-                    .reply
-                    .send("ERR video: recording lost (window closed or device loss)\n".into());
+                fail_video_request(
+                    &rec.reply,
+                    rec.dir,
+                    "recording lost (window closed or device loss)",
+                );
             }
         }
     }
@@ -8071,9 +8650,113 @@ impl App {
         {
             window.request_redraw();
         }
-        let _ = rec
-            .reply
-            .send("ERR video: recording aborted by GPU device loss\n".into());
+        fail_video_request(&rec.reply, rec.dir, "recording aborted by GPU device loss");
+        true
+    }
+
+    /// Abort one recording before an irreversible owner transition destroys its
+    /// target. When the tap is still reachable, drain/discard it first; then
+    /// remove the server-minted output dir and answer the blocked client.
+    fn video_abort_before_owner_loss(
+        &mut self,
+        target: Option<WindowId>,
+        reason: &'static str,
+        drain_tap: bool,
+    ) -> bool {
+        let Some(observed) = self.video_rec.as_ref() else {
+            return false;
+        };
+        if target.is_some_and(|window| observed.window != window) {
+            return false;
+        }
+        let rec = self
+            .video_rec
+            .take()
+            .expect("recording was observed immediately above");
+        if drain_tap
+            && let (Some(gpu), Some(ws)) =
+                (self.backend.gpu_mut(), self.windows.get_mut(&rec.window))
+            && let Some(
+                PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
+            ) = &mut ws.present
+        {
+            let _ = gpu.video_finish(window_gpu);
+        }
+        if let Some(ws) = self.windows.get_mut(&rec.window)
+            && matches!(ws.present, Some(PresentTarget::Virtual { .. }))
+        {
+            ws.present = None;
+        }
+        fail_video_request(&rec.reply, rec.dir, reason);
+        true
+    }
+
+    pub(crate) fn video_abort_window_close(&mut self, window: WindowId) -> bool {
+        self.video_abort_before_owner_loss(
+            Some(window),
+            "recording aborted because its window closed",
+            true,
+        )
+    }
+
+    pub(crate) fn video_abort_backend_rebuild(&mut self) -> bool {
+        self.video_abort_before_owner_loss(
+            None,
+            "recording aborted by renderer backend rebuild",
+            true,
+        )
+    }
+
+    pub(crate) fn video_abort_app_shutdown(&mut self) -> bool {
+        self.video_export.cancel();
+        self.video_abort_before_owner_loss(None, "recording aborted by application shutdown", false)
+    }
+
+    /// Abort a windowed raw swapchain recording before a live opacity change
+    /// makes its client-frame bytes incomplete. The platform compositor owns
+    /// the backdrop behind a translucent client; continuing the tap would
+    /// publish plausible but incomplete app-owned frames.
+    ///
+    /// This runs synchronously on the event-loop thread before the new opacity
+    /// reaches the renderer. Draining and discarding the tap clears its bounded
+    /// GPU state; no partial `index.json` is ever submitted.
+    pub(crate) fn video_abort_translucent_swapchain(
+        &mut self,
+        background_opacity: f32,
+        compositor_blends_client: bool,
+    ) -> bool {
+        let Some(rec) = self.video_rec.as_ref() else {
+            return false;
+        };
+        if !video_capture_opacity_requires_abort(
+            rec.mode,
+            background_opacity,
+            compositor_blends_client,
+        ) {
+            return false;
+        }
+
+        let rec = self
+            .video_rec
+            .take()
+            .expect("recording was observed immediately above");
+        if let (Some(gpu), Some(ws)) = (self.backend.gpu_mut(), self.windows.get_mut(&rec.window))
+            && let Some(PresentTarget::Gpu { window_gpu, .. }) = &mut ws.present
+        {
+            let _ = gpu.video_finish(window_gpu);
+        }
+        if let Some(window) = self
+            .windows
+            .get(&rec.window)
+            .and_then(|window| window.os_window.as_ref())
+        {
+            window.request_redraw();
+        }
+        fail_video_request(
+            &rec.reply,
+            rec.dir,
+            format!("recording aborted: {TRANSLUCENT_CAPTURE_ERROR}"),
+        );
         true
     }
 
@@ -8292,7 +8975,49 @@ impl App {
         self.visible_leaf_plan_for_tab(wid, tab)
     }
 
-    fn active_tab_has_native(&self, wid: WindowId) -> bool {
+    /// Select the one renderer/capture route from the exact visible plan.
+    ///
+    /// Every planned identity is resolved before a route is returned. An empty
+    /// or stale plan fails closed rather than falling back to a parked terminal
+    /// projection or a hidden native sibling.
+    pub(crate) fn active_visible_content_route(
+        &self,
+        wid: WindowId,
+    ) -> Option<VisibleContentRoute> {
+        let plan = self.active_visible_leaf_plan(wid)?;
+        let [only] = plan.leaves.as_slice() else {
+            if plan.leaves.is_empty() {
+                return None;
+            }
+            let mut has_native = false;
+            for leaf in &plan.leaves {
+                match self.view_store.get(leaf.view).copied()? {
+                    tab_model::View::Terminal(_) => {}
+                    tab_model::View::Native(_) => has_native = true,
+                }
+            }
+            return Some(if has_native {
+                VisibleContentRoute::Heterogeneous
+            } else {
+                VisibleContentRoute::Terminal { composed: true }
+            });
+        };
+
+        Some(match self.view_store.get(only.view).copied()? {
+            tab_model::View::Terminal(_) => VisibleContentRoute::Terminal {
+                composed: plan.zoomed,
+            },
+            tab_model::View::Native(native) => VisibleContentRoute::Native {
+                instance: native.instance,
+                view: only.view,
+            },
+        })
+    }
+
+    /// Root-inventory predicate for invalidating retained native state,
+    /// including a leaf currently hidden by pane zoom. Paint/capture dispatch
+    /// must use [`Self::active_visible_content_route`] instead.
+    fn active_tab_contains_native(&self, wid: WindowId) -> bool {
         self.windows
             .get(&wid)
             .and_then(|ws| ws.tab_set.active())
@@ -8601,10 +9326,10 @@ impl App {
     }
 
     /// FOCUS-BOOST (Windows QoS): recompute WHICH sessions deserve the
-    /// focus-linked shell priority boost — every pane session in the ACTIVE
-    /// tab of every FOCUSED window (ALL panes of the visible tab: both halves
-    /// of a split should echo instantly; background tabs and unfocused windows
-    /// drop back to NORMAL) — and apply only the DELTA against the currently
+    /// focus-linked shell priority boost — every actually visible pane session
+    /// in the ACTIVE tab of every FOCUSED window (both halves of an unzoomed
+    /// split, but only the focused leaf while zoomed; background tabs and
+    /// unfocused windows drop back to NORMAL) — and apply only the DELTA against the currently
     /// boosted set, so focus flaps and tab drags cost zero syscalls when
     /// nothing changed. Piggybacks on the [`Self::recompute_notify_suppress`]
     /// call sites (any focus or active-tab change) plus config reload.
@@ -8626,13 +9351,13 @@ impl App {
             // foreground apps, the exact inversion this lane exists to
             // prevent. No OS surface ⇒ no user looking ⇒ no boost.
             self.windows
-                .values()
-                .filter(|ws| ws.focused && ws.os_window.is_some())
-                .filter_map(|ws| ws.tab_set.active())
-                .flat_map(|tab| tab.root.leaves())
+                .iter()
+                .filter(|(_, ws)| ws.focused && ws.os_window.is_some())
+                .filter_map(|(wid, _)| self.active_visible_leaf_plan(*wid))
+                .flat_map(|plan| plan.leaves)
                 .filter_map(|view| {
                     self.view_store
-                        .get(view)
+                        .get(view.view)
                         .copied()
                         .and_then(tab_model::View::terminal_session)
                 })
@@ -8891,6 +9616,7 @@ impl App {
             session_factory,
             proxy: None,
             video_rec: None,
+            video_export: Arc::new(VideoExportState::default()),
             active_handle,
             store,
             subscribers,
@@ -8950,7 +9676,6 @@ impl App {
             handoff_ready: None,
             handoff_commit: None,
             handoff_reader_gate: None,
-            handoff_legacy_expected: None,
             handoff_legacy_parent_build: None,
             incoming_handoff_pending: false,
             handoff_degraded: false,
@@ -8993,6 +9718,7 @@ impl App {
             auto_apply_intent: None,
             auto_apply_manual_only: None,
             auto_overlap_retry: None,
+            auto_apply_physical_retry: None,
             handoff_preverified: std::sync::Arc::default(),
             pending_update_handoff: None,
             update_handoff_activity_epoch: 0,
@@ -9069,16 +9795,22 @@ impl App {
         }
     }
 
-    /// Sparkle-words v3 §1.1 reset table: `pane-space / split change →
-    /// transient reset()`. A pane-space change re-arranges the window's
-    /// composite grid wholesale (words jump panes/rows), so the per-window
-    /// effects engine drops its occurrence/episode state while KEEPING
-    /// `done_marks` — finished one-shots re-enter born-done instead of
-    /// replaying. Called at every main-thread pane-space mutation site
-    /// (split / zoom toggle); a stale/unknown `wid` is a silent no-op.
+    /// Retire the effect state of panes this window no longer shows.
+    ///
+    /// This USED to wipe the whole window's episodes, which under per-pane
+    /// state would kill the untouched pane's cats on every split. It is also
+    /// unnecessary: a split or divider drag changes each affected pane's own
+    /// column count, and the engine's existing `cols_changed → settle_until`
+    /// rule already makes births in that window born-settled. What remains is
+    /// the eviction — closing a pane must not leave its episodes (or its
+    /// `done_marks`) resident. Called at every main-thread pane-space mutation
+    /// site (split / zoom toggle); a stale/unknown `wid` is a silent no-op.
     fn reset_pane_space_decorations(&mut self, wid: WindowId) {
+        let Some(live) = self.active_tree(wid).map(|tree| tree.sessions()) else {
+            return;
+        };
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.word_decos.reset();
+            ws.word_decos.retain_panes(|s| live.contains(&s));
         }
     }
 
@@ -9119,8 +9851,10 @@ impl App {
                 let synced = self.sync_tab_model_from_layout(owner, active);
                 debug_assert!(synced);
             }
-            // Pane-space changed (zoom hides/reveals split siblings): the
-            // sparkle engine takes its v3 §1.1 transient reset.
+            // Pane-space changed (zoom hides/reveals split siblings). Zoom
+            // removes no pane, so nothing is evicted: a zoomed-away sibling
+            // keeps its episodes and unzooms with its cats intact, and the
+            // zoomed pane's own width change arms its own resize settle.
             self.reset_pane_space_decorations(owner);
             self.resize_panes(owner);
             self.sync_window(owner);
@@ -9213,8 +9947,10 @@ impl App {
                     let synced = self.sync_tab_model_from_layout(owner, active);
                     debug_assert!(synced);
                 }
-                // Pane-space changed (a new split re-arranges the composite
-                // grid): the sparkle engine takes its v3 §1.1 transient reset.
+                // A new split adds a pane; it removes none, so the existing
+                // pane keeps its episodes (owner ruling, 2026-07-28 — splitting
+                // must not kill the cats you were already watching). Each
+                // affected pane's own width change arms its own settle.
                 self.reset_pane_space_decorations(owner);
                 // Size every pane in the active tab to its new sub-rect (the original
                 // pane shrank to half; the new pane gets the other half).
@@ -9239,7 +9975,7 @@ impl App {
     fn windows_displaying(&self, session: u64) -> impl Iterator<Item = WindowId> + '_ {
         self.windows
             .iter()
-            .filter(move |(_, ws)| active_tab_contains_session(ws, &self.view_store, session))
+            .filter(move |(_, ws)| active_tab_displays_session(ws, &self.view_store, session))
             .map(|(wid, _)| *wid)
     }
 
@@ -9251,7 +9987,7 @@ impl App {
     fn is_visible_session(&self, id: u64) -> bool {
         self.windows
             .values()
-            .any(|ws| active_tab_contains_session(ws, &self.view_store, id))
+            .any(|ws| active_tab_displays_session(ws, &self.view_store, id))
     }
 
     /// The grid geometry a SHARED (Cmd-Shift-O, `views > 1`) session must be sized
@@ -9516,7 +10252,7 @@ impl App {
         let flashing: Vec<WindowId> = self
             .windows
             .iter()
-            .filter(|(_, ws)| active_tab_contains_session(ws, &self.view_store, session))
+            .filter(|(_, ws)| active_tab_displays_session(ws, &self.view_store, session))
             .map(|(wid, _)| *wid)
             .collect();
         for wid in flashing {
@@ -9545,9 +10281,10 @@ impl App {
     /// shifts it down by the strip). Feature-independent so BOTH publishers (AppKit
     /// NSAccessibility, AccessKit) build byte-identical text. `None` for an unknown window.
     ///
-    /// INTENTIONAL WYSIWYG: the snapshot is the COMPOSED frame's terminal cells, so a
-    /// screen reader hears exactly what is on glass — including any speculative glyphs from
-    /// predictive local echo. Under the default Adaptive mode predictions display only on a
+    /// INTENTIONAL SEMANTIC PARITY: the screen reader receives the same composed
+    /// terminal-cell projection used as application-render input, including speculative
+    /// glyphs from predictive local echo. This does not prove compositor or scanout state.
+    /// Under the default Adaptive mode predictions display only on a
     /// slow link AFTER an echo is confirmed, so what is announced is essentially always what
     /// the program echoed; the opt-in `predictive_echo = always` mode's "unsafe at a
     /// password prompt" tradeoff is mitigated by keeping it non-default, not by diverging
@@ -9966,7 +10703,6 @@ impl App {
             return;
         };
         let commit = self.handoff_commit.take();
-        let legacy_expected = self.handoff_legacy_expected.take();
         #[cfg(unix)]
         {
             let adopted: Vec<(u64, i32, i32)> = self
@@ -9978,29 +10714,6 @@ impl App {
                         .map(|local_id| (local_id, session.master, session.pid))
                 })
                 .collect();
-            if let Some(expected) = legacy_expected {
-                let actual = adopted;
-                let child_build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
-                if !crate::seamless::activate_legacy_bridge(
-                    ready,
-                    &reader_gate,
-                    actual.clone(),
-                    expected,
-                    child_build,
-                    self.handoff_legacy_parent_build,
-                    std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some(),
-                ) {
-                    self.handoff_degraded = true;
-                    self.stop_prepared_handoff_readers(&reader_gate);
-                    return;
-                }
-                aterm_log::info!(
-                    "overlap handoff: exact legacy adoption for {} PTY(s) signaled; releasing prepared readers",
-                    actual.len()
-                );
-                self.incoming_handoff_pending = false;
-                return;
-            }
             let Some(commit) = commit else {
                 self.handoff_degraded = true;
                 self.stop_prepared_handoff_readers(&reader_gate);
@@ -10437,6 +11150,16 @@ impl ApplicationHandler<Wake> for App {
         if !matches!(cause, StartCause::Init) {
             crate::watchdog::beat(crate::watchdog::Breadcrumb::NewEvents);
         }
+        // The blocking control handler owns a drop guard for its request. A
+        // timeout/unwind flips this shared token; retire the tap on the next
+        // event-loop turn instead of exporting bytes for an absent client.
+        if self
+            .video_rec
+            .as_ref()
+            .is_some_and(|recording| recording.cancel.is_cancelled())
+        {
+            self.video_finalize();
+        }
         // A `WaitUntil` deadline fired: a bell-flash end and/or a blink tick. On a
         // single `ResumeTimeReached` wake, several windows' deadlines may have
         // passed at once, so service EVERY window (not just the frontmost).
@@ -10605,10 +11328,10 @@ impl ApplicationHandler<Wake> for App {
                 // PHOSPHOR rain tick: re-present so the field advances/drains.
                 // Disarm here; `about_to_wait` re-arms iff the engine is still
                 // active after the redraw decayed it (drained ⇒ pure Wait).
-                if ws.front_terminal().is_none() {
-                    // Native content freezes the retained engine and consumes
-                    // no rain wake, even if a terminal-era deadline was already
-                    // queued before the canonical front switched.
+                if ws.front_terminal().is_none() || ws.is_split() {
+                    // Native or composed content freezes the retained
+                    // single-pane engine and consumes no rain wake, even if a
+                    // prior eligible frame had already queued the deadline.
                     ws.next_rain_tick = None;
                 } else if ws.next_rain_tick.is_some_and(|d| now >= d) {
                     ws.next_rain_tick = None;
@@ -11160,7 +11883,9 @@ impl ApplicationHandler<Wake> for App {
             // pixels to exact bytes must still present on the unfocused window.
             let now = Instant::now();
             let terminal_front = ws.front_terminal().is_some();
-            let fade_wake = terminal_front && (ws.fade_shown || ws.stream_fade.is_active(now));
+            let fade_wake = terminal_front
+                && !ws.is_split()
+                && (ws.fade_shown || ws.stream_fade.is_active(now));
             if ws.os_window.is_some() && ws.terminal_effect_frame_active(now, cursor_cat_motion) {
                 let aurora_interval = ws
                     .frame_interval
@@ -11173,10 +11898,6 @@ impl ApplicationHandler<Wake> for App {
                 // gate dedups the imperceptible frames, so a keypress never lands
                 // behind a needless 60 fps re-tick. Any moving light or other
                 // effect keeps the full frame cadence.
-                // Split layouts fold only the compose-ticked engines (the
-                // `cursor_fx_active` split law): a latched single-pane-only
-                // engine must not force the full cadence onto a split frame
-                // it can never appear in.
                 let cursor_dependents =
                     ws.cursor_dependents_need_frame_cadence(now, cursor_cat_motion);
                 debug_assert_eq!(
@@ -11936,7 +12657,7 @@ impl ApplicationHandler<Wake> for App {
                 let frame_interval = self.frame_interval; // read before borrowing windows
                 let view_store = &self.view_store;
                 for ws in self.windows.values_mut() {
-                    if !active_tab_contains_session(ws, view_store, session) {
+                    if !active_tab_displays_session(ws, view_store, session) {
                         continue;
                     }
                     // Keep the effects' birth clock honest even in headless mode,
@@ -12108,13 +12829,15 @@ impl ApplicationHandler<Wake> for App {
                 fps,
                 budget_bytes,
                 dir,
+                cancel,
                 reply,
             } => {
-                let fail = |reply: &std::sync::mpsc::Sender<String>, m: &str| {
-                    let _ = reply.send(format!("ERR video: {m}\n"));
-                };
-                if self.video_rec.is_some() {
-                    fail(&reply, "a recording is already in progress");
+                if self.video_rec.is_some() || self.video_export.is_busy() {
+                    fail_video_request(
+                        &reply,
+                        dir,
+                        "a recording or recording export is already in progress",
+                    );
                 } else if let Some(wid) = self.frontmost_window {
                     let opts = aterm_gpu::video_tap::CaptureOpts {
                         half_res: !full_res,
@@ -12134,7 +12857,14 @@ impl ApplicationHandler<Wake> for App {
                             matches!(ws.present, Some(PresentTarget::Gpu { .. }))
                         }),
                         self.backend.is_gpu(),
-                    );
+                    )
+                    .and_then(|mode| {
+                        video_capture_translucency_guard(
+                            mode,
+                            self.render_knobs.background_opacity,
+                            cfg!(target_os = "macos"),
+                        )
+                    });
                     let began: Result<VideoMode, String> = match mode {
                         Err(m) => Err(m.into()),
                         Ok(VideoMode::SwapchainTap) => {
@@ -12195,7 +12925,6 @@ impl ApplicationHandler<Wake> for App {
                                 started_us: crate::metrics::now_us(),
                                 keys,
                                 key_log: Vec::new(),
-                                pace,
                                 mode,
                                 // The offscreen loop's sole redraw driver: due
                                 // NOW, so `about_to_wait` arms WaitUntil(now)
@@ -12205,9 +12934,9 @@ impl ApplicationHandler<Wake> for App {
                                 // moment the RepaintKey early-out skips one
                                 // unchanged frame (the hook never runs), so the
                                 // sweep is the pacing driver that cannot starve.
-                                next_frame: (mode == VideoMode::OffscreenPresentReal || pace)
-                                    .then_some(now),
+                                next_frame: video_initial_next_frame(mode, pace, now),
                                 dir,
+                                cancel,
                                 reply,
                             });
                             // BASELINE KEYFRAME: the RepaintKey early-out is
@@ -12231,10 +12960,10 @@ impl ApplicationHandler<Wake> for App {
                                 w.request_redraw();
                             }
                         }
-                        Err(e) => fail(&reply, &e),
+                        Err(e) => fail_video_request(&reply, dir, e),
                     }
                 } else {
-                    fail(&reply, "no window");
+                    fail_video_request(&reply, dir, "no window");
                 }
             }
             // Observe the in-flight recording without touching it — one cheap line so
@@ -12262,7 +12991,10 @@ impl ApplicationHandler<Wake> for App {
                             rec.mode.as_str()
                         )
                     }
-                    None => "OK recording=false\n".to_string(),
+                    None if self.video_export.is_busy() => {
+                        "OK recording=false exporting=true\n".to_string()
+                    }
+                    None => "OK recording=false exporting=false\n".to_string(),
                 };
                 let _ = reply.send(line);
             }
@@ -12385,22 +13117,28 @@ impl ApplicationHandler<Wake> for App {
                 };
                 let _ = reply.send(ok);
             }
-            // The `window` verb wants the frontmost window's ENTIRE on-screen pixels
-            // (OS chrome + content) as a PNG. Only the main thread may touch AppKit
-            // and read the window number, so the photograph happens HERE; the PNG
-            // encode + confined write + the reply (dims or a clear error) come from
-            // the encode worker, post-write. A dropped receiver (dead client) just
-            // makes send() fail; ignore.
-            Wake::CaptureWindow { path, reply } => {
-                self.capture_window(path, reply);
+            // The `window` verb produces a full front-window artifact: platform
+            // chrome stitched around the exact submitted client destination. It
+            // does not claim compositor visibility or scanout. Only the main thread
+            // may touch AppKit and read the window number, so the chrome photograph
+            // happens HERE; the PNG encode + confined write + reply (dims or a clear
+            // error) come from the encode worker, post-write. A dropped receiver
+            // (dead client) just makes send() fail; ignore.
+            Wake::CaptureWindow {
+                path,
+                cancel,
+                reply,
+            } => {
+                self.capture_window(path, cancel, reply);
             }
             // Capture an own-rendered auxiliary surface through the confined image path.
             Wake::CaptureAuxWindow {
                 target,
                 path,
+                cancel,
                 reply,
             } => {
-                self.capture_aux_window(target, path, reply);
+                self.capture_aux_window(target, path, cancel, reply);
             }
             // Dump an auxiliary surface's controls. Native Settings compiles its
             // exact semantic tree; the remaining compatibility surfaces use their
@@ -13167,13 +13905,16 @@ mod cg_capture {
         pub fn CGImageGetHeight(image: CGImageRef) -> usize;
         pub fn CGImageRelease(image: CGImageRef);
 
-        /// Make a device-RGB colour space for the destination bitmap context.
-        pub fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
+        /// Create the explicitly named destination colour space
+        /// (`kCGColorSpaceSRGB` for canonical full-window capture).
+        //
         // `platform::layer_colorspace` also declares this symbol, spelling the
         // opaque pointer as `*mut CGColorSpace` (it needs the named struct for
         // objc encoding) where this module uses `*mut c_void`. Both are the
         // published one-pointer-argument signature — ABI-identical — so the
         // clash the lint reports is a Rust-type spelling difference only.
+        #[allow(clashing_extern_declarations)]
+        pub fn CGColorSpaceCreateWithName(name: *const c_void) -> CGColorSpaceRef;
         #[allow(clashing_extern_declarations)]
         pub fn CGColorSpaceRelease(space: CGColorSpaceRef);
 
@@ -13385,7 +14126,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // checkpoint, so the swap is visually continuous, not just process-continuous.
     let incoming_handoff = seamless::take_incoming();
     let seamless_nonce = incoming_handoff.nonce.clone();
-    let seamless_expected = incoming_handoff.expected.clone();
     let seamless_layout = incoming_handoff.layout.clone();
     // BOTH digests come from `take_incoming`, which computed them over the exact
     // bytes it consumed from the outgoing process. Recomputing either one here
@@ -13397,7 +14137,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // computed, so a wrong-build candidate refuses loudly instead of silently
     // producing a digest the parent cannot match.
     let seamless_target = seamless::take_target_identity();
-    let seamless_legacy_layout_bridge = incoming_handoff.legacy_layout_bridge;
     let seamless_window = incoming_handoff.window;
     let mut seamless_adopt: Vec<crate::spawn::Adopted> = incoming_handoff.adopted;
     // OVERLAP HANDOFF: the parked parent's readiness-pipe write fd (consume +
@@ -13428,17 +14167,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         ready_raw_fd,
         incoming_exec_fds.parent_pid(),
     );
-    let (handoff_ready, mut handoff_commit, handoff_legacy_expected, overlap_degraded) =
+    let (handoff_ready, mut handoff_commit, overlap_degraded) =
         match (ready, commit) {
-            (Some(ready), Some(commit)) => (Some(ready), Some(commit), None, false),
-            (Some(ready), None)
-                if !commit_env_present
-                    && seamless_legacy_layout_bridge
-                    && seamless_expected.is_some() =>
-            {
-                (Some(ready), None, seamless_expected, false)
-            }
-            _ => (None, None, None, overlap_channels_present),
+            (Some(ready), Some(commit)) => (Some(ready), Some(commit), false),
+            _ => (None, None, overlap_channels_present),
         };
     let handoff_reader_gate = handoff_ready
         .is_some()
@@ -14136,13 +14868,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 config.cursor_trail_bloom_radius_or_default(),
             );
             // Heat shimmer above burning cells (bloom parity class), applied
-            // headless too so on-glass == introspection.
+            // through the same effect-source path in headless introspection.
             g.set_shimmer(
                 !config.serious_mode_or_default() && config.cursor_fire_shimmer_or_default(),
             );
             // M3 phase B: the EDR cursor glow opt-in (default off), applied to the
-            // headless offscreen too so on-glass == introspection. The windowed
-            // path applies it in `finalize_backend` at the deferred-join.
+            // headless offscreen too so the deterministic app-render artifact
+            // carries the same semantic effect. The windowed path applies it in
+            // `finalize_backend` at the deferred-join.
             g.set_hdr_glow(config.hdr_glow_or_default());
             // SDR twin: the swapchain-side crown budget for non-HDR desktops
             // (inert headless — there is no swapchain — but kept in lockstep).
@@ -14434,6 +15167,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         session_factory,
         proxy: Some(proxy.clone()),
         video_rec: None,
+        video_export: Arc::new(VideoExportState::default()),
         active_handle,
         store,
         subscribers,
@@ -14503,7 +15237,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         handoff_ready,
         handoff_commit,
         handoff_reader_gate,
-        handoff_legacy_expected,
         handoff_legacy_parent_build: updated_from,
         incoming_handoff_pending: overlap_channels_present && adopting,
         handoff_degraded: overlap_degraded,
@@ -14558,6 +15291,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         auto_apply_intent: None,
         auto_apply_manual_only: None,
         auto_overlap_retry: None,
+        auto_apply_physical_retry: None,
         handoff_preverified: std::sync::Arc::default(),
         pending_update_handoff: None,
         update_handoff_activity_epoch: 0,
@@ -14626,6 +15360,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // a named main-loop root even in a stripped release.
     watchdog::start();
     event_loop.run_app(&mut app).expect("run");
+    // The event loop is gone: no recording can produce another present or
+    // completion. Answer its client and remove the pre-created directory before
+    // the deliberate `mem::forget(app)` final-exit seam.
+    let _ = app.video_abort_app_shutdown();
+    // A finalized take may already be on its one-shot encoder. Cancellation is
+    // cooperative between frames; do not cross the deliberate process-exit seam
+    // until that worker has acknowledged by dropping its permit (which also
+    // guarantees the unpublished directory was removed). The periodic notice is
+    // diagnostic only: graceful exit continues waiting rather than knowingly
+    // abandoning a writer in a partial export.
+    while !app
+        .video_export
+        .wait_idle(std::time::Duration::from_secs(120))
+    {
+        eprintln!("aterm-gui: still waiting for the cancelled video export to clean up");
+    }
     // Graceful-exit Kitty Log flush (§F4.4): merge any un-debounced sighting
     // delta into `kitty-log.toml` INLINE — past the event loop, blocking is
     // fine, and a detached writer thread might not get to finish. Best-effort
@@ -15432,7 +16182,10 @@ mod overlap_handoff_tests {
         let read = unsafe { libc::read(ready_rd, byte.as_mut_ptr().cast(), 1) };
         assert_eq!(read, 0, "parent observes EOF on rejected proof channel");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
+            // The regression this discriminates resolves after FIFTEEN seconds, so 5s
+            // still separates them by 3x while surviving a preemption. 100ms wrapped a
+            // syscall and measured the scheduler.
+            started.elapsed() < std::time::Duration::from_secs(5),
             "pre-Proof failure must resolve within one parent poll slice"
         );
         assert!(app.handoff_degraded);
@@ -17231,22 +17984,29 @@ mod multi_window_tests {
         assert!(app.structural_invariants_ok());
     }
 
-    /// Sparkle-words v3 §1.1 reset table (adversarial-review fix #9):
-    /// `pane-space / split change → transient reset()`. A pane-space change
-    /// (here: the zoom toggle on a split tab) must drop the per-window
-    /// effects engine's occurrence state — the composite grid re-arranged
-    /// wholesale — returning it to the needs-rescan fresh state.
+    /// A pane-space mutation RETIRES DEPARTED PANES ONLY.
+    ///
+    /// This replaces an older pin that asserted a zoom toggle wholesale-`reset()`s
+    /// the engine. That was the right rule while one engine described one grid;
+    /// with per-pane state (owner ruling, 2026-07-28 — every visible pane gets
+    /// the toys) it is actively wrong: zoom removes no pane, so wiping would kill
+    /// the cats in the pane you are zooming INTO, and in its hidden sibling, every
+    /// single time. Each affected pane's own width change arms its own resize
+    /// settle, which is what the reset was standing in for.
     #[test]
-    fn pane_space_change_transient_resets_word_decorations() {
+    fn pane_space_change_retires_only_departed_panes() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        let _sid = app.split_active_stub_tab(wid); // 2 panes: zoom can toggle
+        let sid = app.split_active_stub_tab(wid); // 2 panes: zoom can toggle
         app.recompute_sparkle();
         let (cfg, lexicon) = app
             .sparkle
             .as_ref()
             .map(|r| (r.cfg.clone(), r.lexicon.clone()))
             .expect("sparkle words default on");
+        let now = Instant::now();
+        // Scan BOTH panes into the engine, each bound to its own pane key —
+        // exactly what a composed frame does.
         let epoch = {
             let terminal = app
                 .front_terminal(wid)
@@ -17259,19 +18019,32 @@ mod multi_window_tests {
             let (rows, cols) = (ws.rows as usize, ws.cols as usize);
             let mut term = term_lock(&terminal);
             let epoch = term.damage_epoch();
-            ws.word_decos
-                .rescan(&term, rows, cols, &lexicon, &cfg, epoch, Instant::now());
+            for pane in [0u64, sid] {
+                ws.word_decos.bind_pane(pane, (0, 0));
+                ws.word_decos
+                    .rescan(&term, rows, cols, &lexicon, &cfg, epoch, now);
+            }
             epoch
         };
         assert!(
             !app.windows[&wid].word_decos.needs_rescan(epoch),
-            "the engine is scanned at this epoch"
+            "the bound pane is scanned at this epoch"
         );
-        // The pane-space mutation (zoom toggle) takes the transient reset.
+        // ZOOM removes no pane, so nothing is retired: the still-live pane keeps
+        // its scan (and its episodes) straight through the toggle.
         app.toggle_pane_zoom();
         assert!(
+            !app.windows[&wid].word_decos.needs_rescan(epoch),
+            "a zoom toggle must not wipe a pane that is still in the layout"
+        );
+        // CLOSING a pane retires it. `sid` is the pane the loop left BOUND, so
+        // its departure is observable right here: the engine drops the live
+        // binding and falls back to needing a fresh scan.
+        app.toggle_pane_zoom(); // unzoom, so the close path runs on the real split
+        app.close_session(wid, sid);
+        assert!(
             app.windows[&wid].word_decos.needs_rescan(epoch),
-            "a pane-space change transient-resets the sparkle engine"
+            "the departed pane took its scan state with it"
         );
     }
 
@@ -19350,11 +20123,13 @@ mod present_retry_tests {
 
 #[cfg(test)]
 mod early_out_tests {
-    use super::{App, RepaintKey, SelectionFingerprint, WindowId};
+    use super::{App, Backend, RepaintKey, SelectionFingerprint, WindowId};
     use crate::app_render::{
         project_asymmetric_pad_layout_key, should_repaint, should_repaint_or_recover,
     };
+    use aterm_core::selection::{SelectionSide, SelectionType};
     use aterm_core::terminal::{CursorStyle, Terminal};
+    use aterm_render::{DamageOutcome, RenderInput};
 
     /// Build the `RepaintKey` for the current frame exactly as `redraw()` does:
     /// observe the damage epoch, the selection, and the supplied visual-only
@@ -19416,6 +20191,129 @@ mod early_out_tests {
             // `os_appearance_flip_repaints`).
             system_dark: false,
         }
+    }
+
+    /// `selection_inactive = true` is host state, not part of `RenderInput`, so a
+    /// focus flip must invalidate both GUI cache layers before the next present.
+    /// Prime the REAL per-window CPU renderer cache, drive the REAL `App::on_focus`
+    /// hook, and use an explicit inactive-background override (not an OSC-17-derived
+    /// colour) to prove the next raster contains the unfocused band and focus gain
+    /// restores the original pixels.
+    #[test]
+    fn explicit_inactive_selection_focus_flip_invalidates_and_repaints() {
+        const INACTIVE_BG: u32 = 0x0001_7AC4;
+
+        fn render_cached(app: &mut App, input: &RenderInput, inactive: bool) -> Vec<u32> {
+            app.backend.set_selection_inactive(inactive);
+            let App {
+                backend, windows, ..
+            } = app;
+            let Backend::Cpu(renderer) = backend.ready_mut() else {
+                panic!("headless test backend is CPU")
+            };
+            let ws = windows
+                .get_mut(&WindowId(0))
+                .expect("headless fixture window");
+            let _ = renderer.render_input_cached(&mut ws.cpu_cache, input);
+            ws.cpu_cache.frame_pixels().to_vec()
+        }
+
+        fn count_colour(pixels: &[u32], rgb: u32) -> usize {
+            pixels
+                .iter()
+                .filter(|pixel| **pixel & 0x00ff_ffff == rgb)
+                .count()
+        }
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.render_knobs.selection_inactive = true;
+        let Backend::Cpu(renderer) = app.backend.ready_mut() else {
+            panic!("headless test backend is CPU")
+        };
+        renderer.set_selection_inactive_bg(Some(INACTIVE_BG));
+
+        let mut term = Terminal::new(2, 3);
+        term.process(b"\x1b[?25lABC");
+        term.text_selection_mut()
+            .start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+        term.text_selection_mut()
+            .update_selection(0, 0, SelectionSide::Right);
+        term.text_selection_mut().complete_selection();
+        let input = term.cell_frame(2, 3);
+        assert!(
+            input.selection.contains(0, 0),
+            "fixture must select a visible cell"
+        );
+
+        let focused_pixels = render_cached(&mut app, &input, false);
+        assert_eq!(
+            count_colour(&focused_pixels, INACTIVE_BG),
+            0,
+            "the explicit inactive override is ignored while focused"
+        );
+        let _ = render_cached(&mut app, &input, false);
+        assert_eq!(
+            app.windows[&wid].cpu_cache.last_damage(),
+            DamageOutcome::GateHit,
+            "negative control: an identical focused frame really is cached"
+        );
+        let focused_key = frame_key(&mut term, true, false, None);
+        app.windows
+            .get_mut(&wid)
+            .expect("headless fixture window")
+            .stamp_present_decision(focused_key);
+
+        app.on_focus(wid, false);
+        assert!(
+            app.windows[&wid].last_present.is_none(),
+            "focus loss invalidates the GUI repaint gate"
+        );
+        assert_eq!(
+            app.windows[&wid].cpu_cache.last_damage(),
+            DamageOutcome::Full,
+            "focus loss invalidates the per-window raster cache"
+        );
+        let inactive = app.render_knobs.selection_inactive && !app.windows[&wid].focused;
+        assert!(
+            inactive,
+            "configured unfocused state reaches the present fold"
+        );
+        let inactive_pixels = render_cached(&mut app, &input, inactive);
+        assert_ne!(
+            inactive_pixels, focused_pixels,
+            "focus loss visibly recolours the selected cell"
+        );
+        assert!(
+            count_colour(&inactive_pixels, INACTIVE_BG) > 0,
+            "the next raster uses the explicit inactive-selection background"
+        );
+
+        let _ = render_cached(&mut app, &input, true);
+        assert_eq!(
+            app.windows[&wid].cpu_cache.last_damage(),
+            DamageOutcome::GateHit,
+            "the unfocused frame is cached before the reverse focus edge"
+        );
+        let unfocused_key = frame_key(&mut term, true, false, Some(CursorStyle::HollowBlock));
+        app.windows
+            .get_mut(&wid)
+            .expect("headless fixture window")
+            .stamp_present_decision(unfocused_key);
+
+        app.on_focus(wid, true);
+        assert!(app.windows[&wid].last_present.is_none());
+        assert_eq!(
+            app.windows[&wid].cpu_cache.last_damage(),
+            DamageOutcome::Full
+        );
+        let inactive = app.render_knobs.selection_inactive && !app.windows[&wid].focused;
+        assert!(!inactive);
+        let refocused_pixels = render_cached(&mut app, &input, inactive);
+        assert_eq!(
+            refocused_pixels, focused_pixels,
+            "focus gain restores the active-selection raster exactly"
+        );
     }
 
     /// Drive the ty-checked `AsymmetricPadLayout` cache actions against the real
@@ -19623,6 +20521,78 @@ mod early_out_tests {
             )
             .is_some(),
             "the shipping split early-out must not swallow recovery"
+        );
+    }
+
+    /// A zoomed split still routes through the compositor, but has exactly one
+    /// visible pane. Its live implicit background is therefore unambiguous and
+    /// must feed both the presented frame (including nonzero window padding) and
+    /// the damage-neutral `image` capture. Before this regression, both paths
+    /// left `default_bg` unset and exposed the static theme around a live
+    /// OSC 11/DECSCNM terminal.
+    #[test]
+    fn zoomed_split_live_and_capture_use_the_visible_panes_effective_background() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.split_active_stub_tab(wid);
+        app.toggle_pane_zoom();
+        app.backend.set_pad(7);
+
+        let terminal = app.front_terminal(wid).expect("focused pane").term.clone();
+        {
+            let mut term = crate::term_lock(&terminal);
+            term.process(
+                b"\x1b]21;cursor=\x07\x1b]10;rgb:a1/b2/c3\x07\x1b]11;rgb:12/34/56\x07\x1b[?5h",
+            );
+            assert_eq!(
+                term.cursor_color(),
+                None,
+                "the fixture selects OSC 21 dynamic cursor behavior"
+            );
+        }
+        let (rows, cols) = {
+            let ws = &app.windows[&wid];
+            (usize::from(ws.rows), usize::from(ws.cols))
+        };
+        assert!(
+            app.redraw_compose(
+                wid,
+                rows,
+                cols,
+                false,
+                false,
+                None,
+                0,
+                std::time::Instant::now(),
+            )
+            .is_some(),
+            "the zoomed compositor presents the live-color change"
+        );
+        assert_eq!(
+            app.windows[&wid].input_scratch.default_bg, 0x00A1_B2C3,
+            "DECSCNM makes OSC 10 the presented implicit/padding background"
+        );
+        assert_eq!(
+            app.windows[&wid].input_scratch.cursor_color, 0x00A1_B2C3,
+            "the split compositor resolves a dynamic cursor from live OSC 10"
+        );
+        assert_eq!(
+            app.windows[&wid].input_scratch.cursor_trail_color, 0x00A1_B2C3,
+            "the focused split wake follows the same effective cursor color"
+        );
+
+        let capture = app
+            .prepare_terminal_capture_grid(wid)
+            .expect("zoomed capture");
+        assert!(capture.composed);
+        assert_eq!(capture.leaves.len(), 1, "zoom exposes one split leaf");
+        assert_eq!(
+            app.windows[&wid].input_scratch.default_bg, 0x00A1_B2C3,
+            "image capture uses the same visible pane ground"
+        );
+        assert_eq!(
+            app.windows[&wid].input_scratch.cursor_color, 0x00A1_B2C3,
+            "zoomed capture preserves the focused pane's dynamic cursor color"
         );
     }
 
@@ -22362,8 +23332,8 @@ mod tab_strip_conformance {
 /// write only ever lands INSIDE the root, and a request resolving OUTSIDE is rejected
 /// with no write; the symlink-escape bug fails at `Buggy=TRUE`). This test ties that
 /// to the code that runs: it drives the genuine `control_auth::confine_image_path`
-/// (the control-thread check) plus `snapshot_path::write_private_at` (the main-thread
-/// writer) over BOTH an honest request and a planted final-component symlink that
+/// (the control-thread check) plus the retained-handle `ConfinedImage` writer over
+/// BOTH an honest request and a planted final-component symlink that
 /// re-points OUTSIDE the root, projects each onto the spec variables `<<linkOutside,
 /// decided, committed, target>>`, and asks the real `ty` binary to confirm each
 /// `Init -> Confine` transition is one the committed `PathConfine.tla`'s `Next`
@@ -22377,17 +23347,14 @@ mod tab_strip_conformance {
 ///
 /// `ty` is located by the same fixed canonical path search; absent `ty` the test
 /// FAILS (honesty ratchet, no skip path).
-// unix-only: the escape half plants a POSIX symlink and drives the openat-based
-// writer; the Windows writer has no dir-fd anchoring to conform (see
-// snapshot_path::write_private_at's Windows variant).
+// unix-only: the escape half plants a POSIX symlink; Windows has separate
+// reparse-point and handle-identity regression coverage.
 #[cfg(all(test, unix))]
 mod path_confine_conformance {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use crate::control_auth::confine_image_path;
-    use crate::snapshot_path::write_private_at;
-
     // VERIFICATION GATE (honesty ratchet, batteries-on) in `aterm_spec::verify`:
     // verification is always required — an absent Trust `ty` FAILS the test with a
     // build hint (`cargo build --release -p tla-cli` in $HOME/trust/first-party/ty).
@@ -22470,8 +23437,12 @@ mod path_confine_conformance {
         // --- HONEST request (linkOutside = FALSE): confine returns Some, the writer
         // COMMITS inside the root → committed=TRUE, target="inside".
         let confined = confine_image_path(&dir, "shot.png").expect("honest request must confine");
-        write_private_at(&confined.dir, &confined.file_name, b"\x89PNG\r\n\x1a\nstub")
+        let written = confined
+            .write_private(b"\x89PNG\r\n\x1a\nstub")
             .expect("write inside the root must succeed");
+        confined
+            .validate_for_reply(&written)
+            .expect("the confined path identity remains current");
         // The committed path is inside the CANONICAL images root (on macOS `/tmp` is a
         // symlink to `/private/tmp`, so compare against the canonicalized dir).
         let canon_images = std::fs::canonicalize(dir.join("images")).expect("canon images");
@@ -23189,7 +24160,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            116,
+            126,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -23223,7 +24194,7 @@ mod spec_xref_gate {
         assert_eq!(
             classify_spec_link(Some(1), &live_report),
             Some(SpecLinkDisposition::ExplicitDesignOnly),
-            "the real 100-machine DesignOnly report shape must classify honestly"
+            "the real 126-machine DesignOnly report shape must classify honestly"
         );
     }
 
@@ -24233,7 +25204,9 @@ mod spec_xref_gate {
 /// headlessly, like the pane-tree math in `pane.rs`.
 #[cfg(test)]
 mod compose_tests {
-    use crate::app_render::{blit_pane_into, divider_cell, fill_divider_grid, terminal_blank_cell};
+    use crate::app_render::{
+        blit_pane_into, divider_cell, fill_blank_pane_into, fill_divider_grid, terminal_blank_cell,
+    };
     use aterm_core::terminal::Terminal;
     use aterm_render::{RenderInput, Theme};
 
@@ -24257,15 +25230,83 @@ mod compose_tests {
         let theme = Theme::default();
         let seam = divider_cell(theme);
         let mut dst = RenderInput::empty();
-        // Sparkle effects are single-pane only: any ink left from a previous
-        // single-pane frame must be cleared by the compose fill.
+        // Every host-owned visual and present transform belongs to the frame
+        // that produced it. A single-pane -> split/native transition must not
+        // retain any of them in the reused window scratch.
         dst.ink.push(aterm_render::InkCell {
             row: 0,
             col: 0,
             color: [9, 9, 9],
         });
+        let atlas = std::sync::Arc::new(aterm_render::SceneAtlas {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 255, 255],
+            version: 1,
+        });
+        dst.cat_quads.push(aterm_render::SpriteQuad::default());
+        dst.cat_atlas = Some(std::sync::Arc::clone(&atlas));
+        dst.free_sprites
+            .push(aterm_core::render::FreeSprite::default());
+        dst.free_atlas = Some(std::sync::Arc::clone(&atlas));
+        dst.rain_quads.push(aterm_render::SpriteQuad::default());
+        dst.rain_atlas = Some(atlas);
+        dst.scroll_frac_px = 3;
+        dst.grid_top_row = 1;
+        dst.grid_bot_row = 3;
+        dst.base_y = 91;
+        dst.absolute_row_revision = 92;
+        dst.input_hot = true;
+        dst.selection.start_selection(
+            0,
+            0,
+            aterm_core::selection::SelectionSide::Left,
+            aterm_core::selection::SelectionType::Simple,
+        );
+        dst.selection
+            .update_selection(0, 1, aterm_core::selection::SelectionSide::Right);
+        dst.selection.complete_selection();
+        dst.selection_bg = 0x0012_3456;
+        dst.selection_fg = 0x0065_4321;
+        assert!(
+            dst.selection.has_selection(),
+            "fixture must seed stale selection state"
+        );
         fill_divider_grid(&mut dst, 3, 5, theme);
-        assert!(dst.ink.is_empty(), "compose path carries no ink");
+        assert!(dst.ink.is_empty(), "fill_divider_grid paints cells only");
+        assert!(
+            dst.cat_quads.is_empty(),
+            "compose path carries no stale cats"
+        );
+        assert!(dst.cat_atlas.is_none(), "compose path drops the cat atlas");
+        assert!(
+            dst.free_sprites.is_empty(),
+            "compose path carries no stale free sprites"
+        );
+        assert!(
+            dst.free_atlas.is_none(),
+            "compose path drops the free-sprite atlas"
+        );
+        assert!(
+            dst.rain_quads.is_empty(),
+            "compose path carries no stale rain sprites"
+        );
+        assert!(
+            dst.rain_atlas.is_none(),
+            "compose path drops the rain atlas"
+        );
+        assert_eq!(
+            (
+                dst.scroll_frac_px,
+                dst.grid_top_row,
+                dst.grid_bot_row,
+                dst.base_y,
+                dst.absolute_row_revision,
+                dst.input_hot,
+            ),
+            (0, 0, 0, 0, 0, false),
+            "compose fill neutralizes stale present transforms and metadata"
+        );
         assert_eq!(dst.rows, 3);
         assert_eq!(dst.cols, 5);
         assert_eq!(dst.cells.len(), 3);
@@ -24277,6 +25318,54 @@ mod compose_tests {
             );
         }
         assert!(!dst.cursor_visible);
+        assert!(
+            !dst.selection.has_selection(),
+            "divider-only frames carry no stale terminal selection"
+        );
+        assert_eq!(
+            (dst.selection_bg, dst.selection_fg),
+            (
+                aterm_core::render::COLOR_UNSET,
+                aterm_core::render::COLOR_UNSET,
+            ),
+            "divider-only frames carry no stale terminal selection colours"
+        );
+        assert!(
+            dst.line_size_spans.iter().all(Vec::is_empty),
+            "divider-only rows carry no pane geometry"
+        );
+        assert!(
+            dst.default_bg_spans.iter().all(Vec::is_empty),
+            "divider-only rows carry no pane background provenance"
+        );
+    }
+
+    /// Recomposition is a frame-hot path. Clearing the outer sparse channels
+    /// would drop every row's retained allocation and turn a stable split into
+    /// per-frame allocator churn; reset the existing inner rows in place.
+    #[test]
+    fn divider_grid_reuses_sparse_row_storage() {
+        let mut dst = RenderInput::empty();
+        dst.clusters = vec![Vec::with_capacity(7)];
+        dst.combining = vec![Vec::with_capacity(9)];
+        dst.images = vec![Vec::with_capacity(11)];
+        dst.line_size_spans = vec![Vec::with_capacity(13)];
+        dst.default_bg_spans = vec![Vec::with_capacity(15)];
+        let capacities = (
+            dst.clusters[0].capacity(),
+            dst.combining[0].capacity(),
+            dst.images[0].capacity(),
+            dst.line_size_spans[0].capacity(),
+            dst.default_bg_spans[0].capacity(),
+        );
+
+        fill_divider_grid(&mut dst, 1, 5, Theme::default());
+
+        assert_eq!(dst.clusters[0].capacity(), capacities.0);
+        assert_eq!(dst.combining[0].capacity(), capacities.1);
+        assert_eq!(dst.images[0].capacity(), capacities.2);
+        assert_eq!(dst.line_size_spans[0].capacity(), capacities.3);
+        assert_eq!(dst.default_bg_spans[0].capacity(), capacities.4);
     }
 
     /// An implicit blank is resolved from the pane's LIVE terminal defaults, not
@@ -24397,6 +25486,136 @@ mod compose_tests {
             aterm_render::row_is_uniform(&dst, 0),
             "the renderers must still see row 0 as uniform"
         );
+    }
+
+    /// Side-by-side terminals own independent DEC line modes, and panes are NOT
+    /// guaranteed to blit left-to-right. The DEC pane must record exactly one
+    /// bounded run over its own columns whichever order it lands in, so blit
+    /// order can never restore last-pane-wins state.
+    #[test]
+    fn blit_records_pane_local_line_size_spans() {
+        use aterm_core::grid::LineSize;
+        use aterm_core::render::LineSizeSpan;
+
+        let theme = Theme::default();
+        let (left, left_blank) = pane_snapshot("AB", 1, 2);
+        let mut right_term = Terminal::new(1, 2);
+        // Only set the row mode. On a 2-column DECDWL row there is one visible
+        // character position; feeding "CD" would legitimately wrap/scroll this
+        // one-row terminal and replace the row with a fresh SingleWidth line,
+        // invalidating the fixture before composition is exercised.
+        right_term.process(b"\x1b#6");
+        let mut right = RenderInput::empty();
+        right_term.cell_frame_into(&mut right, 1, 2);
+        let right_blank = terminal_blank_cell(&right_term);
+        assert_eq!(right.line_sizes, vec![LineSize::DoubleWidth]);
+
+        // Only the DEC pane records a run: a column no run claims already renders
+        // SingleWidth, which is exactly what the ordinary pane wants and is what
+        // keeps `blit_leaves_ordinary_splits_uniform`'s fast path free.
+        let expected = vec![LineSizeSpan::new(3, 5, LineSize::DoubleWidth)];
+        for reverse in [false, true] {
+            let mut dst = RenderInput::empty();
+            fill_divider_grid(&mut dst, 1, 5, theme);
+            if reverse {
+                blit_pane_into(&mut dst, &right, 0, 3, right_blank);
+                blit_pane_into(&mut dst, &left, 0, 0, left_blank);
+            } else {
+                blit_pane_into(&mut dst, &left, 0, 0, left_blank);
+                blit_pane_into(&mut dst, &right, 0, 3, right_blank);
+            }
+            assert_eq!(
+                dst.line_size_spans[0], expected,
+                "pane spans are stable regardless of blit order"
+            );
+            assert_eq!(
+                dst.line_sizes,
+                vec![LineSize::DoubleWidth],
+                "the row-level value survives only as the summary `some pane on \
+                 this row is a DEC line` — placement reads the runs"
+            );
+            assert_eq!(
+                dst.line_size_run_at(0, 0).0,
+                LineSize::SingleWidth,
+                "the ordinary pane beside it is still an ordinary line"
+            );
+        }
+    }
+
+    /// A multi-pane frame cannot represent independent OSC 11/DECSCNM defaults
+    /// with one scalar. Each pane row records its own resolved implicit
+    /// background while the divider gap retains the scalar fallback; order of
+    /// extraction cannot change the sorted provenance.
+    #[test]
+    fn blit_records_pane_local_default_background_spans() {
+        use aterm_core::render::{COLOR_UNSET, DefaultBgSpan};
+
+        let theme = Theme::default();
+        let (left, mut left_blank) = pane_snapshot("AB", 1, 2);
+        left_blank.bg = [0x11, 0x22, 0x33];
+        let (right, mut right_blank) = pane_snapshot("CD", 1, 2);
+        right_blank.bg = [0x44, 0x55, 0x66];
+        let expected = vec![
+            DefaultBgSpan::new(0, 2, 0x0011_2233),
+            DefaultBgSpan::new(3, 5, 0x0044_5566),
+        ];
+
+        for reverse in [false, true] {
+            let mut dst = RenderInput::empty();
+            fill_divider_grid(&mut dst, 1, 5, theme);
+            if reverse {
+                blit_pane_into(&mut dst, &right, 0, 3, right_blank);
+                blit_pane_into(&mut dst, &left, 0, 0, left_blank);
+            } else {
+                blit_pane_into(&mut dst, &left, 0, 0, left_blank);
+                blit_pane_into(&mut dst, &right, 0, 3, right_blank);
+            }
+            assert_eq!(dst.default_bg_spans[0], expected);
+            assert_eq!(dst.default_bg_at(0, 0), 0x0011_2233);
+            assert_eq!(dst.default_bg_at(0, 1), 0x0011_2233);
+            assert_eq!(
+                dst.default_bg_at(0, 2),
+                COLOR_UNSET,
+                "divider gap uses the frame scalar"
+            );
+            assert_eq!(dst.default_bg_at(0, 3), 0x0044_5566);
+            assert_eq!(dst.default_bg_at(0, 4), 0x0044_5566);
+        }
+    }
+
+    /// Native trays may contain transparent antialiasing. Their terminal-grid
+    /// underlay is a themed blank pane, never the divider sentinel, and carries
+    /// the same hard SingleWidth pane clip as a terminal leaf.
+    #[test]
+    fn native_blank_underlay_replaces_only_its_pane_rectangle() {
+        use aterm_core::grid::LineSize;
+        use aterm_core::render::LineSizeSpan;
+
+        let theme = Theme::default();
+        let seam = divider_cell(theme);
+        let mut blank = seam;
+        blank.bg = [3, 5, 7];
+        blank.fg = [211, 212, 213];
+        let mut dst = RenderInput::empty();
+        fill_divider_grid(&mut dst, 3, 5, theme);
+        fill_blank_pane_into(&mut dst, 1, 2, 2, 2, blank);
+
+        assert!(dst.cells[0].iter().all(|cell| *cell == seam));
+        for row in 1..3 {
+            assert_eq!(dst.cells[row][0], seam);
+            assert_eq!(dst.cells[row][1], seam);
+            assert_eq!(dst.cells[row][2], blank);
+            assert_eq!(dst.cells[row][3], blank);
+            assert_eq!(dst.cells[row][4], seam);
+            assert_eq!(
+                dst.line_size_spans[row],
+                vec![LineSizeSpan::new(2, 4, LineSize::SingleWidth)]
+            );
+            assert_eq!(
+                dst.default_bg_spans[row],
+                vec![aterm_core::render::DefaultBgSpan::new(2, 4, 0x0003_0507)]
+            );
+        }
     }
 
     /// A terminal snapshot deliberately keeps unwritten row tails sparse. The
@@ -24531,6 +25750,86 @@ mod compose_tests {
             dst.images[0],
             vec![(3, im)],
             "the pane image lands at composite col 3 (col_off 3 + local 0)"
+        );
+    }
+
+    /// A pane snapshot can briefly contain metadata from a wider engine grid
+    /// while resize convergence is in flight. Cells already clip to `src.cols`;
+    /// every parallel sparse channel must use that same pane-local boundary or
+    /// an emoji/combining mark/image anchor can land on the divider or neighbour.
+    #[test]
+    fn blit_clips_sparse_metadata_to_pane_rectangle() {
+        let theme = Theme::default();
+        let mut dst = RenderInput::empty();
+        fill_divider_grid(&mut dst, 1, 5, theme);
+        let (mut pane, blank) = pane_snapshot("AB", 1, 2);
+        pane.clusters[0] = vec![(1, "inside".into()), (2, "outside".into())];
+        pane.combining[0] = vec![
+            (1, vec!['\u{301}'].into_boxed_slice()),
+            (2, vec!['\u{308}'].into_boxed_slice()),
+        ];
+        let inside_image = test_image_ref();
+        let outside_image = test_image_ref();
+        pane.images[0] = vec![(1, inside_image.clone()), (2, outside_image)];
+
+        blit_pane_into(&mut dst, &pane, 0, 0, blank);
+
+        assert_eq!(
+            dst.clusters[0]
+                .iter()
+                .map(|(col, _)| *col)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "cluster metadata is clipped before the divider at local col 2"
+        );
+        assert_eq!(
+            dst.combining[0]
+                .iter()
+                .map(|(col, _)| *col)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "combining metadata is clipped before the divider at local col 2"
+        );
+        assert_eq!(
+            dst.images[0],
+            vec![(1, inside_image)],
+            "image metadata is clipped before the divider at local col 2"
+        );
+    }
+
+    /// Resize convergence can snapshot a grid wider than the pane rectangle. If
+    /// the pane boundary cuts between a wide glyph's lead and continuation, the
+    /// lead must not survive alone: both renderers would otherwise paint its
+    /// two-cell glyph over the divider even though the continuation was clipped.
+    #[test]
+    fn blit_drops_wide_glyph_cut_by_pane_boundary() {
+        let theme = Theme::default();
+        let seam = divider_cell(theme);
+        let mut term = Terminal::new(1, 3);
+        term.process("A😀".as_bytes());
+        let mut pane = RenderInput::empty();
+        term.cell_frame_into(&mut pane, 1, 2);
+        let blank = terminal_blank_cell(&term);
+        assert_eq!(pane.cols, 2);
+        assert!(
+            pane.cells[0].get(2).is_some_and(|cell| cell.wide),
+            "fixture has a clipped wide-glyph continuation at local col 2"
+        );
+
+        // [two-column pane] [divider] [two-column sibling].
+        let mut dst = RenderInput::empty();
+        fill_divider_grid(&mut dst, 1, 5, theme);
+        blit_pane_into(&mut dst, &pane, 0, 0, blank);
+
+        assert_eq!(dst.cells[0][0].ch, 'A');
+        assert_eq!(
+            dst.cells[0][1], blank,
+            "the orphaned wide lead is replaced by the pane's implicit blank"
+        );
+        assert_eq!(dst.cells[0][2], seam, "the divider remains untouched");
+        assert!(
+            dst.clusters[0].iter().all(|(col, _)| *col != 1),
+            "wide-glyph cluster metadata is dropped with the orphaned lead"
         );
     }
 }
@@ -24726,7 +26025,8 @@ mod tab_strip_math_tests {
     /// `prepend_strip_rows` shifts a terminal frame DOWN by the strip rows: the
     /// terminal content lands `strip` rows lower, the cursor moves down with it, the
     /// row count grows, and every per-row vector stays aligned (cells/clusters/
-    /// combining/images/line_sizes all gain `strip` leading rows).
+    /// combining/images/line_sizes/line_size_spans/default_bg_spans all gain
+    /// `strip` leading rows).
     #[test]
     fn prepend_shifts_content_and_cursor_down() {
         // A 2x4 terminal frame with a cursor at row 1.
@@ -24858,6 +26158,16 @@ mod tab_strip_math_tests {
         assert_eq!(frame.combining.len(), frame.cells.len());
         assert_eq!(frame.images.len(), frame.cells.len());
         assert_eq!(frame.line_sizes.len(), frame.cells.len());
+        assert_eq!(frame.line_size_spans.len(), frame.cells.len());
+        assert_eq!(frame.default_bg_spans.len(), frame.cells.len());
+        assert!(
+            frame.line_size_spans[0].is_empty(),
+            "strip chrome uses the row-wide SingleWidth fallback"
+        );
+        assert!(
+            frame.default_bg_spans[0].is_empty(),
+            "strip chrome uses the frame-wide background fallback"
+        );
     }
 
     /// A MULTI-ROW strip (`tab_strip_rows = 2`): a window-space effect quad whose
@@ -25614,13 +26924,38 @@ mod headless_video_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        PresentDropAccounting, PresentTarget, VideoMode, VideoRec, WindowId, fold_video_deadlines,
-        record_controller_video_attempts, video_capture_mode,
+        Frame, PresentDropAccounting, PresentTarget, VideoCancellation, VideoMode, VideoRec,
+        WindowId, fold_video_deadlines, raw_present_capture_guard,
+        record_controller_video_attempts, require_explicit_capture_readback, video_capture_mode,
+        video_capture_opacity_requires_abort, video_capture_translucency_guard,
+        video_initial_next_frame, video_post_present_should_finalize,
+        window_capture_material_guard, window_capture_translucency_guard,
     };
 
+    use crate::app_config::BackgroundMaterial;
     use crate::app_render::GpuRecoveryOutcome;
     use crate::input::InputEvent;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    fn test_video_dir(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::control_auth::ConfinedVideoDir,
+    ) {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "aterm-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        crate::control_auth::ensure_private_dir(&root).unwrap();
+        let dir = crate::control_auth::confine_video_dir(&root).unwrap();
+        let path = dir.path().to_path_buf();
+        (root, path, dir)
+    }
 
     fn controller_key_with_mods(key: Key, mods: Modifiers, event_type: KeyEventType) -> InputEvent {
         InputEvent::Key {
@@ -25765,13 +27100,13 @@ mod headless_video_tests {
         assert_eq!(
             video_capture_mode(true, true, true),
             Ok(VideoMode::SwapchainTap),
-            "a windowed GPU target records the actually-presented swapchain"
+            "a windowed GPU target records bytes submitted through WSI present"
         );
         // No glass + GPU backend: the offscreen present-real loop, never the tap.
         assert_eq!(
             video_capture_mode(false, false, true),
             Ok(VideoMode::OffscreenPresentReal),
-            "a glass-less window records what glass WOULD have shown"
+            "a glass-less window records its virtual present target"
         );
         // Glass without a GPU swapchain (CPU present / mid-rebuild): an honest
         // refusal — NEVER the offscreen arm for a window that has real glass.
@@ -25800,51 +27135,153 @@ mod headless_video_tests {
         }
     }
 
-    /// The recording LIFECYCLE spec: Idle → Recording{Tap|Offscreen} → Idle,
-    /// with the mode-honesty invariants (offscreen ⇔ no glass at begin; the
-    /// tap ⇔ glass) and the idle-zero timer discipline (the offscreen present
-    /// timer exists exactly while an offscreen recording does). `Buggy=1`
-    /// models the forbidden "helpful" fallback — a WINDOWED begin taking the
-    /// offscreen arm — which `OffscreenOnlyWithoutGlass` rejects.
-    fn headless_video_lifecycle_model() -> aterm_spec::derive::Model {
-        use aterm_spec::ty_model;
-        ty_model! {
-            HeadlessVideoLifecycle {
-                const Buggy = 0;
-                var glass = 0; // 1 while the window has an OS window
-                var mode = 0;  // 0 idle, 1 swapchain-tap, 2 offscreen-present-real
-                var timer = 0; // 1 while the offscreen present timer is armed
-                action AttachGlass when (mode == 0) { glass = 1; }
-                action DetachGlass when (mode == 0) { glass = 0; }
-                action BeginOnGlass when (glass == 1 && mode == 0) { mode = 1; timer = 0; }
-                action BeginHeadless when (glass == 0 && mode == 0) { mode = 2; timer = 1; }
-                action BuggyBeginOnGlassOffscreen when (Buggy == 1 && glass == 1 && mode == 0) { mode = 2; timer = 1; }
-                action Tick when (timer == 1) { timer = 1; }
-                action Finalize when (mode > 0) { mode = 0; timer = 0; }
-                invariant Bounds: glass <= 1 && mode <= 2 && timer <= 1;
-                invariant OffscreenOnlyWithoutGlass: (if mode == 2 { glass } else { 0 }) == 0;
-                invariant TapOnlyOnGlass: (if mode == 1 { glass } else { 1 }) == 1;
-                invariant TimerOnlyWhileOffscreen: (if timer == 1 { mode } else { 2 }) == 2;
-            }
-        }
+    #[test]
+    fn capture_regression_explicit_readback_preserves_gpu_failure() {
+        let error = require_explicit_capture_readback(Err("device lost".to_string()))
+            .expect_err("artifact capture must fail, not manufacture a blank frame");
+        assert_eq!(error, "GPU capture readback failed: device lost");
+
+        // Negative control: the historical policy returned a correctly-shaped
+        // all-zero Frame, which downstream PNG encoding cannot distinguish from a
+        // genuine black terminal. The fallible boundary admits no such sentinel.
+        let historical_blank = Frame {
+            width: 2,
+            height: 1,
+            pixels: vec![0; 2],
+        };
+        assert!(
+            require_explicit_capture_readback(Ok(historical_blank)).is_ok(),
+            "only an actual successful readback may cross the artifact boundary"
+        );
     }
 
     #[test]
-    fn headless_video_lifecycle_model_proves_and_catches_glass_fallback() {
-        let model = headless_video_lifecycle_model();
-        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    fn capture_regression_translucent_raw_present_refuses_wysiwyg_claim() {
+        let error = raw_present_capture_guard(0.75, true)
+            .expect_err("a raw translucent layer omits compositor-owned backdrop pixels");
+        assert!(error.contains("use `image`"));
+        assert!(error.contains("background_opacity = 1"));
+
+        assert!(
+            raw_present_capture_guard(1.0, true).is_ok(),
+            "opaque client bytes are the complete client result"
+        );
+        assert!(
+            raw_present_capture_guard(0.75, false).is_ok(),
+            "headless/opaque-platform capture has no compositor backdrop to omit"
+        );
+        assert!(
+            raw_present_capture_guard(f32::NAN, true).is_ok(),
+            "the render policy treats non-finite opacity as solid"
+        );
+
+        assert!(
+            video_capture_translucency_guard(VideoMode::SwapchainTap, 0.75, true).is_err(),
+            "negative control: the old swapchain-only policy would omit compositor-owned pixels"
+        );
+        assert_eq!(
+            video_capture_translucency_guard(VideoMode::OffscreenPresentReal, 0.75, true),
+            Ok(VideoMode::OffscreenPresentReal),
+            "headless present-real remains honestly raw and labeled"
+        );
+        assert_eq!(
+            video_capture_translucency_guard(VideoMode::SwapchainTap, 0.75, false),
+            Ok(VideoMode::SwapchainTap),
+            "a platform whose client remains opaque need not refuse"
+        );
+
+        assert!(
+            window_capture_translucency_guard(0.75, true, false, false).is_ok(),
+            "macOS CPU/softbuffer is an effective solid fallback, not missing glass"
+        );
+        assert!(
+            window_capture_translucency_guard(0.75, true, true, true).is_err(),
+            "only the actual translucent GPU window needs the raw-layer refusal"
+        );
+        assert!(
+            window_capture_translucency_guard(0.75, true, true, false).is_ok(),
+            "a backend/target mismatch cannot be called a translucent GPU present"
+        );
     }
 
-    /// CONFORMANCE: the real begin decision (`video_capture_mode`) and the real
-    /// finalize projected onto the lifecycle model, transition by transition —
-    /// the model's guards refuse exactly where the code refuses.
+    #[test]
+    fn capture_regression_window_material_and_post_present_stop_fail_closed() {
+        assert!(
+            window_capture_material_guard(BackgroundMaterial::None, false).is_ok(),
+            "the ordinary opaque Windows PrintWindow result remains supported"
+        );
+        for material in [
+            BackgroundMaterial::Hud,
+            BackgroundMaterial::Sidebar,
+            BackgroundMaterial::UnderWindow,
+        ] {
+            let error = window_capture_material_guard(material, false)
+                .expect_err("a window-local capture omits the live DWM material");
+            assert!(error.contains("use `image`"));
+            assert!(error.contains("background_material = \"none\""));
+            assert!(
+                window_capture_material_guard(material, true).is_ok(),
+                "a compositor-aware capture may represent the configured material"
+            );
+        }
+
+        assert!(!video_post_present_should_finalize(false, false));
+        assert!(video_post_present_should_finalize(true, false));
+        assert!(video_post_present_should_finalize(false, true));
+        assert!(video_post_present_should_finalize(true, true));
+        let now = Instant::now();
+        assert_eq!(
+            video_initial_next_frame(VideoMode::SwapchainTap, true, now),
+            Some(now),
+            "paced glass arms the WaitUntil owner at begin"
+        );
+        assert_eq!(
+            video_initial_next_frame(VideoMode::SwapchainTap, false, now),
+            None
+        );
+        assert_eq!(
+            video_initial_next_frame(VideoMode::OffscreenPresentReal, false, now),
+            Some(now),
+            "headless present-real always needs its timer"
+        );
+        let render_source = include_str!("app_render.rs");
+        let post_present = render_source
+            .split("// VIDEO introspection post-present hook")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("// Every successful application-present frame")
+                    .next()
+            })
+            .expect("post-present scheduling source");
+        assert!(
+            !post_present.contains("request_redraw"),
+            "post-present cannot bypass the <=60fps WaitUntil cadence"
+        );
+
+        let source = include_str!("app_introspect.rs");
+        let windows_capture = source
+            .split("#[cfg(windows)]\n    pub(crate) fn capture_window")
+            .nth(1)
+            .and_then(|tail| tail.split("#[cfg(all(not(target_os").next())
+            .expect("Windows capture source");
+        assert!(
+            windows_capture.contains("window_capture_material_guard"),
+            "the pure material guard must stay on the shipping Windows source path"
+        );
+    }
+
+    /// TIER-1 CONFORMANCE: the real begin decision, export permit, cancellation
+    /// CAS, and cleanup transitions projected onto the public
+    /// `VideoRecordingLifecycle` model. Tier-0 proof/catch lives in aterm-spec.
     #[test]
     fn real_video_lifecycle_conforms_to_model() {
-        let model = headless_video_lifecycle_model();
-        let mut st = model.init_state(); // glass 0, mode 0, timer 0
+        let model = aterm_spec::derive::video_recording_lifecycle_model();
+        let mut st = model.init_state();
 
-        // Idle + no glass: the real law picks the offscreen arm; the model
-        // fires BeginHeadless and REFUSES the tap arm, exactly like the code.
+        // The control thread reserves one directory/recording slot before the
+        // event-loop begin decision.
+        assert!(model.fire("Reserve", &mut st));
+        assert_eq!((st["phase"], st["private_dirs"]), (1, 1));
         assert_eq!(
             video_capture_mode(false, false, true),
             Ok(VideoMode::OffscreenPresentReal)
@@ -25854,24 +27291,41 @@ mod headless_video_tests {
         assert_eq!(st["mode"], 2);
         assert_eq!(st["timer"], 1, "the offscreen loop's timer arms at begin");
         assert!(model.check_invariant("OffscreenOnlyWithoutGlass", &st));
-        assert!(model.check_invariant("TimerOnlyWhileOffscreen", &st));
-        // The paced loop ticks; a second begin is refused mid-recording, as in
-        // the Wake::Video "already in progress" gate.
+        assert!(model.check_invariant("OffscreenTimerExact", &st));
         assert!(model.fire("Tick", &mut st));
-        assert!(!model.fire("BeginHeadless", &mut st));
-        // Finalize: back to idle-zero (mode 0, timer 0) — video_finalize's
-        // take + Virtual drop.
-        assert!(model.fire("Finalize", &mut st));
-        assert_eq!(
-            (st["mode"], st["timer"]),
-            (0, 0),
-            "idle-zero after finalize"
+
+        // Finalize transfers the sole ownership slot to the real export permit.
+        let export = std::sync::Arc::new(super::VideoExportState::default());
+        let cancel = VideoCancellation::new();
+        let permit = export
+            .try_begin(cancel.clone())
+            .expect("idle real export state admits one permit");
+        assert!(model.fire("BeginExport", &mut st));
+        assert_eq!((st["recording_slot"], st["export_permit"]), (0, 1));
+        assert!(
+            export.try_begin(VideoCancellation::new()).is_none(),
+            "the real permit refuses a second recording/export lifecycle"
         );
-        assert!(!model.fire("Tick", &mut st), "no timer survives finalize");
+        assert!(!model.fire("Reserve", &mut st));
+
+        // The worker's CAS authorizes publication immediately before rename.
+        assert!(cancel.authorize_commit());
+        assert!(model.fire("AuthorizeCommit", &mut st));
+        cancel.cancel();
+        assert!(
+            !cancel.is_cancelled(),
+            "a late real cancellation cannot revoke commit authorization"
+        );
+        assert!(model.fire("CancelAfterAuthorization", &mut st));
+        assert!(model.fire("PublishSuccess", &mut st));
+        drop(permit);
+        assert!(!export.is_busy());
+        assert_eq!((st["phase"], st["active"], st["private_dirs"]), (0, 0, 0));
 
         // Now WITH glass: the real law picks the tap; the model refuses the
         // headless arm — the honesty law's other direction.
         assert!(model.fire("AttachGlass", &mut st));
+        assert!(model.fire("Reserve", &mut st));
         assert_eq!(
             video_capture_mode(true, true, true),
             Ok(VideoMode::SwapchainTap)
@@ -25883,19 +27337,249 @@ mod headless_video_tests {
         assert!(model.fire("BeginOnGlass", &mut st));
         assert_eq!(st["timer"], 0, "the swapchain arm arms no offscreen timer");
         assert!(model.check_invariant("TapOnlyOnGlass", &st));
-        assert!(model.fire("Finalize", &mut st));
-        assert_eq!((st["mode"], st["timer"]), (0, 0));
+        assert!(model.fire("OwnerLost", &mut st));
+        assert_eq!((st["phase"], st["mode"], st["timer"]), (0, 0, 0));
 
-        // The forbidden fallback (a windowed begin taking the offscreen arm)
-        // violates the invariant the healthy code upholds.
+        // A live transition to translucent glass atomically aborts the raw tap
+        // before another frame can be recorded under its opaque admission.
+        assert!(model.fire("Reserve", &mut st));
+        assert!(model.fire("BeginOnGlass", &mut st));
+        assert!(video_capture_opacity_requires_abort(
+            VideoMode::SwapchainTap,
+            0.75,
+            true,
+        ));
+        assert!(model.fire("MakeTapTranslucent", &mut st));
+        assert_eq!(st["mode"], 0, "opacity transition ends the tap");
+        assert!(model.check_invariant("NoTranslucentTap", &st));
+
+        // Cancellation winning before publication maps to cleanup + permit
+        // acknowledgement; the same token can no longer authorize commit.
+        assert!(model.fire("MakeOpaque", &mut st));
+        assert!(model.fire("DetachGlass", &mut st));
+        assert!(model.fire("Reserve", &mut st));
+        assert!(model.fire("BeginHeadless", &mut st));
+        let cancelled = VideoCancellation::new();
+        let cancelled_permit = export
+            .try_begin(cancelled.clone())
+            .expect("permit was released after prior publication");
+        assert!(model.fire("BeginExport", &mut st));
+        cancelled.cancel();
+        drop(cancelled_permit);
+        assert!(!cancelled.authorize_commit());
+        assert!(model.fire("CancelLive", &mut st));
+        assert!(!export.is_busy());
+        assert!(model.check_invariant("CancelledOwnsNothing", &st));
+
+        // Negative controls construct the historical forbidden fallback and
+        // a publication that skipped the CAS authorization.
         let mut bad = model.init_state();
-        bad.insert("glass", 1);
+        assert!(model.fire("AttachGlass", &mut bad));
+        assert!(model.fire("Reserve", &mut bad));
+        bad.insert("phase", 2);
         bad.insert("mode", 2);
         bad.insert("timer", 1);
         assert!(
             !model.check_invariant("OffscreenOnlyWithoutGlass", &bad),
             "a windowed offscreen recording is exactly what the invariant rejects"
         );
+        let mut bad_publish = model.init_state();
+        assert!(model.fire("Reserve", &mut bad_publish));
+        assert!(model.fire("BeginHeadless", &mut bad_publish));
+        assert!(model.fire("BeginExport", &mut bad_publish));
+        bad_publish.insert("phase", 0);
+        bad_publish.insert("active", 0);
+        bad_publish.insert("private_dirs", 0);
+        bad_publish.insert("export_permit", 0);
+        bad_publish.insert("published", 1);
+        assert!(
+            !model.check_invariant("CommitAuthorizationScope", &bad_publish),
+            "publication without winning the CAS is rejected"
+        );
+    }
+
+    #[test]
+    fn live_opacity_transition_aborts_swapchain_recording_fail_closed() {
+        let mut app = super::App::headless_for_test();
+        let wid = WindowId(0);
+        let now = Instant::now();
+        let (root, dir_path, dir) = test_video_dir("video-opacity-abort");
+        let (reply, rx) = std::sync::mpsc::channel();
+        app.video_rec = Some(VideoRec {
+            window: wid,
+            deadline: now + Duration::from_secs(3),
+            started_us: 0,
+            keys: false,
+            key_log: Vec::new(),
+            mode: VideoMode::SwapchainTap,
+            next_frame: None,
+            dir,
+            cancel: VideoCancellation::new(),
+            reply,
+        });
+
+        assert!(app.video_abort_translucent_swapchain(0.75, true));
+        assert!(
+            app.video_rec.is_none(),
+            "the raw tap is consumed atomically"
+        );
+        assert!(
+            !dir_path.exists(),
+            "an aborted begin never leaks its pre-created recording directory"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            rx.recv()
+                .expect("aborted recording answers its blocked client")
+                .contains("full-window artifact is unavailable for a translucent client")
+        );
+
+        // Negative controls: an opaque transition and the headless present-real
+        // mode retain their recording because neither omits compositor pixels.
+        for (mode, opacity, blends) in [
+            (VideoMode::SwapchainTap, 1.0, true),
+            (VideoMode::OffscreenPresentReal, 0.75, true),
+            (VideoMode::SwapchainTap, 0.75, false),
+        ] {
+            let (root, _path, dir) = test_video_dir("video-opacity-negative");
+            let (reply, _rx) = std::sync::mpsc::channel();
+            app.video_rec = Some(VideoRec {
+                window: wid,
+                deadline: now + Duration::from_secs(3),
+                started_us: 0,
+                keys: false,
+                key_log: Vec::new(),
+                mode,
+                next_frame: None,
+                dir,
+                cancel: VideoCancellation::new(),
+                reply,
+            });
+            assert!(!app.video_abort_translucent_swapchain(opacity, blends));
+            assert!(app.video_rec.take().is_some());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn video_cancel_and_index_commit_have_one_atomic_winner() {
+        // Schedule A: timeout/shutdown wins first. The worker cannot later
+        // authorize the index rename and must abort its unpublished directory.
+        let cancel_wins = VideoCancellation::new();
+        cancel_wins.cancel();
+        assert!(cancel_wins.is_cancelled());
+        assert!(
+            !cancel_wins.authorize_commit(),
+            "a cancelled request cannot publish"
+        );
+
+        // Schedule B: the worker crosses its single CAS immediately before
+        // rename. A later timeout cannot retroactively cancel that authorized
+        // complete publication; shutdown waits for its permit acknowledgement.
+        let commit_wins = VideoCancellation::new();
+        assert!(commit_wins.authorize_commit());
+        commit_wins.cancel();
+        assert!(
+            !commit_wins.is_cancelled(),
+            "commit authorization is irrevocable"
+        );
+        assert!(
+            !commit_wins.authorize_commit(),
+            "the one-shot boundary cannot be authorized twice"
+        );
+    }
+
+    #[test]
+    fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
+        // Survivor close: abort synchronously before WindowState/tap removal.
+        let mut app = super::App::headless_for_test();
+        let survivor_session = app.next_session_id;
+        let _survivor = app.insert_logical_window(super::stub_session(survivor_session), 24, 80);
+        let (root, path, dir) = test_video_dir("video-window-close");
+        let (reply, rx) = std::sync::mpsc::channel();
+        app.video_rec = Some(VideoRec {
+            window: WindowId(0),
+            deadline: Instant::now() + Duration::from_secs(60),
+            started_us: 0,
+            keys: false,
+            key_log: Vec::new(),
+            mode: VideoMode::SwapchainTap,
+            next_frame: Some(Instant::now()),
+            dir,
+            cancel: VideoCancellation::new(),
+            reply,
+        });
+        assert_eq!(
+            app.close_window_logical(WindowId(0)),
+            super::CloseOutcome::Stay
+        );
+        assert!(app.video_rec.is_none());
+        assert_eq!(fold_video_deadlines(app.video_rec.as_ref(), None), None);
+        assert!(!path.exists());
+        assert_eq!(
+            rx.recv().unwrap(),
+            "ERR video: recording aborted because its window closed\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+
+        // Both recording modes are aborted by the real backend rebuild before
+        // WindowGpu replacement. Virtual additionally loses its timer target.
+        for mode in [VideoMode::SwapchainTap, VideoMode::OffscreenPresentReal] {
+            let mut app = super::App::headless_for_test();
+            if mode == VideoMode::OffscreenPresentReal {
+                app.windows.get_mut(&WindowId(0)).unwrap().present = Some(PresentTarget::Virtual {
+                    window_gpu: aterm_gpu::WindowGpu::new(),
+                });
+            }
+            let (root, path, dir) = test_video_dir("video-backend-rebuild");
+            let (reply, rx) = std::sync::mpsc::channel();
+            app.video_rec = Some(VideoRec {
+                window: WindowId(0),
+                deadline: Instant::now() + Duration::from_secs(60),
+                started_us: 0,
+                keys: false,
+                key_log: Vec::new(),
+                mode,
+                next_frame: Some(Instant::now()),
+                dir,
+                cancel: VideoCancellation::new(),
+                reply,
+            });
+            assert!(app.rebuild_backend(), "test backend rebuild succeeds");
+            assert!(app.video_rec.is_none());
+            assert_eq!(fold_video_deadlines(app.video_rec.as_ref(), None), None);
+            assert!(!path.exists());
+            assert_eq!(
+                rx.recv().unwrap(),
+                "ERR video: recording aborted by renderer backend rebuild\n"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        // Drop is the last fail-safe for test/embedding exits; production also
+        // invokes the same seam before its deliberate mem::forget/process::exit.
+        let mut app = super::App::headless_for_test();
+        let (root, path, dir) = test_video_dir("video-app-drop");
+        let (reply, rx) = std::sync::mpsc::channel();
+        app.video_rec = Some(VideoRec {
+            window: WindowId(0),
+            deadline: Instant::now() + Duration::from_secs(60),
+            started_us: 0,
+            keys: false,
+            key_log: Vec::new(),
+            mode: VideoMode::OffscreenPresentReal,
+            next_frame: Some(Instant::now()),
+            dir,
+            cancel: VideoCancellation::new(),
+            reply,
+        });
+        drop(app);
+        assert!(!path.exists());
+        assert_eq!(
+            rx.recv().unwrap(),
+            "ERR video: recording aborted by application shutdown\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// IDLE-ZERO LAW: while an offscreen recording is in flight, the deadline
@@ -25916,6 +27600,7 @@ mod headless_video_tests {
             window_gpu: aterm_gpu::WindowGpu::new(),
         });
         let now = Instant::now();
+        let (root, _path, dir) = test_video_dir("video-finalize");
         let (reply, rx) = std::sync::mpsc::channel();
         app.video_rec = Some(VideoRec {
             window: wid,
@@ -25923,10 +27608,10 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
-            pace: true,
             mode: VideoMode::OffscreenPresentReal,
             next_frame: Some(now),
-            dir: std::path::PathBuf::new(),
+            dir,
+            cancel: VideoCancellation::new(),
             reply,
         });
         // In flight: the fold arms the EARLIEST of {deadline, next_frame} —
@@ -25958,6 +27643,7 @@ mod headless_video_tests {
         // recording-lost error rather than a silent empty artifact.
         let msg = rx.recv().expect("finalize answers the pending client");
         assert!(msg.starts_with("ERR video"), "honest reply, got: {msg}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// GPU loss cannot leave a headless Virtual recording paced forever against
@@ -25976,6 +27662,7 @@ mod headless_video_tests {
             window_gpu: aterm_gpu::WindowGpu::new(),
         });
         let now = Instant::now();
+        let (root, _path, dir) = test_video_dir("video-device-loss");
         let (reply, rx) = std::sync::mpsc::channel();
         app.video_rec = Some(VideoRec {
             window: wid,
@@ -25983,10 +27670,10 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
-            pace: true,
             mode: VideoMode::OffscreenPresentReal,
             next_frame: Some(now),
-            dir: std::path::PathBuf::new(),
+            dir,
+            cancel: VideoCancellation::new(),
             reply,
         });
 
@@ -26018,6 +27705,7 @@ mod headless_video_tests {
             rx.recv().expect("device loss answers the pending client"),
             "ERR video: recording aborted by GPU device loss\n"
         );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The mode labels and stamp semantics are the disclosure contract's exact
@@ -26032,12 +27720,204 @@ mod headless_video_tests {
         assert!(
             VideoMode::SwapchainTap
                 .stamp_semantics()
-                .contains("photons follow")
+                .contains("compositor visibility and scanout not observed")
         );
         assert!(
             VideoMode::OffscreenPresentReal
                 .stamp_semantics()
-                .contains("nothing reached glass")
+                .contains("no OS presentation target existed")
         );
+    }
+}
+
+#[cfg(test)]
+mod visible_content_route_tests {
+    use super::*;
+
+    #[test]
+    fn route_follows_zoom_aware_visible_content_not_hidden_root_membership() {
+        let wid = WindowId(0);
+
+        let mut terminal = App::headless_for_test();
+        assert_eq!(
+            terminal.active_visible_content_route(wid),
+            Some(VisibleContentRoute::Terminal { composed: false })
+        );
+        terminal.split_active_stub_tab(wid);
+        assert_eq!(
+            terminal.active_visible_content_route(wid),
+            Some(VisibleContentRoute::Terminal { composed: true })
+        );
+        assert!(
+            terminal
+                .windows
+                .get_mut(&wid)
+                .expect("window")
+                .tab_set
+                .active_mut()
+                .expect("terminal tab")
+                .toggle_zoom()
+        );
+        assert_eq!(
+            terminal.active_visible_content_route(wid),
+            Some(VisibleContentRoute::Terminal { composed: true }),
+            "a zoomed terminal split keeps the composed terminal coordinate space"
+        );
+
+        let mut native = App::headless_for_test();
+        assert!(native.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (instance, native_view) = native.active_native_view(wid).expect("native front");
+        assert_eq!(
+            native.active_visible_content_route(wid),
+            Some(VisibleContentRoute::Native {
+                instance,
+                view: native_view,
+            })
+        );
+
+        let (_, terminal_view) =
+            native.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        assert_eq!(
+            native.active_visible_content_route(wid),
+            Some(VisibleContentRoute::Heterogeneous),
+            "both visible content kinds select the retained leaf compositor"
+        );
+        assert!(
+            native
+                .windows
+                .get_mut(&wid)
+                .expect("window")
+                .tab_set
+                .active_mut()
+                .expect("mixed tab")
+                .toggle_zoom()
+        );
+        assert_eq!(
+            native.active_visible_content_route(wid),
+            Some(VisibleContentRoute::Terminal { composed: true }),
+            "a hidden native sibling cannot divert the zoomed terminal"
+        );
+
+        assert!(
+            !native
+                .windows
+                .get_mut(&wid)
+                .expect("window")
+                .tab_set
+                .active_mut()
+                .expect("mixed tab")
+                .toggle_zoom(),
+            "first toggle restores the full mixed layout"
+        );
+        assert!(
+            native
+                .windows
+                .get_mut(&wid)
+                .expect("window")
+                .tab_set
+                .active_mut()
+                .expect("mixed tab")
+                .set_focus(native_view)
+        );
+        native.sync_window(wid);
+        assert!(
+            native
+                .windows
+                .get_mut(&wid)
+                .expect("window")
+                .tab_set
+                .active_mut()
+                .expect("mixed tab")
+                .toggle_zoom()
+        );
+        assert_eq!(
+            native.active_visible_content_route(wid),
+            Some(VisibleContentRoute::Native {
+                instance,
+                view: native_view,
+            }),
+            "a hidden terminal sibling cannot divert the zoomed native view"
+        );
+        assert_ne!(native_view, terminal_view);
+
+        let stale_view = native.windows[&wid]
+            .tab_set
+            .active()
+            .expect("mixed tab")
+            .focus;
+        assert!(native.view_store.remove(stale_view).is_some());
+        assert_eq!(
+            native.active_visible_content_route(wid),
+            None,
+            "a stale visible identity fails closed"
+        );
+    }
+
+    #[test]
+    fn zoom_hidden_terminal_is_not_displayed_until_unzoom() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let focused = app.split_active_stub_tab(wid);
+        let hidden = 0;
+
+        assert!(active_tab_displays_session(
+            &app.windows[&wid],
+            &app.view_store,
+            hidden,
+        ));
+        assert!(active_tab_displays_session(
+            &app.windows[&wid],
+            &app.view_store,
+            focused,
+        ));
+        assert_eq!(
+            app.windows_displaying(hidden).collect::<Vec<_>>(),
+            vec![wid]
+        );
+        assert!(app.is_visible_session(hidden));
+
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .expect("window")
+                .tab_set
+                .active_mut()
+                .expect("split tab")
+                .toggle_zoom()
+        );
+        assert!(!active_tab_displays_session(
+            &app.windows[&wid],
+            &app.view_store,
+            hidden,
+        ));
+        assert!(active_tab_displays_session(
+            &app.windows[&wid],
+            &app.view_store,
+            focused,
+        ));
+        assert!(
+            app.windows_displaying(hidden).next().is_none(),
+            "a zoom-hidden sibling is not an image/output viewer"
+        );
+        assert!(!app.is_visible_session(hidden));
+        assert_eq!(
+            app.windows_displaying(focused).collect::<Vec<_>>(),
+            vec![wid]
+        );
+
+        assert!(
+            !app.windows
+                .get_mut(&wid)
+                .expect("window")
+                .tab_set
+                .active_mut()
+                .expect("split tab")
+                .toggle_zoom()
+        );
+        assert_eq!(
+            app.windows_displaying(hidden).collect::<Vec<_>>(),
+            vec![wid]
+        );
+        assert!(app.is_visible_session(hidden));
     }
 }

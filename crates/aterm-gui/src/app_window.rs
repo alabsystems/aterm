@@ -703,10 +703,11 @@ impl App {
                     // Interpretation only — the bytes (and the readback/
                     // introspection parity) are untouched. No-op off macOS.
                     let hdr = surf.is_hdr();
-                    self.apprt.window_set_surface_colorspace(
-                        &window,
-                        crate::platform::resolve_surface_colorspace(self.window_colorspace, hdr),
-                    );
+                    let surface_colorspace =
+                        crate::platform::resolve_surface_colorspace(self.window_colorspace, hdr);
+                    let effective_colorspace = self
+                        .apprt
+                        .window_set_surface_colorspace(&window, surface_colorspace);
                     // M5 TRUE VIBRANCY: with the wgpu CAMetalLayer now attached,
                     // install the NSVisualEffectView backdrop + flip the window /
                     // Metal-layer opacity when `background_opacity < 1.0`, so this
@@ -727,6 +728,15 @@ impl App {
                     // swapchain; the renderer-side sanitizer makes the unset
                     // default (0.0 → headroom 0) provably inert.
                     let mut window_gpu = aterm_gpu::WindowGpu::new();
+                    // Snapshot/video PNGs are unprofiled sRGB. Freeze the ACTUAL
+                    // compositor interpretation alongside the surface instead of
+                    // guessing it from Bgra8 (which can also be tagged P3).
+                    window_gpu.set_capture_color_space(
+                        crate::platform::capture_space_after_surface_tag(
+                            effective_colorspace,
+                            aterm_gpu::video_tap::CaptureColorSpace::Unknown,
+                        ),
+                    );
                     if hdr {
                         window_gpu.set_edr_max(self.apprt.screen_edr_max(&window));
                         window_gpu.set_sdr_white_scale(self.apprt.screen_sdr_white_scale(&window));
@@ -863,8 +873,15 @@ impl App {
         )) {
             return CloseOutcome::Stay;
         }
-        let Some(ws) = self.windows.get(&wid) else {
+        if !self.windows.contains_key(&wid) {
             return CloseOutcome::Stay; // stale/unknown id → no-op
+        }
+        // The recording owns this WindowState's tap and a pre-created output
+        // directory. Abort while the tap is still reachable, before structural
+        // removal can strand the client until its old deadline.
+        let _ = self.video_abort_window_close(wid);
+        let Some(ws) = self.windows.get(&wid) else {
+            return CloseOutcome::Stay;
         };
         // RESTORE-1: this close is about to end the app (the last window is
         // going away) — capture the layout manifest NOW, while the window's tabs/panes
@@ -1262,6 +1279,7 @@ impl App {
         if self.apply_deferred_native_update_on_clean_quit() {
             return;
         }
+        let _ = self.video_abort_app_shutdown();
         el.exit();
     }
 
@@ -1328,6 +1346,7 @@ impl App {
         if !crate::menu::complete_native_termination(generation) {
             return;
         }
+        let _ = self.video_abort_app_shutdown();
         el.exit();
     }
 
@@ -1355,6 +1374,7 @@ impl App {
             // Ordinary quit is now irreversible. Async handoff success exits via
             // `_exit` and intentionally never reaches this completion boundary.
             let _ = crate::menu::complete_current_native_termination();
+            let _ = self.video_abort_app_shutdown();
             el.exit();
             return;
         }

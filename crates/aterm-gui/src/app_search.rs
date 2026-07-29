@@ -597,26 +597,38 @@ impl App {
     }
 
     /// A user-level "Find" request (the Edit ▸ Find… menu item / a rebound Find
-    /// action): focus native Settings search when that app owns the active tab;
-    /// otherwise enter terminal find. The menu key equivalent fires ahead of
-    /// `keyDown`, so this seam must make the content-type decision explicitly.
+    /// action), routed by the canonical focused content.
     pub(crate) fn find_requested(&mut self) {
-        let native_settings = self.frontmost_window.and_then(|wid| {
-            let (instance, _) = self.active_native_view(wid)?;
-            (self.native_runtime.app(instance)?.kind() == crate::native_app::AppKind::Settings)
-                .then_some(wid)
-        });
-        if let Some(wid) = native_settings {
-            let _ = self.dispatch_native_event(
-                wid,
-                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-                    id: crate::native_ui::ActionId::new("settings/search"),
-                    value: None,
-                }),
-            );
-        } else if self.front().is_some_and(|ws| ws.settings().is_some()) {
+        let Some(wid) = self.frontmost_window else {
+            return;
+        };
+        if let Some((instance, _)) = self.active_native_view(wid) {
+            let action =
+                self.native_runtime
+                    .app(instance)
+                    .and_then(|app| match app.kind() {
+                        crate::native_app::AppKind::Settings => Some("settings/search"),
+                        crate::native_app::AppKind::Editor => Some("editor/find"),
+                        crate::native_app::AppKind::Markdown
+                        | crate::native_app::AppKind::Recovery => None,
+                    });
+            if let Some(action) = action {
+                let _ = self.dispatch_native_event(
+                    wid,
+                    crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                        id: crate::native_ui::ActionId::new(action),
+                        value: None,
+                    }),
+                );
+            }
+            // A native front never falls through to the parked terminal search
+            // host. Markdown/Recovery currently have no find action, so Find is
+            // an explicit no-op there.
+            return;
+        }
+        if self.front().is_some_and(|ws| ws.settings().is_some()) {
             self.settings_search_begin();
-        } else {
+        } else if self.front_terminal(wid).is_some() {
             self.search_enter();
         }
     }
@@ -656,35 +668,42 @@ impl App {
         forward: bool,
         legacy_from_start: bool,
     ) {
+        let Some(term) = self
+            .front_terminal(wid)
+            .map(|terminal| terminal.term.clone())
+        else {
+            if let Some(window) = self.windows.get_mut(&wid) {
+                window.search = None;
+                window.find_bar_hit = None;
+            }
+            return;
+        };
         let (case_sensitive, is_regex) = (self.search_sticky_case, self.search_sticky_regex);
         let direction = SearchDirection::from_forward(forward);
-        let origin = self
-            .front_terminal(wid)
-            .map(|t| t.term.clone())
-            .map(|term| {
-                let terminal = term_lock(&term);
-                let display_offset = i32::try_from(terminal.grid().display_offset()).unwrap_or(0);
-                let base_y = i64::try_from(terminal.grid().base_y()).unwrap_or(0);
-                let top = base_y.saturating_sub(i64::from(display_offset));
-                let (anchor_absolute_row, anchor_col) = if display_offset == 0 {
-                    let cursor = terminal.cursor();
-                    (base_y.saturating_add(i64::from(cursor.row)), cursor.col)
-                } else if forward {
-                    (top, 0)
-                } else {
-                    (
-                        top.saturating_add(i64::from(terminal.rows().saturating_sub(1))),
-                        u16::MAX,
-                    )
-                };
+        let origin = {
+            let terminal = term_lock(&term);
+            let display_offset = i32::try_from(terminal.grid().display_offset()).unwrap_or(0);
+            let base_y = i64::try_from(terminal.grid().base_y()).unwrap_or(0);
+            let top = base_y.saturating_sub(i64::from(display_offset));
+            let (anchor_absolute_row, anchor_col) = if display_offset == 0 {
+                let cursor = terminal.cursor();
+                (base_y.saturating_add(i64::from(cursor.row)), cursor.col)
+            } else if forward {
+                (top, 0)
+            } else {
                 (
-                    display_offset,
-                    base_y,
-                    terminal.absolute_row_revision(),
-                    anchor_absolute_row,
-                    anchor_col,
+                    top.saturating_add(i64::from(terminal.rows().saturating_sub(1))),
+                    u16::MAX,
                 )
-            });
+            };
+            (
+                display_offset,
+                base_y,
+                terminal.absolute_row_revision(),
+                anchor_absolute_row,
+                anchor_col,
+            )
+        };
         if let Some(ws) = self.windows.get_mut(&wid) {
             let (
                 origin_display_offset,
@@ -692,7 +711,7 @@ impl App {
                 origin_absolute_row_revision,
                 anchor_absolute_row,
                 anchor_col,
-            ) = origin.unwrap_or((0, 0, 0, 0, 0));
+            ) = origin;
             if let Some(search) = ws.search.as_mut() {
                 search.direction = direction;
                 if legacy_from_start {
@@ -1502,18 +1521,17 @@ impl App {
     }
 
     fn search_close_in(&mut self, wid: crate::WindowId, clear_selection: bool) {
-        let Some(term) = self
+        // Why: a native front has no terminal, but parked host search state must still be
+        // dropped — bailing on the missing terminal left a stale find bar armed.
+        let term = self
             .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
-        else {
-            return;
-        };
+            .map(|terminal| terminal.term.clone());
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         ws.search = None;
         ws.find_bar_hit = None; // drop the clickable-indicator geometry with the overlay
-        if clear_selection {
+        if clear_selection && let Some(term) = term {
             term_lock(&term).text_selection_mut().clear();
         }
         let warning_armed = ws
@@ -1543,6 +1561,26 @@ mod tests {
             matches: vec![(-1, 0, 2), (0, 2, 4), (0, 12, 14)],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn native_front_never_arms_or_traps_host_terminal_search() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+
+        app.search_enter();
+        assert!(
+            app.windows[&wid].search.is_none(),
+            "direct terminal-search entry fails closed on native content"
+        );
+
+        app.windows.get_mut(&wid).unwrap().search = Some(SearchState::default());
+        app.search_exit();
+        assert!(
+            app.windows[&wid].search.is_none(),
+            "close always clears stale host search even without a front terminal"
+        );
     }
 
     /// Native-title ownership is an explicit stack: the destructive-close warning

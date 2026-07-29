@@ -165,12 +165,24 @@ fn shutdown_unblocks_blocked_read() {
     let (a, _b) = CtlStream::pair().expect("pair");
     let clone = a.try_clone().expect("clone");
     let (tx, rx) = std::sync::mpsc::channel();
+    // The sleep alone used to be the ONLY thing ordering "reader is parked" before
+    // "shutdown fires". On a loaded box the thread may not be scheduled inside
+    // 100ms, the shutdown lands FIRST, and the read then returns EOF for a reason
+    // that has nothing to do with unblocking a parked read — the property under
+    // test never runs and the test passes anyway. Publish entry, then keep the
+    // sleep as slack for the gap between the flag and the actual park.
+    let entering = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_entering = entering.clone();
     let reader = std::thread::spawn(move || {
         let mut buf = [0u8; 16];
+        reader_entering.store(true, std::sync::atomic::Ordering::SeqCst);
         // No timeout set: this read parks until the shutdown lands.
         let res = (&a).read(&mut buf);
         let _ = tx.send(res);
     });
+    while !entering.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
     std::thread::sleep(Duration::from_millis(100));
     clone.shutdown(std::net::Shutdown::Both).expect("shutdown");
     let res = rx
