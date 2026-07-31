@@ -194,7 +194,9 @@ fn shade_and_overshoot_single_notch_is_byte_exact() {
     for i in 0..120 {
         // ▓▓▒░ shade run + accented capitals (upward overshoot) + box glyphs.
         let bar = "\u{2593}\u{2593}\u{2592}\u{2591}";
-        term.process(format!("{bar} \u{c9}\u{c1}\u{d1}\u{c5} r{i} \u{2502}\u{2588}\r\n").as_bytes());
+        term.process(
+            format!("{bar} \u{c9}\u{c1}\u{d1}\u{c5} r{i} \u{2502}\u{2588}\r\n").as_bytes(),
+        );
     }
     render_both(&mut warm, &mut wc, &mut term, rows, cols, "warmup");
     let mut blits = 0usize;
@@ -317,7 +319,9 @@ fn shade_row_over_tall_glyph_row_is_byte_exact() {
         // Alternate a pure-shade row and a tall-accent row so every shade band has
         // an overshooting neighbour above AND below across the shift.
         if i % 2 == 0 {
-            term.process(b"\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\r\n");
+            term.process(
+                b"\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\xe2\x96\x93\r\n",
+            );
         } else {
             term.process(format!("\u{c9}\u{c1}\u{d1}\u{c5}\u{ca}{i}\r\n").as_bytes());
         }
@@ -406,7 +410,11 @@ fn assert_blit_equals_full(
             if a != b {
                 diffs += 1;
                 if first.len() < 6 {
-                    first.push(format!("({},{}) blit {a:#08X} != full {b:#08X}", idx % w, idx / w));
+                    first.push(format!(
+                        "({},{}) blit {a:#08X} != full {b:#08X}",
+                        idx % w,
+                        idx / w
+                    ));
                 }
             }
         }
@@ -473,7 +481,8 @@ fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
                             &format!("px{px}/{class}/hist/d{delta}[{step}]"),
                         );
                         notch_renders += 1;
-                        if matches!(o, DamageOutcome::Scroll { delta_rows } if delta_rows == -delta) {
+                        if matches!(o, DamageOutcome::Scroll { delta_rows } if delta_rows == -delta)
+                        {
                             blits += 1;
                         }
                     }
@@ -491,7 +500,13 @@ fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
                     // Park deep in history, warm there.
                     term.scroll_display(40);
                     assert_blit_equals_full(
-                        &mut warm, &mut wc, &mut fresh, &mut term, rows, cols, "deep-warm",
+                        &mut warm,
+                        &mut wc,
+                        &mut fresh,
+                        &mut term,
+                        rows,
+                        cols,
+                        "deep-warm",
                     );
                     combos += 1;
                     for step in 0..8 {
@@ -506,7 +521,8 @@ fn e7_scroll_blit_geometry_direction_glyph_sweep_is_byte_exact() {
                             &format!("px{px}/{class}/botm/d{delta}[{step}]"),
                         );
                         notch_renders += 1;
-                        if matches!(o, DamageOutcome::Scroll { delta_rows } if delta_rows == delta) {
+                        if matches!(o, DamageOutcome::Scroll { delta_rows } if delta_rows == delta)
+                        {
                             blits += 1;
                         }
                     }

@@ -13,8 +13,17 @@
     reason = "native AccessKit host wiring lands with the tab-app window adapter"
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
+
+// FxHash, not SipHash, for the per-frame projection side tables below. They are
+// keyed by internal `UiKey`s and by ids this module derived itself — never by
+// untrusted input — and they are rebuilt from scratch on every presented native
+// frame, so the HashDoS resistance was pure per-lookup cost. No map here is ever
+// iterated (every use is `insert`/`get`/`contains_key`), so published node ids
+// and tree order — which come from `stable_node_id` and the `compiled.semantics`
+// walk — are unchanged.
+use aterm_hash::{FxHashMap, FxHashSet};
 
 use accesskit::{
     Action, Affine, Invalid, Live, Node, NodeId, Rect, Role, TextPosition, TextSelection, Toggled,
@@ -543,7 +552,7 @@ fn materialize_visible_text(
     rect: LogicalRect,
     spec: &TextViewportSpec,
     id_for: &mut impl FnMut(&UiKey) -> NodeId,
-    by_id: &mut HashMap<NodeId, UiKey>,
+    by_id: &mut FxHashMap<NodeId, UiKey>,
 ) -> Result<VisibleTextMaterialization, AccessibilityProjectionError> {
     let geometry = text_viewport_geometry(rect);
     let mut pending = Vec::new();
@@ -932,7 +941,11 @@ fn project_with_transform_and_ids(
         return Err(AccessibilityProjectionError::EmptyTree);
     }
 
-    let focusable = compiled.focus_order.iter().cloned().collect::<HashSet<_>>();
+    let focusable = compiled
+        .focus_order
+        .iter()
+        .cloned()
+        .collect::<FxHashSet<_>>();
     let viewport_specs = compiled
         .paint
         .iter()
@@ -940,7 +953,7 @@ fn project_with_transform_and_ids(
             UiContent::TextViewport(spec) => Some((paint.key.clone(), spec)),
             _ => None,
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
     let text_field_specs = compiled
         .paint
         .iter()
@@ -948,9 +961,11 @@ fn project_with_transform_and_ids(
             UiContent::TextField(control) => Some((paint.key.clone(), &control.spec)),
             _ => None,
         })
-        .collect::<HashMap<_, _>>();
-    let mut by_key: HashMap<UiKey, usize> = HashMap::with_capacity(compiled.semantics.len());
-    let mut by_id: HashMap<NodeId, UiKey> = HashMap::with_capacity(compiled.semantics.len());
+        .collect::<FxHashMap<_, _>>();
+    let mut by_key: FxHashMap<UiKey, usize> =
+        FxHashMap::with_capacity_and_hasher(compiled.semantics.len(), aterm_hash::FxBuildHasher);
+    let mut by_id: FxHashMap<NodeId, UiKey> =
+        FxHashMap::with_capacity_and_hasher(compiled.semantics.len(), aterm_hash::FxBuildHasher);
     let mut pending: Vec<PendingNode> = Vec::with_capacity(compiled.semantics.len());
     let mut routes = Vec::with_capacity(compiled.semantics.len());
     let mut virtual_text = Vec::new();

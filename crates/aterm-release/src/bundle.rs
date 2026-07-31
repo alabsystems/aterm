@@ -44,6 +44,12 @@ pub struct BundleSpec {
     pub git_commit: String,
     /// The ship-ready (universal, stripped) binaries from `buildplan::run`.
     pub aterm_bin: PathBuf,
+    /// A VALIDATED toolchain-seed registry to seal into
+    /// `Contents/Resources/toolchain-seed` (batteries-included, §9.1) — the
+    /// caller runs `seedpack::validate` first; `None` ships today's bundle
+    /// byte-identical. Data payloads only (tarballs + signed manifests), so
+    /// nothing here changes the one-Mach-O signing story.
+    pub seed: Option<crate::seedpack::SeedStat>,
 }
 
 /// Pure `-dirty` rule, EXACTLY matching crates/aterm-gui/build.rs: the suffix
@@ -273,7 +279,59 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
         println!("    bundled Help.html");
     }
 
+    // --- 6d. toolchain seed (batteries-included) ----------------------------
+    // The VALIDATED signed registry (seedpack::validate ran in step_build) is
+    // sealed under Resources/ as plain data — the client's bundled-seed lane
+    // installs from it offline through atpkg's ordinary signature gates. Flat
+    // copy of regular files only; validate() already refused anything else.
+    // Runs before sign::sign_app by pipeline order, so the seal covers it.
+    if let Some(seed) = &spec.seed {
+        let dst = resources.join("toolchain-seed");
+        std::fs::create_dir_all(&dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
+        for entry in std::fs::read_dir(&seed.dir)
+            .map_err(|e| format!("read {}: {e}", seed.dir.display()))?
+        {
+            let entry = entry.map_err(|e| format!("read {}: {e}", seed.dir.display()))?;
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))
+                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
+        }
+        println!(
+            "    bundled toolchain-seed: {} file(s), {}, index_build={}, programs [{}]",
+            seed.files,
+            human_bytes(seed.bytes),
+            seed.index_build,
+            seed
+                .programs
+                .iter()
+                .map(|(p, b)| format!("{p}@{b}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     Ok(app)
+}
+
+/// Short human byte count for the assemble/provenance log lines.
+///
+/// MIRRORS (deliberately, not depends on) `atpkg::cost::human_bytes`: same
+/// B/KiB/MiB/GiB tiers, same one-decimal rendering, so the cut transcript and
+/// the client's cost surface report a seed's size identically. aterm-release
+/// does not depend on atpkg (the cutter must build without the package
+/// manager); if either side's tiering or rounding changes, change both.
+fn human_bytes(n: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if n >= GIB {
+        format!("{:.1} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.1} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 fn copy_exe(src: &Path, dst: &Path) -> Result<(), String> {
@@ -318,6 +376,37 @@ pub fn write_provenance(spec: &BundleSpec, app: &Path, signed_by: &str) -> Resul
     let path = spec
         .out_dir
         .join(format!("aterm-{}-build.txt", spec.short_version));
+    // Batteries-included seed lines (new keys appended so every existing
+    // consumer of the earlier fields keeps parsing): what the seal carries,
+    // from the VALIDATED stat — plus a paranoid recount of the copied dir so
+    // the record describes the actual bundle, not the intent.
+    let seed_lines = match &spec.seed {
+        Some(seed) => {
+            let copied = app.join("Contents/Resources/toolchain-seed");
+            let n = std::fs::read_dir(&copied)
+                .map(|it| it.filter_map(Result::ok).count())
+                .unwrap_or(0);
+            if n != seed.files {
+                return Err(format!(
+                    "provenance: bundled seed holds {n} file(s) but the validated registry had {} — the copy is not what was audited",
+                    seed.files
+                ));
+            }
+            format!(
+                "seed=yes\nseed_files={}\nseed_bytes={}\nseed_index_build={}\nseed_valid_until={}\nseed_programs={}\n",
+                seed.files,
+                seed.bytes,
+                seed.index_build,
+                seed.valid_until,
+                seed.programs
+                    .iter()
+                    .map(|(p, b)| format!("{p}@{b}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        None => "seed=no\n".to_string(),
+    };
     let body = format!(
         "name=aterm\n\
          version={}\n\
@@ -329,7 +418,8 @@ pub fn write_provenance(spec: &BundleSpec, app: &Path, signed_by: &str) -> Resul
          signed_by={}\n\
          has_dsym={}\n\
          layout=one-binary\n\
-         has_aliases={}\n",
+         has_aliases={}\n\
+         {seed_lines}",
         spec.short_version,
         spec.build_number,
         bare_commit,
@@ -351,32 +441,10 @@ fn yes_no(b: bool) -> &'static str {
 
 /// Unix epoch seconds → "YYYY-MM-DDTHH:MM:SSZ" (build-app.sh's
 /// `date -u -r $SOURCE_DATE_EPOCH`), computed in-process so the provenance
-/// record never depends on the host `date` flavor. Civil-date conversion via
-/// Howard Hinnant's days algorithm — exact for all of Unix time.
+/// record never depends on the host `date` flavor — the shared
+/// `aterm_types::rfc3339` civil-calendar math, exact for all of Unix time.
 pub fn epoch_to_rfc3339(epoch: u64) -> String {
-    let days = epoch / 86_400;
-    let secs = epoch % 86_400;
-    // civil_from_days, specialized to day 0 = 1970-01-01 (era math keeps every
-    // intermediate positive; correct across all Gregorian leap rules).
-    let z = days + 719_468; // shift epoch from 1970-01-01 to 0000-03-01
-    let era = z / 146_097;
-    let doe = z % 146_097; // day-of-era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year-of-era
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day-of-year, Mar-based
-    let mp = (5 * doy + 2) / 153; // month, Mar=0
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m,
-        d,
-        secs / 3600,
-        (secs % 3600) / 60,
-        secs % 60
-    )
+    aterm_types::rfc3339::format_rfc3339(epoch)
 }
 
 /// Streaming in-process SHA-256 of a file (shared shape with dmg.rs — kept

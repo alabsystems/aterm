@@ -36,11 +36,16 @@ use crate::{Wake, term_lock};
 /// so the polled and pushed faces stay byte-identical. Caller holds the term lock.
 pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
     let line = t.get_line_text(r as i32, None).unwrap_or_default();
-    line.chars()
-        .map(visible_char)
-        .collect::<String>()
-        .trim_end()
-        .to_string()
+    let mut out: String = line.chars().map(visible_char).collect();
+    // Truncate in place instead of `trim_end().to_string()`: `trim_end` returns
+    // a PREFIX slice, so its length is always a char boundary and the bytes that
+    // survive are identical — but the old form allocated a second full row and
+    // memcpy'd into it. This runs once per screen row per `subscribe screen`
+    // push WITH THE TERMINAL LOCK HELD, so the copy stalled the PTY reader.
+    // (Two statements: `out.truncate(out.trim_end().len())` cannot borrow-check.)
+    let end = out.trim_end().len();
+    out.truncate(end);
+    out
 }
 
 /// `text` -> `OK <nrows>\n` then each visible row (trailing spaces trimmed).
@@ -56,7 +61,14 @@ pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
 pub(crate) fn cmd_text(term: &Arc<Mutex<Terminal>>) -> String {
     let t = term_lock(term);
     let rows = t.rows() as usize;
-    let mut out = format!("OK {rows}\n");
+    // Sized for the whole reply up front (header + one full row + newline each)
+    // so the row loop never reallocates-and-copies the accumulated screen while
+    // holding the terminal lock.
+    let mut out = String::with_capacity(rows * (t.cols() as usize + 1) + 16);
+    {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "OK {rows}");
+    }
     for r in 0..rows {
         out.push_str(&visible_row(&t, r));
         out.push('\n');
@@ -362,10 +374,22 @@ pub(crate) fn cmd_dims(
 /// and `perf_reduced` + `shed_transitions` (the load-shed latch; engaged during light
 /// typing, or flapping at idle, are both wrong).
 ///
-/// STARTUP: `first_present_ms` — main entry → the first successful application
-/// present return; 0.00 until that boundary and NOT zeroed by `metrics reset`
-/// (a startup fact, not a window stat). None of these timestamps observes
-/// compositor selection, display timing, scanout, or photons.
+/// STARTUP: `first_present_ms` keeps the compatibility-stable GUI
+/// `main_entry` → startup-metrics publication point inside the first
+/// successful-present finalizer. That point follows a successful submit and
+/// includes initial reveal, acknowledgement, and synchronous post-submit
+/// recovery bookkeeping.
+/// `rust_main_to_first_present_ms` adds the shipped one-binary Rust `main`
+/// boundary before router work (0.00 in the thin GUI binary). Schema 1's eight
+/// `startup_*_ms` fields exclusively partition that broader interval: router,
+/// synchronous GUI preparation, winit dispatch, initial surface attachment,
+/// wait/retries to the eventually successful redraw, that redraw's compose,
+/// its surface transaction, and successful-present finalization.
+/// `startup_phase_valid` is true only when every timestamp is present, ordered,
+/// and sums exactly to both enclosing startup metrics. All startup facts remain
+/// 0.00 until first present, survive `metrics reset`, and exclude
+/// dyld/process-loader time. None observes compositor selection, display timing,
+/// scanout, or photons.
 ///
 /// `metrics percentiles` -> the latency DISTRIBUTIONS:
 /// input→application-present-return, output→application-present-return,
@@ -460,6 +484,20 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          wake_kind={} wake_owner={} wake_late_ms={:.2} deadline_owner={} \
          deadline_in_ms={:.2} deadline_late_ms={:.2} past_deadline_arms={} \
          max_frame_gap_ms={:.2} \
+         rust_main_to_first_present_ms={:.2} \
+         startup_phase_schema={} startup_phase_valid={} \
+         startup_router_ms={:.2} startup_gui_prepare_ms={:.2} \
+         startup_winit_dispatch_ms={:.2} startup_initial_surface_attach_ms={:.2} \
+         startup_surface_to_successful_redraw_ms={:.2} \
+         startup_successful_compose_ms={:.2} \
+         startup_successful_surface_transaction_ms={:.2} \
+         startup_successful_finalize_ms={:.2} \
+         startup_attach_schema={} startup_attach_valid={} \
+         startup_attach_dispatch_ms={:.2} startup_attach_prepare_ms={:.2} \
+         startup_attach_window_create_ms={:.2} startup_attach_window_setup_ms={:.2} \
+         startup_attach_backend_finalize_ms={:.2} \
+         startup_attach_chrome_geometry_ms={:.2} \
+         startup_attach_surface_create_ms={:.2} startup_attach_finish_ms={:.2} \
          first_present_ms={:.2}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
@@ -504,6 +542,27 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
         ms(m.max_frame_gap_ns),
+        ms(m.rust_main_to_first_present_ns),
+        m.startup_phase_schema,
+        u8::from(m.startup_phase_valid),
+        ms(m.startup_router_ns),
+        ms(m.startup_gui_prepare_ns),
+        ms(m.startup_winit_dispatch_ns),
+        ms(m.startup_initial_surface_attach_ns),
+        ms(m.startup_surface_to_successful_redraw_ns),
+        ms(m.startup_successful_compose_ns),
+        ms(m.startup_successful_surface_transaction_ns),
+        ms(m.startup_successful_finalize_ns),
+        m.startup_attach_schema,
+        u8::from(m.startup_attach_valid),
+        ms(m.startup_attach_dispatch_ns),
+        ms(m.startup_attach_prepare_ns),
+        ms(m.startup_attach_window_create_ns),
+        ms(m.startup_attach_window_setup_ns),
+        ms(m.startup_attach_backend_finalize_ns),
+        ms(m.startup_attach_chrome_geometry_ns),
+        ms(m.startup_attach_surface_create_ns),
+        ms(m.startup_attach_finish_ns),
         ms(m.first_present_ns),
     )
 }
@@ -576,6 +635,20 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"poll_wakes\":{},\"wake_kind\":\"{}\",\"wake_owner\":\"{}\",\
          \"wake_late_ms\":{:.2},\"deadline_owner\":\"{}\",\"deadline_in_ms\":{:.2},\
          \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\"max_frame_gap_ms\":{:.2},\
+         \"rust_main_to_first_present_ms\":{:.2},\
+         \"startup_phase_schema\":{},\"startup_phase_valid\":{},\
+         \"startup_router_ms\":{:.2},\"startup_gui_prepare_ms\":{:.2},\
+         \"startup_winit_dispatch_ms\":{:.2},\"startup_initial_surface_attach_ms\":{:.2},\
+         \"startup_surface_to_successful_redraw_ms\":{:.2},\
+         \"startup_successful_compose_ms\":{:.2},\
+         \"startup_successful_surface_transaction_ms\":{:.2},\
+         \"startup_successful_finalize_ms\":{:.2},\
+         \"startup_attach_schema\":{},\"startup_attach_valid\":{},\
+         \"startup_attach_dispatch_ms\":{:.2},\"startup_attach_prepare_ms\":{:.2},\
+         \"startup_attach_window_create_ms\":{:.2},\"startup_attach_window_setup_ms\":{:.2},\
+         \"startup_attach_backend_finalize_ms\":{:.2},\
+         \"startup_attach_chrome_geometry_ms\":{:.2},\
+         \"startup_attach_surface_create_ms\":{:.2},\"startup_attach_finish_ms\":{:.2},\
          \"first_present_ms\":{:.2}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
@@ -620,6 +693,27 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
         ms(m.max_frame_gap_ns),
+        ms(m.rust_main_to_first_present_ns),
+        m.startup_phase_schema,
+        m.startup_phase_valid,
+        ms(m.startup_router_ns),
+        ms(m.startup_gui_prepare_ns),
+        ms(m.startup_winit_dispatch_ns),
+        ms(m.startup_initial_surface_attach_ns),
+        ms(m.startup_surface_to_successful_redraw_ns),
+        ms(m.startup_successful_compose_ns),
+        ms(m.startup_successful_surface_transaction_ns),
+        ms(m.startup_successful_finalize_ns),
+        m.startup_attach_schema,
+        m.startup_attach_valid,
+        ms(m.startup_attach_dispatch_ns),
+        ms(m.startup_attach_prepare_ns),
+        ms(m.startup_attach_window_create_ns),
+        ms(m.startup_attach_window_setup_ns),
+        ms(m.startup_attach_backend_finalize_ns),
+        ms(m.startup_attach_chrome_geometry_ns),
+        ms(m.startup_attach_surface_create_ns),
+        ms(m.startup_attach_finish_ns),
         ms(m.first_present_ns),
     ))
 }
@@ -1892,29 +1986,21 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
 /// payload-affecting terminal state was captured under the earlier single lock.
 pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
     use std::fmt::Write as _;
-    // ONE buffer for the whole frame. The retired shape built a `String` per
-    // cell, joined those into a `String` per row, then joined the rows into the
-    // frame — three full copies of a payload that reaches megabytes on a large
-    // window, on top of the per-cell allocations. Reserving up front and writing
-    // straight through removes all of it. ~180 bytes/cell is the measured shape
-    // of an ordinary cell; a short read is just one realloc, never wrong.
+    // ONE buffer for the whole frame — now literally one. The retired shape
+    // built a `String` per cell, joined those into a `String` per row, then
+    // joined the rows into the frame; the intermediate `rows_json` that survived
+    // that cleanup still reserved a SECOND full-size buffer (~180 bytes/cell)
+    // and memcpy'd the entire rows payload into `out` at the end — 864 KB
+    // allocated twice and copied once on a 120x40 grid, per pushed frame.
+    // Reserving up front and writing straight through removes all of it.
+    // ~180 bytes/cell is the measured shape of an ordinary cell; a short read is
+    // just one realloc, never wrong.
     let cell_count = snap.cells.iter().map(Vec::len).sum::<usize>();
     let mut out = String::with_capacity(256 + cell_count * 180);
-    let mut rows_json = String::with_capacity(cell_count * 180);
-    for (r, row_cells) in snap.cells.iter().enumerate() {
-        if r > 0 {
-            rows_json.push(',');
-        }
-        rows_json.push('[');
-        for (c, cell) in row_cells.iter().enumerate() {
-            if c > 0 {
-                rows_json.push(',');
-            }
-            write_styled_cell_json(&mut rows_json, cell);
-        }
-        rows_json.push(']');
-    }
-    let _ = &mut out;
+    // Every row-INDEPENDENT field is built first so the header, the streamed
+    // rows, and the tail can be emitted in that order into the single buffer.
+    // These are all tiny (a few bytes to a few hundred) and order-independent
+    // pure functions of the snapshot; only the rows payload is large.
     let line_sizes_json = snap
         .line_sizes
         .iter()
@@ -1941,9 +2027,7 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
         out,
         "{{\"seq\":{},\"dims\":{{\"rows\":{},\"cols\":{}}},\
          \"cursor\":{{\"row\":{},\"col\":{},\"visible\":{},{},\"color\":{cursor_color}}},\
-         \"rows\":[{rows_json}],\"line_sizes\":[{line_sizes_json}],\"selection\":{selection_json},\
-         \"selection_bg\":{selection_bg},\"selection_fg\":{selection_fg},\
-         \"images\":[{images_json}]}}",
+         \"rows\":[",
         snap.seq,
         snap.rows,
         snap.cols,
@@ -1951,6 +2035,25 @@ pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
         snap.cursor_col,
         snap.cursor_visible,
         json_str_field("style", snap.cursor_style),
+    );
+    for (r, row_cells) in snap.cells.iter().enumerate() {
+        if r > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        for (c, cell) in row_cells.iter().enumerate() {
+            if c > 0 {
+                out.push(',');
+            }
+            write_styled_cell_json(&mut out, cell);
+        }
+        out.push(']');
+    }
+    let _ = write!(
+        out,
+        "],\"line_sizes\":[{line_sizes_json}],\"selection\":{selection_json},\
+         \"selection_bg\":{selection_bg},\"selection_fg\":{selection_fg},\
+         \"images\":[{images_json}]}}",
     );
     out
 }
@@ -2688,6 +2791,28 @@ mod tests {
             "last_present_drop_reason=",
             "wake_owner=",
             "deadline_owner=",
+            "rust_main_to_first_present_ms=",
+            "startup_phase_schema=",
+            "startup_phase_valid=",
+            "startup_router_ms=",
+            "startup_gui_prepare_ms=",
+            "startup_winit_dispatch_ms=",
+            "startup_initial_surface_attach_ms=",
+            "startup_surface_to_successful_redraw_ms=",
+            "startup_successful_compose_ms=",
+            "startup_successful_surface_transaction_ms=",
+            "startup_successful_finalize_ms=",
+            "startup_attach_schema=",
+            "startup_attach_valid=",
+            "startup_attach_dispatch_ms=",
+            "startup_attach_prepare_ms=",
+            "startup_attach_window_create_ms=",
+            "startup_attach_window_setup_ms=",
+            "startup_attach_backend_finalize_ms=",
+            "startup_attach_chrome_geometry_ms=",
+            "startup_attach_surface_create_ms=",
+            "startup_attach_finish_ms=",
+            "first_present_ms=",
         ] {
             assert!(
                 text.contains(field),
@@ -2717,6 +2842,28 @@ mod tests {
             "deadline_in_ms",
             "deadline_late_ms",
             "past_deadline_arms",
+            "rust_main_to_first_present_ms",
+            "startup_phase_schema",
+            "startup_phase_valid",
+            "startup_router_ms",
+            "startup_gui_prepare_ms",
+            "startup_winit_dispatch_ms",
+            "startup_initial_surface_attach_ms",
+            "startup_surface_to_successful_redraw_ms",
+            "startup_successful_compose_ms",
+            "startup_successful_surface_transaction_ms",
+            "startup_successful_finalize_ms",
+            "startup_attach_schema",
+            "startup_attach_valid",
+            "startup_attach_dispatch_ms",
+            "startup_attach_prepare_ms",
+            "startup_attach_window_create_ms",
+            "startup_attach_window_setup_ms",
+            "startup_attach_backend_finalize_ms",
+            "startup_attach_chrome_geometry_ms",
+            "startup_attach_surface_create_ms",
+            "startup_attach_finish_ms",
+            "first_present_ms",
         ] {
             assert!(
                 value.get(key).is_some(),

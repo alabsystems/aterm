@@ -307,7 +307,9 @@ pub(crate) fn remove_block(content: &str) -> Result<Option<String>, String> {
 
 /// The user's home directory, from the platform's canonical env var. `None` (an
 /// unset/empty var) makes `aterm agents` fail with a clear message rather than
-/// writing relative to an arbitrary cwd.
+/// writing relative to an arbitrary cwd. Deliberately NOT
+/// `aterm_types::dirs::home_dir`: that one accepts an empty `$HOME` and falls
+/// back to `/etc/passwd`, either of which would defeat the fail-fast here.
 pub(crate) fn home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(var)

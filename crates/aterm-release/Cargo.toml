@@ -15,6 +15,9 @@ name = "aterm-release"
 path = "src/main.rs"
 
 [dependencies]
+# The shared RFC3339 / Howard-Hinnant civil-calendar math (`aterm_types::rfc3339`);
+# already in the dependency graph via aterm-update-core.
+aterm-types = { workspace = true }
 # The shared serde `Manifest` type (release spec §4) lives in aterm-update-core
 # so publisher and updater client agree by compilation, not by convention — the
 # publish-time byte round-trip through the CLIENT's parser is the bridge proof.

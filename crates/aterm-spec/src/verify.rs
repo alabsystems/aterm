@@ -133,7 +133,67 @@ fn find_trust_bin(bin: &str, first_party_rel_dir: &str) -> Option<PathBuf> {
             return Some(p);
         }
     }
+    // The atpkg-managed store (batteries-included installs): the per-tool shim
+    // under the manager-owned prefix. Probed after the developer checkouts (a
+    // live $HOME/trust always wins) and before PATH — atpkg's bin/ reaches PATH
+    // only in interactive aterm shells (~/.aterm/shell.d, APPENDED), so
+    // without this probe a seeded toolchain is invisible to `cargo test` and
+    // CI processes. A shim is trusted only when it resolves to a real file
+    // (a dangling link after a GC must not satisfy discovery).
+    if let Some(p) = atpkg_store_probe(&exe) {
+        return Some(p);
+    }
     path_search(&exe)
+}
+
+/// The default atpkg store shim for `exe`, resolved. The prefix mirrors
+/// `atpkg::platform::default_prefix` (`~/Library/Application Support/aterm/pkg`
+/// on Unix, `%LOCALAPPDATA%\aterm\pkg` on Windows) — kept as a PATH MIRROR, not
+/// a dependency edge, so the spec crate never drags the package manager (ring,
+/// tar, zstd) into every conformance consumer; if atpkg ever moves its prefix,
+/// update both sites (each carries this cross-reference).
+// Skip: fs syscall wrappers (exists/canonicalize — absent std bodies); every
+// miss returns None (fail-closed). Build-tooling discovery, not runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+fn atpkg_store_probe(exe: &str) -> Option<PathBuf> {
+    let bin_dir = if cfg!(windows) {
+        let local = std::env::var("LOCALAPPDATA").ok().filter(|d| !d.is_empty())?;
+        PathBuf::from(local).join("aterm").join("pkg").join("bin")
+    } else {
+        unix_store_bin_dir(&home_dirs().into_iter().next()?)
+    };
+    resolve_store_shim(&bin_dir.join(exe))
+}
+
+/// `<home>/Library/Application Support/aterm/pkg/bin` — the Unix half of the
+/// prefix mirror (see [`atpkg_store_probe`]).
+fn unix_store_bin_dir(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("aterm")
+        .join("pkg")
+        .join("bin")
+}
+
+/// A shim is trusted only when it is a SYMLINK that resolves to a real file.
+///
+/// The symlink requirement is load-bearing, not incidental: atpkg disables a
+/// yanked or below-floor build by REPLACING the forwarding symlink with a
+/// failing regular-file TOMBSTONE script (`atpkg::activate::install_tombstone_shim`).
+/// Accepting any regular file would hand discovery that tombstone — and because
+/// this probe runs before the PATH search, a revoked build would then SHADOW a
+/// working tool the developer already has on PATH (adversarial review
+/// 2026-07-30). A tombstone therefore reads as "absent", which is exactly what
+/// a revoked build should look like to the verification tier.
+// Skip: fs syscall wrappers (symlink_metadata/canonicalize — absent std
+// bodies); every miss returns None (fail-closed).
+#[cfg_attr(trust_verify, trust::skip)]
+fn resolve_store_shim(shim: &Path) -> Option<PathBuf> {
+    if !std::fs::symlink_metadata(shim).is_ok_and(|m| m.file_type().is_symlink()) {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(shim).ok()?;
+    resolved.is_file().then_some(resolved)
 }
 
 /// `<bin>` with the platform executable suffix (`.exe` on Windows, none on Unix).
@@ -563,6 +623,210 @@ pub fn prove_and_catch_scalar(m: &Model, label: &str) -> Covered {
     }
 }
 
+/// PROVE, CATCH **and MULTIPLY** — the discharge protocol for a model whose
+/// safety argument is GLOBAL across every live instance of an enforcing
+/// structure, not local to one of them.
+///
+/// The flash limiter is the motivating case. `FlashLimiter` proves ≤ 2
+/// ignitions per rolling second for ONE limiter, and that theorem stays true
+/// however many limiters exist — so it cannot see the defect where each split
+/// pane gets its own. A model that CAN see it needs a second dial beside
+/// `Buggy`, and this protocol is what keeps that dial honest.
+///
+/// Five gates, all discharged on both tiers (the interpreter always, `ty`
+/// wherever installed; a disagreement panics):
+///
+/// * **G1 SHAPE** — the model declares `Buggy`, `Local` and `Instances`, and
+///   commits them to `Buggy = 0`, `Local = 0`, `Instances >= 2`. Committing
+///   `Instances >= 2` is what makes G2 a statement about a MULTI-enforcer
+///   world rather than a vacuous one.
+/// * **G2 PROVE** — every invariant holds at every `scenarios` corner.
+/// * **G3 CATCH** — the classic non-vacuity mutant: `Buggy = 1` at `buggy_at`
+///   yields a counterexample.
+/// * **G4 MULTIPLY** — `Local = 1` (each enforcer applying the bound to its
+///   OWN state) yields a counterexample at EVERY corner. The asymmetry with G3
+///   is load-bearing: an overlap-blind limiter needs the overlap scenario to
+///   misbehave, while multiplying enforcers is wrong unconditionally.
+/// * **G5 ATTRIBUTION** — `Local = 1, Instances = 1` HOLDS, which proves the
+///   G4 counterexample is attributable to the instance COUNT and not to some
+///   unrelated damage the `Local` dial does to the model.
+///
+/// # Panics
+///
+/// On any gate failing, or on a tier disagreement — the same honesty ratchet
+/// as [`prove_and_catch_scalar`].
+// Skip: a tiered verification DRIVER (shells out to `ty`, renders output, and
+// its asserts are deliberate harness aborts). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn prove_catch_and_multiply_scalar(
+    m: &Model,
+    scenarios: &[&[(&'static str, i64)]],
+    buggy_at: &[(&'static str, i64)],
+    label: &str,
+) -> Covered {
+    assert_scalar(m, label, "prove_catch_and_multiply_scalar");
+    // ---- G1 SHAPE ----
+    let committed = |name: &str| -> i64 {
+        m.consts
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: {} declares no `{name}` constant — a MULTIPLY obligation needs \
+                     the `Buggy` / `Local` / `Instances` dials to exist",
+                    m.name
+                )
+            })
+    };
+    assert_eq!(
+        committed("Buggy"),
+        0,
+        "{label}: {} commits Buggy != 0",
+        m.name
+    );
+    assert_eq!(
+        committed("Local"),
+        0,
+        "{label}: {} commits Local != 0",
+        m.name
+    );
+    let instances = committed("Instances");
+    assert!(
+        instances >= 2,
+        "{label}: {} commits Instances = {instances} — the committed world must already \
+         contain SEVERAL enforcers, or G2 proves nothing about aggregation",
+        m.name
+    );
+    assert!(
+        !scenarios.is_empty(),
+        "{label}: {} was given no scenario corners to prove over",
+        m.name
+    );
+
+    let ty = find_ty();
+    let gate = |extra: &[(&'static str, i64)], scenario: &[(&'static str, i64)], gate: &str| {
+        let mut cfg: Vec<(&'static str, i64)> = scenario.to_vec();
+        for (n, v) in extra {
+            match cfg.iter_mut().find(|(c, _)| c == n) {
+                Some(slot) => slot.1 = *v,
+                None => cfg.push((*n, *v)),
+            }
+        }
+        let interp_verdict = interp::bmc(&interp::with_consts(m, &cfg));
+        let ty_verdict = ty
+            .as_ref()
+            .map(|t| ty_check_derived(t, m, &m.to_cfg_with(&cfg), label));
+        if let Some((ok, evidence)) = &ty_verdict {
+            assert_eq!(
+                *ok,
+                interp_verdict.is_ok(),
+                "{label}: {} TIER DISAGREEMENT at {gate} ({cfg:?}) — interpreter said {}, ty \
+                 said {}\n{evidence}",
+                m.name,
+                if interp_verdict.is_ok() {
+                    "HOLDS"
+                } else {
+                    "VIOLATED"
+                },
+                if *ok { "HOLDS" } else { "VIOLATED" },
+            );
+        }
+        (cfg, interp_verdict)
+    };
+
+    // ---- G2 PROVE ----
+    for scenario in scenarios {
+        let (cfg, verdict) = gate(&[], scenario, "G2 PROVE");
+        match verdict {
+            Ok(n) => eprintln!(
+                "{label}: G2 PROVE {} holds over {n} states at {cfg:?}.",
+                m.name
+            ),
+            Err((st, inv)) => panic!(
+                "{label}: G2 PROVE FAILED — {} invariant `{inv}` VIOLATED at {st:?} ({cfg:?})",
+                m.name
+            ),
+        }
+    }
+    // ---- G3 CATCH ----
+    {
+        let (cfg, verdict) = gate(&[("Buggy", 1)], buggy_at, "G3 CATCH");
+        match verdict {
+            Ok(n) => panic!(
+                "{label}: G3 CATCH FAILED — {} found NO counterexample over {n} states at \
+                 {cfg:?}; the `Buggy` mutant is not caught, so the property is trivial",
+                m.name
+            ),
+            Err((st, inv)) => {
+                eprintln!(
+                    "{label}: G3 CATCH {} `{inv}` VIOLATED at {st:?} ({cfg:?}).",
+                    m.name
+                );
+            }
+        }
+    }
+    // ---- G4 MULTIPLY ----
+    for scenario in scenarios {
+        let (cfg, verdict) = gate(&[("Local", 1)], scenario, "G4 MULTIPLY");
+        match verdict {
+            Ok(n) => panic!(
+                "{label}: G4 MULTIPLY FAILED — {} stayed GREEN over {n} states at {cfg:?} with \
+                 every enforcer applying the bound LOCALLY. That is the per-instance blindness \
+                 this model exists to expose: either the aggregate invariant is not charged \
+                 against every instance, or the `Local` dial does not actually make the \
+                 enforcers blind to each other. Fix the MODEL — this gate is the machine-\
+                 checked form of the sentence a scope-cardinality claim asserts in prose.",
+                m.name
+            ),
+            Err((st, inv)) => {
+                let witness: Vec<String> = st
+                    .iter()
+                    .filter(|(_, v)| **v != 0)
+                    .map(|(k, v)| format!("{k}:{v}"))
+                    .collect();
+                eprintln!(
+                    "{label}: G4 MULTIPLY {} `{inv}` VIOLATED at {{{}}} ({cfg:?}) — every \
+                     enforcer individually within budget.",
+                    m.name,
+                    witness.join(", ")
+                );
+            }
+        }
+    }
+    // ---- G5 ATTRIBUTION ----
+    for scenario in scenarios {
+        let (cfg, verdict) = gate(
+            &[("Local", 1), ("Instances", 1)],
+            scenario,
+            "G5 ATTRIBUTION",
+        );
+        match verdict {
+            Ok(n) => eprintln!(
+                "{label}: G5 ATTRIBUTION {} holds over {n} states at {cfg:?} — the G4 \
+                 counterexample is due to the instance COUNT, nothing else.",
+                m.name
+            ),
+            Err((st, inv)) => panic!(
+                "{label}: G5 ATTRIBUTION FAILED — {} invariant `{inv}` VIOLATED at {st:?} \
+                 ({cfg:?}) with a SINGLE enforcer. The `Local` dial breaks the model even \
+                 without multiplication, so G4's counterexample proves nothing about \
+                 instance count.",
+                m.name
+            ),
+        }
+    }
+    if ty.is_some() {
+        eprintln!(
+            "{label}: {} proved/caught/multiplied on BOTH tiers.",
+            m.name
+        );
+        Covered::InterpreterAndTy
+    } else {
+        Covered::Interpreter
+    }
+}
+
 /// The shared precondition of the `_scalar` forms. `caller` names the function
 /// the site actually called, so the message says which one to stop using.
 // Skip: a build-tooling PRECONDITION — the panic is the deliberate
@@ -925,6 +1189,51 @@ mod tests {
     use super::*;
     use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
     use crate::ty_model;
+
+    /// The atpkg-store prefix mirror must keep matching
+    /// `atpkg::platform::default_prefix` + `/bin` (the deliberate
+    /// no-dependency duplication both sites cross-reference).
+    #[test]
+    fn store_bin_dir_mirrors_the_atpkg_default_prefix() {
+        assert_eq!(
+            unix_store_bin_dir(Path::new("/Users//x")),
+            Path::new("/Users//x/Library/Application Support/aterm/pkg/bin")
+        );
+    }
+
+    /// A dangling store shim never satisfies discovery; a live one resolves to
+    /// the real store target (what the caller will execute), not the link.
+    #[cfg(unix)]
+    #[test]
+    fn store_shim_resolution_is_fail_closed() {
+        let d = std::env::temp_dir().join(format!("aterm-spec-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let shim = d.join("ty");
+        // Absent → None.
+        assert_eq!(resolve_store_shim(&shim), None);
+        // Dangling symlink → None (a GC'd store build must not satisfy).
+        std::os::unix::fs::symlink(d.join("store/gone/ty"), &shim).unwrap();
+        assert_eq!(resolve_store_shim(&shim), None);
+        // A TOMBSTONE (regular-file refusal script atpkg writes for a yanked
+        // build) must read as ABSENT — else a revoked build would shadow a
+        // working tool on PATH, since this probe runs first.
+        std::fs::remove_file(&shim).unwrap();
+        std::fs::write(&shim, b"#!/bin/sh\necho revoked >&2\nexit 1\n").unwrap();
+        assert_eq!(
+            resolve_store_shim(&shim),
+            None,
+            "a tombstone shim must never satisfy discovery"
+        );
+        // Live shim → the RESOLVED store path.
+        std::fs::remove_file(&shim).unwrap();
+        let target = d.join("real-ty");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&target, &shim).unwrap();
+        let got = resolve_store_shim(&shim).expect("live shim resolves");
+        assert_eq!(got, std::fs::canonicalize(&target).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     /// A SCALAR model can never report [`NotRun`] — that is the fact
     /// [`check_scalar`]/[`prove_and_catch_scalar`] convert into an unconditional

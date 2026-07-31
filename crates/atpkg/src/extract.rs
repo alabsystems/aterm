@@ -15,10 +15,16 @@
 //!
 //! **Fail closed by construction:**
 //! * absolute paths, `..` components, and root/prefix components are refused;
-//! * symlinks, hardlinks, and any non-regular/non-directory entry type are refused
-//!   outright — a relocatable bundle has no need to carry links, and a link is both the
-//!   classic slip vector and a TOCTOU hazard; the `exposes` shims are created by `atpkg`
-//!   *after* extraction, never unpacked from the archive;
+//! * symlinks and any non-regular/non-directory/non-hardlink entry type are refused
+//!   outright — a symlink is both the classic slip vector and a TOCTOU hazard, and the
+//!   `exposes` shims are created by `atpkg` *after* extraction, never unpacked from the
+//!   archive;
+//! * an in-root HARDLINK is admitted only after [`vet_hardlink`] walks BOTH ends through
+//!   the same component vet AND the target is already an extracted regular file — a
+//!   toolchain sysroot dedups identical binaries this way (`cargo`↔`targo`,
+//!   `trustc`↔`rustc`, shared dylibs), and the materialized alias hashes into `tree_root`
+//!   exactly like a regular file; an escaping, absolute, or forward-referencing link
+//!   aborts the whole stage;
 //! * the validated path is re-joined to the root and confirmed to still be under it
 //!   (defence in depth against any normalization surprise).
 
@@ -37,22 +43,34 @@ pub enum ExtractReject {
     EmptyPath,
     /// The lexically-joined destination escaped the store root (belt-and-suspenders).
     RootEscape,
-    /// A symlink, hardlink, or any non-regular/non-directory entry — refused outright.
+    /// A symlink or any non-regular/non-directory/non-hardlink entry — refused
+    /// outright. (An in-root hardlink is separately vetted by [`vet_hardlink`];
+    /// one that fails that vet lands here or in the path rejections above.)
     DisallowedKind,
+    /// A hardlink whose target had not been extracted by the time the link entry
+    /// appeared — a forward/self reference no honest archiver produces.
+    HardlinkTargetMissing,
 }
 
-/// The kind of a tar entry, as the tar reader classifies it. Only
-/// [`Regular`](EntryKind::Regular) and [`Directory`](EntryKind::Directory) are ever
-/// extracted; everything else is refused by [`vet_entry`].
+/// The kind of a tar entry, as the tar reader classifies it.
+/// [`Regular`](EntryKind::Regular) and [`Directory`](EntryKind::Directory) are
+/// extracted after [`vet_entry`]; a [`Hardlink`](EntryKind::Hardlink) is laid
+/// down only after the stricter [`vet_hardlink`] (both ends walked, target
+/// already extracted, in-root); everything else is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     /// A regular file.
     Regular,
     /// A directory.
     Directory,
-    /// A symbolic link (refused — slip/TOCTOU vector).
+    /// A symbolic link (refused — slip/TOCTOU vector; and the signed
+    /// `tree_root` is symlink-free by contract).
     Symlink,
-    /// A hard link (refused — slip vector).
+    /// A hard link. Allowed ONLY when [`vet_hardlink`] proves both the entry
+    /// path and the link target resolve inside the store root and the target
+    /// is already extracted — a toolchain sysroot dedups identical binaries
+    /// this way (`cargo`/`targo`, `trustc`/`rustc`, shared dylibs), and the
+    /// materialized file hashes into `tree_root` exactly like a regular file.
     Hardlink,
     /// Any other type (device, fifo, …) — refused.
     Other,
@@ -67,8 +85,9 @@ pub enum EntryKind {
 /// Pure and side-effect-free (no filesystem access), so the full adversarial matrix is
 /// unit-testable without writing any files.
 pub fn vet_entry(root: &Path, raw: &Path, kind: EntryKind) -> Result<PathBuf, ExtractReject> {
-    // 1. Only real files/dirs are ever laid down. Links (the classic slip + TOCTOU
-    //    vector) and exotic types are refused outright — bundles carry neither.
+    // 1. Only real files/dirs are laid down through THIS vet. Symlinks (the
+    //    classic slip + TOCTOU vector) and exotic types are refused outright;
+    //    a hardlink must come through [`vet_hardlink`], which walks BOTH ends.
     match kind {
         EntryKind::Regular | EntryKind::Directory => {}
         EntryKind::Symlink | EntryKind::Hardlink | EntryKind::Other => {
@@ -106,6 +125,27 @@ pub fn vet_entry(root: &Path, raw: &Path, kind: EntryKind) -> Result<PathBuf, Ex
         return Err(ExtractReject::RootEscape);
     }
     Ok(dest)
+}
+
+/// Vet one HARDLINK entry: the entry path AND the link target must each pass
+/// the exact [`vet_entry`] component walk (relative, no `..`, no root/prefix,
+/// non-empty, joined-under-root). Returns `(dest, target)` as safe absolute
+/// paths. The link target is resolved against the store `root` (tar hardlink
+/// names are archive-relative), so a target can never name anything outside
+/// the tree being extracted — an escaping hardlink (the slip vector the old
+/// blanket refusal guarded against) is still structurally unreachable.
+///
+/// Pure like [`vet_entry`]; the existence-at-link-time check
+/// ([`ExtractReject::HardlinkTargetMissing`]) lives at the extraction site,
+/// where the filesystem is in scope.
+pub fn vet_hardlink(
+    root: &Path,
+    raw: &Path,
+    link_target: &Path,
+) -> Result<(PathBuf, PathBuf), ExtractReject> {
+    let dest = vet_entry(root, raw, EntryKind::Regular)?;
+    let target = vet_entry(root, link_target, EntryKind::Regular)?;
+    Ok((dest, target))
 }
 
 /// A failure while extracting a `.tar.zst` bundle. Any variant aborts the WHOLE stage —
@@ -299,6 +339,13 @@ pub fn extract_tar_zst(
     });
     // We drive extraction ourselves — never tar's `unpack` — so every entry is vetted.
     let mut remaining = max_total_bytes;
+    // ONE copy buffer for the whole archive. A `[0u8; 64 * 1024]` local inside
+    // `write_capped` would be zero-initialized per ENTRY and LLVM cannot elide it (the
+    // buffer goes to an opaque `Read::read`), so every unpacked file paid a 16-page stack
+    // probe plus a 64 KiB `bzero` on top of the zstd decode and the write — gigabyte-scale
+    // memset across a real toolchain bundle. Heap `vec!`, not a boxed array literal:
+    // `Box::new([0u8; N])` materializes the array on the stack first.
+    let mut copy_buf = vec![0u8; 64 * 1024];
     let mut count: u64 = 0;
     let mut entries = tar.entries().map_err(map_tar_io)?;
     loop {
@@ -315,6 +362,38 @@ pub fn extract_tar_zst(
         }
         let raw = entry.path()?.into_owned();
         let kind = classify(entry.header().entry_type());
+        // A hardlink is vetted by its own two-ended walk (below), not vet_entry.
+        if kind == EntryKind::Hardlink {
+            let target = entry
+                .link_name()
+                .map_err(map_tar_io)?
+                .ok_or_else(|| {
+                    ExtractError::Rejected(ExtractReject::DisallowedKind, raw.clone())
+                })?
+                .into_owned();
+            let (dest, target_abs) = vet_hardlink(dest_root, &raw, &target)
+                .map_err(|r| ExtractError::Rejected(r, raw.clone()))?;
+            // The target must already be an extracted REGULAR FILE: honest
+            // archivers emit the file before its links, and linking to a
+            // directory/nothing names no valid bundle. `symlink_metadata` so a
+            // (impossible-by-construction, but belt-and-suspenders) symlink at
+            // the target is not followed.
+            let target_meta = std::fs::symlink_metadata(&target_abs)
+                .map_err(|_| ExtractError::Rejected(ExtractReject::HardlinkTargetMissing, raw.clone()))?;
+            if !target_meta.is_file() {
+                return Err(ExtractError::Rejected(
+                    ExtractReject::HardlinkTargetMissing,
+                    raw,
+                ));
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // A same-inode alias of already-counted bytes: no content stream,
+            // no size-cap charge; the entry COUNT cap above still applies.
+            std::fs::hard_link(&target_abs, &dest)?;
+            continue;
+        }
         let dest =
             vet_entry(dest_root, &raw, kind).map_err(|r| ExtractError::Rejected(r, raw.clone()))?;
         let mode = entry.header().mode().unwrap_or(0o644);
@@ -344,9 +423,11 @@ pub fn extract_tar_zst(
                     safe_mode(mode, false),
                     &mut remaining,
                     &budget,
+                    &mut copy_buf,
                 )?;
             }
-            // vet_entry already refused these; the arm is unreachable but kept fail-closed.
+            // vet_entry already refused these (hardlinks took their own arm
+            // above); unreachable but kept fail-closed.
             EntryKind::Symlink | EntryKind::Hardlink | EntryKind::Other => {
                 return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
             }
@@ -358,19 +439,21 @@ pub fn extract_tar_zst(
 /// Stream `reader` into a fresh file at `dest` with permission `mode`, decrementing
 /// `remaining`; abort with [`ExtractError::TooLarge`] the moment the running total would
 /// exceed the cap (so a decompression bomb is stopped mid-stream, never fully written).
+///
+/// `buf` is the caller's single reusable copy buffer (see [`extract_tar_zst`]).
 fn write_capped(
     mut reader: impl Read,
     dest: &Path,
     mode: u32,
     remaining: &mut u64,
     budget: &std::rc::Rc<std::cell::Cell<u64>>,
+    buf: &mut [u8],
 ) -> Result<(), ExtractError> {
     let mut f = crate::platform::open_create_write(dest, mode)?;
-    let mut buf = [0u8; 64 * 1024];
     loop {
         // The read flows through the CappedReader (structural budget); map a budget
         // trip to TooLarge rather than a generic I/O error.
-        let n = reader.read(&mut buf).map_err(map_tar_io)?;
+        let n = reader.read(&mut *buf).map_err(map_tar_io)?;
         if n == 0 {
             break;
         }
@@ -487,6 +570,34 @@ mod tests {
         }
     }
 
+    // Hardlinks go through the two-ended walk: both ends in-root passes;
+    // an escaping / absolute / traversal TARGET is refused with the same
+    // rejections as an escaping entry path (the slip vector stays closed).
+    #[test]
+    fn hardlink_vet_walks_both_ends() {
+        let r = root();
+        assert_eq!(
+            vet_hardlink(&r, Path::new("bin/cargo"), Path::new("bin/targo")).unwrap(),
+            (r.join("bin/cargo"), r.join("bin/targo"))
+        );
+        assert_eq!(
+            vet_hardlink(&r, Path::new("bin/cargo"), Path::new("../outside")),
+            Err(ExtractReject::ParentTraversal)
+        );
+        assert_eq!(
+            vet_hardlink(&r, Path::new("bin/cargo"), Path::new("/etc/passwd")),
+            Err(ExtractReject::AbsolutePath)
+        );
+        assert_eq!(
+            vet_hardlink(&r, Path::new("../escape"), Path::new("bin/targo")),
+            Err(ExtractReject::ParentTraversal)
+        );
+        assert_eq!(
+            vet_hardlink(&r, Path::new("bin/cargo"), Path::new("")),
+            Err(ExtractReject::EmptyPath)
+        );
+    }
+
     // Empty / dot-only paths name no target → refused.
     #[test]
     fn rejects_empty_and_dot_only_paths() {
@@ -593,6 +704,76 @@ mod tests {
         // The extracted tree has a stable tree_root.
         assert_eq!(crate::tree::tree_root(&root).unwrap().len(), 64);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // An in-root hardlink (typeflag '1') materializes as a same-inode alias of
+    // its already-extracted target — the sysroot dedup shape (`cargo`→`targo`,
+    // `trustc`→`rustc`) — and the linked tree still yields a stable tree_root.
+    #[test]
+    fn extracts_in_root_hardlinks() {
+        let d = dest("hardlink-ok");
+        let root = d.join("staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = make_archive(
+            &d,
+            "hl",
+            &[
+                ("bin/targo", b'0', "", b"the one binary"),
+                ("bin/cargo", b'1', "bin/targo", b""),
+            ],
+        );
+        extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap();
+        assert_eq!(std::fs::read(root.join("bin/cargo")).unwrap(), b"the one binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(root.join("bin/cargo")).unwrap().ino(),
+                std::fs::metadata(root.join("bin/targo")).unwrap().ino(),
+                "hardlink must alias the target inode, not copy it"
+            );
+        }
+        assert_eq!(crate::tree::tree_root(&root).unwrap().len(), 64);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // The hardlink escape matrix: a target outside the root, an absolute
+    // target, and a forward reference (target not yet extracted) each abort
+    // with nothing written outside the root — the §9 fixtures for links.
+    #[test]
+    fn aborts_on_escaping_or_dangling_hardlinks() {
+        for (label, entries) in [
+            (
+                "hl-escape",
+                vec![
+                    ("bin/real", b'0', "", b"x".as_slice()),
+                    ("bin/evil", b'1', "../../etc/passwd", b"".as_slice()),
+                ],
+            ),
+            (
+                "hl-abs",
+                vec![("bin/evil", b'1', "/etc/passwd", b"".as_slice())],
+            ),
+            (
+                "hl-forward",
+                vec![("bin/evil", b'1', "bin/not-yet", b"".as_slice())],
+            ),
+        ] {
+            let d = dest(label);
+            let root = d.join("staging");
+            std::fs::create_dir_all(&root).unwrap();
+            let archive = make_archive(&d, label, &entries);
+            let err = extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap_err();
+            assert!(
+                matches!(err, ExtractError::Rejected(_, _)),
+                "{label}: {err:?}"
+            );
+            assert!(
+                !d.join("etc").exists() && !Path::new("/tmp/atpkg-hl-escape-proof").exists(),
+                "{label}: nothing may land outside the root"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     // A `../` traversal entry aborts extraction and never writes outside the root.

@@ -162,6 +162,12 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
 /// Acquisition vocabulary: the method-call tokens that take a lock, and
 /// whether the acquisition can BLOCK (a `try_*` cannot, so it can never be the
 /// waiting half of a deadlock).
+///
+/// SCAN INVARIANT (relied on by [`acquisitions_on`]): every token starts with
+/// `.` and contains NO other `.`, and no token is a prefix of another. That is
+/// what lets the scanner visit each `.` in a line once and `starts_with` the
+/// whole table there, instead of running seven independent `str::find`s. A
+/// future token violating either half would break that equivalence.
 const ACQ_METHODS: &[(&str, bool)] = &[
     (".lock()", true),
     (".lock_or_recover()", true),
@@ -215,6 +221,15 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         symbol: "lock_fonts",
         identity: "chrome_fonts",
         def_file: "crates/aterm-gui/src/tray_raster.rs",
+    },
+    GuardHelper {
+        // The workspace's ONE process-environment mutation lock. `scoped`/
+        // `scoped_unset` hold this guard across a caller-supplied body, so the
+        // hold really is invisible at those call sites — exactly what this
+        // registry exists to make visible to the graph.
+        symbol: "env_lock",
+        identity: "ENV_LOCK",
+        def_file: "crates/aterm-log/src/lib.rs",
     },
     GuardHelper {
         // The serious-mode/search refactor replaced the singular
@@ -319,6 +334,14 @@ fn is_raw_ptr_binding_rhs(line: &str) -> bool {
 /// `base`, `base.add(current)` extends to `item`, `item.read()` is then
 /// `core::ptr::read`.)
 fn rhs_extends_raw_ptr(line: &str, ptr_vars: &BTreeMap<String, (i32, String)>) -> bool {
+    // Every path to `true` below runs through `ptr_vars.contains_key(recv)`, so
+    // an EMPTY ledger can only fall through to `false`. Check it first: this fn
+    // runs on every `let <ident> = …` line of the corpus, and only two fns in
+    // the whole tree ever bind a proven raw pointer, so the 11 `format!`s + 11
+    // line scans below are computed and discarded for essentially every call.
+    if ptr_vars.is_empty() {
+        return false;
+    }
     for m in RAW_PTR_METHODS {
         let pat = format!(".{m}(");
         let mut from = 0;
@@ -714,11 +737,29 @@ fn resolve_receiver(line: &str, dot: usize) -> Option<String> {
 fn acquisitions_on(line: &str) -> Vec<RawAcq> {
     let mut out = Vec::new();
     for h in GUARD_HELPERS {
-        let token = format!("{}(", h.symbol);
+        // Scan for the symbol's first byte and confirm with `starts_with`,
+        // rather than `find(&format!("{}(", h.symbol))`. The needle is a
+        // compile-time constant, but the old spelling paid for it once per
+        // LOGICAL LINE OF THE WHOLE CORPUS (~1259 files): a heap `String` per
+        // helper, plus a fresh two-way `StrSearcher` (critical-factorization
+        // setup) per helper — setup that costs more than scanning the ~100-byte
+        // line it enables. Three helpers x every line.
+        //
+        // Equivalence: on a full match `from` advances past the whole
+        // `symbol(` token exactly as `find` + `token.len()` did; on a partial
+        // match it advances one byte, which is strictly more conservative than
+        // `find`, so the match set and its order are unchanged.
+        let sym = h.symbol;
+        let first = sym.as_bytes()[0];
         let mut from = 0;
-        while let Some(rel) = line[from..].find(&token) {
+        while let Some(rel) = line.as_bytes()[from..].iter().position(|&c| c == first) {
+            // `at` is a char boundary: an ASCII byte can only occur at one.
             let at = from + rel;
-            from = at + token.len();
+            if !line[at..].starts_with(sym) || !line[at + sym.len()..].starts_with('(') {
+                from = at + 1;
+                continue;
+            }
+            from = at + sym.len() + 1;
             let boundary = at == 0 || {
                 let prev = line.as_bytes()[at - 1];
                 !(prev.is_ascii_alphanumeric() || prev == b'_')
@@ -734,17 +775,27 @@ fn acquisitions_on(line: &str) -> Vec<RawAcq> {
             });
         }
     }
-    for (token, blocking) in ACQ_METHODS {
-        let mut from = 0;
-        while let Some(rel) = line[from..].find(token) {
-            let dot = from + rel;
-            from = dot + token.len();
-            out.push(RawAcq {
-                pos: dot,
-                kind: token,
-                blocking: *blocking,
-                identity: resolve_receiver(line, dot),
-            });
+    // ONE `.`-scan for the whole table instead of seven `str::find`s (seven
+    // more `StrSearcher` constructions per line — the single largest cost in
+    // the lock-order census profile). Sound by the SCAN INVARIANT documented on
+    // [`ACQ_METHODS`]: a token can only begin at a `.`, so visiting every `.`
+    // sees every match; no token contains a second `.`, so the old
+    // `from = dot + token.len()` skip could never have hidden a later start;
+    // and no token is a prefix of another, so at most one matches per `.` and
+    // the stable `sort_by_key` below cannot reorder anything. (Guard-helper
+    // tokens never start with `.`, so they can never tie one of these
+    // positions either.)
+    for (dot, _) in line.match_indices('.') {
+        let tail = &line[dot..];
+        for (token, blocking) in ACQ_METHODS {
+            if tail.starts_with(token) {
+                out.push(RawAcq {
+                    pos: dot,
+                    kind: token,
+                    blocking: *blocking,
+                    identity: resolve_receiver(line, dot),
+                });
+            }
         }
     }
     out.sort_by_key(|a| a.pos);
@@ -2056,8 +2107,16 @@ mod tests {
     /// definitions (each helper defined at its registered file, interior
     /// acquiring its declared identity), and the registered vocabulary
     /// interior.
+    /// Crates a synthetic tree must contain BEYOND the base fixture (aterm-gui +
+    /// aterm-types), because a `GUARD_HELPERS` entry is registered in them: the
+    /// registry's interior check reads the SCANNED corpus, so a helper file
+    /// written into a tree that never scans that crate would fail the very check
+    /// it exists to satisfy. Every synthetic tree that composes its own manifest
+    /// set must splice these in too.
+    const SYNTH_HELPER_CRATES: &[(&str, &str)] = &[("aterm-log", "")];
+
     fn synth_helper_files() -> Vec<(String, String)> {
-        let mut files = crate::scan_set::test_fixtures::workspace_manifests(&[]);
+        let mut files = crate::scan_set::test_fixtures::workspace_manifests(SYNTH_HELPER_CRATES);
         files.push((
             // term_lock's registered def_file (moved main.rs -> lib.rs in the
             // ONE-binary refactor); must match GUARD_HELPERS above.
@@ -2078,6 +2137,16 @@ mod tests {
             "crates/aterm-gui/src/control_query.rs".to_string(),
             "fn search_cache_lock() -> MutexGuard<'static, VecDeque<SearchSnapshot>> {\n    \
              SEARCH_SNAPSHOTS.lock().unwrap()\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            // The workspace's ONE process-environment mutation lock
+            // (`aterm_log::env`). `scoped`/`scoped_unset` hold its guard across a
+            // caller-supplied body, which is precisely the invisible hold this
+            // registry models.
+            "crates/aterm-log/src/lib.rs".to_string(),
+            "fn env_lock() -> MutexGuard<'static, ()> {\n    \
+             ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())\n}\n"
                 .to_string(),
         ));
         // The registered vocabulary interior (VOCABULARY_INTERIORS):
@@ -3195,7 +3264,10 @@ mod tests {
         // fail the census (b). No human memory in the loop.
         let newdep = ("aterm-newdep", "[dependencies]\n");
         // (a) The new crate's sites are counted and its identities resolved.
-        let mut files = crate::scan_set::test_fixtures::workspace_manifests(&[newdep]);
+        let extras: Vec<(&str, &str)> = std::iter::once(newdep)
+            .chain(SYNTH_HELPER_CRATES.iter().copied())
+            .collect();
+        let mut files = crate::scan_set::test_fixtures::workspace_manifests(&extras);
         files.extend(synth_helper_files().into_iter().filter(|(p, _)| {
             !p.ends_with("Cargo.toml") // keep ONE manifest set (with the new dep)
         }));
@@ -3210,7 +3282,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "GREEN expected:\n{}", out.log);
         assert!(
-            out.log.contains("across 3 workspace crate(s)")
+            out.log.contains("across 4 workspace crate(s)")
                 && out.log.contains("crates/aterm-newdep/src"),
             "the new dependency must be scanned automatically:\n{}",
             out.log
@@ -3223,7 +3295,7 @@ mod tests {
         );
         // (b) An ABBA planted in the NEW crate goes RED — half the cycle in
         // aterm-gui, half in the crate the census never heard of until now.
-        let mut files = crate::scan_set::test_fixtures::workspace_manifests(&[newdep]);
+        let mut files = crate::scan_set::test_fixtures::workspace_manifests(&extras);
         files.extend(
             synth_helper_files()
                 .into_iter()

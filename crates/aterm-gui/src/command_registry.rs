@@ -164,6 +164,10 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             C::Any,
         ),
         M::ToggleSettings => spec("app.settings.open", S::App, A::ConfigMutate, C::Any),
+        // Settings opened AT the Packages route — same surface class as
+        // ToggleSettings (it raises the durable-config Settings tab; the page's
+        // own switches do the actual [packages] writes through the OCC editor).
+        M::Packages => spec("app.settings.packages", S::App, A::ConfigMutate, C::Any),
         M::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
         M::Minimize => spec("window.minimize", S::Window, A::LocalUi, C::Any),
         M::Zoom => spec("window.maximize", S::Window, A::LocalUi, C::Any),

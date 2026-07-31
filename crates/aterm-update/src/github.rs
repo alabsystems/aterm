@@ -18,12 +18,7 @@
 //!
 //! # The credential ladder (token-first, anonymous fallback)
 //!
-//! This module used to GATE on the token: no token → record "idle", return before any
-//! network call. That was correct only while the release channel was private. It is
-//! now public, and the gate meant a freshly installed Mac — which has no token and no
-//! reason to acquire one — never even asked whether an update existed.
-//!
-//! So the token is RESOLVED, never gated on, and the first releases-LIST response is
+//! The token is RESOLVED, never gated on, and the first releases-LIST response is
 //! the sole classifier, because a network answer is the only real evidence about
 //! whether this machine can read the channel:
 //!
@@ -43,6 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use serde::Deserialize;
 
+use aterm_update_core::tag::{TagError, TagKind};
 use aterm_update_core::{HttpError, token};
 
 use crate::manifest::{Manifest, Ready};
@@ -142,10 +138,7 @@ pub(crate) enum ListDecision {
 /// TOTAL BY CONSTRUCTION, and that is the entire point: there is no "stop" value it
 /// can return. The absence of a token is not evidence that this machine cannot
 /// update — aterm's channel is public and readable anonymously — so only a network
-/// response may decide that, in [`classify_list_error`]. The historical code gated
-/// here with an unconditional `return Ok(None)` ("idle: no update token
-/// provisioned"), which is exactly what made every unprovisioned Mac sit forever in
-/// front of a repo it could have read without any credential at all.
+/// response may decide that, in [`classify_list_error`].
 ///
 /// The `Err` arm keeps the diagnosis rather than discarding it: it is what
 /// `unreadable_explanation` uses to say "a token is present but was refused: …"
@@ -259,55 +252,22 @@ struct Asset {
     size: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct NumericTag(Vec<u64>);
-
-/// What one release tag is to this client.
-enum TagKind {
-    /// A `vMAJOR.MINOR.PATCH` release on the current version scheme.
-    Candidate(NumericTag),
-    /// A pre-cut-over `vMAJOR.MINOR` release. The scheme changed to the unified
-    /// `MAJOR.MINOR.0` version (`VERSIONING.md`) and the old line was NOT
-    /// carried forward — those releases are not candidates and are skipped, not
-    /// errors, so the archive can stay published without stalling the channel.
-    Legacy,
-}
-
 /// Parse the ordering key for one exact-name candidate.
 ///
-/// Only the canonical three-component `vMAJOR.MINOR.PATCH` spelling is a
-/// candidate. Two-component tags are the retired scheme ([`TagKind::Legacy`]).
-/// Anything else — non-numeric, empty or leading-zero components, a bare `v0` —
-/// is a hard error: garbage in the tag namespace must fail the check closed
-/// rather than silently narrow the candidate set.
+/// The grammar is [`aterm_update_core::tag::parse_release_tag`] — the SAME
+/// function the publisher (`aterm-release/src/publish.rs`) classifies with, so
+/// client and publisher cannot disagree about which releases are candidates.
+/// Only the client's diagnostic wording is here: canonical three-component
+/// `vMAJOR.MINOR.PATCH` is a candidate, two-component tags are the retired
+/// scheme ([`TagKind::Legacy`]), anything else fails the check closed rather
+/// than silently narrowing the candidate set.
 fn parse_numeric_tag(tag: &str) -> Result<TagKind, String> {
-    let malformed = || format!("update candidate tag {tag:?} is not numeric dotted vN.N.N");
-    let version = tag.strip_prefix('v').ok_or_else(malformed)?;
-    let components: Vec<&str> = version.split('.').collect();
-    if components.len() < 2 {
-        return Err(malformed());
-    }
-    let parsed = components
-        .iter()
-        .map(|component| {
-            // Reject empty and leading-zero spellings so a tag has exactly ONE
-            // canonical form and two tags can never share a numeric order.
-            if component.is_empty()
-                || !component.bytes().all(|byte| byte.is_ascii_digit())
-                || (component.len() > 1 && component.starts_with('0'))
-            {
-                return Err(malformed());
-            }
-            component.parse::<u64>().map_err(|_| {
-                format!("update candidate tag {tag:?} has an out-of-range numeric component")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    match parsed.len() {
-        2 => Ok(TagKind::Legacy),
-        3 => Ok(TagKind::Candidate(NumericTag(parsed))),
-        _ => Err(malformed()),
-    }
+    aterm_update_core::tag::parse_release_tag(tag).map_err(|error| match error {
+        TagError::Malformed => format!("update candidate tag {tag:?} is not numeric dotted vN.N.N"),
+        TagError::Overflow => {
+            format!("update candidate tag {tag:?} has an out-of-range numeric component")
+        }
+    })
 }
 
 /// The tag contract: a release the client will install is spelled exactly
@@ -317,17 +277,13 @@ fn parse_numeric_tag(tag: &str) -> Result<TagKind, String> {
 /// snapshot, and the tag are one number.
 ///
 /// `numeric` has already been proved three-component by [`parse_numeric_tag`];
-/// re-deriving the string here pins the *spelling* too, so `v01.2.3` can never
-/// be admitted alongside `v1.2.3`.
-fn canonical_authority_version(tag: &str, numeric: &NumericTag) -> Result<String, String> {
-    match numeric.0.as_slice() {
-        [major, minor, patch] if tag == format!("v{major}.{minor}.{patch}") => {
-            Ok(format!("{major}.{minor}.{patch}"))
-        }
-        _ => Err(format!(
-            "authoritative update tag {tag:?} is not canonical vMAJOR.MINOR.PATCH"
-        )),
-    }
+/// [`aterm_update_core::tag::canonical_version`] re-derives the string, which
+/// pins the *spelling* too, so `v01.2.3` can never be admitted alongside
+/// `v1.2.3`.
+fn canonical_authority_version(tag: &str, numeric: &[u64]) -> Result<String, String> {
+    aterm_update_core::tag::canonical_version(tag, numeric).ok_or_else(|| {
+        format!("authoritative update tag {tag:?} is not canonical vMAJOR.MINOR.PATCH")
+    })
 }
 
 fn unique_asset_index(release: &Release, name: &str) -> Result<Option<usize>, String> {
@@ -372,7 +328,7 @@ fn authoritative_dmg_index(
 }
 
 struct AuthoritativeRelease {
-    tag: NumericTag,
+    tag: Vec<u64>,
     version: String,
     release: Release,
     manifest_index: usize,
@@ -571,48 +527,27 @@ fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
     })
 }
 
-/// Background check + stage. Returns the staged version string on success, or
-/// `None` when nothing newer is available / the updater is idle. Errors are
-/// transient/operational (network, parse) and are logged by the caller.
+/// Enumerate the complete bounded release-metadata set. GitHub documents no
+/// ordering contract for List Releases, so the caller chooses the greatest
+/// canonical numeric vMAJOR.MINOR.PATCH tag carrying the exact appcast name
+/// (retired two-component tags are skipped, never ordered), and only after that
+/// decision fetches one manifest (+ one signature under Tier SIG) — row order
+/// cannot select an older release and broken historical assets add no download
+/// latency.
 ///
-/// The running build's *version* is deliberately not a parameter: it plays no
-/// part in the decision. Selection is by numeric release tag
-/// ([`canonical_authority_version`]) and the downgrade gate is `current_build`
-/// against the manifest's `build_number`. Reintroducing a version comparison
-/// here would be wrong even under the single `MAJOR.MINOR.0` scheme: the patch
-/// slot is always 0 and a dev build carries the commit sha in SemVer build
-/// metadata (`0.5.0+g<sha>`), so a dev build and the release it should install
-/// compare EQUAL on the numeric triple — a version test could not tell them
-/// apart, and build metadata is explicitly not ordered (`VERSIONING.md`).
-pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<String>, String> {
-    // Only stage for a real installed bundle (a dev build has nothing to swap).
-    if bundle::resolve().is_none() {
-        return Ok(None);
-    }
-    let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
-    // The Application Support dir is the Updates dir's parent.
-    let support = staging.root.parent().ok_or("no support dir")?.to_path_buf();
-    // ONE walk of the token chain: the token, or the diagnosis explaining why there
-    // isn't one. Resolving and then separately diagnosing would re-spawn `security`
-    // and `gh` on every check of an unprovisioned machine.
-    //
-    // RESOLVE, DO NOT GATE. The absence of a token is not evidence that this machine
-    // cannot update — the channel is public, and only a network response can say. The
-    // historical unconditional early return here ("idle: no update token provisioned")
-    // is exactly what made every unprovisioned Mac sit forever in front of a repo it
-    // could have read anonymously.
-    let (mut tok, diagnosis) = plan_credential(token::resolve_or_diagnose(&support));
+/// Runs the credential ladder: `tok` is cleared in place when a rejected token
+/// falls back to anonymous, so the caller's later asset fetches ride the same
+/// lane. Returns `Ok(None)` for the two non-failure ends of a check — channel
+/// unreadable (announced) or rate limited (status recorded); `Err` is a real
+/// failure, already recorded in the health ledger.
+fn fetch_release_catalog(
+    staging: &Staging,
+    current_build: u64,
+    source: &Source,
+    tok: &mut Option<String>,
+    diagnosis: Option<token::Diagnosis>,
+) -> Result<Option<Vec<Release>>, String> {
     let had_token = tok.is_some();
-
-    // Persisted monotonic recency floor (operator yank + rollback guard, F5/F6).
-    let floor = crate::manifest::Floor::read(&staging.floor());
-
-    // GitHub documents no ordering contract for List Releases. Enumerate the complete
-    // bounded metadata set first, then choose the greatest canonical numeric
-    // vMAJOR.MINOR.PATCH tag carrying the exact appcast name (retired two-component
-    // tags are skipped, never ordered). Only after that decision do we
-    // fetch one manifest (+ one signature under Tier SIG), so row order cannot select
-    // an older release and broken historical assets add no download latency.
     const PER_PAGE: u32 = 100;
     const MAX_PAGES: u32 = 10;
     let mut release_catalog = Vec::new();
@@ -635,9 +570,6 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         let body = loop {
             let error = match aterm_update_core::api_get_classified(&url, tok.as_deref()) {
                 Ok(body) => {
-                    // The FIRST successful list response establishes the lane and
-                    // clears the stranded latch — reading the channel is the property
-                    // that matters, not holding a credential.
                     note_readable(tok.is_some(), source);
                     // A token that our own chain refused (a chmod 644 file, a mangled
                     // paste) still costs this machine the 5000/hour budget even though
@@ -659,7 +591,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
             match decision {
                 ListDecision::RetryAnonymous => {
                     already_retried = true;
-                    tok = None;
+                    *tok = None;
                     // Throttled: this is a STANDING condition (a stale token stays
                     // stale), re-observed on every check, so an unthrottled warning
                     // would be ~48 identical lines an hour.
@@ -673,7 +605,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
                     ));
                 }
                 ListDecision::Blocked(explanation) => {
-                    crate::no_token::announce_unreadable(&staging, current_build, &explanation);
+                    crate::no_token::announce_unreadable(staging, current_build, &explanation);
                     return Ok(None);
                 }
                 ListDecision::RateLimited(message) => {
@@ -683,7 +615,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
                     // that simply checked too often. The latch lengthens the wait.
                     RATE_LIMITED.store(true, Ordering::Relaxed);
                     crate::status::record(
-                        &staging,
+                        staging,
                         current_build,
                         &format!("update check deferred: {message}"),
                     );
@@ -718,6 +650,49 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
             return Err(msg);
         }
     }
+    Ok(Some(release_catalog))
+}
+
+/// Background check + stage. Returns the staged version string on success, or
+/// `None` when nothing newer is available / the updater is idle. Errors are
+/// transient/operational (network, parse) and are logged by the caller.
+///
+/// The running build's *version* is deliberately not a parameter: it plays no
+/// part in the decision. Selection is by numeric release tag
+/// ([`canonical_authority_version`]) and the downgrade gate is `current_build`
+/// against the manifest's `build_number`. Reintroducing a version comparison
+/// here would be wrong even under the single `MAJOR.MINOR.0` scheme: the patch
+/// slot is always 0 and a dev build carries the commit sha in SemVer build
+/// metadata (`0.5.0+g<sha>`), so a dev build and the release it should install
+/// compare EQUAL on the numeric triple — a version test could not tell them
+/// apart, and build metadata is explicitly not ordered (`VERSIONING.md`).
+pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<String>, String> {
+    // Only stage for a real installed bundle (a dev build has nothing to swap).
+    if bundle::resolve().is_none() {
+        return Ok(None);
+    }
+    let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
+    // The Application Support dir is the Updates dir's parent.
+    let support = staging.root.parent().ok_or("no support dir")?.to_path_buf();
+    // ONE walk of the token chain: the token, or the diagnosis explaining why there
+    // isn't one. Resolving and then separately diagnosing would re-spawn `security`
+    // and `gh` on every check of an unprovisioned machine.
+    //
+    // RESOLVE, DO NOT GATE: the absence of a token may never end a check here — only
+    // a network response may declare this machine unable to update (`plan_credential`,
+    // `classify_list_error`).
+    let (mut tok, diagnosis) = plan_credential(token::resolve_or_diagnose(&support));
+
+    // Persisted monotonic recency floor (operator yank + rollback guard, F5/F6).
+    let floor = crate::manifest::Floor::read(&staging.floor());
+
+    // List first, decide after: [`fetch_release_catalog`] documents the ordering
+    // contract and the credential ladder (it may clear `tok` in place).
+    let Some(release_catalog) =
+        fetch_release_catalog(&staging, current_build, source, &mut tok, diagnosis)?
+    else {
+        return Ok(None);
+    };
 
     let authoritative = match select_authoritative_release(release_catalog, PINNED_UPDATE_PUBKEY) {
         Ok(candidate) => candidate,
@@ -755,8 +730,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         let msg = if appcast_fetch_error {
             // Manifests exist but could not be downloaded while the releases list
             // succeeded — a `pipeline`-class failure. The ledger decides the honest
-            // wording: a streak ≥ PERSISTENT_AFTER is no longer called "deferred"
-            // (the build-826 incident hid behind "transient" for a whole release).
+            // wording: a streak ≥ PERSISTENT_AFTER is not called "deferred".
             let h = crate::health::Health::record_failure(
                 &staging.health(),
                 "pipeline",
@@ -1006,11 +980,10 @@ mod tests {
         }
     }
 
-    /// THE regression this whole change exists to close. A machine with no token,
-    /// against a channel it cannot read, used to record an eight-word "idle" and
-    /// return — indistinguishable from "no updates available", forever. It must now
-    /// produce a Blocked decision whose text names the consequence, all three
-    /// indistinguishable causes, and the exact remedy for each.
+    /// A machine with no token, against a channel it cannot read, must produce a
+    /// Blocked decision whose text names the consequence, all three indistinguishable
+    /// causes, and the exact remedy for each — never a bare "idle", which an operator
+    /// cannot tell apart from "no updates available".
     #[test]
     fn an_unreadable_channel_without_a_token_is_loud_and_actionable_not_idle() {
         let source = test_source();
@@ -1062,20 +1035,15 @@ mod tests {
         );
     }
 
-    /// THE regression this whole change exists to prevent: a missing token must not
-    /// stop a check before the network.
+    /// A missing token must not stop a check before the network. `plan_credential` is
+    /// deliberately total — it has no value that means "stop" — so the only way to
+    /// reintroduce a gate is to change its type, which this test pins.
     ///
-    /// Every unprovisioned Mac used to sit idle forever in front of a channel it
-    /// could read anonymously, because the token chain's `Err` arm returned
-    /// `Ok(None)` before any request. `plan_credential` is deliberately total — it
-    /// has no value that means "stop" — so the only way to reintroduce the gate is to
-    /// change its type, which this test pins.
-    ///
-    /// NOTE the residual gap this test does NOT close: a hand-written `return` added
+    /// The residual gap this test does NOT close: a hand-written `return` added
     /// directly inside `check_and_stage` still slips past every automated test here,
     /// because `check_and_stage` resolves its own staging dir and network and cannot
     /// be driven from a unit test. Closing that needs the fetch/staging seams to be
-    /// injectable — see the report accompanying this change.
+    /// injectable.
     #[test]
     fn a_missing_token_never_stops_a_check_before_the_network() {
         // The unprovisioned machine: the chain found nothing.
@@ -1404,7 +1372,7 @@ mod tests {
         before.insert("phase", 1);
         before.insert(
             "selected_minor",
-            i64::try_from(selected.tag.0[1]).expect("bounded minor fits i64"),
+            i64::try_from(selected.tag[1]).expect("bounded minor fits i64"),
         );
         before.insert("metadata_complete", 1);
         before
@@ -1462,7 +1430,7 @@ mod tests {
             let selected = select_authoritative_release(releases, "")
                 .expect("canonical catalog")
                 .expect("one authority");
-            assert_eq!(selected.tag, NumericTag(vec![0, 10, 0]));
+            assert_eq!(selected.tag, vec![0, 10, 0]);
             let before = catalog_model_state(&model, order, false);
             let after = project_authority_selection(before.clone(), &selected);
             assert!(
@@ -2440,9 +2408,8 @@ mod tests {
         let manifest = candidate_manifest();
         std::fs::create_dir_all(&staging.staged_app).unwrap();
 
-        // NEGATIVE CONTROL: the old build-only branch accepted this enormous
-        // parseable marker and permanently bypassed the download, even though it
-        // carries no canonical artifact identity.
+        // NEGATIVE CONTROL: an enormous parseable marker carries no canonical
+        // artifact identity, so it must never permanently bypass the download.
         write_ready(&staging, 9_999, "bad", &"cd".repeat(32));
         assert!(
             !publishable_stage_covers(&staging, &manifest),

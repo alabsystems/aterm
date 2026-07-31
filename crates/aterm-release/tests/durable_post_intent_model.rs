@@ -6,6 +6,9 @@
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)]
+mod seedpack;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;

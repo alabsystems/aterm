@@ -222,7 +222,7 @@ impl std::error::Error for InitError {
 /// [`InitError::AlreadyInitialized`].
 ///
 /// This function establishes runtime immutability directly through
-/// `OnceLock` single-init semantics. In the TLA+ model,
+/// `OnceLock` single-init semantics. In the INTENDED (not-in-tree) TLA+ model,
 /// `ModeImmutableAfterInit` records launcher ownership of the initialized
 /// mode, and `NonEscalation` captures the security effect of staying at or
 /// below that starting mode.

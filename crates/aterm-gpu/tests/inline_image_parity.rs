@@ -12,25 +12,8 @@ use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, Theme};
 use std::sync::Arc;
 
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-
-fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.pixels.iter().zip(b.pixels.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
-}
+mod common;
+use common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
 
 /// Solid-colour `w`×`h` RGBA PNG.
 fn solid_rgba_png(w: u32, h: u32, rgba_pixel: [u8; 4]) -> Vec<u8> {
@@ -80,15 +63,7 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
 fn gpu_skips_glyph_under_image_like_cpu() {
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     // Deterministic parity: block on the lazy fallback parses so neither
@@ -151,15 +126,7 @@ fn gpu_skips_emoji_under_image_like_cpu() {
     // colour atlas; the image guard must suppress it identically on CPU and GPU.
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     // Deterministic parity: block on the lazy fallback parses so neither
@@ -614,15 +581,7 @@ fn image_pixels_gpu_match_cpu() {
     // colour-emoji path also rides (float ALPHA_BLENDING vs integer `blend`).
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     // Deterministic parity: block on the lazy fallback parses so neither
@@ -701,15 +660,7 @@ fn sixel_rawrgba8_pixels_gpu_match_cpu() {
     // below (GPU actually drew the sixel red) doubles as a "feature really on" gate.
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     // Deterministic parity: block on the lazy fallback parses so neither
@@ -780,15 +731,7 @@ fn image_scissored_present_byte_identical_to_full() {
     // covers them — an image can never be left stale on a partial repaint.
     let theme = aterm_render::Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     let (cw, ch) = cpu.cell_size();
@@ -851,15 +794,7 @@ fn image_free_frame_stays_within_cpu_gpu_tolerance() {
     // frame stays within the usual antialiasing tolerance, exactly as before.
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     // Deterministic parity: block on the lazy fallback parses so neither

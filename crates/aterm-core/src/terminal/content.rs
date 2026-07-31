@@ -90,7 +90,16 @@ pub(crate) fn visible_row_bounds_to_string(
         effective_start -= 1;
     }
 
-    let mut line = String::new();
+    // One byte per column is the exact ASCII size and a tight lower bound
+    // otherwise, so a plain row lands in a single allocation instead of growing
+    // by doubling from zero (~ceil(log2(bytes)) realloc+memcpy cycles per
+    // extracted row). `end_col` is already clamped to `cols()-1` and
+    // `effective_start` already backed up over a wide continuation, so this can
+    // never exceed one row's width. Mirrors `Grid::row_text_screen_into`, which
+    // reserves the same way before its identical per-column push loop.
+    let mut line = String::with_capacity(
+        usize::from(end_col.saturating_sub(effective_start)).saturating_add(1),
+    );
     for col in effective_start..=end_col {
         push_cell_text(grid, row, col, &mut line);
     }

@@ -261,6 +261,10 @@ pub fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u
 
 /// The frame-invariant glyph epoch `tick / mq` — `mq` is GLOBAL, so swaps are
 /// synchronized screen-wide and iso-luminant. Hoisted once per frame.
+///
+/// scope-waiver: a PURE function of its two arguments. "screen-wide" describes
+/// agreement between callers, and callers agree by computing the same value —
+/// a second caller cannot disagree, so no instance count can falsify this.
 #[must_use]
 pub fn glyph_epoch(tick: u64, mq: u32) -> u32 {
     (tick / u64::from(mq.max(1))) as u32

@@ -972,37 +972,83 @@ pub(crate) fn config_schema_entry(key: &str) -> Option<&'static ConfigSchemaEntr
 
 /// The same rank used by Settings global search, exported from the schema
 /// authority so Manual labels/keywords cannot silently diverge from completion.
-pub(crate) fn config_schema_match_score(entry: &ConfigSchemaEntry, query: &str) -> Option<u8> {
+///
+/// `entry.key` and every keyword are ASCII-lowercase by construction (pinned by
+/// `config_schema_keys_and_keywords_are_lowercase`), so they are compared as they
+/// are — folding them allocated a `String` each plus the collecting `Vec`, roughly
+/// six throwaway allocations per entry across the whole ~217-entry schema, for
+/// every character typed. Only `label` genuinely needs folding, into the caller's
+/// reusable `scratch`.
+pub(crate) fn config_schema_match_score(
+    entry: &ConfigSchemaEntry,
+    query: &str,
+    scratch: &mut String,
+) -> Option<u8> {
     if query.is_empty() {
         return Some(0);
     }
-    let label = entry.label.to_ascii_lowercase();
-    let key = entry.key.to_ascii_lowercase();
-    let keywords = entry
-        .keywords
-        .iter()
-        .map(|keyword| keyword.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    std::iter::once(label.as_str())
-        .chain(std::iter::once(key.as_str()))
-        .chain(keywords.iter().map(String::as_str))
-        .filter_map(|candidate| {
-            if candidate.starts_with(query) {
-                Some(0)
-            } else if candidate
-                .split(|character: char| !character.is_ascii_alphanumeric())
-                .any(|word| word.starts_with(query))
-            {
-                Some(1)
-            } else if candidate.contains(query) {
-                Some(2)
-            } else if query.chars().count() <= 3 && is_subsequence(query, candidate) {
-                Some(3)
-            } else {
-                None
-            }
-        })
+    scratch.clear();
+    scratch.extend(
+        entry
+            .label
+            .chars()
+            .map(|character| character.to_ascii_lowercase()),
+    );
+    std::iter::once(scratch.as_str())
+        .chain(std::iter::once(entry.key))
+        .chain(entry.keywords.iter().copied())
+        .filter_map(|candidate| candidate_match_score(candidate, query))
         .min()
+}
+
+/// THE search-rank ladder, shared by the config-schema authority above and by
+/// Settings global search (`native_settings::field_match_score_in`).
+///
+/// Exact prefix beats word prefix beats substring beats an ordered subsequence,
+/// and the subsequence rung is capped at 3 characters because a long fuzzy
+/// subsequence is mostly an accident (`materialize` matching unrelated labels).
+/// Lower is better; the caller takes the `min` over a candidate set.
+///
+/// The two surfaces are supposed to rank IDENTICALLY — a key that sorts first in
+/// Settings should sort first in Manual completion — and before this was shared
+/// that was maintained by hand in two places.
+///
+/// PRECONDITION, and it is load-bearing: `query` is non-empty and already
+/// ASCII-lowercased, and `candidate` is already lowercase — folded by the caller
+/// into its scratch buffer, or lowercase by construction and pinned by
+/// `config_schema_keys_and_keywords_are_lowercase` /
+/// `editable_field_keys_are_unique_and_lowercase`. The subsequence rung folds
+/// ASCII case; on already-lowercase input that is indistinguishable from an
+/// exact comparison, which is why both callers can share one ladder.
+pub(crate) fn candidate_match_score(candidate: &str, query: &str) -> Option<u8> {
+    if candidate.starts_with(query) {
+        Some(0)
+    } else if candidate
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| word.starts_with(query))
+    {
+        Some(1)
+    } else if candidate.contains(query) {
+        Some(2)
+    } else if query.chars().count() <= 3 && is_subsequence(query, candidate) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// `haystack.to_ascii_lowercase().contains(needle)` without the per-call
+/// allocation: the fold lands in a caller-owned buffer that a sweep reuses across
+/// every schema entry. `needle` must already be ASCII-lowercased by the caller,
+/// exactly as the allocating form required.
+fn contains_ascii_folded(haystack: &str, needle: &str, scratch: &mut String) -> bool {
+    scratch.clear();
+    scratch.extend(
+        haystack
+            .chars()
+            .map(|character| character.to_ascii_lowercase()),
+    );
+    scratch.contains(needle)
 }
 
 fn is_subsequence(needle: &str, haystack: &str) -> bool {
@@ -2683,6 +2729,7 @@ fn table_assist(
     let current_array_root = (scope != 0)
         .then(|| array_table_root(current_table))
         .flatten();
+    let mut scratch = String::new();
     let mut matches = config_schema()
         .iter()
         .filter(|entry| !is_compatibility_only_key(entry.key))
@@ -2701,19 +2748,27 @@ fn table_assist(
             };
             !authored_path_elsewhere(index, entry.key, &replacement, candidate_scope)
         })
+        // Schema keys and keywords are ASCII-lowercase by construction (pinned by
+        // `config_schema_keys_and_keywords_are_lowercase`) and `prefix` was folded
+        // by the caller, so only the label needs folding — and it folds into a
+        // reused buffer. This runs over the whole ~217-entry schema for every
+        // character typed into the Manual editor.
         .filter(|entry| {
             prefix.is_empty()
-                || entry.key.to_ascii_lowercase().starts_with(&prefix)
-                || entry.label.to_ascii_lowercase().contains(&prefix)
+                || entry.key.starts_with(prefix.as_str())
+                || contains_ascii_folded(entry.label, &prefix, &mut scratch)
                 || entry
                     .keywords
                     .iter()
                     .any(|keyword| keyword.starts_with(&prefix))
         })
         .collect::<Vec<_>>();
+    // `sort_by_key` re-evaluates its key closure on EVERY comparison, so the
+    // `to_ascii_lowercase()` this used to do was ~2 allocations per comparison,
+    // O(n log n) of them — and a no-op, since the key is already lowercase.
     matches.sort_by_key(|entry| {
         (
-            !entry.key.to_ascii_lowercase().starts_with(&prefix),
+            !entry.key.starts_with(prefix.as_str()),
             entry.key.len(),
             entry.key,
         )
@@ -2774,18 +2829,22 @@ fn key_assist(
     let token = &code[leading..token_end];
     let normalized = prefix.to_ascii_lowercase();
     let assignment_exists = key_region_end < code.len();
+    let mut scratch = String::new();
     let mut matches = config_schema()
         .iter()
         .filter(|setting| !is_compatibility_only_key(setting.key))
         .filter(|setting| setting.kind.is_assignable())
+        // `local` is a slice of the (lowercase) schema key and the keywords are
+        // lowercase too, so only the label folds — into a reused buffer. See the
+        // twin in `table_assist`.
         .filter_map(|setting| {
             let local = local_key(setting.key, table)?;
             if authored_path_elsewhere(index, setting.key, &replacement, scope) {
                 return None;
             }
             (normalized.is_empty()
-                || local.to_ascii_lowercase().starts_with(&normalized)
-                || setting.label.to_ascii_lowercase().contains(&normalized)
+                || local.starts_with(normalized.as_str())
+                || contains_ascii_folded(setting.label, &normalized, &mut scratch)
                 || setting
                     .keywords
                     .iter()
@@ -2793,9 +2852,12 @@ fn key_assist(
             .then_some((setting, local))
         })
         .collect::<Vec<_>>();
+    // No allocation in the sort key: `sort_by_key` calls this on every comparison
+    // (~1,260 for the ~170 top-level settings), and the fold it used to do was a
+    // no-op on an already-lowercase key.
     matches.sort_by_key(|(setting, local)| {
         (
-            !local.to_ascii_lowercase().starts_with(&normalized),
+            !local.starts_with(normalized.as_str()),
             local.len(),
             setting.key,
         )
@@ -3614,6 +3676,83 @@ fn one_line(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The completion and search paths compare schema keys and keywords against an
+    /// already-lowercased prefix WITHOUT folding them (they are lowercase by
+    /// construction, and folding them allocated per entry per keystroke). Pin the
+    /// invariant so a capitalized key fails the build instead of silently
+    /// disappearing from Manual completion and global search.
+    #[test]
+    fn config_schema_keys_and_keywords_are_lowercase() {
+        for entry in config_schema() {
+            assert_eq!(
+                entry.key,
+                entry.key.to_ascii_lowercase(),
+                "schema key must be lowercase"
+            );
+            for keyword in entry.keywords {
+                assert_eq!(
+                    *keyword,
+                    keyword.to_ascii_lowercase(),
+                    "keyword of {} must be lowercase",
+                    entry.key
+                );
+            }
+        }
+    }
+
+    /// Every rung of the shared ladder, pinned by example. It had no direct
+    /// coverage while it was written out twice; both copies could have drifted a
+    /// rung and only a user would have noticed the ordering change.
+    #[test]
+    fn candidate_match_score_ranks_each_rung() {
+        // 0 exact prefix, 1 word prefix, 2 substring, 3 short subsequence, None.
+        assert_eq!(candidate_match_score("cursor_trail", "cur"), Some(0));
+        assert_eq!(candidate_match_score("enable_cursor_trail", "cur"), Some(1));
+        assert_eq!(candidate_match_score("thecursorthing", "cur"), Some(2));
+        assert_eq!(candidate_match_score("colour_under_rail", "cur"), Some(3));
+        assert_eq!(candidate_match_score("nothing_here", "cur"), None);
+        // The subsequence rung is capped at 3 chars: a long fuzzy match is mostly
+        // accidental, so it must NOT rank rather than rank last.
+        assert_eq!(candidate_match_score("colour_under_railing", "curl"), None);
+        // Lower wins, so a caller's `min` over a candidate set picks the best rung.
+        assert!(candidate_match_score("cursor", "cur") < candidate_match_score("my_cursor", "cur"));
+    }
+
+    /// The precondition that lets Settings global search and the schema authority
+    /// share ONE ladder: on already-lowercase input, the ladder's ASCII-case-folding
+    /// subsequence rung is indistinguishable from an exact comparison. Settings used
+    /// to carry its own case-SENSITIVE `is_subsequence`; sharing was only sound
+    /// because every candidate on both sides is lowercase. Pin that equivalence, so
+    /// if anyone ever feeds mixed case the difference surfaces here.
+    #[test]
+    fn subsequence_rung_agrees_with_exact_comparison_on_lowercase_input() {
+        fn case_sensitive_subsequence(needle: &str, haystack: &str) -> bool {
+            let mut needle = needle.chars();
+            let mut wanted = needle.next();
+            for character in haystack.chars() {
+                if Some(character) == wanted {
+                    wanted = needle.next();
+                    if wanted.is_none() {
+                        return true;
+                    }
+                }
+            }
+            wanted.is_none()
+        }
+        for entry in config_schema() {
+            for candidate in std::iter::once(entry.key).chain(entry.keywords.iter().copied()) {
+                for query in ["cur", "ab", "z", "trl"] {
+                    assert_eq!(
+                        is_subsequence(query, candidate),
+                        case_sensitive_subsequence(query, candidate),
+                        "case-folding and exact subsequence disagree on \
+                         lowercase candidate {candidate:?} for {query:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn highlighted<'a>(
         source: &'a str,

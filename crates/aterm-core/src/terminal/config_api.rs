@@ -359,18 +359,22 @@ mod tests {
         const AMBIGUOUS: &str = "\u{00B7}"; // MIDDLE DOT, East Asian Width=A
         let (mut terminal, mut config) = clean_terminal_with_defaults();
         config.ambiguous_width_double = true;
-        assert!(terminal
-            .apply_config(&config)
-            .contains(&ConfigChange::AmbiguousWidth));
+        assert!(
+            terminal
+                .apply_config(&config)
+                .contains(&ConfigChange::AmbiguousWidth)
+        );
         terminal.process(AMBIGUOUS.as_bytes());
         assert!(terminal.grid().cell(0, 0).unwrap().is_wide());
         assert!(terminal.grid().is_wide_continuation_at(0, 1));
         terminal.take_damage();
 
         config.ambiguous_width_double = false;
-        assert!(terminal
-            .apply_config(&config)
-            .contains(&ConfigChange::AmbiguousWidth));
+        assert!(
+            terminal
+                .apply_config(&config)
+                .contains(&ConfigChange::AmbiguousWidth)
+        );
         assert!(
             !terminal.has_damage(),
             "policy reload must not pretend it reflowed existing geometry"

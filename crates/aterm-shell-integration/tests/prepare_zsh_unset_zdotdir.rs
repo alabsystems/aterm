@@ -15,36 +15,17 @@
 
 use aterm_shell_integration::{ShellType, prepare_into};
 
-/// Restores ZDOTDIR to its pre-test value on drop (including on panic), so
-/// state cannot leak into a test added to this binary later or into a
-/// same-process embedder of this harness.
-struct RestoreZdotdir(Option<std::ffi::OsString>);
-
-impl Drop for RestoreZdotdir {
-    fn drop(&mut self) {
-        // SAFETY: this binary contains exactly ONE #[test]; only this test
-        // thread reads or writes the environment.
-        unsafe {
-            match self.0.take() {
-                Some(prev) => std::env::set_var("ZDOTDIR", prev),
-                None => std::env::remove_var("ZDOTDIR"),
-            }
-        }
-    }
-}
-
 #[test]
 fn prepare_zsh_sets_unset_zdotdir_when_empty() {
-    let _restore = RestoreZdotdir(std::env::var_os("ZDOTDIR"));
-
-    // Clear ZDOTDIR to simulate unset.
-    // SAFETY: this binary contains exactly ONE #[test]; only this test
-    // thread reads or writes the environment.
-    unsafe { std::env::remove_var("ZDOTDIR") };
-
     let dir = aterm_tempfile::tempdir().unwrap();
     let base = dir.path().join("si");
-    let result = prepare_into(ShellType::Zsh, &base).unwrap().unwrap();
+    // ZDOTDIR is cleared for exactly the length of the `prepare_into` call and
+    // restored on the way out — on a panic as well as a return — by the
+    // workspace's one lock-scoped env helper, so nothing leaks into a test added
+    // to this binary later or into a same-process embedder of this harness.
+    let result = aterm_log::env::scoped_unset("ZDOTDIR", || prepare_into(ShellType::Zsh, &base))
+        .unwrap()
+        .unwrap();
 
     let has_unset_marker = result
         .env_add

@@ -150,7 +150,11 @@ impl EditorBufferView {
     }
 
     pub(crate) fn scroll_lines(&mut self, text: &str, delta: i32) {
-        let total_lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        self.scroll_lines_with(&EditorLines::scanning(text), delta);
+    }
+
+    pub(crate) fn scroll_lines_with(&mut self, lines: &EditorLines<'_>, delta: i32) {
+        let total_lines = lines.total();
         // Store the same stable anchor the renderer can actually present.  A
         // wheel fling used to retain an EOF line here while paint clamped only
         // its temporary clone to the last full viewport.  Reverse scrolling
@@ -158,14 +162,16 @@ impl EditorBufferView {
         // `viewport_lines()` also gives a not-yet-reconciled zero-capacity view
         // the only useful interpretation: one visible line.
         let last_full_viewport_anchor = total_lines.saturating_sub(self.viewport_lines());
-        let current = line_number(text, self.viewport_anchor).min(last_full_viewport_anchor);
+        let current = lines
+            .number_at(self.viewport_anchor)
+            .min(last_full_viewport_anchor);
         let target = if delta < 0 {
             current.saturating_sub(delta.unsigned_abs() as usize)
         } else {
             current.saturating_add(delta as usize)
         }
         .min(last_full_viewport_anchor);
-        self.viewport_anchor = byte_of_line(text, target);
+        self.viewport_anchor = lines.byte_of(target);
     }
 
     pub(crate) fn viewport_lines(&self) -> usize {
@@ -173,21 +179,38 @@ impl EditorBufferView {
     }
 
     pub(crate) fn reconcile_viewport(&mut self, text: &str, visible_lines: usize) -> bool {
+        self.reconcile_viewport_with(&EditorLines::scanning(text), visible_lines)
+    }
+
+    pub(crate) fn reconcile_viewport_with(
+        &mut self,
+        lines: &EditorLines<'_>,
+        visible_lines: usize,
+    ) -> bool {
         let before_anchor = self.viewport_anchor;
         let before_lines = self.viewport_lines;
         self.viewport_lines = visible_lines.clamp(1, 256);
-        self.ensure_primary_visible(text, self.viewport_lines);
+        self.ensure_primary_visible_with(lines, self.viewport_lines);
         before_anchor != self.viewport_anchor || before_lines != self.viewport_lines
     }
 
     pub(crate) fn ensure_primary_visible(&mut self, text: &str, visible_lines: usize) {
+        self.ensure_primary_visible_with(&EditorLines::scanning(text), visible_lines);
+    }
+
+    pub(crate) fn ensure_primary_visible_with(
+        &mut self,
+        lines: &EditorLines<'_>,
+        visible_lines: usize,
+    ) {
         let visible_lines = visible_lines.clamp(1, 256);
         self.viewport_lines = visible_lines;
-        let caret_line = line_number(text, self.primary_selection().head);
-        let total_lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let caret_line = lines.number_at(self.primary_selection().head);
+        let total_lines = lines.total();
         let last_full_viewport_anchor = total_lines.saturating_sub(visible_lines);
-        let mut anchor_line =
-            line_number(text, self.viewport_anchor).min(last_full_viewport_anchor);
+        let mut anchor_line = lines
+            .number_at(self.viewport_anchor)
+            .min(last_full_viewport_anchor);
         if caret_line < anchor_line {
             anchor_line = caret_line;
         } else if caret_line >= anchor_line.saturating_add(visible_lines) {
@@ -198,7 +221,7 @@ impl EditorBufferView {
         // line zero when the viewport can show it in full, rather than leaving
         // authored diagnostics above a synthetic trailing blank line.
         anchor_line = anchor_line.min(last_full_viewport_anchor);
-        self.viewport_anchor = byte_of_line(text, anchor_line);
+        self.viewport_anchor = lines.byte_of(anchor_line);
     }
 
     /// Place or extend the primary selection from a pointer hit expressed as a
@@ -1718,6 +1741,125 @@ fn byte_of_line(text: &str, line: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// Byte offset at which every line of `text` begins: `[0, …]`, exactly one entry
+/// per line, so the length IS the line count. One pass over the document.
+///
+/// A caller that renders the same document revision repeatedly holds one of these
+/// and asks [`EditorLines`] instead of re-deriving the answers from the bytes:
+/// the line count stops costing a full scan, `line_number` becomes a binary
+/// search, and `byte_of_line` becomes an index. Without it a single editor frame
+/// walked the whole document four to six times, so frame time — and typing
+/// latency, since the reducer re-renders — grew linearly with file size all the
+/// way to the 32 MiB document limit.
+pub(crate) fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(1 + text.len() / 40);
+    starts.push(0);
+    starts.extend(
+        text.as_bytes()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1)),
+    );
+    starts
+}
+
+/// Ceiling on resident line-index entries: 2 Mi × 8 B = **16 MiB**.
+///
+/// The index costs one `usize` PER LINE, and line count is bounded only by the
+/// byte count — so an accepted document (the editor's limit is
+/// `DEFAULT_DOCUMENT_LIMIT`, 32 MiB) that is mostly newlines would demand
+/// ~33.5 M entries, i.e. **~268 MiB resident**, and roughly double that
+/// transiently while a post-edit rebuild exists alongside the `Arc` it replaces.
+/// That is a memory cliff reachable from ordinary valid input, which is not a
+/// trade a rendering speed-up is allowed to make.
+///
+/// 2 Mi entries covers every realistic document: at the 32 MiB limit it admits
+/// anything averaging ≥ 16 bytes per line. Past it [`line_starts_capped`]
+/// declines, and the caller falls back to [`EditorLines::scanning`] — the exact
+/// pre-index behaviour, which answers identically in O(n) time and O(1) memory.
+pub(crate) const MAX_LINE_INDEX_ENTRIES: usize = 2 << 20;
+
+/// [`line_starts`], but declines rather than exceed [`MAX_LINE_INDEX_ENTRIES`].
+///
+/// Returns `None` for a document too line-dense to index within the ceiling. The
+/// scan stops at the ceiling, so the peak allocation is bounded even for the
+/// documents it refuses.
+pub(crate) fn line_starts_capped(text: &str) -> Option<Vec<usize>> {
+    let mut starts = Vec::with_capacity((1 + text.len() / 40).min(MAX_LINE_INDEX_ENTRIES));
+    starts.push(0);
+    for (index, byte) in text.as_bytes().iter().enumerate() {
+        if *byte == b'\n' {
+            if starts.len() >= MAX_LINE_INDEX_ENTRIES {
+                return None;
+            }
+            starts.push(index + 1);
+        }
+    }
+    Some(starts)
+}
+
+/// How one editor path answers the three line questions (count, line-of-byte,
+/// byte-of-line) about a document.
+///
+/// The answers are identical either way — this only chooses whether they are
+/// derived by scanning the text or read out of a resident [`line_starts`] index.
+/// Occasional callers (reducer edges that touch a document once) scan; the render
+/// path, which asks all three several times per frame, indexes.
+pub(crate) struct EditorLines<'a> {
+    text: &'a str,
+    starts: Option<&'a [usize]>,
+}
+
+impl<'a> EditorLines<'a> {
+    /// Derive every answer from the bytes, allocation-free. The historical
+    /// behaviour, kept for one-shot callers.
+    pub(crate) fn scanning(text: &'a str) -> Self {
+        Self { text, starts: None }
+    }
+
+    /// Answer from a [`line_starts`] index built for exactly this `text`.
+    pub(crate) fn indexed(text: &'a str, starts: &'a [usize]) -> Self {
+        Self {
+            text,
+            starts: Some(starts),
+        }
+    }
+
+    pub(crate) fn text(&self) -> &'a str {
+        self.text
+    }
+
+    /// Total line count: trailing text after the last line break still counts as
+    /// a line, and an empty document is one line.
+    pub(crate) fn total(&self) -> usize {
+        self.starts.map_or_else(
+            || self.text.bytes().filter(|byte| *byte == b'\n').count() + 1,
+            <[usize]>::len,
+        )
+    }
+
+    /// The count of line breaks strictly before `position` — i.e. the 0-based
+    /// line `position` falls on.
+    pub(crate) fn number_at(&self, position: usize) -> usize {
+        self.starts.map_or_else(
+            || line_number(self.text, position),
+            |starts| {
+                starts
+                    .partition_point(|start| *start <= position)
+                    .saturating_sub(1)
+            },
+        )
+    }
+
+    /// First byte of `line`; out-of-range lines clamp to EOF.
+    pub(crate) fn byte_of(&self, line: usize) -> usize {
+        self.starts.map_or_else(
+            || byte_of_line(self.text, line),
+            |starts| starts.get(line).copied().unwrap_or(self.text.len()),
+        )
+    }
+}
+
 /// A selected byte span within one projected editor line. `bytes` is relative
 /// to [`EditorViewportLine::source`]; `continues` means the selection also owns
 /// the line break (or later text) and therefore paints through one trailing
@@ -1797,13 +1939,28 @@ pub(crate) fn project_viewport(
     requested_lines: usize,
     requested_columns: usize,
 ) -> EditorViewportProjection {
+    project_viewport_with(
+        &EditorLines::scanning(text),
+        view,
+        requested_lines,
+        requested_columns,
+    )
+}
+
+pub(crate) fn project_viewport_with(
+    lines_index: &EditorLines<'_>,
+    view: &EditorBufferView,
+    requested_lines: usize,
+    requested_columns: usize,
+) -> EditorViewportProjection {
     const MAX_PROJECTED_LINES: usize = 512;
     const MAX_PROJECTED_LINE_BYTES: usize = 32 * 1024;
     const MAX_PROJECTED_TOTAL_BYTES: usize = 512 * 1024;
 
+    let text = lines_index.text();
     let anchor = line_start(text, clamp_to_char_boundary(text, view.viewport_anchor));
-    let first_line = line_number(text, anchor);
-    let total_lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let first_line = lines_index.number_at(anchor);
+    let total_lines = lines_index.total();
     let line_limit = requested_lines.clamp(1, MAX_PROJECTED_LINES);
     let column_limit = requested_columns.clamp(4, 4_096);
     let primary_caret = clamp_to_char_boundary(text, view.primary_selection().head);
@@ -2258,6 +2415,42 @@ mod tests {
         Model, native_editor_command_palette_model, native_editor_viewport_model,
     };
     use aterm_spec::interp::{State, admits};
+
+    /// The indexed line oracle must answer EXACTLY what the scanning one does —
+    /// it is the substitution the editor render path makes on every frame, so any
+    /// divergence would move the viewport anchor or the reported line count.
+    #[test]
+    fn indexed_line_oracle_matches_the_scanning_one() {
+        for text in [
+            "",
+            "\n",
+            "one",
+            "one\n",
+            "one\ntwo",
+            "one\ntwo\n",
+            "\n\n\n",
+            "α\nβγ\n\nδ",
+        ] {
+            let starts = line_starts(text);
+            let scanning = EditorLines::scanning(text);
+            let indexed = EditorLines::indexed(text, &starts);
+            assert_eq!(scanning.total(), indexed.total(), "total for {text:?}");
+            for position in 0..=text.len() + 2 {
+                assert_eq!(
+                    scanning.number_at(position),
+                    indexed.number_at(position),
+                    "number_at({position}) for {text:?}"
+                );
+            }
+            for line in 0..scanning.total() + 2 {
+                assert_eq!(
+                    scanning.byte_of(line),
+                    indexed.byte_of(line),
+                    "byte_of({line}) for {text:?}"
+                );
+            }
+        }
+    }
 
     fn editor(text: &str) -> (DocumentStore, EditorWorkspace, EditorBufferView, DocumentId) {
         let mut store = DocumentStore::new();
@@ -3272,5 +3465,45 @@ mod tests {
             .execute(&mut store, &mut view, EditorCommand::MoveBackward)
             .unwrap();
         assert_eq!(view.primary_selection().head, 0);
+    }
+
+    /// The resident line index is BOUNDED, and declining to build it is not a
+    /// behaviour change — `EditorLines::scanning` answers identically.
+    ///
+    /// Regression guard for a memory cliff reachable from valid input: the index
+    /// costs one `usize` per LINE, so a mostly-newline document at the editor's
+    /// 32 MiB limit would want ~33.5 M entries (~268 MiB resident, ~2x that
+    /// while a post-edit rebuild coexists with the `Arc` it replaces).
+    #[test]
+    fn line_index_is_capped_and_the_fallback_answers_identically() {
+        // Dense enough to blow the cap: one line per byte.
+        let dense = "\n".repeat(MAX_LINE_INDEX_ENTRIES + 8);
+        assert!(
+            line_starts_capped(&dense).is_none(),
+            "a document past the cap must decline to be indexed"
+        );
+
+        // Just under the cap still indexes, and agrees with a full scan.
+        let ok = "\n".repeat(64);
+        let starts = line_starts_capped(&ok).expect("under the cap must index");
+        assert_eq!(
+            starts,
+            line_starts(&ok),
+            "capped index must equal the plain one"
+        );
+
+        // The fallback the caller takes when indexing is declined is observably
+        // identical on every question EditorLines answers.
+        let scanning = EditorLines::scanning(&dense);
+        let reference = line_starts(&dense);
+        let indexed = EditorLines::indexed(&dense, &reference);
+        assert_eq!(scanning.total(), indexed.total());
+        for position in [0, 1, 7, dense.len() / 2, dense.len(), dense.len() + 3] {
+            assert_eq!(
+                scanning.number_at(position),
+                indexed.number_at(position),
+                "number_at({position}) must not depend on whether an index exists"
+            );
+        }
     }
 }

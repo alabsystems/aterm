@@ -1389,6 +1389,105 @@ fn acquire_write_lock(lock_file: &File) -> Result<(), String> {
     acquire_write_lock_within(lock_file, WRITE_LOCK_RETRY_BUDGET)
 }
 
+/// Bounded retry for the PRE-PUBLICATION phase of a commit.
+///
+/// Everything from the first `validate_atomic_target` through the version check only
+/// READS. Six leaked fixtures of the
+/// `repeated_save_during_inflight_checkpoint_persists_the_latest_sequence` flake prove
+/// that on disk: the fixture directory's mtime still equals the previous save's rename
+/// ctime to within 0-42 ns, so this phase created nothing, renamed nothing and
+/// unlinked nothing. A `Failed` verdict carrying `AtomicSaveStage::Preflight` is
+/// therefore safe to simply attempt again — and every cause it can carry is transient
+/// by construction: a lock held by a peer save or by a `fork`ed child that has not yet
+/// `exec`ed away its inherited descriptor, a `canonicalize`/`lstat` that failed under
+/// load, an `open` that returned `EINTR`/`EIO`. On-disk forensics cannot tell those
+/// exits apart, so ride out the whole CLASS instead of guessing which one fires. A
+/// `Conflict` (a real verdict about the target) and every post-publication stage are
+/// NOT retried.
+///
+/// The budget dominates the hold a legitimate saver takes. That hold is two
+/// `File::sync_all` calls, which are `F_FULLFSYNC` device-cache barriers on Apple
+/// targets: measured on this machine while idle, one file barrier costs 4.43 ms mean
+/// and 17.3 ms worst against 0.114 ms for a plain `fsync`, and the six fixtures
+/// measure the whole locked section at 82.5-279.7 ms while the volume was busy.
+/// `WRITE_LOCK_RETRY_BUDGET` alone is an order of magnitude short of that.
+///
+/// THE COST, stated plainly because it is real: this is NOT reached only from the
+/// `aterm-native-document` worker. `App::settings_commit_value`
+/// (app_settings.rs:915/:1036) calls `prefs::save_prefs_edits` SYNCHRONOUSLY on the
+/// event-loop thread, and `execute_native_config_persistence` (app_native.rs:770)
+/// writes the same `aterm.toml` from another thread — so a Settings keystroke can
+/// contend, and spending this budget there is a visible hitch.
+///
+/// It is still the right trade. The budget is only consumed while a peer actually
+/// holds the lock, which is bounded by that peer's own `F_FULLFSYNC` pair (82.5-279.7
+/// ms measured), so 500 ms is roughly 2x the worst observed hold rather than an
+/// arbitrary ceiling; an uncontended save never sleeps at all and is byte-for-byte as
+/// fast as before. And the alternative is not a faster save — it is a FAILED one:
+/// app_documents.rs:1710 turns a Preflight failure into a terminal error and :1765
+/// drops `pending_saves`, so the user's latest edits are silently never written. A
+/// bounded hitch beats losing an edit.
+const PREFLIGHT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Take the write lock and prove the target is still the generation the plan was built
+/// on. Side-effect free: see [`PREFLIGHT_RETRY_BUDGET`].
+fn lock_and_verify_target(
+    baseline: &AtomicFileBaseline,
+) -> Result<(File, usize), AtomicCommitResult> {
+    let target = &baseline.target;
+    if let Err(error) = validate_atomic_target(target) {
+        return Err(atomic_validation_failure(
+            target,
+            AtomicSaveStage::Preflight,
+            error,
+        ));
+    }
+    let path = target.target_path();
+    let Some(parent) = path.parent() else {
+        return Err(atomic_failed(
+            AtomicSaveStage::CreateTemporary,
+            "target has no parent",
+        ));
+    };
+    if let Err(error) = fs::create_dir_all(parent) {
+        return Err(atomic_failed(
+            AtomicSaveStage::CreateTemporary,
+            error.to_string(),
+        ));
+    }
+    if let Err(error) = validate_atomic_target(target) {
+        return Err(atomic_validation_failure(
+            target,
+            AtomicSaveStage::Preflight,
+            error,
+        ));
+    }
+    let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
+    let lock_path = parent.join(format!(".{}.aterm-write.lock", name.to_string_lossy()));
+    let lock_file = open_write_lock(&lock_path)
+        .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
+    acquire_write_lock(&lock_file)
+        .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
+
+    if let Err(error) = validate_atomic_target(target) {
+        return Err(atomic_validation_failure(
+            target,
+            AtomicSaveStage::Preflight,
+            error,
+        ));
+    }
+    let baseline_limit = observation_limit(baseline.observed.len);
+    let actual = observe_file(path, baseline_limit)
+        .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
+    if crate::native_document_io::detect_version_conflict(baseline.observed, actual).is_some() {
+        return Err(AtomicCommitResult::Conflict {
+            observed: actual,
+            message: "target changed since it was read".to_string(),
+        });
+    }
+    Ok((lock_file, baseline_limit))
+}
+
 fn commit_atomic_bytes_with_seed(
     baseline: &AtomicFileBaseline,
     bytes: &[u8],
@@ -1401,43 +1500,36 @@ fn commit_atomic_bytes_with_seed(
         );
     }
     let target = &baseline.target;
-    if let Err(error) = validate_atomic_target(target) {
-        return atomic_validation_failure(target, AtomicSaveStage::Preflight, error);
-    }
     let path = target.target_path();
     let Some(parent) = path.parent() else {
         return atomic_failed(AtomicSaveStage::CreateTemporary, "target has no parent");
     };
-    if let Err(error) = fs::create_dir_all(parent) {
-        return atomic_failed(AtomicSaveStage::CreateTemporary, error.to_string());
-    }
-    if let Err(error) = validate_atomic_target(target) {
-        return atomic_validation_failure(target, AtomicSaveStage::Preflight, error);
-    }
     let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
-    let lock_path = parent.join(format!(".{}.aterm-write.lock", name.to_string_lossy()));
-    let lock_file = match open_write_lock(&lock_path) {
-        Ok(file) => file,
-        Err(message) => return atomic_failed(AtomicSaveStage::Preflight, message),
-    };
-    if let Err(message) = acquire_write_lock(&lock_file) {
-        return atomic_failed(AtomicSaveStage::Preflight, message);
-    }
 
-    if let Err(error) = validate_atomic_target(target) {
-        return atomic_validation_failure(target, AtomicSaveStage::Preflight, error);
-    }
-    let baseline_limit = observation_limit(baseline.observed.len);
-    let actual = match observe_file(path, baseline_limit) {
-        Ok(actual) => actual,
-        Err(message) => return atomic_failed(AtomicSaveStage::Preflight, message),
+    let deadline = std::time::Instant::now() + PREFLIGHT_RETRY_BUDGET;
+    let mut backoff = std::time::Duration::from_millis(1);
+    let (_lock_file, baseline_limit) = loop {
+        match lock_and_verify_target(baseline) {
+            Ok(ready) => break ready,
+            Err(verdict) => {
+                if !matches!(
+                    verdict,
+                    AtomicCommitResult::Failed {
+                        stage: AtomicSaveStage::Preflight,
+                        ..
+                    }
+                ) {
+                    return verdict;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return verdict;
+                }
+                std::thread::sleep(backoff.min(remaining));
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(8));
+            }
+        }
     };
-    if crate::native_document_io::detect_version_conflict(baseline.observed, actual).is_some() {
-        return AtomicCommitResult::Conflict {
-            observed: actual,
-            message: "target changed since it was read".to_string(),
-        };
-    }
 
     let (temporary, mut file) = match create_unique_temporary(parent, name, seed) {
         Ok(created) => created,
@@ -1885,7 +1977,6 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    #[test]
     /// A holder that never releases is still refused, and the loop really ran.
     /// Deliberately NO absolute wall-clock upper bound: that assertion class is the one
     /// full-suite load has already crossed twice in this crate, and the sub-second
@@ -1946,6 +2037,7 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    #[test]
     fn held_save_lock_returns_busy_and_retry_commits() {
         let path = unique_file("held-save-lock", b"before");
         let contents = read_atomic_file(&path, DEFAULT_DOCUMENT_LIMIT, false).unwrap();
@@ -2288,6 +2380,52 @@ mod tests {
             reduction,
             SaveReduction::Durable(checkpoint) if checkpoint.document == document
         ));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A save holds the write lock across two `File::sync_all` calls, which on Apple
+    /// targets are `F_FULLFSYNC` device-cache barriers whose latency is bounded by the
+    /// whole machine's I/O, not by the 11 bytes being written. Six leaked fixtures of
+    /// the `repeated_save_during_inflight_checkpoint_persists_the_latest_sequence`
+    /// flake measure that hold at 82.5-279.7 ms (0.014-0.062 ms when the volume is
+    /// idle). Any contender — a genuine concurrent save, or a `fork()`ed child that
+    /// inherited this descriptor before it could `exec` away the `O_CLOEXEC` — must
+    /// OUTWAIT that hold; reporting "busy" instead turns an honest stall into a lost
+    /// save. `flock` is per open-file-description, so a second `open_write_lock` in
+    /// THIS process contends exactly as an inherited descriptor does: no load, no
+    /// fork, no flake.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_held_for_one_stalled_device_barrier_is_waited_out_not_reported_busy() {
+        const HELD: std::time::Duration = std::time::Duration::from_millis(200);
+
+        let path = unique_file("waited-save-lock", b"before");
+        let contents = read_atomic_file(&path, DEFAULT_DOCUMENT_LIMIT, false).unwrap();
+        let lock_path = path.parent().unwrap().join(format!(
+            ".{}.aterm-write.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let holder = open_write_lock(&lock_path).unwrap();
+        acquire_write_lock(&holder).unwrap();
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(HELD);
+            drop(holder);
+        });
+
+        let started = std::time::Instant::now();
+        let verdict = commit_atomic_bytes(&contents.baseline, b"after");
+        let waited = started.elapsed();
+        released.join().unwrap();
+
+        assert!(
+            matches!(verdict, AtomicCommitResult::Committed(_)),
+            "a {HELD:?} lock holder must be waited out, not reported busy: {verdict:?}"
+        );
+        assert!(
+            waited >= HELD,
+            "the commit cannot have published before the holder released: {waited:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"after");
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

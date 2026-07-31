@@ -53,7 +53,7 @@
 
 use std::io::{self, Read, Write};
 
-use aterm_session::EdgeToken;
+use aterm_session::{EdgeToken, hex_nibble};
 use aterm_uds::CtlStream;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -204,19 +204,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap());
     }
     s
-}
-
-/// Decode one ASCII hex digit to its value (`0..=15`). Byte-for-byte the same
-/// accept set and values as `char::from(c).to_digit(16)` — digits, `a..=f`,
-/// `A..=F` — but in `u8` arithmetic whose range each match arm bounds, so the
-/// subtractions are provably underflow-free.
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

@@ -31,21 +31,64 @@ pub(crate) fn lower_fold_char(c: char) -> impl Iterator<Item = char> {
         .map(|lc| if lc == FINAL_SIGMA { SIGMA } else { lc })
 }
 
-/// Lowercase + sigma-fold an entire string using [`lower_fold_char`].
+/// How much work lowering `text` actually needs, so callers can skip or
+/// specialize the fold instead of always materializing a lowered `String`.
+///
+/// This is the single home of the predicate the trigram
+/// index/removal/rebuild passes share: they MUST agree on when the lowered
+/// pass ran, or removal double-deletes trigrams the insert never added and the
+/// posting lists corrupt.
+pub(crate) enum LowerNeed {
+    /// Lowering is the identity (pure ASCII, no uppercase): the lowered
+    /// trigrams equal the original-case ones, so the pass can be skipped.
+    None,
+    /// Pure ASCII with at least one uppercase letter: lowering is exactly
+    /// per-byte `to_ascii_lowercase` and never changes byte length, so the
+    /// lowered trigram of a window is that window's bytes lowercased in place
+    /// — no buffer required.
+    Ascii,
+    /// Non-ASCII: needs the real [`lower_fold`] (byte lengths can change).
+    Unicode,
+}
+
+/// Classify `text` for the lowered trigram pass. Exactly the two arms of the
+/// `!text.is_ascii() || text.bytes().any(|b| b.is_ascii_uppercase())` predicate
+/// the index used to spell three times.
+pub(crate) fn lower_need(text: &str) -> LowerNeed {
+    if !text.is_ascii() {
+        LowerNeed::Unicode
+    } else if text.bytes().any(|b| b.is_ascii_uppercase()) {
+        LowerNeed::Ascii
+    } else {
+        LowerNeed::None
+    }
+}
+
+/// Lowercase + sigma-fold `s` into `out` (cleared first), so a caller with a
+/// per-line loop can pay for the buffer's capacity ONCE instead of allocating
+/// and freeing a fresh `String` per line.
 ///
 /// Shared by the query key and the trigram index/removal/rebuild passes so
 /// that index, query, and per-line scan are byte-identical.
-pub(crate) fn lower_fold(s: &str) -> String {
-    // Spelled as an explicit push loop (not `.collect()`) because the Trust L0
-    // gate's bulk-allocation recognizer cannot derive an element count for the
-    // flat_map collect and refuses to prove the allocation bounded;
+pub(crate) fn lower_fold_into(s: &str, out: &mut String) {
+    // Spelled as an explicit push loop (not `.collect()`/`extend`) because the
+    // Trust L0 gate's bulk-allocation recognizer cannot derive an element count
+    // for the flat_map collect and refuses to prove the allocation bounded;
     // incremental `push` growth carries the bounds instead. Identical output.
-    let mut out = String::new();
+    out.clear();
     for c in s.chars() {
         for lc in lower_fold_char(c) {
             out.push(lc);
         }
     }
+}
+
+/// Lowercase + sigma-fold an entire string using [`lower_fold_char`].
+///
+/// Thin wrapper over [`lower_fold_into`] so there is one lowering routine.
+pub(crate) fn lower_fold(s: &str) -> String {
+    let mut out = String::new();
+    lower_fold_into(s, &mut out);
     out
 }
 

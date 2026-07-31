@@ -179,10 +179,8 @@ pub enum FlowError {
 }
 
 // Hand-rendered through `Formatter::write_str` + direct `Display::fmt`/`Debug::fmt`
-// calls (no `write!`): the `write!`/`format_args!` expansion embeds `fmt::Arguments`
-// construction (with inlined `unsafe`) that the strict Trust gate cannot lower and
-// fails closed on. Byte-identical output (`write!` with `{}`/`{:?}` args performs
-// exactly these formatter writes in sequence; no width/fill flags are used).
+// calls (no `write!`) — Trust-gate lowering workaround, see `lib.rs`. Byte-identical
+// to the `write!` forms (no width/fill flags are used).
 impl std::fmt::Display for FlowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -238,7 +236,6 @@ impl std::fmt::Display for FlowError {
                 f.write_str("activate: ")?;
                 f.write_str(e)
             }
-            // Best-of-both additions (write_str style, Trust-gate-safe — no `write!`):
             FlowError::Rollback(m) => {
                 f.write_str("rollback: ")?;
                 f.write_str(m)
@@ -330,16 +327,9 @@ fn install_inner(
         return Err(FlowError::Linked(program.to_string()));
     }
     seen.insert(program.to_string());
-    // 1–2. Resolve + verify-select the index (cached-fallback, §14), then reachability.
-    let candidates = resolve_candidates(fetcher, layout)?;
-    let selected = select_index(root_pubkey_b64, candidates, floor).ok_or(FlowError::NoIndex)?;
-    let index = selected.index;
-    // Freshness (§8 gate 2): refuse a selected index whose window has lapsed. A
-    // valid_until we cannot parse is treated as lapsed (fail closed).
-    match rfc3339_to_unix(&index.valid_until) {
-        Some(until) if crate::sig::check_freshness(now_unix, until).is_ok() => {}
-        _ => return Err(FlowError::Stale),
-    }
+    // 1–2. Resolve + verify-select the index + freshness (§8 gate 2) — the shared
+    // [`resolve_verified_index`] prologue (cached-fallback, §14) — then reachability.
+    let index = resolve_verified_index(fetcher, layout, root_pubkey_b64, floor, now_unix)?;
     let repo = index
         .program(program)
         .ok_or_else(|| FlowError::NotReachable(program.to_string()))?
@@ -399,6 +389,10 @@ fn install_inner(
     // is SIGNED metadata (parsed from the just-verified &VerifiedBytes), so a repo-write
     // adversary can neither inject nor redirect a dependency edge.
     let mut dependencies: Vec<DepOutcome> = Vec::new();
+    // ONE `bin/` scan for the whole loop: any program this recursion installs is in
+    // `seen` (inserted at entry) and screened by the check below BEFORE the map is
+    // consulted, so a pre-loop snapshot decides identically.
+    let active = crate::ops::active_builds(layout);
     for dep in &pkg.requires {
         if dep.as_str() == program || seen.contains(dep) {
             dependencies.push(DepOutcome {
@@ -407,7 +401,7 @@ fn install_inner(
             });
             continue;
         }
-        if let Some(b) = crate::ops::active_builds(layout).get(dep).copied() {
+        if let Some(b) = active.get(dep).copied() {
             dependencies.push(DepOutcome {
                 program: dep.clone(),
                 result: DepResult::AlreadyPresent(b),
@@ -587,10 +581,8 @@ struct Staged {
     build: u64,
     build_dir: PathBuf,
     /// The tools that will actually be shimmed — the ADMITTED set, not the raw manifest list.
-    /// Holding [`ToolName`]s here rather than `Vec<String>` is what forces `rollback_member`
-    /// below to say `exe_file()` when it probes the prior build for a binary; it used to join
-    /// the bare name, so on Windows the probe missed `ay.exe` and the rollback dropped the
-    /// shim of a tool the prior build had all along.
+    /// Holding [`ToolName`]s here rather than `Vec<String>` forces `rollback_member` to probe
+    /// the prior build via `exe_file()`, never the bare name — see [`ToolName`]'s docs.
     exposes: Vec<ToolName>,
     /// The member's prior active build (`None` ⇒ a fresh install: rollback removes the shims).
     prior_build: Option<u64>,
@@ -671,14 +663,9 @@ pub fn apply_channel(
     floor: u64,
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
-    // 1–2. Resolve + verify-select the index ONCE (cached-fallback, §14), then freshness (§8).
-    let candidates = resolve_candidates(fetcher, layout)?;
-    let selected = select_index(root_pubkey_b64, candidates, floor).ok_or(FlowError::NoIndex)?;
-    let index = selected.index;
-    match rfc3339_to_unix(&index.valid_until) {
-        Some(until) if crate::sig::check_freshness(now_unix, until).is_ok() => {}
-        _ => return Err(FlowError::Stale),
-    }
+    // 1–2. Resolve + verify-select the index ONCE + freshness (§8) — the shared
+    //      [`resolve_verified_index`] prologue (cached-fallback, §14).
+    let index = resolve_verified_index(fetcher, layout, root_pubkey_b64, floor, now_unix)?;
     let ch = index
         .channels
         .iter()
@@ -804,7 +791,7 @@ pub fn bootstrap_group(
 /// that cannot fully exist on this host is a correct state the 6h loop must not scream
 /// about, not a failure). `None` ⇒ no missing triple was PROVEN: any fetch/verify/parse
 /// failure defers to the real stage, which fails the transaction loudly. Verify-before-
-/// parse is identical to [`stage_member`]/[`group_disk_required`].
+/// parse is the shared [`verified_pkg`] sequence.
 pub fn group_missing_triple(
     fetcher: &dyn Fetcher,
     index: &Index,
@@ -814,19 +801,7 @@ pub fn group_missing_triple(
 ) -> Option<String> {
     let ch = index.channels.iter().find(|c| c.name == channel)?;
     for m in members {
-        let Some(&pinned) = ch.pin.get(m.as_str()) else {
-            continue;
-        };
-        let Some(p) = index.program(m) else {
-            continue;
-        };
-        let Ok((raw, sig)) = fetcher.pkg_manifest(&p.repo, m, pinned) else {
-            continue;
-        };
-        let Ok(verified) = verify_pkg(raw, &sig, &index.delegation()) else {
-            continue;
-        };
-        let Ok(pkg) = parse_pkg(&verified) else {
+        let Some((_, _, pkg)) = verified_pkg(fetcher, index, ch, m) else {
             continue;
         };
         if pkg.artifact_for(triple).is_none() {
@@ -1009,9 +984,9 @@ fn disk_gate(required: u64, available: Option<u64>) -> Result<(), FlowError> {
 
 /// The aggregate installed-bytes a group's Install members need — the sum of each member's
 /// signed `size` (compressed asset) + `disk_installed` (extracted tree). Preserves
-/// VERIFY-BEFORE-PARSE: it runs the IDENTICAL verify_pkg → parse_pkg sequence as
-/// [`stage_member`], never parsing unverified TOML. `None` on any verify/parse/fetch failure
-/// so the caller's [`disk_gate`] fails OPEN, letting the real stage surface the failure.
+/// VERIFY-BEFORE-PARSE via the shared [`verified_pkg`] sequence (never parsing unverified
+/// TOML). `None` on any verify/parse/fetch failure so the caller's [`disk_gate`] fails
+/// OPEN, letting the real stage surface the failure.
 fn group_disk_required(
     fetcher: &dyn Fetcher,
     index: &Index,
@@ -1021,11 +996,7 @@ fn group_disk_required(
 ) -> Option<u64> {
     let mut total = 0u64;
     for &m in install_members {
-        let pinned = *ch.pin.get(m.as_str())?;
-        let repo = index.program(m)?.repo.clone();
-        let (raw, sig) = fetcher.pkg_manifest(&repo, m, pinned).ok()?;
-        let verified = verify_pkg(raw, &sig, &index.delegation()).ok()?; // verify FIRST
-        let pkg = parse_pkg(&verified).ok()?; // parse only &VerifiedBytes
+        let (_, _, pkg) = verified_pkg(fetcher, index, ch, m)?;
         let a = pkg.artifact_for(triple)?;
         total = total
             .saturating_add(a.size)
@@ -1048,6 +1019,20 @@ pub fn resolve_verified_index(
     now_unix: i64,
 ) -> Result<Index, FlowError> {
     let candidates = resolve_candidates(fetcher, layout)?;
+    verify_select_fresh(root_pubkey_b64, candidates, floor, now_unix)
+}
+
+/// The verify-select + freshness half of [`resolve_verified_index`], over caller-supplied
+/// `candidates` — shared with the single-program paths ([`rollback`], [`apply_program`],
+/// [`plan_update`]), which fetch their candidates directly (no §14 cached fallback).
+/// Freshness (§8 gate 2): refuse a selected index whose window has lapsed; a
+/// `valid_until` we cannot parse is treated as lapsed (fail closed).
+fn verify_select_fresh(
+    root_pubkey_b64: &str,
+    candidates: Vec<Candidate>,
+    floor: u64,
+    now_unix: i64,
+) -> Result<Index, FlowError> {
     let selected = select_index(root_pubkey_b64, candidates, floor).ok_or(FlowError::NoIndex)?;
     let index = selected.index;
     match rfc3339_to_unix(&index.valid_until) {
@@ -1101,14 +1086,10 @@ pub fn rollback(
     let current = *crate::ops::active_builds(layout)
         .get(program)
         .ok_or_else(|| FlowError::Rollback(format!("{program} is not installed/active")))?;
-    // 2. Resolve + verify-select the SIGNED index so the floor/yank gate is authoritative.
+    // 2. Resolve + verify-select the SIGNED index so the floor/yank gate is authoritative
+    //    (direct fetch — the single-program paths use no §14 cached fallback).
     let candidates = fetcher.index_candidates().map_err(|_| FlowError::NoIndex)?;
-    let selected = select_index(root_pubkey_b64, candidates, floor).ok_or(FlowError::NoIndex)?;
-    let index = selected.index;
-    match rfc3339_to_unix(&index.valid_until) {
-        Some(until) if crate::sig::check_freshness(now_unix, until).is_ok() => {}
-        _ => return Err(FlowError::Stale),
-    }
+    let index = verify_select_fresh(root_pubkey_b64, candidates, floor, now_unix)?;
     // 3. Reachability — capture the coherence group for the report/warn.
     let coherence_group = index
         .program(program)
@@ -1162,10 +1143,12 @@ pub fn rollback(
     })
 }
 
-/// The transactional `update <grouped-member>` path (§11 tuple-split fix): resolve + verify-
-/// select the index (same prologue as [`apply_channel`]), find the ONE coherence group
-/// containing `program`, and apply THAT WHOLE group atomically via [`apply_group`]. A grouped
-/// member therefore stages-all → flips-all → rolls-back atomically and can NEVER move
+/// The transactional `update <grouped-member>` path (§11 tuple-split fix): verify-select the
+/// index + freshness like [`apply_channel`], but from a DIRECT candidate fetch — the single-
+/// program paths do not use the §14 cached-index fallback, so a transient index-fetch failure
+/// is `NoIndex` rather than a cache fallback. Then find the ONE coherence group containing
+/// `program`, and apply THAT WHOLE group atomically via [`apply_group`]. A grouped member
+/// therefore stages-all → flips-all → rolls-back atomically and can NEVER move
 /// independently. A program the channel does not pin yields [`FlowError::NotPinned`].
 #[allow(
     clippy::too_many_arguments,
@@ -1185,12 +1168,7 @@ pub fn apply_program(
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
     let candidates = fetcher.index_candidates().map_err(|_| FlowError::NoIndex)?;
-    let selected = select_index(root_pubkey_b64, candidates, floor).ok_or(FlowError::NoIndex)?;
-    let index = selected.index;
-    match rfc3339_to_unix(&index.valid_until) {
-        Some(until) if crate::sig::check_freshness(now_unix, until).is_ok() => {}
-        _ => return Err(FlowError::Stale),
-    }
+    let index = verify_select_fresh(root_pubkey_b64, candidates, floor, now_unix)?;
     let ch = index
         .channels
         .iter()
@@ -1252,12 +1230,7 @@ pub fn plan_update(
     now_unix: i64,
 ) -> Result<UpdatePlan, FlowError> {
     let candidates = fetcher.index_candidates().map_err(|_| FlowError::NoIndex)?;
-    let selected = select_index(root_pubkey_b64, candidates, floor).ok_or(FlowError::NoIndex)?;
-    let index = selected.index;
-    match rfc3339_to_unix(&index.valid_until) {
-        Some(until) if crate::sig::check_freshness(now_unix, until).is_ok() => {}
-        _ => return Err(FlowError::Stale),
-    }
+    let index = verify_select_fresh(root_pubkey_b64, candidates, floor, now_unix)?;
     let ch = index
         .channels
         .iter()
@@ -1286,6 +1259,25 @@ pub struct UpdatePlan {
     pub current_build_ok: bool,
 }
 
+/// The verified per-build manifest for `program`'s channel pin: pin lookup → repo lookup →
+/// fetch → [`verify_pkg`] → [`parse_pkg`], in exactly that order (VERIFY-BEFORE-PARSE, §4.2).
+/// Returns `(pinned build, repo, manifest)`; `None` on a missing pin/program or any
+/// fetch/verify/parse failure. A caller that must bind the signed `program`/`build_number`
+/// to its request (anti-replay) checks that on the returned manifest.
+fn verified_pkg(
+    fetcher: &dyn Fetcher,
+    index: &Index,
+    ch: &Channel,
+    program: &str,
+) -> Option<(u64, String, crate::manifest::PkgManifest)> {
+    let pinned = *ch.pin.get(program)?;
+    let repo = index.program(program)?.repo.clone();
+    let (raw, sig) = fetcher.pkg_manifest(&repo, program, pinned).ok()?;
+    let verified = verify_pkg(raw, &sig, &index.delegation()).ok()?;
+    let pkg = parse_pkg(&verified).ok()?;
+    Some((pinned, repo, pkg))
+}
+
 /// Stage one group member: fetch + verify + parse its per-build manifest, bind program +
 /// build, select the artifact (Shim kinds only — sysroot-bundle fails closed), download, and
 /// `verify_and_stage` into its build dir. NO activation. `Some(Staged)` on success (with the
@@ -1299,11 +1291,7 @@ fn stage_member(
     triple: &str,
     prior_build: Option<u64>,
 ) -> Option<Staged> {
-    let pinned = *ch.pin.get(program)?;
-    let repo = index.program(program)?.repo.clone();
-    let (raw, sig) = fetcher.pkg_manifest(&repo, program, pinned).ok()?;
-    let verified = verify_pkg(raw, &sig, &index.delegation()).ok()?;
-    let pkg = parse_pkg(&verified).ok()?;
+    let (pinned, repo, pkg) = verified_pkg(fetcher, index, ch, program)?;
     if !pkg.is_for(program) || pkg.build_number != pinned {
         return None;
     }
@@ -1389,11 +1377,7 @@ fn flip_member(layout: &Layout, channel: &str, program: &str, s: &Staged) -> boo
 /// (re-pointing it would dangle). A fresh install (`prior_build == None`) removes the shims.
 ///
 /// The "does the prior build contain it?" probe must name the EXECUTABLE
-/// ([`ToolName::exe_file`]), not the logical tool: it used to join the bare name, which on
-/// Windows never matched `ay.exe`, so every tool looked absent and the rollback deleted shims
-/// it should have re-pointed — leaving the user with no `PATH` entry at all after a failed
-/// update. The `shim_allowed` calls this loop used to make are gone because a `ToolName`
-/// cannot exist without them.
+/// ([`ToolName::exe_file`]), never the bare tool name — see [`ToolName`]'s docs.
 fn rollback_member(layout: &Layout, channel: &str, program: &str, s: &Staged) {
     match s.prior_build {
         Some(prior) if prior != s.build => {
@@ -1493,9 +1477,20 @@ fn bundle_resolve_check(build_dir: &Path, exposes: &[ToolName]) -> Result<(), Fl
     Ok(())
 }
 
+/// Current Unix epoch second — the `now_unix` input every freshness gate takes as a
+/// parameter (the flow entry points stay clock-free for determinism; the CLI edge reads
+/// the real clock through THIS one definition). 0 if the clock is before the epoch.
+pub(crate) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// Parse an RFC3339 UTC timestamp `YYYY-MM-DDTHH:MM:SSZ` to a Unix epoch second. Pure (no
 /// clock), so the freshness gate stays deterministic; `None` on any malformed field, which
-/// the caller treats as lapsed (fail closed). Uses the standard `days_from_civil` algorithm.
+/// the caller treats as lapsed (fail closed). Calendar math is the shared
+/// `aterm_types::rfc3339::days_from_civil`.
 pub(crate) fn rfc3339_to_unix(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 19
@@ -1516,13 +1511,7 @@ pub(crate) fn rfc3339_to_unix(s: &str) -> Option<i64> {
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
         return None;
     }
-    // days_from_civil (Howard Hinnant): days since 1970-01-01.
-    let yy = if mo <= 2 { y - 1 } else { y };
-    let era = (if yy >= 0 { yy } else { yy - 399 }) / 400;
-    let yoe = yy - era * 400;
-    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
+    let days = aterm_types::rfc3339::days_from_civil(y, mo, d);
     Some(days * 86400 + h * 3600 + mi * 60 + se)
 }
 

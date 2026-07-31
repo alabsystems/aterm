@@ -658,9 +658,10 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
                 // Hand the selection to the init funnel by setting the env var it reads:
                 // explicit flag thus beats any pre-existing $ATERM_CONTAINMENT_MODE, and a
                 // bad value fails CLOSED through the exact same `init_mode_from_env` path.
-                // SAFETY: single-threaded startup, before any thread is spawned or any PTY
-                // byte flows; this is the trusted launcher establishing the mode.
-                unsafe { std::env::set_var("ATERM_CONTAINMENT_MODE", val) };
+                // Single-threaded startup, before any thread is spawned or any PTY byte
+                // flows — the trusted launcher establishing the mode — and routed through
+                // the workspace's one lock-scoped env helper rather than a raw `set_var`.
+                aterm_log::env::set("ATERM_CONTAINMENT_MODE", val);
             }
             quiet
         }

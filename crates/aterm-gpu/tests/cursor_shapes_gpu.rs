@@ -13,29 +13,11 @@
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{Frame, Renderer, Theme};
 
+mod common;
+use common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
+
 const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
 const PX: f32 = 18.0;
-
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-
-/// Max per-channel absolute difference between two same-sized frames.
-fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.pixels.iter().zip(b.pixels.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
-}
 
 /// Per-channel closeness to a packed `0x00RRGGBB` colour. Tolerance is 2 LSB, not 1:
 /// at a GLYPH-EDGE pixel the GPU's fixed-function linear blend can round 1 LSB below
@@ -71,19 +53,7 @@ fn cursor_positions(f: &Frame) -> Vec<(usize, usize)> {
 
 /// Both renderers at the same px/theme, or `None` to skip (no GPU / no font).
 fn renderers() -> Option<(Renderer, aterm_gpu::GpuRenderer)> {
-    let theme = Theme::default();
-    let gpu = match aterm_gpu::GpuRenderer::new(PX, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return None;
-        }
-    };
-    let Some(cpu) = Renderer::from_system(PX, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return None;
-    };
-    Some((cpu, gpu))
+    backends(PX, Theme::default())
 }
 
 /// A 2x4 terminal (text "a", cursor back over it) with `bytes` processed —

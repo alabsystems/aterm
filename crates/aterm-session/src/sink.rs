@@ -629,10 +629,13 @@ impl SinkWriter {
         //   * `O_NONBLOCK` description (declared via `note_master_nonblocking`, and
         //     what the direct-read gather actually leaves the master in): `write(2)`
         //     short-writes or returns `EAGAIN` and can never park, so the whole
-        //     remaining frame is a parking-free unit. This is the fast case — one
-        //     `poll`+`write` pair for the frame instead of one PAIR PER BYTE, which
-        //     cost the event loop ~20-44 syscalls for a single Kitty-protocol key
-        //     (press and release, ~5-11 bytes each).
+        //     remaining frame is a parking-free unit — AND the poll is pure
+        //     overhead, because the write itself reports the same "no room" the
+        //     poll would have (`WouldBlock` and `Ok(false)` funnel to the identical
+        //     `spill_tail_locked(guard, bytes, off)` from the same `off`). So this
+        //     path skips the poll entirely: ONE `write(2)` for the frame, where the
+        //     one-byte cadence cost the event loop ~20-44 syscalls for a single
+        //     Kitty-protocol key (press and release, ~5-11 bytes each).
         //   * otherwise: a blocking `write(2)` larger than the free room does NOT
         //     short-write — it parks until EVERY byte is accepted. Since the
         //     wedged-foreground scenario fills the queue with these very keystrokes,
@@ -646,10 +649,24 @@ impl SinkWriter {
         let whole_frame = self.master_nonblocking.load(Ordering::Relaxed);
         let mut off = 0;
         while off < bytes.len() {
-            match aterm_pty::poll_writable(self.master, 0) {
-                Ok(true) => {}
-                Ok(false) => return self.spill_tail_locked(guard, bytes, off),
-                Err(e) => return Err(e),
+            // The readiness check is load-bearing ONLY on a blocking description,
+            // where an over-large `write(2)` parks instead of short-writing. On an
+            // `O_NONBLOCK` one the write short-writes or returns `EAGAIN`, which
+            // `write_some_nonparking` reports as `WouldBlock` → the SAME
+            // `spill_tail_locked(guard, bytes, off)` this poll would have taken,
+            // from the same `off`; a poll-only error becomes the write's own error
+            // of the same kind (`poll_writable` already reports POLLERR/POLLHUP as
+            // writable precisely so the write surfaces the real errno). Polling
+            // first is then a pure extra syscall per frame on the winit event loop.
+            // `whole_frame` comes only from the actual `fcntl` result
+            // (`note_master_nonblocking`), which is why dropping the poll here
+            // cannot introduce a park.
+            if !whole_frame {
+                match aterm_pty::poll_writable(self.master, 0) {
+                    Ok(true) => {}
+                    Ok(false) => return self.spill_tail_locked(guard, bytes, off),
+                    Err(e) => return Err(e),
+                }
             }
             // `off < bytes.len()` (the loop condition) makes both `get`s always
             // `Some`; the `else` arm never fires, and exiting the loop there is
@@ -674,8 +691,10 @@ impl SinkWriter {
                     let room = bytes.len().saturating_sub(off);
                     off = off.saturating_add(if n <= room { n } else { room });
                 }
-                // The gather keeps the master O_NONBLOCK; a race with the
-                // poll_writable(0) above lands here — treat as "no room".
+                // On the whole-frame (O_NONBLOCK) path this is the PRIMARY
+                // no-room signal — there is no preceding poll. On the one-byte
+                // path it is the poll-race case. Both mean the same thing: spill
+                // the tail from here.
                 aterm_pty::NonParkWrite::WouldBlock => {
                     return self.spill_tail_locked(guard, bytes, off);
                 }

@@ -330,9 +330,27 @@ impl Parser {
     /// the final byte simultaneously. Handles private markers, subparams,
     /// and intermediate bytes.
     ///
-    /// For non-private-marker sequences, attempts SIMD-accelerated parameter
-    /// parsing first (see `simd::simd_parse_csi_params`), falling back to
-    /// byte-by-byte when subparams or private markers are present.
+    /// This used to speculatively run `simd_csi::simd_parse_csi_params` first
+    /// and fall back to the byte loop below when it reported subparams. That
+    /// pre-parse was removed (2026-07): it never won and lost on everything
+    /// that actually reaches here. `try_parse_csi_fast` already routes `D;…`
+    /// and `DD;…` — i.e. `38;2;255;128;0m` and every ordinary multi-param SGR,
+    /// the shapes the pre-parse was written for — to
+    /// `parse_csi_after_first_param`, and a private marker sets `pos = 1`,
+    /// which disabled the pre-parse anyway. What was left for it was 3+-digit
+    /// first params, a leading `;`, and colon-subparam shapes: on a colon
+    /// sequence the entire 72-byte `CsiParamResult` was thrown away and these
+    /// same bytes re-parsed from zero, and otherwise the params were copied a
+    /// second time out of it — on top of a 48-byte zero-init and an sret
+    /// return from a non-inlined call. Measured in-tree on `advance_fast` +
+    /// `NullSink` over 8 MiB corpora (release, best-of-5), with vs. without
+    /// the pre-parse: `ESC[4:3m` / `ESC[58:2::255:0:0m` + text 1,580 -> 2,764
+    /// MB/s (+75%), `ESC[123;45H` + text 3,748 -> 4,886 (+30%), and a 13-param
+    /// leading-`;` SGR — the best case FOR the pre-parse — 1,731 -> 2,058
+    /// (+19%). It was never faster, anywhere. A 400k-case randomized
+    /// differential over CSI-shaped inputs plus 20 hand-picked edge shapes
+    /// hashed bit-identical events before and after removal (442,617 calls
+    /// reached this function, 126,260 of them through the pre-parse).
     #[inline]
     fn parse_csi_general<S: ActionSink>(&mut self, input: &[u8], sink: &mut S) -> Option<usize> {
         self.params.clear();
@@ -355,48 +373,6 @@ impl Parser {
             pos = 1;
         }
 
-        // SIMD fast path: when no private marker was consumed (pos == 0),
-        // try bulk parameter parsing. This accelerates the common case of
-        // multi-param CSI sequences like `38;2;255;128;0m`.
-        if pos == 0
-            && let Some(result) = crate::simd_csi::simd_parse_csi_params(input)
-            && !result.has_subparams
-        {
-            // No subparams — we can use the SIMD result directly.
-            let consumed = result.bytes_consumed;
-            if let Some(&b) = scan.get(consumed) {
-                if (0x40..=0x7E).contains(&b) {
-                    // Final byte — dispatch with SIMD-parsed params.
-                    // `take(count)` caps at the array length, matching the
-                    // previous `count.min(MAX_PARAMS)` bound without indexing.
-                    for &p in result.params.iter().take(result.count) {
-                        self.params.push(p);
-                    }
-                    sink.csi_dispatch(
-                        pty_wrap_ref(self.params.as_slice()),
-                        pty_wrap_ref(self.intermediates.as_slice()),
-                        b,
-                    );
-                    self.state = State::Ground;
-                    return Some(consumed.saturating_add(1));
-                }
-                if (0x20..=0x2F).contains(&b) {
-                    // Intermediate byte — load params and delegate
-                    for &p in result.params.iter().take(result.count) {
-                        self.params.push(p);
-                    }
-                    return self.parse_csi_intermediates(input, sink, consumed, limit);
-                }
-                // Invalid byte (< 0x20 or 0x7F) — reject
-                return None;
-            }
-            // Consumed up to the limit with no final byte — reject
-            return None;
-        }
-        // Note: when has_subparams is true, or no SIMD result, or private
-        // marker present (pos != 0), falls through to byte-by-byte below.
-
-        // Byte-by-byte fallback (private markers, subparams, or SIMD unavailable)
         let mut next_is_subparam = false;
 
         // Single pass: parse params and find final byte simultaneously

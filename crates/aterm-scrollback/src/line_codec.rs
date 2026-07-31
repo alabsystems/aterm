@@ -375,6 +375,92 @@ impl Line {
         })
     }
 
+    /// Whether `data` frames a record [`Self::deserialize`] would ACCEPT —
+    /// decided from the header alone, without reconstructing the `Line`.
+    ///
+    /// This encodes exactly `deserialize`'s `None` conditions and nothing else.
+    /// It exists so the warm→cold eviction path can VALIDATE a page whose lines
+    /// it does not need (`WarmBlock::try_decompress_serialized` reuses the
+    /// decompressed bytes verbatim) without paying a full `Line` materialization
+    /// per line. A divergence from `deserialize` would either let a corrupt
+    /// block through to the cold tier or reject a good one, so the two are
+    /// pinned together by a `debug_assert_eq!` on every record the block
+    /// decoder walks (see `walk_records`).
+    ///
+    /// Only the header and the attrs PRESENCE byte can reject: the hyperlink
+    /// and underline-colour sections clamp and truncate rather than fail, and
+    /// `deserialize_attrs` fails in exactly two places — its
+    /// `content_end >= data.len()` guard (implied by the length check below)
+    /// and the 4-byte run-count read it performs when the has-attrs byte is
+    /// set. So these ARE the whole predicate.
+    #[must_use]
+    pub(crate) fn record_is_valid(data: &[u8]) -> bool {
+        let Some(&version) = data.first() else {
+            return false;
+        };
+
+        if version == 0 {
+            // Legacy: `[flags:1][len:4][content:len]` (`deserialize_legacy`).
+            // Sub-slice + length guard + constant indexing, the same spelling
+            // the decoders use so the strict L0 gate can prove the indexes.
+            let Some(header) = data.get(1..5) else {
+                return false;
+            };
+            if header.len() < 4 {
+                return false;
+            }
+            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            if len > MAX_LINE_CONTENT_BYTES {
+                return false;
+            }
+            let Some(end) = 5usize.checked_add(len) else {
+                return false;
+            };
+            return data.len() >= end;
+        }
+
+        // v1+: `[version:1][flags:1][len:4][content:len][has_attrs:1]…`
+        if data.len() < 7 {
+            return false;
+        }
+        let Some(header) = data.get(2..6) else {
+            return false;
+        };
+        if header.len() < 4 {
+            return false;
+        }
+        let content_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        if content_len > MAX_LINE_CONTENT_BYTES {
+            return false;
+        }
+        let Some(content_end) = 6usize.checked_add(content_len) else {
+            return false;
+        };
+        let Some(min_len) = content_end.checked_add(1) else {
+            return false;
+        };
+        if data.len() < min_len {
+            return false;
+        }
+        // `deserialize_attrs` reads a 4-byte run count after the has-attrs
+        // byte and rejects a record that ends inside it. (The block framing
+        // walk never offers such a record — `line_size_v1v2` needs those same
+        // bytes to size it — but the predicate mirrors `deserialize`, not the
+        // walk, so callers cannot be surprised.)
+        let Some(&has_attrs) = data.get(content_end) else {
+            return false;
+        };
+        if has_attrs == 0 {
+            return true;
+        }
+        // `content_end + 5` is `attrs_start(+1) + run_count(4)`; one checked
+        // add covers both of `deserialize_attrs`'s overflow checks.
+        let Some(runs_start) = content_end.checked_add(5) else {
+            return false;
+        };
+        data.len() >= runs_start
+    }
+
     /// Deserialize RLE attributes starting at `content_end` in `data`.
     ///
     /// Returns `(attrs, next_offset)` or `None` if data is truncated.
@@ -744,7 +830,7 @@ impl Line {
 // Block-level serialization (serialize_lines, deserialize_lines) is in line_codec_block.rs.
 // Exposed publicly (B.3.2): `TerminalCheckpoint` encodes both grid bodies with
 // this exact block codec, so it must be reachable from aterm-core.
-pub(crate) use super::line_codec_block::MAX_DECODE_PAGE_LINES;
+pub(crate) use super::line_codec_block::{MAX_DECODE_PAGE_LINES, count_page_lines};
 pub use super::line_codec_block::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_tail_strict,
     deserialize_page_lines, serialize_lines,

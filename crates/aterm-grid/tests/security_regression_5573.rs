@@ -245,14 +245,52 @@ fn aterm_grid_rlib() -> Option<std::path::PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// Resolve the probe's compiler: trustc from the Trust stage2 tool dir
+/// (`TRUST_STAGE2_BIN` overrides; default `$HOME/trust/build/host/stage2/bin`,
+/// canonicalized — protected Trust drivers refuse symlinked toolchain paths),
+/// else a PATH `rustc` (upstream boxes). A bare PATH `rustc` alone is not
+/// enough since the 2026-07-30 stock-name purge: the rustup shim exists but
+/// the repo's pinned toolchain no longer carries a stock-named compiler, so
+/// the shim exits nonzero and every negative probe would "pass" vacuously —
+/// exactly the failure mode the positive control below exists to catch.
+/// The bool is "this is trustc" — the caller adds the verification off-switch
+/// (a direct compiler invocation bypasses .cargo/config.toml's native-lane
+/// opt-out, and an unverified probe snippet is the point here).
+fn probe_compiler() -> Option<(std::path::PathBuf, bool)> {
+    let mut candidates: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    let stage2 = std::env::var_os("TRUST_STAGE2_BIN")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::Path::new(&home).join("trust/build/host/stage2/bin"))
+        });
+    if let Some(dir) = stage2 && let Ok(physical) = std::fs::canonicalize(&dir) {
+        candidates.push((physical.join("trustc"), true));
+    }
+    candidates.push((std::path::PathBuf::from("rustc"), false));
+    candidates.into_iter().find(|(path, _)| {
+        std::process::Command::new(path)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
 /// Compile `src` against the real `aterm_grid` rlib. `Some(true)` = compiled,
-/// `Some(false)` = rejected, `None` = could not run the probe at all (no rustc,
-/// no rlib) — reported as a SKIP rather than a silent pass.
+/// `Some(false)` = rejected, `None` = could not run the probe at all (no
+/// usable compiler, no rlib) — reported as a SKIP rather than a silent pass.
 fn probe_compiles(src: &str) -> Option<bool> {
     let rlib = aterm_grid_rlib()?;
     let deps = deps_dir()?;
     let out = std::env::temp_dir().join(format!("aterm_grid_probe_{}", std::process::id()));
-    let mut child = std::process::Command::new("rustc")
+    let (compiler, is_trustc) = probe_compiler()?;
+    let mut cmd = std::process::Command::new(&compiler);
+    if is_trustc {
+        cmd.arg("-Ztrust-verify=off");
+    }
+    let mut child = cmd
         .arg("--edition=2021")
         .arg("--crate-type=lib")
         .arg("--extern")

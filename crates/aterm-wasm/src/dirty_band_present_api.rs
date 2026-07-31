@@ -60,15 +60,30 @@ use wasm_bindgen::prelude::*;
 /// Expand `pixels[start..end]` (0xTTRRGGBB) into `rgba[start*4..end*4]`
 /// (straight RGBA8, alpha = 255 − TT) — the one packing rule of the CPU
 /// present path, band-scoped.
+///
+/// This is the innermost loop of the whole CPU present path (every `Full`
+/// frame, every scroll frame's exposed bands, every keystroke's row bands),
+/// so it is written to cost ONE store per pixel: zipping the destination's
+/// `as_chunks_mut::<4>()` proves the bound once for the entire band and makes
+/// each pixel a single 4-byte array store, instead of four separately
+/// bounds-checked byte writes whose interleaved panic edges also block LLVM's
+/// store-merging pass. `(end - start) * 4` is divisible by 4 so the chunk
+/// remainder is always empty, and `[u8; 4]` is align-1. Same packing rule,
+/// same order, byte-identical output — the same idiom `aterm-render`'s spill
+/// buffer already uses.
 pub(crate) fn expand_rgba_band(pixels: &[u32], rgba: &mut [u8], start: usize, end: usize) {
     let end = end.min(pixels.len());
     let start = start.min(end);
-    for (i, &p) in pixels[start..end].iter().enumerate() {
-        let o = (start + i) * 4;
-        rgba[o] = (p >> 16) as u8;
-        rgba[o + 1] = (p >> 8) as u8;
-        rgba[o + 2] = p as u8;
-        rgba[o + 3] = 0xff - (p >> 24) as u8;
+    for (&p, out) in pixels[start..end]
+        .iter()
+        .zip(rgba[start * 4..end * 4].as_chunks_mut::<4>().0)
+    {
+        *out = [
+            (p >> 16) as u8,
+            (p >> 8) as u8,
+            p as u8,
+            0xff - (p >> 24) as u8,
+        ];
     }
 }
 
@@ -225,8 +240,12 @@ impl AtermTerminal {
                 }
                 // Retained rows moved on-canvas → export one full band.
                 self.present_bands.clear();
-                self.present_bands
-                    .extend_from_slice(&[0, 0, self.width as i32, self.height as i32]);
+                self.present_bands.extend_from_slice(&[
+                    0,
+                    0,
+                    self.width as i32,
+                    self.height as i32,
+                ]);
             }
             // Full damage — and any stale-buffer surprise on the other arms
             // (first frame, resize race): one full expansion, one full band.
@@ -452,7 +471,8 @@ mod tests {
         t.set_scrollback_limit(4000);
         for i in 0..1500 {
             // ▓▓▒░ shade + accented capitals (upward overshoot) + box glyphs.
-            let line = format!("\u{2593}\u{2593}\u{2592}\u{2591} \u{c9}\u{c1}\u{d1} r{i} \u{2588}\r\n");
+            let line =
+                format!("\u{2593}\u{2593}\u{2592}\u{2591} \u{c9}\u{c1}\u{d1} r{i} \u{2588}\r\n");
             t.process(line.as_bytes());
         }
         t.scroll_to_bottom();

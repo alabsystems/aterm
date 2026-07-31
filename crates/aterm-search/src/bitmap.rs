@@ -29,9 +29,9 @@
 //! probe. The stored container never retains a decoded copy, so the retained
 //! heap reflects the compressed form.
 
+use std::cmp::Ordering;
 #[cfg(test)]
 use std::ops::RangeBounds;
-use std::cmp::Ordering;
 use std::ops::{BitAnd, BitAndAssign};
 
 /// A sparse bitmap backed by delta + varint-encoded ascending doc ids.

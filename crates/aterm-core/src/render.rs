@@ -1018,6 +1018,10 @@ pub struct RenderInput {
     /// one [`DefaultBgSpan`] per pane so background opacity, deepest Kitty image
     /// layering, cursor fallback, and trail fallback classify cells against the
     /// default of the pane that supplied them rather than one window-wide scalar.
+    ///
+    /// scope-waiver: the phrase names the value this field REPLACED. A default
+    /// background is a colour, not an enforcement budget — no instance count
+    /// can make it wrong, and going per-pane here is the fix, not the hazard.
     pub default_bg_spans: Vec<Vec<DefaultBgSpan>>,
     /// Per-row, sparse inline-image placements (`term.images_row(r)`):
     /// `(col, ImageRef)` for every cell covered by an iTerm2 OSC 1337 `File=`

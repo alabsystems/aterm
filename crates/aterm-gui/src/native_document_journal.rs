@@ -461,22 +461,45 @@ fn synthetic_snapshot(document: DocumentId, seq: Seq, text: Arc<str>) -> Documen
     }
 }
 
+/// Narrow two document snapshots to the one replaced range between their common prefix and
+/// common suffix.
+///
+/// PERF: this runs on the UI thread for EVERY committed edit (`next_effect` ← the editor's
+/// per-keystroke commit), and both scans cover the whole UNCHANGED region — for the common
+/// append-at-end that is the entire document, twice. Comparing `char`s meant two decoding
+/// iterators zipped together: several times the cost of a byte compare, and unvectorisable.
+/// So compare bytes and then snap the divergence point back onto a `char` boundary.
+///
+/// That is exactly equivalent, by UTF-8 self-synchronisation. Two strings agreeing on bytes
+/// `[0, k)` have the SAME char boundaries inside that window, so the largest boundary `b <= k`
+/// bounds a run of identical chars; and the char straddling `b` differs in the two strings
+/// (they differ at byte `k`, which lies inside it in both). The mirror argument holds for the
+/// suffix: a byte that is a boundary from one end is not a continuation byte, so it is a
+/// boundary in both tails. The returned [`JournalEdit`] is therefore bit-identical — which it
+/// must be, since `insert.len()` picks delta-vs-snapshot encoding against `MAX_INSERT_BYTES`.
 fn single_edit(before: &str, after: &str) -> JournalEdit {
-    let mut prefix = 0;
-    for (left, right) in before.chars().zip(after.chars()) {
-        if left != right {
-            break;
-        }
-        prefix += left.len_utf8();
+    let mut prefix = before
+        .as_bytes()
+        .iter()
+        .zip(after.as_bytes())
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| before.len().min(after.len()));
+    while prefix > 0 && !before.is_char_boundary(prefix) {
+        prefix -= 1;
     }
-    let mut suffix = 0;
+    // The tails already exclude the prefix, so the suffix can never overlap it.
     let before_tail = &before[prefix..];
     let after_tail = &after[prefix..];
-    for (left, right) in before_tail.chars().rev().zip(after_tail.chars().rev()) {
-        if left != right {
-            break;
-        }
-        suffix += left.len_utf8();
+    let mut suffix = before_tail
+        .as_bytes()
+        .iter()
+        .rev()
+        .zip(after_tail.as_bytes().iter().rev())
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| before_tail.len().min(after_tail.len()));
+    // Snap DOWN (shrinking the matched tail) so the split lands on a boundary of both tails.
+    while suffix > 0 && !before_tail.is_char_boundary(before_tail.len() - suffix) {
+        suffix -= 1;
     }
     JournalEdit {
         range: prefix..before.len().saturating_sub(suffix),
@@ -2061,5 +2084,89 @@ mod tests {
         assert!(model.check_invariant("JournalImageCas", &rejected));
         assert!(model.successors("AcceptJournal", &external).is_empty());
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// `single_edit` swapped its two `char`-decoding scans for byte scans plus a boundary
+    /// snap. The delta it emits feeds the `MAX_INSERT_BYTES` delta-vs-snapshot decision and is
+    /// proof-checked against the durable image, so it has to stay bit-identical. Differential
+    /// test against the original definition over strings built from 1-, 2-, 3- and 4-byte
+    /// scalars, with the divergence deliberately landing mid-sequence at both ends.
+    #[test]
+    fn single_edit_matches_the_char_scan_definition_on_multi_byte_boundaries() {
+        /// The pre-optimisation implementation, verbatim.
+        fn reference(before: &str, after: &str) -> JournalEdit {
+            let mut prefix = 0;
+            for (left, right) in before.chars().zip(after.chars()) {
+                if left != right {
+                    break;
+                }
+                prefix += left.len_utf8();
+            }
+            let mut suffix = 0;
+            let before_tail = &before[prefix..];
+            let after_tail = &after[prefix..];
+            for (left, right) in before_tail.chars().rev().zip(after_tail.chars().rev()) {
+                if left != right {
+                    break;
+                }
+                suffix += left.len_utf8();
+            }
+            JournalEdit {
+                range: prefix..before.len().saturating_sub(suffix),
+                insert: after[prefix..after.len().saturating_sub(suffix)].to_string(),
+            }
+        }
+
+        // Same byte length, differing only in a trailing continuation byte, so a byte scan
+        // stops INSIDE a scalar and the snap is what recovers the char answer.
+        const ALPHABET: [&str; 8] = ["a", "b", "é", "è", "→", "←", "🙂", "🙁"];
+        let mut cases: Vec<(String, String)> = vec![
+            (String::new(), String::new()),
+            (String::new(), "🙂".to_string()),
+            ("🙂".to_string(), String::new()),
+            ("🙂é→".to_string(), "🙁é→".to_string()),
+            ("→é🙂".to_string(), "→é🙁".to_string()),
+            ("aéb".to_string(), "aèb".to_string()),
+            ("prefix🙂".to_string(), "prefix🙂suffix".to_string()),
+            ("🙂tail".to_string(), "🙂more tail".to_string()),
+        ];
+        // A deterministic LCG walk over the alphabet: every (length, edit-site) combination
+        // the two loops can disagree on shows up within a few hundred draws.
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut draw = |modulus: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % modulus) as usize
+        };
+        for _ in 0..512 {
+            let len = draw(7);
+            let before: Vec<&str> = (0..len).map(|_| ALPHABET[draw(8)]).collect();
+            let mut after = before.clone();
+            match draw(3) {
+                0 if !after.is_empty() => {
+                    let at = draw(after.len() as u64);
+                    after[at] = ALPHABET[draw(8)];
+                }
+                1 => {
+                    let at = draw(after.len() as u64 + 1);
+                    after.insert(at, ALPHABET[draw(8)]);
+                }
+                _ if !after.is_empty() => {
+                    let at = draw(after.len() as u64);
+                    after.remove(at);
+                }
+                _ => {}
+            }
+            cases.push((before.concat(), after.concat()));
+        }
+
+        for (before, after) in cases {
+            assert_eq!(
+                single_edit(&before, &after),
+                reference(&before, &after),
+                "single_edit diverged on {before:?} -> {after:?}"
+            );
+        }
     }
 }

@@ -313,6 +313,30 @@ impl<C> RelayShared<C> {
 /// # Errors
 /// On setup failure (socket clone) or an unexpected mid-stream I/O error (a
 /// normal peer close — EOF / `close_notify` / reset — is not an error).
+/// Move every plaintext byte rustls has ALREADY decrypted into `plain`.
+///
+/// `Ok(true)` means the peer's stream ended (close_notify or a normal close);
+/// `Ok(false)` means it is merely out of decrypted bytes for now. Decryption
+/// happens when TLS records are fed in, so buffered plaintext can exist before
+/// the relay has read a single byte itself — see the drain at the top of the
+/// downloader.
+fn drain_decrypted<C, S>(conn: &mut C, plain: &mut Vec<u8>) -> io::Result<bool>
+where
+    C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
+    S: rustls::SideData,
+{
+    loop {
+        let mut tmp = [0u8; 4096];
+        match conn.reader().read(&mut tmp) {
+            Ok(0) => return Ok(true), // close_notify
+            Ok(k) => plain.extend_from_slice(&tmp[..k]),
+            Err(e) if is_would_block(&e) => return Ok(false), // no more plaintext yet
+            Err(e) if is_normal_close(&e) => return Ok(true),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 pub fn relay<C, S>(transport: TlsTransport<C>, local: CtlStream) -> io::Result<()>
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>> + Send + 'static,
@@ -495,7 +519,50 @@ where
     let mut tls_in = [0u8; 16 * 1024];
     let mut plain: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut fatal_down = false;
+
+    // DRAIN BEFORE THE FIRST BLOCK. A peer's first application record routinely
+    // rides in the SAME TCP segment as the handshake's final flight, so
+    // `accept`/`connect`'s `complete_io` consumes both and leaves that first
+    // request already DECRYPTED in rustls' plaintext buffer. Going straight to
+    // `tcp_down.read()` deadlocks the whole exchange: the local service never
+    // receives the request it is supposed to answer, and the peer — waiting for
+    // that answer — sends nothing further, so the blocking read never returns.
+    // Whether the segments coalesce is load-dependent, which is why this
+    // surfaced as an intermittent hang (and, wherever the local end had a read
+    // timeout, a WouldBlock failure ~10 s in) rather than a constant one.
+    let mut drained_eof = false;
+    {
+        let mut g = shared.lock();
+        match drain_decrypted(&mut g.conn, &mut plain) {
+            Ok(eof) => drained_eof = eof,
+            Err(e) => {
+                g.record_err(e);
+                g.done = true;
+                fatal_down = true;
+            }
+        }
+        if g.conn.wants_write() {
+            shared.cv.notify_all();
+        }
+    }
+    if !fatal_down
+        && !plain.is_empty()
+        && let Err(e) = local_down
+            .write_all(&plain)
+            .and_then(|()| local_down.flush())
+    {
+        let mut g = shared.lock();
+        g.record_err(e);
+        g.done = true;
+        fatal_down = true;
+    }
+
     'down: loop {
+        // The pre-loop drain already saw the peer's EOF (or failed): the
+        // teardown below is the only thing left to run.
+        if fatal_down || drained_eof {
+            break;
+        }
         let n = match tcp_down.read(&mut tls_in) {
             Ok(0) => break, // TCP EOF (with or without close_notify)
             Ok(n) => n,
@@ -511,7 +578,8 @@ where
             }
         };
         plain.clear();
-        let mut clean_eof = false;
+        // Always set by the drain below; the error arm leaves the loop instead.
+        let clean_eof;
         {
             let mut g = shared.lock();
             if g.done {
@@ -541,25 +609,13 @@ where
                     break 'down;
                 }
             }
-            loop {
-                let mut tmp = [0u8; 4096];
-                match g.conn.reader().read(&mut tmp) {
-                    Ok(0) => {
-                        clean_eof = true; // close_notify
-                        break;
-                    }
-                    Ok(k) => plain.extend_from_slice(&tmp[..k]),
-                    Err(e) if is_would_block(&e) => break, // no more plaintext yet
-                    Err(e) if is_normal_close(&e) => {
-                        clean_eof = true;
-                        break;
-                    }
-                    Err(e) => {
-                        g.record_err(e);
-                        g.done = true;
-                        fatal_down = true;
-                        break 'down;
-                    }
+            match drain_decrypted(&mut g.conn, &mut plain) {
+                Ok(eof) => clean_eof = eof,
+                Err(e) => {
+                    g.record_err(e);
+                    g.done = true;
+                    fatal_down = true;
+                    break 'down;
                 }
             }
             if g.conn.wants_write() {
@@ -848,7 +904,7 @@ mod tests {
             svc_b.write_all(&response).unwrap();
             svc_b.flush().unwrap();
             ack_attempted_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(NET_TEST_LIVENESS_BOUND)
                 .unwrap();
             let mut reverse = Vec::new();
             svc_b.read_to_end(&mut reverse).unwrap();
@@ -1088,6 +1144,16 @@ mod tests {
     /// half, announces that it has done so, and only THEN does the client send
     /// the second request. Under the old `Shutdown::Both` that second request can
     /// never arrive; with a directional half-close it must.
+    /// Upper bound on how long a socket read in these tests may block.
+    ///
+    /// Not a latency budget — a liveness guard. Its only job is that a stall can
+    /// never be UNBOUNDED, because an unbounded one hangs `cargo test
+    /// --workspace` (and therefore `tools/verify.sh --fast`, the merge contract)
+    /// instead of failing it. Sized to survive worst-case scheduler starvation
+    /// when the whole workspace suite runs concurrently, not to measure a
+    /// loopback round trip, which takes milliseconds.
+    const NET_TEST_LIVENESS_BOUND: Duration = Duration::from_secs(60);
+
     #[test]
     fn graceful_local_eof_half_closes_without_killing_the_request_direction() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1104,8 +1170,15 @@ mod tests {
         let (second_seen_tx, second_seen_rx) = std::sync::mpsc::channel();
 
         let service = std::thread::spawn(move || {
+            // Same liveness bound as the client side below: this thread's reads
+            // are the ones the test's `recv_timeout`s are WAITING on, so an
+            // unbounded read here converts a bounded channel timeout into a
+            // permanent stall of the whole test run.
+            svc_b.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
             let mut first = vec![0u8; FIRST.len()];
-            svc_b.read_exact(&mut first).unwrap();
+            svc_b
+                .read_exact(&mut first)
+                .expect("the relay must deliver the first request within the read timeout");
             assert_eq!(first, FIRST, "the relay must deliver the first request");
             svc_b.write_all(REPLY).unwrap();
             svc_b.flush().unwrap();
@@ -1125,23 +1198,43 @@ mod tests {
         });
 
         let tcp = TcpStream::connect(addr).unwrap();
+        // LIVENESS, not just ordering. The channel handoffs below are bounded by
+        // `recv_timeout`, but a socket `read_exact` is not: if the relay has not
+        // delivered yet the read blocks FOREVER, and the whole
+        // `cargo test --workspace` run stops making progress instead of failing.
+        // That is worse than a failing test, since `tools/verify.sh --fast` (the
+        // merge contract, there being no CI) then never returns. Observed
+        // hanging a full workspace run for >30 min at 0 % CPU.
+        //
+        // The bound is deliberately FAR above a loopback TLS round trip (the
+        // test finishes in 0.42 s on an idle machine). It is not policing
+        // latency — it exists so a stall cannot be unbounded. It must therefore
+        // survive worst-case SCHEDULER STARVATION: `cargo test --workspace` runs
+        // this concurrently with `aterm-spec`'s exhaustive BFS model checks,
+        // which peg every core, and at 10 s this test failed spuriously under
+        // exactly that load while passing 22/22 in isolation. Sixty seconds is
+        // still a bounded failure and still names itself in under a minute.
+        tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
         let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
         client.stream().write_all(FIRST).unwrap();
         client.stream().flush().unwrap();
 
         let mut reply = vec![0u8; REPLY.len()];
-        client.stream().read_exact(&mut reply).unwrap();
+        client
+            .stream()
+            .read_exact(&mut reply)
+            .expect("the relay must deliver the reply within the read timeout");
         assert_eq!(reply, REPLY, "the reply must survive intact");
 
         // Sequenced: the half-close has definitely happened before this send.
         write_half_closed_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(NET_TEST_LIVENESS_BOUND)
             .expect("service should announce its write-half close");
         client.stream().write_all(SECOND).unwrap();
         client.stream().flush().unwrap();
 
         let seen = second_seen_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(NET_TEST_LIVENESS_BOUND)
             .expect("service should report on the second request");
         assert_eq!(
             seen.as_deref(),

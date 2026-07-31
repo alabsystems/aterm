@@ -4541,7 +4541,8 @@ impl App {
                          window in ~{}s, then eligible again",
                         intent.build,
                         intent.attempts,
-                        at.saturating_duration_since(std::time::Instant::now()).as_secs()
+                        at.saturating_duration_since(std::time::Instant::now())
+                            .as_secs()
                     );
                 } else {
                     aterm_log::warn!(
@@ -7017,7 +7018,10 @@ mod tests {
         // builds converges to manual-only instead of costing a park/spawn/paint
         // round trip forever.
         assert_eq!(
-            automatic_retry_delay(MAX_PHYSICAL_FAILURE_CYCLES, AutomaticRetryKind::PhysicalFailure),
+            automatic_retry_delay(
+                MAX_PHYSICAL_FAILURE_CYCLES,
+                AutomaticRetryKind::PhysicalFailure
+            ),
             None,
             "the budget is spent"
         );
@@ -7196,11 +7200,15 @@ mod tests {
                 "a spent physical budget must never mint another timer retry"
             );
         }
-        assert!(
-            MAX_PHYSICAL_FAILURE_CYCLES < MAX_ACTIVITY_REVOKED_CYCLES,
-            "a lossless revocation must always be retried more readily than a \
-             physical failure"
-        );
+        // Both budgets are constants, so this ordering is decided at COMPILE time —
+        // a const block says so by failing the build rather than one test run.
+        const {
+            assert!(
+                MAX_PHYSICAL_FAILURE_CYCLES < MAX_ACTIVITY_REVOKED_CYCLES,
+                "a lossless revocation must always be retried more readily than a \
+                 physical failure"
+            )
+        };
     }
 
     /// The physical-failure budget must survive a latch LAPSE, or "two tries" is

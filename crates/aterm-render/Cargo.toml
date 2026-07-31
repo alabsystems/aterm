@@ -71,6 +71,11 @@ libc = { workspace = true }
 
 [dev-dependencies]
 libc = { workspace = true }
+# The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
+# these parity tests export a font / rasterizer selection to both renderers, and
+# every mutation in the workspace routes through that helper rather than a raw
+# `set_var`. Dependency-free leaf, already linked transitively.
+aterm-log = { workspace = true }
 # Base64 encoder for the inline-image (OSC 1337) integration tests.
 aterm-codec = { workspace = true }
 # Sparkle-words v2 visual demo (examples/sparkle_v2_demo.rs, design §13): the

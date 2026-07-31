@@ -34,6 +34,10 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Start the broad window cold-start clock before argv0 parsing or route
+    // selection. The compatibility GUI-entry clock is anchored separately if
+    // this dispatches to a window. Dyld/process-loader time remains excluded.
+    aterm_gui::mark_rust_main_start();
     // A GUI-subsystem exe (the attribute above) has no console on Windows;
     // reattach the parent's FIRST — before ANY route prints — so help/version/
     // verbs/diag output reaches a launching console and the TTY probe below
@@ -112,9 +116,10 @@ fn main() -> ExitCode {
     // Toolchain dispatch (`aterm <tool> …`, docs/ATERM-DISTRIBUTION-WEDGE.md §4):
     // when the managed store resolves the first operand as an installed tool,
     // run it through `pkg run` (which execs the tool — process replacement,
-    // exactly like the binary era). Resolution goes through a SELF-SPAWNED
-    // `pkg which` so its stdout stays out of ours; a non-tool falls through to
-    // the normal unknown-operand usage error.
+    // exactly like the binary era). Resolution is the IN-PROCESS `atpkg::which`
+    // (a readlink on the store shim — the library call never touches stdout,
+    // which is why it needs no subprocess); a non-tool falls through to the
+    // normal unknown-operand usage error.
     if aterm_cli::is_tool_candidate(Some(first.as_str())) && store_resolves(&first) {
         // KNOWN LIMIT: atpkg's CLI is String-typed, so non-UTF8 tool args
         // are lossy-converted (the binary era exec'd OsStrings verbatim);
@@ -176,21 +181,23 @@ fn main() -> ExitCode {
     aterm_cli::session_main(quiet);
 }
 
-/// Whether the managed store resolves `tool` — a self-spawned `pkg which`
-/// (stdout/stderr discarded), mirroring the binary era's co-located
-/// `atpkg which` probe. Best-effort: any spawn failure means "not a tool".
+/// Whether the managed store resolves `tool` — the IN-PROCESS `atpkg::which`
+/// against the same `store::resolve(None)` layout `pkg which` uses, mirroring
+/// the binary era's co-located `atpkg which` probe. Best-effort: an unset HOME
+/// (no layout) or an unresolvable shim both mean "not a tool".
+//
+// This used to self-spawn `<current_exe> pkg which <tool>` with all three stdio
+// streams to /dev/null, on the theory that resolution had to be sandboxed so
+// its stdout stayed out of ours. It never did: `cmd_which` is `layout()` +
+// `atpkg::which()` + a `println!` of the result, and only the print — which we
+// simply don't do — touches stdout. The spawn cost the full startup of the 10 MB
+// aterm binary on the FRONT DOOR of every `aterm <operand>` invocation, to answer
+// what is one `readlink(2)` on `<prefix>/bin/<tool>`: measured warm against the
+// installed bundle, `aterm pkg which <not-a-tool>` runs 5-19 ms depending on
+// machine load, against a ~1.4 ms `/bin/echo` spawn baseline (and ~0.5 s cold,
+// with the page cache empty).
 fn store_resolves(tool: &str) -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    std::process::Command::new(exe)
-        .args(["pkg", "which", tool])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    atpkg::store::resolve(None).is_some_and(|layout| atpkg::which(&layout, tool).is_some())
 }
 
 /// TTY probe for the mode fork. std's `IsTerminal` on stdin: a Finder/.app

@@ -12,10 +12,9 @@ use aterm_render::{FaceId, Renderer, Theme};
 
 #[test]
 fn env_var_restores_font_glyphs_for_box_drawing() {
-    // SAFETY: single-threaded test binary — no concurrent env reads.
-    unsafe {
-        std::env::set_var("ATERM_NO_PROCEDURAL_GLYPHS", "1");
-    }
+    // Single-threaded test binary — no concurrent env reads — and routed through
+    // the workspace's one lock-scoped env helper.
+    aterm_log::env::set("ATERM_NO_PROCEDURAL_GLYPHS", "1");
 
     let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
         eprintln!("SKIP: no system mono font found");

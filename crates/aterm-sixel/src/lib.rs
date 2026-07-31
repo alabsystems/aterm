@@ -558,6 +558,123 @@ impl SixelDecoder {
         if stride == 0 {
             return;
         }
+        // The paint used to be a column-outer / row-inner nest that redid
+        // `py * stride`, a length compare, the store and TWO `self.max_*`
+        // read-modify-writes for every one of the `count * 6` pixels, and
+        // vectorized not at all. But the raster is row-major over `stride`, so a
+        // DECGRI run writes the SAME value into `count` CONTIGUOUS slots of each
+        // set row: the real shape of the work is one run per row, and the row
+        // set is column-invariant (the guards read only `bits`, `band_top`,
+        // `alloc_height`). Inverting the nest hoists the multiply and the
+        // bookkeeping out of the column dimension and lets the run become a
+        // vector memset. Same reasoning as the `unhook` compose loop: on this
+        // path the work must be row-wise and bulk.
+        //
+        // Measured on this machine (`-C opt-level=3 -C codegen-units=1`,
+        // 1024x768 raster painted band by band, vs the old nest): count=1 1.3x,
+        // count=2 1.4x, count=4 2.1x, count=8 3.5x, count=64 12x. The
+        // single-column split below is what keeps the count=1 case — a sixel
+        // stream with NO `!Pn` repeats, i.e. one data byte per column — a win
+        // instead of a ~4% regression: `fill` on a one-element slice costs more
+        // setup than the store it replaces.
+        //
+        // The fast path needs `raster.len() == alloc_width * alloc_height` to
+        // know a whole row-run is in bounds. `ensure_capacity` establishes that
+        // on all three of its exits (in-place resize, realloc, refused grow) and
+        // `new`/`hook`/`release` start from 0 == 0*0, so the `else` is dead —
+        // but it is spelled out (and `#[cold]`, off this function's hot body) so
+        // the rewrite is behavior-identical by CONSTRUCTION rather than by an
+        // invariant argument the loop does not itself establish.
+        if self.raster.len() == stride.saturating_mul(self.alloc_height) {
+            // Columns at/past `alloc_width` were never painted by the old nest
+            // (it broke at the first `px >= self.alloc_width`), so the painted
+            // run is exactly `self.x .. min(self.x + count, alloc_width)`.
+            // Computed HERE, after `ensure_capacity` — that call grows
+            // `alloc_width`.
+            let run_end = self.x.saturating_add(count).min(self.alloc_width);
+            if run_end > self.x {
+                // Alpha 0xFF marks the pixel as set; `color` is already masked
+                // to 0x00FF_FFFF (line above), so no collision with the
+                // TRANSPARENT (0) sentinel even for painted black.
+                let pixel = 0xFF00_0000 | color;
+                // Highest painted `py + 1`, folded into `self.max_y` once at the
+                // end instead of once per pixel. Zero means nothing landed.
+                let mut painted_max_y = 0usize;
+                if run_end.saturating_sub(self.x) == 1 {
+                    // Single column (no DECGRI repeat) — the common case for a
+                    // plain sixel stream. Store directly; `fill` over one
+                    // element is pure overhead here.
+                    for row in 0..6 {
+                        if bits & (1 << row) == 0 {
+                            continue;
+                        }
+                        let py = self.band_top.saturating_add(row);
+                        if py >= self.alloc_height {
+                            break;
+                        }
+                        let idx = py.saturating_mul(stride).saturating_add(self.x);
+                        // Total probe: fail-closes exactly like the old
+                        // `idx < self.raster.len()` guard, no panic site.
+                        if let Some(slot) = self.raster.get_mut(idx) {
+                            *slot = pixel;
+                            painted_max_y = painted_max_y.max(py.saturating_add(1));
+                        }
+                    }
+                } else {
+                    for row in 0..6 {
+                        if bits & (1 << row) == 0 {
+                            continue;
+                        }
+                        let py = self.band_top.saturating_add(row);
+                        if py >= self.alloc_height {
+                            break;
+                        }
+                        // One multiply per SET ROW, not per painted pixel.
+                        let base = py.saturating_mul(stride);
+                        let s = base.saturating_add(self.x);
+                        let e = base.saturating_add(run_end);
+                        // Total probe again; under the length invariant checked
+                        // above (`py < alloc_height`, `run_end <= alloc_width`)
+                        // it always yields `Some`.
+                        if let Some(slice) = self.raster.get_mut(s..e) {
+                            slice.fill(pixel);
+                            painted_max_y = painted_max_y.max(py.saturating_add(1));
+                        }
+                    }
+                }
+                if painted_max_y > 0 {
+                    // The old code took the max of `px + 1` / `py + 1` over the
+                    // painted pixels. Since every column of the run paints the
+                    // identical row set, that is exactly `run_end` and
+                    // `painted_max_y`. The `max_x` fold is redundant with the
+                    // one below — `run_end <= self.x + count` and `run_end <=
+                    // alloc_width <= SIXEL_MAX_DIMENSION` — but it is kept so
+                    // the equality with the old code stays local.
+                    self.max_x = self.max_x.max(run_end);
+                    self.max_y = self.max_y.max(painted_max_y);
+                }
+            }
+        } else {
+            self.paint_pixelwise(bits, count, color, stride);
+        }
+        self.x = self.x.saturating_add(count).min(SIXEL_MAX_DIMENSION);
+        self.max_x = self.max_x.max(self.x.min(SIXEL_MAX_DIMENSION));
+    }
+
+    /// The original per-PIXEL paint, verbatim, for the one state
+    /// [`Self::emit_sixel`]'s row-run fast path refuses: a raster whose length is
+    /// not `alloc_width * alloc_height`.
+    ///
+    /// `ensure_capacity` maintains that invariant on every exit and the decoder
+    /// starts at `0 == 0 * 0`, so this is unreachable — it exists so the run-fill
+    /// rewrite is behavior-identical by construction instead of resting on an
+    /// invariant proven elsewhere. `#[cold] #[inline(never)]` keeps it out of the
+    /// caller's body: this workspace builds with `lto = true` and
+    /// `codegen-units = 1`, where code merely PRESENT in a hot function's body
+    /// costs measurable throughput even when it never executes.
+    #[cold]
+    #[inline(never)]
+    fn paint_pixelwise(&mut self, bits: u8, count: usize, color: u32, stride: usize) {
         for col in 0..count {
             let px = self.x.saturating_add(col);
             if px >= self.alloc_width {
@@ -572,18 +689,16 @@ impl SixelDecoder {
                     break;
                 }
                 let idx = py.saturating_mul(stride).saturating_add(px);
-                if idx < self.raster.len() {
-                    // Alpha 0xFF marks the pixel as set; `color` is already
-                    // masked to 0x00FF_FFFF (line above), so no collision with
-                    // the TRANSPARENT (0) sentinel even for painted black.
-                    self.raster[idx] = 0xFF00_0000 | color;
+                if let Some(slot) = self.raster.get_mut(idx) {
+                    // Alpha 0xFF marks the pixel as set; `color` is masked to
+                    // 0x00FF_FFFF by the caller, so no collision with the
+                    // TRANSPARENT (0) sentinel even for painted black.
+                    *slot = 0xFF00_0000 | color;
                     self.max_x = self.max_x.max(px.saturating_add(1));
                     self.max_y = self.max_y.max(py.saturating_add(1));
                 }
             }
         }
-        self.x = self.x.saturating_add(count).min(SIXEL_MAX_DIMENSION);
-        self.max_x = self.max_x.max(self.x.min(SIXEL_MAX_DIMENSION));
     }
 
     /// Grow the raster/mask so coordinates up to `(want_x, want_y)` inclusive

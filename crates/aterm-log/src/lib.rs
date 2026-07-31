@@ -447,6 +447,179 @@ macro_rules! trace {
     };
 }
 
+// ── Process environment ─────────────────────────────────────────────────────
+
+/// The ONE serialization point for process-global environment MUTATION.
+///
+/// `set_var`/`remove_var` are `unsafe` on every modern Rust because they race
+/// `getenv` in any other thread — including threads inside libc and the dynamic
+/// loader, which the caller does not control and cannot stop. The Trust toolchain
+/// denies them outright (`env_mutation`), and the fix it asks for is exactly this:
+/// route every mutation through one lock-scoped helper and bless that single call
+/// site, so the mutations at least cannot race EACH OTHER or a same-process reader
+/// that takes the same lock.
+///
+/// This lives in `aterm-log` for one reason: it is the workspace's dependency-free
+/// leaf that everything already links (`aterm-types`, `aterm-update`,
+/// `aterm-update-core`, `aterm-core`, `aterm-gui`, …). A lock only serializes the
+/// mutators that SHARE it, so a per-crate lock would be theatre — the whole point
+/// is that the one binary has one lock.
+///
+/// **This does not make environment mutation safe.** It bounds the in-process race
+/// between our own writers; a `getenv` in a C library on another thread is still
+/// unsynchronized. Every caller must therefore still be a genuine
+/// single-threaded-startup or trusted-launcher path, and say why. The helpers are
+/// deliberately few and narrow (take / unset / set / scoped), because the only
+/// defensible uses in this codebase are startup handoff, launcher intent, and a
+/// test that must own one variable for the length of one call.
+pub mod env {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes our own mutations against each other and against [`read`].
+    /// Poisoning is irrelevant here — the guarded section is a couple of libc calls
+    /// with no invariant to break — so every acquisition recovers from a poisoned
+    /// lock rather than propagating a panic into a startup path.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire [`ENV_LOCK`]. Named distinctly (not a bare `lock`) because it
+    /// RETURNS the guard: its callers hold the lock invisibly, so the lock-order
+    /// census registers it in `GUARD_HELPERS` by this symbol — a free fn called
+    /// `lock` would carry no `.lock()` token at its call sites and hide those
+    /// holds from the graph.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The one blessed `remove_var`. Callers hold [`ENV_LOCK`].
+    fn remove_locked(key: &OsStr) {
+        // SAFETY: the documented contract of this module — the caller is a
+        // single-threaded startup, trusted-launcher, or single-test-binary path,
+        // and this is one of the two blessed mutation sites in the workspace,
+        // reached only with `ENV_LOCK` held.
+        #[allow(
+            env_mutation,
+            reason = "THE lock-scoped helper the env_mutation lint asks callers to route through; see the module docs for the bound this does and does not provide"
+        )]
+        unsafe {
+            std::env::remove_var(key)
+        };
+    }
+
+    /// The one blessed `set_var`. Callers hold [`ENV_LOCK`].
+    fn set_locked(key: &OsStr, value: &OsStr) {
+        // SAFETY: as `remove_locked` — blessed mutation site, `ENV_LOCK` held.
+        #[allow(
+            env_mutation,
+            reason = "THE lock-scoped helper the env_mutation lint asks callers to route through; see the module docs for the bound this does and does not provide"
+        )]
+        unsafe {
+            std::env::set_var(key, value)
+        };
+    }
+
+    /// Read `key` and REMOVE it, atomically with respect to every other user of
+    /// this module — the startup HANDOFF idiom: a parent process passes authority
+    /// in the environment, the child consumes it once, and no later reader (nor any
+    /// child process we spawn, nor the user's shell) can observe it.
+    ///
+    /// Read-then-remove must be one critical section: split, two callers racing the
+    /// same key can both observe the value, and a one-shot authority that is
+    /// consumed twice is not one-shot.
+    #[must_use]
+    pub fn take(key: impl AsRef<OsStr>) -> Option<OsString> {
+        let key = key.as_ref();
+        let _guard = env_lock();
+        let value = std::env::var_os(key);
+        remove_locked(key);
+        value
+    }
+
+    /// Remove `key` under the lock, discarding any value — the "make sure this is
+    /// not set" idiom (a test establishing a clean baseline, a launcher clearing an
+    /// inherited setting). [`take`] when the value matters; this when it does not.
+    pub fn unset(key: impl AsRef<OsStr>) {
+        let _ = take(key);
+    }
+
+    /// Set `key` to `value` under the same lock — the trusted-LAUNCHER idiom: an
+    /// explicit command-line flag establishing the mode that a later env-gated
+    /// reader consumes, so the flag beats any inherited value through the exact
+    /// same code path a bare environment variable would take.
+    pub fn set(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
+        let _guard = env_lock();
+        set_locked(key.as_ref(), value.as_ref());
+    }
+
+    /// Run `body` with `key` OVERRIDDEN to `value`, restoring the previous state
+    /// (including "was unset") on the way out — on a panic as well as a return.
+    /// The lock is held for the whole scope, so the override is exclusive against
+    /// every other user of this module for exactly as long as it is in effect:
+    /// this is the "sets and restores the variable under a global lock" shape the
+    /// `env_mutation` lint asks for.
+    ///
+    /// **`body` must not call back into this module** — the lock is a plain
+    /// `Mutex`, so a nested [`set`]/[`take`]/[`read`] would deadlock. `body` may
+    /// freely call code that READS the environment through `std::env` directly,
+    /// which is the entire point: it observes the override.
+    pub fn scoped<T>(
+        key: impl AsRef<OsStr>,
+        value: impl AsRef<OsStr>,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        scoped_opt(key.as_ref(), Some(value.as_ref()), body)
+    }
+
+    /// Run `body` with `key` guaranteed UNSET, restoring the previous state on the
+    /// way out — the complement of [`scoped`], for the "what happens when this is
+    /// absent?" case. Same lock discipline and the same no-reentrancy rule.
+    pub fn scoped_unset<T>(key: impl AsRef<OsStr>, body: impl FnOnce() -> T) -> T {
+        scoped_opt(key.as_ref(), None, body)
+    }
+
+    fn scoped_opt<T>(key: &OsStr, value: Option<&OsStr>, body: impl FnOnce() -> T) -> T {
+        /// Restores the prior value and releases the lock on drop, so an unwinding
+        /// `body` cannot leak the override into the rest of the process.
+        struct Restore {
+            key: OsString,
+            prev: Option<OsString>,
+            _guard: MutexGuard<'static, ()>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.prev.take() {
+                    Some(prev) => set_locked(&self.key, &prev),
+                    None => remove_locked(&self.key),
+                }
+            }
+        }
+
+        let guard = env_lock();
+        let prev = std::env::var_os(key);
+        match value {
+            Some(value) => set_locked(key, value),
+            None => remove_locked(key),
+        }
+        let _restore = Restore {
+            key: key.to_os_string(),
+            prev,
+            _guard: guard,
+        };
+        body()
+    }
+
+    /// Read `key` under the lock, so a reader cannot observe a key mid-mutation by
+    /// one of our own writers. Plain `std::env::var_os` remains fine for keys
+    /// nothing in-process mutates; use this one for keys the helpers above touch.
+    #[must_use]
+    pub fn read(key: impl AsRef<OsStr>) -> Option<OsString> {
+        let _guard = env_lock();
+        std::env::var_os(key.as_ref())
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -640,5 +813,91 @@ mod tests {
         info!("i {}", 3);
         debug!("d {}", 4);
         trace!("t {}", 5);
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    //! Each test uses its OWN key: the helpers serialize mutation against each
+    //! other, but this is a multithreaded test binary and two tests sharing a key
+    //! would still race on the VALUE. Distinct keys make the assertions honest
+    //! without pretending the lock does more than it does.
+
+    #[test]
+    fn take_reads_and_removes_in_one_step() {
+        const KEY: &str = "ATERM_LOG_TEST_TAKE";
+        super::env::set(KEY, "authority");
+        assert_eq!(super::env::read(KEY).as_deref(), Some("authority".as_ref()));
+        assert_eq!(super::env::take(KEY).as_deref(), Some("authority".as_ref()));
+        // ONE-SHOT: a consumed handoff authority is gone, so a second consumer
+        // cannot observe it. This is the property `take` exists for.
+        assert_eq!(super::env::take(KEY), None);
+        assert_eq!(super::env::read(KEY), None);
+    }
+
+    #[test]
+    fn unset_clears_a_key_that_was_never_set() {
+        const KEY: &str = "ATERM_LOG_TEST_UNSET";
+        super::env::unset(KEY);
+        assert_eq!(super::env::read(KEY), None);
+        super::env::set(KEY, "x");
+        super::env::unset(KEY);
+        assert_eq!(super::env::read(KEY), None);
+    }
+
+    /// `scoped` restores what it found — a value, or the absence of one.
+    #[test]
+    fn scoped_restores_the_previous_value_and_the_previous_absence() {
+        const KEY: &str = "ATERM_LOG_TEST_SCOPED";
+        super::env::set(KEY, "outer");
+        let seen = super::env::scoped(KEY, "inner", || std::env::var_os(KEY));
+        assert_eq!(
+            seen.as_deref(),
+            Some("inner".as_ref()),
+            "body sees the override"
+        );
+        assert_eq!(
+            super::env::read(KEY).as_deref(),
+            Some("outer".as_ref()),
+            "and the previous value is back"
+        );
+
+        super::env::unset(KEY);
+        let seen = super::env::scoped(KEY, "inner", || std::env::var_os(KEY));
+        assert_eq!(seen.as_deref(), Some("inner".as_ref()));
+        assert_eq!(
+            super::env::read(KEY),
+            None,
+            "restoring an absent key means REMOVING it, not setting it empty"
+        );
+    }
+
+    #[test]
+    fn scoped_unset_hides_a_set_key_for_exactly_the_body() {
+        const KEY: &str = "ATERM_LOG_TEST_SCOPED_UNSET";
+        super::env::set(KEY, "present");
+        let seen = super::env::scoped_unset(KEY, || std::env::var_os(KEY));
+        assert_eq!(seen, None, "the body sees the key as absent");
+        assert_eq!(super::env::read(KEY).as_deref(), Some("present".as_ref()));
+        super::env::unset(KEY);
+    }
+
+    /// A PANICKING body still restores: an override that outlived a failing test
+    /// would silently corrupt every later test in the binary, which is precisely
+    /// the failure the hand-rolled restore guards this replaces were written for.
+    #[test]
+    fn scoped_restores_even_when_the_body_panics() {
+        const KEY: &str = "ATERM_LOG_TEST_SCOPED_PANIC";
+        super::env::set(KEY, "outer");
+        let caught = std::panic::catch_unwind(|| {
+            super::env::scoped(KEY, "inner", || panic!("body blew up"));
+        });
+        assert!(caught.is_err(), "the panic propagates to the caller");
+        assert_eq!(
+            super::env::read(KEY).as_deref(),
+            Some("outer".as_ref()),
+            "and the override did not leak past it"
+        );
+        super::env::unset(KEY);
     }
 }

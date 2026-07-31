@@ -72,11 +72,11 @@ fn startup_authority_decision(
 }
 
 fn take_reexec_nonce() -> Option<std::ffi::OsString> {
-    let nonce = std::env::var_os("ATERM_UPDATE_REEXEC");
-    // SAFETY: apply runs before any thread spawn. Clear even malformed authority
-    // before health verification helpers can launch codesign/spctl children.
-    unsafe { std::env::remove_var("ATERM_UPDATE_REEXEC") };
-    nonce
+    // Apply runs before any thread spawn. Clear even malformed authority before
+    // health verification helpers can launch codesign/spctl children. Read and
+    // clear are ONE critical section (`aterm_log::env::take`) so a one-shot
+    // re-exec authority can never be observed twice.
+    aterm_log::env::take("ATERM_UPDATE_REEXEC")
 }
 
 fn classify_reexec_authority(
@@ -102,17 +102,13 @@ fn classify_reexec_authority(
 }
 
 fn take_expected_artifact() -> Result<Option<ExpectedArtifact>, String> {
-    let raw_build = std::env::var_os(EXPECTED_BUILD_ENV);
-    let raw_commit = std::env::var_os(EXPECTED_COMMIT_ENV);
-    let raw_digest = std::env::var_os(EXPECTED_DIGEST_ENV);
-    // SAFETY: apply runs at the top of main before any thread is spawned. Clear
-    // handoff authority immediately so verification helpers and user shells never
-    // inherit it.
-    unsafe {
-        std::env::remove_var(EXPECTED_BUILD_ENV);
-        std::env::remove_var(EXPECTED_COMMIT_ENV);
-        std::env::remove_var(EXPECTED_DIGEST_ENV);
-    }
+    // Apply runs at the top of main before any thread is spawned. Each key is read
+    // and cleared in ONE critical section (`aterm_log::env::take`), so handoff
+    // authority is consumed exactly once and verification helpers and user shells
+    // never inherit it.
+    let raw_build = aterm_log::env::take(EXPECTED_BUILD_ENV);
+    let raw_commit = aterm_log::env::take(EXPECTED_COMMIT_ENV);
+    let raw_digest = aterm_log::env::take(EXPECTED_DIGEST_ENV);
     match (raw_build, raw_commit, raw_digest) {
         (None, None, None) => Ok(None),
         (Some(build), Some(commit), Some(digest)) => {
@@ -592,20 +588,18 @@ fn validate_fixed_rollback(
 #[derive(Debug)]
 struct VerifiedRollback {
     path: PathBuf,
-    build: u64,
 }
 
-fn ensure_fixed_rollback(
-    staging: &Staging,
-    installed: &Path,
-    current_build: u64,
-) -> Result<VerifiedRollback, String> {
+fn ensure_fixed_rollback(installed: &Path, current_build: u64) -> Result<VerifiedRollback, String> {
     let fixed = rollback_path(installed);
     match std::fs::symlink_metadata(&fixed) {
         Ok(_) => {
-            let (build, _) = validate_fixed_rollback(&fixed, installed, current_build)
+            // Validation is the whole point of this call — it refuses a rollback
+            // whose sealed build is not a strict predecessor. Callers need only
+            // the verified PATH; the build number it proved is not carried on.
+            validate_fixed_rollback(&fixed, installed, current_build)
                 .map_err(|error| format!("fixed rollback is invalid: {error}"))?;
-            return Ok(VerifiedRollback { path: fixed, build });
+            return Ok(VerifiedRollback { path: fixed });
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("inspect fixed rollback: {error}")),
@@ -679,115 +673,13 @@ fn previous_receipt_for_sealed_old(
         .filter(|receipt| receipt.matches_sealed(old_build, old_commit))
 }
 
-/// The v0.52 updater's post-swap disk shape is distinguishable without trusting
-/// an inherited environment variable: it deleted `ready.toml` before writing its
-/// re-exec stamp, never wrote an installed receipt, and left an armed exact trial
-/// plus the verified older rollback. The modern updater deliberately retains
-/// `ready.toml` until its full-commit receipt is durable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LegacyTrialReceiptMigrationFacts {
-    armed_current_trial: bool,
-    receipt_absent: bool,
-    ready_absent: bool,
-    sealed_current_exact_short: bool,
-    trial_identity_exact: bool,
-    rollback_strictly_older: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LegacyTrialReceiptMigrationDecision {
-    Reject,
-    Synthesize,
-}
-
-/// Pure shipping decision seam used by the derived model and disk conformance
-/// tests. Every fact is necessary; there is no re-exec/stamp prerequisite because
-/// v0.52 could crash in the window after deleting ready and before minting it.
-#[must_use]
-fn legacy_trial_receipt_migration_decision(
-    facts: LegacyTrialReceiptMigrationFacts,
-) -> LegacyTrialReceiptMigrationDecision {
-    if facts.armed_current_trial
-        && facts.receipt_absent
-        && facts.ready_absent
-        && facts.sealed_current_exact_short
-        && facts.trial_identity_exact
-        && facts.rollback_strictly_older
-    {
-        LegacyTrialReceiptMigrationDecision::Synthesize
-    } else {
-        LegacyTrialReceiptMigrationDecision::Reject
-    }
-}
-
-fn path_is_exactly_absent(path: &Path) -> bool {
-    matches!(
-        std::fs::symlink_metadata(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    )
-}
-
-fn clean_exact_legacy_commit(commit: &str) -> Option<&str> {
-    let commit = commit.trim();
-    (commit.len() == 12 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(commit)
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "explicit evidence tuple is the model seam"
-)]
-fn maybe_migrate_legacy_trial_receipt(
-    staging: &Staging,
-    current_build: u64,
-    current_commit: Option<&str>,
-    sealed_build: u64,
-    sealed_commit: &str,
-    trial_digest: &str,
-    verified_rollback_build: Option<u64>,
-) -> Result<bool, String> {
-    let sealed_current_exact_short = current_commit
-        .and_then(clean_exact_legacy_commit)
-        .zip(clean_exact_legacy_commit(sealed_commit))
-        .is_some_and(|(running, sealed)| running.eq_ignore_ascii_case(sealed))
-        && sealed_build == current_build;
-    let trial_identity_exact =
-        crate::manifest::FailedMark::read(&staging.trial()).is_some_and(|trial| {
-            trial.build_number == current_build
-                && canonical_digest(&trial.sha256).as_deref() == Some(trial_digest)
-        });
-    let facts = LegacyTrialReceiptMigrationFacts {
-        armed_current_trial: matches!(
-            boot_sentinel(staging).read_state(),
-            Some((build, _)) if build == current_build
-        ),
-        receipt_absent: path_is_exactly_absent(&staging.installed_receipt()),
-        ready_absent: path_is_exactly_absent(&staging.ready),
-        sealed_current_exact_short,
-        trial_identity_exact,
-        rollback_strictly_older: verified_rollback_build
-            .is_some_and(|build| build != 0 && build < current_build),
-    };
-    if legacy_trial_receipt_migration_decision(facts)
-        != LegacyTrialReceiptMigrationDecision::Synthesize
-    {
-        return Ok(false);
-    }
-    crate::manifest::InstalledReceipt::record_legacy_sealed_short(
-        &staging.installed_receipt(),
-        sealed_build,
-        sealed_commit,
-        trial_digest,
-    )?;
-    Ok(true)
-}
-
 fn ensure_current_trial_receipt(
     staging: &Staging,
     installed: &Path,
     current_build: u64,
     current_commit: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let verified_rollback = ensure_fixed_rollback(staging, installed, current_build)?;
+    let verified_rollback = ensure_fixed_rollback(installed, current_build)?;
     let (sealed_build, sealed_commit) = verified_bundle_identity(installed)
         .map_err(|error| format!("installed trial is not verified: {error}"))?;
     if sealed_build != current_build {
@@ -836,21 +728,6 @@ fn ensure_current_trial_receipt(
         return Ok(verified_rollback.path);
     }
 
-    // v0.52 deleted ready before stamp/exec and had no receipt format. Recover
-    // only its complete legacy-only disk shape. This is idempotent across every
-    // crash cut: before the atomic receipt rename all source evidence remains;
-    // after it, the exact receipt branch above succeeds on every later launch.
-    if maybe_migrate_legacy_trial_receipt(
-        staging,
-        current_build,
-        current_commit,
-        sealed_build,
-        &sealed_commit,
-        &trial_digest,
-        Some(verified_rollback.build),
-    )? {
-        return Ok(verified_rollback.path);
-    }
     Err("installed trial has no exact receipt or authorized recovery record".to_string())
 }
 
@@ -1871,7 +1748,6 @@ fn restore_rollback(rollback: &Path, installed: &Path) -> Result<(), String> {
     checked_bundle_exchange(rollback, installed, "atomic rollback restore")
 }
 
-
 /// 16 CSPRNG bytes, hex-encoded (32 chars), for the single-use re-exec nonce (F9).
 /// Unguessable so an attacker can't preset a matching env var. Minted through
 /// `aterm_uds::rand` — the ONE audited entropy surface — not a hand-rolled
@@ -1955,29 +1831,10 @@ pub(crate) fn rfc3339_delta_secs(earlier: &str, later: &str) -> Option<u64> {
     epoch(later)?.checked_sub(epoch(earlier)?)
 }
 
-/// Format seconds-since-Unix-epoch as an RFC3339 UTC instant
-/// (`YYYY-MM-DDTHH:MM:SSZ`). The calendar date is derived with Howard Hinnant's
-/// branch-free civil-from-days algorithm; time-of-day is a plain `secs % 86400`
-/// split. Pure and total for all `u64` inputs.
-fn format_rfc3339(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-
-    // civil_from_days: `days` is the count of days since 1970-01-01. Shift the
-    // epoch to 0000-03-01 so leap days land at the end of each 400-year era.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // day-of-era      [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day-of-year (Mar 1 = 0)
-    let mp = (5 * doy + 2) / 153; // month, shifted so Mar = 0  [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // day-of-month  [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month  [1, 12]
-    let y = yoe + era * 400 + i64::from(m <= 2); // Jan/Feb belong to the next year
-
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
+// The RFC3339 UTC stamp is `aterm_types::rfc3339::format_rfc3339` — one
+// workspace home for the Howard-Hinnant civil-calendar math the publisher,
+// the updater client, the GUI and atpkg all stamp with.
+use aterm_types::rfc3339::format_rfc3339;
 
 #[cfg(test)]
 mod tests {
@@ -2250,441 +2107,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_receipt_reducer_requires_every_legacy_only_disk_fact() {
-        let all = LegacyTrialReceiptMigrationFacts {
-            armed_current_trial: true,
-            receipt_absent: true,
-            ready_absent: true,
-            sealed_current_exact_short: true,
-            trial_identity_exact: true,
-            rollback_strictly_older: true,
-        };
-        assert_eq!(
-            legacy_trial_receipt_migration_decision(all),
-            LegacyTrialReceiptMigrationDecision::Synthesize
-        );
-        for rejected in [
-            LegacyTrialReceiptMigrationFacts {
-                armed_current_trial: false,
-                ..all
-            },
-            LegacyTrialReceiptMigrationFacts {
-                receipt_absent: false,
-                ..all
-            },
-            LegacyTrialReceiptMigrationFacts {
-                ready_absent: false,
-                ..all
-            },
-            LegacyTrialReceiptMigrationFacts {
-                sealed_current_exact_short: false,
-                ..all
-            },
-            LegacyTrialReceiptMigrationFacts {
-                trial_identity_exact: false,
-                ..all
-            },
-            LegacyTrialReceiptMigrationFacts {
-                rollback_strictly_older: false,
-                ..all
-            },
-        ] {
-            assert_eq!(
-                legacy_trial_receipt_migration_decision(rejected),
-                LegacyTrialReceiptMigrationDecision::Reject
-            );
-        }
-    }
-
-    #[test]
-    fn deployed_v052_disk_shape_migrates_idempotently_without_nonce_or_ready() {
-        // Immutable identities copied from the deployed read-only fixture:
-        // installed v0.52 plist SHA-256 b04517f1..., staged v0.53 plist
-        // bc85a137..., and ready.toml SHA-256 ac83ab07.... The old updater
-        // deletes that ready record before it writes a stamp or execs.
-        const OLD_BUILD: u64 = 1_784_345_099;
-        const OLD_COMMIT: &str = "f1a7e6571f8e";
-        const NEW_BUILD: u64 = 1_784_433_247;
-        const NEW_SEALED_COMMIT: &str = "c16c6fd7955b";
-        const NEW_FULL_COMMIT: &str = "c16c6fd7955bf565fcdc6e700548b987acce31b9";
-        const DIGEST: &str = "cdfc51afab0d5212206e169047df2a23b97b396ecb22f38edaab7eb1e2c93e95";
-        const { assert!(OLD_BUILD < NEW_BUILD) };
-        assert!(NEW_FULL_COMMIT.starts_with(NEW_SEALED_COMMIT));
-        assert_ne!(OLD_COMMIT, NEW_SEALED_COMMIT);
-
-        let (staging, root) = temp_staging();
-        let sentinel = boot_sentinel(&staging);
-        sentinel.arm(NEW_BUILD).unwrap();
-        crate::manifest::FailedMark::record(&staging.trial(), NEW_BUILD, DIGEST);
-        assert!(!staging.ready.exists());
-        assert!(!staging.installed_receipt().exists());
-
-        // Pre-stamp crash is recoverable: no inherited nonce and no stamp are
-        // necessary because the exact disk shape itself is legacy-only.
-        assert!(
-            maybe_migrate_legacy_trial_receipt(
-                &staging,
-                NEW_BUILD,
-                Some(NEW_SEALED_COMMIT),
-                NEW_BUILD,
-                NEW_SEALED_COMMIT,
-                DIGEST,
-                Some(OLD_BUILD),
-            )
-            .unwrap()
-        );
-        let receipt = crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
-            .expect("legacy receipt committed");
-        assert!(receipt.matches_sealed(NEW_BUILD, NEW_SEALED_COMMIT));
-        assert_eq!(receipt.dmg_sha256, DIGEST);
-        assert!(
-            !receipt.matches_sealed(NEW_BUILD, NEW_FULL_COMMIT),
-            "tagged short provenance is an exact sealed-stamp match"
-        );
-
-        // A later launch observes the durable receipt; the migration seam does
-        // not overwrite it, and exact receipt verification remains idempotent.
-        assert!(
-            !maybe_migrate_legacy_trial_receipt(
-                &staging,
-                NEW_BUILD,
-                Some(NEW_SEALED_COMMIT),
-                NEW_BUILD,
-                NEW_SEALED_COMMIT,
-                DIGEST,
-                Some(OLD_BUILD),
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            crate::manifest::InstalledReceipt::read(&staging.installed_receipt()),
-            Some(receipt)
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Optional local escalation over the immutable, genuinely signed deployed
-    /// v0.52/v0.53 bundle fixture. The deterministic representation and physical
-    /// migration tests above always run; setting this path additionally binds
-    /// the reducer/model premise to `verified_bundle_identity`, including the
-    /// real codesign policy and sealed plist/binary stamps.
-    #[test]
-    fn signed_deployed_v052_v053_fixture_conforms_to_legacy_model() {
-        let Ok(root) = std::env::var("ATERM_SIGNED_LEGACY_UPDATE_FIXTURE") else {
-            eprintln!(
-                "signed legacy fixture escalation not requested; deterministic migration proof still ran"
-            );
-            return;
-        };
-        let root = Path::new(&root);
-        let (old_build, old_commit) =
-            verified_bundle_identity(&root.join("installed-v052.app")).unwrap();
-        let (new_build, new_commit) =
-            verified_bundle_identity(&root.join("staged-v053.app")).unwrap();
-        assert_eq!(
-            (old_build, old_commit.as_str()),
-            (1_784_345_099, "f1a7e6571f8e")
-        );
-        assert_eq!(
-            (new_build, new_commit.as_str()),
-            (1_784_433_247, "c16c6fd7955b")
-        );
-        assert!(old_build < new_build);
-
-        let facts = LegacyTrialReceiptMigrationFacts {
-            armed_current_trial: true,
-            receipt_absent: true,
-            ready_absent: true,
-            sealed_current_exact_short: clean_exact_legacy_commit(&new_commit).is_some(),
-            trial_identity_exact: true,
-            rollback_strictly_older: old_build < new_build,
-        };
-        assert_eq!(
-            legacy_trial_receipt_migration_decision(facts),
-            LegacyTrialReceiptMigrationDecision::Synthesize
-        );
-
-        let model = aterm_spec::derive::native_update_disk_transaction_model();
-        let mut state = model.init_state();
-        for action in [
-            "EnterLegacyPostSwapExact",
-            "LoseLegacyReexecAuthority",
-            "ConsumeStartupAuthority",
-            "SynthesizeAuthenticatedLegacyReceipt",
-        ] {
-            disk_model_step(&model, &mut state, action);
-        }
-        assert_eq!(state["receipt_exact"], 1);
-        assert_eq!(state["legacy_short_commit_exact"], 1);
-    }
-
-    #[test]
-    fn legacy_receipt_migration_fails_closed_on_each_disk_identity_mismatch() {
-        const OLD_BUILD: u64 = 1_784_345_099;
-        const NEW_BUILD: u64 = 1_784_433_247;
-        const COMMIT: &str = "c16c6fd7955b";
-        const DIGEST: &str = "cdfc51afab0d5212206e169047df2a23b97b396ecb22f38edaab7eb1e2c93e95";
-
-        let run_case = |label: &str,
-                        armed_build: Option<u64>,
-                        trial_build: u64,
-                        trial_digest: &str,
-                        running_commit: Option<&str>,
-                        sealed_build: u64,
-                        sealed_commit: &str,
-                        rollback_build: Option<u64>,
-                        ready_wire: Option<&str>,
-                        receipt_wire: Option<&str>| {
-            let (staging, root) = temp_staging();
-            if let Some(build) = armed_build {
-                boot_sentinel(&staging).arm(build).unwrap();
-            }
-            crate::manifest::FailedMark::record(&staging.trial(), trial_build, trial_digest);
-            if let Some(wire) = ready_wire {
-                std::fs::write(&staging.ready, wire).unwrap();
-            }
-            if let Some(wire) = receipt_wire {
-                std::fs::write(staging.installed_receipt(), wire).unwrap();
-            }
-            assert!(
-                !maybe_migrate_legacy_trial_receipt(
-                    &staging,
-                    NEW_BUILD,
-                    running_commit,
-                    sealed_build,
-                    sealed_commit,
-                    DIGEST,
-                    rollback_build,
-                )
-                .unwrap(),
-                "mismatch must reject: {label}"
-            );
-            if receipt_wire.is_none() {
-                assert!(
-                    !staging.installed_receipt().exists(),
-                    "rejection must not mint a receipt: {label}"
-                );
-            }
-            assert_eq!(
-                boot_sentinel(&staging).read_state(),
-                armed_build.map(|build| (build, 0)),
-                "rejection preserves sentinel: {label}"
-            );
-            assert!(
-                staging.trial().exists(),
-                "rejection preserves trial: {label}"
-            );
-            let _ = std::fs::remove_dir_all(root);
-        };
-
-        run_case(
-            "missing sentinel",
-            None,
-            NEW_BUILD,
-            DIGEST,
-            Some(COMMIT),
-            NEW_BUILD,
-            COMMIT,
-            Some(OLD_BUILD),
-            None,
-            None,
-        );
-        run_case(
-            "wrong sentinel build",
-            Some(NEW_BUILD + 1),
-            NEW_BUILD,
-            DIGEST,
-            Some(COMMIT),
-            NEW_BUILD,
-            COMMIT,
-            Some(OLD_BUILD),
-            None,
-            None,
-        );
-        run_case(
-            "wrong trial build",
-            Some(NEW_BUILD),
-            NEW_BUILD + 1,
-            DIGEST,
-            Some(COMMIT),
-            NEW_BUILD,
-            COMMIT,
-            Some(OLD_BUILD),
-            None,
-            None,
-        );
-        run_case(
-            "wrong trial digest",
-            Some(NEW_BUILD),
-            NEW_BUILD,
-            &"ab".repeat(32),
-            Some(COMMIT),
-            NEW_BUILD,
-            COMMIT,
-            Some(OLD_BUILD),
-            None,
-            None,
-        );
-        for (label, running, sealed_build, sealed) in [
-            ("missing compiled commit", None, NEW_BUILD, COMMIT),
-            ("wrong sealed build", Some(COMMIT), NEW_BUILD + 1, COMMIT),
-            (
-                "wrong sealed commit",
-                Some(COMMIT),
-                NEW_BUILD,
-                "d16c6fd7955b",
-            ),
-            (
-                "full commit is not legacy exact",
-                Some(COMMIT),
-                NEW_BUILD,
-                "c16c6fd7955bf565fcdc6e700548b987acce31b9",
-            ),
-        ] {
-            run_case(
-                label,
-                Some(NEW_BUILD),
-                NEW_BUILD,
-                DIGEST,
-                running,
-                sealed_build,
-                sealed,
-                Some(OLD_BUILD),
-                None,
-                None,
-            );
-        }
-        for (label, rollback) in [
-            ("missing rollback", None),
-            ("zero rollback", Some(0)),
-            ("equal rollback", Some(NEW_BUILD)),
-            ("newer rollback", Some(NEW_BUILD + 1)),
-        ] {
-            run_case(
-                label,
-                Some(NEW_BUILD),
-                NEW_BUILD,
-                DIGEST,
-                Some(COMMIT),
-                NEW_BUILD,
-                COMMIT,
-                rollback,
-                None,
-                None,
-            );
-        }
-        run_case(
-            "ready path exists but is malformed",
-            Some(NEW_BUILD),
-            NEW_BUILD,
-            DIGEST,
-            Some(COMMIT),
-            NEW_BUILD,
-            COMMIT,
-            Some(OLD_BUILD),
-            Some("not valid toml {{{"),
-            None,
-        );
-        run_case(
-            "receipt path exists but is malformed",
-            Some(NEW_BUILD),
-            NEW_BUILD,
-            DIGEST,
-            Some(COMMIT),
-            NEW_BUILD,
-            COMMIT,
-            Some(OLD_BUILD),
-            None,
-            Some("not valid toml {{{"),
-        );
-    }
-
-    #[test]
-    fn legacy_receipt_atomic_write_failure_preserves_retry_authority() {
-        const OLD_BUILD: u64 = 1_784_345_099;
-        const NEW_BUILD: u64 = 1_784_433_247;
-        const COMMIT: &str = "c16c6fd7955b";
-        const DIGEST: &str = "cdfc51afab0d5212206e169047df2a23b97b396ecb22f38edaab7eb1e2c93e95";
-        let (staging, root) = temp_staging();
-        boot_sentinel(&staging).arm(NEW_BUILD).unwrap();
-        crate::manifest::FailedMark::record(&staging.trial(), NEW_BUILD, DIGEST);
-        let blocked_tmp = staging
-            .installed_receipt()
-            .with_extension(format!("toml.{}.tmp", std::process::id()));
-        std::fs::create_dir(&blocked_tmp).unwrap();
-
-        assert!(
-            maybe_migrate_legacy_trial_receipt(
-                &staging,
-                NEW_BUILD,
-                Some(COMMIT),
-                NEW_BUILD,
-                COMMIT,
-                DIGEST,
-                Some(OLD_BUILD),
-            )
-            .is_err(),
-            "injected pre-rename failure must be reported"
-        );
-        assert!(!staging.installed_receipt().exists());
-        assert_eq!(boot_sentinel(&staging).read_state(), Some((NEW_BUILD, 0)));
-        assert!(staging.trial().exists());
-
-        std::fs::remove_dir(&blocked_tmp).unwrap();
-        assert!(
-            maybe_migrate_legacy_trial_receipt(
-                &staging,
-                NEW_BUILD,
-                Some(COMMIT),
-                NEW_BUILD,
-                COMMIT,
-                DIGEST,
-                Some(OLD_BUILD),
-            )
-            .unwrap(),
-            "unchanged disk evidence authorizes the retry"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn inverse_swap_restores_tagged_legacy_receipt_without_format_loss() {
-        let (staging, root) = temp_staging();
-        let commit = "c16c6fd7955b";
-        let digest = "cd".repeat(32);
-        crate::manifest::InstalledReceipt::record_legacy_sealed_short(
-            &staging.installed_receipt(),
-            1_784_433_247,
-            commit,
-            &digest,
-        )
-        .unwrap();
-        let previous = crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
-            .expect("legacy OLD receipt");
-        crate::manifest::InstalledReceipt::record(
-            &staging.installed_receipt(),
-            1_784_500_000,
-            "0123456789abcdef0123456789abcdef01234567",
-            &"ef".repeat(32),
-        )
-        .unwrap();
-
-        restore_installed_receipt(&staging, Some(&previous)).unwrap();
-        assert_eq!(
-            crate::manifest::InstalledReceipt::read(&staging.installed_receipt()),
-            Some(previous),
-            "exec-failure inverse rollback restores OLD's tagged receipt exactly"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn inverse_swap_receipt_restore_binds_old_identity_and_fails_closed() {
         let model = aterm_spec::derive::native_update_disk_transaction_model();
         let (staging, root) = temp_staging();
-        let old_commit = "c16c6fd7955b";
+        let old_commit = "c16c6fd7955b0011223344556677889900aabbcc";
         let old_digest = "cd".repeat(32);
-        crate::manifest::InstalledReceipt::record_legacy_sealed_short(
+        crate::manifest::InstalledReceipt::record(
             &staging.installed_receipt(),
             52,
             old_commit,
@@ -2696,7 +2124,7 @@ mod tests {
         let mut stale_state = disk_model_ready(&model);
         disk_model_step(&model, &mut stale_state, "CorruptPreviousReceipt");
         assert!(
-            previous_receipt_for_sealed_old(&staging, 52, "ffffffffffff").is_none(),
+            previous_receipt_for_sealed_old(&staging, 52, &"f".repeat(40)).is_none(),
             "well-formed but stale local receipt is not rollback authority"
         );
         assert!(
@@ -2744,76 +2172,6 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn genuine_signed_v052_v053_bundles_conform_to_legacy_receipt_migration() {
-        const OLD_BUILD: u64 = 1_784_345_099;
-        const OLD_COMMIT: &str = "f1a7e6571f8e";
-        const NEW_BUILD: u64 = 1_784_433_247;
-        const NEW_COMMIT: &str = "c16c6fd7955b";
-        const DIGEST: &str = "cdfc51afab0d5212206e169047df2a23b97b396ecb22f38edaab7eb1e2c93e95";
-
-        let fixture = std::env::var_os("ATERM_V052_V053_BUNDLE_FIXTURE").map(PathBuf::from);
-        let Some(fixture) = fixture else {
-            eprintln!(
-                "VERIFY NOTICE: signed v0.52/v0.53 bundle fixture absent; set \
-                 ATERM_V052_V053_BUNDLE_FIXTURE to run the additional Tier-1 migration check"
-            );
-            return;
-        };
-
-        let (staging, root) = temp_staging();
-        let installed = root.join("Applications/aterm.app");
-        let fixed = rollback_path(&installed);
-        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
-        for (source, destination) in [
-            (fixture.join("staged-v053.app"), installed.clone()),
-            (fixture.join("installed-v052.app"), fixed.clone()),
-        ] {
-            let status = Command::new("/usr/bin/ditto")
-                .arg(&source)
-                .arg(&destination)
-                .status()
-                .expect("copy signed fixture with xattrs");
-            assert!(status.success(), "ditto fixture {}", source.display());
-        }
-        assert_eq!(
-            verified_bundle_identity(&installed).unwrap(),
-            (NEW_BUILD, NEW_COMMIT.to_string())
-        );
-        assert_eq!(
-            verified_bundle_identity(&fixed).unwrap(),
-            (OLD_BUILD, OLD_COMMIT.to_string())
-        );
-        boot_sentinel(&staging).arm(NEW_BUILD).unwrap();
-        crate::manifest::FailedMark::record(&staging.trial(), NEW_BUILD, DIGEST);
-        assert!(!staging.ready.exists() && !staging.installed_receipt().exists());
-
-        let wrong_commit = "d16c6fd7955b";
-        assert!(
-            ensure_current_trial_receipt(&staging, &installed, NEW_BUILD, Some(wrong_commit),)
-                .is_err(),
-            "negative control: genuine signed bundles do not bypass running/sealed provenance"
-        );
-        assert!(!staging.installed_receipt().exists());
-        assert_eq!(
-            boot_sentinel(&staging).read_state(),
-            Some((NEW_BUILD, 0)),
-            "rejected genuine identity preserves retry authority"
-        );
-        assert!(fixed.is_dir() && staging.trial().exists());
-
-        assert_eq!(
-            ensure_current_trial_receipt(&staging, &installed, NEW_BUILD, Some(NEW_COMMIT),)
-                .unwrap(),
-            fixed
-        );
-        let receipt = crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
-            .expect("genuine bundle migration receipt");
-        assert!(receipt.matches_sealed(NEW_BUILD, NEW_COMMIT));
-        assert_eq!(receipt.dmg_sha256, DIGEST);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     #[test]
     fn apply_retirement_never_removes_stage_owned_download_scratch() {
         let (s, root) = temp_staging();
@@ -3316,73 +2674,53 @@ mod tests {
             disk_model_step(&model, &mut malformed, action);
         }
 
-        // Bind the exact v0.52 legacy-only reducer to the reachable post-swap
-        // model branch. The old protocol can crash before writing any stamp, so
-        // authority is the conjunction of durable disk facts: armed current
-        // trial, absent receipt+ready, exact sealed 12-hex current identity,
-        // exact trial digest, and a verified strict predecessor rollback.
-        let legacy_facts = LegacyTrialReceiptMigrationFacts {
-            armed_current_trial: true,
-            receipt_absent: true,
-            ready_absent: true,
-            sealed_current_exact_short: true,
-            trial_identity_exact: true,
-            rollback_strictly_older: true,
-        };
-        assert_eq!(
-            legacy_trial_receipt_migration_decision(legacy_facts),
-            LegacyTrialReceiptMigrationDecision::Synthesize
-        );
-        let mut legacy_state = model.init_state();
+        // The post-swap startup lane, without the retired v0.52 synthesis.
+        //
+        // That branch recovered a receipt for a machine whose updater deleted
+        // `ready.toml` before minting one; it and its model action are gone with
+        // the rest of the two-component lineage. What survives is the MODERN
+        // recovery — `ready.toml` is still present, so the receipt is rebuilt
+        // from evidence the current updater actually writes — and this binds it
+        // to the model, then proves each corrupted disk fact disables it.
+        let mut modern_state = model.init_state();
         for action in [
             "EnterLegacyPostSwapExact",
-            "LoseLegacyReexecAuthority",
+            "SupplyModernReadyRecovery",
             "ConsumeStartupAuthority",
-            "SynthesizeAuthenticatedLegacyReceipt",
+            "RecoverModernReceiptFromReady",
         ] {
-            disk_model_step(&model, &mut legacy_state, action);
+            disk_model_step(&model, &mut modern_state, action);
         }
-        assert_eq!(legacy_state["receipt_exact"], 1);
-        assert_eq!(legacy_state["legacy_receipt_migrated"], 1);
+        assert_eq!(modern_state["receipt_exact"], 1);
+        assert_eq!(modern_state["modern_receipt_recovered"], 1);
 
-        for (rejected, corrupt, refuse) in [
+        // Each corrupted disk fact must leave its REFUSAL enabled and preserve
+        // recovery authority — trial armed, rollback fixed, no receipt minted —
+        // so a later launch can still act on unchanged evidence. A corruption
+        // that silently disabled both the recovery and its refusal would strand
+        // the machine with no path forward, which is what this excludes.
+        //
+        // `legacy_variant` is the model's mutex: supplying modern ready evidence
+        // and corrupting a fact are mutually exclusive scenarios, so these runs
+        // deliberately do NOT also supply ready — with `ready_present == 0`,
+        // `RecoverModernReceiptFromReady` is disabled by its own guard.
+        for (corrupt, refuse) in [
+            ("CorruptLegacySentinel", "RefuseLegacySentinelMismatch"),
             (
-                LegacyTrialReceiptMigrationFacts {
-                    armed_current_trial: false,
-                    ..legacy_facts
-                },
-                "CorruptLegacySentinel",
-                "RefuseLegacySentinelMismatch",
+                "CorruptLegacyCurrentBuild",
+                "RefuseLegacyCurrentBuildMismatch",
             ),
             (
-                LegacyTrialReceiptMigrationFacts {
-                    sealed_current_exact_short: false,
-                    ..legacy_facts
-                },
-                "CorruptLegacyShortCommit",
-                "RefuseLegacyShortCommitMismatch",
+                "CorruptLegacyCurrentCommit",
+                "RefuseLegacyCurrentCommitMismatch",
             ),
+            ("CorruptLegacyTrialBuild", "RefuseLegacyTrialBuildMismatch"),
             (
-                LegacyTrialReceiptMigrationFacts {
-                    trial_identity_exact: false,
-                    ..legacy_facts
-                },
                 "CorruptLegacyTrialDigest",
                 "RefuseLegacyTrialDigestMismatch",
             ),
-            (
-                LegacyTrialReceiptMigrationFacts {
-                    rollback_strictly_older: false,
-                    ..legacy_facts
-                },
-                "CorruptLegacyRollback",
-                "RefuseLegacyRollbackMismatch",
-            ),
+            ("CorruptLegacyRollback", "RefuseLegacyRollbackMismatch"),
         ] {
-            assert_eq!(
-                legacy_trial_receipt_migration_decision(rejected),
-                LegacyTrialReceiptMigrationDecision::Reject
-            );
             let mut rejected_state = model.init_state();
             for action in [
                 "EnterLegacyPostSwapExact",
@@ -3393,90 +2731,15 @@ mod tests {
             }
             assert!(
                 model
-                    .successors("SynthesizeAuthenticatedLegacyReceipt", &rejected_state)
+                    .successors("RecoverModernReceiptFromReady", &rejected_state)
                     .is_empty(),
-                "production rejection {corrupt} remained model-enabled"
+                "{corrupt} left receipt recovery model-enabled"
             );
             disk_model_step(&model, &mut rejected_state, refuse);
             assert_eq!(rejected_state["trial"], 1);
             assert_eq!(rejected_state["fixed"], 1);
             assert_eq!(rejected_state["receipt"], 0);
         }
-
-        // Receipt/ready presence rejects *legacy synthesis* and selects the
-        // existing modern/existing-receipt lanes in both implementations.
-        for (rejected, model_action) in [
-            (
-                LegacyTrialReceiptMigrationFacts {
-                    receipt_absent: false,
-                    ..legacy_facts
-                },
-                "SupplyExistingExactReceipt",
-            ),
-            (
-                LegacyTrialReceiptMigrationFacts {
-                    ready_absent: false,
-                    ..legacy_facts
-                },
-                "SupplyModernReadyRecovery",
-            ),
-        ] {
-            assert_eq!(
-                legacy_trial_receipt_migration_decision(rejected),
-                LegacyTrialReceiptMigrationDecision::Reject
-            );
-            let mut state = model.init_state();
-            for action in [
-                "EnterLegacyPostSwapExact",
-                model_action,
-                "ConsumeStartupAuthority",
-            ] {
-                disk_model_step(&model, &mut state, action);
-            }
-            assert!(
-                model
-                    .successors("SynthesizeAuthenticatedLegacyReceipt", &state)
-                    .is_empty()
-            );
-        }
-
-        // Drive the shipping atomic writer and parser with the deployed v0.52→
-        // v0.53 identities, then project the committed disk receipt onto the
-        // model. A failed pre-rename attempt is covered by the dedicated injected
-        // write-failure test; retry sees this unchanged exact source evidence.
-        const LEGACY_OLD_BUILD: u64 = 1_784_345_099;
-        const LEGACY_NEW_BUILD: u64 = 1_784_433_247;
-        const LEGACY_NEW_COMMIT: &str = "c16c6fd7955b";
-        const LEGACY_DIGEST: &str =
-            "cdfc51afab0d5212206e169047df2a23b97b396ecb22f38edaab7eb1e2c93e95";
-        let (legacy_staging, legacy_root) = temp_staging();
-        boot_sentinel(&legacy_staging)
-            .arm(LEGACY_NEW_BUILD)
-            .unwrap();
-        crate::manifest::FailedMark::record(
-            &legacy_staging.trial(),
-            LEGACY_NEW_BUILD,
-            LEGACY_DIGEST,
-        );
-        assert!(
-            maybe_migrate_legacy_trial_receipt(
-                &legacy_staging,
-                LEGACY_NEW_BUILD,
-                Some(LEGACY_NEW_COMMIT),
-                LEGACY_NEW_BUILD,
-                LEGACY_NEW_COMMIT,
-                LEGACY_DIGEST,
-                Some(LEGACY_OLD_BUILD),
-            )
-            .unwrap()
-        );
-        let migrated_receipt =
-            crate::manifest::InstalledReceipt::read(&legacy_staging.installed_receipt())
-                .expect("model-authorized legacy receipt must commit");
-        assert!(migrated_receipt.matches_sealed(LEGACY_NEW_BUILD, LEGACY_NEW_COMMIT));
-        assert_eq!(migrated_receipt.dmg_sha256, LEGACY_DIGEST);
-        assert_eq!(legacy_state["receipt_exact"], 1);
-        let _ = std::fs::remove_dir_all(legacy_root);
 
         // OLD authority is build+commit, not build-only. Likewise NEW handoff
         // authority is the exact marker build+commit+digest tuple.

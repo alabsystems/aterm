@@ -311,7 +311,12 @@ mod x86_simd {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", not(kani)))]
+// This re-export exists solely for `crate::simd_csi`; every call site inside
+// this module reaches `x86_simd::has_avx2()` directly. `simd_csi` became
+// `#[cfg(test)]`-only when the speculative CSI parameter pre-parse was removed
+// from production, so the `test` cfg here tracks it — without it this would be
+// an unused import in an ordinary x86_64 build.
+#[cfg(all(target_arch = "x86_64", not(kani), test))]
 pub(crate) use x86_simd::has_avx2;
 
 // =============================================================================
@@ -327,6 +332,47 @@ pub(crate) use x86_simd::has_avx2;
 /// unmodeled intrinsic calls, so the scans are expressed as safe,
 /// obligation-free code with identical results. The saturating position
 /// arithmetic is exact at runtime (`offset + i` never exceeds `input.len()`).
+///
+/// ## Codegen contract — the classifier shape is load-bearing
+///
+/// The chunk classifiers here MUST be written as a min/max reduction over a
+/// `u8` accumulator, never as an OR-reduction over a `bool`. The `bool` form
+/// (`let mut any = false; any |= byte < 0x20 || byte > 0x7E;`) reads as the
+/// obvious branch-free fold, but it does not survive to the emitted code: an
+/// i1 reduction over a short-circuiting `||` defeats LLVM's loop vectorizer,
+/// which instead fully unrolls the 16 lanes into scalar code — 17 `ldrb` and
+/// ZERO vector instructions per chunk (~62 scalar instructions per 16 bytes)
+/// against the ~6 the reduce form emits (`ldr q` / `sub.16b` / `umaxv.16b` /
+/// `fmov` / compare / branch).
+///
+/// Do NOT judge this by compiling the classifier standalone. Under this
+/// repo's pinned compiler the old `bool` fold in `find_non_printable_neon`
+/// DOES vectorize when the function is compiled on its own — and then LLVM
+/// throws the vectorization away once the function inlines into
+/// `advance_simd_loop`, which is the only place that matters. (The `bool`
+/// fold in `find_c0_control_neon` never vectorized at all, standalone or
+/// not.) A plain `u8` OR-accumulator fails the same way; only the min/max
+/// reduce holds up after inlining.
+///
+/// This is the hottest scan in the parser — `find_non_printable` runs once
+/// per ground-state printable run, i.e. per line, per SGR, per multibyte
+/// lead — so the shape change is worth real throughput. Measured in-tree on
+/// aarch64 (release profile, `advance_fast` + `NullSink`, 8 MiB corpora,
+/// best-of-5), `bool` fold -> reduce: 80-col CRLF text 4,608 -> 7,898 MB/s;
+/// 4 KiB printable flood 8,569 -> 27,691 MB/s; mixed international text
+/// 1,193 -> 1,590 MB/s; `CUP` + text 2,857 -> 3,748 MB/s; 40 chars + SGR
+/// 2,622 -> 2,951 MB/s.
+///
+/// LLVM's choice here is version-sensitive, so a toolchain bump that
+/// de-vectorizes these folds would be a silent throughput regression: check
+/// for `umaxv`/`uminv` in this module's `--emit asm` output if parser
+/// throughput ever falls off a cliff.
+///
+/// [`find_any_of_neon`] keeps its `bool` OR-reduce, and that is deliberate:
+/// equality compares over a fixed needle set DO vectorize (verified on this
+/// toolchain — 13 `.16b` ops per chunk, the only `ldrb` being the sub-16-byte
+/// tail), because the lane predicate is a chain of `==` with no
+/// short-circuiting range test for the vectorizer to choke on.
 #[cfg(all(target_arch = "aarch64", not(kani)))]
 mod arm_simd {
     /// Find first C0 control byte (< 0x20) via chunked classification.
@@ -335,11 +381,17 @@ mod arm_simd {
         let (chunks, rem) = input.as_chunks::<16>();
         let mut offset = 0usize;
         for chunk in chunks {
-            let mut any = false;
+            // Min-reduce, not an OR-reduce over `bool`: LLVM lowers this to a
+            // single `uminv.16b`. The `let mut any = false; any |= byte < 0x20`
+            // form it replaced did NOT vectorize (an i1 reduction over a
+            // short-circuiting `||` defeats the loop vectorizer) — it fully
+            // unrolled to 16 `ldrb`/compare pairs per chunk. See the module
+            // doc for the codegen contract.
+            let mut lowest = 0xFFu8;
             for &byte in chunk {
-                any |= byte < 0x20;
+                lowest = if byte < lowest { byte } else { lowest };
             }
-            if any {
+            if lowest < 0x20 {
                 for (i, &byte) in chunk.iter().enumerate() {
                     if byte < 0x20 {
                         return Some(offset.saturating_add(i));
@@ -400,19 +452,25 @@ mod arm_simd {
     #[inline]
     #[allow(
         clippy::manual_range_contains,
-        reason = "branch-free `byte < 0x20 || byte > 0x7E` is the lowerable form the strict Trust gate can vectorize; the RangeInclusive::contains rewrite is not"
+        reason = "the locate-the-index rescan keeps the branch-free `byte < 0x20 || byte > 0x7E` spelling; the RangeInclusive::contains rewrite is not the lowerable form the strict Trust gate accepts. The CLASSIFIER above it must stay a max-reduce so it lowers to `umaxv.16b` — see the module doc"
     )]
     pub(crate) fn find_non_printable_neon(input: &[u8]) -> Option<usize> {
         let (chunks, rem) = input.as_chunks::<16>();
         let mut offset = 0usize;
         for chunk in chunks {
-            // Branch-free fold over the chunk: check for bytes < 0x20 or
-            // > 0x7E (vectorizes; no early exit inside the chunk).
-            let mut any = false;
+            // Max-reduce over `byte.wrapping_sub(0x20)`: LLVM lowers this to a
+            // single `umaxv.16b`. `biased > 0x5E` is exactly
+            // `byte < 0x20 || byte > 0x7E` over u8 — 0x20..=0x7E biases to
+            // 0..=0x5E, 0x7F..=0xFF to 0x5F..=0xDF, and 0x00..=0x1F wraps to
+            // 0xE0..=0xFF. The `bool` OR-reduce this replaced did NOT
+            // vectorize; see the module doc for the codegen contract and the
+            // measured cost.
+            let mut worst = 0u8;
             for &byte in chunk {
-                any |= byte < 0x20 || byte > 0x7E;
+                let biased = byte.wrapping_sub(0x20);
+                worst = if biased > worst { biased } else { worst };
             }
-            if any {
+            if worst > 0x5E {
                 // First match is in this chunk; locate it with a short scan.
                 for (i, &byte) in chunk.iter().enumerate() {
                     if byte < 0x20 || byte > 0x7E {

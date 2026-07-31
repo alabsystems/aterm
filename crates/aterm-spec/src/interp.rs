@@ -40,6 +40,23 @@ pub type State = BTreeMap<&'static str, i64>;
 /// states means the bounds regressed — fail loudly rather than spin.
 const MAX_STATES: usize = 100_000;
 
+/// The BFS drivers below evaluate the BORROWED `&Action`/`&Invariant` the loop
+/// already holds — via [`Model::successors_in`] and `inv.expr.eval` — rather
+/// than re-resolving each by NAME through [`Model::successors`] /
+/// [`Model::check_invariant`], which rebuild the whole evaluation environment
+/// and `find` the FIRST record carrying that name. The two forms agree exactly
+/// when names are pairwise distinct within a model: with a duplicate, the
+/// by-name form would evaluate the first record TWICE and never the second.
+/// Every derived model satisfies this by construction; assert it in debug builds
+/// (which is what `cargo test` runs) so a future duplicate surfaces as a loud
+/// failure rather than a silently skipped action or invariant.
+#[cfg_attr(trust_verify, trust::skip)]
+fn names_are_unique(m: &Model) -> bool {
+    let actions: BTreeSet<&'static str> = m.actions.iter().map(|a| a.name).collect();
+    let invariants: BTreeSet<&'static str> = m.invariants.iter().map(|i| i.name).collect();
+    actions.len() == m.actions.len() && invariants.len() == m.invariants.len()
+}
+
 /// A copy of `m` with the named constants overridden (the interpreter reads
 /// constants from `m.consts`, so this is the interpreter analogue of a `.cfg`
 /// override list). Unknown names are ignored, like `to_cfg_with`.
@@ -76,6 +93,11 @@ pub fn with_buggy(m: &Model, b: i64) -> Model {
 // tier as `find_deadlock`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn bmc(m: &Model) -> Result<usize, (State, &'static str)> {
+    debug_assert!(
+        names_are_unique(m),
+        "{}: duplicate action/invariant name",
+        m.name
+    );
     let key = |s: &State| -> Vec<(&'static str, i64)> { s.iter().map(|(k, v)| (*k, *v)).collect() };
     let mut seen: BTreeSet<Vec<(&'static str, i64)>> = BTreeSet::new();
     let mut q: VecDeque<State> = VecDeque::new();
@@ -90,13 +112,20 @@ pub fn bmc(m: &Model) -> Result<usize, (State, &'static str)> {
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
+        // The env is a pure function of (consts, pre-state), so it is the SAME
+        // map for every invariant and every action at this state: build it once
+        // here instead of once per (state, invariant) and once per (state,
+        // action) inside `check_invariant`/`successors`. On the committed
+        // registry that is ~1.6M fewer throwaway `BTreeMap`s per sweep — 2.54 s
+        // -> 0.75 s in release, identical verdicts and counterexamples.
+        let env = m.eval_env(&st);
         for inv in &m.invariants {
-            if !m.check_invariant(inv.name, &st) {
+            if !m.check_invariant_in(inv, &env) {
                 return Err((st, inv.name));
             }
         }
         for a in &m.actions {
-            for ns in m.successors(a.name, &st) {
+            for ns in m.successors_in(a, &env, &st) {
                 if seen.insert(key(&ns)) {
                     q.push_back(ns);
                 }
@@ -156,6 +185,11 @@ pub fn prove_and_catch(m: &Model) {
 // frontier over spec-model machinery, not shipping runtime code.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fired_actions(m: &Model) -> BTreeSet<&'static str> {
+    debug_assert!(
+        names_are_unique(m),
+        "{}: duplicate action/invariant name",
+        m.name
+    );
     let key = |s: &State| -> Vec<(&'static str, i64)> { s.iter().map(|(k, v)| (*k, *v)).collect() };
     let mut seen: BTreeSet<Vec<(&'static str, i64)>> = BTreeSet::new();
     let mut fired: BTreeSet<&'static str> = BTreeSet::new();
@@ -171,8 +205,10 @@ pub fn fired_actions(m: &Model) -> BTreeSet<&'static str> {
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
+        // One env per popped state, shared by every action — see `bmc`.
+        let env = m.eval_env(&st);
         for a in &m.actions {
-            for ns in m.successors(a.name, &st) {
+            for ns in m.successors_in(a, &env, &st) {
                 fired.insert(a.name);
                 if seen.insert(key(&ns)) {
                     q.push_back(ns);
@@ -194,6 +230,11 @@ pub fn fired_actions(m: &Model) -> BTreeSet<&'static str> {
 // machinery, same tier as `eval`/`successors`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn find_deadlock(m: &Model, is_final: impl Fn(&State) -> bool) -> Option<State> {
+    debug_assert!(
+        names_are_unique(m),
+        "{}: duplicate action/invariant name",
+        m.name
+    );
     let key = |s: &State| -> Vec<(&'static str, i64)> { s.iter().map(|(k, v)| (*k, *v)).collect() };
     let mut seen: BTreeSet<Vec<(&'static str, i64)>> = BTreeSet::new();
     let mut q: VecDeque<State> = VecDeque::new();
@@ -202,8 +243,10 @@ pub fn find_deadlock(m: &Model, is_final: impl Fn(&State) -> bool) -> Option<Sta
     q.push_back(init);
     while let Some(st) = q.pop_front() {
         let mut any_succ = false;
+        // One env per popped state, shared by every action — see `bmc`.
+        let env = m.eval_env(&st);
         for a in &m.actions {
-            for ns in m.successors(a.name, &st) {
+            for ns in m.successors_in(a, &env, &st) {
                 any_succ = true;
                 if seen.insert(key(&ns)) {
                     q.push_back(ns);
@@ -225,9 +268,16 @@ pub fn find_deadlock(m: &Model, is_final: impl Fn(&State) -> bool) -> Option<Sta
 /// transition does not conform — the negative-control rejection).
 #[must_use]
 pub fn admits(m: &Model, prev: &State, next: &State) -> Option<&'static str> {
+    // Every candidate action is evaluated at the SAME `prev`, so the env is
+    // loop-invariant — build it once rather than once per action. (No
+    // `names_are_unique` debug-assert here: unlike the BFS drivers this fn is
+    // not `trust::skip`ped, and the assert would add a bare panic obligation.
+    // The invariant it guards is the same one, and every model reaching `admits`
+    // is BMC'd by the same suites.)
+    let env = m.eval_env(prev);
     m.actions
         .iter()
-        .find(|a| m.successors(a.name, prev).contains(next))
+        .find(|a| m.successors_in(a, &env, prev).contains(next))
         .map(|a| a.name)
 }
 

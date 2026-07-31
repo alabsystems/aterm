@@ -145,765 +145,7 @@ pub(crate) fn take_physical_release_trace() -> Option<PhysicalReleaseTrace> {
     PHYSICAL_RELEASE_TRACE.with(|trace| trace.borrow_mut().take())
 }
 
-#[cfg(unix)]
-struct HandoffWorkerJob {
-    attempt_id: u64,
-    current_build: u64,
-    target_build: u64,
-    target_commit: String,
-    /// Run the staged-candidate pre-verification (codesign + sealed rebinding)
-    /// as the worker's first action, off the GUI main thread. False for the
-    /// same-binary debug re-exec, which has no staged `.app` to authenticate.
-    verify_staged_candidate: bool,
-    command: std::process::Command,
-    manifest: crate::session_store::SessionHandoff,
-    fds: crate::session_store::HandoffFds,
-    screens: Vec<(u64, aterm_core::terminal::TerminalCheckpoint)>,
-    window: Option<crate::session_store::WindowCarry>,
-    layout: crate::restore::RestoreManifest,
-    layout_digest: [u8; 32],
-    screen_digest: [u8; 32],
-    live: Vec<(u64, i32, i32)>,
-    cleanup: HandoffWorkerCleanup,
-    cancel: std::sync::mpsc::Receiver<()>,
-    arbiter: crate::HandoffAttemptArbiter,
-    _owned_masters: Vec<std::os::fd::OwnedFd>,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Default)]
-struct HandoffWorkerCleanup {
-    parent_socket: Option<(std::path::PathBuf, String)>,
-    reconcile: Option<(
-        crate::app_native::NativeUpdateReconcileSender,
-        crate::app_native::NativeUpdateReconcileTicket,
-    )>,
-}
-
-/// Fresh mutable facts required immediately before the attempt-wide Commit CAS.
-/// Keeping this conjunction pure gives the derived handoff model a shipping
-/// decision seam; `ProofReady` alone never grants replacement authority.
-///
-/// SEAMLESS ADMISSION (deliberate 2026-07 semantics change): queued PTY OUTPUT
-/// is no longer a fact here at all. The screen-carry digest is captured
-/// post-park at parser ground and the parent provably consumes no further PTY
-/// bytes, so bytes queued in the kernel replay through the child's fresh
-/// parser after Commit — the carried checkpoint stays a valid ground-state
-/// prefix and nothing is lost. What remains from the old `ptys_still_quiet`
-/// conjunct is its fail-closed core, `sessions_alive`: POLLHUP/POLLERR on a
-/// master means the shell (live-set identity) died, which must still reject.
-/// Queued-but-undispatched HARDWARE input is likewise no longer an admission
-/// fact — the completion path DRAINS it (re-posting itself so the run loop
-/// dispatches the queued events into the still-open masters) rather than
-/// revoking; see `finish_update_handoff`'s drain gate.
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HandoffCommitFacts {
-    exact_sessions: bool,
-    exact_layout: bool,
-    exact_activity: bool,
-    teardown_allows_commit: bool,
-    parent_still_parked: bool,
-    sessions_alive: bool,
-    /// The OS input queue has been DISPATCHED into the masters: the main thread
-    /// ran the event loop for a bounded interval after ProofReady, so every
-    /// hardware event CoreGraphics had already accepted has flowed through the
-    /// tolerated input path to the still-open PTY masters. This replaced "no
-    /// hardware event happened in the last 50 ms", which was unsatisfiable on a
-    /// machine in use AND never the property that mattered (see the drain gate
-    /// in `finish_update_handoff`).
-    input_dispatch_fenced: bool,
-    /// PROCESS-LOCAL egress is drained to the kernel: no tolerated keystroke is
-    /// still sitting in this process's paste-order FIFO or a wedged-tty sink
-    /// spill. Distinct from `input_dispatch_fenced` (the OS/AppKit hardware
-    /// queue) — that input, once dispatched, may land in THESE queues, and they
-    /// die with `_exit` unless flushed to the master first. Below the spec
-    /// model's abstraction (the model's single "deliver queued input to the
-    /// masters" step), so it is asserted directly rather than model-fired.
-    egress_settled: bool,
-    native_safe: bool,
-    proof_exact: bool,
-    commit_channel: bool,
-}
-
-#[cfg(unix)]
-#[must_use]
-fn handoff_commit_admitted(facts: HandoffCommitFacts) -> bool {
-    facts.exact_sessions
-        && facts.exact_layout
-        && facts.exact_activity
-        && facts.teardown_allows_commit
-        && facts.parent_still_parked
-        && facts.sessions_alive
-        && facts.input_dispatch_fenced
-        && facts.egress_settled
-        && facts.native_safe
-        && facts.proof_exact
-        && facts.commit_channel
-}
-
-#[cfg(unix)]
-impl HandoffWorkerCleanup {
-    /// Complete all filesystem repair before the UI is told rollback is safe.
-    /// Thus the event-loop completion performs no directory scan, unlink,
-    /// symlink publication, status read, or child-process probe.
-    fn complete(&self, nonce: Option<&str>) {
-        if let Some(nonce) = nonce {
-            crate::seamless::discard_outgoing(nonce);
-        }
-        if let Some((latest_link, socket_path)) = &self.parent_socket {
-            crate::control_auth::publish_latest_link(latest_link, socket_path);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn make_cloexec_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    use std::os::fd::FromRawFd as _;
-    let mut raw = [0i32; 2];
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let created = unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let created = unsafe { libc::pipe(raw.as_mut_ptr()) };
-    // A real one-way pipe gives every fixed <=PIPE_BUF proof/Commit wire the
-    // atomic all-or-nothing write property used by `commit_and_exit`. A byte
-    // stream socketpair does not provide that theorem and may short-write.
-    if created != 0 {
-        return None;
-    }
-    // SAFETY: fresh pipe fds, exclusively owned from here.
-    let rd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw[0]) };
-    let wr = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw[1]) };
-    use std::os::fd::AsRawFd as _;
-    if aterm_pty::set_cloexec(rd.as_raw_fd(), true).is_err()
-        || aterm_pty::set_cloexec(wr.as_raw_fd(), true).is_err()
-    {
-        return None;
-    }
-    Some((rd, wr))
-}
-
-#[cfg(unix)]
-fn kill_and_reap_handoff_child(child: &mut std::process::Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // The candidate is placed in its own process group in `pre_exec`.
-        // Kill the whole group so ditto/codesign/spctl descendants cannot keep
-        // mutating fixed updater paths after the direct child is reaped.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
-    }
-    // This runs only on the handoff worker. `wait` is load-bearing: no rollback
-    // Wake is emitted until the group was killed and its direct child reaped.
-    let _ = child.wait();
-}
-
-/// Acquire the worker's unique reaper capability.  Losing to `Committing`
-/// means exactly what it says: this worker must neither signal nor reap the
-/// candidate while the UI thread is performing the atomic Commit write.
-#[cfg(unix)]
-fn worker_claim_handoff_reaper(arbiter: &crate::HandoffAttemptArbiter) -> bool {
-    loop {
-        match arbiter.phase() {
-            crate::HandoffAttemptPhase::Waiting => {
-                if !arbiter.try_begin_reject() {
-                    continue;
-                }
-            }
-            crate::HandoffAttemptPhase::Rejecting => {}
-            crate::HandoffAttemptPhase::Committing => return false,
-        }
-        return arbiter.claim_reaper(crate::HandoffReaperOwner::Worker);
-    }
-}
-
-#[cfg(unix)]
-fn emergency_kill_and_reap_handoff_child(pid: u32) {
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    let mut status = 0i32;
-    // PRECONDITION: the caller won the attempt-wide Emergency reaper CAS. That
-    // is the unique capability proving `pid` is still this attempt's unreaped
-    // direct child; no worker can concurrently consume/reuse its identity.
-    // Signal the process group BEFORE any wait: `waitpid(WNOHANG)` also reaps an
-    // already-dead leader, and the old ordering then returned while its
-    // ditto/codesign/spctl descendants continued mutating fixed updater paths.
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    loop {
-        // SAFETY: wait for this process's exact child. Under the unique reaper
-        // capability ECHILD can only mean the child was already consumed during
-        // process teardown; either way the group signal happened first.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited == pid
-            || (waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-        {
-            return;
-        }
-        if waited < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return;
-        }
-    }
-}
-
-/// PRE-PARK admission peek only: any readable byte OR error/hangup counts.
-/// Automatic mode refuses to even BEGIN an overlap while output is actively
-/// flowing (the quiet-epoch policy). Once an attempt is in flight this
-/// function must NOT be used — mid-flight, queued output is tolerated and
-/// only session death revokes; use [`handoff_masters_closed`] there.
-#[cfg(unix)]
-fn handoff_masters_have_activity(live: &[(u64, i32, i32)]) -> bool {
-    let mut fds = live
-        .iter()
-        .map(|(_, fd, _)| libc::pollfd {
-            fd: *fd,
-            events: libc::POLLIN,
-            revents: 0,
-        })
-        .collect::<Vec<_>>();
-    if fds.is_empty() {
-        return false;
-    }
-    // SAFETY: initialized stable pollfd slice; timeout 0 is a non-consuming peek.
-    let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
-    let activity = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-    polled > 0 && fds.iter().any(|fd| fd.revents & activity != 0)
-}
-
-/// MID-FLIGHT death peek: true only when a handed-off master reports
-/// POLLHUP/POLLERR/POLLNVAL — the session (the live-set identity the adoption
-/// proof committed to) is gone or the descriptor is invalid. Readable output
-/// deliberately does NOT count: post-park bytes wait gap-free in the kernel
-/// queue for the child's fresh parser, so output during the overlap is
-/// buffered through, never revoking. `events: POLLIN` is load-bearing despite
-/// POLLIN being ignored in the answer: macOS's poll(2) evaluates a PTY
-/// master's stream state only for requested events and reports a dead slave
-/// as `POLLIN|POLLHUP` — with `events: 0` it reports NOTHING, ever (verified
-/// by the paired unit test). The filter to HUP/ERR/NVAL in `revents` is what
-/// makes plain readable output invisible here.
-#[cfg(unix)]
-fn handoff_masters_closed(live: &[(u64, i32, i32)]) -> bool {
-    let mut fds = live
-        .iter()
-        .map(|(_, fd, _)| libc::pollfd {
-            fd: *fd,
-            events: libc::POLLIN,
-            revents: 0,
-        })
-        .collect::<Vec<_>>();
-    if fds.is_empty() {
-        return false;
-    }
-    // SAFETY: initialized stable pollfd slice; timeout 0 is a non-consuming peek.
-    let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
-    let dead = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-    polled > 0 && fds.iter().any(|fd| fd.revents & dead != 0)
-}
-
-/// Whether every handed-off session's PROCESS-LOCAL egress has reached the
-/// kernel — no keystroke tolerated into the overlap is still queued in this
-/// process (the paste-order FIFO or a wedged-tty sink spill) where `_exit`
-/// would destroy it. A master no longer in the pool is treated as settled: its
-/// session is gone, `sessions_alive`/`exact_sessions` own that rejection, and
-/// there is no sink left to flush. Cheap on the fast path (no paste in flight,
-/// nothing spilled → one relaxed atomic load + one empty-buffer check).
-#[cfg(unix)]
-fn handoff_egress_settled(pool: &crate::SessionPool, live: &[(u64, i32, i32)]) -> bool {
-    live.iter().all(|(_, master, _)| {
-        !paste_order::is_ordering(*master)
-            && pool
-                .iter()
-                .find(|session| session.master == *master)
-                .is_none_or(|session| session.ctx.sink.egress_drained_to_kernel())
-    })
-}
-
-fn bind_expected_update_artifact(
-    command: &mut std::process::Command,
-    attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
-) {
-    const BUILD: &str = "ATERM_UPDATE_EXPECTED_BUILD";
-    const COMMIT: &str = "ATERM_UPDATE_EXPECTED_COMMIT";
-    const DIGEST: &str = "ATERM_UPDATE_EXPECTED_DMG_SHA256";
-    command
-        .env_remove(BUILD)
-        .env_remove(COMMIT)
-        .env_remove(DIGEST);
-    if let Some(attempt) = attempt {
-        command
-            .env(BUILD, attempt.target_build().to_string())
-            .env(COMMIT, attempt.target_commit())
-            .env(DIGEST, attempt.target_dmg_sha256());
-    }
-}
-
-#[cfg(unix)]
-impl crate::UpdateHandoffCompletion {
-    fn failure(
-        attempt_id: u64,
-        nonce: Option<String>,
-        child_pid: Option<u32>,
-        outcome: crate::UpdateHandoffOutcome,
-        detail: impl Into<String>,
-    ) -> Self {
-        Self {
-            attempt_id,
-            nonce,
-            child_pid,
-            outcome,
-            commit_fd: None,
-            reject: None,
-            reconcile: None,
-            detail: detail.into(),
-            input_drain_spins: 0,
-        }
-    }
-}
-
-#[cfg(unix)]
-fn send_reaped_handoff_failure(
-    cleanup: &HandoffWorkerCleanup,
-    proxy: &winit::event_loop::EventLoopProxy<Wake>,
-    current_build: u64,
-    completion: crate::UpdateHandoffCompletion,
-) {
-    cleanup.complete(completion.nonce.as_deref());
-    // Reader rollback and reducer re-arm are latency-critical. Publish the
-    // child-reaped fact before waiting behind the updater FIFO for disk facts.
-    if proxy
-        .send_event(Wake::UpdateHandoffFinished(completion))
-        .is_err()
-    {
-        return;
-    }
-    if let Some(facts) = cleanup.reconcile.as_ref().and_then(|(worker, ticket)| {
-        crate::app_native::collect_native_update_reconcile_facts(worker, *ticket, current_build)
-    }) {
-        let _ = proxy.send_event(Wake::NativeUpdateReconcileFinished {
-            purpose: crate::app_native::NativeUpdateReconcilePurpose::Startup,
-            facts,
-        });
-    }
-}
-
-/// Reject, kill, and reap on the worker only after winning the attempt-wide
-/// arbiter. `false` means Commit won the race and the caller must keep the child
-/// untouched while waiting for Commit success or its explicit failure transfer.
-#[cfg(unix)]
-fn worker_reject_and_reap_handoff_child(
-    job: &HandoffWorkerJob,
-    proxy: &winit::event_loop::EventLoopProxy<Wake>,
-    child: &mut std::process::Child,
-    nonce: &str,
-    child_pid: u32,
-    outcome: crate::UpdateHandoffOutcome,
-    detail: String,
-) -> bool {
-    if !worker_claim_handoff_reaper(&job.arbiter) {
-        return false;
-    }
-    kill_and_reap_handoff_child(child);
-    let completed = job.arbiter.finish_reap(crate::HandoffReaperOwner::Worker);
-    debug_assert!(
-        completed,
-        "the worker must retain its unique reaper ownership"
-    );
-    send_reaped_handoff_failure(
-        &job.cleanup,
-        proxy,
-        job.current_build,
-        crate::UpdateHandoffCompletion::failure(
-            job.attempt_id,
-            Some(nonce.to_string()),
-            Some(child_pid),
-            outcome,
-            detail,
-        ),
-    );
-    true
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HandoffRejectDelivery {
-    /// `Ok` and `Full` both prove that the worker receiver still owns the
-    /// rejection. A full one-slot channel is an already-queued command, not a
-    /// disconnected worker and never authority for an emergency reaper.
-    WorkerOwned,
-    Disconnected,
-}
-
-#[cfg(unix)]
-fn deliver_handoff_rejection(
-    reject: Option<std::sync::mpsc::SyncSender<()>>,
-) -> HandoffRejectDelivery {
-    let Some(reject) = reject else {
-        return HandoffRejectDelivery::Disconnected;
-    };
-    match reject.try_send(()) {
-        Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => HandoffRejectDelivery::WorkerOwned,
-        Err(std::sync::mpsc::TrySendError::Disconnected(())) => HandoffRejectDelivery::Disconnected,
-    }
-}
-
-#[cfg(unix)]
-fn handoff_preparation_cancelled(
-    job: &HandoffWorkerJob,
-    proxy: &winit::event_loop::EventLoopProxy<Wake>,
-    nonce: Option<String>,
-) -> bool {
-    if job.cancel.try_recv().is_err() {
-        return false;
-    }
-    send_reaped_handoff_failure(
-        &job.cleanup,
-        proxy,
-        job.current_build,
-        crate::UpdateHandoffCompletion::failure(
-            job.attempt_id,
-            nonce,
-            None,
-            // Typed activity classification: a cancel poke during preparation
-            // is user/structural activity, never evidence against the staged
-            // artifact — automatic mode may re-attempt at a later quiet window.
-            crate::UpdateHandoffOutcome::ActivityRevoked,
-            "activity revoked handoff during physical preparation",
-        ),
-    );
-    true
-}
-
-#[cfg(unix)]
-fn send_handoff_preparation_failure(
-    job: &HandoffWorkerJob,
-    proxy: &winit::event_loop::EventLoopProxy<Wake>,
-    nonce: Option<String>,
-    detail: impl Into<String>,
-) {
-    send_reaped_handoff_failure(
-        &job.cleanup,
-        proxy,
-        job.current_build,
-        crate::UpdateHandoffCompletion::failure(
-            job.attempt_id,
-            nonce,
-            None,
-            crate::UpdateHandoffOutcome::PreparationFailed,
-            detail,
-        ),
-    );
-}
-
-#[cfg(unix)]
-fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::EventLoopProxy<Wake>) {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::process::CommandExt as _;
-
-    if handoff_preparation_cancelled(&job, &proxy, None) {
-        return;
-    }
-
-    // STAGED-CANDIDATE PRE-VERIFICATION (seamless seam 1), off the GUI thread.
-    // The `codesign --deep` + bundle-flock authenticity check that used to freeze
-    // the main thread before every handoff runs HERE, as the worker's first real
-    // action, so a doomed candidate is refused before any manifest is written or
-    // any child is spawned — and the UI thread never blocks on it. Still strictly
-    // additive: the child re-runs the complete gate under the apply lock at swap
-    // time. A refusal is an ordinary `PreparationFailed` (manual-only).
-    if job.verify_staged_candidate
-        && let Err(error) = aterm_update::preverify_staged_for_handoff(
-            job.current_build,
-            Some(job.target_build),
-            Some(&job.target_commit),
-        )
-    {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            None,
-            format!("staged update failed pre-park verification: {error}"),
-        );
-        return;
-    }
-    if handoff_preparation_cancelled(&job, &proxy, None) {
-        return;
-    }
-
-    let layout_roundtrip = job
-        .layout
-        .to_toml()
-        .ok()
-        .and_then(|wire| crate::restore::RestoreManifest::from_toml(&wire));
-    if job.layout.is_empty() || layout_roundtrip.as_ref() != Some(&job.layout) {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            None,
-            "could not persist the bounded handoff layout",
-        );
-        return;
-    }
-    if handoff_preparation_cancelled(&job, &proxy, None) {
-        return;
-    }
-    let Some(outgoing) =
-        crate::seamless::write_outgoing(&job.manifest, &job.fds, &job.screens, job.window)
-    else {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            None,
-            "could not write the authenticated handoff manifest",
-        );
-        return;
-    };
-    let crate::seamless::OutgoingHandoff {
-        manifest_path: path,
-        nonce,
-        fds_wire: wire,
-        screen_digest: carried_screen_digest,
-    } = outgoing;
-    // BYTE-IDENTITY ASSERTION. `job.screen_digest` was committed on the main
-    // thread from the live checkpoints; `carried_screen_digest` was taken over
-    // the bytes just written. The child hashes those SAME bytes, so a divergence
-    // here would surface later as an unexplained `AdoptionMismatch`. Catch it now
-    // as an ordinary, explained preparation failure instead.
-    if carried_screen_digest != job.screen_digest {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            Some(nonce),
-            "handoff screen carry did not match the committed screen digest",
-        );
-        return;
-    }
-    if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
-        return;
-    }
-    let layout_path = std::path::Path::new(&path).with_extension("layout.toml");
-    if crate::restore::write_to(&layout_path, &job.layout).is_err() {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            Some(nonce),
-            "could not write the attempt-bound handoff layout",
-        );
-        return;
-    }
-    if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
-        return;
-    }
-    let Some(expected) = crate::seamless::adoption_proof(
-        &nonce,
-        job.target_build,
-        &job.target_commit,
-        &job.layout_digest,
-        &job.screen_digest,
-        &job.live,
-    ) else {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            Some(nonce),
-            "handoff identity set exceeds the proof format",
-        );
-        return;
-    };
-    let Some((proof_rd, proof_wr)) = make_cloexec_pipe() else {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            Some(nonce),
-            "could not create the adoption-proof channel",
-        );
-        return;
-    };
-    let Some((commit_rd, commit_wr)) = make_cloexec_pipe() else {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            Some(nonce),
-            "could not create the handoff-commit channel",
-        );
-        return;
-    };
-    if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
-        return;
-    }
-
-    job.command
-        .env("ATERM_SEAMLESS_MANIFEST", path)
-        .env("ATERM_SEAMLESS_NONCE", &nonce)
-        .env("ATERM_SEAMLESS_FDS", wire)
-        .env("ATERM_SEAMLESS_LAYOUT", layout_path)
-        // The candidate proves "I am the build you authorized" by comparison,
-        // and logs which half disagreed when it is not. Forging this can only
-        // LOSE a handoff — the parent still compares against its own ticket.
-        .env(
-            "ATERM_SEAMLESS_TARGET",
-            crate::seamless::encode_target_identity(job.target_build, &job.target_commit),
-        )
-        .env("ATERM_HANDOFF_READY_FD", proof_wr.as_raw_fd().to_string())
-        .env("ATERM_HANDOFF_COMMIT_FD", commit_rd.as_raw_fd().to_string())
-        .env("ATERM_HANDOFF_PARENT_PID", std::process::id().to_string());
-    // Parent descriptors remain CLOEXEC for the WHOLE asynchronous interval.
-    // Clear only the fork child's copies immediately before its exec image.
-    let mut child_inherit = job
-        .live
-        .iter()
-        .map(|(_, master, _)| *master)
-        .collect::<Vec<_>>();
-    child_inherit.push(proof_wr.as_raw_fd());
-    child_inherit.push(commit_rd.as_raw_fd());
-    // SAFETY: the closure performs only async-signal-safe fcntl calls between
-    // fork and exec and touches captured integer fd values, not shared memory.
-    unsafe {
-        job.command.pre_exec(move || {
-            // Candidate and every helper it later launches inherit a dedicated
-            // process group. Adopted shell PTYs/process groups are unrelated.
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for fd in &child_inherit {
-                let flags = libc::fcntl(*fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
-        return;
-    }
-    let mut child = match job.command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            send_handoff_preparation_failure(
-                &job,
-                &proxy,
-                Some(nonce),
-                format!("handoff process could not start: {error}"),
-            );
-            return;
-        }
-    };
-    let child_pid = child.id();
-    drop(proof_wr);
-    drop(commit_rd);
-    let proof_outcome = wait_handoff_ready(
-        &proof_rd,
-        expected,
-        &job.cancel,
-        &job.live.iter().map(|(_, fd, _)| *fd).collect::<Vec<_>>(),
-    );
-    if proof_outcome != crate::UpdateHandoffOutcome::ProofReady {
-        let rejected = worker_reject_and_reap_handoff_child(
-            &job,
-            &proxy,
-            &mut child,
-            &nonce,
-            child_pid,
-            proof_outcome,
-            format!("handoff proof ended {proof_outcome:?}"),
-        );
-        debug_assert!(rejected, "Commit is unreachable before ProofReady");
-        return;
-    }
-
-    let (reject, rejected) = std::sync::mpsc::sync_channel(1);
-    let ready = Wake::UpdateHandoffFinished(crate::UpdateHandoffCompletion {
-        attempt_id: job.attempt_id,
-        nonce: Some(nonce.clone()),
-        child_pid: Some(child_pid),
-        outcome: crate::UpdateHandoffOutcome::ProofReady,
-        commit_fd: Some(commit_wr),
-        reject: Some(reject),
-        reconcile: None,
-        detail: "child painted and proved exact readerless adoption".to_string(),
-        input_drain_spins: 0,
-    });
-    if proxy.send_event(ready).is_err() {
-        // No main-thread final validation occurred, therefore Commit is impossible.
-        // Kill/reap readerless child; never exit as though authority was granted.
-        let rejected = worker_reject_and_reap_handoff_child(
-            &job,
-            &proxy,
-            &mut child,
-            &nonce,
-            child_pid,
-            crate::UpdateHandoffOutcome::Rejected,
-            "event loop closed before final handoff admission".to_string(),
-        );
-        debug_assert!(rejected, "Commit is unreachable after a failed ready wake");
-        return;
-    }
-
-    let decision_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        // SEAMLESS: readable PTY output no longer revokes here — post-park
-        // bytes wait gap-free in the kernel for the child. Only an explicit
-        // cancel poke (structural/mode-changing activity, typed as
-        // ActivityRevoked for the retry budget) or session DEATH (HUP/ERR —
-        // the proof's live-set identity is stale) rejects before Commit.
-        if job.cancel.try_recv().is_ok()
-            && worker_reject_and_reap_handoff_child(
-                &job,
-                &proxy,
-                &mut child,
-                &nonce,
-                child_pid,
-                crate::UpdateHandoffOutcome::ActivityRevoked,
-                "structural activity revoked handoff before Commit".to_string(),
-            )
-        {
-            return;
-        }
-        if handoff_masters_closed(&job.live)
-            && worker_reject_and_reap_handoff_child(
-                &job,
-                &proxy,
-                &mut child,
-                &nonce,
-                child_pid,
-                crate::UpdateHandoffOutcome::Rejected,
-                "a handed-off PTY session closed before Commit".to_string(),
-            )
-        {
-            return;
-        }
-        match rejected.try_recv() {
-            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                if worker_reject_and_reap_handoff_child(
-                    &job,
-                    &proxy,
-                    &mut child,
-                    &nonce,
-                    child_pid,
-                    crate::UpdateHandoffOutcome::Rejected,
-                    "final handoff admission rejected before Commit".to_string(),
-                ) {
-                    return;
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-        if std::time::Instant::now() >= decision_deadline
-            && worker_reject_and_reap_handoff_child(
-                &job,
-                &proxy,
-                &mut child,
-                &nonce,
-                child_pid,
-                crate::UpdateHandoffOutcome::Rejected,
-                "main-thread final handoff decision timed out".to_string(),
-            )
-        {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-}
-
-/// Compatibility `open prefs|about|update` spellings now resolve to durable
+/// Compatibility `open prefs|about|update` spellings resolve to durable
 /// routes in the process-singleton Settings tab. Keeping the mapping pure makes
 /// the alias contract independently testable and prevents a modal constructor
 /// from creeping back into command dispatch.
@@ -990,7 +232,7 @@ const fn native_binding_allowed(action: keybinding::Action) -> bool {
 /// runs on the single UI thread, so a session's `pending` count is only ever
 /// raised by that thread and lowered by its writer: a keystroke that observes
 /// `pending == 0` knows the paste already landed and can safely go inline.
-mod paste_order {
+pub(crate) mod paste_order {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
@@ -1007,10 +249,7 @@ mod paste_order {
         /// The hardware key-arrival stamp CLAIMED from the metrics module at
         /// enqueue, so the writer thread can book the true key→write slice once the
         /// bytes actually leave. `0` when no keystroke is behind this job (a paste
-        /// body, a control verb). Without this the UI thread consumed the stamp at
-        /// enqueue and recorded the cost of a channel push, so the histogram read
-        /// its BEST exactly while a keystroke sat behind a draining paste — its
-        /// single largest real outlier class, invisible.
+        /// body, a control verb).
         key_ns: u64,
     }
 
@@ -1082,7 +321,7 @@ mod paste_order {
     /// Whether egress for `master` must currently be ORDERED behind an in-flight
     /// paste. One relaxed atomic in the common (no-paste) case; the registry lock
     /// is taken only while some paste is draining.
-    pub(super) fn is_ordering(master: i32) -> bool {
+    pub(crate) fn is_ordering(master: i32) -> bool {
         if ACTIVE.load(Ordering::Acquire) == 0 {
             return false;
         }
@@ -1120,13 +359,12 @@ mod paste_order {
         //
         // A PASTE claims nothing. Cmd-V arms a key-arrival stamp like any other
         // press, and `paste_clipboard` runs synchronously on the UI thread before
-        // the stamp is cleared — so an unconditional claim here books the ENTIRE
-        // paste, written under `EgressMode::Backpressured`, as ONE key_write
-        // sample. A large paste into a slow child then files seconds against a
-        // metric that means "keystroke to PTY", and because `MAX_KEY_WRITE_NS` is
-        // a `fetch_max` that never resets, that reading poisons the maximum for
-        // the life of the process. Hoisted out of the literal because `ev` moves
-        // into the struct two fields above this one.
+        // the stamp is cleared — so an unconditional claim here would book the
+        // ENTIRE paste, written under `EgressMode::Backpressured`, as ONE
+        // key_write sample. A large paste into a slow child then files seconds
+        // against a metric that means "keystroke to PTY", and `MAX_KEY_WRITE_NS`
+        // is a `fetch_max` that never resets, so that reading poisons the maximum
+        // for the life of the process.
         let key_ns = if matches!(ev, InputEvent::Paste(_)) {
             0
         } else {
@@ -1153,6 +391,34 @@ mod paste_order {
             }
         }
     }
+
+    /// The shared "enqueue onto the FIFO, else write inline" tail. While a
+    /// paste is draining for this sink's master, submit `ev` onto the same
+    /// per-session FIFO so it cannot overtake the pasted bytes — a successful
+    /// enqueue is full delivery into the ordered spill contract. Otherwise
+    /// (including the no-writer fallback) write inline through `seam_egress`.
+    /// Returns the egress verdict plus whether the write ran INLINE: an
+    /// enqueued event wrote nothing here — the real write happens later on the
+    /// writer thread. `ev` is cloned only on the (paste-draining) enqueue
+    /// path, never on the common inline one.
+    pub(super) fn ordered_or_inline(
+        term: &Arc<Mutex<Terminal>>,
+        sink: &Arc<SinkWriter>,
+        ev: &InputEvent,
+        mode: crate::input::EgressMode,
+    ) -> (crate::input::Egress, bool) {
+        if is_ordering(sink.master()) {
+            match enqueue(term, sink, ev.clone()) {
+                Ok(()) => (
+                    crate::input::Egress::Reported(crate::input::Delivery::Full),
+                    false,
+                ),
+                Err(ev) => (crate::input::seam_egress(term, sink, &ev, mode), true),
+            }
+        } else {
+            (crate::input::seam_egress(term, sink, ev, mode), true)
+        }
+    }
 }
 
 /// Map the seam's [`input::Egress`] to the reply-bearing [`InputOutcome`]: a failed
@@ -1168,18 +434,12 @@ pub(crate) fn egress_to_outcome(e: input::Egress) -> InputOutcome {
 /// The modifier-INDEPENDENT logical key of a winit event (the unshifted base
 /// key), used for the keybinding chord lookup so a binding written as the base
 /// key (`cmd+shift+]`, not `cmd+}`) matches regardless of how Shift composes the
-/// glyph on the active layout. On macOS this is `key_without_modifiers()` (a
-/// platform extension); elsewhere winit's plain `logical_key` is the closest
-/// equivalent (aterm-gui ships on macOS — this keeps the crate compiling for the
-/// host test build). It returns an OWNED key so the borrow on `ev` ends before
+/// glyph on the active layout (e.g. `ctrl+shift+=` for zoom-in still matches
+/// once Shift has composed `+`). macOS, the X11/Wayland backends, and Windows all
+/// implement `KeyEventExtModifierSupplement`, so this is `key_without_modifiers()`
+/// on all three; the cfg twin below is the fallback for platforms without that
+/// extension. It returns an OWNED key so the borrow on `ev` ends before
 /// `on_key`'s later `&ev.logical_key` matches.
-// macOS, Linux AND Windows: `KeyEventExtModifierSupplement` (hence
-// `key_without_modifiers`) is implemented for the X11/Wayland backends and the
-// Windows backend too, so a keybinding written with the UNSHIFTED base key (e.g.
-// `ctrl+shift+=` for zoom-in) matches even though Shift composed a different glyph
-// (`+`). Using the shifted `logical_key` here is what made the documented
-// Ctrl+Shift+= zoom chord silently never fire on Linux — and on Windows, which the
-// original cfg wrongly lumped into the no-extension fallback.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -1286,28 +546,21 @@ fn is_plain_enter(ev: &InputEvent) -> bool {
 }
 
 /// How many terminals are currently in vi (keyboard copy-mode) — the GUI-side
-/// mirror the press path consults INSTEAD of the engine.
-///
-/// Every plain keystroke used to ask the ENGINE this question twice
-/// ([`App::vi_repeat_action`] and [`App::on_key_vi_mode`] each took a `term_lock`
-/// to read one bool field). Neither read needed the terminal at all, and the
-/// terminal mutex is the ONE lock a keystroke shares with the PTY reader: under
-/// heavy output both acquisitions queue behind the reader's `process()` holds, so
-/// a keystroke paid two flood-scale waits to learn something the GUI itself
-/// decided. `Terminal::vi_toggle` is the sole writer of the engine's `vi.active`
-/// anywhere in the workspace (`ViMode::activate`/`deactivate` have no callers),
-/// and its two non-test call sites are both in this file on the GUI thread — so
-/// the GUI can simply COUNT what it toggled and answer for free.
+/// mirror the two per-keystroke vi gates ([`App::vi_repeat_action`] and
+/// [`App::on_key_vi_mode`]) consult INSTEAD of the engine. Neither needs the
+/// terminal to answer, and the terminal mutex is the ONE lock a keystroke shares
+/// with the PTY reader: under heavy output an acquisition queues behind the
+/// reader's `process()` holds. `Terminal::vi_toggle` is the sole writer of the
+/// engine's `vi.active` anywhere in the workspace (`ViMode::activate`/
+/// `deactivate` have no callers) and its two non-test call sites are both in this
+/// file on the GUI thread, so the GUI can simply COUNT what it toggled.
 ///
 /// A COUNT, not a flag: two windows can hold two terminals in copy-mode at once.
 /// It is only ever consulted as "is it zero?", and every update is made under the
 /// SAME `term_lock` that performed the toggle (reading back `vi_is_active` there
 /// costs nothing), so the mirror cannot disagree with the engine. A terminal
-/// destroyed while still in copy-mode used to leak its `+1`; that is now
-/// balanced by [`vi_note_terminal_gone`], whose doc explains why the leak was
-/// worth closing even though its direction was fail-safe — a single "close a tab
-/// while in vi" permanently surrendered the lock elision this mirror exists to
-/// provide.
+/// destroyed while still in copy-mode retires its `+1` through
+/// [`vi_note_terminal_gone`].
 static VI_ACTIVE_TERMINALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Record the post-toggle vi state of one terminal in the mirror above. MUST be
@@ -1329,14 +582,13 @@ fn vi_note_toggled(now_active: bool) {
 /// A terminal that was in copy-mode is GOING AWAY (its last view detached), so
 /// retire its contribution to the mirror.
 ///
-/// Without this the count is a one-way ratchet: `vi_toggle` is the only decrement,
-/// so closing a tab while copy-mode is on strands a `+1` that nothing can ever
-/// clear. The gate then reads "maybe active" forever and BOTH per-keystroke vi
-/// checks fall back to taking the terminal mutex — for the rest of the process,
-/// silently. The direction is fail-safe (correctness never depended on the
-/// mirror, only speed), which is exactly why it would never be noticed: one
-/// "close a tab while in vi" permanently gives back the lock elision this mirror
-/// exists to provide, worth ~0.15-0.37 ms per keystroke under output load.
+/// `vi_toggle` is the only other decrement, so without this the count is a
+/// one-way ratchet: closing a tab while copy-mode is on strands a `+1` that
+/// nothing can clear, the gate reads "maybe active" for the rest of the process,
+/// and BOTH per-keystroke vi checks fall back to the terminal mutex (worth
+/// ~0.15-0.37 ms per keystroke under output load). The direction is fail-safe —
+/// correctness never depended on the mirror, only speed — which is exactly why
+/// the loss would go unnoticed.
 pub(crate) fn vi_note_terminal_gone(was_active: bool) {
     if was_active {
         vi_note_toggled(false);
@@ -1384,13 +636,287 @@ fn publish_release_relevance(session: u64, relevant: bool) {
 
 /// `Some(false)` iff the last press-path sample for `session` PROVED that a key
 /// release for it encodes nothing; `None` when nothing was sampled for this
-/// session (the caller must ask the engine, exactly as before this fix).
+/// session (the caller must ask the engine).
 fn sampled_release_relevance(session: u64) -> Option<bool> {
     let packed = RELEASE_RELEVANCE.with(std::cell::Cell::get);
     if packed == 0 || packed >> 1 != session.wrapping_add(1) {
         return None;
     }
     Some(packed & 1 == 1)
+}
+
+/// Mint a fresh App-wide kitty-summon ident: bump the shared sequence FIRST,
+/// then namespace the new value under `tag`. One ordering for every minting
+/// site — the sequence keeps two windows sharing one session from minting
+/// colliding episodes, and the tag partitions each summon kind's ident space.
+///
+/// scope-waiver: "App-wide" here names an IDENT NAMESPACE, not a safety budget.
+/// The value is a monotonic counter partitioned by `tag`; there is no enforcing
+/// state whose duplication could put anything extra on the glass, so no
+/// instance count can falsify the phrase. A second sequence would mint
+/// COLLIDING idents (a correctness bug the episode map catches), never 2N of a
+/// rate-limited effect — which is the hazard OB-17 exists to surface.
+fn next_kitty_summon_ident(seq: &mut u64, tag: u64) -> u64 {
+    *seq = seq.wrapping_add(1);
+    tag ^ *seq
+}
+
+/// ONE pure classification of a committed Key/Text/KeySequence press, computed
+/// once at the top of `input_to_session`'s key arm and read by every effect
+/// feed on that path (predictor arming, cursor-FX hints, and the post-egress
+/// cosmetic feeds). Pure over the event — no terminal or App state — and it
+/// NEVER gates bytes.
+struct PressClass<'ev> {
+    /// Predictive-echo candidate for a BARE printable key (no ⌃/⌥/⌘):
+    /// `(Some(glyph), false)` registers a speculative glyph, `(None, true)` is
+    /// a Backspace retraction. The predictor's `predict_mode` gate stays at
+    /// the call site.
+    predict_candidate: Option<(Option<char>, bool)>,
+    /// Forward-typing direction for the Nyan-cursor momentum (INDEPENDENT of
+    /// the predictor's mode gate, so the cat flies whether or not predictive
+    /// echo is on): a visible char / space / newline advances the cursor
+    /// (forward), a backspace moves it back; every other key leaves momentum
+    /// to decay.
+    typed_forward: Option<bool>,
+    /// NAVIGATION key-hint (responsiveness): keys that MOVE the cursor without
+    /// writing text — arrow keys, Home/End, Page Up/Down, and the emacs
+    /// line/word motions readline binds (Ctrl-A/E/B/F, Alt-B/F). Arming the
+    /// fire nav-hint tells the cursor-glow engine the paired cursor move is
+    /// scrubbing, so jumping to line start/end (Ctrl-A/E) never erupts a
+    /// full-width blaze and held arrows lay no fire. Style-agnostic scalar
+    /// bump; only the fire style reads it.
+    navigation_key: bool,
+    /// KILL key-hint (the erase POOF's semantic half): keys that erase a SPAN
+    /// of text in one stroke — kill-to-end (Ctrl-K), kill-line/backward
+    /// (Ctrl-U), word kills (Ctrl-W, Alt-D, Alt/Ctrl-Backspace — modified
+    /// Backspaces never reach the `typed_forward` matcher), and forward
+    /// Delete. The glow engine only poofs when the hint pairs with a real
+    /// same-row content shrink (see `CursorGlow::note_kill`), so a kill key an
+    /// app ignores stays silent.
+    kill_key: bool,
+    /// Backward kills (Ctrl-U/W, word-backspaces) LEAP the caret — their echo
+    /// move rides the nav-hint choreography (meteor, no blaze). Stationary
+    /// kills (Ctrl-K, Alt-D, forward Delete) must NOT arm nav or the leaked
+    /// hint eats the next typed glyph's wake.
+    kill_moves: bool,
+    /// Any Enter press, chorded or not (`is_plain_enter` is the bare form).
+    enter_like: bool,
+    /// Any Tab press (joins the typed-hint disarm set).
+    tab_key: bool,
+    /// Bare printable glyph for the cosmetic feeds — the SHIFTED glyph the
+    /// encoder sends (`Key::Character` holds the unshifted base, so KITTY
+    /// still counts once the detector folds case).
+    typed: Option<char>,
+    /// A committed IME run (CJK, dead keys, Option-compose) — typed text.
+    /// `Text` is built only by `on_ime_commit` and the two human `on_key`
+    /// fallbacks, never by paste.
+    ime: Option<&'ev str>,
+    /// A plain (unchorded) Backspace.
+    backspace: bool,
+    /// A key that edits or moves beyond one glyph (Enter, Tab, Escape,
+    /// Delete, nav keys, any modified chord, raw controller byte sequences):
+    /// the cosmetic feeds' BREAK boundary — a word assembled across an
+    /// editing boundary was never typed as a word.
+    brk: bool,
+}
+
+fn classify_press(ev: &InputEvent) -> PressClass<'_> {
+    use aterm_types::keyboard::{Key as TKey, Modifiers as TMods, NamedKey as TNamed};
+    let predict_candidate: Option<(Option<char>, bool)> = match ev {
+        InputEvent::Key { key, mods, .. }
+            if !mods.contains(TMods::CTRL)
+                && !mods.contains(TMods::ALT)
+                && !mods.contains(TMods::SUPER) =>
+        {
+            match key {
+                // Predict the SHIFTED glyph the encoder will send
+                // (and the shell will echo) — `Key::Character` holds
+                // the unshifted base, so 'h'+Shift must predict 'H'.
+                TKey::Character(c) => Some((
+                    Some(aterm_types::keyboard::shifted_character(*c, *mods).unwrap_or(*c)),
+                    false,
+                )),
+                TKey::Named(TNamed::Space) => Some((Some(' '), false)),
+                TKey::Named(TNamed::Backspace) => Some((None, true)),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let typed_forward: Option<bool> = match ev {
+        InputEvent::Key { key, mods, .. }
+            if !mods.contains(TMods::CTRL)
+                && !mods.contains(TMods::ALT)
+                && !mods.contains(TMods::SUPER) =>
+        {
+            match key {
+                TKey::Character(_) => Some(true),
+                TKey::Named(TNamed::Space | TNamed::Enter) => Some(true),
+                TKey::Named(TNamed::Backspace) => Some(false),
+                _ => None,
+            }
+        }
+        // A committed IME run is typed text: its echo advances the caret — and
+        // can WRAP an Ink box exactly like a plain Character, so it must arm
+        // the re-anchor hint.
+        InputEvent::Text(t) if !t.is_empty() => Some(true),
+        _ => None,
+    };
+    let navigation_key: bool = match ev {
+        InputEvent::Key { key, mods, .. } => {
+            let ctrl = mods.contains(TMods::CTRL);
+            let alt = mods.contains(TMods::ALT);
+            match key {
+                TKey::Named(
+                    TNamed::ArrowLeft
+                    | TNamed::ArrowRight
+                    | TNamed::ArrowUp
+                    | TNamed::ArrowDown
+                    | TNamed::Home
+                    | TNamed::End
+                    | TNamed::PageUp
+                    | TNamed::PageDown,
+                ) => true,
+                // Ctrl-P/N join the emacs line motions: shell
+                // history recall / vim-emacs line moves are the
+                // SAME (suppressed) gesture as Up/Down-arrow
+                // recall, so both spellings must classify alike.
+                TKey::Character(c) if ctrl && matches!(c, 'a' | 'e' | 'b' | 'f' | 'p' | 'n') => {
+                    true
+                }
+                TKey::Character(c) if alt && matches!(c, 'b' | 'f') => true,
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    let (kill_key, kill_moves): (bool, bool) = match ev {
+        InputEvent::Key { key, mods, .. } => {
+            let ctrl = mods.contains(TMods::CTRL);
+            let alt = mods.contains(TMods::ALT);
+            match key {
+                TKey::Character(c) if ctrl && *c == 'k' => (true, false),
+                TKey::Character(c) if ctrl && matches!(c, 'u' | 'w') => (true, true),
+                TKey::Character(c) if alt && *c == 'd' => (true, false),
+                TKey::Named(TNamed::Backspace) if ctrl || alt => (true, true),
+                TKey::Named(TNamed::Delete) => (true, false),
+                _ => (false, false),
+            }
+        }
+        _ => (false, false),
+    };
+    let enter_like = matches!(
+        ev,
+        InputEvent::Key {
+            key: TKey::Named(TNamed::Enter),
+            ..
+        }
+    );
+    let tab_key = matches!(
+        ev,
+        InputEvent::Key {
+            key: TKey::Named(TNamed::Tab),
+            ..
+        }
+    );
+    let mut typed: Option<char> = None;
+    let mut ime: Option<&str> = None;
+    let mut backspace = false;
+    let mut brk = false;
+    match ev {
+        InputEvent::Key { key, mods, .. } => {
+            let chorded = mods.contains(TMods::CTRL)
+                || mods.contains(TMods::ALT)
+                || mods.contains(TMods::SUPER);
+            match key {
+                TKey::Character(c) if !chorded => {
+                    // The SHIFTED glyph the encoder sends
+                    // (`Key::Character` holds the unshifted
+                    // base) — folded to lowercase inside
+                    // the detector, so KITTY still counts.
+                    typed = Some(aterm_types::keyboard::shifted_character(*c, *mods).unwrap_or(*c));
+                }
+                TKey::Named(TNamed::Space) if !chorded => typed = Some(' '),
+                TKey::Named(TNamed::Backspace) if !chorded => backspace = true,
+                // A chorded Character is an editing/nav/
+                // kill chord (Ctrl-U/W/K, Ctrl-A/E, Alt-B/
+                // F, …): it rewrote or left the word.
+                TKey::Character(_) => brk = true,
+                TKey::Named(
+                    TNamed::Enter
+                    | TNamed::Tab
+                    | TNamed::Escape
+                    | TNamed::Delete
+                    | TNamed::Backspace
+                    | TNamed::ArrowLeft
+                    | TNamed::ArrowRight
+                    | TNamed::ArrowUp
+                    | TNamed::ArrowDown
+                    | TNamed::Home
+                    | TNamed::End
+                    | TNamed::PageUp
+                    | TNamed::PageDown,
+                ) => brk = true,
+                // Anything else (F-keys, lone modifiers,
+                // media keys) neither types nor edits.
+                _ => {}
+            }
+        }
+        // A committed IME run is typed text.
+        InputEvent::Text(t) if !t.is_empty() => ime = Some(t),
+        // Raw controller byte payloads are not classified
+        // typing — break the run rather than guess.
+        InputEvent::KeySequence(_) => brk = true,
+        _ => {}
+    }
+    PressClass {
+        predict_candidate,
+        typed_forward,
+        navigation_key,
+        kill_key,
+        kill_moves,
+        enter_like,
+        tab_key,
+        typed,
+        ime,
+        backspace,
+        brk,
+    }
+}
+
+/// The shared brk → backspace → typed+ime dispatch cascade of one classified
+/// press into a cosmetic feed. `on_char` runs for the bare typed glyph and for
+/// each char of a committed IME run; `target` threads the feed's receiver
+/// through so the three callbacks never hold simultaneous borrows of it.
+#[derive(Clone, Copy)]
+struct CosmeticFeedPress<'ev> {
+    brk: bool,
+    backspace: bool,
+    typed: Option<char>,
+    ime: Option<&'ev str>,
+}
+
+fn feed_classified_press<T>(
+    target: &mut T,
+    press: CosmeticFeedPress<'_>,
+    on_break: impl FnOnce(&mut T),
+    on_backspace: impl FnOnce(&mut T),
+    mut on_char: impl FnMut(&mut T, char),
+) {
+    if press.brk {
+        on_break(target);
+    } else if press.backspace {
+        on_backspace(target);
+    } else {
+        if let Some(c) = press.typed {
+            on_char(target, c);
+        }
+        if let Some(t) = press.ime {
+            for c in t.chars() {
+                on_char(target, c);
+            }
+        }
+    }
 }
 
 impl App {
@@ -1404,8 +930,8 @@ impl App {
     /// `encode_key_with_layout` /
     /// the `encode_mouse_*` family / `encode_committed_text` / `format_paste` / the
     /// focus-report egress, reading the relevant mode ONCE per event under a single
-    /// `term_lock` — closing the mid-event mode-flip window the two-lock
-    /// `on_mouse_input` had, ending at `self.sink.write_frame`, the 0e floor). This
+    /// `term_lock` — so no mode flip can land mid-event — and ending at
+    /// `self.sink.write_frame`, the 0e floor). This
     /// method wraps it with the viewport/gesture/clipboard/geometry side-effects
     /// that need the renderer + window + gesture state: it is the ONLY caller of
     /// `seam_egress` / `scroll_display` / `clear_selection` / `snap_to_bottom` /
@@ -1417,6 +943,22 @@ impl App {
     /// by `input::tests::bytes_human_eq_controller`).
     pub(crate) fn input(&mut self, wid: WindowId, ev: InputEvent, src: Source) -> InputOutcome {
         self.input_to_session(wid, ev, src, None)
+    }
+
+    /// Whether tone-of-typing inference may run AT ALL: the `tone_melody`
+    /// knob, the trail-sound config gates (master toggle + nonzero volume —
+    /// a muted synth needs no mood), and a LIVE trail-audio worker. The last
+    /// conjunct is the "never runs headless-muted" policy: a headless app,
+    /// a non-macOS build (inert audio stub), or a permanently failed audio
+    /// worker never spends a cycle on the classifier, never loads its
+    /// weights, never even buffers chars. Focus and reduced-motion need no
+    /// check HERE — the tone only rides sound events those policies already
+    /// gate at the drain seams.
+    fn tone_infer_active(&self) -> bool {
+        self.trail_audio.is_live()
+            && self.config.tone_melody_or_default()
+            && self.config.trail_sounds_or_default()
+            && self.config.trail_sound_volume() > 0.0
     }
 
     /// Summon the typed-"kitty" cameo (detector: [`crate::kitty_summon`]).
@@ -1443,26 +985,11 @@ impl App {
     /// ambient on-screen "kitty" word-cats land in (langs resolved from the
     /// live lexicon's own "kitty" entry — the file stays bounded by the
     /// vocabulary, no new row shape).
-    /// Whether tone-of-typing inference may run AT ALL: the `tone_melody`
-    /// knob, the trail-sound config gates (master toggle + nonzero volume —
-    /// a muted synth needs no mood), and a LIVE trail-audio worker. The last
-    /// conjunct is the "never runs headless-muted" policy: a headless app,
-    /// a non-macOS build (inert audio stub), or a permanently failed audio
-    /// worker never spends a cycle on the classifier, never loads its
-    /// weights, never even buffers chars. Focus and reduced-motion need no
-    /// check HERE — the tone only rides sound events those policies already
-    /// gate at the drain seams.
-    fn tone_infer_active(&self) -> bool {
-        self.trail_audio.is_live()
-            && self.config.tone_melody_or_default()
-            && self.config.trail_sounds_or_default()
-            && self.config.trail_sound_volume() > 0.0
-    }
-
+    ///
     /// `record` is the LEDGER tier: `false` when the Kitty Log's cooldown has
     /// not elapsed. The cameo draws either way — typing the word is a direct
-    /// request, and answering it only sometimes reads as broken (owner,
-    /// 2026-07-24: "it should be 100% of the time"). See `kitty_summon`.
+    /// request, and answering it only sometimes reads as broken. See
+    /// `kitty_summon`.
     fn summon_typed_kitty(
         &mut self,
         wid: WindowId,
@@ -1480,7 +1007,7 @@ impl App {
         let Some(rs) = self.sparkle.as_ref() else {
             return;
         };
-        // FELINE SUB-GATE (adversarial review): `[sparkle_words.feline]
+        // FELINE SUB-GATE: `[sparkle_words.feline]
         // enabled = false` leaves the master resolved (any other family keeps
         // `sparkle` Some) but silences every ambient cat — the scanner drops
         // `Class::Feline` matches before they can render or log, so an
@@ -1497,8 +1024,8 @@ impl App {
         }
         // Same resolution order as the per-frame sync in `app_render`: an
         // explicitly collected companion wins, otherwise this session's own
-        // kitty. Never `KittyLook::default()` — that is the one cat every
-        // session used to share.
+        // kitty. Never `KittyLook::default()` — that is one cat shared by
+        // every session.
         let look = self
             .kitty_log
             .companion_look()
@@ -1530,7 +1057,10 @@ impl App {
             // episodes, and the tag namespaces summons away from the word
             // renderer's position-bearing occurrence idents. Only bumped when a
             // row is actually minted, so the namespace stays dense.
-            self.kitty_summon_seq = self.kitty_summon_seq.wrapping_add(1);
+            let ident = next_kitty_summon_ident(
+                &mut self.kitty_summon_seq,
+                crate::kitty_summon::TYPED_SUMMON_IDENT_TAG,
+            );
             let sighting = KittySighting {
                 kitty_type: KittyType::HeadPeek,
                 magic: KittyMagic::None,
@@ -1538,7 +1068,7 @@ impl App {
                 langs,
                 traits,
                 look,
-                ident: crate::kitty_summon::TYPED_SUMMON_IDENT_TAG ^ self.kitty_summon_seq,
+                ident,
             };
             // `kitty_log_on = false` drains-and-drops here exactly as at the
             // render drain: the cameo still shows, nothing is recorded.
@@ -1549,19 +1079,18 @@ impl App {
             None
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
-            // TWO REASONS, TWO PRESENTATIONS (owner, 2026-07-26: "it's not that
-            // I need it to be locked so much as I don't want the kitty changing
-            // for no reason").
+            // TWO REASONS, TWO PRESENTATIONS — the companion identity may only
+            // change for a reason.
             //
             // * A first-ever sighting is a genuine discovery — a real reason to
             //   swap. Present that exact unlocked identity, like the render
             //   drain would.
-            // * Merely typing the word is NOT a reason. It used to run through
-            //   the same `on_collect`, which replaces `look` outright (the
-            //   two-path rule's path 2), so every typed `kitty` could re-skin
-            //   the companion out from under the session. `on_summon` gives the
-            //   identical appearance/hold WITHOUT touching the identity, so the
-            //   session's own kitty is the one that shows up.
+            // * Merely typing the word is NOT a reason. `on_collect` replaces
+            //   `look` outright (the two-path rule's path 2), so routing a
+            //   typed `kitty` through it would re-skin the companion out from
+            //   under the session. `on_summon` gives the identical
+            //   appearance/hold WITHOUT touching the identity, so the session's
+            //   own kitty is the one that shows up.
             match discovered {
                 Some(unlocked) => ws.cursor_cat.on_collect(now, unlocked),
                 None => ws.cursor_cat.on_summon(now, 1),
@@ -1577,10 +1106,7 @@ impl App {
     }
 
     /// Promote the FRONT SESSION's own kitty into the durable kitty registry
-    /// and pin it as the companion (owner: "I like that there is a unique kitty
-    /// chosen per session and sticks with that session because that makes the
-    /// session kitty special … and if somebody really likes that kitty it goes
-    /// into the kitty registry"). The menu-bar item, the ⇧⌘P palette row, and
+    /// and pin it as the companion. The menu-bar item, the ⇧⌘P palette row, and
     /// `aterm-ctl invoke FavouriteSessionKitty` all land here.
     pub(crate) fn favourite_session_kitty(&mut self, wid: WindowId, now: std::time::Instant) {
         use aterm_effects::kitty_registry::{
@@ -1606,6 +1132,10 @@ impl App {
         // on a used ledger it would only ever re-pin the cat that already won.
         let look = KittyLook::for_session(session);
         let enabled = self.kitty_log_enabled();
+        let ident = next_kitty_summon_ident(
+            &mut self.kitty_summon_seq,
+            crate::kitty_summon::FAVOURITE_IDENT_TAG,
+        );
         let sighting = KittySighting {
             kitty_type: KittyType::HeadPeek,
             magic: KittyMagic::None,
@@ -1618,9 +1148,8 @@ impl App {
             // and no displayed-trait bit may be claimed.
             traits: 0,
             look,
-            ident: crate::kitty_summon::FAVOURITE_IDENT_TAG ^ self.kitty_summon_seq,
+            ident,
         };
-        self.kitty_summon_seq = self.kitty_summon_seq.wrapping_add(1);
         self.kitty_log
             .favourite(&sighting, &rs.lexicon, now, enabled);
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -1699,24 +1228,9 @@ impl App {
                 terminal.text_selection_mut().clear();
             }
         }
-        if paste_order::is_ordering(sink.master()) {
-            match paste_order::enqueue(&term, &sink, ev) {
-                Ok(()) => InputOutcome::Ok,
-                Err(ev) => egress_to_outcome(input::seam_egress(
-                    &term,
-                    &sink,
-                    &ev,
-                    input::EgressMode::Interactive,
-                )),
-            }
-        } else {
-            egress_to_outcome(input::seam_egress(
-                &term,
-                &sink,
-                &ev,
-                input::EgressMode::Interactive,
-            ))
-        }
+        let (egress, _) =
+            paste_order::ordered_or_inline(&term, &sink, &ev, input::EgressMode::Interactive);
+        egress_to_outcome(egress)
     }
 
     /// Route an input event through the complete convergence seam while pinning
@@ -1732,7 +1246,7 @@ impl App {
         target_session: Option<u64>,
     ) -> InputOutcome {
         // Every real input advances the automatic-update quiet clock, but a
-        // PENDING overlap now BUFFERS THROUGH byte-producing input instead of
+        // PENDING overlap BUFFERS THROUGH byte-producing input rather than
         // revoking on it. Keys/text/raw sequences encode against the (frozen)
         // terminal modes and write to the PTY masters, which persist across
         // the whole overlap — the shell receives the bytes exactly once and
@@ -1786,9 +1300,9 @@ impl App {
         // `consumed_press_keys`, keyed on the engine `Key` because controller events
         // carry no physical key): a Key RELEASE whose PRESS the overlay gate below
         // consumed is swallowed HERE — including one arriving AFTER the overlay closed,
-        // which is exactly the case the gate itself can no longer see. Without this, a
-        // controller press swallowed under the overlay leaked a default-encoded release
-        // once the overlay closed — an orphan Kitty `REPORT_EVENT_TYPES` release report
+        // which is exactly the case the gate itself can no longer see. Otherwise a
+        // controller press swallowed under the overlay leaks a default-encoded release
+        // once the overlay closes: an orphan Kitty `REPORT_EVENT_TYPES` release report
         // for a press the app never saw. Checked BEFORE the gate so the entry is always
         // removed (swallow once, leak-free); a legacy release encodes to nothing anyway,
         // so this is a byte-identical no-op outside Kitty event-type mode.
@@ -1935,17 +1449,17 @@ impl App {
             // --- Keyboard egress (kills f/h; uniform k/g side-effects) ---------
             ev @ (InputEvent::Key { .. } | InputEvent::Text(_) | InputEvent::KeySequence(_)) => {
                 // blink reset -> viewport snap -> selection clear run for BOTH
-                // sources (divergences d/g/k): controller key verbs now snap +
+                // sources (divergences d/g/k): controller key verbs snap +
                 // deselect + keep the cursor solid exactly like human typing. The
                 // snap + clear are inlined under ONE term lock below (with the
-                // predictor's cursor sample) instead of calling the per-concern
-                // helpers — same change-gated behavior, one mutex acquisition. The
-                // ENCODE (sole keyboard-mode read + encoder call) is `seam_egress`.
+                // predictor's cursor sample) rather than calling the per-concern
+                // helpers, so a press costs one mutex acquisition. The ENCODE
+                // (sole keyboard-mode read + encoder call) is `seam_egress`.
                 // A key RELEASE report (Kitty REPORT_EVENT_TYPES) is NOT a press/typing
                 // event, so it must not reset the blink, snap the viewport, or clear the
                 // selection — only encode. (A Repeat IS press-like and keeps them.) The
                 // encoder emits nothing for a release outside Kitty mode, so legacy
-                // output stays byte-identical whether or not this side-effect gate runs.
+                // output is unaffected whether or not this side-effect gate runs.
                 let is_release = matches!(
                     &ev,
                     InputEvent::Key { event_type, .. }
@@ -1958,16 +1472,30 @@ impl App {
                 // is exactly the `!is_release` gate: a release still pays no clock
                 // read and runs no press side-effect.
                 let input_now = (!is_release).then(std::time::Instant::now);
+                // ONE pure classification of this press (see `PressClass`),
+                // shared by the pre-egress hint/predictor block and the
+                // post-egress cosmetic feeds.
+                let PressClass {
+                    predict_candidate,
+                    typed_forward,
+                    navigation_key,
+                    kill_key,
+                    kill_moves,
+                    enter_like,
+                    tab_key,
+                    typed,
+                    ime,
+                    backspace,
+                    brk,
+                } = classify_press(&ev);
                 if let Some(input_now) = input_now {
                     self.reset_blink(wid);
-                    // Predictive local echo (mosh-style): for a BARE printable key
-                    // (no ⌃/⌥/⌘) register a speculative glyph so it can paint before the
-                    // shell echoes it. Inert unless `predictive_echo` is enabled; the
-                    // `key` here is `aterm_types::keyboard::Key` (NOT the winit `Key`
-                    // imported above), so the paths are fully qualified. The candidate
-                    // is resolved BEFORE the term lock below (pure, no term state), so
-                    // a non-printable key never pays for the cursor sample.
-                    // Resolved once per config generation (invalidated by
+                    // Predictive local echo (mosh-style): register the classified
+                    // `predict_candidate` glyph so it can paint before the shell
+                    // echoes it. Resolved BEFORE the term lock below (pure, no term
+                    // state), so a non-printable key never pays for the cursor
+                    // sample. Inert unless `predictive_echo` is enabled; `pmode` is
+                    // resolved once per config generation (invalidated by
                     // `reload_config`) instead of re-parsing the config string every
                     // keystroke — the shared cache the render paths read too.
                     let pmode = self.predict_mode();
@@ -1975,156 +1503,16 @@ impl App {
                         if pmode == crate::predict::PredictMode::Off {
                             None
                         } else {
-                            use aterm_types::keyboard::{
-                                Key as TKey, Modifiers as TMods, NamedKey as TNamed,
-                            };
-                            match &ev {
-                                InputEvent::Key { key, mods, .. }
-                                    if !mods.contains(TMods::CTRL)
-                                        && !mods.contains(TMods::ALT)
-                                        && !mods.contains(TMods::SUPER) =>
-                                {
-                                    match key {
-                                        // Predict the SHIFTED glyph the encoder will send
-                                        // (and the shell will echo) — `Key::Character` holds
-                                        // the unshifted base, so 'h'+Shift must predict 'H'.
-                                        TKey::Character(c) => Some((
-                                            Some(
-                                                aterm_types::keyboard::shifted_character(*c, *mods)
-                                                    .unwrap_or(*c),
-                                            ),
-                                            false,
-                                        )),
-                                        TKey::Named(TNamed::Space) => Some((Some(' '), false)),
-                                        TKey::Named(TNamed::Backspace) => Some((None, true)),
-                                        _ => None,
-                                    }
-                                }
-                                _ => None,
-                            }
+                            predict_candidate
                         };
-                    // Forward-typing direction for the Nyan-cursor momentum
-                    // (INDEPENDENT of the predictor's `pmode` gate above, so the
-                    // cat flies whether or not predictive echo is on): a visible
-                    // char / space / newline advances the cursor (forward), a
-                    // backspace moves it back; every other key leaves momentum to
-                    // decay.
-                    let typed_forward: Option<bool> = {
-                        use aterm_types::keyboard::{
-                            Key as TKey, Modifiers as TMods, NamedKey as TNamed,
-                        };
-                        match &ev {
-                            InputEvent::Key { key, mods, .. }
-                                if !mods.contains(TMods::CTRL)
-                                    && !mods.contains(TMods::ALT)
-                                    && !mods.contains(TMods::SUPER) =>
-                            {
-                                match key {
-                                    TKey::Character(_) => Some(true),
-                                    TKey::Named(TNamed::Space | TNamed::Enter) => Some(true),
-                                    TKey::Named(TNamed::Backspace) => Some(false),
-                                    _ => None,
-                                }
-                            }
-                            // A committed IME run (CJK, dead keys, Option-compose)
-                            // is typed text: its echo advances the caret — and can
-                            // WRAP an Ink box exactly like a plain Character, so
-                            // it must arm the re-anchor hint (adversarial review:
-                            // Text is built only by `on_ime_commit` and the two
-                            // human `on_key` fallbacks, never by paste).
-                            InputEvent::Text(t) if !t.is_empty() => Some(true),
-                            _ => None,
-                        }
-                    };
                     let typed_enter = is_plain_enter(&ev);
-                    // NAVIGATION key-hint (responsiveness): keys that MOVE the
-                    // cursor without writing text — arrow keys, Home/End, Page
-                    // Up/Down, and the emacs line/word motions readline binds
-                    // (Ctrl-A/E/B/F, Alt-B/F). Arming the fire nav-hint tells the
-                    // cursor-glow engine the paired cursor move is scrubbing, so
-                    // jumping to line start/end (Ctrl-A/E) never erupts a
-                    // full-width blaze and held arrows lay no fire. Style-agnostic
-                    // scalar bump; only the fire style reads it. Never gates bytes.
-                    let navigation_key: bool = {
-                        use aterm_types::keyboard::{
-                            Key as TKey, Modifiers as TMods, NamedKey as TNamed,
-                        };
-                        match &ev {
-                            InputEvent::Key { key, mods, .. } => {
-                                let ctrl = mods.contains(TMods::CTRL);
-                                let alt = mods.contains(TMods::ALT);
-                                match key {
-                                    TKey::Named(
-                                        TNamed::ArrowLeft
-                                        | TNamed::ArrowRight
-                                        | TNamed::ArrowUp
-                                        | TNamed::ArrowDown
-                                        | TNamed::Home
-                                        | TNamed::End
-                                        | TNamed::PageUp
-                                        | TNamed::PageDown,
-                                    ) => true,
-                                    // Ctrl-P/N join the emacs line motions: shell
-                                    // history recall / vim-emacs line moves are the
-                                    // SAME gesture as Up/Down-arrow recall, which is
-                                    // suppressed — without them the two spellings of
-                                    // one gesture gave inconsistent feedback.
-                                    TKey::Character(c)
-                                        if ctrl
-                                            && matches!(c, 'a' | 'e' | 'b' | 'f' | 'p' | 'n') =>
-                                    {
-                                        true
-                                    }
-                                    TKey::Character(c) if alt && matches!(c, 'b' | 'f') => true,
-                                    _ => false,
-                                }
-                            }
-                            _ => false,
-                        }
-                    };
-                    // KILL key-hint (the erase POOF's semantic half): keys that
-                    // erase a SPAN of text in one stroke — kill-to-end (Ctrl-K),
-                    // kill-line/backward (Ctrl-U), word kills (Ctrl-W, Alt-D,
-                    // Alt/Ctrl-Backspace — modified Backspaces never reach the
-                    // `typed_forward` matcher above), and forward Delete. The
-                    // glow engine only poofs when the hint pairs with a real
-                    // same-row content shrink (see `CursorGlow::note_kill`), so
-                    // a kill key an app ignores stays silent. Style-agnostic
-                    // scalar arm, exactly like the hints above. Never gates bytes.
-                    // `kill_moves`: backward kills (Ctrl-U/W, word-backspaces)
-                    // LEAP the caret — their echo move rides the nav-hint
-                    // choreography (meteor, no blaze). Stationary kills (Ctrl-K,
-                    // Alt-D, forward Delete) must NOT arm nav or the leaked hint
-                    // eats the next typed glyph's wake (adversarial review).
-                    let (kill_key, kill_moves): (bool, bool) = {
-                        use aterm_types::keyboard::{
-                            Key as TKey, Modifiers as TMods, NamedKey as TNamed,
-                        };
-                        match &ev {
-                            InputEvent::Key { key, mods, .. } => {
-                                let ctrl = mods.contains(TMods::CTRL);
-                                let alt = mods.contains(TMods::ALT);
-                                match key {
-                                    TKey::Character(c) if ctrl && *c == 'k' => (true, false),
-                                    TKey::Character(c) if ctrl && matches!(c, 'u' | 'w') => {
-                                        (true, true)
-                                    }
-                                    TKey::Character(c) if alt && *c == 'd' => (true, false),
-                                    TKey::Named(TNamed::Backspace) if ctrl || alt => (true, true),
-                                    TKey::Named(TNamed::Delete) => (true, false),
-                                    _ => (false, false),
-                                }
-                            }
-                            _ => (false, false),
-                        }
-                    };
                     // Momentum can only arm the cursor cat while the trail
                     // master is ON and the selected style is Nyan. The master
                     // owns both the ribbon and its ordinary flying companion;
                     // collection/typed hellos are activated separately below
-                    // this gate and remain intentionally independent.
-                    // Collection hellos are activated separately by the log and
-                    // remain interactive without paying an invisible 60 fps loop.
+                    // this gate by the log and remain intentionally independent,
+                    // so they stay interactive without paying an invisible
+                    // 60 fps loop.
                     // Cached like `pmode` above (invalidated by `reload_config`): the
                     // trail style only changes on a config reload.
                     let nyan_style = match self.nyan_style_cache {
@@ -2237,36 +1625,31 @@ impl App {
                     // lock.
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         ws.input_hot = true;
-                        // ECHO-CORRELATION DEADLINE (touch-to-glass audit): the bypass
-                        // used to be cleared by the FIRST content present after the key,
-                        // with nothing tying that present to this keystroke. Typing into
-                        // a session that is already streaming (a build log, a TUI) meant
-                        // the next spew frame spent the bypass and re-stamped
+                        // ECHO-CORRELATION DEADLINE. Clearing the bypass on the FIRST
+                        // content present after the key would not correlate it with THIS
+                        // keystroke: in a session that is already streaming (a build log,
+                        // a TUI) the next spew frame spends the bypass and re-stamps
                         // `last_present_at`, so the real echo — arriving milliseconds
-                        // later — was paced against a FULL frame interval measured from
-                        // that spew frame. Consecutive keystrokes then got 8/16/8 ms:
-                        // jitter, which reads worse than a stable higher latency.
+                        // later — is paced against a FULL frame interval measured from
+                        // that spew frame, and consecutive keystrokes land at 8/16/8 ms.
                         //
                         // A deadline is the honest correlation: every key re-arms it, so
-                        // the bypass covers the whole typing burst instead of one frame,
+                        // the bypass covers the whole typing burst rather than one frame,
                         // and it fails OPEN after the window so a key that never echoes
                         // (a password prompt, a swallowed chord) cannot pin it. Still
                         // half-interval paced by `hot_floor`, so the present rate stays
-                        // bounded at 2x refresh — the pool-exhaustion guard that
-                        // motivated the original clear is untouched.
+                        // bounded at 2x refresh — the pool-exhaustion guard is untouched.
                         ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
                         crate::metrics::note_input();
                         // Stamp the arrival for the `metrics` verb's input→present
-                        // slice — the latency a human FEELS when typing. (Touch-to-
-                        // glass audit: this call was MISSING — the comment promised
-                        // it, only control-verb sends stamped — so the histogram
-                        // recorded nothing for real typing AND `input_pending()`
-                        // stayed false, letting the PTY reader hold the term lock
-                        // for whole 64 KiB bursts instead of the 8 KiB THRU-2
-                        // slices while a human waited on the echo.) The write-slice
-                        // close (`note_pty_write`) is deferred to AFTER the real egress
-                        // below, so it separately isolates any blocking WriteFile inside
-                        // this end-to-end input→present interval.
+                        // slice — the latency a human FEELS when typing. The same
+                        // stamp drives `input_pending()`, which keeps the PTY reader
+                        // on the short THRU-2 slices (instead of whole 64 KiB
+                        // bursts under the term lock) while a human waits on the
+                        // echo. The write-slice close (`note_pty_write`) is deferred
+                        // to AFTER the real egress below, so it separately isolates
+                        // any blocking WriteFile inside this end-to-end
+                        // input→present interval.
                         // Feed the cadence-comet IGNITION heat: this key/text egress is
                         // a keystroke, so heat the typing tracker. Fast sustained typing
                         // compounds heat toward ignition (a longer, hotter comet); a few
@@ -2277,9 +1660,7 @@ impl App {
                         // nav-hint below enforces for the glow engine: held arrows /
                         // Ctrl-A/E scrubbing and line kills are not writing, so they
                         // must not ignite the comet, spin the rainbow cursor, or
-                        // charge the phaser emitter's wings (they did all three: the
-                        // classification is computed right here yet was never
-                        // consulted for the cadence).
+                        // charge the phaser emitter's wings.
                         if !navigation_key && !kill_key {
                             ws.typing_cadence.on_keystroke(input_now);
                         }
@@ -2296,7 +1677,7 @@ impl App {
                             // "lay no comet across cells the caret never swept".
                             // Armed ALWAYS (like the typed hint below): the
                             // engine-side alt/repaint-blink conjunct is the
-                            // discriminator now — plain vim (alt screen, never
+                            // discriminator — plain vim (alt screen, never
                             // blinks inside DEC-2026) keeps its jump drama
                             // through blink-absence, while full-redraw agent
                             // TUIs (including Codex) re-anchor through their
@@ -2315,45 +1696,28 @@ impl App {
                         // Ink-style box rewraps per keystroke), never a jump.
                         // Plain Enter, Tab, nav keys, and modified chords never
                         // arm — their jumps keep the owner-mandated
-                        // meteors/ZOOMs. Armed ALWAYS (the v0.48 `!is_alt ||
-                        // kitty_keys` gate is retired): keyboard negotiation
-                        // does not classify repaint geometry. vim safety moved into the
-                        // engines — their re-anchor conjunct requires a fresh
-                        // REPAINT BLINK on the alt screen (the hide-inside-
+                        // meteors/ZOOMs. Armed ALWAYS: keyboard negotiation
+                        // does not classify repaint geometry. vim safety lives
+                        // in the engines — their re-anchor conjunct requires a
+                        // fresh REPAINT BLINK on the alt screen (the hide-inside-
                         // DEC-2026 bracket only per-keystroke-repaint TUIs
                         // emit), so vim's hinted one-row motions keep their
                         // drama through blink-ABSENCE, not arming-absence.
                         // Both cursor engines take the hint; bracketed paste is
                         // not a Key event, so paste landings keep their jumps.
-                        let enter_like = {
-                            use aterm_types::keyboard::{Key as TKey, NamedKey as TNamed};
-                            matches!(
-                                &ev,
-                                InputEvent::Key {
-                                    key: TKey::Named(TNamed::Enter),
-                                    ..
-                                }
-                            )
-                        };
                         // Alt-gated: agent-composer insert-newline lives on the alt
                         // screen; in a plain (main-screen) shell Shift+Enter IS Enter
-                        // and keeps its meteor (adversarial review).
+                        // and keeps its meteor.
                         let shift_enter_insert = enter_like && !typed_enter && is_alt;
                         if typed_forward == Some(true) && (!enter_like || shift_enter_insert) {
                             ws.cursor_glow.note_typed(input_now);
                             ws.cursor_trail.note_typed(input_now);
                             // CLICK AT THE KEY, not at the echo (touch-to-glass
-                            // audio). The typing click used to be born at the
-                            // engine's SPAWN edge — after key → PTY → shell → PTY
-                            // → parse → the next presented frame — so under a
-                            // flood (the reader holds the term lock through whole
-                            // bursts) or on any remote link it landed tens to
-                            // hundreds of milliseconds after the finger moved, on
-                            // top of the ~21 ms the audio queue already carries.
-                            // Past ~20 ms a click stops feeling attached to the
-                            // key, which is exactly the "typing feels slow"
-                            // report. The engine spends the credit when the echo
-                            // finally spawns, so the character still clicks
+                            // audio): past ~20 ms a click stops feeling attached
+                            // to the key, and echo time can lag by tens to
+                            // hundreds of milliseconds under a flood or on a
+                            // remote link. The engine spends the credit when the
+                            // echo finally spawns, so the character still clicks
                             // exactly once.
                             //
                             // EXACTLY this arm: the same printable-glyph set that
@@ -2418,20 +1782,10 @@ impl App {
                         // re-anchor the NEXT legit jump. RAINBOW RETURN: plain
                         // Enter intentionally stays a real row-change jump, so
                         // Nyan turns the submitted newline into its official
-                        // short rainbow snap/ZOOM. The glow's clear_typed also drops a
-                        // dangling backspace quench hint (THE METEOR EATER: a
-                        // no-move backspace's surviving pairing used to
-                        // "re-anchor" a following Ctrl-A/E and eat its meteor).
-                        let tab_key = {
-                            use aterm_types::keyboard::{Key as TKey, NamedKey as TNamed};
-                            matches!(
-                                &ev,
-                                InputEvent::Key {
-                                    key: TKey::Named(TNamed::Tab),
-                                    ..
-                                }
-                            )
-                        };
+                        // short rainbow snap/ZOOM. The glow's clear_typed also
+                        // drops a dangling backspace quench hint, so a no-move
+                        // backspace's surviving pairing cannot "re-anchor" a
+                        // following Ctrl-A/E and eat its meteor.
                         // Tab joins the disarm set: with the re-anchor now
                         // accepting dr == 0 (the box-growth wrap), a completion
                         // landing after Tab must not pair with the previous
@@ -2457,13 +1811,11 @@ impl App {
                         // it (same stamp ⇒ the two instances stay in lockstep), and
                         // fires the "oops" on a live cat.
                         //
-                        // FORWARD momentum no longer builds HERE (M2): a keystroke
-                        // alone is not proof of typed text — a password prompt
-                        // echoes nothing, vim vertical navigation echoes a non-
-                        // forward move — yet the old key-only feed summoned the cat
-                        // over a dark (non-advancing) ribbon whenever the glow, which
-                        // is ECHO-fed, built nothing. The correlated forward build now
-                        // rides the glow's echo pulse in `tick_cursor_fx`
+                        // FORWARD momentum never builds HERE: a keystroke alone
+                        // is not proof of typed text (a password prompt echoes
+                        // nothing, vim vertical navigation echoes a non-forward
+                        // move). The correlated forward build rides the glow's
+                        // echo pulse in `tick_cursor_fx`
                         // ([`CursorGlow::take_momentum_pulse`]): a real printable key
                         // PAIRED with its forward/wrap/coalesced echo, the exact same
                         // event the ribbon spine builds from, so the cat and the
@@ -2483,16 +1835,15 @@ impl App {
                             // command's confirmation and would flash the secret.
                             let was_displaying = ws.predictor.is_displaying(input_now);
                             ws.predictor.note_line_submit();
-                            // `note_line_submit` no longer FLUSHES — it ends the epoch
-                            // and leaves the submitted line's in-flight guesses
-                            // painting (flushing them made the tail of the command
-                            // vanish at the exact instant of commit, one RTT before
-                            // the real echo caught up, which read as the terminal
-                            // stalling on Enter). Visibility can still CHANGE here
-                            // though: the new epoch's guesses go dark while
-                            // grandfathered ones keep their pixels, so the redraw
-                            // request stays load-bearing — it just delivers a
-                            // transition now rather than a wholesale erase.
+                            // `note_line_submit` ends the epoch WITHOUT flushing: the
+                            // submitted line's in-flight guesses keep painting
+                            // (flushing them makes the tail of the command vanish at
+                            // the exact instant of commit, one RTT before the real
+                            // echo catches up, which reads as the terminal stalling on
+                            // Enter). Visibility can still CHANGE here though: the new
+                            // epoch's guesses go dark while grandfathered ones keep
+                            // their pixels, so the redraw request stays load-bearing —
+                            // it delivers a transition rather than a wholesale erase.
                             if prediction_visibility_requires_redraw(was_displaying, false)
                                 && let Some(w) = ws.os_window.as_ref()
                             {
@@ -2538,8 +1889,8 @@ impl App {
                             // this note, and a no-echo TUI may swallow the key
                             // without any repaint — one redraw lets the next
                             // emit apply it, resume the CALM drizzle, and
-                            // re-arm (codex re-audit: pending notes must be
-                            // able to wake a drained engine).
+                            // re-arm: a pending note must be able to wake a
+                            // drained engine.
                             if !rain.is_active()
                                 && rain.notes_can_wake()
                                 && let Some(w) = ws.os_window.as_ref()
@@ -2564,7 +1915,7 @@ impl App {
                             // last presented frame until one explicit erase redraw.
                             let was_displaying = ws.predictor.is_displaying(now);
                             if no_echo {
-                                // STALE-EPOCH hardening (predict findings): a
+                                // STALE-EPOCH hardening: a
                                 // no-echo press (alt screen / app-owned Kitty mode)
                                 // registers nothing — but a confirmed_epoch
                                 // from BEFORE entering the app could otherwise
@@ -2612,44 +1963,27 @@ impl App {
                 // common inline one — so the classified cosmetic feeds below can still
                 // read it after the dispatch (see their note on why they now run AFTER
                 // the write).
-                let (outcome, wrote_inline) = if paste_order::is_ordering(sink.master()) {
-                    match paste_order::enqueue(&term, &sink, ev.clone()) {
-                        Ok(()) => (InputOutcome::Ok, false),
-                        Err(ev) => (
-                            egress_to_outcome(input::seam_egress(
-                                &term,
-                                &sink,
-                                &ev,
-                                input::EgressMode::Interactive,
-                            )),
-                            true,
-                        ),
-                    }
-                } else {
-                    (
-                        egress_to_outcome(input::seam_egress(
-                            &term,
-                            &sink,
-                            &ev,
-                            input::EgressMode::Interactive,
-                        )),
-                        true,
-                    )
-                };
+                let (egress, wrote_inline) = paste_order::ordered_or_inline(
+                    &term,
+                    &sink,
+                    &ev,
+                    input::EgressMode::Interactive,
+                );
+                let outcome = egress_to_outcome(egress);
                 // The PTY write has now RETURNED — close the key→write latency slice
                 // here (a press-path key only), so it isolates a blocking WriteFile
                 // within the end-to-end input_present interval. Paired with
                 // `note_input()` above.
                 //
                 // ONLY when the write actually ran INLINE. An enqueued key wrote
-                // nothing here: `paste_order::enqueue` just pushed a Job onto the FIFO
+                // nothing here: `paste_order::enqueue` only pushed a Job onto the FIFO
                 // and the real write happens later on the writer thread. Recording the
-                // slice at enqueue time CONSUMED the arrival stamp
-                // (`note_pty_write` does `LAT_KEY_NS.swap(0)`) and filed a
-                // few-microsecond sample for a write that had not happened — so the
-                // histogram reported its BEST numbers in exactly the case the user
-                // feels as its worst (a key typed while a paste drains), and the real
-                // write was never measured at all. Disarm instead: this is precisely
+                // slice at enqueue time would CONSUME the arrival stamp
+                // (`note_pty_write` does `LAT_KEY_NS.swap(0)`) and file a
+                // few-microsecond sample for a write that had not happened, so the
+                // histogram would report its BEST numbers in exactly the case the user
+                // feels as its worst (a key typed while a paste drains) and the real
+                // write would never be measured. Disarm instead: this is precisely
                 // the documented "dispatch ended WITHOUT a PTY write" case, and it
                 // also stops the stamp being inherited by an unrelated later `send`.
                 if !is_release {
@@ -2664,8 +1998,8 @@ impl App {
                 // None of this steers a byte: the classified press feeds the tone
                 // tracker, the sing-along run, and the typed-"kitty" detector, all of
                 // which are consumed by the render/sound tick, never by the encoder.
-                // Running it BEFORE the write put a full neural classifier on the key
-                // path — `ToneTracker::note_char` can evaluate the mood model over its
+                // Running it BEFORE the write would put a full neural classifier on the
+                // key path — `ToneTracker::note_char` can evaluate the mood model over its
                 // 160-char window (thousands of flops plus an embedding-table walk)
                 // synchronously between the keypress and the `write` syscall. Its
                 // cadence is worst where it hurts most: every few keystrokes for a fast
@@ -2675,7 +2009,7 @@ impl App {
                 // must precede the write to buy perceived latency.
                 if let Some(input_now) = input_now {
                     // TYPED-"kitty" CAMEO (the terminal twin of the Settings
-                    // §L.4 cameo): classify this committed PRESS for the
+                    // §L.4 cameo): feed this classified PRESS to the
                     // per-window detector. PRINTED characters — bare
                     // Character/Space plus committed IME Text, the same set
                     // `typed_forward` calls forward — feed the rolling window;
@@ -2694,65 +2028,12 @@ impl App {
                     // O(1) per key: a bounded 8-slot window + 5-char suffix
                     // compare, so the hottest typing path pays scalar work.
                     let summoned = {
-                        use aterm_types::keyboard::{
-                            Key as TKey, Modifiers as TMods, NamedKey as TNamed,
+                        let cosmetic_press = CosmeticFeedPress {
+                            brk,
+                            backspace,
+                            typed,
+                            ime,
                         };
-                        let mut typed: Option<char> = None;
-                        let mut ime: Option<&str> = None;
-                        let mut backspace = false;
-                        let mut brk = false;
-                        match &ev {
-                            InputEvent::Key { key, mods, .. } => {
-                                let chorded = mods.contains(TMods::CTRL)
-                                    || mods.contains(TMods::ALT)
-                                    || mods.contains(TMods::SUPER);
-                                match key {
-                                    TKey::Character(c) if !chorded => {
-                                        // The SHIFTED glyph the encoder sends
-                                        // (`Key::Character` holds the unshifted
-                                        // base) — folded to lowercase inside
-                                        // the detector, so KITTY still counts.
-                                        typed = Some(
-                                            aterm_types::keyboard::shifted_character(*c, *mods)
-                                                .unwrap_or(*c),
-                                        );
-                                    }
-                                    TKey::Named(TNamed::Space) if !chorded => typed = Some(' '),
-                                    TKey::Named(TNamed::Backspace) if !chorded => backspace = true,
-                                    // A chorded Character is an editing/nav/
-                                    // kill chord (Ctrl-U/W/K, Ctrl-A/E, Alt-B/
-                                    // F, …): it rewrote or left the word.
-                                    TKey::Character(_) => brk = true,
-                                    TKey::Named(
-                                        TNamed::Enter
-                                        | TNamed::Tab
-                                        | TNamed::Escape
-                                        | TNamed::Delete
-                                        | TNamed::Backspace
-                                        | TNamed::ArrowLeft
-                                        | TNamed::ArrowRight
-                                        | TNamed::ArrowUp
-                                        | TNamed::ArrowDown
-                                        | TNamed::Home
-                                        | TNamed::End
-                                        | TNamed::PageUp
-                                        | TNamed::PageDown,
-                                    ) => brk = true,
-                                    // Anything else (F-keys, lone modifiers,
-                                    // media keys) neither types nor edits.
-                                    _ => {}
-                                }
-                            }
-                            // A committed IME run is typed text (see the
-                            // `typed_forward` matcher above: Text is built
-                            // only by `on_ime_commit` / the human `on_key`
-                            // fallbacks, never by paste).
-                            InputEvent::Text(t) if !t.is_empty() => ime = Some(t),
-                            // Raw controller byte payloads are not classified
-                            // typing — break the run rather than guess.
-                            InputEvent::KeySequence(_) => brk = true,
-                            _ => {}
-                        }
                         // TONE-OF-TYPING feed — the SAME classified press,
                         // the same typed-provenance law (PTY output, `cat`,
                         // and pastes can never steer the melody; a break
@@ -2770,26 +2051,13 @@ impl App {
                         // when it is set (see `ToneTracker::note_char`).
                         let tone_active = self.tone_infer_active();
                         if let Some(ws) = self.windows.get_mut(&wid) {
-                            if brk {
-                                ws.tone_tracker.note_break();
-                            } else if backspace {
-                                ws.tone_tracker.note_backspace(session);
-                            } else {
-                                if let Some(c) = typed {
-                                    ws.tone_tracker
-                                        .note_char(input_now, session, c, tone_active);
-                                }
-                                if let Some(t) = ime {
-                                    for c in t.chars() {
-                                        ws.tone_tracker.note_char(
-                                            input_now,
-                                            session,
-                                            c,
-                                            tone_active,
-                                        );
-                                    }
-                                }
-                            }
+                            feed_classified_press(
+                                &mut ws.tone_tracker,
+                                cosmetic_press,
+                                |tone| tone.note_break(),
+                                |tone| tone.note_backspace(session),
+                                |tone, c| tone.note_char(input_now, session, c, tone_active),
+                            );
                         }
                         // FULL-NYAN SING-ALONG feed (`aterm_effects::nyan_sing`)
                         // — the SAME classified press, the same typed-
@@ -2802,22 +2070,15 @@ impl App {
                         // break key releases too — each release a graceful
                         // wind-down, never a hard cut. O(1) scalar state per
                         // key. Style gating (the Nyan trail) is consumption-
-                        // side policy in `redraw_native_window`.
+                        // side policy in `redraw_window`.
                         if let Some(ws) = self.windows.get_mut(&wid) {
-                            if brk {
-                                ws.nyan_sing.note_break(input_now);
-                            } else if backspace {
-                                ws.nyan_sing.note_backspace(input_now);
-                            } else {
-                                if let Some(c) = typed {
-                                    ws.nyan_sing.note_char(input_now, session, c);
-                                }
-                                if let Some(t) = ime {
-                                    for c in t.chars() {
-                                        ws.nyan_sing.note_char(input_now, session, c);
-                                    }
-                                }
-                            }
+                            feed_classified_press(
+                                &mut ws.nyan_sing,
+                                cosmetic_press,
+                                |sing| sing.note_break(input_now),
+                                |sing| sing.note_backspace(input_now),
+                                |sing, c| sing.note_char(input_now, session, c),
+                            );
                         }
                         // The detector needs the compiled lexicon (multilingual
                         // feline + profanity) while `windows` is borrowed mutably;
@@ -2830,36 +2091,31 @@ impl App {
                             .map(|rs| rs.cfg.scan_opts())
                             .unwrap_or_default();
                         match (self.windows.get_mut(&wid), lexicon) {
-                            (Some(ws), _) if brk => {
-                                ws.kitty_summon.note_break();
-                                crate::kitty_summon::TypedHit::default()
-                            }
-                            (Some(ws), _) if backspace => {
-                                ws.kitty_summon.note_backspace(session);
-                                crate::kitty_summon::TypedHit::default()
-                            }
-                            (Some(ws), Some(lx)) => {
+                            (Some(ws), lexicon) => {
+                                // `merge` fold across one IME commit: a granted
+                                // record outranks a cooldown-only cameo, and
+                                // both family reactions are kept
+                                // (`TypedHit::default()` is `merge`'s
+                                // identity). Sparkle words off ⇒ no vocabulary,
+                                // no reactions — break/backspace still maintain
+                                // the detector window.
                                 let mut fired = crate::kitty_summon::TypedHit::default();
-                                if let Some(c) = typed {
-                                    fired = ws
-                                        .kitty_summon
-                                        .note_char(input_now, session, c, &lx, &opts);
-                                }
-                                if let Some(t) = ime {
-                                    for c in t.chars() {
-                                        // `merge`: across one IME commit, a granted
-                                        // record outranks a cooldown-only cameo, and
-                                        // both family reactions are kept.
-                                        fired = fired.merge(
-                                            ws.kitty_summon
-                                                .note_char(input_now, session, c, &lx, &opts),
-                                        );
-                                    }
-                                }
+                                feed_classified_press(
+                                    &mut ws.kitty_summon,
+                                    cosmetic_press,
+                                    |kitty| kitty.note_break(),
+                                    |kitty| kitty.note_backspace(session),
+                                    |kitty, c| {
+                                        if let Some(lx) = lexicon.as_ref() {
+                                            fired = fired.merge(
+                                                kitty.note_char(input_now, session, c, lx, &opts),
+                                            );
+                                        }
+                                    },
+                                );
                                 fired
                             }
-                            // Sparkle words off ⇒ no vocabulary, no reactions.
-                            _ => crate::kitty_summon::TypedHit::default(),
+                            (None, _) => crate::kitty_summon::TypedHit::default(),
                         }
                     };
                     // The cameo is owed on EVERY completion; only the ledger row
@@ -2867,10 +2123,9 @@ impl App {
                     if summoned.summon.shows_cameo() {
                         self.summon_typed_kitty(wid, session, input_now, summoned.summon.records());
                     }
-                    // COMPANION REACTIONS (owner, 2026-07-26: "I want the cursor
-                    // kitty to react to `fuck` and `kitty` words. This must also
-                    // work multilingual"). Expression only — the session's kitty
-                    // never changes identity for a typed word.
+                    // COMPANION REACTIONS (multilingual, via the lexicon scan
+                    // above). Expression only — the session's kitty never changes
+                    // identity for a typed word.
                     if summoned.feline || summoned.profanity {
                         self.react_typed_word(wid, input_now, summoned);
                     }
@@ -2896,7 +2151,7 @@ impl App {
                 }
                 // A held-button drag with tracking OFF grows the local selection
                 // (regardless of mode — finishing a drag the app started tracking
-                // mid-gesture still settles locally, matching the old handler).
+                // mid-gesture still settles locally).
                 if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
                     self.drag_selection(wid, row, col);
                     return InputOutcome::Ok;
@@ -3519,7 +2774,7 @@ impl App {
     /// event) echoes the new size to the window (`apply_grid_resize` ->
     /// `request_inner_size`); the winit `Resized` handler (window already this size)
     /// applies just the term+PTY+framebuffer (`apply_term_resize`) so it never fights
-    /// an interactive edge-drag — the RES-1 regression fix. A `Resized` for a SHARED
+    /// an interactive edge-drag. A `Resized` for a SHARED
     /// (Cmd-Shift-O) session is driven to the element-wise min across co-viewers
     /// inside `apply_term_resize` so it can't corrupt the other viewer's display.
     fn input_resize(
@@ -3592,7 +2847,7 @@ impl App {
         }
     }
 
-    /// BUG 9: record that this key's PRESS was CONSUMED by a GUI gate (it produced no
+    /// Record that this key's PRESS was CONSUMED by a GUI gate (it produced no
     /// PTY key-press report), so [`on_key`]'s release branch swallows the matching
     /// RELEASE instead of leaking an orphan Kitty `REPORT_EVENT_TYPES` release report.
     /// Keyed on the winit PHYSICAL key (stable across the press↔release pair regardless
@@ -3820,6 +3075,22 @@ impl App {
         }
     }
 
+    /// One press-disposition tail for [`on_key`]'s gate chain: a gate that
+    /// consumed a genuine press either captures a repeatable action
+    /// ([`Self::note_local_repeat_press`]) or records a plain consumed press
+    /// ([`Self::note_consumed_press`]).
+    fn note_press_disposition(
+        &mut self,
+        wid: WindowId,
+        ev: &KeyEvent,
+        repeat: Option<crate::LocalRepeatAction>,
+    ) {
+        match repeat {
+            Some(action) => self.note_local_repeat_press(wid, ev.physical_key, action),
+            None => self.note_consumed_press(wid, ev),
+        }
+    }
+
     /// Apply one captured local repeat only while its original owner identity
     /// remains live. A stale owner returns `false` and is silently retained until
     /// release; it can never fall through into newly focused content.
@@ -3980,7 +3251,7 @@ impl App {
         }
     }
 
-    /// BUG 9 addendum: whether `physical_key`'s press is currently tracked as
+    /// Whether `physical_key`'s press is currently tracked as
     /// GUI-consumed — a PEEK ([`take_consumed_release`] without the remove), for
     /// [`on_key`]'s repeat fall-through swallow. The repeat must NOT un-track the key:
     /// the eventual RELEASE still needs the entry to be swallowed itself.
@@ -4116,7 +3387,7 @@ impl App {
         true
     }
 
-    /// BUG 9: if `physical_key`'s PRESS was recorded as GUI-consumed (by
+    /// If `physical_key`'s PRESS was recorded as GUI-consumed (by
     /// [`note_consumed_press`]), REMOVE it and return `true` so [`on_key`]'s release
     /// branch swallows the matching RELEASE without encoding — suppressing the orphan
     /// Kitty `REPORT_EVENT_TYPES` release report. Removing on the FIRST release keeps
@@ -4262,25 +3533,30 @@ impl App {
                 mods,
                 base_layout,
             } => {
-                // Preserve the pre-fix input-activity semantics for a genuine
-                // forwarded release while avoiding all current-window routing.
-                self.note_update_handoff_activity();
+                // A key RELEASE is the same tolerated key traffic as its press:
+                // `input_to_session` and the window-event seam both buffer
+                // `Key`/`KeyboardInput` events (all event types) through a
+                // pending seamless-update overlap, so this out-of-band release
+                // path must not bump the activity epoch (which falsifies the
+                // `exact_activity` Commit fact) or poke the overlap's cancel
+                // channel.
+                self.note_update_handoff_tolerated_activity();
                 #[cfg(test)]
                 let trace_key = key.clone();
                 #[cfg(not(test))]
                 let _ = window;
                 // BYTE-SILENT RELEASE: unless the app negotiated Kitty
                 // `REPORT_EVENT_TYPES`, `encode_key_with_layout` returns an EMPTY
-                // vec for a Release — so in essentially every shell the main thread
-                // was taking the terminal mutex (the one lock it shares with the PTY
-                // reader's `process()` bouts) once per key-up purely to encode
-                // nothing. The press published that answer lock-free
-                // (`publish_release_relevance`), so a proven-silent release now
-                // skips the seam entirely. Byte-identical by construction: the seam
+                // vec for a Release, so in essentially every shell taking the seam
+                // costs the terminal mutex (the one lock the main thread shares with
+                // the PTY reader's `process()` bouts) once per key-up purely to
+                // encode nothing. The press published that answer lock-free
+                // (`publish_release_relevance`), so a proven-silent release skips
+                // the seam entirely. Byte-identical by construction: the seam
                 // writes nothing and reports `Delivery::Full` ("nothing to deliver
                 // and nothing lost") for exactly this case, which is the verdict
                 // synthesized here. `None` (nothing sampled for this session) keeps
-                // the old ask-the-engine path.
+                // the ask-the-engine path.
                 let byte_silent = sampled_release_relevance(session) == Some(false);
                 let Some(session) = self.pool.get(session) else {
                     return;
@@ -4300,23 +3576,14 @@ impl App {
                     // Nothing to order behind a draining paste either: an event that
                     // encodes to zero bytes cannot overtake anything.
                     input::Egress::Reported(input::Delivery::Full)
-                } else if paste_order::is_ordering(session.ctx.sink.master()) {
-                    match paste_order::enqueue(&session.term, &session.ctx.sink, event) {
-                        Ok(()) => input::Egress::Reported(input::Delivery::Full),
-                        Err(event) => input::seam_egress(
-                            &session.term,
-                            &session.ctx.sink,
-                            &event,
-                            input::EgressMode::Interactive,
-                        ),
-                    }
                 } else {
-                    input::seam_egress(
+                    paste_order::ordered_or_inline(
                         &session.term,
                         &session.ctx.sink,
                         &event,
                         input::EgressMode::Interactive,
                     )
+                    .0
                 };
                 #[cfg(test)]
                 {
@@ -4550,43 +3817,41 @@ impl App {
         if ev.state != ElementState::Pressed {
             // Key RELEASE. Only the Kitty keyboard protocol's event-type reporting
             // (REPORT_EVENT_TYPES) consumes it; forward it straight to the seam encoder,
-            // which emits a release report ONLY in that mode and NOTHING in legacy/default
-            // mode — so non-Kitty behaviour is byte-identical to the old early-return. The
-            // shortcut / keybinding / IME / Cmd handling below is press-only and is
-            // intentionally skipped; the seam's press side-effects are gated off a release.
+            // which emits a release report ONLY in that mode and NOTHING in
+            // legacy/default mode. The shortcut / keybinding / IME / Cmd handling below
+            // is press-only and is intentionally skipped; the seam's press side-effects
+            // are gated off a release.
             //
-            // BUG 9 — orphan-release suppression: if this key's PRESS was CONSUMED by a
+            // ORPHAN-RELEASE SUPPRESSION: if this key's PRESS was CONSUMED by a
             // GUI gate (settings/search mode, a keybinding `Action`, a `[key_sequences]`
             // raw-byte rule, a Cmd/Super shortcut, a scrollback / pane-focus / font-zoom
             // chord, or an IME-suppressed key) it produced NO PTY key-press report, so
             // its RELEASE must not be encoded either — otherwise a Kitty
-            // `REPORT_EVENT_TYPES` app would receive a release for a key it never saw
-            // pressed (breaking the protocol's press/release pairing). Tracking the
-            // PHYSICAL key from the press (rather than re-evaluating the gates here) is
-            // TOCTOU-safe: modifier state can differ between press and release, so a
-            // re-check on the live `mods` could miss the swallow. Checked FIRST so the
-            // entry is always removed (no stale key can survive to mis-gate a later
-            // press's release). Legacy/non-Kitty releases encode to nothing, so this is a
-            // byte-identical no-op there. `[key_sequences]` presses are tracked here too
-            // (noted at the press site that actually sent the mapped raw bytes): the old
-            // release-time chord RE-LOOKUP was itself a TOCTOU hole — a chord formed
-            // mid-hold swallowed a release the app was owed (orphan press), and a chord
-            // broken mid-hold leaked a release for a press the app never saw.
+            // `REPORT_EVENT_TYPES` app receives a release for a key it never saw
+            // pressed (breaking the protocol's press/release pairing). The disposition
+            // is tracked from the PHYSICAL key at press time and must NEVER be
+            // re-derived here from the live gates: modifier state can differ between
+            // press and release, so a chord formed mid-hold would swallow a release the
+            // app is owed and a chord broken mid-hold would leak a release for a press
+            // the app never saw. Checked FIRST so the entry is always removed (no stale
+            // key can survive to mis-gate a later press's release). Legacy/non-Kitty
+            // releases encode to nothing, so this is a byte-identical no-op there.
+            // `[key_sequences]` presses are tracked here too, noted at the press site
+            // that actually sent the mapped raw bytes.
             self.release_physical_press(wid, ev.physical_key);
             return;
         }
         // A repeat belongs to the physical PRESS epoch, not to the content,
         // focus, modifiers, or keybinding state visible when winit delivers it.
-        // Route it before even resetting this arrival window's blink: doing so
-        // later let terminal-A holds type/animate/dispatch into terminal-B or a
-        // native tab and caused both injected ESC bytes and cursor oscillation.
+        // Route it before even resetting this arrival window's blink: routing any
+        // later lets a terminal-A hold type/animate/dispatch into terminal-B or a
+        // native tab.
         if ev.repeat {
             self.route_physical_repeat(wid, ev.physical_key);
             return;
         }
         // The current modifier state for this window (a `Copy` snapshot, so the
-        // borrow does not outlive the read). No such window ⇒ nothing to do
-        // (mirrors the old "no window" no-op).
+        // borrow does not outlive the read). No such window ⇒ nothing to do.
         let Some(mods) = self.windows.get(&wid).map(|ws| ws.mods) else {
             return;
         };
@@ -4600,24 +3865,20 @@ impl App {
         // modal. `on_key_settings_mode` returns `true` for every key while the panel is up.
         let overlay_repeat = self.palette_repeat_event(wid, &ev);
         if self.on_key_overlay_mode(wid, mods, &ev) {
-            if let Some(event) = overlay_repeat {
-                self.note_local_repeat_press(
-                    wid,
-                    ev.physical_key,
-                    crate::LocalRepeatAction::Palette(event),
-                );
-            } else {
-                self.note_consumed_press(wid, &ev);
-            }
+            self.note_press_disposition(
+                wid,
+                &ev,
+                overlay_repeat.map(crate::LocalRepeatAction::Palette),
+            );
             return;
         }
         // NATIVE KEYBOARD OWNERSHIP: once a native view is frontmost, classify
         // host commands and lower the key into the engine-neutral input seam
         // BEFORE any terminal vi/find/raw-sequence/PTY shortcut path can observe
         // it. This is the physical-winit counterpart of `App::input`'s native
-        // boundary; without it Cmd-S/Cmd-Z were swallowed as unknown macOS
-        // commands and a configured `[key_sequences]` rule could still write raw
-        // bytes to the parked terminal beneath an editor or Settings tab.
+        // boundary: it claims Cmd-S/Cmd-Z for the native view and stops a
+        // configured `[key_sequences]` rule writing raw bytes to the parked
+        // terminal beneath an editor or Settings tab.
         if self.on_key_native_mode(wid, mods, &ev) {
             return;
         }
@@ -4625,9 +3886,8 @@ impl App {
         // lookup is O(1) and SKIPPED entirely when no bindings are configured
         // (the empty-map default), so the hardcoded path below is byte-identical
         // with no config. A configured chord dispatches its action and returns; a
-        // MISS falls through to the hardcoded matches, so an unbound key (or a
-        // key the user did NOT remap) behaves exactly as before. Keybindings are
-        // GLOBAL; dispatch is threaded with the routed `wid`.
+        // MISS falls through to the hardcoded matches. Keybindings are GLOBAL;
+        // dispatch is threaded with the routed `wid`.
         if !self.keybindings.is_empty() || !self.key_sequences.is_empty() {
             // Match on the modifier-independent BASE key (e.g. `]` under Shift, not `}`)
             // so a binding the user wrote matches across layouts — the same base key
@@ -4684,11 +3944,7 @@ impl App {
                         _ => None,
                     });
                     self.dispatch_action(wid, action);
-                    if let Some(action) = repeat_action {
-                        self.note_local_repeat_press(wid, ev.physical_key, action);
-                    } else {
-                        self.note_consumed_press(wid, &ev);
-                    }
+                    self.note_press_disposition(wid, &ev, repeat_action);
                     return;
                 }
                 keybinding::ChordResolution::Sequence(bytes) => {
@@ -4702,14 +3958,11 @@ impl App {
                         // Literal sequences have their own press-time owner. A genuine
                         // press captures the exact session + bytes; its repeats reuse
                         // that route and its release stays silent (raw bytes have no
-                        // Kitty release peer). A repeat that merely CHANGED into this
-                        // chord mid-hold is swallowed: it must neither replace an
-                        // existing encoded-key disposition nor inject raw bytes into a
-                        // newly focused tab.
-                        if ev.repeat {
-                            let _ = self.repeat_literal(wid, ev.physical_key);
-                            return;
-                        }
+                        // Kitty release peer). Repeats never reach this arm: `on_key`
+                        // routes every repeat through `route_physical_repeat` at the
+                        // top, which owns the mid-hold chord-change case (a repeat
+                        // must neither replace an existing encoded-key disposition
+                        // nor inject raw bytes into a newly focused tab).
                         self.forward_literal_press(
                             wid,
                             ev.physical_key,
@@ -4728,15 +3981,11 @@ impl App {
         // pane chords still work on the vi selection. A no-op when vi mode is inactive.
         let vi_repeat = self.vi_repeat_action(wid, mods, &ev);
         if self.on_key_vi_mode(wid, mods, &ev) {
-            if let Some((session, action)) = vi_repeat {
-                self.note_local_repeat_press(
-                    wid,
-                    ev.physical_key,
-                    crate::LocalRepeatAction::Vi { session, action },
-                );
-            } else {
-                self.note_consumed_press(wid, &ev);
-            }
+            self.note_press_disposition(
+                wid,
+                &ev,
+                vi_repeat.map(|(session, action)| crate::LocalRepeatAction::Vi { session, action }),
+            );
             return;
         }
         // Terminal Emacs navigation: native content, configured bindings, and vi copy
@@ -4799,15 +4048,13 @@ impl App {
         let search_repeat = self.search_repeat_action(wid, mods, &ev);
         let search_session = self.front_terminal(wid).map(|terminal| terminal.session);
         if self.on_key_search_mode(wid, mods, &ev) {
-            if let (Some(session), Some(action)) = (search_session, search_repeat) {
-                self.note_local_repeat_press(
-                    wid,
-                    ev.physical_key,
-                    crate::LocalRepeatAction::Search { session, action },
-                );
-            } else {
-                self.note_consumed_press(wid, &ev);
-            }
+            self.note_press_disposition(
+                wid,
+                &ev,
+                search_session
+                    .zip(search_repeat)
+                    .map(|(session, action)| crate::LocalRepeatAction::Search { session, action }),
+            );
             return;
         }
         // Cmd-C -> copy the selection to the system clipboard (before the
@@ -4822,26 +4069,23 @@ impl App {
             return;
         }
         // Any key press past this point jumps the viewport back to the live view
-        // if scrolled into history. The TERMINAL half of that snap is no longer
-        // taken here for keys that continue into the seam: `self.input` /
+        // if scrolled into history. The TERMINAL half of that snap is deliberately
+        // NOT taken here for keys that continue into the seam: `self.input` /
         // `forward_literal_press` reach the consolidated "ONE term-lock scope for
         // every press-path terminal touch", which performs byte-for-byte the same
-        // `display_offset() != 0` test under a lock it has to take anyway. The
-        // unconditional `snap_to_bottom` was left behind when that consolidation
-        // landed INSIDE the seam, so a plain keystroke paid a whole extra
-        // terminal-mutex acquisition — queued behind the PTY reader's `process()`
-        // holds during an output flood — to redo work the seam was about to do.
-        // The arms that END the press here (Cmd-V, font zoom, IME suppression, the
-        // bare-Cmd swallow, the un-encodable tail) never reach the seam and so keep
-        // an explicit `snap_to_bottom`, at exactly the point the old single call
-        // ran relative to their own side-effects.
+        // `display_offset() != 0` test under a lock it has to take anyway — a
+        // `snap_to_bottom` here would cost a plain keystroke a whole extra
+        // terminal-mutex acquisition, queued behind the PTY reader's `process()`
+        // holds during an output flood. The arms that END the press here (Cmd-V,
+        // font zoom, IME suppression, the bare-Cmd swallow, the un-encodable tail)
+        // never reach the seam and so keep an explicit `snap_to_bottom`, each
+        // placed relative to its own side-effects.
         //
         // The WINDOW half stays unconditional and needs NO terminal lock: M1's
         // "typing snaps INSTANTLY" cancels any in-flight wheel glide, elastic
         // overscroll bounce, and banked sub-row residual, so an eased momentum tail
         // cannot scroll the viewport back off the prompt a moment after the key
-        // landed. The seam only touches the terminal, so dropping this half with
-        // the lock would have silently reinstated exactly that bug.
+        // landed. The seam only touches the terminal, so this half must stay here.
         self.cancel_press_scroll_motion(wid);
         //
         // Cmd-V -> paste the system clipboard (bracketed when the app enabled
@@ -4859,21 +4103,16 @@ impl App {
         }
         let zoom_repeat = font_zoom_repeat_action(mods, &ev);
         // Snapped off the SAME classifier `on_key_font_zoom` matches on, not off
-        // its return value: the snap has to precede the zoom's re-grid, exactly as
-        // it did when one unconditional call sat above this arm.
+        // its return value: the snap has to precede the zoom's re-grid.
         if zoom_repeat.is_some() {
             self.snap_to_bottom(wid);
         }
         if self.on_key_font_zoom(mods, &ev) {
-            if let Some(action) = zoom_repeat {
-                self.note_local_repeat_press(
-                    wid,
-                    ev.physical_key,
-                    crate::LocalRepeatAction::FontZoom(action),
-                );
-            } else {
-                self.note_consumed_press(wid, &ev);
-            }
+            self.note_press_disposition(
+                wid,
+                &ev,
+                zoom_repeat.map(crate::LocalRepeatAction::FontZoom),
+            );
             return;
         }
         // IME-1: while a composition (CJK / dead key) is in flight, SUPPRESS the
@@ -4881,16 +4120,14 @@ impl App {
         // text arrives via `Ime::Commit` (encoded through the same engine path).
         // Without this the composing keys would ALSO emit raw bytes (double
         // input). ASCII typing with no active composition is unaffected (preedit
-        // is empty), so normal keys still send below. The Ctrl+letter `& 0x1f`
-        // branch is intentionally GONE: K-1 routing (below) encodes Ctrl, Alt,
-        // named keys, and Kitty CSI-u via the engine's `keymap` encoder.
+        // is empty), so normal keys still send below.
         if self
             .windows
             .get(&wid)
             .is_some_and(|ws| keymap::suppress_direct_send(&ws.preedit))
         {
-            // A composing key never reaches the seam, so it snaps here (HEAD parity:
-            // typing into an IME composition still jumps back to the live view).
+            // A composing key never reaches the seam, so it snaps here: typing into
+            // an IME composition still jumps back to the live view.
             self.snap_to_bottom(wid);
             self.note_consumed_press(wid, &ev);
             return;
@@ -4941,20 +4178,14 @@ impl App {
         // platform lock state into the Kitty modifier byte (WIRE-MODIFIERS).
         let km_mods = keymap::modifiers_from_winit(mods) | keymap::lock_modifiers();
         if let Some((key, km_mods, base_layout)) = keymap::build_key_input(&ev, km_mods) {
-            // Press vs auto-REPEAT (winit sets `ev.repeat` for OS key-repeat). Only the
-            // Kitty protocol's REPORT_EVENT_TYPES distinguishes them; the legacy encoder
-            // ignores `event_type`, so a repeat stays byte-identical there (and the
-            // press-like side-effects still run — a repeat is repeated typing). A RELEASE
-            // is handled at the top of this fn.
-            let event_type = if ev.repeat {
-                aterm_types::keyboard::KeyEventType::Repeat
-            } else {
-                aterm_types::keyboard::KeyEventType::Press
-            };
+            // Always a genuine PRESS: `on_key` routes every auto-repeat through
+            // `route_physical_repeat` and every RELEASE through
+            // `release_physical_press` at the top of this fn, so neither can
+            // reach this encoder call.
             self.note_forwarded_press_key(
                 wid,
                 ev.physical_key,
-                ev.repeat,
+                false,
                 key.clone(),
                 km_mods,
                 base_layout,
@@ -4965,7 +4196,7 @@ impl App {
                     key,
                     mods: km_mods,
                     base_layout,
-                    event_type,
+                    event_type: aterm_types::keyboard::KeyEventType::Press,
                 },
                 Source::Human,
             );
@@ -4988,8 +4219,8 @@ impl App {
         // no valid peer and must be swallowed even if its release-time logical
         // mapping differs. This tail is REACHED by every bare modifier press
         // (winit reports Shift/Ctrl/… as key events and `build_key_input` maps
-        // them to nothing), and those snapped the viewport before the seam owned
-        // the snap — keep that: the human parity is "any key press jumps to live".
+        // them to nothing), which never reaches the seam — so it must snap here:
+        // the human parity is "any key press jumps to live".
         self.snap_to_bottom(wid);
         self.note_consumed_press(wid, &ev);
     }
@@ -5033,17 +4264,14 @@ impl App {
                 }
                 // Cmd-Shift-D: split the FOCUSED pane HORIZONTALLY (panes stacked
                 // top/bottom). This is the default chord for `Action::SplitHorizontal`
-                // (keybinding parity). The multi-window "view active session in a
-                // second window" affordance was RELOCATED to Cmd-Shift-O (below) to
-                // resolve the Cmd-Shift-D double-binding.
+                // (keybinding parity).
                 "d" | "D" => {
                     self.split_focused_pane(pane::SplitDir::Horizontal);
                     return true;
                 }
                 // Cmd-Shift-O "Open Active Session in New Window": show the
                 // frontmost window's active session in a SECOND window (same live
-                // grid in two windows). RELOCATED here from Cmd-Shift-D (which is
-                // now SplitHorizontal). `on_key` has no `ActiveEventLoop`, so post a
+                // grid in two windows). `on_key` has no `ActiveEventLoop`, so post a
                 // Wake; the `user_event` arm (which has `el`) runs the attach +
                 // OS-window create.
                 "o" | "O" => {
@@ -5108,12 +4336,12 @@ impl App {
                 // common Cmd chord with no keyboard fallback. Post the same
                 // Wake the menu item posts: on_quit_requested (needs the `el`
                 // only user_event has) shows the same confirm dialog, so both
-                // entries stay behaviorally identical. Repeats are dropped — a
-                // held Cmd-Q must not queue a second confirm behind the modal.
+                // entries stay behaviorally identical. A held Cmd-Q cannot
+                // queue a second confirm behind the modal: `on_key` routes
+                // every repeat through `route_physical_repeat` before any
+                // chord path, which replays the consumed-press disposition.
                 "q" => {
-                    if !ev.repeat
-                        && let Some(proxy) = self.proxy.as_ref()
-                    {
+                    if let Some(proxy) = self.proxy.as_ref() {
                         let _ = proxy.send_event(Wake::MenuAction {
                             action: crate::menu::MenuAction::Quit,
                         });
@@ -5196,9 +4424,9 @@ impl App {
     /// so word motion lives on `⌥`+ARROW only.
     ///
     /// The trailing text arm accepts only PRINTABLE text: `ev.text` carries `"\u{1b}"`
-    /// for ⎋, `"\r"` for ⏎ and `"\t"` for ⇥ (winit's `NamedKey::to_text`), and inserting
-    /// those made ⎋ type an escape into the query instead of closing the bar — the named
-    /// keys below it are commands, never content.
+    /// for ⎋, `"\r"` for ⏎ and `"\t"` for ⇥ (winit's `NamedKey::to_text`), and those
+    /// named keys are commands here, never content — inserting their payloads would
+    /// type an escape into the query instead of closing the bar.
     fn search_repeat_action(
         &self,
         wid: WindowId,
@@ -5435,7 +4663,7 @@ impl App {
     ) -> Option<(u64, crate::vi_keys::ViAction)> {
         // Copy-mode is off for every terminal ⇒ no key can be a vi repeat. Answered
         // from the GUI-side mirror so the common keystroke takes NO terminal lock
-        // here (this read used to queue behind the PTY reader during a flood).
+        // here (which would queue behind the PTY reader during a flood).
         if !vi_any_active() {
             return None;
         }
@@ -5462,9 +4690,9 @@ impl App {
     /// state. Called from `on_key` right after the keybinding block, so `toggle_vi_mode`'s
     /// own chord is handled before this gate ever sees a key.
     fn on_key_vi_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
-        // The SECOND of the two per-keystroke `vi_is_active` reads (this one also
-        // cloned the terminal `Arc` first). Same mirror, same reason: with copy-mode
-        // off the gate must cost nothing, least of all a mutex shared with the PTY
+        // The SECOND of the two per-keystroke `vi_is_active` gates (this one also
+        // clones the terminal `Arc`). Same mirror, same reason: with copy-mode off
+        // the gate must cost nothing, least of all a mutex shared with the PTY
         // reader's output bursts.
         if !vi_any_active() {
             return false;
@@ -5593,9 +4821,8 @@ impl App {
 
     /// The SINGLE modal-overlay key gate: if an overlay is open on `wid`, delegate to the
     /// ACTIVE variant's handler and SWALLOW the key (return `true`); closed ⇒ `false` (keys
-    /// flow normally). Dispatch is by the one live variant, so there is no gate ORDERING —
-    /// the old "hidden palette swallows keys while About renders" hazard is structurally
-    /// impossible (one slot holds one surface).
+    /// flow normally). Dispatch is by the one live variant, so there is no gate ORDERING:
+    /// one slot holds one surface, and a hidden surface can never swallow keys.
     fn on_key_overlay_mode(&mut self, wid: WindowId, _mods: ModifiersState, ev: &KeyEvent) -> bool {
         use crate::overlay::OverlayKind;
         match self
@@ -6203,7 +5430,7 @@ impl App {
                 let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::About);
             }
             // Per-session: flips the FRONT session of the window the chord
-            // landed in (no longer the old app-global kill latch).
+            // landed in, not an app-global latch.
             Action::ToggleMatrixRain => self.toggle_matrix_rain(wid),
             Action::ToggleSeriousMode => {
                 self.user_toggle_serious_mode();
@@ -6246,8 +5473,8 @@ impl App {
 
     /// IME-1: tell the platform WHERE the text cursor is (winit
     /// `set_ime_cursor_area`) so the CJK / dead-key / compose CANDIDATE window
-    /// appears AT the caret instead of pinned to the window origin (the bug this
-    /// fixes on X11/Wayland). Idempotent + cheap: only calls into winit when the
+    /// appears AT the caret rather than pinned to the window origin (which is
+    /// where X11/Wayland put it otherwise). Idempotent + cheap: only calls into winit when the
     /// fully resolved PIXEL rectangle changes; a hidden cursor is left untouched.
     /// `cur` is the focused pane's cursor in pane
     /// sub-coords and `off` its window-space origin (matching the present path).
@@ -6376,1138 +5603,6 @@ impl App {
         m
     }
 
-    /// PROOF-CARRYING DSU (RFC Rung 1): APPLY a staged update now by re-execing — the
-    /// staged build swaps in at the top of the new `main` (`apply_staged_if_ready`).
-    /// Reached from `Wake::ApplyStagedUpdate` (the `aterm-ctl update apply` verb / the
-    /// GUI [Relaunch] nudge). No-op unless a STRICTLY-NEWER build is actually staged
-    /// (never a pointless restart). Rung 1b live wiring (DEFAULT-ON, opt out with
-    /// `ATERM_NO_SEAMLESS_UPDATE`): hands every live PTY master, its exact visible-screen
-    /// checkpoint, and a `SessionHandoff` manifest to the new process so the running shell survives
-    /// (the round-trip that makes that safe is
-    /// proven — `SessionHandoff` + `handoff_roundtrip_model`; the single-use nonce by
-    /// `seamless_nonce_model`). Scope: the live process, visible rows, terminal modes/cursors,
-    /// and output queued after reader park survive. Preexisting off-screen scrollback is
-    /// deliberately excluded to keep capture latency bounded. A cold relaunch is
-    /// permitted only when no foreground terminal job would be destroyed. Every path that
-    /// leaves this process alive returns an actionable failure so the updater reducer can
-    /// re-arm the verified stage instead of remaining stuck in `Applying`.
-    pub(crate) fn apply_staged_update_now(
-        &mut self,
-        safety_token: crate::app_native::NativeUpdateSafetyToken,
-        mode: crate::native_updater_service::ApplyMode,
-        apply_attempt: Option<crate::native_updater_service::ApplyAttemptTicket>,
-    ) -> Result<(), crate::UpdateHandoffStartError> {
-        if self.pending_update_handoff.is_some() {
-            return Err(crate::UpdateHandoffStartError::failed(
-                "an update handoff is already in flight",
-            ));
-        }
-        let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
-        // QA SEAM: `ATERM_DEBUG_SEAMLESS_REEXEC=1` re-execs the SAME binary (no staged
-        // build, no bundle swap) but exercises the FULL seamless handoff + adopt path, so
-        // the shell-survives-an-update contract is testable end-to-end without a release.
-        let debug_seamless = std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some();
-        if !debug_seamless && apply_attempt.is_none() {
-            let message = "no exact verified update authority was supplied".to_string();
-            aterm_log::info!("update apply: {message}");
-            return Err(crate::UpdateHandoffStartError::failed(message));
-        }
-        let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
-            Err(error) => {
-                let message = format!("current executable is unavailable: {error}");
-                aterm_log::warn!("update apply: {message}; cannot re-exec");
-                return Err(crate::UpdateHandoffStartError::failed(message));
-            }
-        };
-        aterm_log::info!("update apply: authorized process replacement from build {build}");
-        // Re-exec THIS binary; the swap to the staged build happens at the top of the
-        // new `main`. `exec` never returns on success. (Rung 1b: serialize the session
-        // + pass the PTY master fds here so the new process re-adopts them.)
-        // Hand the OLD build number to the post-update process via `ATERM_UPDATED_FROM`
-        // (inherited through `apply_staged_if_ready`'s own re-exec) so it shows the quiet
-        // cursor-themed "leveled-up" notice on startup. Read + cleared at startup so it
-        // never leaks into the user's shell children (`App::take_just_updated`).
-        #[cfg(unix)]
-        {
-            return self.start_unix_update_handoff(
-                exe,
-                build,
-                safety_token,
-                mode,
-                apply_attempt,
-                debug_seamless,
-            );
-        }
-        // Windows has no exec(2); the analog is spawn-the-new-then-exit. Dead in
-        // practice today (the updater is macOS-only, so `staged` is always None
-        // above), but kept correct for when a Windows update lane exists.
-        #[cfg(windows)]
-        {
-            let live_ptys = self.pool.iter().count();
-            let facts = crate::native_update_admission::AdmissionFacts {
-                staged_verified: debug_seamless || apply_attempt.is_some(),
-                seamless_capable: false,
-                native_state_certified: safety_token.is_certified(),
-                live_ptys,
-                foreground_jobs: 0,
-                // ConPTY currently has no exact foreground-pgrp proof. Any live
-                // session is therefore both non-cold and foreground-unknown.
-                unknown_foregrounds: live_ptys,
-            };
-            match crate::native_update_admission::classify(facts) {
-                crate::native_update_admission::AdmissionDecision::Apply(
-                    crate::native_update_admission::ApplyLane::Cold,
-                ) if live_ptys == 0 => {}
-                crate::native_update_admission::AdmissionDecision::Block(reason) => {
-                    return Err(crate::UpdateHandoffStartError::failed(
-                        reason.message(facts),
-                    ));
-                }
-                _ => {
-                    return Err(crate::UpdateHandoffStartError::failed(
-                        "Windows update replacement requires an exact zero-session state",
-                    ));
-                }
-            }
-            self.shutdown_title_summaries();
-            match {
-                let mut cmd = std::process::Command::new(exe);
-                cmd.args(std::env::args_os().skip(1))
-                    .env("ATERM_UPDATED_FROM", build.to_string());
-                bind_expected_update_artifact(&mut cmd, apply_attempt.as_ref());
-                // Same headless re-injection as the unix exec path above.
-                if self.headless {
-                    cmd.env("ATERM_HEADLESS", "1");
-                }
-                cmd.spawn()
-            } {
-                Ok(_) => std::process::exit(0),
-                Err(err) => {
-                    // A failed spawn leaves this process live. Restore a fresh exact
-                    // authority/worker after the pre-replacement shutdown.
-                    self.reconfigure_title_summaries();
-                    aterm_log::warn!("update apply: re-spawn failed: {err}");
-                    return Err(crate::UpdateHandoffStartError::failed(format!(
-                        "replacement process could not start: {err}"
-                    )));
-                }
-            }
-        }
-
-        #[allow(unreachable_code)]
-        Err(crate::UpdateHandoffStartError::failed(
-            "process replacement returned without applying the update",
-        ))
-    }
-
-    #[cfg(unix)]
-    fn start_unix_update_handoff(
-        &mut self,
-        exe: std::path::PathBuf,
-        build: u64,
-        safety_token: crate::app_native::NativeUpdateSafetyToken,
-        mode: crate::native_updater_service::ApplyMode,
-        apply_attempt: Option<crate::native_updater_service::ApplyAttemptTicket>,
-        debug_seamless: bool,
-    ) -> Result<(), crate::UpdateHandoffStartError> {
-        use std::os::unix::process::CommandExt as _;
-
-        let live: Vec<(u64, i32, i32)> =
-            self.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
-        let automatic_activity_epoch = (mode
-            == crate::native_updater_service::ApplyMode::Automatic)
-            .then_some(self.update_handoff_activity_epoch);
-        if automatic_activity_epoch.is_some()
-            && !self.automatic_update_activity_quiet(std::time::Instant::now())
-        {
-            return Err(crate::UpdateHandoffStartError::activity(
-                "terminal activity has not reached the automatic-update quiet epoch",
-            ));
-        }
-        let (foreground_jobs, unknown_foregrounds) = live.iter().fold(
-            (0usize, 0usize),
-            |(jobs, unknown), (_, master, shell_pid)| {
-                let foreground = crate::quit_safety::foreground_pgrp(*master);
-                if foreground <= 0 {
-                    (jobs, unknown + 1)
-                } else if foreground != *shell_pid {
-                    (jobs + 1, unknown)
-                } else {
-                    (jobs, unknown)
-                }
-            },
-        );
-        let overlap_available = !self.headless
-            && std::env::var_os("ATERM_NO_SEAMLESS_UPDATE").is_none()
-            && std::env::var_os("ATERM_CONTROL_SOCK").is_none()
-            && std::env::var_os("ATERM_NO_OVERLAP_HANDOFF").is_none()
-            && self.proxy.is_some();
-        let facts = crate::native_update_admission::AdmissionFacts {
-            staged_verified: debug_seamless || apply_attempt.is_some(),
-            seamless_capable: overlap_available && !live.is_empty(),
-            native_state_certified: safety_token.is_certified(),
-            live_ptys: live.len(),
-            foreground_jobs,
-            unknown_foregrounds,
-        };
-        match crate::native_update_admission::classify(facts) {
-            crate::native_update_admission::AdmissionDecision::Block(reason) => {
-                return Err(crate::UpdateHandoffStartError::failed(
-                    reason.message(facts),
-                ));
-            }
-            crate::native_update_admission::AdmissionDecision::Apply(
-                crate::native_update_admission::ApplyLane::Cold,
-            ) => {
-                // Direct exec is authorized only for an exact zero-PTY state.
-                debug_assert!(live.is_empty());
-                let mut command = std::process::Command::new(exe);
-                command
-                    .args(std::env::args_os().skip(1))
-                    .env("ATERM_UPDATED_FROM", build.to_string());
-                bind_expected_update_artifact(&mut command, apply_attempt.as_ref());
-                if self.headless {
-                    command.env("ATERM_HEADLESS", "1");
-                }
-                self.shutdown_title_summaries();
-                let error = command.exec();
-                // `exec` returns only on failure. Recreate the worker/authority so
-                // Smart Titles continue in the still-running old process.
-                self.reconfigure_title_summaries();
-                return Err(crate::UpdateHandoffStartError::failed(format!(
-                    "process replacement failed: {error}"
-                )));
-            }
-            crate::native_update_admission::AdmissionDecision::Apply(
-                crate::native_update_admission::ApplyLane::Seamless,
-            ) => {}
-        }
-
-        // PRE-VERIFY THE STAGED CANDIDATE (seamless seam 1) — codesign policy +
-        // sealed build/commit rebinding, bound to the exact authorized artifact.
-        // This authenticates a doomed candidate BEFORE the worker spawns the
-        // child, so no doomed child is ever launched. It is strictly ADDITIVE
-        // authority: the child re-runs the complete gate at swap time under the
-        // apply lock (the TOCTOU defence is unchanged; `Ok` here is a latency +
-        // warm-cache optimization, never a grant).
-        //
-        // OFF THE UI THREAD: the check is `codesign --deep` plus a bundle flock —
-        // unbounded, disk-bound work that MUST NOT run on the GUI main thread
-        // (it froze every frame before every handoff). It now runs as the
-        // worker's FIRST action (see `run_handoff_worker`), so the main thread
-        // parks readers and returns without ever blocking on codesign. A failing
-        // candidate is caught there and rolled back via the ordinary
-        // `PreparationFailed` completion (manual-only, like every other worker-
-        // stage preparation failure). The same-binary debug re-exec has no
-        // staged bundle, so it carries `verify_staged_candidate: false`.
-        //
-        // …AND BETTER STILL, OUT OF THE PARKED WINDOW ENTIRELY: when this exact
-        // artifact already passed `spawn_staged_handoff_preverification` while
-        // every reader was still live, the worker skips the repeat and the
-        // parked interval shrinks by the whole `codesign --deep` cost. A cached
-        // REFUSAL short-circuits the attempt right here, before anything parks.
-        // Never an authorization either way — the child re-runs the complete
-        // gate under the apply lock at swap time.
-        let preverified = apply_attempt.as_ref().and_then(|attempt| {
-            let cached = self
-                .handoff_preverified
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cached
-                .as_ref()
-                .filter(|entry| {
-                    entry.build == attempt.target_build()
-                        && entry.commit == attempt.target_commit()
-                        && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
-                })
-                .map(|entry| entry.passed)
-        });
-        if preverified == Some(false) {
-            return Err(crate::UpdateHandoffStartError::failed(
-                "the staged update failed verification; the terminal was left untouched",
-            ));
-        }
-        let verify_staged_candidate = !debug_seamless && preverified != Some(true);
-
-        let Some(proxy) = self.proxy.clone() else {
-            return Err(crate::UpdateHandoffStartError::failed(
-                "overlap handoff has no event-loop completion channel",
-            ));
-        };
-        let Some(reconcile_ticket) = self.mint_native_update_reconcile_ticket() else {
-            return Err(crate::UpdateHandoffStartError::failed(
-                "updater reconciliation identity space is exhausted",
-            ));
-        };
-        let Some(reconcile_worker) = self.native_update_reconcile_worker() else {
-            return Err(crate::UpdateHandoffStartError::failed(
-                "updater reconciliation worker is unavailable",
-            ));
-        };
-        // Parent master flags are an invariant, not mutable handoff state. Child
-        // inheritance is installed later by `pre_exec` on child copies only.
-        for (_, master, _) in &live {
-            if aterm_pty::set_cloexec(*master, true).is_err() {
-                return Err(crate::UpdateHandoffStartError::failed(
-                    "could not enforce CLOEXEC on every parent PTY master",
-                ));
-            }
-        }
-
-        // Capture owned structural data before parking. These projections perform
-        // no disk I/O; terminal metadata uses try_lock and degrades to empty rather
-        // than waiting behind reflow/compression.
-        let layout = self.capture_restore_manifest();
-        let manifest = match self.store.try_read() {
-            Ok(store) => crate::session_store::SessionHandoff::from_store(&store),
-            Err(std::sync::TryLockError::Poisoned(poison)) => {
-                let store = poison.into_inner();
-                crate::session_store::SessionHandoff::from_store(&store)
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(crate::UpdateHandoffStartError::failed(
-                    "session registry was busy; update handoff stayed in place",
-                ));
-            }
-        };
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
-        let mut owned_masters = Vec::with_capacity(live.len());
-        let mut adoption = Vec::with_capacity(live.len());
-        for (local_id, master, pid) in &live {
-            // SAFETY: duplicates one live parent master as an independent CLOEXEC
-            // descriptor. The original can later close/reuse its number without
-            // changing the open-file-description inherited by the child.
-            let duplicate = unsafe { libc::fcntl(*master, libc::F_DUPFD_CLOEXEC, 3) };
-            if duplicate < 0 {
-                return Err(crate::UpdateHandoffStartError::failed(
-                    "could not reserve child-only PTY descriptors",
-                ));
-            }
-            // SAFETY: F_DUPFD_CLOEXEC returned a fresh descriptor owned here.
-            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
-            adoption.push((*local_id, owned.as_raw_fd(), *pid));
-            owned_masters.push(owned);
-        }
-        let fds = crate::session_store::HandoffFds {
-            entries: adoption.clone(),
-        };
-        let window = self.windows.values().next().map(|state| {
-            let position = state
-                .os_window
-                .as_ref()
-                .and_then(|window| window.outer_position().ok());
-            crate::session_store::WindowCarry {
-                rows: state.rows,
-                cols: state.cols,
-                outer_x: position.map(|point| point.x),
-                outer_y: position.map(|point| point.y),
-            }
-        });
-
-        // Provision the worker BEFORE readers park. A resource-exhausted thread
-        // creation therefore returns with the terminal completely untouched.
-        let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
-        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<HandoffWorkerJob>(1);
-        let worker_proxy = proxy.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("aterm-update-handoff".to_string())
-            .spawn(move || {
-                if let Ok(job) = job_rx.recv() {
-                    run_handoff_worker(job, worker_proxy);
-                }
-            })
-        {
-            return Err(crate::UpdateHandoffStartError::failed(format!(
-                "overlap handoff worker could not start: {error}"
-            )));
-        }
-
-        // Close the synchronous-preparation TOCTOU immediately before the first
-        // reader stop. Activity defers automatic apply while every reader is
-        // still live; manual explicit apply bypasses only this quiet policy.
-        if automatic_activity_epoch.is_some_and(|epoch| {
-            self.update_handoff_activity_epoch != epoch
-                || !self.automatic_update_activity_quiet(std::time::Instant::now())
-                || handoff_masters_have_activity(&live)
-        }) {
-            return Err(crate::UpdateHandoffStartError::activity(
-                "input or PTY output arrived before automatic reader park",
-            ));
-        }
-        // How much of the capture window must remain before a session is willing to
-        // serialize scrollback as well as its visible screen. Half the budget: the
-        // visible screen is mandatory and cheap, history is optional and priced per
-        // line, so once the window is half gone every remaining session drops to
-        // visible-only rather than risking the deadline for a bonus. This is what
-        // makes carrying history safe to enable by default — the failure mode is
-        // "less scrollback", never "the update did not apply".
-        const HANDOFF_HISTORY_COMFORT: std::time::Duration = std::time::Duration::from_millis(10);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
-        if !self.park_all_readers(deadline) {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "a PTY reader missed the 20 ms handoff park deadline",
-            ));
-        }
-        // SEAMLESS: the post-park re-check tolerates activity that used to
-        // revoke here. A final burst consumed by a reader during the bounded
-        // park is already inside the engine, so the checkpoints captured next
-        // carry it; bytes that arrived after park wait in the kernel for the
-        // child; hardware input queued during the ~20 ms park is dispatched
-        // normally after this function returns and delivers to the still-open
-        // masters. (The activity EPOCH provably cannot move here: every bump
-        // happens on this thread, which is inside this function.) What must
-        // still reject mid-flight is session DEATH — a HUP/ERR master means
-        // the live-set identity the proof would commit to is already stale.
-        // Classified as an activity deferral (matching the old disposition for
-        // a death observed here): intent is retained and the next quiet-window
-        // attempt sees the post-exit session set.
-        if automatic_activity_epoch.is_some() && handoff_masters_closed(&live) {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::activity(
-                "a PTY session closed during automatic reader park",
-            ));
-        }
-        let mut screens = Vec::new();
-        if screens.try_reserve_exact(live.len()).is_err() {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "visible checkpoint set could not reserve bounded storage",
-            ));
-        }
-        let mut capture_failed = None;
-        let mut capture_budget = 0_u64;
-        let mut capture_cells = 0_u64;
-        for session in self.pool.iter() {
-            if std::time::Instant::now() >= deadline {
-                capture_failed = Some("bounded visible-screen capture exceeded 20 ms");
-                break;
-            }
-            let terminal = match session.term.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    capture_failed = Some("a terminal engine was busy during handoff capture");
-                    break;
-                }
-            };
-            if !terminal.parser_is_ground() {
-                capture_failed = Some("a terminal parser was mid-sequence during handoff capture");
-                break;
-            }
-            // SCROLLBACK IS BEST-EFFORT AND MUST NEVER COST THE HANDOFF.
-            //
-            // Carrying history is what stops an in-session update truncating every
-            // tab to one screen, but it is strictly a bonus: the visible screen is
-            // what adoption actually requires. So the depth is chosen per session
-            // against the REMAINING time, and collapses to zero once the window is
-            // more than half spent. Failing the handoff to protect scrollback would
-            // trade the whole update for the thing the update was carrying.
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let history = if remaining >= HANDOFF_HISTORY_COMFORT {
-                crate::seamless::max_handoff_history_lines()
-            } else {
-                0
-            };
-            // Reject decoded allocation dimensions BEFORE the checkpoint serializes
-            // anything. Conservatively reserve main+alt because querying the copied
-            // checkpoint to discover alt presence is exactly the potentially
-            // expensive work this admission must precede.
-            let per_grid = crate::seamless::admit_checkpoint_dimensions(
-                &mut capture_cells,
-                terminal.rows(),
-                terminal.cols(),
-                history,
-                true,
-            );
-            capture_budget = per_grid
-                .and_then(|bytes| bytes.checked_mul(2))
-                .and_then(|bytes| capture_budget.checked_add(bytes))
-                .unwrap_or(u64::MAX);
-            if capture_budget > 256 * 1024 * 1024 {
-                capture_failed = Some("aggregate visible-screen capture exceeded its memory cap");
-                break;
-            }
-            let Some(checkpoint) = terminal.checkpoint_carry(history as usize) else {
-                capture_failed = Some("a terminal parser left Ground during handoff capture");
-                break;
-            };
-            screens.push((session.id, checkpoint));
-            if std::time::Instant::now() >= deadline {
-                capture_failed = Some("bounded visible-screen capture exceeded 20 ms");
-                break;
-            }
-        }
-        if capture_failed.is_none() && std::time::Instant::now() >= deadline {
-            capture_failed = Some("bounded visible-screen capture exceeded 20 ms");
-        }
-        if let Some(reason) = capture_failed {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(format!(
-                "{reason}; update handoff stayed in place"
-            )));
-        }
-
-        let attempt_id = self.next_update_handoff_id;
-        let Some(next_attempt_id) = attempt_id.checked_add(1) else {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "handoff identity space is exhausted",
-            ));
-        };
-        self.next_update_handoff_id = next_attempt_id;
-        let mut command = std::process::Command::new(exe);
-        command
-            .args(std::env::args_os().skip(1))
-            .env("ATERM_UPDATED_FROM", build.to_string());
-        bind_expected_update_artifact(&mut command, apply_attempt.as_ref());
-        let target_build = apply_attempt
-            .as_ref()
-            .map_or(build, |attempt| attempt.target_build());
-        let target_commit = apply_attempt.as_ref().map_or_else(
-            || crate::build_info::GIT_COMMIT.to_string(),
-            |attempt| attempt.target_commit().to_string(),
-        );
-        let Some(layout_digest) = crate::seamless::layout_digest(&layout) else {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "handoff layout could not be committed canonically",
-            ));
-        };
-        let Some(screen_digest) = crate::seamless::screen_digest(&screens) else {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "visible checkpoint set could not be committed canonically",
-            ));
-        };
-        if std::time::Instant::now() >= deadline {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "handoff proof capture exceeded the 20 ms deadline",
-            ));
-        }
-        if self.update_handoff_activity_epoch == u64::MAX {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "handoff activity identity space is exhausted",
-            ));
-        }
-        let activity_epoch = self.update_handoff_activity_epoch;
-        let arbiter = crate::HandoffAttemptArbiter::new();
-        self.pending_update_handoff = Some(crate::PendingUpdateHandoff {
-            attempt_id,
-            nonce: None,
-            live: live.clone(),
-            adoption: adoption.clone(),
-            child_pid: None,
-            mode,
-            apply_attempt,
-            target_build,
-            target_commit: target_commit.clone(),
-            layout: layout.clone(),
-            layout_digest,
-            screen_digest,
-            activity_epoch,
-            cancel: cancel.clone(),
-            arbiter: arbiter.clone(),
-            teardown: if mode == crate::native_updater_service::ApplyMode::CleanQuit {
-                crate::DeferredHandoffTeardown::CleanQuitReady
-            } else {
-                crate::DeferredHandoffTeardown::None
-            },
-            commit_drain_started: None,
-            revoked_by_activity: false,
-        });
-        let cleanup = HandoffWorkerCleanup {
-            parent_socket: self
-                .sock_bound
-                .load(std::sync::atomic::Ordering::Acquire)
-                .then(|| {
-                    let plan = self.sock_plan.as_ref()?;
-                    Some((plan.latest_link.clone()?, plan.sock_path.clone()))
-                })
-                .flatten(),
-            reconcile: Some((reconcile_worker, reconcile_ticket)),
-        };
-        let job = HandoffWorkerJob {
-            attempt_id,
-            current_build: build,
-            target_build,
-            target_commit,
-            verify_staged_candidate,
-            command,
-            manifest,
-            fds,
-            screens,
-            window,
-            layout,
-            layout_digest,
-            screen_digest,
-            live: adoption,
-            cleanup,
-            cancel: cancelled,
-            arbiter,
-            _owned_masters: owned_masters,
-        };
-        if job_tx.send(job).is_err() {
-            self.pending_update_handoff = None;
-            let live: Vec<_> = self
-                .pool
-                .iter()
-                .map(|session| (session.id, session.master, session.pid))
-                .collect();
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "overlap handoff worker stopped before preparation",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Main-thread completion of the asynchronous overlap proof. `ProofReady` is
-    /// deliberately not sufficient by itself: native state and the exact live PTY
-    /// identity set may have changed while the child booted. Only a fresh proof plus
-    /// unchanged sessions authorizes the destructor-free parent exit.
-    #[cfg(unix)]
-    pub(crate) fn finish_update_handoff(
-        &mut self,
-        el: &ActiveEventLoop,
-        completion: crate::UpdateHandoffCompletion,
-    ) {
-        let crate::UpdateHandoffCompletion {
-            attempt_id,
-            nonce,
-            child_pid,
-            outcome,
-            commit_fd,
-            reject,
-            reconcile,
-            detail,
-            input_drain_spins,
-        } = completion;
-        let matches_pending = self
-            .pending_update_handoff
-            .as_ref()
-            .is_some_and(|pending| pending.attempt_id == attempt_id);
-        if !matches_pending {
-            // A stale proof can never authorize Commit. Ask its still-owning worker
-            // to kill/reap readerless child; never wait on the event loop.
-            let _ = deliver_handoff_rejection(reject);
-            aterm_log::warn!("update apply: ignored stale handoff completion {attempt_id}");
-            return;
-        }
-        if outcome == crate::UpdateHandoffOutcome::ProofReady {
-            {
-                let Some(pending) = self.pending_update_handoff.as_mut() else {
-                    if let Some(reject) = reject {
-                        let _ = reject.try_send(());
-                    }
-                    return;
-                };
-                pending.nonce = nonce.clone();
-                pending.child_pid = child_pid;
-            }
-            // DRAIN, DON'T DIE (seamless: OS-accepted input): hardware events
-            // accepted immediately before this callback may not yet have been
-            // dispatched through winit and would die with `_exit`. Defer Commit
-            // through a short CoreGraphics quiet epoch, using a scalar event
-            // source clock that cannot recursively pump AppKit. Re-posting this
-            // exact completion gives the run loop time to dispatch those events —
-            // their bytes flow through the tolerated input path into the
-            // still-open PTY masters — and the re-post re-runs this admission
-            // against a drained queue. Bounded by the spin cap below (sustained
-            // typing exhausts it and is then treated as activity revocation,
-            // retaining the automatic retry budget) and absolutely by the
-            // worker's 15 s decision deadline. A failed re-post means the event
-            // loop is closing; dropping the completion drops the reject sender,
-            // which the worker observes as Disconnected and rejects/reaps.
-            //
-            // …AND DON'T LEAVE IT IN A RUST QUEUE EITHER: a tolerated keystroke,
-            // once dispatched, does not go straight to the master — under a live
-            // paste it rides the per-session paste-order FIFO, and against a
-            // wedged tty it lands in the sink's spill buffer. Both are
-            // PROCESS-LOCAL: they die with `_exit` exactly like the AppKit queue.
-            // So Commit also waits until every handed-off session's egress has
-            // reached the kernel (`handoff_egress_settled`) — the drainer/writer
-            // threads flush it to the still-open master between re-posts. Same
-            // bounded, lossless defer; the fact below fences a budget-exhausted
-            // Commit so an unflushable spill fails closed (rollback) instead of
-            // `_exit`ing over undelivered bytes.
-            //
-            // WHY THIS IS NOT "WAIT FOR QUIET" ANY MORE (2026-07). The old gate
-            // demanded a 50 ms window with NO CoreGraphics hardware event
-            // anywhere in the session, respun at most 200 times. A respin costs
-            // microseconds, so the entire budget bought ~54 µs of wall clock
-            // against a 50 ms requirement: on any machine actually in use the
-            // gate could only fail, and every seamless handoff ever attempted
-            // died as `ActivityRevoked`. Worse, it was never the property that
-            // mattered — a quiet period cannot make Commit lossless, because a
-            // key can always arrive one microsecond after the check passes and
-            // before `_exit`. It only lowered the odds, at the price of the
-            // whole feature.
-            //
-            // The properties that DO matter, and are now the hard admission facts:
-            //   * DISPATCH FENCE — the main thread has run the event loop for a
-            //     bounded interval since ProofReady, so every OS event that
-            //     CoreGraphics had already accepted has been dispatched through
-            //     the tolerated input path into the still-open masters.
-            //   * EGRESS SETTLED — nothing dispatched is still sitting in a
-            //     PROCESS-LOCAL queue (paste FIFO, wedged-tty spill) that would
-            //     die with `_exit`. This is the real "no stranded bytes" check
-            //     and it is unchanged.
-            // A quiet window is still PREFERRED — it is simply no longer
-            // required, and we stop paying for it after a bounded budget.
-            const HANDOFF_INPUT_DRAIN_SPIN_CAP: u32 = 4_000;
-            /// Opportunistic gap we would LIKE to commit inside.
-            const HANDOFF_INPUT_QUIET_EPOCH: std::time::Duration =
-                std::time::Duration::from_millis(15);
-            /// How long we are willing to wait for that gap before committing
-            /// anyway. Under a continuously-driven terminal it never comes.
-            const HANDOFF_INPUT_QUIET_BUDGET: std::time::Duration =
-                std::time::Duration::from_millis(400);
-            /// MANDATORY minimum event-loop time between ProofReady and Commit.
-            const HANDOFF_INPUT_DISPATCH_FENCE: std::time::Duration =
-                std::time::Duration::from_millis(30);
-            /// Per-respin yield, so the fence is measured in loop iterations
-            /// that really dispatched events instead of a busy spin.
-            const HANDOFF_INPUT_DRAIN_YIELD: std::time::Duration =
-                std::time::Duration::from_millis(2);
-            /// Absolute wall-clock backstop. An egress queue that never settles
-            /// must fail CLOSED (rollback), never `_exit` over undelivered bytes.
-            const HANDOFF_INPUT_DRAIN_DEADLINE: std::time::Duration =
-                std::time::Duration::from_millis(3_000);
-            // A vanished pending attempt cannot be drained toward Commit; fall
-            // straight through to the rejection path rather than respinning on
-            // a clock that would restart every iteration.
-            let drained_for = {
-                let now = std::time::Instant::now();
-                self.pending_update_handoff.as_mut().map(|pending| {
-                    now.saturating_duration_since(*pending.commit_drain_started.get_or_insert(now))
-                })
-            };
-            let drained_for = drained_for.unwrap_or(HANDOFF_INPUT_DRAIN_DEADLINE);
-            // The fence needs BOTH a completed re-post (so the loop really
-            // iterated) and the elapsed floor.
-            let input_dispatch_fenced =
-                input_drain_spins >= 1 && drained_for >= HANDOFF_INPUT_DISPATCH_FENCE;
-            let input_quiet = !crate::platform::recent_user_input_event(HANDOFF_INPUT_QUIET_EPOCH);
-            let quiet_window_settled = input_quiet || drained_for >= HANDOFF_INPUT_QUIET_BUDGET;
-            let egress_settled = self
-                .pending_update_handoff
-                .as_ref()
-                .map(|pending| pending.live.clone())
-                .is_none_or(|live| handoff_egress_settled(&self.pool, &live));
-            if (!input_dispatch_fenced || !quiet_window_settled || !egress_settled)
-                && input_drain_spins < HANDOFF_INPUT_DRAIN_SPIN_CAP
-                && drained_for < HANDOFF_INPUT_DRAIN_DEADLINE
-                && let Some(proxy) = self.proxy.clone()
-            {
-                // Yield the main thread so the run loop actually dispatches the
-                // queued NSEvents before our re-post comes back around. Cheap
-                // and bounded: the frozen frame is already parked.
-                std::thread::sleep(HANDOFF_INPUT_DRAIN_YIELD);
-                let respin = crate::UpdateHandoffCompletion {
-                    attempt_id,
-                    nonce,
-                    child_pid,
-                    outcome,
-                    commit_fd,
-                    reject,
-                    reconcile,
-                    detail,
-                    input_drain_spins: input_drain_spins.saturating_add(1),
-                };
-                let _ = proxy.send_event(Wake::UpdateHandoffFinished(respin));
-                return;
-            }
-            let Some(pending) = self.pending_update_handoff.as_ref() else {
-                if let Some(reject) = reject {
-                    let _ = reject.try_send(());
-                }
-                return;
-            };
-            let pending_live = pending.live.clone();
-            let pending_adoption = pending.adoption.clone();
-            let pending_target_build = pending.target_build;
-            let pending_target_commit = pending.target_commit.clone();
-            let pending_layout = pending.layout.clone();
-            let pending_layout_digest = pending.layout_digest;
-            let pending_screen_digest = pending.screen_digest;
-            let pending_activity_epoch = pending.activity_epoch;
-            let arbiter = pending.arbiter.clone();
-            let teardown_allows_commit = matches!(
-                pending.teardown,
-                crate::DeferredHandoffTeardown::None
-                    | crate::DeferredHandoffTeardown::CleanQuitReady
-            );
-            let exact_activity = self.update_handoff_activity_epoch == pending_activity_epoch;
-            let mut current_live: Vec<(u64, i32, i32)> =
-                self.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
-            current_live.sort_unstable();
-            let mut expected_live = pending_live.clone();
-            expected_live.sort_unstable();
-            let exact_sessions = current_live == expected_live;
-            let exact_layout = self.capture_restore_manifest() == pending_layout;
-            let parent_still_parked = self
-                .pool
-                .iter()
-                .all(|session| session.reader_join.is_none());
-            let native_safety = self.revalidate_native_update_safety();
-            // Death-only peek: queued output on a master is tolerated (it
-            // waits in the kernel for the child); HUP/ERR means the adopted
-            // live-set identity is already stale and must reject.
-            let sessions_alive = !handoff_masters_closed(&pending_live);
-            let proof = nonce.as_deref().and_then(|nonce| {
-                crate::seamless::adoption_proof(
-                    nonce,
-                    pending_target_build,
-                    &pending_target_commit,
-                    &pending_layout_digest,
-                    &pending_screen_digest,
-                    &pending_adoption,
-                )
-            });
-            let commit_admitted = handoff_commit_admitted(HandoffCommitFacts {
-                exact_sessions,
-                exact_layout,
-                exact_activity,
-                teardown_allows_commit,
-                parent_still_parked,
-                sessions_alive,
-                input_dispatch_fenced,
-                egress_settled,
-                native_safe: native_safety.is_ok(),
-                proof_exact: proof.is_some(),
-                commit_channel: commit_fd.is_some(),
-            });
-            let mut commit_lost_arbiter = false;
-            let mut commit_write_failed = false;
-            if commit_admitted && let (Some(commit_fd), Some(proof)) = (commit_fd.as_ref(), proof) {
-                if arbiter.try_begin_commit() {
-                    aterm_log::info!(
-                        "update apply: committing exact readerless handoff to child {:?}",
-                        child_pid
-                    );
-                    // Success cannot return: `commit_and_exit` performs the one
-                    // atomic <=PIPE_BUF write and `_exit(0)` in the same typed
-                    // operation. EPIPE explicitly transfers Committing back to
-                    // Rejecting so one reaper can restore the parent.
-                    let Err(_) = crate::seamless::commit_and_exit(commit_fd, proof);
-                    commit_write_failed = true;
-                    let _ = arbiter.commit_failed_to_rejecting();
-                } else {
-                    commit_lost_arbiter = true;
-                }
-            }
-
-            let rejection = if !exact_sessions {
-                "live terminal set changed during async preparation".to_string()
-            } else if !exact_layout {
-                "window/tab/pane topology changed during async preparation".to_string()
-            } else if !exact_activity {
-                "structural activity arrived before Commit".to_string()
-            } else if !teardown_allows_commit {
-                "destructive intent revoked Commit before teardown replay".to_string()
-            } else if !sessions_alive {
-                "a handed-off PTY session closed before Commit".to_string()
-            } else if !input_dispatch_fenced {
-                "the OS input queue did not dispatch into the masters before Commit".to_string()
-            } else if !egress_settled {
-                "tolerated input outlasted the pre-Commit egress-flush budget".to_string()
-            } else if !parent_still_parked {
-                "a parent PTY reader resumed before Commit".to_string()
-            } else if let Err(reasons) = native_safety {
-                format!(
-                    "native safety changed before Commit: {}",
-                    reasons.join(" · ")
-                )
-            } else if commit_lost_arbiter {
-                "worker atomically revoked the handoff before Commit".to_string()
-            } else if commit_write_failed {
-                "attempt-bound Commit pipe closed before its atomic write".to_string()
-            } else {
-                "attempt-bound Commit could not be delivered atomically".to_string()
-            };
-            // TYPED RETRY CLASSIFICATION: record whether this rejection was
-            // activity-shaped (the terminal's world moved — sessions, layout,
-            // epoch, deferred teardown, undrainable typing) versus genuine
-            // (safety/proof/channel/arbiter faults). Activity rollback is
-            // lossless and repeatable, so automatic mode may spend bounded retry
-            // budget on it; the worker's later `Rejected` completion reads this
-            // flag in the non-ready arm below. Never decided by string matching.
-            //
-            // SESSION DEATH IS NOT ACTIVITY (consistency with the worker): a
-            // handed-off shell dying mid-overlap is a GENUINE failure — exactly
-            // as `wait_handoff_ready` and the worker decision loop classify it
-            // (a plain `Rejected` with no activity flag → manual-only). The
-            // adoption proof's live-set identity is gone, and reclassifying that
-            // as retry-eligible only here — because the main thread happened to
-            // observe the HUP first — would spend the automatic budget on a
-            // handoff that can never re-prove the same set. `sessions_alive` is
-            // therefore deliberately absent from the activity set below.
-            let activity_shaped = !exact_sessions
-                || !exact_layout
-                || !exact_activity
-                || !teardown_allows_commit
-                || !input_dispatch_fenced
-                || !egress_settled;
-            if activity_shaped && let Some(pending) = self.pending_update_handoff.as_mut() {
-                pending.revoked_by_activity = true;
-            }
-            aterm_log::warn!("update apply: {rejection}; rejecting readerless child");
-            let rejection_started = arbiter.try_begin_reject()
-                || arbiter.phase() == crate::HandoffAttemptPhase::Rejecting;
-            let delivery = rejection_started.then(|| deliver_handoff_rejection(reject));
-            if delivery == Some(HandoffRejectDelivery::Disconnected)
-                && child_pid.is_some()
-                && self.proxy.is_some()
-                && arbiter.claim_reaper(crate::HandoffReaperOwner::Emergency)
-            {
-                aterm_log::warn!(
-                    "update apply: handoff reaper channel closed; starting emergency reaper"
-                );
-                if let (Some(child_pid), Some(proxy)) = (child_pid, self.proxy.clone()) {
-                    let cleanup = HandoffWorkerCleanup {
-                        parent_socket: self
-                            .sock_bound
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            .then(|| {
-                                let plan = self.sock_plan.as_ref()?;
-                                Some((plan.latest_link.clone()?, plan.sock_path.clone()))
-                            })
-                            .flatten(),
-                        reconcile: None,
-                    };
-                    let emergency_nonce = nonce.clone();
-                    let detail = format!("emergency reaper completed after: {rejection}");
-                    let thread_arbiter = arbiter.clone();
-                    let thread_cleanup = cleanup.clone();
-                    let thread_nonce = emergency_nonce.clone();
-                    let thread_detail = detail.clone();
-                    let thread_proxy = proxy.clone();
-                    let spawned = std::thread::Builder::new()
-                        .name("aterm-handoff-emergency-reaper".to_string())
-                        .spawn(move || {
-                            emergency_kill_and_reap_handoff_child(child_pid);
-                            let completed =
-                                thread_arbiter.finish_reap(crate::HandoffReaperOwner::Emergency);
-                            debug_assert!(completed, "emergency reaper retained sole ownership");
-                            thread_cleanup.complete(thread_nonce.as_deref());
-                            let _ = thread_proxy.send_event(Wake::UpdateHandoffFinished(
-                                crate::UpdateHandoffCompletion {
-                                    attempt_id,
-                                    nonce: thread_nonce,
-                                    child_pid: Some(child_pid),
-                                    outcome: crate::UpdateHandoffOutcome::Rejected,
-                                    commit_fd: None,
-                                    reject: None,
-                                    reconcile: None,
-                                    detail: thread_detail,
-                                    input_drain_spins: 0,
-                                },
-                            ));
-                        });
-                    if spawned.is_err() {
-                        // Resource exhaustion cannot strand a readerless child.
-                        // This fail-safe blocks only after both the normal worker
-                        // and emergency thread creation have failed.
-                        emergency_kill_and_reap_handoff_child(child_pid);
-                        let completed = arbiter.finish_reap(crate::HandoffReaperOwner::Emergency);
-                        debug_assert!(completed, "fallback retained emergency ownership");
-                        cleanup.complete(emergency_nonce.as_deref());
-                        let _ = proxy.send_event(Wake::UpdateHandoffFinished(
-                            crate::UpdateHandoffCompletion {
-                                attempt_id,
-                                nonce: emergency_nonce,
-                                child_pid: Some(child_pid),
-                                outcome: crate::UpdateHandoffOutcome::Rejected,
-                                commit_fd: None,
-                                reject: None,
-                                reconcile: None,
-                                detail,
-                                input_drain_spins: 0,
-                            },
-                        ));
-                    }
-                }
-            } else if !rejection_started {
-                // A live `Committing` owner is the only state in which rejection
-                // may not proceed. Never signal or reap out from under its write.
-                aterm_log::warn!(
-                    "update apply: Commit owns the attempt; rejection left child untouched"
-                );
-            }
-            return;
-        }
-
-        // Every non-ready completion is emitted only AFTER the worker killed and
-        // reaped the child. It is now safe to restore parent readers and reduce the
-        // exact ticket using disk facts that were also collected off the UI thread.
-        let Some(pending) = self.pending_update_handoff.take() else {
-            return;
-        };
-        // Activity classification for the bounded automatic retry budget: the
-        // worker's typed `ActivityRevoked` outcome, or a main-thread rejection
-        // this attempt recorded as activity-shaped. Only automatic mode owns a
-        // timer budget; a manual attempt's failure surfaces to the user as
-        // before. Genuine failures (ChildDied/TimedOut/AdoptionMismatch/
-        // PreparationFailed/plain Rejected without the flag) stay manual-only.
-        let activity_revoked = (outcome == crate::UpdateHandoffOutcome::ActivityRevoked
-            || pending.revoked_by_activity)
-            && pending.mode == crate::native_updater_service::ApplyMode::Automatic;
-        let teardown = match (pending.mode, pending.teardown) {
-            // Construction records this eagerly; keep a fail-safe derivation from
-            // the typed mode so a future constructor cannot strand an authorized
-            // clean quit merely by omitting the replay marker.
-            (
-                crate::native_updater_service::ApplyMode::CleanQuit,
-                crate::DeferredHandoffTeardown::None,
-            ) => crate::DeferredHandoffTeardown::CleanQuitReady,
-            (_, teardown) => teardown,
-        };
-        self.rollback_overlap(nonce.as_deref(), &pending.live);
-        let surfaced = match (pending.apply_attempt, reconcile) {
-            (Some(attempt), Some(facts)) => self.finish_async_native_update_handoff(
-                attempt,
-                facts,
-                format!("overlap handoff failed safely: {detail}"),
-                activity_revoked,
-            ),
-            (None, _) => Some(crate::native_app::UpdateOutcome::Failed {
-                message: format!("debug overlap handoff failed safely: {detail}"),
-            }),
-            (Some(attempt), None) => Some(self.abort_reaped_native_apply_before_reconcile(
-                &attempt,
-                format!("overlap handoff failed safely: {detail}"),
-            )),
-        };
-        if let Some(surfaced) = surfaced {
-            self.surface_update_apply_outcome("automatic handoff", surfaced, false);
-        }
-        // The child process group is reaped and overlap rollback has run. Only now
-        // may the event-loop lane replay destructive intent. A whole-app request
-        // dominates individual closes; AppKit generation ownership is preserved.
-        match teardown {
-            crate::DeferredHandoffTeardown::None => {
-                let _ = crate::menu::cancel_current_native_termination();
-            }
-            crate::DeferredHandoffTeardown::Mutations(mutations) => {
-                let _ = crate::menu::cancel_current_native_termination();
-                let closing_windows: std::collections::BTreeSet<_> = mutations
-                    .iter()
-                    .filter_map(|mutation| match mutation {
-                        crate::DeferredHandoffMutation::CloseWindow(window) => Some(*window),
-                        _ => None,
-                    })
-                    .collect();
-                let closing_tabs: std::collections::BTreeSet<_> = mutations
-                    .iter()
-                    .filter_map(|mutation| match mutation {
-                        crate::DeferredHandoffMutation::CloseTab { window, tab } => {
-                            Some((*window, *tab))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let mut replay_close_windows = closing_windows.clone();
-                for mutation in mutations {
-                    match mutation {
-                        crate::DeferredHandoffMutation::ExitSession(session) => {
-                            replay_close_windows.extend(self.exit_session_logical(session));
-                        }
-                        crate::DeferredHandoffMutation::CloseView { window, tab, view }
-                            if !closing_windows.contains(&window)
-                                && !closing_tabs.contains(&(window, tab)) =>
-                        {
-                            if let Some(window) =
-                                self.replay_deferred_handoff_view_close(window, tab, view)
-                            {
-                                replay_close_windows.insert(window);
-                            }
-                        }
-                        crate::DeferredHandoffMutation::CloseTab { window, tab }
-                            if !closing_windows.contains(&window) =>
-                        {
-                            if self.replay_deferred_handoff_tab_close(window, tab) {
-                                replay_close_windows.insert(window);
-                            }
-                        }
-                        crate::DeferredHandoffMutation::CloseWindow(_)
-                        | crate::DeferredHandoffMutation::CloseView { .. }
-                        | crate::DeferredHandoffMutation::CloseTab { .. } => {}
-                    }
-                }
-                for window in replay_close_windows {
-                    self.close_window(el, window);
-                }
-            }
-            crate::DeferredHandoffTeardown::QuitRequested => {
-                let _ = crate::menu::cancel_current_native_termination();
-                self.on_quit_requested(el);
-            }
-            crate::DeferredHandoffTeardown::NativeTerminate { generation } => {
-                self.on_native_terminate_requested(el, generation);
-            }
-            crate::DeferredHandoffTeardown::CleanQuitReady => {
-                // The rollback worker may have taken long enough for a native
-                // view to acquire new unsaved work after the document barrier's
-                // completion. Revalidate at the actual exit edge and surface the
-                // reducer's recovery payload instead of replaying a stale Ready.
-                match self.prepare_quit_native_shutdown() {
-                    Ok(true) => {
-                        let _ = crate::menu::complete_current_native_termination();
-                        el.exit();
-                    }
-                    Ok(false) => {
-                        let _ = crate::menu::cancel_current_native_termination();
-                    }
-                    Err(error) => {
-                        aterm_log::warn!("deferred clean-quit native barrier: {error}");
-                        let _ = crate::menu::cancel_current_native_termination();
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn finish_update_handoff(
-        &mut self,
-        _el: &ActiveEventLoop,
-        _completion: crate::UpdateHandoffCompletion,
-    ) {
-        aterm_log::warn!("ignored unix-only handoff completion on this platform");
-    }
-
-    /// OVERLAP-HANDOFF failure rollback: restore this (still-running) parent to
-    /// a fully-working terminal after a child that never became ready. The
-    /// caller has already KILLED + reaped the child (kill-before-resume — see
-    /// the call site), so exactly zero readers exist when ours restart:
-    /// * the worker has already retired attempt artifacts and republished the
-    ///   parent socket link before emitting this completion;
-    /// * re-arm CLOEXEC on every master (the exact pre-apply fd posture);
-    /// * resume the parked readers ([`Self::attach_deferred_readers`] — parked
-    ///   sessions are self-describing: `reader_join: None`);
-    ///
-    /// The event-loop half performs no filesystem I/O, update-status read, or
-    /// child-process probe.
-    #[cfg(unix)]
-    fn rollback_overlap(&mut self, _nonce: Option<&str>, live: &[(u64, i32, i32)]) {
-        for (_, master, _) in live {
-            let _ = aterm_pty::set_cloexec(*master, true);
-        }
-        self.resume_deferred_readers_nonblocking();
-    }
-
-    /// Dispatch a macOS menu-bar click into the EXISTING `App` command method the
-    /// matching keybinding already uses — the menu adds an entry point, never a
-    /// parallel implementation. Anything the user could do from the menu, they can
-    /// still do from the keyboard (handled in `on_key`), byte-for-byte the same.
-    /// `el` is needed only for the items that must exit the loop (Quit, and Close
-    /// Tab when it closes the last tab). Off macOS this is reachable code (the
-    /// `Wake::MenuAction` arm calls it) but never actually fired (no platform menu
-    /// ever constructs the variant), so it stays warning-clean on every target.
     /// `invoke <action>` (control socket): fire a menu action BY NAME through the
     /// SAME single sink the native menu bar and the ⌘K palette land in
     /// ([`Self::dispatch_menu_action`]), gated by the live palette row's `enabled`
@@ -7567,6 +5662,14 @@ impl App {
             .then_some(wid)
     }
 
+    /// Dispatch a macOS menu-bar click into the EXISTING `App` command method the
+    /// matching keybinding already uses — the menu adds an entry point, never a
+    /// parallel implementation. Anything the user could do from the menu, they can
+    /// still do from the keyboard (handled in `on_key`), byte-for-byte the same.
+    /// `el` is needed only for the items that must exit the loop (Quit, and Close
+    /// Tab when it closes the last tab). Off macOS this is reachable code (the
+    /// `Wake::MenuAction` arm calls it) but never actually fired (no platform menu
+    /// ever constructs the variant), so it stays warning-clean on every target.
     pub(crate) fn dispatch_menu_action(&mut self, el: &ActiveEventLoop, action: menu::MenuAction) {
         use menu::MenuAction;
         match action {
@@ -7718,6 +5821,11 @@ impl App {
             // Focus or create the process-singleton native Settings tab.
             MenuAction::ToggleSettings => {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Home);
+            }
+            // Same singleton tab, opened AT the Packages route — the menu-bar
+            // path to the batteries-included toolchain surface.
+            MenuAction::Packages => {
+                self.open_settings_tab(crate::native_settings::SettingsRoute::Packages);
             }
             // Toggle the own-rendered, cross-platform command palette.
             MenuAction::OpenPalette => self.toggle_palette(),
@@ -7877,7 +5985,7 @@ impl App {
 
     /// Open a compatibility GUI target, reusing the SAME paths as human menu items.
     /// `prefs`, `about`, and `update` retain their wire spellings but resolve to routes
-    /// in the native Settings tab; `menu` remains a transient overlay. The
+    /// in the native Settings tab; `menu` remains a transient overlay.
     /// The front terminal window is always open, so opening it is an error. Native
     /// Settings and the palette render through the ordinary virtual frame in headless mode.
     pub(crate) fn open_aux_window(
@@ -7942,651 +6050,72 @@ impl App {
 }
 
 #[cfg(all(test, unix))]
-mod handoff_process_group_tests {
-    use super::{
-        HandoffCommitFacts, HandoffRejectDelivery, ReadyPollAction, classify_ready_poll,
-        deliver_handoff_rejection, emergency_kill_and_reap_handoff_child, handoff_commit_admitted,
-        handoff_masters_closed, handoff_masters_have_activity, kill_and_reap_handoff_child,
-        make_cloexec_pipe, wait_handoff_ready, worker_claim_handoff_reaper,
-    };
-    use std::io::{BufRead as _, Read as _};
-    use std::os::unix::process::CommandExt as _;
+mod forwarded_release_handoff_activity_tests {
+    use crate::{App, WindowId};
+    use winit::keyboard::{KeyCode, PhysicalKey};
 
-    /// Panic-safe ownership for fixtures that deliberately leave a 30-second
-    /// descendant alive while assertions exercise reaper ordering.
-    struct ProcessGroupCleanup {
-        leader: i32,
-        armed: bool,
+    /// Arm a minimal pending overlap so the tolerated/revoking distinction is
+    /// observable: the revoking activity form bumps the epoch and pokes the
+    /// cancel channel; the tolerated form does neither while one is pending.
+    fn arm_pending_overlap(app: &mut App) -> std::sync::mpsc::Receiver<()> {
+        let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
+        app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
+            attempt_id: 1,
+            nonce: None,
+            live: Vec::new(),
+            adoption: Vec::new(),
+            child_pid: None,
+            mode: crate::native_updater_service::ApplyMode::Immediate,
+            apply_attempt: None,
+            target_build: 0,
+            target_commit: String::new(),
+            layout: crate::restore::RestoreManifest::new(Vec::new()),
+            layout_digest: [0; 32],
+            screen_digest: [0; 32],
+            activity_epoch: app.update_handoff_activity_epoch,
+            cancel,
+            arbiter: crate::HandoffAttemptArbiter::new(),
+            teardown: crate::DeferredHandoffTeardown::None,
+            commit_drain_started: None,
+            revoked_by_activity: false,
+        });
+        cancelled
     }
 
-    impl ProcessGroupCleanup {
-        fn new(leader: i32) -> Self {
-            Self {
-                leader,
-                armed: true,
-            }
-        }
-
-        fn disarm(&mut self) {
-            self.armed = false;
-        }
-    }
-
-    impl Drop for ProcessGroupCleanup {
-        fn drop(&mut self) {
-            if !self.armed {
-                return;
-            }
-            unsafe { libc::kill(-self.leader, libc::SIGKILL) };
-            let mut status = 0;
-            loop {
-                let waited = unsafe { libc::waitpid(self.leader, &mut status, 0) };
-                if waited == self.leader
-                    || (waited < 0
-                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-                {
-                    break;
-                }
-                if waited < 0
-                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                {
-                    break;
-                }
-            }
-        }
-    }
-
-    fn assert_process_group_gone(leader: i32, descendant: i32, message: &str) {
-        // Waits for launchd to REAP an orphaned descendant — work this process does not
-        // control and cannot hurry. The old wait also busy-spun on `yield_now()` at
-        // 100% CPU, delaying the very reaping it waited for. A real regression leaves
-        // the descendant alive indefinitely, so this is a failure bound.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let group_gone = unsafe { libc::kill(-leader, 0) } != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-            let descendant_gone = unsafe { libc::kill(descendant, 0) } != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-            if group_gone && descendant_gone {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                // Fail clean: no intentionally long-lived fixture escapes even
-                // when the assertion is proving a real production regression.
-                unsafe {
-                    libc::kill(-leader, libc::SIGKILL);
-                    libc::kill(descendant, libc::SIGKILL);
-                }
-                panic!("{message}");
-            }
-            // sleep, not yield_now(): yielding keeps this thread RUNNABLE, so on an
-            // oversubscribed box it competes with the very work it is waiting for.
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
+    /// A forwarded key RELEASE is the same tolerated key traffic as its press:
+    /// `input_to_session` and the window-event seam both buffer key events
+    /// through a pending seamless-update overlap, so the out-of-band release
+    /// path must neither bump the activity epoch (which would falsify the
+    /// `exact_activity` Commit fact) nor poke the overlap's cancel channel.
     #[test]
-    fn final_handoff_admission_conforms_to_every_model_guard() {
-        let all = HandoffCommitFacts {
-            exact_sessions: true,
-            exact_layout: true,
-            exact_activity: true,
-            teardown_allows_commit: true,
-            parent_still_parked: true,
-            sessions_alive: true,
-            input_dispatch_fenced: true,
-            egress_settled: true,
-            native_safe: true,
-            proof_exact: true,
-            commit_channel: true,
-        };
-        assert!(handoff_commit_admitted(all));
+    fn forwarded_release_is_tolerated_while_overlap_pending() {
+        use aterm_types::keyboard::{Key as TKey, Modifiers};
 
-        // Process-local egress (paste-order FIFO / sink spill) is one concrete
-        // queue BEHIND the spec model's single "deliver queued input to the
-        // masters" step, so it is fenced by direct admission assertion rather
-        // than a model-fired action: an unflushed egress buffer must block
-        // Commit exactly like an undrained OS input queue.
-        assert!(
-            !handoff_commit_admitted(HandoffCommitFacts {
-                egress_settled: false,
-                ..all
-            }),
-            "Commit must not fire while tolerated input is still in a process-local queue"
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let physical = PhysicalKey::Code(KeyCode::KeyA);
+        app.note_forwarded_press_key(
+            wid,
+            physical,
+            false,
+            TKey::Character('a'),
+            Modifiers::empty(),
+            None,
         );
-
-        let cases = [
-            (
-                "sessions",
-                HandoffCommitFacts {
-                    exact_sessions: false,
-                    ..all
-                },
-                "SessionsChange",
-            ),
-            (
-                "layout",
-                HandoffCommitFacts {
-                    exact_layout: false,
-                    ..all
-                },
-                "LayoutChanges",
-            ),
-            (
-                "activity epoch",
-                HandoffCommitFacts {
-                    exact_activity: false,
-                    ..all
-                },
-                "ActivityRevokesEpoch",
-            ),
-            (
-                "teardown",
-                HandoffCommitFacts {
-                    teardown_allows_commit: false,
-                    ..all
-                },
-                "DestructiveIntentRevokesCommit",
-            ),
-            (
-                "parent reader",
-                HandoffCommitFacts {
-                    parent_still_parked: false,
-                    ..all
-                },
-                "ParentReaderResumesBeforeCommit",
-            ),
-            (
-                "session death",
-                HandoffCommitFacts {
-                    sessions_alive: false,
-                    ..all
-                },
-                "PtySessionDies",
-            ),
-            (
-                "queued hardware input",
-                HandoffCommitFacts {
-                    input_dispatch_fenced: false,
-                    ..all
-                },
-                "QueueHardwareInput",
-            ),
-            (
-                "native safety",
-                HandoffCommitFacts {
-                    native_safe: false,
-                    ..all
-                },
-                "RevokeNativeSafety",
-            ),
-            (
-                "proof",
-                HandoffCommitFacts {
-                    proof_exact: false,
-                    ..all
-                },
-                "ChildSendsMismatchedProof",
-            ),
-            (
-                "commit channel",
-                HandoffCommitFacts {
-                    commit_channel: false,
-                    ..all
-                },
-                "LoseCommitChannel",
-            ),
-        ];
-        for (name, facts, revoked_action) in cases {
-            assert!(
-                !handoff_commit_admitted(facts),
-                "missing {name} was admitted"
-            );
-            let model = aterm_spec::derive::native_update_overlap_handoff_model();
-            let mut state = model.init_state();
-            assert!(model.fire("ParkParentReaders", &mut state));
-            assert!(model.fire("SpawnReaderlessChild", &mut state));
-            if revoked_action == "ChildSendsMismatchedProof" {
-                assert!(model.fire(revoked_action, &mut state));
-            } else {
-                assert!(model.fire("ChildPaintsExactProof", &mut state));
-                assert!(model.fire(revoked_action, &mut state), "{name}: {state:?}");
-            }
-            assert!(
-                model.successors("MainWinsCommitArbiter", &state).is_empty(),
-                "model still authorized Commit without {name}: {state:?}"
-            );
-        }
-
-        let model = aterm_spec::derive::native_update_overlap_handoff_model();
-        let mut exact = model.init_state();
-        for action in [
-            "ParkParentReaders",
-            "SpawnReaderlessChild",
-            "ChildPaintsExactProof",
-            "MainWinsCommitArbiter",
-        ] {
-            assert!(model.fire(action, &mut exact), "{action}: {exact:?}");
-        }
-        assert_eq!(exact["arbiter"], 1);
-    }
-
-    /// Seamless seam 2, model level: queued PTY output and queued-then-drained
-    /// hardware input BUFFER THROUGH the overlap — Commit stays reachable with
-    /// output queued the whole way, while an UNDRAINED OS input queue parks
-    /// (never fails) Commit until the drain action delivers it to the masters.
-    #[test]
-    fn queued_output_and_drained_input_buffer_through_commit_in_the_model() {
-        let model = aterm_spec::derive::native_update_overlap_handoff_model();
-        let mut state = model.init_state();
-        for action in [
-            "ParkParentReaders",
-            "SpawnReaderlessChild",
-            "ChildPaintsExactProof",
-            "PtyOutputQueues",
-            "QueueHardwareInput",
-        ] {
-            assert!(model.fire(action, &mut state), "{action}: {state:?}");
-        }
-        // Undispatched hardware input PARKS Commit (it would die with _exit)…
+        let cancelled = arm_pending_overlap(&mut app);
+        let epoch = app.update_handoff_activity_epoch;
+        app.release_physical_press(wid, physical);
         assert!(
-            model.successors("MainWinsCommitArbiter", &state).is_empty(),
-            "commit admitted with an undrained OS input queue: {state:?}"
+            !app.physical_press_owners.contains_key(&physical),
+            "the forwarded episode is closed by its release"
         );
-        // …but is not a failure: the reject arbiter has no authority either.
-        assert!(
-            model
-                .successors("WorkerWinsRejectArbiter", &state)
-                .is_empty(),
-            "queued input must defer, not fail, the attempt: {state:?}"
-        );
-        for action in [
-            "DrainQueuedHardwareInput",
-            "MainWinsCommitArbiter",
-            "CommitModern",
-            "ReleaseModernReaders",
-        ] {
-            assert!(model.fire(action, &mut state), "{action}: {state:?}");
-        }
-        assert_eq!(state["commit"], 1);
-        assert_eq!(state["child_readers"], 1);
         assert_eq!(
-            state["pty_output_queued"], 1,
-            "the committed run carried queued output the whole way — the child drains it"
-        );
-    }
-
-    /// Seamless seam 2, descriptor level: readable bytes on a handed-off
-    /// master are visible to the PRE-PARK admission peek but invisible to the
-    /// mid-flight death peek; closing the peer flips the death peek without
-    /// consuming the queued bytes (they remain for the child).
-    #[test]
-    fn queued_output_is_buffered_mid_flight_but_peer_death_still_revokes() {
-        // A REAL PTY pair — the deployed descriptor shape — not a pipe:
-        // poll(2)'s HUP semantics differ between the two, and the death peek's
-        // contract is stated for masters.
-        let (mut master, mut slave) = (-1i32, -1i32);
-        // SAFETY: openpty(3) into two valid out-slots; no termios/winsize.
-        let opened = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(opened, 0, "openpty");
-        let live = [(1u64, master, 4242i32)];
-
-        assert!(!handoff_masters_have_activity(&live), "quiet pty is quiet");
-        assert!(!handoff_masters_closed(&live), "live peer is not dead");
-
-        // "Shell output" queued in the kernel for the (future) child.
-        // SAFETY: bounded write of a stack byte to the test-owned slave.
-        assert_eq!(
-            unsafe { libc::write(slave, [0x62u8].as_ptr().cast(), 1) },
-            1
+            app.update_handoff_activity_epoch, epoch,
+            "a key release must not bump the activity epoch while an overlap is pending"
         );
         assert!(
-            handoff_masters_have_activity(&live),
-            "pre-park admission still refuses to START over flowing output"
-        );
-        assert!(
-            !handoff_masters_closed(&live),
-            "mid-flight, queued output buffers through instead of revoking"
-        );
-
-        aterm_pty::close_fd(slave);
-        assert!(
-            handoff_masters_closed(&live),
-            "peer death must still revoke — the live-set identity is stale"
-        );
-        aterm_pty::close_fd(master);
-    }
-
-    /// Seamless seam 2, worker level: the ready wait completes to `ProofReady`
-    /// while a handed-off master has queued readable output, and a cancel poke
-    /// is typed `ActivityRevoked` (the retry-budget classification), never a
-    /// generic rejection.
-    #[test]
-    fn ready_wait_tolerates_queued_output_and_types_cancel_as_activity() {
-        let expected = crate::seamless::adoption_proof(
-            "ready-wait-buffered-output",
-            2,
-            "abcdef0",
-            &[0x11; 32],
-            &[0x22; 32],
-            &[],
-        )
-        .expect("bounded proof fixture");
-
-        // Master with queued output the whole time.
-        let mut master = [0i32; 2];
-        // SAFETY: plain pipe(2) into a valid 2-slot out-array.
-        assert_eq!(unsafe { libc::pipe(master.as_mut_ptr()) }, 0, "master pipe");
-        let (master_rd, master_wr) = (master[0], master[1]);
-        // SAFETY: bounded write of a stack byte to the test-owned pipe.
-        assert_eq!(
-            unsafe { libc::write(master_wr, [0x62u8].as_ptr().cast(), 1) },
-            1
-        );
-
-        let (proof_rd, proof_wr) = make_cloexec_pipe().expect("proof pipe");
-        let wire = expected.to_wire();
-        // SAFETY: bounded write of the fixed proof wire to the test-owned pipe.
-        let wrote = unsafe {
-            use std::os::fd::AsRawFd as _;
-            libc::write(proof_wr.as_raw_fd(), wire.as_ptr().cast(), wire.len())
-        };
-        assert_eq!(wrote as usize, wire.len(), "one complete proof wire");
-        let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
-        assert_eq!(
-            wait_handoff_ready(&proof_rd, expected, &cancel_rx, &[master_rd]),
-            crate::UpdateHandoffOutcome::ProofReady,
-            "queued shell output must not abort the ready wait"
-        );
-
-        // Cancel is the typed activity outcome.
-        let (proof_rd, _proof_wr) = make_cloexec_pipe().expect("second proof pipe");
-        let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
-        cancel_tx.try_send(()).expect("queue cancel poke");
-        assert_eq!(
-            wait_handoff_ready(&proof_rd, expected, &cancel_rx, &[master_rd]),
-            crate::UpdateHandoffOutcome::ActivityRevoked,
-            "cancel must carry the typed activity classification"
-        );
-
-        aterm_pty::close_fd(master_rd);
-        aterm_pty::close_fd(master_wr);
-    }
-
-    /// S0 ANTI-SPIN: the ready-wait poll classifier must route a master that is
-    /// merely READABLE (queued shell output — the exact condition the tolerate-
-    /// output contract newly allows) to `NoProgress`, the branch that YIELDS
-    /// before re-polling. A plain-POLLIN master answer that fell through to an
-    /// immediate `continue` is what pegged a core; proving it lands on the
-    /// yielding verdict (and never on `ReadProof`/`SessionDied`) is the fix's
-    /// standing guard, with none of a CPU/timing assertion's flakiness.
-    #[test]
-    fn ready_poll_classifies_queued_master_output_as_a_yield() {
-        let pfd = |revents: libc::c_short| libc::pollfd {
-            fd: -1,
-            events: libc::POLLIN,
-            revents,
-        };
-        // Proof idle, master carrying plain queued output → YIELD (the spin
-        // condition). Before the fix this fell through to a sleepless continue.
-        assert_eq!(
-            classify_ready_poll(&[pfd(0), pfd(libc::POLLIN)]),
-            ReadyPollAction::NoProgress,
-            "queued master output must yield, never busy-spin"
-        );
-        // A bare wake with nothing readable is also just a yield.
-        assert_eq!(
-            classify_ready_poll(&[pfd(0), pfd(0)]),
-            ReadyPollAction::NoProgress
-        );
-        // Death on a master dominates — even while it also reports readable
-        // bytes (macOS reports a dead slave as POLLIN|POLLHUP).
-        assert_eq!(
-            classify_ready_poll(&[pfd(0), pfd(libc::POLLIN | libc::POLLHUP)]),
-            ReadyPollAction::SessionDied,
-            "a stale live-set identity must reject, not read the proof"
-        );
-        assert_eq!(
-            classify_ready_poll(&[pfd(libc::POLLIN), pfd(libc::POLLERR)]),
-            ReadyPollAction::SessionDied,
-            "master death outranks a readable proof"
-        );
-        // A readable proof is progress — even with queued output alongside it.
-        assert_eq!(
-            classify_ready_poll(&[pfd(libc::POLLIN), pfd(libc::POLLIN)]),
-            ReadyPollAction::ReadProof
-        );
-        assert_eq!(
-            classify_ready_poll(&[pfd(libc::POLLHUP), pfd(libc::POLLIN)]),
-            ReadyPollAction::ReadProof,
-            "proof EOF (its write end dropped) is still a read, detecting ChildDied"
-        );
-    }
-
-    #[test]
-    fn full_reject_channel_remains_worker_owned_but_disconnect_does_not() {
-        let (full_sender, full_receiver) = std::sync::mpsc::sync_channel(1);
-        full_sender.try_send(()).expect("fill rejection slot");
-        assert_eq!(
-            deliver_handoff_rejection(Some(full_sender)),
-            HandoffRejectDelivery::WorkerOwned,
-            "Full means a rejection is already queued for the live worker"
-        );
-        assert_eq!(full_receiver.try_recv(), Ok(()));
-
-        let (disconnected_sender, disconnected_receiver) = std::sync::mpsc::sync_channel(1);
-        drop(disconnected_receiver);
-        assert_eq!(
-            deliver_handoff_rejection(Some(disconnected_sender)),
-            HandoffRejectDelivery::Disconnected,
-            "only receiver loss transfers authority to an emergency reaper"
-        );
-        assert_eq!(
-            deliver_handoff_rejection(None),
-            HandoffRejectDelivery::Disconnected
-        );
-    }
-
-    #[test]
-    fn cancellation_kills_descendant_process_group_before_returning() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg("sleep 30 & printf '%s\\n' \"$!\"; wait")
-            .stdout(std::process::Stdio::piped());
-        // SAFETY: async-signal-safe setpgid only; identical to the production
-        // update child setup and executed after fork/before exec.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        let mut child = command.spawn().expect("spawn process-group leader");
-        let leader = i32::try_from(child.id()).expect("bounded child pid");
-        let mut cleanup = ProcessGroupCleanup::new(leader);
-        let mut descendant_line = String::new();
-        std::io::BufReader::new(child.stdout.take().expect("child stdout"))
-            .read_line(&mut descendant_line)
-            .expect("descendant pid line");
-        let descendant: i32 = descendant_line
-            .trim()
-            .parse()
-            .expect("numeric descendant pid");
-        assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant live");
-
-        kill_and_reap_handoff_child(&mut child);
-        cleanup.disarm();
-        assert_process_group_gone(
-            leader,
-            descendant,
-            "kill/reap returned but a descendant process-group member survived",
-        );
-    }
-
-    #[test]
-    fn pre_ready_eof_preserves_leader_identity_until_normal_group_reap() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit 0")
-            .stdout(std::process::Stdio::piped());
-        // SAFETY: async-signal-safe setpgid only, matching production.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        let mut child = command.spawn().expect("spawn exiting group leader");
-        let leader = i32::try_from(child.id()).expect("bounded child pid");
-        let mut cleanup = ProcessGroupCleanup::new(leader);
-        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
-        let mut descendant_line = String::new();
-        stdout
-            .read_line(&mut descendant_line)
-            .expect("descendant pid line");
-        let descendant: i32 = descendant_line
-            .trim()
-            .parse()
-            .expect("numeric descendant pid");
-        let mut eof = Vec::new();
-        stdout.read_to_end(&mut eof).expect("leader stdout EOF");
-        assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant live");
-
-        // Tier-1 projection: EOF observes an exited direct leader while retaining
-        // its waitable identity and a live same-group descendant. Rollback is not
-        // enabled until the shipping reaper has signaled that group and waited the
-        // direct child, in that order.
-        let model = aterm_spec::derive::native_update_overlap_handoff_model();
-        let mut model_state = model.init_state();
-        for action in [
-            "ParkParentReaders",
-            "SpawnReaderlessChild",
-            "SpawnProcessGroupDescendant",
-            "LeaderDiesLeavingLiveDescendant",
-        ] {
-            assert!(
-                model.fire(action, &mut model_state),
-                "{action}: {model_state:?}"
-            );
-        }
-
-        let (proof_rd, proof_wr) = make_cloexec_pipe().expect("proof pipe");
-        drop(proof_wr); // exact pre-ready child-death signal: proof EOF
-        let expected = crate::seamless::adoption_proof(
-            "pre-ready-eof-test",
-            2,
-            "abcdef0",
-            &[0x11; 32],
-            &[0x22; 32],
-            &[],
-        )
-        .expect("bounded proof fixture");
-        let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
-        assert_eq!(
-            wait_handoff_ready(&proof_rd, expected, &cancel_rx, &[]),
-            crate::UpdateHandoffOutcome::ChildDied,
-            "proof EOF detects death without reaping the group leader"
-        );
-
-        let arbiter = crate::HandoffAttemptArbiter::new();
-        assert!(worker_claim_handoff_reaper(&arbiter));
-        assert!(model.fire("WorkerWinsRejectArbiter", &mut model_state));
-
-        // Negative control: the removed wait-before-kill ordering is explicitly
-        // executable only in the mutant and immediately violates the ordering
-        // property while this real descendant is known live.
-        let buggy = aterm_spec::interp::with_buggy(&model, 1);
-        let mut old_order = model_state.clone();
-        assert!(buggy.fire("BuggyWaitBeforeGroupSignal", &mut old_order));
-        assert!(!buggy.check_invariant("ProcessGroupSignalPrecedesDirectChildReap", &old_order,));
-        assert_eq!(old_order["descendant_live"], 1);
-
-        kill_and_reap_handoff_child(&mut child);
-        assert!(model.fire("KillRejectedChild", &mut model_state));
-        assert!(model.fire("ReapKilledChild", &mut model_state));
-        assert!(arbiter.finish_reap(crate::HandoffReaperOwner::Worker));
-        cleanup.disarm();
-        assert_process_group_gone(
-            leader,
-            descendant,
-            "pre-ready EOF path reaped leader but left its descendant live",
-        );
-        assert_eq!(model_state["group_signaled"], 1);
-        assert_eq!(model_state["descendant_live"], 0);
-        assert_eq!(model_state["child_reaped"], 1);
-        assert_eq!(
-            model
-                .successors("ResumeParentAfterReap", &model_state)
-                .len(),
-            1,
-            "rollback becomes enabled only after group signal + direct-child reap"
-        );
-    }
-
-    #[test]
-    fn emergency_reaper_kills_group_even_after_leader_exits() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            // The descendant does not retain stdout, so EOF proves the leader
-            // completed its immediate exit without our test reaping it.
-            .arg("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit 0")
-            .stdout(std::process::Stdio::piped());
-        // SAFETY: async-signal-safe setpgid only, matching production.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        let mut child = command.spawn().expect("spawn exiting group leader");
-        let leader = i32::try_from(child.id()).expect("bounded child pid");
-        let mut cleanup = ProcessGroupCleanup::new(leader);
-        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("child stdout"));
-        let mut descendant_line = String::new();
-        stdout
-            .read_line(&mut descendant_line)
-            .expect("descendant pid line");
-        let descendant: i32 = descendant_line
-            .trim()
-            .parse()
-            .expect("numeric descendant pid");
-        let mut eof = Vec::new();
-        stdout.read_to_end(&mut eof).expect("leader stdout EOF");
-        assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant live");
-
-        let arbiter = crate::HandoffAttemptArbiter::new();
-        assert!(arbiter.try_begin_reject());
-        assert!(arbiter.claim_reaper(crate::HandoffReaperOwner::Emergency));
-        emergency_kill_and_reap_handoff_child(child.id());
-        // The raw emergency reaper consumed this exact child. An explicit wait
-        // observes ECHILD and documents the `Child` handle's completed lifecycle.
-        let _ = child.wait();
-        assert!(arbiter.finish_reap(crate::HandoffReaperOwner::Emergency));
-        cleanup.disarm();
-        assert_process_group_gone(
-            leader,
-            descendant,
-            "emergency reap returned but exited leader left a live descendant",
+            cancelled.try_recv().is_err(),
+            "a key release must not poke the pending overlap's cancel channel"
         );
     }
 }
@@ -9452,11 +6981,10 @@ mod settings_cmd_f_tests {
             .is_some_and(|s| s.searching)
     }
 
-    /// REGRESSION (audit, design §4.4): ⌘F while Settings is open focuses the
-    /// settings SEARCH exactly like `/` — it was a dead key (the overlay gate
-    /// swallows every key, and only `/` reached `search_begin`). Driven through
-    /// the engine-neutral input seam (the controller twin, kept identical to
-    /// the winit branch).
+    /// ⌘F while Settings is open focuses the settings SEARCH exactly like `/`
+    /// (design §4.4). The overlay gate swallows every key, so without this arm
+    /// the chord is dead. Driven through the engine-neutral input seam (the
+    /// controller twin, kept identical to the winit branch).
     #[test]
     fn cmd_f_focuses_settings_search() {
         let mut app = App::headless_for_test();
@@ -9528,12 +7056,12 @@ mod mouse_cell_clobber_tests {
     use crate::input::{InputEvent, PixelOffset, Source};
     use aterm_core::selection::SelectionSide;
 
-    /// (D) regression: a `MouseMove` reaching the `App::input` seam must NOT overwrite
-    /// the PANE-LOCAL `last_mouse_cell` that `on_cursor_moved` already published. A
+    /// A `MouseMove` reaching the `App::input` seam must NOT overwrite the
+    /// PANE-LOCAL `last_mouse_cell` that `on_cursor_moved` already published. A
     /// follow-up press/wheel (which carries no winit position) reads `last_mouse_cell`,
-    /// so clobbering it with the event's window-relative row/col misreported the cell
-    /// to a mouse-tracking app in a split. Before the fix the seam overwrote it to
-    /// (30, 30); after, it stays the pane-local sentinel (5, 7).
+    /// so clobbering it with the event's window-relative row/col misreports the cell
+    /// to a mouse-tracking app in a split — here the window cell is (30, 30) and the
+    /// pane-local sentinel that must survive is (5, 7).
     #[test]
     fn mouse_move_does_not_clobber_pane_local_cell() {
         let mut app = App::headless_for_test();
@@ -9582,7 +7110,7 @@ mod kitty_orphan_release_tests {
         }
     }
 
-    /// BUG 9: a key RELEASE whose PRESS a GUI gate CONSUMED (settings/search mode, a
+    /// A key RELEASE whose PRESS a GUI gate CONSUMED (settings/search mode, a
     /// keybinding `Action`, a Cmd/Super shortcut, a scrollback/pane/zoom chord, an
     /// IME-suppressed key) must be SWALLOWED exactly once — `take_consumed_release`
     /// removes the tracked physical key and returns `true`, so `on_key` returns WITHOUT
@@ -9693,7 +7221,7 @@ mod kitty_orphan_release_tests {
         pairing_step(&model, &mut state, "ReleaseForwardedPress");
     }
 
-    /// BUG 9 addendum (Fix 2b): the repeat fall-through swallow PEEKS
+    /// The repeat fall-through swallow PEEKS
     /// (`press_was_consumed`) without removing — a chord broken mid-hold (Shift+PageUp
     /// pressed and consumed, Shift released, PageUp still repeating) has its repeats
     /// swallowed at the egress fall-through, and the eventual RELEASE must still find
@@ -10684,7 +8212,7 @@ pub(crate) mod input_release_pairing_conformance {
 
 #[cfg(test)]
 mod overlay_gate_pairing_tests {
-    //! Fix 3 — the `App::input` overlay gate must preserve Kitty press/release
+    //! The `App::input` overlay gate must preserve Kitty press/release
     //! pairing across overlay open/close boundaries. The observable is the seam's
     //! reply on the stub session's INVALID (-1) sink with Kitty REPORT_EVENT_TYPES
     //! (`CSI > 2 u`) negotiated: an event the seam ENCODES + writes reports
@@ -10736,8 +8264,8 @@ mod overlay_gate_pairing_tests {
 
     /// A RELEASE whose press PREDATES the overlay (press delivered to the PTY, then
     /// the overlay opened mid-hold via menu click / aterm-ctl) must FALL THROUGH the
-    /// gate to the seam encoder — swallowing it left the app an orphan press, and
-    /// bought nothing (every overlay handler ignores releases).
+    /// gate to the seam encoder — swallowing it would leave the app an orphan press,
+    /// and buys nothing (every overlay handler ignores releases).
     #[test]
     fn release_of_pre_overlay_press_falls_through_the_gate() {
         let mut app = app_with_event_types();
@@ -10785,8 +8313,8 @@ mod overlay_gate_pairing_tests {
     }
 
     /// A (controller) PRESS consumed by the overlay gate is recorded, and its RELEASE
-    /// arriving AFTER the overlay closed is swallowed exactly once — previously it
-    /// encoded as an orphan Kitty release report for a press the app never saw.
+    /// arriving AFTER the overlay closed is swallowed exactly once — otherwise it
+    /// encodes an orphan Kitty release report for a press the app never saw.
     #[test]
     fn press_under_overlay_release_swallowed_after_close() {
         let mut app = app_with_event_types();
@@ -10922,166 +8450,6 @@ mod overlay_gate_pairing_tests {
                 .is_empty(),
             "the release removed its entry (leak-free)"
         );
-    }
-}
-
-#[cfg(unix)]
-#[must_use]
-fn readiness_proof_matches(
-    expected: crate::seamless::AdoptionProof,
-    wire: &[u8; crate::seamless::READY_WIRE_LEN],
-) -> bool {
-    crate::seamless::AdoptionProof::from_wire(wire) == Some(expected)
-}
-
-/// Block (bounded) until the overlap-handoff child signals readiness, closes its
-/// proof pipe, or times out. Crucially this never calls `Child::try_wait`: that
-/// API reaps an exited group leader and destroys the PID identity before the
-/// unique reaper can signal all descendants. Proof EOF detects pre-ready death;
-/// after a full proof, an exited child is rejected by the atomic Commit pipe
-/// write (EPIPE). The deadline defaults to 15 s — generous against a
-/// staged-swap re-exec + GPU init + multi-window present (~1-2 s observed) —
-/// and is tunable via `ATERM_HANDOFF_READY_TIMEOUT_MS` for the QA seam.
-///
-/// SEAMLESS: `masters` are watched for session DEATH (HUP/ERR/NVAL →
-/// `Rejected` — the adoption proof's live-set identity is stale) but NOT for
-/// readable output — shell bytes produced while the child boots wait in the
-/// kernel queues and replay through the child's fresh parser after Commit, so
-/// output during the overlap must never abort the wait. A cancel poke returns
-/// the typed `ActivityRevoked` so the retry budget can classify it.
-/// The three mutually exclusive verdicts on one `poll` answer during the ready
-/// wait. Split out from the loop so the anti-spin contract is provable without
-/// timing: queued master output must land on [`ReadyPollAction::NoProgress`]
-/// (the yielding branch), NEVER on a path that re-polls immediately.
-#[cfg(unix)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ReadyPollAction {
-    /// A handed-off master reported HUP/ERR/NVAL — the adopted live-set identity
-    /// is stale; reject.
-    SessionDied,
-    /// The proof fd is readable (POLLIN or its own HUP/ERR/NVAL) — read the wire.
-    ReadProof,
-    /// Neither: `poll` returned because a master had queued readable output
-    /// (plain POLLIN — deliberately not an abort) or a bare slice. No progress
-    /// toward readiness, so the caller must YIELD before re-polling; a master
-    /// that stays readable would otherwise make `poll` return instantly forever.
-    NoProgress,
-}
-
-/// Classify one `poll` answer. Death on ANY master dominates (the proof is
-/// meaningless if the adopted set is already stale); otherwise a readable proof
-/// fd is progress; otherwise there is nothing to do but yield. `pollfds[0]` is
-/// the proof fd, `pollfds[1..]` the watched masters (see [`wait_handoff_ready`]).
-#[cfg(unix)]
-#[must_use]
-fn classify_ready_poll(pollfds: &[libc::pollfd]) -> ReadyPollAction {
-    let dead = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-    if pollfds.iter().skip(1).any(|pfd| pfd.revents & dead != 0) {
-        return ReadyPollAction::SessionDied;
-    }
-    let proof_readable = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-    if pollfds
-        .first()
-        .is_some_and(|proof| proof.revents & proof_readable != 0)
-    {
-        return ReadyPollAction::ReadProof;
-    }
-    ReadyPollAction::NoProgress
-}
-
-#[cfg(unix)]
-fn wait_handoff_ready(
-    rd: &std::os::fd::OwnedFd,
-    expected: crate::seamless::AdoptionProof,
-    cancel: &std::sync::mpsc::Receiver<()>,
-    masters: &[i32],
-) -> crate::UpdateHandoffOutcome {
-    use std::os::fd::AsRawFd as _;
-    let timeout_ms = std::env::var("ATERM_HANDOFF_READY_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(15_000)
-        .clamp(1_000, 120_000);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    let mut wire = [0u8; crate::seamless::READY_WIRE_LEN];
-    let mut offset = 0usize;
-    let mut pollfds = Vec::with_capacity(masters.len().saturating_add(1));
-    pollfds.push(libc::pollfd {
-        fd: rd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    });
-    // Masters are watched for DEATH only: POLLIN must be REQUESTED (macOS
-    // evaluates a PTY's stream state only for requested events and reports a
-    // dead slave as POLLIN|POLLHUP; with `events: 0` it reports nothing) but
-    // plain POLLIN in the answer is IGNORED below — queued shell output waits
-    // in the kernel for the child and must not abort the wait.
-    pollfds.extend(masters.iter().copied().map(|fd| libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }));
-    loop {
-        if cancel.try_recv().is_ok() {
-            return crate::UpdateHandoffOutcome::ActivityRevoked;
-        }
-        if std::time::Instant::now() >= deadline {
-            return crate::UpdateHandoffOutcome::TimedOut;
-        }
-        for pfd in &mut pollfds {
-            pfd.revents = 0;
-        }
-        // SAFETY: a stable initialized pollfd slice; 10 ms bounds death abort.
-        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 10) };
-        if n <= 0 {
-            continue; // timeout slice or EINTR — re-check child + deadline (poll already blocked)
-        }
-        match classify_ready_poll(&pollfds) {
-            ReadyPollAction::SessionDied => return crate::UpdateHandoffOutcome::Rejected,
-            ReadyPollAction::NoProgress => {
-                // A booting child's shell can produce queued output on a handed-
-                // off master (the tolerate-output contract). That master answers
-                // plain POLLIN, which makes `poll` return IMMEDIATELY every
-                // iteration but matches neither the dead mask nor the proof fd —
-                // so without this yield the loop would busy-spin at 100% CPU,
-                // starving the very child we are waiting on. The same ~2 ms sleep
-                // the post-ProofReady decision loop uses bounds the spin while
-                // staying an order of magnitude tighter than the ~1-2 s boot the
-                // proof arrives after.
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                continue;
-            }
-            ReadyPollAction::ReadProof => {}
-        }
-        // SAFETY: bounded read into the unfilled suffix of a fixed local wire.
-        let r = unsafe {
-            libc::read(
-                rd.as_raw_fd(),
-                wire[offset..].as_mut_ptr().cast(),
-                wire.len() - offset,
-            )
-        };
-        match r {
-            n if n > 0 => {
-                offset += usize::try_from(n).unwrap_or(0);
-                if offset != wire.len() {
-                    continue;
-                }
-                if !readiness_proof_matches(expected, &wire) {
-                    return crate::UpdateHandoffOutcome::AdoptionMismatch;
-                }
-                // Recheck AFTER the complete proof. A child that raced death with
-                // the final bytes is not an exit authority.
-                if cancel.try_recv().is_ok() {
-                    return crate::UpdateHandoffOutcome::ActivityRevoked;
-                }
-                return crate::UpdateHandoffOutcome::ProofReady;
-            }
-            // EOF: the only live write end was the child's, so it dropped the fd
-            // (a failed validation) or died/malformed mid-proof.
-            0 => return crate::UpdateHandoffOutcome::ChildDied,
-            _ => continue, // EINTR/EAGAIN — re-loop
-        }
     }
 }
 
@@ -11255,10 +8623,10 @@ mod smooth_scroll_tests {
         );
     }
 
-    /// Defensive tick regression for the exact audited defect: even if a policy
-    /// fact is installed without its normal edge reducer, the next due tick must
-    /// jump to the intended target and disarm. Sampling the old ease at this early
-    /// timestamp would leave both an intermediate row and another deadline.
+    /// Defensive tick convergence: even if a policy fact is installed without its
+    /// normal edge reducer, the next due tick must jump to the intended target and
+    /// disarm. Sampling the old ease at this early timestamp would leave both an
+    /// intermediate row and another deadline.
     #[test]
     fn reduced_motion_tick_defensively_lands_instead_of_sampling() {
         let mut app = App::headless_for_test();
@@ -11653,12 +9021,11 @@ mod keystroke_press_side_effect_tests {
         }
     }
 
-    /// The press path's snap + deselect + predictor sample now run under ONE term
-    /// lock (they were three separate acquisitions, each contending with the PTY
-    /// reader). This pins the helpers' semantics across that consolidation: a key
-    /// PRESS at the seam snaps a history-scrolled viewport back to the live bottom
-    /// AND clears an active selection ("typing deselects"); a key RELEASE (Kitty
-    /// REPORT_EVENT_TYPES) is not a typing event and must do neither — only encode.
+    /// The press path's snap + deselect + predictor sample run under ONE term
+    /// lock. This pins their semantics: a key PRESS at the seam snaps a
+    /// history-scrolled viewport back to the live bottom AND clears an active
+    /// selection ("typing deselects"); a key RELEASE (Kitty REPORT_EVENT_TYPES)
+    /// is not a typing event and must do neither — only encode.
     #[test]
     fn press_snaps_and_deselects_release_does_not() {
         let mut app = App::headless_for_test();
@@ -11707,8 +9074,7 @@ mod keystroke_press_side_effect_tests {
 /// The press/release path's LOCK-ELISION guards. The terminal mutex is the one
 /// lock a keystroke shares with the PTY reader, so the press path must take it
 /// EXACTLY once (the seam's consolidated scope) and a byte-silent release must not
-/// take it at all — while every human-visible side-effect those acquisitions used
-/// to carry still happens.
+/// take it at all — while every human-visible side-effect still happens.
 #[cfg(test)]
 mod press_path_lock_elision_tests {
     use super::{publish_release_relevance, sampled_release_relevance};
@@ -11728,7 +9094,7 @@ mod press_path_lock_elision_tests {
     }
 
     /// A real winit key event, so the tests below drive the shipping `on_key`
-    /// routing (where the press-path snap now lives) rather than the seam alone.
+    /// routing (where the press-path snap lives) rather than the seam alone.
     fn character_event(ch: char, state: ElementState) -> winit::event::KeyEvent {
         let text = winit::keyboard::SmolStr::new(ch.to_string());
         winit::event::KeyEvent::synthetic_for_test(
@@ -11775,9 +9141,9 @@ mod press_path_lock_elision_tests {
         bytes[..read as usize].to_vec()
     }
 
-    /// A seam-bound keystroke must still land the WHOLE press-path snap even though
-    /// the caller-side `snap_to_bottom` (a third terminal-mutex acquisition per key)
-    /// is gone: the seam's consolidated lock scope pulls the viewport back to the
+    /// A seam-bound keystroke must land the WHOLE press-path snap without any
+    /// caller-side `snap_to_bottom` (which would be a third terminal-mutex
+    /// acquisition per key): the seam's consolidated lock scope pulls the viewport back to the
     /// live bottom, and the lock-free window half cancels the wheel glide's banked
     /// residual so no momentum tail can ease the view back off the prompt (M1/M1b).
     #[cfg(unix)]
@@ -11815,7 +9181,7 @@ mod press_path_lock_elision_tests {
     /// The arms that END a press before the seam keep their own snap. A bare Cmd
     /// chord no shortcut claims is swallowed (real terminals never forward Cmd
     /// combos), and swallowing it must still jump the viewport back to live — the
-    /// human parity the single unconditional call used to provide.
+    /// human parity "any key press jumps to live".
     #[cfg(unix)]
     #[test]
     fn a_swallowed_cmd_chord_still_snaps_the_viewport() {
@@ -11871,9 +9237,8 @@ mod press_path_lock_elision_tests {
 
     /// LEGACY SHELL (no Kitty flags): the press publishes "releases encode
     /// nothing", so the forwarded release skips `seam_egress` — and therefore the
-    /// terminal mutex — entirely. Byte-identical: the seam would have written
-    /// nothing and reported `Delivery::Full`, which is exactly what the release
-    /// path still reports.
+    /// terminal mutex — entirely. Byte-identical: the seam would write nothing and
+    /// report `Delivery::Full`, which is exactly what the release path reports.
     #[cfg(unix)]
     #[test]
     fn legacy_release_is_byte_silent_and_skips_the_seam() {
@@ -12006,9 +9371,9 @@ mod predictive_echo_input_gate_tests {
         let model = aterm_spec::derive::predictive_echo_visibility_model();
         let mut model_state = model.init_state();
 
-        // Start from the dangerous state the old gate mishandled: this line has
-        // already proved a slow echo, so an Adaptive guess is both pending and
-        // visible before Codex takes ownership of the composer.
+        // Start from the dangerous state: this line has already proved a slow
+        // echo, so an Adaptive guess is both pending and visible before Codex
+        // takes ownership of the composer.
         app.config.predictive_echo = Some("adaptive".to_string());
         let now = Instant::now();
         {
@@ -12039,7 +9404,7 @@ mod predictive_echo_input_gate_tests {
 
         // Codex's observed main-screen flags are 1|2|4: disambiguate, report event
         // types, and report alternate keys. It does not set REPORT_ALL_KEYS_AS_ESC,
-        // which is why the old gate mistakenly armed and later erased ghost text.
+        // so a gate keyed only on that flag would arm and later erase ghost text.
         term_lock(&term).process(b"\x1b[>7u");
         assert!(model.fire("EnterComposer", &mut model_state));
         let _ = app.input(wid, printable('c'), Source::Human);
@@ -12066,8 +9431,8 @@ mod predictive_echo_input_gate_tests {
     /// The last two conjuncts additionally close a CREDIT LEAK, which is why
     /// this gate may not merely approximate the drain's: cueing at the key also
     /// arms a credit the echo spends to stay silent, so a cue the drain drops
-    /// leaves a credit standing for a click that never sounded — muting the echo
-    /// that pre-seam would have clicked.
+    /// leaves a credit standing for a click that never sounded, muting an echo
+    /// that should have clicked.
     #[test]
     fn a_click_that_cannot_be_heard_is_never_cued() {
         assert!(keystroke_click_audible(true, true, 0.4, true, false));
@@ -12146,11 +9511,6 @@ mod predictive_echo_input_gate_tests {
         assert!(!prediction_visibility_requires_redraw(false, false));
     }
 }
-
-// (The DEFAULT-ON / opt-OUT seamless gate helpers and their unit test were removed when
-// origin/main's reconciled seamless flow — `crate::seamless` + `spawn::Adopted`, keyed on
-// `ATERM_DEBUG_SEAMLESS_REEXEC` — superseded this branch's earlier slice. The NoReplay
-// nonce guarantee is still proven by `aterm_spec::derive::seamless_nonce_model`.)
 
 #[cfg(test)]
 mod vi_dispatch_tests {
@@ -12236,11 +9596,11 @@ mod vi_dispatch_tests {
     }
 
     /// The GUI-side vi mirror must track the ENGINE exactly, because the two
-    /// per-keystroke vi gates now answer from it instead of taking the terminal
+    /// per-keystroke vi gates answer from it instead of taking the terminal
     /// mutex twice per key. Off ⇒ `vi_any_active()` is false and neither gate can
     /// touch a terminal; a toggle ON must raise it (or a key would leak to the PTY
     /// while the user is navigating copy-mode), and the toggle OFF must lower it
-    /// again (or every keystroke would go on paying the pre-fix locks forever).
+    /// again (or every keystroke keeps paying both locks forever).
     #[test]
     fn vi_mirror_tracks_the_engine_so_the_key_path_can_skip_the_term_lock() {
         let _serial = VI_MIRROR_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -12291,15 +9651,14 @@ mod vi_dispatch_tests {
         }
     }
 
-    /// REGRESSION: a terminal that DIES in copy-mode must retire its contribution.
+    /// A terminal that DIES in copy-mode must retire its contribution.
     ///
-    /// `vi_toggle` used to be the mirror's only decrement, making the count a
-    /// one-way ratchet: close a tab while copy-mode is on and the stranded `+1`
-    /// pinned the gate "maybe active" for the rest of the PROCESS, so both
-    /// per-keystroke vi checks silently went back to taking the terminal mutex —
-    /// the exact lock elision this mirror exists to provide, given away for good by
-    /// one ordinary user action, in the fail-safe direction that guarantees nobody
-    /// notices.
+    /// `vi_toggle` is the mirror's only other decrement, so without this the count
+    /// is a one-way ratchet: close a tab while copy-mode is on and the stranded
+    /// `+1` pins the gate "maybe active" for the rest of the PROCESS, sending both
+    /// per-keystroke vi checks back to the terminal mutex — the exact lock elision
+    /// this mirror exists to provide, given away by one ordinary user action, in
+    /// the fail-safe direction that guarantees nobody notices.
     #[test]
     fn a_terminal_dying_in_copy_mode_does_not_strand_the_mirror() {
         let _serial = VI_MIRROR_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -12559,11 +9918,11 @@ mod typed_kitty_summon_tests {
     }
 
     /// M2 HOST WIRING PROOF — keys alone build NO cat momentum: the cursor
-    /// cat's metric now builds only from a real keystroke correlated with its
+    /// cat's metric builds only from a real keystroke correlated with its
     /// forward ECHO (the glow's `take_momentum_pulse`, fed in `tick_cursor_fx`),
     /// never from key presses at the input seam. A printable keystream through
-    /// the real press path with no rendered forward echo — the non-echoing case
-    /// (a password prompt; the old key-only feed) — leaves the metric at zero,
+    /// the real press path with no rendered forward echo — the non-echoing case,
+    /// e.g. a password prompt — leaves the metric at zero,
     /// so it can never summon the cat over a dark, non-advancing ribbon. (The
     /// correlated case building BOTH instances identically is pinned at the
     /// effects layer by `momentum_unifies_glow_and_cat_metrics`.)
@@ -12572,8 +9931,7 @@ mod typed_kitty_summon_tests {
         let mut app = App::headless_for_test();
         app.recompute_sparkle();
         let wid = WindowId(0);
-        // The style the cat rides — so this exercises exactly the path the old
-        // key-only feed used to build momentum on.
+        // The style the cat rides, so a key-only feed would build momentum here.
         app.config.cursor_trail_style = Some("nyan".to_string());
         let now = std::time::Instant::now();
         // 40 printable presses through the real seam. No present/tick runs, so
@@ -12594,7 +9952,8 @@ mod typed_kitty_summon_tests {
 
     /// The rate limit holds on the real input path: back-to-back completions
     /// land inside [`crate::kitty_summon::TYPED_SUMMON_COOLDOWN`], so
-    /// kitty-spam yields one LEDGER episode, not a flood (the CAMEO itself is no longer rate-limited — see `kitty_summon`'s two tiers).
+    /// kitty-spam yields one LEDGER episode, not a flood (the CAMEO itself is not
+    /// rate-limited — see `kitty_summon`'s two tiers).
     #[test]
     fn kitty_spam_is_rate_limited_to_one_episode() {
         let mut app = App::headless_for_test();
@@ -12621,8 +9980,8 @@ mod typed_kitty_summon_tests {
         assert!(!app.windows[&wid].cursor_cat.is_active());
         assert_eq!(app.kitty_log.log().sightings, 0);
         // The orphaned `ty` is still in the window, so the next word needs its
-        // delimiter: since 2026-07-26 completion is the lexicon's WORD-boundary
-        // match, not a substring suffix, so `tykitty` is not the word `kitty`.
+        // delimiter: completion is the lexicon's WORD-boundary match, not a
+        // substring suffix, so `tykitty` is not the word `kitty`.
         type_word(&mut app, wid, " kitty");
         assert_eq!(
             app.kitty_log.log().sightings,
@@ -12644,14 +10003,13 @@ mod typed_kitty_summon_tests {
         assert_eq!(app.kitty_log.log().sightings, 0);
     }
 
-    /// FELINE SUB-GATE (adversarial review): `[sparkle_words.feline]
-    /// enabled = false` disables every ambient cat decoration — and with it
-    /// every ambient Kitty Log sighting — while the OTHER families keep the
-    /// sparkle master resolved ON. The typed summon must be equally inert
-    /// under that config: no cameo, no ledger row. The first cut gated only
-    /// on the master, so a feline-opted-out user still got the cameo AND a
-    /// durable `head_peek` episode in a ledger category their config could
-    /// never produce ambiently.
+    /// FELINE SUB-GATE: `[sparkle_words.feline] enabled = false` disables every
+    /// ambient cat decoration — and with it every ambient Kitty Log sighting —
+    /// while the OTHER families keep the sparkle master resolved ON. The typed
+    /// summon must be equally inert under that config: no cameo, and no ledger
+    /// row, since a `head_peek` episode would land in a category the user's
+    /// config can never produce ambiently. Gating on the master alone is not
+    /// enough.
     #[test]
     fn summon_is_inert_with_feline_family_off() {
         let mut app = App::headless_for_test();
@@ -12713,10 +10071,9 @@ mod typed_kitty_summon_tests {
         );
     }
 
-    /// THE TWO TIERS AT THE APP SEAM (owner, 2026-07-24: "it should be 100% of
-    /// the time"). A ledger-suppressed summon (`record = false`) must still
-    /// present the cameo, and must not touch the log — not the sighting count,
-    /// not the ident sequence.
+    /// THE TWO TIERS AT THE APP SEAM. A ledger-suppressed summon
+    /// (`record = false`) must still present the cameo, and must not touch the
+    /// log — not the sighting count, not the ident sequence.
     #[test]
     fn a_ledger_suppressed_summon_still_shows_the_cameo() {
         let mut app = App::headless_for_test();
@@ -12744,11 +10101,10 @@ mod typed_kitty_summon_tests {
     }
 }
 
-/// FAVOURITE-THE-SESSION-KITTY App seams (owner: "I like that there is a unique
-/// kitty chosen per session … and if somebody really likes that kitty it goes
-/// into the kitty registry"). The ledger laws (composition transfer, the
-/// restart election, ring bypass) are proven in `kitty_log`; this module binds
-/// the App seam: WHICH cat is promoted, the two gates, and the surface wiring.
+/// FAVOURITE-THE-SESSION-KITTY App seams. The ledger laws (composition
+/// transfer, the restart election, ring bypass) are proven in `kitty_log`; this
+/// module binds the App seam: WHICH cat is promoted, the two gates, and the
+/// surface wiring.
 ///
 /// `dispatch_menu_action` takes an `&ActiveEventLoop` and is not
 /// headless-callable, so — exactly as the summon tests do — the action is
@@ -12773,10 +10129,10 @@ mod favourite_session_kitty_tests {
         let look = KittyLook::for_session(session);
         let now = std::time::Instant::now();
 
-        // TRAP 3. Collect something ELSE first, so the App-global companion —
-        // which wins for EVERY window in `app_render` — is a different cat.
+        // Collect something ELSE first, so the App-global companion — which
+        // wins for EVERY window in `app_render` — is a different cat.
         // Favouriting "what I can see" could then never promote a session
-        // kitty, which is exactly what the owner asked for.
+        // kitty.
         let other = KittyLook {
             variant: aterm_effects::cat_glyphs_gen::CatGlyphId::SpecWitch,
             ..KittyLook::default()
@@ -13040,14 +10396,19 @@ mod full_nyan_sing_seam_tests {
             // failing under 2x-core spinners at load average 36. Re-arm instead of
             // asserting a wall-clock window this test does not own — `note_char`
             // re-anchors when `count >= SING_ARM_REPEATS`, so repeating is enough.
-            let now = 'arm: {
+            // The armed instant itself is spent where it is taken (the `is_armed`
+            // check that ends the retry IS the old `assert!(is_armed(now))`); every
+            // assertion below samples `after`, i.e. post-release. So this block arms
+            // for effect and yields nothing — unlike its twin above, whose `drive`
+            // assertion has to be made at the armed instant.
+            'arm: {
                 for attempt in 0..8 {
                     for _ in 0..SING_ARM_REPEATS {
                         app.input(wid, key('x'), Source::Human);
                     }
                     let sample = std::time::Instant::now();
                     if app.windows[&wid].nyan_sing.is_armed(sample) {
-                        break 'arm sample;
+                        break 'arm;
                     }
                     assert!(
                         attempt < 7,
@@ -13056,7 +10417,7 @@ mod full_nyan_sing_seam_tests {
                     );
                 }
                 unreachable!("the bounded loop either breaks or asserts")
-            };
+            }
             app.input(wid, release, Source::Human);
             let after = std::time::Instant::now();
             assert!(
@@ -13085,7 +10446,7 @@ mod find_field_key_tests {
 
     /// A pressed key event shaped like the platform's: `text` is what winit reports,
     /// INCLUDING the control strings it produces for ⎋ (`\u{1b}`), ⏎ (`\r`) and ⇥
-    /// (`\t`) — the payloads that used to be typed straight into the query.
+    /// (`\t`) — the payloads that must never reach the query as text.
     fn press(logical: Key, text: Option<&str>) -> KeyEvent {
         KeyEvent::synthetic_for_test(
             PhysicalKey::Code(KeyCode::KeyA),
@@ -13123,8 +10484,8 @@ mod find_field_key_tests {
     }
 
     /// ⎋ CLOSES the find bar — it is a command, never a character. winit reports
-    /// `text = "\u{1b}"` for it, and the classifier used to insert exactly that, so ⎋
-    /// typed an escape into the query and the bar stayed open.
+    /// `text = "\u{1b}"` for it, so a classifier that inserts every `text` payload
+    /// types an escape into the query and leaves the bar open.
     #[test]
     fn escape_closes_the_bar_and_types_nothing() {
         let mut app = App::headless_for_test();
@@ -13322,7 +10683,7 @@ mod find_field_key_tests {
 
     /// The field claims TEXT input, not the whole keyboard: ⌘C still copies the match
     /// the find bar highlighted (its accept contract promises exactly that), and ⇧Home
-    /// no longer yanks the viewport out from under an open find.
+    /// must not yank the viewport out from under an open find.
     #[test]
     fn the_field_claims_text_input_not_every_chord() {
         let mut app = App::headless_for_test();

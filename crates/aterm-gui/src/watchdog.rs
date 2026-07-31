@@ -296,8 +296,9 @@ mod tests {
         let _ = aterm_log::set_logger(cap);
         aterm_log::set_max_level(aterm_log::LevelFilter::Trace);
 
-        // Ensure the sampler is enabled regardless of debug/release.
-        unsafe { std::env::set_var("ATERM_WATCHDOG", "1") };
+        // Ensure the sampler is enabled regardless of debug/release. Routed
+        // through the workspace's one lock-scoped env helper.
+        aterm_log::env::set("ATERM_WATCHDOG", "1");
 
         // Enter the resize-settle arm, then STOP beating (simulate the wedge).
         beat(Breadcrumb::ResizeSettle);

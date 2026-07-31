@@ -313,12 +313,9 @@ mod imp {
                 let _ = self.remove_exact();
                 return Err(error);
             }
-            if let Err(error) = rename_no_replace_with_hook(
-                self.dir.leaf(),
-                &self.name,
-                name,
-                after_publish,
-            ) {
+            if let Err(error) =
+                rename_no_replace_with_hook(self.dir.leaf(), &self.name, name, after_publish)
+            {
                 let _ = self.remove_exact();
                 return Err(error);
             }
@@ -329,7 +326,6 @@ mod imp {
             }
             Ok(self)
         }
-
     }
 
     impl PinnedDir {
@@ -805,6 +801,13 @@ mod imp {
                     .is_some_and(|fd| is_regular_file(&fd))
         }
 
+        /// Hard-bounded enumeration: overrunning `limit` is an ERROR, not a
+        /// truncation. Every retention caller moved to `names_up_to` (see its
+        /// note: a directory that outgrew the bound must not become a permanent
+        /// failure), so this stricter variant is compiled for the TEST build
+        /// only — it is where the fail-closed bound is still stated and
+        /// exercised, and shipping it would be unreachable code.
+        #[cfg(test)]
         pub(crate) fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
             let mut directory = Dir::read_from(self.leaf()).map_err(io::Error::from)?;
             let mut names = Vec::with_capacity(limit.min(256));
@@ -892,6 +895,14 @@ mod imp {
             self.remove_contents(budget, 0)
         }
 
+        /// Remove a child tree named only BY NAME, resolving it through the
+        /// retained parent. Every production cleanup already holds the child's
+        /// own handle and therefore goes through `remove_child_tree_exact`, so
+        /// this variant is compiled for the TEST build only: it is what lets a
+        /// test hand the parent nothing but a name AFTER the parent's pathname
+        /// was swapped, proving the removal still lands on the retained inode
+        /// and never on the replacement. Shipping it would be unreachable code.
+        #[cfg(test)]
         pub(crate) fn remove_child_tree(&self, name: &OsStr) -> io::Result<()> {
             validate_component(name)?;
             let child = match self.child(name) {
@@ -1244,7 +1255,6 @@ mod imp {
             }
             Ok(self)
         }
-
     }
 
     impl PinnedDir {
@@ -1696,6 +1706,7 @@ mod imp {
             probe_regular_file(&self.path.join(name)).is_ok()
         }
 
+        #[cfg(test)]
         pub(crate) fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
             self.validate_path_identity()?;
             let mut names = Vec::with_capacity(limit.min(256));
@@ -1775,6 +1786,7 @@ mod imp {
             self.remove_contents(budget, 0)
         }
 
+        #[cfg(test)]
         pub(crate) fn remove_child_tree(&self, name: &OsStr) -> io::Result<()> {
             validate_component(name)?;
             let child = match self.child(name) {

@@ -21,8 +21,29 @@
 //! full-width container `NSView`: it hosts one [`TabView`] sub-view PER tab laid out
 //! left→right from the leading pad, and the right-pinned "+" [`ChromeButton`]. The tab
 //! views let each tab carry an explicit theme-aware selected surface, accent keyline,
-//! and semibold label; a per-tab CLOSE × (revealed on hover via an `NSTrackingArea`,
-//! always shown on the active tab), and a drag-to-reorder gesture.
+//! and semibold label; a per-tab CLOSE ✕ revealed on hover via an `NSTrackingArea`,
+//! and a drag-to-reorder gesture.
+//!
+//! SHAPED LIKE macOS TERMINAL'S TAB BAR, on three counts:
+//!   * ALIGNED TO THE STOPLIGHTS. Every vertical position in the strip — chips, the
+//!     "+", the ✕, app icons, status dots — is derived from the traffic lights
+//!     MEASURED on the live window each refresh ([`macos::strip_metrics`]), not from
+//!     the row AppKit happened to hand the toolbar item, and the band's leading edge
+//!     is held clear of their trailing edge. (Measured before: the chips floated 2pt
+//!     high — the exact misalignment that reads as "the tab bar is bolted on".)
+//!   * THE ✕ HIDES. It appears only while the pointer is inside a chip — the selected
+//!     tab included, because a permanent ✕ on the tab you are looking at is the one
+//!     that gets mis-clicked. Its slot is reserved whether or not it is painted, so
+//!     the reveal never reflows the title, and the title is CENTRED in its chip.
+//!   * THE BAND IS SPENT, NOT RATIONED. Chips split the whole band into EQUAL shares
+//!     with no maximum width, so a wide window buys longer titles rather than bare
+//!     titlebar past a capped chip.
+//!
+//! ONE TAB IS A TITLE, NOT A SWITCHER. With a single tab there is nothing to switch
+//! between, so the lone chip drops its pill and its ✕ and becomes the window's title:
+//! the name beside its DESCRIPTION (from the same composed session chrome the hover
+//! card renders), centred on the WINDOW. Opening a second tab turns both back into
+//! chips.
 //!
 //! Like the menu bar (`menu.rs`), this chrome adds NO new behavior: each affordance is
 //! a thin DISPATCH stub that posts a `Wake` the main loop turns into an existing `App`
@@ -46,10 +67,13 @@
 //!     [`WindowId`](crate::WindowId) and its bound action, so the button looks and
 //!     behaves like a real button;
 //!   * a [`TabView`] — a custom `NSView` subclass, ONE per tab, owning the proxy +
-//!     window + its tab index + active flag, plus its title `NSTextField` label and a
-//!     close `NSButton`. It draws the (in)active background/accent in `drawRect:`,
-//!     tracks hover (`mouseEntered:`/`mouseExited:`) to reveal the ×, and turns a
-//!     `mouseDown:`/`mouseDragged:` gesture into select / reorder `Wake`s;
+//!     window + its tab index + active flag, plus its title `NSTextField` label, its
+//!     solo description label, and a close `NSButton`. It draws the (in)active
+//!     background/accent in `drawRect:`, tracks hover (`mouseEntered:`/`mouseExited:`)
+//!     to reveal the ✕, and turns a `mouseDown:`/`mouseDragged:` gesture into select /
+//!     reorder `Wake`s. ALL of its geometry — both modes — is placed by the single
+//!     `TabView::relayout` seam, so the painted ornaments can never disagree with the
+//!     laid-out text;
 //!   * a [`ToolbarDelegate`] — an `NSObject` conforming to `NSToolbarDelegate` that
 //!     vends the single strip-item identifier and builds its custom-view item.
 //!
@@ -261,12 +285,19 @@ fn tab_close_accessibility_label(title: &str) -> String {
 // Below 64 pt, equal two-tab cells cannot preserve the measured 55 pt active
 // "Settings" identity after gutters. Enter the active-priority layout first.
 const PREFERRED_MIN_TAB_WIDTH: f64 = 64.0;
-const MAX_TAB_WIDTH: f64 = 220.0;
 const TAB_CELL_GUTTER: f64 = 1.0;
 
 /// Lay out a native tab band without ever overlapping the trailing New Tab action.
-/// Preferred-width tabs are used when they fit; under pressure the selected identity
-/// gets the useful share and inactive tabs compress while remaining ordered/reachable.
+///
+/// EQUAL SHARES THAT FILL THE BAND (macOS Terminal's tab bar): every tab takes
+/// `band / count`, so two tabs are two half-width chips and eight tabs are eight
+/// eighths — the whole strip is spent on titles instead of leaving bare titlebar
+/// past a capped chip. There is deliberately no maximum width: an unread title is
+/// the only thing a wide window can spend that space on.
+///
+/// Under pressure — once an equal share would drop below the legibility floor —
+/// the selected identity gets the useful share and inactive tabs compress while
+/// remaining ordered/reachable.
 #[must_use]
 fn native_tab_cells(band_width: f64, count: usize, active: usize) -> Vec<(f64, f64)> {
     if count == 0 {
@@ -276,7 +307,7 @@ fn native_tab_cells(band_width: f64, count: usize, active: usize) -> Vec<(f64, f
     let ideal = band_width / count as f64;
     let active = active.min(count - 1);
     let widths = if ideal >= PREFERRED_MIN_TAB_WIDTH {
-        vec![ideal.min(MAX_TAB_WIDTH); count]
+        vec![ideal; count]
     } else {
         // Once equal tabs would become illegible, reserve up to 60% of the band (capped
         // at a useful 96pt) for the selected identity and share the remainder. Hidden
@@ -437,7 +468,7 @@ mod shared_tests {
             "a selected Settings tab wins space even in the common two-tab case"
         );
         let settings_layout =
-            crate::tab_bar::native_tab_content_layout(phone_pair[1].1, 28.0, true, false);
+            crate::tab_bar::native_tab_content_layout(phone_pair[1].1, 14.0, true, false);
         assert!(
             settings_layout.label[2] >= 55.0,
             "the selected phone tab preserves AppKit's measured Settings title"
@@ -446,6 +477,40 @@ mod shared_tests {
         let extreme = native_tab_cells(12.0, 40, 39);
         let last = extreme.last().unwrap();
         assert!(last.0 + last.1 <= 12.0 + f64::EPSILON);
+    }
+
+    /// A wide window spends its whole band on titles: equal shares, no cap, no bare
+    /// titlebar trailing the last chip. This is the macOS Terminal rule, and the
+    /// reason a two-tab window on a 1200 pt display gets two 600 pt titles rather
+    /// than two 220 pt chips with 760 pt of nothing beside them.
+    #[test]
+    fn wide_bands_are_split_evenly_and_spent_to_the_last_point() {
+        for count in 1..=8usize {
+            let band = 1180.0;
+            let cells = native_tab_cells(band, count, 0);
+            assert_eq!(cells.len(), count);
+            let share = band / count as f64;
+            for (index, &(x, width)) in cells.iter().enumerate() {
+                assert!(
+                    (x - share * index as f64).abs() < 1e-9,
+                    "cell {index} of {count} starts on its equal share"
+                );
+                assert!(
+                    (width - (share - TAB_CELL_GUTTER)).abs() < 1e-9,
+                    "cell {index} of {count} is one equal share wide"
+                );
+            }
+            let (last_x, last_w) = *cells.last().unwrap();
+            assert!(
+                band - (last_x + last_w) <= TAB_CELL_GUTTER,
+                "nothing but the gutter is left over at {count} tabs"
+            );
+        }
+
+        // The lone identity is the whole band: a one-tab window has no leftover
+        // titlebar to explain, and its title band is what fills it.
+        assert_eq!(native_tab_cells(1180.0, 1, 0)[0].0, 0.0);
+        assert!(native_tab_cells(1180.0, 1, 0)[0].1 >= 1180.0 - TAB_CELL_GUTTER);
     }
 }
 
@@ -796,7 +861,7 @@ mod macos {
         NSBezierPath, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventModifierFlags,
         NSFont, NSLineCapStyle, NSMenu, NSMenuItem, NSTextAlignment, NSTextField, NSToolbar,
         NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSToolbarItemIdentifier,
-        NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowTitleVisibility,
+        NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindowButton, NSWindowTitleVisibility,
         NSWindowToolbarStyle,
     };
     use objc2_foundation::{CGPoint, CGRect, CGSize, MainThreadMarker, NSArray, NSRect, NSString};
@@ -810,8 +875,9 @@ mod macos {
     use crate::menu::MenuAction;
     use crate::session_chrome::{TabChromeExt, TabMenuEntry};
     use crate::tab_bar::{
-        TAB_ICON_DESIGN_SIZE, TAB_STATUS_KINDS, TabIconKind, TabIconPrimitive, TabStatusKind,
-        TabStripMetadata, native_tab_content_layout, tab_icon_primitives, tab_status_center,
+        TAB_ICON_DESIGN_SIZE, TAB_ICON_NATIVE_SIZE, TAB_STATUS_KINDS, TabIconKind,
+        TabIconPrimitive, TabStatusKind, TabStripMetadata, native_tab_content_layout,
+        tab_icon_primitives, tab_status_center,
     };
     use crate::tab_model::TabId;
     use crate::{TabAction, Wake, WindowId};
@@ -828,8 +894,16 @@ mod macos {
     /// edge — we do NOT reserve the full ~70pt light span here; this is just a tidy
     /// gutter so the first tab is composed cleanly past the stoplights, not jammed
     /// against the item edge. The leading edge carries NOTHING but tabs (no icon to
-    /// misalign with the stoplights).
-    const STRIP_LEADING_PAD: f64 = 8.0;
+    /// misalign with the stoplights). [`strip_metrics`] can widen it: the band never
+    /// starts before the MEASURED right edge of the live traffic lights plus
+    /// [`LIGHTS_CLEARANCE`], so an AppKit metrics change can never tuck a chip under
+    /// the stoplights.
+    const STRIP_LEADING_PAD: f64 = 4.0;
+
+    /// Clear space (points) kept between the trailing edge of the window's traffic
+    /// lights and the first tab chip. Only binds when AppKit places the toolbar item
+    /// far enough left that [`STRIP_LEADING_PAD`] alone would not clear the lights.
+    const LIGHTS_CLEARANCE: f64 = 10.0;
 
     /// Width (points) of the trailing "+" New Tab button at the right end of the cluster.
     const PLUS_WIDTH: f64 = 28.0;
@@ -843,13 +917,18 @@ mod macos {
     /// never butts straight against it.
     const TAB_GAP: f64 = 6.0;
 
-    /// The [`ChromeButton`] hover/press/accent fill is a rounded rect inset from the full
-    /// button cell by this vertical margin (matching the tab pills' `TAB_PILL_INSET_Y`, so
-    /// the buttons sit at the same optical height as the tab chips) with this corner
+    /// The [`ChromeButton`] hover/press/accent fill is a rounded rect inset horizontally
+    /// from the full button cell by this margin, of this fixed height, CENTRED on the
+    /// strip's measured content line (the same one the tab pills use), with this corner
     /// radius. An accent capsule-style pill overrides the radius to half its height.
     const BTN_INSET_X: f64 = 2.0;
-    const BTN_INSET_Y: f64 = 4.0;
+    const BTN_PILL_HEIGHT: f64 = 20.0;
     const BTN_RADIUS: f64 = 6.0;
+
+    /// The "+" mark: half-length of each arm and the stroke width, drawn as two
+    /// round-capped strokes crossing on the strip's measured centre line.
+    const PLUS_ARM: f64 = 5.5;
+    const PLUS_STROKE: f64 = 1.6;
 
     /// Min/max width (points) of the tab-strip toolbar ITEM. A plain custom `NSView`
     /// has no intrinsic size; without these the `UnifiedCompact` toolbar collapses the
@@ -858,15 +937,203 @@ mod macos {
     const STRIP_MIN_WIDTH: f64 = 120.0;
     const STRIP_MAX_WIDTH: f64 = 100_000.0;
 
-    /// The widest a single tab grows to (so two tabs don't each eat half a wide
-    /// window); extra width is left as bare strip background past the last tab.
-    /// Curved-tab "pill" geometry. The active/hovered fill is a rounded rect inset from
-    /// the full tab cell by these margins (so it floats with breathing room, the iTerm
-    /// look) with this corner radius. The horizontal inset also yields the visual gap
-    /// between adjacent pills.
-    const TAB_PILL_INSET_X: f64 = 3.0;
-    const TAB_PILL_INSET_Y: f64 = 4.0;
+    /// Curved-tab "pill" geometry. The active/hovered fill is a rounded rect of this
+    /// fixed HEIGHT, centred on the strip's measured content line, inset horizontally
+    /// from the full tab cell by this margin (so it floats with breathing room, the
+    /// iTerm look) with this corner radius. The horizontal inset also yields the visual
+    /// gap between adjacent pills — kept tight, because the cells now fill the band
+    /// edge to edge and adjacent chips should read as one segmented bar.
+    const TAB_PILL_INSET_X: f64 = 2.0;
+    const TAB_PILL_HEIGHT: f64 = 22.0;
     const TAB_PILL_RADIUS: f64 = 7.0;
+
+    /// Height (points) of the hairline rule an unselected chip draws on its leading
+    /// edge to separate it from the chip before it. Shorter than the pill on purpose:
+    /// it should divide two titles, not draw a box around each.
+    const TAB_RULE_HEIGHT: f64 = 14.0;
+
+    /// Gap (points) between the SOLO title and its description, and the minimum clear
+    /// space kept at each end of the solo band before the title group is compressed.
+    const SOLO_GAP: f64 = 10.0;
+    const SOLO_EDGE_PAD: f64 = 12.0;
+    /// Height (points) of the solo band's title / description labels, and of the solo
+    /// status canvas trailing them.
+    const SOLO_LABEL_HEIGHT: f64 = 18.0;
+    const SOLO_STATUS_SIZE: f64 = 16.0;
+
+    /// Where a chip sits in the strip, resolved ONCE per refresh by
+    /// [`set_window_tabs`] from the measured [`StripMetrics`] and the tab COUNT, then
+    /// handed to every [`TabView`]. Bundled so the vertical alignment, the solo/tabbed
+    /// mode, and the solo centre travel together and can never be applied half-way.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct TabGeometry {
+        /// The measured content centre line, in the chip's own coordinates.
+        center_y: f64,
+        /// Exactly one tab in this window: render as the window TITLE, not a chip.
+        solo: bool,
+        /// The window's horizontal centre, in the chip's own coordinates (solo only).
+        solo_center_x: f64,
+        /// Draw the leading-edge hairline that divides this chip from the one before
+        /// it. False for the first chip (nothing precedes it) and for either chip
+        /// touching the selected pill, which draws its own edge.
+        separator: bool,
+    }
+
+    impl TabGeometry {
+        /// Whether the chip at `index` of a strip whose `active` chip is selected
+        /// draws a leading divider. PURE, so the rule is stated once and testable.
+        #[must_use]
+        const fn separates(index: usize, active: usize) -> bool {
+            index > 0 && index != active && index != active + 1
+        }
+    }
+
+    #[cfg(test)]
+    mod geometry_tests {
+        use super::TabGeometry;
+
+        /// Dividers separate two quiet titles and nothing else: never before the first
+        /// chip, and never on either side of the selected pill, which draws its own
+        /// edge (a rule beside a pill reads as grime, not as structure).
+        #[test]
+        fn dividers_separate_quiet_titles_and_never_crowd_the_selected_pill() {
+            let drawn = |active: usize| {
+                (0..5)
+                    .map(|index| TabGeometry::separates(index, active))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(drawn(0), [false, false, true, true, true]);
+            assert_eq!(drawn(2), [false, true, false, false, true]);
+            assert_eq!(drawn(4), [false, true, true, true, false]);
+            // A lone chip is a title band; nothing precedes it either way.
+            assert!(!TabGeometry::separates(0, 0));
+        }
+    }
+
+    /// `[x, y, w, h]` (the point-space layout arrays) as an AppKit rect.
+    fn rect_of([x, y, w, h]: [f64; 4]) -> CGRect {
+        CGRect::new(CGPoint::new(x, y), CGSize::new(w.max(0.0), h.max(0.0)))
+    }
+
+    /// `NSLineBreakByTruncatingTail` — a title too long for its chip must end in an
+    /// ELLIPSIS, not simply stop: a silently clipped title reads as a complete (and
+    /// therefore wrong) name, and equal-share chips truncate routinely. A
+    /// `labelWithString:` label clips by default, so every strip label is switched
+    /// over explicitly.
+    ///
+    /// Sent to the field's CELL by raw message rather than through the typed setter,
+    /// which lives behind objc2-app-kit's `NSParagraphStyle` feature — the same
+    /// reason the accessibility setters here are raw messages: no new binding surface
+    /// for one integer.
+    fn truncate_tail(field: &NSTextField) {
+        const NS_LINE_BREAK_BY_TRUNCATING_TAIL: usize = 4;
+        // SAFETY: `cell` is a side-effect-free main-thread getter, and every
+        // `NSTextField`'s cell is an `NSCell`, which has responded to
+        // `setLineBreakMode:` since 10.0. The argument is the documented
+        // `NSLineBreakMode` enumerator, encoded as the `NSUInteger` it is.
+        unsafe {
+            if let Some(cell) = field.cell() {
+                let _: () =
+                    objc2::msg_send![&*cell, setLineBreakMode: NS_LINE_BREAK_BY_TRUNCATING_TAIL];
+            }
+        }
+    }
+
+    /// The strip geometry MEASURED from the live window rather than assumed: where the
+    /// window's traffic lights actually sit, expressed in the strip container view's own
+    /// coordinates.
+    ///
+    /// The `UnifiedCompact` toolbar hands our custom view a row whose optical centre is
+    /// NOT the stoplights' centre — measured on a stock window the chips floated ~2pt
+    /// high, which is exactly the kind of misalignment the eye reads as "the tab bar is
+    /// not part of the titlebar". Rather than bake a magic offset that a macOS metrics
+    /// change would silently invalidate, every vertical position in the strip is derived
+    /// from [`Self::center_y`] — the close button's own centre line — and the band's
+    /// leading edge is held clear of [`Self::lights_right`].
+    #[derive(Clone, Copy, Debug)]
+    struct StripMetrics {
+        /// Vertical centre the whole strip's content aligns to: the traffic lights'
+        /// centre line, in container coordinates. Falls back to the container's own
+        /// midpoint when the window or its buttons cannot be read (headless teardown).
+        center_y: f64,
+        /// Trailing edge of the rightmost visible traffic light, in container
+        /// coordinates. Normally NEGATIVE (the lights sit left of the toolbar item);
+        /// `f64::NEG_INFINITY` when no light could be measured, so the `max` that
+        /// consumes it degrades to the plain leading pad.
+        lights_right: f64,
+        /// Horizontal centre of the WINDOW (not of the band), in container
+        /// coordinates — what the solo title centres on, so a one-tab window's title
+        /// reads centred in its window the way macOS Terminal's does, rather than
+        /// centred in the leftover space between the stoplights and the "+".
+        window_center_x: f64,
+    }
+
+    impl StripMetrics {
+        /// The geometry a container with no reachable window falls back to: its own
+        /// centre, no measured lights.
+        fn unmeasured(container: &NSView) -> Self {
+            let bounds = container.bounds();
+            Self {
+                center_y: bounds.origin.y + bounds.size.height * 0.5,
+                lights_right: f64::NEG_INFINITY,
+                window_center_x: bounds.origin.x + bounds.size.width * 0.5,
+            }
+        }
+    }
+
+    /// Measure the live window's traffic lights in `container`'s coordinate space.
+    ///
+    /// Returns [`StripMetrics::unmeasured`] whenever the window, its standard buttons,
+    /// or its content view cannot be read — a detached or tearing-down container still
+    /// lays out, it just centres on itself. `center_y` is clamped so a full-height pill
+    /// always lands inside the container even if AppKit hands us a short row.
+    fn strip_metrics(container: &NSView) -> StripMetrics {
+        let mut metrics = StripMetrics::unmeasured(container);
+        // SAFETY: every call here is a side-effect-free main-thread AppKit getter on
+        // live objects (`window`/`standardWindowButton:`/`superview`/`frame`/
+        // `convertRect:fromView:`/`contentView`); each Option is checked, and a button
+        // belonging to the same window is always convertible into this view's space.
+        unsafe {
+            let Some(window) = container.window() else {
+                return metrics;
+            };
+            for button in [
+                NSWindowButton::NSWindowCloseButton,
+                NSWindowButton::NSWindowMiniaturizeButton,
+                NSWindowButton::NSWindowZoomButton,
+            ] {
+                let Some(light) = window.standardWindowButton(button) else {
+                    continue;
+                };
+                if light.isHidden() {
+                    continue;
+                }
+                let superview = light.superview();
+                let rect = container.convertRect_fromView(light.frame(), superview.as_deref());
+                if !(rect.size.width.is_finite() && rect.size.height > 0.0) {
+                    continue;
+                }
+                if button == NSWindowButton::NSWindowCloseButton {
+                    metrics.center_y = rect.origin.y + rect.size.height * 0.5;
+                }
+                metrics.lights_right = metrics.lights_right.max(rect.origin.x + rect.size.width);
+            }
+            if let Some(content) = window.contentView() {
+                let rect = container.convertRect_fromView(content.bounds(), Some(&content));
+                if rect.size.width.is_finite() && rect.size.width > 1.0 {
+                    metrics.window_center_x = rect.origin.x + rect.size.width * 0.5;
+                }
+            }
+        }
+        // Never let a measurement push the pill outside the row AppKit gave us.
+        let bounds = container.bounds();
+        let lo = bounds.origin.y + TAB_PILL_HEIGHT * 0.5;
+        let hi = bounds.origin.y + bounds.size.height - TAB_PILL_HEIGHT * 0.5;
+        if lo <= hi {
+            metrics.center_y = metrics.center_y.clamp(lo, hi);
+        }
+        metrics
+    }
 
     /// What [`install_window_toolbar`] returns: the retained backing objects. AppKit
     /// references a toolbar item's view and a toolbar's delegate only WEAKLY, so they
@@ -899,11 +1166,12 @@ mod macos {
         /// the per-tab targets/labels stay live and introspection can read them.
         tabs: RefCell<Vec<Retained<TabView>>>,
         /// The trailing "+" New Tab [`ChromeButton`], pinned right. Retained because the
-        /// container holds its subviews weakly w.r.t. our Rust ownership; keeping it
-        /// here documents ownership of the whole strip. (The accent "Update" capsule
-        /// that used to sit left of it is RETIRED — the update affordance lives in the
-        /// VERSION menu now; see `crate::menu::update_version_menu`.)
-        _plus: Retained<ChromeButton>,
+        /// container holds its subviews weakly w.r.t. our Rust ownership, and because
+        /// [`set_window_tabs`] re-pins it to the live width and puts it on the strip's
+        /// measured centre line every refresh. (The accent "Update" capsule that used to
+        /// sit left of it is RETIRED — the update affordance lives in the VERSION menu
+        /// now; see `crate::menu::update_version_menu`.)
+        plus: Retained<ChromeButton>,
     }
 
     /// The live custom-view subtree AppKit places in the unified titlebar.
@@ -941,9 +1209,10 @@ mod macos {
         hovered: Cell<bool>,
         /// Whether the mouse is held down inside the button (drives the pressed state).
         pressed: Cell<bool>,
-        /// The retained centered `NSTextField` label (the glyph/word), kept so hover can
-        /// recolor it and so the handle keeps it alive.
-        label: RefCell<Option<Retained<NSTextField>>>,
+        /// The strip's MEASURED content centre line ([`StripMetrics::center_y`]) in this
+        /// button's own coordinates, so the "+" sits on the same optical row as the
+        /// traffic lights and the tab chips instead of on the cell's own midpoint.
+        center_y: Cell<f64>,
         /// The retained tracking area, so `updateTrackingAreas` can swap it on a frame
         /// change without leaking the old one.
         tracking: RefCell<Option<Retained<NSTrackingArea>>>,
@@ -978,25 +1247,29 @@ mod macos {
         }
 
         unsafe impl ChromeButton {
-            /// Paint the button affordance. ICON: nothing at rest (blends into the
-            /// titlebar), a subtle translucent-white rounded pill on hover, a stronger one
-            /// while pressed — the modern macOS toolbar-button look. ACCENT: a filled
-            /// `controlAccentColor` capsule always (the CTA), darkened while pressed. The
-            /// centered label draws ON TOP (AppKit paints subviews after this).
+            /// Paint the button affordance, then its "+" mark. ICON: nothing at rest
+            /// (blends into the titlebar), a subtle translucent-white rounded pill on
+            /// hover, a stronger one while pressed — the modern macOS toolbar-button
+            /// look. ACCENT: a filled `controlAccentColor` capsule always (the CTA),
+            /// darkened while pressed.
             #[method(drawRect:)]
             #[allow(non_snake_case)]
             fn drawRect(&self, _dirty: NSRect) {
                 let bounds = self.bounds();
                 let ivars = self.ivars();
                 let accent = ivars.accent;
-                // The fill is inset from the full cell so it floats at the same optical
-                // height as the tab pills (a capsule for accent, a soft rounded rect for
-                // the icon hover).
+                // The fill is inset horizontally from the cell and CENTRED on the strip's
+                // measured content line, so it floats at exactly the same optical height
+                // as the tab pills and the traffic lights (a capsule for accent, a soft
+                // rounded rect for the icon hover).
                 let pill = CGRect::new(
-                    CGPoint::new(bounds.origin.x + BTN_INSET_X, bounds.origin.y + BTN_INSET_Y),
+                    CGPoint::new(
+                        bounds.origin.x + BTN_INSET_X,
+                        ivars.center_y.get() - BTN_PILL_HEIGHT * 0.5,
+                    ),
                     CGSize::new(
                         (bounds.size.width - 2.0 * BTN_INSET_X).max(0.0),
-                        (bounds.size.height - 2.0 * BTN_INSET_Y).max(0.0),
+                        BTN_PILL_HEIGHT,
                     ),
                 );
                 let radius = if accent { pill.size.height / 2.0 } else { BTN_RADIUS };
@@ -1026,6 +1299,24 @@ mod macos {
                         NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(pill, radius, radius)
                             .fill();
                     }
+                    // The "+" is DRAWN, not set in a font: a glyph is centred on its
+                    // line box, and a line box's centre is not the glyph's optical
+                    // centre — measured, a 17pt "+" in an `NSTextField` sat ~1.3pt
+                    // below the stoplights no matter how the box was placed. Two
+                    // strokes crossing exactly at the measured centre line cannot be
+                    // off, and read crisper at this size besides.
+                    Self::glyph_color(accent, ivars.hovered.get()).set();
+                    let cx = bounds.origin.x + bounds.size.width * 0.5;
+                    let cy = ivars.center_y.get();
+                    let arm = PLUS_ARM;
+                    let mark = NSBezierPath::bezierPath();
+                    mark.setLineWidth(PLUS_STROKE);
+                    mark.setLineCapStyle(NSLineCapStyle::Round);
+                    mark.moveToPoint(CGPoint::new(cx - arm, cy));
+                    mark.lineToPoint(CGPoint::new(cx + arm, cy));
+                    mark.moveToPoint(CGPoint::new(cx, cy - arm));
+                    mark.lineToPoint(CGPoint::new(cx, cy + arm));
+                    mark.stroke();
                 }
             }
 
@@ -1065,21 +1356,19 @@ mod macos {
                 }
             }
 
-            /// Pointer entered — show the hover highlight (and brighten a quiet icon label).
+            /// Pointer entered — show the hover highlight and brighten the "+" mark.
             #[method(mouseEntered:)]
             #[allow(non_snake_case)]
             fn mouseEntered(&self, _event: &NSEvent) {
                 self.ivars().hovered.set(true);
-                self.refresh_label_color();
                 self.mark_dirty();
             }
 
-            /// Pointer left — drop the hover highlight (and dim the icon label back).
+            /// Pointer left — drop the hover highlight and dim the "+" mark back.
             #[method(mouseExited:)]
             #[allow(non_snake_case)]
             fn mouseExited(&self, _event: &NSEvent) {
                 self.ivars().hovered.set(false);
-                self.refresh_label_color();
                 self.mark_dirty();
             }
 
@@ -1120,24 +1409,17 @@ mod macos {
     );
 
     impl ChromeButton {
-        /// Build a titlebar button of `frame` showing `text`, wired to relay `action`
-        /// through `proxy`. `accent` selects the ACCENT-CAPSULE CTA style vs the
-        /// QUIET-ICON style ("+"); `font_pt`/`bold` size the centered label glyph.
-        /// The label is a non-selectable `NSTextField` (so it passes the mouse through to
-        /// this view, which owns the click). All construction is via NON-RAISING factory
-        /// initializers on the main thread.
-        #[allow(
-            clippy::too_many_arguments,
-            reason = "button identity (action/accent/text) plus its render context (mtm/proxy/font/frame); all needed at construction"
-        )]
+        /// Build a titlebar "+" button of `frame`, wired to relay `action` through
+        /// `proxy`. `accent` selects the ACCENT-CAPSULE CTA style vs the QUIET-ICON
+        /// style. The mark itself is drawn in [`drawRect:`](Self::drawRect) rather than
+        /// set in a font, so it lands exactly on the strip's measured centre line. All
+        /// construction is via NON-RAISING factory initializers on the main thread.
         fn build(
             mtm: MainThreadMarker,
             proxy: EventLoopProxy<Wake>,
             action: MenuAction,
             accent: bool,
-            text: &str,
-            font_pt: f64,
-            bold: bool,
+            accessibility_label: &str,
             frame: NSRect,
         ) -> Retained<Self> {
             let ivars = ChromeIvars {
@@ -1146,48 +1428,18 @@ mod macos {
                 accent,
                 hovered: Cell::new(false),
                 pressed: Cell::new(false),
-                label: RefCell::new(None),
+                center_y: Cell::new(frame.size.height * 0.5),
                 tracking: RefCell::new(None),
-                accessibility_label: match action {
-                    MenuAction::NewTab => "New Tab".to_string(),
-                    _ => text.to_string(),
-                },
+                accessibility_label: accessibility_label.to_string(),
             };
             let this = mtm.alloc().set_ivars(ivars);
             // SAFETY: `initWithFrame:` is the documented non-raising NSView initializer.
             let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
 
-            // The centered label (a glyph like "+" or a CTA word). A label —
-            // NON-editable, NON-selectable — passes the mouse through to this view, so the
-            // whole button is one click target. SAFETY: `labelWithString:` is the
-            // documented non-raising factory; plain setters follow; on the main thread.
-            let label = unsafe {
-                let lbl = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-                lbl.setDrawsBackground(false);
-                lbl.setBezeled(false);
-                lbl.setEditable(false);
-                lbl.setSelectable(false);
-                lbl.setAlignment(NSTextAlignment::Center);
-                lbl.setUsesSingleLineMode(true);
-                let font = if bold {
-                    NSFont::boldSystemFontOfSize(font_pt)
-                } else {
-                    NSFont::systemFontOfSize(font_pt)
-                };
-                lbl.setFont(Some(&font));
-                lbl.setTextColor(Some(&Self::label_color(accent, false)));
-                let lh = 18.0;
-                let lbl_frame = CGRect::new(
-                    CGPoint::new(0.0, (frame.size.height - lh) / 2.0),
-                    CGSize::new(frame.size.width, lh),
-                );
-                lbl.setFrame(lbl_frame);
-                this.addSubview(&lbl);
-                lbl
-            };
-            *this.ivars().label.borrow_mut() = Some(label);
             // The custom NSView must opt into accessibility explicitly; otherwise the
-            // visible `+` is skipped because its child NSTextField is decorative.
+            // drawn "+" is invisible to VoiceOver — it is pixels, not a control.
+            // SAFETY: NSView implements the NSAccessibility setters on every supported
+            // macOS version; plain main-thread metadata writes on the fresh view.
             unsafe {
                 let role = NSString::from_str("AXButton");
                 let name = NSString::from_str(&this.ivars().accessibility_label);
@@ -1200,13 +1452,13 @@ mod macos {
             this
         }
 
-        /// The label color for the given style + hover: an ACCENT button's word is always
-        /// near-white (on the accent fill); a QUIET icon is `secondaryLabelColor` at rest
-        /// and brightens to `labelColor` on hover.
-        fn label_color(accent: bool, hovered: bool) -> Retained<NSColor> {
+        /// Ink for the "+" mark: on an ACCENT capsule it is always near-white (it sits
+        /// on the accent fill); a QUIET icon is `secondaryLabelColor` at rest and
+        /// brightens to `labelColor` on hover.
+        fn glyph_color(accent: bool, hovered: bool) -> Retained<NSColor> {
             // SAFETY: the NSColor class-color factories are main-thread AppKit calls that
-            // return an autoreleased instance and never raise; every caller (build /
-            // refresh_label_color) runs on the main thread.
+            // return an autoreleased instance and never raise; the only caller is
+            // `drawRect:`, which runs on the main thread.
             unsafe {
                 if accent {
                     NSColor::whiteColor()
@@ -1218,16 +1470,14 @@ mod macos {
             }
         }
 
-        /// Recolor the label for the current hover state (icon only — an accent word is
-        /// fixed near-white).
-        fn refresh_label_color(&self) {
-            let ivars = self.ivars();
-            if let Some(lbl) = ivars.label.borrow().as_ref() {
-                // SAFETY: plain main-thread setter on the live label.
-                unsafe {
-                    lbl.setTextColor(Some(&Self::label_color(ivars.accent, ivars.hovered.get())));
-                }
+        /// Move this button onto the strip's measured content line. No-op when
+        /// unchanged, so the per-refresh call costs nothing in the steady state.
+        fn set_center_y(&self, center_y: f64) {
+            if self.ivars().center_y.get() == center_y {
+                return;
             }
+            self.ivars().center_y.set(center_y);
+            self.mark_dirty();
         }
 
         /// Whether `event`'s location is within the button's bounds (a click that ends on
@@ -1332,10 +1582,43 @@ mod macos {
         /// Whether the current gesture has already fired a reorder (so a long drag
         /// fires at most one `Move` per press — avoids a stutter of swaps).
         dragged: Cell<bool>,
+        /// SOLO MODE: this is the window's ONLY tab, so the chip stops being a
+        /// switcher and becomes the window title — no pill, no accent keyline, no
+        /// close ✕, and the description label beside the title. Set from the tab
+        /// COUNT at layout time; a count change always rebuilds the strip, so this
+        /// can only flip on a rebuild.
+        solo: Cell<bool>,
+        /// The strip's MEASURED content centre line ([`StripMetrics::center_y`]) in
+        /// this view's own coordinates — every vertical slot derives from it, so the
+        /// chip sits on the traffic lights' optical row rather than the cell's own
+        /// midpoint.
+        center_y: Cell<f64>,
+        /// SOLO MODE: the horizontal centre the title group aligns to, in this view's
+        /// coordinates — the WINDOW's centre, not the band's, so a one-tab title reads
+        /// centred in the window even though the band is offset by the stoplights and
+        /// the trailing "+".
+        solo_center_x: Cell<f64>,
+        /// Draw the leading-edge divider ([`TabGeometry::separates`]) — what tells the
+        /// eye that three equal full-width titles are three TABS.
+        separator: Cell<bool>,
+        /// Whether the current geometry reserves a close slot at all
+        /// ([`NativeTabContentLayout::close_available`]), cached by [`Self::relayout`]
+        /// so a hover reveal is a single `setHidden:` and never a re-layout.
+        close_available: Cell<bool>,
+        /// Where [`Self::paint_identity`] draws the app icon and the status canvas,
+        /// resolved by [`Self::relayout`] for whichever mode is live. `None` = that
+        /// ornament has no room (or no facts) and is not painted; it stays visible in
+        /// the tooltip, the context menu, and accessibility either way.
+        icon_rect: Cell<Option<[f64; 4]>>,
+        status_rect: Cell<Option<[f64; 4]>>,
         /// The retained close `NSButton` and title `NSTextField`, so the view can
         /// show/hide the × on hover and so the handle keeps them alive.
         close_btn: RefCell<Option<Retained<NSButton>>>,
         label: RefCell<Option<Retained<NSTextField>>>,
+        /// SOLO MODE: the retained DESCRIPTION `NSTextField` drawn beside the title
+        /// (hidden in every multi-tab layout). Its text is [`super::solo_subtitle`] of
+        /// the composed session chrome — the same facts the hover card shows.
+        desc_label: RefCell<Option<Retained<NSTextField>>>,
         /// The retained tracking area, so `updateTrackingAreas` can swap it on a frame
         /// change without leaking the old one.
         tracking: RefCell<Option<Retained<NSTrackingArea>>>,
@@ -1394,13 +1677,25 @@ mod macos {
             fn drawRect(&self, _dirty: NSRect) {
                 let bounds = self.bounds();
                 let ivars = self.ivars();
-                // The pill is inset from the full tab cell so it floats with a small
-                // margin (the curved iTerm look) instead of butting edge-to-edge.
+                if ivars.solo.get() {
+                    // SOLO: the window's only tab is its TITLE, not a switcher. There is
+                    // nothing to select away from, so no pill, no keyline, and no
+                    // selected surface — just the title group over the seamless
+                    // terminal-coloured titlebar, exactly like macOS Terminal.
+                    self.paint_identity();
+                    return;
+                }
+                // The pill is inset horizontally from the tab cell and CENTRED on the
+                // strip's measured content line, so it floats with a small margin (the
+                // curved iTerm look) on the traffic lights' optical row.
                 let pill = CGRect::new(
-                    CGPoint::new(bounds.origin.x + TAB_PILL_INSET_X, bounds.origin.y + TAB_PILL_INSET_Y),
+                    CGPoint::new(
+                        bounds.origin.x + TAB_PILL_INSET_X,
+                        ivars.center_y.get() - TAB_PILL_HEIGHT * 0.5,
+                    ),
                     CGSize::new(
                         (bounds.size.width - 2.0 * TAB_PILL_INSET_X).max(0.0),
-                        (bounds.size.height - 2.0 * TAB_PILL_INSET_Y).max(0.0),
+                        TAB_PILL_HEIGHT,
                     ),
                 );
                 // SAFETY: standard AppKit drawing primitives, on the main thread inside
@@ -1454,8 +1749,21 @@ mod macos {
                             pill, TAB_PILL_RADIUS, TAB_PILL_RADIUS,
                         );
                         path.fill();
+                    } else if ivars.separator.get() {
+                        // Flat and quiet — the seamless terminal-coloured titlebar shows
+                        // through — but a hairline on the leading edge, because equal
+                        // full-width cells give three identical titles no other cue that
+                        // they are three TABS. macOS Terminal draws the same divider.
+                        // Suppressed next to the selected pill and while hovered: both
+                        // already draw their own edge, and a rule beside one reads as
+                        // grime. Deliberately short, so it separates without boxing.
+                        NSColor::separatorColor().set();
+                        let rule = CGRect::new(
+                            CGPoint::new(bounds.origin.x, ivars.center_y.get() - TAB_RULE_HEIGHT * 0.5),
+                            CGSize::new(1.0, TAB_RULE_HEIGHT),
+                        );
+                        NSBezierPath::bezierPathWithRect(rule).fill();
                     }
-                    // else: flat — the seamless terminal-coloured titlebar shows through.
                 }
                 self.paint_identity();
             }
@@ -1546,8 +1854,8 @@ mod macos {
                 });
             }
 
-            /// Pointer entered the tab — reveal the close × (inactive tabs hide it until
-            /// hover) and repaint the faint hover highlight.
+            /// Pointer entered the tab — reveal the close ✕ (every tab hides it until
+            /// hover, the selected one included) and repaint the faint hover highlight.
             #[method(mouseEntered:)]
             #[allow(non_snake_case)]
             fn mouseEntered(&self, _event: &NSEvent) {
@@ -1556,8 +1864,8 @@ mod macos {
                 self.mark_dirty();
             }
 
-            /// Pointer left the tab — hide the × again (unless this is the active tab,
-            /// which always shows it) and repaint.
+            /// Pointer left the tab — hide the ✕ again (it is a hover-only affordance,
+            /// on the selected tab too) and repaint.
             #[method(mouseExited:)]
             #[allow(non_snake_case)]
             fn mouseExited(&self, _event: &NSEvent) {
@@ -1664,7 +1972,6 @@ mod macos {
         /// RawRgba8 raster exactly.
         fn paint_identity(&self) {
             let ivars = self.ivars();
-            let bounds = self.bounds();
             let metadata = TabStripMetadata {
                 icon: ivars.icon.get(),
                 dirty: ivars.dirty.get(),
@@ -1672,22 +1979,21 @@ mod macos {
                 attention: ivars.attention.get(),
                 closable: ivars.closable.get(),
             };
-            let layout = native_tab_content_layout(
-                bounds.size.width,
-                bounds.size.height,
-                metadata.icon.is_some(),
-                metadata.has_status(),
-            );
+            // Geometry is resolved once by `relayout` (which also placed the labels and
+            // the ✕) and cached, so the draw cycle never re-derives it — and the painted
+            // ornaments are guaranteed to agree with the laid-out text.
+            let layout_icon = ivars.icon_rect.get();
+            let layout_status = ivars.status_rect.get();
             // SAFETY: all operations are standard AppKit drawing calls made from
             // `drawRect:` on the main thread with an active graphics context.
             unsafe {
-                let ink = if ivars.active.get() {
+                let ink = if ivars.active.get() || ivars.solo.get() {
                     NSColor::labelColor()
                 } else {
                     NSColor::secondaryLabelColor()
                 };
                 ink.set();
-                if let (Some(kind), Some(icon)) = (ivars.icon.get(), layout.icon) {
+                if let (Some(kind), Some(icon)) = (ivars.icon.get(), layout_icon) {
                     let scale = (icon[2] / f64::from(TAB_ICON_DESIGN_SIZE))
                         .min(icon[3] / f64::from(TAB_ICON_DESIGN_SIZE));
                     let ox = icon[0] + (icon[2] - f64::from(TAB_ICON_DESIGN_SIZE) * scale) * 0.5;
@@ -1745,7 +2051,7 @@ mod macos {
                         }
                     }
                 }
-                if let Some(status) = layout.status {
+                if let Some(status) = layout_status {
                     let count = metadata.status_count();
                     let mut ordinal = 0usize;
                     let scale = status[2] / f64::from(TAB_ICON_DESIGN_SIZE);
@@ -1794,13 +2100,15 @@ mod macos {
         }
 
         /// Build a fresh tab view for `index`/`count` showing `title`, wired to relay
-        /// through `proxy`/`window`. Lays out the
-        /// close × on the left and the title to its right, installs the hover tracking
-        /// area, and sets the active flag (drives the accent + always-on ×). All
-        /// construction is via NON-RAISING factory initializers on the main thread.
+        /// through `proxy`/`window`. Creates the sub-views (close ✕, title label,
+        /// solo description label) and hands ALL geometry to [`Self::relayout`], so
+        /// build and every later in-place update place content through exactly one
+        /// function. Installs the hover tracking area and sets the active flag (drives
+        /// the accent). All construction is via NON-RAISING factory initializers on
+        /// the main thread.
         #[allow(
             clippy::too_many_arguments,
-            reason = "tab state (id/index/count/text/active/metadata/ext) plus its render context (mtm/proxy/window); both are needed at construction and splitting them only relocates the list"
+            reason = "tab state (id/index/count/text/active/metadata/ext) plus its render context (mtm/proxy/window/geometry); both are needed at construction and splitting them only relocates the list"
         )]
         fn build(
             mtm: MainThreadMarker,
@@ -1815,6 +2123,7 @@ mod macos {
             metadata: TabStripMetadata,
             ext: &TabChromeExt,
             frame: NSRect,
+            geometry: TabGeometry,
         ) -> Retained<Self> {
             let ivars = TabIvars {
                 proxy,
@@ -1832,8 +2141,16 @@ mod macos {
                 hovered: Cell::new(false),
                 press_x: Cell::new(0.0),
                 dragged: Cell::new(false),
+                solo: Cell::new(geometry.solo),
+                center_y: Cell::new(geometry.center_y),
+                solo_center_x: Cell::new(geometry.solo_center_x),
+                separator: Cell::new(geometry.separator),
+                close_available: Cell::new(false),
+                icon_rect: Cell::new(None),
+                status_rect: Cell::new(None),
                 close_btn: RefCell::new(None),
                 label: RefCell::new(None),
+                desc_label: RefCell::new(None),
                 tracking: RefCell::new(None),
                 title: RefCell::new(title.to_string()),
                 tooltip: RefCell::new(tooltip.map(str::to_string)),
@@ -1843,8 +2160,9 @@ mod macos {
             // SAFETY: `initWithFrame:` is the documented non-raising NSView initializer.
             let this: Retained<Self> = unsafe { msg_send_id![super(this), initWithFrame: frame] };
 
-            // The close × button: a small borderless title button (factory initializer,
-            // NEVER `initWithFrame`). Its action targets THIS view's `closeTab:`.
+            // The close ✕ button: a small borderless title button (factory initializer,
+            // NEVER `initWithFrame`). Its action targets THIS view's `closeTab:`. Born
+            // HIDDEN — the ✕ is a hover-only reveal (see `refresh_close_visibility`).
             // SAFETY: `buttonWithTitle:target:action:` is the documented factory; plain
             // setters follow on the fresh button; all on the main thread.
             let close = unsafe {
@@ -1859,76 +2177,244 @@ mod macos {
                 btn.setImagePosition(NSCellImagePosition::NSNoImage);
                 let close_font = NSFont::systemFontOfSize(10.0);
                 btn.setFont(Some(&close_font));
-                let content = native_tab_content_layout(
-                    frame.size.width,
-                    frame.size.height,
-                    metadata.icon.is_some(),
-                    metadata.has_status(),
-                );
-                let close_frame = CGRect::new(
-                    CGPoint::new(content.close[0], content.close[1]),
-                    CGSize::new(content.close[2], content.close[3]),
-                );
-                btn.setFrame(close_frame);
+                btn.setHidden(true);
                 btn.setToolTip(Some(&NSString::from_str("Close Tab")));
                 this.addSubview(&btn);
                 btn
             };
 
-            // The title label: a non-editable, non-bezeled label (factory initializer).
+            // The title label and — solo only — the description beside it. Both are
+            // non-editable, non-bezeled labels (factory initializer), so they pass the
+            // mouse through to this view and the whole chip stays one click target.
             // SAFETY: `labelWithString:` is the documented non-raising factory; plain
             // setters follow; on the main thread.
-            let label = unsafe {
-                let content = native_tab_content_layout(
-                    frame.size.width,
-                    frame.size.height,
-                    metadata.icon.is_some(),
-                    metadata.has_status(),
-                );
-                let display = tab_display_label(title, index, content.label[2]);
-                let lbl = NSTextField::labelWithString(&NSString::from_str(&display), mtm);
-                lbl.setDrawsBackground(false);
-                lbl.setBezeled(false);
-                lbl.setEditable(false);
-                lbl.setSelectable(false);
-                lbl.setAlignment(NSTextAlignment::Left);
-                // Single-line, truncating-tail (the `labelWithString:` default is a
-                // truncating single-line label; force single-line to be explicit and
-                // keep the row height exact).
-                lbl.setUsesSingleLineMode(true);
-                // Active = full label color (override-aware); inactive = secondary
-                // (dim), Ghostty-like.
-                let color = if active {
-                    active_label_color()
-                } else {
-                    NSColor::secondaryLabelColor()
-                };
-                lbl.setTextColor(Some(&color));
-                let label_font = if active {
-                    NSFont::boldSystemFontOfSize(12.0)
-                } else {
-                    NSFont::systemFontOfSize(12.0)
-                };
-                lbl.setFont(Some(&label_font));
-                let label_frame = CGRect::new(
-                    CGPoint::new(content.label[0], content.label[1]),
-                    CGSize::new(content.label[2], content.label[3]),
-                );
-                lbl.setFrame(label_frame);
+            let (label, desc) = unsafe {
+                let lbl = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+                let desc = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+                for field in [&lbl, &desc] {
+                    field.setDrawsBackground(false);
+                    field.setBezeled(false);
+                    field.setEditable(false);
+                    field.setSelectable(false);
+                    // Single line, ellipsised on overflow: explicit on both counts so
+                    // the row height is exact and a clipped title never masquerades as
+                    // a complete one.
+                    field.setUsesSingleLineMode(true);
+                    truncate_tail(field);
+                }
+                desc.setHidden(true);
                 this.addSubview(&lbl);
-                lbl
+                this.addSubview(&desc);
+                (lbl, desc)
             };
 
             *this.ivars().close_btn.borrow_mut() = Some(close);
             *this.ivars().label.borrow_mut() = Some(label);
+            *this.ivars().desc_label.borrow_mut() = Some(desc);
             // Session chrome (tooltip + context-menu model) — the same in-place
             // applier the diff path uses, so build and diff share one seam.
             this.set_chrome_ext(ext);
             this.sync_close_semantics();
-            this.refresh_close_visibility();
+            this.relayout();
             this.sync_semantics();
             this.install_tracking_area();
             this
+        }
+
+        /// THE geometry seam: place every sub-view and cache every painted ornament's
+        /// rect from the current bounds, mode, metadata, and measured centre line. Build
+        /// and every in-place update (title, metadata, selection, re-centre) route
+        /// through here, so the pixels can never disagree with the text — and so the
+        /// solo/tabbed split lives in exactly one place.
+        fn relayout(&self) {
+            let ivars = self.ivars();
+            let bounds = self.bounds();
+            let center_y = ivars.center_y.get();
+            let title = ivars.title.borrow().clone();
+            if ivars.solo.get() {
+                self.relayout_solo(&title, bounds, center_y);
+                self.mark_dirty();
+                return;
+            }
+            let metadata = self.metadata();
+            let content = native_tab_content_layout(
+                bounds.size.width,
+                center_y,
+                metadata.icon.is_some(),
+                metadata.has_status(),
+            );
+            ivars.close_available.set(content.close_available);
+            ivars.icon_rect.set(content.icon);
+            ivars.status_rect.set(content.status);
+            let active = ivars.active.get();
+            // SAFETY: plain main-thread setters on our retained live sub-views; every
+            // rect comes from `native_tab_content_layout` (finite, non-negative).
+            unsafe {
+                if let Some(btn) = ivars.close_btn.borrow().as_ref() {
+                    btn.setFrame(rect_of(content.close));
+                }
+                if let Some(desc) = ivars.desc_label.borrow().as_ref() {
+                    desc.setHidden(true);
+                }
+                if let Some(lbl) = ivars.label.borrow().as_ref() {
+                    // Active = full label color (override-aware) and semibold; inactive
+                    // = secondary (dim) and regular, Ghostty-like.
+                    let color = if active {
+                        active_label_color()
+                    } else {
+                        NSColor::secondaryLabelColor()
+                    };
+                    let font = if active {
+                        NSFont::boldSystemFontOfSize(12.0)
+                    } else {
+                        NSFont::systemFontOfSize(12.0)
+                    };
+                    lbl.setAlignment(NSTextAlignment::Center);
+                    lbl.setTextColor(Some(&color));
+                    lbl.setFont(Some(&font));
+                    lbl.setStringValue(&NSString::from_str(&tab_display_label(
+                        &title,
+                        ivars.index.get(),
+                        content.label[2],
+                    )));
+                    lbl.setFrame(rect_of(content.label));
+                }
+            }
+            self.refresh_close_visibility();
+            self.mark_dirty();
+        }
+
+        /// SOLO layout: the window's only tab reads as its TITLE — `title` in the
+        /// primary ink beside its description in the secondary, centred as ONE group on
+        /// the window's centre line, with the app icon leading and the status canvas
+        /// trailing. No pill and no ✕: there is nothing to switch to, and the red
+        /// traffic light already closes the window.
+        ///
+        /// The group is measured (`sizeToFit`) rather than guessed, then compressed
+        /// description-first if the band cannot hold it, so a long `cwd` never pushes
+        /// the title itself off the strip.
+        fn relayout_solo(&self, title: &str, bounds: NSRect, center_y: f64) {
+            let ivars = self.ivars();
+            let metadata = self.metadata();
+            let subtitle = crate::tab_bar::solo_subtitle(title, ivars.tooltip.borrow().as_deref());
+            let available = (bounds.size.width - 2.0 * SOLO_EDGE_PAD).max(0.0);
+            let icon_w = metadata
+                .icon
+                .map_or(0.0, |_| TAB_ICON_NATIVE_SIZE + SOLO_GAP);
+            let status_w = if metadata.has_status() {
+                SOLO_STATUS_SIZE + SOLO_GAP
+            } else {
+                0.0
+            };
+            ivars.close_available.set(false);
+            // SAFETY: plain main-thread AppKit setters/getters on our retained live
+            // sub-views; `sizeToFit` only resizes the label it is sent to.
+            let (title_w, desc_w) = unsafe {
+                if let Some(btn) = ivars.close_btn.borrow().as_ref() {
+                    btn.setHidden(true);
+                }
+                let mut title_w = 0.0;
+                let mut desc_w = 0.0;
+                if let Some(lbl) = ivars.label.borrow().as_ref() {
+                    lbl.setAlignment(NSTextAlignment::Left);
+                    lbl.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                    lbl.setTextColor(Some(&NSColor::labelColor()));
+                    lbl.setStringValue(&NSString::from_str(title));
+                    lbl.sizeToFit();
+                    title_w = lbl.frame().size.width;
+                }
+                if let Some(desc) = ivars.desc_label.borrow().as_ref() {
+                    match subtitle.as_deref() {
+                        Some(text) => {
+                            desc.setHidden(false);
+                            desc.setAlignment(NSTextAlignment::Left);
+                            desc.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                            desc.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                            desc.setStringValue(&NSString::from_str(text));
+                            desc.sizeToFit();
+                            desc_w = desc.frame().size.width;
+                        }
+                        None => desc.setHidden(true),
+                    }
+                }
+                (title_w, desc_w)
+            };
+            let desc_gap = if desc_w > 0.0 { SOLO_GAP } else { 0.0 };
+            // Compress the DESCRIPTION first, then the title: the title is the one
+            // string the band exists to show.
+            let fixed = icon_w + status_w;
+            let title_w = title_w.min((available - fixed).max(0.0));
+            let desc_w = desc_w.min((available - fixed - title_w - desc_gap).max(0.0));
+            let desc_gap = if desc_w > 0.0 { desc_gap } else { 0.0 };
+            let total = fixed + title_w + desc_gap + desc_w;
+            let mut x = (ivars.solo_center_x.get() - total * 0.5)
+                .max(SOLO_EDGE_PAD)
+                .min((bounds.size.width - SOLO_EDGE_PAD - total).max(SOLO_EDGE_PAD));
+
+            ivars.icon_rect.set(metadata.icon.map(|_| {
+                let rect = [
+                    x,
+                    center_y - TAB_ICON_NATIVE_SIZE * 0.5,
+                    TAB_ICON_NATIVE_SIZE,
+                    TAB_ICON_NATIVE_SIZE,
+                ];
+                x += TAB_ICON_NATIVE_SIZE + SOLO_GAP;
+                rect
+            }));
+            // SAFETY: main-thread geometry setters on the retained live labels.
+            unsafe {
+                if let Some(lbl) = ivars.label.borrow().as_ref() {
+                    lbl.setFrame(rect_of([
+                        x,
+                        center_y - SOLO_LABEL_HEIGHT * 0.5,
+                        title_w,
+                        SOLO_LABEL_HEIGHT,
+                    ]));
+                }
+                x += title_w;
+                if let Some(desc) = ivars.desc_label.borrow().as_ref() {
+                    // A description the band could not fit is HIDDEN, not left at its
+                    // measured size: a stale frame would paint the old text.
+                    desc.setHidden(desc_w <= 0.0);
+                    if desc_w > 0.0 {
+                        desc.setFrame(rect_of([
+                            x + desc_gap,
+                            center_y - SOLO_LABEL_HEIGHT * 0.5,
+                            desc_w,
+                            SOLO_LABEL_HEIGHT,
+                        ]));
+                    }
+                }
+                x += desc_gap + desc_w;
+            }
+            // `status_w` reserved the leading gap as well as the canvas, so spend it
+            // here — otherwise a status with no description would sit a gap too far
+            // left and pull the whole centred group off centre.
+            ivars.status_rect.set(metadata.has_status().then_some([
+                x + SOLO_GAP,
+                center_y - SOLO_STATUS_SIZE * 0.5,
+                SOLO_STATUS_SIZE,
+                SOLO_STATUS_SIZE,
+            ]));
+        }
+
+        /// Move this chip onto the strip's measured content line / window centre and
+        /// switch it between the tabbed chip and the solo title band. Relayouts only
+        /// when something actually moved, so a steady refresh costs nothing.
+        fn set_geometry(&self, geometry: TabGeometry) {
+            let ivars = self.ivars();
+            let unchanged = ivars.solo.get() == geometry.solo
+                && ivars.center_y.get() == geometry.center_y
+                && ivars.solo_center_x.get() == geometry.solo_center_x
+                && ivars.separator.get() == geometry.separator;
+            if unchanged {
+                return;
+            }
+            ivars.solo.set(geometry.solo);
+            ivars.center_y.set(geometry.center_y);
+            ivars.solo_center_x.set(geometry.solo_center_x);
+            ivars.separator.set(geometry.separator);
+            self.relayout();
         }
 
         /// Request a repaint of the whole tab (after a hover / active change). Wraps the
@@ -1958,28 +2444,12 @@ mod macos {
             }
             if title_changed {
                 *self.ivars().title.borrow_mut() = title.to_string();
-            }
-            if title_changed && let Some(lbl) = self.ivars().label.borrow().as_ref() {
-                // SAFETY: `setStringValue:` is a plain main-thread setter on the live label.
-                let bounds = self.bounds();
-                let metadata = TabStripMetadata {
-                    icon: self.ivars().icon.get(),
-                    dirty: self.ivars().dirty.get(),
-                    busy: self.ivars().busy.get(),
-                    attention: self.ivars().attention.get(),
-                    closable: self.ivars().closable.get(),
-                };
-                let content = native_tab_content_layout(
-                    bounds.size.width,
-                    bounds.size.height,
-                    metadata.icon.is_some(),
-                    metadata.has_status(),
-                );
-                let display = tab_display_label(title, self.ivars().index.get(), content.label[2]);
-                unsafe { lbl.setStringValue(&NSString::from_str(&display)) };
-            }
-            if title_changed {
                 self.sync_close_semantics();
+            }
+            // A SOLO band shows the description too, so a tooltip-only change still
+            // moves pixels there; a chip re-lays out only when its title changed.
+            if title_changed || self.ivars().solo.get() {
+                self.relayout();
             }
             self.sync_semantics();
         }
@@ -2021,6 +2491,12 @@ mod macos {
             if *ivars.tooltip.borrow() != ext.tooltip {
                 *ivars.tooltip.borrow_mut() = ext.tooltip.clone();
                 self.sync_semantics();
+                // The SOLO band renders its DESCRIPTION from this very tooltip, so a
+                // composed-chrome change is a visible change there (a chip's tooltip
+                // is hover-only and needs no re-layout).
+                if ivars.solo.get() {
+                    self.relayout();
+                }
             }
             if *ivars.menu_entries.borrow() != ext.menu {
                 *ivars.menu_entries.borrow_mut() = ext.menu.clone();
@@ -2145,46 +2621,27 @@ mod macos {
             {
                 return;
             }
-            let old_has_status = old_dirty || old_busy || old_attention;
-            if (old_icon.is_some() != metadata.icon.is_some()
-                || old_has_status != metadata.has_status())
-                && let Some(label) = ivars.label.borrow().as_ref()
-            {
-                let bounds = self.bounds();
-                let content = native_tab_content_layout(
-                    bounds.size.width,
-                    bounds.size.height,
-                    metadata.icon.is_some(),
-                    metadata.has_status(),
-                );
-                // SAFETY: main-thread geometry setter on our retained label; the
-                // finite, non-negative rect comes from `native_tab_content_layout`.
-                unsafe {
-                    label.setFrame(CGRect::new(
-                        CGPoint::new(content.label[0], content.label[1]),
-                        CGSize::new(content.label[2], content.label[3]),
-                    ));
-                    let title = ivars.title.borrow();
-                    let display = tab_display_label(&title, ivars.index.get(), content.label[2]);
-                    label.setStringValue(&NSString::from_str(&display));
-                }
-            }
-            self.refresh_close_visibility();
+            // Ornament slots (and, in the solo band, the whole centred group) move when
+            // an icon or a status appears or disappears; `relayout` is the one place
+            // that decides where.
+            self.relayout();
             self.sync_semantics();
-            self.mark_dirty();
         }
 
-        /// Flip the ACTIVE flag IN PLACE (the diff path): recolour the label (full vs.
-        /// secondary/dim), re-evaluate the close-× visibility (active always shows it), and
         /// Re-resolve this tab's label ink against the CURRENT selected-tab color
         /// override without changing its active state — the repaint half of
         /// [`set_active_tab_color`], so a live config edit recolors the strip
-        /// in place (no tab rebuild, no focus change).
+        /// in place (no tab rebuild, no focus change). A SOLO band has no selected
+        /// surface to tint, so its title keeps the primary label ink.
         fn refresh_label_ink(&self) {
-            if let Some(lbl) = self.ivars().label.borrow().as_ref() {
+            let ivars = self.ivars();
+            if ivars.solo.get() {
+                return;
+            }
+            if let Some(lbl) = ivars.label.borrow().as_ref() {
                 // SAFETY: main-thread `setTextColor:` on the live retained label.
                 unsafe {
-                    let color = if self.ivars().active.get() {
+                    let color = if ivars.active.get() {
                         active_label_color()
                     } else {
                         NSColor::secondaryLabelColor()
@@ -2194,33 +2651,15 @@ mod macos {
             }
         }
 
-        /// repaint the accent. No-op when unchanged.
+        /// Flip the ACTIVE flag IN PLACE (the diff path): recolour + re-weight the label
+        /// and repaint the accent pill. No-op when unchanged.
         fn set_active(&self, active: bool) {
             if self.ivars().active.get() == active {
                 return;
             }
             self.ivars().active.set(active);
-            if let Some(lbl) = self.ivars().label.borrow().as_ref() {
-                // SAFETY: `labelColor`/`secondaryLabelColor` + `setTextColor:` are plain
-                // main-thread AppKit calls on the live label.
-                unsafe {
-                    let color = if active {
-                        active_label_color()
-                    } else {
-                        NSColor::secondaryLabelColor()
-                    };
-                    lbl.setTextColor(Some(&color));
-                    let font = if active {
-                        NSFont::boldSystemFontOfSize(12.0)
-                    } else {
-                        NSFont::systemFontOfSize(12.0)
-                    };
-                    lbl.setFont(Some(&font));
-                }
-            }
-            self.refresh_close_visibility();
+            self.relayout();
             self.sync_semantics();
-            self.mark_dirty();
         }
 
         /// Keep hover text and native accessibility synchronized from canonical tab
@@ -2257,21 +2696,23 @@ mod macos {
             }
         }
 
-        /// Show the close × when this tab is ACTIVE or HOVERED and the chip is wide
-        /// enough to reserve its slot. Compact chips spend those points on identity;
-        /// Close Tab remains available from the menu and keyboard shortcut.
+        /// Show the close ✕ only while the pointer is INSIDE this chip — macOS
+        /// Terminal's rule, and the reason the strip reads as titles rather than as a
+        /// row of buttons. The selected tab is no exception: a permanent ✕ on the tab
+        /// you are looking at is the one that gets mis-clicked, and selection is
+        /// already stated by the pill, the accent keyline, and the bolder ink.
+        ///
+        /// The ✕'s slot is reserved by [`native_tab_content_layout`] whether or not it
+        /// is painted, so revealing it never reflows the title. Compact chips reserve
+        /// no slot at all and spend those points on identity; a SOLO band has no ✕
+        /// (the red traffic light closes the window). Close Tab remains available from
+        /// the context menu, the File menu, and ⌘W at every size.
         fn refresh_close_visibility(&self) {
             let ivars = self.ivars();
-            let bounds = self.bounds();
-            let layout = native_tab_content_layout(
-                bounds.size.width,
-                bounds.size.height,
-                ivars.icon.get().is_some(),
-                ivars.dirty.get() || ivars.busy.get() || ivars.attention.get(),
-            );
-            let show = layout.close_available
+            let show = ivars.close_available.get()
+                && !ivars.solo.get()
                 && ivars.closable.get()
-                && (ivars.active.get() || ivars.hovered.get());
+                && ivars.hovered.get();
             if let Some(btn) = ivars.close_btn.borrow().as_ref() {
                 btn.setHidden(!show);
             }
@@ -2497,9 +2938,7 @@ mod macos {
             proxy.clone(),
             MenuAction::NewTab,
             false,
-            "+",
-            17.0,
-            true,
+            "New Tab",
             CGRect::new(
                 CGPoint::new(win_w - TRAILING_PAD - PLUS_WIDTH, 0.0),
                 CGSize::new(PLUS_WIDTH, STRIP_HEIGHT),
@@ -2574,7 +3013,7 @@ mod macos {
             proxy: proxy.clone(),
             window: wid,
             tabs: RefCell::new(Vec::new()),
-            _plus: plus,
+            plus,
         })
     }
 
@@ -2680,6 +3119,18 @@ mod macos {
     /// as needed: the old set is removed as subviews + dropped, a fresh view is built per title (laid out
     /// left→right in the band from `STRIP_LEADING_PAD` up to the right-pinned "+"),
     /// with the `active` one accented.
+    ///
+    /// THE BAND IS SPENT, NOT RATIONED. Chips divide the whole band between the
+    /// stoplights and the "+" into equal shares ([`native_tab_cells`]) — no maximum
+    /// width, so a wide window buys longer titles rather than bare titlebar. And with
+    /// exactly ONE tab there is nothing to switch between, so the lone chip drops its
+    /// pill and its ✕ and becomes the window TITLE: the name, its description, centred
+    /// on the WINDOW (macOS Terminal's one-tab titlebar).
+    ///
+    /// Every vertical position — chips, "+", ✕, icons, status dots — is derived from
+    /// the traffic lights MEASURED on the live window ([`strip_metrics`]), so the strip
+    /// sits on the stoplights' own centre line instead of on whatever row the toolbar
+    /// happened to hand us.
     pub fn set_window_tabs(
         handle: &ToolbarHandle,
         titles: &[String],
@@ -2724,19 +3175,43 @@ mod macos {
             return;
         }
 
-        // Compute the tab band: from the leading pad to the trailing right-pinned "+",
-        // so a chip never draws under the button.
-        let left = STRIP_LEADING_PAD;
+        // Measure the live window ONCE per refresh: the stoplights' centre line (what
+        // every vertical slot aligns to), their trailing edge (what the band must clear),
+        // and the window's own centre (what a solo title centres on).
+        let metrics = strip_metrics(container);
+        let strip_h = container.bounds().size.height.max(STRIP_HEIGHT);
+
+        // Compute the tab band: from the leading pad — never tucked under the traffic
+        // lights — to the trailing right-pinned "+", so a chip never draws under either.
+        let left = STRIP_LEADING_PAD.max(metrics.lights_right + LIGHTS_CLEARANCE);
         let cluster = TAB_GAP + PLUS_WIDTH + TRAILING_PAD;
         let total_w = container.frame().size.width.max(left + cluster + 1.0);
         let band_w = (total_w - left - cluster).max(1.0);
         let n = titles.len();
         let active = active.min(n.saturating_sub(1));
 
+        // Keep the "+" on the measured line too, and re-pin it to the live width — its
+        // autoresizing mask only carries it between refreshes.
+        // SAFETY: main-thread geometry setter on the retained live button.
+        unsafe {
+            handle.plus.setFrame(CGRect::new(
+                CGPoint::new(total_w - TRAILING_PAD - PLUS_WIDTH, 0.0),
+                CGSize::new(PLUS_WIDTH, strip_h),
+            ));
+        }
+        handle.plus.set_center_y(metrics.center_y);
+
         let cells = native_tab_cells(band_w, n, active)
             .into_iter()
             .map(|(x, width)| (left + x, width))
             .collect::<Vec<_>>();
+        // ONE tab is the window's title, not a switcher (see the fn doc).
+        let geometry_at = |index: usize, cell_x: f64| TabGeometry {
+            center_y: metrics.center_y,
+            solo: n == 1,
+            solo_center_x: metrics.window_center_x - cell_x,
+            separator: TabGeometry::separates(index, active),
+        };
 
         // DIFF PATH: same tab COUNT and same GEOMETRY (every live frame matches its
         // computed cell — i.e. the container width is unchanged) ⇒ update the existing
@@ -2756,6 +3231,10 @@ mod macos {
                 })
             {
                 for (i, (tab, title)) in tabs.iter().zip(titles).enumerate() {
+                    // Geometry FIRST: a window drag between displays, a light/dark flip,
+                    // or a full-screen toggle can move the stoplights without changing
+                    // any cell width, and the content must follow them.
+                    tab.set_geometry(geometry_at(i, cells[i].0));
                     tab.set_context(title, tooltip_at(i));
                     tab.set_tab_id(id_at(i));
                     tab.set_metadata(metadata_at(i));
@@ -2778,7 +3257,9 @@ mod macos {
         let mut new_tabs: Vec<Retained<TabView>> = Vec::with_capacity(n);
         for (i, title) in titles.iter().enumerate() {
             let (cx, cw) = cells[i];
-            let frame = CGRect::new(CGPoint::new(cx, 0.0), CGSize::new(cw, STRIP_HEIGHT));
+            // The cell spans the FULL strip height so the whole chip is one
+            // select/reorder target; only its CONTENT rides the measured centre line.
+            let frame = CGRect::new(CGPoint::new(cx, 0.0), CGSize::new(cw, strip_h));
             let tab = TabView::build(
                 mtm,
                 handle.proxy.clone(),
@@ -2792,6 +3273,7 @@ mod macos {
                 metadata_at(i),
                 ext_at(i),
                 frame,
+                geometry_at(i, cx),
             );
             // SAFETY: `addSubview:` on the live container, main thread.
             unsafe { container.addSubview(&tab) };

@@ -143,6 +143,11 @@ const BUF_CAP: usize = 48;
 /// granted summon presents a FRESH `(session, ident)` episode to the Kitty
 /// Log's dedupe ring — and so summon idents live in their own namespace,
 /// apart from the word renderer's position-bearing occurrence idents.
+///
+/// scope-waiver: the DECLARATION is a compile-time namespace tag — a constant
+/// cannot multiply. The App-wide sequence it is XOR'd with is
+/// `App::kitty_summon_seq`, whose own cardinality is waived (and queued as a
+/// ScopeClaim) at its declaration in `lib.rs`.
 pub(crate) const TYPED_SUMMON_IDENT_TAG: u64 = 0x7479_7065_644B_6974;
 
 /// Ident-namespace tag for SYNTHETIC favourite sightings (`b"favKitty"` as
@@ -151,6 +156,9 @@ pub(crate) const TYPED_SUMMON_IDENT_TAG: u64 = 0x7479_7065_644B_6974;
 /// episode. The favourite path bypasses the dedupe ring outright, so this tag
 /// exists to keep the ledger's episode identities honest and collision-free,
 /// not to defeat a suppression.
+///
+/// scope-waiver: same shape as [`TYPED_SUMMON_IDENT_TAG`] — a constant
+/// namespace tag, not the sequence.
 pub(crate) const FAVOURITE_IDENT_TAG: u64 = 0x6661_764B_6974_7479;
 
 /// Per-window detector state: the rolling keystroke window (keyed to the

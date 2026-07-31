@@ -13,6 +13,8 @@
 
 use std::process::ExitCode;
 
+use crate::flow::now_unix;
+
 /// The whole package-manager CLI as a callable: `argv[1..]` in, exit code
 /// out. Served in-process by the ONE `aterm` binary (`aterm pkg …` / the
 /// `atpkg` argv0 alias) and by the thin standalone bin. Everything below is
@@ -86,7 +88,7 @@ fn layout() -> Option<crate::store::Layout> {
 /// Whether `verb` MUTATES the store and must therefore hold the store-wide
 /// single-writer lock ([`crate::lock`]) for its whole run. The mutators are every
 /// verb that stages/activates/discards builds or rewrites shims (`install` — incl.
-/// `--default-set` —, `update`, `sync`, `rollback`, `uninstall`, `gc`), every
+/// `--default-set` —, `seed`, `update`, `sync`, `rollback`, `uninstall`, `gc`), every
 /// link-mutating verb (`link`, `unlink`, `refresh` — which also covers the
 /// `[packages.links]` reconciliation the network verbs run), and `pin`/`unpin`:
 /// pins are LOCAL state files, but they gate the coherence-group transaction and
@@ -261,6 +263,54 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
+    // 2a — the SIGNED bundled-seed lane (§9.1/§11): a release cut may seal a
+    // signed seed registry beside this executable; fill the store from it —
+    // zero network, zero toolchain — through the UNCHANGED root-key +
+    // freshness + floor + sha256 + tree_root gates. Consent is the same
+    // coarse [packages].auto_install switch that gates the network bootstrap;
+    // without it the seed is announced (status + a stable stdout marker the
+    // GUI surfaces), never extracted. Runs before the source lane so a
+    // batteries-included box never source-builds what it already carries.
+    let mut prebuilt_failed = 0u32;
+    // The seed is a BOOTSTRAP source (see `resolve_fetcher`): once the store
+    // holds anything, updates belong to the network + cache path, so the lane
+    // is skipped entirely rather than resolving an index it will not use.
+    let bootstrap = crate::active_builds(&layout).is_empty();
+    if let Some(seed_dir) = crate::bundled_seed_dir().filter(|_| bootstrap) {
+        if !crate::manager_enabled() {
+            println!(
+                "atpkg: bundled seed present ({}) but no root key is pinned — prebuilt lane skipped (fail-closed)",
+                seed_dir.display()
+            );
+        } else {
+            let cfg = crate::config::cached();
+            // The chain (network when reachable + this seed) so a fresher
+            // published index outranks stale sealed pins even at seed time.
+            let fetcher = resolve_fetcher(&layout);
+            if cfg.auto_install() {
+                let before = crate::active_builds(&layout);
+                prebuilt_failed =
+                    install_default_set(&layout, &*fetcher, &effective_root_key(), cfg, now_unix());
+                // New shims must reach interactive shells without a relaunch.
+                crate::hooks::refresh(&layout);
+                let after = crate::active_builds(&layout);
+                let mut new: Vec<String> = after
+                    .keys()
+                    .filter(|k| !before.contains_key(k.as_str()))
+                    .cloned()
+                    .collect();
+                if !new.is_empty() {
+                    new.sort();
+                    // The stable marker the GUI parses — change it and the
+                    // first-run notice goes blind (crates/aterm-gui,
+                    // spawn_pkg_update_check).
+                    println!("atpkg: seed-installed: {}", new.join(", "));
+                }
+            } else {
+                announce_pending_seed(&layout, &*fetcher, cfg, &seed_dir);
+            }
+        }
+    }
     let manifest = match crate::companions::load() {
         Ok(m) => m,
         Err(e) => {
@@ -290,11 +340,123 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         "atpkg: seed complete ({ready} ready, {failed} failed, {} companion(s) considered)",
         results.len()
     );
-    if failed > 0 {
+    if failed > 0 || prebuilt_failed > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Retire the `*seed*` pending-consent row (the offer was taken, or nothing is
+/// installable here). `record_status` MERGES the program map, so a row nobody
+/// removes lives forever — Settings ▸ Packages would keep advertising an offer
+/// the user already accepted.
+fn clear_seed_status(layout: &crate::store::Layout) {
+    let Some(mut status) = crate::status::read(layout) else {
+        return;
+    };
+    if status.programs.remove("*seed*").is_none() {
+        return;
+    }
+    status.updated_at = now_rfc3339();
+    status.outcome = "bundled seed: nothing pending".to_string();
+    let _ = crate::status::write(layout, &status);
+}
+
+/// The consent-pending half of the bundled-seed lane (§11): resolve the ONE
+/// verified index through the chain, count the channel-pinned installable
+/// members not yet installed, and say so — a stable stdout marker line
+/// (`seed-pending: …`, what the GUI's launch-time seed run parses for the
+/// first-run notice) plus a `status.toml` entry so Settings ▸ Packages shows
+/// the same truth. Announcement only: nothing is downloaded or extracted, and
+/// a failure to resolve the index here is itself only announced (the seed is
+/// an offer, not an obligation).
+fn announce_pending_seed(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    cfg: &crate::config::PackagesConfig,
+    seed_dir: &std::path::Path,
+) {
+    let floor = crate::sig::Floor::new(layout.floor()).current();
+    let index = match crate::resolve_verified_index(
+        fetcher,
+        layout,
+        &effective_root_key(),
+        floor,
+        now_unix(),
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("atpkg: bundled seed present ({}) but its index did not verify: {e}", seed_dir.display());
+            return;
+        }
+    };
+    let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
+        println!(
+            "atpkg: bundled seed present ({}) but names no '{}' channel — nothing to offer",
+            seed_dir.display(),
+            cfg.channel()
+        );
+        return;
+    };
+    let installed = crate::active_builds(layout);
+    let wanted = index.installable(cfg.include(), cfg.exclude());
+    let mut missing: Vec<String> = Vec::new();
+    for group in crate::plan_groups(&index, ch) {
+        for m in &group.members {
+            if wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()) {
+                missing.push(m.clone());
+            }
+        }
+    }
+    // A program with no artifact for THIS triple can never be installed here
+    // (`install_default_set` clean-skips it, §6), so offering it would be a
+    // pill and a status row the user can never satisfy. Narrow to what the
+    // seed can actually lay down on this machine.
+    // Reuses the §11 bootstrap prescan (`group_missing_triple`) one member at a
+    // time: `Some(_)` means that program's pinned manifest carries no artifact
+    // for this triple, exactly the clean-skip `install_default_set` would take.
+    let triple = current_triple();
+    missing.retain(|program| {
+        crate::flow::group_missing_triple(
+            fetcher,
+            &index,
+            cfg.channel(),
+            triple,
+            std::slice::from_ref(program),
+        )
+        .is_none()
+    });
+    if missing.is_empty() {
+        // Nothing left to offer: retire any stale pending-consent row so the
+        // Packages page cannot keep showing an offer that is already taken
+        // (record_status MERGES the program map, so an untouched row lingers
+        // forever — adversarial review 2026-07-30).
+        clear_seed_status(layout);
+        return;
+    }
+    missing.sort();
+    let list = missing.join(", ");
+    // The stable marker the GUI parses — change it and the first-run notice
+    // goes blind (crates/aterm-gui, spawn_pkg_update_check).
+    println!(
+        "atpkg: seed-pending: {} program(s) ready to install from the bundled seed: {list} \
+         (Settings ▸ Packages ▸ Install ALab toolset, or `aterm pkg install --default-set`)",
+        missing.len()
+    );
+    // Value-first so the offer survives the Packages card's truncation width
+    // (UX review 2026-07-30: "bundled seed offers: ay · 2026-…" truncated the
+    // payload away); the page's own "Install ALab toolset" button is the act.
+    record_status(
+        layout,
+        "*seed*",
+        crate::ProgramStatus {
+            installed_build: None,
+            state: format!("pending-consent: {list}"),
+            tree_root: String::new(),
+        },
+        format!("ALab toolchain ready: {list} — Install ALab toolset below"),
+    );
 }
 
 /// `atpkg relocate <stage-root> [--sign <id>] [--advisory]` — PRODUCER-side
@@ -491,39 +653,19 @@ fn current_triple() -> &'static str {
     }
 }
 
-/// Current Unix epoch second (for the freshness gate); 0 if the clock is before the epoch.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
-
 /// RFC3339 UTC timestamp for the status record. Pure Rust — NO `/bin/date` shell-out, which
 /// could never spawn on Windows (no such binary; the absolute path also bypasses PATHEXT), so
 /// `updated_at` was left permanently empty there, silently disabling doctor's index-freshness /
-/// "publishing looks frozen" warning. Formats the current epoch second via `civil_from_days`
-/// (Howard Hinnant), the exact inverse of `flow::rfc3339_to_unix`, so the two round-trip.
+/// "publishing looks frozen" warning. Formats the current epoch second via the shared
+/// `aterm_types::rfc3339` civil-calendar math, the exact inverse of `flow::rfc3339_to_unix`,
+/// so the two round-trip. Empty string on a pre-epoch (or exactly-epoch) clock.
 fn now_rfc3339() -> String {
     let secs = now_unix();
     if secs <= 0 {
         return String::new();
     }
-    let days = secs.div_euclid(86400);
-    let tod = secs.rem_euclid(86400);
-    let (h, mi, se) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    // civil_from_days: days since 1970-01-01 → (year, month, day).
-    let z = days + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{se:02}Z")
+    // secs > 0, so the cast is lossless.
+    aterm_types::rfc3339::format_rfc3339(secs as u64)
 }
 
 /// Record the install outcome to `status.toml` (the silent manager's observability surface,
@@ -630,7 +772,36 @@ fn resolve_fetcher(layout: &crate::store::Layout) -> Box<dyn crate::flow::Fetche
             return Box::new(crate::DirFetcher::new(std::path::PathBuf::from(dir)));
         }
     }
-    Box::new(github_fetcher(layout))
+    let github = Box::new(github_fetcher(layout));
+    // An app bundle sealing a signed seed registry (§9.1) joins the flow as a
+    // FALLBACK leg — but ONLY as a BOOTSTRAP source, never an update source.
+    //
+    // The seal is a snapshot of the channel at CUT time; a machine that has
+    // already trusted a published index holds a durable floor at or above it,
+    // and `select_index` admits any signature-valid index `>= floor`. Chaining
+    // the seed unconditionally therefore had two teeth (found by adversarial
+    // review 2026-07-30, both traced end-to-end):
+    //   * DOWNGRADE — the seed and a later publish routinely share an
+    //     `index_build` (the refresh script reads the counter that only a
+    //     successful UPLOAD bumps) while pinning different builds, so an
+    //     unreachable network let the sealed pins re-install OVER newer
+    //     installed builds on the GUI's unattended 6h pass (`gate::decide`
+    //     force-installs on any `pinned != installed`, including lower).
+    //   * CACHE MASKING — a seed-leg success turned a network failure into
+    //     `Ok`, so `flow::resolve_candidates`' §14 last-good-index cache
+    //     fallback (its `Err` arm) could never fire, and the seed-only set
+    //     then OVERWROTE that cache under the chain's source id.
+    // Restricting the chain to an EMPTY store keeps the batteries-included
+    // promise exactly where it is real — the first run, where there is no
+    // floor to roll back and no cache to mask — and leaves every subsequent
+    // update to the network + cache path that predates this feature.
+    let seeded_bootstrap = crate::bundled_seed_dir()
+        .filter(|_| crate::active_builds(layout).is_empty())
+        .map(|seed| Box::new(crate::DirFetcher::new(seed)) as Box<dyn crate::flow::Fetcher>);
+    match seeded_bootstrap {
+        Some(seed) => Box::new(crate::ChainFetcher::new(github, seed)),
+        None => github,
+    }
 }
 
 /// The out-of-band root-key OVERRIDE (§8): a caller/config-supplied Ed25519 root public key
@@ -668,6 +839,30 @@ fn effective_root_key() -> String {
 /// overridden) AND the user has not opted out via `ATPKG_DISABLE`.
 fn manager_enabled() -> bool {
     crate::manager_enabled()
+}
+
+/// Record each freshly-installed `requires` dependency of `parent` into `status.toml`
+/// (each carries its own SIGNED tree_root for `verify`). Shared by [`do_install`] and the
+/// default-set bootstrap's ungrouped arm — identical writes at both.
+fn record_installed_deps(
+    layout: &crate::store::Layout,
+    parent: &str,
+    deps: &[crate::flow::DepOutcome],
+) {
+    for dep in deps {
+        if let crate::flow::DepResult::Installed { build, tree_root } = &dep.result {
+            record_status(
+                layout,
+                &dep.program,
+                crate::ProgramStatus {
+                    installed_build: Some(*build),
+                    state: "active".into(),
+                    tree_root: tree_root.clone(),
+                },
+                format!("pulled in {} (required by {parent})", dep.program),
+            );
+        }
+    }
 }
 
 /// Install/force-upgrade one program to its `channel`-pinned build, advancing the durable
@@ -709,21 +904,8 @@ fn do_install(
                 format!("installed {program} build {}", r.build)
             };
             // Record each pulled-in dependency FIRST (§17), so the main program's outcome
-            // remains the final aggregate. Each carries its own SIGNED tree_root for `verify`.
-            for dep in &r.dependencies {
-                if let crate::flow::DepResult::Installed { build, tree_root } = &dep.result {
-                    record_status(
-                        layout,
-                        &dep.program,
-                        crate::ProgramStatus {
-                            installed_build: Some(*build),
-                            state: "active".into(),
-                            tree_root: tree_root.clone(),
-                        },
-                        format!("pulled in {} (required by {program})", dep.program),
-                    );
-                }
-            }
+            // remains the final aggregate.
+            record_installed_deps(layout, program, &r.dependencies);
             record_status(
                 layout,
                 program,
@@ -799,8 +981,26 @@ fn cmd_install(program: Option<&String>) -> ExitCode {
         return ExitCode::from(1);
     };
     let cfg = crate::config::cached();
-    reconcile_links(&layout, cfg);
-    match do_install(&layout, &*resolve_fetcher(&layout), cfg.channel(), program) {
+    cmd_install_with(program, &layout, cfg, &*resolve_fetcher(&layout))
+}
+
+/// The body of [`cmd_install`] against an ALREADY-BUILT fetcher, so a caller that has one
+/// does not construct a second.
+///
+/// Building a `GithubFetcher` is not free: it runs the whole token chain (a keychain probe
+/// plus up to three `gh auth token` spawns — hundreds of ms of blocking subprocess latency
+/// for an answer that cannot differ within one process), and a fresh fetcher also throws
+/// away the first one's memoized release listings + index candidates, so the entire signed
+/// index (a listing plus up to 20 × 2 asset downloads) is re-fetched. `atpkg update
+/// <ungrouped-program>` paid both twice because it re-entered through `cmd_install`.
+fn cmd_install_with(
+    program: &str,
+    layout: &crate::store::Layout,
+    cfg: &crate::config::PackagesConfig,
+    fetcher: &dyn crate::flow::Fetcher,
+) -> ExitCode {
+    reconcile_links(layout, cfg);
+    match do_install(layout, fetcher, cfg.channel(), program) {
         Ok(r) => {
             if r.already_current {
                 println!("atpkg: {} already current (build {})", r.program, r.build);
@@ -1136,204 +1336,16 @@ fn install_default_set(
         }
         match &group.group {
             // A coherence tuple fresh-installs ALL-OR-NOTHING against the one index
-            // resolved above (§7): stage-all → flip-all → rollback, exactly the
-            // update path's transaction, so no failure mode can activate a partial
-            // or version-split trust toolchain.
+            // resolved above (§7) — see [`bootstrap_group`].
             Some(g) => {
-                // If the narrowing include/exclude leaves part of the tuple absent,
-                // refuse the WHOLE group — a deliberately partial tuple is exactly
-                // the split state the transaction exists to prevent. Loud diagnostic,
-                // not a loop failure (config-induced; correct every 6h pass).
-                let narrowed_out: Vec<&String> = group
-                    .members
-                    .iter()
-                    .filter(|m| !wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
-                    .collect();
-                if !narrowed_out.is_empty() {
-                    eprintln!(
-                        "atpkg: [packages] include/exclude leaves {narrowed_out:?} out of \
-                         coherence group '{g}' — a locked tuple installs whole; skipping the group"
-                    );
-                    continue;
-                }
-                // Missing-triple prescan: the singleton NoArtifact clean-skip doctrine
-                // lifted to the tuple — a group that cannot fully exist on this host
-                // is a correct state, not a 6h scream.
-                if let Some(m) = crate::flow::group_missing_triple(
-                    fetcher,
-                    &index,
-                    cfg.channel(),
-                    current_triple(),
-                    &missing,
-                ) {
-                    println!(
-                        "atpkg: {m}: no artifact for {} — coherence group '{g}' skipped whole \
-                         (§6 clean skip)",
-                        current_triple()
-                    );
-                    continue;
-                }
-                match crate::flow::bootstrap_group(
-                    fetcher,
-                    layout,
-                    &index,
-                    cfg.channel(),
-                    current_triple(),
-                    &group,
-                    &installed,
-                ) {
-                    Ok((crate::TxnOutcome::Applied(_), applied)) => {
-                        // Advance the durable floor to the ONE index the whole group
-                        // trusted (§8 gate 3).
-                        let _ = crate::sig::Floor::new(layout.floor())
-                            .check_and_record(index.index_build);
-                        for (m, a) in &applied {
-                            record_status(
-                                layout,
-                                m,
-                                crate::ProgramStatus {
-                                    installed_build: Some(a.build),
-                                    state: "active".into(),
-                                    tree_root: effective_tree_root(layout, m, &a.tree_root),
-                                },
-                                format!(
-                                    "bootstrap installed {m} build {} (coherence group '{g}')",
-                                    a.build
-                                ),
-                            );
-                            println!(
-                                "atpkg: installed {m} build {} (default set, coherence group '{g}')",
-                                a.build
-                            );
-                        }
-                    }
-                    Ok((crate::TxnOutcome::UpToDate, _)) => {}
-                    Ok((crate::TxnOutcome::Pinned(held), _)) => {
-                        println!(
-                            "atpkg: coherence group '{g}' held by local pin {held:?} — skipped"
-                        );
-                    }
-                    Ok((crate::TxnOutcome::Tombstoned(members), _)) => {
-                        eprintln!(
-                            "atpkg: coherence group '{g}': pins tombstoned for {members:?} — \
-                             nothing installed"
-                        );
-                    }
-                    Ok((
-                        crate::TxnOutcome::Aborted {
-                            failed,
-                            during_flip,
-                        },
-                        _,
-                    )) => {
-                        failures += 1;
-                        let phase = if during_flip {
-                            "flip (already-flipped members rolled back)"
-                        } else {
-                            "stage (nothing flipped)"
-                        };
-                        eprintln!(
-                            "atpkg: bootstrap of coherence group '{g}' aborted at {failed} \
-                             during {phase} — no member left changed (all-or-nothing, continuing)"
-                        );
-                        record_status(
-                            layout,
-                            &failed,
-                            crate::ProgramStatus {
-                                // An already-installed member keeps its honest build; a
-                                // fresh member records none.
-                                installed_build: installed.get(&failed).copied(),
-                                state: format!("error: coherence group '{g}' bootstrap aborted"),
-                                tree_root: String::new(),
-                            },
-                            format!("bootstrap group '{g}' aborted at {failed}"),
-                        );
-                    }
-                    Err(e) => {
-                        failures += 1;
-                        eprintln!(
-                            "atpkg: bootstrap of coherence group '{g}' failed: {e} (continuing)"
-                        );
-                    }
-                }
+                failures += bootstrap_group(
+                    layout, fetcher, &index, cfg, g, &group, &wanted, &installed, &missing,
+                );
             }
-            // An ungrouped member can move alone (§7) — the per-member install path
-            // keeps its signed `requires` dependency resolution (§17). Re-read the
-            // durable floor each member so a floor advance recorded earlier in this
-            // pass is never undercut by the entry-time snapshot.
+            // An ungrouped member can move alone (§7) — see [`bootstrap_singleton`].
             None => {
-                let program = &group.members[0];
-                let floor = crate::sig::Floor::new(layout.floor()).current();
-                let req = crate::InstallRequest {
-                    channel: cfg.channel(),
-                    program,
-                    triple: current_triple(),
-                    installed: None,
-                };
-                match crate::install(fetcher, layout, root_key, &req, floor, now) {
-                    Ok(r) => {
-                        // Advance the durable floor to the index this install trusted
-                        // (§8 gate 3).
-                        let _ =
-                            crate::sig::Floor::new(layout.floor()).check_and_record(r.index_build);
-                        for dep in &r.dependencies {
-                            if let crate::flow::DepResult::Installed { build, tree_root } =
-                                &dep.result
-                            {
-                                record_status(
-                                    layout,
-                                    &dep.program,
-                                    crate::ProgramStatus {
-                                        installed_build: Some(*build),
-                                        state: "active".into(),
-                                        tree_root: tree_root.clone(),
-                                    },
-                                    format!("pulled in {} (required by {program})", dep.program),
-                                );
-                            }
-                        }
-                        record_status(
-                            layout,
-                            program,
-                            crate::ProgramStatus {
-                                installed_build: Some(r.build),
-                                state: "active".into(),
-                                tree_root: effective_tree_root(layout, program, &r.tree_root),
-                            },
-                            format!("bootstrap installed {program} build {}", r.build),
-                        );
-                        println!("atpkg: installed {program} build {} (default set)", r.build);
-                    }
-                    // Correct non-failure states — skipped quietly-but-visibly:
-                    Err(crate::FlowError::Linked(p)) => {
-                        println!("atpkg: {p} dev-linked — skipped");
-                    }
-                    Err(crate::FlowError::NoArtifact(t)) => {
-                        println!("atpkg: {program}: no artifact for {t} — skipped (§6 clean skip)");
-                    }
-                    Err(crate::FlowError::AppBundleRefused(_)) => {
-                        println!(
-                            "atpkg: {program}: app-bundle member — managed by the app's own updater, skipped"
-                        );
-                    }
-                    Err(e @ crate::FlowError::Tombstoned(_)) => {
-                        eprintln!("atpkg: {program}: {e} — nothing installed");
-                    }
-                    Err(e) => {
-                        failures += 1;
-                        eprintln!("atpkg: bootstrap install {program} failed: {e} (continuing)");
-                        record_status(
-                            layout,
-                            program,
-                            crate::ProgramStatus {
-                                installed_build: None,
-                                state: format!("error: {e}"),
-                                tree_root: String::new(),
-                            },
-                            format!("bootstrap install {program}: {e}"),
-                        );
-                    }
-                }
+                failures +=
+                    bootstrap_singleton(layout, fetcher, root_key, cfg, &group.members[0], now);
             }
         }
     }
@@ -1349,18 +1361,226 @@ fn install_default_set(
         let e = crate::FlowError::NotPinned(program.clone());
         failures += 1;
         eprintln!("atpkg: bootstrap install {program} failed: {e} (continuing)");
-        record_status(
-            layout,
-            program,
-            crate::ProgramStatus {
-                installed_build: None,
-                state: format!("error: {e}"),
-                tree_root: String::new(),
-            },
-            format!("bootstrap install {program}: {e}"),
-        );
+        record_bootstrap_error(layout, program, &e);
     }
     failures
+}
+
+/// The grouped (coherence-tuple) arm of [`install_default_set`]: refuse a config-narrowed
+/// partial tuple, clean-skip a tuple with no artifact for this triple, else fresh-install
+/// the WHOLE group all-or-nothing against the caller's ONE resolved index (§7) via
+/// [`crate::flow::bootstrap_group`] — stage-all → flip-all → rollback, exactly the update
+/// path's transaction, so no failure mode can activate a partial or version-split trust
+/// toolchain. Returns the hard-failure count (0 or 1); skips are never failures.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the group arm consumes install_default_set's whole resolved context: layout, \
+              fetcher, the ONE verified index, config, the group + its name, and the \
+              wanted/installed/missing member sets the narrowing check and prescan read"
+)]
+fn bootstrap_group(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    index: &crate::Index,
+    cfg: &crate::config::PackagesConfig,
+    g: &str,
+    group: &crate::Group,
+    wanted: &std::collections::BTreeSet<String>,
+    installed: &std::collections::BTreeMap<String, u64>,
+    missing: &[String],
+) -> u32 {
+    // If the narrowing include/exclude leaves part of the tuple absent,
+    // refuse the WHOLE group — a deliberately partial tuple is exactly
+    // the split state the transaction exists to prevent. Loud diagnostic,
+    // not a loop failure (config-induced; correct every 6h pass).
+    let narrowed_out: Vec<&String> = group
+        .members
+        .iter()
+        .filter(|m| !wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
+        .collect();
+    if !narrowed_out.is_empty() {
+        eprintln!(
+            "atpkg: [packages] include/exclude leaves {narrowed_out:?} out of \
+             coherence group '{g}' — a locked tuple installs whole; skipping the group"
+        );
+        return 0;
+    }
+    // Missing-triple prescan: the singleton NoArtifact clean-skip doctrine
+    // lifted to the tuple — a group that cannot fully exist on this host
+    // is a correct state, not a 6h scream.
+    if let Some(m) =
+        crate::flow::group_missing_triple(fetcher, index, cfg.channel(), current_triple(), missing)
+    {
+        println!(
+            "atpkg: {m}: no artifact for {} — coherence group '{g}' skipped whole \
+             (§6 clean skip)",
+            current_triple()
+        );
+        return 0;
+    }
+    match crate::flow::bootstrap_group(
+        fetcher,
+        layout,
+        index,
+        cfg.channel(),
+        current_triple(),
+        group,
+        installed,
+    ) {
+        Ok((crate::TxnOutcome::Applied(_), applied)) => {
+            // Advance the durable floor to the ONE index the whole group
+            // trusted (§8 gate 3).
+            let _ = crate::sig::Floor::new(layout.floor()).check_and_record(index.index_build);
+            for (m, a) in &applied {
+                record_status(
+                    layout,
+                    m,
+                    crate::ProgramStatus {
+                        installed_build: Some(a.build),
+                        state: "active".into(),
+                        tree_root: effective_tree_root(layout, m, &a.tree_root),
+                    },
+                    format!(
+                        "bootstrap installed {m} build {} (coherence group '{g}')",
+                        a.build
+                    ),
+                );
+                println!(
+                    "atpkg: installed {m} build {} (default set, coherence group '{g}')",
+                    a.build
+                );
+            }
+            0
+        }
+        Ok((crate::TxnOutcome::UpToDate, _)) => 0,
+        Ok((crate::TxnOutcome::Pinned(held), _)) => {
+            println!("atpkg: coherence group '{g}' held by local pin {held:?} — skipped");
+            0
+        }
+        Ok((crate::TxnOutcome::Tombstoned(members), _)) => {
+            eprintln!(
+                "atpkg: coherence group '{g}': pins tombstoned for {members:?} — \
+                 nothing installed"
+            );
+            0
+        }
+        Ok((
+            crate::TxnOutcome::Aborted {
+                failed,
+                during_flip,
+            },
+            _,
+        )) => {
+            let phase = if during_flip {
+                "flip (already-flipped members rolled back)"
+            } else {
+                "stage (nothing flipped)"
+            };
+            eprintln!(
+                "atpkg: bootstrap of coherence group '{g}' aborted at {failed} \
+                 during {phase} — no member left changed (all-or-nothing, continuing)"
+            );
+            record_status(
+                layout,
+                &failed,
+                crate::ProgramStatus {
+                    // An already-installed member keeps its honest build; a
+                    // fresh member records none.
+                    installed_build: installed.get(&failed).copied(),
+                    state: format!("error: coherence group '{g}' bootstrap aborted"),
+                    tree_root: String::new(),
+                },
+                format!("bootstrap group '{g}' aborted at {failed}"),
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!("atpkg: bootstrap of coherence group '{g}' failed: {e} (continuing)");
+            1
+        }
+    }
+}
+
+/// The ungrouped arm of [`install_default_set`]: the per-member install path, which keeps
+/// its signed `requires` dependency resolution (§17). Re-reads the durable floor so a
+/// floor advance recorded earlier in the pass is never undercut by the entry-time
+/// snapshot. Returns the hard-failure count (0 or 1); the correct non-failure states
+/// (dev-link, missing triple, app-bundle, tombstoned pin) are skips.
+fn bootstrap_singleton(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    root_key: &str,
+    cfg: &crate::config::PackagesConfig,
+    program: &str,
+    now: i64,
+) -> u32 {
+    let floor = crate::sig::Floor::new(layout.floor()).current();
+    let req = crate::InstallRequest {
+        channel: cfg.channel(),
+        program,
+        triple: current_triple(),
+        installed: None,
+    };
+    match crate::install(fetcher, layout, root_key, &req, floor, now) {
+        Ok(r) => {
+            // Advance the durable floor to the index this install trusted
+            // (§8 gate 3).
+            let _ = crate::sig::Floor::new(layout.floor()).check_and_record(r.index_build);
+            record_installed_deps(layout, program, &r.dependencies);
+            record_status(
+                layout,
+                program,
+                crate::ProgramStatus {
+                    installed_build: Some(r.build),
+                    state: "active".into(),
+                    tree_root: effective_tree_root(layout, program, &r.tree_root),
+                },
+                format!("bootstrap installed {program} build {}", r.build),
+            );
+            println!("atpkg: installed {program} build {} (default set)", r.build);
+            0
+        }
+        // Correct non-failure states — skipped quietly-but-visibly:
+        Err(crate::FlowError::Linked(p)) => {
+            println!("atpkg: {p} dev-linked — skipped");
+            0
+        }
+        Err(crate::FlowError::NoArtifact(t)) => {
+            println!("atpkg: {program}: no artifact for {t} — skipped (§6 clean skip)");
+            0
+        }
+        Err(crate::FlowError::AppBundleRefused(_)) => {
+            println!(
+                "atpkg: {program}: app-bundle member — managed by the app's own updater, skipped"
+            );
+            0
+        }
+        Err(e @ crate::FlowError::Tombstoned(_)) => {
+            eprintln!("atpkg: {program}: {e} — nothing installed");
+            0
+        }
+        Err(e) => {
+            eprintln!("atpkg: bootstrap install {program} failed: {e} (continuing)");
+            record_bootstrap_error(layout, program, &e);
+            1
+        }
+    }
+}
+
+/// Record one hard bootstrap failure for `program` into `status.toml` — shared by the
+/// ungrouped install arm and [`install_default_set`]'s unpinned-member sweep, which
+/// perform identical writes.
+fn record_bootstrap_error(layout: &crate::store::Layout, program: &str, e: &crate::FlowError) {
+    record_status(
+        layout,
+        program,
+        crate::ProgramStatus {
+            installed_build: None,
+            state: format!("error: {e}"),
+            tree_root: String::new(),
+        },
+        format!("bootstrap install {program}: {e}"),
+    );
 }
 
 /// `atpkg install --default-set` — the explicit one-shot §11 bootstrap: install every
@@ -1556,6 +1776,11 @@ fn cmd_update_one(program: &String) -> ExitCode {
         for p in &report.skipped_linked {
             println!("atpkg: {p} dev-linked — skipped");
         }
+        // GC after every successful activate — the same policy (and order: GC, then the
+        // shell-hook refresh) as `cmd_update_all` and `do_install`, which the ungrouped
+        // path below reaches through `cmd_install`. Best-effort; never fails the update.
+        let gc = crate::gc::run(&layout);
+        print_gc_abstentions("update", &gc);
         crate::hooks::refresh(&layout);
         return if failures == 0 {
             ExitCode::SUCCESS
@@ -1589,7 +1814,12 @@ fn cmd_update_one(program: &String) -> ExitCode {
              force-upgrading off it (a pin never keeps a revoked build running)"
         );
     }
-    cmd_install(Some(program))
+    // Re-enter the single-program install path with the fetcher THIS verb already built
+    // and already warmed (token chain + index candidates), instead of `cmd_install`'s
+    // second one. Everything `cmd_install` would re-do first — `manager_enabled`,
+    // `layout()`, `cfg` — ran above with the same answers, and `reconcile_links` still
+    // runs inside `cmd_install_with` exactly as before, so the output is unchanged.
+    cmd_install_with(program, &layout, cfg, &*fetcher)
 }
 
 /// Report a channel-apply outcome per coherence group and record per-program status,

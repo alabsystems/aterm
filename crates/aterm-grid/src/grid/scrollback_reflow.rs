@@ -291,6 +291,13 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
     let mut byte_idx = 0usize;
     let mut char_idx = 0usize;
     let mut col: u16 = 0;
+    // E6a: `unit_char_start` is monotone across this walk, so a run cursor reads
+    // the RLE attrs in O(runs) TOTAL instead of `get_attr`'s rescan-from-start
+    // per cell (O(cells × runs)) — the same fix already applied to the per-cell
+    // hyperlink/underline lookups below and to `materialize_from_line`. This
+    // walk runs over the WHOLE retained history on every width change, so the
+    // quadratic attr term is paid session-history-wide.
+    let mut attr_cursor = line.attr_cursor();
     // Hyperlink spans are emitted sorted by start_col and disjoint (every producer
     // walks columns left-to-right), and `col` below is monotonic, so resolve each
     // cell's link with a single advancing cursor instead of Line::get_hyperlink_span's
@@ -336,7 +343,7 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
         let unit = super::scroll_materialize::advance_grapheme_unit_wide(text, &mut byte_idx);
         let chars_consumed = unit.chars;
         char_idx += chars_consumed;
-        let attrs = line.get_attr(unit_char_start);
+        let attrs = attr_cursor.attr_at(unit_char_start);
         let width = if super::scroll_materialize::stored_unit_is_wide(unit, attrs) {
             2
         } else {
@@ -374,7 +381,16 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
 
 /// Build an output [`Line`] from a slice of display-cell units.
 fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
-    let mut text = String::new();
+    // Exact capacity: `text` is precisely the concatenation of the units' text,
+    // and it is HANDED to the `Line` below rather than copied into it — so
+    // sizing it here means the line's content buffer is allocated once, with no
+    // doubling slack to trim and no memcpy.
+    let mut text = String::with_capacity(
+        units
+            .iter()
+            .map(|unit| unit.text.len())
+            .fold(0usize, usize::saturating_add),
+    );
     let mut attrs_rle: Rle<CellAttrs> = Rle::new();
     let mut spans: Vec<HyperlinkSpan> = Vec::new();
     // Coalesce consecutive cells sharing a hyperlink (url ptr + id) into spans.
@@ -423,7 +439,7 @@ fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
         ul_spans.push(UnderlineColorSpan::new(start, col, color));
     }
 
-    let mut line = Line::with_hyperlinks(&text, attrs_rle, spans);
+    let mut line = Line::with_hyperlinks_owned(text, attrs_rle, spans);
     if !ul_spans.is_empty() {
         line.set_underline_colors(ul_spans);
     }

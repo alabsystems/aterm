@@ -51,7 +51,7 @@
 // DECSCUSR via the SAME geometry helper the CPU uses (`aterm_render::cursor_rects`);
 // a block cursor is the CPU's exact recipe (cursor-colour bg quad + cut-out glyph).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 // The sprite-atlas texture cache holds the exact published `SceneAtlas`
 // snapshot it uploaded and skips on `Arc::ptr_eq` (see `SpriteTex::src`).
 use std::sync::Arc;
@@ -59,7 +59,7 @@ use std::sync::Arc;
 // FxHashMap for the per-drawable-cell glyph atlas lookups (same fast non-DoS hasher the
 // CPU renderer + the engine grid/core caches use): the glyph atlas `map` is keyed on the
 // local `GlyphKey` once per drawable cell on the encode hot path; SipHash is wasted there.
-use aterm_hash::FxHashMap;
+use aterm_hash::{FxHashMap, FxHashSet};
 
 // A-3: the GPU renderer no longer borrows `&Terminal` — it consumes only the
 // engine-built `RenderInput`. `Terminal` is imported solely in the test modules
@@ -1610,7 +1610,7 @@ pub struct GpuSurface {
     /// can toggle HDR without changing window size or guaranteeing an
     /// Outdated/Lost acquire, so bounded present-time probing cannot rely on
     /// `Surface::configure` being called first.
-    last_hdr_probe: Option<std::time::Instant>,
+    last_hdr_probe: Option<web_time::Instant>,
     /// M5 true vibrancy: whether this surface offers `CompositeAlphaMode::PostMultiplied`
     /// (the non-opaque composite the translucent present needs). Captured from the
     /// surface caps at attach so [`GpuRenderer::present_input`] can flip the swapchain
@@ -1646,7 +1646,7 @@ impl GpuSurface {
 const HDR_COLOR_SPACE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[must_use]
-fn hdr_color_space_probe_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+fn hdr_color_space_probe_due(last: Option<web_time::Instant>, now: web_time::Instant) -> bool {
     match last {
         None => true,
         Some(last) => now.saturating_duration_since(last) >= HDR_COLOR_SPACE_PROBE_INTERVAL,
@@ -1830,7 +1830,7 @@ impl Atlas {
 ///
 /// A free function (not a `GpuRenderer` method) so the atlas-byte-identity
 /// unit test can exercise it with no GPU device.
-fn build_atlas(cpu: &mut Renderer, keys: &BTreeSet<GlyphKey>, cap_h: u32) -> Atlas {
+fn build_atlas(cpu: &mut Renderer, keys: &[GlyphKey], cap_h: u32) -> Atlas {
     build_kind(cpu, keys, AtlasKind::Mono, cap_h)
 }
 
@@ -1839,7 +1839,7 @@ fn build_atlas(cpu: &mut Renderer, keys: &BTreeSet<GlyphKey>, cap_h: u32) -> Atl
 /// renderer. The CPU already scaled each emoji to its final on-cell size, so the
 /// GPU blits these 1:1 with NEAREST sampling — exact bytes, like the mono path.
 /// Mono and empty glyphs are skipped here (they live in the R8 atlas).
-fn build_color_atlas(cpu: &mut Renderer, keys: &BTreeSet<GlyphKey>, cap_h: u32) -> Atlas {
+fn build_color_atlas(cpu: &mut Renderer, keys: &[GlyphKey], cap_h: u32) -> Atlas {
     build_kind(cpu, keys, AtlasKind::Color, cap_h)
 }
 
@@ -1847,7 +1847,7 @@ fn build_color_atlas(cpu: &mut Renderer, keys: &BTreeSet<GlyphKey>, cap_h: u32) 
 /// bytes. `data` is sized to the occupied height once packing is known, so it
 /// holds exactly the packed shelves (no slack) — byte-identical to the old
 /// per-kind packers.
-fn build_kind(cpu: &mut Renderer, keys: &BTreeSet<GlyphKey>, kind: AtlasKind, cap_h: u32) -> Atlas {
+fn build_kind(cpu: &mut Renderer, keys: &[GlyphKey], kind: AtlasKind, cap_h: u32) -> Atlas {
     let mut atlas = Atlas {
         kind,
         width: ATLAS_WIDTH,
@@ -2418,7 +2418,12 @@ pub(crate) struct ImagePlane {
     w: u32,
     h: u32,
     /// `(arc_ptr, fp_w, fp_h) -> (y0_in_texture, fp_w, fp_h)` for each placement.
-    placements: HashMap<(usize, usize, usize), (u32, u32, u32)>,
+    /// FxHash, not SipHash: the instance-emission loop probes this map once per
+    /// image-COVERED CELL (thousands for a full-screen image), and nothing here
+    /// depends on the hasher — the map is only `get`/`insert`/`is_empty`/`==`,
+    /// and the stacked-plane layout comes from the `order` Vec, never from map
+    /// iteration.
+    placements: FxHashMap<(usize, usize, usize), (u32, u32, u32)>,
     /// The `Arc<ImageData>` of every PLACED image, retained for this resident
     /// plane's lifetime. `placements` is keyed by raw `Arc::as_ptr`, and the
     /// reuse fast-path compares those keys; without holding the Arcs, a placed
@@ -2625,8 +2630,12 @@ pub struct GpuRenderer {
     mono_res: Option<ResidentAtlas>,
     color_res: Option<ResidentAtlas>,
     /// The full glyph-key set currently resident across both atlases. A frame
-    /// whose keys are a SUBSET of this skips all atlas work.
-    resident_keys: BTreeSet<GlyphKey>,
+    /// whose keys are a SUBSET of this skips all atlas work. Membership-only
+    /// (`contains`/`extend`/replace, never iterated for order — the atlas
+    /// PACKING order comes from the sorted key slice), so it uses the workspace
+    /// FxHasher rather than an ordered tree: the subset probe runs once per
+    /// distinct key per frame.
+    resident_keys: FxHashSet<GlyphKey>,
     /// Count of atlas textures created (full (re)builds, not reuses). The
     /// persistence test asserts this does NOT advance across an unchanged frame.
     atlas_tex_creations: u64,
@@ -2902,13 +2911,23 @@ pub(crate) struct BloomTarget {
 }
 
 /// The persistent per-frame instance streams + glyph-key set. Previously fresh
-/// `Vec`s and a `BTreeSet` were allocated EVERY `encode_frame`; now they are
+/// `Vec`s and a key set were allocated EVERY `encode_frame`; now they are
 /// hoisted and `.clear()`ed (capacity retained) at the start of each frame, so the
 /// steady state does zero heap allocation for them. Identical contents built in
 /// identical order → byte-identical. Field order mirrors `VertexBuffers`.
 #[derive(Default)]
 struct Instances {
-    keys: BTreeSet<GlyphKey>,
+    /// Dedup side of the per-frame glyph-key set. Hashed, not ordered: the set
+    /// is INSERTED INTO once per drawable cell (tens of thousands on a full
+    /// repaint) but only ever holds the few hundred DISTINCT glyphs on screen,
+    /// so an ordered-tree descent per cell was paying an order of magnitude
+    /// over a single Fx probe to rediscover the same small set.
+    keys: FxHashSet<GlyphKey>,
+    /// First-insertion order of `keys`. Sorted once per frame (a few hundred
+    /// elements) before it reaches `ensure_atlases`, which reproduces exactly
+    /// the old `BTreeSet` iteration order — `GlyphKey`'s `Ord` is load-bearing
+    /// there: atlas packing order must be stable frame to frame.
+    key_order: Vec<GlyphKey>,
     bg: Vec<BgInstance>,
     /// Kitty images below the protocol's `INT32_MIN / 2` boundary. Drawn after
     /// the default frame/background reset but before `image_bg_cover`, so they
@@ -3058,6 +3077,7 @@ impl Instances {
     /// Empty all streams (retaining capacity) for a fresh frame.
     fn clear(&mut self) {
         self.keys.clear();
+        self.key_order.clear();
         self.bg.clear();
         self.image_below_bg.clear();
         self.image_bg_cover.clear();
@@ -4420,7 +4440,7 @@ impl GpuRenderer {
             cached_surface_format: None,
             mono_res: None,
             color_res: None,
-            resident_keys: BTreeSet::new(),
+            resident_keys: FxHashSet::default(),
             atlas_tex_creations: 0,
             vbufs,
             inst: Instances::default(),
@@ -4921,6 +4941,12 @@ impl GpuRenderer {
     #[must_use]
     pub fn admitted_font_sources(&self) -> aterm_render::AdmittedFontSources {
         self.cpu.admitted_font_sources()
+    }
+
+    /// Whether the wrapped CPU generation is sealed against later font I/O.
+    #[must_use]
+    pub fn admitted_font_sources_sealed(&self) -> bool {
+        self.cpu.admitted_font_sources_sealed()
     }
 
     /// Worker-only settlement of every path-backed face in the wrapped
@@ -5441,7 +5467,7 @@ impl GpuRenderer {
     /// into free space on a small miss, and full-repacking into a fresh texture
     /// only on genuine overflow (or the first frame). Pure GPU/CPU bookkeeping
     /// — the render passes below just bind `mono_res`/`color_res`.
-    fn ensure_atlases(&mut self, keys: &BTreeSet<GlyphKey>) {
+    fn ensure_atlases(&mut self, keys: &[GlyphKey]) {
         // Fast path: every requested key already resident in BOTH atlases → the
         // resident textures + bind groups are exactly what this frame needs.
         // (`resident_keys` is the union packed across both atlases.)
@@ -5494,7 +5520,7 @@ impl GpuRenderer {
 
     /// Full (re)pack of both atlases from the complete key set, replacing the
     /// resident textures. Used on the first frame and on genuine overflow.
-    fn rebuild_atlases(&mut self, keys: &BTreeSet<GlyphKey>) {
+    fn rebuild_atlases(&mut self, keys: &[GlyphKey]) {
         // Cap the packed atlas height at the device's max 2D texture dimension so a
         // very large distinct-glyph set can never ask wgpu to create a texture
         // taller than the GPU allows (which aborts the device). Far above any real
@@ -5504,7 +5530,7 @@ impl GpuRenderer {
         self.mono_res = Some(self.create_atlas_texture(mono));
         let color = build_color_atlas(&mut self.cpu, keys, cap_h);
         self.color_res = Some(self.create_atlas_texture(color));
-        self.resident_keys = keys.clone();
+        self.resident_keys = keys.iter().copied().collect();
     }
 
     /// Pack each placed footprint's RGBA rows into a stacked `tw`×`th` plane
@@ -5564,7 +5590,15 @@ impl GpuRenderer {
             usize,
             usize,
         )> = Vec::new();
-        let mut seen: HashMap<(usize, usize, usize), ()> = HashMap::new();
+        // `input.images` carries one entry per COVERED CELL, not per image, so
+        // this walk is O(covered cells) to discover a distinct set that is
+        // realistically 1-8 large. Two cheap guards keep that from costing:
+        // FxHash instead of SipHash (nothing here depends on the hasher), and a
+        // one-slot memo for the previous key — a run of cells covered by the
+        // same image is the normal shape, and re-inserting a key the immediately
+        // preceding cell already inserted is a no-op by construction.
+        let mut seen: FxHashSet<(usize, usize, usize)> = FxHashSet::default();
+        let mut last_key: Option<(usize, usize, usize)> = None;
         for row in &input.images {
             for (_c, image) in row {
                 let fp_w = image.image.cols as usize * cw;
@@ -5573,7 +5607,11 @@ impl GpuRenderer {
                     continue;
                 }
                 let key = (std::sync::Arc::as_ptr(&image.image) as usize, fp_w, fp_h);
-                if seen.insert(key, ()).is_none() {
+                if last_key == Some(key) {
+                    continue;
+                }
+                last_key = Some(key);
+                if seen.insert(key) {
                     // Carry the live `Arc` (not just its raw pointer): the decode cache
                     // holds an `Arc` clone to PIN the allocation, so the pointer-keyed
                     // `placements`/plane-reuse below can't be fooled by a freed+reused
@@ -5598,7 +5636,8 @@ impl GpuRenderer {
         // image that doesn't fit emits no quad (its bg shows through) — the same
         // graceful fallback a failed decode already uses.
         let max_tex_dim = self.ctx.device.limits().max_texture_dimension_2d;
-        let mut placements: HashMap<(usize, usize, usize), (u32, u32, u32)> = HashMap::new();
+        let mut placements: FxHashMap<(usize, usize, usize), (u32, u32, u32)> =
+            FxHashMap::default();
         let mut total_h: u32 = 0;
         let mut max_w: u32 = 0;
         for (image, fp_w, fp_h) in &order {
@@ -6316,7 +6355,7 @@ impl GpuRenderer {
                         config,
                         sdr_format,
                         supports_f16: true,
-                        last_hdr_probe: Some(std::time::Instant::now()),
+                        last_hdr_probe: Some(web_time::Instant::now()),
                         post_mult,
                         copyable,
                     });
@@ -6396,7 +6435,7 @@ impl GpuRenderer {
             config,
             sdr_format: format,
             supports_f16: caps.formats.contains(&wgpu::TextureFormat::Rgba16Float),
-            last_hdr_probe: Some(std::time::Instant::now()),
+            last_hdr_probe: Some(web_time::Instant::now()),
             post_mult,
             copyable,
         })
@@ -6534,9 +6573,7 @@ impl GpuRenderer {
             }
             _ => {}
         }
-        if cfg!(target_os = "macos")
-            && caps.present_modes.contains(&wgpu::PresentMode::Immediate)
-        {
+        if cfg!(target_os = "macos") && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
             wgpu::PresentMode::Immediate
         } else {
             wgpu::PresentMode::Fifo
@@ -6675,7 +6712,7 @@ impl GpuRenderer {
             was_hdr,
             scrgb_retagged,
             reason,
-            std::time::Instant::now(),
+            web_time::Instant::now(),
         );
     }
 
@@ -6689,7 +6726,7 @@ impl GpuRenderer {
         was_hdr: bool,
         scrgb_retagged: bool,
         reason: &'static str,
-        validated_at: std::time::Instant,
+        validated_at: web_time::Instant,
     ) {
         let plan = crate::format_plan::hdr_reconfigure_plan(was_hdr, scrgb_retagged);
         if plan == crate::format_plan::HdrReconfigurePlan::FallbackToSdr {
@@ -6732,7 +6769,7 @@ impl GpuRenderer {
         if !surf.is_hdr() && !(self.hdr_glow && surf.supports_f16) {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         if !hdr_color_space_probe_due(surf.last_hdr_probe, now) {
             return;
         }
@@ -6994,7 +7031,7 @@ impl GpuRenderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let work_started = std::time::Instant::now();
+        let work_started = web_time::Instant::now();
         self.present_to_view(
             win,
             input,
@@ -7618,7 +7655,7 @@ impl GpuRenderer {
         // A fresh per-present view of the persistent texture — exactly how the
         // swapchain arm views its acquired frame.
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let work_started = std::time::Instant::now();
+        let work_started = web_time::Instant::now();
         self.present_to_view(
             win,
             input,
@@ -8311,8 +8348,11 @@ impl GpuRenderer {
         // sync's halo/haze wrote over the copy (dropping that term would leave the
         // previous frame's halo baked into the copy — a smeared comet trail on
         // glass). `None` on either side means "unknown" and forces the full copy.
-        let stale =
-            union_rect_opt(win.offscreen_dirty_since_sync, win.present_offscreen_fx, (w, h));
+        let stale = union_rect_opt(
+            win.offscreen_dirty_since_sync,
+            win.present_offscreen_fx,
+            (w, h),
+        );
         let off = win.offscreen.as_ref().expect("offscreen resident");
         let po = win
             .present_offscreen
@@ -8776,12 +8816,12 @@ impl GpuRenderer {
             // on-glass path folds it into the blit's command buffer); this arm has
             // no blit, so it owns and submits one — the readback below must see
             // the composited texels.
-            let mut enc =
-                self.ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("aterm-gpu readback present-offscreen composite"),
-                    });
+            let mut enc = self
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("aterm-gpu readback present-offscreen composite"),
+                });
             self.compose_present_offscreen(win, input, &mut enc);
             self.ctx.queue.submit([enc.finish()]);
             win.present_offscreen
@@ -10275,6 +10315,7 @@ impl GpuRenderer {
         let cutout_color = cursor_cell.map_or([0, 0, 0, 0], |cell| rgb4(cell.bg));
 
         let mut keys = std::mem::take(&mut self.inst.keys);
+        let mut key_order = std::mem::take(&mut self.inst.key_order);
         for (r, cells) in rendered.iter().enumerate() {
             // A scissored Dirty repaint only re-encodes its dirty rows (the instance
             // loops below skip the rest via `row_active`), so it only needs THOSE
@@ -10337,13 +10378,18 @@ impl GpuRenderer {
                         aterm_render::cell_x_run(input, r, c, cw).0
                     };
                     let key = aterm_render::shade_phase_key(key, pad + cell_x, grid_top + r * ch);
-                    keys.insert(key);
+                    if keys.insert(key) {
+                        key_order.push(key);
+                    }
                     // Combining-mark glyphs share the mono atlas.
                     if input.cluster_at(r, c).is_none()
                         && let Some(marks) = input.combining_at(r, c)
                     {
                         for &m in marks {
-                            keys.insert(self.cpu.glyph_key(m));
+                            let mk = self.cpu.glyph_key(m);
+                            if keys.insert(mk) {
+                                key_order.push(mk);
+                            }
                         }
                     }
                 }
@@ -10354,11 +10400,19 @@ impl GpuRenderer {
         // groups untouched; a miss grows them incrementally; only genuine
         // overflow recreates a texture. This is the G-1 fix — no per-frame
         // rebuild/re-upload. After this, `mono_res`/`color_res` are Some and hold
-        // every key in `keys`. (`keys` is still the moved-out local here, so
-        // `ensure_atlases`' `&mut self` doesn't alias it; it returns to
-        // `self.inst.keys` right after.)
-        self.ensure_atlases(&keys);
+        // every key in `keys`. (`keys`/`key_order` are still the moved-out
+        // locals here, so `ensure_atlases`' `&mut self` doesn't alias them; they
+        // return to `self.inst` right after.)
+        //
+        // Sort ONCE (a few hundred distinct keys) instead of paying a tree
+        // descent per drawable cell: a deduped Vec sorted by `GlyphKey`'s
+        // derived `Ord` is exactly the old `BTreeSet` iteration order, which is
+        // what `build_kind`/`grow_atlas` pack in — so the atlas layout, and
+        // therefore every byte the differentials pin, is unchanged.
+        key_order.sort_unstable();
+        self.ensure_atlases(&key_order);
         self.inst.keys = keys;
+        self.inst.key_order = key_order;
         // Build the per-frame inline-image texture (iTerm2 OSC 1337). `&mut self`,
         // so it runs BEFORE the resident-atlas borrows below. A no-op (drops any
         // prior plane) for image-free frames — the common path is untouched.
@@ -13107,11 +13161,14 @@ impl GpuRenderer {
         // the view each pass attaches. Shared by the plan below and the encode.
         let (pass_of, pass_srgb, passes) = coalesce_frame_passes(&enabled, &GROUP_SRGB);
 
-        for p in 0..passes {
+        // `pass_srgb` is sized for the worst case (one pass per group), so only its
+        // first `passes` entries were populated — hence the `take`, which walks
+        // exactly the same indices the old `0..passes` range did.
+        for (p, &srgb) in pass_srgb.iter().enumerate().take(passes) {
             // Only pass 0 carries `load_op` (the Clear/Load decision above); every
             // later pass Loads what its predecessor stored on the same attachment.
             let load = if p == 0 { load_op } else { wgpu::LoadOp::Load };
-            let mut pass = if pass_srgb[p] {
+            let mut pass = if srgb {
                 open_pass!(view_srgb, load)
             } else {
                 open_pass!(view, load)
@@ -13933,14 +13990,18 @@ ab\r\n",
 
         // The same key set encode_frame builds for this frame.
         let input = term.cell_frame(rows, cols);
-        let mut keys: BTreeSet<GlyphKey> = BTreeSet::new();
+        // Same shape encode_frame builds: dedup, then sort (the packing order
+        // `build_atlas` consumes).
+        let mut keys: Vec<GlyphKey> = Vec::new();
         for cells in &input.cells {
             for cell in cells.iter().take(cols) {
                 if GpuRenderer::drawable(cell) {
-                    keys.insert(cpu.glyph_key(cell.ch));
+                    keys.push(cpu.glyph_key(cell.ch));
                 }
             }
         }
+        keys.sort_unstable();
+        keys.dedup();
         assert!(
             keys.len() >= 5,
             "demo frame should contribute several glyphs"
@@ -15201,7 +15262,7 @@ ab\r\n",
     /// window's DXGI calls to one per interval.
     #[test]
     fn hdr_state_probe_is_immediate_then_throttled() {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         assert!(hdr_color_space_probe_due(None, now));
         assert!(!hdr_color_space_probe_due(Some(now), now));
 

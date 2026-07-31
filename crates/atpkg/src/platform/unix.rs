@@ -28,6 +28,11 @@ pub const SHIM_SUFFIX: &str = "";
 
 /// The default install prefix under `home`: `…/Library/Application Support/aterm/pkg`,
 /// a sibling of the updater's `Updates` dir (so the two share the hardened support root).
+///
+/// MIRRORED (deliberately, not depended on) by
+/// `aterm-spec::verify::unix_store_bin_dir` — the verification tier's
+/// discovery probes `<prefix>/bin` without dragging this crate into every
+/// conformance consumer. Moving this prefix means updating that mirror too.
 #[must_use]
 pub fn default_prefix(home: &Path) -> PathBuf {
     home.join("Library")

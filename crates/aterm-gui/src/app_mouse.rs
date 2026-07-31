@@ -698,6 +698,43 @@ impl App {
         strip_col_for_pixel(x, y, cw, ch, cols, self.tab_strip_rows, pad, pad_top, head)
     }
 
+    /// Track which in-grid tab-strip tab the pointer is over, so the `✕` can be a
+    /// HOVER-ONLY affordance there exactly as it is on the native macOS strip. Runs
+    /// on every `CursorMoved` — including motion that later paths consume — because
+    /// leaving the strip must clear the reveal just as surely as entering it sets it.
+    ///
+    /// Cheap and change-gated: a no-op when the in-grid strip is disabled (the
+    /// default), and it only requests a redraw when the hovered TAB changes, so
+    /// sweeping the pointer across one tab costs nothing. The redraw is what
+    /// re-runs `splice_tab_strip_with`, whose cache key carries the hover.
+    fn track_strip_hover(&mut self, wid: WindowId, x: f64, y: f64) {
+        if !self.tab_strip_enabled() {
+            return;
+        }
+        let hovered = self.strip_col_at(wid, x, y).and_then(|col| {
+            let segs = self
+                .windows
+                .get(&wid)
+                .map(|ws| ws.tab_segments.as_slice())?;
+            match crate::tab_bar::hit_test(segs, col)? {
+                crate::tab_bar::TabHit::Select(index) => Some(index),
+                // The `+` and the `↻` are not tabs; the pointer is in the strip but
+                // on no tab, so nothing reveals a `✕`.
+                _ => None,
+            }
+        });
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        if ws.strip_hover == hovered {
+            return;
+        }
+        ws.strip_hover = hovered;
+        if let Some(window) = &ws.os_window {
+            window.request_redraw();
+        }
+    }
+
     /// A left click on the Cmd-F find panel. On the `Aa` (case) / `.*` (regex)
     /// indicators it fires the matching toggle — the SAME action as the ⌥⌘C / ⌥⌘R
     /// chords, so a mouse user can flip modes without the keyboard. Inside the query
@@ -1203,6 +1240,7 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_cursor_px = (x, y);
         }
+        self.track_strip_hover(wid, x, y);
         if self.palette_claims_pointer(wid) {
             self.palette_pointer_motion(wid, x, y);
             return;

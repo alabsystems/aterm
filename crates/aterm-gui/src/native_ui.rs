@@ -13,20 +13,31 @@
     reason = "native tab-app migration foundation; consumers land with the tab host"
 )]
 
-use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 use aterm_grapheme::GraphemeClusters;
+use aterm_hash::FxHashSet;
 
 use crate::type_scale::TypeStep;
 
 /// Stable logical identity of a semantic node.  Keys survive layout, filtering,
 /// and route changes; vector positions are deliberately not identities.
+///
+/// The payload is an `Arc<str>`, not a `String`, because a key is authored ONCE
+/// per node and then CLONED up to six times on the way through
+/// [`UiTree::compile`] (duplicate-key set, paint node, semantic node, that
+/// node's parent link, focus order, hit region) plus three more per node in the
+/// accessibility projection — every one of those was a malloc + memcpy of the
+/// key text on every native frame.  `Arc<str>` makes each of them a refcount
+/// bump while `as_str`, `Debug`, `Ord`, and `Hash` all still forward to `str`,
+/// so key ordering and hashing are unchanged.  `Arc` (not `Rc`) keeps `UiKey`
+/// — and therefore the retained `CompiledUi` — `Send`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct UiKey(String);
+pub(crate) struct UiKey(Arc<str>);
 
 impl UiKey {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
+    pub(crate) fn new(value: impl Into<Arc<str>>) -> Self {
         Self(value.into())
     }
 
@@ -42,11 +53,13 @@ impl fmt::Debug for UiKey {
 }
 
 /// Stable reducer action identity emitted by an interactive semantic node.
+/// `Arc<str>` for the same reason [`UiKey`] is — an action is authored once and
+/// cloned into the semantic node, the hit region, and the default-action slot.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ActionId(String);
+pub(crate) struct ActionId(Arc<str>);
 
 impl ActionId {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
+    pub(crate) fn new(value: impl Into<Arc<str>>) -> Self {
         Self(value.into())
     }
 
@@ -307,7 +320,7 @@ fn length_valid(length: Length) -> bool {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SemanticRole {
     Application,
     Group,
@@ -337,7 +350,7 @@ pub(crate) enum SemanticValue {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ControlState {
     pub(crate) enabled: bool,
     pub(crate) focused: bool,
@@ -1359,7 +1372,7 @@ pub(crate) struct UiNode {
 }
 
 impl UiNode {
-    pub(crate) fn new(key: impl Into<String>, content: UiContent) -> Self {
+    pub(crate) fn new(key: impl Into<Arc<str>>, content: UiContent) -> Self {
         Self {
             key: UiKey::new(key),
             layout: Layout::default(),
@@ -1468,19 +1481,31 @@ impl UiTree {
     }
 
     /// Compile all observable UI products from one typed tree.
-    pub(crate) fn compile(&self, viewport: LogicalRect) -> Result<CompiledUi, CompileError> {
+    ///
+    /// CONSUMES the authored tree. Every production caller renders a fresh tree
+    /// and drops it on the next line, and the compiler is the only reader — so
+    /// taking `self` by value lets each node's [`UiContent`] be MOVED into its
+    /// paint node instead of deep-cloned. That clone was the single largest
+    /// per-frame allocation in the native path: for the editor it copied the
+    /// entire visible `TextViewportSpec` projection (up to 256 lines, each an
+    /// owned `String` of up to 4 KiB plus its selection/caret/syntax/diagnostic
+    /// vectors) once per frame, and for a Markdown reader the whole block text.
+    pub(crate) fn compile(self, viewport: LogicalRect) -> Result<CompiledUi, CompileError> {
         if !viewport.is_valid() || viewport.is_empty() {
             return Err(CompileError::InvalidViewport);
         }
         let mut compiler = Compiler {
-            seen: HashSet::new(),
+            seen: FxHashSet::default(),
             output: CompiledUi {
                 bounds: viewport,
                 ..CompiledUi::default()
             },
         };
-        compiler.node(&self.root, viewport, viewport, None)?;
         // From the AUTHORED tree, not the clipped observers — see the field doc.
+        // Hoisted ABOVE the traversal because the traversal now consumes the
+        // tree; it still walks every child (a clipped subtree keeps contributing
+        // its default action), and on the error path its result is discarded by
+        // the `?` exactly as before.
         fn find_default(node: &UiNode) -> Option<(UiKey, ActionId)> {
             if let UiContent::Button(control) = &node.content
                 && control.style == StyleRef::Primary
@@ -1490,7 +1515,9 @@ impl UiTree {
             }
             node.children.iter().find_map(find_default)
         }
-        compiler.output.default_action = find_default(&self.root);
+        let default_action = find_default(&self.root);
+        compiler.node(self.root, viewport, viewport, None)?;
+        compiler.output.default_action = default_action;
         Ok(compiler.output)
     }
 }
@@ -1858,16 +1885,30 @@ impl CompiledUi {
     /// plus exact compiled geometry. The host folds this into its repaint and
     /// raster-cache keys; responsive paint-only copy must therefore participate
     /// even though accessibility deliberately does not publish it.
+    ///
+    /// This runs once per native frame (and once per visible native leaf in the
+    /// split path), so it deliberately touches NO heap: the semantic half hashes
+    /// the typed fields directly rather than round-tripping them through
+    /// `controls_lines()`'s `format!` per node, and the paint fallback streams
+    /// `Debug` straight into the hasher through [`HashFmt`] instead of
+    /// materializing a `String` per node. FxHash replaces SipHash for the same
+    /// reason the rest of the workspace uses it: this is a cache key over
+    /// first-party data, not a hash table exposed to untrusted input.
     pub(crate) fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let mut hash = aterm_hash::FxHasher::default();
         self.bounds.x.to_bits().hash(&mut hash);
         self.bounds.y.to_bits().hash(&mut hash);
         self.bounds.width.to_bits().hash(&mut hash);
         self.bounds.height.to_bits().hash(&mut hash);
-        for line in self.controls_lines() {
-            line.hash(&mut hash);
+        // Exactly the fields `controls_lines()` renders — key, role, label,
+        // value, action, state, rect — fed to the hasher untouched. Geometry is
+        // hashed at full precision instead of the audit line's `{:.1}`, which
+        // only ever makes the fingerprint MORE discriminating (the paint loop
+        // below already hashes the same rect bit-exactly).
+        for node in &self.semantics {
+            hash_semantic_node(node, &mut hash);
         }
         // Paint can intentionally differ from semantics (compact button labels,
         // responsive status copy, editor windows, preview animation). Hash the
@@ -1892,7 +1933,7 @@ impl CompiledUi {
                     markdown_paint_fingerprint(node, spec).hash(&mut hash);
                 }
                 UiContent::TextViewport(spec) => text_viewport_fingerprint(spec).hash(&mut hash),
-                content => format!("{content:?}").hash(&mut hash),
+                content => hash_debug(content, &mut hash),
             }
         }
         hash.finish() | 1
@@ -1931,36 +1972,116 @@ impl CompiledUi {
     }
 
     /// Assert the cross-observer invariant for every actionable semantic node.
+    ///
+    /// Indexed, not nested-scanned: this runs on every native frame, and the
+    /// three per-semantic linear scans it replaces cost `S x (P + 2H)` key
+    /// comparisons — quadratic in page size for a check that answers "OK" every
+    /// frame in practice. One `O(P + H)` sweep builds the tally, then each
+    /// actionable semantic is a single lookup. Semantics are still walked in
+    /// THEIR authored order so the FIRST offending key is the one reported.
     pub(crate) fn validate_parity(&self) -> Result<(), CompileError> {
+        // (paint count, hit count, first hit's action) per key. `Compiler::seen`
+        // already rejects duplicate keys before anything is pushed, so a count
+        // can only be 0 or 1 — but the counts are kept exact so this stays a
+        // faithful restatement of the scans, not a restatement of the invariant.
+        let mut index: aterm_hash::FxHashMap<&UiKey, (u32, u32, Option<&ActionId>)> =
+            aterm_hash::FxHashMap::with_capacity_and_hasher(
+                self.paint.len(),
+                aterm_hash::FxBuildHasher,
+            );
+        for node in &self.paint {
+            index.entry(&node.key).or_default().0 += 1;
+        }
+        for node in &self.hits {
+            let entry = index.entry(&node.key).or_default();
+            entry.1 += 1;
+            // First-wins, matching the `.find(..)` this replaces.
+            if entry.2.is_none() {
+                entry.2 = Some(&node.action);
+            }
+        }
         for semantic in self
             .semantics
             .iter()
             .filter(|node| node.action.is_some() && node.state.is_none_or(|state| state.enabled))
         {
-            let painted = self
-                .paint
-                .iter()
-                .filter(|node| node.key == semantic.key)
-                .count();
-            let hit = self
-                .hits
-                .iter()
-                .filter(|node| node.key == semantic.key)
-                .count();
+            // A key absent from the index tallies 0/0 and therefore fails the
+            // same way the scans did.
+            let (painted, hit, hit_action) = index.get(&semantic.key).copied().unwrap_or_default();
             if painted != 1 || hit != 1 {
                 return Err(CompileError::ObserverMismatch(semantic.key.clone()));
             }
-            let hit_action = self
-                .hits
-                .iter()
-                .find(|node| node.key == semantic.key)
-                .map(|node| &node.action);
             if hit_action != semantic.action.as_ref() {
                 return Err(CompileError::ObserverMismatch(semantic.key.clone()));
             }
         }
         Ok(())
     }
+}
+
+/// `fmt::Write` sink that streams a formatter's output straight into a hasher.
+///
+/// The paint fingerprint needs the COMPLETE `Debug` projection of the ordinary
+/// control specs (they are value-only structs, so `Debug` is an exhaustive,
+/// derive-checked field list — a new field cannot silently escape the cache
+/// key). It does not need that projection to exist as a `String`, which is what
+/// `format!("{content:?}").hash(..)` was buying once per paint node per frame.
+struct HashFmt<'a, H: std::hash::Hasher>(&'a mut H);
+
+impl<H: std::hash::Hasher> fmt::Write for HashFmt<'_, H> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Hash a value's `Debug` rendering without allocating it.
+fn hash_debug<H: std::hash::Hasher>(value: &impl fmt::Debug, hash: &mut H) {
+    use fmt::Write as _;
+
+    // Infallible: `HashFmt::write_str` never errors, and `Debug` for these
+    // value-only structs never returns `Err` on its own.
+    let _ = write!(HashFmt(hash), "{value:?}");
+    // Terminator, so two adjacent nodes cannot alias by concatenation — the
+    // same job `str`'s own `Hash` impl does with its trailing 0xff.
+    hash.write_u8(0xff);
+}
+
+/// Hash one semantic node's observable fields — the exact set
+/// [`CompiledUi::controls_lines`] renders, minus the `format!` per node.
+fn hash_semantic_node<H: std::hash::Hasher>(node: &SemanticNode, hash: &mut H) {
+    use std::hash::Hash;
+
+    node.key.as_str().hash(hash);
+    node.role.hash(hash);
+    node.label.hash(hash);
+    match &node.value {
+        SemanticValue::None => 0_u8.hash(hash),
+        SemanticValue::Text(value) => {
+            1_u8.hash(hash);
+            value.hash(hash);
+        }
+        SemanticValue::Bool(value) => {
+            2_u8.hash(hash);
+            value.hash(hash);
+        }
+        SemanticValue::Number {
+            value,
+            minimum,
+            maximum,
+        } => {
+            3_u8.hash(hash);
+            value.to_bits().hash(hash);
+            minimum.to_bits().hash(hash);
+            maximum.to_bits().hash(hash);
+        }
+    }
+    node.state.hash(hash);
+    node.action.as_ref().map(ActionId::as_str).hash(hash);
+    node.rect.x.to_bits().hash(hash);
+    node.rect.y.to_bits().hash(hash);
+    node.rect.width.to_bits().hash(hash);
+    node.rect.height.to_bits().hash(hash);
 }
 
 fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut H) {
@@ -2026,7 +2147,10 @@ fn hash_text_viewport<H: std::hash::Hasher>(spec: &TextViewportSpec, hash: &mut 
 fn text_viewport_fingerprint(spec: &TextViewportSpec) -> u64 {
     use std::hash::Hasher;
 
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    // FxHash, not SipHash: this walks the whole visible editor projection
+    // (up to 256 lines of up to 4 KiB) on every frame, and it is a repaint
+    // cache key over first-party text, never a hash table under attack.
+    let mut hash = aterm_hash::FxHasher::default();
     hash_text_viewport(spec, &mut hash);
     hash.finish() | 1
 }
@@ -2393,10 +2517,36 @@ fn markdown_kind_label(kind: &MarkdownBlockKind) -> String {
     }
 }
 
+fn hash_markdown_kind<H: std::hash::Hasher>(kind: &MarkdownBlockKind, hash: &mut H) {
+    use std::hash::Hash;
+
+    match kind {
+        MarkdownBlockKind::Heading(level) => {
+            0_u8.hash(hash);
+            level.hash(hash);
+        }
+        MarkdownBlockKind::Paragraph => 1_u8.hash(hash),
+        MarkdownBlockKind::ListItem { depth, ordinal } => {
+            2_u8.hash(hash);
+            depth.hash(hash);
+            ordinal.hash(hash);
+        }
+        MarkdownBlockKind::Quote => 3_u8.hash(hash),
+        MarkdownBlockKind::Code { language } => {
+            4_u8.hash(hash);
+            language.hash(hash);
+        }
+        MarkdownBlockKind::Table => 5_u8.hash(hash),
+        MarkdownBlockKind::Rule => 6_u8.hash(hash),
+    }
+}
+
 fn markdown_paint_fingerprint(node: &PaintNode, spec: &MarkdownBlockSpec) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    // FxHash, not SipHash: `spec.text` is up to 128 KiB of block source and this
+    // runs per visible block per frame.
+    let mut hash = aterm_hash::FxHasher::default();
     node.rect.x.to_bits().hash(&mut hash);
     node.rect.y.to_bits().hash(&mut hash);
     node.rect.width.to_bits().hash(&mut hash);
@@ -2405,7 +2555,11 @@ fn markdown_paint_fingerprint(node: &PaintNode, spec: &MarkdownBlockSpec) -> u64
     node.clip.y.to_bits().hash(&mut hash);
     node.clip.width.to_bits().hash(&mut hash);
     node.clip.height.to_bits().hash(&mut hash);
-    markdown_kind_label(&spec.kind).hash(&mut hash);
+    // The typed kind, not its `markdown_kind_label(..)` `String`: one fewer
+    // heap allocation per visible block per frame, and strictly more
+    // discriminating (the label collapses `Code { language: None }` and
+    // `Code { language: Some("") }` to the same "code:plain" text).
+    hash_markdown_kind(&spec.kind, &mut hash);
     spec.text.hash(&mut hash);
     spec.dense.hash(&mut hash);
     spec.selectable.hash(&mut hash);
@@ -3722,9 +3876,18 @@ fn paint_markdown_block(
 
 /// Bounded, allocation-conscious wrapping for visible reader blocks. The app
 /// already caps source copied into a block; this cap also bounds paint prims.
+///
+/// `skip` is the number of leading wrapped rows the caller does not want. They
+/// are still COUNTED — the row budget and the tail-ellipsis rule below are
+/// defined over the whole wrap, not over the returned window — but never
+/// materialized. Intra-block scrolling therefore costs one `String` per VISIBLE
+/// row instead of one per row from the top of the block; the thousand-line
+/// fence in the shipped Manual, scrolled near its end, used to build and
+/// immediately drop ~970 of them on every frame.
 fn wrap_markdown_text(
     text: &str,
     max_columns: usize,
+    skip: usize,
     max_lines: usize,
     preserve_lines: bool,
 ) -> Vec<String> {
@@ -3733,24 +3896,42 @@ fn wrap_markdown_text(
     // case is therefore bounded while still allowing a tail viewport far past
     // the former 512-row ceiling.
     let max_lines = max_lines.clamp(1, 131_072);
-    let mut output = Vec::with_capacity(max_lines.min(16));
+    let mut output = Vec::with_capacity(max_lines.saturating_sub(skip).min(16));
+    // `produced` is the total row counter this function used to keep implicitly
+    // in `output.len()`; `produced_chars` is the emitted-character total the
+    // tail-ellipsis rule compares against, which must still cover the SKIPPED
+    // prefix or that rule would change meaning.
+    let mut produced = 0usize;
+    let mut produced_chars = 0usize;
+    // Hoisted out of the source-line loop: a long fence is thousands of lines,
+    // and a fresh `Vec<char>` per line was thousands of malloc/free pairs per
+    // frame for a buffer that is dead the moment the line is wrapped.
+    let mut characters: Vec<char> = Vec::new();
     for source_line in text.lines().chain(text.is_empty().then_some("")) {
-        if output.len() >= max_lines {
+        if produced >= max_lines {
             break;
         }
         if preserve_lines {
-            let characters = source_line.chars().collect::<Vec<_>>();
+            characters.clear();
+            characters.extend(source_line.chars());
             if characters.is_empty() {
-                output.push(String::new());
+                if produced >= skip {
+                    output.push(String::new());
+                }
+                produced += 1;
             } else {
                 let mut start = 0usize;
                 while start < characters.len() {
-                    if output.len() >= max_lines {
+                    if produced >= max_lines {
                         break;
                     }
                     let hard_end = (start + max_columns).min(characters.len());
                     if hard_end == characters.len() {
-                        output.push(characters[start..hard_end].iter().collect());
+                        if produced >= skip {
+                            output.push(characters[start..hard_end].iter().collect());
+                        }
+                        produced += 1;
+                        produced_chars += hard_end - start;
                         break;
                     }
                     // Preserve authored line boundaries and interior spacing,
@@ -3763,7 +3944,11 @@ fn wrap_markdown_text(
                         .map(|offset| start + offset)
                         .filter(|end| *end > start);
                     let end = soft_end.unwrap_or(hard_end);
-                    output.push(characters[start..end].iter().collect());
+                    if produced >= skip {
+                        output.push(characters[start..end].iter().collect());
+                    }
+                    produced += 1;
+                    produced_chars += end - start;
                     start = end;
                     while start < characters.len() && characters[start].is_whitespace() {
                         start += 1;
@@ -3786,8 +3971,15 @@ fn wrap_markdown_text(
                 continue;
             }
             if !line.is_empty() {
-                output.push(std::mem::take(&mut line));
-                if output.len() >= max_lines {
+                let row = std::mem::take(&mut line);
+                if produced >= skip {
+                    output.push(row);
+                }
+                produced += 1;
+                // `line_columns` is `line.chars().count()` by construction, so
+                // the ellipsis rule sees the same total it always did.
+                produced_chars += line_columns;
+                if produced >= max_lines {
                     break;
                 }
             }
@@ -3797,9 +3989,14 @@ fn wrap_markdown_text(
                 chunk.push(character);
                 chunk_columns += 1;
                 if chunk_columns == max_columns {
-                    output.push(std::mem::take(&mut chunk));
+                    let row = std::mem::take(&mut chunk);
+                    if produced >= skip {
+                        output.push(row);
+                    }
+                    produced += 1;
+                    produced_chars += chunk_columns;
                     chunk_columns = 0;
-                    if output.len() >= max_lines {
+                    if produced >= max_lines {
                         break;
                     }
                 }
@@ -3807,19 +4004,19 @@ fn wrap_markdown_text(
             line = chunk;
             line_columns = chunk_columns;
         }
-        if output.len() >= max_lines {
+        if produced >= max_lines {
             break;
         }
         if !line.is_empty() || source_line.is_empty() {
-            output.push(line);
+            if produced >= skip {
+                output.push(line);
+            }
+            produced += 1;
+            produced_chars += line_columns;
         }
     }
-    if output.len() == max_lines
-        && text.chars().count()
-            > output
-                .iter()
-                .map(|line| line.chars().count())
-                .sum::<usize>()
+    if produced == max_lines
+        && text.chars().count() > produced_chars
         && let Some(last) = output.last_mut()
     {
         let keep = max_columns.saturating_sub(1);
@@ -3838,11 +4035,11 @@ fn wrap_markdown_text_window(
 ) -> Vec<String> {
     let take = max_lines.clamp(1, 512);
     let requested = visual_row.saturating_add(take).clamp(1, 131_072);
-    let mut lines = wrap_markdown_text(text, max_columns, requested, preserve_lines);
-    if visual_row >= lines.len() {
-        return Vec::new();
-    }
-    lines.drain(..visual_row);
+    // `skip = visual_row` replaces a `drain(..visual_row)` over rows that were
+    // built only to be thrown away. `truncate` still stands: the word-wrap path
+    // can overshoot the budget by one row (it pushes, then tests), exactly as
+    // it did before.
+    let mut lines = wrap_markdown_text(text, max_columns, visual_row, requested, preserve_lines);
     lines.truncate(take);
     lines
 }
@@ -4460,36 +4657,53 @@ pub(crate) enum CompileError {
 }
 
 struct Compiler {
-    seen: HashSet<UiKey>,
+    // FxHash, not SipHash: this set exists only to reject duplicate keys inside
+    // one compile, is keyed by internal authored keys (never untrusted input),
+    // and is rebuilt from scratch every native frame — the DoS resistance was
+    // paying for nothing.
+    seen: FxHashSet<UiKey>,
     output: CompiledUi,
 }
 
 impl Compiler {
+    /// Takes the node BY VALUE so its `content` can be moved into the paint
+    /// node. Everything else the node carries (`layout`, `children`) is still
+    /// read in full afterwards — the destructure below just separates the field
+    /// that moves from the fields that do not.
     fn node(
         &mut self,
-        node: &UiNode,
+        node: UiNode,
         rect: LogicalRect,
         inherited_clip: LogicalRect,
         parent: Option<&UiKey>,
     ) -> Result<(), CompileError> {
-        if node.key.as_str().trim().is_empty() {
+        let UiNode {
+            key,
+            layout,
+            content,
+            children,
+            paint_only,
+        } = node;
+        if key.as_str().trim().is_empty() {
             return Err(CompileError::EmptyKey);
         }
-        if !node.layout.is_valid() || !rect.is_valid() {
-            return Err(CompileError::InvalidLayout(node.key.clone()));
+        if !layout.is_valid() || !rect.is_valid() {
+            return Err(CompileError::InvalidLayout(key));
         }
-        if !self.seen.insert(node.key.clone()) {
-            return Err(CompileError::DuplicateKey(node.key.clone()));
+        if !self.seen.insert(key.clone()) {
+            return Err(CompileError::DuplicateKey(key));
         }
-        if let UiContent::Custom(custom) = &node.content
+        if let UiContent::Custom(custom) = &content
             && custom.audit_id.trim().is_empty()
         {
-            return Err(CompileError::CustomWithoutAudit(node.key.clone()));
+            return Err(CompileError::CustomWithoutAudit(key));
         }
 
-        let projection = node.content.semantic();
-        if node.paint_only && (projection.action.is_some() || projection.focusable) {
-            return Err(CompileError::PaintOnlyAction(node.key.clone()));
+        // Runs BEFORE `content` moves into the paint node; `semantic()` clones
+        // only the labels it needs.
+        let projection = content.semantic();
+        if paint_only && (projection.action.is_some() || projection.focusable) {
+            return Err(CompileError::PaintOnlyAction(key));
         }
 
         let own_clip = inherited_clip.intersect(rect);
@@ -4499,14 +4713,14 @@ impl Compiler {
             return Ok(());
         };
         self.output.paint.push(PaintNode {
-            key: node.key.clone(),
+            key: key.clone(),
             rect,
             clip: visible,
-            content: node.content.clone(),
+            content,
         });
-        if !node.paint_only {
+        if !paint_only {
             self.output.semantics.push(SemanticNode {
-                key: node.key.clone(),
+                key: key.clone(),
                 parent: parent.cloned(),
                 rect: visible,
                 role: projection.role,
@@ -4517,21 +4731,21 @@ impl Compiler {
                 audit_id: projection.audit_id,
             });
             if projection.focusable {
-                self.output.focus_order.push(node.key.clone());
+                self.output.focus_order.push(key.clone());
             }
             if let Some(action) = projection.action
                 && projection.state.is_none_or(|state| state.enabled)
             {
                 self.output.hits.push(HitRegion {
-                    key: node.key.clone(),
+                    key: key.clone(),
                     rect: visible,
                     action,
                 });
             }
         }
 
-        let content_rect = rect.inset(node.layout.padding);
-        let child_clip = if node.layout.clip {
+        let content_rect = rect.inset(layout.padding);
+        let child_clip = if layout.clip {
             inherited_clip.intersect(content_rect).unwrap_or_default()
         } else {
             inherited_clip
@@ -4539,32 +4753,31 @@ impl Compiler {
         if child_clip.is_empty() {
             return Ok(());
         }
-        let child_rects = layout_children(node, content_rect)?;
-        let semantic_parent = if node.paint_only {
-            parent
-        } else {
-            Some(&node.key)
-        };
-        for (child, child_rect) in node.children.iter().zip(child_rects) {
+        let child_rects = layout_children(&layout, &children, content_rect)?;
+        let semantic_parent = if paint_only { parent } else { Some(&key) };
+        for (child, child_rect) in children.into_iter().zip(child_rects) {
             self.node(child, child_rect, child_clip, semantic_parent)?;
         }
         Ok(())
     }
 }
 
-fn layout_children(node: &UiNode, content: LogicalRect) -> Result<Vec<LogicalRect>, CompileError> {
-    if node.children.is_empty() {
+fn layout_children(
+    layout: &Layout,
+    children: &[UiNode],
+    content: LogicalRect,
+) -> Result<Vec<LogicalRect>, CompileError> {
+    if children.is_empty() {
         return Ok(Vec::new());
     }
-    if node.layout.flow == Flow::Overlay {
-        return node
-            .children
+    if layout.flow == Flow::Overlay {
+        return children
             .iter()
             .map(|child| child_rect_overlay(child, content))
             .collect::<Result<Vec<_>, _>>();
     }
 
-    let is_row = node.layout.flow == Flow::Row;
+    let is_row = layout.flow == Flow::Row;
     let main_extent = if is_row {
         content.width
     } else {
@@ -4575,12 +4788,12 @@ fn layout_children(node: &UiNode, content: LogicalRect) -> Result<Vec<LogicalRec
     } else {
         content.width
     };
-    let total_gap = node.layout.gap * node.children.len().saturating_sub(1) as f32;
+    let total_gap = layout.gap * children.len().saturating_sub(1) as f32;
     let available = (main_extent - total_gap).max(0.0);
     let mut fixed = 0.0;
     let mut fills = 0usize;
-    let mut main_lengths = Vec::with_capacity(node.children.len());
-    for child in &node.children {
+    let mut main_lengths = Vec::with_capacity(children.len());
+    for child in children {
         let (intrinsic_w, intrinsic_h) = child.content.intrinsic_size();
         let main = if is_row {
             child.layout.width
@@ -4609,8 +4822,8 @@ fn layout_children(node: &UiNode, content: LogicalRect) -> Result<Vec<LogicalRec
     };
 
     let mut cursor = if is_row { content.x } else { content.y };
-    let mut out = Vec::with_capacity(node.children.len());
-    for (child, main) in node.children.iter().zip(main_lengths) {
+    let mut out = Vec::with_capacity(children.len());
+    for (child, main) in children.iter().zip(main_lengths) {
         let main = main.unwrap_or(fill).max(0.0);
         let (intrinsic_w, intrinsic_h) = child.content.intrinsic_size();
         let cross_length = if is_row {
@@ -4629,7 +4842,7 @@ fn layout_children(node: &UiNode, content: LogicalRect) -> Result<Vec<LogicalRec
             return Err(CompileError::InvalidLayout(child.key.clone()));
         }
         out.push(rect);
-        cursor += main + node.layout.gap;
+        cursor += main + layout.gap;
     }
     Ok(out)
 }
@@ -4944,8 +5157,11 @@ mod tests {
     fn editor_fingerprint_tracks_every_paint_only_viewport_state() {
         use crate::native_editor::{EditorDiagnosticSpan, EditorSyntaxClass, EditorSyntaxSpan};
 
+        // `compile` consumes its tree, so this fixture helper clones — every
+        // caller below wants to keep its authored variant around.
         let compile = |tree: &UiTree| {
-            tree.compile(LogicalRect::new(0.0, 0.0, 640.0, 360.0))
+            tree.clone()
+                .compile(LogicalRect::new(0.0, 0.0, 640.0, 360.0))
                 .unwrap()
                 .fingerprint()
         };
@@ -5665,17 +5881,46 @@ mod tests {
     #[test]
     fn preserved_markdown_source_soft_wraps_at_words_before_hard_chunks() {
         assert_eq!(
-            wrap_markdown_text("alpha beta gamma", 10, 4, true),
+            wrap_markdown_text("alpha beta gamma", 10, 0, 4, true),
             ["alpha beta", "gamma"]
         );
         assert_eq!(
-            wrap_markdown_text("supercalifragilistic", 5, 8, true),
+            wrap_markdown_text("supercalifragilistic", 5, 0, 8, true),
             ["super", "calif", "ragil", "istic"]
         );
         assert_eq!(
-            wrap_markdown_text("  let value = exact;", 14, 4, true),
+            wrap_markdown_text("  let value = exact;", 14, 0, 4, true),
             ["  let value =", "exact;"]
         );
+    }
+
+    /// `skip` is a pure window over the SAME wrap: the returned rows, the row
+    /// budget, and the tail-ellipsis rule must not depend on where the window
+    /// starts. Checked against the un-skipped wrap for every start offset over
+    /// both wrap modes, including the saturated (ellipsized) case.
+    #[test]
+    fn wrap_skip_returns_exactly_the_unskipped_suffix() {
+        const CASES: [(&str, usize, bool); 6] = [
+            ("alpha beta gamma delta epsilon zeta", 10, false),
+            ("alpha beta gamma delta epsilon zeta", 10, true),
+            ("supercalifragilisticexpialidocious", 5, true),
+            ("one\ntwo\nthree\nfour\nfive\nsix\nseven", 6, true),
+            ("one\ntwo\nthree\nfour\nfive\nsix\nseven", 6, false),
+            ("", 8, true),
+        ];
+        for (text, columns, preserve) in CASES {
+            for total in 1..=8usize {
+                let full = wrap_markdown_text(text, columns, 0, total, preserve);
+                for skip in 0..=total + 1 {
+                    let windowed = wrap_markdown_text(text, columns, skip, total, preserve);
+                    let expected = full.get(skip.min(full.len())..).unwrap_or_default();
+                    assert_eq!(
+                        windowed, expected,
+                        "text={text:?} columns={columns} preserve={preserve} total={total} skip={skip}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6037,6 +6282,7 @@ mod tests {
                 ]),
         );
         let compiled = tree
+            .clone()
             .compile(LogicalRect::new(0.0, 0.0, 200.0, 120.0))
             .unwrap();
         let (key, action) = compiled.default_action.clone().expect("enabled Primary");

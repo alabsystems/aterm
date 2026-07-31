@@ -176,6 +176,13 @@ pub struct AtermTerminal {
     // until the host opts in via set_predictive_echo. pub(crate) so the
     // predict_api module (and tests) reach it (the effects-field posture).
     pub(crate) predict: aterm_predict::Predictor,
+    // Resident scratch row for the predictive-echo reconcile probe (the wasm
+    // twin of aterm-gui's `pred_row_scratch`): `Predictor::reconcile` runs its
+    // observe closure once per retired guess plus the head, all on the SAME
+    // row, so `Terminal::render_row` would allocate a fresh Vec and re-resolve
+    // the whole row (palette, decorations, the lot) once per pending guess just
+    // to read one `ch`. `render_row_into` refills this buffer in place instead.
+    pub(crate) pred_row_scratch: Vec<aterm_core::terminal::RenderCell>,
     // Chrome-band spill rasterizer (the cross-pane window-space effects
     // export): refreshed per `render`, read back via the `spill_*` bindings.
     // Identity at 0/0 chrome — empty buffer, zero per-frame work. pub(crate)
@@ -367,6 +374,7 @@ impl AtermTerminal {
             notifications,
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
+            pred_row_scratch: Vec::new(),
             spill: SpillBand::new(),
             pending_reflow: None,
             reflow_grace: 0,
@@ -1545,17 +1553,30 @@ impl AtermTerminal {
     /// (orca-terminal headless) so the output stays byte-compatible with the existing
     /// string-based replay pipeline.
     pub fn serialize(&self, scrollback_rows: Option<u32>) -> String {
+        use std::fmt::Write as _;
         let grid = self.term.grid();
         let cap = scrollback_rows.map(|n| n as usize);
         let active_history = grid.scrollback_lines();
         let take = cap.map_or(active_history, |n| n.min(active_history));
-        let mut out = String::from("\x1b[0m");
+        // Pre-size: `take` reaches the construction default of 100k lines, and a
+        // doubling `String` would re-copy the whole (multi-megabyte) output ~two
+        // dozen times on the way there.
+        let mut out = String::with_capacity(
+            take.saturating_mul(8)
+                .saturating_add(self.rows.saturating_mul(16)),
+        );
+        out.push_str("\x1b[0m");
         for i in (active_history - take)..active_history {
-            let line = grid
-                .get_history_line(i)
-                .and_then(|l| l.as_str().map(|s| s.trim_end().to_string()))
-                .unwrap_or_default();
-            out.push_str(&line);
+            // Bind the `Cow<'_, Line>` so `as_str`'s borrow outlives the read:
+            // the old `.and_then(|l| l.as_str().map(|s| s.trim_end().to_string()))`
+            // allocated, copied and freed one owned `String` per history line
+            // purely because the `Cow` died inside the closure. A missing or
+            // non-UTF-8 line contributes nothing before its CRLF, exactly as the
+            // old `unwrap_or_default()` did.
+            let line = grid.get_history_line(i);
+            if let Some(s) = line.as_ref().and_then(|l| l.as_str()) {
+                out.push_str(s.trim_end());
+            }
             out.push_str("\r\n");
         }
         if take > 0 {
@@ -1567,25 +1588,23 @@ impl AtermTerminal {
             // (at most rows-1: the final CRLF left the bottom row blank) from the
             // bottom row scrolls each top line into history and leaves a clean
             // screen for the viewport paint.
-            out.push_str(&format!("\x1b[{};1H", self.rows));
+            let _ = write!(out, "\x1b[{};1H", self.rows);
             for _ in 0..take.min(self.rows.saturating_sub(1)) {
                 out.push('\n');
             }
         }
         out.push_str("\x1b[H");
         for r in 0..self.rows as u16 {
-            out.push_str(&format!("\x1b[{};1H\x1b[K", r + 1));
+            // `write!` straight into `out` — `push_str(&format!(…))` allocated a
+            // throwaway `String` per visible row.
+            let _ = write!(out, "\x1b[{};1H\x1b[K", r + 1);
             if let Some(row_ansi) = grid.row_ansi_text_screen(r) {
                 out.push_str(&row_ansi);
             }
             out.push_str("\x1b[0m");
         }
         let c = self.term.cursor();
-        out.push_str(&format!(
-            "\x1b[{};{}H",
-            c.row as usize + 1,
-            c.col as usize + 1
-        ));
+        let _ = write!(out, "\x1b[{};{}H", c.row as usize + 1, c.col as usize + 1);
         out
     }
 
@@ -1602,13 +1621,15 @@ impl AtermTerminal {
             return String::new();
         }
         let take = max_rows.map_or(history, |n| (n as usize).min(history));
-        let mut out = String::new();
+        let mut out = String::with_capacity(take.saturating_mul(8));
         for i in (history - take)..history {
-            let line = grid
-                .get_history_line(i)
-                .and_then(|l| l.as_str().map(|s| s.trim_end().to_string()))
-                .unwrap_or_default();
-            out.push_str(&line);
+            // Same borrow-don't-copy discipline as `serialize`: one owned
+            // `String` per history line, allocated and immediately freed, was
+            // pure churn over a scrollback that defaults to 100k lines.
+            let line = grid.get_history_line(i);
+            if let Some(s) = line.as_ref().and_then(|l| l.as_str()) {
+                out.push_str(s.trim_end());
+            }
             out.push_str("\r\n");
         }
         out
@@ -1903,21 +1924,33 @@ impl AtermTerminal {
             // Per-column wide map from the same source `cell_is_wide` reads; the
             // continuation spacer of a wide cell reports narrow, matching the
             // host's `cell_is_wide(y,x) ? '2' : '1'` per-cell walk.
-            let cells = self.term.display_row_grapheme_cells(y as usize);
+            //
+            // Read straight off ONE row view rather than through
+            // `display_row_grapheme_cells`: that accessor builds a
+            // `Vec<(String, bool)>` with a heap `String` per column carrying the
+            // resolved cluster text — text this loop never touches (the row's
+            // text came from `display_row_text` above), so a 200-col mirror
+            // refresh allocated and freed up to 200 Strings + a Vec PER ROW
+            // purely to read one bit each. `view.cell(col).is_wide()` is exactly
+            // the predicate that accessor computes for its `.1`, so the digit
+            // string is unchanged; an out-of-grid row yields `Empty`, whose
+            // `cell()` is `None` ⇒ the all-`'1'`/omitted shape the old `None`
+            // arm produced. It also materializes a scrolled-in history row once
+            // per record instead of twice.
+            let view = self.term.grid().visible_row_view(row_u16);
             let mut widths = String::with_capacity(cols);
             let mut any_wide = false;
-            match &cells {
-                Some(cells) => {
-                    for col in 0..cols {
-                        if cells.get(col).is_some_and(|(_, wide)| *wide) {
-                            widths.push('2');
-                            any_wide = true;
-                        } else {
-                            widths.push('1');
-                        }
-                    }
+            for col in 0..cols {
+                let wide = u16::try_from(col)
+                    .ok()
+                    .and_then(|c| view.cell(c))
+                    .is_some_and(|c| c.is_wide());
+                if wide {
+                    widths.push('2');
+                    any_wide = true;
+                } else {
+                    widths.push('1');
                 }
-                None => widths = "1".repeat(cols),
             }
             out.push_str("{\"text\":");
             out.push_str(&json_string(&text));
@@ -1968,9 +2001,9 @@ impl AtermTerminal {
             return empty();
         }
         let (matches, total, incomplete) = {
-            let Ok(results) =
-                self.term
-                    .search_summary_results(query, case_sensitive, is_regex)
+            let Ok(results) = self
+                .term
+                .search_summary_results(query, case_sensitive, is_regex)
             else {
                 return empty();
             };
@@ -2174,7 +2207,7 @@ pub fn encode_key_with_mode(
     base_layout_key: Option<char>,
     mode_bits: u32,
 ) -> Option<Vec<u8>> {
-    use aterm_types::keyboard::{encode_dom_key, KeyboardMode};
+    use aterm_types::keyboard::{KeyboardMode, encode_dom_key};
     let mode = KeyboardMode::from_bits_truncate(mode_bits as u16);
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }
@@ -2389,6 +2422,7 @@ impl AtermTerminal {
             notifications,
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
+            pred_row_scratch: Vec::new(),
             spill: SpillBand::new(),
             pending_reflow: None,
             reflow_grace: 0,
@@ -2522,8 +2556,10 @@ mod tests {
         let (cw, ch) = t.renderer.cell_size();
         assert_eq!(
             t.rgba()
-                .chunks_exact(4)
-                .filter(|pixel| *pixel == [0x21, 0xc3, 0x65, 0xff])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| **pixel == [0x21, 0xc3, 0x65, 0xff])
                 .count(),
             cw * ch,
             "the steady blank block cursor uses the dynamic OSC 10 color"
@@ -2534,8 +2570,10 @@ mod tests {
         assert_eq!(t.frame_scratch.cursor_color, 0x00BA_DA55);
         assert_eq!(
             t.rgba()
-                .chunks_exact(4)
-                .filter(|pixel| *pixel == [0xba, 0xda, 0x55, 0xff])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| **pixel == [0xba, 0xda, 0x55, 0xff])
                 .count(),
             cw * ch,
             "changing OSC 10 changes wasm cursor pixels while the cursor slot stays dynamic"

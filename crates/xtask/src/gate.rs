@@ -53,7 +53,11 @@
 //!   code (`fault::triggered("name")`, M7 FAULT-INJECT) must be armed by some test,
 //!   and every armed name must have a real injection site. Keeps the deterministic
 //!   fault-injection harness honest — an untested fail-closed path rots silently.
-//! - `lint`: clippy `-D warnings` + rustfmt + grep_guard + license headers.
+//! - `lint`: TRUST's linter and formatter — `targo-tippy -D warnings` + `cargo fmt`
+//!   through the stage2 cargo — plus grep_guard + license headers. Stock
+//!   `cargo clippy` is wrong here and fails closed: the stage2 tree ships no
+//!   `cargo-clippy`, so it would resolve one off PATH and drive a stable rustc
+//!   that rejects this workspace's `-Ztrust-verify=off`.
 //! - `counts`: COMPUTED-ONLY PROOF INVENTORY. Counts ordinary `#[kani::proof]`
 //!   attributes under workspace crates, fails closed on scan/read errors or an
 //!   empty inventory, and rejects a hand-maintained README total. The semantic
@@ -72,7 +76,7 @@
 //!
 //! See docs/EXCEED_GHOSTTY_PLAN.md.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use crate::{collect_rs_files, workspace_root};
@@ -84,6 +88,7 @@ pub(crate) fn run(check: Option<&str>) -> ExitCode {
         Some("mainloop") => gate_mainloop(),
         Some("lockorder") => gate_lockorder(),
         Some("wasmloop") => gate_wasmloop(),
+        Some("scope") => gate_scope(),
         Some("fault") => gate_fault(),
         Some("linux") => gate_linux(),
         Some("web") => gate_web(),
@@ -101,6 +106,7 @@ pub(crate) fn run(check: Option<&str>) -> ExitCode {
                 ("mainloop", gate_mainloop()),
                 ("lockorder", gate_lockorder()),
                 ("wasmloop", gate_wasmloop()),
+                ("scope", gate_scope()),
                 ("fault", gate_fault()),
                 ("counts", gate_counts()),
                 ("perf", gate_perf()),
@@ -113,7 +119,7 @@ pub(crate) fn run(check: Option<&str>) -> ExitCode {
                 .collect();
             if failed.is_empty() {
                 eprintln!(
-                    "\ngate all: GREEN — drift, dormant, mainloop, lockorder, wasmloop, fault, counts, perf, lint all passed."
+                    "\ngate all: GREEN — drift, dormant, mainloop, lockorder, wasmloop, scope, fault, counts, perf, lint all passed."
                 );
                 true
             } else {
@@ -123,7 +129,7 @@ pub(crate) fn run(check: Option<&str>) -> ExitCode {
         }
         other => {
             eprintln!(
-                "usage: xtask gate <all|drift|dormant|mainloop|lockorder|wasmloop|fault|linux|web|certified|lint|counts|miri|perf>\n\
+                "usage: xtask gate <all|drift|dormant|mainloop|lockorder|wasmloop|scope|fault|linux|web|certified|lint|counts|miri|perf>\n\
                  (unknown check {other:?})"
             );
             false
@@ -577,6 +583,28 @@ fn gate_wasmloop() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// G-SCOPE: SCOPE-CARDINALITY CENSUS (the "one enforcer, N instances" class)
+// ---------------------------------------------------------------------------
+//
+// The fourth census of the shared `crates/aterm-census` library (obligations
+// OB-13..OB-18), fused into the same freeze-safety-gate build; this verb is
+// the manual entry point. A model that verifies a LOCAL property of ONE
+// instance of an enforcing structure says nothing about a refactor that
+// MULTIPLIES the instances — the flash limiter proves 2 ignitions/second for
+// one limiter, and stays green if every split pane gets its own while the
+// retina sees 2N. The census pins each safety budget's ownership chain from
+// its scope root down to the enforcing state, closes the set of other places
+// that state may live, and re-derives both from the tree every build. Only
+// the vocabulary lock (OB-17) has a waiver channel; the cardinality
+// obligations have none.
+
+fn gate_scope() -> bool {
+    let outcome = aterm_census::run_scope_census(&workspace_root());
+    eprint!("{}", outcome.log);
+    outcome.ok
+}
+
+// ---------------------------------------------------------------------------
 // G-LINT
 // ---------------------------------------------------------------------------
 
@@ -672,6 +700,62 @@ fn gate_certified() -> bool {
         );
     }
     all_ok
+}
+
+/// The Trust stage2 tool directory — THE toolchain, resolved the same way
+/// tools/verify.sh and .githooks/pre-push resolve it: `$TRUST_STAGE2_BIN` when
+/// set, else `$HOME/trust/build/host/stage2/bin`, with `build/host`'s target-triple
+/// symlink resolved to a physical path (Trust's drivers reject a symlinked
+/// toolchain path).
+fn trust_stage2_bin() -> PathBuf {
+    let raw = std::env::var_os("TRUST_STAGE2_BIN").map_or_else(
+        || {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            PathBuf::from(home).join("trust/build/host/stage2/bin")
+        },
+        PathBuf::from,
+    );
+    raw.canonicalize().unwrap_or(raw)
+}
+
+/// [`run_shell`] with extra environment and an optional directory prepended to
+/// PATH — needed by the Trust tools, which resolve sibling drivers (`tippy` finds
+/// `tippy-driver`, `cargo fmt` finds `trustfmt`) by looking along PATH.
+fn run_shell_env(
+    desc: &str,
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    path_prefix: Option<&Path>,
+) -> bool {
+    eprintln!("  $ {program} {}", args.join(" "));
+    let mut command = Command::new(program);
+    command.args(args).current_dir(workspace_root());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    if let Some(prefix) = path_prefix {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut entries = vec![prefix.to_path_buf()];
+        entries.extend(std::env::split_paths(&existing));
+        match std::env::join_paths(entries) {
+            Ok(joined) => {
+                command.env("PATH", joined);
+            }
+            Err(e) => eprintln!("  {desc}: could not extend PATH ({e}); using inherited PATH"),
+        }
+    }
+    match command.status() {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("  {desc}: FAILED (exit {:?})", s.code());
+            false
+        }
+        Err(e) => {
+            eprintln!("  {desc}: could not run ({e})");
+            false
+        }
+    }
 }
 
 fn run_shell(desc: &str, program: &str, args: &[&str]) -> bool {
@@ -820,21 +904,68 @@ fn gate_linux() -> bool {
 }
 
 fn gate_lint() -> bool {
-    eprintln!("=== gate lint (clippy -D warnings + rustfmt + guards) ===");
+    eprintln!("=== gate lint (tippy -D warnings + trustfmt + guards) ===");
     let mut ok = true;
-    ok &= run_shell(
-        "clippy",
-        "cargo",
-        &[
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    );
-    ok &= run_shell("rustfmt", "cargo", &["fmt", "--all", "--", "--check"]);
+    // THE linter and formatter here are Trust's, not stock Rust's. The stage2 tree
+    // ships `targo-tippy` and `trustfmt` and ships NO `cargo-clippy`, so plain
+    // `cargo clippy` resolves whatever `cargo-clippy` happens to be on PATH —
+    // Homebrew's, typically — which drives a stable rustc and dies on this
+    // workspace's `-Ztrust-verify=off` before linting a single line. The gate then
+    // reports an environment break in the shape of a lint finding.
+    //
+    // Resolve and invoke exactly as tools/verify.sh does, so verb and gate cannot
+    // disagree about what "lint" means: the same candidate order, the same
+    // separate CARGO_TARGET_DIR (tippy's flags differ from the main build's, and
+    // sharing one dir makes the two thrash each other's cache), and tippy's own
+    // directory first on PATH so it finds its `tippy-driver`.
+    let tools = trust_stage2_bin();
+    let target_tippy = workspace_root().join("target-tippy");
+    let tippy = ["targo-tippy", "targo-clippy"]
+        .iter()
+        .map(|name| tools.join(name))
+        .find(|path| path.is_file());
+    match &tippy {
+        Some(bin) => {
+            ok &= run_shell_env(
+                "tippy",
+                &bin.to_string_lossy(),
+                &["--workspace", "--all-targets", "--", "-D", "warnings"],
+                &[
+                    ("CARGO_TARGET_DIR", target_tippy.to_string_lossy().as_ref()),
+                    ("TRUST_NO_MIGRATE_WARN", "1"),
+                ],
+                Some(&tools),
+            );
+        }
+        None => {
+            eprintln!(
+                "  tippy: NOT RUN — no targo-tippy/targo-clippy in {}. Nothing was \
+                 linted; this is not a clean lint. Build the Trust stage2 \
+                 (`python3 x.py build --stage 2` in $HOME/trust) and re-run.",
+                tools.display()
+            );
+            ok = false;
+        }
+    }
+    // `fmt` goes through the stage2 cargo so it picks up Trust's `targo-fmt` /
+    // `trustfmt` from the same directory, rather than a stock rustfmt that would
+    // reformat to a different style than the one the tree is written in.
+    let stage2_cargo = tools.join("cargo");
+    if stage2_cargo.is_file() {
+        ok &= run_shell_env(
+            "trustfmt",
+            &stage2_cargo.to_string_lossy(),
+            &["fmt", "--all", "--", "--check"],
+            &[],
+            Some(&tools),
+        );
+    } else {
+        eprintln!(
+            "  trustfmt: NOT RUN — no cargo in {}. Formatting was not checked.",
+            tools.display()
+        );
+        ok = false;
+    }
     // Both guards take the repo root as their argument (as verify.sh passes it).
     let root = workspace_root();
     let root_str = root.to_string_lossy().into_owned();

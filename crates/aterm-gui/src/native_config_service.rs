@@ -105,15 +105,17 @@ pub(crate) struct ConfigDiskObservation {
     pub(crate) baseline: crate::native_document_host::AtomicFileBaseline,
 }
 
-/// Exact disk bytes plus every filesystem-backed asset needed to admit those
-/// bytes on the event loop. Construction belongs to a host worker; admission
-/// performs parsing and in-memory state transitions only.
-#[derive(Clone, PartialEq)]
+/// Exact disk bytes plus every filesystem-backed asset and effect-feed runtime
+/// needed to admit those bytes on the event loop. Construction belongs to a
+/// host worker; admission and the downstream font worker perform only bounded
+/// computation over this immutable generation.
+#[derive(Clone)]
 pub(crate) struct PreparedConfigObservation {
     pub(crate) observation: ConfigDiskObservation,
     pub(crate) config: crate::app_config::Config,
     pub(crate) values: BTreeMap<String, String>,
     pub(crate) assets: Arc<crate::app_config::ConfigAssetCatalog>,
+    pub(crate) path_feeds: crate::app_config::PreparedPathFeedGeneration,
 }
 
 impl std::fmt::Debug for PreparedConfigObservation {
@@ -193,20 +195,34 @@ impl VersionedConfigService {
         Self::new_with_themes(text, crate::app_config::ThemeCatalog::empty())
     }
 
-    /// Runtime constructor used only before presentation. Theme discovery is
-    /// bounded and parsed once here; tests use the deterministic test constructor to remain
-    /// deterministic and independent of the host's theme directory.
+    /// Runtime constructor used only before presentation. Theme/Nyan discovery
+    /// is bounded and parsed once here; Trail/Sparkle feeds remain explicitly
+    /// pending for the parallel startup worker. Tests use the deterministic
+    /// test constructor and its complete synchronous catalog.
     pub(crate) fn new_runtime(text: String) -> Result<Self, String> {
-        Self::new_with_themes(text, crate::app_config::ThemeCatalog::discover())
+        Self::new_with_themes_mode(text, crate::app_config::ThemeCatalog::discover(), true)
     }
 
+    #[cfg(test)]
     fn new_with_themes(
         text: String,
         themes: Arc<crate::app_config::ThemeCatalog>,
     ) -> Result<Self, String> {
+        Self::new_with_themes_mode(text, themes, false)
+    }
+
+    fn new_with_themes_mode(
+        text: String,
+        themes: Arc<crate::app_config::ThemeCatalog>,
+        path_feeds_pending: bool,
+    ) -> Result<Self, String> {
         let values = parse_values(&text)?;
         let config = parse_config(&text)?;
-        let assets = config.resolve_asset_catalog_with_themes(themes);
+        let assets = if path_feeds_pending {
+            config.resolve_preliminary_asset_catalog_with_themes(themes)
+        } else {
+            config.resolve_asset_catalog_with_themes(themes)
+        };
         let config = Arc::new(config);
         Ok(Self {
             durable_text: text.clone(),
@@ -268,12 +284,20 @@ impl VersionedConfigService {
     ) -> Result<PreparedConfigObservation, String> {
         let values = parse_values(&observation.text)?;
         let config = parse_config(&observation.text)?;
-        let assets = config.resolve_asset_catalog_with_themes(themes);
+        let path_feeds = config.prepare_path_feed_generation();
+        let preliminary = config.resolve_preliminary_asset_catalog_with_themes(themes);
+        let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
+            trail_packs: Arc::clone(&path_feeds.trail_packs),
+            nyan_sprite: preliminary.nyan_sprite.clone(),
+            themes: Arc::clone(&preliminary.themes),
+            sparkle_spec_consumers: Some(Arc::new(path_feeds.sparkle.consumer_capabilities())),
+        });
         Ok(PreparedConfigObservation {
             observation,
             config,
             values,
             assets,
+            path_feeds,
         })
     }
 
@@ -288,17 +312,18 @@ impl VersionedConfigService {
         }
     }
 
-    /// Install the exact sparkle consumer projection prepared for the current
-    /// startup generation before any view can observe the service. This does
-    /// not advance the revision: it completes revision 1's preliminary asset
-    /// catalog rather than admitting a new text generation.
-    pub(crate) fn complete_startup_sparkle_consumers(
+    /// Install the exact path-backed effect generation prepared for startup
+    /// before any view can observe the service. This does not advance the
+    /// revision: it completes revision 1's preliminary asset catalog rather
+    /// than admitting a new text generation.
+    pub(crate) fn complete_startup_path_generation(
         &mut self,
         consumers: aterm_effects::spec::SpecConsumerCapabilities,
+        trail_packs: Arc<crate::app_config::TrailPackCatalog>,
     ) {
         debug_assert_eq!(self.revision, 1);
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
-            trail_packs: Arc::clone(&self.assets.trail_packs),
+            trail_packs,
             nyan_sprite: self.assets.nyan_sprite.clone(),
             themes: Arc::clone(&self.assets.themes),
             sparkle_spec_consumers: Some(Arc::new(consumers)),
@@ -447,12 +472,14 @@ impl VersionedConfigService {
         &mut self,
         prepared: PreparedConfigObservation,
     ) -> Result<ConfigSnapshot, String> {
-        self.synchronize_observation_prepared(
-            prepared.observation,
-            prepared.config,
-            prepared.values,
-            prepared.assets,
-        )
+        let PreparedConfigObservation {
+            observation,
+            config,
+            values,
+            assets,
+            path_feeds: _,
+        } = prepared;
+        self.synchronize_observation_prepared(observation, config, values, assets)
     }
 
     /// Roll an optimistic in-memory candidate back to the last bytes proven
@@ -948,13 +975,13 @@ mod tests {
         let preliminary = service.snapshot();
         assert!(preliminary.assets.sparkle_spec_consumers.is_none());
 
-        let prepared = preliminary.config.prepare_sparkle_runtime();
-        let exact = prepared.consumer_capabilities();
+        let prepared = preliminary.config.prepare_path_feed_generation();
+        let exact = prepared.sparkle.consumer_capabilities();
         assert!(
             exact.sparkle_or_starburst_burst && exact.rainbow_ink && exact.twotone_ink,
             "negative control: the checked-in pack has shared-setting consumers"
         );
-        service.complete_startup_sparkle_consumers(exact);
+        service.complete_startup_path_generation(exact, prepared.trail_packs);
         let published = service.snapshot();
         assert_eq!(published.revision, preliminary.revision);
         assert_eq!(
@@ -977,11 +1004,9 @@ mod tests {
         )
         .unwrap();
         let initial = service.snapshot();
-        let exact = initial
-            .config
-            .prepare_sparkle_runtime()
-            .consumer_capabilities();
-        service.complete_startup_sparkle_consumers(exact);
+        let prepared = initial.config.prepare_path_feed_generation();
+        let exact = prepared.sparkle.consumer_capabilities();
+        service.complete_startup_path_generation(exact, prepared.trail_packs);
         let exact_snapshot = service.snapshot();
         let exact_assets = Arc::clone(&exact_snapshot.assets);
         assert_eq!(

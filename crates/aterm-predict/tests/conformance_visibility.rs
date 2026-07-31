@@ -147,10 +147,17 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
         ((row, col) == (0, 2)).then_some('c')
     });
     assert!(model.fire("ConfirmFastInFlight", &mut st));
-    assert_eq!(st["slow"], 1, "a gate flip with pixels in flight is the blink");
+    assert_eq!(
+        st["slow"], 1,
+        "a gate flip with pixels in flight is the blink"
+    );
     assert_eq!(st["retracted"], 0);
     assert_eq!(st["visible"], 1);
-    assert_eq!(p.overlay(at).len(), 1, "the shipping gate keeps painting 'd'");
+    assert_eq!(
+        p.overlay(at).len(),
+        1,
+        "the shipping gate keeps painting 'd'"
+    );
 
     // Drain, then one DECISIVE fast turn with nothing pending: still open. The model
     // counts turns; the implementation additionally waits for its smoothed estimate to
@@ -163,7 +170,10 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
     assert!(model.fire("Echo", &mut st));
     at = echo_turn(&mut p, 'e', 4, at, fast);
     assert!(model.fire("ConfirmFast", &mut st));
-    assert_eq!(st["slow"], 1, "one decisive fast turn must not close the gate");
+    assert_eq!(
+        st["slow"], 1,
+        "one decisive fast turn must not close the gate"
+    );
     assert_eq!(st["retracted"], 0);
     assert!(p.predict_char('z', (0, 5), 80, at));
     assert!(model.fire("Key", &mut st));

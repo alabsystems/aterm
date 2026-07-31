@@ -136,7 +136,10 @@ fn uniform_bottom_flood_gate_hits_on_equal_offsets() {
         // Preconditions: this IS the flood shape — bottom-pinned (equal
         // offsets, both 0) with a MOVING anchor (base_y advances), so the
         // equal-anchor arm alone cannot admit these frames.
-        assert_eq!(frame.display_offset, 0, "a bottom-pinned flood never scrolls");
+        assert_eq!(
+            frame.display_offset, 0,
+            "a bottom-pinned flood never scrolls"
+        );
         assert!(
             frame.base_y > base_before + burst,
             "precondition: each flood line advances base_y"

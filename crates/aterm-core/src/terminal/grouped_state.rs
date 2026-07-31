@@ -83,6 +83,10 @@ pub(super) struct ColorStackEntry {
 /// Kitty's OSC 30001/30101 push/pop protocol. Accessed from OSC handlers
 /// (handler_osc.rs), SGR resolution (handler_sgr.rs), config API, and
 /// the public colors API.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the three frame_*_authoritative flags are INDEPENDENT per-channel authority bits (fg, bg, cursor can each be host- or OSC-owned in any combination), so they are not a state machine an enum could model; bold_is_bright is an unrelated rendering flag"
+)]
 pub(super) struct ColorState {
     /// Maps 256 indexed colors to RGB values (OSC 4).
     pub(super) palette: ColorPalette,

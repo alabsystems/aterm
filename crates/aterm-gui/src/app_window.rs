@@ -51,6 +51,21 @@ pub(crate) const fn window_title_authority(
     }
 }
 
+/// Decide the `attach_os_window` outcome at its real installation seam. A
+/// stale/missing logical window must fail closed: it cannot publish startup
+/// milestones or tell the caller that a present target exists.
+#[must_use]
+fn present_target_install_outcome(
+    pending_join: bool,
+    present_installed: bool,
+    milestones: crate::metrics::StartupAttachMilestones,
+) -> (bool, Option<crate::metrics::StartupAttachMilestones>) {
+    if !present_installed {
+        return (false, None);
+    }
+    (true, pending_join.then_some(milestones))
+}
+
 impl App {
     /// Coalesce a destructive request behind the one live overlap handoff and
     /// nonblockingly ask its worker to abort.  Returning `true` is a hard
@@ -302,6 +317,10 @@ impl App {
             eprintln!("aterm-gui: backend-build thread panicked; no renderer — exiting");
             std::process::exit(1);
         });
+        assert!(
+            backend.admitted_font_sources_sealed(),
+            "backend worker published an unsealed font generation"
+        );
         self.backend = BackendSlot::Ready(backend);
         self.use_gpu = use_gpu;
         crate::metrics::set_backend_gpu(use_gpu);
@@ -334,11 +353,12 @@ impl App {
             // SDR twin: the swapchain-side crown budget for non-HDR desktops.
             g.set_sdr_glow_boost(self.config.cursor_glow_sdr_boost_or_default());
         }
-        // Fresh backends start at renderer defaults. Re-pin the ONE canonical
-        // shaping/typography/render/font configuration used by every rebuild and
-        // fallback path so startup cannot drift from runtime recovery.
-        self.pin_backend_render_config();
-        self.backend.seal_admitted_font_sources();
+        // The build worker already applied and sealed the complete font
+        // generation before publishing this backend. Re-pin only memory-backed
+        // shaping/typography/render knobs here; reopening configured font paths
+        // on the event-loop thread would violate the worker-only seal contract
+        // and serialize hundreds of MB of fallback parsing before first paint.
+        self.pin_backend_render_config_core();
         // Once-only font-feature diagnostics — now that the backend carries the
         // shaping AND the resolved font config, so the font probe is accurate.
         self.warn_font_feature_issues();
@@ -377,6 +397,10 @@ impl App {
         // size jump on 1× displays, no unthemed flash). Every non-first attach
         // (Cmd-N) sees a Ready slot — byte-identical behavior to before.
         let pending_join = self.backend.is_pending();
+        // Startup-only drill-down. These stamps are committed to the metrics
+        // ledger only if this pending-backend attach installs a present target;
+        // later Cmd-N windows cannot publish or replace the startup sample.
+        let startup_attach_entry = Instant::now();
         // The window holds the terminal grid PLUS the tab-strip rows at the top PLUS
         // independent configured top and base bottom padding. `window_frame_px`
         // folds in both; with both zero this is the original `rows * ch`. Chrome headroom
@@ -418,6 +442,7 @@ impl App {
         } else {
             attrs
         };
+        let startup_before_window_create = Instant::now();
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -427,6 +452,7 @@ impl App {
                 return false;
             }
         };
+        let startup_after_window_create = Instant::now();
         // P2: attach this window's AccessKit adapter (events arrive as `Wake::Accessibility`
         // via the proxy), then SHOW the window. Stored into `ws` at the os_window assignment
         // below. `update_if_active` (in app_settings) pushes the Settings tree on change.
@@ -495,9 +521,11 @@ impl App {
         // corrected window size, the present target — needs the real backend. A
         // build panic exits inside `finalize_backend` (launch-fatal, same outcome
         // as the old pre-`run_app` `.expect`).
+        let startup_before_backend_finalize = Instant::now();
         if pending_join {
             self.finalize_backend();
         }
+        let startup_after_backend_finalize = Instant::now();
         // FIRE-INTO-CHROME (order matters): extend the content view under the
         // titlebar FIRST (fullSizeContentView), THEN measure the band via
         // `contentLayoutRect` — the ONE truth for how much chrome sits above the
@@ -682,17 +710,19 @@ impl App {
         } else {
             inner
         };
+        let startup_before_surface_create = Instant::now();
         if self.backend.is_gpu() {
             // GPU mode: a wgpu swapchain on the SAME instance/adapter as the
             // offscreen renderer. The offscreen frame is blitted into it and
             // presented on the GPU — no softbuffer surface is created.
             let (w_px, h_px) = (raw_px.width, raw_px.height);
-            match self
-                .backend
-                .gpu_mut()
-                .unwrap()
-                .create_window_surface(window.clone(), w_px, h_px)
-            {
+            let surface_result =
+                self.backend
+                    .gpu_mut()
+                    .unwrap()
+                    .create_window_surface(window.clone(), w_px, h_px);
+            let startup_after_surface_create = Instant::now();
+            match surface_result {
                 Ok(surf) => {
                     // M3 (colour-managed present): the wgpu surface creation just
                     // attached a CAMetalLayer to this view; tag it so ColorSync
@@ -742,7 +772,7 @@ impl App {
                         window_gpu.set_sdr_white_scale(self.apprt.screen_sdr_white_scale(&window));
                     }
                     self.winit_to_window.insert(window.id(), wid);
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    let present_installed = if let Some(ws) = self.windows.get_mut(&wid) {
                         ws.os_window = Some(window);
                         ws.pending_reveal = defer_reveal
                             .then(|| Instant::now() + std::time::Duration::from_millis(1500));
@@ -755,8 +785,27 @@ impl App {
                             gpu_surface: surf,
                             window_gpu,
                         });
+                        true
+                    } else {
+                        false
+                    };
+                    let (attached, startup_milestones) = present_target_install_outcome(
+                        pending_join,
+                        present_installed,
+                        crate::metrics::StartupAttachMilestones::new([
+                            startup_attach_entry,
+                            startup_before_window_create,
+                            startup_after_window_create,
+                            startup_before_backend_finalize,
+                            startup_after_backend_finalize,
+                            startup_before_surface_create,
+                            startup_after_surface_create,
+                        ]),
+                    );
+                    if let Some(milestones) = startup_milestones {
+                        crate::metrics::record_initial_attach_milestones(milestones);
                     }
-                    return true;
+                    return attached;
                 }
                 Err(e) => {
                     // The window's GPU swapchain failed even though the offscreen
@@ -826,8 +875,9 @@ impl App {
                 return false;
             }
         };
+        let startup_after_surface_create = Instant::now();
         self.winit_to_window.insert(window.id(), wid);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        let present_installed = if let Some(ws) = self.windows.get_mut(&wid) {
             ws.os_window = Some(window);
             ws.pending_reveal =
                 defer_reveal.then(|| Instant::now() + std::time::Duration::from_millis(1500));
@@ -840,8 +890,27 @@ impl App {
                 surface,
                 _context: context,
             });
+            true
+        } else {
+            false
+        };
+        let (attached, startup_milestones) = present_target_install_outcome(
+            pending_join,
+            present_installed,
+            crate::metrics::StartupAttachMilestones::new([
+                startup_attach_entry,
+                startup_before_window_create,
+                startup_after_window_create,
+                startup_before_backend_finalize,
+                startup_after_backend_finalize,
+                startup_before_surface_create,
+                startup_after_surface_create,
+            ]),
+        );
+        if let Some(milestones) = startup_milestones {
+            crate::metrics::record_initial_attach_milestones(milestones);
         }
-        true
+        attached
     }
 
     /// LOGICAL window teardown (NO winit/`el`): close window `wid` — drop every one
@@ -941,6 +1010,16 @@ impl App {
         // Release this window's retained native toolbar backing objects (no-op off
         // macOS / when none was installed) so they don't outlive the window.
         self._toolbars.remove(&wid);
+        // A multi-line-paste confirmation sheet hanging off this window dies with it,
+        // and AppKit posts no answer for a sheet torn down that way — so retire the
+        // entry (and with it the key interceptor) HERE. Without this the app would keep
+        // a filter alive for a window that no longer exists and refuse the next paste
+        // confirmation as "already outstanding" until the self-healing attachment check
+        // caught it.
+        #[cfg(target_os = "macos")]
+        if self.paste_confirm.as_ref().is_some_and(|c| c.wid == wid) {
+            self.paste_confirm = None;
+        }
         // Clear the winit→logical mapping for this window (its OS id is gone).
         self.winit_to_window.retain(|_, &mut v| v != wid);
         // Drop the closed window from the focus-order stack so it can never be picked
@@ -1854,6 +1933,27 @@ fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_window_cannot_publish_or_claim_a_present_target() {
+        let now = Instant::now();
+        let milestones = crate::metrics::StartupAttachMilestones::new([now; 7]);
+        let (attached, publication) = present_target_install_outcome(true, false, milestones);
+        assert!(
+            !attached && publication.is_none(),
+            "negative control: a stale wid must fail even after surface creation"
+        );
+        let (attached, publication) = present_target_install_outcome(false, true, milestones);
+        assert!(
+            attached && publication.is_none(),
+            "a later successfully installed window remains a normal success"
+        );
+        let (attached, publication) = present_target_install_outcome(true, true, milestones);
+        assert!(
+            attached && publication.is_some(),
+            "only a successfully installed initial target may publish milestones"
+        );
+    }
 
     #[test]
     fn automatic_window_chrome_remains_system_owned_independent_of_terminal_palette() {

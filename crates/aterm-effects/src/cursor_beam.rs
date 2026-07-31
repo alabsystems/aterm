@@ -38,6 +38,7 @@ use web_time::Instant;
 use aterm_render::{GlowQuad, premul_rgb};
 
 use crate::cursor_glow::Geom;
+use crate::effect_util::push_fx_rect as push_rect;
 
 /// Breathing rate in turns/second: a slow, calm shimmer — steady light, not
 /// fire. The phase only advances when frames render, so a settled rod
@@ -341,44 +342,6 @@ impl CursorBeamRod {
                 premul_rgb(lerp(cfg.color, cfg.haze, haze), cov),
             );
         }
-    }
-}
-
-/// Push a pixel rect of premultiplied light in WINDOW px, CLAMPED to the
-/// effects box and SPLIT into per-cell-row [`GlowQuad`]s — the same contract
-/// (and now the same math) as the aurora's emitter (see `cursor_glow`),
-/// duplicated privately because that one is module-private too (the fireball
-/// precedent). Callers pass window px (`geom.origin_*` already applied) —
-/// the original grid-relative math coincided with this under the tests'
-/// identity geometry while drawing one origin too high on a real padded
-/// window.
-fn push_rect(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32, premul: u32) {
-    if w <= 0 || h <= 0 || premul == 0 {
-        return;
-    }
-    let x0 = x.max(geom.fx_left());
-    let x1 = (x + w).min(geom.fx_right());
-    let y0 = y.max(geom.fx_top());
-    let y1 = (y + h).min(geom.fx_bot());
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let ch = geom.ch as i32;
-    let oy = i32::from(geom.origin_y);
-    let mut yy = y0;
-    while yy < y1 {
-        // Grid-row DAMAGE HINT, anchored at origin_y (above-grid bands tag row 0).
-        let row = (yy - oy).div_euclid(ch);
-        let band_end = (oy + (row + 1) * ch).min(y1);
-        out.push(GlowQuad {
-            row: row.max(0) as u16,
-            x: x0 as u16,
-            y: yy as u16,
-            w: (x1 - x0) as u16,
-            h: (band_end - yy) as u16,
-            color: premul,
-        });
-        yy = band_end;
     }
 }
 

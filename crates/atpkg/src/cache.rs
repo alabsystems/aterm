@@ -101,6 +101,21 @@ impl IndexCache {
         if crate::platform::ensure_private_dir(parent).is_err() {
             return;
         }
+        // Already exactly what is on disk ⇒ nothing left to write. The install flow
+        // resolves the candidates once per program AND once per transitive dependency,
+        // and every successful resolve lands here with a byte-identical document, so this
+        // collapses N temp-file writes + renames to one. Placed AFTER the parent
+        // hardening (which must run either way) and guarded on the SAME bounded no-follow
+        // reader `load` uses, so a symlinked/oversize/non-regular cache path never matches
+        // and still takes the replacing temp+rename path below. The file mode is
+        // re-asserted — a plain chmod on a path just read as a regular file — so the 0600
+        // invariant a write establishes is not skipped along with the write.
+        if crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_INDEX_CACHE_BYTES)
+            .is_ok_and(|on_disk| on_disk == text)
+        {
+            let _ = crate::platform::harden_file(&self.path);
+            return;
+        }
         let tmp = parent.join(format!(".index-cache.tmp-{}", std::process::id()));
         if fs::write(&tmp, text.as_bytes()).is_err() {
             return;

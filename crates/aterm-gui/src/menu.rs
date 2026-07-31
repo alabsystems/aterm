@@ -250,6 +250,11 @@ pub enum MenuAction {
     /// Focus or create the process-singleton Settings tab. The app-menu Settings…
     /// item — ⌘, — uses the standard macOS settings chord.
     ToggleSettings,
+    /// Open Settings AT the Packages route (the batteries-included toolchain
+    /// surface: install/update the ALab toolset, posture, consent switches).
+    /// The app-menu Packages… item beneath Settings… — the menu-bar path to the
+    /// same page the seed notice pill points at.
+    Packages,
     /// Toggle the own-rendered, cross-platform command PALETTE overlay
     /// (`App::toggle_palette`).
     OpenPalette,
@@ -332,6 +337,7 @@ impl MenuAction {
             MenuAction::ToggleMatrixRain => 44,
             MenuAction::ToggleSeriousMode => 45,
             MenuAction::FavouriteSessionKitty => 46,
+            MenuAction::Packages => 47,
         }
     }
 
@@ -383,6 +389,7 @@ impl MenuAction {
             44 => MenuAction::ToggleMatrixRain,
             45 => MenuAction::ToggleSeriousMode,
             46 => MenuAction::FavouriteSessionKitty,
+            47 => MenuAction::Packages,
             _ => return None,
         })
     }
@@ -472,8 +479,11 @@ impl MenuAction {
             | MenuAction::CopySessionId
             | MenuAction::CopyCwd => ClipboardWrite,
             // Durable `aterm.toml` writes / the security-knob config surface.
+            // `Packages` raises the SAME durable-config Settings tab as
+            // `ToggleSettings`, just at the /packages route — same fence.
             MenuAction::Preferences
             | MenuAction::ToggleSettings
+            | MenuAction::Packages
             | MenuAction::ToggleSeriousMode => ConfigWrite,
             // Gateway to every action + the staged-update re-exec twins.
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
@@ -560,6 +570,7 @@ impl MenuAction {
             "FavouriteSessionKitty" => Some(MenuAction::FavouriteSessionKitty),
             "ToggleSeriousMode" => Some(MenuAction::ToggleSeriousMode),
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
+            "Packages" => Some(MenuAction::Packages),
             "OpenPalette" => Some(MenuAction::OpenPalette),
             "Minimize" => Some(MenuAction::Minimize),
             "Zoom" => Some(MenuAction::Zoom),
@@ -635,6 +646,14 @@ const APP_MENU: &[MenuEntry] = &[
         action: MenuAction::ToggleSettings,
         key: ",",
         mods: MenuMods::Command,
+    },
+    // Settings at the /packages route — the batteries-included toolchain
+    // surface (install/update the ALab toolset; the seed notice points here).
+    Item {
+        label: "Packages…",
+        action: MenuAction::Packages,
+        key: "",
+        mods: MenuMods::None,
     },
     Item {
         label: "Open aterm.toml",
@@ -1034,7 +1053,8 @@ mod macos {
         ClassType, DeclaredClass, class, declare_class, msg_send, msg_send_id, mutability, sel,
     };
     use objc2_app_kit::{
-        NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel,
+        NSApplication, NSButton, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponseOK,
+        NSOpenPanel, NSWindow,
     };
     use objc2_foundation::{MainThreadMarker, NSString};
     use winit::event_loop::EventLoopProxy;
@@ -1251,6 +1271,18 @@ mod macos {
             MenuAction::ToggleSettings,
             ",",
             true,
+        );
+        // The batteries-included toolchain surface: Settings ▸ Packages, one
+        // item below Settings… so the toolset is discoverable from the menu
+        // bar (the seed notice pill points at the same page).
+        add_item(
+            mtm,
+            &app_menu,
+            target,
+            "Packages…",
+            MenuAction::Packages,
+            "",
+            false,
         );
         add_item(
             mtm,
@@ -1797,14 +1829,23 @@ mod macos {
     /// Show a native modal confirmation alert (a ⌘Q quit, or a close gesture that
     /// would lose work) and block until the user answers. `title` is the primary
     /// message, `body` the secondary explanatory line, and `proceed_label` titles the
-    /// affirmative (destructive) button — the DEFAULT button, so Return confirms; a
-    /// "Cancel" button is always added and Escape maps to it. Returns `true` iff the
-    /// user chose to proceed.
+    /// affirmative (destructive) button — the DEFAULT button; a "Cancel" button is
+    /// always added and Escape maps to it. Returns `true` iff the user chose to proceed.
     ///
     /// `runModal` spins a nested modal run loop on the main thread (the standard
     /// AppKit pattern, the same one native file pickers use), so it is safe to call
     /// straight from the winit event handler. Best-effort: if somehow off the main
     /// thread it returns `true` (proceed) so a quit can never wedge.
+    ///
+    /// # Return with ⌘ held
+    ///
+    /// The default button's Return equivalent carries an EMPTY modifier mask and
+    /// AppKit's key-equivalent match is exact, so ⌘Return answers this alert no more
+    /// than it answered the paste sheet — and ⌘Q is precisely a gesture that leaves ⌘
+    /// under the finger. So the same [`crate::alert_keys`] interceptor is installed for
+    /// the duration of the `runModal` call: Return (any modifiers) clicks PROCEED,
+    /// Escape clicks Cancel, everything else passes through. The watch is a LOCAL whose
+    /// scope ends with the blocking call, so it cannot outlive the alert.
     pub fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
         if MainThreadMarker::new().is_none() {
             return true;
@@ -1817,14 +1858,20 @@ mod macos {
         // main thread. Every operand is a valid, retained object for the call;
         // `runModal` returns the clicked button's `NSModalResponse` (an `isize`). The
         // alert keeps the default `NSAlertStyleWarning` (the app-icon caution panel).
+        // `window` / `addButtonWithTitle:` are plain accessors on the fresh alert.
         unsafe {
             let alert: Retained<AnyObject> = msg_send_id![class!(NSAlert), new];
             let _: () = msg_send![&alert, setMessageText: &*title];
             let _: () = msg_send![&alert, setInformativeText: &*body];
-            // First button added is the default (responds to Return): the PROCEED
-            // action. The second is Cancel (AppKit binds Escape to it).
-            let _: Retained<AnyObject> = msg_send_id![&alert, addButtonWithTitle: &*proceed];
-            let _: Retained<AnyObject> = msg_send_id![&alert, addButtonWithTitle: &*cancel];
+            // First button added is the default (Return, with an EMPTY modifier mask —
+            // hence the key watch below): the PROCEED action. The second is Cancel
+            // (AppKit binds Escape to it).
+            let accept: Retained<NSButton> = msg_send_id![&alert, addButtonWithTitle: &*proceed];
+            let refuse: Retained<NSButton> = msg_send_id![&alert, addButtonWithTitle: &*cancel];
+            let panel: Retained<NSWindow> = msg_send_id![&alert, window];
+            // Dropped when this function returns — i.e. the moment `runModal` comes
+            // back — so the interceptor's lifetime is exactly the alert's.
+            let _keys = crate::alert_keys::watch_alert_keys(panel, None, accept, refuse);
             let response: isize = msg_send![&alert, runModal];
             // NSAlertFirstButtonReturn == 1000 → the user clicked PROCEED.
             response == 1000
@@ -1968,6 +2015,7 @@ mod tests {
         MenuAction::ToggleMatrixRain,
         MenuAction::FavouriteSessionKitty,
         MenuAction::ToggleSettings,
+        MenuAction::Packages,
         MenuAction::OpenPalette,
         MenuAction::Help,
         MenuAction::Version,

@@ -204,6 +204,54 @@ impl CellExtras {
         self.enforce_hyperlink_limit();
     }
 
+    /// Extract every entry on `internal_row` in `[start_col, max_col)`, removing
+    /// it from the map, and return the `(col, extra)` pairs.
+    ///
+    /// The map is keyed by the exact coordinate being searched for, so the
+    /// column range — always <= `cols` wide, since ICH/DCH clamp to the right
+    /// margin — can be probed directly in O(width) hash lookups instead of
+    /// iterating every key in the grid-wide map (O(E), where E counts entries on
+    /// ALL rows). On a hyperlink-saturated screen E reaches thousands while
+    /// width is ~200, so the scan is the wrong side of that trade. The scan is
+    /// still cheaper when the map is small relative to the range, so pick per
+    /// call: a nearly-empty map is faster to walk than to probe 200 times.
+    ///
+    /// Extraction order differs between the two branches (ascending column vs
+    /// HashMap order); that is unobservable because the caller's reinsert loop
+    /// is order-independent and the shift is injective on destination keys.
+    fn take_row_range(
+        &mut self,
+        internal_row: u16,
+        start_col: u16,
+        max_col: u16,
+    ) -> aterm_alloc::SmallVec<(u16, CellExtra), 8> {
+        let mut extracted: aterm_alloc::SmallVec<(u16, CellExtra), 8> =
+            aterm_alloc::SmallVec::new();
+        let width = usize::from(max_col.saturating_sub(start_col));
+        if width.saturating_mul(2) <= self.data.len() {
+            for col in start_col..max_col {
+                // `internal_row` is already offset-mapped — key it directly
+                // rather than re-mapping through `internal_coord`.
+                if let Some(extra) = self.data.remove(&CellCoord::new(internal_row, col)) {
+                    extracted.push((col, extra));
+                }
+            }
+        } else {
+            let keys: aterm_alloc::SmallVec<CellCoord, 8> = self
+                .data
+                .keys()
+                .filter(|c| c.row == internal_row && c.col >= start_col && c.col < max_col)
+                .copied()
+                .collect();
+            for key in keys {
+                if let Some(extra) = self.data.remove(&key) {
+                    extracted.push((key.col, extra));
+                }
+            }
+        }
+        extracted
+    }
+
     /// Shift columns right within a single row for ICH (Insert Character).
     ///
     /// Columns in `[start_col, max_col - count)` shift right by `count`.
@@ -230,19 +278,7 @@ impl CellExtras {
         // in place, mirroring shift_cols_left. Without the upper bound, an entry
         // already past max_col would be extracted and then dropped by the reinsert
         // guard below, silently losing its extras (#7458 follow-up).
-        let keys: aterm_alloc::SmallVec<CellCoord, 8> = self
-            .data
-            .keys()
-            .filter(|c| c.row == internal_row && c.col >= start_col && c.col < max_col)
-            .copied()
-            .collect();
-        let mut extracted: aterm_alloc::SmallVec<(u16, CellExtra), 8> =
-            aterm_alloc::SmallVec::new();
-        for key in keys {
-            if let Some(extra) = self.data.remove(&key) {
-                extracted.push((key.col, extra));
-            }
-        }
+        let extracted = self.take_row_range(internal_row, start_col, max_col);
         for (col, extra) in extracted {
             let new_col = col.saturating_add(count);
             if new_col < max_col {
@@ -274,19 +310,7 @@ impl CellExtras {
         // Two-phase extract-then-reinsert (same rationale as shift_cols_right).
         // Only extract columns within [start_col, max_col); columns at or beyond
         // max_col are outside the margin boundary and must be preserved in place.
-        let keys: aterm_alloc::SmallVec<CellCoord, 8> = self
-            .data
-            .keys()
-            .filter(|c| c.row == internal_row && c.col >= start_col && c.col < max_col)
-            .copied()
-            .collect();
-        let mut extracted: aterm_alloc::SmallVec<(u16, CellExtra), 8> =
-            aterm_alloc::SmallVec::new();
-        for key in keys {
-            if let Some(extra) = self.data.remove(&key) {
-                extracted.push((key.col, extra));
-            }
-        }
+        let extracted = self.take_row_range(internal_row, start_col, max_col);
         for (col, extra) in extracted {
             if col >= shift_start {
                 // After deletion range: shift left by count

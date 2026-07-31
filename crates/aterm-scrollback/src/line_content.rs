@@ -93,6 +93,33 @@ impl LineContent {
         }
     }
 
+    /// Create from an OWNED buffer, taking it over instead of copying it.
+    ///
+    /// Every row materialized out of the grid ring builds its text into a fresh
+    /// `String` that dies one line later; routing that buffer through
+    /// [`from_bytes`](Self::from_bytes) makes the >32-byte case (i.e. any
+    /// full-width output row) pay a second allocation plus a full memcpy plus
+    /// the first buffer's free. Moving it makes that exactly one allocation and
+    /// zero copies.
+    ///
+    /// The shrink keeps `Line::memory_used()` — which counts `Vec::capacity`,
+    /// and which the scrollback byte budget is enforced against — reporting the
+    /// same exact-fit size `from_bytes` produced. It is a no-op (and so free)
+    /// in the common case where the caller sized its buffer exactly, and where
+    /// it does fire it replaces today's unconditional malloc+memcpy+free with a
+    /// single (usually in-place) realloc.
+    #[must_use]
+    pub(crate) fn from_vec(mut bytes: Vec<u8>) -> Self {
+        if bytes.len() <= INLINE_SIZE {
+            Self::Inline(InlineBuf::from_slice(&bytes))
+        } else {
+            if bytes.capacity() != bytes.len() {
+                bytes.shrink_to_fit();
+            }
+            Self::Heap(bytes)
+        }
+    }
+
     /// Get as byte slice.
     #[must_use]
     #[inline]

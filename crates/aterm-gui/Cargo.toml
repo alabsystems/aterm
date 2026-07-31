@@ -164,7 +164,6 @@ toml_edit = "0.22"
 # and encodes them here. Same crate (and version) aterm-render already uses for the
 # `image` verb's framebuffer PNG, so this adds bindings, not a new dep to the tree.
 png = "0.17"
-
 # Glyph rasterization for the widget-tray text labels (free-positioned, multi-size).
 # The SAME crate + version aterm-render uses, so it adds no new dep to the tree.
 fontdue = "0.9"
@@ -183,6 +182,9 @@ sha2 = { workspace = true }
 embed-resource = "3"
 
 [dev-dependencies]
+# Enables a path-filtered, thread-local counter at the actual visual-feed
+# platform-open seam. It is used only by same-read/ABA conformance tests.
+aterm-effects = { workspace = true, features = ["test-open-probe"] }
 # VISUAL CAPTURE (`find_panel_visual_capture`, #[ignore]d): dump a real rendered
 # find-panel frame to a PNG so the chrome can be reviewed as pixels, not asserts —
 # the same pattern `aterm-gpu`'s rain screenshot harness uses.

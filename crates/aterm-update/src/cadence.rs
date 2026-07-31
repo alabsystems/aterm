@@ -341,11 +341,20 @@ mod tests {
             "the anonymous cadence must leave headroom for several machines behind one \
              NAT: {anon_per_hour}/hour against a {ANON_BUDGET_PER_HOUR}/hour budget"
         );
-        assert!(
-            (3600 / AUTHENTICATED_INTERVAL_SECS) * REQUESTS_PER_CHECK > ANON_BUDGET_PER_HOUR,
-            "…and the authenticated cadence must genuinely be too fast for it, or this \
-             whole split is pointless"
-        );
+        // Every operand is a constant, so this is decided at COMPILE time — the
+        // split stops being meaningful the moment it stops holding, and a const
+        // block says so by failing the build rather than one test run. The rate
+        // is named rather than interpolated into the message: a const panic takes
+        // a literal, so the number has to be readable in the source instead.
+        const AUTHENTICATED_PER_HOUR: u64 =
+            (3600 / AUTHENTICATED_INTERVAL_SECS) * REQUESTS_PER_CHECK;
+        const {
+            assert!(
+                AUTHENTICATED_PER_HOUR > ANON_BUDGET_PER_HOUR,
+                "…and the authenticated cadence must genuinely be too fast for it, or this \
+                 whole split is pointless"
+            )
+        };
 
         let mut c = Cadence::new(Duration::from_secs(AUTHENTICATED_INTERVAL_SECS));
         c.failed();

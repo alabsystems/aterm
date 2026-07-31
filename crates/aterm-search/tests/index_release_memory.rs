@@ -76,7 +76,11 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
     let grown_rel = (net() - base_rel).max(0);
     idx_rel.release();
     let retained_after_release = (net() - base_rel).max(0);
-    assert_eq!(idx_rel.indexed_line_count(), 0, "release empties logically too");
+    assert_eq!(
+        idx_rel.indexed_line_count(),
+        0,
+        "release empties logically too"
+    );
     drop(idx_rel);
 
     eprintln!(
@@ -115,7 +119,10 @@ fn release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings() {
     let mut a = build(LINES);
     let b = build(LINES);
     let hits_before = b.search("svc-worker").len();
-    assert!(hits_before > 0, "sibling B should have matches before release");
+    assert!(
+        hits_before > 0,
+        "sibling B should have matches before release"
+    );
 
     let before_release = net();
     a.release();

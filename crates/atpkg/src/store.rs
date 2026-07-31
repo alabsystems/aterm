@@ -141,13 +141,8 @@ impl Layout {
 ///
 /// `None` if `build_dir` has no final path component (never, for a real build dir).
 fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
-    // `Path::file_name` / `OsStr::to_str` go via `call1`: std's INLINED `unsafe`
-    // (the `from_utf8_unchecked` fast path, the `OsStr` byte-slice casts) is
-    // otherwise attributed to this function's spans as missing-SAFETY-comment
-    // refutations under the strict Trust gate (see `lib.rs`). Same calls, same
-    // receivers; behavior identical. The `format!("{name}.ready")` is a manual
-    // concat for the same reason (its expansion embeds `fmt::Arguments`
-    // construction the gate cannot lower) — byte-identical.
+    // `call1` routing + manual concat (no `format!`): Trust-gate lowering
+    // workaround — see `lib.rs::call1`.
     let name = crate::call1(std::path::Path::file_name, build_dir)?;
     let name = crate::call1(std::ffi::OsStr::to_str, name)?;
     let mut marker = String::from(name);
@@ -168,17 +163,12 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
     })?;
     let parent = dest.parent().unwrap_or(build_dir);
-    // Manual rendering of the previous `format!(".ready.tmp-{}", std::process::id())`
-    // — byte-identical: the `format!` expansion embeds `fmt::Arguments`
-    // construction (with inlined `unsafe`) that the strict Trust gate cannot
-    // lower and fails closed on.
+    // Manual (byte-identical) render of `format!(".ready.tmp-{pid}")`: Trust-gate
+    // lowering workaround — see `lib.rs::dec_u64`.
     let mut tmp_name = String::from(".ready.tmp-");
     tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
     let tmp = parent.join(tmp_name);
-    // `fs::write` goes via `call2`: the hardened pass name-matches any direct
-    // callee named `write` against the libc `write(2)` FFI-boundary contracts,
-    // which do not apply to this safe std function (see `lib.rs`). Same
-    // function, same arguments; behavior identical.
+    // `fs::write` via `call2`: Trust-gate name-matching workaround — see `lib.rs::call2`.
     crate::call2(std::fs::write, &tmp, b"ok\n".as_slice())?;
     std::fs::rename(&tmp, &dest)
 }
@@ -395,9 +385,8 @@ pub struct ToolName(String);
 /// developed on and would hold for a wrong implementation too. The tests drive this with
 /// literal `.cmd`/`.exe`.
 ///
-/// Built with `push_str`, not `format!`: the `format!` expansion embeds `fmt::Arguments`
-/// construction (with inlined `unsafe`) that the strict Trust gate cannot lower and fails
-/// closed on (see `lib.rs`). Byte-identical result.
+/// Built with `push_str`, not `format!` (byte-identical) — Trust-gate lowering
+/// workaround, see `lib.rs`.
 fn with_suffix(name: &str, suffix: &str) -> String {
     let mut s = String::new();
     s.push_str(name);
@@ -498,10 +487,8 @@ pub fn split_exposed(exposes: &[String]) -> (Vec<ToolName>, Vec<String>) {
 pub fn append_bin_to_path(inherited: Option<&OsStr>, bin_dir: &Path) -> OsString {
     // An absent OR empty inherited `PATH` means "no directories" — start empty so we never
     // emit a leading empty component (which Unix reads as the current directory).
-    // `OsStr::is_empty` goes via `call1`: std's INLINED `unsafe` (the `OsStr`
-    // byte-slice cast) is otherwise attributed to this function's span as a
-    // missing-SAFETY-comment refutation under the strict Trust gate (see
-    // `lib.rs`). Same call, same receiver; behavior identical.
+    // `OsStr::is_empty` via `call1`: Trust-gate span-attribution workaround — see
+    // `lib.rs::call1`.
     let mut dirs: Vec<PathBuf> = match inherited {
         Some(p) if !crate::call1(std::ffi::OsStr::is_empty, p) => {
             std::env::split_paths(p).collect()

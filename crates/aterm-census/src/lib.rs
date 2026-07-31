@@ -74,8 +74,10 @@ use std::path::{Path, PathBuf};
 
 mod lock_order;
 pub mod scan_set;
+mod scope_census;
 mod wasm_census;
 pub use lock_order::run_lock_order_census;
+pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
 pub use wasm_census::run_wasm_census;
 
 /// The census verdict plus its full human/AI-readable transcript. The log is

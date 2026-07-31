@@ -17,11 +17,9 @@ use aterm_containment::ContainmentMode;
 
 #[test]
 fn init_from_env_rejects_invalid_value() {
-    // Set to an invalid mode string.
-    // SAFETY: Single-threaded test binary — no concurrent env reads.
-    unsafe {
-        std::env::set_var("ATERM_CONTAINMENT_MODE", "ESCALATE_TO_ROOT");
-    }
+    // Set to an invalid mode string. Single-threaded test binary — no concurrent
+    // env reads — and routed through the workspace's one lock-scoped env helper.
+    aterm_log::env::set("ATERM_CONTAINMENT_MODE", "ESCALATE_TO_ROOT");
 
     let result = aterm_containment::init_mode_from_env(ContainmentMode::Master);
     assert!(result.is_err(), "should reject invalid mode string");

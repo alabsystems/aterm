@@ -3,9 +3,8 @@
 
 //! Trail SOUND — the aural half of the cursor effects: a pure, clockless,
 //! allocation-free procedural synthesizer that gives every [`GlowStyle`] its
-//! own signature sound palette, and (since the cursor-audio framework) a
-//! namespaced gesture vocabulary other effects can speak through the same
-//! engine.
+//! own signature sound palette, plus a namespaced gesture vocabulary other
+//! effects can speak through the same engine.
 //!
 //! Design contract (mirrors the rest of this crate):
 //! - **Pure + host-agnostic.** No device I/O, no clock reads, no allocation
@@ -128,11 +127,6 @@ pub enum SoundKind {
     /// the trail vocabulary says, because it accompanies the biggest thing the
     /// trail DRAWS.
     ///
-    /// Before this existed a landing was announced by whatever the MOVE
-    /// classified as — a Jump flourish at best, and for a hinted Ctrl-A/E leap
-    /// (which reaches the very same starburst code) nothing louder than the
-    /// [`SoundKind::Sweep`] whisper, 22 dB under the bonk.
-    ///
     /// Style-agnostic and designed once before palette dispatch (like
     /// Kill/Bonk), pitched through `melody_hz` so it sits in the melody's key
     /// under every [`crate::tone::Tone`]. BYPASSES the min-gap governor like
@@ -197,16 +191,15 @@ pub enum SoundGesture {
 }
 
 /// WHICH palette family speaks for an event — the host's `trail_sound_style`
-/// setting riding the per-event seam exactly like `gain`/`tone`/`bed` (the
-/// established policy-carriage precedent), so a settings change takes effect
-/// on the next keystroke with zero channel changes. [`SoundVoice::Style`] is
-/// the exact identity: the palette follows [`SoundEvent::style`], bit for bit
-/// (byte-pinned by the `v056_reference` proofs). [`SoundVoice::Mech`] routes
-/// every palette-designed gesture to the mechanical-keyboard palette
+/// setting riding the per-event seam like `gain`: policy is carried per
+/// event, so a settings change takes effect on the next keystroke with zero
+/// channel changes. [`SoundVoice::Style`] is the exact identity: the palette
+/// follows [`SoundEvent::style`], bit for bit (byte-pinned by the
+/// `v056_reference` proofs). [`SoundVoice::Mech`] routes every
+/// palette-designed gesture to the mechanical-keyboard palette
 /// ([`MechPalette`]) regardless of the visual trail style; the style-agnostic
 /// kind-level gestures (Glide/Sweep melody tones, the bonk's clash shape)
-/// keep their shared design. An enum, so the non-finite filter below has
-/// nothing new to check.
+/// keep their shared design.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SoundVoice {
     /// Follow the visual trail style's palette — today's sound, bit for bit.
@@ -242,28 +235,21 @@ pub struct SoundEvent {
     pub gain: f32,
     /// The host's inferred TONE of what is being typed (the tiny
     /// [`crate::tone`] classifier over the current typed line, throttled and
-    /// cached host-side). Rides the per-event seam exactly like `gain` — the
-    /// established policy-carriage precedent — so a live settings/tone change
-    /// takes effect on the next keystroke with zero channel changes. TRAIL
+    /// cached host-side). Rides the per-event seam like `gain`. TRAIL
     /// gestures steer the melody's constitution with it (scale table,
     /// transpose, walk bias, note-length feel — see [`tone_tables`]);
     /// [`Tone::Technical`] is the exact identity (today's sound, bit for
     /// bit), and the Bonk ignores the field entirely (the wrong note is
-    /// wrong in every mood). An enum, so the non-finite filter below has
-    /// nothing new to check.
+    /// wrong in every mood).
     pub tone: Tone,
     /// Whether this gesture may feed the ambient BED layer (the continuous
-    /// per-style texture). Rides the per-event seam exactly like `gain` and
-    /// `tone` — the established policy-carriage precedent — so the host's
-    /// `trail_sound_bed` setting (default OFF: the owner dislikes the drone)
-    /// takes effect on the next keystroke with zero channel changes. With
-    /// every event carrying `false` the bed is never energised, so the bed
-    /// mixer contributes EXACTLY ZERO samples structurally (its level-floor
-    /// early-out, grains included — not a gain-0 render of the same DSP);
-    /// the discrete notes, the brrrring, the bonk and the melody are
-    /// untouched. A bool: the non-finite filter below has nothing new to
-    /// check. The bed DSP itself stays intact behind this gate — a redesign
-    /// tournament evaluates it next phase.
+    /// per-style texture). Rides the per-event seam like `gain`, so the
+    /// host's `trail_sound_bed` setting (default OFF) takes effect on the
+    /// next keystroke. With every event carrying `false` the bed is never
+    /// energised, so the bed mixer contributes EXACTLY ZERO samples
+    /// structurally (its level-floor early-out, grains included — not a
+    /// gain-0 render of the same DSP); the discrete notes, the brrrring, the
+    /// bonk and the melody are untouched.
     pub bed: bool,
 }
 
@@ -294,8 +280,8 @@ const PENTA_MINOR: [f32; 5] = [1.0, 1.2, 1.333_333_3, 1.5, 1.8];
 
 /// PLAYFUL suspended pentatonic (1 9/8 4/3 3/2 5/3 — the Japanese *yo*
 /// scale): major penta with the third lifted to a fourth, open and floaty.
-/// This is the consonant stand-in for the brief's "lydian-ish" — a true
-/// lydian ♯4 IS the bonk's tritone (45/32), so shipping it in a melody table
+/// The consonant stand-in for "lydian-ish": a true lydian ♯4 IS the bonk's
+/// tritone (45/32), so shipping that in a melody table
 /// would both break the no-beating invariant and dilute the bonk's
 /// exclusive claim to "wrong". Suspension reads as whimsy without either.
 const PENTA_YO: [f32; 5] = [1.0, 1.125, 1.333_333_3, 1.5, 1.666_666_7];
@@ -374,10 +360,9 @@ const ARC_AMP: f32 = 2.0;
 /// consonant sixth/octave, never a rub.
 const MELODY_LEAP: i32 = 2;
 
-/// Per-tone melodic REGISTER `(lo, hi)` the phrase walk is clamped into — the
-/// tonal twin of the old per-tone walk clamps (Excited taller, Frustrated
-/// shorter). `lo` is 0 for every table so the cadence tonics (degrees 0 and 5)
-/// are always reachable.
+/// Per-tone melodic REGISTER `(lo, hi)` the phrase walk is clamped into —
+/// Excited taller, Frustrated shorter. `lo` is 0 for every table so the
+/// cadence tonics (degrees 0 and 5) are always reachable.
 fn tone_register(tone: Tone) -> (i32, i32) {
     match tone {
         Tone::Technical | Tone::Calm => (0, 7),
@@ -398,8 +383,8 @@ fn melody_span(tone: Tone) -> i32 {
 }
 
 /// Per-tone LEAN added to the pitch register: Excited climbs (+1), Frustrated
-/// sinks (−1), the rest sit level (0). A quiet directional bias on top of the
-/// arc, the modern form of the old walk's per-tone reversion pull.
+/// sinks (−1), the rest sit level (0) — a quiet directional bias on top of the
+/// arc.
 fn melody_lean(tone: Tone) -> i32 {
     match tone {
         Tone::Excited => 1,
@@ -434,9 +419,7 @@ const BONK_TRITONE: f32 = 45.0 / 32.0;
 // RULE: loudness is indexed by how OFTEN a gesture can repeat, not by how big it
 // LOOKS. Every per-character gesture sits on one FLOOR; each rarer tier is
 // ~+1.5 dB over the one below, and the whole span is ~7 dB — the rarest events
-// are audibly SLIGHTLY louder, never a jump scare (owner, 2026-07-24: "bigger
-// rare actions should be slightly louder. common typing should be the most soft
-// (but not too soft)").
+// are audibly SLIGHTLY louder, never a jump scare.
 //
 // The dBFS figures are RENDERED peaks at the default `trail_sound_volume` (0.4),
 // heat 0.5, one isolated event, median over the ten palettes. The governor
@@ -455,36 +438,32 @@ const BONK_TRITONE: f32 = 45.0 / 32.0;
 
 /// TIER 1 — the FLOOR. A keystroke is the unit everything else is measured in.
 const TYPED_KIND_GAIN: f32 = 1.0;
-/// TIER 1. Deletions arrive at typing speed, so they sit ON the floor, not under
-/// it (was 0.8 — 2 dB of "softer", which only made an already-common gesture
-/// harder to hear). The mirrored PITCH still carries "undo".
+/// TIER 1. Deletions arrive at typing speed, so they sit ON the floor, not
+/// under it; the mirrored PITCH carries "undo" instead.
 const BACKSPACE_KIND_GAIN: f32 = 1.0;
 /// TIER 1. Above 1.0 because a glide's whole voice is one bare sine pluck,
-/// intrinsically ~1 dB under a palette keystroke at equal gain. Was 0.32, i.e.
-/// 11 dB below a keystroke: a cursor move you could SEE moved a live typing mix
-/// by -0.2 dB — inaudible.
+/// intrinsically ~1 dB under a palette keystroke at equal gain.
 const GLIDE_KIND_GAIN: f32 = 1.11;
-/// TIER 2 — one per gesture, not one per character. NOTE no production path
-/// cues `Navigation` any more (`cursor_glow` splits every hinted move into
-/// Glide/Sweep); this arm is kept for the audition harness and for hosts that
-/// still speak it. Was 0.32.
+/// TIER 2 — one per gesture, not one per character. No production path cues
+/// `Navigation` (`cursor_glow` splits every hinted move into Glide/Sweep);
+/// the arm serves the audition harness and hosts that still speak it.
 const NAVIGATION_KIND_GAIN: f32 = 1.19;
-/// TIER 2. The per-note taper in `design_cursor` still drops the run's tail;
-/// this sets where its FIRST note lands. Was 0.30.
+/// TIER 2. The per-note taper in `design_cursor` drops the run's tail; this
+/// sets where its FIRST note lands.
 const SWEEP_KIND_GAIN: f32 = 1.14;
-/// TIER 3 — a kill is per-command and destroys a line; it may not be the
-/// quietest thing in the engine (it WAS, by 14 dB under a keystroke). Most of
-/// that correction lives in the swoosh's own voice gain rather than here,
-/// because the deficit was a VOICE deficit — see `design_trail`'s Kill arm.
+/// TIER 3 — a kill is per-command and destroys a line, so it may not be the
+/// quietest thing in the engine. Most of the level correction lives in the
+/// swoosh's own voice gain rather than here, because the deficit is a VOICE
+/// deficit — see `design_trail`'s Kill arm.
 const KILL_KIND_GAIN: f32 = 1.25;
-/// TIER 3. UNCHANGED at 1.25: with the palette trim in place this already lands
-/// Jump at -17.6 dBFS, and holding it here keeps [`BONK_KIND_GAIN`] strictly
-/// above every trail kind-gain (const-asserted).
+/// TIER 3. With the palette trim in place this lands Jump at -17.6 dBFS, and
+/// it is the trail ceiling [`BONK_KIND_GAIN`] must stay strictly above
+/// (const-asserted).
 const JUMP_KIND_GAIN: f32 = 1.25;
 
-/// Bonk kind-gain. Deliberately ABOVE every trail gesture (Jump's 1.25 was
-/// the previous ceiling): punctuation with higher priority, per the owner's
-/// brief — the wrong note must not hide in the texture it interrupts.
+/// Bonk kind-gain. Deliberately ABOVE every trail gesture (Jump's 1.25 is the
+/// trail ceiling): punctuation with higher priority — the wrong note must not
+/// hide in the texture it interrupts.
 const BONK_KIND_GAIN: f32 = 1.35;
 
 /// The cursor-LANDING star chime ([`SoundKind::Land`]). Register an octave
@@ -494,13 +473,11 @@ const LAND_ANCHOR_HZ: f32 = 784.0;
 /// TIER 4 — the landing kind-gain. DELIBERATELY BELOW the trail tiers' ceiling
 /// (Jump/Kill 1.25): the landing's presence comes from its VOICE DESIGN — three
 /// stacked star tones over an arrival body, four voices where a keystroke has
-/// one — not from its gain. At 1.25 the delivered chime measured -12.8 dBFS,
-/// i.e. LOUDER than the bonk it is meant to sit under; 0.865 lands it on tier 4
-/// at -16.0 dBFS: +5 dB over a keystroke, 2 dB under the bonk.
-///
-/// (An earlier revision quoted "+10.9 dB over a keystroke" as if universal. That
-/// was a Nyan-only figure — against Laser the same chime is only +5.9 dB,
-/// because Land is style-agnostic while the keystroke is not.)
+/// one — not from its gain. Raised to the ceiling the chime measures
+/// -12.8 dBFS, LOUDER than the bonk it is meant to sit under; 0.865 lands it on
+/// tier 4 at -16.0 dBFS, 2 dB under the bonk. Its margin over a keystroke
+/// varies by palette (+5.9 dB against Laser, +10.9 against Nyan) because Land
+/// is style-agnostic while the keystroke is not.
 const LAND_KIND_GAIN: f32 = 0.865;
 /// Star tones per landing, [`LAND_STAR_DEGREE_STEP`] scale-degrees apart and
 /// pre-delayed [`LAND_STAR_STEP_S`] — the arpeggio idiom (delayed voices, no
@@ -548,18 +525,14 @@ const CELEBRATION_PHRASE_BARS: usize = 8;
 /// pentatonic-lattice law, so the typed-note melody under it can never rub.
 ///
 /// The form is A A' B A" | C C' B' D — verse, lifted chorus, breathing bridge,
-/// turnaround. Bars 0 and 1 are the ORIGINAL two-bar cell VERBATIM, so the
-/// celebration still OPENS on the phrase the owner already knows and then keeps
-/// GOING instead of looping every 3.2 s. (2026-07-24, owner: "the sing song
-/// needs a bit more, it sounds too repetitive to me". It was never more varied
-/// than two bars — the loop has been 3.2 s since it was written.)
+/// turnaround; bars 0 and 1 are the hook the celebration opens on.
 ///
 /// `REST` slots do NOT silence: the preceding note SUSTAINS through them, which
 /// is where the phrase's long notes and its air come from.
 const CELEBRATION_PHRASE: [[i32; 8]; CELEBRATION_PHRASE_BARS] = [
-    // 0 — A, THE HOOK (the original `CELEBRATION_BAR_A`, verbatim).
+    // 0 — A, THE HOOK.
     [0, 2, 4, 5, 4, 2, 4, 7],
-    // 1 — A', THE ANSWER (the original `CELEBRATION_BAR_B`, verbatim).
+    // 1 — A', THE ANSWER.
     [5, 7, 5, 4, 2, 4, 2, 0],
     // 2 — B, the hook syncopated: two held notes and two holes.
     [2, 4, REST, 7, 5, REST, 3, 2],
@@ -584,12 +557,11 @@ const CELEBRATION_PHRASE: [[i32; 8]; CELEBRATION_PHRASE_BARS] = [
 const CELEBRATION_FILL: [i32; 4] = [7, 5, 4, 2];
 
 /// THE BASSLINE, one note per BEAT (four per bar) — an independent voice with
-/// its own motion, which is what the pre-change riff lacked: its "bass" was the
-/// lead's own note an octave down, so there was no harmony to follow.
+/// its own motion, so the lead has a harmony to follow.
 ///
-/// A bass note rides as the THIRD PARTIAL of the lead voice that OPENS its beat
-/// — zero extra voices, exactly like the old downbeat sub — so every non-`REST`
-/// bass beat REQUIRES a non-`REST` lead slot at `2 * beat`, pinned by
+/// A bass note rides as the THIRD PARTIAL of the lead voice that OPENS its
+/// beat — zero extra voices — so every non-`REST` bass beat REQUIRES a
+/// non-`REST` lead slot at `2 * beat`, pinned by
 /// `celebration_bass_always_has_a_carrier`.
 const CELEBRATION_BASS: [[i32; 4]; CELEBRATION_PHRASE_BARS] = [
     [-10, REST, -7, REST], // C3 … G3 …
@@ -603,9 +575,8 @@ const CELEBRATION_BASS: [[i32; 4]; CELEBRATION_PHRASE_BARS] = [
 ];
 
 /// THE GROOVE — per-slot velocity across the eighth grid, shared by every bar:
-/// downbeat strongest, a BACKBEAT lift on slots 2 and 6, offbeats ghosted.
-/// ~4.5 dB of internal dynamics where the pre-change riff had 1.9 dB across
-/// exactly two levels.
+/// downbeat strongest, a BACKBEAT lift on slots 2 and 6, offbeats ghosted —
+/// ~4.5 dB of internal dynamics.
 const CELEBRATION_GROOVE: [f32; 8] = [0.55, 0.33, 0.44, 0.36, 0.50, 0.33, 0.46, 0.38];
 
 /// Per-BAR dynamic shape multiplying [`CELEBRATION_GROOVE`]: the chorus pushes,
@@ -635,10 +606,9 @@ const CELEBRATION_BASE_HZ: f32 = 523.25;
 
 /// TIER 5 — the sing-along riff's place on the loudness ladder. The riff is the
 /// ONLY governor-exempt gesture (`design_celebration` omits the flood duck by
-/// design), so without a kind gain of its own it escaped the ladder entirely:
-/// bar 12 rendered at -9.5 dBFS, 2 dB OVER the bonk and 11 dB over a keystroke
-/// — while additionally ducking that keystroke -9 dB ([`SING_DUCK_DEPTH`]).
-/// That is a jump scare, not "slightly louder".
+/// design), so without a kind gain of its own it escapes the ladder entirely:
+/// at 1.0 bar 12 renders at -9.5 dBFS, 2 dB OVER the bonk and 11 dB over a
+/// keystroke it is simultaneously ducking by -9 dB ([`SING_DUCK_DEPTH`]).
 ///
 /// 0.6 lands the whole ESCALATION inside tier 5: the riff opens at -18.9 dBFS
 /// (bar 0, lean), reaches -14.9 by the chorus and tops out at -13.7 with the
@@ -829,11 +799,11 @@ struct Bed {
 // Ambient-bed TOURNAMENT — candidate variants behind the audition seam
 // ---------------------------------------------------------------------------
 
-/// One AMBIENT-BED TOURNAMENT candidate. The owner dislikes the shipping low
-/// drone ("don't keep it if it doesn't sound good"; beds are off-by-default
-/// behind `trail_sound_bed`), so the redesign is run as a judged tournament:
-/// each candidate is a complete alternative continuous-bed design, rendered
-/// and measured by `examples/bed_audition.rs` against the real melody.
+/// One AMBIENT-BED TOURNAMENT candidate. Beds ship off-by-default behind
+/// `trail_sound_bed`, and the redesign of the low drone runs as a judged
+/// tournament: each candidate is a complete alternative continuous-bed
+/// design, rendered and measured by `examples/bed_audition.rs` against the
+/// real melody.
 ///
 /// Selection is an ENGINE-LEVEL seam ([`TrailSynth::set_bed_variant`]), not a
 /// host setting: no config path reaches it, the default is [`Current`]
@@ -854,8 +824,8 @@ struct Bed {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum BedVariant {
     /// C0 — the incumbent-in-code: the per-palette `Palette::bed_sample`/
-    /// `bed_grain` units, i.e. the disliked drone under audit. The default,
-    /// and the only variant hosts can ever reach.
+    /// `bed_grain` units. The default, and the only variant hosts can ever
+    /// reach.
     #[default]
     Current,
     /// C1 — SLOW CHORD DRIFT: three bed tones stacked on the pentatonic
@@ -914,7 +884,7 @@ const CHORD_DRIFT_STACK: [i32; 3] = [0, 2, 4];
 /// transition, not a state.
 const CHORD_DRIFT_GLIDE_TAU: f32 = 1.2;
 
-/// C2 breath period in seconds, and the brief's swell law endpoints: the
+/// C2 breath period in seconds, and the swell-law endpoints: the
 /// pad's amplitude factor rides `0.05..=0.2` on a raised cosine — even at
 /// the top of the breath the bed stays a texture, and at the bottom it all
 /// but disappears without ever gating.
@@ -967,26 +937,17 @@ pub struct TrailSynth {
     since_voice: f32,
     /// Seconds since the last event of any kind (rate decay bookkeeping).
     since_event: f32,
-    /// Melodic random walk over pentatonic degrees, gently mean-reverting so
-    /// phrases wander but never march off the top of the register. Advanced
-    /// by TRAIL gestures only — a bonk clashes AGAINST the current degree, it
-    /// does not move the melody. Step distribution, range and reversion
-    /// target are shaped by [`Self::tone`] (the melody's "personality
-    /// knobs").
-    ///
-    /// SINCE THE MELODIC RE-BASELINE `walk` is no longer stepped by a
-    /// memoryless ±1 draw; it is the DERIVED current degree of the phrase
-    /// generator (`phrase_home + phrase_step + arc`, clamped) — see
-    /// [`Self::advance_melody`]. It stays the one scalar every consumer reads
-    /// (the bonk clashes against it; `design_trail` offsets it by the column;
-    /// a cursor Glide/Sweep plays relative to it), so those paths are
-    /// untouched — only HOW it moves changed.
+    /// The melody's CURRENT degree on the pentatonic lattice: the derived
+    /// output of the phrase generator (`phrase_home + phrase_step + arc`,
+    /// clamped into [`tone_register`]) — see [`Self::advance_melody`].
+    /// Advanced by TRAIL gestures only: a bonk clashes AGAINST the current
+    /// degree, it does not move the melody. It is the one scalar every
+    /// consumer reads — the bonk clashes against it, `design_trail` offsets
+    /// it by the column, a cursor Glide/Sweep plays relative to it.
     walk: i32,
     /// PHRASE-AWARE MELODY STATE. The 4-step motif CELL — scale-step deltas
     /// re-chosen each phrase and replayed to fill it, so a recognisable shape
-    /// RECURS and varies instead of drifting. This memory (a cell, a cursor, a
-    /// contour) is the whole difference between a tune and the old aimless
-    /// walk — the owner asked for "more of a melody".
+    /// RECURS and varies instead of drifting.
     motif: [i8; 4],
     /// Index of the current note within the phrase (`0..phrase_len`).
     phrase_pos: u8,
@@ -1034,23 +995,16 @@ pub struct TrailSynth {
     dc_y_r: f32,
 }
 
-/// Master output scale. Sized so a single default-volume Typed event peaks
-/// around −20 dBFS — clearly audible in a quiet room at normal system volume,
-/// far below alert/bell level.
+/// Master output scale. Sized so a single default-volume (0.4) Typed event
+/// peaks on the ladder floor, ~−21 dBFS — clearly audible in a quiet room at
+/// normal system volume, far below alert/bell level. (The per-palette voice
+/// designs differ by ~8 dB for the SAME gesture; [`palette_trim`], not this
+/// constant, is what flattens them onto that floor.)
 ///
-/// MEASURED, not asserted — but PER STYLE, because the per-palette voice gains
-/// swamp the kind-gain ladder: a single default-volume (0.4) Typed event peaks
-/// at −23.7 dBFS on Nyan, −19.1 on Lumen, −17.6 on Mech and −25.7 on Beam —
-/// an 8.1 dB spread across palettes for the SAME gesture. (An earlier revision
-/// of this comment quoted "−24.0 Nyan / −23.1 Lumen" from a single-style
-/// measurement; the Lumen figure was 4 dB stale. Quote the spread, not one
-/// palette.)
-/// It was 0.9 — which delivered −30.9 dBFS and −43.1 dBFS RMS, ~11 dB under
-/// this doc's OWN spec: the owner's "the volume of effects are a bit too
-/// quiet" (2026-07-24). Raised uniformly rather than by re-tuning the kind
-/// gains or the rate governor because those are duplicated VERBATIM in the
-/// `v056_reference` oracle, while this const is the one the oracle SHARES — so
-/// both byte-identity pins multiply by the same changed value and still hold.
+/// Tune delivered loudness HERE rather than in the kind gains or the rate
+/// governor: those are duplicated VERBATIM in the `v056_reference` oracle,
+/// while this const is the one the oracle SHARES — so both byte-identity pins
+/// multiply by the same value and still hold.
 const MASTER: f32 = 2.0;
 
 /// Governor: sustained admission gap for discrete voices, per event kind
@@ -1059,24 +1013,19 @@ const MIN_GAP: f32 = 0.045;
 
 /// PER-PALETTE LEVEL TRIM — the one knob that makes the loudness ladder a
 /// property of the GESTURE instead of the LOOK. Each palette's voice design has
-/// its own intrinsic level (a Mech thock is ~8 dB hotter than a Beam blip at the
-/// same gain), so before this every style had its OWN ladder: a Laser Jump was
-/// LOUDER than the bonk while a Beam Jump was quieter than a Lumen keystroke.
+/// its own intrinsic level (a Mech thock is ~8 dB hotter than a Beam blip at
+/// the same gain); untrimmed, every style has its OWN ladder.
 ///
 /// Each value is fitted so that style's `Typed` peaks at the ladder FLOOR
 /// (-21.0 dBFS at gain 0.4 / heat 0.5, 24-seed mean) — measured by rendering,
-/// not asserted. Residual spread across the ten palettes: 0.2 dB, from 8.1.
+/// not asserted. Residual spread across the ten palettes: 0.2 dB.
 ///
 /// Applied at the palette dispatch ONLY, so the gestures designed BEFORE that
-/// dispatch (Kill, Glide, Sweep, Land, Bonk, the riff) are untouched.
-///
-/// NOT because they are all perfectly flat: Kill's swoosh band is style-tinted
-/// (Water 900/250, Fire 1400/300, Sparkle 2600/700, Comet 1200/280, else
-/// 1600/350, plus its own Mech branch), which leaves it ~3 dB of residual
-/// spread. Glide/Sweep/Land/Bonk/riff genuinely are flat. The reason the trim
-/// stops here is structural — it is the knob that anchors a PALETTE, and these
-/// gestures never reach a palette — not a claim that every one of them is
-/// already uniform.
+/// dispatch (Kill, Glide, Sweep, Land, Bonk, the riff) are untouched — a
+/// structural boundary, not a claim that they are uniform: Kill's swoosh band
+/// is style-tinted (Water 900/250, Fire 1400/300, Sparkle 2600/700, Comet
+/// 1200/280, else 1600/350, plus its own Mech branch), leaving it ~3 dB of
+/// residual spread. Glide/Sweep/Land/Bonk/riff genuinely are flat.
 fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
     match voice {
         SoundVoice::Mech => 0.68,
@@ -1185,9 +1134,8 @@ impl TrailSynth {
         // Defense in depth at the pure synth boundary: TOML accepts NaN/Inf and
         // hosts are fallible. One non-finite scalar would poison the persistent
         // bed/voice state and every later sample. Reject it before any mutation;
-        // clamp finite out-of-range inputs into the documented domain. (No new
-        // float field rode in with the gesture namespacing — the filter below
-        // still covers every scalar `SoundEvent` carries.)
+        // clamp finite out-of-range inputs into the documented domain. Every
+        // scalar `SoundEvent` carries must appear in this filter.
         if !ev.pan.is_finite()
             || !ev.heat.is_finite()
             || !ev.hue.is_finite()
@@ -1237,8 +1185,8 @@ impl TrailSynth {
                 let kick = match kind {
                     SoundKind::Jump | SoundKind::Kill | SoundKind::Land => 0.5,
                     SoundKind::Typed | SoundKind::Backspace => 0.3,
-                    // Cursor scrubbing feeds the bed as gently as the old
-                    // Navigation whisper — presence, not a swell.
+                    // Cursor scrubbing feeds the bed at a whisper — presence,
+                    // not a swell.
                     SoundKind::Navigation | SoundKind::Glide { .. } | SoundKind::Sweep { .. } => {
                         0.12
                     }
@@ -1307,13 +1255,12 @@ impl TrailSynth {
     /// bit-for-bit per `(events, seed, tone)`. `pause` is the typing gap since
     /// the previous event (captured before the governor reset it).
     ///
-    /// This is the mechanism that answers "I thought we'd have more of a
-    /// melody": every named tune-making device — a repeat-and-vary MOTIF cell,
-    /// a raised-cosine contour ARC, CALL-AND-RESPONSE by phrase parity, a
-    /// leap-and-recover at the peak, and a CADENCE onto the tonic at phrase
-    /// ends (Enter or a pause) — layered onto the register, with pitch still
-    /// flowing through [`Self::melody_hz`] so consonance and tone adaptation
-    /// are inherited untouched.
+    /// The tune-making devices are layered onto the register — a
+    /// repeat-and-vary MOTIF cell, a raised-cosine contour ARC,
+    /// CALL-AND-RESPONSE by phrase parity, a leap-and-recover at the peak, and
+    /// a CADENCE onto the tonic at phrase ends (Enter or a pause) — with pitch
+    /// still flowing through [`Self::melody_hz`], so consonance and tone
+    /// adaptation are inherited untouched.
     fn advance_melody(&mut self, kind: SoundKind, pause: f32) {
         let (lo, hi) = tone_register(self.tone);
         // PHRASE BOUNDARY: Enter (a Jump), a comma-length typing gap, or the
@@ -1371,8 +1318,8 @@ impl TrailSynth {
     }
 
     /// The melody's pitch lattice under the CURRENT tone: `base` scaled to
-    /// `degree` of the tone's table, times the tone's transpose. This is
-    /// what every palette calls where it used to call the free [`penta`] —
+    /// `degree` of the tone's table, times the tone's transpose. Every
+    /// palette draws its pitches through this rather than the free [`penta`];
     /// under [`Tone::Technical`]/[`Tone::Calm`] the table is [`PENTA`] and
     /// the transpose an exact ×1.0, so the result is bit-identical to
     /// [`penta`] (the `v056_reference` proofs run through this very path).
@@ -1440,9 +1387,8 @@ impl TrailSynth {
 
     /// Design and spawn the voice(s) for one admitted TRAIL gesture: the
     /// kind-level shaping shared by all styles, the style-agnostic Kill
-    /// swoosh, then the per-palette dispatch. The numbers that were the
-    /// monolithic `design()` live on the [`Palette`] implementors now — each
-    /// palette IS its own sound designer.
+    /// swoosh, then the per-palette dispatch (each [`Palette`] implementor IS
+    /// its own sound designer).
     fn design_trail(&mut self, ev: SoundEvent, kind: SoundKind, duck: f32) {
         // Heat warms level slightly (+45 % at full blaze) — presence, not
         // a volume ride.
@@ -1463,9 +1409,9 @@ impl TrailSynth {
             SoundKind::Land => LAND_KIND_GAIN,
         };
         let g = g * kg;
-        // The column now only NUDGES the melody ±1 (was ±2): the phrase motif
-        // owns the pitch, so a long line drifts by at most a single scale-step
-        // instead of the column swamping the tune.
+        // The column only NUDGES the melody ±1: the phrase motif owns the
+        // pitch, so a long line drifts by at most a single scale-step instead
+        // of the column swamping the tune.
         let col_off = (ev.pan).round() as i32;
         let deg = self.walk + col_off;
 
@@ -1500,8 +1446,8 @@ impl TrailSynth {
                     GlowStyle::Water => (900.0, 250.0),
                     GlowStyle::Fire => (1400.0, 300.0),
                     GlowStyle::Sparkle => (2600.0, 700.0),
-                    // Comet fell to deep space (A3 transmissions) — its kill
-                    // swoosh falls dark with it, not through the old icy top.
+                    // Comet lives in deep space (A3 transmissions) — its kill
+                    // swoosh falls dark with it, not through an icy top.
                     GlowStyle::Comet => (1200.0, 280.0),
                     _ => (1600.0, 350.0),
                 }
@@ -1518,29 +1464,24 @@ impl TrailSynth {
                 lp_cut: 2400.0,
                 ..Voice::default()
             };
-            // 2.6, not 0.5: this voice is PURE band-passed noise (no partials),
-            // whose peak sits ~17 dB under a tonal voice at the same gain — so
-            // at 0.5 the kill was the QUIETEST gesture in the engine, 14 dB
-            // under a keystroke and completely masked by live typing (inserting
-            // one moved a 6 cps mix by -0.2 dB). The correction belongs in the
-            // VOICE, not in `KILL_KIND_GAIN`, which is a PRIORITY statement and
-            // must stay under `BONK_KIND_GAIN`.
+            // 2.6, not the ~0.5 a tonal voice would take: this voice is PURE
+            // band-passed noise (no partials), whose peak sits ~17 dB under a
+            // tonal voice at the same gain, so the compensation belongs in the
+            // VOICE. Not in `KILL_KIND_GAIN`, which is a PRIORITY statement
+            // and must stay under `BONK_KIND_GAIN`.
             self.spawn(v, g * 2.6, ev.pan);
             return;
         }
 
         // The palette's own level trim lands THIS style's keystroke on the
-        // ladder floor, so the kind-gain tiers above mean the same number of dB
-        // in every style. Before this, style — not gesture — dominated loudness:
-        // a Laser Jump was louder than the bonk, a Beam Jump quieter than a
-        // Lumen keystroke, and "the ladder" did not exist as heard.
+        // ladder floor, so the kind-gain tiers above mean the same number of
+        // dB in every style.
         let g = g * palette_trim(ev.voice, ev.style);
         palette_for(ev.voice, ev.style).design(self, &ev, kind, g, deg, col_off);
     }
 
-    /// The CURSOR-MOVEMENT gesture, aligned with the melody — the owner's
-    /// "a sound effect for the movement of the cursor aligned with the
-    /// melody". Style-agnostic and soft (a gentle sine pluck), pitched through
+    /// The CURSOR-MOVEMENT gesture, aligned with the melody.
+    /// Style-agnostic and soft (a gentle sine pluck), pitched through
     /// [`Self::melody_hz`] on the ACTIVE tone at the melody's CURRENT degree,
     /// so it sits in the same key/scale as the tune the typing is playing:
     ///
@@ -1726,12 +1667,11 @@ impl TrailSynth {
             duck_exempt: true,
             ..Voice::default()
         };
-        // VOICE TRIM (2026-07-24, with the MASTER 0.9 -> 2.0 lift): the bonk's
-        // authored ABSOLUTE level is ~-16 dBFS, and riding the master lift
-        // untouched would have carried it to -9.4 dBFS — genuine alert
+        // VOICE TRIM: holds the bonk's delivered level near -16 dBFS. Without
+        // it the clash rides `MASTER` up to ~-9.4 dBFS — genuine alert
         // territory, against this module's "far below alert/bell level" ethos.
-        // `BONK_KIND_GAIN` is deliberately NOT reduced: its job is PRIORITY
-        // (the bonk outranks every trail kind-gain), which is unchanged.
+        // `BONK_KIND_GAIN` is deliberately NOT the knob for this: its job is
+        // PRIORITY (the bonk outranks every trail kind-gain).
         self.spawn(clash, g * 0.306, ev.pan);
         // The body: a low woody thump with a whisper of knock noise.
         let thump = Voice {
@@ -1818,8 +1758,8 @@ impl TrailSynth {
             let span = celebration_span(phrase, i, sustain_limit);
             let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg);
             // The BASSLINE rides the lead voice that opens its beat — third
-            // partial, no extra voice (the old downbeat sub, given a part of
-            // its own). `build` fades the low end in over the opening bars.
+            // partial, no extra voice. `build` fades the low end in over the
+            // opening bars.
             let sub = if i.is_multiple_of(2) && bass_bar[i / 2] != REST {
                 let b = self.melody_hz(CELEBRATION_BASE_HZ, bass_bar[i / 2]);
                 Partial {
@@ -1840,7 +1780,7 @@ impl TrailSynth {
             };
             let v = Voice {
                 delay: celebration_slot_delay(i),
-                // Span 1 is EXACTLY the pre-change 0.30 s: in f32,
+                // Span 1 is EXACTLY 0.30 s: in f32,
                 // `CELEBRATION_EIGHTH * 1.5 == 0.30` bit for bit.
                 dur: span as f32 * CELEBRATION_EIGHTH * 1.5,
                 attack: 0.004,
@@ -2253,7 +2193,7 @@ impl TrailSynth {
     }
 
     /// C2 — BREATHING PAD. The [`BREATH_DEGREES`] lattice pad under the
-    /// brief's swell law (amplitude factor 0.05→0.2 on a ~12 s raised
+    /// swell law (amplitude factor 0.05→0.2 on a ~12 s raised
     /// cosine) with the spectral tilt animating on the same breath: a
     /// one-pole lowpass opens toward ~2.6 kHz at the top of the inhale and
     /// closes to ~250 Hz at the bottom, so the pad brightens as it swells —
@@ -2385,9 +2325,8 @@ fn palette_for(voice: SoundVoice, style: GlowStyle) -> &'static dyn Palette {
 }
 
 /// LUMEN — lamplight: each key BLOOMS onto its note with a beating twin and
-/// sub-octave glow. The "default" sound: a good keyboard should sound like
-/// this feels. (The airy Lumen/Laser shared pad retired with the live-review
-/// redesign: Lumen breathes its own lamp pad, Laser rumbles a distant storm.)
+/// sub-octave glow, over its own breathing lamp pad. The "default" sound: a
+/// good keyboard should sound like this feels.
 struct LumenPalette;
 
 impl Palette for LumenPalette {
@@ -2400,10 +2339,9 @@ impl Palette for LumenPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // LAMPLIGHT (live review: "blank and small"): each key BLOOMS — a
-        // warm mid tone easing gently UP onto its note, a softly beating
-        // twin for width, a sub-octave glow, and a breath of air. Backspace
-        // dims (the bloom drifts back down).
+        // LAMPLIGHT: each key BLOOMS — a warm mid tone easing gently UP onto
+        // its note, a softly beating twin for width, a sub-octave glow, and a
+        // breath of air. Backspace dims (the bloom drifts back down).
         let f = s.melody_hz(
             330.0,
             deg + if kind == SoundKind::Backspace { -2 } else { 0 },
@@ -2455,7 +2393,7 @@ impl Palette for LumenPalette {
         s.spawn(v, g * 0.42, ev.pan);
         if kind == SoundKind::Jump {
             // Grace note a fifth up, blooming the same way — the little
-            // "arrived" flourish, warmer than before.
+            // "arrived" flourish.
             let f2 = f * 1.5;
             let v2 = Voice {
                 delay: 0.055,
@@ -2513,10 +2451,8 @@ impl Palette for PhaserPalette {
         _deg: i32,
         col_off: i32,
     ) {
-        // THE PLAYFUL EMITTER (live review: "so blank… satisfaction and
-        // some cuteness"; the 2.2× pew dive and 3× shimmer were the
-        // shrillness): a rounded "boop" that SETTLES onto a note whose
-        // degree follows the LIVE HUE, a tiny low THOCK for the tactile
+        // THE PLAYFUL EMITTER: a rounded "boop" that SETTLES onto a note
+        // whose degree follows the LIVE HUE, a tiny low THOCK for the tactile
         // landing, an up-turned "hm?" on backspace, a two-note "ba-deep!"
         // on Jump.
         let hue_deg = (ev.hue * 5.0) as i32;
@@ -2540,7 +2476,7 @@ impl Palette for PhaserPalette {
                     ..Partial::default()
                 },
                 // A quiet octave doubles the warmth without reaching into
-                // the register that grated.
+                // the shrill upper register.
                 Partial {
                     lvl: 0.12,
                     f0: f * 2.0,
@@ -2666,11 +2602,9 @@ impl Palette for NyanPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // MELLOWED (live review: "more mellow… make the doop doop sound a
-        // bit longer"): rounded "doop"s — a 50 % square (hollow, odd-
-        // harmonic) instead of the buzzy 25 % pulse, a sub-octave sine for
-        // warmth, an eased attack, each note lingering a touch longer, the
-        // register down a fourth from the old C5 ping.
+        // MELLOW DOOPS: a 50 % square (hollow, odd-harmonic) rather than a
+        // buzzy narrow pulse, a sub-octave sine for warmth, an eased attack,
+        // and notes that linger.
         let base = 392.0; // G4 — the mellow chip register
         let d = deg + if kind == SoundKind::Backspace { -3 } else { 0 };
         let f = s.melody_hz(base, d);
@@ -2740,10 +2674,9 @@ impl Palette for SparklePalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // GROWN UP (live review: "not ding ding ding but dong dong dong"):
-        // still a scatter of twinkling grains per key, but each grain is a
-        // round DONG — C5, two octaves under the old G6 dings, a soft 3 ms
-        // attack, a warm sub-octave body and a gentle glassy halo.
+        // A scatter of twinkling grains per key, each grain a round DONG —
+        // C5, a soft 3 ms attack, a warm sub-octave body and a gentle glassy
+        // halo.
         let n = if kind == SoundKind::Jump { 3 } else { 2 };
         for i in 0..n {
             let d = deg + i * 2 + (s.rnd() * 2.0) as i32;
@@ -2771,7 +2704,7 @@ impl Palette for SparklePalette {
                         f1: f * 0.5,
                         ..Partial::default()
                     },
-                    // A gentle halo where the old ding lived — quiet.
+                    // A gentle glassy halo — quiet.
                     Partial {
                         lvl: 0.08,
                         f0: f * 2.01,
@@ -2790,9 +2723,8 @@ impl Palette for SparklePalette {
     }
 
     fn bed_grain(&self, s: &mut TrailSynth, level: f32, gain: f32) {
-        // Residual glitter: soft dongs drifting after the hands stop — same
-        // register as the key grains, so the afterglow never turns back
-        // into dings.
+        // Residual glitter: soft dongs drifting after the hands stop, in the
+        // same register as the key grains.
         let grain_deg = (s.rnd() * 8.0) as i32;
         let f = s.melody_hz(523.25, grain_deg);
         let v = Voice {
@@ -2823,9 +2755,9 @@ impl Palette for SparklePalette {
     }
 
     fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, u2: f32) -> (f32, f32) {
-        // No longer grains alone — a barely-there warm pad breathes under
-        // them (C4 pair, slow-swelling soft octave), so the background is a
-        // glow, not a void, and never a whine.
+        // A barely-there warm pad breathes under the grains (C4 pair,
+        // slow-swelling soft octave), so the background is a glow, not a
+        // void, and never a whine.
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 261.6 * dt).fract();
         b.ph2 = (b.ph2 + 262.4 * dt).fract();
@@ -2855,13 +2787,11 @@ impl Palette for FirePalette {
         _deg: i32,
         _col_off: i32,
     ) {
-        // GENUINE CRACKLE (live review: "super bad… doesn't sound like
-        // water and waves, make it like fire crackling"): every key is an
-        // impulsive few-millisecond high-Q SNAP — a wood fibre parting —
-        // over a woody ember knock. Impulsiveness, not softness, is what
-        // separates fire from water. Jump = the flame LEAPING: a dark low
-        // whoomph (no high splash — that would be a wave) plus a scatter
-        // of spark snaps.
+        // GENUINE CRACKLE: every key is an impulsive few-millisecond high-Q
+        // SNAP — a wood fibre parting — over a woody ember knock.
+        // Impulsiveness, not softness, is what separates fire from water.
+        // Jump = the flame LEAPING: a dark low whoomph (no high splash —
+        // that would be a wave) plus a scatter of spark snaps.
         if kind == SoundKind::Jump {
             // The whoomph: air rushing into the flare, all low-mid.
             let v = Voice {
@@ -2999,8 +2929,8 @@ impl Palette for FirePalette {
         // The roar under the crackle — dark filtered noise whose loudness
         // FLICKERS fast and irregularly (~9 Hz random flutter), like flame
         // light. Flicker is the one cue that separates fire-body from wind
-        // or surf: waves swell smoothly and slowly, flames gutter. (The old
-        // slow-LFO undulation here is exactly why this bed read as waves.)
+        // or surf: waves swell smoothly and slowly, flames gutter — a slow
+        // LFO undulation here reads as waves.
         let white = {
             let mut x = s.rng;
             x ^= x << 13;
@@ -3037,13 +2967,12 @@ impl Palette for LaserPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // THE LIGHTNING STRIKE (live review: "I want the ZAP sound and like
-        // a lightning/thunderstorm effect"): the two-octave dive kept, with
-        // a brief electric SIZZLE on the tone and a bright high-Q CRACK of
-        // air snapping over it. Backspace = the zap reversed, crackless and
-        // softer. Jump = the FULL STRIKE: crack, zap, sub-thump landing,
-        // then THUNDER — a long low roll that sweeps down and echoes once.
-        // Still the archetype kept soft; thunder rumbles, it never booms.
+        // THE LIGHTNING STRIKE: a two-octave dive with a brief electric
+        // SIZZLE on the tone and a bright high-Q CRACK of air snapping over
+        // it. Backspace = the zap reversed, crackless and softer. Jump = the
+        // FULL STRIKE: crack, zap, sub-thump landing, then THUNDER — a long
+        // low roll that sweeps down and echoes once. The archetype is kept
+        // soft; thunder rumbles, it never booms.
         let f_hi = s.melody_hz(880.0, deg.min(5));
         let f_lo = f_hi * 0.25;
         let (a, b) = if kind == SoundKind::Backspace {
@@ -3202,8 +3131,7 @@ impl Palette for LaserPalette {
     fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, _u2: f32) -> (f32, f32) {
         // The storm on the horizon — deep filtered rumble whose level
         // swells and sags slowly and UNEVENLY (a ~1.3 Hz random wander, not
-        // a metronome LFO): weather, not machinery. Replaces the anonymous
-        // airy pad.
+        // a metronome LFO): weather, not machinery.
         let white = {
             let mut x = s.rng;
             x ^= x << 13;
@@ -3242,12 +3170,10 @@ impl Palette for BeamPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // THE ROCKET CONSOLE (live review: "the background noise I hate so
-        // much that I can't take it… buttons being pressed on a rocket ship
-        // traveling in deep space"): every key is a button on a spacecraft
-        // panel — a soft rubberized THUD (the button seating) and a muted
-        // low confirmation blip settling downward. No glassy tick, no dyad
-        // — the old rod chime fed the hum. Backspace = the blip inverted
+        // THE ROCKET CONSOLE: every key is a button on a spacecraft panel —
+        // a soft rubberized THUD (the button seating) and a muted low
+        // confirmation blip settling downward. No glassy tick, no dyad: a
+        // rod chime here feeds the bed hum. Backspace = the blip inverted
         // (a gentle un-press). Jump = ENGAGE: press, a slow rising two-tone
         // confirm, and a distant engine surge from below decks. Everything
         // at a whisper — the standing law: never annoying.
@@ -3340,15 +3266,12 @@ impl Palette for BeamPalette {
     }
 
     fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, _u2: f32) -> (f32, f32) {
-        // The ship, not the hum. The old sustained root+fifth+octave chord
-        // was the single most complained-about sound in the whole engine
-        // ("agonizing", then "I hate it so much I can't take it") — a held
-        // tone is a whine no matter how soft. Replaced with the hull
-        // ambience of a rocket coasting through deep space: very low
-        // filtered air (the engines, decks away), no tonal content at all,
-        // breathing slowly. The power-down droop survives as the engine
-        // note darkening — the cutoff sinks as the energy dies, so the ship
-        // audibly winds down with the tube's visual fade.
+        // The ship, not the hum: the hull ambience of a rocket coasting
+        // through deep space — very low filtered air (the engines, decks
+        // away), NO tonal content at all, breathing slowly. A sustained
+        // chord here is a whine no matter how soft. The power-down droop
+        // darkens the engine note — the cutoff sinks as the energy dies, so
+        // the ship audibly winds down with the tube's visual fade.
         let white = {
             let mut x = s.rng;
             x ^= x << 13;
@@ -3388,13 +3311,12 @@ impl Palette for WaterPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // THE DROPLET, done the way water actually sounds (live review:
-        // "the typing sound doesn't very match… the water trail"): a soft
-        // surface TAP and then the BLOOP — the collapsing air bubble's
-        // RISING chirp (the old voice fell in pitch, which is why it read
-        // as a dry blip; real drops rise). A round attack and a low "gulp"
-        // partial keep it liquid. Backspace = the bloop reversed (falling —
-        // the drop climbing back out). The stream/ocean bed is untouched.
+        // THE DROPLET, done the way water actually sounds: a soft surface
+        // TAP and then the BLOOP — the collapsing air bubble's RISING chirp.
+        // The rise is the cue: a falling pitch reads as a dry blip, not a
+        // drop. A round attack and a low "gulp" partial keep it liquid.
+        // Backspace = the bloop reversed (falling — the drop climbing back
+        // out).
         let f = s.melody_hz(430.0, deg);
         let rev = kind == SoundKind::Backspace;
         let (a, b) = if rev {
@@ -3578,16 +3500,14 @@ impl Palette for CometPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // DEEP SPACE (live review: "I don't like the bell… space themed and
-        // eerily mysterious with a couple of excitement"): every key is a
-        // soft TRANSMISSION — a low hollow tone drifting downward a few
-        // cents (the doppler of something immense passing far away), a
-        // faintly beating twin so the pair shimmers darkly, a cold distant
-        // twelfth, and the whisper of ice dust. Nothing clicks, nothing
-        // chimes. The excitement: rare SHOOTING STARS off typed keys, and
-        // Jump = the full FLYBY — a doppler swoosh with a scatter of short
-        // crystal debris glints (a tenth of the old bell's decay — icy, not
-        // churchy). Backspace drifts UP: it recedes.
+        // DEEP SPACE: every key is a soft TRANSMISSION — a low hollow tone
+        // drifting downward a few cents (the doppler of something immense
+        // passing far away), a faintly beating twin so the pair shimmers
+        // darkly, a cold distant twelfth, and the whisper of ice dust.
+        // Nothing clicks, nothing chimes. The excitement: rare SHOOTING
+        // STARS off typed keys, and Jump = the full FLYBY — a doppler swoosh
+        // with a scatter of SHORT crystal debris glints (icy, not churchy).
+        // Backspace drifts UP: it recedes.
         let d = deg + if kind == SoundKind::Backspace { -2 } else { 0 };
         let f = s.melody_hz(220.0, d); // A3 region — the void register
         let (f0, f1v) = if kind == SoundKind::Backspace {
@@ -3625,7 +3545,7 @@ impl Palette for CometPalette {
                     ..Partial::default()
                 },
             ],
-            n_lvl: 0.025, // ice dust, kept
+            n_lvl: 0.025, // ice dust
             n_f0: 6000.0,
             n_f1: 6000.0,
             n_glide: 0.0,
@@ -3758,8 +3678,8 @@ impl Palette for CometPalette {
     fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, _u2: f32) -> (f32, f32) {
         // The void — a deep pair beating once every ~2 s (the slow dark
         // pulse of empty space) under a cold fifth that breathes with the
-        // slow LFO. Replaces the old ~1 kHz shimmer, which read as
-        // tinnitus, with something felt in the chest.
+        // slow LFO. Kept low deliberately: a ~1 kHz shimmer here reads as
+        // tinnitus.
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 110.0 * dt).fract();
         b.ph2 = (b.ph2 + 110.5 * dt).fract();
@@ -3966,12 +3886,12 @@ mod tests {
             heat: 0.5,
             hue: 0.3,
             gain: 0.4,
-            // The neutral identity tone — every pre-tone proof keeps its
-            // exact pre-tone meaning under it.
+            // The neutral identity tone: the byte-identity pins below hold
+            // only on this path.
             tone: Tone::Technical,
-            // Bed ON: every pre-`trail_sound_bed` proof (byte pins included)
-            // keeps its exact pre-gate meaning; the bed-off proofs construct
-            // their own `bed: false` events.
+            // Bed ON — the v0.56 oracle has no bed gate, so the byte pins
+            // need it fed; the bed-off proofs build their own `bed: false`
+            // events.
             bed: true,
         }
     }
@@ -3986,9 +3906,8 @@ mod tests {
             hue: 0.3,
             gain: 0.4,
             tone: Tone::Technical,
-            // Structurally irrelevant on a Words gesture (a bonk never feeds
-            // the bed) — carried as ON so the pinned bonk scripts stay
-            // byte-stable if that structure ever changes under review.
+            // Structurally irrelevant on a Words gesture: a bonk never
+            // reaches the bed feed.
             bed: true,
         }
     }
@@ -3999,6 +3918,31 @@ mod tests {
             tone,
             ..ev(style, kind)
         }
+    }
+
+    /// Octave-reduce a frequency ratio into `[1.0, 2.0)` — the consonance
+    /// proofs' shared interval normal form.
+    fn reduce(mut r: f32) -> f32 {
+        while r < 1.0 {
+            r *= 2.0;
+        }
+        while r >= 2.0 {
+            r /= 2.0;
+        }
+        r
+    }
+
+    /// The bonk's two exclusive rub zones (minor-second crush, tritone band):
+    /// shared by every consonance proof so the zone bounds cannot drift apart
+    /// between tests.
+    fn assert_outside_bonk_zones(raw: f32, ctx: &str) {
+        let r = reduce(raw);
+        let m2_zone = r > 1.0 + 1e-4 && r < 1.09;
+        let tritone_zone = r > 1.395 && r < 1.43;
+        assert!(
+            !m2_zone && !tritone_zone,
+            "{ctx}: interval {r} lands in a bonk rub zone"
+        );
     }
 
     const STYLES: [GlowStyle; 9] = [
@@ -4248,20 +4192,15 @@ mod tests {
         }
     }
 
-    /// THE BACKLOG-CROWDING REFUTATION (adversarial review). The claim under
-    /// test: the glow engine's 8-slot cue backlog can overflow under a stalled
-    /// present, and a dropped keystroke cue is a lost click — so the backlog
-    /// should be grown, or its drop policy made value-ranked.
-    ///
-    /// It is the governor, not the backlog, that decides how many clicks a
-    /// stalled frame delivers. `since_voice` advances only with RENDERED
-    /// samples, and a drain pushes the whole backlog inside one host tick with
-    /// no render between — so every cue after the first shares one audio
-    /// instant, sits inside [`MIN_GAP`], and is thinned to silence INSIDE the
-    /// synth. A 24-deep backlog is audibly identical to a 1-deep one. Growing
-    /// the cap therefore buys exactly zero clicks, and evicting a "less
-    /// valuable" older cue to make room for a newer keystroke buys zero too:
-    /// the newcomer still lands at the tail of the same batch and is thinned by
+    /// BACKLOG DEPTH CANNOT BUY A CLICK. It is the governor, not the glow
+    /// engine's cue backlog, that decides how many clicks a stalled frame
+    /// delivers: `since_voice` advances only with RENDERED samples, and a
+    /// drain pushes the whole backlog inside one host tick with no render
+    /// between — so every cue after the first shares one audio instant, sits
+    /// inside [`MIN_GAP`], and is thinned to silence INSIDE the synth. A
+    /// 24-deep backlog is audibly identical to a 1-deep one, so neither
+    /// growing the cap nor value-ranking its drop policy buys a click: a
+    /// newcomer still lands at the tail of the same batch and is thinned by
     /// whatever preceded it.
     ///
     /// (The bypass kinds — Jump/Sweep/Land/Bonk/riff — are the deliberate
@@ -4293,10 +4232,10 @@ mod tests {
         }
     }
 
-    /// THE MEASUREMENT behind the key-time click's timbre fix (adversarial
-    /// review asked for evidence that a one-keystroke heat lag is not
-    /// inaudible). `heat` rides the note level as `0.55 + 0.45·heat` and the
-    /// ember/thump layer as `0.1 + 0.28·heat`, so one missing `HEAT_GAIN` step
+    /// THE MEASUREMENT behind the key-time click's timbre prediction: is a
+    /// one-keystroke heat lag audible? `heat` rides the note level as
+    /// `0.55 + 0.45·heat` and the ember/thump layer as
+    /// `0.1 + 0.28·heat`, so one missing `HEAT_GAIN` step
     /// (0.16, the glow engine's per-keystroke charge at full cadence) is a
     /// systematic level error through the whole cold→hot ramp of every typing
     /// burst — not a one-off.
@@ -4345,9 +4284,9 @@ mod tests {
         }
     }
 
-    /// OWNER PROOF ("that ambient bed — I don't like it": beds are OFF by
-    /// default): events carrying `bed: false` — what every host event carries
-    /// under the `trail_sound_bed` default — never energise the bed layer, so
+    /// BEDS ARE OFF BY DEFAULT: events carrying `bed: false` — what every
+    /// host event carries under the `trail_sound_bed` default — never
+    /// energise the bed layer, so
     /// the bed mixer contributes exactly ZERO samples (structurally: the
     /// level floor never lifts, grains never arm — not a gain-0 render),
     /// while the discrete notes still speak at full identity; and the very
@@ -4411,30 +4350,13 @@ mod tests {
     /// degree on the ACTIVE tone lattice, so for every tone table, every
     /// (bed tone × bed tone) and (bed tone × melody-walk note) interval —
     /// octave-reduced, inversions included — stays outside the bonk's
-    /// minor-second and tritone rub zones. The zone predicate mirrors
+    /// minor-second and tritone rub zones. The zone predicate is the shared
+    /// `assert_outside_bonk_zones`, as in
     /// `tone_tables_are_mutually_consonant_and_exclude_the_bonk_clash` (that
     /// test also proves the zones non-vacuous via the bonk's own ratios).
     /// Plus the C3 voicing pin: SHIMMER truly has no low fundamental.
     #[test]
     fn bed_variant_pitches_stay_on_the_active_lattice_for_every_tone() {
-        fn reduce(mut r: f32) -> f32 {
-            while r < 1.0 {
-                r *= 2.0;
-            }
-            while r >= 2.0 {
-                r /= 2.0;
-            }
-            r
-        }
-        fn assert_outside_bonk_zones(raw: f32, ctx: &str) {
-            let r = reduce(raw);
-            let m2_zone = r > 1.0 + 1e-4 && r < 1.09;
-            let tritone_zone = r > 1.395 && r < 1.43;
-            assert!(
-                !m2_zone && !tritone_zone,
-                "{ctx}: interval {r} lands in a bonk rub zone"
-            );
-        }
         // Union of every candidate's lattice degrees (C1 chords, C2 pad,
         // C3 wash — C0/C4 have no candidate pitches).
         let mut bed_degrees: Vec<i32> = Vec::new();
@@ -4460,7 +4382,7 @@ mod tests {
                 }
             }
             // C3's thesis is structural: its lowest partial sits ≥ 4× the
-            // palette anchor — there is no low fundamental to dislike.
+            // palette anchor — there is no low fundamental at all.
             for d in SHIMMER_DEGREES {
                 assert!(
                     s.melody_hz(330.0, d) >= 330.0 * 3.9,
@@ -4506,10 +4428,7 @@ mod tests {
                 }
             }
             assert!(
-                // The absolute slack is an OUTPUT-unit allowance, so it must ride
-                // MASTER: changing the master scale scales both `flood` and
-                // `single`, but would otherwise leave this term fixed and
-                // silently tighten the bound (0.05 at the historical 0.9).
+                // The same MASTER-riding output-unit slack as `flood_is_ducked`.
                 flood <= single * 2.5 + MASTER * (0.05 / 0.9),
                 "{variant:?} flood peak {flood} vs single {single} — governor failed"
             );
@@ -4758,8 +4677,8 @@ mod tests {
     fn bonk_is_discordant_against_the_walk_and_moves_nothing() {
         let mut s = TrailSynth::new(48_000.0, 33);
         let walk_before = s.walk;
-        // Nyan anchor, current degree (G4 since the mellowing pass dropped
-        // the chip register a fourth — the anchor tracks the melody).
+        // Nyan's bonk anchor (G4) at the current degree — the anchor tracks
+        // the palette's own melodic register.
         let root = penta(392.0, walk_before);
         s.push(bonk(GlowStyle::Nyan));
         assert_eq!(s.walk, walk_before, "a bonk must not step the melody walk");
@@ -5013,10 +4932,6 @@ mod tests {
         );
     }
 
-    /// The riff's phrase tables stay on the consonant major-pentatonic
-    /// lattice (degrees, not raw ratios) — so the sing-along can never rub
-    /// against the typed melody under it, and the bonk keeps its exclusive
-    /// claim to "wrong".
     /// A bass note rides the lead voice that OPENS its beat, so it needs a
     /// carrier: no `REST` lead slot may sit under a sounding bass beat, or the
     /// low end silently vanishes for that beat.
@@ -5042,8 +4957,11 @@ mod tests {
     fn celebration_form_is_wrap_safe() {
         assert!(CELEBRATION_PHRASE_BARS.is_power_of_two());
         assert_eq!((usize::from(u16::MAX) + 1) % CELEBRATION_PHRASE_BARS, 0);
-        // And the swung last eighth still starts inside its own bar.
-        assert!((7.0 + CELEBRATION_SWING) * CELEBRATION_EIGHTH < CELEBRATION_BAR_SECONDS);
+        // And the swung last eighth still starts inside its own bar — every
+        // operand is a constant, so this is a build failure, not a test failure.
+        const {
+            assert!((7.0 + CELEBRATION_SWING) * CELEBRATION_EIGHTH < CELEBRATION_BAR_SECONDS);
+        }
     }
 
     /// POLYPHONY BUDGET: a whole bar is spawned at once as pre-delayed voices,
@@ -5077,6 +4995,10 @@ mod tests {
         }
     }
 
+    /// The riff's phrase tables stay on the consonant major-pentatonic
+    /// lattice (degrees, not raw ratios), so the sing-along can never rub
+    /// against the typed melody under it and the bonk keeps its exclusive
+    /// claim to "wrong".
     #[test]
     fn celebration_phrases_live_on_the_pentatonic_lattice() {
         for deg in CELEBRATION_PHRASE.iter().flatten().filter(|d| **d != REST) {
@@ -5085,7 +5007,6 @@ mod tests {
                 "riff degree {deg} outside the two-octave singable range"
             );
         }
-        // Two DIFFERENT authored bars — a loop, not a stuck record.
         for deg in &CELEBRATION_FILL {
             assert!((0..=9).contains(deg), "fill degree {deg} out of range");
         }
@@ -5095,14 +5016,12 @@ mod tests {
                 "bass degree {deg} outside the bass register"
             );
         }
-        // EIGHT DIFFERENT bars, pairwise — a song, not a stuck record. This
-        // supersedes the old `assert_ne!(CELEBRATION_BAR_A, CELEBRATION_BAR_B)`.
-        for a in 0..CELEBRATION_PHRASE_BARS {
-            for b in (a + 1)..CELEBRATION_PHRASE_BARS {
-                assert_ne!(
-                    CELEBRATION_PHRASE[a], CELEBRATION_PHRASE[b],
-                    "bars {a} and {b} are the same bar"
-                );
+        // EIGHT DIFFERENT bars, pairwise — a song, not a stuck record.
+        for (a, bar_a) in CELEBRATION_PHRASE.iter().enumerate() {
+            // `skip(a + 1)` keeps the upper triangle: each unordered pair is
+            // compared once, and `b` still names the bar's own index.
+            for (b, bar_b) in CELEBRATION_PHRASE.iter().enumerate().skip(a + 1) {
+                assert_ne!(bar_a, bar_b, "bars {a} and {b} are the same bar");
             }
         }
     }
@@ -5180,24 +5099,6 @@ mod tests {
     /// every mood.
     #[test]
     fn tone_tables_are_mutually_consonant_and_exclude_the_bonk_clash() {
-        fn reduce(mut r: f32) -> f32 {
-            while r < 1.0 {
-                r *= 2.0;
-            }
-            while r >= 2.0 {
-                r /= 2.0;
-            }
-            r
-        }
-        fn assert_outside_bonk_zones(raw: f32, ctx: &str) {
-            let r = reduce(raw);
-            let m2_zone = r > 1.0 + 1e-4 && r < 1.09;
-            let tritone_zone = r > 1.395 && r < 1.43;
-            assert!(
-                !m2_zone && !tritone_zone,
-                "{ctx}: interval {r} lands in a bonk rub zone"
-            );
-        }
         for tone in Tone::ALL {
             let (table, transpose) = tone_tables(tone);
             assert!(
@@ -5453,9 +5354,8 @@ mod tests {
     /// A PHRASE RESOLVES: Enter (a Jump), like a comma-length typing pause,
     /// CADENCES the melody onto the tonic — degree 0 or its octave 5, the
     /// pentatonic root pitch class. This is what makes phrases LAND instead of
-    /// drifting off the top of the register forever (the owner's "aimless"
-    /// complaint). The walk wanders during the phrase, then the Enter snaps it
-    /// home.
+    /// drifting off the top of the register forever: the walk wanders during
+    /// the phrase, then the Enter snaps it home.
     #[test]
     fn a_phrase_resolves_toward_the_tonic_on_enter() {
         let mut s = TrailSynth::new(48_000.0, 0xCADE_5EED);
@@ -5489,9 +5389,9 @@ mod tests {
     }
 
     /// A GLIDE plays exactly ONE in-key tone, a scale-step in the travel
-    /// direction of the melody's current degree, and is SOFTER than the
-    /// keystroke it accompanies. It does NOT step the phrase (the cursor sings
-    /// the tune, it doesn't compose it).
+    /// direction of the melody's current degree, and sits ON the typing floor
+    /// beside the keystroke it accompanies. It does NOT step the phrase (the
+    /// cursor sings the tune, it doesn't compose it).
     #[test]
     fn glide_plays_one_soft_in_key_tone() {
         let mut s = TrailSynth::new(48_000.0, 0x6117);
@@ -5516,20 +5416,13 @@ mod tests {
             "glide pitch {f} must be the in-key step {expect}"
         );
 
-        // LADDER TIER 1 (2026-07-24). This assertion used to read "a glide must
-        // be SOFTER than a keystroke". That contract was retired deliberately,
-        // on the owner's direction: "common typing should be the most soft (but
-        // not too soft) and whatever other effects need to be heard." Measured,
-        // the old rule had put a glide 11 dB under a keystroke — a cursor move
-        // you could SEE moved a live 6 cps typing mix by 0.2 dB, i.e. it was
-        // inaudible. Typing is the FLOOR now, and a glide sits on that floor
-        // WITH it (both are per-character gestures), not beneath it.
-        //
-        // What is still pinned is that it never becomes a jump scare: within
-        // one tier of a keystroke, in BOTH directions. The band is wide on the
-        // upper side because a glide is style-agnostic (designed before palette
-        // dispatch) while a keystroke carries `palette_trim`, so their exact
-        // ratio legitimately varies by style — here Lumen trims to 0.95.
+        // LADDER TIER 1: typing is the FLOOR, and a glide — also a
+        // per-character gesture — sits ON that floor with it, not beneath it.
+        // What is pinned is that it never becomes a jump scare either way:
+        // within one tier of a keystroke, in BOTH directions. The band is wide
+        // on the upper side because a glide is style-agnostic (designed before
+        // palette dispatch) while a keystroke carries `palette_trim`, so their
+        // exact ratio legitimately varies by style — here Lumen trims to 0.95.
         let mut typed = TrailSynth::new(48_000.0, 0x6117);
         typed.push(ev(GlowStyle::Lumen, SoundKind::Typed));
         let (g_e, t_e) = (voice_energy(&s), voice_energy(&typed));
@@ -5615,12 +5508,11 @@ mod tests {
             since_voice: f32,
             since_event: f32,
             walk: i32,
-            // Re-frozen with the melodic re-baseline: the phrase-generator
-            // state, kept in lock-step with `TrailSynth`'s so the byte pins
-            // cross-check the whole render path around a SHARED generator (the
-            // oracle's value is catching drift in voice/bed/render arithmetic
-            // and rng ordering; the generator itself is duplicated here on
-            // purpose so any divergence in it also trips the pin).
+            // The phrase-generator state, kept in lock-step with
+            // `TrailSynth`'s: duplicated here on purpose, so a divergence in
+            // the generator itself also trips the pin (the oracle's other
+            // value is catching drift in voice/bed/render arithmetic and rng
+            // ordering).
             motif: [i8; 4],
             phrase_pos: u8,
             phrase_len: u8,
@@ -5712,8 +5604,8 @@ mod tests {
                     return;
                 }
                 self.since_voice = 0.0;
-                // The RE-BASELINED phrase-aware melody, Technical path — kept
-                // verbatim in step with `TrailSynth::advance_melody` (this
+                // The phrase-aware melody, Technical path — kept verbatim in
+                // step with `TrailSynth::advance_melody` (this
                 // oracle only ever renders the neutral tone, so the register is
                 // (0,7), the motif span 1, and the lean 0). The pins push only
                 // Typed/Backspace/Navigation/Kill/Jump, so the cursor gestures
@@ -5816,7 +5708,7 @@ mod tests {
                     SoundKind::Land => LAND_KIND_GAIN,
                 };
                 let g = g * kg;
-                // Re-baselined with the melody: ±1 column nudge (was ±2).
+                // ±1 column nudge, as in production.
                 let col_off = (pan).round() as i32;
                 let deg = self.walk + col_off;
 
@@ -5852,16 +5744,8 @@ mod tests {
                 let g = g * palette_trim(SoundVoice::Style, style);
 
                 match style {
-                    // LUMEN — lamplight: the default voice, but no longer a bare
-                    // pluck. Each key BLOOMS — a warm mid tone easing gently UP onto
-                    // its note (light coming on, the inverse of comet's fall), a
-                    // softly beating twin for width, a sub-octave glow underneath,
-                    // and a breath of air where comet keeps ice dust. Fuller and
-                    // rounder than the old two-partial tick, still unobtrusive: a
-                    // good keyboard should sound like this feels. Backspace dims
-                    // (the bloom drifts back down). Trail Packs (Custom) are
-                    // DATA-driven looks with no sound palette of their own, so they
-                    // ride the default bloom.
+                    // LUMEN/CUSTOM — the design intent lives on
+                    // `LumenPalette::design`; this arm is its frozen twin.
                     GlowStyle::Lumen | GlowStyle::Custom => {
                         let f = penta(
                             330.0,
@@ -5944,21 +5828,14 @@ mod tests {
                         }
                     }
 
-                    // PHASER — the playful emitter: a rounded "boop" that SETTLES
-                    // onto a pentatonic note whose degree follows the LIVE HUE, so
-                    // the band's colour and pitch still travel together — but the
-                    // note now leads with its warm fundamental (no 2.2× dive-bomb,
-                    // no 3× shimmer image; those were the shrillness). Under it, a
-                    // tiny low THOCK gives each key a tactile, satisfying landing.
-                    // Backspace turns the boop upward — a small questioning "hm?"
-                    // as the phaser un-fires. Jump = a miniature two-note "ba-deep!"
+                    // PHASER — see `PhaserPalette::design`.
                     GlowStyle::Phaser => {
                         let hue_deg = (hue * 5.0) as i32;
                         let d =
                             hue_deg + col_off + if kind == SoundKind::Backspace { -2 } else { 0 };
                         let f = penta(392.0, d);
                         // The rounded settle: start a whisker sharp and relax onto
-                        // the note — a "byoop", not a laser. Backspace inverts it.
+                        // the note. Backspace inverts it.
                         let (f0, f1v) = if kind == SoundKind::Backspace {
                             (f, f * 1.12)
                         } else {
@@ -6041,13 +5918,7 @@ mod tests {
                         }
                     }
 
-                    // NYAN — the chiptune ribbon, mellowed: rounded "doop"s walking
-                    // the pentatonic — still a sound chip, but one with a felt mute.
-                    // A 50 % square (hollow, odd-harmonic) replaces the buzzy 25 %
-                    // pulse, a sub-octave sine warms the body, the attack is eased so
-                    // the blip doesn't click, and each note lingers a touch longer
-                    // than the old machine-gun "doo". Register sits at G4, a fourth
-                    // below the old C5 ping. Jump = the same major-arpeggio power-up.
+                    // NYAN — see `NyanPalette::design`.
                     GlowStyle::Nyan => {
                         let base = 392.0; // G4 — the mellow chip register
                         let d = deg + if kind == SoundKind::Backspace { -3 } else { 0 };
@@ -6086,12 +5957,7 @@ mod tests {
                         }
                     }
 
-                    // SPARKLE — glitter, grown up: still a scatter of two or three
-                    // shimmering grains per key, but each grain is now a round DONG
-                    // — C5 register (two octaves under the old G6 dings), a soft
-                    // 3 ms attack instead of a click, a warm sub-octave body, a
-                    // gentle glassy halo, and the twinkle kept. The scatter and the
-                    // stereo toss stay; only the voice traded ding for dong.
+                    // SPARKLE — see `SparklePalette::design`.
                     GlowStyle::Sparkle => {
                         let n = if kind == SoundKind::Jump { 3 } else { 2 };
                         for i in 0..n {
@@ -6120,7 +5986,7 @@ mod tests {
                                         f1: f * 0.5,
                                         ..Partial::default()
                                     },
-                                    // A gentle halo where the old ding lived — quiet.
+                                    // A gentle glassy halo — quiet.
                                     Partial {
                                         lvl: 0.08,
                                         f0: f * 2.01,
@@ -6138,13 +6004,7 @@ mod tests {
                         }
                     }
 
-                    // FIRE — the hearth: every key is a genuine crackle SNAP — an
-                    // impulsive few-millisecond high-Q noise ring, the sound of a wood
-                    // fibre parting — over a woody ember knock that grows with heat.
-                    // Impulsiveness (not softness) is what separates fire from water:
-                    // a long soft noise burst reads as a plop, a 10 ms snap reads as
-                    // burning. Jump = the flame LEAPING: a dark low whoomph (no high
-                    // splash — that would be a wave) plus a scatter of spark snaps.
+                    // FIRE — see `FirePalette::design`.
                     GlowStyle::Fire => {
                         if kind == SoundKind::Jump {
                             // The whoomph: air rushing into the flare, all low-mid.
@@ -6247,14 +6107,7 @@ mod tests {
                         }
                     }
 
-                    // LASER — the LIGHTNING STRIKE: every key is a real ZAP — the
-                    // fast two-octave dive kept, but with a brief electric SIZZLE
-                    // (fast-decaying FM buzz) on the tone and a bright high-Q CRACK
-                    // of air snapping over it. Backspace = the zap reversed (rising),
-                    // crackless and softer. Jump = the FULL STRIKE: crack, zap, a
-                    // round sub-thump as the bolt lands, then the THUNDER — a long
-                    // low roll that sweeps down and echoes once. Still the archetype
-                    // kept soft; thunder rumbles, it never booms.
+                    // LASER — see `LaserPalette::design`.
                     GlowStyle::Laser => {
                         let f_hi = penta(880.0, deg.min(5));
                         let f_lo = f_hi * 0.25;
@@ -6372,16 +6225,7 @@ mod tests {
                         }
                     }
 
-                    // BEAM — the ROCKET CONSOLE: every key is a button pressed on a
-                    // spacecraft panel somewhere in deep space — a soft rubberized
-                    // THUD (tiny dark noise tap: the button seating) and a muted low
-                    // confirmation blip that settles downward (acknowledged, says the
-                    // ship). No glassy tick, no dyad — the old rod chime fed the hum
-                    // the user couldn't take. Backspace = the blip inverted (a
-                    // gentle deny/un-press). Jump = ENGAGE: press, a slow rising
-                    // two-tone confirm, and a distant engine surge answering from
-                    // below decks. Everything soft — the whole console lives at a
-                    // whisper (the standing law: never annoying).
+                    // BEAM — see `BeamPalette::design`.
                     GlowStyle::Beam => {
                         let f = penta(330.0, (deg / 2) * 2); // even degrees: stabler line
                         // The button seating: felt more than heard.
@@ -6471,14 +6315,7 @@ mod tests {
                         }
                     }
 
-                    // WATER — the droplet, done the way water actually sounds: a
-                    // soft surface TAP and then the BLOOP — the collapsing air
-                    // bubble's RISING chirp (the old voice fell in pitch, which is
-                    // why it read as a dry blip, not a drop; real drops rise). A
-                    // round attack and a low "gulp" partial keep it liquid.
-                    // Backspace = the bloop reversed (falling — the drop climbing
-                    // back out). Jump = a small splash: noise + three scattered
-                    // late bloops. The stream/ocean bed is untouched.
+                    // WATER — see `WaterPalette::design`.
                     GlowStyle::Water => {
                         let f = penta(430.0, deg);
                         let rev = kind == SoundKind::Backspace;
@@ -6597,16 +6434,7 @@ mod tests {
                         }
                     }
 
-                    // COMET — deep space. Not a bell any more: every key is a soft
-                    // TRANSMISSION — a low hollow tone drifting downward a few cents
-                    // (the doppler of something immense passing far away), a faintly
-                    // beating twin under it so the pair shimmers darkly, a cold
-                    // distant fifth, and the old whisper of ice dust. Eerie lives in
-                    // the soft attack + detune-beat + drift; nothing clicks, nothing
-                    // chimes. The excitement: once in a while a key throws a tiny
-                    // SHOOTING STAR (a quick quiet streak falling out of the dark),
-                    // and Jump is the full FLYBY — a doppler swoosh with a scatter of
-                    // crystal debris glints. Backspace drifts UP: it recedes.
+                    // COMET — see `CometPalette::design`.
                     GlowStyle::Comet => {
                         let d = deg + if kind == SoundKind::Backspace { -2 } else { 0 };
                         let f = penta(220.0, d); // A3 region — the void register
@@ -6645,7 +6473,7 @@ mod tests {
                                     ..Partial::default()
                                 },
                             ],
-                            n_lvl: 0.025, // ice dust, kept
+                            n_lvl: 0.025, // ice dust
                             n_f0: 6000.0,
                             n_f1: 6000.0,
                             n_glide: 0.0,
@@ -6712,7 +6540,7 @@ mod tests {
                             };
                             self.spawn(swoosh, g * 0.4, pan);
                             // Debris glints: three SHORT crystal ticks scattered in
-                            // the wake — icy, not churchy (tenth of the old decay).
+                            // the wake — icy, not churchy.
                             for i in 0..3 {
                                 let fg = penta(1046.5, (self.rnd() * 5.0) as i32);
                                 let delay = 0.08 + i as f32 * 0.07 + self.rnd_in(0.0, 0.03);
@@ -6908,8 +6736,8 @@ mod tests {
                         match style {
                             GlowStyle::Sparkle => {
                                 // Residual glitter: soft dongs drifting after the
-                                // hands stop — same register as the key grains, so
-                                // the afterglow never turns back into dings.
+                                // hands stop, in the same register as the key
+                                // grains.
                                 let f = penta(523.25, (self.rnd() * 8.0) as i32);
                                 let v = Voice {
                                     dur: 0.45,
@@ -7106,15 +6934,7 @@ mod tests {
                 let u2 = 0.5 * (1.0 + sin01(b.lfo2));
 
                 let (m, side) = match self.bed_style {
-                    // BEAM: the ship, not the hum. The old sustained root+fifth+octave
-                    // chord was the single most complained-about sound in the whole
-                    // engine ("agonizing", then "I hate it so much I can't take it")
-                    // — a held tone is a whine no matter how soft. Replaced with the
-                    // hull ambience of a rocket coasting through deep space: very low
-                    // filtered air (the engines, decks away), no tonal content at
-                    // all, breathing slowly. The power-down droop survives as the
-                    // engine note darkening — the cutoff sinks as the energy dies, so
-                    // the ship audibly winds down with the tube's visual fade.
+                    // BEAM — see `BeamPalette::bed_sample`.
                     GlowStyle::Beam => {
                         let white = {
                             let mut x = self.rng;
@@ -7150,12 +6970,7 @@ mod tests {
                         let und = 0.55 + 0.3 * u1 + 0.15 * u2;
                         (b.lp2 * lvl * 0.5 * und, b.lp1 * lvl * 0.06)
                     }
-                    // FIRE: the roar under the crackle — dark filtered noise whose
-                    // loudness FLICKERS fast and irregularly, like flame light. The
-                    // flicker (a ~9 Hz random flutter) is the one cue that separates
-                    // fire-body from wind or surf: waves swell smoothly and slowly,
-                    // flames gutter. (The old slow-LFO undulation here is exactly why
-                    // this bed used to read as waves.)
+                    // FIRE — see `FirePalette::bed_sample`.
                     GlowStyle::Fire => {
                         let white = {
                             let mut x = self.rng;
@@ -7175,10 +6990,7 @@ mod tests {
                         let flick = (1.0 + 26.0 * b.lp2).clamp(0.35, 1.8);
                         (b.lp1 * lvl * 0.4 * flick, 0.0)
                     }
-                    // COMET: the void — a deep pair beating once every ~2 s (the
-                    // slow dark pulse of empty space) under a cold fifth that
-                    // breathes with the slow LFO. Replaces the old ~1 kHz shimmer,
-                    // which read as tinnitus, with something felt in the chest.
+                    // COMET — see `CometPalette::bed_sample`.
                     GlowStyle::Comet => {
                         b.ph1 = (b.ph1 + 110.0 * dt).fract();
                         b.ph2 = (b.ph2 + 110.5 * dt).fract();
@@ -7210,9 +7022,7 @@ mod tests {
                         b.lp1 += k * (s - b.lp1);
                         (b.lp1 * lvl * 0.022, 0.0)
                     }
-                    // SPARKLE: no longer grains alone — a barely-there warm pad
-                    // breathes underneath them (C4 pair, slow-swelling soft octave),
-                    // so the background is a glow, not a void, and never a whine.
+                    // SPARKLE — see `SparklePalette::bed_sample`.
                     GlowStyle::Sparkle => {
                         b.ph1 = (b.ph1 + 261.6 * dt).fract();
                         b.ph2 = (b.ph2 + 262.4 * dt).fract();
@@ -7220,11 +7030,7 @@ mod tests {
                         let s = sin01(b.ph1) + sin01(b.ph2) + (0.08 + 0.15 * u2) * sin01(b.ph3);
                         (s * lvl * 0.022, s * lvl * 0.006)
                     }
-                    // LASER gets a barely-there airy pad an octave under its voice.
-                    // LASER: the storm on the horizon — deep filtered rumble whose
-                    // level swells and sags slowly and UNEVENLY (a ~1.3 Hz random
-                    // wander, not a metronome LFO): weather, not machinery. Replaces
-                    // the old anonymous airy pad.
+                    // LASER — see `LaserPalette::bed_sample`.
                     GlowStyle::Laser => {
                         let white = {
                             let mut x = self.rng;
@@ -7241,9 +7047,7 @@ mod tests {
                         let swell = (1.0 + 40.0 * b.lp2).clamp(0.25, 2.2);
                         (b.lp1 * lvl * 0.5 * swell, 0.0)
                     }
-                    // LUMEN/CUSTOM: the lamp left on — the same detuned pair, plus a
-                    // soft third a tenth above that breathes with the slow LFO, so
-                    // the afterglow gently swells and dims instead of holding flat.
+                    // LUMEN/CUSTOM — see `LumenPalette::bed_sample`.
                     GlowStyle::Lumen | GlowStyle::Custom => {
                         b.ph1 = (b.ph1 + 165.0 * dt).fract();
                         b.ph2 = (b.ph2 + 165.6 * dt).fract();

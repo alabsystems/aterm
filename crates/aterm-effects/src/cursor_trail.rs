@@ -571,6 +571,11 @@ pub fn ignition_intensity(heat: f32, knee_lo: f32, knee_hi: f32) -> f32 {
 /// and [`Self::intensity`] both take an injected `now`, so a host feeds it real
 /// `Instant`s while tests feed synthetic ones. Cheap (`f32` + one `Instant`); the
 /// host keeps one per window and reads [`Self::intensity`] each frame.
+///
+/// scope-waiver: heat is an AESTHETIC intensity, not a safety budget — a
+/// second tracker costs a second lazily-decayed `f32` and a differently-lit
+/// comet, never a bound anyone can exceed. (The ignition limiter that IS a
+/// budget lives in `word_decorations`, under the `flash-limiter` scope claim.)
 #[derive(Clone, Debug)]
 pub struct TypingCadence {
     params: CadenceParams,

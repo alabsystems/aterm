@@ -33,7 +33,7 @@ pub fn run(layout: &Layout) -> bool {
         layout,
         home.as_deref(),
         path.as_deref(),
-        now_unix(),
+        crate::flow::now_unix(),
         cfg_account.as_deref(),
         token_source.as_deref(),
     )
@@ -82,6 +82,13 @@ pub fn run_with(
             "doctor: ok — no GitHub token provisioned (anonymous API: fine for public \
              repos, rate-limited; private fetch overrides need one)"
         ),
+    }
+    // Bundled seed (§9.1): whether this executable ships a sealed offline
+    // registry. Presence is an offer, not trust — its bytes still pass the
+    // identical signed gates, so absence is informational, never a failure.
+    match crate::bundled_seed_dir() {
+        Some(dir) => println!("doctor: ok — bundled seed at {}", dir.display()),
+        None => println!("doctor: ok — no bundled seed (network registry only)"),
     }
 
     // (2) PREFIX / STORE.
@@ -324,14 +331,6 @@ fn native_hook_ext() -> &'static str {
 #[cfg(not(windows))]
 fn native_hook_ext() -> &'static str {
     "zsh"
-}
-
-/// Current Unix epoch second (for the age math); 0 if the clock is before the epoch.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

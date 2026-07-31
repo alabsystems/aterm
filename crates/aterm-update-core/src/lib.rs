@@ -11,7 +11,9 @@
 //! GitHub Releases API ([`api_get`], [`download_bytes`], [`download_to`] — anonymous
 //! when no token is provisioned, so a PUBLIC channel needs no credential); the
 //! per-machine [`token`] resolution chain; private-dir hardening
-//! ([`ensure_private_dir`]); a `shasum`-backed [`sha256_file`]; and a generic
+//! ([`ensure_private_dir`]); a `shasum`-backed [`sha256_file`]; the release-tag
+//! grammar ([`tag`]) the publisher and the updater client BOTH classify with, so
+//! they cannot disagree about which releases are candidates; and a generic
 //! compile-time-pin idiom ([`compile_time_pin!`] + [`pin_active`]).
 //!
 //! `aterm-update` layers the macOS-only pieces (DMG mount/extract, codesign/spctl
@@ -26,6 +28,7 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 pub mod manifest;
+pub mod tag;
 pub mod token;
 
 mod hash;

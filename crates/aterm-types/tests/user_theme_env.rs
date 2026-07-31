@@ -47,24 +47,21 @@ fn load_reads_user_theme_file_then_not_found() {
         .expect("size huge theme");
     drop(oversized);
 
-    // SAFETY: single `#[test]` in its own integration-test binary — no other
-    // thread exists in this process to read the environment concurrently. We
-    // still save and restore the var so the process exits with a clean env.
-    let prev = std::env::var_os("XDG_CONFIG_HOME");
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", &tmp);
-    }
-    let loaded = load("Custom");
-    let missing = load("DoesNotExist_xyz");
-    let huge = load("Huge");
-    let traversal = load("../../outside");
-    // Restore before asserting so a failure can't leak the override.
-    unsafe {
-        match prev {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-    }
+    // Single `#[test]` in its own integration-test binary — no other thread exists
+    // in this process to read the environment concurrently — and routed through the
+    // workspace's one lock-scoped env helper regardless. `scoped` restores the
+    // previous value (including "was unset") on the way out, on a panic as well as
+    // a return, so a failing assertion can never leak the override; note the loads
+    // happen INSIDE the scope and the asserts after it, exactly as before.
+    let (loaded, missing, huge, traversal) =
+        aterm_log::env::scoped("XDG_CONFIG_HOME", &tmp, || {
+            (
+                load("Custom"),
+                load("DoesNotExist_xyz"),
+                load("Huge"),
+                load("../../outside"),
+            )
+        });
     let _ = std::fs::remove_dir_all(&tmp);
 
     let s = loaded.expect("user theme loads");

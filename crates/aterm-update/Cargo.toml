@@ -26,6 +26,9 @@ serde_json = { workspace = true }
 # renamex_np(RENAME_SWAP) for the atomic bundle swap (the .app-only syscall that
 # stays here). Already a workspace dependency (used by the control socket).
 libc = { workspace = true }
+# The shared RFC3339 / Howard-Hinnant civil-calendar math (`aterm_types::rfc3339`);
+# already in the dependency graph via aterm-update-core.
+aterm-types = { workspace = true }
 # The artifact-agnostic, portable update primitives (Source resolution, FileLock +
 # same_volume, curl/token plumbing, ensure_private_dir, sha256_file, the pin idiom).
 aterm-update-core = { workspace = true }

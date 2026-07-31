@@ -2218,7 +2218,7 @@ fn paint_window_tabs(
 /// Canonical construction helper for Settings workbenches. The returned node is
 /// a single semantic object with stable bounds regardless of visual settings.
 pub(crate) fn preview_node(
-    key: impl Into<String>,
+    key: impl Into<std::sync::Arc<str>>,
     spec: SettingsPreviewSpec,
     height: f32,
 ) -> UiNode {

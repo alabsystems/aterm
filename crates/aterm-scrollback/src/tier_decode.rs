@@ -3,7 +3,9 @@
 // Author: Andrew Yates
 
 use super::WarmBlock;
-use crate::line::{Line, deserialize_page_lines, serialize_lines};
+use crate::line::{
+    Line, MAX_DECODE_PAGE_LINES, count_page_lines, deserialize_page_lines, serialize_lines,
+};
 use crate::{ScrollbackError, decompress_lz4_bounded};
 
 impl WarmBlock {
@@ -112,13 +114,40 @@ impl WarmBlock {
     fn try_decompress_serialized(&self) -> Result<Vec<u8>, ScrollbackError> {
         let decompressed = decompress_lz4_bounded(&self.compressed)?;
         let stored_line_count = Self::stored_line_count(&decompressed)?;
-        let lines = self.logical_suffix(&decompressed, stored_line_count)?;
         if stored_line_count == self.line_count {
-            // No trim occurred ⇒ `decompressed` == serialize_lines(lines) (it is what
-            // `logical_suffix` just deserialized), so skip the re-serialize.
-            Ok(decompressed)
-        } else {
-            Ok(serialize_lines(&lines))
+            // No trim ⇒ `decompressed` ALREADY is the serialization of this
+            // block's logical lines, so the only thing wanted from them is the
+            // framing VALIDATION `logical_suffix` performs — never the
+            // `Vec<Line>` it materialized to get there and this arm then
+            // dropped. Counting complete records instead removes one full
+            // `Line` construct+destruct (heap content copy, boxed attrs `Rle`,
+            // boxed hyperlink `SmallVec`) per line, and at the default tier
+            // limits an eviction fires once per 100 pushed lines, so that
+            // amortized to a wasted malloc/free chain for EVERY line aging out
+            // of the warm tier — on the output thread.
+            //
+            // Byte-identical outcome: `count_page_lines` runs the SAME framing
+            // walk with the SAME acceptance predicate (`walk_records` +
+            // `Line::record_is_valid`, pinned to `Line::deserialize` by a
+            // debug_assert in the decoder), under the same page cap; the
+            // `stored_line_count < self.line_count` rejection is unreachable on
+            // this branch; and the error text and the `decompress_failures`
+            // reset are reproduced exactly.
+            let counted = count_page_lines(&decompressed, MAX_DECODE_PAGE_LINES);
+            if counted != stored_line_count {
+                return Err(ScrollbackError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "warm block serialized {} lines but decoded {} complete lines",
+                        stored_line_count, counted
+                    ),
+                )));
+            }
+            self.decompress_failures.set(0);
+            return Ok(decompressed);
         }
+        // Trimmed suffix: this is the one arm that genuinely consumes the lines.
+        let lines = self.logical_suffix(&decompressed, stored_line_count)?;
+        Ok(serialize_lines(&lines))
     }
 }

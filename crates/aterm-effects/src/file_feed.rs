@@ -14,6 +14,79 @@
 use std::io::{self, Read as _};
 use std::path::Path;
 
+#[cfg(feature = "test-open-probe")]
+#[derive(Clone)]
+struct OpenProbeState {
+    path: std::path::PathBuf,
+    attempts: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+#[cfg(feature = "test-open-probe")]
+thread_local! {
+    static OPEN_PROBE: std::cell::RefCell<Option<OpenProbeState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only RAII observation of actual open attempts for one exact absolute
+/// path. Thread-local scope prevents parallel test cases from contaminating
+/// one another; `Rc` deliberately keeps the guard on its installing thread.
+#[cfg(feature = "test-open-probe")]
+#[doc(hidden)]
+pub struct OpenProbeGuard {
+    previous: Option<OpenProbeState>,
+    attempts: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+#[cfg(feature = "test-open-probe")]
+impl OpenProbeGuard {
+    #[must_use]
+    pub fn attempts(&self) -> usize {
+        self.attempts.get()
+    }
+}
+
+#[cfg(feature = "test-open-probe")]
+impl Drop for OpenProbeGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        OPEN_PROBE.with(|probe| {
+            *probe.borrow_mut() = previous;
+        });
+    }
+}
+
+/// Install a test-only counter at the platform `open` seam for `path`.
+#[cfg(feature = "test-open-probe")]
+#[doc(hidden)]
+#[must_use]
+pub fn probe_open_attempts(path: &Path) -> OpenProbeGuard {
+    assert!(
+        path.is_absolute(),
+        "visual-feed open probes require an exact absolute path"
+    );
+    let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+    let state = OpenProbeState {
+        path: path.to_owned(),
+        attempts: std::rc::Rc::clone(&attempts),
+    };
+    let previous = OPEN_PROBE.with(|probe| probe.borrow_mut().replace(state));
+    OpenProbeGuard { previous, attempts }
+}
+
+#[inline]
+fn note_open_attempt(path: &Path) {
+    #[cfg(not(feature = "test-open-probe"))]
+    let _ = path;
+    #[cfg(feature = "test-open-probe")]
+    OPEN_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_ref()
+            && probe.path == path
+        {
+            probe.attempts.set(probe.attempts.get().saturating_add(1));
+        }
+    });
+}
+
 /// Maximum accepted size of a user-supplied Sparkle Words lexicon override.
 ///
 /// The override is parsed and merged on config admission, so matching the
@@ -51,6 +124,7 @@ fn not_regular() -> io::Error {
 fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
+    note_open_attempt(path);
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
@@ -70,6 +144,7 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
+    note_open_attempt(path);
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -90,6 +165,7 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
         return Err(not_regular());
     }
+    note_open_attempt(path);
     let file = std::fs::File::open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(not_regular());
@@ -152,6 +228,17 @@ fn fingerprint_fold(mut hash: u64, bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// Fingerprint UTF-8 contents that were already admitted through
+/// [`read_bounded_regular_utf8`]. This is the in-memory twin of
+/// [`fingerprint_bounded_regular_utf8`]: hosts can parse and identify the exact
+/// same-handle bytes without reopening a pathname and introducing an ABA race.
+#[must_use]
+pub fn fingerprint_admitted_utf8(contents: &str) -> u64 {
+    let hash = fingerprint_fold(FNV_OFFSET, contents.as_bytes());
+    let hash = fingerprint_fold(hash, &[0xff]);
+    fingerprint_fold(hash, &(contents.len() as u64).to_le_bytes())
 }
 
 fn invalid_utf8() -> io::Error {
@@ -241,11 +328,14 @@ mod tests {
         let root = fixture_dir("regular");
         let path = root.join("feed.toml");
         std::fs::write(&path, "snowcat 😺\n").expect("write regular feed");
-        assert_eq!(
-            read_bounded_regular_utf8(&path, 64).expect("regular feed reads"),
-            "snowcat 😺\n"
-        );
+        let admitted = read_bounded_regular_utf8(&path, 64).expect("regular feed reads");
+        assert_eq!(admitted, "snowcat 😺\n");
         let before = fingerprint_bounded_regular_utf8(&path, 64).expect("fingerprint feed");
+        assert_eq!(
+            before,
+            fingerprint_admitted_utf8(&admitted),
+            "same-handle admitted bytes and streaming path fingerprint agree"
+        );
         assert_eq!(
             before,
             fingerprint_bounded_regular_utf8(&path, 64).expect("fingerprint is stable")

@@ -11,6 +11,11 @@
 
 /// Format a byte count as a short human string (`B`/`KiB`/`MiB`/`GiB`) for the cost surface.
 ///
+/// MIRRORED (deliberately, not depended on) by `aterm-release::bundle::human_bytes`,
+/// which renders the sealed toolchain seed's size in the cut transcript: the
+/// release cutter must build without the package manager, so the tiers and the
+/// one-decimal rendering are duplicated there. Change both or neither.
+///
 /// Byte-identical to the previous `format!("{:.1} GiB", n as f64 / GIB as f64)`
 /// spelling for every `n` (see [`one_decimal`]) — rewritten `format!`-free because the
 /// `format!` expansion embeds `fmt::Arguments` construction (with inlined `unsafe`)

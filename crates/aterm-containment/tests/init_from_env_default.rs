@@ -11,10 +11,9 @@ use aterm_containment::ContainmentMode;
 
 #[test]
 fn init_from_env_uses_default_when_var_unset() {
-    // Ensure env var is NOT set.
-    unsafe {
-        std::env::remove_var("ATERM_CONTAINMENT_MODE");
-    }
+    // Ensure env var is NOT set. Routed through the workspace's one lock-scoped
+    // env helper (`aterm_log::env`), never a raw `remove_var`.
+    aterm_log::env::unset("ATERM_CONTAINMENT_MODE");
 
     let mode = aterm_containment::init_mode_from_env(ContainmentMode::User)
         .expect("init_mode_from_env should succeed with default");

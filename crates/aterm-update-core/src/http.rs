@@ -702,8 +702,7 @@ mod tests {
     #[test]
     fn empty_token_is_refused() {
         let err = curl_fetch(&["-sS"], "https://api.github.com/repos/o/r", Some(""))
-            .err()
-            .expect("an empty token must be refused before spawning curl");
+            .expect_err("an empty token must be refused before spawning curl");
         assert!(err.contains("empty"), "{err}");
         assert!(
             err.contains("anonymously"),
@@ -711,8 +710,7 @@ mod tests {
         );
         // The injection guard still fires ahead of any spawn, too.
         let err = curl_fetch(&["-sS"], "https://api.github.com/repos/o/r", Some("a\"b"))
-            .err()
-            .expect("an injection-shaped token must be refused");
+            .expect_err("an injection-shaped token must be refused");
         assert!(err.contains("illegal characters"), "{err}");
     }
 

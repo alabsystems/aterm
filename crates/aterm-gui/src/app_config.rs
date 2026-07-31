@@ -891,7 +891,9 @@ const MAX_ACTIVE_TOY_PACKS: usize = 8;
 /// consume one sentinel byte past its parser cap, for at most 17 opens and
 /// 2,883,601 bytes read. This is an I/O-volume bound, not a wall-clock promise
 /// for an unhealthy filesystem.
+#[cfg(test)]
 const MAX_PATH_FEED_OPEN_ATTEMPTS: usize = 1 + 2 * MAX_ACTIVE_TOY_PACKS;
+#[cfg(test)]
 const MAX_PATH_FEED_FINGERPRINT_READ_BYTES: usize =
     (aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES + 1)
         + MAX_ACTIVE_TOY_PACKS
@@ -904,6 +906,51 @@ struct LoadedToyPacks {
     lexicon_toml: String,
 }
 
+type AdmittedPathFeed = (std::path::PathBuf, Result<String, String>);
+
+/// Read one configured effect feed once, then bind both its consumer bytes and
+/// its fingerprint to that same admitted handle. The path and readability bits
+/// deliberately match the test-only independent fingerprint oracle.
+fn read_and_fingerprint_path_feed(
+    path: &str,
+    max_bytes: usize,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+) -> AdmittedPathFeed {
+    read_and_fingerprint_path_feed_with_reader(
+        path,
+        max_bytes,
+        hasher,
+        aterm_effects::file_feed::read_bounded_regular_utf8,
+    )
+}
+
+/// Testable one-open core. `FnOnce` makes a second read through the admitted
+/// reader unrepresentable; the returned `String` is the sole parser/hash input.
+fn read_and_fingerprint_path_feed_with_reader(
+    path: &str,
+    max_bytes: usize,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    read: impl FnOnce(&std::path::Path, usize) -> std::io::Result<String>,
+) -> AdmittedPathFeed {
+    use std::hash::Hash as _;
+
+    #[cfg(test)]
+    PATH_FEED_READS.with(|count| count.set(count.get().saturating_add(1)));
+    path.hash(hasher);
+    let expanded = sparkle_expand_tilde(path);
+    match read(&expanded, max_bytes) {
+        Ok(contents) => {
+            true.hash(hasher);
+            aterm_effects::file_feed::fingerprint_admitted_utf8(&contents).hash(hasher);
+            (expanded, Ok(contents))
+        }
+        Err(error) => {
+            false.hash(hasher);
+            (expanded, Err(error.to_string()))
+        }
+    }
+}
+
 /// Immutable word-decoration runtime compiled for one admitted config
 /// generation. File reads, Toy Pack compilation, and lexicon construction all
 /// happen before this value reaches the event loop; render-time recomputation
@@ -911,6 +958,17 @@ struct LoadedToyPacks {
 #[derive(Clone)]
 pub(crate) struct PreparedSparkleRuntime {
     resolved: Option<crate::word_decorations::Resolved>,
+}
+
+/// One bounded, internally consistent generation of every path-backed effect
+/// feed. Each prepared consumer and its fingerprint derive from the same
+/// same-handle admitted bytes, so pathname replacement and ABA edits cannot
+/// label stale runtime data as the current generation.
+#[derive(Clone)]
+pub(crate) struct PreparedPathFeedGeneration {
+    pub(crate) sparkle: PreparedSparkleRuntime,
+    pub(crate) trail_packs: std::sync::Arc<TrailPackCatalog>,
+    pub(crate) fingerprints: PathFeedFps,
 }
 
 impl PreparedSparkleRuntime {
@@ -942,6 +1000,7 @@ impl PreparedSparkleRuntime {
 thread_local! {
     static SPARKLE_HOST_PREPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PATH_FEED_FINGERPRINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PATH_FEED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -962,6 +1021,16 @@ fn reset_path_feed_fingerprint_count() {
 #[cfg(test)]
 fn path_feed_fingerprint_count() -> usize {
     PATH_FEED_FINGERPRINTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_path_feed_read_count() {
+    PATH_FEED_READS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn path_feed_read_count() -> usize {
+    PATH_FEED_READS.with(std::cell::Cell::get)
 }
 
 /// One immutable, validated Trail Pack catalog for one config generation.
@@ -2509,7 +2578,31 @@ impl Config {
             .unwrap_or_else(|| vec!["en".to_string()])
     }
 
+    fn admitted_sparkle_lexicon(
+        &self,
+        fingerprint: &mut std::collections::hash_map::DefaultHasher,
+    ) -> Option<AdmittedPathFeed> {
+        let path = self
+            .sparkle_words
+            .as_ref()
+            .and_then(|sparkle| sparkle.lexicon.as_deref())?;
+        Some(read_and_fingerprint_path_feed(
+            path,
+            aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES,
+            fingerprint,
+        ))
+    }
+
+    #[cfg(test)]
     fn sparkle_toy_packs(&self) -> LoadedToyPacks {
+        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+        self.sparkle_toy_packs_with_fingerprint(&mut fingerprint)
+    }
+
+    fn sparkle_toy_packs_with_fingerprint(
+        &self,
+        fingerprint: &mut std::collections::hash_map::DefaultHasher,
+    ) -> LoadedToyPacks {
         let mut loaded = LoadedToyPacks::default();
         let Some(paths) = self
             .sparkle_words
@@ -2526,8 +2619,12 @@ impl Config {
             );
         }
         for (index, path) in paths.iter().take(MAX_ACTIVE_TOY_PACKS).enumerate() {
-            let expanded = sparkle_expand_tilde(path);
-            let source = match aterm_effects::spec::read_toy_pack_file(&expanded) {
+            let (expanded, source) = read_and_fingerprint_path_feed(
+                path,
+                aterm_effects::spec::MAX_TOY_PACK_BYTES,
+                fingerprint,
+            );
+            let source = match source {
                 Ok(source) => source,
                 Err(error) => {
                     eprintln!(
@@ -2555,18 +2652,40 @@ impl Config {
         loaded
     }
 
-    /// Resolve one immutable Trail Pack catalog. This is the only manifest IO
-    /// primitive; production calls it exactly once when the versioned config
-    /// service admits a new generation, then shares the returned `Arc`.
+    /// Resolve one immutable Trail Pack catalog. This is the only manifest I/O
+    /// primitive. Preliminary startup catalogs remain empty; the published
+    /// path-feed generation resolves consumer data and fingerprint from the
+    /// same admitted bytes, then shares the returned `Arc`.
     ///
     /// Fail-closed per pack: unreadable/invalid manifests become retained
     /// diagnostics and are skipped, while a later duplicate id wins. Diagnostics
     /// are data rather than immediate stderr writes so each host can surface them
     /// once without Settings construction producing duplicate warnings.
     pub(crate) fn resolve_trail_pack_catalog(&self) -> std::sync::Arc<TrailPackCatalog> {
+        self.resolve_trail_pack_catalog_with_fingerprint_and_reader(|_, path, max_bytes| {
+            aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes)
+        })
+        .0
+    }
+
+    fn resolve_trail_pack_catalog_with_fingerprint(
+        &self,
+    ) -> (std::sync::Arc<TrailPackCatalog>, u64) {
+        self.resolve_trail_pack_catalog_with_fingerprint_and_reader(|_, path, max_bytes| {
+            aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes)
+        })
+    }
+
+    fn resolve_trail_pack_catalog_with_fingerprint_and_reader(
+        &self,
+        mut read: impl FnMut(usize, &std::path::Path, usize) -> std::io::Result<String>,
+    ) -> (std::sync::Arc<TrailPackCatalog>, u64) {
+        use std::hash::Hasher as _;
+
+        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
         let mut loaded = TrailPackCatalog::default();
         let Some(paths) = self.cursor_trail_packs.as_deref() else {
-            return std::sync::Arc::new(loaded);
+            return (std::sync::Arc::new(loaded), fingerprint.finish());
         };
         if paths.len() > MAX_ACTIVE_TOY_PACKS {
             loaded.diagnostics.push(format!(
@@ -2576,8 +2695,13 @@ impl Config {
             ));
         }
         for (index, path) in paths.iter().take(MAX_ACTIVE_TOY_PACKS).enumerate() {
-            let expanded = sparkle_expand_tilde(path);
-            let source = match aterm_effects::trail_pack::read_trail_pack_file(&expanded) {
+            let (expanded, source) = read_and_fingerprint_path_feed_with_reader(
+                path,
+                aterm_effects::trail_pack::MAX_TRAIL_PACK_BYTES,
+                &mut fingerprint,
+                |expanded, max_bytes| read(index, expanded, max_bytes),
+            );
+            let source = match source {
                 Ok(source) => source,
                 Err(error) => {
                     loaded.diagnostics.push(format!(
@@ -2600,7 +2724,23 @@ impl Config {
         }
         loaded.ids = loaded.packs.keys().cloned().collect();
         loaded.ids.sort();
-        std::sync::Arc::new(loaded)
+        (std::sync::Arc::new(loaded), fingerprint.finish())
+    }
+
+    /// Resolve the non-feed portion of a catalog while the exact Trail/Sparkle
+    /// generation is prepared separately. This admits the custom Nyan sprite
+    /// once and installs an intentionally empty Trail placeholder that must be
+    /// replaced before publication to a live `App`.
+    pub(crate) fn resolve_preliminary_asset_catalog_with_themes(
+        &self,
+        themes: std::sync::Arc<ThemeCatalog>,
+    ) -> std::sync::Arc<ConfigAssetCatalog> {
+        std::sync::Arc::new(ConfigAssetCatalog {
+            trail_packs: std::sync::Arc::new(TrailPackCatalog::default()),
+            nyan_sprite: resolve_nyan_sprite_asset(self.cursor_nyan_sprite.as_deref()),
+            themes,
+            sparkle_spec_consumers: None,
+        })
     }
 
     /// Resolve every filesystem-backed visual asset for one config generation.
@@ -2630,15 +2770,17 @@ impl Config {
         self.resolve_asset_catalog_with_themes(ThemeCatalog::empty())
     }
 
-    /// Content fingerprints of every file the config references BY PATH — see
-    /// [`PathFeedFps`]. Streams each referenced file through the same bounded,
-    /// same-handle admission used by its loader (cold path only: config reload +
-    /// [`App::recompute_sparkle`]). The
+    /// Content fingerprints of every active file the config references BY PATH
+    /// — see [`PathFeedFps`]. Streams each referenced file through the same
+    /// bounded, same-handle admission used by its loader (test oracle only; the
+    /// production generation carries the fingerprint from its consumer read).
+    /// Disabled Sparkle feeds have no consumer and therefore no file identity. The
     /// PATH participates in each stream (two files swapping contents must not
     /// cancel out) and so does readability (a file appearing or disappearing is
     /// a content change even though its bytes stay unknown). Pack lists are
     /// capped at the same `MAX_ACTIVE_TOY_PACKS` the consumers load, so an
     /// over-cap tail can neither mask nor fake a change.
+    #[cfg(test)]
     pub(crate) fn path_feed_fingerprints(&self) -> PathFeedFps {
         #[cfg(test)]
         PATH_FEED_FINGERPRINTS.with(|count| count.set(count.get().saturating_add(1)));
@@ -2675,7 +2817,11 @@ impl Config {
         let mut remaining_opens = MAX_PATH_FEED_OPEN_ATTEMPTS;
         let mut remaining_bytes = MAX_PATH_FEED_FINGERPRINT_READ_BYTES;
         let mut deco = std::collections::hash_map::DefaultHasher::new();
-        if let Some(sw) = self.sparkle_words.as_ref() {
+        if let Some(sw) = self
+            .sparkle_words
+            .as_ref()
+            .filter(|sparkle| sparkle.enabled != Some(false))
+        {
             if let Some(lexicon) = sw.lexicon.as_deref() {
                 fold(
                     &mut deco,
@@ -2766,30 +2912,59 @@ impl Config {
     pub(crate) fn sparkle_runtime_parts(
         &self,
     ) -> Option<(crate::word_decorations::DecoConfig, Option<String>)> {
+        self.sparkle_runtime_parts_with_fingerprint().0
+    }
+
+    fn sparkle_runtime_parts_with_fingerprint(
+        &self,
+    ) -> (
+        Option<(crate::word_decorations::DecoConfig, Option<String>)>,
+        u64,
+    ) {
+        use std::hash::Hasher as _;
+
         #[cfg(test)]
         SPARKLE_HOST_PREPARES.with(|count| count.set(count.get().saturating_add(1)));
+        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
         if self
             .sparkle_words
             .as_ref()
             .and_then(|sparkle| sparkle.enabled)
             == Some(false)
         {
-            return None;
+            // A disabled feed has no consumer. Configuring/re-enabling it changes
+            // the semantic table itself and forces a fresh worker generation, so
+            // touching dormant paths need not do any startup I/O or parsing.
+            return (None, fingerprint.finish());
         }
+        let admitted_lexicon = self.admitted_sparkle_lexicon(&mut fingerprint);
         let LoadedToyPacks {
             spec_table,
             lexicon_toml,
-        } = self.sparkle_toy_packs();
-        let cfg = self.sparkle_deco_config_with_pack_specs(spec_table)?;
-        let override_toml = self.sparkle_override_toml_with_packs(&lexicon_toml);
-        Some((cfg, override_toml))
+        } = self.sparkle_toy_packs_with_fingerprint(&mut fingerprint);
+        let resolved = self
+            .sparkle_deco_config_with_pack_specs(spec_table)
+            .map(|cfg| {
+                let override_toml = self.sparkle_override_toml_with_admitted_lexicon(
+                    &lexicon_toml,
+                    admitted_lexicon.as_ref(),
+                );
+                (cfg, override_toml)
+            });
+        (resolved, fingerprint.finish())
     }
 
     /// Compile the complete sparkle runtime on a host worker (or once during
     /// startup, before the event loop begins). This is the only production
     /// caller of the path-backed runtime resolver.
+    #[cfg(test)]
     pub(crate) fn prepare_sparkle_runtime(&self) -> PreparedSparkleRuntime {
-        let resolved = self.sparkle_runtime_parts().map(|(cfg, override_toml)| {
+        self.prepare_sparkle_runtime_with_fingerprint().0
+    }
+
+    fn prepare_sparkle_runtime_with_fingerprint(&self) -> (PreparedSparkleRuntime, u64) {
+        let (parts, fingerprint) = self.sparkle_runtime_parts_with_fingerprint();
+        let resolved = parts.map(|(cfg, override_toml)| {
             let langs = self.sparkle_languages();
             let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
             let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(
@@ -2810,7 +2985,21 @@ impl Config {
                 lexicon: std::sync::Arc::new(lexicon),
             }
         });
-        PreparedSparkleRuntime { resolved }
+        (PreparedSparkleRuntime { resolved }, fingerprint)
+    }
+
+    /// Prepare every path-backed effect consumer and identify it from the exact
+    /// same-handle bytes that entered its parser. The deco and trail feeds are
+    /// independent transactions; combining their two immutable results needs
+    /// no filesystem-wide snapshot or stability assumption.
+    pub(crate) fn prepare_path_feed_generation(&self) -> PreparedPathFeedGeneration {
+        let (sparkle, deco) = self.prepare_sparkle_runtime_with_fingerprint();
+        let (trail_packs, trail) = self.resolve_trail_pack_catalog_with_fingerprint();
+        PreparedPathFeedGeneration {
+            sparkle,
+            trail_packs,
+            fingerprints: PathFeedFps { deco, trail },
+        }
     }
 
     /// Resolve the `[sparkle_words]` table into a renderer-ready [`DecoConfig`],
@@ -3000,28 +3189,28 @@ impl Config {
     /// A missing/unreadable input is logged and skipped while the rest survives.
     #[cfg(test)]
     pub(crate) fn sparkle_override_toml(&self) -> Option<String> {
-        let packs = self.sparkle_toy_packs();
-        self.sparkle_override_toml_with_packs(&packs.lexicon_toml)
+        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+        let lexicon = self.admitted_sparkle_lexicon(&mut fingerprint);
+        let packs = self.sparkle_toy_packs_with_fingerprint(&mut fingerprint);
+        self.sparkle_override_toml_with_admitted_lexicon(&packs.lexicon_toml, lexicon.as_ref())
     }
 
-    fn sparkle_override_toml_with_packs(&self, pack_lexicon_toml: &str) -> Option<String> {
+    fn sparkle_override_toml_with_admitted_lexicon(
+        &self,
+        pack_lexicon_toml: &str,
+        admitted_lexicon: Option<&AdmittedPathFeed>,
+    ) -> Option<String> {
         let sw = self.sparkle_words.as_ref()?;
         let mut out = String::new();
-        if let Some(path) = sw.lexicon.as_deref() {
-            let expanded = sparkle_expand_tilde(path);
-            match aterm_effects::file_feed::read_bounded_regular_utf8(
-                &expanded,
-                aterm_effects::file_feed::MAX_SPARKLE_LEXICON_BYTES,
-            ) {
+        if let Some((expanded, admitted)) = admitted_lexicon {
+            match admitted {
                 Ok(contents) => {
                     let languages = self.sparkle_languages();
                     let refs: Vec<&str> = languages.iter().map(String::as_str).collect();
-                    match aterm_lexicon::Lexicon::with_languages_and_override(
-                        &refs,
-                        Some(&contents),
-                    ) {
+                    match aterm_lexicon::Lexicon::with_languages_and_override(&refs, Some(contents))
+                    {
                         Ok(_) => {
-                            out.push_str(&contents);
+                            out.push_str(contents);
                             if !contents.ends_with('\n') {
                                 out.push('\n');
                             }
@@ -3032,9 +3221,9 @@ impl Config {
                         ),
                     }
                 }
-                Err(e) => {
+                Err(error) => {
                     eprintln!(
-                        "aterm-gui: sparkle_words.lexicon {expanded:?} unreadable ({e}); \
+                        "aterm-gui: sparkle_words.lexicon {expanded:?} unreadable ({error}); \
                          skipping that layer"
                     );
                 }
@@ -3764,7 +3953,7 @@ impl Default for RenderKnobs {
 /// ([`Self::from_config`]) so the key→path mapping is unit-testable; the one
 /// impure step (family → file via [`aterm_render::resolve_font_family`]) is the
 /// same resolver `font_family` uses. Applied to the backend by
-/// [`crate::App::apply_font_config`].
+/// [`crate::apply_font_config_to_backend`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct FontConfig {
     /// Resolved styled-face file paths `[bold, italic, bold-italic]`
@@ -4235,7 +4424,7 @@ impl BackgroundMaterial {
     }
 }
 
-/// Content fingerprints of the files the config references BY PATH: the
+/// Content fingerprints of the active files the config references BY PATH: the
 /// `sparkle_words.lexicon` file and `sparkle_words.toy_packs` manifests (the
 /// word-decoration feed) and the `cursor_trail_packs` manifests (the Trail Pack
 /// registry feed). The APPLIED configuration includes these files' CONTENT, yet
@@ -4244,7 +4433,9 @@ impl BackgroundMaterial {
 /// pack/lexicon file, then re-save/`touch` a byte-identical `aterm.toml` —
 /// docs/trail-packs.md, docs/TOY_PACKS.md, docs/sparkle-words-design.md) silently
 /// stops re-reading them, with restartless recovery only via non-obvious
-/// workarounds. Split in two so the consumers reset precisely: the deco feed
+/// workarounds. An explicitly disabled Sparkle table has no active consumer and
+/// therefore performs no path I/O; re-enabling changes the table itself and
+/// prepares current bytes. Split in two so the consumers reset precisely: the deco feed
 /// warrants a per-window `word_decos.hard_reset()`, the trail feed only a
 /// registry rebuild (cursor glow — never a decoration reset).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -5010,12 +5201,22 @@ pub(crate) fn resolve_initial_lines(config: &Config) -> u16 {
 /// window's `scale_factor()`, driving the auto-scaled font (`round(FONT_PX·f)`) and the
 /// interior padding (`pad_for_scale(f)`) so an offscreen `image` capture renders at
 /// the same DPI a real window of that scale would (e.g. `--scale 2` ≈ 2× Retina).
+///
+/// Resolved ONCE per process (`OnceLock`), like [`crate::headroom_override`]: this
+/// sits on the redraw path — `apply_window_scale` calls it for every frame BEFORE
+/// the repaint early-out — and `env::var` takes the process-wide env lock and
+/// linearly scans the whole environ block, which is far too expensive to repeat at
+/// frame rate for a launch-time-only knob. `--scale` therefore has to keep writing
+/// the variable during CLI parsing (cli.rs), before `run()` — which it already does.
 pub(crate) fn resolve_force_scale() -> Option<f64> {
-    std::env::var("ATERM_FORCE_SCALE")
-        .ok()?
-        .parse::<f64>()
-        .ok()
-        .filter(|f| f.is_finite() && *f > 0.0)
+    static FORCE_SCALE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *FORCE_SCALE.get_or_init(|| {
+        std::env::var("ATERM_FORCE_SCALE")
+            .ok()?
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite() && *f > 0.0)
+    })
 }
 
 /// Pure precedence core for [`resolve_font_px`], with the `$ATERM_FONT_PX` env
@@ -5800,16 +6001,9 @@ impl App {
         }
     }
 
-    /// Re-pin every App-owned renderer setting onto a freshly constructed or
-    /// re-faced backend. Backend construction starts from defaults; keeping this
-    /// as one funnel prevents startup, zoom, first-surface fallback, and runtime
-    /// device-loss fallback from silently losing different subsets of typography,
-    /// contrast, opacity, or configured faces.
-    pub(crate) fn pin_backend_render_config(&mut self) {
-        self.pin_backend_render_config_core();
-        self.apply_font_config();
-    }
-
+    /// Re-pin every memory-backed App-owned renderer setting onto a freshly
+    /// constructed or re-faced backend. Path-backed font generations cross
+    /// their own worker-only prepare/seal boundary before publication.
     pub(crate) fn pin_backend_render_config_core(&mut self) {
         self.backend.set_text_shaping(self.text_shaping.clone());
         self.backend.set_text_blending(self.text_blending);
@@ -6074,64 +6268,6 @@ impl App {
                 w.request_redraw();
             }
         }
-    }
-
-    /// Push the W6 per-style / fallback font config (`self.font_config`, the
-    /// resolved source of truth) onto the live backend: the injected real-bold
-    /// face + styled italic/bold-italic slots, the synthetic-style flag, and
-    /// the config fallback / symbol / emoji chains. Idempotent for the chain
-    /// and flag setters (they no-op on equal values), and called after every
-    /// backend (re)build — the same re-pin discipline as `set_text_shaping` —
-    /// so a zoom / reload / family change never reverts the user's fonts. A
-    /// styled file that fails to read/parse warns and is skipped (never a
-    /// crash; the other faces still apply).
-    pub(crate) fn apply_font_config(&mut self) {
-        let fc = self.font_config.clone();
-        self.backend.set_synthetic_styles(fc.synthetic_style);
-        // font_family_bold rides the existing injected-real-bold seam
-        // (`set_bold_font`, previously reachable only from the web hosts);
-        // italic / bold-italic fill the renderer's styled sibling slots.
-        let styled: [(&str, Option<&String>); 3] = [
-            ("font_family_bold", fc.styled_paths[0].as_ref()),
-            ("font_family_italic", fc.styled_paths[1].as_ref()),
-            ("font_family_bold_italic", fc.styled_paths[2].as_ref()),
-        ];
-        for (slot, (key, path)) in styled.into_iter().enumerate() {
-            let Some(path) = path else { continue };
-            let bytes = match aterm_render::font_file::read_font_file(std::path::Path::new(path)) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!(
-                        "aterm-gui: config {key}: {path:?} failed bounded font admission \
-                         ({e}); keeping the current working face"
-                    );
-                    continue;
-                }
-            };
-            let res = if slot == 0 {
-                self.backend.set_bold_font(&bytes)
-            } else {
-                self.backend.set_styled_font(slot, &bytes)
-            };
-            if let Err(e) = res {
-                eprintln!(
-                    "aterm-gui: config {key}: {path:?} rejected ({e}); \
-                     keeping the current working face"
-                );
-            }
-        }
-        self.backend.set_config_fallback_fonts(&fc.fallback_fonts);
-        self.backend
-            .set_config_symbol_font(fc.symbol_font.as_deref());
-        self.backend.set_config_emoji_font(fc.emoji_font.as_deref());
-        // W9: the variable-font instantiation config (requests + dark nudge),
-        // same re-pin discipline — a fresh face resolved only the DEFAULT
-        // instantiation, so pin the user's requests before the caller
-        // re-grids. A default config is a free no-op (the setter no-ops on
-        // equal values and a non-variable primary resolves to nothing).
-        let reqs = self.font_variations.clone();
-        self.backend
-            .set_font_variations(&reqs, self.font_weight_dark_nudge);
     }
 
     /// Live THEME-ONLY swap — the cheap sibling of [`Self::rebuild_backend`], shared
@@ -6505,24 +6641,12 @@ impl App {
     /// diffed by `Terminal::apply_config`) are re-applied.
     fn request_font_catalog_generation(
         &mut self,
-        observation: crate::native_config_service::ConfigDiskObservation,
-        config: Config,
-        values: std::collections::BTreeMap<String, String>,
-    ) {
-        self.request_font_catalog_generation_with_assets(observation, config, values, None);
-    }
-
-    fn request_font_catalog_generation_with_assets(
-        &mut self,
-        observation: crate::native_config_service::ConfigDiskObservation,
-        config: Config,
-        values: std::collections::BTreeMap<String, String>,
-        prepared_assets: Option<std::sync::Arc<ConfigAssetCatalog>>,
+        mut prepared: crate::native_config_service::PreparedConfigObservation,
     ) {
         let Some(primary) = self.backend.ready().primary_seed() else {
             self.native_config_service.mark_reconciliation_required();
             self.reject_config_watch_admission_for(
-                &observation.baseline,
+                &prepared.observation.baseline,
                 crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
             );
             aterm_log::warn!("config reload: active renderer has no immutable primary font bytes");
@@ -6531,7 +6655,7 @@ impl App {
         let Some(previous_sources) = self.backend.admitted_font_sources() else {
             self.native_config_service.mark_reconciliation_required();
             self.reject_config_watch_admission_for(
-                &observation.baseline,
+                &prepared.observation.baseline,
                 crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
             );
             aterm_log::warn!("config reload: active renderer font generation is unavailable");
@@ -6540,18 +6664,23 @@ impl App {
         let sequence = self.next_font_catalog_sequence.max(1);
         self.next_font_catalog_sequence = sequence.saturating_add(1);
         self.requested_font_catalog_sequence = sequence;
+        if !std::sync::Arc::ptr_eq(&prepared.assets.themes, &self.config_assets.themes) {
+            // Theme discovery can overtake a config worker. Trail/Nyan and
+            // Sparkle consumers do not depend on the theme catalog, so rebase
+            // that Arc in memory instead of reopening any source.
+            prepared.assets = std::sync::Arc::new(ConfigAssetCatalog {
+                trail_packs: std::sync::Arc::clone(&prepared.assets.trail_packs),
+                nyan_sprite: prepared.assets.nyan_sprite.clone(),
+                themes: std::sync::Arc::clone(&self.config_assets.themes),
+                sparkle_spec_consumers: prepared.assets.sparkle_spec_consumers.clone(),
+            });
+        }
         let request = crate::native_font_catalog::Request {
             sequence,
             theme_generation: self.theme_catalog_generation,
-            observation,
-            config,
-            values,
+            prepared,
             px: self.font_px,
             appearance: self.os_appearance,
-            themes: std::sync::Arc::clone(&self.config_assets.themes),
-            prepared_assets: prepared_assets.filter(|assets| {
-                std::sync::Arc::ptr_eq(&assets.themes, &self.config_assets.themes)
-            }),
             previous_family: self.font_family.clone(),
             previous_font_config: self.font_config.clone(),
             previous_sources,
@@ -6566,7 +6695,7 @@ impl App {
         } else {
             self.native_config_service.mark_reconciliation_required();
             self.reject_config_watch_admission_for(
-                &request.observation.baseline,
+                &request.prepared.observation.baseline,
                 crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
             );
             aterm_log::warn!(
@@ -6591,10 +6720,19 @@ impl App {
             crate::native_font_catalog::CompletionDisposition::Publish => {}
             crate::native_font_catalog::CompletionDisposition::RejectStaleConfig => return,
             crate::native_font_catalog::CompletionDisposition::ReprepareLatestTheme => {
+                let path_feeds = PreparedPathFeedGeneration {
+                    sparkle: completion.sparkle.clone(),
+                    trail_packs: std::sync::Arc::clone(&completion.assets.trail_packs),
+                    fingerprints: completion.path_feed_fps,
+                };
                 self.request_font_catalog_generation(
-                    completion.observation,
-                    completion.config,
-                    completion.values,
+                    crate::native_config_service::PreparedConfigObservation {
+                        observation: completion.observation,
+                        config: completion.config,
+                        values: completion.values,
+                        assets: completion.assets,
+                        path_feeds,
+                    },
                 );
                 return;
             }
@@ -6641,23 +6779,17 @@ impl App {
     }
 
     /// Exact worker-prepared twin of [`Self::reload_config_observation`]. The
-    /// supplied asset catalog is reused only while its theme Arc is still the
-    /// current generation; a theme that overtook persistence is re-resolved by
-    /// the font worker and guarded by the theme-generation ticket.
+    /// supplied feed/Nyan generation is immutable; a theme that overtook
+    /// persistence is rebased in memory and guarded by the theme-generation
+    /// ticket.
     pub(crate) fn reload_prepared_config_observation(
         &mut self,
         prepared: crate::native_config_service::PreparedConfigObservation,
     ) {
-        let crate::native_config_service::PreparedConfigObservation {
-            observation,
-            config,
-            values,
-            assets,
-        } = prepared;
-        if let Err(error) = self.refresh_open_config_editor_observation(&observation) {
+        if let Err(error) = self.refresh_open_config_editor_observation(&prepared.observation) {
             aterm_log::warn!("config reload: Manual refresh needs attention ({error})");
         }
-        self.request_font_catalog_generation_with_assets(observation, config, values, Some(assets));
+        self.request_font_catalog_generation(prepared);
     }
 
     pub(crate) fn apply_prepared_config_generation(
@@ -10725,6 +10857,139 @@ mod reload_dedupe_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A path generation is one transaction per consumer: mutation after the
+    /// same-handle read cannot relabel the admitted bytes with the replacement
+    /// file's fingerprint. This is the ABA-resistant Tier-1 projection for the
+    /// derived path-feed snapshot model.
+    #[test]
+    fn path_feed_generation_binds_consumer_and_fingerprint_to_one_read() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-feed-generation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pack = dir.join("trail-pack.toml");
+        let v1 = "pack = 1\nid = \"generation-v1\"\n";
+        let v2 = "pack = 1\nid = \"generation-v2\"\n";
+        std::fs::write(&pack, v1).unwrap();
+        let config = cfg(&format!(
+            "cursor_trail_packs = [{:?}]\n[sparkle_words]\nenabled = false\n",
+            pack.to_string_lossy(),
+        ));
+        let model = aterm_spec::derive::path_feed_snapshot_model();
+        let mut model_state = model.init_state();
+        let v1_fingerprint = config.path_feed_fingerprints().trail;
+
+        let mut reads = 0;
+        let (catalog, admitted_fingerprint) = config
+            .resolve_trail_pack_catalog_with_fingerprint_and_reader(
+                |_, admitted_path, max_bytes| {
+                    reads += 1;
+                    let admitted = aterm_effects::file_feed::read_bounded_regular_utf8(
+                        admitted_path,
+                        max_bytes,
+                    );
+                    // The pathname changes after the real bounded read but before
+                    // this sole injected reader returns. Consumer parsing and
+                    // fingerprinting must both stay on the returned v1 String.
+                    std::fs::write(&pack, v2).unwrap();
+                    admitted
+                },
+            );
+        for action in ["Read", "LiveMutate", "Publish"] {
+            assert!(
+                model.fire(action, &mut model_state),
+                "{action}: {model_state:?}"
+            );
+        }
+        assert!(model.check_invariant("PublishedPairComesFromAdmittedRead", &model_state));
+        assert_eq!(model_state["prepared"], 1);
+        assert_eq!(model_state["fingerprint"], 1);
+        assert_eq!(model_state["live"], 2);
+        assert_eq!(reads, 1, "the configured path is opened exactly once");
+        assert!(catalog.packs.contains_key("generation-v1"));
+        assert!(!catalog.packs.contains_key("generation-v2"));
+        assert_eq!(
+            admitted_fingerprint, v1_fingerprint,
+            "Tier-1 projection: prepared=1 and fingerprint=1 derive from the admitted v1 String"
+        );
+        assert_ne!(
+            admitted_fingerprint,
+            config.path_feed_fingerprints().trail,
+            "Tier-1 negative control: the v1 consumer never carries the live v2 fingerprint"
+        );
+
+        let replacement = config.prepare_path_feed_generation();
+        assert!(replacement.trail_packs.packs.contains_key("generation-v2"));
+        assert!(!replacement.trail_packs.packs.contains_key("generation-v1"));
+        assert_eq!(
+            replacement.fingerprints,
+            config.path_feed_fingerprints(),
+            "the next generation admits and identifies the replacement bytes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn disabled_sparkle_performs_no_path_feed_reads() {
+        let dir = std::env::temp_dir().join(format!("aterm-disabled-feed-{}", std::process::id()));
+        let lexicon = dir.join("lexicon.toml");
+        let toy = dir.join("toy.toml");
+        let disabled = cfg(&format!(
+            "[sparkle_words]\nenabled = false\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
+            lexicon.to_string_lossy(),
+            toy.to_string_lossy(),
+        ));
+
+        super::reset_path_feed_read_count();
+        let prepared = disabled.prepare_path_feed_generation();
+        assert_eq!(super::path_feed_read_count(), 0);
+        assert_eq!(prepared.sparkle.consumer_capabilities(), Default::default());
+
+        let enabled = cfg(&format!(
+            "[sparkle_words]\nenabled = true\nlexicon = {:?}\ntoy_packs = [{:?}]\n",
+            lexicon.to_string_lossy(),
+            toy.to_string_lossy(),
+        ));
+        super::reset_path_feed_read_count();
+        let _ = enabled.prepare_path_feed_generation();
+        assert_eq!(
+            super::path_feed_read_count(),
+            2,
+            "negative control: enabling the same two configured feeds admits each once"
+        );
+    }
+
+    #[test]
+    fn preliminary_startup_catalog_defers_trail_feed_to_exact_generation() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-preliminary-feed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trail = dir.join("trail.toml");
+        std::fs::write(&trail, "pack = 1\nid = \"deferred-trail\"\n").unwrap();
+        let config = cfg(&format!(
+            "cursor_trail_packs = [{:?}]\n[sparkle_words]\nenabled = false\n",
+            trail.to_string_lossy(),
+        ));
+
+        super::reset_path_feed_read_count();
+        let preliminary =
+            config.resolve_preliminary_asset_catalog_with_themes(super::ThemeCatalog::empty());
+        assert_eq!(
+            super::path_feed_read_count(),
+            0,
+            "serialized startup catalog must not admit Trail/Sparkle feeds"
+        );
+        assert!(preliminary.trail_packs.ids.is_empty());
+
+        let exact = config.prepare_path_feed_generation();
+        assert_eq!(
+            super::path_feed_read_count(),
+            1,
+            "parallel exact generation admits the one configured trail once"
+        );
+        assert_eq!(exact.trail_packs.ids, ["deferred-trail"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn path_feed_fingerprints_enforce_the_loader_specific_caps() {
         assert_eq!(super::MAX_PATH_FEED_OPEN_ATTEMPTS, 17);
@@ -10978,7 +11243,7 @@ mod theme_live_tests {
         let before = render(app.backend.ready_mut());
 
         // Seed the strip cache so its invalidation is observable (non-vacuous).
-        app.windows.get_mut(&wid).unwrap().last_strip_fp = Some((0xFEED, 80, false));
+        app.windows.get_mut(&wid).unwrap().last_strip_fp = Some((0xFEED, 80, false, None, None));
 
         let tp = aterm_types::scheme::builtin("Dracula")
             .unwrap()

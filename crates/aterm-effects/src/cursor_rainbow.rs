@@ -1394,8 +1394,11 @@ mod tests {
             "twinkle scintillation is {hz} Hz — over the 3 Hz general-flash bound"
         );
         // …and it must still WOBBLE: a rate of zero would be a silent removal
-        // of the glint rather than a bound on it.
-        assert!(TWINKLE_SCINT > 0.0, "the flare must still scintillate");
+        // of the glint rather than a bound on it. Both sides are constants, so
+        // this is checked at build time — a retune to zero never compiles.
+        const {
+            assert!(TWINKLE_SCINT > 0.0, "the flare must still scintillate");
+        }
     }
 
     #[test]

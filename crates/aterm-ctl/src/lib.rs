@@ -714,7 +714,10 @@ fn discovery_targets(sock: Option<&str>, pid: Option<u32>) -> Result<Vec<(u32, S
         return Ok(vec![(p, s.to_string())]);
     }
     if let Some(want) = pid {
-        let hit: Vec<(u32, String)> = live_instances().into_iter().filter(|(p, _)| *p == want).collect();
+        let hit: Vec<(u32, String)> = live_instances()
+            .into_iter()
+            .filter(|(p, _)| *p == want)
+            .collect();
         if hit.is_empty() {
             return Err(format!(
                 "no live aterm instance with pid {want} (run `aterm-ctl instances` to list them)"
@@ -1547,8 +1550,7 @@ fn send_request(mut stream: &CtlStream, token: Option<&str>, request: &str) -> i
 /// client remains compatible with them. A new server writes the response and
 /// challenge in one flush; if a relay delays that trailer past this bound, the
 /// client safely falls back to close and the server's failed-ACK quarantine.
-const ARTIFACT_ACK_PROBE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(250);
+const ARTIFACT_ACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn acknowledge_artifact_reply(
     mut stream: &CtlStream,
@@ -1656,7 +1658,18 @@ fn copy_body<R: io::Read, W: Write>(reader: &mut R, out: &mut W, nbytes: u64) ->
 /// error so a guarded artifact reply is never acknowledged while truncated.
 fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result<()> {
     let stdout = stdout_handle();
-    let mut out = stdout.lock();
+    // `io::Stdout` is a `LineWriter` unconditionally (not TTY-dependent), so the
+    // trailing `\n` below drained the buffer to the fd on EVERY row — one
+    // `write(2)` per payload line, with `count` peer-supplied and capped only by
+    // `MAX_STREAM_LINES` (200_000). This is the print path for every line-framed
+    // verb (`text`, `search`, `selection`, `chrome`, `controls`, `history`,
+    // `image read`, `cast frames`) — exactly what an agent drive loop calls per
+    // turn. Batching is invisible here because the payload is a bounded one-shot
+    // body: nothing reads our stdout mid-payload, and the explicit `flush()`
+    // below (NOT BufWriter's Drop) keeps a broken-pipe/ENOSPC error propagating
+    // to the caller. Deliberately NOT applied to `subscribe_watch`, which
+    // flushes per frame for liveness by design.
+    let mut out = io::BufWriter::new(stdout.lock());
     for _ in 0..count {
         let mut line = String::new();
         if read_bounded_line(reader, &mut line)? == 0 {
@@ -1671,7 +1684,7 @@ fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result
         out.write_all(line.as_bytes())?;
         out.write_all(b"\n")?;
     }
-    Ok(())
+    out.flush()
 }
 
 /// Guarded line replies are currently `video frames`, whose server-side maximum

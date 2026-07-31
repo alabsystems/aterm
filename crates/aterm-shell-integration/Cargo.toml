@@ -25,6 +25,11 @@ getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
+# The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
+# the two single-test-per-binary integration tests here must clear a shell var
+# for the length of one call, and every mutation in the workspace routes through
+# that helper rather than a raw `set_var`/`remove_var`.
+aterm-log = { workspace = true }
 
 [lints]
 workspace = true

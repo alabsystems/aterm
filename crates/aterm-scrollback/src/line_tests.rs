@@ -1098,3 +1098,81 @@ fn fuzz_serialize_deserialize_roundtrip() {
         }
     }
 }
+
+/// `Line::record_is_valid` is the acceptance predicate the warm→cold eviction
+/// path validates a page with WITHOUT materializing it, so it must agree with
+/// `Line::deserialize` on every record — including the corrupt and truncated
+/// ones. A divergence would either admit a corrupt block to the cold tier or
+/// reject a good one. (The block decoder additionally debug-asserts the pair on
+/// every record it walks; this pins the malformed inputs that decoder never
+/// sees.)
+#[test]
+fn record_is_valid_agrees_with_deserialize_on_malformed_records() {
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    rle.extend_with(CellAttrs::from_raw(1, 2, 0), 4);
+    let mut styled = Line::with_hyperlinks(
+        "styled line with more than thirty-two content bytes",
+        rle,
+        vec![HyperlinkSpan::new(
+            0,
+            4,
+            Arc::from("https://example.invalid"),
+        )],
+    );
+    styled.set_wrapped(true);
+
+    let samples = [
+        Line::new(),
+        Line::from("plain"),
+        Line::from("x".repeat(300).as_str()),
+        styled,
+    ];
+
+    for line in &samples {
+        let encoded = line.serialize();
+        // Every truncation of a real record, plus the record itself.
+        for cut in 0..=encoded.len() {
+            let record = &encoded[..cut];
+            assert_eq!(
+                Line::deserialize(record).is_some(),
+                Line::record_is_valid(record),
+                "truncated to {cut} of {}",
+                encoded.len()
+            );
+        }
+        // Corrupt each header byte (version, flags, and the content length) —
+        // the region the predicate reads.
+        for idx in 0..encoded.len().min(8) {
+            for patch in [0u8, 1, 0x7F, 0xFF] {
+                let mut record = encoded.clone();
+                record[idx] = patch;
+                assert_eq!(
+                    Line::deserialize(&record).is_some(),
+                    Line::record_is_valid(&record),
+                    "byte {idx} patched to {patch:#x}"
+                );
+            }
+        }
+    }
+
+    // Arbitrary bytes: a corrupt block hands the decoder records that were
+    // never a serialized line at all.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) as u32
+    };
+    for _ in 0..20_000 {
+        let len = (next() % 20) as usize;
+        // Small byte alphabet so short lengths and zero/one flag bytes (the
+        // interesting boundaries) come up often.
+        let record: Vec<u8> = (0..len).map(|_| (next() % 5) as u8).collect();
+        assert_eq!(
+            Line::deserialize(&record).is_some(),
+            Line::record_is_valid(&record),
+            "record {record:?}"
+        );
+    }
+}

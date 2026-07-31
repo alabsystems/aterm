@@ -42,20 +42,25 @@ pub const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
 pub const BUILD_NUMBER: &str = env!("ATERM_BUILD_NUMBER");
 
 /// Full first line of the producing compiler's `-vV`, e.g.
-/// `rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)`. Stamped by `build.rs`.
-pub const RUSTC_VERSION: &str = env!("ATERM_RUSTC_VERSION");
+/// `rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)` or
+/// `rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc)` — trustc leads with the
+/// canonical `rustc` token by ecosystem contract (version-sniffing build
+/// scripts assert it) and self-identifies in the parenthetical. Stamped by
+/// `build.rs`.
+pub const COMPILER_VERSION_LINE: &str = env!("ATERM_COMPILER_VERSION_LINE");
 
 /// The producing compiler's FULL git commit hash (`commit-hash:` from `-vV`), or
 /// `"unknown"`. This is what tells two coexisting 1.96.0 toolchains apart —
 /// per-binary compiler provenance. Stamped by `build.rs`.
-pub const RUSTC_COMMIT: &str = env!("ATERM_RUSTC_COMMIT");
+pub const COMPILER_COMMIT: &str = env!("ATERM_COMPILER_COMMIT");
 
 /// The producing compiler's host triple (`host:` from `-vV`). Stamped by `build.rs`.
-pub const RUSTC_HOST: &str = env!("ATERM_RUSTC_HOST");
+pub const COMPILER_HOST: &str = env!("ATERM_COMPILER_HOST");
 
-/// Compiler flavor: `"r"` = upstream Rust, `"t"` = the Trust fork. Detection order
+/// Compiler flavor: `"r"` = upstream Rust, `"t"` = Trust (trustc). Detection order
 /// (see `build.rs` / `compiler_probe.rs`): explicit `ATERM_COMPILER_FLAVOR` override,
-/// `/trust/` in the RUSTC path, `RUSTUP_TOOLCHAIN=trust`, else `"r"`.
+/// the `-vV` self-identification, `/trust/` in the RUSTC path,
+/// `RUSTUP_TOOLCHAIN=trust`, else `"r"`.
 pub const COMPILER_FLAVOR: &str = env!("ATERM_COMPILER_FLAVOR");
 
 /// Cargo profile the binary was compiled under (`"debug"`/`"release"`).
@@ -97,8 +102,8 @@ static ATERM_UPDATE_PIN_RECORD: [u8; 64] = update_pin_record_bytes(EMBEDDED_UPDA
 /// `"unknown"` when the toolchain didn't report a hash (e.g. some distro builds).
 #[must_use]
 pub fn compiler_commit_short() -> &'static str {
-    if RUSTC_COMMIT.len() >= 8 && RUSTC_COMMIT.bytes().all(|b| b.is_ascii_hexdigit()) {
-        &RUSTC_COMMIT[..8]
+    if COMPILER_COMMIT.len() >= 8 && COMPILER_COMMIT.bytes().all(|b| b.is_ascii_hexdigit()) {
+        &COMPILER_COMMIT[..8]
     } else {
         "unknown"
     }
@@ -121,12 +126,24 @@ pub fn version_display() -> &'static str {
 
 /// The compiler's bare release, e.g. `1.96.0` / `1.96.0-dev` — the second token of
 /// the `-vV` first line (`rustc <release> (<hash> <date>)`), `"unknown"` if absent.
-fn rustc_release() -> &'static str {
-    RUSTC_VERSION.split_whitespace().nth(1).unwrap_or("unknown")
+fn compiler_release() -> &'static str {
+    COMPILER_VERSION_LINE
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("unknown")
+}
+
+/// The producing compiler's real NAME: `trustc` for a Trust build, `rustc` for
+/// upstream. The `-vV` first line leads with the canonical `rustc` token by
+/// ecosystem contract, so the honest display name comes from the flavor — the
+/// classifier that already weighs the compiler's own self-identification.
+fn compiler_name() -> &'static str {
+    if COMPILER_FLAVOR == "t" { "trustc" } else { "rustc" }
 }
 
 /// One human line of compiler provenance for the About panel, e.g.
-/// `rustc 1.96.0 (ac68faa2) · rust · release · trust_verify off`.
+/// `trustc 1.99.0-dev (2b118046) · trust · release · trust_verify on` (or
+/// `rustc … · rust · …` on the upstream-stable compat slice).
 #[must_use]
 pub fn compiler_summary() -> String {
     let flavor_word = if COMPILER_FLAVOR == "t" {
@@ -135,8 +152,9 @@ pub fn compiler_summary() -> String {
         "rust"
     };
     format!(
-        "rustc {} ({}) \u{00b7} {flavor_word} \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}",
-        rustc_release(),
+        "{} {} ({}) \u{00b7} {flavor_word} \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}",
+        compiler_name(),
+        compiler_release(),
         compiler_commit_short(),
     )
 }
@@ -196,20 +214,25 @@ pub fn about_fields() -> Vec<(&'static str, String)> {
 
 /// The control-socket (`aterm-ctl version`) response line: a stable, greppable
 /// `key=value` form so scripts can parse the running build's provenance. Existing
-/// keys keep their meaning (additive only); `version=` carries the display suffix
-/// (`+r.<slug>`/`+t.<slug>`) — nothing machine-side compares it (the updater orders
-/// by `build=`, which stays the bare monotonic counter).
+/// keys keep their meaning (additive only — with ONE deliberate exception:
+/// v0.10.0 renamed the compiler keys `rustc=`/`rustc_commit=`/`rustc_host=` to
+/// `trustc=`/`trustc_commit=`/`trustc_host=` by owner ruling, because the
+/// toolchain that builds aterm is trustc and the surface must say so; on the
+/// upstream-stable x86_64 compat slice the same keys carry that slice's stock
+/// compiler data — `flavor=r` marks it). `version=` carries the display suffix
+/// (`+r.<slug>`/`+t.<slug>`) — nothing machine-side compares it (the updater
+/// orders by `build=`, which stays the bare monotonic counter).
 #[must_use]
 pub fn control_line() -> String {
     let update_pin_sha256 = aterm_update::compiled_update_pin_sha256();
     format!(
         "OK version={} build={BUILD_NUMBER} commit={GIT_COMMIT} built={BUILD_TIME} \
-         arch={} rustc={} rustc_commit={} rustc_host={RUSTC_HOST} flavor={COMPILER_FLAVOR} \
+         arch={} trustc={} trustc_commit={} trustc_host={COMPILER_HOST} flavor={COMPILER_FLAVOR} \
          profile={BUILD_PROFILE} trust_verify={TRUST_VERIFY} update_pin_sha256={update_pin_sha256} \
          signature={}\n",
         version_display(),
         std::env::consts::ARCH,
-        rustc_release(),
+        compiler_release(),
         compiler_commit_short(),
         binary_signature()
     )
@@ -238,9 +261,17 @@ mod tests {
             "stamped flavor must be r|t: {COMPILER_FLAVOR}"
         );
         assert!(TRUST_VERIFY == "on" || TRUST_VERIFY == "off");
-        assert!(!RUSTC_VERSION.is_empty() && RUSTC_VERSION.starts_with("rustc "));
+        // The raw -vV first line leads with `rustc` today by ecosystem contract;
+        // accept a future trustc-led banner too so the toolchain can drop the
+        // compat token without breaking this crate.
+        assert!(
+            !COMPILER_VERSION_LINE.is_empty()
+                && (COMPILER_VERSION_LINE.starts_with("rustc ")
+                    || COMPILER_VERSION_LINE.starts_with("trustc ")),
+            "unexpected -vV first line: {COMPILER_VERSION_LINE}"
+        );
         assert_ne!(
-            rustc_release(),
+            compiler_release(),
             "unknown",
             "release parsed from the -vV line"
         );
@@ -284,8 +315,8 @@ mod tests {
         assert_eq!(compiler.len(), 1, "exactly one compiler row");
         let row = compiler[0];
         assert!(
-            row.starts_with("rustc "),
-            "leads with the compiler name: {row}"
+            row.starts_with("trustc ") || row.starts_with("rustc "),
+            "leads with the real compiler name (trustc for a Trust build): {row}"
         );
         assert!(
             row.contains(compiler_commit_short()),
@@ -316,9 +347,9 @@ mod tests {
             "build=",
             "commit=",
             "built=",
-            "rustc=",
-            "rustc_commit=",
-            "rustc_host=",
+            "trustc=",
+            "trustc_commit=",
+            "trustc_host=",
             "flavor=",
             "profile=",
             "trust_verify=",

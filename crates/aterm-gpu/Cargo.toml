@@ -75,6 +75,11 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 criterion = "0.5"
+# The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
+# these parity tests export a font / rasterizer selection to both renderers, and
+# every mutation in the workspace routes through that helper rather than a raw
+# `set_var`. Dependency-free leaf, already linked transitively.
+aterm-log = { workspace = true }
 # Inline-image (OSC 1337) parity tests: encode test PNGs + base64 payloads.
 png = "0.17"
 aterm-codec = { workspace = true }

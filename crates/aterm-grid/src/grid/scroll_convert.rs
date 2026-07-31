@@ -271,7 +271,7 @@ impl DeferredLine {
             attrs_rle.push(CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits()));
         }
 
-        let mut line = Line::with_hyperlinks(&text, attrs_rle, Vec::new());
+        let mut line = Line::with_hyperlinks_owned(text, attrs_rle, Vec::new());
         if wrapped {
             line.set_wrapped(true);
         }
@@ -320,7 +320,7 @@ impl DeferredLine {
             );
         }
 
-        let mut line = Line::with_hyperlinks(&text, attrs_rle, extras.hyperlinks.clone());
+        let mut line = Line::with_hyperlinks_owned(text, attrs_rle, extras.hyperlinks.clone());
         if !extras.underline_colors.is_empty() {
             line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
         }
@@ -759,7 +759,7 @@ impl Grid {
             );
         }
 
-        let mut line = Line::with_hyperlinks(&text, attrs_rle, extras.hyperlinks.clone());
+        let mut line = Line::with_hyperlinks_owned(text, attrs_rle, extras.hyperlinks.clone());
         if !extras.underline_colors.is_empty() {
             line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
         }
@@ -794,7 +794,7 @@ impl Grid {
             attrs_rle.push(CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits()));
         }
 
-        let mut line = Line::with_hyperlinks(&text, attrs_rle, Vec::new());
+        let mut line = Line::with_hyperlinks_owned(text, attrs_rle, Vec::new());
         if row.is_wrapped() {
             line.set_wrapped(true);
         }

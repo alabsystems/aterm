@@ -27,7 +27,7 @@
 //! vendor is a HARD error (a "portable" bundle that still dlopens the builder's
 //! `~/.rustup` is worse than none).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -164,10 +164,15 @@ pub fn relocate_with(
     let mut report = Report::default();
     let vendored = stage.join(VENDOR_REL);
 
+    // ONE recursive traversal of the stage feeds BOTH passes below. The stage is a
+    // multi-GB toolchain payload, so walking it twice was a second full `read_dir` +
+    // sort over tens of thousands of entries for a list we already had.
+    let files = walk_files(stage)?;
+
     // Shared libs already in the payload, by basename — never re-vendor them.
     let mut have: BTreeSet<String> = BTreeSet::new();
-    for rel in walk_files(stage)? {
-        if is_shared_lib_name(&rel)
+    for rel in &files {
+        if is_shared_lib_name(rel)
             && let Some(b) = rel.file_name().and_then(|n| n.to_str())
         {
             have.insert(b.to_string());
@@ -178,15 +183,23 @@ pub fn relocate_with(
     // for `@rpath/<name>` / soname deps that don't resolve inside the payload.
     let mut donors: BTreeSet<PathBuf> = BTreeSet::new();
     let mut queue: Vec<PathBuf> = Vec::new();
-    for rel in walk_files(stage)? {
-        let p = stage.join(&rel);
+    // The pre-scan's load commands, KEPT rather than thrown away. `read_refs` is not a
+    // parse — it SPAWNS a subprocess per object (`otool -l` on macOS; three `patchelf`
+    // calls on Linux) — and the queue loop below immediately re-read every object the
+    // pre-scan had just read. A staged sysroot holds hundreds to thousands of native
+    // objects, so that was hundreds-to-thousands of redundant fork+exec cycles.
+    let mut prescanned: BTreeMap<PathBuf, ObjectRefs> = BTreeMap::new();
+    for rel in &files {
+        let p = stage.join(rel);
         if backend.is_native_object(&p) {
-            for r in backend.read_refs(&p)?.rpaths {
-                if is_machine_local(&r) {
+            let refs = backend.read_refs(&p)?;
+            for r in &refs.rpaths {
+                if is_machine_local(r) {
                     donors.insert(PathBuf::from(r));
                 }
             }
-            queue.push(p);
+            queue.push(p.clone());
+            prescanned.insert(p, refs);
         }
     }
 
@@ -195,7 +208,17 @@ pub fn relocate_with(
         if !processed.insert(obj.clone()) {
             continue;
         }
-        let refs = backend.read_refs(&obj)?;
+        // Serve the pre-scan when it has this object, else read it. The miss case is
+        // exactly the files VENDORED mid-loop (pushed below): those are freshly copied
+        // and re-id'd, so they must never be served from a pre-mutation entry — hence
+        // both push sites also drop any pre-scan entry for the destination. Everything
+        // else is read strictly before the loop's first mutation and `processed`
+        // guarantees each object is handled at most once, so a served entry is exactly
+        // what a fresh read would return.
+        let refs = match prescanned.remove(&obj) {
+            Some(refs) => refs,
+            None => backend.read_refs(&obj)?,
+        };
         let mut changed = false;
 
         // 1. A machine-local install-id → the portable form.
@@ -212,7 +235,9 @@ pub fn relocate_with(
                 // Absolute machine-local load (Mach-O) → vendor + repoint.
                 let base = basename(dep);
                 if vendor_file(Path::new(dep), &vendored, &base, &mut have, &mut report)? {
-                    queue.push(vendored.join(&base));
+                    let dest = vendored.join(&base);
+                    prescanned.remove(&dest); // freshly copied + re-id'd: never stale-serve it
+                    queue.push(dest);
                 }
                 backend.repoint_dep(&obj, dep, &base)?;
                 changed = true;
@@ -230,7 +255,9 @@ pub fn relocate_with(
                     && let Some(src) = find_in_donors(&base, &donors)
                 {
                     if vendor_file(&src, &vendored, &base, &mut have, &mut report)? {
-                        queue.push(vendored.join(&base));
+                        let dest = vendored.join(&base);
+                        prescanned.remove(&dest); // freshly copied + re-id'd (see above)
+                        queue.push(dest);
                     }
                     changed = true;
                 }
@@ -516,13 +543,20 @@ pub mod macho {
             &self,
             path: &Path,
             rel_origin: &str,
-            _keep: &[String],
+            keep: &[String],
             drop: &[String],
         ) -> Result<(), String> {
             // Mach-O rpaths are additive: add the vendored search path, then delete
             // each machine-local one (keep the rest untouched).
-            let refs = self.read_refs(path)?;
-            if !refs.rpaths.iter().any(|r| r == rel_origin) {
+            //
+            // "Is `rel_origin` already there?" is answered from `keep` instead of a THIRD
+            // `otool -l` spawn on this object. `keep` and `drop` ARE the caller's exact
+            // `is_machine_local` partition of this object's rpaths, and neither `-id` nor
+            // `-change` (the only rewrites between that read and here) touches LC_RPATH —
+            // so `keep ∪ drop` is still the live rpath set. `rel_origin` is an
+            // `@loader_path`-relative path, never machine-local, so it can only ever land
+            // in `keep` (asserted by `origin_relative_rpath_is_never_machine_local`).
+            if !keep.iter().any(|r| r == rel_origin) {
                 install_name_tool(&["-add_rpath", rel_origin], path)?;
             }
             for d in drop {
@@ -721,6 +755,35 @@ mod tests {
             origin_relative("$ORIGIN", &stage.join("lib/rustlib/x/bin"), &vendored),
             "$ORIGIN/../../../atpkg-vendored"
         );
+    }
+
+    // The Mach-O `fix_rpaths` decides "is the vendored rpath already on this object?"
+    // from the caller's `keep` list rather than re-spawning `otool -l`. That is sound
+    // because `keep`/`drop` are the exact `is_machine_local` partition of the object's
+    // rpaths AND the rpath being added is origin-relative, so it can only ever be
+    // classified into `keep` — never into `drop`, and never missed. It holds even when
+    // the stage itself sits under a machine-local prefix, because `origin_relative`
+    // strips the common prefix before emitting the token-relative tail.
+    #[test]
+    fn origin_relative_rpath_is_never_machine_local() {
+        for stage in [
+            Path::new("/Users//builder/stage"),
+            Path::new("/opt/homebrew/var/stage"),
+            Path::new("/home/builder/.cargo/checkout/stage"),
+        ] {
+            let vendored = stage.join(VENDOR_REL);
+            for dir in [
+                stage.join("bin"),
+                stage.join("lib/rustlib/x/bin"),
+                vendored.clone(),
+            ] {
+                for token in ["@loader_path", "$ORIGIN"] {
+                    let rel = origin_relative(token, &dir, &vendored);
+                    assert!(rel.starts_with(token));
+                    assert!(!is_machine_local(&rel), "{rel} must partition into `keep`");
+                }
+            }
+        }
     }
 
     #[test]

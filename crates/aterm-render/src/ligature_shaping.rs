@@ -471,10 +471,17 @@ pub fn shape_ligature_run_with_face(
     // Map each output glyph to its INPUT char by `cluster` (the byte offset we
     // pushed). For a per-char run on a monospace font the clusters are the char
     // boundaries in order; build a glyph id per char position.
-    let mut byte_to_idx = Vec::with_capacity(run_chars.len());
+    // The table is STRICTLY INCREASING by construction (every entry is the
+    // previous plus a non-zero `len_utf8`), so the lookup is a binary search,
+    // not a linear `position` scan: the run length is bounded only by `cols`,
+    // and a 200-column run of shapeable cells (a `---` separator, a base64
+    // blob, one-line JSON) turned an O(n) probe per output glyph into O(n²)
+    // per run on every ShapedRunCache miss — i.e. on every newly scrolled-in
+    // line. Same unique `Ok(idx)` `position` returned, same `Err` → bail.
+    let mut byte_to_idx: Vec<usize> = Vec::with_capacity(run_chars.len());
     let mut b = 0usize;
     for ch in run_chars {
-        byte_to_idx.push((b, ()));
+        byte_to_idx.push(b);
         b += ch.len_utf8();
     }
     let mut gids = vec![0u16; run_chars.len()];
@@ -482,7 +489,7 @@ pub fn shape_ligature_run_with_face(
         let gid = u16::try_from(info.glyph_id).ok()?;
         let cluster = info.cluster as usize;
         // Find the char index whose byte offset == this cluster.
-        let Some(idx) = byte_to_idx.iter().position(|&(bo, ())| bo == cluster) else {
+        let Ok(idx) = byte_to_idx.binary_search(&cluster) else {
             return None; // cluster didn't land on a char boundary — bail to per-cell
         };
         gids[idx] = gid;

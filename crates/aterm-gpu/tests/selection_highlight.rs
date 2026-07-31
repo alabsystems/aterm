@@ -13,26 +13,8 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, SelectionClip, Theme};
 
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-
-/// Max per-channel absolute difference between two same-sized frames.
-fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.pixels.iter().zip(b.pixels.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
-}
+mod common;
+use common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
 
 fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u32> {
     let mut out = Vec::with_capacity(cw * ch);
@@ -54,16 +36,7 @@ fn selection_highlight_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    // Gate: no GPU or no font -> skip cleanly.
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
 
@@ -296,15 +269,7 @@ fn inactive_selection_bg_gpu_matches_cpu() {
     let theme = Theme::default();
     let px = 18.0;
 
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
 
@@ -392,15 +357,7 @@ fn selection_fg_override_gpu_matches_cpu() {
     // contrast-floor default.
     let theme = Theme::default();
     let px = 18.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     // Distinctive override unlike the default fg/bg/selection, on BOTH paths.

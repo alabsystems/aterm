@@ -33,6 +33,7 @@ use web_time::Instant;
 use aterm_render::{GlowQuad, premul_rgb};
 
 use crate::cursor_glow::Geom;
+use crate::effect_util::{push_grid_rect as push_rect, water_ramp};
 
 /// Slosh rate in turns/second: a glassy sway at rest, a churning slosh at full
 /// surge. The phase only advances when frames render, so a settled bead sways
@@ -417,78 +418,10 @@ impl CursorDroplet {
     }
 }
 
-/// Clamp a pixel rect to the grid interior and split it into per-cell-row
-/// [`GlowQuad`]s (the renderer row-gate + CPU/GPU parity invariant) — the same
-/// contract as the aurora's `push_rect`, kept local so this module needs no
-/// cross-import (mirrors `cursor_fireball::push_rect`).
-fn push_rect(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32, premul: u32) {
-    if w <= 0 || h <= 0 || premul == 0 {
-        return;
-    }
-    let gw = (geom.cols * geom.cw) as i32;
-    let gh = (geom.rows * geom.ch) as i32;
-    let x0 = x.max(0);
-    let x1 = (x + w).min(gw);
-    let y0 = y.max(0);
-    let y1 = (y + h).min(gh);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let ch = geom.ch as i32;
-    let mut yy = y0;
-    while yy < y1 {
-        let row = yy / ch;
-        let band_end = ((row + 1) * ch).min(y1);
-        out.push(GlowQuad {
-            row: row as u16,
-            x: x0 as u16,
-            y: yy as u16,
-            w: (x1 - x0) as u16,
-            h: (band_end - yy) as u16,
-            color: premul,
-        });
-        yy = band_end;
-    }
-}
-
-/// Per-channel linear interpolation between two `0x00RRGGBB` colours, `t` 0..1.
-fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    let mix = |sh: u32| {
-        let ca = ((a >> sh) & 0xff) as f32;
-        let cb = ((b >> sh) & 0xff) as f32;
-        ((ca + (cb - ca) * t) + 0.5) as u32
-    };
-    (mix(16) << 16) | (mix(8) << 8) | mix(0)
-}
-
-/// The WATER ramp, `t` 0 (deep-sea abyss) → 1 (foam crest) — the same ocean
-/// palette as the aurora's fluid wake and droplet splash (kept local, no
-/// cross-import, mirroring `cursor_fireball::fire_ramp`). Saturated and
-/// green-leaning through the midband — rich blue-green WATER, never pale ice.
-fn water_ramp(t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    let stops = [
-        (0.0f32, 0x0005_2C48u32),
-        (0.35, 0x000E_66B4),
-        (0.65, 0x0014_AAC8),
-        (0.85, 0x0032_DCDE),
-        (1.0, 0x00C2_F2F5),
-    ];
-    for w in stops.windows(2) {
-        let (t0, c0) = w[0];
-        let (t1, c1) = w[1];
-        if t <= t1 {
-            let local = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
-            return lerp_rgb(c0, c1, local);
-        }
-    }
-    stops[stops.len() - 1].1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect_util::ink;
     use std::time::Duration;
 
     fn geom() -> Geom {
@@ -509,14 +442,6 @@ mod tests {
             enabled: true,
             intensity: 1.0,
         }
-    }
-    fn ink(out: &[GlowQuad]) -> u64 {
-        out.iter()
-            .map(|q| {
-                let px = (q.w as u64) * (q.h as u64);
-                px * (((q.color >> 16) & 0xff) + ((q.color >> 8) & 0xff) + (q.color & 0xff)) as u64
-            })
-            .sum()
     }
 
     /// Disabled ⇒ no fill, no bead, fp 0 (byte-identical to the plain cursor).

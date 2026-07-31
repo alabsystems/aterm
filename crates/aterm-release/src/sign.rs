@@ -69,7 +69,18 @@ impl ReleaseConf {
             "ATERM_EXPECTED_TEAM_ID",
         ]
         .iter()
-        .filter_map(|k| self.get(k).map(|v| (k.to_string(), v.to_string())))
+        // EMPTY assignments are dropped, not exported: a stale `KEY=` line
+        // would otherwise pin the empty string into the cargo child env and
+        // OVERRIDE a non-empty value the operator has exported — baking an
+        // inert client while the cut's own gates pass under the env key
+        // (adversarial review 2026-07-30). An absent pin and an empty pin mean
+        // the same thing (inert); only a real value is worth exporting.
+        .filter_map(|k| {
+            self.get(k)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| (k.to_string(), v.to_string()))
+        })
         .collect()
     }
 

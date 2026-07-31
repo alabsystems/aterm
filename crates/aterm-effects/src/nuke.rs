@@ -232,7 +232,7 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
     };
     match part {
         NukePart::Stem => {
-            if t_ms < FLASH_END_MS || t_ms >= NUKE_TOTAL_MS {
+            if !(FLASH_END_MS..NUKE_TOTAL_MS).contains(&t_ms) {
                 return None;
             }
             let q = ((t_ms - FLASH_END_MS) as f32 / (STEM_RISE_END_MS - FLASH_END_MS) as f32)
@@ -249,7 +249,7 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
             })
         }
         NukePart::Cap => {
-            if t_ms < CAP_BLOOM_START_MS || t_ms >= NUKE_TOTAL_MS {
+            if !(CAP_BLOOM_START_MS..NUKE_TOTAL_MS).contains(&t_ms) {
                 return None;
             }
             let q = ((t_ms - CAP_BLOOM_START_MS) as f32
@@ -272,7 +272,7 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
             })
         }
         NukePart::Skirt => {
-            if t_ms < SKIRT_START_MS || t_ms >= SKIRT_END_MS {
+            if !(SKIRT_START_MS..SKIRT_END_MS).contains(&t_ms) {
                 return None;
             }
             let q = ((t_ms - SKIRT_START_MS) as f32 / (SKIRT_END_MS - SKIRT_START_MS) as f32)
@@ -350,8 +350,12 @@ mod tests {
             "the cap must bloom at its edge"
         );
         // The cap starts BEFORE the stem finishes: the head is pushed up by the
-        // column, it does not appear on a finished one.
-        assert!(CAP_BLOOM_START_MS < STEM_RISE_END_MS);
+        // column, it does not appear on a finished one. Both are constants, so
+        // this is checked at build time — a retune that inverts them never
+        // compiles.
+        const {
+            assert!(CAP_BLOOM_START_MS < STEM_RISE_END_MS);
+        }
         for part in PARTS {
             assert!(
                 nuke_draw(NUKE_TOTAL_MS, part).is_none(),

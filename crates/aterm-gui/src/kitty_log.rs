@@ -1114,24 +1114,10 @@ fn now_rfc3339() -> String {
     }
 }
 
-/// Format seconds-since-Unix-epoch as an RFC3339 UTC instant, via Howard
-/// Hinnant's branch-free civil-from-days (the exact `aterm-update::install`
-/// helper — that fn is crate-private there). Pure and total for all inputs.
-fn format_rfc3339(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // day-of-era      [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day-of-year (Mar 1 = 0)
-    let mp = (5 * doy + 2) / 153; // month, shifted so Mar = 0  [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // day-of-month  [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month  [1, 12]
-    let y = yoe + era * 400 + i64::from(m <= 2); // Jan/Feb belong to the next year
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
+// The RFC3339 UTC stamp is `aterm_types::rfc3339::format_rfc3339` — the ONE
+// workspace home for the Howard-Hinnant civil-calendar math. This file used to
+// carry a byte-identical copy and said so in its own doc comment.
+use aterm_types::rfc3339::format_rfc3339;
 
 /// The settings overlay's SNAPSHOT of the log (§F4.6): taken on open /
 /// category switch / drain-while-open, so the card painter stays a pure
@@ -1415,10 +1401,10 @@ impl KittyLogHost {
             .as_mut()
             .and_then(|writer| writer.initial.take())
             .map(|receiver| receiver.recv());
-        match received {
-            Some(Ok(loaded)) => self.absorb_initial(loaded),
-            // Worker gone without sending: nothing to import, same as before.
-            Some(Err(_)) | None => {}
+        // A worker that went away without sending — `None`, or `Err(Disconnected)`
+        // — leaves nothing to import, which is the same no-op as before.
+        if let Some(Ok(loaded)) = received {
+            self.absorb_initial(loaded);
         }
     }
 

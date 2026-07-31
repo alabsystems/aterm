@@ -318,7 +318,7 @@ impl TerminalHandler<'_> {
             } else {
                 "\x1b\\"
             };
-            let response = format!("\x1b]19;{}{}", ColorPalette::format_color_spec(color), st,);
+            let response = format!("\x1b]19;{}{}", ColorPalette::format_color_spec(color), st);
             self.send_response(cap, response.as_bytes());
             return;
         }

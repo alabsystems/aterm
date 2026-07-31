@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 description = "aterm visual-effects engines — the host-agnostic cursor aurora/comet-trail and sparkle-words (animated ink, peeking cat, supernova) state machines, extracted from aterm-gui so the native GUI and the web embedders (aterm-wasm / aterm-gpu-web) drive ONE implementation of the art."
 
+[features]
+# Test-only observation seam for proving how many OS open attempts one exact
+# visual-feed path receives. No shipping crate enables this feature.
+test-open-probe = []
+
 [dependencies]
 # Engine snapshot types (Terminal for the rescan, RenderCell, selection view).
 # default-features = false keeps the closure wasm32-clean (no disk-tier libc/zstd);

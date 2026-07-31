@@ -115,6 +115,13 @@ mod csi;
 mod dispatch;
 mod invariants;
 mod simd;
+// No production caller since the speculative CSI parameter pre-parse was
+// removed from `parse_csi_general` (it measured as a net loss on every shape
+// that reached it — see the doc comment there). The module is kept compiled
+// under `cfg(test)` only, for its exhaustive SIMD-vs-scalar differential and
+// fuzz tests, which remain the documentation of what a bulk CSI parameter
+// parser has to agree with should anyone attempt one again.
+#[cfg(test)]
 mod simd_csi;
 mod state;
 /// State transition table.

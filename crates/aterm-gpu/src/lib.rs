@@ -471,20 +471,28 @@ impl GpuContext {
             Err(_) => return Err("readback buffer map never completed".to_string()),
         }
         let data = slice.get_mapped_range();
+        // Deref the BufferView ONCE. `wgpu::BufferView: Deref` runs
+        // `self.inner.read_slice()` through `DispatchBufferMappedRange`, so the
+        // old `data[p]`/`data[p+1]`/... form paid that chain (plus a bounds
+        // check) FOUR TIMES PER PIXEL — ~24M redundant deref/bounds pairs for a
+        // 3024x1964 readback, on the UI event loop behind the snapshot/image
+        // verbs. Binding `&[u8]` once and walking row slices as `[u8; 4]` texels
+        // gives the compiler a fixed-size, bounds-check-free window; the packing
+        // expression below is byte-for-byte the old one.
+        let bytes: &[u8] = &data;
 
         let mut pixels = Vec::with_capacity(w * h);
         for row in 0..h {
             let base = row * padded;
-            for col in 0..w {
-                let p = base + col * 4;
-                let (r, g, b, a) = (
-                    data[p] as u32,
-                    data[p + 1] as u32,
-                    data[p + 2] as u32,
-                    data[p + 3] as u32,
-                );
-                pixels.push(((255 - a) << 24) | (r << 16) | (g << 8) | b);
-            }
+            let src = &bytes[base..base + w * 4];
+            // `src` is exactly `w * 4` bytes, so the `as_chunks` remainder is always
+            // empty — the discarded tail is the one `chunks_exact` also dropped.
+            pixels.extend(src.as_chunks::<4>().0.iter().map(|c| {
+                ((255 - u32::from(c[3])) << 24)
+                    | (u32::from(c[0]) << 16)
+                    | (u32::from(c[1]) << 8)
+                    | u32::from(c[2])
+            }));
         }
         drop(data);
         buffer.unmap();

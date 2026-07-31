@@ -25,6 +25,11 @@ aterm-containment = { workspace = true }
 # diagnostic subcommand that prints and exits before any PTY spawn.
 aterm-render = { workspace = true }
 aterm-types = { workspace = true }
+# The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
+# `--containment` hands its selection to the init funnel through the env var that
+# funnel reads, and every mutation in the workspace routes through that helper
+# rather than a raw `set_var`. Dependency-free leaf, already linked transitively.
+aterm-log = { workspace = true }
 
 # The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
 # the Windows driver is kernel32 console FFI with no libc.

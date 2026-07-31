@@ -1503,9 +1503,20 @@ impl App {
     /// window's AccessKit adapter. The tree fans out through [`crate::overlay::OverlayModel::a11y`]
     /// off the SAME model the pixels + `controls` verb read, so which surface is live routes
     /// itself (a missing variant is a compile error, not a Settings-only fallback to empty).
+    ///
+    /// PERF: bails before building ANYTHING unless an OS a11y client has actually attached
+    /// ([`crate::WindowState::a11y_active`]). The whole body below is thrown away by
+    /// `update_if_active` while the adapter is inactive — it just used to be thrown away
+    /// *after* walking every visible cell into a string, on every present. Attachment always
+    /// arrives as `InitialTreeRequested`, which raises the latch and then publishes here, so
+    /// the first tree a screen reader sees is unchanged.
     #[cfg(feature = "a11y-accesskit")]
     pub(crate) fn push_a11y_tree(&mut self, wid: crate::WindowId) {
-        if self.windows.get(&wid).is_none_or(|ws| ws.a11y.is_none()) {
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|ws| ws.a11y.is_none() || !ws.a11y_active)
+        {
             return;
         }
         // DEFAULT-2: with NO overlay open, publish the live terminal GRID (its visible text,
@@ -1563,11 +1574,26 @@ impl App {
             return;
         };
         match event.window_event {
-            // The OS a11y client is initialising — hand it the live overlay's tree.
-            AkWindowEvent::InitialTreeRequested => self.push_a11y_tree(wid),
+            // The OS a11y client is initialising — hand it the live overlay's tree. This is
+            // the ONLY edge that says "someone is actually listening": raise the latch first
+            // so the publish below (and every later present) is allowed to build a tree.
+            AkWindowEvent::InitialTreeRequested => {
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.a11y_active = true;
+                }
+                self.push_a11y_tree(wid);
+            }
             // A screen reader activated/focused a control → drive the live overlay's model.
             AkWindowEvent::ActionRequested(req) => self.on_accessibility_action(wid, req),
-            AkWindowEvent::AccessibilityDeactivated => {}
+            // The client detached. Drop the latch so presents stop building trees nobody
+            // reads; a later re-attach re-fires `InitialTreeRequested` (the platform adapter
+            // returns to its inactive state, so it re-runs the activation handler). Never
+            // fires on macOS, whose winit adapter installs no deactivation handler.
+            AkWindowEvent::AccessibilityDeactivated => {
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.a11y_active = false;
+                }
+            }
         }
     }
 
@@ -2483,5 +2509,40 @@ mod tests {
         app.settings_select(idx);
         app.settings_wheel_open();
         assert_eq!(wheel_hex(&app), canonical_hex(u32_rgb(app.theme.fg)));
+    }
+
+    /// PERF/CONTRACT: `push_a11y_tree` builds the whole visible-screen tree eagerly and only
+    /// then offers it to `update_if_active`, so the adapter's own "is anyone listening?" test
+    /// arrives far too late to save the work. The window's `a11y_active` latch is what moves
+    /// that test to the front — it must start DOWN (the adapter exists for every OS window,
+    /// attached or not), rise on the attach edge, and fall again on detach.
+    #[cfg(feature = "a11y-accesskit")]
+    #[test]
+    fn accessibility_publish_latches_on_attach_and_clears_on_detach() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let winit_id = winit::window::WindowId::from(1u64);
+        app.winit_to_window.insert(winit_id, wid);
+
+        assert!(
+            !app.windows[&wid].a11y_active,
+            "no OS a11y client has attached, so presents must not build a tree"
+        );
+        app.on_accessibility_event(accesskit_winit::Event {
+            window_id: winit_id,
+            window_event: accesskit_winit::WindowEvent::InitialTreeRequested,
+        });
+        assert!(
+            app.windows[&wid].a11y_active,
+            "InitialTreeRequested is the attach edge — publishing must resume"
+        );
+        app.on_accessibility_event(accesskit_winit::Event {
+            window_id: winit_id,
+            window_event: accesskit_winit::WindowEvent::AccessibilityDeactivated,
+        });
+        assert!(
+            !app.windows[&wid].a11y_active,
+            "the client detached; a re-attach re-fires InitialTreeRequested"
+        );
     }
 }

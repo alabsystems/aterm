@@ -153,7 +153,7 @@ mod line_codec;
 mod line_codec_block;
 // Re-exported publicly (B.3.2): the block codec is the on-the-wire form for
 // `TerminalCheckpoint` grid bodies and must be callable from aterm-core.
-pub(crate) use line_codec::MAX_DECODE_PAGE_LINES;
+pub(crate) use line_codec::{MAX_DECODE_PAGE_LINES, count_page_lines};
 pub use line_codec::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_tail_strict,
     deserialize_page_lines, serialize_lines,
@@ -279,39 +279,13 @@ impl Line {
         }
     }
 
-    /// Create a line with text and RLE-compressed attributes.
+    /// Shared body of the text constructors: the "don't store what is
+    /// all-default / empty" normalization, applied to already-built content.
     ///
-    /// This is the primary constructor when converting from grid Row to scrollback Line.
-    /// The attrs RLE should have the same length as the character count in text.
-    #[must_use]
-    pub fn with_attrs(text: &str, attrs: Rle<CellAttrs>) -> Self {
-        // Optimization: if empty or all attrs are default, don't store them
-        let is_all_default = attrs.run_count() == 0
-            || (attrs.run_count() == 1
-                && attrs.runs().first().is_some_and(|r| r.value.is_default()));
-
-        let attrs = if is_all_default {
-            None
-        } else {
-            Some(Box::new(attrs))
-        };
-
-        Self {
-            content: LineContent::from_bytes(text.as_bytes()),
-            attrs,
-            flags: LineFlags::empty(),
-            hyperlinks: None,
-            underline_colors: None,
-        }
-    }
-
-    /// Create a line with text, attributes, and hyperlinks.
-    ///
-    /// This is the full constructor for preserving hyperlinks from the visible grid
-    /// when lines scroll into scrollback.
-    #[must_use]
-    pub fn with_hyperlinks(
-        text: &str,
+    /// Factored so the borrowing and owning forms cannot drift — they differ
+    /// only in how `content` was produced.
+    fn from_parts(
+        content: LineContent,
         attrs: Rle<CellAttrs>,
         hyperlinks: Vec<HyperlinkSpan>,
     ) -> Self {
@@ -334,12 +308,52 @@ impl Line {
         };
 
         Self {
-            content: LineContent::from_bytes(text.as_bytes()),
+            content,
             attrs,
             flags: LineFlags::empty(),
             hyperlinks,
             underline_colors: None,
         }
+    }
+
+    /// Create a line with text and RLE-compressed attributes.
+    ///
+    /// This is the primary constructor when converting from grid Row to scrollback Line.
+    /// The attrs RLE should have the same length as the character count in text.
+    #[must_use]
+    pub fn with_attrs(text: &str, attrs: Rle<CellAttrs>) -> Self {
+        Self::from_parts(LineContent::from_bytes(text.as_bytes()), attrs, Vec::new())
+    }
+
+    /// Create a line with text, attributes, and hyperlinks.
+    ///
+    /// This is the full constructor for preserving hyperlinks from the visible grid
+    /// when lines scroll into scrollback.
+    #[must_use]
+    pub fn with_hyperlinks(
+        text: &str,
+        attrs: Rle<CellAttrs>,
+        hyperlinks: Vec<HyperlinkSpan>,
+    ) -> Self {
+        Self::from_parts(LineContent::from_bytes(text.as_bytes()), attrs, hyperlinks)
+    }
+
+    /// [`with_hyperlinks`](Self::with_hyperlinks) taking OWNERSHIP of the text.
+    ///
+    /// The row→line materialization sites all build the text into a `String`
+    /// they drop immediately afterwards, so the borrowing form makes every line
+    /// over 32 bytes (any full-width output row) allocate a second buffer,
+    /// memcpy into it, and free the first. Handing the buffer over instead
+    /// makes that one allocation and zero copies, on the per-line path every
+    /// row pays as it ages out of the ring. The stored bytes — and therefore
+    /// serialization, search, and `memory_used()` — are identical.
+    #[must_use]
+    pub fn with_hyperlinks_owned(
+        text: String,
+        attrs: Rle<CellAttrs>,
+        hyperlinks: Vec<HyperlinkSpan>,
+    ) -> Self {
+        Self::from_parts(LineContent::from_vec(text.into_bytes()), attrs, hyperlinks)
     }
 
     /// Get the RLE-compressed attributes, if any.

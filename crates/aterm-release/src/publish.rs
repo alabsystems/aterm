@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use aterm_update_core::Manifest;
+use aterm_update_core::tag::TagError;
 
 use crate::ledger::{self, Error, GitCli, GitRunner, Result, RunOut, git_ok, rev_parse};
 use crate::{buildplan, bundle, changelog, dmg, gates, manifest_out, mirror, sign, verify};
@@ -95,7 +96,7 @@ pub fn fmt_elapsed(start: Instant) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// version + slug helpers (pure, ported from the retired shell derivations)
+// version + slug helpers (pure)
 // ---------------------------------------------------------------------------
 
 /// Read the source tree's `[workspace.package]` `MAJOR.MINOR.0` version —
@@ -271,17 +272,14 @@ pub fn unix_now() -> u64 {
 // gh plumbing (3 retries with backoff — spec §7)
 // ---------------------------------------------------------------------------
 
-/// One `gh` invocation, captured. Spawn failure is an error; a non-zero exit
-/// is returned to the caller (probes need to see "not found" exits).
-/// The release-org token, read from disk. `cargo ship cut` otherwise authenticates
-/// EVERY call with `gh auth token`, which on the owner's machine is the dev account
-/// (`alabsystems`) and has no push on the public update channel — so the mirror
-/// step could never write there, and the cut refused at
-/// [`preflight_mirror_target`] with the access sitting unused next to it.
+/// The release-org token, read from disk. Without it `cargo ship cut` authenticates
+/// EVERY call with `gh auth token` — the dev account, which has no push on the public
+/// update channel, so the mirror step cannot write there and the cut refuses at
+/// [`preflight_mirror_target`].
 ///
-/// Same file the publication engine uses (`publication/bin/pub` `MIRROR_TOKEN_PATH`,
-/// documented in its `KEYS.md`), so the two pipelines finally share one credential
-/// for the release org instead of disagreeing about whether it exists.
+/// Same file the publication engine reads (`publication/bin/pub` `MIRROR_TOKEN_PATH`,
+/// documented in its `KEYS.md`): one credential for the release org, shared by both
+/// pipelines.
 fn channel_token_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".secrets/gh_access_token_alabsystems"))
@@ -330,6 +328,8 @@ fn active_channel_token() -> Option<String> {
         .flatten()
 }
 
+/// One `gh` invocation, captured. Spawn failure is an error; a non-zero exit
+/// is returned to the caller (probes need to see "not found" exits).
 pub fn gh_raw(args: &[&str]) -> Result<RunOut> {
     let mut command = Command::new("gh");
     command.args(args);
@@ -1265,8 +1265,10 @@ impl Journal {
     fn validate(&self) -> Result<()> {
         if !(1..=JOURNAL_FORMAT).contains(&self.format) {
             return Err(Error::new(format!(
-                "unsupported release journal format {} (this cutter accepts completed formats 1–4, refuses unfinished legacy formats, and writes {})",
-                self.format, JOURNAL_FORMAT
+                "unsupported release journal format {} (this cutter accepts completed formats 1–{}, refuses unfinished legacy formats, and writes {})",
+                self.format,
+                JOURNAL_FORMAT - 1,
+                JOURNAL_FORMAT
             )));
         }
         if self.format == JOURNAL_FORMAT {
@@ -1309,84 +1311,79 @@ impl Journal {
                 "release journal marks build complete without its required manifest signature",
             ));
         }
-        if self.format == JOURNAL_FORMAT
-            && self.is_done("draft")
-            && self.release_id.is_none_or(|id| id == 0)
-        {
-            return Err(Error::new(
-                "current release journal marks draft complete without a nonzero immutable GitHub release ID",
-            ));
+        if self.format == JOURNAL_FORMAT {
+            if self.is_done("draft") && self.release_id.is_none_or(|id| id == 0) {
+                return Err(Error::new(
+                    "current release journal marks draft complete without a nonzero immutable GitHub release ID",
+                ));
+            }
+            if self.is_done("draft") && !self.draft_create_issued {
+                return Err(Error::new(
+                    "current release journal marks draft complete without durable create intent",
+                ));
+            }
+            if self.release_id.is_some() && !self.draft_create_issued {
+                return Err(Error::new(
+                    "release journal carries an immutable release ID without durable create intent",
+                ));
+            }
+            Self::validate_upload_intent_set(
+                "",
+                self.release_id,
+                self.draft_create_issued,
+                &self.upload_intents,
+            )?;
+            // The public-channel mirror enforces the private side's capability
+            // invariants: an object ID implies a durable create intent, and
+            // upload intents imply both. A journal that failed these could
+            // authorize a second POST against the channel the whole fleet reads.
+            if self.mirror_release_id.is_some_and(|id| id == 0) {
+                return Err(Error::new(
+                    "release journal carries a zero mirror release ID",
+                ));
+            }
+            if self.mirror_release_id.is_some() && !self.mirror_create_issued {
+                return Err(Error::new(
+                    "release journal carries a mirror release ID without durable create intent",
+                ));
+            }
+            Self::validate_upload_intent_set(
+                "mirror ",
+                self.mirror_release_id,
+                self.mirror_create_issued,
+                &self.mirror_upload_intents,
+            )?;
         }
-        if self.format == JOURNAL_FORMAT && self.is_done("draft") && !self.draft_create_issued {
-            return Err(Error::new(
-                "current release journal marks draft complete without durable create intent",
-            ));
-        }
-        if self.format == JOURNAL_FORMAT && self.release_id.is_some() && !self.draft_create_issued {
-            return Err(Error::new(
-                "release journal carries an immutable release ID without durable create intent",
-            ));
-        }
+        Ok(())
+    }
+
+    /// The shared private/mirror upload-intent invariants: every intent name is
+    /// non-empty, in the exact upload URL alphabet, and unique; any intent at
+    /// all implies the durable draft capability (a persisted release ID and
+    /// create intent). `label` is `""` for the private side, `"mirror "` for
+    /// the channel side.
+    fn validate_upload_intent_set(
+        label: &str,
+        release_id: Option<u64>,
+        create_issued: bool,
+        upload_intents: &[String],
+    ) -> Result<()> {
         let mut intents = std::collections::BTreeSet::new();
-        if self.format == JOURNAL_FORMAT
-            && self.upload_intents.iter().any(|name| {
-                name.is_empty()
-                    || !name.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
-                    })
-                    || !intents.insert(name)
-            })
-        {
-            return Err(Error::new(
-                "release journal upload intents are empty, non-canonical, or duplicated",
-            ));
+        if upload_intents.iter().any(|name| {
+            name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+                || !intents.insert(name)
+        }) {
+            return Err(Error::new(format!(
+                "release journal {label}upload intents are empty, non-canonical, or duplicated"
+            )));
         }
-        if self.format == JOURNAL_FORMAT
-            && !self.upload_intents.is_empty()
-            && (self.release_id.is_none() || !self.draft_create_issued)
-        {
-            return Err(Error::new(
-                "release journal carries upload intents without its durable draft capability",
-            ));
-        }
-        // The public-channel mirror repeats the private side's capability
-        // invariants verbatim: an object ID implies a durable create intent,
-        // and upload intents imply both. A journal that failed these could
-        // authorize a second POST against the channel the whole fleet reads.
-        if self.format == JOURNAL_FORMAT && self.mirror_release_id.is_some_and(|id| id == 0) {
-            return Err(Error::new(
-                "release journal carries a zero mirror release ID",
-            ));
-        }
-        if self.format == JOURNAL_FORMAT
-            && self.mirror_release_id.is_some()
-            && !self.mirror_create_issued
-        {
-            return Err(Error::new(
-                "release journal carries a mirror release ID without durable create intent",
-            ));
-        }
-        let mut mirror_intents = std::collections::BTreeSet::new();
-        if self.format == JOURNAL_FORMAT
-            && self.mirror_upload_intents.iter().any(|name| {
-                name.is_empty()
-                    || !name.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
-                    })
-                    || !mirror_intents.insert(name)
-            })
-        {
-            return Err(Error::new(
-                "release journal mirror upload intents are empty, non-canonical, or duplicated",
-            ));
-        }
-        if self.format == JOURNAL_FORMAT
-            && !self.mirror_upload_intents.is_empty()
-            && (self.mirror_release_id.is_none() || !self.mirror_create_issued)
-        {
-            return Err(Error::new(
-                "release journal carries mirror upload intents without its durable mirror draft capability",
-            ));
+        if !upload_intents.is_empty() && (release_id.is_none() || !create_issued) {
+            return Err(Error::new(format!(
+                "release journal carries {label}upload intents without its durable {label}draft capability"
+            )));
         }
         Ok(())
     }
@@ -1557,19 +1554,31 @@ pub fn validate_one_shot_curl_help(help: &str) -> Result<()> {
     Ok(())
 }
 
+/// Prove the curl binary supports every one-shot POST option. The option set
+/// cannot change within one process, so the probe runs once and every later
+/// caller sees the same verdict (including the original failure, verbatim).
+fn curl_transport_preflight() -> Result<()> {
+    static VERDICT: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    VERDICT
+        .get_or_init(|| {
+            let curl = Command::new("curl")
+                .args(["--help", "all"])
+                .output()
+                .map_err(|error| format!("spawn curl transport preflight: {error}"))?;
+            if !curl.status.success() {
+                return Err("curl transport preflight failed before durable POST intent".into());
+            }
+            let curl_help = std::str::from_utf8(&curl.stdout)
+                .map_err(|_| "curl transport help is not UTF-8".to_string())?;
+            validate_one_shot_curl_help(curl_help).map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(Error::new)
+}
+
 fn prepare_github_auth_headers() -> Result<GithubAuthHeaders> {
-    let curl = Command::new("curl")
-        .args(["--help", "all"])
-        .output()
-        .map_err(|error| Error::new(format!("spawn curl transport preflight: {error}")))?;
-    if !curl.status.success() {
-        return Err(Error::new(
-            "curl transport preflight failed before durable POST intent",
-        ));
-    }
-    let curl_help = std::str::from_utf8(&curl.stdout)
-        .map_err(|_| Error::new("curl transport help is not UTF-8"))?;
-    validate_one_shot_curl_help(curl_help)?;
+    curl_transport_preflight()?;
     // Under a channel scope the upload targets the PUBLIC channel, which `gh auth`
     // cannot write; use the release-org token for the header file instead. Outside
     // the scope this is unchanged.
@@ -1617,6 +1626,99 @@ fn prepare_github_auth_headers() -> Result<GithubAuthHeaders> {
         _dir: dir,
         curl_header_arg: format!("@{header_path}"),
     })
+}
+
+/// A fully prepared one-shot POST. Every fallible preflight — the private
+/// payload file, the auth-header file, argv encoding — completes at
+/// construction, BEFORE the caller persists its durable intent; the
+/// permit-consuming [`Self::issue`] then goes straight to curl. The held temp
+/// dirs keep the payload and header files alive until the POST returns.
+struct OneShotPost {
+    _payload_dir: Option<PrivateTempDir>,
+    _auth: GithubAuthHeaders,
+    args: Vec<String>,
+}
+
+impl OneShotPost {
+    /// JSON-body POST (draft creates). `temp_label` distinguishes the
+    /// private/mirror temp directories; `subject` names the request in errors.
+    fn prepare_json(
+        temp_label: &str,
+        subject: &str,
+        endpoint: &str,
+        payload: &[u8],
+    ) -> Result<Self> {
+        let payload_dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
+            "aterm-release-{temp_label}-{}-{}",
+            std::process::id(),
+            RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )))?;
+        let payload_path = payload_dir.path().join("request.json");
+        fs::write(&payload_path, payload)
+            .map_err(|error| Error::new(format!("write {subject}: {error}")))?;
+        let payload_arg = payload_path
+            .to_str()
+            .ok_or_else(|| Error::new(format!("{subject} path is not UTF-8")))?;
+        let data_arg = format!("@{payload_arg}");
+        let auth = prepare_github_auth_headers()?;
+        Ok(Self {
+            args: Self::curl_args(&auth, "Content-Type: application/json", &data_arg, endpoint),
+            _payload_dir: Some(payload_dir),
+            _auth: auth,
+        })
+    }
+
+    /// Raw file-body POST (asset uploads). `subject` names the file in errors.
+    fn prepare_binary(subject: &str, endpoint: &str, file: &Path) -> Result<Self> {
+        let file_arg = file
+            .to_str()
+            .ok_or_else(|| Error::new(format!("{subject} path is not UTF-8")))?;
+        let data_arg = format!("@{file_arg}");
+        let auth = prepare_github_auth_headers()?;
+        Ok(Self {
+            args: Self::curl_args(
+                &auth,
+                "Content-Type: application/octet-stream",
+                &data_arg,
+                endpoint,
+            ),
+            _payload_dir: None,
+            _auth: auth,
+        })
+    }
+
+    fn curl_args(
+        auth: &GithubAuthHeaders,
+        content_type: &str,
+        data_arg: &str,
+        endpoint: &str,
+    ) -> Vec<String> {
+        [
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--retry",
+            "0",
+            "--request",
+            "POST",
+            "--header",
+            &auth.curl_header_arg,
+            "--header",
+            content_type,
+            "--data-binary",
+            data_arg,
+            "--url",
+            endpoint,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    fn issue(self, permit: DurablePostPermit) -> Result<RunOut> {
+        let args: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        issue_nonidempotent_post(permit, &args)
+    }
 }
 
 /// Canonical release-channel floor. Zero has the same semantics as absence,
@@ -1818,62 +1920,31 @@ fn unique_asset_id(release: &AppcastRelease, name: &str) -> Result<Option<u64>> 
 }
 
 /// What one published release tag is to the CURRENT version protocol. The
-/// publisher's classification is byte-for-byte the client's
-/// (`aterm-update/src/github.rs`) — publisher and fleet must agree on which
-/// releases are even candidates.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TagKind {
-    /// A `vMAJOR.MINOR.PATCH` release on the current version scheme, carrying
-    /// its numeric ordering key.
-    Candidate(Vec<u64>),
-    /// A pre-cut-over `vMAJOR.MINOR` release. The scheme changed to the
-    /// unified `MAJOR.MINOR.0` version (`VERSIONING.md`) and the old line
-    /// was NOT carried forward — those releases stay published in the archive
-    /// but are never candidates, and are skipped rather than treated as
-    /// errors so the archive cannot stall the channel.
-    Legacy,
-}
+/// publisher's classification IS the client's (`aterm-update/src/github.rs`):
+/// both compile the one grammar in [`aterm_update_core::tag`], so publisher and
+/// fleet cannot disagree about which releases are even candidates.
+pub use aterm_update_core::tag::TagKind;
 
 /// Classify one release tag.
 ///
-/// Only the canonical three-component `vMAJOR.MINOR.PATCH` spelling is a
-/// candidate. Exactly two components are the retired scheme
-/// ([`TagKind::Legacy`]). Anything else — non-numeric, empty or leading-zero
-/// components, a bare `v0`, more than three components — is a hard error:
-/// garbage in the tag namespace must fail closed rather than silently narrow
-/// the candidate set.
+/// The grammar is [`aterm_update_core::tag::parse_release_tag`]; only the
+/// publisher's diagnostic wording is here. Only the canonical three-component
+/// `vMAJOR.MINOR.PATCH` spelling is a candidate. Exactly two components are the
+/// retired scheme ([`TagKind::Legacy`]). Anything else — non-numeric, empty or
+/// leading-zero components, a bare `v0`, more than three components — is a hard
+/// error: garbage in the tag namespace must fail closed rather than silently
+/// narrow the candidate set.
 pub fn parse_release_tag(tag: &str) -> Result<TagKind> {
-    let malformed = || {
-        Error::new(format!(
-            "published appcast tag {tag:?} is not numeric dotted vN.N.N"
-        ))
-    };
-    let version = tag.strip_prefix('v').ok_or_else(malformed)?;
-    let components: Vec<&str> = version.split('.').collect();
-    if components.len() < 2 {
-        return Err(malformed());
-    }
-    let mut parsed = Vec::with_capacity(components.len());
-    for component in components {
-        // Reject empty and leading-zero spellings so a tag has exactly ONE
-        // canonical form and two tags can never share a numeric order.
-        if component.is_empty()
-            || !component.bytes().all(|byte| byte.is_ascii_digit())
-            || (component.len() > 1 && component.starts_with('0'))
-        {
-            return Err(malformed());
-        }
-        parsed.push(component.parse::<u64>().map_err(|_| {
-            Error::new(format!(
-                "published appcast tag {tag:?} has an overflowing numeric component"
-            ))
-        })?);
-    }
-    match parsed.len() {
-        2 => Ok(TagKind::Legacy),
-        3 => Ok(TagKind::Candidate(parsed)),
-        _ => Err(malformed()),
-    }
+    aterm_update_core::tag::parse_release_tag(tag).map_err(|error| {
+        Error::new(match error {
+            TagError::Malformed => {
+                format!("published appcast tag {tag:?} is not numeric dotted vN.N.N")
+            }
+            TagError::Overflow => {
+                format!("published appcast tag {tag:?} has an overflowing numeric component")
+            }
+        })
+    })
 }
 
 /// Parse the release protocol's canonical `vMAJOR.MINOR.PATCH` tag into a
@@ -1892,14 +1963,14 @@ pub fn canonical_channel_tag_order(tag: &str) -> Result<(u64, u64, u64)> {
     let TagKind::Candidate(components) = parse_release_tag(tag)? else {
         return Err(not_canonical());
     };
+    // `parse_release_tag` already refused non-canonical spellings; the shared
+    // pin re-derives the string, tying the spelling to this exact tag too.
+    if aterm_update_core::tag::canonical_version(tag, &components).is_none() {
+        return Err(not_canonical());
+    }
     let [major, minor, patch] = components.as_slice() else {
         return Err(not_canonical());
     };
-    // `parse_release_tag` already refused non-canonical spellings; re-deriving
-    // the string pins the spelling to this exact tag too.
-    if tag.strip_prefix('v') != Some(format!("{major}.{minor}.{patch}").as_str()) {
-        return Err(not_canonical());
-    }
     Ok((*major, *minor, *patch))
 }
 
@@ -2355,14 +2426,6 @@ impl AppcastArchiveRemote for GhAppcastArchiveRemote<'_> {
 // cryptographic channel ratchet + exact asset reads
 // ---------------------------------------------------------------------------
 
-/// Recovery capability marker. In the Tier REPO model there is a single
-/// authority: recovery reconstructs a claim under the same optional-signing
-/// verdict a fresh cut would use. The historical retired-epoch mode is gone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryEpochMode {
-    CurrentAuthority,
-}
-
 fn update_key_fingerprint(encoded: &str) -> Result<String> {
     let canonical = canonical_update_pubkey(encoded)?;
     let raw = base64::engine::general_purpose::STANDARD
@@ -2796,9 +2859,9 @@ const RELEASE_IDENTITY_LIST_JQ: &str =
     r#".[] | [.id, .tag_name, (.draft | tostring), .target_commitish] | @tsv"#;
 
 /// Pin the GitHub JSON shape at each endpoint. Collection endpoints return an
-/// array and must enumerate it; exact-ID endpoints return one object. Sharing
-/// one jq program silently made the real-cut duplicate-draft preflight reject
-/// every non-empty release list.
+/// array and must enumerate it; exact-ID endpoints return one object. One jq
+/// program cannot serve both: sharing it makes the real-cut duplicate-draft
+/// preflight reject every non-empty release list.
 pub(crate) const fn release_identity_jq(listing: bool) -> &'static str {
     if listing {
         RELEASE_IDENTITY_LIST_JQ
@@ -3044,10 +3107,9 @@ fn exact_release_asset_download(slug: &str, id: u64) -> Result<std::process::Chi
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // This is a STREAMING download, so it spawns its own child instead of going
-    // through `gh_raw` — and therefore needs the channel credential threaded in
-    // explicitly. Missing it is exactly how the first v0.6.0 cut failed: the mirror
-    // uploaded the DMG to the public channel fine and then 404'd re-downloading its
-    // OWN asset, because the read fell back to the dev account.
+    // through `gh_raw` — the channel credential must therefore be threaded in here
+    // explicitly. Without it a read inside a `ChannelCred` scope falls back to the
+    // dev account and 404s on the public channel's own assets.
     if let Some(token) = active_channel_token() {
         command.env("GH_TOKEN", token);
     }
@@ -3688,18 +3750,16 @@ fn verify_release_asset_digest_inner(
     }
 }
 
-fn preflight_signature_policy(
-    repo: &Path,
-    _slug: &str,
-    _releases: &[AppcastRelease],
-    _target_version: &str,
-) -> Result<SignaturePolicy> {
+fn preflight_signature_policy(repo: &Path) -> Result<SignaturePolicy> {
     // Signing is OPTIONAL opt-in. The channel is Tier REPO (gh-authenticated
     // private repo + SHA-256 + monotonic build number); no signing key and no
     // permanent authority file are required to cut. When a complete signing
     // configuration IS present in ~/.aterm/release.conf the cut signs under
     // that key, but nothing in the repository or published history can force a
     // machine without a key to sign — so any gh-authenticated machine can cut.
+    // Recovery uses this same verdict: there is no epoch/authority and no
+    // lost-key retired mode, so a keyless machine can recover an unsigned
+    // release and a key-configured machine keeps signing.
     match load_signing_material(repo)? {
         Some(material) => Ok(SignaturePolicy {
             required: true,
@@ -3710,21 +3770,6 @@ fn preflight_signature_policy(
             pubkey: None,
         }),
     }
-}
-
-/// Recovery preflight in the Tier REPO model: there is no epoch/authority and
-/// no lost-key retired mode. Recovery reconstructs a claim under the same
-/// optional-signing verdict a fresh cut would use, so a keyless machine can
-/// recover an unsigned release and a key-configured machine keeps signing.
-fn preflight_recovery_signature_policy(
-    repo: &Path,
-    slug: &str,
-    releases: &[AppcastRelease],
-    target_version: &str,
-    _release_state: verify::ReleaseState,
-) -> Result<(SignaturePolicy, RecoveryEpochMode)> {
-    let policy = preflight_signature_policy(repo, slug, releases, target_version)?;
-    Ok((policy, RecoveryEpochMode::CurrentAuthority))
 }
 
 fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
@@ -4912,22 +4957,14 @@ pub fn run_recover_lost(
         )));
     }
 
+    // The release-state probe stays ahead of the fence rotation: an
+    // unreachable remote must fail recovery before its first mutation.
+    verify::release_state(&slug, &format!("v{version}"))?;
     // Validate the immutable signing identity before rotating a killed
     // process's token.  Missing key recovery therefore leaves the old fence
     // untouched and the channel visibly blocked, never silently unsigned.
-    let mut metadata_remote = GhAppcastArchiveRemote::read_only(&slug);
-    let metadata = metadata_remote.list_releases()?;
-    let recovery_release_state = verify::release_state(&slug, &format!("v{version}"))?;
-    let (signature_policy, recovery_epoch_mode) = preflight_recovery_signature_policy(
-        repo,
-        &slug,
-        &metadata,
-        version,
-        recovery_release_state,
-    )?;
+    let signature_policy = preflight_signature_policy(repo)?;
     if let Some(journal) = &journal
-        && (recovery_epoch_mode == RecoveryEpochMode::CurrentAuthority
-            || recovery_release_state == verify::ReleaseState::Published)
         && (journal.signature_required != signature_policy.required
             || journal.signature_pubkey.as_deref() != signature_policy.pubkey.as_deref())
     {
@@ -4941,9 +4978,7 @@ pub fn run_recover_lost(
     // lost machine is quiescent or cancel its already-issued REST request.
     step("recover", RECOVERY_STOPPED_PROCESS_BANNER);
     let fence = rotate_publisher_fence_for_recovery(&git, &owner)?;
-    let resume_local_journal = journal.as_ref().is_some_and(|journal| {
-        recovery_epoch_mode == RecoveryEpochMode::CurrentAuthority || journal.is_done("flip")
-    });
+    let resume_local_journal = journal.is_some();
     let create_intent_knowledge = journal.as_ref().and_then(|journal| {
         (journal.format == JOURNAL_FORMAT).then_some(journal.draft_create_issued)
     });
@@ -5106,16 +5141,13 @@ fn fresh_published_recovery_signature_policy(
     slug: &str,
     version: &str,
 ) -> Result<SignaturePolicy> {
-    let mut remote = GhAppcastArchiveRemote::read_only(slug);
-    let releases = remote.list_releases()?;
     let state = verify::release_state(slug, &format!("v{version}"))?;
     if state != verify::ReleaseState::Published {
         return Err(Error::new(format!(
             "recovery release v{version} changed away from Published while refreshing its signature authority"
         )));
     }
-    let (policy, _) = preflight_recovery_signature_policy(repo, slug, &releases, version, state)?;
-    Ok(policy)
+    preflight_signature_policy(repo)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5480,8 +5512,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     step(
         "",
         &format!(
-            "Cargo.lock exact/offline · trust rustc ok ({}) · {} · disk ok ({} GiB free)",
-            gr.trust_rustc.display(),
+            "Cargo.lock exact/offline · trustc ok ({}) · {} · disk ok ({} GiB free)",
+            gr.trustc.display(),
             if gr.universal {
                 "x86_64 target ok"
             } else {
@@ -5548,14 +5580,11 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     };
     let newest_channel = channel.first();
     let newest_min_build = newest_channel.and_then(|published| published.min_build);
-    let mut archive_remote = GhAppcastArchiveRemote::read_only(&origin_slug);
-    let release_metadata = archive_remote.list_releases()?;
-    let signature_policy =
-        preflight_signature_policy(repo, &origin_slug, &release_metadata, &version)?;
+    let signature_policy = preflight_signature_policy(repo)?;
     step(
         "signature",
         if signature_policy.required {
-            "signed-channel ratchet active · actual signing key matches persisted public identity"
+            "signing key configured · matches persisted public identity"
         } else {
             "channel has no signature history and no signing configuration"
         },
@@ -5934,22 +5963,17 @@ fn ensure_ctx_release_lease(ctx: &CutCtx) -> Result<()> {
     assert_publisher_session(&git, lease, fence)
 }
 
-/// Re-derive the complete signing ratchet while the exact owner+process token
-/// is held.  Equality includes the actual canonical key, not just a boolean.
-/// A stale unsigned claimant therefore aborts while still invisible if another
-/// cut established signed history after its pre-claim scan.
+/// Re-derive the local optional-signing verdict while the exact owner+process
+/// token is held.  Equality includes the actual canonical key, not just a
+/// boolean: a cut whose signing key vanished, or whose signing configuration
+/// appeared, mid-cut aborts instead of proceeding under the stale key state it
+/// claimed under.
 fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
     if ctx.kind != CutKind::Real {
         return Ok(());
     }
     ensure_ctx_release_lease(ctx)?;
-    // Signing is local opt-in and no longer ratcheted by published history, so
-    // re-derive the same optional-signing verdict and confirm the cut has not
-    // drifted from the key state it claimed under (a key that vanished, or a
-    // configuration that appeared, mid-cut).
-    let mut remote = GhAppcastArchiveRemote::read_only(&ctx.slug);
-    let releases = remote.list_releases()?;
-    let observed = preflight_signature_policy(&ctx.repo, &ctx.slug, &releases, &ctx.version)?;
+    let observed = preflight_signature_policy(&ctx.repo)?;
     if observed.required != ctx.signature_required
         || observed.pubkey.as_deref() != ctx.signature_pubkey.as_deref()
     {
@@ -6036,8 +6060,7 @@ pub(crate) fn regen_release_files(repo: &Path, version: &str, date: &str) -> Res
     Ok(vec![changelog::CHANGELOG_FILE.into()])
 }
 
-/// Opt-in deep gate: `tools/verify.sh --full`, streamed (spec decisions
-/// 15/22 — the optional successor of the retired mandatory VERIFY-1 gate).
+/// Opt-in deep gate: `tools/verify.sh --full`, streamed (spec decisions 15/22).
 fn run_gate_script(repo: &Path) -> Result<()> {
     step("gate", "tools/verify.sh --full (opt-in deep gate)");
     let status = Command::new(repo.join("tools/verify.sh"))
@@ -6127,6 +6150,33 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         ),
     );
 
+    // Batteries-included seed (§9.1): validate BEFORE assemble so a cut never
+    // seals a seed its own client would refuse. The gate is fail-closed both
+    // ways — a seed present without the root key the client bakes is dead
+    // weight plus a false "batteries included" label, so it errors rather
+    // than silently shipping either half.
+    let seed = match crate::seedpack::resolve(&ctx.dist) {
+        Some(dir) => {
+            let root_key = conf
+                .as_ref()
+                .and_then(|c| c.get("ATERM_PKG_ROOTKEY"))
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string)
+                .or_else(|| std::env::var("ATERM_PKG_ROOTKEY").ok().filter(|k| !k.is_empty()));
+            let Some(root_key) = root_key else {
+                return Err(Error::new(format!(
+                    "{} is present but no ATERM_PKG_ROOTKEY is configured (release.conf or env) — \
+                     the client would bake no root key and ignore the seed; configure the pin or \
+                     remove the seed dir",
+                    dir.display()
+                )));
+            };
+            Some(crate::seedpack::validate(&dir, &root_key).map_err(Error::new)?)
+        }
+        None => None,
+    };
+
     let spec = bundle::BundleSpec {
         repo_root: ctx.repo.clone(),
         out_dir: ctx.dist.clone(),
@@ -6135,13 +6185,19 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         bundle_id: "com.aterm.aterm".to_string(),
         git_commit: stamp.clone(),
         aterm_bin: bout.aterm,
+        seed,
     };
     let app = bundle::assemble(&spec)?;
     step(
         "bundle",
         &format!(
-            "aterm.app: Short={}  CFBundleVersion={}  ATermGitCommit={stamp}",
-            ctx.version, ctx.build
+            "aterm.app: Short={}  CFBundleVersion={}  ATermGitCommit={stamp}  seed={}",
+            ctx.version,
+            ctx.build,
+            match &spec.seed {
+                Some(s) => format!("{} program(s), index_build {}", s.programs.len(), s.index_build),
+                None => "none".to_string(),
+            }
         ),
     );
 
@@ -6288,7 +6344,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
 
 /// team_id for the manifest: `""` = ad-hoc tier (the shipped default). When a
 /// Dev-ID identity is configured, prefer the explicit conf keys, else parse
-/// the "(TEAMID)" suffix of the identity — gen-appcast.sh's exact precedence.
+/// the "(TEAMID)" suffix of the identity, in that order.
 fn manifest_team_id(conf: Option<&sign::ReleaseConf>) -> String {
     let Some(c) = conf else { return String::new() };
     let Some(id) = c.sign_id() else {
@@ -6301,7 +6357,7 @@ fn manifest_team_id(conf: Option<&sign::ReleaseConf>) -> String {
             return t.to_string();
         }
     }
-    // "(ABCDE12345)" — exactly 10 uppercase alphanumerics, like the sed.
+    // "(ABCDE12345)" — exactly 10 uppercase alphanumerics.
     id.split('(')
         .filter_map(|part| part.split(')').next())
         .find(|t| {
@@ -6674,12 +6730,6 @@ fn create_draft(ctx: &mut CutCtx) -> Result<ReleaseObjectIdentity> {
         .map_err(|error| Error::new(format!("read draft release notes: {error}")))?;
     let title = format!("aterm {}", ctx.version);
     let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{}/releases", ctx.slug);
-    let payload_dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
-        "aterm-release-create-{}-{}",
-        std::process::id(),
-        RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    )))?;
-    let payload_path = payload_dir.path().join("request.json");
     let payload = serde_json::to_vec(&serde_json::json!({
         "tag_name": ctx.tag.as_str(),
         "target_commitish": ctx.commit.as_str(),
@@ -6689,30 +6739,7 @@ fn create_draft(ctx: &mut CutCtx) -> Result<ReleaseObjectIdentity> {
         "prerelease": false,
     }))
     .map_err(|error| Error::new(format!("serialize draft release request: {error}")))?;
-    fs::write(&payload_path, payload)
-        .map_err(|error| Error::new(format!("write draft release request: {error}")))?;
-    let payload_arg = payload_path
-        .to_str()
-        .ok_or_else(|| Error::new("draft release request path is not UTF-8"))?;
-    let payload_arg = format!("@{payload_arg}");
-    let auth = prepare_github_auth_headers()?;
-    let args = [
-        "--silent",
-        "--show-error",
-        "--fail-with-body",
-        "--retry",
-        "0",
-        "--request",
-        "POST",
-        "--header",
-        &auth.curl_header_arg,
-        "--header",
-        "Content-Type: application/json",
-        "--data-binary",
-        &payload_arg,
-        "--url",
-        &endpoint,
-    ];
+    let post = OneShotPost::prepare_json("create", "draft release request", &endpoint, &payload)?;
     // Every fallible preflight precedes the durable edge. The returned
     // non-cloneable permit is consumed by the immediately following POST.
     ensure_ctx_release_lease(ctx)?;
@@ -6720,7 +6747,7 @@ fn create_draft(ctx: &mut CutCtx) -> Result<ReleaseObjectIdentity> {
     // Creation is deliberately attempted at most once per invocation. A
     // timeout followed by an eventually-consistent empty list cannot prove
     // the POST did not land; retrying here can mint a duplicate draft.
-    let out = issue_nonidempotent_post(permit, &args)?;
+    let out = post.issue(permit)?;
     if out.success() {
         let release = parse_release_object_response(&out.stdout)?;
         validate_release_object_capability(
@@ -6867,15 +6894,6 @@ fn upload_release_asset_by_id(ctx: &mut CutCtx, release_id: u64, file: &Path) ->
                 true,
             )?;
             ensure_ctx_release_lease(ctx)?;
-            let adjacent = release_object_by_id(&ctx.slug, release_id)?;
-            validate_release_object_capability(
-                adjacent.as_ref(),
-                release_id,
-                &ctx.tag,
-                &ctx.commit,
-                true,
-            )?;
-            ensure_ctx_release_lease(ctx)?;
             let endpoint = format!("repos/{}/releases/assets/{old_id}", ctx.slug);
             let out = gh_raw(&["api", "--method", "DELETE", &endpoint])?;
             match release_asset_identity_for_release_id_optional(&ctx.slug, release_id, name)? {
@@ -6901,39 +6919,15 @@ fn upload_release_asset_by_id(ctx: &mut CutCtx, release_id: u64, file: &Path) ->
         )));
     }
     let endpoint = exact_release_upload_url(&ctx.slug, release_id, name)?;
-    let file_arg = file
-        .to_str()
-        .ok_or_else(|| Error::new("release asset path is not UTF-8"))?;
-    let data_arg = format!("@{file_arg}");
-    let auth = prepare_github_auth_headers()?;
+    let post = OneShotPost::prepare_binary("release asset", &endpoint, file)?;
     let release = release_object_by_id(&ctx.slug, release_id)?;
     validate_release_object_capability(release.as_ref(), release_id, &ctx.tag, &ctx.commit, true)?;
     ensure_ctx_release_lease(ctx)?;
-    let adjacent = release_object_by_id(&ctx.slug, release_id)?;
-    validate_release_object_capability(adjacent.as_ref(), release_id, &ctx.tag, &ctx.commit, true)?;
-    ensure_ctx_release_lease(ctx)?;
-    let args = [
-        "--silent",
-        "--show-error",
-        "--fail-with-body",
-        "--retry",
-        "0",
-        "--request",
-        "POST",
-        "--header",
-        &auth.curl_header_arg,
-        "--header",
-        "Content-Type: application/octet-stream",
-        "--data-binary",
-        &data_arg,
-        "--url",
-        &endpoint,
-    ];
     let permit = ctx.persist_upload_intent(name)?;
     // Like draft creation, an upload POST is issued once per invocation. An
     // absent immediate probe after timeout may be visibility lag, not proof
     // of non-delivery; resume will first converge on any exact-name object.
-    let out = issue_nonidempotent_post(permit, &args)?;
+    let out = post.issue(permit)?;
     if release_asset_identity_for_release_id_optional(&ctx.slug, release_id, name)?.is_some() {
         verify_release_asset_id_matches_local(&ctx.slug, release_id, name, file)?;
         return Ok(());
@@ -8092,12 +8086,6 @@ fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIden
         .map_err(|error| Error::new(format!("read mirror release notes: {error}")))?;
     let title = format!("aterm {}", ctx.version);
     let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{slug}/releases");
-    let payload_dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
-        "aterm-release-mirror-{}-{}",
-        std::process::id(),
-        RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    )))?;
-    let payload_path = payload_dir.path().join("request.json");
     let payload = serde_json::to_vec(&serde_json::json!({
         "tag_name": ctx.tag.as_str(),
         "name": title,
@@ -8106,35 +8094,12 @@ fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIden
         "prerelease": false,
     }))
     .map_err(|error| Error::new(format!("serialize mirror release request: {error}")))?;
-    fs::write(&payload_path, payload)
-        .map_err(|error| Error::new(format!("write mirror release request: {error}")))?;
-    let payload_arg = payload_path
-        .to_str()
-        .ok_or_else(|| Error::new("mirror release request path is not UTF-8"))?;
-    let payload_arg = format!("@{payload_arg}");
-    let auth = prepare_github_auth_headers()?;
-    let args = [
-        "--silent",
-        "--show-error",
-        "--fail-with-body",
-        "--retry",
-        "0",
-        "--request",
-        "POST",
-        "--header",
-        &auth.curl_header_arg,
-        "--header",
-        "Content-Type: application/json",
-        "--data-binary",
-        &payload_arg,
-        "--url",
-        &endpoint,
-    ];
+    let post = OneShotPost::prepare_json("mirror", "mirror release request", &endpoint, &payload)?;
     // Every fallible preflight precedes the durable edge; the non-cloneable
     // permit is consumed by the POST that immediately follows.
     ensure_ctx_release_lease(ctx)?;
     let permit = ctx.persist_mirror_create_intent()?;
-    let out = issue_nonidempotent_post(permit, &args)?;
+    let out = post.issue(permit)?;
     if out.success() {
         let release = parse_release_object_response(&out.stdout)?;
         validate_mirror_release_capability(Some(&release), release.id, &ctx.tag, true)?;
@@ -8199,33 +8164,12 @@ fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Pat
     }
 
     let endpoint = exact_release_upload_url(slug, release_id, name)?;
-    let file_arg = file
-        .to_str()
-        .ok_or_else(|| Error::new("mirror asset path is not UTF-8"))?;
-    let data_arg = format!("@{file_arg}");
-    let auth = prepare_github_auth_headers()?;
+    let post = OneShotPost::prepare_binary("mirror asset", &endpoint, file)?;
     let release = release_object_by_id(slug, release_id)?;
     validate_mirror_release_capability(release.as_ref(), release_id, &ctx.tag, true)?;
     ensure_ctx_release_lease(ctx)?;
-    let args = [
-        "--silent",
-        "--show-error",
-        "--fail-with-body",
-        "--retry",
-        "0",
-        "--request",
-        "POST",
-        "--header",
-        &auth.curl_header_arg,
-        "--header",
-        "Content-Type: application/octet-stream",
-        "--data-binary",
-        &data_arg,
-        "--url",
-        &endpoint,
-    ];
     let permit = ctx.persist_mirror_upload_intent(name)?;
-    let out = issue_nonidempotent_post(permit, &args)?;
+    let out = post.issue(permit)?;
     if release_asset_identity_for_release_id_optional(slug, release_id, name)?.is_some() {
         verify_release_asset_id_matches_local(slug, release_id, name, file)?;
         return Ok(());
@@ -8292,9 +8236,8 @@ fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
     // The CHANNEL scan is the required one here, not `scan_published`. A mirrored
     // release's `target_commitish` is the channel's default branch, because the
     // claim commit does not exist in that repository at all (see
-    // `create_mirror_draft`, which sends no target for exactly this reason).
-    // Binding the private claim-SHA invariant to a channel object is what made
-    // this function refuse its own completed flip on v0.6.0 and v0.7.0.
+    // `create_mirror_draft`, which sends no target for exactly this reason, and
+    // `validate_mirror_release_capability` for the channel-side invariant).
     let published = verify::scan_published_channel(slug, true)?;
     let head = verify::select_newest(&published).ok_or_else(|| {
         Error::new(format!(

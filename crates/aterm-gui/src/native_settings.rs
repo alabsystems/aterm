@@ -383,6 +383,14 @@ pub(crate) struct SettingsViewState {
     pub(crate) route: SettingsRoute,
     pub(crate) search: String,
     pub(crate) legacy: SettingsState,
+    /// `key -> index into legacy.fields`, rebuilt in lockstep with that vector by
+    /// [`Self::set_fields`] (its only two writers). `editable_fields` is ~170 rows
+    /// and a single Settings frame resolves values by key dozens of times per row
+    /// (the preview spec alone makes ~50 lookups), so the `iter().find()` this
+    /// replaces was thousands of `&str` compares per view build. First-wins
+    /// (`entry().or_insert`) so a lookup returns exactly what `Iterator::find`
+    /// would if a duplicate key ever appeared.
+    field_index: aterm_hash::FxHashMap<&'static str, usize>,
     /// Values that are literally present in `aterm.toml`, normalized through
     /// the same parser used by the process-wide transaction service.  This is
     /// intentionally separate from `EditField::seed`: Boolean seeds carry the
@@ -497,6 +505,7 @@ impl SettingsViewState {
     ) -> Self {
         let legacy =
             SettingsState::from_config_with_trail_pack_ids(config, &assets.trail_packs.ids);
+        let field_index = build_field_index(&legacy.fields);
         let raw_values = fallback_raw_values(config, &legacy.fields);
         let environment_overrides = legacy
             .fields
@@ -511,6 +520,7 @@ impl SettingsViewState {
             route: SettingsRoute::Home,
             search: String::new(),
             legacy,
+            field_index,
             raw_values,
             about: AboutState::new(),
             pending: BTreeMap::new(),
@@ -572,11 +582,10 @@ impl SettingsViewState {
             else {
                 continue;
             };
+            // Still the OUTGOING generation here — `set_fields` runs below, so the
+            // index this resolves through still describes `legacy.fields`.
             let previous_seed = self
-                .legacy
-                .fields
-                .iter()
-                .find(|field| field.key == key)
+                .field_by_key(key)
                 .and_then(|field| field.seed.as_deref())
                 .unwrap_or_default();
             let is_draft = input.value() != previous_seed || input.preedit().is_some();
@@ -597,7 +606,7 @@ impl SettingsViewState {
                 }
             }
         }
-        self.legacy.fields = fields;
+        self.set_fields(fields);
         self.legacy.trail_pack_ids = snapshot.assets.trail_packs.ids.clone();
         self.legacy.selected = self
             .legacy
@@ -641,6 +650,30 @@ impl SettingsViewState {
         };
         self.reduce_page_scroll(limit, SettingsPageScrollCommand::Absolute(self.page_scroll));
         Ok(())
+    }
+
+    /// The ONLY writer of `legacy.fields` on this view, so the key index cannot
+    /// drift from the vector it indexes. (The other mutations of that vector —
+    /// `seed` rewrites — never touch a key, so the index survives them.)
+    fn set_fields(&mut self, fields: Vec<EditField>) {
+        self.field_index = build_field_index(&fields);
+        self.legacy.fields = fields;
+    }
+
+    /// O(1) replacement for `legacy.fields.iter().find(|f| f.key == key)`; see
+    /// [`Self::field_index`]. Byte-identical to `find` including the duplicate-key
+    /// case (the index is first-wins).
+    fn field_by_key(&self, key: &str) -> Option<&EditField> {
+        self.field_index_of(key)
+            .and_then(|index| self.legacy.fields.get(index))
+    }
+
+    /// The row POSITION for `key`. The reducers want this rather than
+    /// [`Self::field_by_key`]: a `usize` ends the borrow of `self` at the call,
+    /// so the resolved row can be read out of `legacy.fields` while other view
+    /// fields are being mutated.
+    fn field_index_of(&self, key: &str) -> Option<usize> {
+        self.field_index.get(key).copied()
     }
 
     fn reduce_page_scroll(&mut self, limit: usize, command: SettingsPageScrollCommand) {
@@ -747,17 +780,13 @@ impl SettingsViewState {
     fn focus_field(&mut self, focus: Option<&UiKey>) {
         let text_key = focus
             .and_then(|focus| focus.as_str().strip_prefix("settings/control/"))
-            .and_then(|key| {
-                self.legacy
-                    .fields
-                    .iter()
-                    .find(|field| field.key == key && field_accepts_text_input(field))
-                    .map(|field| {
-                        (
-                            field.key.to_string(),
-                            field.seed.clone().unwrap_or_default(),
-                        )
-                    })
+            .and_then(|key| self.field_by_key(key))
+            .filter(|field| field_accepts_text_input(field))
+            .map(|field| {
+                (
+                    field.key.to_string(),
+                    field.seed.clone().unwrap_or_default(),
+                )
             });
         let Some((key, seed)) = text_key else {
             self.clear_field_edit();
@@ -808,27 +837,35 @@ impl SettingsViewState {
                 .any(|pending| matches!(pending, PendingAction::Config(_)))
     }
 
+    /// Walks the SPARSE draft map, not the ~170-row field vector: a draft can only
+    /// exist where `field_inputs` has an entry (a control that was focused or
+    /// edited), which is normally empty. The dense form asked all ~170 rows and a
+    /// single view build asks this predicate ~8 times.
     fn has_unsaved_field_drafts(&self) -> bool {
-        self.legacy
-            .fields
-            .iter()
-            .any(|field| self.field_has_unsaved_draft(field.key))
+        self.field_inputs
+            .keys()
+            .any(|key| self.field_has_unsaved_draft(key))
     }
 
     fn field_has_unsaved_draft(&self, key: &str) -> bool {
-        let Some(field) = self.legacy.fields.iter().find(|field| field.key == key) else {
+        // Map lookup FIRST: no draft entry means no draft, whatever the field says,
+        // so the common case never resolves the field at all.
+        let Some(input) = self.field_inputs.get(key) else {
             return false;
         };
-        self.field_inputs.get(key).is_some_and(|input| {
-            input.value() != field.seed.as_deref().unwrap_or_default() || input.preedit().is_some()
-        })
+        let Some(field) = self.field_by_key(key) else {
+            return false;
+        };
+        input.value() != field.seed.as_deref().unwrap_or_default() || input.preedit().is_some()
     }
 
+    /// Counts drafted KEYS, which is the same number as the drafted FIELDS the
+    /// dense sweep used to count — field keys are unique
+    /// (`editable_field_keys_are_unique_and_lowercase` pins that).
     fn unsaved_field_draft_count(&self) -> usize {
-        self.legacy
-            .fields
-            .iter()
-            .filter(|field| self.field_has_unsaved_draft(field.key))
+        self.field_inputs
+            .keys()
+            .filter(|key| self.field_has_unsaved_draft(key))
             .count()
     }
 
@@ -1212,7 +1249,8 @@ impl SettingsApp {
                     .get(&key)
                     .map(|input| input.value().trim().to_string())
                     .filter(|value| !value.is_empty());
-                if let Some(field) = view.legacy.fields.iter().find(|field| field.key == key) {
+                if let Some(index) = view.field_index_of(&key) {
+                    let field = &view.legacy.fields[index];
                     if let Some(message) = bounded_numeric_submission_error(field, value.as_deref())
                     {
                         // A rejected Return is still an edit: retain the exact
@@ -1269,11 +1307,12 @@ impl SettingsApp {
         let Some(key) = action.strip_prefix("settings/set/") else {
             return false;
         };
-        let Some(field) = view.legacy.fields.iter().find(|field| field.key == key) else {
+        let Some(index) = view.field_index_of(key) else {
             // An action from a prior compiled Settings revision is consumed but
             // cannot create arbitrary field state or mutate configuration.
             return true;
         };
+        let field = &view.legacy.fields[index];
         if !field_accepts_text_input(field) {
             // Typed pointer positions are valid only for actual text fields.
             return true;
@@ -1322,9 +1361,10 @@ impl SettingsApp {
         if Self::reject_pending_key(view, &key, cx) {
             return;
         }
-        let Some(field) = view.legacy.fields.iter().find(|field| field.key == key) else {
+        let Some(index) = view.field_index_of(&key) else {
             return;
         };
+        let field = &view.legacy.fields[index];
         let Some((current, _)) = numeric_slider_value_for_state(view, field) else {
             return;
         };
@@ -1726,9 +1766,10 @@ impl SettingsApp {
         }
 
         if let Some(key) = action.strip_prefix("settings/set/") {
-            let Some(field) = view.legacy.fields.iter().find(|field| field.key == key) else {
+            let Some(index) = view.field_index_of(key) else {
                 return EventResult::Handled;
             };
+            let field = &view.legacy.fields[index];
             if let Some(SemanticInput::Text(value)) = invocation.value.as_ref()
                 && let Some(message) = bounded_numeric_submission_error(field, Some(value))
             {
@@ -2061,7 +2102,7 @@ impl SettingsApp {
         }
 
         if let Some(key) = action.strip_prefix("settings/reset/") {
-            if view.legacy.fields.iter().any(|field| field.key == key) {
+            if view.field_index_of(key).is_some() {
                 if Self::reject_pending_key(view, key, cx) {
                     return EventResult::Handled;
                 }
@@ -2370,10 +2411,7 @@ impl SettingsApp {
                     PendingAction::Config(patch) => config_application_projection(
                         view,
                         patch,
-                        SettingsAvailability::for_state(
-                            view,
-                            crate::metrics::snapshot().backend_gpu,
-                        ),
+                        SettingsAvailability::for_state(view, crate::metrics::backend_gpu()),
                     ),
                     _ => ConfigApplicationProjection {
                         has_live_edit: true,
@@ -2576,6 +2614,7 @@ fn settings_field_result_count(view: &SettingsViewState) -> usize {
         return 0;
     }
     let modified_only = !global_search && view.route == SettingsRoute::Modified;
+    let mut scratch = String::new();
     let native = view
         .legacy
         .fields
@@ -2592,7 +2631,7 @@ fn settings_field_result_count(view: &SettingsViewState) -> usize {
         .filter(|field| {
             !modified_only || view.is_explicit(field.key) || view.field_has_unsaved_draft(field.key)
         })
-        .filter(|field| field_match_score(field, &query).is_some())
+        .filter(|field| field_match_score_in(field, &query, &mut scratch).is_some())
         .count();
     native
         + usize::from(global_search && manual_search_match_count(view, &query) > 0)
@@ -2851,12 +2890,14 @@ fn manual_search_matching_keys(view: &SettingsViewState, query: &str) -> Vec<Str
     if query.is_empty() {
         return Vec::new();
     }
+    let mut scratch = String::new();
     let mut matches = crate::native_config_language::config_schema()
         .iter()
         .filter(|entry| !crate::native_config_language::is_compatibility_only_key(entry.key))
         .filter(|entry| !entry.native_scalar || !settings_field_is_visible(entry.key, false, true))
         .filter(|entry| {
-            crate::native_config_language::config_schema_match_score(entry, query).is_some()
+            crate::native_config_language::config_schema_match_score(entry, query, &mut scratch)
+                .is_some()
         })
         .map(|entry| entry.key.to_string())
         .collect::<BTreeSet<_>>();
@@ -3148,10 +3189,7 @@ impl NativeAppModel for SettingsApp {
             }
             AppEvent::TextInput(TextInputEvent::Left { extend })
                 if view.focused_setting_key().is_some_and(|key| {
-                    view.legacy
-                        .fields
-                        .iter()
-                        .find(|field| field.key == key)
+                    view.field_by_key(key)
                         .is_some_and(|field| numeric_slider_value(field).is_some())
                 }) =>
             {
@@ -3160,10 +3198,7 @@ impl NativeAppModel for SettingsApp {
             }
             AppEvent::TextInput(TextInputEvent::Right { extend })
                 if view.focused_setting_key().is_some_and(|key| {
-                    view.legacy
-                        .fields
-                        .iter()
-                        .find(|field| field.key == key)
+                    view.field_by_key(key)
                         .is_some_and(|field| numeric_slider_value(field).is_some())
                 }) =>
             {
@@ -3400,6 +3435,20 @@ impl NativeAppModel for SettingsApp {
         // view. Closing Settings never discards committed configuration.
         CloseReadiness::Ready
     }
+}
+
+/// Build the `key -> index` side table for [`SettingsViewState::field_index`].
+/// FIRST occurrence wins, which is exactly what `fields.iter().find(..)` returns,
+/// so a duplicate key (there are none today — see
+/// `editable_field_keys_are_unique_and_lowercase`) cannot change what a lookup
+/// resolves to, only how fast it resolves.
+fn build_field_index(fields: &[EditField]) -> aterm_hash::FxHashMap<&'static str, usize> {
+    let mut index =
+        aterm_hash::FxHashMap::with_capacity_and_hasher(fields.len(), aterm_hash::FxBuildHasher);
+    for (position, field) in fields.iter().enumerate() {
+        index.entry(field.key).or_insert(position);
+    }
+    index
 }
 
 /// Best-effort raw projection for callers that only have the parsed `Config`
@@ -3745,7 +3794,12 @@ fn picker_candidate<'a>(state: &'a SettingsViewState, key: &str) -> Option<&'a s
 }
 
 fn field_text(state: &SettingsViewState, key: &str, fallback: &str) -> String {
-    let field = state.legacy.fields.iter().find(|field| field.key == key);
+    // The row is resolved LAZILY, in the one arm that actually reads it, through
+    // the O(1) key index (see `SettingsViewState::field_index`). This function is
+    // the substrate under `field_bool`/`field_number`/`preview_field_*`, and the
+    // renderer preview spec alone calls it ~50 times per event-loop iteration
+    // while a Settings tab is up — it used to open with a full scan of the ~170-row
+    // field vector that three of its four arms then discarded.
     match picker_choice(state, key) {
         Some(ChoiceOption {
             value: Some(candidate),
@@ -3773,7 +3827,7 @@ fn field_text(state: &SettingsViewState, key: &str, fallback: &str) -> String {
                     draft.to_string()
                 };
             }
-            let Some(field) = field else {
+            let Some(field) = state.field_by_key(key) else {
                 return fallback.trim().to_string();
             };
             if field.seed.is_some() {
@@ -3873,12 +3927,7 @@ fn settings_number_including_retained_draft(
             .and_then(|value| value.parse::<f32>().ok())
             .unwrap_or(fallback);
     }
-    let committed = state
-        .legacy
-        .fields
-        .iter()
-        .find(|field| field.key == key)
-        .map(SettingsState::display_value);
+    let committed = state.field_by_key(key).map(SettingsState::display_value);
     committed
         .and_then(|value| value.split_whitespace().next())
         .and_then(|value| value.parse::<f32>().ok())
@@ -3981,10 +4030,7 @@ fn post_patch_window_top_constraint(
 
 fn committed_settings_number(state: &SettingsViewState, key: &str, fallback: f32) -> f32 {
     state
-        .legacy
-        .fields
-        .iter()
-        .find(|field| field.key == key)
+        .field_by_key(key)
         .and_then(|field| field.seed.as_deref())
         .and_then(|value| value.split_whitespace().next())
         .and_then(|value| value.parse::<f32>().ok())
@@ -4144,10 +4190,7 @@ fn preview_font_candidate(state: &SettingsViewState) -> crate::widget::SemanticF
             return None;
         }
         state
-            .legacy
-            .fields
-            .iter()
-            .find(|field| field.key == key)
+            .field_by_key(key)
             .and_then(|field| field.seed.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -6802,11 +6845,7 @@ fn choice_picker_node(
 ) -> Option<UiNode> {
     configure_choice_picker_for_width(state, width);
     let picker = state.choice_picker.as_ref()?;
-    let field = state
-        .legacy
-        .fields
-        .iter()
-        .find(|field| field.key == picker.key)?;
+    let field = state.field_by_key(&picker.key)?;
     let columns = choice_picker_columns(width, viewport_width);
     let row_height = scaled_control_height();
     // Use the ordinary 720pt Settings measure as a conservative floor. Top's
@@ -7027,11 +7066,7 @@ fn compact_landscape_choice_page(
     viewport_width: f32,
 ) -> Option<Vec<UiNode>> {
     let picker = state.choice_picker.as_ref()?;
-    let field = state
-        .legacy
-        .fields
-        .iter()
-        .find(|field| field.key == picker.key)?;
+    let field = state.field_by_key(&picker.key)?;
     let row_height = scaled_control_height();
     let columns = choice_picker_columns(SettingsWidth::Compact, viewport_width);
     let page_width = settings_page_content_width(viewport_width, SettingsWidth::Compact, 720.0);
@@ -8798,7 +8833,7 @@ fn manual_override_disclosure(
         state,
         None,
         &authored.key,
-        SettingsAvailability::for_state(state, crate::metrics::snapshot().backend_gpu),
+        SettingsAvailability::for_state(state, crate::metrics::backend_gpu()),
         state.presented_motion.get(),
     );
     parts.extend(effect.notes.into_iter().map(|note| note.semantic));
@@ -9430,6 +9465,7 @@ fn settings_fields_page(
     } else {
         settings_fields_subtitle(state.route, width, global_search, modified_only)
     };
+    let mut scratch = String::new();
     let mut fields: Vec<(u8, usize, &EditField)> = state
         .legacy
         .fields
@@ -9460,7 +9496,7 @@ fn settings_fields_page(
                 && width != SettingsWidth::Compact)
         })
         .filter_map(|(index, field)| {
-            field_match_score(field, &query).map(|score| (score, index, field))
+            field_match_score_in(field, &query, &mut scratch).map(|score| (score, index, field))
         })
         .collect();
     fields.sort_by_key(|(score, index, field)| {
@@ -10173,10 +10209,7 @@ struct ConfigApplicationProjection {
 
 fn committed_setting_text(state: &SettingsViewState, key: &str, fallback: &str) -> String {
     state
-        .legacy
-        .fields
-        .iter()
-        .find(|field| field.key == key)
+        .field_by_key(key)
         .and_then(|field| field.seed.clone())
         .unwrap_or_else(|| fallback.to_string())
 }
@@ -10761,89 +10794,102 @@ fn parent_or_motion_inactivity(
         return motion_suppression(state, patch, motion);
     }
 
+    // Every one of the five flags below is `false` unless `key` is a cursor-trail
+    // key, so gate the whole block on that cheap key-only test: `candidate_trail_resolution`
+    // is a field-vector scan plus a `String` plus a walk of the trail-pack catalog,
+    // and this runs for EVERY settings row on every view rebuild — the ~160 rows that
+    // have nothing to do with the trail used to resolve it and throw it away.
     let trail_tuning = TRAIL_TUNING_KEYS.contains(&key);
-    let trail_resolution = candidate_trail_resolution(state, patch);
-    let trail_style_enabling =
-        key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.style.is_some();
-    let trail_style_invalid =
-        key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.issue.is_some();
-    let trail_master_enabling = key == prefs::EDIT_CURSOR_TRAIL
-        && candidate_setting_bool(state, patch, prefs::EDIT_CURSOR_TRAIL, true);
-    let music_switch_enabling =
-        key == prefs::EDIT_TRAIL_SOUNDS && candidate_setting_bool(state, patch, key, true);
     if trail_tuning
-        || trail_style_enabling
-        || trail_style_invalid
-        || trail_master_enabling
-        || music_switch_enabling
+        || matches!(
+            key,
+            prefs::EDIT_CURSOR_TRAIL_STYLE | prefs::EDIT_CURSOR_TRAIL | prefs::EDIT_TRAIL_SOUNDS
+        )
     {
-        if let Some(issue) = trail_resolution.issue {
-            return Some(match issue {
-                crate::app_config::TrailStyleIssue::Unknown => unavailable(
-                    "The configured Cursor trail style is unknown, so the renderer disables the trail and this setting has no current consumer",
-                    "Invalid trail style · No effect",
-                    "Cursor trail style is unknown; trail remains disabled",
-                ),
-                crate::app_config::TrailStyleIssue::EmptyPackId => unavailable(
-                    "The configured Trail Pack id is empty, so the renderer disables the trail until a concrete pack is selected",
-                    "Empty Trail Pack id · No effect",
-                    "Trail Pack id is empty; trail remains disabled",
-                ),
-                crate::app_config::TrailStyleIssue::MissingPack => unavailable(
-                    "The configured Trail Pack is not present in the admitted pack catalog, so the renderer disables the trail",
-                    "Trail Pack missing · No effect",
-                    "Selected Trail Pack is missing; trail remains disabled",
-                ),
-            });
-        }
-        if !candidate_setting_bool(state, patch, prefs::EDIT_CURSOR_TRAIL, true)
-            || trail_resolution.style.is_none()
+        let trail_resolution = candidate_trail_resolution(state, patch);
+        let trail_style_enabling =
+            key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.style.is_some();
+        let trail_style_invalid =
+            key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.issue.is_some();
+        let trail_master_enabling = key == prefs::EDIT_CURSOR_TRAIL
+            && candidate_setting_bool(state, patch, prefs::EDIT_CURSOR_TRAIL, true);
+        let music_switch_enabling =
+            key == prefs::EDIT_TRAIL_SOUNDS && candidate_setting_bool(state, patch, key, true);
+        if trail_tuning
+            || trail_style_enabling
+            || trail_style_invalid
+            || trail_master_enabling
+            || music_switch_enabling
         {
-            return Some(inactive(
-                "This cursor-trail setting is saved but inactive while Cursor trail is Off",
-                "Inactive · Cursor trail Off",
-                "Currently inactive: Cursor trail is Off",
-            ));
+            if let Some(issue) = trail_resolution.issue {
+                return Some(match issue {
+                    crate::app_config::TrailStyleIssue::Unknown => unavailable(
+                        "The configured Cursor trail style is unknown, so the renderer disables the trail and this setting has no current consumer",
+                        "Invalid trail style · No effect",
+                        "Cursor trail style is unknown; trail remains disabled",
+                    ),
+                    crate::app_config::TrailStyleIssue::EmptyPackId => unavailable(
+                        "The configured Trail Pack id is empty, so the renderer disables the trail until a concrete pack is selected",
+                        "Empty Trail Pack id · No effect",
+                        "Trail Pack id is empty; trail remains disabled",
+                    ),
+                    crate::app_config::TrailStyleIssue::MissingPack => unavailable(
+                        "The configured Trail Pack is not present in the admitted pack catalog, so the renderer disables the trail",
+                        "Trail Pack missing · No effect",
+                        "Selected Trail Pack is missing; trail remains disabled",
+                    ),
+                });
+            }
+            if !candidate_setting_bool(state, patch, prefs::EDIT_CURSOR_TRAIL, true)
+                || trail_resolution.style.is_none()
+            {
+                return Some(inactive(
+                    "This cursor-trail setting is saved but inactive while Cursor trail is Off",
+                    "Inactive · Cursor trail Off",
+                    "Currently inactive: Cursor trail is Off",
+                ));
+            }
+            if key == prefs::EDIT_TRAIL_SOUND_VOLUME
+                && !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true)
+            {
+                return Some(inactive(
+                    "Trail sound volume is saved but inactive while Music effects is Off",
+                    "Inactive · Music effects Off",
+                    "Currently inactive: Music effects is Off",
+                ));
+            }
+            if matches!(
+                key,
+                prefs::EDIT_CURSOR_TRAIL_RADIUS | prefs::EDIT_CURSOR_TRAIL_RING
+            ) && trail_resolution.pack.is_some()
+            {
+                return Some(inactive(
+                    "The selected Trail Pack owns its crown radius and landing ring; this built-in tuning value is saved for non-pack styles",
+                    "Inactive · Trail Pack owns this",
+                    "Currently inactive: selected Trail Pack owns crown and ring tuning",
+                ));
+            }
+            if key == prefs::EDIT_CURSOR_FIRE_SHIMMER && trail_resolution.canonical != Some("fire")
+            {
+                return Some(inactive(
+                    "Heat shimmer is saved but inactive unless the Cursor trail style is Fire",
+                    "Inactive · Fire style only",
+                    "Currently inactive: heat shimmer requires the Fire trail style",
+                ));
+            }
+            if matches!(
+                key,
+                prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH | prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS
+            ) && !candidate_setting_bool(state, patch, prefs::EDIT_CURSOR_TRAIL_BLOOM, true)
+            {
+                return Some(inactive(
+                    "Bloom tuning is saved but inactive while Cursor trail bloom is Off",
+                    "Inactive · Bloom Off",
+                    "Currently inactive: Cursor trail bloom is Off",
+                ));
+            }
+            return motion_suppression(state, patch, motion);
         }
-        if key == prefs::EDIT_TRAIL_SOUND_VOLUME
-            && !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true)
-        {
-            return Some(inactive(
-                "Trail sound volume is saved but inactive while Music effects is Off",
-                "Inactive · Music effects Off",
-                "Currently inactive: Music effects is Off",
-            ));
-        }
-        if matches!(
-            key,
-            prefs::EDIT_CURSOR_TRAIL_RADIUS | prefs::EDIT_CURSOR_TRAIL_RING
-        ) && trail_resolution.pack.is_some()
-        {
-            return Some(inactive(
-                "The selected Trail Pack owns its crown radius and landing ring; this built-in tuning value is saved for non-pack styles",
-                "Inactive · Trail Pack owns this",
-                "Currently inactive: selected Trail Pack owns crown and ring tuning",
-            ));
-        }
-        if key == prefs::EDIT_CURSOR_FIRE_SHIMMER && trail_resolution.canonical != Some("fire") {
-            return Some(inactive(
-                "Heat shimmer is saved but inactive unless the Cursor trail style is Fire",
-                "Inactive · Fire style only",
-                "Currently inactive: heat shimmer requires the Fire trail style",
-            ));
-        }
-        if matches!(
-            key,
-            prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH | prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS
-        ) && !candidate_setting_bool(state, patch, prefs::EDIT_CURSOR_TRAIL_BLOOM, true)
-        {
-            return Some(inactive(
-                "Bloom tuning is saved but inactive while Cursor trail bloom is Off",
-                "Inactive · Bloom Off",
-                "Currently inactive: Cursor trail bloom is Off",
-            ));
-        }
-        return motion_suppression(state, patch, motion);
     }
 
     if key == SPARKLE_MASTER_KEY {
@@ -11607,7 +11653,7 @@ fn setting_row(
         state,
         None,
         field.key,
-        SettingsAvailability::for_state(state, crate::metrics::snapshot().backend_gpu),
+        SettingsAvailability::for_state(state, crate::metrics::backend_gpu()),
         state.presented_motion.get(),
     );
     let value = if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
@@ -12822,11 +12868,7 @@ fn compact_about_support(about: &AboutState) -> UiNode {
             "Interface",
             "Native semantic tab app".to_string(),
         ),
-        row(
-            "capture",
-            "Capture",
-            "Exact app-render pixels".to_string(),
-        ),
+        row("capture", "Capture", "Exact app-render pixels".to_string()),
         row(
             "accessibility",
             "Accessibility",
@@ -14537,12 +14579,12 @@ fn packages_switch_row(
     key: &str,
     width: SettingsWidth,
 ) -> Option<UiNode> {
-    let field = state.legacy.fields.iter().find(|field| field.key == key)?;
+    let field = state.field_by_key(key)?;
     let effect = setting_effect_projection(
         state,
         None,
         key,
-        SettingsAvailability::for_state(state, crate::metrics::snapshot().backend_gpu),
+        SettingsAvailability::for_state(state, crate::metrics::backend_gpu()),
         state.presented_motion.get(),
     );
     let value = SettingsState::display_value(field)
@@ -15170,35 +15212,45 @@ fn packages_page(
 /// then ordered subsequence for short abbreviation-like queries. Long fuzzy
 /// subsequences are mostly accidental matches (for example `materialize`
 /// matching unrelated labels), so product and config language stay precise.
+/// One-shot rank for callers outside a sweep; the sweeps use
+/// [`field_match_score_in`] so one scratch buffer serves the whole pass.
 fn field_match_score(field: &EditField, query: &str) -> Option<u8> {
+    field_match_score_in(field, query, &mut String::new())
+}
+
+/// Rank `field` against an ALREADY-LOWERCASED `query` (`None` = no match), folding
+/// only what actually needs folding.
+///
+/// `field.key` and every keyword from `keywords_of` are ASCII-lowercase by
+/// construction (pinned by `editable_field_keys_are_unique_and_lowercase`), so they are
+/// compared as they are: folding them allocated a `String` per keyword plus one
+/// per key plus the collecting `Vec` — about six throwaway allocations per field,
+/// over all ~170 fields, for every character typed into the search box. The label
+/// is the one candidate with genuine mixed case, and it folds into the caller's
+/// `scratch`, which the sweep reuses across fields.
+fn field_match_score_in(field: &EditField, query: &str, scratch: &mut String) -> Option<u8> {
     if query.is_empty() {
         return Some(0);
     }
-    let label = field.label.to_ascii_lowercase();
-    let key = field.key.to_ascii_lowercase();
-    let keywords = prefs::keywords_of(field.key)
-        .iter()
-        .map(|keyword| keyword.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let candidates = std::iter::once(label.as_str())
-        .chain(std::iter::once(key.as_str()))
-        .chain(keywords.iter().map(String::as_str));
+    scratch.clear();
+    scratch.extend(
+        field
+            .label
+            .chars()
+            .map(|character| character.to_ascii_lowercase()),
+    );
+    let candidates = std::iter::once(scratch.as_str())
+        .chain(std::iter::once(field.key))
+        .chain(prefs::keywords_of(field.key).iter().copied());
+    // THE ladder lives once, in the config-schema authority, so Settings search and
+    // Manual completion cannot drift into ranking the same query differently. Every
+    // candidate here is already lowercase — `scratch` is the folded label, and keys
+    // and keywords are lowercase by construction (pinned by
+    // `editable_field_keys_are_unique_and_lowercase`) — which is the precondition
+    // that ladder documents.
     candidates
         .filter_map(|candidate| {
-            if candidate.starts_with(query) {
-                Some(0)
-            } else if candidate
-                .split(|character: char| !character.is_ascii_alphanumeric())
-                .any(|word| word.starts_with(query))
-            {
-                Some(1)
-            } else if candidate.contains(query) {
-                Some(2)
-            } else if query.chars().count() <= 3 && is_subsequence(query, candidate) {
-                Some(3)
-            } else {
-                None
-            }
+            crate::native_config_language::candidate_match_score(candidate, query)
         })
         .min()
 }
@@ -15311,6 +15363,48 @@ mod tests {
     use crate::native_ui::LogicalRect;
     use crate::tab_model::ViewStore;
     use std::collections::BTreeSet;
+
+    /// Two invariants the fast paths depend on, pinned so a new field turns a
+    /// silent regression into a build failure:
+    /// * keys are UNIQUE — `SettingsViewState::field_index` maps a key to one row,
+    ///   and `unsaved_field_draft_count` counts keys rather than rows;
+    /// * keys and search keywords are ASCII-LOWERCASE — `field_match_score_in`
+    ///   compares them against a lowercased query without folding them first, so a
+    ///   capitalized key would become unsearchable.
+    #[test]
+    fn editable_field_keys_are_unique_and_lowercase() {
+        let fields = prefs::editable_fields(&Config::default());
+        let mut seen = BTreeSet::new();
+        for field in &fields {
+            assert!(
+                seen.insert(field.key),
+                "duplicate editable field {}",
+                field.key
+            );
+            assert_eq!(
+                field.key,
+                field.key.to_ascii_lowercase(),
+                "key must be lowercase"
+            );
+            for keyword in prefs::keywords_of(field.key) {
+                assert_eq!(
+                    *keyword,
+                    keyword.to_ascii_lowercase(),
+                    "keyword of {} must be lowercase",
+                    field.key
+                );
+            }
+        }
+        let state = SettingsViewState::new(&Config::default());
+        assert_eq!(
+            state.field_index.len(),
+            state.legacy.fields.len(),
+            "the key index must cover every row"
+        );
+        for (position, field) in state.legacy.fields.iter().enumerate() {
+            assert_eq!(state.field_index_of(field.key), Some(position));
+        }
+    }
 
     fn audited_availability() -> SettingsAvailability {
         SettingsAvailability {

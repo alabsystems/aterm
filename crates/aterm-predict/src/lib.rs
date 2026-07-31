@@ -617,7 +617,10 @@ impl Predictor {
             // cold link slower than the floor still bootstraps (the window widens until
             // an echo fits inside it, and THAT confirmation is the real evidence that
             // opens the gate), but no amount of silence can ever open the gate itself.
-            self.expiry_backoff = self.expiry_backoff.saturating_add(1).min(EXPIRY_BACKOFF_MAX);
+            self.expiry_backoff = self
+                .expiry_backoff
+                .saturating_add(1)
+                .min(EXPIRY_BACKOFF_MAX);
         }
     }
 
@@ -1539,7 +1542,10 @@ mod tests {
         );
         // The confirmation also collapses the probe back to the floor — the estimate is
         // now doing the sizing, so the backoff must not keep the window inflated.
-        assert_eq!(p.expiry_backoff, 0, "a real echo retires the cold-link probe");
+        assert_eq!(
+            p.expiry_backoff, 0,
+            "a real echo retires the cold-link probe"
+        );
 
         // A SECOND genuine slow confirmation is what opens the gate.
         let mut at = armed + rtt;
@@ -1709,7 +1715,11 @@ mod tests {
         assert!(p.predict_char_in_grid('b', (0, 79), (80, 24), now)); // wraps to (1,0)
         p.reconcile(Some((1, 0)), false, now, cell(&[((0, 79), 'a')]));
         let shown = p.overlay(now);
-        assert_eq!(shown.len(), 1, "'a' retires; the wrapped 'b' is no divergence");
+        assert_eq!(
+            shown.len(),
+            1,
+            "'a' retires; the wrapped 'b' is no divergence"
+        );
         assert_eq!((shown[0].row, shown[0].col, shown[0].ch), (1, 0, 'b'));
     }
 
@@ -1898,12 +1908,18 @@ mod tests {
         let now = t0();
         assert!(p.predict_char('a', (0, 0), 80, now));
         let _ = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 1));
-        assert_eq!(p.expiry_backoff, 1, "control: the timeout widened the probe");
+        assert_eq!(
+            p.expiry_backoff, 1,
+            "control: the timeout widened the probe"
+        );
 
         let est = p.take_link_estimate();
         assert_eq!(p.expiry_backoff, 0, "an unknown link probes from the floor");
         p.restore_link_estimate(est);
-        assert_eq!(p.expiry_backoff, 1, "…the probing session gets its window back");
+        assert_eq!(
+            p.expiry_backoff, 1,
+            "…the probing session gets its window back"
+        );
     }
 
     #[test]
@@ -1916,7 +1932,10 @@ mod tests {
         let now = t0();
         assert!(p.predict_char('a', (0, 0), 80, now));
         let _ = p.overlay(now + Duration::from_millis(GLITCH_FLOOR_MS + 1));
-        assert_eq!(p.expiry_backoff, 1, "control: the timeout widened the probe");
+        assert_eq!(
+            p.expiry_backoff, 1,
+            "control: the timeout widened the probe"
+        );
         p.reset_session();
         assert_eq!(p.expiry_backoff, 0);
         assert_eq!(p.glitch_window(), Duration::from_millis(GLITCH_FLOOR_MS));

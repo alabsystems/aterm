@@ -140,33 +140,21 @@ pub fn refinements() -> impl Iterator<Item = &'static RefinementAnchor> {
 }
 
 /// All [`Waiver`]s linked into the current binary.
-// Skip: the linkme/`inventory` registry iterator's body lives in the
-// third-party `inventory` crate (an absent callee — a static-slice walk
-// over link-section entries; no user code, no panic path in practice).
-// These accessors are the SPEC-ANCHOR ledger read by the xref gate, not
-// shipping runtime code.
+// Skip: inventory registry walk — see `refinements()`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn waivers() -> impl Iterator<Item = &'static Waiver> {
     inventory::iter::<Waiver>.into_iter()
 }
 
 /// All [`InvariantAnchor`]s linked into the current binary.
-// Skip: the linkme/`inventory` registry iterator's body lives in the
-// third-party `inventory` crate (an absent callee — a static-slice walk
-// over link-section entries; no user code, no panic path in practice).
-// These accessors are the SPEC-ANCHOR ledger read by the xref gate, not
-// shipping runtime code.
+// Skip: inventory registry walk — see `refinements()`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn invariant_anchors() -> impl Iterator<Item = &'static InvariantAnchor> {
     inventory::iter::<InvariantAnchor>.into_iter()
 }
 
 /// All [`ProofAnchor`]s linked into the current binary (the kani-harness ledger half).
-// Skip: the linkme/`inventory` registry iterator's body lives in the
-// third-party `inventory` crate (an absent callee — a static-slice walk
-// over link-section entries; no user code, no panic path in practice).
-// These accessors are the SPEC-ANCHOR ledger read by the xref gate, not
-// shipping runtime code.
+// Skip: inventory registry walk — see `refinements()`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn proof_anchors() -> impl Iterator<Item = &'static ProofAnchor> {
     inventory::iter::<ProofAnchor>.into_iter()
@@ -360,6 +348,7 @@ pub fn model_registry() -> Vec<Model> {
         // them enrolls every action in the global strict-vacuity audit as well
         // as making them first-class spec-link targets.
         surface_coverage_model(),
+        startup_phase_publication_model(),
         present_retry_model(),
         gpu_loss_route_model(),
         gpu_loss_recovery_model(),
@@ -386,6 +375,21 @@ pub fn model_registry() -> Vec<Model> {
         // (conformance_hyperlink_scheme_cap.rs).
         hyperlink_scheme_cap_model(),
     ]
+}
+
+/// The action/anchor name set of an embedded [`Model`] — for embedded models the
+/// invariant-def and coverage-action namespaces coincide, so both
+/// [`SpecModule::invariant_names`] and [`SpecModule::coverage_actions`] use this.
+// Explicit insert loop (not `collect`) so the Trust L0 allocation check sees
+// per-element growth instead of an unbounded bulk allocation.
+// Skip: BTreeSet keyed build + iterator `next` (absent std bodies).
+#[cfg_attr(trust_verify, trust::skip)]
+fn embedded_action_set(m: &Model) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for (_, a) in m.anchors() {
+        names.insert(a.to_string());
+    }
+    names
 }
 
 /// A registered spec module — an embedded [`Model`] or a parsed external `.tla`.
@@ -443,16 +447,7 @@ impl SpecModule {
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn invariant_names(&self) -> BTreeSet<String> {
         match self {
-            SpecModule::Embedded(m) => {
-                // Explicit insert loop (not `collect`) so the Trust L0 allocation
-                // check sees per-element growth instead of an unbounded bulk
-                // allocation; behavior-identical.
-                let mut names = BTreeSet::new();
-                for (_, a) in m.anchors() {
-                    names.insert(a.to_string());
-                }
-                names
-            }
+            SpecModule::Embedded(m) => embedded_action_set(m),
             SpecModule::External(t) => t.actions.clone(),
         }
     }
@@ -470,16 +465,7 @@ impl SpecModule {
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn coverage_actions(&self) -> BTreeSet<String> {
         match self {
-            SpecModule::Embedded(m) => {
-                // Explicit insert loop (not `collect`) so the Trust L0 allocation
-                // check sees per-element growth instead of an unbounded bulk
-                // allocation; behavior-identical.
-                let mut names = BTreeSet::new();
-                for (_, a) in m.anchors() {
-                    names.insert(a.to_string());
-                }
-                names
-            }
+            SpecModule::Embedded(m) => embedded_action_set(m),
             SpecModule::External(t) => {
                 if t.next_actions.is_empty() {
                     t.actions.clone()
@@ -644,22 +630,21 @@ pub fn verifier_ledger(modules: &[SpecModule]) -> Vec<LedgerEntry> {
     };
 
     // ty half: refinements and machine+action waivers mark `ty` for their action.
-    for r in refinements() {
-        if let Some(canon) = resolve(r.machine)
-            && let Some(e) = rows.get_mut(&(canon, r.action.to_string()))
+    let mut mark_ty = |machine: &str, action: &str| {
+        if let Some(canon) = resolve(machine)
+            && let Some(e) = rows.get_mut(&(canon, action.to_string()))
         {
             e.ty = true;
         }
+    };
+    for r in refinements() {
+        mark_ty(r.machine, r.action);
     }
     for w in waivers() {
         if w.machine.is_empty() || w.action.is_empty() {
             continue;
         }
-        if let Some(canon) = resolve(w.machine)
-            && let Some(e) = rows.get_mut(&(canon, w.action.to_string()))
-        {
-            e.ty = true;
-        }
+        mark_ty(w.machine, w.action);
     }
 
     // kani half: each proof anchor marks `kani` and records the harness name.
@@ -673,6 +658,76 @@ pub fn verifier_ledger(modules: &[SpecModule]) -> Vec<LedgerEntry> {
     }
 
     rows.into_values().collect()
+}
+
+/// One module's three indexed namespaces, keyed by its declared machine name:
+/// `(machine name, action set, invariant-def set, coverage-action set)`. They
+/// coincide for embedded models and diverge for external `.tla` (see [`check_closure`]).
+type ModuleActionIndex = (String, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
+
+struct AnchorObligationSpec<'a> {
+    site: &'a str,
+    machine: &'a str,
+    target: Option<&'a str>,
+    select: fn(&ModuleActionIndex) -> &BTreeSet<String>,
+    authoring_hint: bool,
+    noun: &'a str,
+    known: &'a str,
+}
+
+/// Shared Ob.4 ("machine exists") + Ob.1 ("action/id exists") arm for one anchor:
+/// push a [`ClosureViolation`] when `resolved` is `None`, else when `target` does
+/// not resolve in the namespace `select`ed from the module's index. `site` is the
+/// anchor's rendered position (e.g. `"#[refines] at src/x.rs:3 (Foo::bar)"`);
+/// `authoring_hint` appends the refinement/proof arms' "Either author the model…"
+/// tail to the Ob.4 message; `noun`/`known` fix the Ob.1 wording ("action"/
+/// "actions" vs "id"/"definitions"). `target == None` skips Ob.1 (a waiver with
+/// no action). Message text is byte-identical to the former per-arm formats.
+fn check_anchor_obligations(
+    violations: &mut Vec<ClosureViolation>,
+    resolved: Option<&ModuleActionIndex>,
+    spec: AnchorObligationSpec<'_>,
+) {
+    let AnchorObligationSpec {
+        site,
+        machine,
+        target,
+        select,
+        authoring_hint,
+        noun,
+        known,
+    } = spec;
+    match resolved {
+        None => {
+            let tail = if authoring_hint {
+                " (embedded Model or external .tla). Either author the model or fix the \
+                 machine name."
+            } else {
+                "."
+            };
+            violations.push(ClosureViolation {
+                obligation: 4,
+                message: format!(
+                    "{site} names machine `{machine}` which resolves to NO registered \
+                     SpecModule{tail}"
+                ),
+            });
+        }
+        Some(idx) => {
+            let set = select(idx);
+            if let Some(t) = target
+                && !set.contains(t)
+            {
+                violations.push(ClosureViolation {
+                    obligation: 1,
+                    message: format!(
+                        "{site} names {noun} `{t}` which does NOT exist in machine \
+                         `{machine}`. Known {known}: {set:?}"
+                    ),
+                });
+            }
+        }
+    }
 }
 
 /// Enforce the four bidirectional obligations of TRUST_NATIVE_TLA §2.2 over the
@@ -700,11 +755,6 @@ pub fn verifier_ledger(modules: &[SpecModule]) -> Vec<LedgerEntry> {
 /// the `trust-ir` symbol resolution of Phase 3. The Phase-0 aterm-local gate proves
 /// 1/3/4 (the linkage/coverage closure); behavioural alignment is the separate
 /// Tier-1 conformance layer (already green for window_routing).
-/// One module's three indexed namespaces, keyed by its declared machine name:
-/// `(machine name, action set, invariant-def set, coverage-action set)`. They
-/// coincide for embedded models and diverge for external `.tla` (see [`check_closure`]).
-type ModuleActionIndex = (String, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
-
 // Skip: the closure gate's set algebra + format (BTreeSet/Map keyed builds,
 // absent std bodies). THE xref gate itself — verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -742,29 +792,19 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
 
     // ---- Obligation 4 + 1 for refinements ----
     for r in refinements() {
-        match resolve(r.machine) {
-            None => violations.push(ClosureViolation {
-                obligation: 4,
-                message: format!(
-                    "#[refines] at {} ({}) names machine `{}` which resolves to NO registered \
-                     SpecModule (embedded Model or external .tla). Either author the model or \
-                     fix the machine name.",
-                    r.location, r.rust_method, r.machine
-                ),
-            }),
-            Some((_, actions, _, _)) => {
-                if !actions.contains(r.action) {
-                    violations.push(ClosureViolation {
-                        obligation: 1,
-                        message: format!(
-                            "#[refines] at {} ({}) names action `{}` which does NOT exist in \
-                             machine `{}`. Known actions: {:?}",
-                            r.location, r.rust_method, r.action, r.machine, actions
-                        ),
-                    });
-                }
-            }
-        }
+        check_anchor_obligations(
+            &mut violations,
+            resolve(r.machine),
+            AnchorObligationSpec {
+                site: &format!("#[refines] at {} ({})", r.location, r.rust_method),
+                machine: r.machine,
+                target: Some(r.action),
+                select: |idx| &idx.1,
+                authoring_hint: true,
+                noun: "action",
+                known: "actions",
+            },
+        );
     }
 
     // ---- Obligation 4 + 1 for invariant anchors (machine optional) ----
@@ -772,32 +812,26 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
         if inv.machine.is_empty() {
             continue;
         }
-        match resolve(inv.machine) {
-            None => violations.push(ClosureViolation {
-                obligation: 4,
-                message: format!(
-                    "#[spec_invariant] at {} ({}) names machine `{}` which resolves to NO \
-                     registered SpecModule.",
-                    inv.location, inv.rust_method, inv.machine
+        // An invariant anchor's `id` should name a top-level DEFINITION in the
+        // module (invariants legitimately name non-`Next` defs like `TypeOK`),
+        // so it resolves against the WIDER `invariant_names()` set — NOT the
+        // Next-only action set the refinement/proof arms use (§2.4).
+        check_anchor_obligations(
+            &mut violations,
+            resolve(inv.machine),
+            AnchorObligationSpec {
+                site: &format!(
+                    "#[spec_invariant] at {} ({})",
+                    inv.location, inv.rust_method
                 ),
-            }),
-            Some((_, _, inv_defs, _)) => {
-                // An invariant anchor's `id` should name a top-level DEFINITION in the
-                // module (invariants legitimately name non-`Next` defs like `TypeOK`),
-                // so it resolves against the WIDER `invariant_names()` set — NOT the
-                // Next-only action set the refinement/proof arms use (§2.4).
-                if !inv_defs.contains(inv.id) {
-                    violations.push(ClosureViolation {
-                        obligation: 1,
-                        message: format!(
-                            "#[spec_invariant] at {} ({}) names id `{}` which does NOT exist in \
-                             machine `{}`. Known definitions: {:?}",
-                            inv.location, inv.rust_method, inv.id, inv.machine, inv_defs
-                        ),
-                    });
-                }
-            }
-        }
+                machine: inv.machine,
+                target: Some(inv.id),
+                select: |idx| &idx.2,
+                authoring_hint: false,
+                noun: "id",
+                known: "definitions",
+            },
+        );
     }
 
     // ---- Obligation 4 + 1 for waivers that name a machine/action ----
@@ -807,28 +841,19 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
             // nothing to resolve. It cannot discharge coverage either.
             continue;
         }
-        match resolve(w.machine) {
-            None => violations.push(ClosureViolation {
-                obligation: 4,
-                message: format!(
-                    "#[spec_unmodeled] at {} ({}) names machine `{}` which resolves to NO \
-                     registered SpecModule.",
-                    w.location, w.rust_method, w.machine
-                ),
-            }),
-            Some((_, actions, _, _)) => {
-                if !w.action.is_empty() && !actions.contains(w.action) {
-                    violations.push(ClosureViolation {
-                        obligation: 1,
-                        message: format!(
-                            "#[spec_unmodeled] at {} ({}) names action `{}` which does NOT exist \
-                             in machine `{}`. Known actions: {:?}",
-                            w.location, w.rust_method, w.action, w.machine, actions
-                        ),
-                    });
-                }
-            }
-        }
+        check_anchor_obligations(
+            &mut violations,
+            resolve(w.machine),
+            AnchorObligationSpec {
+                site: &format!("#[spec_unmodeled] at {} ({})", w.location, w.rust_method),
+                machine: w.machine,
+                target: (!w.action.is_empty()).then_some(w.action),
+                select: |idx| &idx.1,
+                authoring_hint: false,
+                noun: "action",
+                known: "actions",
+            },
+        );
     }
 
     // ---- Obligation 4 + 1 for PROOF anchors (TRUST_NATIVE_TLA §4, Phase 4) ----
@@ -840,29 +865,19 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
     // discharge the coverage obligation — kani is bounded-LOCAL, not the temporal binding
     // coverage demands — so it is intentionally NOT folded into `bound` below.)
     for p in proof_anchors() {
-        match resolve(p.machine) {
-            None => violations.push(ClosureViolation {
-                obligation: 4,
-                message: format!(
-                    "proof_anchor! at {} (proof `{}`) names machine `{}` which resolves to NO \
-                     registered SpecModule (embedded Model or external .tla). Either author the \
-                     model or fix the machine name.",
-                    p.location, p.proof_name, p.machine
-                ),
-            }),
-            Some((_, actions, _, _)) => {
-                if !actions.contains(p.action) {
-                    violations.push(ClosureViolation {
-                        obligation: 1,
-                        message: format!(
-                            "proof_anchor! at {} (proof `{}`) names action `{}` which does NOT \
-                             exist in machine `{}`. Known actions: {:?}",
-                            p.location, p.proof_name, p.action, p.machine, actions
-                        ),
-                    });
-                }
-            }
-        }
+        check_anchor_obligations(
+            &mut violations,
+            resolve(p.machine),
+            AnchorObligationSpec {
+                site: &format!("proof_anchor! at {} (proof `{}`)", p.location, p.proof_name),
+                machine: p.machine,
+                target: Some(p.action),
+                select: |idx| &idx.1,
+                authoring_hint: true,
+                noun: "action",
+                known: "actions",
+            },
+        );
     }
 
     // ---- Obligation 3: coverage over active machines, report over the rest ----

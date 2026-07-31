@@ -5277,7 +5277,19 @@ pub(crate) struct EditorApp {
             crate::native_config_language::ConfigAssist,
         )>,
     >,
+    /// `(document, seq, line-start index)` for the last rendered revision — see
+    /// [`EditorApp::line_index`]. Same memo shape as `config_assist_cache`, keyed
+    /// on the same document revision, so staleness is structurally excluded.
+    line_index_cache: std::cell::RefCell<LineIndexMemo>,
 }
+
+/// `(document id, document seq, line-start index)` — the memo behind
+/// [`EditorApp::line_index`], keyed on the revision it was built from.
+/// The inner `Option` is the DECISION, not a miss: `None` records that this
+/// revision is too line-dense to index within
+/// [`crate::native_editor::MAX_LINE_INDEX_ENTRIES`], so the refusal is memoized
+/// too and a pathological document does not re-scan on every frame.
+type LineIndexMemo = Option<(u64, u64, Option<std::sync::Arc<[usize]>>)>;
 
 impl EditorApp {
     pub(crate) fn new(document: DocumentId, title: String) -> Self {
@@ -5305,7 +5317,42 @@ impl EditorApp {
             config_analysis_revision: 0,
             config_host_requested_revision: None,
             config_assist_cache: std::cell::RefCell::new(Vec::new()),
+            line_index_cache: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Line-start index for `snapshot`, built once per document REVISION.
+    ///
+    /// `view` runs on every frame and every keystroke, and it asks three separate
+    /// questions that each used to re-derive the document's line structure from
+    /// the bytes: `reconcile_viewport` (one full newline scan plus two
+    /// caret-length scans), `project_viewport` (a second full scan), and the
+    /// cursor label (another caret-length scan). That is four to six passes over
+    /// the WHOLE document per frame, so editor frame time — and, since the
+    /// reducer re-renders, typing latency — grew linearly with file size, up to
+    /// ~150 ms/frame at the 32 MiB document limit. One pass per revision answers
+    /// all of them (binary search / direct index thereafter).
+    ///
+    /// `None` means "do not index this revision" — see [`LineIndexMemo`]. Callers
+    /// fall back to `EditorLines::scanning`, which answers identically.
+    fn line_index(
+        &self,
+        snapshot: &crate::document_store::DocumentSnapshot,
+    ) -> Option<std::sync::Arc<[usize]>> {
+        let hit = self
+            .line_index_cache
+            .borrow()
+            .as_ref()
+            .filter(|(document, seq, _)| *document == snapshot.id.get() && *seq == snapshot.seq.0)
+            .map(|(_, _, starts)| starts.clone());
+        if let Some(decision) = hit {
+            return decision;
+        }
+        let starts: Option<std::sync::Arc<[usize]>> =
+            crate::native_editor::line_starts_capped(&snapshot.text).map(Into::into);
+        *self.line_index_cache.borrow_mut() =
+            Some((snapshot.id.get(), snapshot.seq.0, starts.clone()));
+        starts
     }
 
     fn config_assist(
@@ -5503,14 +5550,24 @@ impl NativeAppModel for EditorApp {
             .floor() as usize;
         let mut projection = cx.document.and_then(|snapshot| {
             view.buffer.as_ref().map(|buffer| {
+                // ONE line index per document revision serves the reconcile, the
+                // projection, and the cursor label below (the second and third
+                // asks are memo hits) — see `EditorApp::line_index`.
+                let starts = self.line_index(snapshot);
+                let lines = match starts.as_deref() {
+                    Some(starts) => {
+                        crate::native_editor::EditorLines::indexed(&snapshot.text, starts)
+                    }
+                    None => crate::native_editor::EditorLines::scanning(&snapshot.text),
+                };
                 // Runtime-only renderers do not have a host resize event. Use a
                 // reconciled view clone so direct semantic/introspection renders
                 // still obey the renderer's actual capacity; the window host
                 // persists this same capacity before ordinary reducer input.
                 let mut effective = buffer.clone();
-                effective.reconcile_viewport(&snapshot.text, line_capacity);
-                crate::native_editor::project_viewport(
-                    &snapshot.text,
+                effective.reconcile_viewport_with(&lines, line_capacity);
+                crate::native_editor::project_viewport_with(
+                    &lines,
                     &effective,
                     line_capacity,
                     column_capacity,
@@ -5523,9 +5580,16 @@ impl NativeAppModel for EditorApp {
             crate::native_config_language::decorate_projection(projection, analysis);
         }
         let cursor_label = cx.document.and_then(|snapshot| {
-            view.buffer
-                .as_ref()
-                .map(|buffer| editor_cursor_label(&snapshot.text, buffer))
+            view.buffer.as_ref().map(|buffer| {
+                let starts = self.line_index(snapshot);
+                let lines = match starts.as_deref() {
+                    Some(starts) => {
+                        crate::native_editor::EditorLines::indexed(&snapshot.text, starts)
+                    }
+                    None => crate::native_editor::EditorLines::scanning(&snapshot.text),
+                };
+                editor_cursor_label_with(&lines, buffer)
+            })
         });
         let footer_chars =
             (((editor_rect.width - 88.0).max(112.0) / 7.0).floor() as usize).clamp(16, 256);
@@ -6401,14 +6465,26 @@ fn command_palette_status(matches: usize, compact: bool) -> String {
     }
 }
 
+/// Scanning form: derives the caret's line by walking the document. Kept for
+/// one-shot callers; the render path uses [`editor_cursor_label_with`] with the
+/// resident line index instead of re-scanning every frame.
+#[cfg(test)]
 fn editor_cursor_label(text: &str, view: &crate::native_editor::EditorBufferView) -> String {
+    editor_cursor_label_with(&crate::native_editor::EditorLines::scanning(text), view)
+}
+
+fn editor_cursor_label_with(
+    lines: &crate::native_editor::EditorLines<'_>,
+    view: &crate::native_editor::EditorBufferView,
+) -> String {
+    let text = lines.text();
     let caret = view.primary_selection().head.min(text.len());
     let caret = (0..=caret)
         .rev()
         .find(|candidate| text.is_char_boundary(*candidate))
         .unwrap_or(0);
     let before = &text[..caret];
-    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let line = lines.number_at(caret) + 1;
     let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
     // Give the shared editor geometry the complete logical line. A defensive
     // selection can arrive on a UTF-8 character boundary inside a combining

@@ -633,14 +633,32 @@ pub fn inflate(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError>
 /// The RFC 1950 Adler-32 checksum of `data`.
 fn adler32(data: &[u8]) -> u32 {
     const MOD: u32 = 65521;
+    // zlib's NMAX: the largest block length for which the accumulators cannot
+    // reach 2^32 before the next reduction. Worst case at a block head is
+    // `a = MOD-1 = 65520`, every byte 0xFF, so after n bytes
+    //   a_n = 65520 + 255n
+    //   b_n = 65520 + 65520n + 255*n*(n+1)/2
+    // and at n = 5552 that is 4_294_690_200 < 2^32. Deferring the reduction to
+    // once per block instead of twice per byte removes two constant-modulo
+    // sequences (multiply-high + shift + multiply + subtract) from the serial
+    // `a -> b` dependency chain that dominated the loop: measured on a 4 MiB
+    // Kitty `o=z` graphics payload this took adler32 from 10.2 ms to 1.2 ms and
+    // the whole `zlib_decompress` from 15.6 ms to 6.6 ms. The result is
+    // bit-identical — the modulo is distributive over the accumulation, which is
+    // exactly why RFC 1950 specifies it this way.
+    const NMAX: usize = 5552;
     let mut a = 1u32;
     let mut b = 0u32;
-    for &byte in data {
-        // `a` and `b` are `< MOD` at every loop head, so neither addition can
-        // actually saturate; `saturating_add` keeps the no-overflow argument
-        // local (the verifier drops the `< MOD` fact across iterations).
-        a = a.saturating_add(u32::from(byte)) % MOD;
-        b = b.saturating_add(a) % MOD;
+    for block in data.chunks(NMAX) {
+        for &byte in block {
+            // By the bound above neither add can actually wrap; `wrapping_add`
+            // is used only because it is total (no panic obligation) without
+            // needing the `< MOD` fact carried across iterations.
+            a = a.wrapping_add(u32::from(byte));
+            b = b.wrapping_add(a);
+        }
+        a %= MOD;
+        b %= MOD;
     }
     (b << 16) | a
 }

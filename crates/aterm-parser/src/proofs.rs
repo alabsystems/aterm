@@ -781,6 +781,15 @@ fn simd_avx2_bias_correct() {
 // F11-3 (#7941): CSI 16-byte SIMD chunk — non-param byte is always found
 // =============================================================================
 //
+// LEDGER NOTE (2026-07): these two harnesses no longer guard production code.
+// `simd_csi` lost its last production caller when the speculative parameter
+// pre-parse was removed from `parse_csi_general` (it measured as a net loss on
+// every shape that reached it), and the module is now `#[cfg(test)]`. The
+// `unreachable!()` these proofs were written for is also long gone — the line
+// anchor below is stale. They are kept as standing proofs of the `has_end`
+// predicate algebra, which any future bulk CSI parameter parser would have to
+// re-establish; do not count them as covering shipped code.
+//
 // The NEON implementation in `simd_csi.rs` (line 403) contains an
 // `unreachable!()` guarded by the claim "has_end guarantees at least one
 // non-param byte in the 16-byte chunk, so the `else` branch above always

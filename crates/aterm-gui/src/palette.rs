@@ -487,13 +487,24 @@ impl PaletteState {
     /// query matches everything; otherwise every query char must appear, in order, somewhere
     /// in the lowercased `"label  section"` haystack (a classic subsequence fuzzy match, which
     /// also covers plain substrings).
+    ///
+    /// PERF: the haystack is streamed and lowercased lazily rather than built with `format!`.
+    /// This is called a linear number of times per pointer event (hit testing walks slots, and
+    /// each layout derivation asks for `wanted_rows` + `body`), and the palette carries ~40–60
+    /// rows, so the two `String`s per row this used to allocate dominated pointer motion while
+    /// the modal was open. The query is still lowercased once per call, not once per row.
     pub(crate) fn filtered(&self) -> Vec<usize> {
         let q = self.query.to_ascii_lowercase();
         (0..self.rows.len())
             .filter(|&i| {
                 let r = &self.rows[i];
-                let hay = format!("{}  {}", r.label, r.section).to_ascii_lowercase();
-                fuzzy_subsequence(&q, &hay)
+                let hay = r
+                    .label
+                    .chars()
+                    .chain("  ".chars())
+                    .chain(r.section.chars())
+                    .map(|c| c.to_ascii_lowercase());
+                fuzzy_subsequence(&q, hay)
             })
             .collect()
     }
@@ -768,12 +779,18 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
     const LIST: NodeId = NodeId(u64::MAX);
     let root_id = NodeId(0);
     let vis = state.filtered();
+    // Derive the epoch ONCE. It is slot-independent by construction ("cursor/focus movement
+    // deliberately does not enter this hash") and `state` is immutable here, so every
+    // per-row `a11y_node_id` call was recomputing the identical value — and each derivation
+    // itself walks the whole filtered set. That made the publish O(rows²) with a Debug-format
+    // allocation per inner step, on a path driven by every palette keystroke and hover.
+    let epoch = state.a11y_epoch();
 
     let mut nodes: Vec<(NodeId, Node)> = Vec::with_capacity(vis.len() + 2);
     let mut items: Vec<NodeId> = Vec::with_capacity(vis.len());
     for (slot, &i) in vis.iter().enumerate() {
         let row = &state.rows[i];
-        let id = state.a11y_node_id(slot);
+        let id = a11y_node_id_for(epoch, slot);
         let mut node = Node::new(Role::MenuItem);
         node.set_label(row.label.as_ref());
         let description = if row.shortcut.is_empty() {
@@ -806,7 +823,7 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
     let focus = if vis.is_empty() {
         root_id
     } else {
-        state.a11y_node_id(state.selected.min(vis.len() - 1))
+        a11y_node_id_for(epoch, state.selected.min(vis.len() - 1))
     };
 
     TreeUpdate {
@@ -815,6 +832,14 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
         tree_id: TreeId::ROOT,
         focus,
     }
+}
+
+/// Mint a palette row node id from an ALREADY-derived epoch. The single-shot decode path
+/// ([`PaletteState::a11y_filtered_index`]) keeps using the `&self` method; only bulk minting,
+/// where the epoch is loop-invariant, goes through here.
+#[cfg(feature = "a11y-accesskit")]
+fn a11y_node_id_for(epoch: u32, slot: usize) -> accesskit::NodeId {
+    accesskit::NodeId((u64::from(epoch) << 32) | (slot as u64 + 1))
 }
 
 /// Transient per-window state for the command palette (mirrors `AboutState`'s `Option`
@@ -900,7 +925,7 @@ impl PaletteState {
 
     #[cfg(feature = "a11y-accesskit")]
     fn a11y_node_id(&self, slot: usize) -> accesskit::NodeId {
-        accesskit::NodeId((u64::from(self.a11y_epoch()) << 32) | (slot as u64 + 1))
+        a11y_node_id_for(self.a11y_epoch(), slot)
     }
 
     /// Decode only a node minted by the current filtered target epoch. An old native
@@ -946,15 +971,33 @@ fn row_accel(row: &PaletteRow) -> String {
     }
 }
 
-/// Exact painted selection/hit rectangle for one VISIBLE command slot. Both the tray and
-/// pointer hit-test use this function, so resize, zoom, and native DPI conversion cannot
-/// make the interactive row drift away from its visible wash and ring.
+/// Exact painted selection/hit rectangle for one VISIBLE command slot, deriving the layout
+/// itself. The tray painter and the pointer hit-test both reach the same geometry through
+/// `palette_row_rect_in` against the layout they already hold, so this layout-deriving entry
+/// is only what the tests measure with — it lets them assert painter and hit-test against ONE
+/// rectangle, which is what keeps resize, zoom, and native DPI conversion from drifting the
+/// interactive row away from its visible wash and ring. Test build only: no painter or
+/// hit-test path calls it, so shipping it would be unreachable code.
+#[cfg(test)]
 pub(crate) fn palette_row_rect(
     state: &PaletteState,
     g: &SettingsGeom,
     slot: usize,
 ) -> Option<(f32, f32, f32, f32)> {
-    let layout = palette_layout(state, g);
+    palette_row_rect_in(&palette_layout(state, g), g, slot)
+}
+
+/// `palette_row_rect` against an ALREADY-derived layout. `palette_layout` costs two
+/// `PaletteState::filtered()` derivations (`wanted_rows` + `body`), and each of those
+/// allocates two `String`s per palette row — so re-deriving it once per slot inside a hit
+/// test made a single pointer motion do ~30x the filtering work of the frame that painted
+/// those same rows. The layout is a pure function of `(state, g)` and neither moves during
+/// the scan, so hoisting it is a plain common-subexpression elimination.
+fn palette_row_rect_in(
+    layout: &PaletteLayout,
+    g: &SettingsGeom,
+    slot: usize,
+) -> Option<(f32, f32, f32, f32)> {
     if slot >= layout.body_rows {
         return None;
     }
@@ -976,9 +1019,9 @@ pub(crate) fn palette_row_hit(
     y: f32,
 ) -> Option<usize> {
     let visible = state.filtered();
-    let body = palette_layout(state, g).body_rows;
-    for slot in 0..body {
-        let (rx, ry, rw, rh) = palette_row_rect(state, g, slot)?;
+    let layout = palette_layout(state, g);
+    for slot in 0..layout.body_rows {
+        let (rx, ry, rw, rh) = palette_row_rect_in(&layout, g, slot)?;
         if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
             let filtered = state.scroll + slot;
             return visible.get(filtered).map(|_| filtered);
@@ -989,8 +1032,12 @@ pub(crate) fn palette_row_hit(
 
 /// True iff every char of `needle` (already lowercased) appears in `haystack` (already
 /// lowercased) in order — a subsequence match. An empty needle always matches.
-fn fuzzy_subsequence(needle: &str, haystack: &str) -> bool {
-    let mut hay = haystack.chars();
+///
+/// The haystack is an ITERATOR, not a `&str`, so [`PaletteState::filtered`] can lowercase
+/// `"label  section"` lazily instead of `format!`-ing and lowercasing a fresh `String` for
+/// every row on every call. The body only ever consumed `haystack.chars()` anyway.
+fn fuzzy_subsequence(needle: &str, haystack: impl Iterator<Item = char>) -> bool {
+    let mut hay = haystack;
     'outer: for nc in needle.chars() {
         for hc in hay.by_ref() {
             if hc == nc {
@@ -1167,8 +1214,10 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
         let y0 = card_y + (2 + slot) as f32 * ch;
         let is_sel = state.scroll + slot == state.selected;
         if is_sel {
-            let (x, y, width, height) =
-                palette_row_rect(state, g, slot).expect("painted palette slot has a row rectangle");
+            // The same `layout` the card above was placed from — re-deriving it here would
+            // re-run the whole filter twice (see `palette_row_rect_in`).
+            let (x, y, width, height) = palette_row_rect_in(&layout, g, slot)
+                .expect("painted palette slot has a row rectangle");
             prims.push(DrawPrim::Panel {
                 x,
                 y,

@@ -48,10 +48,11 @@ pub fn parse_rustc_vv(vv: &str) -> RustcVv {
 ///   1. an explicit `ATERM_COMPILER_FLAVOR=r|t` override (other values are ignored,
 ///      falling through — a typo must not silently mislabel provenance);
 ///   2. the compiler's own `-vV` self-identification: `binary: trustc` or a
-///      `(trustc)` version-line parenthetical (the 2026-07 toolchains stamp both;
-///      direct evidence from the probed binary, so it survives lanes where no
-///      env hint exists — e.g. `ATERM_CARGO=targo` resolves a bare `rustc` via
-///      PATH and sets neither RUSTC nor RUSTUP_TOOLCHAIN);
+///      `(trustc)` / `(trustc <version>)` version-line parenthetical (the 2026-07
+///      toolchains stamp both; direct evidence from the probed binary, so it
+///      survives lanes where no env hint exists — e.g. `ATERM_CARGO=targo`
+///      resolves a bare `rustc` via PATH and sets neither RUSTC nor
+///      RUSTUP_TOOLCHAIN);
 ///   3. the `RUSTC` path contains `/trust/` (the fork lives at `$HOME/trust/build/...`,
 ///      linked as `~/.rustup/toolchains/trust/` — covers pre-marker toolchains);
 ///   4. `RUSTUP_TOOLCHAIN == "trust"` (a `rustup toolchain link trust ...` lane).
@@ -76,7 +77,7 @@ pub fn detect_flavor(
     }) || vv
         .lines()
         .next()
-        .is_some_and(|first| first.contains("(trustc)"));
+        .is_some_and(|first| first.contains("(trustc)") || first.contains("(trustc "));
     if vv_says_trust || rustc_path.contains("/trust/") || rustup_toolchain == Some("trust") {
         return "t";
     }
@@ -185,6 +186,11 @@ mod tests {
         // …or the `binary: trustc` field.
         let field_only = "rustc 1.96.0-dev (7e631b2a4 2026-07-04)\nbinary: trustc";
         assert_eq!(detect_flavor(None, field_only, "rustc", None), "t");
+        // …or the versioned parenthetical the post-purge toolchains print
+        // (`(trustc <trust-version>)` — Trust's own version, not the rust-compat
+        // number).
+        let versioned = "rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc 0.1.0)\nbinary: rustc";
+        assert_eq!(detect_flavor(None, versioned, "rustc", None), "t");
         // "(trustc)" anywhere PAST the first line is not the marker (defensive:
         // only the version line's parenthetical is the compiler's self-name).
         let stray = "rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)\nbinary: rustc\nnote: (trustc)";

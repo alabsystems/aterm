@@ -1135,16 +1135,20 @@ impl EffectsPipeline {
         // the styles that don't emit it (and `tick` clears its scratches each
         // frame), so a non-fire/halo style stays byte-identical to the
         // pre-splice frames.
-        input.glow_halo.clear();
-        input.glow_halo.extend_from_slice(self.glow.halos());
-        input.fire_patch.clear();
-        input.fire_patch.extend_from_slice(self.glow.patches());
-        input.glow_under.clear();
-        input.glow_under.extend_from_slice(self.glow.under_quads());
-        input.char_fg.clear();
-        input.char_fg.extend_from_slice(self.glow.charred());
-        input.fire_halo.clear();
-        input.fire_halo.extend_from_slice(self.glow.halo_cells());
+        //
+        // SWAPPED, not copied — for the same reason the channels above are
+        // (`tick` clears every one of these scratches at entry, so the buffer
+        // handed back holds the previous frame and is never read). `glow_under`
+        // is the one that pays: a hot Nyan ribbon pins 6k-14k 16-byte GlowQuad
+        // (tests/cursor_bench.rs), i.e. ~100-230 KB of memcpy per present that
+        // duplicates bytes the emitter just wrote. `apply` is the sole consumer
+        // of the pipeline's glow and reads each stream exactly once, which is
+        // the precondition the swap needs.
+        self.glow.swap_halos(&mut input.glow_halo);
+        self.glow.swap_patches(&mut input.fire_patch);
+        self.glow.swap_under_quads(&mut input.glow_under);
+        self.glow.swap_charred(&mut input.char_fg);
+        self.glow.swap_halo_cells(&mut input.fire_halo);
         // Fire's FORGE cursor is visible state just like its flame streams:
         // carry the warm-metal fill through the shared RenderInput seam on the
         // wasm/gpu-web hosts too. Stamp this field on EVERY enabled frame so a

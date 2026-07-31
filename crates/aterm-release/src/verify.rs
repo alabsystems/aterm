@@ -85,11 +85,9 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
 /// sends no `target_commitish` for that reason — so GitHub anchors the mirrored
 /// release at the channel's default branch (`main`).
 ///
-/// Applying the private capability check here is what made `step_mirror` refuse
-/// its own completed flip on v0.6.0 and v0.7.0: the release was correctly live
-/// with the right bytes, and `release_target_matches("main", <40-hex claim>)` is
-/// false, so the cut wedged with the lease still held. It is also why
-/// `publish::validate_mirror_release_capability` exists and omits the field.
+/// The channel-side identity invariant lives on
+/// `publish::validate_mirror_release_capability`, which omits the field for the
+/// same reason.
 ///
 /// Everything else still holds, enforced inside [`scan_published_snapshot`]: the
 /// immutable release ID, the listing-row-to-snapshot binding, exact tag identity,
@@ -243,11 +241,18 @@ fn scan_published_snapshot(slug: &str, stop_early: bool) -> Result<Vec<Published
                 "release ID {release_id} has no captured immutable identity"
             ))
         })?;
-        let observed = publish::release_object_by_id(slug, release_id)?;
-        if observed.as_ref() != Some(captured) {
-            return Err(Error::new(format!(
-                "release ID {release_id} identity changed after manifest validation"
-            )));
+        // On an exhaustive scan every remaining release's fetch+download round
+        // ran since this release's bracketed before/after pair, so re-read once
+        // more: concurrent channel mutation during the long scan must fail the
+        // scan, not return a torn view. The stop-early replay fetches exactly
+        // one manifest and its own pair already brackets that only transfer.
+        if !stop_early {
+            let observed = publish::release_object_by_id(slug, release_id)?;
+            if observed.as_ref() != Some(captured) {
+                return Err(Error::new(format!(
+                    "release ID {release_id} identity changed after manifest validation"
+                )));
+            }
         }
         publish::validate_release_object_tag_state(
             Some(captured),
@@ -1034,10 +1039,7 @@ fn validate_published_identity(published: &Published) -> Result<Manifest> {
 pub fn yank_successor_covers(bad: &Published, successor: &Published) -> Result<bool> {
     validate_published_identity(bad)?;
     validate_published_identity(successor)?;
-    let required_floor = bad
-        .build
-        .checked_add(1)
-        .ok_or_else(|| Error::new("cannot yank u64::MAX: min_build successor would overflow"))?;
+    let required_floor = yank_required_floor(bad.build)?;
     // Both ends must be current-scheme candidates. A retired two-component
     // release is inert archive history no client will ever select, so it is
     // neither a yank target nor a successor — and "not orderable against the
@@ -1091,15 +1093,27 @@ fn verification_pubkey_for(repo: &Path, version: &str) -> Result<Option<String>>
     Ok(None)
 }
 
-/// Re-prove that the bad release is already inert before every cleanup
-/// mutation. The full post-publish replay covers canonical arbitration, exact
-/// manifest bytes, current signature + all signed history, and DMG availability.
-fn prove_yank_successor(repo: &Path, slug: &str, bad: &Published) -> Result<Option<Published>> {
+/// The channel floor a successor must carry before build `build` may be
+/// destroyed: yanking `u64::MAX` cannot be expressed and must fail, never wrap.
+fn yank_required_floor(build: u64) -> Result<u64> {
+    build
+        .checked_add(1)
+        .ok_or_else(|| Error::new("cannot yank u64::MAX: successor min_build would overflow"))
+}
+
+/// Shared skeleton of the yank convergence proofs: elect the channel head,
+/// test it with the caller's coverage predicate, then fully re-verify it with
+/// the post-publish replay before reporting it as the covering successor.
+fn verified_channel_successor(
+    repo: &Path,
+    slug: &str,
+    covers: impl Fn(&Published) -> Result<bool>,
+) -> Result<Option<Published>> {
     let scanned = scan_published_in_repo(repo, slug, true)?;
     let Some(successor) = scanned.first() else {
         return Ok(None);
     };
-    if !yank_successor_covers(bad, successor)? {
+    if !covers(successor)? {
         return Ok(None);
     }
     let pubkey = verification_pubkey_for(repo, &successor.version)?;
@@ -1119,41 +1133,28 @@ fn prove_yank_successor(repo: &Path, slug: &str, bad: &Published) -> Result<Opti
     Ok(Some(successor.clone()))
 }
 
+/// Re-prove that the bad release is already inert before every cleanup
+/// mutation. The full post-publish replay covers canonical arbitration, exact
+/// manifest bytes, current signature + all signed history, and DMG availability.
+fn prove_yank_successor(repo: &Path, slug: &str, bad: &Published) -> Result<Option<Published>> {
+    verified_channel_successor(repo, slug, |successor| {
+        yank_successor_covers(bad, successor)
+    })
+}
+
 /// Command-level convergence after tag-first cleanup and a release-delete
 /// crash/response loss. The original manifest is gone, so only claim success
 /// when no parsed release carries the build and the exact current authority is
 /// newer, fully verified, and permanently poisons that build via min_build.
 fn prove_absent_yank_converged(repo: &Path, slug: &str, build: u64) -> Result<Option<Published>> {
-    let required_floor = build
-        .checked_add(1)
-        .ok_or_else(|| Error::new("cannot yank u64::MAX: successor min_build would overflow"))?;
-    let scanned = scan_published_in_repo(repo, slug, true)?;
-    let Some(successor) = scanned.first() else {
-        return Ok(None);
-    };
-    validate_published_identity(successor)?;
-    if successor.build <= build
-        || !successor
-            .min_build
-            .is_some_and(|floor| floor >= required_floor)
-    {
-        return Ok(None);
-    }
-    let pubkey = verification_pubkey_for(repo, &successor.version)?;
-    post_publish(
-        repo,
-        slug,
-        &successor.version,
-        Some(successor.build),
-        None,
-        false,
-        PostPublishSignature {
-            expected: None,
-            pubkey: pubkey.as_deref(),
-            local_signature: None,
-        },
-    )?;
-    Ok(Some(successor.clone()))
+    let required_floor = yank_required_floor(build)?;
+    verified_channel_successor(repo, slug, |successor| {
+        validate_published_identity(successor)?;
+        Ok(successor.build > build
+            && successor
+                .min_build
+                .is_some_and(|floor| floor >= required_floor))
+    })
 }
 
 fn published_commit(published: &Published) -> Result<String> {
@@ -1340,9 +1341,7 @@ pub fn run_yank(repo: &Path, build: u64) -> Result<()> {
             if live.is_empty() { "none" } else { &live }
         ))
     })?;
-    let required_floor = build
-        .checked_add(1)
-        .ok_or_else(|| Error::new("cannot yank u64::MAX: successor min_build would overflow"))?;
+    let required_floor = yank_required_floor(build)?;
 
     // An unfinished local cut remains actionable operator state. A completed
     // journal is harmless history and run_cut will replace it if needed.

@@ -26,55 +26,8 @@ use aterm_core::terminal::Terminal;
 use aterm_effects::supernova::{self, SuperEnv};
 use aterm_render::{DamageOutcome, GlowQuad, Renderer, Theme, WindowCpu, premul_rgb};
 
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-fn max_channel_delta(a: &[u32], b: &[u32]) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.iter().zip(b.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
-}
-
-fn backends(px: f32, theme: Theme) -> Option<(Renderer, aterm_gpu::GpuRenderer)> {
-    // Deterministic rasterizer for additive parity — same rationale as
-    // glow_parity.rs (One/One light over a crisp CoreText edge amplifies the
-    // inherent sub-pixel divergence; fontdue's soft AA absorbs it).
-    static FORCE_FONTDUE: std::sync::Once = std::sync::Once::new();
-    FORCE_FONTDUE.call_once(|| {
-        // SAFETY: set once, before any renderer in this test binary is built.
-        unsafe { std::env::set_var("ATERM_RASTERIZER", "fontdue") };
-    });
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return None;
-        }
-    };
-    // The GPU bloom feeds ONLY off `cursor_glow_add`; disable it anyway so the
-    // differential covers exactly the shared, proven base path. Ditto the heat
-    // shimmer (same parity class, wall-clock at present).
-    gpu.set_bloom(false);
-    gpu.set_shimmer(false);
-    let cpu = match Renderer::from_system(px, theme) {
-        Some(c) => c,
-        None => {
-            eprintln!("SKIP: no system monospace font");
-            return None;
-        }
-    };
-    Some((cpu, gpu))
-}
+mod common;
+use common::{backends_fontdue as backends, bb, max_channel_delta};
 
 /// A hand-built nova frame: a 3-row crown column plus per-row ring-band chord
 /// quads (the §6.3 emitter shape: every quad in exactly one row band).

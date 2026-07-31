@@ -98,6 +98,14 @@ fn handoff_is_modern_overlap(
     manifest && fds && nonce && layout && ready && commit
 }
 
+/// One adopted session's identity in the handoff protocol: the pool-local
+/// session id, the inherited PTY master fd, and the shell's pid, in that order.
+/// This triple is the unit the fd channel carries, the unit
+/// [`validated_identities`] proves is a bijection against the manifest, and the
+/// unit [`adoption_proof`] hashes — naming it keeps those three agreeing on
+/// field ORDER, which a bare tuple of three integers cannot enforce.
+pub(crate) type SessionIdentity = (u64, i32, i32);
+
 /// Exact, attempt-bound proof of the PTYs the incoming process really adopted.
 /// The nonce binds it to one outgoing manifest; the sorted identity triples bind
 /// both cardinality and membership, so zero/subset/duplicate adoption cannot be
@@ -157,7 +165,7 @@ pub(crate) fn adoption_proof(
     target_commit: &str,
     layout_digest: &[u8; 32],
     screen_digest: &[u8; 32],
-    identities: &[(u64, i32, i32)],
+    identities: &[SessionIdentity],
 ) -> Option<AdoptionProof> {
     let count = u32::try_from(identities.len()).ok()?;
     let mut identities = identities.to_vec();
@@ -445,7 +453,6 @@ fn take_regular_capped(
     result
 }
 
-
 fn take_grid_capped(
     path: &std::path::Path,
     dir: &std::path::Path,
@@ -646,7 +653,7 @@ fn normalize_incoming_checkpoint_grid(
 fn validated_identities(
     manifest: &SessionHandoff,
     fds: &HandoffFds,
-) -> Option<Vec<(u64, i32, i32)>> {
+) -> Option<Vec<SessionIdentity>> {
     if manifest.sessions.len() > MAX_HANDOFF_SESSIONS
         || manifest.sessions.len() != fds.entries.len()
     {
@@ -681,7 +688,7 @@ fn validated_identities(
     Some(identities)
 }
 
-fn parse_fd_entry(entry: &str) -> Option<(u64, i32, i32)> {
+fn parse_fd_entry(entry: &str) -> Option<SessionIdentity> {
     let (local_id, rest) = entry.split_once('=')?;
     let (fd, pid) = rest.split_once(':')?;
     Some((local_id.parse().ok()?, fd.parse().ok()?, pid.parse().ok()?))
@@ -1113,21 +1120,20 @@ impl PrearmedIncomingFds {
 
 #[cfg(unix)]
 fn clear_handoff_env() {
-    // SAFETY: this helper is called only during the single-threaded startup seam
-    // (or under the module-wide environment lock in tests), before any worker or
-    // user process can concurrently observe environment mutation.
-    unsafe {
-        for key in [
-            ENV_MANIFEST,
-            ENV_FDS,
-            ENV_NONCE,
-            ENV_LAYOUT,
-            ENV_READY_FD,
-            ENV_COMMIT_FD,
-            ENV_PARENT_PID,
-        ] {
-            std::env::remove_var(key);
-        }
+    // Called only during the single-threaded startup seam (or under the
+    // module-wide environment lock in tests), before any worker or user process
+    // can concurrently observe environment mutation — and routed through the
+    // workspace's one lock-scoped env helper rather than raw `remove_var`s.
+    for key in [
+        ENV_MANIFEST,
+        ENV_FDS,
+        ENV_NONCE,
+        ENV_LAYOUT,
+        ENV_READY_FD,
+        ENV_COMMIT_FD,
+        ENV_PARENT_PID,
+    ] {
+        aterm_log::env::unset(key);
     }
 }
 
@@ -1158,7 +1164,7 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
         .filter(|pid| *pid > 1 && unsafe { libc::getppid() } == *pid);
     // Parent identity is now process-local typed state; never let the raw env
     // reach updater verification helpers or user shells.
-    unsafe { std::env::remove_var(ENV_PARENT_PID) };
+    aterm_log::env::unset(ENV_PARENT_PID);
     let recognizable = manifest_present
         || fds_present
         || nonce_present
@@ -1369,9 +1375,9 @@ pub(crate) fn encode_target_identity(build: u64, commit: &str) -> String {
 /// alongside [`take_incoming`].
 #[must_use]
 pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
-    let raw = std::env::var(ENV_TARGET).ok();
-    // SAFETY: single-threaded launcher (caller contract), so `remove_var` is sound.
-    unsafe { std::env::remove_var(ENV_TARGET) };
+    // Read and cleared in ONE critical section: single-threaded launcher (caller
+    // contract), and the authority is one-shot by construction.
+    let raw = aterm_log::env::take(ENV_TARGET).and_then(|v| v.into_string().ok());
     let own = HandoffTarget::own();
     let Some(raw) = raw else {
         // Older parent: it hashes ITS ticket's target and we hash our own
@@ -1438,7 +1444,7 @@ impl ReadySignal {
     /// lets the child provision its Commit waiter before ProofReady becomes
     /// observable by the parent.
     #[must_use]
-    pub(crate) fn proof(&self, adopted: &[(u64, i32, i32)]) -> Option<AdoptionProof> {
+    pub(crate) fn proof(&self, adopted: &[SessionIdentity]) -> Option<AdoptionProof> {
         adoption_proof(
             &self.nonce,
             self.target.build,
@@ -1456,9 +1462,7 @@ impl ReadySignal {
     pub(crate) fn signal_proof(self, proof: AdoptionProof) -> bool {
         write_wire(&self.fd, &proof.to_wire())
     }
-
 }
-
 
 #[cfg(unix)]
 pub(crate) struct CommitReceiver {
@@ -1673,9 +1677,9 @@ pub(crate) fn take_ready_fd(
     target: Option<HandoffTarget>,
     adopted_fds: &[i32],
 ) -> Option<ReadySignal> {
-    let raw = std::env::var(ENV_READY_FD).ok();
-    // SAFETY: single-threaded launcher (caller contract), so `remove_var` is sound.
-    unsafe { std::env::remove_var(ENV_READY_FD) };
+    // Read and cleared in ONE critical section (caller contract: single-threaded
+    // launcher); a one-shot descriptor handoff must never be consumable twice.
+    let raw = aterm_log::env::take(ENV_READY_FD).and_then(|v| v.into_string().ok());
     let fd: i32 = raw?.trim().parse().ok()?;
     if fd < 3 {
         return None; // never adopt stdio
@@ -1710,9 +1714,9 @@ pub(crate) fn take_commit_fd(
     ready_fd: Option<i32>,
     expected_parent_pid: Option<libc::pid_t>,
 ) -> Option<CommitReceiver> {
-    let raw = std::env::var(ENV_COMMIT_FD).ok();
-    // SAFETY: single-threaded launcher (caller contract), so `remove_var` is sound.
-    unsafe { std::env::remove_var(ENV_COMMIT_FD) };
+    // Read and cleared in ONE critical section (caller contract: single-threaded
+    // launcher); a one-shot descriptor handoff must never be consumable twice.
+    let raw = aterm_log::env::take(ENV_COMMIT_FD).and_then(|v| v.into_string().ok());
     let _nonce = nonce?;
     let expected_parent_pid = expected_parent_pid?;
     if expected_parent_pid <= 1 || unsafe { libc::getppid() } != expected_parent_pid {
@@ -1778,15 +1782,12 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
     let mut incoming_pty_guard = fds_wire
         .as_deref()
         .map_or_else(|| IncomingPtyGuard(Vec::new()), IncomingPtyGuard::from_wire);
-    // Clear immediately so the vars never reach a spawned shell, regardless of outcome.
-    // SAFETY: single-threaded launcher (caller contract), so `remove_var` is sound. The
-    // multithreaded test binary is the ONE exception: there every caller serializes env
-    // mutation under the test module's `ENV_LOCK` instead.
-    unsafe {
-        std::env::remove_var(ENV_MANIFEST);
-        std::env::remove_var(ENV_FDS);
-        std::env::remove_var(ENV_NONCE);
-        std::env::remove_var(ENV_LAYOUT);
+    // Clear immediately so the vars never reach a spawned shell, regardless of
+    // outcome. Single-threaded launcher (caller contract); the multithreaded test
+    // binary is the ONE exception, and there every caller serializes env mutation
+    // under the test module's `ENV_LOCK` on top of the helper's own lock.
+    for key in [ENV_MANIFEST, ENV_FDS, ENV_NONCE, ENV_LAYOUT] {
+        aterm_log::env::unset(key);
     }
     let (Some(path), Some(env_nonce), Some(fds_wire)) = (manifest_path, env_nonce, fds_wire) else {
         return IncomingHandoff::default();
@@ -1919,12 +1920,8 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
             }
             let wire_cap = grid_cap;
             let grid = take_grid_capped(&grid_path, &dir, wire_cap, &mut remaining_grid_bytes)?;
-            let grid = normalize_incoming_checkpoint_grid(
-                grid,
-                meta.rows,
-                meta.cols,
-                meta.history_lines,
-                )?;
+            let grid =
+                normalize_incoming_checkpoint_grid(grid, meta.rows, meta.cols, meta.history_lines)?;
             let alt_grid = match (&meta.alt_cursor, sc.alt_grid_file.as_deref()) {
                 (None, None) => None,
                 (Some(_), Some(encoded_path)) => {
@@ -1937,11 +1934,8 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
                         take_grid_capped(&alt_path, &dir, wire_cap, &mut remaining_grid_bytes)?;
                     // The alt screen never carries history.
                     Some(normalize_incoming_checkpoint_grid(
-                        bytes,
-                        meta.rows,
-                        meta.cols,
-                        0,
-                        )?)
+                        bytes, meta.rows, meta.cols, 0,
+                    )?)
                 }
                 _ => return None,
             };
@@ -2008,7 +2002,6 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2046,16 +2039,14 @@ mod tests {
     }
     impl Drop for RestoreVar {
         fn drop(&mut self) {
-            // SAFETY: mutation is serialized by ENV_LOCK, which the enclosing
-            // test holds for our whole lifetime. Readers elsewhere in the
-            // process may still observe the transient value — acceptable
-            // because no non-seamless test depends on these vars and the prior
-            // value is what we reinstate here.
-            unsafe {
-                match &self.prior {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
+            // Mutation is serialized by ENV_LOCK, which the enclosing test holds
+            // for our whole lifetime, AND by the helper's own process-global lock.
+            // Readers elsewhere in the process may still observe the transient
+            // value — acceptable because no non-seamless test depends on these
+            // vars and the prior value is what we reinstate here.
+            match &self.prior {
+                Some(v) => aterm_log::env::set(self.key, v),
+                None => aterm_log::env::unset(self.key),
             }
         }
     }
@@ -2129,7 +2120,6 @@ mod tests {
     // ScreenCarry also had no schema key. The four retained off-width entries
     // are the real resize semantics the compatibility parser must preserve.
 
-
     #[test]
     fn a_carried_checkpoint_round_trips_its_scrollback_and_bounds_it() {
         use aterm_core::terminal::Terminal;
@@ -2201,7 +2191,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn modern_wide_narrow_checkpoint_preserves_full_tab_vector_and_rejects_bad_lengths() {
         let mut source = aterm_core::terminal::Terminal::new(6, 120);
@@ -2244,7 +2233,6 @@ mod tests {
             "oversize vector is rejected before restore/allocation growth"
         );
     }
-
 
     #[test]
     fn decoded_cell_budget_accepts_exact_max_and_rejects_max_plus_one() {
@@ -2342,11 +2330,9 @@ mod tests {
         ));
         // The descriptor position is syntactically valid, while both identity
         // and pid invalidate the authority. Duplicate mentions must close once.
-        unsafe {
-            std::env::remove_var(ENV_MANIFEST);
-            std::env::remove_var(ENV_NONCE);
-            std::env::set_var(ENV_FDS, format!("bad={named}:badpid,bad={named}:badpid"));
-        }
+        aterm_log::env::unset(ENV_MANIFEST);
+        aterm_log::env::unset(ENV_NONCE);
+        aterm_log::env::set(ENV_FDS, format!("bad={named}:badpid,bad={named}:badpid"));
         assert!(take_incoming().adopted.is_empty());
         // A process forked in the tiny pipe-create→CLOEXEC window can retain a
         // duplicate until it execs. POLLHUP is still the exact open-file-
@@ -2399,14 +2385,12 @@ mod tests {
         let (aliased, peer) = (pipe[0], pipe[1]);
         // This is an otherwise recognizable v0.52 overlap shape, but READY
         // aliases the PTY authority. A single fd cannot have two owners.
-        unsafe {
-            std::env::set_var(ENV_MANIFEST, "/tmp/not-consumed-by-prearm");
-            std::env::set_var(ENV_FDS, format!("7={aliased}:4242"));
-            std::env::set_var(ENV_NONCE, "0123456789abcdef0123456789abcdef");
-            std::env::remove_var(ENV_LAYOUT);
-            std::env::set_var(ENV_READY_FD, aliased.to_string());
-            std::env::remove_var(ENV_COMMIT_FD);
-        }
+        aterm_log::env::set(ENV_MANIFEST, "/tmp/not-consumed-by-prearm");
+        aterm_log::env::set(ENV_FDS, format!("7={aliased}:4242"));
+        aterm_log::env::set(ENV_NONCE, "0123456789abcdef0123456789abcdef");
+        aterm_log::env::unset(ENV_LAYOUT);
+        aterm_log::env::set(ENV_READY_FD, aliased.to_string());
+        aterm_log::env::unset(ENV_COMMIT_FD);
 
         let prearmed = prearm_incoming_fds();
         assert!(prearmed.rejects_boot());
@@ -2505,15 +2489,13 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(commit_pipe.as_mut_ptr()) }, 0, "pipe");
         let parent = unsafe { libc::getppid() };
         assert!(parent > 1, "test harness must have a real parent");
-        unsafe {
-            std::env::set_var(ENV_MANIFEST, "/tmp/not-consumed-by-prearm");
-            std::env::set_var(ENV_FDS, format!("7={}:4242", master_pipe[0]));
-            std::env::set_var(ENV_NONCE, "0123456789abcdef0123456789abcdef");
-            std::env::set_var(ENV_LAYOUT, "/tmp/not-consumed-by-prearm.layout.toml");
-            std::env::set_var(ENV_READY_FD, ready_pipe[1].to_string());
-            std::env::set_var(ENV_COMMIT_FD, commit_pipe[0].to_string());
-            std::env::set_var(ENV_PARENT_PID, parent.to_string());
-        }
+        aterm_log::env::set(ENV_MANIFEST, "/tmp/not-consumed-by-prearm");
+        aterm_log::env::set(ENV_FDS, format!("7={}:4242", master_pipe[0]));
+        aterm_log::env::set(ENV_NONCE, "0123456789abcdef0123456789abcdef");
+        aterm_log::env::set(ENV_LAYOUT, "/tmp/not-consumed-by-prearm.layout.toml");
+        aterm_log::env::set(ENV_READY_FD, ready_pipe[1].to_string());
+        aterm_log::env::set(ENV_COMMIT_FD, commit_pipe[0].to_string());
+        aterm_log::env::set(ENV_PARENT_PID, parent.to_string());
 
         let prearmed = prearm_incoming_fds();
         assert!(
@@ -2549,8 +2531,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn nonce_mismatch_and_missing_env_fail_closed() {
         // Hold the env lock for the whole body: the roundtrip test SETS these
@@ -2560,11 +2540,9 @@ mod tests {
         // SAFETY: mutation is serialized by ENV_LOCK (held for this whole test).
         // Readers elsewhere in the process may still observe the removal —
         // acceptable: no non-seamless test depends on ATERM_SEAMLESS_*.
-        unsafe {
-            std::env::remove_var(ENV_MANIFEST);
-            std::env::remove_var(ENV_NONCE);
-            std::env::remove_var(ENV_FDS);
-        }
+        aterm_log::env::unset(ENV_MANIFEST);
+        aterm_log::env::unset(ENV_NONCE);
+        aterm_log::env::unset(ENV_FDS);
         assert!(
             take_incoming().adopted.is_empty(),
             "no handoff env → fresh start"
@@ -2580,8 +2558,8 @@ mod tests {
     fn take_ready_fd_fails_closed() {
         let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let _restore = RestoreVar::new("ATERM_HANDOFF_READY_FD");
-        // SAFETY (all set/remove below): serialized by ENV_LOCK for the whole body.
-        unsafe { std::env::remove_var("ATERM_HANDOFF_READY_FD") };
+        // All set/unset below: serialized by ENV_LOCK for the whole body.
+        aterm_log::env::unset("ATERM_HANDOFF_READY_FD");
         assert!(
             take_ready_fd(
                 Some("n".to_string()),
@@ -2593,7 +2571,7 @@ mod tests {
             .is_none(),
             "absent env → None"
         );
-        unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", "not-a-number") };
+        aterm_log::env::set("ATERM_HANDOFF_READY_FD", "not-a-number");
         assert!(
             take_ready_fd(
                 Some("n".to_string()),
@@ -2609,7 +2587,7 @@ mod tests {
             std::env::var_os("ATERM_HANDOFF_READY_FD").is_none(),
             "cleared on read regardless of outcome"
         );
-        unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", "1") };
+        aterm_log::env::set("ATERM_HANDOFF_READY_FD", "1");
         assert!(
             take_ready_fd(
                 Some("n".to_string()),
@@ -2635,7 +2613,7 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "openpty");
-        unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", m.to_string()) };
+        aterm_log::env::set("ATERM_HANDOFF_READY_FD", m.to_string());
         assert!(
             take_ready_fd(
                 Some("n".to_string()),
@@ -2666,8 +2644,8 @@ mod tests {
         let (rd, wr) = (fds[0], fds[1]);
         // Simulate the fork child's inherited copy just before exec.
         let _ = aterm_pty::set_cloexec(wr, false);
-        // SAFETY: serialized by ENV_LOCK.
-        unsafe { std::env::set_var("ATERM_HANDOFF_READY_FD", wr.to_string()) };
+        // Serialized by ENV_LOCK.
+        aterm_log::env::set("ATERM_HANDOFF_READY_FD", wr.to_string());
         let owned = take_ready_fd(
             Some("n".to_string()),
             Some([7; 32]),
@@ -2697,7 +2675,6 @@ mod tests {
         aterm_pty::close_fd(rd);
     }
 
-
     /// Rollback hygiene: `discard_outgoing` retires exactly THIS attempt's
     /// artifacts (manifest + sidecars named by our pid + the nonce) and leaves
     /// every other file — another attempt's manifest, unrelated files — alone.
@@ -2707,8 +2684,8 @@ mod tests {
         let _restore_xdg = RestoreVar::new("XDG_RUNTIME_DIR");
         let tmp = std::env::temp_dir().join(format!("aterm-discard-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
-        // SAFETY: serialized by ENV_LOCK; restored by `_restore_xdg`.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &tmp) };
+        // Serialized by ENV_LOCK; restored by `_restore_xdg`.
+        aterm_log::env::set("XDG_RUNTIME_DIR", &tmp);
         let dir = crate::control_auth::socket_dir().expect("scratch control dir");
         std::fs::create_dir_all(&dir).ok();
         let pid = std::process::id();
@@ -2946,11 +2923,9 @@ mod tests {
             std::env::temp_dir().join(format!("aterm-handoff-e2e-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).expect("scratch");
-        // SAFETY: every caller holds ENV_LOCK for its whole body.
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", &scratch);
-            std::env::set_var("HOME", &scratch);
-        }
+        // Every caller holds ENV_LOCK for its whole body.
+        aterm_log::env::set("XDG_RUNTIME_DIR", &scratch);
+        aterm_log::env::set("HOME", &scratch);
         let dir = crate::control_auth::socket_dir().expect("scratch control dir");
         std::fs::create_dir_all(&dir).expect("control dir");
 
@@ -3100,19 +3075,19 @@ mod tests {
     impl StagedHandoff {
         fn publish_env(&self, ready_write: i32, commit_read: i32, target: Option<String>) {
             let layout_path = self.manifest_path.with_extension("layout.toml");
-            // SAFETY: serialized by ENV_LOCK, held by the calling test.
-            unsafe {
-                std::env::set_var(ENV_MANIFEST, &self.manifest_path);
-                std::env::set_var(ENV_NONCE, &self.nonce);
-                std::env::set_var(ENV_FDS, &self.fds_wire);
-                std::env::set_var(ENV_LAYOUT, &layout_path);
-                std::env::set_var(ENV_READY_FD, ready_write.to_string());
-                std::env::set_var(ENV_COMMIT_FD, commit_read.to_string());
-                std::env::set_var(ENV_PARENT_PID, libc::getppid().to_string());
-                match target {
-                    Some(value) => std::env::set_var(ENV_TARGET, value),
-                    None => std::env::remove_var(ENV_TARGET),
-                }
+            // SAFETY: `getppid` is a side-effect-free libc getter.
+            let parent_pid = unsafe { libc::getppid() };
+            // Serialized by ENV_LOCK, held by the calling test.
+            aterm_log::env::set(ENV_MANIFEST, &self.manifest_path);
+            aterm_log::env::set(ENV_NONCE, &self.nonce);
+            aterm_log::env::set(ENV_FDS, &self.fds_wire);
+            aterm_log::env::set(ENV_LAYOUT, &layout_path);
+            aterm_log::env::set(ENV_READY_FD, ready_write.to_string());
+            aterm_log::env::set(ENV_COMMIT_FD, commit_read.to_string());
+            aterm_log::env::set(ENV_PARENT_PID, parent_pid.to_string());
+            match target {
+                Some(value) => aterm_log::env::set(ENV_TARGET, value),
+                None => aterm_log::env::unset(ENV_TARGET),
             }
         }
 
@@ -3132,10 +3107,20 @@ mod tests {
         (fds[0], fds[1])
     }
 
+    /// Everything the child half holds at the instant it is ready to publish:
+    /// the proof it computed, the still-unfired ready channel it will publish
+    /// on, and the adopted session set that proof commits to. The three travel
+    /// together because a test that inspects one usually has to check it against
+    /// another (proof vs. adopted set, or signal-then-commit). The session set is
+    /// spelled with the crate-wide [`SessionIdentity`] alias, so the test oracle
+    /// and the production signatures it drives cannot drift on field ORDER.
+    #[cfg(unix)]
+    type ReadyChild = (AdoptionProof, ReadySignal, Vec<SessionIdentity>);
+
     /// Drive the CHILD half exactly as `run()` does: consume the manifest,
     /// prove the target identity, adopt the ready channel, compute the proof.
     #[cfg(unix)]
-    fn child_proof() -> Option<(AdoptionProof, ReadySignal, Vec<(u64, i32, i32)>)> {
+    fn child_proof() -> Option<ReadyChild> {
         let incoming = take_incoming();
         if incoming.adopted.is_empty() {
             return None;

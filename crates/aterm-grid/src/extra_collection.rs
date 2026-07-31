@@ -1476,9 +1476,28 @@ impl CellExtras {
         #[cfg(any(test, feature = "testing"))]
         crate::test_counters::count_extras_clear_ops(self.data.len());
         let internal_row = self.internal_row(row);
-        self.data.retain(|coord, _| {
-            !(coord.row == internal_row && coord.col >= start_col && coord.col < end_col)
-        });
+        // The retain predicate is exactly membership in
+        // `{(internal_row, c) : start_col <= c < end_col}`, and the map is KEYED
+        // by that coordinate — so delete by coordinate (O(range) probes) rather
+        // than visiting every entry in the grid-wide map. EL/ECH run per erase,
+        // and the map spans the whole scrollback-adjacent extras population, so
+        // the scan was O(all extras) to remove at most one row's worth.
+        //
+        // The scan is kept for the case where it is genuinely cheaper: a map
+        // smaller than the range walks faster than the range probes it. Both
+        // arms remove exactly the same keys, so this is a cost choice only.
+        // `clear_row` above deliberately keeps its retain — it has no column
+        // bound and must still reach stale entries past the current width.
+        let width = usize::from(end_col.saturating_sub(start_col));
+        if width.saturating_mul(2) <= self.data.len() {
+            for col in start_col..end_col {
+                self.data.remove(&CellCoord::new(internal_row, col));
+            }
+        } else {
+            self.data.retain(|coord, _| {
+                !(coord.row == internal_row && coord.col >= start_col && coord.col < end_col)
+            });
+        }
         self.maybe_shrink();
     }
 
@@ -1853,7 +1872,36 @@ impl CellExtras {
     ///
     /// After re-keying, enforces the hyperlink entry limit to clean up any
     /// hyperlink-bearing entries that accumulated between compactions (#7208).
+    /// # The `#[inline(never)]` here is LOAD-BEARING — do not remove it
+    ///
+    /// This sits on the scroll path, which the mixed-VT workload hammers through
+    /// its erase/clear/CUP traffic. Under `lto = true` + `codegen-units = 1` its
+    /// body size decides an inlining cascade several frames deep, and the mixed
+    /// lane is acutely sensitive to where that cascade lands: before this pin,
+    /// **every** edit to [`Self::enforce_hyperlink_limit`] cost ~10-11 % on that
+    /// lane — including one that changed no behaviour whatsoever (moving the body
+    /// out of line and nothing else). Two controls held flat across the same
+    /// runs, so it was neither build noise nor generic layout roulette: a
+    /// rebuild-with-no-change, and adding a dead `#[inline(never)]` fn to this
+    /// same file. `#[inline]`, `#[inline(never)]` and `#[cold]` on
+    /// `enforce_hyperlink_limit` itself all failed to pin it; pinning the CALLER
+    /// is what works.
+    ///
+    /// With the pin, the hyperlink-limit rewrite below is free on the mixed lane
+    /// (interleaved A/B: 324.7 -> 327.1 MB/s) while `long_escapes` goes
+    /// **130 -> 360 MB/s (2.8x)**. Without it, that same rewrite cost 11 %.
+    #[inline(never)]
     fn apply_offset_and_shift(&mut self, shift: u16) {
+        self.apply_offset_and_shift_only(shift);
+        self.enforce_hyperlink_limit();
+    }
+
+    /// The compaction core, WITHOUT the trailing hyperlink-limit enforcement, so
+    /// [`Self::enforce_hyperlink_limit_cold`] can compact before it decides
+    /// anything without recursing back into itself. `#[inline(never)]` for the
+    /// same cascade reason as its caller above.
+    #[inline(never)]
+    fn apply_offset_and_shift_only(&mut self, shift: u16) {
         let total = match self.row_offset.checked_add(shift) {
             Some(0) => return,
             Some(t) => t,
@@ -1876,12 +1924,6 @@ impl CellExtras {
         }
         self.data = new_data;
         self.row_offset = 0;
-
-        // Enforce hyperlink limit after compaction: scrollback eviction
-        // can leave stale hyperlink entries that are now promoted to the
-        // active set. Without this, hyperlink-heavy sessions leak memory
-        // as entries accumulate beyond MAX_HYPERLINK_ENTRIES (#7208).
-        self.enforce_hyperlink_limit();
     }
 
     /// Shrink internal storage if capacity significantly exceeds usage.
@@ -1994,47 +2036,66 @@ impl CellExtras {
     ///
     /// Callers should invoke this after setting hyperlinks on entries to bound
     /// memory usage from OSC 8 spam (#7172).
+    #[inline]
     pub fn enforce_hyperlink_limit(&mut self) {
         if self.data.len() <= MAX_HYPERLINK_ENTRIES {
             return;
         }
+        self.enforce_hyperlink_limit_cold();
+    }
 
-        // Count actual hyperlink entries — the map may contain non-hyperlink
-        // extras (RGB, combining, underline) that don't count toward the limit.
-        let hyperlink_count = self
-            .data
-            .values()
-            .filter(|e| e.hyperlink().is_some())
-            .count();
+    #[cold]
+    #[inline(never)]
+    fn enforce_hyperlink_limit_cold(&mut self) {
+        let mut compacted = false;
+        loop {
+            // One walk, not two: the old code counted, then collected the same
+            // set. The count IS the collected length.
+            let mut hyperlink_coords: Vec<CellCoord> = self
+                .data
+                .iter()
+                .filter(|(_, extra)| extra.hyperlink().is_some())
+                .map(|(coord, _)| *coord)
+                .collect();
 
-        if hyperlink_count <= MAX_HYPERLINK_ENTRIES {
-            return;
-        }
+            // The map may hold non-hyperlink extras (RGB, combining, underline)
+            // that do not count toward the limit.
+            if hyperlink_coords.len() <= MAX_HYPERLINK_ENTRIES {
+                return;
+            }
 
-        let to_evict = hyperlink_count - MAX_HYPERLINK_ENTRIES;
+            // Genuinely over. Entries the O(1) scroll-offset amortization has
+            // already scrolled off are unreachable but still counted, so drop
+            // those first and retry — at most once, since compaction zeroes
+            // `row_offset`.
+            if !compacted && self.row_offset != 0 {
+                compacted = true;
+                self.apply_offset_and_shift_only(0);
+                continue;
+            }
 
-        // Collect coordinates of hyperlink entries, sorted by internal row
-        // (ascending = oldest first) then column for deterministic eviction.
-        let mut hyperlink_coords: Vec<CellCoord> = self
-            .data
-            .iter()
-            .filter(|(_, extra)| extra.hyperlink().is_some())
-            .map(|(coord, _)| *coord)
-            .collect();
-        hyperlink_coords.sort_unstable_by(|a, b| a.row.cmp(&b.row).then(a.col.cmp(&b.col)));
+            let to_evict = hyperlink_coords.len() - MAX_HYPERLINK_ENTRIES;
 
-        // Evict the oldest `to_evict` hyperlink entries.
-        for coord in hyperlink_coords.into_iter().take(to_evict) {
-            if let Some(extra) = self.data.get_mut(&coord) {
-                extra.set_hyperlink(None);
-                // Remove the entry entirely if it has no remaining data.
-                if !extra.has_data() {
-                    self.data.remove(&coord);
+            // Only the `to_evict` SMALLEST coords are needed, so partition
+            // instead of sorting: O(n) rather than O(n log n), and the evicted
+            // SET is identical (keys are unique, and eviction clears each
+            // independently, so order within the prefix is unobservable).
+            hyperlink_coords.select_nth_unstable_by(to_evict - 1, |a, b| {
+                a.row.cmp(&b.row).then(a.col.cmp(&b.col))
+            });
+
+            for &coord in &hyperlink_coords[..to_evict] {
+                if let Some(extra) = self.data.get_mut(&coord) {
+                    extra.set_hyperlink(None);
+                    if !extra.has_data() {
+                        self.data.remove(&coord);
+                    }
                 }
             }
-        }
 
-        self.maybe_shrink();
+            self.maybe_shrink();
+            return;
+        }
     }
 
     /// The maximum number of hyperlink entries allowed before eviction.

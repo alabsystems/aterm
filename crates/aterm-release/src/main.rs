@@ -25,6 +25,7 @@ mod ledger;
 mod manifest_out;
 mod mirror;
 mod publish;
+mod seedpack;
 mod sign;
 mod verify;
 

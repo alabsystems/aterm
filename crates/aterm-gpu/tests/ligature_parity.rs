@@ -17,7 +17,10 @@
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
-use aterm_render::{Frame, LigatureMode, Renderer, TextShapingConfig, Theme};
+use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
+
+mod common;
+use common::{backends, max_channel_delta_frame as max_channel_delta};
 
 // Layout-independent ligature font discovery, and the SINGLE point where
 // $ATERM_FONT is exported to both renderers. Order: (a) $ATERM_FONT if already
@@ -47,34 +50,14 @@ fn ligature_test_font() -> Option<&'static std::path::Path> {
                 let p = std::path::PathBuf::from(FIXTURE);
                 p.exists().then_some(p)
             })?;
-        // SAFETY: set exactly once per process (OnceLock init), before any renderer
-        // is constructed — every concurrent caller is parked in get_or_init until
-        // this write completes, so no getenv can observe it mid-mutation. (set_var
-        // is unsafe in edition 2024.)
-        unsafe { std::env::set_var("ATERM_FONT", &found) };
+        // Set exactly once per process (OnceLock init), before any renderer is
+        // constructed — every concurrent caller is parked in get_or_init until this
+        // write completes, so no getenv can observe it mid-mutation — and routed
+        // through the workspace's one lock-scoped env helper.
+        aterm_log::env::set("ATERM_FONT", &found);
         Some(found)
     })
     .as_deref()
-}
-
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-
-fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.pixels.iter().zip(b.pixels.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
 }
 
 #[test]
@@ -89,15 +72,7 @@ fn ligature_font_gpu_matches_cpu() {
         return;
     }
 
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
     // A CPU renderer with ligatures FORCED OFF, to prove the ligated frame is not
@@ -160,15 +135,7 @@ fn ligature_selection_gpu_matches_cpu() {
         return;
     }
 
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
 
@@ -234,15 +201,7 @@ fn cursor_cutout_gpu_matches_cpu() {
         return;
     }
 
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
 
@@ -303,15 +262,7 @@ fn ligature_ink_gpu_matches_cpu() {
         return;
     }
 
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
 

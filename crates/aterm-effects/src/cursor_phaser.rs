@@ -34,6 +34,7 @@ use web_time::Instant;
 use aterm_render::{GlowQuad, premul_rgb};
 
 use crate::cursor_glow::Geom;
+use crate::effect_util::push_fx_rect as push_rect;
 
 /// The block-cursor base the beam hue tints FROM: white on a dark theme, a soft
 /// near-black on a light theme (the same pair as the rainbow cursor, so the two
@@ -304,42 +305,6 @@ impl CursorPhaser {
     }
 }
 
-/// Clamp a pixel rect to the EFFECTS BOX (grid + head band, window-absolute —
-/// the aurora's `push_rect` contract) and split it into per-cell-row
-/// [`GlowQuad`]s with origin-anchored row DAMAGE tags (the renderer row-gate +
-/// CPU/GPU parity invariant). The old grid-relative clamp painted the wings a
-/// full origin up-left AND tagged rows whose bands don't contain the pixels —
-/// stray light the damage repaint could never clean off the glass.
-fn push_rect(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32, premul: u32) {
-    if w <= 0 || h <= 0 || premul == 0 {
-        return;
-    }
-    let x0 = x.max(geom.fx_left());
-    let x1 = (x + w).min(geom.fx_right());
-    let y0 = y.max(geom.fx_top());
-    let y1 = (y + h).min(geom.fx_bot());
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let ch = geom.ch as i32;
-    let oy = i32::from(geom.origin_y);
-    let mut yy = y0;
-    while yy < y1 {
-        // Grid-row DAMAGE HINT, anchored at origin_y (above-grid bands tag row 0).
-        let row = (yy - oy).div_euclid(ch);
-        let band_end = (oy + (row + 1) * ch).min(y1);
-        out.push(GlowQuad {
-            row: row.max(0) as u16,
-            x: x0 as u16,
-            y: yy as u16,
-            w: (x1 - x0) as u16,
-            h: (band_end - yy) as u16,
-            color: premul,
-        });
-        yy = band_end;
-    }
-}
-
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t.clamp(0.0, 1.0)
 }
@@ -379,6 +344,7 @@ fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect_util::ink;
     use std::time::Duration;
 
     fn geom() -> Geom {
@@ -399,14 +365,6 @@ mod tests {
             enabled: true,
             intensity: 1.0,
         }
-    }
-    fn ink(out: &[GlowQuad]) -> u64 {
-        out.iter()
-            .map(|q| {
-                let px = (q.w as u64) * (q.h as u64);
-                px * (((q.color >> 16) & 0xff) + ((q.color >> 8) & 0xff) + (q.color & 0xff)) as u64
-            })
-            .sum()
     }
 
     /// Disabled ⇒ no fill, no wings, fp 0 (byte-identical to the plain cursor).

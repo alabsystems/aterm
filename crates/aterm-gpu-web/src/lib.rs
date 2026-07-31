@@ -231,6 +231,14 @@ pub struct AtermGpuTerminal {
     // predict_api module (and tests) reach it (the effects-field posture).
     // Mirrors aterm-wasm.
     pub(crate) predict: aterm_predict::Predictor,
+    // Resident scratch row for the predictive-echo reconcile probe (the GPU
+    // twin of aterm-gui's `pred_row_scratch`): `Predictor::reconcile` runs its
+    // observe closure once per retired guess plus the head, all on the SAME
+    // row, so `Terminal::render_row` would allocate a fresh Vec and re-resolve
+    // the whole row (palette, decorations, the lot) once per pending guess just
+    // to read one `ch`. `render_row_into` refills this buffer in place instead.
+    // Mirrors aterm-wasm.
+    pub(crate) pred_row_scratch: Vec<aterm_core::terminal::RenderCell>,
     // Chrome-band spill rasterizer (the cross-pane window-space effects
     // export): refreshed per `render`/`render_offscreen` from the CPU face's
     // geometry (set_chrome keeps it and the live GPU renderer in lockstep) —
@@ -436,6 +444,7 @@ impl AtermGpuTerminal {
             notifications,
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
+            pred_row_scratch: Vec::new(),
             spill: SpillBand::new(),
             pending_reflow: None,
             reflow_grace: 0,
@@ -2508,6 +2517,7 @@ impl AtermGpuTerminal {
             notifications,
             scroll_input: scroll_input_api::ScrollInputState::default(),
             predict: aterm_predict::Predictor::default(),
+            pred_row_scratch: Vec::new(),
             spill: SpillBand::new(),
             pending_reflow: None,
             reflow_grace: 0,

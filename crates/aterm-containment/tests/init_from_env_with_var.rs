@@ -12,10 +12,9 @@ use aterm_containment::ContainmentMode;
 #[test]
 fn init_from_env_uses_env_var_over_default() {
     // Set the env var to Safety. The default is Master.
-    // SAFETY: Single-threaded test binary — no concurrent env reads.
-    unsafe {
-        std::env::set_var("ATERM_CONTAINMENT_MODE", "safety");
-    }
+    // Single-threaded test binary — no concurrent env reads — and routed through
+    // the workspace's one lock-scoped env helper (`aterm_log::env`) regardless.
+    aterm_log::env::set("ATERM_CONTAINMENT_MODE", "safety");
 
     let mode = aterm_containment::init_mode_from_env(ContainmentMode::Master)
         .expect("init_mode_from_env should succeed");

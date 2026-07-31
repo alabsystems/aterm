@@ -20,8 +20,8 @@
 //! as building a [`SearchIndex`] over the same rows and calling
 //! [`SearchIndex::search_results_opts`] — regardless of how the rows were
 //! sliced across calls. This holds because every per-row verifier IS the batch
-//! path's own machinery run over one row (the forward match iterator for
-//! case-sensitive literals, [`CaseInsensitiveMatcher`] for case-insensitive
+//! path's own machinery run over one row (the forward match iterator's scan
+//! for case-sensitive literals, [`CaseInsensitiveMatcher`] for case-insensitive
 //! literals, the same compiled/capped regex for regex mode), rows are fed in
 //! the same ascending absolute order the batch build indexes them, and the
 //! [`MAX_SEARCH_MATCHES`] cap is applied to exactly the final retained suffix.
@@ -42,6 +42,7 @@ use crate::index::{
     CaseInsensitiveMatcher, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError,
     final_evicted_prefix,
 };
+use crate::iterators::next_literal_match;
 use crate::types::{SearchMatch, SearchResults};
 
 /// Per-row verifier, fixed at construction from `(case_sensitive, is_regex)`.
@@ -49,8 +50,8 @@ use crate::types::{SearchMatch, SearchResults};
 /// Each variant reuses the corresponding batch-search machinery so budgeted
 /// results are equal to one-shot results by construction (module docs).
 enum RowMatcher {
-    /// Case-sensitive literal: verified via the index's own forward match
-    /// iterator, range-bounded to the just-indexed row.
+    /// Case-sensitive literal: verified with the batch forward iterator's own
+    /// scan ([`next_literal_match`]) run over the just-indexed row.
     Literal,
     /// Case-insensitive literal: the batch path's per-line matcher.
     CaseInsensitive(CaseInsensitiveMatcher),
@@ -267,16 +268,49 @@ impl BudgetedSearch {
     fn verify_row(&mut self, abs_row: usize, text: &str) {
         match &mut self.matcher {
             RowMatcher::Literal => {
-                // The index's own forward iterator, started at this row: no
-                // later rows exist in the index yet, so it verifies exactly
-                // this row with the batch path's overlap/column semantics.
-                let remaining = MAX_SEARCH_MATCHES.saturating_sub(self.matches.len());
-                let found: Vec<SearchMatch> = self
-                    .index
-                    .search_from_line(&self.query, abs_row)
-                    .take(remaining)
-                    .collect();
-                self.matches.extend(found);
+                // Sweep THIS row with the batch path's own scan
+                // ([`next_literal_match`], shared with the forward match
+                // iterator) instead of re-entering the index query pipeline.
+                //
+                // `search_from_line(query, abs_row)` can only ever yield
+                // matches on `abs_row` — no higher row is indexed yet — but
+                // reaching that verdict decodes EVERY posting list of the query
+                // into a fresh `Vec<u32>` (`decode_smallest_first`), and those
+                // lists grow with every row fed, so verification was O(rows)
+                // per row: quadratic in window depth. A 3-trigram query over a
+                // 50k-line log with 20% hit density burned ~15k varint steps
+                // and 3 Vec allocations per row to confirm one ~80-byte sweep.
+                //
+                // Results are unchanged: the trigram/bloom prefilter it drops
+                // is a pure negative filter (no false negatives — this row's
+                // own trigrams were just inserted), and the iterator's verify
+                // IS this sweep. The two sibling arms below already verify
+                // against `text` + the cached column map this same way.
+                if self.query.is_empty() {
+                    // `search_from_line` short-circuits an empty query before
+                    // touching the row; the sweep below would walk the whole
+                    // row to produce nothing.
+                    return;
+                }
+                // `index_line` just cached this row's column map; reuse it.
+                let fallback;
+                let col_map = match self.index.column_maps.get(&abs_row) {
+                    Some(map) => map,
+                    None => {
+                        fallback = ColumnMap::new(text);
+                        &fallback
+                    }
+                };
+                let mut next_byte = 0;
+                while let Some((found, resume)) =
+                    next_literal_match(abs_row, text, &self.query, col_map, next_byte)
+                {
+                    next_byte = resume;
+                    self.matches.push(found);
+                    if self.matches.len() >= MAX_SEARCH_MATCHES {
+                        break;
+                    }
+                }
             }
             RowMatcher::CaseInsensitive(matcher) => {
                 // `index_line` just cached this row's column map; reuse it.

@@ -448,9 +448,10 @@ const STARTER_CONFIG: &str = "\
 /// very top of `main` before any thread is spawned (no concurrent env access), so
 /// the edition-2024 `set_var` safety contract holds.
 fn flag_env(key: &str, val: &str) {
-    // SAFETY: single-threaded program startup (see fn doc) — no other thread can
-    // be reading the environment concurrently.
-    unsafe { std::env::set_var(key, val) };
+    // Single-threaded program startup (see fn doc) — no other thread can be
+    // reading the environment concurrently — and routed through the workspace's
+    // one lock-scoped env helper rather than a raw `set_var`.
+    aterm_log::env::set(key, val);
 }
 
 /// Pull the next argument as the value for `flag`, exiting 2 with a hint if it is
@@ -647,15 +648,15 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             "--gpu" => {
                 // Symmetric last-flag-wins precedence: an inherited or earlier
                 // --cpu must not outrank this explicit later flag.
-                // SAFETY: startup, single-threaded (see flag_env).
-                unsafe { std::env::remove_var("ATERM_CPU") };
+                // Startup, single-threaded (see flag_env).
+                aterm_log::env::unset("ATERM_CPU");
                 flag_env("ATERM_GPU", "1");
             }
             // CPU override: clear any inherited/earlier ATERM_GPU so the GPU path
             // is not taken (config `gpu = true` still loses to an explicit --cpu).
             "--cpu" => {
-                // SAFETY: startup, single-threaded (see flag_env).
-                unsafe { std::env::remove_var("ATERM_GPU") };
+                // Startup, single-threaded (see flag_env).
+                aterm_log::env::unset("ATERM_GPU");
                 flag_env("ATERM_CPU", "1");
             }
             "--containment" => {
@@ -803,13 +804,13 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\"--cpu\" =>"))
             .map(|(arm, _)| arm)
             .expect("GPU flag arm");
-        assert!(gpu.contains("remove_var(\"ATERM_CPU\")"));
+        assert!(gpu.contains("env::unset(\"ATERM_CPU\")"));
         let cpu = source
             .split_once("\"--cpu\" => {")
             .and_then(|(_, tail)| tail.split_once("\"--containment\" =>"))
             .map(|(arm, _)| arm)
             .expect("CPU flag arm");
-        assert!(cpu.contains("remove_var(\"ATERM_GPU\")"));
+        assert!(cpu.contains("env::unset(\"ATERM_GPU\")"));
     }
 
     #[test]

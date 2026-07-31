@@ -34,46 +34,14 @@
 // are asserted unconditionally.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{FireMode, FirePatch, Renderer, Theme, WindowCpu};
+use aterm_render::{FireMode, FirePatch, Theme, WindowCpu};
 
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-
-fn max_channel_delta(a: &[u32], b: &[u32]) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.iter().zip(b.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
-}
+mod common;
+use common::{backends, bb, gg, max_channel_delta, rr};
 
 /// Summed-RGB luminance proxy (monotone per channel, so ordering is exact).
 fn luma(p: u32) -> i32 {
     rr(p) + gg(p) + bb(p)
-}
-
-fn backends(px: f32, theme: Theme) -> Option<(Renderer, aterm_gpu::GpuRenderer)> {
-    let gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return None;
-        }
-    };
-    let Some(cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return None;
-    };
-    Some((cpu, gpu))
 }
 
 /// One burn's parameters (grid-interior px), turned into legal per-row-band

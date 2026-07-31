@@ -31,18 +31,18 @@ use aterm_spec::derive::{
     emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
     exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
     fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
-    flash_limiter_model, focus_modifier_cache_model, gpu_loss_recovery_model, gpu_loss_route_model,
-    grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
-    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
-    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
-    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
-    kitty_flush_worker_model, kitty_sidecar_durability_model, layout_coordinate_reset_model,
-    ligature_gate_model, manual_config_completion_model, manual_config_diagnostics_lane_model,
-    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
-    motion_policy_model, native_async_delivery_model, native_capture_source_model,
-    native_close_plan_model, native_config_observation_handoff_model,
-    native_config_transaction_model, native_control_routing_model,
-    native_document_publication_model, native_draft_journal_model,
+    flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
+    gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
+    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
+    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
+    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
+    kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
+    layout_coordinate_reset_model, ligature_gate_model, manual_config_completion_model,
+    manual_config_diagnostics_lane_model, manual_config_handoff_model,
+    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
+    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
+    native_config_observation_handoff_model, native_config_transaction_model,
+    native_control_routing_model, native_document_publication_model, native_draft_journal_model,
     native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
     native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
     native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
@@ -56,8 +56,8 @@ use aterm_spec::derive::{
     net_dial_after_grant_model, nova_phase_model, nyan_exit_sampling_model,
     nyan_idle_twinkle_model, nyan_jump_burst_lifecycle_model, nyan_sing_detector_model,
     nyan_terminus_admission_model, one_shot_peek_model, pad_absorption_model, pane_tree_model,
-    per_window_metrics_model, predictive_echo_visibility_model, present_retry_model,
-    presentation_gate_model, presented_frame_tap_model, proxy_forward_model,
+    path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
+    present_retry_model, presentation_gate_model, presented_frame_tap_model, proxy_forward_model,
     rain_band_containment_model, rain_ignition_model, rain_lifecycle_model, read_image_seq_model,
     recording_model, recovery_redraw_model, release_channel_floor_model,
     release_channel_single_head_model, release_durable_post_intent_model,
@@ -71,10 +71,10 @@ use aterm_spec::derive::{
     session_chrome_expiry_model, session_pool_model, settings_page_scroll_model, shade_phase_model,
     shared_budget_model, snapshot_generation_commit_model, snapshot_model, sparkle_identity_model,
     sparkle_persist_capacity_model, sparkle_reflow_cardinality_model, sparkle_retype_rearm_model,
-    spawn_locale_model, stream_fade_gate_model, strike_selection_model, styled_run_face_model,
-    subscribe_model, surface_coverage_model, tab_nav_model, tab_stop_handoff_model,
-    tab_strip_model, text_blend_gate_model, tier_residency_model,
-    title_summary_managed_endpoint_model, title_summary_model,
+    spawn_locale_model, startup_phase_publication_model, stream_fade_gate_model,
+    strike_selection_model, styled_run_face_model, subscribe_model, surface_coverage_model,
+    tab_nav_model, tab_stop_handoff_model, tab_strip_model, text_blend_gate_model,
+    tier_residency_model, title_summary_managed_endpoint_model, title_summary_model,
     title_summary_observation_scheduler_model, title_summary_runtime_model,
     title_summary_socket_owner_retry_model, top_anchored_scroll_history_model,
     trail_audio_lifecycle_model, trail_audio_start_latency_model, transact_model,
@@ -275,9 +275,42 @@ fn derived_idle_deadline_proves_and_catches_missed_earliest() {
     assert_proves_and_catches(&idle_deadline_model());
 }
 
+/// A valid first-present phase ledger is published only after all eight
+/// exclusive intervals exist. PROVES the ordered completion gate and CATCHES
+/// an early-valid publication.
+#[test]
+fn derived_startup_phase_publication_requires_all_eight_intervals() {
+    let model = startup_phase_publication_model();
+    let mut state = model.init_state();
+    for completed in 1..=8 {
+        assert!(model.fire("Step", &mut state));
+        assert_eq!(state["phase"], completed);
+        if completed < 8 {
+            assert!(
+                model.successors("Publish", &state).is_empty(),
+                "a {completed}/8 timeline must not publish as valid"
+            );
+        }
+    }
+    assert!(model.fire("Publish", &mut state));
+    assert_eq!(state["published"], 1);
+    assert!(model.check_invariant("CompleteBeforeValidPublication", &state));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut early = buggy.init_state();
+    assert!(buggy.fire("Publish", &mut early));
+    assert!(
+        !buggy.check_invariant("CompleteBeforeValidPublication", &early),
+        "negative control: an empty timeline cannot publish as valid"
+    );
+    assert_proves_and_catches(&model);
+}
+
 /// A dropped surface may autonomously retry only on strictly-future deadlines
-/// and only while finite episode fuel remains. PROVES the delayed/bounded train
-/// and CATCHES the old immediate, non-consuming redraw loop.
+/// and only while finite episode fuel remains. One pristine pre-first-present
+/// `GpuOccluded` drop owns exactly one such bootstrap retry. PROVES the
+/// delayed/bounded train and CATCHES the old immediate, non-consuming redraw
+/// loop.
 #[test]
 fn derived_present_retry_proves_future_bounded_recovery_and_catches_unbounded_train() {
     let model = present_retry_model();
@@ -289,6 +322,101 @@ fn derived_present_retry_proves_future_bounded_recovery_and_catches_unbounded_tr
     let forced = model.successors("ForcedStimulus", &idle);
     assert_eq!(forced.len(), 1);
     assert_eq!(forced[0]["outstanding"], 1);
+
+    let bootstrap = model.successors("DropBootstrapOccluded", &idle);
+    assert_eq!(
+        bootstrap.len(),
+        1,
+        "the pristine initial retry state admits one GpuOccluded bootstrap retry"
+    );
+    let mut after_bootstrap_drop = bootstrap[0].clone();
+    assert_eq!(after_bootstrap_drop["remaining"], 5);
+    assert_eq!(after_bootstrap_drop["train"], 0);
+    assert_eq!(after_bootstrap_drop["retry"], 1);
+    assert_eq!(after_bootstrap_drop["ready"], 0);
+    assert_eq!(after_bootstrap_drop["parked"], 0);
+    assert_eq!(after_bootstrap_drop["outstanding"], 0);
+    assert_eq!(after_bootstrap_drop["bootstrap_available"], 0);
+    assert!(
+        model.check_invariant("RetryDeadlineIsStrictlyFuture", &after_bootstrap_drop),
+        "the bootstrap retry must use the same strictly-future deadline encoding"
+    );
+    assert!(model.fire("Wake", &mut after_bootstrap_drop));
+    assert_eq!(after_bootstrap_drop["remaining"], 4);
+    assert_eq!(after_bootstrap_drop["train"], 1);
+    assert_eq!(after_bootstrap_drop["retry"], 0);
+    assert_eq!(after_bootstrap_drop["ready"], 1);
+    assert_eq!(after_bootstrap_drop["outstanding"], 1);
+    assert!(
+        model
+            .successors("DropBootstrapOccluded", &after_bootstrap_drop)
+            .is_empty(),
+        "Tier-0 negative control: the consumed bootstrap permit cannot retry a second occlusion"
+    );
+    assert_eq!(
+        model
+            .successors("DropPersistent", &after_bootstrap_drop)
+            .len(),
+        1,
+        "the negative control remains a live drop state; only the bootstrap classification is disabled"
+    );
+
+    let mut presented_without_bootstrap = idle.clone();
+    assert!(model.fire("Present", &mut presented_without_bootstrap));
+    assert_eq!(presented_without_bootstrap["bootstrap_available"], 0);
+    assert!(
+        model
+            .successors("DropBootstrapOccluded", &presented_without_bootstrap)
+            .is_empty(),
+        "a successful first present permanently closes bootstrap admission"
+    );
+
+    // Synchronous capture/internal stimuli redraw inside the same main-thread
+    // operation, so they do not create a new OS request. They do preserve one
+    // that was already outstanding, matching the shipping reducer.
+    let mut synchronous = idle.clone();
+    assert!(model.fire("DropPersistent", &mut synchronous));
+    let mut coupled = synchronous.clone();
+    assert!(model.fire("Stimulus", &mut coupled));
+    assert_eq!(coupled["outstanding"], 1);
+    assert!(
+        model
+            .successors("DropBootstrapOccluded", &coupled)
+            .is_empty(),
+        "negative control: a coupled outstanding redraw is not pristine bootstrap state"
+    );
+
+    assert!(model.fire("SynchronousStimulus", &mut synchronous));
+    assert_eq!(synchronous["remaining"], 5);
+    assert_eq!(synchronous["train"], 0);
+    assert_eq!(synchronous["retry"], 0);
+    assert_eq!(synchronous["ready"], 1);
+    assert_eq!(synchronous["parked"], 0);
+    assert_eq!(synchronous["outstanding"], 0);
+    assert_eq!(synchronous["bootstrap_available"], 1);
+    assert_eq!(
+        model
+            .successors("DropBootstrapOccluded", &synchronous)
+            .len(),
+        1,
+        "a synchronous pre-first-present attempt preserves the one bootstrap permit"
+    );
+    assert!(model.fire("DropBootstrapOccluded", &mut synchronous));
+    assert!(model.fire("Wake", &mut synchronous));
+    assert!(model.fire("SynchronousStimulus", &mut synchronous));
+    assert_eq!(synchronous["bootstrap_available"], 0);
+    assert_eq!(synchronous["outstanding"], 1);
+    assert!(
+        model
+            .successors("DropBootstrapOccluded", &synchronous)
+            .is_empty(),
+        "Tier-0 negative control: a later synchronous reset cannot replenish the consumed permit"
+    );
+    assert_eq!(
+        model.successors("DropPersistent", &synchronous).len(),
+        1,
+        "the consumed-permit control remains a live present/drop state"
+    );
 
     let mut past_deadline = model.init_state();
     past_deadline.insert("ready", 0);
@@ -471,6 +599,7 @@ fn zoom_and_typing_incident_models_are_registered_for_global_verification() {
         .collect();
     for expected in [
         "SurfaceCoverage",
+        "StartupPhasePublication",
         "PresentRetry",
         "GpuLossRoute",
         "GpuLossRecovery",
@@ -5158,6 +5287,54 @@ fn derived_font_catalog_generation_rejects_stale_completion() {
 }
 
 #[test]
+fn derived_path_feed_snapshot_proves_same_read_binding_and_catches_reread() {
+    let model = path_feed_snapshot_model();
+    assert_proves_and_catches(&model);
+
+    // The host's after-read hook replaces the path only after the admitted
+    // String has fed both the parser and fingerprint. Publication retains that
+    // exact pair even though the live pathname now names generation two.
+    let mut replaced = model.init_state();
+    for action in ["Read", "LiveMutate", "Publish"] {
+        assert!(model.fire(action, &mut replaced), "{action}: {replaced:?}");
+    }
+    assert_eq!(replaced["live"], 2);
+    assert_eq!(replaced["admitted"], 1);
+    assert_eq!(replaced["prepared"], 1);
+    assert_eq!(replaced["fingerprint"], 1);
+    assert_eq!(replaced["published"], 1);
+    assert!(model.check_invariant("PublishedPairComesFromAdmittedRead", &replaced));
+
+    // ABA is irrelevant to the transaction: generation two may be admitted
+    // while the pathname later returns to generation one, but both published
+    // projections remain generation two.
+    let mut aba = model.init_state();
+    for action in ["LiveMutate", "Read", "LiveRestore", "Publish"] {
+        assert!(model.fire(action, &mut aba), "{action}: {aba:?}");
+    }
+    assert_eq!(aba["live"], 1);
+    assert_eq!(aba["admitted"], 2);
+    assert_eq!(aba["prepared"], 2);
+    assert_eq!(aba["fingerprint"], 2);
+    assert!(model.check_invariant("PublishedPairComesFromAdmittedRead", &aba));
+
+    // The mutant performs a second live read at publication. The same ordinary
+    // replacement trace pairs the generation-one consumer with a generation-two
+    // fingerprint and must violate the invariant.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut mixed = buggy.init_state();
+    for action in ["Read", "LiveMutate", "Publish"] {
+        assert!(buggy.fire(action, &mut mixed), "{action}: {mixed:?}");
+    }
+    assert_eq!(mixed["prepared"], 1);
+    assert_eq!(mixed["fingerprint"], 2);
+    assert!(
+        !buggy.check_invariant("PublishedPairComesFromAdmittedRead", &mixed),
+        "negative control: a live reread must not relabel the admitted consumer"
+    );
+}
+
+#[test]
 fn derived_font_theme_generation_reprepares_overtaken_config() {
     let model = aterm_spec::derive::font_theme_generation_model();
     assert_proves_and_catches(&model);
@@ -5843,31 +6020,43 @@ fn derived_native_update_disk_transaction_proves_and_catches_identity_or_early_g
 
     // Genuine v0.52 child startup is a reachable POST-swap state, not an OLD
     // transaction init: NEW is canonical, exact OLD is fixed, trial is armed,
-    // and both ready + receipt are absent. Exact sealed/trial/rollback disk
-    // evidence synthesizes the receipt before the boot-health verdict. The same
-    // transition remains available after the old parent crashed before writing
-    // its re-exec stamp, because this precise no-ready shape identifies the old
-    // protocol while modern swaps retain ready until receipt commit.
+    // and both ready + receipt are absent. The retired v0.52 branch synthesized a
+    // receipt from sealed disk evidence at this point; it is gone, and the
+    // surviving route rebuilds the receipt from the `ready.toml` the current
+    // updater still retains until its receipt commits.
     let legacy = model.successors("EnterLegacyPostSwapExact", &model.init_state())[0].clone();
     assert_eq!(legacy.get("installed"), Some(&2));
     assert_eq!(legacy.get("fixed"), Some(&1));
     assert_eq!(legacy.get("trial"), Some(&1));
     assert_eq!(legacy.get("receipt"), Some(&0));
     assert_eq!(legacy.get("ready_present"), Some(&0));
-    let consumed = model.successors("ConsumeStartupAuthority", &legacy)[0].clone();
-    let migrated = model.successors("SynthesizeAuthenticatedLegacyReceipt", &consumed)[0].clone();
+    let ready = model.successors("SupplyModernReadyRecovery", &legacy)[0].clone();
+    let consumed = model.successors("ConsumeStartupAuthority", &ready)[0].clone();
+    let migrated = model.successors("RecoverModernReceiptFromReady", &consumed)[0].clone();
     let observed_legacy = model.successors("ObserveBootHealth", &migrated)[0].clone();
     let returned_legacy =
         model.successors("ReturnAfterRecoveredLegacy", &observed_legacy)[0].clone();
     assert_eq!(returned_legacy.get("receipt_exact"), Some(&1));
     assert_eq!(returned_legacy.get("rollback_verified"), Some(&1));
 
+    // A parent that crashed before writing its re-exec stamp AND left no ready
+    // record now has nothing to rebuild from. The retired v0.52 branch recovered
+    // this from sealed disk facts alone; today it DEFERS, keeping the armed trial
+    // and fixed rollback so a later launch can still act. `legacy_variant` is the
+    // model's mutex, so losing the stamp and supplying ready are distinct runs.
     let no_stamp = model.successors("LoseLegacyReexecAuthority", &legacy)[0].clone();
     let consumed = model.successors("ConsumeStartupAuthority", &no_stamp)[0].clone();
-    let migrated = model.successors("SynthesizeAuthenticatedLegacyReceipt", &consumed)[0].clone();
-    let observed = model.successors("ObserveBootHealth", &migrated)[0].clone();
-    let returned = model.successors("ReturnAfterRecoveredLegacy", &observed)[0].clone();
-    assert_eq!(returned.get("startup_returned"), Some(&1));
+    assert!(
+        model
+            .successors("RecoverModernReceiptFromReady", &consumed)
+            .is_empty(),
+        "no ready record leaves no recovery route"
+    );
+    let deferred = model.successors("RefuseLegacyMissingRecoveryEvidence", &consumed)[0].clone();
+    assert_eq!(deferred.get("startup_deferred"), Some(&1));
+    assert_eq!(deferred.get("trial"), Some(&1));
+    assert_eq!(deferred.get("fixed"), Some(&1));
+    assert_eq!(deferred.get("receipt"), Some(&0));
 
     // Every mismatched sealed build/commit, trial build/digest, or predecessor
     // proof refuses synthesis and preserves the armed trial + fixed rollback.
@@ -5881,10 +6070,6 @@ fn derived_native_update_disk_transaction_proves_and_catches_identity_or_early_g
             "CorruptLegacyCurrentCommit",
             "RefuseLegacyCurrentCommitMismatch",
         ),
-        (
-            "CorruptLegacyShortCommit",
-            "RefuseLegacyShortCommitMismatch",
-        ),
         ("CorruptLegacyTrialBuild", "RefuseLegacyTrialBuildMismatch"),
         (
             "CorruptLegacyTrialDigest",
@@ -5897,9 +6082,9 @@ fn derived_native_update_disk_transaction_proves_and_catches_identity_or_early_g
         let consumed = model.successors("ConsumeStartupAuthority", &corrupt_state)[0].clone();
         assert!(
             model
-                .successors("SynthesizeAuthenticatedLegacyReceipt", &consumed)
+                .successors("RecoverModernReceiptFromReady", &consumed)
                 .is_empty(),
-            "{corrupt} still authorized receipt synthesis"
+            "{corrupt} still authorized receipt recovery"
         );
         let refused = model.successors(refuse, &consumed)[0].clone();
         assert_eq!(refused.get("startup_deferred"), Some(&1));
@@ -5908,25 +6093,23 @@ fn derived_native_update_disk_transaction_proves_and_catches_identity_or_early_g
         assert_eq!(refused.get("receipt"), Some(&0));
     }
 
-    // Modern recovery is separate: a surviving exact ready record takes the
-    // existing full-commit route and never sets the legacy migration bit.
+    // Recovery requires the ready record: without it there is no route at all,
+    // which is what makes `ready.toml` the load-bearing evidence now that the
+    // sealed-disk synthesis branch is gone.
     let legacy = model.successors("EnterLegacyPostSwapExact", &model.init_state())[0].clone();
-    let modern = model.successors("SupplyModernReadyRecovery", &legacy)[0].clone();
-    let consumed = model.successors("ConsumeStartupAuthority", &modern)[0].clone();
+    let consumed_dry = model.successors("ConsumeStartupAuthority", &legacy)[0].clone();
     assert!(
         model
-            .successors("SynthesizeAuthenticatedLegacyReceipt", &consumed)
-            .is_empty()
+            .successors("RecoverModernReceiptFromReady", &consumed_dry)
+            .is_empty(),
+        "receipt recovery without a ready record must have no route"
     );
+    let modern = model.successors("SupplyModernReadyRecovery", &legacy)[0].clone();
+    let consumed = model.successors("ConsumeStartupAuthority", &modern)[0].clone();
     let recovered = model.successors("RecoverModernReceiptFromReady", &consumed)[0].clone();
     assert_eq!(recovered.get("modern_receipt_recovered"), Some(&1));
-    assert_eq!(recovered.get("legacy_receipt_migrated"), Some(&0));
 
     let buggy_legacy = buggy.successors("EnterLegacyPostSwapExact", &buggy.init_state())[0].clone();
-    let wrong_commit = buggy.successors("CorruptLegacyCurrentCommit", &buggy_legacy)[0].clone();
-    let consumed = buggy.successors("ConsumeStartupAuthority", &wrong_commit)[0].clone();
-    let forged = buggy.successors("SynthesizeLegacyReceiptFromInexactShape", &consumed)[0].clone();
-    assert!(!buggy.check_invariant("LegacySynthesisUsesExactDiskShape", &forged));
 
     let early = buggy.successors("BuggyReturnInheritedAuthority", &buggy_legacy)[0].clone();
     assert!(!buggy.check_invariant("LegacyStartupReturnRequiresReceiptProof", &early,));
@@ -6813,6 +6996,30 @@ fn derived_flash_limiter_proves_and_catches_overlap_blindness() {
     }
     eprintln!(
         "derived FlashLimiter: proven for Overlap in {{0,1}} and caught at (Buggy=1, Overlap=1)."
+    );
+}
+
+/// The WINDOW-WIDE twin (`FlashLimiterWindow`): the WCAG 2.3.1 budget belongs
+/// to the retina, so it is charged against EVERY live enforcer at once.
+///
+/// This is the machine-checked form of the sentence the scope-cardinality
+/// census (`aterm-census` OB-13..OB-18, claim `flash-limiter`) would otherwise
+/// assert in prose: "if N enforcers each apply the bound locally, the
+/// aggregate is violated". It does NOT catch the per-pane refactor — no state
+/// machine can know how many engines the host builds; the census does that,
+/// and OB-16 fails the build if this model is deleted while
+/// `prove_catch_and_multiply_scalar` fails this test if it goes toothless.
+///
+/// G4 fires at BOTH `Overlap` corners while G3 needs `Overlap = 1`: an
+/// overlap-blind limiter misbehaves only where regions coincide, but
+/// multiplying enforcers is wrong unconditionally.
+#[test]
+fn derived_flash_limiter_window_proves_catches_and_multiplies() {
+    let _ = verify::prove_catch_and_multiply_scalar(
+        &flash_limiter_window_model(),
+        &[&[], &[("Overlap", 1)]],
+        &[("Overlap", 1)],
+        "derived flash limiter (window-wide)",
     );
 }
 

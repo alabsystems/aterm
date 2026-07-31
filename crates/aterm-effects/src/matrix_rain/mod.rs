@@ -433,6 +433,12 @@ fn frame_vertical(ch: char) -> bool {
 }
 
 /// The PHOSPHOR rain engine. One per window; all buffers resident.
+///
+/// scope-waiver: a RESOURCE statement, not a safety budget. Rain has no
+/// ignition limiter and no burst mutex — it is a continuous field, so N
+/// engines cost N sets of resident buffers rather than N times a bound the
+/// user experiences the sum of. Should rain ever gain a flash-rate or
+/// quad-budget enforcer, this waiver must become a ScopeClaim.
 pub struct MatrixRain {
     cfg: RainConfig,
     // -- config-derived caches (rebuilt by `set_config`) --------------------
@@ -1107,8 +1113,17 @@ impl MatrixRain {
         }
         self.material_sample_needed = false;
         self.material_scratch.clear();
-        let mut material_head = 0usize;
-        for r in 0..rows {
+        // Walked BOTTOM-UP, and stopped the instant MATERIAL_CAP is reached.
+        // The sample is defined as the LAST <= MATERIAL_CAP supported
+        // codepoints in row-major order, so a forward walk that hashed every
+        // occupied cell on the screen threw ~90% of that work away on a dense
+        // pane (each miss/hit costs a `rom::material_bitmap` — up to seven
+        // font-table binary searches). Collecting in reverse and reversing once
+        // at the end yields the identical sequence while touching only the
+        // cells that can actually contribute. The row band gate below is a pure
+        // function of `r` (and `rows`/`cursor`/`hidden_band`), so it selects the
+        // same rows in either direction.
+        'rows: for r in (0..rows).rev() {
             let row = r as u16;
             let cursor_banded =
                 cursor.is_some_and(|(cr, _)| i32::from(cr.abs_diff(row)) <= CURSOR_BAND_ROWS);
@@ -1128,24 +1143,22 @@ impl MatrixRain {
             let Some(row_cells) = cells.get(r) else {
                 continue;
             };
-            for cell in row_cells {
+            for cell in row_cells.iter().rev() {
                 if cell.ch != ' ' && !cell.wide && rom::material_bitmap(cell.ch).is_some() {
-                    // Fixed-size occurrence ring: retain only the latest real
-                    // codepoints while scanning. A viewport-sized scratch Vec
-                    // would permanently retain megabytes after one huge grid.
-                    if self.material_scratch.len() < MATERIAL_CAP {
-                        self.material_scratch.push(cell.ch);
-                    } else {
-                        self.material_scratch[material_head] = cell.ch;
-                        material_head = (material_head + 1) % MATERIAL_CAP;
+                    // Bounded by construction: MATERIAL_CAP entries is the whole
+                    // product of the pass, so a viewport-sized scratch (which
+                    // would permanently retain megabytes after one huge grid)
+                    // never forms.
+                    self.material_scratch.push(cell.ch);
+                    if self.material_scratch.len() == MATERIAL_CAP {
+                        break 'rows;
                     }
                 }
             }
         }
-        if self.material_scratch.len() == MATERIAL_CAP && material_head != 0 {
-            // Restore oldest->newest source order after the circular writes.
-            self.material_scratch.rotate_left(material_head);
-        }
+        // Newest-first -> oldest->newest source order, the order the slot bake
+        // and `semantic_material_index` read.
+        self.material_scratch.reverse();
         let n = self.material_scratch.len();
         if n == 0 {
             self.clear_material_bank();
@@ -3364,6 +3377,111 @@ mod tests {
             e.material_chars.is_empty(),
             "unsupported glyph is never substituted"
         );
+    }
+
+    /// The sampler's whole product is the LAST [`MATERIAL_CAP`] supported
+    /// codepoints in row-major order, so it walks BOTTOM-UP and stops at the
+    /// cap instead of hashing every occupied cell on the screen. That must be
+    /// indistinguishable from the exhaustive forward walk it replaced — pin it
+    /// against a plainly-written reference on a grid dense enough for the cap
+    /// to land mid-row, with banded rows, wide cells, spaces, unsupported
+    /// scalars and a ragged/short row mixed in.
+    #[test]
+    fn literal_material_tail_matches_an_exhaustive_forward_walk() {
+        /// The pre-optimisation semantics, spelled out: every unbanded row
+        /// top-down, keep the tail.
+        fn forward_tail(
+            cells: &[Vec<RenderCell>],
+            rows: usize,
+            cursor: Option<(u16, u16)>,
+            hidden_band: &[u16],
+        ) -> Vec<char> {
+            let mut all: Vec<char> = Vec::new();
+            for r in 0..rows {
+                let row = r as u16;
+                let cursor_banded =
+                    cursor.is_some_and(|(cr, _)| i32::from(cr.abs_diff(row)) <= CURSOR_BAND_ROWS);
+                let remembered_banded = hidden_band.contains(&row);
+                let fallback_banded = cursor.is_none()
+                    && hidden_band.is_empty()
+                    && r + HIDDEN_CURSOR_BAND_ROWS >= rows;
+                if cursor_banded || remembered_banded || fallback_banded {
+                    continue;
+                }
+                let Some(row_cells) = cells.get(r) else {
+                    continue;
+                };
+                for cell in row_cells {
+                    if cell.ch != ' ' && !cell.wide && rom::material_bitmap(cell.ch).is_some() {
+                        all.push(cell.ch);
+                    }
+                }
+            }
+            if all.len() > MATERIAL_CAP {
+                all.drain(..all.len() - MATERIAL_CAP);
+            }
+            all
+        }
+
+        let (rows, cols) = (16usize, 24usize);
+        let pattern = ['A', 'b', '3', '{', '}', 'z', '7'];
+        let mut cells = vec![vec![space_cell(bg3()); cols]; rows];
+        for (r, row_cells) in cells.iter_mut().enumerate() {
+            for (c, cell) in row_cells.iter_mut().enumerate() {
+                match (r + c) % 7 {
+                    0 => {}                     // stays a space
+                    1 => cell.ch = '\u{1F408}', // unsupported: never sampled
+                    2 => {
+                        cell.ch = pattern[(r * cols + c) % pattern.len()];
+                        cell.wide = true; // wide: never sampled
+                    }
+                    _ => cell.ch = pattern[(r * cols + c) % pattern.len()],
+                }
+            }
+        }
+        // A trimmed row and a grid shorter than `rows` are legal input; both
+        // directions must skip exactly the same cells.
+        cells[9].truncate(5);
+        cells.truncate(rows - 1);
+
+        for (cursor, band) in [
+            (Some((2u16, 0u16)), &[][..]),
+            (Some((2, 0)), &[7u16, 8][..]),
+            (None, &[][..]),      // hidden cursor -> bottom-K fallback band
+            (None, &[11u16][..]), // hidden cursor with a host-fed band
+        ] {
+            let mut e = MatrixRain::new(literal_cfg_on());
+            e.sample_material(&cells, rows, cursor, band);
+            let expected = forward_tail(&cells, rows, cursor, band);
+            assert_eq!(
+                e.material_scratch, expected,
+                "bottom-up sampling must reproduce the forward walk's tail \
+                 (cursor {cursor:?}, band {band:?})"
+            );
+            let sampled: Vec<char> = e
+                .material
+                .iter()
+                .map(|&slot| e.material_chars[usize::from(slot)])
+                .collect();
+            assert_eq!(
+                sampled, expected,
+                "the emitted tape follows the same source order"
+            );
+        }
+
+        // Under the cap the tail is the WHOLE sample — no truncation, same order.
+        let mut sparse = vec![vec![space_cell(bg3()); cols]; rows];
+        for (c, cell) in sparse[8].iter_mut().take(9).enumerate() {
+            cell.ch = pattern[c % pattern.len()];
+        }
+        let mut e = MatrixRain::new(literal_cfg_on());
+        e.sample_material(&sparse, rows, Some((2, 0)), &[]);
+        assert_eq!(
+            e.material_scratch,
+            forward_tail(&sparse, rows, Some((2, 0)), &[]),
+            "a sub-cap sample keeps every hit in source order"
+        );
+        assert!(e.material_scratch.len() < MATERIAL_CAP);
     }
 
     /// Literal mode has no decorative escape hatch: until supported output is

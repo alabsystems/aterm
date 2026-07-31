@@ -177,9 +177,10 @@ const INPUT_SLICE_CAP_NS: u64 = 5_000_000_000;
 
 /// Monotonic nanoseconds since the first call (process-lifetime clock for the
 /// input→present stamps). Saturates far beyond any session length.
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
 fn now_ns() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    let start = *START.get_or_init(Instant::now);
+    let start = *PROCESS_START.get_or_init(Instant::now);
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -403,18 +404,338 @@ impl PresentDropReason {
     }
 }
 
-/// Anchor the process-lifetime clock at the top of `main()` so
-/// `first_present_ns` measures main-entry → first successful application-present
-/// return. Without this call the clock self-anchors at whichever metric fires
-/// first and the startup figure is meaningless — call it before any thread
-/// spawns. Platform compositor and scanout timing are outside this boundary.
+/// Anchor the GUI process-lifetime clock at the top of [`crate::main_entry`] so
+/// `first_present_ns` retains its compatibility-stable GUI-entry → first
+/// startup-metrics publication point inside the successful-present finalizer.
+/// Publication runs after submit succeeds and includes initial reveal,
+/// application acknowledgement, and any synchronous post-submit recovery
+/// bookkeeping. Without this call the clock self-anchors at whichever metric
+/// fires first and the startup figure is meaningless — call it before any
+/// thread spawns. Platform compositor and scanout timing are outside this
+/// boundary.
 pub fn mark_process_start() {
-    let _ = now_ns();
+    let _ = PROCESS_START.set(Instant::now());
 }
 
-// Main-entry → first presented frame, in ns since `mark_process_start` (0 =
-// no present yet). A startup FACT, not a window stat: `reset` keeps it.
-static FIRST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+/// Anchor the shipped one-binary Rust entry before argv0/router work. Kept
+/// separate from [`mark_process_start`] so the long-standing
+/// `first_present_ns` boundary stays comparable across versions and thin GUI
+/// binaries. Dyld/process-loader work precedes this stamp and remains outside
+/// both metrics.
+pub fn mark_rust_main_start() {
+    let _ = RUST_MAIN_START.set(Instant::now());
+}
+
+static RUST_MAIN_START: OnceLock<Instant> = OnceLock::new();
+static GUI_READY_FOR_WINIT: OnceLock<Instant> = OnceLock::new();
+static FIRST_WINIT_RESUMED: OnceLock<Instant> = OnceLock::new();
+static INITIAL_SURFACE_READY: OnceLock<Instant> = OnceLock::new();
+static INITIAL_ATTACH_MILESTONES: OnceLock<StartupAttachMilestones> = OnceLock::new();
+
+/// Mark the end of synchronous GUI preparation immediately before entering
+/// winit. First-write wins because a process has one startup timeline.
+pub(crate) fn mark_gui_ready_for_winit() {
+    let _ = GUI_READY_FOR_WINIT.set(Instant::now());
+}
+
+/// Mark the first instruction of winit's first `resumed` callback.
+pub(crate) fn mark_first_winit_resumed() {
+    let _ = FIRST_WINIT_RESUMED.set(Instant::now());
+}
+
+/// Mark the first successfully attached OS window surface. A failed attachment
+/// never advances the startup timeline.
+pub(crate) fn mark_initial_surface_ready() {
+    let _ = INITIAL_SURFACE_READY.set(Instant::now());
+}
+
+/// Wire schema for the exclusive Rust-main → first-present phase partition.
+pub(crate) const STARTUP_PHASE_SCHEMA: u64 = 1;
+
+/// Wire schema for the exclusive first-resume → initial-surface-ready attach
+/// partition nested inside [`STARTUP_PHASE_SCHEMA`]'s surface-attach phase.
+pub(crate) const STARTUP_ATTACH_SCHEMA: u64 = 1;
+
+/// Ordered internal boundaries of the one successful initial window attach.
+/// The caller records the complete array only after a present target has been
+/// installed, so a failed OS-window or surface attempt cannot publish a partial
+/// timeline. The outer `winit_resumed` and `surface_ready` stamps are supplied
+/// by the existing startup ledger and make the eight subphases reconcile
+/// exactly with `startup_initial_surface_attach_ns`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StartupAttachMilestones {
+    points: [Instant; 7],
+}
+
+impl StartupAttachMilestones {
+    pub(crate) const fn new(points: [Instant; 7]) -> Self {
+        Self { points }
+    }
+}
+
+/// Publish the complete internal timeline for the first successful window
+/// attach. First-write wins; later Cmd-N windows cannot replace startup data.
+pub(crate) fn record_initial_attach_milestones(milestones: StartupAttachMilestones) {
+    let _ = INITIAL_ATTACH_MILESTONES.set(milestones);
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StartupPresentTiming {
+    frame_started: Instant,
+    pre_present: Instant,
+    surface_return: Instant,
+}
+
+impl StartupPresentTiming {
+    pub(crate) const fn new(
+        frame_started: Instant,
+        pre_present: Instant,
+        surface_return: Instant,
+    ) -> Self {
+        Self {
+            frame_started,
+            pre_present,
+            surface_return,
+        }
+    }
+
+    pub(crate) const fn collapsed(at: Instant) -> Self {
+        Self::new(at, at, at)
+    }
+
+    pub(crate) const fn frame_started(self) -> Instant {
+        self.frame_started
+    }
+
+    pub(crate) fn finish(frame_started: Instant, pre_present: Option<Instant>) -> Self {
+        pre_present.map_or_else(
+            || Self::collapsed(frame_started),
+            |pre_present| Self::new(frame_started, pre_present, Instant::now()),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StartupPhaseSample {
+    valid: bool,
+    router_ns: u64,
+    gui_prepare_ns: u64,
+    winit_dispatch_ns: u64,
+    initial_surface_attach_ns: u64,
+    surface_to_successful_redraw_ns: u64,
+    successful_compose_ns: u64,
+    successful_surface_transaction_ns: u64,
+    successful_finalize_ns: u64,
+}
+
+impl StartupPhaseSample {
+    fn total_ns(self) -> Option<u64> {
+        [
+            self.router_ns,
+            self.gui_prepare_ns,
+            self.winit_dispatch_ns,
+            self.initial_surface_attach_ns,
+            self.surface_to_successful_redraw_ns,
+            self.successful_compose_ns,
+            self.successful_surface_transaction_ns,
+            self.successful_finalize_ns,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, phase| total.checked_add(phase))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StartupAttachSample {
+    valid: bool,
+    dispatch_ns: u64,
+    prepare_ns: u64,
+    window_create_ns: u64,
+    window_setup_ns: u64,
+    backend_finalize_ns: u64,
+    chrome_geometry_ns: u64,
+    surface_create_ns: u64,
+    finish_ns: u64,
+}
+
+impl StartupAttachSample {
+    fn total_ns(self) -> Option<u64> {
+        [
+            self.dispatch_ns,
+            self.prepare_ns,
+            self.window_create_ns,
+            self.window_setup_ns,
+            self.backend_finalize_ns,
+            self.chrome_geometry_ns,
+            self.surface_create_ns,
+            self.finish_ns,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, phase| total.checked_add(phase))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StartupMilestones {
+    rust_main: Option<Instant>,
+    gui_entry: Option<Instant>,
+    gui_ready: Option<Instant>,
+    winit_resumed: Option<Instant>,
+    surface_ready: Option<Instant>,
+}
+
+fn duration_ns(start: Instant, end: Instant) -> Option<u64> {
+    u64::try_from(end.checked_duration_since(start)?.as_nanos()).ok()
+}
+
+fn derive_startup_phases(
+    milestones: StartupMilestones,
+    timing: StartupPresentTiming,
+    published_at: Instant,
+) -> StartupPhaseSample {
+    let Some(rust_main) = milestones.rust_main else {
+        return StartupPhaseSample::default();
+    };
+    let Some(gui_entry) = milestones.gui_entry else {
+        return StartupPhaseSample::default();
+    };
+    let Some(gui_ready) = milestones.gui_ready else {
+        return StartupPhaseSample::default();
+    };
+    let Some(winit_resumed) = milestones.winit_resumed else {
+        return StartupPhaseSample::default();
+    };
+    let Some(surface_ready) = milestones.surface_ready else {
+        return StartupPhaseSample::default();
+    };
+    let Some(router_ns) = duration_ns(rust_main, gui_entry) else {
+        return StartupPhaseSample::default();
+    };
+    let Some(gui_prepare_ns) = duration_ns(gui_entry, gui_ready) else {
+        return StartupPhaseSample::default();
+    };
+    let Some(winit_dispatch_ns) = duration_ns(gui_ready, winit_resumed) else {
+        return StartupPhaseSample::default();
+    };
+    let Some(initial_surface_attach_ns) = duration_ns(winit_resumed, surface_ready) else {
+        return StartupPhaseSample::default();
+    };
+    let Some(surface_to_successful_redraw_ns) = duration_ns(surface_ready, timing.frame_started)
+    else {
+        return StartupPhaseSample::default();
+    };
+    let Some(successful_compose_ns) = duration_ns(timing.frame_started, timing.pre_present) else {
+        return StartupPhaseSample::default();
+    };
+    let Some(successful_surface_transaction_ns) =
+        duration_ns(timing.pre_present, timing.surface_return)
+    else {
+        return StartupPhaseSample::default();
+    };
+    let Some(successful_finalize_ns) = duration_ns(timing.surface_return, published_at) else {
+        return StartupPhaseSample::default();
+    };
+    let sample = StartupPhaseSample {
+        valid: true,
+        router_ns,
+        gui_prepare_ns,
+        winit_dispatch_ns,
+        initial_surface_attach_ns,
+        surface_to_successful_redraw_ns,
+        successful_compose_ns,
+        successful_surface_transaction_ns,
+        successful_finalize_ns,
+    };
+    let rust_main_total = duration_ns(rust_main, published_at);
+    let gui_total = duration_ns(gui_entry, published_at);
+    let partition_total = sample.total_ns();
+    if partition_total != rust_main_total
+        || partition_total.and_then(|total| total.checked_sub(router_ns)) != gui_total
+    {
+        return StartupPhaseSample::default();
+    }
+    sample
+}
+
+fn derive_startup_attach(
+    winit_resumed: Option<Instant>,
+    milestones: Option<StartupAttachMilestones>,
+    surface_ready: Option<Instant>,
+) -> StartupAttachSample {
+    let Some(winit_resumed) = winit_resumed else {
+        return StartupAttachSample::default();
+    };
+    let Some(milestones) = milestones else {
+        return StartupAttachSample::default();
+    };
+    let Some(surface_ready) = surface_ready else {
+        return StartupAttachSample::default();
+    };
+    let [
+        attach_entry,
+        before_window_create,
+        after_window_create,
+        before_backend_finalize,
+        after_backend_finalize,
+        before_surface_create,
+        after_surface_create,
+    ] = milestones.points;
+    let Some(dispatch_ns) = duration_ns(winit_resumed, attach_entry) else {
+        return StartupAttachSample::default();
+    };
+    let Some(prepare_ns) = duration_ns(attach_entry, before_window_create) else {
+        return StartupAttachSample::default();
+    };
+    let Some(window_create_ns) = duration_ns(before_window_create, after_window_create) else {
+        return StartupAttachSample::default();
+    };
+    let Some(window_setup_ns) = duration_ns(after_window_create, before_backend_finalize) else {
+        return StartupAttachSample::default();
+    };
+    let Some(backend_finalize_ns) = duration_ns(before_backend_finalize, after_backend_finalize)
+    else {
+        return StartupAttachSample::default();
+    };
+    let Some(chrome_geometry_ns) = duration_ns(after_backend_finalize, before_surface_create)
+    else {
+        return StartupAttachSample::default();
+    };
+    let Some(surface_create_ns) = duration_ns(before_surface_create, after_surface_create) else {
+        return StartupAttachSample::default();
+    };
+    let Some(finish_ns) = duration_ns(after_surface_create, surface_ready) else {
+        return StartupAttachSample::default();
+    };
+    let sample = StartupAttachSample {
+        valid: true,
+        dispatch_ns,
+        prepare_ns,
+        window_create_ns,
+        window_setup_ns,
+        backend_finalize_ns,
+        chrome_geometry_ns,
+        surface_create_ns,
+        finish_ns,
+    };
+    if sample.total_ns() != duration_ns(winit_resumed, surface_ready) {
+        return StartupAttachSample::default();
+    }
+    sample
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StartupPresentSample {
+    gui_entry_ns: u64,
+    rust_main_ns: u64,
+    phases: StartupPhaseSample,
+    attach: StartupAttachSample,
+}
+
+// One coherent, immutable startup fact. `OnceLock` publishes both clock
+// projections together, so a racing control snapshot cannot pair a populated
+// compatibility field with a missing router field. `reset` deliberately keeps
+// it. `rust_main_ns` is 0 only for the thin dev GUI binary.
+static STARTUP_PRESENT: OnceLock<StartupPresentSample> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Latency distributions (the PERF_GYM §2 histogram slice — LAT-3).
@@ -589,11 +910,44 @@ pub const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333; // 1/30 s
 /// or time spent encoding GPU commands and calling `queue.submit`. It is not
 /// completed GPU execution and excludes surface acquisition and final-present
 /// pacing.
-pub fn record_present(latency_ns: u64, render_ns: u64) {
-    FRAMES_PRESENTED.fetch_add(1, Ordering::Relaxed);
-    // First successful application-present return (see `mark_process_start`).
-    // CAS keeps the first, races included.
-    let _ = FIRST_PRESENT_NS.compare_exchange(0, now_ns(), Ordering::Relaxed, Ordering::Relaxed);
+pub(crate) fn record_present(
+    latency_ns: u64,
+    render_ns: u64,
+    startup_timing: StartupPresentTiming,
+) {
+    // First startup-metrics publication point inside the successful-present
+    // finalizer (see `mark_process_start`). Capture one end Instant and derive
+    // both scopes from it, then publish the pair atomically through OnceLock
+    // before the frame count becomes observable.
+    let _ = STARTUP_PRESENT.get_or_init(|| {
+        let published_at = Instant::now();
+        let elapsed_ns = |start: Instant| {
+            u64::try_from(published_at.saturating_duration_since(start).as_nanos())
+                .unwrap_or(u64::MAX)
+                .max(1)
+        };
+        StartupPresentSample {
+            gui_entry_ns: elapsed_ns(*PROCESS_START.get_or_init(|| published_at)),
+            rust_main_ns: RUST_MAIN_START.get().copied().map_or(0, elapsed_ns),
+            phases: derive_startup_phases(
+                StartupMilestones {
+                    rust_main: RUST_MAIN_START.get().copied(),
+                    gui_entry: PROCESS_START.get().copied(),
+                    gui_ready: GUI_READY_FOR_WINIT.get().copied(),
+                    winit_resumed: FIRST_WINIT_RESUMED.get().copied(),
+                    surface_ready: INITIAL_SURFACE_READY.get().copied(),
+                },
+                startup_timing,
+                published_at,
+            ),
+            attach: derive_startup_attach(
+                FIRST_WINIT_RESUMED.get().copied(),
+                INITIAL_ATTACH_MILESTONES.get().copied(),
+                INITIAL_SURFACE_READY.get().copied(),
+            ),
+        }
+    });
+    FRAMES_PRESENTED.fetch_add(1, Ordering::Release);
     if latency_ns != 0 {
         LAST_PRESENT_LATENCY_NS.store(latency_ns, Ordering::Relaxed);
         MAX_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed);
@@ -980,6 +1334,16 @@ pub fn set_backend_gpu(on: bool) {
     BACKEND_GPU.store(on, Ordering::Relaxed);
 }
 
+/// Just the live-renderer flag — the single field of [`snapshot`] that the
+/// Settings view needs, without building the ~400-byte `Snapshot` (≈50 atomic
+/// loads, three enum decodes and a `now_ns()` monotonic-clock read) and throwing
+/// all of it away. `setting_row` asks per ROW, so a Settings page rebuild used to
+/// pay that a few dozen times per keystroke/hover for one bool.
+#[must_use]
+pub fn backend_gpu() -> bool {
+    BACKEND_GPU.load(Ordering::Relaxed)
+}
+
 /// Zero the measurement-window stats (frame count, maxima, slow count) so a driver
 /// can time a SPECIFIC operation: `metrics reset`, run the workload, then `metrics`.
 /// Keeps `backend` and legacy momentary `last_*` readings. The redraw-audit
@@ -1026,7 +1390,7 @@ pub fn reset() {
     // sample in this window" instead of silently reprinting the PREVIOUS run's
     // number. Without this, the documented `reset` → drive → read protocol turns a
     // zero-sample run into a passing regression test. True GAUGES (`SYNC_HOLDING`,
-    // `PERF_REDUCED`, `BACKEND_GPU`) and the startup fact (`FIRST_PRESENT_NS`) are
+    // `PERF_REDUCED`, `BACKEND_GPU`) and the coherent `STARTUP_PRESENT` fact are
     // state, not observations, and deliberately survive.
     OFFSCREEN_RASTERS.store(0, Ordering::Relaxed);
     LAST_OFFSCREEN_RASTER_NS.store(0, Ordering::Relaxed);
@@ -1104,17 +1468,53 @@ pub struct Snapshot {
     /// window). The hitch/stutter signal for scrub sweeps — see the static's
     /// note on the reset→drive→read discipline. ARENA-SCROLL's frame-gap number.
     pub max_frame_gap_ns: u64,
-    /// Main entry → first presented frame (0 until the first present); see
+    /// GUI entry → first startup-metrics publication point inside the
+    /// successful-present finalizer (0 until the first present); see
     /// [`mark_process_start`]. Survives `reset`.
     pub first_present_ns: u64,
+    /// Shipped one-binary Rust entry → the same publication point (0 until the
+    /// first present, and unavailable in the thin GUI binary); see
+    /// [`mark_rust_main_start`]. Survives `reset`.
+    pub rust_main_to_first_present_ns: u64,
+    /// Exclusive startup-phase schema. `startup_phase_valid` is false until a
+    /// complete, ordered one-binary timeline reaches its first successful
+    /// present. The immutable phase fact survives `reset`.
+    pub startup_phase_schema: u64,
+    pub startup_phase_valid: bool,
+    pub startup_router_ns: u64,
+    pub startup_gui_prepare_ns: u64,
+    pub startup_winit_dispatch_ns: u64,
+    pub startup_initial_surface_attach_ns: u64,
+    pub startup_surface_to_successful_redraw_ns: u64,
+    pub startup_successful_compose_ns: u64,
+    pub startup_successful_surface_transaction_ns: u64,
+    pub startup_successful_finalize_ns: u64,
+    /// Exclusive drill-down of `startup_initial_surface_attach_ns`.
+    /// `startup_attach_valid` is false until all successful initial-attach
+    /// boundaries are ordered and reconcile exactly with their parent phase.
+    pub startup_attach_schema: u64,
+    pub startup_attach_valid: bool,
+    pub startup_attach_dispatch_ns: u64,
+    pub startup_attach_prepare_ns: u64,
+    pub startup_attach_window_create_ns: u64,
+    pub startup_attach_window_setup_ns: u64,
+    pub startup_attach_backend_finalize_ns: u64,
+    pub startup_attach_chrome_geometry_ns: u64,
+    pub startup_attach_surface_create_ns: u64,
+    pub startup_attach_finish_ns: u64,
 }
 
 /// Read the current counters (lock-free).
 #[must_use]
 pub fn snapshot() -> Snapshot {
     let deadline_due = LAST_DEADLINE_DUE_NS.load(Ordering::Relaxed);
+    let frames_presented = FRAMES_PRESENTED.load(Ordering::Acquire);
+    // Read the OnceLock only after acquiring the publication counter. Once a
+    // caller observes frame 1, it must also observe the startup sample that
+    // record_present initialized before its Release increment.
+    let startup = STARTUP_PRESENT.get().copied().unwrap_or_default();
     Snapshot {
-        frames_presented: FRAMES_PRESENTED.load(Ordering::Relaxed),
+        frames_presented,
         last_present_latency_ns: LAST_PRESENT_LATENCY_NS.load(Ordering::Relaxed),
         last_frame_render_ns: LAST_FRAME_RENDER_NS.load(Ordering::Relaxed),
         max_present_latency_ns: MAX_PRESENT_LATENCY_NS.load(Ordering::Relaxed),
@@ -1163,7 +1563,322 @@ pub fn snapshot() -> Snapshot {
         last_deadline_late_ns: LAST_DEADLINE_LATE_NS.load(Ordering::Relaxed),
         past_deadline_arms: PAST_DEADLINE_ARMS.load(Ordering::Relaxed),
         max_frame_gap_ns: MAX_FRAME_GAP_NS.load(Ordering::Relaxed),
-        first_present_ns: FIRST_PRESENT_NS.load(Ordering::Relaxed),
+        first_present_ns: startup.gui_entry_ns,
+        rust_main_to_first_present_ns: startup.rust_main_ns,
+        startup_phase_schema: STARTUP_PHASE_SCHEMA,
+        startup_phase_valid: startup.phases.valid,
+        startup_router_ns: startup.phases.router_ns,
+        startup_gui_prepare_ns: startup.phases.gui_prepare_ns,
+        startup_winit_dispatch_ns: startup.phases.winit_dispatch_ns,
+        startup_initial_surface_attach_ns: startup.phases.initial_surface_attach_ns,
+        startup_surface_to_successful_redraw_ns: startup.phases.surface_to_successful_redraw_ns,
+        startup_successful_compose_ns: startup.phases.successful_compose_ns,
+        startup_successful_surface_transaction_ns: startup.phases.successful_surface_transaction_ns,
+        startup_successful_finalize_ns: startup.phases.successful_finalize_ns,
+        startup_attach_schema: STARTUP_ATTACH_SCHEMA,
+        startup_attach_valid: startup.attach.valid,
+        startup_attach_dispatch_ns: startup.attach.dispatch_ns,
+        startup_attach_prepare_ns: startup.attach.prepare_ns,
+        startup_attach_window_create_ns: startup.attach.window_create_ns,
+        startup_attach_window_setup_ns: startup.attach.window_setup_ns,
+        startup_attach_backend_finalize_ns: startup.attach.backend_finalize_ns,
+        startup_attach_chrome_geometry_ns: startup.attach.chrome_geometry_ns,
+        startup_attach_surface_create_ns: startup.attach.surface_create_ns,
+        startup_attach_finish_ns: startup.attach.finish_ns,
+    }
+}
+
+#[cfg(test)]
+mod startup_phase_tests {
+    use super::*;
+
+    fn timeline() -> (StartupMilestones, StartupPresentTiming, Instant) {
+        let rust_main = Instant::now();
+        let gui_entry = rust_main + std::time::Duration::from_millis(1);
+        let gui_ready = gui_entry + std::time::Duration::from_millis(2);
+        let winit_resumed = gui_ready + std::time::Duration::from_millis(3);
+        let surface_ready = winit_resumed + std::time::Duration::from_millis(4);
+        let frame_started = surface_ready + std::time::Duration::from_millis(5);
+        let pre_present = frame_started + std::time::Duration::from_millis(6);
+        let surface_return = pre_present + std::time::Duration::from_millis(7);
+        let published_at = surface_return + std::time::Duration::from_millis(8);
+        (
+            StartupMilestones {
+                rust_main: Some(rust_main),
+                gui_entry: Some(gui_entry),
+                gui_ready: Some(gui_ready),
+                winit_resumed: Some(winit_resumed),
+                surface_ready: Some(surface_ready),
+            },
+            StartupPresentTiming::new(frame_started, pre_present, surface_return),
+            published_at,
+        )
+    }
+
+    fn attach_timeline() -> (Instant, StartupAttachMilestones, Instant) {
+        let winit_resumed = Instant::now();
+        let points = std::array::from_fn(|index| {
+            winit_resumed + std::time::Duration::from_millis((index + 1) as u64)
+        });
+        let surface_ready = winit_resumed + std::time::Duration::from_millis(8);
+        (
+            winit_resumed,
+            StartupAttachMilestones::new(points),
+            surface_ready,
+        )
+    }
+
+    #[test]
+    fn startup_phases_are_an_exact_exclusive_partition() {
+        let (milestones, timing, published_at) = timeline();
+        let phases = derive_startup_phases(milestones, timing, published_at);
+        assert!(phases.valid);
+        assert_eq!(
+            [
+                phases.router_ns,
+                phases.gui_prepare_ns,
+                phases.winit_dispatch_ns,
+                phases.initial_surface_attach_ns,
+                phases.surface_to_successful_redraw_ns,
+                phases.successful_compose_ns,
+                phases.successful_surface_transaction_ns,
+                phases.successful_finalize_ns,
+            ],
+            [
+                1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000, 7_000_000,
+                8_000_000,
+            ]
+        );
+        assert_eq!(phases.total_ns(), Some(36_000_000));
+        assert_eq!(
+            phases
+                .total_ns()
+                .and_then(|total| total.checked_sub(phases.router_ns)),
+            Some(35_000_000)
+        );
+    }
+
+    #[test]
+    fn startup_phases_fail_closed_on_missing_or_out_of_order_milestones() {
+        let (_, timing, published_at) = timeline();
+        assert_eq!(
+            derive_startup_phases(StartupMilestones::default(), timing, published_at),
+            StartupPhaseSample::default()
+        );
+
+        let (milestones, timing, published_at) = timeline();
+        let reversed = StartupPresentTiming::new(
+            timing.pre_present,
+            timing.frame_started,
+            timing.surface_return,
+        );
+        assert_eq!(
+            derive_startup_phases(milestones, reversed, published_at),
+            StartupPhaseSample::default()
+        );
+    }
+
+    #[test]
+    fn startup_phase_sum_overflow_fails_closed() {
+        let phases = StartupPhaseSample {
+            valid: true,
+            router_ns: u64::MAX,
+            successful_finalize_ns: 1,
+            ..StartupPhaseSample::default()
+        };
+        assert_eq!(phases.total_ns(), None);
+    }
+
+    #[test]
+    fn startup_attach_is_an_exact_exclusive_parent_partition() {
+        let (winit_resumed, milestones, surface_ready) = attach_timeline();
+        let attach =
+            derive_startup_attach(Some(winit_resumed), Some(milestones), Some(surface_ready));
+        assert!(attach.valid);
+        assert_eq!(
+            [
+                attach.dispatch_ns,
+                attach.prepare_ns,
+                attach.window_create_ns,
+                attach.window_setup_ns,
+                attach.backend_finalize_ns,
+                attach.chrome_geometry_ns,
+                attach.surface_create_ns,
+                attach.finish_ns,
+            ],
+            [1_000_000; 8]
+        );
+        assert_eq!(attach.total_ns(), Some(8_000_000));
+        assert_eq!(
+            attach.total_ns(),
+            duration_ns(winit_resumed, surface_ready),
+            "the drill-down must equal its initial-surface-attach parent"
+        );
+    }
+
+    #[test]
+    fn startup_attach_fails_closed_on_missing_reordered_or_overflowing_data() {
+        let (winit_resumed, milestones, surface_ready) = attach_timeline();
+        assert_eq!(
+            derive_startup_attach(Some(winit_resumed), None, Some(surface_ready)),
+            StartupAttachSample::default()
+        );
+        let mut reversed = milestones;
+        reversed.points.swap(3, 4);
+        assert_eq!(
+            derive_startup_attach(Some(winit_resumed), Some(reversed), Some(surface_ready)),
+            StartupAttachSample::default()
+        );
+        let overflow = StartupAttachSample {
+            valid: true,
+            dispatch_ns: u64::MAX,
+            finish_ns: 1,
+            ..StartupAttachSample::default()
+        };
+        assert_eq!(overflow.total_ns(), None);
+    }
+
+    #[test]
+    fn failed_attempt_stamp_cannot_replace_the_successful_redraw_boundary() {
+        let (milestones, timing, published_at) = timeline();
+        let failed_attempt =
+            milestones.surface_ready.unwrap() + std::time::Duration::from_millis(1);
+        assert!(failed_attempt < timing.frame_started);
+        let phases = derive_startup_phases(milestones, timing, published_at);
+        assert!(phases.valid);
+        assert_eq!(phases.surface_to_successful_redraw_ns, 5_000_000);
+
+        let wrong_projection = derive_startup_phases(
+            milestones,
+            StartupPresentTiming::new(failed_attempt, timing.pre_present, timing.surface_return),
+            published_at,
+        );
+        assert!(wrong_projection.valid);
+        assert_eq!(wrong_projection.surface_to_successful_redraw_ns, 1_000_000);
+        assert_ne!(
+            wrong_projection, phases,
+            "negative control: selecting the failed attempt must change the partition"
+        );
+    }
+
+    #[test]
+    fn release_published_frame_exposes_the_same_immutable_phase_sample() {
+        let sample = std::sync::Arc::new(OnceLock::new());
+        let frames = std::sync::Arc::new(AtomicU64::new(0));
+        let expected = StartupPresentSample {
+            gui_entry_ns: 35,
+            rust_main_ns: 36,
+            phases: StartupPhaseSample {
+                valid: true,
+                router_ns: 1,
+                successful_finalize_ns: 35,
+                ..StartupPhaseSample::default()
+            },
+            attach: StartupAttachSample::default(),
+        };
+        let writer_sample = std::sync::Arc::clone(&sample);
+        let writer_frames = std::sync::Arc::clone(&frames);
+        let writer = std::thread::spawn(move || {
+            writer_sample.set(expected).unwrap();
+            writer_frames.store(1, Ordering::Release);
+        });
+        while frames.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        assert_eq!(sample.get().copied(), Some(expected));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn reset_preserves_the_immutable_startup_fact() {
+        let before = *STARTUP_PRESENT.get_or_init(|| StartupPresentSample {
+            gui_entry_ns: 35,
+            rust_main_ns: 36,
+            phases: StartupPhaseSample {
+                valid: true,
+                router_ns: 1,
+                successful_finalize_ns: 35,
+                ..StartupPhaseSample::default()
+            },
+            attach: StartupAttachSample::default(),
+        });
+        reset();
+        assert_eq!(STARTUP_PRESENT.get().copied(), Some(before));
+    }
+
+    #[test]
+    fn phase_derivation_conforms_to_the_derived_publication_gate() {
+        let model = aterm_spec::derive::startup_phase_publication_model();
+        let (milestones, timing, published_at) = timeline();
+        let mut incomplete_milestones = milestones;
+        incomplete_milestones.surface_ready = None;
+
+        let mut state = model.init_state();
+        for _ in 0..7 {
+            assert!(model.fire("Step", &mut state));
+        }
+        let host_valid = derive_startup_phases(incomplete_milestones, timing, published_at).valid;
+        assert_eq!(
+            !model.successors("Publish", &state).is_empty(),
+            host_valid,
+            "Tier-1: the real missing-milestone decision matches phase 7"
+        );
+
+        assert!(model.fire("Step", &mut state));
+        let host_valid = derive_startup_phases(milestones, timing, published_at).valid;
+        assert_eq!(
+            !model.successors("Publish", &state).is_empty(),
+            host_valid,
+            "Tier-1: the complete real partition matches phase 8"
+        );
+        assert!(model.fire("Publish", &mut state));
+
+        let reversed = StartupPresentTiming::new(
+            timing.pre_present,
+            timing.frame_started,
+            timing.surface_return,
+        );
+        assert!(
+            !derive_startup_phases(milestones, reversed, published_at).valid,
+            "negative control: real out-of-order stamps must fail closed"
+        );
+
+        let attach_model = aterm_spec::derive::startup_phase_publication_model();
+        let (winit_resumed, attach_milestones, surface_ready) = attach_timeline();
+        let mut attach_state = attach_model.init_state();
+        for _ in 0..7 {
+            assert!(attach_model.fire("Step", &mut attach_state));
+        }
+        let incomplete_attach =
+            derive_startup_attach(Some(winit_resumed), Some(attach_milestones), None).valid;
+        assert_eq!(
+            !attach_model.successors("Publish", &attach_state).is_empty(),
+            incomplete_attach,
+            "Tier-1: the missing surface-ready boundary matches attach phase 7"
+        );
+        assert!(attach_model.fire("Step", &mut attach_state));
+        let complete_attach = derive_startup_attach(
+            Some(winit_resumed),
+            Some(attach_milestones),
+            Some(surface_ready),
+        )
+        .valid;
+        assert_eq!(
+            !attach_model.successors("Publish", &attach_state).is_empty(),
+            complete_attach,
+            "Tier-1: the complete attach partition matches phase 8"
+        );
+        let mut reversed_attach = attach_milestones;
+        reversed_attach.points.swap(1, 2);
+        assert!(
+            !derive_startup_attach(
+                Some(winit_resumed),
+                Some(reversed_attach),
+                Some(surface_ready),
+            )
+            .valid,
+            "negative control: an out-of-order attach stamp must fail closed"
+        );
     }
 }
 

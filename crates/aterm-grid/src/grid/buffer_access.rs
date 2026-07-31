@@ -81,12 +81,20 @@ impl BufferAccess for Grid {
             // ONE materialization for the whole line — the point of batching.
             // `Cell::is_wide_continuation` reads the cell's own flag, so this
             // needs no neighbour inference.
-            return scrollback_row(self, line)
-                .map(|row| row.cells.iter().map(crate::Cell::is_wide_continuation).collect());
+            return scrollback_row(self, line).map(|row| {
+                row.cells
+                    .iter()
+                    .map(crate::Cell::is_wide_continuation)
+                    .collect()
+            });
         }
         let row = line_to_visible_row(line)?;
         let cols = self.cols();
-        Some((0..cols).map(|c| self.is_wide_continuation_at(row, c)).collect())
+        Some(
+            (0..cols)
+                .map(|c| self.is_wide_continuation_at(row, c))
+                .collect(),
+        )
     }
 
     fn is_wide(&self, line: i32, col: u16) -> bool {

@@ -24,43 +24,11 @@ use std::sync::Arc;
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::Terminal;
 use aterm_effects::pipeline::EffectsPipeline;
-use aterm_render::{Renderer, SceneAtlas, SpriteQuad, Theme};
+use aterm_render::{SceneAtlas, SpriteQuad, Theme};
 use rain_common::RainScene;
 
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-
-fn max_channel_delta(a: &[u32], b: &[u32]) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.iter().zip(b.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
-}
-
-fn backends(px: f32, theme: Theme) -> Option<(Renderer, aterm_gpu::GpuRenderer)> {
-    let gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return None;
-        }
-    };
-    let Some(cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return None;
-    };
-    Some((cpu, gpu))
-}
+mod common;
+use common::{backends, max_channel_delta};
 
 /// A deterministic patterned RGBA atlas, tall enough for a rect spanning
 /// several cell-row bands at any realistic cell height: per-texel distinct

@@ -971,7 +971,8 @@ mod confined_video_reader {
             selected = Some((name, recording, published_marker, index_file, index));
             break;
         }
-        let Some((recording_name, recording, published_marker, index_file, index)) = selected else {
+        let Some((recording_name, recording, published_marker, index_file, index)) = selected
+        else {
             return Ok(None);
         };
 
@@ -986,18 +987,18 @@ mod confined_video_reader {
             drop(namespace);
             return Err("recording retention sweep is in progress");
         };
-        let sweep_root =
-            match crate::pinned_dir::PinnedDir::open_resolved(&namespace.instance_path) {
-                Ok(root) => root,
-                Err(_) => {
-                    drop(index_file);
-                    drop(published_marker);
-                    drop(recording);
-                    drop(namespace);
-                    drop(lease);
-                    return Err("recording namespace changed during read");
-                }
-            };
+        let sweep_root = match crate::pinned_dir::PinnedDir::open_resolved(&namespace.instance_path)
+        {
+            Ok(root) => root,
+            Err(_) => {
+                drop(index_file);
+                drop(published_marker);
+                drop(recording);
+                drop(namespace);
+                drop(lease);
+                return Err("recording namespace changed during read");
+            }
+        };
         let mut rows = Vec::new();
         for candidate in video_frame_candidates(&index) {
             let Some(frame) = open_file_at(&recording, candidate.file.as_str()) else {
@@ -1041,10 +1042,7 @@ mod confined_video_reader {
         if sweep_root.validate_path_identity().is_err()
             || !sweep_root.same_directory_fd(&namespace.instance)
             || lease
-                .arm_video_reader_sweep(
-                    sweep_root,
-                    std::ffi::OsString::from(&recording_name),
-                )
+                .arm_video_reader_sweep(sweep_root, std::ffi::OsString::from(&recording_name))
                 .is_err()
         {
             drop(rows);
@@ -2487,11 +2485,7 @@ mod video_parse_tests {
         let waiter = std::thread::spawn(move || {
             let mut cancel_on_drop = cancel_on_drop;
             done_tx
-                .send(recv_video_reply(
-                    &rx,
-                    &mut cancel_on_drop,
-                    Duration::ZERO,
-                ))
+                .send(recv_video_reply(&rx, &mut cancel_on_drop, Duration::ZERO))
                 .unwrap();
         });
         assert!(
@@ -2501,10 +2495,8 @@ mod video_parse_tests {
             ),
             "video commit winner has no second deadline while its result is pending"
         );
-        tx.send(crate::control::Retained::plain(
-            "OK video\n".to_string(),
-        ))
-        .unwrap();
+        tx.send(crate::control::Retained::plain("OK video\n".to_string()))
+            .unwrap();
         let reply = done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("committed video result completes the pending waiter")

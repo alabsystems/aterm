@@ -1935,7 +1935,7 @@ mod tests {
             &[black, black, black].concat(),
             &[black, black, green].concat(),
         ];
-        let source = padded_fixture(&[&rows[0], &rows[1], &rows[2]], 256);
+        let source = padded_fixture(&[rows[0], rows[1], rows[2]], 256);
         let (rgba, w, h) = mapped_to_rgba8(
             &source,
             3,

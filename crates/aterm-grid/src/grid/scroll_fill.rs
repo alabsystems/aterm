@@ -263,6 +263,13 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> Vec<Defe
     use crate::{CellFlags, PackedColor};
 
     let mut deferred = Vec::new();
+    // E6a: `unit_char_start` is monotone across this walk, so a run cursor reads
+    // the RLE attrs in O(runs) TOTAL instead of `get_attr`'s rescan-from-start
+    // per cell (which made the walk O(cols × runs) — the accidental attr term in
+    // the scrolled-frame cost). Same fix as `materialize_from_line`; this filler
+    // runs once per rewrapped ring-scrollback row on a width change, so the term
+    // stacks on top of the reflow walk's.
+    let mut attr_cursor = line.attr_cursor();
     let mut byte_idx: usize = 0;
     let mut char_idx: usize = 0;
     let mut col: u16 = 0;
@@ -288,7 +295,7 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> Vec<Defe
         // live cell stayed narrow there; demote to match).
         let unit = advance_grapheme_unit_wide(text, &mut byte_idx);
         let chars_consumed = unit.chars;
-        let attrs = line.get_attr(unit_char_start);
+        let attrs = attr_cursor.attr_at(unit_char_start);
         let is_wide = super::scroll_materialize::stored_unit_is_wide(unit, attrs)
             && !(unit.vs16_widened && col + 1 >= cols);
         char_idx += chars_consumed;

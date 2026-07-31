@@ -4,7 +4,9 @@
 
 //! Containment mode enum — the 4 security levels.
 //!
-//! Matches TLA+ spec `tla/Containment.tla` mode encoding:
+//! Mirrors the mode encoding of the INTENDED `tla/Containment.tla` model
+//! (not in-tree and on no build/CI path — see the crate-root note; this enum
+//! and its tests are the source of truth):
 //! Master=3, User=2, Safety=1, Containment=0.
 //! Higher value = more capability. Non-escalation means mode can
 //! only decrease or stay the same.

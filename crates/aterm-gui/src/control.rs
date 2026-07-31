@@ -2791,43 +2791,35 @@ fn await_guarded_reply_close_with_quarantine(
         aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX
     );
     let deadline = std::time::Instant::now() + ARTIFACT_ACK_TIMEOUT;
-    loop {
-        let now = std::time::Instant::now();
-        if now >= deadline
-            || stream
-                .set_read_timeout(Some(deadline.saturating_duration_since(now)))
-                .is_err()
-        {
+    let now = std::time::Instant::now();
+    if now >= deadline
+        || stream
+            .set_read_timeout(Some(deadline.saturating_duration_since(now)))
+            .is_err()
+    {
+        retention.acknowledge_failed_anchor();
+        quarantine_artifact_reply_until(retention, std::time::Instant::now() + failure_quarantine);
+        return ArtifactAckOutcome::AcknowledgementQuarantined;
+    }
+    // EXACTLY one line decides the outcome — the challenge is one-shot, so a
+    // line that is not the ACK is a failure and never a re-read: reading again
+    // would let a peer keep guessing the nonce inside one deadline. The read
+    // timeout set above bounds this single read, and `read_request_line` folds
+    // its expiry, EOF, and I/O failure alike into `None`.
+    match read_request_line(reader) {
+        Some(line) if line == expected => {
+            retention.acknowledge_peer_anchor();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            drop(retention);
+            ArtifactAckOutcome::PeerAcknowledged
+        }
+        Some(_) | None => {
             retention.acknowledge_failed_anchor();
             quarantine_artifact_reply_until(
                 retention,
                 std::time::Instant::now() + failure_quarantine,
             );
-            return ArtifactAckOutcome::AcknowledgementQuarantined;
-        }
-        match read_request_line(reader) {
-            Some(line) if line == expected => {
-                retention.acknowledge_peer_anchor();
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-                drop(retention);
-                return ArtifactAckOutcome::PeerAcknowledged;
-            }
-            Some(_) => {
-                retention.acknowledge_failed_anchor();
-                quarantine_artifact_reply_until(
-                    retention,
-                    std::time::Instant::now() + failure_quarantine,
-                );
-                return ArtifactAckOutcome::AcknowledgementQuarantined;
-            }
-            None => {
-                retention.acknowledge_failed_anchor();
-                quarantine_artifact_reply_until(
-                    retention,
-                    std::time::Instant::now() + failure_quarantine,
-                );
-                return ArtifactAckOutcome::AcknowledgementQuarantined;
-            }
+            ArtifactAckOutcome::AcknowledgementQuarantined
         }
     }
 }
@@ -2949,132 +2941,125 @@ fn serve_borrowed(
         return ServeDisposition::Close;
     }
 
-    // A folded-in verb runs first (empty tail = bare TOKEN line, just an ack).
+    // A folded-in verb runs first (empty tail = bare TOKEN line, just an ack), and
+    // runs through the SAME handler as a request line — a folded-in verb that
+    // behaved differently from the identical verb sent on its own line would be a
+    // protocol wart nobody could see from either call site.
     if let Some(verb) = inline_verb
         && !verb.is_empty()
-    {
-        // Cross-process forward (Item 5b): a `@<child-sid>` we don't host but
-        // spawned is relayed to the child's socket; this connection is then
-        // owned by the relay and never returns here.
-        if try_proxy_forward(&verb, scope, store, sock_dir, stream, &mut reader) {
-            return ServeDisposition::Close;
-        }
-        // Network drive: a folded-in `dial <name>` relays this connection over TLS
-        // to a saved remote aterm; this connection is then owned by the relay.
-        if try_net_dial(&verb, scope, stream, &mut reader) {
-            return ServeDisposition::Close;
-        }
-        // A folded-in `subscribe` flips straight to push mode (and never
-        // returns to this poll loop) the same as a request-line one. Transfer the
-        // socket to the reserved push pool so a quiet subscriber never consumes
-        // an ordinary RPC worker.
-        if is_subscribe_line(&verb) {
-            return ServeDisposition::Subscribe { line: verb, scope };
-        }
-        // A folded-in `feed-bin`/`paste-bin <n>` reads its N-byte payload from the
-        // buffered stream (same as a request-line one), then dispatches as a write verb.
-        if let Some(bin_verb) = binary_frame_verb(&verb) {
-            let mut dispatch_front_input =
-                |event| post_input_reply(proxy, Op::WriteInput, vec![event]);
-            if !run_feed_bin_routed(
-                &verb,
-                bin_verb,
-                &mut reader,
-                FeedBinRoute {
-                    active,
-                    store,
-                    scope,
-                },
-                &mut dispatch_front_input,
-                &mut writer,
-            ) {
-                return ServeDisposition::Close;
-            }
-        } else {
-            let resp = dispatch_request(
-                &verb,
-                active,
-                store,
-                subscribers,
-                scope,
-                proxy,
-                queue,
-                sock_dir,
-            );
-            match write_control_reply(&mut writer, resp) {
-                Ok(Some(retention)) => {
-                    await_guarded_reply_close(stream, &mut reader, retention);
-                    return ServeDisposition::Close;
-                }
-                Ok(None) => {}
-                Err(_) => return ServeDisposition::Close,
-            }
-        }
-    }
-
-    while let Some(line) = read_authenticated_request_line(&mut reader) {
-        // Cross-process forward (Item 5b): relay a `@<child-sid>` we spawned but
-        // don't host to the child's socket; the relay then owns the connection.
-        if try_proxy_forward(&line, scope, store, sock_dir, stream, &mut reader) {
-            return ServeDisposition::Close;
-        }
-        // Network drive: `dial <name>` relays this connection over TLS to a saved
-        // remote aterm; the relay then owns the connection.
-        if try_net_dial(&line, scope, stream, &mut reader) {
-            return ServeDisposition::Close;
-        }
-        // PUSH FLIP: `subscribe` authorizes its targets EXACTLY like a read verb,
-        // then this connection becomes push-only (never reads another line). On an
-        // auth/parse failure `run_subscribe` writes a single `ERR ...` and returns,
-        // and we close the connection (a half-subscribed connection is meaningless).
-        if is_subscribe_line(&line) {
-            return ServeDisposition::Subscribe { line, scope };
-        }
-        // BINARY FRAME: `feed-bin`/`paste-bin <n>` consumes the following N raw bytes
-        // from the SAME buffered stream and feeds them to the resolved target's PTY —
-        // the length-prefixed (vs hex) wire form. `feed-bin` writes raw; `paste-bin`
-        // applies paste semantics. Both authorize EXACTLY like `feed` (WriteInput) via
-        // the normal `@<selector>` + op gate inside `run_feed_bin`.
-        if let Some(bin_verb) = binary_frame_verb(&line) {
-            let mut dispatch_front_input =
-                |event| post_input_reply(proxy, Op::WriteInput, vec![event]);
-            if !run_feed_bin_routed(
-                &line,
-                bin_verb,
-                &mut reader,
-                FeedBinRoute {
-                    active,
-                    store,
-                    scope,
-                },
-                &mut dispatch_front_input,
-                &mut writer,
-            ) {
-                break;
-            }
-            continue;
-        }
-        let resp = dispatch_request(
-            &line,
+        && let Some(disposition) = serve_request_line(
+            verb,
+            scope,
+            stream,
+            &mut reader,
+            &mut writer,
             active,
             store,
             subscribers,
-            scope,
             proxy,
             queue,
             sock_dir,
-        );
-        // A dead client (broken pipe) must not crash the app — just drop it.
-        match write_control_reply(&mut writer, resp) {
-            Ok(Some(retention)) => {
-                await_guarded_reply_close(stream, &mut reader, retention);
-                return ServeDisposition::Close;
-            }
-            Ok(None) => {}
-            Err(_) => break,
+        )
+    {
+        return disposition;
+    }
+
+    while let Some(line) = read_authenticated_request_line(&mut reader) {
+        if let Some(disposition) = serve_request_line(
+            line,
+            scope,
+            stream,
+            &mut reader,
+            &mut writer,
+            active,
+            store,
+            subscribers,
+            proxy,
+            queue,
+            sock_dir,
+        ) {
+            return disposition;
         }
     }
     ServeDisposition::Close
+}
+
+/// Handle ONE authenticated request, whether it arrived folded into the `TOKEN`
+/// handshake line or on its own line in the polling loop.
+///
+/// `None` = handled, keep polling. `Some(disposition)` ends this lane exactly as
+/// the caller's own `return` did. Both callers ran this identical sequence —
+/// proxy forward, TLS dial, subscribe flip, binary frame, dispatch+reply — and
+/// keeping two copies meant a new early-exit verb had to be added to both, with
+/// nothing to catch it if only one was.
+#[allow(clippy::too_many_arguments)]
+fn serve_request_line(
+    line: String,
+    scope: Scope,
+    stream: &CtlStream,
+    reader: &mut BufReader<&CtlStream>,
+    writer: &mut &CtlStream,
+    active: &ActiveHandle,
+    store: &Store,
+    subscribers: &Subscribers,
+    proxy: &EventLoopProxy<Wake>,
+    queue: &ImageQueue,
+    sock_dir: &std::path::Path,
+) -> Option<ServeDisposition> {
+    // Cross-process forward (Item 5b): relay a `@<child-sid>` we spawned but
+    // don't host to the child's socket; the relay then owns the connection.
+    if try_proxy_forward(&line, scope, store, sock_dir, stream, reader) {
+        return Some(ServeDisposition::Close);
+    }
+    // Network drive: `dial <name>` relays this connection over TLS to a saved
+    // remote aterm; the relay then owns the connection.
+    if try_net_dial(&line, scope, stream, reader) {
+        return Some(ServeDisposition::Close);
+    }
+    // PUSH FLIP: `subscribe` authorizes its targets EXACTLY like a read verb,
+    // then this connection becomes push-only (never reads another line). On an
+    // auth/parse failure `run_subscribe` writes a single `ERR ...` and returns,
+    // and we close the connection (a half-subscribed connection is meaningless).
+    // Transferred to the reserved push pool so a quiet subscriber never consumes
+    // an ordinary RPC worker.
+    if is_subscribe_line(&line) {
+        return Some(ServeDisposition::Subscribe { line, scope });
+    }
+    // BINARY FRAME: `feed-bin`/`paste-bin <n>` consumes the following N raw bytes
+    // from the SAME buffered stream and feeds them to the resolved target's PTY —
+    // the length-prefixed (vs hex) wire form. `feed-bin` writes raw; `paste-bin`
+    // applies paste semantics. Both authorize EXACTLY like `feed` (WriteInput) via
+    // the normal `@<selector>` + op gate inside `run_feed_bin`.
+    if let Some(bin_verb) = binary_frame_verb(&line) {
+        let mut dispatch_front_input = |event| post_input_reply(proxy, Op::WriteInput, vec![event]);
+        if !run_feed_bin_routed(
+            &line,
+            bin_verb,
+            reader,
+            FeedBinRoute {
+                active,
+                store,
+                scope,
+            },
+            &mut dispatch_front_input,
+            writer,
+        ) {
+            return Some(ServeDisposition::Close);
+        }
+        return None;
+    }
+    let resp = dispatch_request(
+        &line, active, store, subscribers, scope, proxy, queue, sock_dir,
+    );
+    // A dead client (broken pipe) must not crash the app — just drop it.
+    match write_control_reply(writer, resp) {
+        Ok(Some(retention)) => {
+            await_guarded_reply_close(stream, reader, retention);
+            Some(ServeDisposition::Close)
+        }
+        Ok(None) => None,
+        Err(_) => Some(ServeDisposition::Close),
+    }
 }
 
 /// Read one newline-delimited request line from the buffered control stream,

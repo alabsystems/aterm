@@ -13,8 +13,11 @@
 // Gated: no GPU / font -> skip cleanly.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{Frame, LigatureMode, Renderer, TextShapingConfig, Theme};
+use aterm_render::{LigatureMode, TextShapingConfig, Theme};
 use aterm_types::text_shaping::{FontFeature, FontFeatureSet};
+
+mod common;
+use common::{backends, max_channel_delta_frame as max_channel_delta};
 
 // Layout-independent ligature font discovery (mirrors ligature_parity.rs): the
 // bundled JetBrains Mono ligates `=>` and carries a `zero` (slashed-zero) feature.
@@ -53,35 +56,15 @@ fn ligature_test_font() -> Option<(&'static std::path::Path, bool)> {
                 (p, true)
             }
         };
-        // SAFETY: set exactly once per process (OnceLock init), before any renderer
-        // is constructed — every concurrent caller is parked in get_or_init until
-        // this write completes, so no getenv can observe it mid-mutation. (set_var
-        // is unsafe in edition 2024.)
-        unsafe { std::env::set_var("ATERM_FONT", &found) };
+        // Set exactly once per process (OnceLock init), before any renderer is
+        // constructed — every concurrent caller is parked in get_or_init until this
+        // write completes, so no getenv can observe it mid-mutation — and routed
+        // through the workspace's one lock-scoped env helper.
+        aterm_log::env::set("ATERM_FONT", &found);
         Some((found, is_fixture))
     })
     .as_ref()
     .map(|(p, is_fixture)| (p.as_path(), *is_fixture))
-}
-
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-
-fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.pixels.iter().zip(b.pixels.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
 }
 
 /// A live ligature on->off flip via `set_text_shaping` reaches GPU pixels and keeps
@@ -99,15 +82,7 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
         return;
     }
 
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
 
@@ -174,15 +149,7 @@ fn live_font_feature_flip_reaches_gpu_pixels() {
         return;
     };
 
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
-    };
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
 

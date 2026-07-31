@@ -122,15 +122,30 @@ impl AtermGpuTerminal {
         // Read-only display projection — never a byte producer.
         let no_echo =
             self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo();
+        // `reconcile` probes once per retired guess plus the head, and the
+        // predictor is a same-row model — so the allocating `render_row` would
+        // rebuild the identical row (fresh Vec + full colour/decoration resolve
+        // over every column) N times per call to read N single chars. Memoize
+        // by row into the resident scratch and refill it in place with
+        // `render_row_into`, which IS `render_row`'s one code path (and clears
+        // `out` itself), so observations are unchanged. This is the fix
+        // aterm-gui already carries; the wasm binding never received it.
+        let mut scratch = std::mem::take(&mut self.pred_row_scratch);
+        let mut cached: Option<u16> = None;
         let (term, predict) = (&self.term, &mut self.predict);
         predict.reconcile(Some((cur.row, cur.col)), no_echo, now, |r, c| {
+            if cached != Some(r) {
+                term.render_row_into(r as usize, &mut scratch);
+                cached = Some(r);
+            }
             // The native observe: the cell's glyph, with blank/space mapped to
             // None (a typed space confirms by cursor advance instead).
-            term.render_row(r as usize)
+            scratch
                 .get(c as usize)
                 .map(|cell| cell.ch)
                 .filter(|ch| *ch != ' ')
         });
+        self.pred_row_scratch = scratch;
     }
 
     /// The ghost cells to paint THIS frame, as flat `[row, col, codepoint]`

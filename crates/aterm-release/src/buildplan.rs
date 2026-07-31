@@ -276,8 +276,9 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
     if !compiler_line.contains("\u{00b7} trust \u{00b7}") {
         return Err(format!(
             "compiler provenance gate: the native slice reports {compiler_line:?} — not a \
-             Trust-flavor build. The repo compiles with Trust always (rust-toolchain.toml); \
-             restore the rustup `trust` toolchain link ($HOME/trust/build/host/stage2) and recut"
+             Trust-flavor build. The repo compiles with Trust always; the native lane must \
+             have been driven by something other than the stage2 targo/trustc (stale env, \
+             wrong TRUST_STAGE2_BIN?). Fix the toolchain resolution and recut"
         ));
     }
     println!("    compiler: {compiler_line}  (Trust provenance gate passed)");
@@ -299,23 +300,50 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
 /// operator needs cargo's own progress; on failure cargo has already printed
 /// the errors, so the returned Err only names the step.
 fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), String> {
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(&plan.repo_root)
-        .args(["build", "--release", "--locked", "-p", pkg]);
+    // The build driver, per lane. Native slice: `targo` from the Trust stage2
+    // tool dir — never a PATH `cargo`, which since the stock-name purge is a
+    // rustup shim the repo's toolchain pin can no longer satisfy. Compat
+    // slice: upstream stable's `cargo` via the rustup shim — the ONE
+    // deliberately stock lane (Trust has no x86_64-apple-darwin std).
+    let driver: (PathBuf, &'static str) = if target.is_some() {
+        (PathBuf::from("cargo"), "cargo")
+    } else {
+        let stage2 = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
+        (stage2.join("targo"), "targo")
+    };
+    let (driver_path, driver_name) = driver;
+    let mut cmd = Command::new(&driver_path);
+    cmd.current_dir(&plan.repo_root);
+    // targo refuses a bare verb: every artifact is EXPLICITLY verified
+    // (`targo trust build`) or explicitly not (`--unverified`). The workspace
+    // rides the unverified lane until the Trust-Std campaign greens — the
+    // same statement .cargo/config.toml's off-switch makes, now visible in
+    // the invocation. The compat slice's cargo has no such flag.
+    if target.is_none() {
+        cmd.arg("--unverified");
+    }
+    cmd.args(["build", "--release", "--locked", "-p", pkg]);
     if let Some(triple) = target {
         cmd.args(["--target", triple]);
     }
 
-    // Prefer the rustup-managed toolchain: only rustup can supply the other
-    // Apple arch's std, so ~/.cargo/bin must be first for `cargo` to resolve
-    // to the rustup shim (port of build-app.sh's PATH preference; no-op when
-    // rustup isn't installed).
-    if let Some(home) = std::env::var_os("HOME") {
-        let shim = Path::new(&home).join(".cargo/bin");
-        if shim.join("rustup").is_file() {
-            let old = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", format!("{}:{}", shim.display(), old));
+    // Toolchain PATH, per lane. Native: the Trust stage2 bin dir first, so
+    // targo resolves its co-located trustc/trustdoc (the physical dir —
+    // protected Trust drivers refuse symlinked toolchain paths). Compat:
+    // ~/.cargo/bin first so `cargo` resolves to the rustup shim and the
+    // RUSTUP_TOOLCHAIN=stable below picks the toolchain that carries the
+    // other Apple arch's std (port of build-app.sh's PATH preference; no-op
+    // when rustup isn't installed).
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    if target.is_some() {
+        if let Some(home) = std::env::var_os("HOME") {
+            let shim = Path::new(&home).join(".cargo/bin");
+            if shim.join("rustup").is_file() {
+                cmd.env("PATH", format!("{}:{}", shim.display(), old_path));
+            }
         }
+    } else if let Some(bin_dir) = driver_path.parent() {
+        cmd.env("PATH", format!("{}:{}", bin_dir.display(), old_path));
     }
 
     // THE build-number conduit (spec §2 propagation): build.rs reads
@@ -340,13 +368,14 @@ fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), St
         cmd.env(k, v);
     }
 
-    // Lane env. Native slice: NOTHING — rust-toolchain.toml supplies the
-    // Trust compiler and .cargo/config.toml the verification opt-out; adding
-    // env here would create a second, undocumented lane. Compat slice:
-    // RUSTUP_TOOLCHAIN=stable overrides the toolchain file (Trust has no
-    // x86_64 std), and inherited RUSTC/RUSTC_BOOTSTRAP/RUSTFLAGS are scrubbed
-    // on BOTH lanes — a release cutter must not be steerable by stale shell
-    // state (same rule as the CARGO_PROFILE pins above).
+    // Lane env. Native slice: NOTHING beyond the driver itself — the resolved
+    // targo supplies trustc and .cargo/config.toml (which targo reads, same
+    // discovery as cargo) the verification opt-out; adding env here would
+    // create a second, undocumented lane. Compat slice: RUSTUP_TOOLCHAIN=stable
+    // overrides the toolchain file (Trust has no x86_64 std), and inherited
+    // RUSTC/RUSTC_BOOTSTRAP/RUSTFLAGS are scrubbed on BOTH lanes — a release
+    // cutter must not be steerable by stale shell state (same rule as the
+    // CARGO_PROFILE pins above).
     cmd.env_remove("RUSTC")
         .env_remove("RUSTC_BOOTSTRAP")
         .env_remove("RUSTFLAGS")
@@ -364,17 +393,17 @@ fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), St
     };
 
     println!(
-        "==> cargo build --release {}-p {pkg}  [{lane}]",
+        "==> {driver_name} build --release {}-p {pkg}  [{lane}]",
         target.map(|t| format!("--target {t} ")).unwrap_or_default()
     );
     let status = cmd
         .stdin(std::process::Stdio::null())
         .status()
-        .map_err(|e| format!("spawn cargo for {pkg}: {e}"))?;
+        .map_err(|e| format!("spawn {driver_name} for {pkg}: {e}"))?;
     if !status.success() {
         // Hard error (release cutter): a warn-and-skip would let a release
         // ship with a missing slice or missing atpkg/aterm-ctl/aterm-cli.
-        return Err(format!("cargo build -p {pkg} failed ({status})"));
+        return Err(format!("{driver_name} build -p {pkg} failed ({status})"));
     }
     Ok(())
 }

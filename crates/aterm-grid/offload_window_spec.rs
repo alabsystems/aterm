@@ -18,6 +18,28 @@
 //                      state (window output discarded BY DESIGN when no replacement
 //                      exists — loss is accepted on abort, rather than wedging)
 //
+// NOT IN THIS ALPHABET — the honest scope line, and the one every invariant below
+// inherits: a RESIZE that lands while the window is open. It is reachable, and by
+// design: once the store is out, `resize_offloading_scrollback` detaches nothing and
+// returns `None`, so a further resize is a plain `Grid::resize` running with
+// `scrollback_detached_for_reflow == true` (see the "width re-resize while stashed"
+// note in `aterm-wasm`'s `resize`, and `cross_resize` in aterm-gui, which rewraps
+// off-lock while main/PTY keep taking the same `term` mutex). Such a resize SHEDS
+// rows straight into `lazy_buffer` with NO PTY scroll-off:
+//   reflow.rs:391 / :425        height shrink — front/back ring rows, gated on
+//                               `scrollback.is_some() || detached_for_reflow`
+//   reflow.rs:622               viewport overflow in `finalize_reflow` — UNGATED, so
+//                               it also fires in the resize that OPENS the window,
+//                               i.e. the real grid can ENTER the window with rows
+//                               already staged (measured: 9 on a 10x80 grid of
+//                               wrapped lines, before any Produce)
+//   scrollback_reflow.rs:137    rewrapped-ring overflow past `max_scrollback` — gated
+//                               ON the detach flag, so it fires ONLY inside a window
+// (measured: a bare height shrink inside an open window stages 14 rows at
+// produced == 0.) Adding a resize step to this alphabet is a MODEL CHANGE that must
+// be made together with the `StagedWithinProduced` note below — a counterexample
+// produced by adding it naively is a modeling artifact, not a code bug.
+//
 // Invariants (found by the adversarial audit; L1 history-integrity class):
 //   NoLoss            (bug B): on a clean Reattach OR replacement-backed Abort,
 //                     every line produced during the window is SAFE — still staged
@@ -27,6 +49,11 @@
 //                     the window is open or after a backend-less Abort, 0 after a
 //                     clean Reattach/replacement Abort — exact whenever a backend can
 //                     preserve output, honestly waived only when the worker/store died.
+//   StagedWithinProduced (bug C through the staging buffer): the staging buffer never
+//                     holds MORE than the window has produced since the last erase.
+//                     SCOPED to this alphabet — it is not a claim about the real
+//                     `lazy_buffer` vs PTY scroll-off; read its note at the invariant
+//                     itself before deriving anything from it.
 //   ErasedStaysErased (bug C): an erase during the window is never resurrected.
 //   PendingIffUnresolved: the detach-time settings snapshot exists for exactly the
 //                        unresolved window and is consumed by Reattach/Abort.
@@ -251,6 +278,40 @@ fn offload_window_model() -> Model {
             // Reattach may leave safe rows staged or drain them in the full-verbatim
             // production body. A discard in place of that transfer breaks the sum.
             invariant NoLoss: produced <= retained + relocated + slack;
+            // The LOWER bound `NoLoss` structurally cannot state (it bounds
+            // `produced` from ABOVE, so a LARGER `retained` only makes it easier to
+            // satisfy): over THIS alphabet the staging buffer holds exactly the rows
+            // produced since the last erase, so it can never hold MORE. Every action
+            // that resets the produced debt (`Erase`) or hands the staged rows on
+            // (`AttachReplacement`, `Abort`) must empty the buffer in the SAME step.
+            // An erase that bumps the clear generation but leaves the staged rows in
+            // `lazy_buffer` breaks this — those rows are ERASED history a later drain
+            // re-enters into the store, and they are invisible to `NoLoss`.
+            //
+            // SCOPE — TRUE STATEMENT, read it before deriving from this. It holds
+            // over every state reachable by the actions above, and NOT over every
+            // production-reachable detach-window state. It is NOT the claim that the
+            // real `lazy_buffer` never exceeds the window's PTY scroll-off count:
+            // that claim is FALSE, because resize/reflow shedding stages rows with no
+            // `Produce` (four sites, with file:line and measured counts, under "NOT
+            // IN THIS ALPHABET" in the file header — one of them can even stage rows
+            // during the resize that OPENS the window, so the real grid may enter at
+            // `retained > 0 == produced`). b71e02c8's commit message called this "one
+            // the real code has always guaranteed"; that sentence overclaims and this
+            // note supersedes it. What is actually guaranteed is the abstraction:
+            // `produced` counts rows that entered the window's staging OBLIGATION,
+            // and `Produce` is the only action here that creates one. Two rules follow:
+            //   * NEVER lower this to a runtime `debug_assert!` on
+            //     `lazy_buffer.len()`. It would fire on a height shrink during a
+            //     reflow window — which is the audit-bug-B FIX doing its job, not a
+            //     defect.
+            //   * A resize/shed action added later MUST be Produce-LIKE: it increments
+            //     `produced` AND `retained` in the same step, because a shed row
+            //     carries the identical preserve-to-history obligation (that is also
+            //     what keeps `NoLoss` honest about it). One that bumps only `retained`
+            //     makes ty refute this invariant, and the gate would then prescribe
+            //     deleting a real fix.
+            invariant StagedWithinProduced: retained <= produced;
             invariant ErasedStaysErased: resurrected <= 0;
             // The window CLOSES: detached and done are never both set. This is the
             // invariant the abort-wedge violates at the MODEL level (an Abort that

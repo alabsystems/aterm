@@ -296,6 +296,20 @@ impl<T> SplitTree<T> {
         }
     }
 
+    /// Allocation-free, short-circuiting twin of `leaves().into_iter().any(..)`: same
+    /// left-to-right leaf order as [`Self::visit`], stops at the first match.
+    ///
+    /// PERF: `leaves()` costs a `len()` recursion plus a heap `Vec` — even for a lone leaf —
+    /// which is pure waste when the caller only wants a bool. The predicates on the wake and
+    /// present paths (`active_tab_displays_session`, `active_tab_contains_native`) run at the PTY
+    /// reader's batch rate, i.e. thousands of times a second under a flood, so they use this.
+    pub(crate) fn any_leaf(&self, pred: &mut impl FnMut(&T) -> bool) -> bool {
+        match self {
+            Self::Leaf(value) => pred(value),
+            Self::Split { first, second, .. } => first.any_leaf(pred) || second.any_leaf(pred),
+        }
+    }
+
     /// Preserve split structure/ratios while projecting leaf payloads into a
     /// different identity domain (terminal compatibility mirror ↔ stable view).
     #[must_use]
@@ -2072,6 +2086,47 @@ mod tests {
         dangling.insert("focused", dangling["leaf_count"]);
         assert_eq!(admits(&model, &split_twice, &dangling), None);
         assert!(!model.check_invariant("FocusInRange", &dangling));
+    }
+
+    /// `any_leaf` replaces `leaves().into_iter().any(..)` on the wake/present paths, so it
+    /// has to agree with it on EVERY leaf of a nested tree — including the short-circuit
+    /// point, which is what makes the two orderings observationally the same.
+    ///
+    /// The reference side is spelled `leaves.contains(&probe)`: for a slice that IS
+    /// `iter().any(|leaf| leaf == &probe)` by definition, so it is the same oracle written
+    /// the way the standard library wants an equality search written.
+    #[test]
+    fn any_leaf_agrees_with_leaves_any_and_stops_at_the_first_match() {
+        let (_, views) = view_store_with(3);
+        let mut tab = Tab::new(
+            TabId::from_stored(1),
+            views[0],
+            TabPresentation::terminal("one"),
+        );
+        assert!(tab.split_focused(SplitAxis::Horizontal, views[1]));
+        assert!(tab.split_focused(SplitAxis::Vertical, views[2]));
+        let leaves = tab.root.leaves();
+        assert_eq!(leaves.len(), 3, "a nested three-pane tree, not a lone leaf");
+
+        for probe in views.iter().copied().chain([ViewId::from_stored(9999)]) {
+            assert_eq!(
+                tab.root.any_leaf(&mut |view| *view == probe),
+                leaves.contains(&probe),
+                "any_leaf disagrees with leaves().contains() on {probe}"
+            );
+        }
+
+        // Short-circuit: a predicate true for the FIRST visited leaf must not visit a second.
+        let mut seen = Vec::new();
+        assert!(tab.root.any_leaf(&mut |view| {
+            seen.push(*view);
+            true
+        }));
+        assert_eq!(
+            seen,
+            leaves[..1],
+            "stopped at the first match, in visit order"
+        );
     }
 
     #[test]

@@ -114,6 +114,16 @@ fn validate_override(requested: &Path) -> Option<PathBuf> {
         .then(|| canon.join(file_name))
 }
 
+// The two wrappers below — and the lexical-absolutization helper they share —
+// have no production caller left: the snapshot writer now pins the directory
+// itself and keeps the handle across the whole PNG/.txt/.done generation
+// (`app_introspect::begin_snapshot_generation`), so it cannot re-derive the
+// parent per file. They are kept, compiled for the TEST build only, because
+// they are the smallest harness that drives the pinned-writer contract this
+// module depends on end to end: `0600` on creation, mode re-tightened on
+// overwrite, `O_NOFOLLOW` on the final component, and single-component names.
+// Shipping them would be unreachable code in the binary.
+#[cfg(test)]
 fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     let source = if path.is_absolute() {
         path.to_path_buf()
@@ -143,6 +153,7 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
 /// Compatibility wrapper around the retained-handle writer. The directory and
 /// exact final file remain pinned until durable write and identity validation
 /// have both completed.
+#[cfg(test)]
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
@@ -161,6 +172,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Compatibility wrapper for a single child of an already-authorized
 /// directory. All mutation is relative to a retained directory handle.
+#[cfg(test)]
 pub fn write_private_at(
     dir: &Path,
     file_name: &std::ffi::OsString,

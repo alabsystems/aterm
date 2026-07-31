@@ -235,41 +235,36 @@ fn hyperlinks_size_v3(data: &[u8], base_size: usize) -> Option<usize> {
 /// never clip a LEGITIMATE block — it only rejects a crafted over-count one.
 pub(crate) const MAX_DECODE_PAGE_LINES: usize = 1 << 20;
 
-/// Deserialize multiple lines from a block, capped at `max_lines` reconstructed
-/// lines. See [`MAX_DECODE_PAGE_LINES`] for why the disk decode path needs this and
-/// why the checkpoint path must NOT be capped.
-#[must_use]
+/// Walk the framed records of a serialized block, offering each COMPLETE record's
+/// bytes to `accept`.
+///
+/// The single framing loop of this module: [`deserialize_lines_capped`] accepts
+/// with `Line::deserialize` (pushing the reconstructed line),
+/// [`count_page_lines`] accepts with `Line::record_is_valid` (counting only).
+/// Factoring it means the two cannot disagree about where records begin or which
+/// ones are complete — the property the cold tier's validation depends on.
+///
+/// `accept` returns whether the record decoded; the walk stops after `max_lines`
+/// ACCEPTED records (the memory-amplification cap), once the header's declared
+/// `count` is reached, or at the first misframed record. Returns the accepted
+/// count and the offset the walk stopped at (the truncation warn needs both).
 // Skip: the block decode reader's guarded slice walk — the SliceBoundsCheck /
 // decode-reader class its per-line siblings carry. Round-trip tested; the
-// max_lines cap bounds the reservation (memory-amplification guard).
+// max_lines cap bounds the accepted count (memory-amplification guard).
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn deserialize_lines_capped(data: &[u8], max_lines: usize) -> Vec<Line> {
-    if data.len() < 4 {
-        return Vec::new();
-    }
-
-    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    // Clamp pre-allocation to what the data can actually contain.
-    // Minimum serialized line is 5 bytes (v0: flags + content_len + empty content).
-    let max_possible = data.len().saturating_sub(4) / 5;
-    // Additionally cap the INITIAL reservation. `count` is untrusted (up to
-    // u32::MAX) and `max_possible` is only a loose bound — for a ~64 MiB page it
-    // is ~13M line slots, i.e. hundreds of MiB of `Line` structs. A crafted page
-    // can inflate `count` while containing only a few real records, so reserving
-    // `count` up front is a memory-amplification vector; worse, once such a Vec is
-    // retained in the DiskColdTier page cache its spare capacity is pinned but NOT
-    // counted by page_byte_size (which measures len), silently defeating
-    // cache_byte_limit. Cap the initial reservation to comfortably exceed any
-    // legitimate page (a cold page is one warm block, <= warm_limit ≈ 10K lines by
-    // default) and let the Vec grow from real pushes.
-    const MAX_PREALLOC_LINES: usize = 16_384;
-    let mut lines = Vec::with_capacity(count.min(max_possible).min(MAX_PREALLOC_LINES));
+fn walk_records(
+    data: &[u8],
+    count: usize,
+    max_lines: usize,
+    mut accept: impl FnMut(&[u8]) -> bool,
+) -> (usize, usize) {
+    let mut accepted = 0usize;
     let mut offset = 4;
 
-    // The TOTAL pushed count is bounded by `max_lines`, not just the reservation —
-    // otherwise a crafted block of ~5-byte records reconstructs millions of `Line`
-    // structs regardless of the reservation cap (memory-amplification DoS).
-    while offset < data.len() && lines.len() < count && lines.len() < max_lines {
+    // The TOTAL accepted count is bounded by `max_lines`, not just the reservation
+    // — otherwise a crafted block of ~5-byte records reconstructs millions of
+    // `Line` structs regardless of the reservation cap (memory-amplification DoS).
+    while offset < data.len() && accepted < count && accepted < max_lines {
         let Some(&version) = data.get(offset) else {
             break;
         };
@@ -297,11 +292,96 @@ pub fn deserialize_lines_capped(data: &[u8], max_lines: usize) -> Vec<Line> {
             break;
         };
 
-        if let Some(line) = Line::deserialize(record_bytes) {
-            lines.push(line);
+        if accept(record_bytes) {
+            // Bounded by `max_lines` (the loop guard); saturation is dead code
+            // carrying the no-overflow proof.
+            accepted = accepted.saturating_add(1);
         }
         offset = line_end;
     }
+
+    (accepted, offset)
+}
+
+/// Read a block's declared line count (the 4-byte header), or `None` when the
+/// buffer is too short to hold one.
+fn declared_count(data: &[u8]) -> Option<usize> {
+    let header = data.get(..4)?;
+    if header.len() < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize)
+}
+
+/// Count the records of a serialized block that [`Line::deserialize`] would
+/// accept, WITHOUT reconstructing any of them (capped like
+/// [`deserialize_lines_capped`]).
+///
+/// The warm→cold eviction path re-compresses the decompressed page bytes
+/// verbatim, so all it needs from them is the framing check
+/// `deserialize_page_lines(..).len()` used to provide — not the `Vec<Line>` that
+/// check built and dropped. At the default tier limits an eviction fires once per
+/// 100 pushed lines, so that materialization amortized to a full `Line`
+/// construct+destruct (heap content copy, boxed attrs `Rle`, boxed hyperlink
+/// `SmallVec`) for EVERY line aging out of the warm tier, on the output thread.
+///
+/// Same framing walk and same acceptance predicate as the real decode — see
+/// [`walk_records`] and `Line::record_is_valid`. Deliberately silent: the
+/// truncation warn belongs to the decoder that truncates.
+#[must_use]
+pub(crate) fn count_page_lines(data: &[u8], max_lines: usize) -> usize {
+    let Some(count) = declared_count(data) else {
+        return 0;
+    };
+    let (accepted, _offset) = walk_records(data, count, max_lines, Line::record_is_valid);
+    accepted
+}
+
+/// Deserialize multiple lines from a block, capped at `max_lines` reconstructed
+/// lines. See [`MAX_DECODE_PAGE_LINES`] for why the disk decode path needs this and
+/// why the checkpoint path must NOT be capped.
+#[must_use]
+// Skip: the block decode reader's guarded slice walk — the SliceBoundsCheck /
+// decode-reader class its per-line siblings carry. Round-trip tested; the
+// max_lines cap bounds the reservation (memory-amplification guard).
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn deserialize_lines_capped(data: &[u8], max_lines: usize) -> Vec<Line> {
+    let Some(count) = declared_count(data) else {
+        return Vec::new();
+    };
+    // Clamp pre-allocation to what the data can actually contain.
+    // Minimum serialized line is 5 bytes (v0: flags + content_len + empty content).
+    let max_possible = data.len().saturating_sub(4) / 5;
+    // Additionally cap the INITIAL reservation. `count` is untrusted (up to
+    // u32::MAX) and `max_possible` is only a loose bound — for a ~64 MiB page it
+    // is ~13M line slots, i.e. hundreds of MiB of `Line` structs. A crafted page
+    // can inflate `count` while containing only a few real records, so reserving
+    // `count` up front is a memory-amplification vector; worse, once such a Vec is
+    // retained in the DiskColdTier page cache its spare capacity is pinned but NOT
+    // counted by page_byte_size (which measures len), silently defeating
+    // cache_byte_limit. Cap the initial reservation to comfortably exceed any
+    // legitimate page (a cold page is one warm block, <= warm_limit ≈ 10K lines by
+    // default) and let the Vec grow from real pushes.
+    const MAX_PREALLOC_LINES: usize = 16_384;
+    let mut lines = Vec::with_capacity(count.min(max_possible).min(MAX_PREALLOC_LINES));
+
+    let (_accepted, offset) = walk_records(data, count, max_lines, |record_bytes| {
+        let decoded = Line::deserialize(record_bytes);
+        // Pin the cheap acceptance predicate to the real decoder on every
+        // record any block decode walks: `count_page_lines` (the cold-tier
+        // validation) trusts them to agree.
+        debug_assert_eq!(
+            decoded.is_some(),
+            Line::record_is_valid(record_bytes),
+            "record_is_valid must mirror Line::deserialize exactly"
+        );
+        if let Some(line) = decoded {
+            lines.push(line);
+            true
+        } else {
+            false
+        }
+    });
 
     if lines.len() >= max_lines && offset < data.len() {
         // Pre-composed message via the log shim: identical rendered record,

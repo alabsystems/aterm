@@ -4,10 +4,13 @@
 
 //! Containment policy — maps mode to allowed capabilities.
 //!
-//! The policy functions here match the TLA+ spec `tla/Containment.tla`
-//! `PolicyNetwork`, `PolicyFs`, `PolicyProcess`, `PolicyMcp`,
-//! `PolicyPlugins`, `PolicyOutput`, `PolicyInput`, and `PolicyCommand`
-//! operators exactly.
+//! The policy functions here mirror the operators of the INTENDED
+//! `tla/Containment.tla` model (`PolicyNetwork`, `PolicyFs`, `PolicyProcess`,
+//! `PolicyMcp`, `PolicyPlugins`, `PolicyOutput`, `PolicyInput`,
+//! `PolicyCommand`). That model is NOT in-tree and is on no build/CI path
+//! (see the crate-root note); these functions and the tests below are the
+//! source of truth. The `TLA+:` tags on each function name the corresponding
+//! operator in that intended model — they are naming, not a discharged proof.
 
 use crate::capability::{
     CommandCapability, FsCapability, InputCapability, McpCapability, NetworkCapability,
@@ -46,8 +49,10 @@ pub struct Capabilities {
 /// All policy functions are pure (no state) and `const`-evaluable.
 ///
 /// The policy is defined once and is immutable — it encodes the security
-/// contract between the launcher and aterm. The Rust implementation must
-/// match the TLA+ specification.
+/// contract between the launcher and aterm. This Rust implementation IS the
+/// specification: the intended `tla/Containment.tla` model is not in-tree, so
+/// nothing cross-checks these functions except the tests in this module and
+/// the opt-in, `#[cfg(kani)]`-gated `kani_proofs` harnesses.
 #[derive(Debug, Clone, Copy)]
 pub struct ContainmentPolicy;
 
@@ -192,9 +197,11 @@ impl ContainmentPolicy {
 mod tests {
     use super::*;
 
-    /// Verify all policy mappings match the TLA+ spec table exactly.
+    /// Verify all policy mappings match the intended policy table exactly.
     ///
-    /// TLA+ Containment.tla policy table:
+    /// Policy table (named after the intended `tla/Containment.tla` model,
+    /// which is not in-tree — this table and these assertions are the
+    /// authority):
     /// | Mode        | Net       | Fs        | Proc      | MCP       | Plug      | Out          | In        |
     /// |-------------|-----------|-----------|-----------|-----------|-----------|--------------|-----------|
     /// | Master(3)   | Full(2)   | Full(3)   | Full(2)   | Full(2)   | Full(2)   | Unmodified(2)| Unmod(2)  |
@@ -306,13 +313,15 @@ mod tests {
         assert_eq!(c.command as u8, 0, "Containment command = NoCommands");
     }
 
-    /// Exhaustive numeric cross-check against TLA+ Containment.tla policy table.
+    /// Exhaustive numeric cross-check against the policy table this crate
+    /// implements (named after the intended `tla/Containment.tla` model, which
+    /// is NOT in-tree — see the crate-root note).
     ///
-    /// Encodes the exact TLA+ numeric values as raw u8 constants and verifies
-    /// each Rust policy function returns the matching capability. This catches
-    /// any drift between the TLA+ spec and the Rust implementation.
+    /// Encodes the intended numeric values as raw u8 constants and verifies
+    /// each Rust policy function returns the matching capability, catching any
+    /// drift between the documented encoding and the Rust implementation.
     ///
-    /// TLA+ encoding reference (Containment.tla lines 54-95):
+    /// Numeric encoding reference:
     ///   Network: None=0, Allowlist=1, Full=2
     ///   Fs:      TmpOnly=0, ProjectRW=1, HomeRW=2, Full=3
     ///   Process: NoFork=0, Restricted=1, Full=2

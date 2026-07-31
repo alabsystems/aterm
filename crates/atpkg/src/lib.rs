@@ -47,6 +47,7 @@
 pub mod activate;
 pub mod appgate;
 pub mod apply;
+pub mod bundled;
 pub mod cache;
 /// The `atpkg` CLI (all verbs), callable in-process by the ONE `aterm` binary.
 pub mod cli;
@@ -92,7 +93,9 @@ pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
 pub use cost::{disk_ok, human_bytes, needs_consent};
 pub use discovery::{IndexRepo, resolve_account, resolve_account_with};
 pub use dispatch::{ApplyStrategy, strategy_for};
-pub use extract::{EntryKind, ExtractError, ExtractReject, extract_tar_zst, vet_entry};
+pub use extract::{
+    EntryKind, ExtractError, ExtractReject, extract_tar_zst, vet_entry, vet_hardlink,
+};
 pub use flow::{
     AppliedMember, ChannelApplyReport, DepOutcome, DepResult, Fetcher, FlowError, InstallReport,
     InstallRequest, apply_channel, install, resolve_verified_index,
@@ -109,7 +112,8 @@ pub use manifest::{
     Artifact, Channel, Cost, Index, Keys, PkgManifest, Program, SUPPORTED_SCHEMA, parse_index,
     parse_pkg,
 };
-pub use net::{DirFetcher, GithubFetcher};
+pub use bundled::bundled_seed_dir;
+pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
 pub use ops::{active_builds, list_installed, uninstall, which};
 pub use select::{Candidate, Selected, select_index};
 pub use sig::{

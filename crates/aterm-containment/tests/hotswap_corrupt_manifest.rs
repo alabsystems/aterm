@@ -16,10 +16,10 @@ use aterm_containment::ContainmentMode;
 /// parse fails → init_mode_from_env(Containment).
 #[test]
 fn corrupt_manifest_mode_falls_back_to_env_default() {
-    // Ensure env var is NOT set (so default is used).
-    unsafe {
-        std::env::remove_var("ATERM_CONTAINMENT_MODE");
-    }
+    // Ensure env var is NOT set (so default is used). Routed through the
+    // workspace's one lock-scoped env helper (`aterm_log::env`), never a raw
+    // `remove_var`.
+    aterm_log::env::unset("ATERM_CONTAINMENT_MODE");
 
     // Simulate corrupted manifest mode field.
     let manifest_mode: Option<String> = Some("CORRUPTED_BY_ATTACKER".to_string());

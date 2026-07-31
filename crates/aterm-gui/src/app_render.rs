@@ -1604,7 +1604,7 @@ mod trail_present_pacing_tests {
 
         app.finalize_successful_present(
             id,
-            frame,
+            crate::metrics::StartupPresentTiming::collapsed(frame),
             0,
             None,
             SuccessfulPresentRoute::Terminal,
@@ -1619,7 +1619,7 @@ mod trail_present_pacing_tests {
 
         app.finalize_successful_present(
             id,
-            frame + Duration::from_millis(1),
+            crate::metrics::StartupPresentTiming::collapsed(frame + Duration::from_millis(1)),
             0,
             None,
             SuccessfulPresentRoute::Heterogeneous,
@@ -3481,19 +3481,39 @@ pub(crate) fn apply_bell_invert(frame: &mut Frame, active: bool) {
     }
 }
 
+/// Where the renderer's content frame sits inside the RAW destination surface:
+/// a `frame_width`×`frame_height` frame at `(origin_x, origin_y)` within a
+/// `surface_width`×`surface_height` window. The origin is the centred
+/// [`aterm_render::band_offset`], so it goes NEGATIVE on a transient crop, and
+/// the leftover is the platform-chrome band. The six scalars are one value
+/// because they are only ever meaningful together — a region pass handed a
+/// frame rect measured against a different surface would clip against the
+/// wrong edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlacedFrame {
+    /// Raw destination surface extent (the whole window), in device pixels.
+    surface_width: usize,
+    surface_height: usize,
+    /// Frame origin inside that surface; negative while the frame is cropped.
+    origin_x: i64,
+    origin_y: i64,
+    /// Content frame extent, in device pixels.
+    frame_width: usize,
+    frame_height: usize,
+}
+
 /// Region-scoped twin used by the CPU window presenter after tray composition.
 /// The remainder bands are platform chrome and stay uninverted, matching the
 /// GPU blit's frame-relative effect.
-fn apply_bell_invert_at(
-    pixels: &mut [u32],
-    surface_width: usize,
-    surface_height: usize,
-    origin_x: i64,
-    origin_y: i64,
-    frame_width: usize,
-    frame_height: usize,
-    active: bool,
-) {
+fn apply_bell_invert_at(pixels: &mut [u32], placement: PlacedFrame, active: bool) {
+    let PlacedFrame {
+        surface_width,
+        surface_height,
+        origin_x,
+        origin_y,
+        frame_width,
+        frame_height,
+    } = placement;
     if !active || surface_width == 0 || surface_height == 0 {
         return;
     }
@@ -3815,12 +3835,14 @@ pub(crate) fn apply_host_chrome_at(
     }
     apply_bell_invert_at(
         pixels,
-        surface_width,
-        surface_height,
-        origin_x,
-        origin_y,
-        frame_width,
-        frame_height,
+        PlacedFrame {
+            surface_width,
+            surface_height,
+            origin_x,
+            origin_y,
+            frame_width,
+            frame_height,
+        },
         invert,
     );
     if let Some(overlay) = overlay {
@@ -4729,10 +4751,16 @@ pub(crate) fn translate_ink_into_pane(ink: &mut Vec<aterm_render::InkCell>, plac
 ///
 /// `FreeSprite` dest origins are SIGNED grid-interior pixels, so the shift is
 /// `col_off·cell_w` / `row_off·cell_h`. A sprite straddling an interior pane
-/// edge is cropped in the dest rect AND, in lockstep, in its atlas source rect
-/// — the cat regime is NEAREST at exactly 1:1, so that is a texel-for-pixel
-/// crop. A sprite that is not 1:1 cannot be cropped that way and is dropped
-/// whole rather than sampled wrong.
+/// edge is cropped in the dest rect AND, in lockstep, in its atlas source rect.
+///
+/// The crop is PROPORTIONAL, not texel-for-texel. Peeking word-cats are baked
+/// at exactly 1:1 (`push_cat_free`), where the two are the same thing — but the
+/// CURSOR COMPANION is not: it ships `w/h` as the pose-scaled destination and
+/// `aw/ah` as the natural art size, so a 1:1 texel crop really would sample it
+/// wrong. Dropping non-1:1 sprites instead (the original guard) deleted the
+/// companion outright the moment it touched an interior pane edge — the kitty
+/// vanished near every divider. Scaling the crop by `aw/w` keeps both regimes
+/// correct: at 1:1 it reduces exactly to the old texel arithmetic.
 pub(crate) fn translate_free_into_pane(
     free: &mut Vec<aterm_core::render::FreeSprite>,
     place: PanePlace,
@@ -4754,15 +4782,27 @@ pub(crate) fn translate_free_into_pane(
         if (cx0, cy0, cx1, cy1) == (x0, y0, x1, y1) {
             return true; // wholly inside: a pure shift, no atlas math
         }
-        if (s.aw, s.ah) != (s.w, s.h) {
-            return false; // not 1:1 — a lockstep texel crop would be a lie
-        }
-        s.ax += (cx0 - x0) as u16;
-        s.ay += (cy0 - y0) as u16;
+        // Map a dest-space span onto the atlas by the sprite's own scale.
+        // Rounds to nearest so a one-pixel dest sliver still selects a texel
+        // rather than collapsing to an empty source rect (which the backends
+        // would treat as nothing to sample).
+        let scale = |span: i32, dest: u16, atlas: u16| -> u16 {
+            if dest == 0 {
+                return 0;
+            }
+            let n = i64::from(span) * i64::from(atlas) + i64::from(dest) / 2;
+            (n / i64::from(dest)).clamp(0, i64::from(u16::MAX)) as u16
+        };
+        let (aw0, ah0) = (s.aw, s.ah);
+        let (w0, h0) = (s.w, s.h);
+        s.ax = s.ax.saturating_add(scale(cx0 - x0, w0, aw0));
+        s.ay = s.ay.saturating_add(scale(cy0 - y0, h0, ah0));
         s.w = (cx1 - cx0) as u16;
         s.h = (cy1 - cy0) as u16;
-        s.aw = s.w;
-        s.ah = s.h;
+        // A cropped source must keep at least one texel, or the sprite is
+        // present in the stream with nothing to sample from.
+        s.aw = scale(cx1 - cx0, w0, aw0).max(1);
+        s.ah = scale(cy1 - cy0, h0, ah0).max(1);
         true
     });
 }
@@ -5154,6 +5194,26 @@ pub(crate) fn clear_effect_overlays_for_compose(dst: &mut RenderInput) {
     dst.rain_quads.clear();
     dst.rain_atlas = None;
     dst.rain_add.clear();
+}
+
+/// The focused pane's cell-space box plus the window's cell metrics: the INPUT
+/// geometry that [`ComposedCursorEffectClip`] is projected from.
+///
+/// Both split-pane callers derive all six scalars from the same focused leaf
+/// rect and the same `win_cell_size`, so they travel as one value: a pane box
+/// measured in one window's cells but projected with another's cell size would
+/// clip the pixel streams against a rectangle that exists on no screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComposedCursorEffectPane {
+    /// Pane origin in cells, window-relative.
+    row: usize,
+    col: usize,
+    /// Pane extent in cells.
+    pane_rows: usize,
+    pane_cols: usize,
+    /// Device pixels per cell, for the pixel-space half of the clip.
+    cell_w: usize,
+    cell_h: usize,
 }
 
 /// Exact focused-pane bounds for the cursor-effect streams in a composed frame.
@@ -9036,13 +9096,16 @@ impl App {
     fn composed_cursor_effect_clip(
         &self,
         wid: WindowId,
-        row: usize,
-        col: usize,
-        pane_rows: usize,
-        pane_cols: usize,
-        cell_w: usize,
-        cell_h: usize,
+        pane: ComposedCursorEffectPane,
     ) -> Option<ComposedCursorEffectClip> {
+        let ComposedCursorEffectPane {
+            row,
+            col,
+            pane_rows,
+            pane_cols,
+            cell_w,
+            cell_h,
+        } = pane;
         if pane_rows == 0 || pane_cols == 0 {
             return None;
         }
@@ -9199,8 +9262,17 @@ impl App {
         let pane_rows = (leaf.rect.size.height.round() as usize).max(1);
         let pane_cols = (leaf.rect.size.width.round() as usize).max(1);
         let (cell_w, cell_h) = self.win_cell_size(wid);
-        let clip =
-            self.composed_cursor_effect_clip(wid, row, col, pane_rows, pane_cols, cell_w, cell_h);
+        let clip = self.composed_cursor_effect_clip(
+            wid,
+            ComposedCursorEffectPane {
+                row,
+                col,
+                pane_rows,
+                pane_cols,
+                cell_w,
+                cell_h,
+            },
+        );
         let cursor_override = self.windows.get(&wid).and_then(|window| {
             (!window.focused && window.os_window.is_some()).then_some(CursorStyle::HollowBlock)
         });
@@ -10259,8 +10331,10 @@ impl App {
 
     /// A surface transaction returned no successful commit. Clear the
     /// optimistic repaint stamp and schedule only a bounded, strictly-future
-    /// recovery attempt. Persistent occlusion/validation/mismatch failures park
-    /// immediately; retryable failures use exponential backoff then park. Any
+    /// recovery attempt. The pristine first drawable gets one future-only
+    /// `GpuOccluded` bootstrap retry because a newly-created CAMetalLayer may not
+    /// be composited yet; every later occlusion, validation, or mismatch parks
+    /// immediately. Retryable failures use exponential backoff then park. Any
     /// later genuine external stimulus opens the redraw gate for the same
     /// unstamped frame.
     pub(crate) fn rearm_dropped_present(
@@ -10270,10 +10344,17 @@ impl App {
     ) {
         if let Some(state) = self.windows.get_mut(&id) {
             state.on_present_dropped();
-            let parked = state
-                .present_retry
-                .on_drop(reason, Instant::now())
-                .is_none();
+            let now = Instant::now();
+            let bootstrap_occluded = reason == metrics::PresentDropReason::GpuOccluded
+                && state.bootstrap_present_retry_available
+                && state.present_retry.bootstrap_drop_allowed();
+            let deadline = if bootstrap_occluded {
+                state.bootstrap_present_retry_available = false;
+                state.present_retry.on_bootstrap_drop(reason, now)
+            } else {
+                state.present_retry.on_drop(reason, now)
+            };
+            let parked = deadline.is_none();
             metrics::note_present_drop(reason, parked);
         }
     }
@@ -10443,12 +10524,13 @@ impl App {
     fn finalize_successful_present(
         &mut self,
         id: WindowId,
-        frame_started: Instant,
+        startup_timing: metrics::StartupPresentTiming,
         render_ns: u64,
         window: Option<&Arc<Window>>,
         route: SuccessfulPresentRoute,
         visuals: HostVisualState,
     ) {
+        let frame_started = startup_timing.frame_started();
         self.reveal_successfully_presented_window(id);
         let app_frame_interval = self.frame_interval;
         let presented_at = Instant::now();
@@ -10511,7 +10593,7 @@ impl App {
         // read back over the control socket's `metrics` verb. `render_ns` is
         // causal CPU wall time (compose plus raster/copy or GPU submit); surface
         // acquisition and final-present waits remain in `redraw_total`.
-        metrics::record_present(present_latency_ns, render_ns);
+        metrics::record_present(present_latency_ns, render_ns, startup_timing);
 
         // Warm broad font coverage only after the first frame reaches the
         // compositor, keeping system-font IO off time-to-glass.
@@ -10732,9 +10814,13 @@ impl App {
         }
         let compose_ns = u64::try_from(frame_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         metrics::note_pre_present(compose_ns);
-        let raster_submit_ns = match self.present_input_scratch(id, visuals.invert, visuals.overlay)
-        {
-            Ok(work_ns) => work_ns,
+        let startup_pre_present = (!self.first_present_done).then(Instant::now);
+        let present_result = self.present_input_scratch(id, visuals.invert, visuals.overlay);
+        let (raster_submit_ns, startup_timing) = match present_result {
+            Ok(work_ns) => (
+                work_ns,
+                metrics::StartupPresentTiming::finish(frame_started, startup_pre_present),
+            ),
             Err(reason) => {
                 self.handle_failed_present(id, reason, frame_started);
                 return;
@@ -10743,7 +10829,7 @@ impl App {
         let render_ns = causal_render_cost_ns(compose_ns, raster_submit_ns);
         self.finalize_successful_present(
             id,
-            frame_started,
+            startup_timing,
             render_ns,
             window.as_ref(),
             SuccessfulPresentRoute::Heterogeneous,
@@ -10781,9 +10867,13 @@ impl App {
         }
         let compose_ns = u64::try_from(frame_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         metrics::note_pre_present(compose_ns);
-        let raster_submit_ns = match self.present_input_scratch(id, visuals.invert, visuals.overlay)
-        {
-            Ok(work_ns) => work_ns,
+        let startup_pre_present = (!self.first_present_done).then(Instant::now);
+        let present_result = self.present_input_scratch(id, visuals.invert, visuals.overlay);
+        let (raster_submit_ns, startup_timing) = match present_result {
+            Ok(work_ns) => (
+                work_ns,
+                metrics::StartupPresentTiming::finish(frame_started, startup_pre_present),
+            ),
             Err(reason) => {
                 self.handle_failed_present(id, reason, frame_started);
                 return;
@@ -10793,7 +10883,7 @@ impl App {
         let presented_stamp = self.native_ui_compile_stamp(id).ok();
         self.finalize_successful_present(
             id,
-            frame_started,
+            startup_timing,
             render_ns,
             window.as_ref(),
             SuccessfulPresentRoute::Native {
@@ -12708,8 +12798,13 @@ impl App {
         // FIFO/nextDrawable pacing out of the adaptive feedback signal.
         let compose_ns = u64::try_from(frame_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         metrics::note_pre_present(compose_ns);
-        let raster_submit_ns = match self.present_input_scratch(id, invert, overlay) {
-            Ok(work_ns) => work_ns,
+        let startup_pre_present = (!self.first_present_done).then(Instant::now);
+        let present_result = self.present_input_scratch(id, invert, overlay);
+        let (raster_submit_ns, startup_timing) = match present_result {
+            Ok(work_ns) => (
+                work_ns,
+                metrics::StartupPresentTiming::finish(frame_started, startup_pre_present),
+            ),
             Err(reason) => {
                 self.handle_failed_present(id, reason, frame_started);
                 // Failed acquire/commit work is the path most likely to explain
@@ -12734,7 +12829,7 @@ impl App {
             .saturating_add(self.gpu_backpressure_ns(id));
         self.finalize_successful_present(
             id,
-            frame_started,
+            startup_timing,
             render_ns,
             window.as_ref(),
             SuccessfulPresentRoute::Terminal,
@@ -15046,12 +15141,14 @@ impl App {
         // shipping early-out source audit above.
         let pane_clip = self.composed_cursor_effect_clip(
             wid,
-            usize::from(focus_off.0),
-            usize::from(focus_off.1),
-            usize::from(focus_dims.0),
-            usize::from(focus_dims.1),
-            glow_cw,
-            glow_ch,
+            ComposedCursorEffectPane {
+                row: usize::from(focus_off.0),
+                col: usize::from(focus_off.1),
+                pane_rows: usize::from(focus_dims.0),
+                pane_cols: usize::from(focus_dims.1),
+                cell_w: glow_cw,
+                cell_h: glow_ch,
+            },
         );
         // Commit to presenting. Re-borrow `ws` mutably now (the immutable borrow
         // above is dropped). Fill the composite: window-size grid of divider cells
@@ -15133,6 +15230,15 @@ impl App {
                         // but still run the expiry flush after this branch.
                         Some(false)
                     } else {
+                        // Cursor position and the no-echo gate (alt screen OR an
+                        // app-owned Kitty composer) both ride the pass-1 LOCK A
+                        // sample, so the reconcile agrees with the very cells it
+                        // compares against instead of re-reading a terminal that
+                        // may have moved on. The resolver then indexes THIS pane's
+                        // already-extracted snapshot: no per-guess row rebuild and
+                        // no second focused terminal hold, so the single-pane
+                        // path's memoised `pred_row_scratch` row has no twin here —
+                        // the row it would cache is already materialised.
                         let input = &ws.pane_scratch;
                         ws.predictor.reconcile(
                             Some(focus_cur_pos),
@@ -15384,9 +15490,23 @@ impl App {
         // A staged update shows the leading `↻` alert in the strip (even with one tab),
         // so it's folded into the cache key + it forces the strip to appear.
         let show_update = self.relaunch.is_some();
-        let cache_key = (tab_strip, cols, show_update);
+        // Which tab the pointer is on: the ONLY tab that paints a `✕`. Part of the
+        // cache key, so moving the pointer between tabs repaints the strip — and,
+        // just as importantly, moving it WITHIN a tab does not.
+        let hovered = self.windows.get(&wid).and_then(|ws| ws.strip_hover);
+        // The lone tab's description, from the same composed session chrome the
+        // native strip's solo band and the hover card render. Only a one-tab window
+        // has a solo band, so this is at most one `Option<String>` per rebuild.
+        let subtitle = (tab_count == 1)
+            .then(|| {
+                let ws = self.windows.get(&wid)?;
+                let tab = ws.tab_set.tabs().first()?;
+                tab_bar::solo_subtitle(&tab.presentation.title, tab.presentation.tooltip.as_deref())
+            })
+            .flatten();
+        let cache_key = (tab_strip, cols, show_update, hovered, subtitle.clone());
         let hit = self.windows.get(&wid).is_some_and(|ws| {
-            ws.last_strip_fp == Some(cache_key) && ws.cached_strip_rows.len() == strip
+            ws.last_strip_fp.as_ref() == Some(&cache_key) && ws.cached_strip_rows.len() == strip
         });
         if !hit {
             // Rebuild: lay out the segments + paint the labels onto the LAST strip row
@@ -15426,11 +15546,16 @@ impl App {
             for r in 0..strip {
                 let mut row = vec![tab_bar::blank_cell(theme); cols];
                 if r + 1 == strip && !segments.is_empty() {
+                    let paint = tab_bar::StripPaint {
+                        hovered,
+                        subtitle: subtitle.as_deref(),
+                    };
                     strip_images = tab_bar::paint_strip_with_metadata(
                         &mut row,
                         &segments,
                         &titles,
                         &metadata,
+                        paint,
                         active,
                         theme,
                         self.config.active_tab_color_rgb(),
@@ -19427,6 +19552,70 @@ mod split_sparkle_tests {
             (free[0].x, free[0].y, free[0].w, free[0].h),
             (-8, -6, 20, 20),
             "an edge pane keeps its off-grid peek, untouched"
+        );
+    }
+
+    /// THE COMPANION AT A DIVIDER. Peeking word-cats bake 1:1 (`aw == w`), but
+    /// the cursor companion does NOT: it ships the pose-scaled destination in
+    /// `w/h` and the natural art size in `aw/ah`. The original crop refused any
+    /// non-1:1 sprite and dropped it whole, so the companion was DELETED the
+    /// moment it touched an interior pane edge — the kitty vanished near every
+    /// divider, in exactly the split panes this feature exists to serve.
+    ///
+    /// A proportional crop is the correct arithmetic for a scaled blit, and it
+    /// degrades to the old texel-for-texel form at 1:1 (pinned above).
+    #[test]
+    fn a_scaled_companion_is_cropped_at_a_divider_not_deleted() {
+        // Dest 40x20 drawn from a 20x10 atlas tile: a 2x upscale.
+        let companion = aterm_core::render::FreeSprite {
+            x: 380,
+            y: 40,
+            w: 40,
+            h: 20,
+            ax: 100,
+            ay: 200,
+            aw: 20,
+            ah: 10,
+            tint: 0x00FF_FFFF,
+            alpha: 255,
+            flip_x: false,
+            z: aterm_core::render::FreeZ::OverText,
+            sampler: aterm_core::render::FreeSampler::Nearest,
+        };
+        let mut free = vec![companion];
+        translate_free_into_pane(&mut free, place(0, 40));
+        assert_eq!(
+            free.len(),
+            1,
+            "the companion SURVIVES the divider — dropping it is the bug"
+        );
+        // Half the dest is cropped away, so half the SOURCE must be too — 10 of
+        // the 20 atlas texels, not the 20 dest pixels a 1:1 crop would take.
+        assert_eq!((free[0].x, free[0].w), (380, 20), "dest cropped at 400");
+        assert_eq!(
+            (free[0].ax, free[0].aw),
+            (100, 10),
+            "source cropped PROPORTIONALLY (aw/w = 1/2), not texel-for-pixel"
+        );
+        assert_eq!(
+            (free[0].ay, free[0].ah),
+            (200, 10),
+            "the untouched axis keeps its whole source span"
+        );
+
+        // A sliver thinner than the scale factor must still select a texel: an
+        // empty source rect is a sprite the backends have nothing to sample.
+        let mut sliver = vec![aterm_core::render::FreeSprite {
+            x: 399,
+            ..companion
+        }];
+        translate_free_into_pane(&mut sliver, place(0, 40));
+        assert_eq!(sliver.len(), 1);
+        assert!(
+            sliver[0].aw >= 1 && sliver[0].ah >= 1,
+            "a cropped source never collapses to zero texels, got {}x{}",
+            sliver[0].aw,
+            sliver[0].ah
         );
     }
 

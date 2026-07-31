@@ -81,7 +81,11 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 
 /// Decode a single ASCII hex digit (either case) to its value (`0..=15`).
-fn hex_nibble(c: u8) -> Option<u8> {
+/// Same accept set and values as `char::from(c).to_digit(16)`, but in `u8`
+/// arithmetic whose range each match arm bounds, so the subtractions are
+/// provably underflow-free. Shared workspace-wide (aterm-net, aterm-gui also
+/// decode hex); keep this the one copy.
+pub const fn hex_nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),

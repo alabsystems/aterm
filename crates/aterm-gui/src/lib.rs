@@ -44,6 +44,10 @@ mod accessibility;
 /// Settings and Manual use `native_accessibility` below.
 #[cfg(feature = "a11y-accesskit")]
 mod accesskit_tree;
+/// Keystroke routing for the native confirmation alerts (the multi-line-paste sheet
+/// and the app-modal close/quit alert): the pure accept/cancel/pass-through decision
+/// plus the macOS interceptor that makes Return answer them with ANY modifier held.
+mod alert_keys;
 mod app_about;
 mod app_colorscheme;
 mod app_config;
@@ -58,6 +62,10 @@ mod app_render;
 mod app_search;
 mod app_settings;
 mod app_tabs;
+/// The seamless update handoff — `apply_staged_update_now`, the unix overlap
+/// worker, the Commit-time admission facts and `finish_update_handoff`. Split
+/// out of `app_input` verbatim; still an inherent `impl App`.
+mod app_update_handoff;
 mod app_update_screen;
 mod app_window;
 #[cfg(test)]
@@ -348,32 +356,6 @@ fn plain_url_at(cells: &[RenderCell], col: usize) -> Option<(String, usize, usiz
         .map(|c| if c.wide { ' ' } else { c.ch })
         .collect();
     find_url_span(&chars, col)
-}
-
-/// (Re)build the [`Backend`] at `px` for live font-zoom. When `use_gpu`, rebuilds
-/// the GPU renderer — it renders offscreen and the window's GPU surface is
-/// re-created separately by `on_resize`, so re-creating the renderer mid-session
-/// is the same proven call as startup. A GPU failure or a missing system font
-/// yields `None`, and the caller keeps the current backend (zoom is a no-op
-/// rather than a crash).
-fn build_backend(px: f32, use_gpu: bool, theme: Theme, family: Option<&str>) -> Option<Backend> {
-    // A configured family must take the strict CPU constructor below: the GPU
-    // convenience constructor intentionally falls through to built-ins, which
-    // is useful at cold launch but wrong for live reload (a path swapped after
-    // validation would silently clobber the current working font). An already-
-    // GPU backend rebuilds in place through its strict `set_font_theme` path.
-    if use_gpu
-        && family.is_none()
-        && let Ok(g) = aterm_gpu::GpuRenderer::new_with_family(None, px, theme)
-    {
-        return Some(Backend::Gpu(GpuBackend::new(g)));
-    }
-    match family {
-        Some(family) => Renderer::from_configured_font_family(family, px, theme)
-            .ok()
-            .map(Backend::Cpu),
-        None => Renderer::from_system(px, theme).map(Backend::Cpu),
-    }
 }
 
 /// The GUI app's out-of-the-box default font family, tried ahead of the library's
@@ -1894,16 +1876,20 @@ enum Wake {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     FindPasteReady { wid: WindowId, text: String },
     /// The multi-line paste SHEET was answered (macOS). The pastejacking confirmation
-    /// is a window sheet rather than an app-modal `NSAlert`, so it cannot block the
-    /// event loop and cannot depend on the app holding activation to receive a
-    /// keystroke — a sheet is key whenever its parent window is, which is what makes
-    /// Return reliably fire its default button. Because the sheet is asynchronous, the
+    /// is a window sheet rather than an app-modal `NSAlert` so it cannot block the
+    /// event loop. It does NOT follow that the sheet reliably receives Return: an
+    /// `NSAlert`'s default button only matches Return with an EMPTY modifier mask, so
+    /// ⌘Return is dead — see [`App::present_multiline_paste_sheet`] and [`alert_keys`],
+    /// which route the answering keystrokes. Because the sheet is asynchronous, the
     /// paste it guards has to resume on a later loop turn: the completion handler posts
     /// this, and `user_event` finishes the delivery through
     /// [`App::deliver_paste_confirmed`]. `proceed` is false when the user cancelled, in
-    /// which case the text is dropped exactly as the blocking dialog dropped it.
+    /// which case the text is dropped exactly as the blocking dialog dropped it. `id`
+    /// names the sheet being answered so `user_event` retires exactly that sheet's
+    /// outstanding-confirmation entry (and its key interceptor) and never a newer one's.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     PasteConfirmed {
+        id: u64,
         wid: WindowId,
         text: String,
         source: Source,
@@ -2093,6 +2079,22 @@ enum Wake {
         /// lifecycle, or dismiss the Menu palette through its overlay exit path.
         close: bool,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    /// The batteries-included TOOLCHAIN SEED reported (first launch / first launch after
+    /// an app update added programs). Constructed ONLY by the `atpkg-update` thread
+    /// (`spawn_pkg_update_check`), ONCE per process at most: the launch-time `atpkg seed`
+    /// child's captured stdout carried one of the two STABLE marker lines
+    /// (`atpkg: seed-installed: …` / `atpkg: seed-pending: …` — see
+    /// [`parse_seed_markers`]); a quiet seed posts nothing. `installed` is the bundled
+    /// programs the pass just installed (may be empty when only the consent-pending
+    /// marker matched); `pending` is the human tail of the pending line — present when a
+    /// seed is available but `[packages].auto_install` consent is off. Fire-and-forget
+    /// and safe by construction: the main thread only raises the NON-clickable transient
+    /// status pill (details stay in Settings ▸ Packages, the same truth atpkg records in
+    /// its own `status.toml`) — no install authority crosses this event.
+    PkgSeed {
+        installed: Vec<String>,
+        pending: Option<String>,
     },
 }
 
@@ -2864,6 +2866,13 @@ impl Backend {
         }
     }
 
+    fn admitted_font_sources_sealed(&self) -> bool {
+        match self {
+            Backend::Cpu(renderer) => renderer.admitted_font_sources_sealed(),
+            Backend::Gpu(renderer) => renderer.admitted_font_sources_sealed(),
+        }
+    }
+
     fn seal_admitted_font_sources(&mut self) -> aterm_render::AdmittedFontSources {
         match self {
             Backend::Cpu(renderer) => renderer.seal_admitted_font_sources(),
@@ -3353,6 +3362,58 @@ impl Backend {
     }
 }
 
+/// Complete path-backed font generation handed to the backend build worker.
+/// Resolving config names stays overlapped with GPU/device construction on the
+/// main thread; all bounded file reads, broad fallback parsing, and sealing then
+/// finish on the worker before the backend is published.
+struct StartupFontGeneration {
+    config: app_config::FontConfig,
+    variations: Vec<(u32, f32)>,
+    dark_nudge: f32,
+}
+
+fn apply_font_config_to_backend(
+    backend: &mut Backend,
+    config: &app_config::FontConfig,
+    variations: &[(u32, f32)],
+    dark_nudge: f32,
+) {
+    backend.set_synthetic_styles(config.synthetic_style);
+    let styled: [(&str, Option<&String>); 3] = [
+        ("font_family_bold", config.styled_paths[0].as_ref()),
+        ("font_family_italic", config.styled_paths[1].as_ref()),
+        ("font_family_bold_italic", config.styled_paths[2].as_ref()),
+    ];
+    for (slot, (key, path)) in styled.into_iter().enumerate() {
+        let Some(path) = path else { continue };
+        let bytes = match aterm_render::font_file::read_font_file(std::path::Path::new(path)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!(
+                    "aterm-gui: config {key}: {path:?} failed bounded font admission \
+                     ({error}); keeping the current working face"
+                );
+                continue;
+            }
+        };
+        let result = if slot == 0 {
+            backend.set_bold_font(&bytes)
+        } else {
+            backend.set_styled_font(slot, &bytes)
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "aterm-gui: config {key}: {path:?} rejected ({error}); \
+                 keeping the current working face"
+            );
+        }
+    }
+    backend.set_config_fallback_fonts(&config.fallback_fonts);
+    backend.set_config_symbol_font(config.symbol_font.as_deref());
+    backend.set_config_emoji_font(config.emoji_font.as_deref());
+    backend.set_font_variations(variations, dark_nudge);
+}
+
 /// The App's [`Backend`] slot (#7 tail): on a WINDOWED cold launch the backend
 /// build (GPU device/pipelines + font) is still running on its spawn thread when
 /// the event loop starts, so the first `attach_os_window` can issue the OS
@@ -3487,20 +3548,8 @@ impl BackendSlot {
         self.ready_mut().set_stem_gamma(gamma);
     }
 
-    fn set_font_variations(&mut self, requests: &[(u32, f32)], dark_nudge: f32) {
-        self.ready_mut().set_font_variations(requests, dark_nudge);
-    }
-
     fn set_selection_inactive(&mut self, inactive: bool) {
         self.ready_mut().set_selection_inactive(inactive);
-    }
-
-    fn set_bold_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.ready_mut().set_bold_font(bytes)
-    }
-
-    fn set_styled_font(&mut self, slot: usize, bytes: &[u8]) -> Result<(), String> {
-        self.ready_mut().set_styled_font(slot, bytes)
     }
 
     fn admitted_font_sources(&self) -> Option<aterm_render::AdmittedFontSources> {
@@ -3510,35 +3559,12 @@ impl BackendSlot {
         }
     }
 
-    fn seal_admitted_font_sources(&mut self) -> Option<aterm_render::AdmittedFontSources> {
-        match self {
-            Self::Pending(_) => None,
-            Self::Ready(backend) => Some(backend.seal_admitted_font_sources()),
-        }
-    }
-
     fn rebuild_font_from_admitted(&mut self, px: f32, theme: Theme) -> Result<(), String> {
         self.ready_mut().rebuild_font_from_admitted(px, theme)
     }
 
     fn cpu_renderer_from_admitted(&self, px: f32, theme: Theme) -> Result<Renderer, String> {
         self.ready().cpu_renderer_from_admitted(px, theme)
-    }
-
-    fn set_synthetic_styles(&mut self, on: bool) {
-        self.ready_mut().set_synthetic_styles(on);
-    }
-
-    fn set_config_fallback_fonts(&mut self, paths: &[String]) {
-        self.ready_mut().set_config_fallback_fonts(paths);
-    }
-
-    fn set_config_symbol_font(&mut self, path: Option<&str>) {
-        self.ready_mut().set_config_symbol_font(path);
-    }
-
-    fn set_config_emoji_font(&mut self, path: Option<&str>) {
-        self.ready_mut().set_config_emoji_font(path);
     }
 
     fn set_line_height(&mut self, scale: f32) {
@@ -4926,9 +4952,40 @@ impl PresentRetry {
     /// retry deadline or a genuine external stimulus may open the attempt gate
     /// again; animation redraws cannot spend the retry budget early.
     fn on_drop(&mut self, reason: metrics::PresentDropReason, now: Instant) -> Option<Instant> {
+        self.on_drop_with_bootstrap(reason, now, false)
+    }
+
+    fn bootstrap_drop_allowed(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The first drawable acquired from a newly-created CAMetalLayer can report
+    /// `GpuOccluded` before AppKit has composited the window. Admit exactly one
+    /// strictly-future retry for that bootstrap-only observation. A second
+    /// occlusion parks like every ordinary hidden/minimized window, so startup
+    /// recovery cannot turn into an autonomous redraw loop.
+    fn on_bootstrap_drop(
+        &mut self,
+        reason: metrics::PresentDropReason,
+        now: Instant,
+    ) -> Option<Instant> {
+        self.on_drop_with_bootstrap(reason, now, true)
+    }
+
+    fn on_drop_with_bootstrap(
+        &mut self,
+        reason: metrics::PresentDropReason,
+        now: Instant,
+        before_first_present: bool,
+    ) -> Option<Instant> {
+        let bootstrap_occluded = before_first_present
+            && reason == metrics::PresentDropReason::GpuOccluded
+            && *self == Self::default();
         self.deadline = None;
         self.recovery_redraw_outstanding = false;
-        if reason.autonomous_retry() && self.autonomous_retries < PRESENT_RETRY_CAP {
+        if (reason.autonomous_retry() || bootstrap_occluded)
+            && self.autonomous_retries < PRESENT_RETRY_CAP
+        {
             let shift = u32::from(self.autonomous_retries);
             let factor = 1u32 << shift;
             // A FIRST `GpuReconfigured` drop has already repaired its own cause: the
@@ -4949,7 +5006,7 @@ impl PresentRetry {
             // 1 ms removes ~94% of the floor and keeps the property intact.
             const RECONFIGURE_FAST_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
             let delay = if self.autonomous_retries == 0
-                && reason == metrics::PresentDropReason::GpuReconfigured
+                && (reason == metrics::PresentDropReason::GpuReconfigured || bootstrap_occluded)
             {
                 RECONFIGURE_FAST_RETRY
             } else {
@@ -5089,6 +5146,12 @@ fn rearm_present_and_request(
 /// WindowState>` (one entry today). The typed constructors establish either a
 /// terminal or native front-content contract; the OS window + present target
 /// attach later in `resumed` (never in headless).
+/// Everything the painted tab-strip rows depend on, so a cache hit is a hit for the
+/// RIGHT reason: the strip fingerprint (count + active + titles + metadata), the
+/// column width, whether the staged-update `↻` is showing, which tab the pointer is
+/// on (the hover-only `✕`), and the SOLO band's description.
+type StripCacheKey = (u64, usize, bool, Option<usize>, Option<String>);
+
 struct WindowState {
     os_window: Option<Arc<Window>>,
     present: Option<PresentTarget>,
@@ -5747,6 +5810,11 @@ struct WindowState {
     /// immediate redraw: retryable failures arm an exponential deadline;
     /// persistent/occluded/invalid surfaces park until external activity.
     present_retry: PresentRetry,
+    /// One per-window permit for the fresh-CAMetalLayer occlusion seam. The
+    /// pristine first `GpuOccluded` drop consumes it; any successful present
+    /// closes it. External stimuli never replenish it, so a genuinely occluded
+    /// window cannot manufacture an autonomous retry train.
+    bootstrap_present_retry_available: bool,
     /// Keystroke-priority present: set on a PTY-bound key/text egress, cleared by
     /// the next CONTENT present. While set, the `Wake::Output` soft cap presents
     /// the first burst (very likely this keystroke's echo) immediately instead of
@@ -5763,6 +5831,10 @@ struct WindowState {
     /// on a different monitor (`None` → the app-wide primary-monitor default in
     /// `App::frame_interval`). A window on a 120 Hz panel then coalesces at 8.3 ms
     /// even when the PRIMARY display reports 60 Hz, and vice versa.
+    ///
+    /// scope-waiver: names a FALLBACK config value (the primary monitor's
+    /// refresh period). Nothing enforces a budget against it, and per-window
+    /// override is the feature — no instance count can make it wrong.
     frame_interval: Option<Duration>,
     /// The monitor `frame_interval` was sampled from; `Moved` fires continuously
     /// during a drag, so re-sample only when the handle actually changes.
@@ -5830,7 +5902,13 @@ struct WindowState {
     /// match — the common present (terminal content changed, the strip did not), so
     /// the per-present `paint_strip` + row build is skipped. Invalidated wherever
     /// `tab_segments` is cleared (geometry/font change).
-    last_strip_fp: Option<(u64, usize, bool)>,
+    last_strip_fp: Option<StripCacheKey>,
+    /// Index of the tab under the POINTER in this window's in-grid strip, or `None`
+    /// when the pointer is elsewhere. The `✕` is a hover-only affordance (the same
+    /// rule the native strip follows), so this is a paint input — it is folded into
+    /// `last_strip_fp` so moving BETWEEN tabs repaints and moving WITHIN one does
+    /// not. Always `None` while the in-grid strip is disabled.
+    strip_hover: Option<usize>,
     /// The painted tab-strip rows from the last build (see `last_strip_fp`). Cloned
     /// into `input_scratch` on a cache hit; rebuilt on a miss.
     cached_strip_rows: Vec<Vec<RenderCell>>,
@@ -5982,6 +6060,26 @@ struct WindowState {
     /// `None` until attached / headless. Only present under the `a11y-accesskit` feature.
     #[cfg(feature = "a11y-accesskit")]
     a11y: Option<accesskit_winit::Adapter>,
+    /// Has an OS accessibility client actually ATTACHED to this window's adapter?
+    ///
+    /// PERF: the adapter above is created for every OS window whether or not any assistive
+    /// technology is running, so `ws.a11y.is_some()` is NOT "a screen reader is listening".
+    /// `Adapter::update_if_active` takes a `FnOnce() -> TreeUpdate` precisely so the tree is
+    /// built lazily and skipped while inactive — but `push_a11y_tree` has to materialise the
+    /// update BEFORE it can borrow the adapter (the `&ws.overlay` read and the `&mut ws.a11y`
+    /// borrow overlap), so the factory always arrived pre-built and the platform's cheap
+    /// active-check threw the work away. On the default no-screen-reader desktop that is a
+    /// full walk of every visible cell into a `String` (plus a second copy inside `grid_tree`)
+    /// on EVERY present — ~35 KB of copying and ~17k char pushes per frame at 250x70.
+    ///
+    /// This latch restores the lazy contract from the outside: `false` until AccessKit posts
+    /// `InitialTreeRequested` (the event fired when a client attaches, at which point the
+    /// platform adapter is in `Placeholder` state and WILL run the factory), `false` again on
+    /// `AccessibilityDeactivated`. While it is `false`, `push_a11y_tree` bails before building
+    /// anything — the exact state `update_if_active` would have discarded, and the same state
+    /// headless windows (`a11y: None`) have always been in.
+    #[cfg(feature = "a11y-accesskit")]
+    a11y_active: bool,
     /// AccessKit projection built from the exact `CompiledUi` used by the pending
     /// native frame. Consumed only after that frame presents successfully.
     #[cfg(feature = "a11y-accesskit")]
@@ -6135,6 +6233,7 @@ impl WindowState {
     /// from [`Self::on_content_presented`], whose pacing clock is content-gated.
     fn on_present_succeeded(&mut self) {
         self.present_retry.on_presented();
+        self.bootstrap_present_retry_available = false;
         self.capture_present_serial = self.capture_present_serial.wrapping_add(1);
     }
 
@@ -6708,6 +6807,7 @@ impl WindowState {
             pending_deco_birth: None,
             redraw_pending: false,
             present_retry: PresentRetry::default(),
+            bootstrap_present_retry_available: true,
             input_hot: false,
             input_hot_until: None,
             frame_interval: None,
@@ -6724,6 +6824,7 @@ impl WindowState {
             leaf_render_cache: std::collections::BTreeMap::new(),
             tab_segments: Vec::new(),
             last_strip_fp: None,
+            strip_hover: None,
             cached_strip_rows: Vec::new(),
             strip_row_pool: Vec::new(),
             strip_titles_scratch: Vec::new(),
@@ -6748,6 +6849,8 @@ impl WindowState {
             overlay: None,
             #[cfg(feature = "a11y-accesskit")]
             a11y: None,
+            #[cfg(feature = "a11y-accesskit")]
+            a11y_active: false,
             #[cfg(feature = "a11y-accesskit")]
             native_a11y_staged: None,
             #[cfg(feature = "a11y-accesskit")]
@@ -6797,9 +6900,14 @@ fn active_tab_displays_session(
                 .and_then(tab_model::View::terminal_session)
                 == Some(session);
         }
-        tab.root.leaves().into_iter().any(|view| {
+        // `any_leaf`, not `leaves().into_iter().any(..)`: this runs twice per window on every
+        // `Wake::Output` — the PTY reader's batch rate — and a `Vec` per burst just to answer
+        // a bool is exactly the allocation the fan-out below was written to avoid. It is the
+        // documented allocation-free twin of `leaves().into_iter().any(..)` (same left-to-right
+        // leaf order, same short-circuit), so it does not disturb the zoom gate above.
+        tab.root.any_leaf(&mut |view| {
             views
-                .get(view)
+                .get(*view)
                 .copied()
                 .and_then(tab_model::View::terminal_session)
                 == Some(session)
@@ -6862,10 +6970,11 @@ struct AutoApplyManualOnly {
     /// budget is spent, after which it is `None` and sticky. `None` used to be
     /// unconditional for these, and because `TimedOut` is classified physical
     /// while the handoff deadline has to cover an entire cold boot + bundle swap
-    /// + re-exec + repaint, one slow moment permanently retired automatic
+    /// followed by re-exec + repaint, one slow moment permanently retired automatic
     /// in-session apply for that build. The budget lives on
     /// `auto_apply_physical_retry`, NOT in this struct, because this struct is
     /// cleared when the latch lapses.
+    ///
     /// An ACTIVITY-shaped exhaustion sets a deadline instead. Activity
     /// revocation is fully rolled back and says nothing about the artifact; it
     /// only says the terminal was busy, which on the machine this feature
@@ -7769,6 +7878,13 @@ struct App {
     /// [`App::summon_typed_kitty`]). App-wide — not per window — so two
     /// windows sharing one session can never mint the same `(session, ident)`
     /// episode and lose a granted summon to the Kitty Log's dedupe ring.
+    ///
+    /// scope-waiver: a genuine member of the scope-cardinality class (the
+    /// uniqueness argument really does rest on there being ONE sequence), and
+    /// queued as a `ScopeClaim` alongside `KittyLogHost.ring` rather than
+    /// registered here — `App` is the process singleton, so the claim needs a
+    /// `Scope::Process` root the census does not carry yet. Waived, visibly
+    /// and counted, until it does.
     kitty_summon_seq: u64,
     /// The OS desktop appearance currently in effect (light/dark), seeded at window
     /// attach from `Window::theme()` and updated on `WindowEvent::ThemeChanged`. Drives
@@ -7835,9 +7951,6 @@ struct App {
     /// Commit (or a successful legacy ACK) releases it without allocating,
     /// spawning, locking application state, or depending on a UI Wake.
     handoff_reader_gate: Option<crate::spawn::DeferredReaderGate>,
-    /// Authenticated expected set for the v0.52/v0.53 one-channel parent bridge.
-    /// `Some` only when READY exists but COMMIT does not.
-    handoff_legacy_parent_build: Option<u64>,
     /// Incoming overlap child is readerless and must not structurally mutate or
     /// quit between ProofReady and Commit. Cleared only by legacy success or the
     /// exact v2 Commit activation Wake.
@@ -7964,7 +8077,7 @@ struct App {
     stem_gamma: f32,
     /// W9 variable-font requests (config `font_variation` + `font_weight`,
     /// parsed `(tag, value)` pairs): the source of truth re-applied after
-    /// every rebuild ([`App::apply_font_config`]). A change re-instantiates
+    /// every rebuild ([`apply_font_config_to_backend`]). A change re-instantiates
     /// the primary, which can move cell GEOMETRY — hot-reload routes it
     /// through the full rebuild branch (like `line_height`). GLOBAL.
     font_variations: Vec<(u32, f32)>,
@@ -7983,7 +8096,7 @@ struct App {
     /// `_italic` / `_bold_italic`, `font_synthetic_style`, `fallback_fonts`,
     /// `symbol_font`, `emoji_font`), RESOLVED to file paths: the source of
     /// truth re-applied after every backend rebuild
-    /// ([`App::apply_font_config`]) and diffed on hot-reload. GLOBAL
+    /// ([`apply_font_config_to_backend`]) and diffed on hot-reload. GLOBAL
     /// (window-uniform).
     font_config: app_config::FontConfig,
     /// Whether Alt/Option sends ESC-prefixed (Meta) sequences (config
@@ -7994,6 +8107,16 @@ struct App {
     /// off (config `confirm_multiline_paste`, default `true`). Read in
     /// `paste_clipboard`. Live-reloadable. GLOBAL (window-uniform).
     confirm_multiline_paste: bool,
+    /// macOS: the ONE outstanding multi-line-paste confirmation sheet — the retained
+    /// parent/panel windows plus the live key interceptor that lets Return answer it
+    /// with any modifier held (see [`alert_keys`]). `Some` ⇔ a sheet is up and its
+    /// answer is still owed, which is how "at most one confirmation at a time" is
+    /// enforced; cleared when `Wake::PasteConfirmed` reports THIS sheet's id, when the
+    /// parent window closes, and — self-healingly — whenever AppKit says the recorded
+    /// sheet is no longer attached. Dropping the entry removes the interceptor, so no
+    /// exit path can leave a keystroke filter behind.
+    #[cfg(target_os = "macos")]
+    paste_confirm: Option<alert_keys::PasteConfirm>,
     /// Whether a completed mouse selection auto-copies to the system clipboard
     /// (config `copy_on_select`, default `true`). Read in
     /// `finish_selection` when a drag-select settles. Live-reloadable. GLOBAL
@@ -9022,8 +9145,10 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.tab_set.active())
             .is_some_and(|tab| {
-                tab.root.leaves().into_iter().any(|view| {
-                    matches!(self.view_store.get(view), Some(tab_model::View::Native(_)))
+                // Runs at the top of every `redraw_window`; see `SplitTree::any_leaf` — no
+                // `Vec` per frame just to learn whether any leaf is native.
+                tab.root.any_leaf(&mut |view| {
+                    matches!(self.view_store.get(*view), Some(tab_model::View::Native(_)))
                 })
             })
     }
@@ -9570,11 +9695,14 @@ impl App {
                 .expect("empty config is valid TOML");
 
         let startup_config = Config::default();
-        let prepared_sparkle = startup_config.prepare_sparkle_runtime();
-        native_config_service
-            .complete_startup_sparkle_consumers(prepared_sparkle.consumer_capabilities());
+        let path_generation = startup_config.prepare_path_feed_generation();
+        native_config_service.complete_startup_path_generation(
+            path_generation.sparkle.consumer_capabilities(),
+            Arc::clone(&path_generation.trail_packs),
+        );
         let config_assets = native_config_service.snapshot().assets;
-        let path_feed_fps = startup_config.path_feed_fingerprints();
+        let prepared_sparkle = path_generation.sparkle;
+        let path_feed_fps = path_generation.fingerprints;
         App {
             apprt,
             system_reduce_motion: false,
@@ -9655,6 +9783,8 @@ impl App {
             font_config: app_config::FontConfig::default(),
             option_as_meta: true,
             confirm_multiline_paste: true,
+            #[cfg(target_os = "macos")]
+            paste_confirm: None,
             copy_on_select: Config::default().copy_on_select_or_default(),
             window_theme: app_config::WindowTheme::default(),
             window_colorspace: app_config::WindowColorspace::default(),
@@ -9676,7 +9806,6 @@ impl App {
             handoff_ready: None,
             handoff_commit: None,
             handoff_reader_gate: None,
-            handoff_legacy_parent_build: None,
             incoming_handoff_pending: false,
             handoff_degraded: false,
             bootstrap_session_adopted: false,
@@ -10322,8 +10451,9 @@ impl App {
     /// AccessKit (`a11y-accesskit`, the DEFAULT ship, cross-platform): re-publish the tree
     /// each present so a screen reader hears live output. When no overlay is open this is
     /// the terminal GRID (DEFAULT-2, via `push_a11y_tree` → `grid_tree`); an overlay keeps
-    /// its own tree. `update_if_active` is ~a bool check when no AT is attached, so a static
-    /// screen (no new present) costs nothing.
+    /// its own tree. With no AT attached this is a single bool test — see
+    /// [`WindowState::a11y_active`], which is what actually makes that true; before the latch
+    /// existed the whole tree was materialised first and only then discarded.
     #[cfg(all(
         feature = "a11y-accesskit",
         not(all(target_os = "macos", feature = "a11y-appkit"))
@@ -10426,16 +10556,18 @@ impl App {
             if paste_needs_confirm(&text, bracketed) {
                 // macOS: present a window SHEET and return. The paste resumes in
                 // `Wake::PasteConfirmed`. A sheet is the correct pattern for a
-                // window-scoped confirmation and, critically, is key whenever its
-                // parent window is — so Return fires its default button without the
-                // app-modal path's dependency on this app holding activation.
+                // window-scoped confirmation and it returns immediately, so a modal
+                // answer can never park the loop that serves every other window; the
+                // keystrokes that ANSWER it are routed by `alert_keys` (see the
+                // rewritten doc comment on `present_multiline_paste_sheet`).
                 #[cfg(target_os = "macos")]
                 {
-                    // `None` ⇒ the sheet is up and will resume the paste itself.
-                    // `Some(text)` ⇒ no AppKit window to attach one to (headless, or
-                    // before `attach_os_window`), so hand the text back and deliver it:
-                    // the guard has no UI to ask through, matching the posture of the
-                    // no-dialog platform fallback below.
+                    // `None` ⇒ handled here: either the sheet is up and will resume the
+                    // paste itself, or a confirmation was ALREADY outstanding and this
+                    // unconfirmed text was dropped. `Some(text)` ⇒ no AppKit window to
+                    // attach one to (headless, or before `attach_os_window`), so hand
+                    // the text back and deliver it: the guard has no UI to ask through,
+                    // matching the posture of the no-dialog platform fallback below.
                     if let Some(text) = self.present_multiline_paste_sheet(wid, text, source) {
                         self.deliver_paste_confirmed(wid, text, source);
                     }
@@ -10460,16 +10592,43 @@ impl App {
     }
 
     /// Present the multi-line paste confirmation as a WINDOW SHEET on `wid`, resuming
-    /// the paste through `Wake::PasteConfirmed`. Returns `false` when no sheet could be
-    /// presented (no AppKit window, no proxy, not on the main thread), leaving the
-    /// caller to fall back.
+    /// the paste through `Wake::PasteConfirmed`. Returns `Some(text)` — the text handed
+    /// back — when no sheet could be presented (no AppKit window, no proxy, not on the
+    /// main thread), leaving the caller to fall back; `None` when the answer is owed
+    /// (the sheet is up) or when the text was dropped because a confirmation was
+    /// already outstanding.
     ///
-    /// Why a sheet and not the app-modal `NSAlert` this replaces: an app-modal alert
-    /// receives keystrokes only while the APPLICATION is active, and it blocks the
-    /// winit event loop inside `runModal` for as long as it is up. A sheet is owned by
-    /// the window, is key whenever that window is, and returns immediately — so the
-    /// default button's Return equivalent fires reliably and a modal confirmation can
-    /// never park the loop that serves rendering and input for every other window.
+    /// # Why a sheet and not the app-modal `NSAlert` this replaces
+    ///
+    /// An app-modal alert blocks the winit event loop inside `runModal` for as long as
+    /// it is up, so rendering and input for every OTHER window stop dead. A sheet is
+    /// owned by the window and returns immediately, so a modal confirmation can never
+    /// park the loop.
+    ///
+    /// # What is NOT true — and the bug it hid
+    ///
+    /// This comment used to claim that a sheet, being key whenever its parent window
+    /// is, makes "the default button's Return equivalent fire reliably". It does not,
+    /// and that claim is why the owner's ⌘V-then-Return gesture appeared to hang:
+    ///
+    /// * A default button's key equivalent is `"\r"` with an EMPTY
+    ///   `keyEquivalentModifierMask`, and AppKit matches the characters AND the mask
+    ///   exactly — so `⌘Return` (0x100000) matches NOTHING. Press ⌘V, and the Return
+    ///   that follows while ⌘ is still held does nothing at all. Plain Return and
+    ///   ⇧Return did work, which is exactly what made the bug look like flakiness.
+    /// * The sheet is also not "key whenever the parent is": it puts its own
+    ///   `_NSAlertPanel` up as THE key window (measured: `keyWindow=_NSAlertPanel
+    ///   sheetIsKey=true sheetFirstResponder=_NSAlertPanel`), which is why the
+    ///   keystroke never reaches this app's winit key path either.
+    ///
+    /// So the answering keystrokes are routed by [`alert_keys`]: a local `NSEvent`
+    /// monitor, installed for exactly this sheet's lifetime, maps Return/keypad Enter
+    /// (with ANY modifiers) to a `performClick:` on the "Paste" button and Escape to
+    /// "Cancel" — the same action path the mouse uses — and swallows the key so it can
+    /// never leak into the terminal underneath. Everything else passes through
+    /// untouched, including plain Return and Escape's stock handling if the monitor
+    /// could not be installed. What IS true about a sheet is only the loop-parking part
+    /// above; keystroke delivery is aterm's job.
     #[cfg(target_os = "macos")]
     fn present_multiline_paste_sheet(
         &mut self,
@@ -10487,6 +10646,27 @@ impl App {
         let Some(proxy) = self.proxy.clone() else {
             return Some(text);
         };
+        // ONE confirmation at a time. A second sheet would leave two answers owed for
+        // one interceptor slot, and stacking modal asks over a terminal is hostile
+        // anyway. Self-healing: an entry whose sheet AppKit no longer reports attached
+        // (its completion handler never ran — e.g. the parent was torn down under it)
+        // is DISCARDED here rather than blocking every later paste. Dropping it also
+        // removes its key monitor.
+        // The `take` is load-bearing in BOTH arms: an attached sheet is put straight
+        // back, and a detached one is simply never returned — which is the discard
+        // described above. A let-chain keeps that, because a binding whose later
+        // condition fails is dropped exactly as it was by the nested form.
+        if let Some(outstanding) = self.paste_confirm.take()
+            && outstanding.is_attached()
+        {
+            self.paste_confirm = Some(outstanding);
+            aterm_log::warn!(
+                "multiline-paste confirmation already open; dropping the new \
+                 unconfirmed paste ({} bytes) rather than stacking a second sheet",
+                text.len(),
+            );
+            return None;
+        }
         // Reach the NSWindow exactly as the toolbar / colour-space code does:
         // winit Window -> AppKit RawWindowHandle -> NSView -> NSWindow.
         let ns_window = self
@@ -10509,6 +10689,8 @@ impl App {
         };
 
         let lines = text.lines().count();
+        // Minted BEFORE the handler so the answer can name the sheet it answers.
+        let id = alert_keys::next_confirm_id();
         // The completion handler is `Fn`, but the paste payload can only be delivered
         // once — park it in a cell the handler `take`s. A sheet answers exactly once,
         // so a second call (which AppKit does not make) would simply find `None` and
@@ -10520,6 +10702,7 @@ impl App {
             };
             let proceed = response == objc2_app_kit::NSAlertFirstButtonReturn;
             let _ = proxy.send_event(Wake::PasteConfirmed {
+                id,
                 wid,
                 text,
                 source,
@@ -10529,18 +10712,42 @@ impl App {
 
         // SAFETY: standard NSAlert construction + `beginSheetModalForWindow:` on the
         // main thread (`mtm` proves it), against a live NSWindow retained by winit.
-        unsafe {
+        // `window` / `addButtonWithTitle:` are plain accessors on the fresh alert.
+        let (panel, accept, cancel) = unsafe {
             let alert = NSAlert::new(mtm);
             alert.setMessageText(&NSString::from_str("Paste multiple lines?"));
             alert.setInformativeText(&NSString::from_str(&format!(
                 "The clipboard holds {lines} lines and bracketed paste is off, so each line \
                  could run as a command. Paste anyway?"
             )));
-            // First button added is the default and carries Return; Cancel takes Escape.
-            let _ = alert.addButtonWithTitle(&NSString::from_str("Paste"));
-            let _ = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            // First button added is the default (AppKit gives it Return with an EMPTY
+            // modifier mask, which is why `alert_keys` has to route ⌘Return itself);
+            // Cancel takes Escape. Both are retained for the key interceptor to click.
+            let accept = alert.addButtonWithTitle(&NSString::from_str("Paste"));
+            let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            let panel = alert.window();
             alert.beginSheetModalForWindow_completionHandler(&ns_window, Some(&handler));
+            (panel, accept, cancel)
+        };
+        // Watch the keys for exactly as long as this entry lives. Installed AFTER the
+        // sheet is up so the monitor's own liveness test (`attachedSheet`) is already
+        // true for the very first keystroke.
+        let keys = alert_keys::watch_alert_keys(
+            panel.clone(),
+            Some(ns_window.clone()),
+            accept,
+            cancel,
+        );
+        if keys.is_none() {
+            aterm_log::warn!(
+                "multiline-paste sheet: AppKit declined a local key monitor; the sheet \
+                 keeps its stock keys (plain Return / Escape / the mouse), so ⌘Return \
+                 will not answer it",
+            );
         }
+        self.paste_confirm = Some(alert_keys::PasteConfirm::new(
+            id, wid, ns_window, panel, keys,
+        ));
         None
     }
 
@@ -11103,14 +11310,14 @@ impl App {
             }
             // Refresh the native (macOS) toolbar strip — it re-reads every
             // tab's title (idempotent / no-op off macOS).
-            self.refresh_window_tabs(wid);
+            // Reuse the exact snapshot the strip was just handed instead of
+            // re-locking every tab's meta + terminal to rebuild it.
+            let (titles, metadata) = self.refresh_window_tabs(wid);
             // In-grid (Linux) strip: request a redraw ONLY when the recomputed
             // strip fingerprint differs from the last presented frame's, so a
             // background change that doesn't alter the visible strip (e.g. a
             // title that hashes the same) costs no extra present.
             let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
-            let titles = self.tab_titles(wid);
-            let metadata = self.tab_strip_metadata(wid);
             let fp = self.tab_strip_fingerprint_from_parts(&titles, &metadata, active);
             let needs_redraw = self
                 .windows
@@ -12368,6 +12575,7 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        metrics::mark_first_winit_resumed();
         // (#3) Cap bulk-output frames at the ACTUAL display refresh rather than a
         // fixed ~125fps: resolve the primary monitor's refresh period now that the
         // display is up. `refresh_rate_millihertz()` is Hz×1000, so the period is
@@ -12411,6 +12619,7 @@ impl ApplicationHandler<Wake> for App {
             el.exit();
             return;
         }
+        metrics::mark_initial_surface_ready();
         // SEAMLESS WINDOW CARRY: reappear where the outgoing window was. Applied
         // after attach (winit has no reliable pre-create position on macOS) —
         // the move happens before the first present, so there is no visible hop.
@@ -12740,10 +12949,11 @@ impl ApplicationHandler<Wake> for App {
                     .collect();
                 for wid in label_windows {
                     let focused = self.focused_session_id(wid) == Some(session);
-                    self.refresh_window_tabs(wid);
+                    // Same snapshot the strip was just pushed — see
+                    // `refresh_window_tabs`; recomputing it here doubled the
+                    // per-tab meta-lock + term-try-lock + compose round trips.
+                    let (titles, metadata) = self.refresh_window_tabs(wid);
                     let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
-                    let titles = self.tab_titles(wid);
-                    let metadata = self.tab_strip_metadata(wid);
                     let fp = self.tab_strip_fingerprint_from_parts(&titles, &metadata, active);
                     let strip_changed = self.windows.get(&wid).is_some_and(|ws| {
                         ws.last_present.as_ref().is_none_or(|k| k.tab_strip != fp)
@@ -13370,6 +13580,22 @@ impl ApplicationHandler<Wake> for App {
                     );
                 }
             }
+            // Batteries-included toolchain seed: the atpkg-update thread's one-shot
+            // launch-time `atpkg seed` pass matched a stable stdout marker. Raise the
+            // NON-clickable transient status pill only — details stay in
+            // Settings ▸ Packages (App ▸ Packages… jumps straight there).
+            Wake::PkgSeed { installed, pending } => {
+                if !installed.is_empty() {
+                    self.surface_nonmodal_update_status(&seed_pill_text(&installed));
+                } else if let Some(tail) = pending {
+                    // Consent (`[packages].auto_install`) is off: offer, don't act.
+                    // The full roster stays in the log; the pill points at the switch.
+                    aterm_log::info!("atpkg seed pending: {tail}");
+                    self.surface_nonmodal_update_status(
+                        "⇣ ALab toolchain available — install via Settings ▸ Packages",
+                    );
+                }
+            }
             // `settings` control verb: drive the native Settings tab and reply its open
             // state. The enum variant keeps the historical wire-facing name only.
             Wake::SpawnSession { cwd, reply } => {
@@ -13487,11 +13713,25 @@ impl ApplicationHandler<Wake> for App {
             // The pastejacking sheet was answered. `deliver_paste_confirmed` (not
             // `deliver_paste`) so the guard does not ask a second time.
             Wake::PasteConfirmed {
+                id,
                 wid,
                 text,
                 source,
                 proceed,
             } => {
+                // Retire the outstanding-confirmation entry — the answer is in, so the
+                // sheet is gone and its key interceptor must go with it. Matched BY ID:
+                // the answer to sheet N must never drop sheet N+1's interceptor (which
+                // would silently restore the ⌘Return bug for the live sheet), and an
+                // answer whose entry was already retired simply matches nothing. This is
+                // the primary clear; `present_multiline_paste_sheet`'s attachment check
+                // and `close_window_logical` cover the paths that post no answer at all.
+                #[cfg(target_os = "macos")]
+                if self.paste_confirm.as_ref().is_some_and(|c| c.id == id) {
+                    self.paste_confirm = None;
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = id;
                 if proceed {
                     self.deliver_paste_confirmed(wid, text, source);
                 }
@@ -13967,11 +14207,14 @@ fn co_located_atpkg() -> Option<std::path::PathBuf> {
 /// `atpkg` verifies its own signed channel and is itself inert on a build with no pinned
 /// root key, so this is safe to always spawn for a real `.app`. Interval is
 /// `ATPKG_UPDATE_INTERVAL_SECS` (default 6h; 0 = once — the env override survives the
-/// config gate on purpose: it tunes cadence, never consent). Output is discarded — atpkg
-/// records its own `status.toml` (§9). The gate reads launch-time config only: flipping
-/// the switch takes effect at the next launch (documented; the loop itself is stateless
-/// between passes).
-fn spawn_pkg_update_check(config: &Config) -> bool {
+/// config gate on purpose: it tunes cadence, never consent). The `update` loop's output
+/// is discarded — atpkg records its own `status.toml` (§9); the ONE-SHOT seed pass is
+/// the exception: its stdout is captured and scanned for the two stable marker lines
+/// ([`parse_seed_markers`]), and a match posts [`Wake::PkgSeed`] through `proxy` so the
+/// first launch can SAY what the batteries-included seed did (or is offering). The gate
+/// reads launch-time config only: flipping the switch takes effect at the next launch
+/// (documented; the loop itself is stateless between passes).
+fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool {
     if !config.packages_update_loop_enabled() {
         return false;
     }
@@ -13992,12 +14235,20 @@ fn spawn_pkg_update_check(config: &Config) -> bool {
             // Idempotent; the source-build lane stays DEFAULT-OFF unless the machine opted in
             // (`ATPKG_SOURCE_BUILD=1`), so this never builds without consent, and store mutation
             // is serialized by atpkg's own store-wide lock. Runs once BEFORE the loop, off the
-            // event loop; output discarded (atpkg records its own seed-status.toml).
-            let _ = std::process::Command::new(&atpkg)
+            // event loop. Stdout is captured for the stable seed markers (stderr stays
+            // discarded — atpkg records its own seed-status.toml); a marker match posts
+            // the one-shot `Wake::PkgSeed`, a quiet seed posts nothing.
+            let seeded = std::process::Command::new(&atpkg)
                 .arg("seed")
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
-                .status();
+                .output();
+            if let Ok(out) = seeded {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some((installed, pending)) = parse_seed_markers(&stdout) {
+                    let _ = proxy.send_event(Wake::PkgSeed { installed, pending });
+                }
+            }
             loop {
                 let _ = std::process::Command::new(&atpkg)
                     .arg("update")
@@ -14011,6 +14262,120 @@ fn spawn_pkg_update_check(config: &Config) -> bool {
             }
         })
         .is_ok()
+}
+
+/// Scan an `atpkg seed` child's stdout for the two STABLE marker lines the
+/// batteries-included lane prints (crates/atpkg/src/cli.rs `cmd_seed` — the
+/// markers are a cross-crate contract; changing either side blinds the other):
+///
+///   `atpkg: seed-installed: <name>, <name>, …`
+///   `atpkg: seed-pending: <human tail>`
+///
+/// Returns `None` when neither matched (the quiet-seed common case), else
+/// `(installed_names, pending_tail)`. Pure so the contract is unit-testable
+/// without spawning a child.
+fn parse_seed_markers(stdout: &str) -> Option<(Vec<String>, Option<String>)> {
+    let mut installed: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("atpkg: seed-installed: ") {
+            installed.extend(
+                rest.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        } else if let Some(rest) = line.strip_prefix("atpkg: seed-pending: ") {
+            let tail = rest.trim();
+            if !tail.is_empty() {
+                pending = Some(tail.to_string());
+            }
+        }
+    }
+    (!installed.is_empty() || pending.is_some()).then_some((installed, pending))
+}
+
+/// The installed-roster pill caption. Extracted from the `Wake::PkgSeed` arm so
+/// the cap and the marker glyph are unit-testable (the arm itself runs only on
+/// the UI thread). The leading "✓" is deliberate: the notice renderer tints the
+/// FIRST character with the accent colour, so without a marker the "A" of
+/// "ALab" would be tinted alone and the word would read as "A Lab".
+fn seed_pill_text(installed: &[String]) -> String {
+    // Cap the roster so the pill stays a pill: ≤5 names, then an ellipsis
+    // standing in for the rest.
+    let mut names = installed
+        .iter()
+        .take(5)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if installed.len() > 5 {
+        names.push('…');
+    }
+    format!("✓ ALab toolchain installed: {names}")
+}
+
+/// The seed-marker contract with atpkg (`cmd_seed`'s two stable stdout lines):
+/// pinned here so a wording drift on either side goes red instead of silently
+/// blinding the first-run notice.
+#[cfg(test)]
+mod seed_marker_tests {
+    use super::{parse_seed_markers, seed_pill_text};
+
+    #[test]
+    fn pill_caps_the_roster_and_keeps_its_marker_glyph() {
+        let names = |n: usize| -> Vec<String> {
+            ["ay", "clean", "ny", "trust", "ty", "nn"][..n]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        };
+        // ≤5: every name, no ellipsis.
+        assert_eq!(
+            seed_pill_text(&names(3)),
+            "✓ ALab toolchain installed: ay, clean, ny"
+        );
+        assert_eq!(
+            seed_pill_text(&names(5)),
+            "✓ ALab toolchain installed: ay, clean, ny, trust, ty"
+        );
+        // >5: exactly five, then the ellipsis.
+        assert_eq!(
+            seed_pill_text(&names(6)),
+            "✓ ALab toolchain installed: ay, clean, ny, trust, ty…"
+        );
+        // The marker glyph must lead — the renderer tints the FIRST char, so
+        // losing it makes "ALab" render as "A Lab".
+        assert!(seed_pill_text(&names(1)).starts_with("✓ "));
+    }
+
+    #[test]
+    fn quiet_seed_posts_nothing() {
+        assert_eq!(parse_seed_markers(""), None);
+        assert_eq!(
+            parse_seed_markers("atpkg: ay reused — already installed for 8af5cbb3a7aa\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn installed_marker_yields_the_name_roster() {
+        let out = "atpkg: seed complete (2 ready, 0 failed, 2 companion(s) considered)\n\
+                   atpkg: seed-installed: ay, trust, ty\n";
+        let (installed, pending) = parse_seed_markers(out).unwrap();
+        assert_eq!(installed, ["ay", "trust", "ty"]);
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn pending_marker_yields_the_human_tail() {
+        let out = "atpkg: seed-pending: 3 program(s) ready to install from the bundled seed: \
+                   ay, trust, ty (Settings ▸ Packages ▸ Install ALab toolset, or `aterm pkg \
+                   install --default-set`)\n";
+        let (installed, pending) = parse_seed_markers(out).unwrap();
+        assert!(installed.is_empty());
+        assert!(pending.unwrap().starts_with("3 program(s) ready"));
+    }
 }
 
 /// Set ONCE in `main` (single-threaded launcher) from `$ATERM_UPDATED_FROM`: `true` when
@@ -14028,6 +14393,14 @@ pub fn attach_parent_console() {
     win32::attach_parent_console();
 }
 
+/// Anchor the broader shipped one-binary timing boundary before its router.
+///
+/// The thin dev-only GUI binary deliberately leaves this unavailable; its
+/// compatibility [`main_entry`] clock remains valid. Dyld precedes both.
+pub fn mark_rust_main_start() {
+    metrics::mark_rust_main_start();
+}
+
 /// The whole windowed terminal as a callable: `argv[1..]` in, runs the window
 /// (or headless engine) to completion. Called by the ONE `aterm` binary when
 /// the launch is window-shaped (no TTY, `--window`, `--headless`, a Finder
@@ -14035,10 +14408,8 @@ pub fn attach_parent_console() {
 /// `aterm-gui` bin. Verb routing happens in the caller — this entry is purely
 /// the window.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) {
-    // Anchor the metrics clock at the top of the window path so
-    // `first_present_ms` means main entry → first successful application-present
-    // return, not whichever-metric-fired-first → first present. Platform
-    // compositor and scanout timing are outside this boundary.
+    // Compatibility-stable GUI-entry clock. The one-binary router separately
+    // anchors its broader Rust-main boundary before dispatch.
     metrics::mark_process_start();
     // Child-copy fd posture must be repaired before the updater spawns any
     // codesign/PlistBuddy/spctl helper. The updater receives this exact list
@@ -14103,18 +14474,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     }
     // Post-update "leveled-up" handoff: `ATERM_UPDATED_FROM` is set by
     // `apply_staged_update_now` before its re-exec and inherited through the swap above,
-    // so its presence means "this run is the result of an update apply". Record it for the
-    // App (shows the quiet cursor-themed notice on the first window) and CLEAR the env
-    // HERE — still single-threaded, before any session/shell spawn — so it never leaks to
-    // the user's shell children.
-    let updated_from = std::env::var("ATERM_UPDATED_FROM")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok());
+    // so its presence means "this run is the result of an update apply". Record that
+    // fact for the quiet cursor-themed notice on the first window and CLEAR the env HERE
+    // — still single-threaded, before any session/shell spawn — so it never leaks to the
+    // user's shell children.
     let just_updated = std::env::var_os("ATERM_UPDATED_FROM").is_some();
     if just_updated {
-        // SAFETY: the launcher is still single-threaded here (this runs before any thread
-        // or session spawn), so the edition-2024 `remove_var` safety contract holds.
-        unsafe { std::env::remove_var("ATERM_UPDATED_FROM") };
+        // The launcher is still single-threaded here (this runs before any thread or
+        // session spawn); routed through the workspace's one lock-scoped env helper.
+        aterm_log::env::unset("ATERM_UPDATED_FROM");
     }
     let _ = JUST_UPDATED.set(just_updated);
     // PROOF-CARRYING DSU Rung 1b — SEAMLESS adopt: if this run is an update apply that
@@ -14167,11 +14535,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         ready_raw_fd,
         incoming_exec_fds.parent_pid(),
     );
-    let (handoff_ready, mut handoff_commit, overlap_degraded) =
-        match (ready, commit) {
-            (Some(ready), Some(commit)) => (Some(ready), Some(commit), false),
-            _ => (None, None, overlap_channels_present),
-        };
+    let (handoff_ready, mut handoff_commit, overlap_degraded) = match (ready, commit) {
+        (Some(ready), Some(commit)) => (Some(ready), Some(commit), false),
+        _ => (None, None, overlap_channels_present),
+    };
     let handoff_reader_gate = handoff_ready
         .is_some()
         .then(crate::spawn::DeferredReaderGate::closed);
@@ -14216,8 +14583,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Same single-threaded safety window as the ATERM_UPDATED_FROM removal
     // above: no thread exists yet (the first spawn is the font-warm/backend
     // thread below).
-    let headless = std::env::var_os("ATERM_HEADLESS").is_some();
-    unsafe { std::env::remove_var("ATERM_HEADLESS") };
+    // Read and cleared in ONE critical section (`aterm_log::env::take`), so the
+    // flag cannot be observed twice nor survive into a child session.
+    let headless = aterm_log::env::take("ATERM_HEADLESS").is_some();
     // Every process-environment mutation is now complete. Start the modern
     // Commit channel's parent-liveness watcher before any session/helper spawn:
     // parent EOF at preproof, ProofReady, or pre-Commit fail-stops this
@@ -14260,9 +14628,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // bounded, correct). The single-threaded-process requirement of the env
     // mutations above (`remove_var`, `seamless::take_incoming`) still holds: NO
     // process-env mutation past this line, and no thread spawns before it.
-    // Capture user config ONCE. The service validates the text and resolves its
-    // Trail Pack catalog as one generation; startup derives App.config from that
-    // same snapshot so a concurrent file edit cannot pair config A with catalog B.
+    // Capture user config ONCE. The service validates the text and resolves the
+    // bounded theme/Nyan portion; the parallel config-runtime worker below
+    // admits Trail/Sparkle feeds as one exact generation before publication.
+    // Startup derives App.config from this same text snapshot, so a concurrent
+    // config-file edit cannot pair config A with assets for config B.
     let mut native_config_service = native_config_service::VersionedConfigService::load_current()
         .unwrap_or_else(|error| {
             eprintln!("aterm-gui: native config service: {error}");
@@ -14308,6 +14678,17 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // explicit size is never double-scaled. (Mirrors `resolve_font_px`'s
     // env > config > default precedence: either valid source counts as explicit.)
     let font_px_explicit = app_config::font_px_is_explicit(&config);
+    // Explicit render-scale override ($ATERM_FORCE_SCALE / --scale). Resolve it
+    // before backend construction so a headless default face is built and
+    // sealed once at its final scale instead of parsing a generation that an
+    // immediate post-join rebuild would discard.
+    let force_scale = resolve_force_scale();
+    let headless_scale = force_scale.unwrap_or(1.0);
+    if headless && force_scale.is_some() && !font_px_explicit && headless_scale > 1.0 {
+        font_px = (FONT_PX * headless_scale as f32)
+            .round()
+            .clamp(FONT_PX_MIN, FONT_PX_MAX);
+    }
     // GPU (Metal) is the DEFAULT on macOS: the CPU renderer re-rasterizes every
     // glyph on heavy full-screen colour output (the dominant per-frame cost for
     // streaming TUIs like Claude Code), while the GPU path re-encodes cached glyph
@@ -14368,6 +14749,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // tail too. The build owns the GPU-or-CPU-fallback decision, so the thread
     // returns `(Backend, use_gpu)`.
     let family_for_build = font_family.clone();
+    let (startup_font_tx, startup_font_rx) =
+        std::sync::mpsc::sync_channel::<StartupFontGeneration>(1);
     let backend_handle = std::thread::spawn(move || -> (Backend, bool) {
         let build_cpu = || -> Renderer {
             Renderer::from_system_with_family(family_for_build.as_deref(), font_px, theme)
@@ -14376,7 +14759,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                     std::process::exit(1);
                 })
         };
-        if want_gpu {
+        let (mut backend, use_gpu) = if want_gpu {
             match aterm_gpu::GpuRenderer::new_with_family(
                 family_for_build.as_deref(),
                 font_px,
@@ -14394,27 +14777,60 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             }
         } else {
             (Backend::Cpu(build_cpu()), false)
-        }
+        };
+        let startup_fonts = startup_font_rx
+            .recv()
+            .expect("startup font generation sender dropped before backend publication");
+        apply_font_config_to_backend(
+            &mut backend,
+            &startup_fonts.config,
+            &startup_fonts.variations,
+            startup_fonts.dark_nudge,
+        );
+        // This method is intentionally worker-only: it can read and parse the
+        // broad fallback, symbol, and emoji candidates. Publish a sealed,
+        // resident generation so the first event-loop turn performs no font I/O.
+        backend.seal_admitted_font_sources();
+        (backend, use_gpu)
     });
-    // Explicit render-scale override ($ATERM_FORCE_SCALE / --scale). When set it
-    // wins over the headless 1.0 default (and, in `resumed`, over the real window's
-    // scale_factor). Precedence: --scale flag > ATERM_FORCE_SCALE env > (headless
-    // 1.0 / windowed scale_factor).
-    let force_scale = resolve_force_scale();
+    // Resolve configured face names while the backend worker is constructing
+    // the GPU device/pipelines and primary face. Hand the generation over
+    // immediately so its broad fallback parsing can overlap every remaining
+    // launch task, including initial-session creation.
+    let (font_config, font_cfg_warns) = app_config::FontConfig::from_config(&config);
+    let (font_variations, vf_warns) = config.font_variation_requests();
+    if startup_font_tx
+        .send(StartupFontGeneration {
+            config: font_config.clone(),
+            variations: font_variations.clone(),
+            dark_nudge: config.font_weight_dark_nudge_or_default(),
+        })
+        .is_err()
+    {
+        eprintln!("aterm-gui: backend-build thread stopped before font admission");
+        std::process::exit(1);
+    }
+    // Sparkle lexicon compilation and path-feed fingerprinting share only the
+    // immutable launch config. Start them beside backend construction so their
+    // bounded parsing/I/O overlaps authority, event-loop, socket, and PTY setup
+    // instead of forming a serial pre-run_app tail.
+    let runtime_config = config.clone();
+    let config_runtime_handle = std::thread::Builder::new()
+        .name("aterm-config-runtime".into())
+        .spawn(move || runtime_config.prepare_path_feed_generation());
     // Interior padding so text doesn't sit flush against the window edge. Seeded
     // at scale 1.0 (so the initial window — created before its display's scale is
     // known — fits the grid + border); `resumed()` re-applies it at the window's
     // real scale (`round(22·scale)`). Headless (no window) keeps this 1× value
     // UNLESS a scale override is given, so the `image` introspection renders at the
     // requested DPI (e.g. --scale 2 → ~2× the 1× framebuffer).
-    let headless_scale = force_scale.unwrap_or(1.0);
     // With a scale override and a DEFAULT (non-explicit) font, auto-scale the glyph
     // size the same way `resumed` does for a real HiDPI window — `round(FONT_PX·scale)` —
     // so the headless capture's cell metrics (and thus framebuffer size) match a
     // real window of that scale. An explicit $ATERM_FONT_PX is honoured verbatim
     // (never double-scaled), preserving the env > config > default precedence.
-    // (#7) The backend-dependent setup — the `metrics` backend tag, the headless
-    // `--scale` font rebuild and pad seed — is DEFERRED: headless
+    // (#7) The backend-dependent setup — the `metrics` backend tag and headless
+    // pad seed — is DEFERRED: headless
     // runs it just after `spawn_session` below (where it joins `backend_handle`);
     // windowed runs it in `App::finalize_backend` at the first-window join (#7
     // tail). Nothing between here and there touches the backend (the compiler
@@ -14684,7 +15100,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // its own signed channel and is inert on a build with no pinned root key. A no-op for
     // dev/`cargo run` (no co-located `atpkg`), skipped headless (no background network),
     // and gated on the `[packages]` loop flags (enabled + auto_update, default on).
-    let package_update_loop_running = !headless && spawn_pkg_update_check(&config);
+    let package_update_loop_running =
+        !headless && spawn_pkg_update_check(&config, proxy.clone());
 
     // Latency self-introspection state (see App::trace_latency). The epoch is a
     // shared monotonic origin so each tab's reader thread and the UI thread
@@ -14812,8 +15229,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let master = session0.master;
     let app_sink = session0.ctx.sink.clone();
 
-    // (#7) HEADLESS joins the backend build here — its first consumer (the
-    // `--scale` rebuild, `set_pad`, `cell_size`) is immediately below, and the
+    // (#7) HEADLESS joins the backend build here — its first consumers
+    // (`set_pad`, `cell_size`) are immediately below, and the
     // whole control-socket/introspection surface must see a Ready backend from
     // the first request. Everything above (containment/authority, the SIGUSR1
     // mask, env build, spawn_session + session-0 wiring) overlapped the build.
@@ -14829,19 +15246,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         let (mut backend, use_gpu) = backend_handle
             .join()
             .expect("backend-build thread panicked");
+        assert!(
+            backend.admitted_font_sources_sealed(),
+            "backend worker published an unsealed font generation"
+        );
         metrics::set_backend_gpu(use_gpu);
-        if force_scale.is_some() && !font_px_explicit && headless_scale > 1.0 {
-            let scaled = (FONT_PX * headless_scale as f32)
-                .round()
-                .clamp(FONT_PX_MIN, FONT_PX_MAX);
-            match build_backend(scaled, use_gpu, theme, font_family.as_deref()) {
-                Some(b) => {
-                    font_px = scaled;
-                    backend = b;
-                }
-                None => eprintln!("aterm-gui: --scale font rebuild failed; keeping {font_px}px"),
-            }
-        }
         // Config-resolved padding (`window_padding`; the built-in 12px default
         // when unset) so headless captures match a configured window's border.
         backend.set_pad(logical_to_device_px(
@@ -14886,10 +15295,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // Windowed does NOT join here: the slot stays `Pending` and the first
         // `attach_os_window` joins it in `App::finalize_backend`, where the
         // backend-dependent setup — pad seed, GPU bloom, AND our M3 EDR
-        // `set_hdr_glow` / W2 blending / W5 render knobs / W6 font config — is
-        // applied at that single join point (see `app_window.rs`). `use_gpu` is
-        // seeded with the build's INTENT; `finalize_backend` overwrites it with the
-        // actual outcome at the join.
+        // `set_hdr_glow` / W2 blending / W5 render knobs — is applied at that
+        // single join point (see `app_window.rs`). W6 font admission/sealing
+        // already completed on the worker. `use_gpu` is seeded with the build's
+        // INTENT; `finalize_backend` overwrites it with the actual outcome.
         (BackendSlot::Pending(Some(backend_handle)), want_gpu)
     };
 
@@ -15058,9 +15467,24 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Complete the preliminary catalog with the exact inline + Toy Pack table
     // before any view can observe revision 1. Runtime rendering and Settings
     // now share this one already-compiled generation.
-    let prepared_sparkle = config.prepare_sparkle_runtime();
-    native_config_service
-        .complete_startup_sparkle_consumers(prepared_sparkle.consumer_capabilities());
+    let prepared_path_feeds = match config_runtime_handle {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            eprintln!("aterm-gui: config-runtime worker panicked; preparing inline");
+            config.prepare_path_feed_generation()
+        }),
+        Err(error) => {
+            eprintln!(
+                "aterm-gui: could not start config-runtime worker ({error}); preparing inline"
+            );
+            config.prepare_path_feed_generation()
+        }
+    };
+    native_config_service.complete_startup_path_generation(
+        prepared_path_feeds.sparkle.consumer_capabilities(),
+        Arc::clone(&prepared_path_feeds.trail_packs),
+    );
+    let prepared_sparkle = prepared_path_feeds.sparkle;
+    let path_feed_fps = prepared_path_feeds.fingerprints;
     // One revisioned config authority owns every filesystem-backed visual
     // asset. The live host, capture, windows, and semantic Settings views clone
     // this exact outer catalog Arc.
@@ -15093,13 +15517,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     if let Some(w) = config.cursor_trail_style_warning(&config_assets.trail_packs) {
         cfg_warns.push(format!("config {w}"));
     }
-    // W6: resolve the per-style / fallback font keys once (families → paths),
-    // collecting unresolvable-entry warnings into the same banner.
-    let (font_config, font_cfg_warns) = app_config::FontConfig::from_config(&config);
+    // W6: surface the warnings collected while configured face names were
+    // resolved concurrently with backend construction above.
     cfg_warns.extend(font_cfg_warns);
-    // W9: parse the variable-font requests once (malformed entries warn +
-    // skip, riding the same banner).
-    let (font_variations, vf_warns) = config.font_variation_requests();
+    // W9: malformed variable-font requests were skipped by the same startup
+    // generation and ride the shared warning banner.
     cfg_warns.extend(vf_warns);
     for w in &cfg_warns {
         eprintln!("aterm-gui: {w}");
@@ -15125,7 +15547,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let native_font_catalog = native_font_catalog::Lane::spawn(proxy.clone())
         .map_err(|error| eprintln!("aterm-gui: {error}"))
         .ok();
-    let path_feed_fps = config.path_feed_fingerprints();
     let mut app = App {
         apprt,
         system_reduce_motion: false,
@@ -15208,6 +15629,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         font_config,
         option_as_meta: config.option_as_meta_or_default(),
         confirm_multiline_paste: config.confirm_multiline_paste_or_default(),
+        #[cfg(target_os = "macos")]
+        paste_confirm: None,
         copy_on_select: config.copy_on_select_or_default(),
         window_theme: config.window_theme_or_default(),
         window_colorspace: config.window_colorspace_or_default(),
@@ -15237,7 +15660,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         handoff_ready,
         handoff_commit,
         handoff_reader_gate,
-        handoff_legacy_parent_build: updated_from,
         incoming_handoff_pending: overlap_channels_present && adopting,
         handoff_degraded: overlap_degraded,
         bootstrap_session_adopted: adopting,
@@ -15311,11 +15733,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // This is Arc/scalar-only: the config service completed every bounded path
     // read and optional PNG decode before App construction.
     app.install_window_config_assets(WindowId(0));
-    // HEADLESS only: the backend is already built. Windowed startup reaches the
-    // same canonical pin in `finalize_backend` after its deferred join.
+    // HEADLESS only: the backend worker already applied and sealed its complete
+    // font generation. Windowed startup reaches the same memory-only pin in
+    // `finalize_backend` after its deferred join.
     if headless {
-        app.pin_backend_render_config();
-        app.backend.seal_admitted_font_sources();
+        app.pin_backend_render_config_core();
         // Warn once about configured `font_features` that can't take effect (typo'd
         // tokens, or tags the active font lacks) — now that the backend carries the
         // shaping AND the resolved font config, so the font probe is accurate. A
@@ -15359,6 +15781,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // `ApplicationHandler` roots call `watchdog::beat` so a future wedge is pinned to
     // a named main-loop root even in a stripped release.
     watchdog::start();
+    metrics::mark_gui_ready_for_winit();
     event_loop.run_app(&mut app).expect("run");
     // The event loop is gone: no recording can produce another present or
     // completion. Answer its client and remove the pre-created directory before
@@ -16594,7 +17017,8 @@ mod backend_slot_tests {
         // same `(Backend, use_gpu)` shape the windowed cold launch hands run_app.
         let theme = app.theme;
         let handle = std::thread::spawn(move || -> (Backend, bool) {
-            let r = Renderer::from_system(FONT_PX, theme).expect("system font for test build");
+            let mut r = Renderer::from_system(FONT_PX, theme).expect("system font for test build");
+            r.seal_admitted_font_sources();
             (Backend::Cpu(r), false)
         });
         app.backend = BackendSlot::Pending(Some(handle));
@@ -16616,14 +17040,32 @@ mod backend_slot_tests {
         assert_eq!(app.backend.pad(), pad_for_scale(1.0));
     }
 
+    /// Negative control for the worker-only publication contract: a raw
+    /// renderer may never cross the deferred join as though its font
+    /// generation had already been sealed.
+    #[test]
+    #[should_panic(expected = "published an unsealed font generation")]
+    fn finalize_backend_rejects_unsealed_generation() {
+        let mut app = App::headless_for_test();
+        let theme = app.theme;
+        let handle = std::thread::spawn(move || -> (Backend, bool) {
+            let renderer =
+                Renderer::from_system(FONT_PX, theme).expect("system font for test build");
+            (Backend::Cpu(renderer), false)
+        });
+        app.backend = BackendSlot::Pending(Some(handle));
+        app.finalize_backend();
+    }
+
     /// Touching a still-Pending backend is an ORDERING BUG and must fail loud
     /// (never a silent lazy join from a `&self` site).
     #[test]
     #[should_panic(expected = "before attach_os_window")]
     fn pending_slot_access_is_fail_loud() {
         let slot = BackendSlot::Pending(Some(std::thread::spawn(move || -> (Backend, bool) {
-            let r = Renderer::from_system(FONT_PX, Theme::default())
+            let mut r = Renderer::from_system(FONT_PX, Theme::default())
                 .expect("system font for test build");
+            r.seal_admitted_font_sources();
             (Backend::Cpu(r), false)
         })));
         let _ = slot.cell_size();
@@ -19430,7 +19872,11 @@ mod present_retry_tests {
     use aterm_core::selection::SelectionSide;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 
-    fn project(retry: &PresentRetry, now: Instant) -> BTreeMap<&'static str, i64> {
+    fn project(
+        retry: &PresentRetry,
+        now: Instant,
+        bootstrap_available: bool,
+    ) -> BTreeMap<&'static str, i64> {
         // The host increments `autonomous_retries` when it SCHEDULES; the model
         // spends `remaining` when that deadline WAKES. Add the still-pending
         // slot back so both describe the same lifecycle instant.
@@ -19454,6 +19900,10 @@ mod present_retry_tests {
             (
                 "outstanding",
                 i64::from(u8::from(retry.recovery_redraw_outstanding)),
+            ),
+            (
+                "bootstrap_available",
+                i64::from(u8::from(bootstrap_available)),
             ),
         ])
     }
@@ -19854,8 +20304,183 @@ mod present_retry_tests {
         model_state: &BTreeMap<&'static str, i64>,
         retry: &PresentRetry,
         now: Instant,
+        bootstrap_available: bool,
     ) {
-        assert_eq!(project(retry, now), *model_state);
+        assert_eq!(project(retry, now, bootstrap_available), *model_state);
+    }
+
+    /// Tier-1 binding for the macOS cold-start seam: drive the real App drop
+    /// reducer so one pristine per-window `GpuOccluded` result arms a future
+    /// retry, consumes its permit, and a second result parks.
+    #[test]
+    fn bootstrap_occlusion_gets_exactly_one_future_retry() {
+        let model = aterm_spec::derive::present_retry_model();
+        let mut model_state = model.init_state();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        assert!(model.fire("DropBootstrapOccluded", &mut model_state));
+        let before_drop = Instant::now();
+        app.rearm_dropped_present(wid, PresentDropReason::GpuOccluded);
+        let deadline = {
+            let window = &app.windows[&wid];
+            assert!(!window.bootstrap_present_retry_available);
+            let deadline = window
+                .present_retry
+                .deadline
+                .expect("the pristine occlusion must arm one retry");
+            assert!(deadline > before_drop);
+            assert_matches(&model_state, &window.present_retry, before_drop, false);
+            deadline
+        };
+
+        assert!(model.fire("Wake", &mut model_state));
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .present_retry
+                .take_due(deadline)
+        );
+        assert_matches(
+            &model_state,
+            &app.windows[&wid].present_retry,
+            deadline,
+            false,
+        );
+
+        assert!(model.fire("DropPersistent", &mut model_state));
+        app.rearm_dropped_present(wid, PresentDropReason::GpuOccluded);
+        let window = &app.windows[&wid];
+        assert!(window.present_retry.parked);
+        assert_eq!(window.present_retry.deadline, None);
+        assert!(!window.bootstrap_present_retry_available);
+        assert_matches(&model_state, &window.present_retry, Instant::now(), false);
+    }
+
+    /// Tier-1 binding for the other one-way edge: the genuine window-success
+    /// reducer closes bootstrap admission, and a later external stimulus cannot
+    /// replenish it or reclassify an occlusion as a startup retry.
+    #[test]
+    fn successful_present_permanently_closes_bootstrap_retry() {
+        let model = aterm_spec::derive::present_retry_model();
+        let mut model_state = model.init_state();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        assert!(model.fire("Present", &mut model_state));
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.on_present_succeeded();
+            assert!(!window.bootstrap_present_retry_available);
+            assert_matches(&model_state, &window.present_retry, Instant::now(), false);
+        }
+
+        assert!(model.fire("ForcedStimulus", &mut model_state));
+        let mut requests = 0;
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            assert!(rearm_present_and_request(
+                &mut window.present_retry,
+                true,
+                || requests += 1,
+            ));
+            assert!(!window.bootstrap_present_retry_available);
+            assert_matches(&model_state, &window.present_retry, Instant::now(), false);
+        }
+        assert_eq!(requests, 1);
+
+        assert!(model.fire("DropPersistent", &mut model_state));
+        app.rearm_dropped_present(wid, PresentDropReason::GpuOccluded);
+        let window = &app.windows[&wid];
+        assert!(window.present_retry.parked);
+        assert!(!window.bootstrap_present_retry_available);
+        assert_matches(&model_state, &window.present_retry, Instant::now(), false);
+    }
+
+    /// Tier-1 binding for synchronous capture/internal redraws, whose shipping
+    /// call sites reset retry state directly and present in the same operation
+    /// without creating a new winit request. A request already in flight stays
+    /// outstanding until present/drop acknowledges it.
+    #[test]
+    fn synchronous_stimulus_preserves_but_never_replenishes_bootstrap_retry() {
+        let model = aterm_spec::derive::present_retry_model();
+        let mut model_state = model.init_state();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        assert!(model.fire("DropPersistent", &mut model_state));
+        app.rearm_dropped_present(wid, PresentDropReason::GpuValidation);
+        {
+            let window = &app.windows[&wid];
+            assert!(window.bootstrap_present_retry_available);
+            assert_matches(&model_state, &window.present_retry, Instant::now(), true);
+        }
+
+        assert!(model.fire("SynchronousStimulus", &mut model_state));
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            assert!(window.present_retry.on_external_stimulus());
+            assert!(window.bootstrap_present_retry_available);
+            assert_matches(&model_state, &window.present_retry, Instant::now(), true);
+        }
+
+        assert!(model.fire("DropBootstrapOccluded", &mut model_state));
+        let before_drop = Instant::now();
+        app.rearm_dropped_present(wid, PresentDropReason::GpuOccluded);
+        let deadline = {
+            let window = &app.windows[&wid];
+            assert!(!window.bootstrap_present_retry_available);
+            let deadline = window
+                .present_retry
+                .deadline
+                .expect("the preserved bootstrap permit arms one future retry");
+            assert!(deadline > before_drop);
+            assert_matches(&model_state, &window.present_retry, before_drop, false);
+            deadline
+        };
+
+        assert!(model.fire("Wake", &mut model_state));
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .present_retry
+                .take_due(deadline)
+        );
+        assert!(model.fire("SynchronousStimulus", &mut model_state));
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            assert!(window.present_retry.on_external_stimulus());
+            assert!(window.present_retry.recovery_redraw_outstanding);
+            assert!(!window.bootstrap_present_retry_available);
+            assert_matches(&model_state, &window.present_retry, deadline, false);
+        }
+
+        assert!(model.fire("DropPersistent", &mut model_state));
+        app.rearm_dropped_present(wid, PresentDropReason::GpuOccluded);
+        {
+            let window = &app.windows[&wid];
+            assert!(window.present_retry.parked);
+            assert!(!window.bootstrap_present_retry_available);
+            assert_matches(&model_state, &window.present_retry, deadline, false);
+        }
+
+        assert!(model.fire("SynchronousStimulus", &mut model_state));
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            assert!(window.present_retry.on_external_stimulus());
+            assert!(!window.bootstrap_present_retry_available);
+            assert_matches(&model_state, &window.present_retry, deadline, false);
+        }
+
+        assert!(model.fire("DropPersistent", &mut model_state));
+        app.rearm_dropped_present(wid, PresentDropReason::GpuOccluded);
+        let window = &app.windows[&wid];
+        assert!(window.present_retry.parked);
+        assert_eq!(window.present_retry.deadline, None);
+        assert!(!window.bootstrap_present_retry_available);
+        assert_matches(&model_state, &window.present_retry, Instant::now(), false);
     }
 
     /// Tier-1: drive the genuine per-window retry state through every model
@@ -19868,7 +20493,8 @@ mod present_retry_tests {
         let mut model_state = model.init_state();
         let mut retry = PresentRetry::default();
         let mut now = Instant::now();
-        assert_matches(&model_state, &retry, now);
+        let mut bootstrap_available = true;
+        assert_matches(&model_state, &retry, now, bootstrap_available);
 
         for slot in 0..PRESENT_RETRY_CAP {
             assert!(retry.present_attempt_allowed());
@@ -19885,13 +20511,13 @@ mod present_retry_tests {
                 deadline.duration_since(now),
                 PRESENT_RETRY_BASE.saturating_mul(1u32 << u32::from(slot))
             );
-            assert_matches(&model_state, &retry, now);
+            assert_matches(&model_state, &retry, now, bootstrap_available);
 
             assert!(model.fire("Wake", &mut model_state));
             assert!(retry.take_due(deadline));
             assert!(retry.present_attempt_allowed());
             now = deadline;
-            assert_matches(&model_state, &retry, now);
+            assert_matches(&model_state, &retry, now, bootstrap_available);
         }
 
         // Retry fuel is empty: this drop parks and owns no deadline.
@@ -19900,7 +20526,7 @@ mod present_retry_tests {
         assert!(retry.parked);
         assert_eq!(retry.deadline, None);
         assert!(!retry.present_attempt_allowed());
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
 
         // A real surface stimulus starts a FRESH bounded episode.
         assert!(model.fire("Stimulus", &mut model_state));
@@ -19910,12 +20536,13 @@ mod present_retry_tests {
         }));
         assert_eq!(stimulus_requests, 1);
         assert!(retry.present_attempt_allowed());
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
 
         // And a successful present returns to the same idle projection.
         assert!(model.fire("Present", &mut model_state));
         retry.on_presented();
-        assert_matches(&model_state, &retry, now);
+        bootstrap_available = false;
+        assert_matches(&model_state, &retry, now, bootstrap_available);
 
         // An ordinary external input while completely idle is a no-op in both
         // systems; a genuine surface/expose event is the distinct forced edge
@@ -19924,17 +20551,17 @@ mod present_retry_tests {
         assert!(!rearm_present_and_request(&mut retry, false, || {
             panic!("idle non-forced stimulus must not manufacture a redraw")
         }));
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
         assert!(model.fire("ForcedStimulus", &mut model_state));
         let mut forced_requests = 0;
         assert!(rearm_present_and_request(&mut retry, true, || {
             forced_requests += 1;
         }));
         assert_eq!(forced_requests, 1);
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
         assert!(model.fire("Present", &mut model_state));
         retry.on_presented();
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
 
         // Production accepts an external stimulus while already ready. Make
         // this transition non-vacuous: first consume one autonomous wake so the
@@ -19948,7 +20575,7 @@ mod present_retry_tests {
         assert!(model.fire("Wake", &mut model_state));
         assert!(retry.take_due(deadline));
         now = deadline;
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
         assert!(retry.present_attempt_allowed());
         assert_ne!(retry, PresentRetry::default());
         assert_eq!(model_state["remaining"], i64::from(PRESENT_RETRY_CAP - 1));
@@ -19959,17 +20586,17 @@ mod present_retry_tests {
         assert!(rearm_present_and_request(&mut retry, false, || {
             replacement_requests += 1;
         }));
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
         assert!(retry.recovery_redraw_outstanding);
         assert!(model.fire("Stimulus", &mut model_state));
         assert!(rearm_present_and_request(&mut retry, false, || {
             replacement_requests += 1;
         }));
         assert_eq!(replacement_requests, 2);
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
         assert!(model.fire("Present", &mut model_state));
         retry.on_presented();
-        assert_matches(&model_state, &retry, now);
+        assert_matches(&model_state, &retry, now, bootstrap_available);
         assert!(!rearm_present_and_request(&mut retry, false, || {
             panic!("idle state has no recovery redraw to replace")
         }));
@@ -20008,14 +20635,14 @@ mod present_retry_tests {
             assert_eq!(retry.on_drop(reason, now), None);
             assert!(retry.parked);
             assert_eq!(retry.deadline, None);
-            assert_matches(&model_state, &retry, now);
+            assert_matches(&model_state, &retry, now, true);
         }
 
         let immediate = PresentRetry {
             deadline: Some(now - Duration::from_nanos(1)),
             ..PresentRetry::default()
         };
-        let bad = project(&immediate, now);
+        let bad = project(&immediate, now, true);
         assert_eq!(bad["retry"], 2);
         assert!(
             !model.check_invariant("RetryDeadlineIsStrictlyFuture", &bad),
@@ -24160,7 +24787,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            126,
+            127,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -24194,7 +24821,7 @@ mod spec_xref_gate {
         assert_eq!(
             classify_spec_link(Some(1), &live_report),
             Some(SpecLinkDisposition::ExplicitDesignOnly),
-            "the real 126-machine DesignOnly report shape must classify honestly"
+            "the real 127-machine DesignOnly report shape must classify honestly"
         );
     }
 
@@ -26228,7 +26855,7 @@ mod tab_strip_math_tests {
         let segments = tab_bar::layout_segments(cols as u16, 2, 0, false);
         let titles = vec!["zsh".to_string(), "vim".to_string()];
         let mut strip_row = vec![tab_bar::blank_cell(theme); cols];
-        tab_bar::paint_strip(&mut strip_row, &segments, &titles, 0, theme);
+        tab_bar::paint_strip(&mut strip_row, &segments, &titles, None, 0, theme);
         prepend_strip_rows(&mut frame, &[strip_row], 16, 0, &mut Vec::new());
         // The composed frame is one row taller; the strip is row 0.
         assert_eq!(frame.rows, 4);

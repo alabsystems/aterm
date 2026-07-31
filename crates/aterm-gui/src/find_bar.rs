@@ -488,12 +488,12 @@ fn field_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize)
     } else {
         right_edge
     };
-    if reserve > GAP + IND_W || !with_indicators {
-        if let Some(status) = status_seg(v, c, zone) {
-            let start = status_right.saturating_sub(status.text.chars().count());
-            if start >= layout.well.end {
-                layout.status = Some((start, vec![status]));
-            }
+    if (reserve > GAP + IND_W || !with_indicators)
+        && let Some(status) = status_seg(v, c, zone)
+    {
+        let start = status_right.saturating_sub(status.text.chars().count());
+        if start >= layout.well.end {
+            layout.status = Some((start, vec![status]));
         }
     }
     layout

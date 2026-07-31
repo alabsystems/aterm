@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -246,11 +246,11 @@ impl Ledger {
     }
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// [`crate::flow::now_unix`] in the ledger's unsigned width. That source is non-negative by
+/// construction (0 for a pre-epoch clock, `i64::MAX` if the seconds overflow `i64`), so the
+/// conversion never fails and the `unwrap_or` is unreachable.
+fn now_unix_u64() -> u64 {
+    u64::try_from(crate::flow::now_unix()).unwrap_or(0)
 }
 
 /// The commit of the currently-installed (active) build of `program`, from its provenance
@@ -325,7 +325,7 @@ pub fn reconcile_source(
                         .map(|e| e.attempts)
                         .unwrap_or(0),
                     reason: String::new(),
-                    updated_unix: now_unix(),
+                    updated_unix: now_unix_u64(),
                 },
             );
             out.push(SeedResult {
@@ -352,7 +352,7 @@ pub fn reconcile_source(
                         .map(|e| e.attempts)
                         .unwrap_or(0),
                     reason: reason.to_string(),
-                    updated_unix: now_unix(),
+                    updated_unix: now_unix_u64(),
                 },
             );
             out.push(SeedResult {
@@ -402,7 +402,7 @@ pub fn reconcile_source(
                 build: 0,
                 attempts: attempts_for_commit + 1,
                 reason: String::new(),
-                updated_unix: now_unix(),
+                updated_unix: now_unix_u64(),
             },
         );
         ledger.write(layout);
@@ -419,7 +419,7 @@ pub fn reconcile_source(
                         build: installed.build,
                         attempts: attempts_for_commit + 1,
                         reason: String::new(),
-                        updated_unix: now_unix(),
+                        updated_unix: now_unix_u64(),
                     },
                 );
                 out.push(SeedResult {
@@ -440,7 +440,7 @@ pub fn reconcile_source(
                         build: 0,
                         attempts: attempts_for_commit + 1,
                         reason: detail.clone(),
-                        updated_unix: now_unix(),
+                        updated_unix: now_unix_u64(),
                     },
                 );
                 out.push(SeedResult {

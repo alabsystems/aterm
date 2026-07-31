@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use winit::event_loop::EventLoopProxy;
 
-use crate::app_config::{Config, ConfigAssetCatalog, FontConfig, ThemeCatalog};
+use crate::app_config::{Config, ConfigAssetCatalog, FontConfig};
 use crate::native_config_service::ConfigDiskObservation;
 use crate::{Wake, effective_font_family};
 
@@ -21,13 +21,9 @@ pub(crate) struct PrimarySeed {
 pub(crate) struct Request {
     pub(crate) sequence: u64,
     pub(crate) theme_generation: u64,
-    pub(crate) observation: ConfigDiskObservation,
-    pub(crate) config: Config,
-    pub(crate) values: std::collections::BTreeMap<String, String>,
+    pub(crate) prepared: crate::native_config_service::PreparedConfigObservation,
     pub(crate) px: f32,
     pub(crate) appearance: aterm_types::Appearance,
-    pub(crate) themes: Arc<ThemeCatalog>,
-    pub(crate) prepared_assets: Option<Arc<ConfigAssetCatalog>>,
     pub(crate) previous_family: Option<String>,
     pub(crate) previous_font_config: FontConfig,
     pub(crate) previous_sources: aterm_render::AdmittedFontSources,
@@ -153,35 +149,35 @@ fn worker(rx: Receiver<Request>, proxy: EventLoopProxy<Wake>) {
 }
 
 pub(crate) fn prepare(request: Request) -> Completion {
-    let values = request.values;
-    let path_feed_fps = request.config.path_feed_fingerprints();
-    let sparkle = request.config.prepare_sparkle_runtime();
-    let sparkle_spec_consumers = sparkle.consumer_capabilities();
-    let assets = request.prepared_assets.unwrap_or_else(|| {
-        request
-            .config
-            .resolve_asset_catalog_with_themes(Arc::clone(&request.themes))
-    });
-    // Bind Settings disclosure to the SAME compiled table the runtime will
-    // install. This is an Arc/scalar rewrap only: Toy Pack I/O occurred once,
-    // above, in `prepare_sparkle_runtime`.
-    let assets = Arc::new(ConfigAssetCatalog {
-        trail_packs: Arc::clone(&assets.trail_packs),
-        nyan_sprite: assets.nyan_sprite.clone(),
-        themes: Arc::clone(&assets.themes),
-        sparkle_spec_consumers: Some(Arc::new(sparkle_spec_consumers)),
-    });
-    let theme = request
-        .config
-        .theme_for_with_assets(request.appearance, &assets.themes);
-    let requested_family = effective_font_family(request.config.font_family_request().as_deref());
+    let crate::native_config_service::PreparedConfigObservation {
+        observation,
+        config: source_config,
+        values,
+        assets,
+        path_feeds: path_generation,
+    } = request.prepared;
+    let path_feed_fps = path_generation.fingerprints;
+    let sparkle = path_generation.sparkle;
+    // The required bundle was composed from this exact path generation by the
+    // config worker. Font/theme preparation consumes it literally: no feed
+    // reopen, no second lexicon projection, and no representable "assets from
+    // A, runtime from B" fallback.
+    debug_assert!(Arc::ptr_eq(
+        &path_generation.trail_packs,
+        &assets.trail_packs
+    ));
+    debug_assert_eq!(
+        assets.sparkle_spec_consumers.as_deref(),
+        Some(&sparkle.consumer_capabilities())
+    );
+    let theme = source_config.theme_for_with_assets(request.appearance, &assets.themes);
+    let requested_family = effective_font_family(source_config.font_family_request().as_deref());
     let styles = [
-        request.config.font_family_bold.as_deref(),
-        request.config.font_family_italic.as_deref(),
-        request.config.font_family_bold_italic.as_deref(),
+        source_config.font_family_bold.as_deref(),
+        source_config.font_family_italic.as_deref(),
+        source_config.font_family_bold_italic.as_deref(),
     ];
-    let fallbacks = request
-        .config
+    let fallbacks = source_config
         .fallback_fonts
         .as_ref()
         .map(|fonts| fonts.0.as_slice())
@@ -204,15 +200,13 @@ pub(crate) fn prepare(request: Request) -> Completion {
         .iter()
         .map(|value| push(value))
         .collect::<Vec<_>>();
-    let symbol_i = request
-        .config
+    let symbol_i = source_config
         .symbol_font
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(&mut push);
-    let emoji_i = request
-        .config
+    let emoji_i = source_config
         .emoji_font
         .as_deref()
         .map(str::trim)
@@ -290,8 +284,8 @@ pub(crate) fn prepare(request: Request) -> Completion {
             return Completion {
                 sequence: request.sequence,
                 theme_generation: request.theme_generation,
-                observation: request.observation,
-                config: request.config,
+                observation,
+                config: source_config,
                 values,
                 assets,
                 path_feed_fps,
@@ -317,7 +311,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
 
     let mut config = FontConfig::default();
     let mut preserve_current_generation = false;
-    config.synthetic_style = request.config.font_synthetic_style.unwrap_or(true);
+    config.synthetic_style = source_config.font_synthetic_style.unwrap_or(true);
     renderer.set_synthetic_styles(config.synthetic_style);
     for (slot, index) in style_i.into_iter().enumerate() {
         let Some(index) = index else { continue };
@@ -389,8 +383,8 @@ pub(crate) fn prepare(request: Request) -> Completion {
     {
         preserve_current_generation = true;
     }
-    let (variations, _) = request.config.font_variation_requests();
-    let dark_nudge = request.config.font_weight_dark_nudge_or_default();
+    let (variations, _) = source_config.font_variation_requests();
+    let dark_nudge = source_config.font_weight_dark_nudge_or_default();
     renderer.set_font_variations(&variations, dark_nudge);
     let sources = renderer.seal_admitted_font_sources();
     let install_required = family != request.previous_family
@@ -408,8 +402,8 @@ pub(crate) fn prepare(request: Request) -> Completion {
     Completion {
         sequence: request.sequence,
         theme_generation: request.theme_generation,
-        observation: request.observation,
-        config: request.config,
+        observation,
+        config: source_config,
         values,
         assets,
         path_feed_fps,
@@ -459,6 +453,10 @@ mod tests {
     };
 
     fn request(sequence: u64) -> Request {
+        request_with_text(sequence, "")
+    }
+
+    fn request_with_text(sequence: u64, text: &str) -> Request {
         let dir = std::env::temp_dir().join(format!(
             "aterm-font-lane-{}-{}",
             std::process::id(),
@@ -467,20 +465,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, "").unwrap();
+        std::fs::write(&path, text).unwrap();
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .unwrap();
+        let prepared = crate::native_config_service::VersionedConfigService::prepare_observation(
+            observation,
+            crate::app_config::ThemeCatalog::empty(),
+        )
+        .unwrap();
         Request {
             sequence,
             theme_generation: 0,
-            observation,
-            config: crate::app_config::Config::default(),
-            values: std::collections::BTreeMap::new(),
+            prepared,
             px: 12.0,
             appearance: aterm_types::Appearance::Dark,
-            themes: crate::app_config::ThemeCatalog::empty(),
-            prepared_assets: None,
             previous_family: None,
             previous_font_config: crate::app_config::FontConfig::default(),
             previous_sources: {
@@ -579,9 +578,7 @@ mod tests {
             "semantic no-op text must publish service state without replacing the renderer"
         );
 
-        let mut unrelated = request(11);
-        unrelated.config.trail_sounds = Some(false);
-        let unrelated = prepare(unrelated);
+        let unrelated = prepare(request_with_text(11, "trail_sounds = false\n"));
         assert!(
             unrelated.fonts.is_none(),
             "an unrelated effects toggle must not replace/regrid an identical font generation"
@@ -592,11 +589,13 @@ mod tests {
     fn prepared_catalog_carries_exact_admitted_toy_pack_consumers() {
         let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../aterm-effects/toy-packs/community/tiny-triumphs/pack.toml");
-        let mut request = request(12);
-        request.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
-            toy_packs: Some(vec![pack.to_string_lossy().into_owned()]),
-            ..Default::default()
-        });
+        let request = request_with_text(
+            12,
+            &format!(
+                "[sparkle_words]\ntoy_packs = [{:?}]\n",
+                pack.to_string_lossy()
+            ),
+        );
         let completion = prepare(request);
         let consumers = *completion
             .assets
@@ -616,27 +615,75 @@ mod tests {
     }
 
     #[test]
+    fn prepared_path_feeds_are_not_reopened_by_font_preparation() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-font-prepared-feeds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let trail = dir.join("trail.toml");
+        let v1 = "pack = 1\nid = \"font-worker-exact\"\n";
+        let v2 = "pack = 1\nid = \"font-worker-replacement\"\n";
+        std::fs::write(&trail, v1).unwrap();
+        let text = format!(
+            "cursor_trail_packs = [{:?}]\n[sparkle_words]\nenabled = false\n",
+            trail.to_string_lossy(),
+        );
+
+        let open_probe = aterm_effects::file_feed::probe_open_attempts(&trail);
+        crate::app_config::reset_path_feed_read_count();
+        let request = request_with_text(13, &text);
+        assert_eq!(crate::app_config::path_feed_read_count(), 1);
+        assert_eq!(
+            open_probe.attempts(),
+            1,
+            "the genuine config worker opens the one active trail exactly once"
+        );
+
+        // ABA the pathname after preparation. The required immutable bundle
+        // must remain v1 and native font/theme work must perform no new open.
+        std::fs::write(&trail, v2).unwrap();
+        std::fs::write(&trail, v1).unwrap();
+        crate::app_config::reset_path_feed_read_count();
+        let completion = prepare(request);
+        assert_eq!(
+            crate::app_config::path_feed_read_count(),
+            0,
+            "font/theme work must consume the carried generation without reopening feeds"
+        );
+        assert_eq!(open_probe.attempts(), 1);
+        assert_eq!(completion.assets.trail_packs.ids, ["font-worker-exact"]);
+
+        let _ = aterm_effects::file_feed::fingerprint_bounded_regular_utf8(
+            &trail,
+            aterm_effects::trail_pack::MAX_TRAIL_PACK_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            open_probe.attempts(),
+            2,
+            "negative control: a genuine independent fingerprint reopen reaches the OS seam"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn prepared_catalog_distinguishes_observed_no_consumers_from_unobserved() {
         let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../aterm-effects/toy-packs/community/tiny-triumphs/pack.toml");
-        let mut request = request(13);
-        request.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
-            toy_packs: Some(vec![pack.to_string_lossy().into_owned()]),
-            // Shadow every Tiny Triumphs recipe that consumes a shared
-            // setting. The remaining pack recipe is SelfGlow + graphic, so
-            // the exact reachable table has an authoritative all-false
-            // projection even though its arena still contains pack specs.
-            custom: Some(vec![aterm_effects::spec::RawCustomEntry {
-                words: ["shipit", "shipped", "ultrathink", "deepthink"]
-                    .map(str::to_string)
-                    .to_vec(),
-                graphic: Some(aterm_effects::spec::RawGraphic {
-                    collection: "cats".to_string(),
-                }),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        });
+        // Shadow every Tiny Triumphs recipe that consumes a shared setting.
+        // The remaining pack recipe is SelfGlow + graphic, so the exact
+        // reachable table has an authoritative all-false projection even
+        // though its arena still contains pack specs.
+        let request = request_with_text(
+            14,
+            &format!(
+                "[sparkle_words]\ntoy_packs = [{:?}]\n\
+                 [[sparkle_words.custom]]\n\
+                 words = [\"shipit\", \"shipped\", \"ultrathink\", \"deepthink\"]\n\
+                 graphic = {{ collection = \"cats\" }}\n",
+                pack.to_string_lossy()
+            ),
+        );
 
         let completion = prepare(request);
         let none = aterm_effects::spec::SpecConsumerCapabilities::default();

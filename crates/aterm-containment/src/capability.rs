@@ -5,8 +5,12 @@
 //! Capability enums for each subsystem.
 //!
 //! Each subsystem has a capability level that maps to a containment mode.
-//! Higher numeric value = more access. These match the TLA+ spec
-//! `tla/Containment.tla` capability encodings exactly.
+//! Higher numeric value = more access.
+//!
+//! The `TLA+ encoding:` notes below name the encodings of the INTENDED
+//! `tla/Containment.tla` model. That model is NOT in-tree and is on no
+//! build/CI path (see the crate-root note); these Rust definitions and the
+//! tests over them are the source of truth for the numbering.
 
 /// Network capability levels.
 ///
@@ -122,7 +126,8 @@ pub enum InputCapability {
 /// [`CommandCapability::max_tier_level`] derives the corresponding
 /// `aterm-security` `CommandTier` ceiling when commands are allowed.
 /// TLA+ encoding: `CmdNone`=0, `CmdTier2`=1, `CmdTier3`=2, `CmdAll`=3.
-/// This mirrors `CommandCaps` and `PolicyCommand` in `tla/Containment.tla`.
+/// This mirrors `CommandCaps` and `PolicyCommand` in the INTENDED
+/// `tla/Containment.tla` model (not in-tree; see the crate-root note).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 #[non_exhaustive]

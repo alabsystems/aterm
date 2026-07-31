@@ -74,6 +74,29 @@ struct PresentedWindowCapture {
     frame: PresentedFrameCapture,
 }
 
+/// One `image` request already resolved to the window it renders, on its way to
+/// the compiled native/heterogeneous route.
+///
+/// Every field but `front` and `presented` is carried verbatim from [`ImageReq`]
+/// and documented there. They travel as one value because they ARE one request:
+/// `render_image` only chooses the route and forwards them, so nothing here may
+/// be re-derived or reordered on the way through.
+struct NativeImageRequest<'a> {
+    /// The window `render_image` resolved — the frontmost one, or the window
+    /// whose active tab displays a cross-session `@<sid> image`.
+    front: WindowId,
+    clean: bool,
+    /// The successful application present this capture is bound to. `None` means
+    /// no present authority exists, so the route stages its own input scratch.
+    presented: Option<PresentedFrameCapture>,
+    target: crate::control_auth::ConfinedImage,
+    want_bytes: bool,
+    want_metadata: bool,
+    cancel: crate::control::CaptureCancellation,
+    frame_metadata: &'a std::sync::Arc<std::sync::OnceLock<crate::control::ImageFrameMetadata>>,
+    reply: std::sync::mpsc::Sender<crate::control::ImageReply>,
+}
+
 /// Convert an exact straight-RGBA client destination into the renderer Frame
 /// container used by the snapshot encoder without changing dimensions or bytes.
 fn snapshot_frame_from_presented_client(
@@ -235,11 +258,13 @@ pub(crate) enum EncodeJob {
     },
 }
 
-/// Encode + confined-write one job, then transfer its guarded result. Runs on
-/// the encode worker (or inline when the worker cannot be spawned/reached).
-/// The write keeps the TOCTOU confinement contract verbatim: each target owns
-/// the directory handles retained when the control thread confined it; the
-/// worker never re-opens a multi-segment pathname.
+/// Reconstruct a snapshot sidecar as a whole pathname. Only tests want this
+/// shape: production never names a sidecar this way, because the writer reaches
+/// every payload through the pinned directory handle and a single component
+/// (`sidecar_name` + [`crate::pinned_dir::PinnedDir`]), which is what keeps the
+/// TOCTOU confinement contract. Tests, which just stat what a snapshot
+/// published, need the ordinary path.
+#[cfg(test)]
 fn snapshot_sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let mut sidecar = path.as_os_str().to_os_string();
     sidecar.push(suffix);
@@ -264,6 +289,12 @@ pub(crate) struct SnapshotTransaction {
     target: SnapshotTarget,
 }
 
+/// The generation is private on purpose: every production reader lives in this
+/// module and takes the field directly, so nothing outside can invent or hold a
+/// generation the fence did not mint. The refinement harness in
+/// [`crate::artifact_transaction_conformance`] is the one outside observer, and
+/// it only ever reads.
+#[cfg(test)]
 impl SnapshotTransaction {
     #[must_use]
     pub(crate) fn generation(&self) -> u64 {
@@ -710,6 +741,11 @@ fn send_capture_reply_after_validation<T: Send>(
     true
 }
 
+/// Encode + confined-write one job, then transfer its guarded result. Runs on
+/// the encode worker (or inline when the worker cannot be spawned/reached).
+/// The write keeps the TOCTOU confinement contract verbatim: each target owns
+/// the directory handles retained when the control thread confined it; the
+/// worker never re-opens a multi-segment pathname.
 fn run_encode_job(job: EncodeJob) {
     match job {
         EncodeJob::Image {
@@ -2960,18 +2996,23 @@ impl App {
     /// application-present render. Native views have no terminal to snapshot; their semantic
     /// tray is nevertheless a first-class framebuffer and must remain visible
     /// through the canonical `image` verb.
-    fn render_native_image(
-        &mut self,
-        front: WindowId,
-        clean: bool,
-        presented: Option<PresentedFrameCapture>,
-        target: crate::control_auth::ConfinedImage,
-        want_bytes: bool,
-        want_metadata: bool,
-        cancel: crate::control::CaptureCancellation,
-        frame_metadata: &std::sync::Arc<std::sync::OnceLock<crate::control::ImageFrameMetadata>>,
-        reply: std::sync::mpsc::Sender<crate::control::ImageReply>,
-    ) {
+    ///
+    /// The request travels as one value ([`NativeImageRequest`]) rather than as
+    /// nine positional arguments: the capture, authority, cancellation, metadata
+    /// and reply state are independent, so naming them at every call site is
+    /// what keeps them from being silently reordered.
+    fn render_native_image(&mut self, request: NativeImageRequest<'_>) {
+        let NativeImageRequest {
+            front,
+            clean,
+            presented,
+            target,
+            want_bytes,
+            want_metadata,
+            cancel,
+            frame_metadata,
+            reply,
+        } = request;
         if cancel.is_cancelled() {
             let _ = reply.send(Err("image request cancelled before render".to_string()));
             return;
@@ -3568,7 +3609,7 @@ impl App {
                     return;
                 }
             };
-            self.render_native_image(
+            self.render_native_image(NativeImageRequest {
                 front,
                 clean,
                 presented,
@@ -3576,9 +3617,9 @@ impl App {
                 want_bytes,
                 want_metadata,
                 cancel,
-                &frame_metadata,
+                frame_metadata: &frame_metadata,
                 reply,
-            );
+            });
             return;
         }
         // A WINDOWED capture routes through the real present and then reuses THAT
@@ -4628,8 +4669,14 @@ impl App {
         presented: &PresentedWindowCapture,
     ) -> Result<(Vec<u8>, u32, u32), String> {
         let (mut rgba, width, height) = self.window_rgba_of(Some(wid))?;
+        // The platform photograph is tightly-packed RGBA8 (`width * height * 4`
+        // bytes), so the chunk remainder is empty and the mask keeps exactly one
+        // alpha byte per platform pixel — the length
+        // `multiply_platform_outer_shape_alpha` fails closed on below.
         let platform_shape_alpha = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| pixel[3])
             .collect::<Vec<_>>();
         let state = self
@@ -5316,7 +5363,10 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
 /// clamp after division, matching the integer definition of unassociation.
 #[cfg(any(target_os = "macos", test))]
 fn unpremultiply_rgba8(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    // Tightly-packed RGBA8: callers pass a whole number of pixels, so the chunk
+    // remainder is empty. A trailing partial pixel would carry no alpha byte to
+    // unassociate by, so leaving it byte-identical is the only defined answer.
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         let alpha = u32::from(pixel[3]);
         match alpha {
             0 => pixel[..3].fill(0),
@@ -6058,8 +6108,11 @@ mod chrome_output_tests {
         .unwrap();
         multiply_platform_outer_shape_alpha(&mut window, width, height, &platform_alpha).unwrap();
 
+        // Byte offset of the (x, y) pixel's first channel in the RGBA window,
+        // so every assertion below keeps its row/column shape on the page.
+        let at = |x: u32, y: u32| ((y * width + x) * 4) as usize;
         for (x, y) in [(0, 0), (4, 0), (0, 4), (4, 4)] {
-            let index = ((y * width + x) * 4) as usize;
+            let index = at(x, y);
             assert_eq!(
                 &window[index..index + 3],
                 &fresh[index..index + 3],
@@ -6067,8 +6120,10 @@ mod chrome_output_tests {
             );
             assert_eq!(window[index + 3], 0);
         }
-        assert_eq!(window[(1 * 4 + 3) as usize], 100);
-        let center = ((2 * width + 2) * 4) as usize;
+        // The half-shape pixel at (1, 0): 200 fresh alpha scaled by the 128
+        // platform sample.
+        assert_eq!(window[at(1, 0) + 3], 100);
+        let center = at(2, 2);
         assert_eq!(&window[center..center + 3], &fresh[center..center + 3]);
         assert_eq!(
             window[center + 3],
@@ -6149,16 +6204,13 @@ mod chrome_output_tests {
             &client,
         )
         .unwrap();
-        assert_eq!(
-            &window[((1 * 5 + 2) * 4)..((1 * 5 + 4) * 4)],
-            &client.rgba[..8]
-        );
-        assert_eq!(
-            &window[((2 * 5 + 2) * 4)..((2 * 5 + 4) * 4)],
-            &client.rgba[8..]
-        );
-        assert!(window[..(1 * 5 + 2) * 4].iter().all(|&byte| byte == 9));
-        assert!(window[(3 * 5 * 4)..].iter().all(|&byte| byte == 9));
+        // Byte offset of the (row, col) pixel in the 5-wide RGBA window, so the
+        // client's two rows stay legible as rows rather than as byte counts.
+        let at = |row: usize, col: usize| (row * 5 + col) * 4;
+        assert_eq!(&window[at(1, 2)..at(1, 4)], &client.rgba[..8]);
+        assert_eq!(&window[at(2, 2)..at(2, 4)], &client.rgba[8..]);
+        assert!(window[..at(1, 2)].iter().all(|&byte| byte == 9));
+        assert!(window[at(3, 0)..].iter().all(|&byte| byte == 9));
     }
 
     #[test]
@@ -6234,11 +6286,11 @@ mod chrome_output_tests {
             "straight-alpha source-over must weight both source and destination alpha"
         );
         assert_eq!(&destination[8..12], &[4, 5, 6, 255]);
-        assert!(
-            destination[12..]
-                .chunks_exact(4)
-                .all(|px| px == [1, 2, 3, 255])
-        );
+        // Bytes 12.. are the whole second row — three whole pixels — so the
+        // `as_chunks` remainder is always empty; the discarded tail is the one
+        // `chunks_exact` also dropped.
+        let (second_row, _) = destination[12..].as_chunks::<4>();
+        assert!(second_row.iter().all(|px| *px == [1, 2, 3, 255]));
     }
 
     #[test]
@@ -8010,17 +8062,17 @@ mod encode_worker_tests {
         let (_, view) = app.active_native_view(wid).expect("Settings view");
         let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
         let (tx, rx) = std::sync::mpsc::channel();
-        app.render_native_image(
-            wid,
-            false,
-            None,
-            confined(&dir, "binding.png"),
-            true,
-            true,
-            crate::control::CaptureCancellation::new(),
-            &metadata,
-            tx,
-        );
+        app.render_native_image(NativeImageRequest {
+            front: wid,
+            clean: false,
+            presented: None,
+            target: confined(&dir, "binding.png"),
+            want_bytes: true,
+            want_metadata: true,
+            cancel: crate::control::CaptureCancellation::new(),
+            frame_metadata: &metadata,
+            reply: tx,
+        });
         let (width, height, png) = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("native image reply")
@@ -8111,17 +8163,17 @@ mod encode_worker_tests {
         let capture = |app: &mut App, name: &str| {
             let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
             let (tx, rx) = std::sync::mpsc::channel();
-            app.render_native_image(
-                wid,
-                false,
-                None,
-                confined(&dir, name),
-                true,
-                true,
-                crate::control::CaptureCancellation::new(),
-                &metadata,
-                tx,
-            );
+            app.render_native_image(NativeImageRequest {
+                front: wid,
+                clean: false,
+                presented: None,
+                target: confined(&dir, name),
+                want_bytes: true,
+                want_metadata: true,
+                cancel: crate::control::CaptureCancellation::new(),
+                frame_metadata: &metadata,
+                reply: tx,
+            });
             let image = rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("paint identity image reply")
@@ -8441,17 +8493,17 @@ mod encode_worker_tests {
         let capture = |app: &mut App, name: &str| {
             let (tx, rx) = std::sync::mpsc::channel();
             let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
-            app.render_native_image(
-                wid,
-                false,
-                None,
-                confined(&dir, name),
-                true,
-                true,
-                crate::control::CaptureCancellation::new(),
-                &frame_metadata,
-                tx,
-            );
+            app.render_native_image(NativeImageRequest {
+                front: wid,
+                clean: false,
+                presented: None,
+                target: confined(&dir, name),
+                want_bytes: true,
+                want_metadata: true,
+                cancel: crate::control::CaptureCancellation::new(),
+                frame_metadata: &frame_metadata,
+                reply: tx,
+            });
             let image = rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("mixed capture reply")
@@ -8566,17 +8618,17 @@ mod encode_worker_tests {
         let capture = |app: &mut App, clean: bool, name: &str, frame: PresentedFrameCapture| {
             let (tx, rx) = std::sync::mpsc::channel();
             let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
-            app.render_native_image(
-                wid,
+            app.render_native_image(NativeImageRequest {
+                front: wid,
                 clean,
-                Some(frame),
-                confined(&dir, name),
-                true,
-                false,
-                crate::control::CaptureCancellation::new(),
-                &metadata,
-                tx,
-            );
+                presented: Some(frame),
+                target: confined(&dir, name),
+                want_bytes: true,
+                want_metadata: false,
+                cancel: crate::control::CaptureCancellation::new(),
+                frame_metadata: &metadata,
+                reply: tx,
+            });
             rx.recv_timeout(Duration::from_secs(10))
                 .expect("mixed plain reply")
                 .expect("mixed plain capture")

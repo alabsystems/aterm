@@ -96,17 +96,67 @@ impl CandidateSource {
             Self::FilteredForward {
                 candidates,
                 filters,
-            } => candidates
-                .find(|candidate| filters.iter().all(|list| list.binary_search(candidate).is_ok())),
+            } => candidates.find(|candidate| {
+                filters
+                    .iter()
+                    .all(|list| list.binary_search(candidate).is_ok())
+            }),
             Self::FilteredBackward {
                 candidates,
                 filters,
-            } => candidates
-                .rfind(|candidate| filters.iter().all(|list| list.binary_search(candidate).is_ok())),
+            } => candidates.rfind(|candidate| {
+                filters
+                    .iter()
+                    .all(|list| list.binary_search(candidate).is_ok())
+            }),
             Self::Range(range) => range.next(),
             Self::RangeRev(rev) => rev.next(),
         }
     }
+}
+
+/// Advance a case-sensitive literal sweep of `text` from byte `from_byte`,
+/// yielding the next match plus the byte offset to resume the sweep at.
+///
+/// This is the SINGLE source of the forward literal scan: the batch path drives
+/// it across the index's candidate lines via [`SearchMatchIterator`], and the
+/// budgeted engine drives it over the one row it just indexed. Keeping one body
+/// is what makes budgeted results equal to one-shot results by construction
+/// rather than by reimplementation.
+///
+/// Semantics (unchanged from the loop this was extracted from): byte spans that
+/// resolve to zero display columns are skipped, and the resume offset advances
+/// by ONE character past the match start so overlapping matches are preserved.
+#[inline]
+pub(crate) fn next_literal_match(
+    line: usize,
+    text: &str,
+    query: &str,
+    col_map: &ColumnMap,
+    from_byte: usize,
+) -> Option<(SearchMatch, usize)> {
+    let mut next_byte = from_byte;
+    while let Some(tail) = text.get(next_byte..) {
+        // E9b: SIMD memmem for the forward literal verify, matching the reverse
+        // iterator's `memmem::rfind`. Byte-identical to `tail.find(query)`: a
+        // byte-aligned occurrence of a valid-UTF-8 needle in a valid-UTF-8
+        // haystack is necessarily char-aligned, so the offset is the same one
+        // str::find's two-way scan returns — just found with the faster scanner.
+        let relative = memchr::memmem::find(tail.as_bytes(), query.as_bytes())?;
+        let abs_pos = next_byte.checked_add(relative)?;
+        let match_end = abs_pos.checked_add(query.len())?;
+        let step = text
+            .get(abs_pos..)
+            .and_then(|suffix| suffix.chars().next())
+            .map_or(1, char::len_utf8);
+        next_byte = abs_pos.checked_add(step)?;
+        let start_col = col_map.byte_to_column(abs_pos);
+        let end_col = col_map.byte_to_column(match_end);
+        if start_col != end_col {
+            return Some((SearchMatch::new(line, start_col, end_col), next_byte));
+        }
+    }
+    None
 }
 
 /// Lazy iterator over search matches with early termination support.
@@ -129,11 +179,7 @@ pub(crate) struct SearchMatchIterator<'a> {
 
 impl<'a> SearchMatchIterator<'a> {
     /// Create a new match iterator from a candidate source.
-    pub(super) fn new(
-        index: &'a SearchIndex,
-        query: &'a str,
-        candidates: CandidateSource,
-    ) -> Self {
+    pub(super) fn new(index: &'a SearchIndex, query: &'a str, candidates: CandidateSource) -> Self {
         Self {
             index,
             query,
@@ -160,30 +206,11 @@ impl Iterator for SearchMatchIterator<'_> {
                         &fallback
                     }
                 };
-                while let Some(tail) = text.get(self.next_byte..) {
-                    // E9b: SIMD memmem for the forward literal verify, matching
-                    // the reverse iterator's `memmem::rfind`. Byte-identical to
-                    // `tail.find(self.query)`: a byte-aligned occurrence of a
-                    // valid-UTF-8 needle in a valid-UTF-8 haystack is necessarily
-                    // char-aligned, so the offset is the same one str::find's
-                    // two-way scan returns — just found with the faster scanner.
-                    let Some(relative) =
-                        memchr::memmem::find(tail.as_bytes(), self.query.as_bytes())
-                    else {
-                        break;
-                    };
-                    let abs_pos = self.next_byte.checked_add(relative)?;
-                    let match_end = abs_pos.checked_add(self.query.len())?;
-                    let step = text
-                        .get(abs_pos..)
-                        .and_then(|suffix| suffix.chars().next())
-                        .map_or(1, char::len_utf8);
-                    self.next_byte = abs_pos.checked_add(step)?;
-                    let start_col = col_map.byte_to_column(abs_pos);
-                    let end_col = col_map.byte_to_column(match_end);
-                    if start_col != end_col {
-                        return Some(SearchMatch::new(line_num, start_col, end_col));
-                    }
+                if let Some((found, resume)) =
+                    next_literal_match(line_num, text, self.query, col_map, self.next_byte)
+                {
+                    self.next_byte = resume;
+                    return Some(found);
                 }
             }
             self.current_line = self
@@ -216,11 +243,7 @@ pub(crate) struct SearchMatchReverseIterator<'a> {
 
 impl<'a> SearchMatchReverseIterator<'a> {
     /// Create a new reverse match iterator.
-    pub(super) fn new(
-        index: &'a SearchIndex,
-        query: &'a str,
-        candidates: CandidateSource,
-    ) -> Self {
+    pub(super) fn new(index: &'a SearchIndex, query: &'a str, candidates: CandidateSource) -> Self {
         Self {
             index,
             query,

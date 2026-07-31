@@ -463,18 +463,12 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
 }
 
 /// Confirm the running build reached a healthy checkpoint (window up / first
-/// frame): clears the boot-health sentinel and GCs the retained rollback bundle.
-/// Call **once, from the GUI, after deep init** so a crash BEFORE this point is
-/// caught and auto-reverted by [`apply_staged_if_ready`]'s boot-health check on the
-/// next launch(es), while a crash AFTER it is a normal fault the updater ignores.
+/// frame): clears the boot-health sentinel and GCs the retained rollback bundle,
+/// binding both to the compiled git commit of the running binary. Call **once,
+/// from the GUI, after deep init** so a crash BEFORE this point is caught and
+/// auto-reverted by [`apply_staged_if_ready`]'s boot-health check on the next
+/// launch(es), while a crash AFTER it is a normal fault the updater ignores.
 /// Idempotent, best-effort, and a no-op when the last launch was not a self-update.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn confirm_boot_health(current_build: u64) -> bool {
-    install::confirm_boot_health(current_build, None)
-}
-
-/// Exact-identity health confirmation used by the shipped one-binary GUI.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn confirm_boot_health_exact(current_build: u64, current_commit: &str) -> bool {
@@ -484,35 +478,8 @@ pub fn confirm_boot_health_exact(current_build: u64, current_commit: &str) -> bo
 /// Non-macOS no-op: there is no self-swap to confirm.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
-pub fn confirm_boot_health(_current_build: u64) -> bool {
-    true
-}
-
-#[cfg(not(target_os = "macos"))]
-#[must_use]
 pub fn confirm_boot_health_exact(_current_build: u64, _current_commit: &str) -> bool {
     true
-}
-
-/// Read the build number currently installed at this process's canonical `.app` path.
-///
-/// During overlap handoff the old process can remain alive from its original inode after
-/// the child atomically swaps the bundle and consumes `ready.toml`. This read distinguishes
-/// that successful on-disk install from a merely missing/corrupt staged marker, so the old
-/// reducer never advertises a stale artifact as retryable.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn installed_build_number() -> Option<u64> {
-    let installed = bundle::resolve()?;
-    verify::verify_bundle_policy(&installed.app_root, effective_team_id()).ok()?;
-    verify::bundle_build_number(&installed.app_root).ok()
-}
-
-/// Non-macOS has no installed `.app` self-update lane.
-#[cfg(not(target_os = "macos"))]
-#[must_use]
-pub fn installed_build_number() -> Option<u64> {
-    None
 }
 
 /// Sealed installed-bundle identity plus the durable exact-artifact receipt written
@@ -610,11 +577,9 @@ pub fn spawn_background_check(
         .spawn(move || {
             // Re-check on a short cadence so a running session picks a release up
             // within ~a minute of publish (the owner's "no passive scheduler —
-            // immediate" directive). The GUI then ATTEMPTS an auto-apply through the
-            // seamless handoff; as of 2026-07-24 that handoff has never been observed
-            // to complete on a real machine, so in practice this cadence buys a fast
-            // STAGE and the swap still happens at the next launch. Do not describe
-            // this loop as delivering a seamless update until a field log shows one.
+            // immediate" directive). In practice this cadence buys a fast STAGE and
+            // the swap happens at the next launch (see the module docs' delivery
+            // model for what the seamless handoff does and does not deliver).
             // Cost honesty: a check spends a couple of requests per cycle. WITH a
             // token that is ~100/h against the 5000/h budget; WITHOUT one (the public
             // channel, no credential provisioned) the budget is ~60/h PER IP and the
@@ -1098,14 +1063,8 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
     if let Some(text) = read_ledger_text(&staging.status)
         && let Ok(v) = text.parse::<toml::Value>()
     {
-        // `u64::try_from` instead of the old `.unwrap_or(cur as i64) as u64`
-        // (the verifier cannot lower i64<->u64 `as` casts: unsupported-MIR cast
-        // overflow). The status marker is OUR OWN writer's output — it stores a
-        // genuine build number, always representable as a non-negative i64 —
-        // and for every such value `u64::try_from(n)` == `n as u64`, while an
-        // absent field falls back to `cur` exactly as the old i64 round-trip
-        // (bit-identity) did. Only a hand-tampered negative integer differs,
-        // and that reads best-effort as "unparseable ⇒ keep the running build".
+        // Best-effort (via `u64::try_from` — the verifier cannot lower i64<->u64
+        // `as` casts): absent or negative reads keep the running build.
         checked_from_build = v
             .get("current_build")
             .and_then(toml::Value::as_integer)
@@ -1246,8 +1205,8 @@ mod commit_match_tests {
 
     use super::{
         ReconciledStatusOutcome, StatusReconciliation, commit_matches, compiled_update_pin_sha256,
-        installed_build_number, persisted_claims_stage, reconcile_status_outcome,
-        status_reconciliation_projection, update_pubkey_sha256,
+        persisted_claims_stage, reconcile_status_outcome, status_reconciliation_projection,
+        update_pubkey_sha256,
     };
 
     #[test]
@@ -1554,11 +1513,6 @@ mod commit_match_tests {
         assert!(super::read_ledger_text(&oversized).is_none());
         assert!(super::read_ledger_text(&dir).is_none());
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn development_test_binary_has_no_installed_app_build() {
-        assert_eq!(installed_build_number(), None);
     }
 
     #[test]

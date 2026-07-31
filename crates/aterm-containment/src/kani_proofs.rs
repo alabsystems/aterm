@@ -4,7 +4,16 @@
 
 //! Kani bounded model checking proofs for the containment crate.
 //!
-//! Proves the safety properties from TLA+ `tla/Containment.tla`:
+//! Harnesses for the safety properties named after the INTENDED
+//! `tla/Containment.tla` model — which is NOT in-tree and on no build/CI path
+//! (see the crate-root note).
+//!
+//! These harnesses are `#[cfg(kani)]`-gated (the module itself is declared
+//! under `#[cfg(kani)]` in `lib.rs`), so a plain `cargo build`/`cargo test`
+//! COMPILES THEM OUT ENTIRELY and discharges nothing. They are discharged only
+//! by a Kani / trust-mc model checker run deliberately via the opt-in
+//! `scripts/verify-kani-proofs.sh`, which is not wired into any default gate.
+//! The properties:
 //! - Mode immutability (no escalation from Rust code)
 //! - Capabilities match mode (policy consistency)
 //! - Monotonic capabilities (downgrade never increases any capability)
@@ -70,10 +79,11 @@ fn mode_ordering_matches_tla_encoding() {
 // Property 2: Capabilities always match mode (TLA+ CapabilitiesMatchMode)
 // -----------------------------------------------------------------------
 
-/// For every mode, `ContainmentPolicy::capabilities` returns exactly
-/// the TLA+ specified values.
+/// For every mode, `ContainmentPolicy::capabilities` returns exactly the
+/// intended policy values (the ones this crate documents — the TLA+ model
+/// naming them is not in-tree).
 ///
-/// Encodes the TLA+ policy table as raw numeric constants and verifies
+/// Encodes that policy table as raw numeric constants and verifies
 /// the Rust implementation matches for all 4 × 8 = 32 mappings.
 // Asserted via the per-field policy functions directly (not `caps.field as u8`):
 // `capabilities(mode)` is `Capabilities { network: network(mode), .. }` by

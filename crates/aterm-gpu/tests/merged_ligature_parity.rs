@@ -14,26 +14,10 @@
 // either.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{Frame, LigatureMode, Renderer, TextShapingConfig, Theme};
+use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
-fn rr(p: u32) -> i32 {
-    ((p >> 16) & 0xff) as i32
-}
-fn gg(p: u32) -> i32 {
-    ((p >> 8) & 0xff) as i32
-}
-fn bb(p: u32) -> i32 {
-    (p & 0xff) as i32
-}
-fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.pixels.iter().zip(b.pixels.iter()) {
-        m = m.max((rr(pa) - rr(pb)).abs());
-        m = m.max((gg(pa) - gg(pb)).abs());
-        m = m.max((bb(pa) - bb(pb)).abs());
-    }
-    m
-}
+mod common;
+use common::max_channel_delta_frame as max_channel_delta;
 
 /// A font path whose `fi` collapses N:1 under `liga`/`calt`. Order:
 /// $ATERM_MERGED_FONT, then well-known macOS faces carrying Latin `f`-ligatures.
@@ -88,11 +72,11 @@ fn merged_ligature_font() -> Option<&'static std::path::Path> {
     static FONT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     FONT.get_or_init(|| {
         let found = merged_ligature_font_path()?;
-        // SAFETY: set exactly once per process (OnceLock init), before any renderer
-        // is constructed — every concurrent caller is parked in get_or_init until
-        // this write completes, so no getenv can observe it mid-mutation. (set_var
-        // is unsafe in edition 2024.)
-        unsafe { std::env::set_var("ATERM_FONT", &found) };
+        // Set exactly once per process (OnceLock init), before any renderer is
+        // constructed — every concurrent caller is parked in get_or_init until this
+        // write completes, so no getenv can observe it mid-mutation — and routed
+        // through the workspace's one lock-scoped env helper.
+        aterm_log::env::set("ATERM_FONT", &found);
         Some(found)
     })
     .as_deref()

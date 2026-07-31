@@ -168,6 +168,12 @@ WHAT IT IS
 
 KEY USAGE
   atpkg list                 installed (program, build) pairs — local, no network
+  atpkg seed                 batteries-included reconcile: on a FIRST RUN (empty store) the
+                             signed BUNDLED SEED the .app ships (Contents/Resources/
+                             toolchain-seed) can fill it with NO network at all — the same
+                             signature gates apply, and a reachable published index still
+                             wins; consent is [packages].auto_install. Then the compiled-in
+                             companions source lane
   atpkg install <program>    verify the signed index, then install/upgrade the pinned build
   atpkg update [program]     upgrade all (or one) to the channel pin; coherence groups apply
                              all-or-nothing (the rustc-locked tuple moves together)

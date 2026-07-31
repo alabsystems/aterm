@@ -307,15 +307,18 @@ pub struct TabSegment {
     pub close_col: Option<u16>,
     /// The action a plain (non-close) click on this segment performs.
     pub kind: TabHit,
+    /// This is the window's ONLY tab, so it is drawn as the window TITLE — the
+    /// name and its description centred on the body background — rather than as a
+    /// raised chip with a close affordance. Mirrors the native strip's solo band
+    /// (`toolbar::TabView`'s solo mode): with one tab there is nothing to switch
+    /// between, so a switcher is the wrong thing to draw.
+    pub solo: bool,
 }
 
 /// The minimum cells a tab segment needs to show ` x ` (a leading pad, at least
 /// one title cell, a pad, the close `x`, a trailing pad). Below this, tabs are
 /// drawn without a close `x` (just the title) so they still fit + remain clickable.
 const MIN_SEG_WITH_CLOSE: u16 = 5;
-/// The widest a single tab segment grows to (so two tabs don't each eat half a
-/// 200-col window); extra width past this is left as bare strip background.
-const MAX_SEG: u16 = 24;
 /// Columns the trailing `+` (open-a-tab) affordance occupies: ` + `.
 const NEW_TAB_W: u16 = 3;
 /// Columns the LEADING update icon (`↻`) occupies: ` ↻ ` — same width as `+` so it
@@ -331,10 +334,19 @@ const ICON_COLS: u16 = 2;
 const ICON_GAP: u16 = 1;
 
 /// Point-space content geometry shared with the macOS view renderer. The entire tab
-/// view remains the select/reorder target. Wide chips reserve a 24 pt close target;
-/// compact chips give that space back to the title (Close Tab remains available from
-/// the menu/shortcut). Responsive icon/status slots appear only after a useful title
-/// width survives.
+/// view remains the select/reorder target. Wide chips reserve a close target under
+/// the leading edge; compact chips give that space back to the title (Close Tab
+/// remains available from the menu/shortcut). Responsive icon/status slots appear
+/// only after a useful title width survives.
+///
+/// SYMMETRIC BY CONSTRUCTION (macOS Terminal's tab shape): the label's leading and
+/// trailing insets are the SAME number, so a centre-aligned title reads centred in
+/// its own cell — never nudged off-centre by the close slot, the app icon, or the
+/// status canvas. That symmetry is also what lets the close ✕ be a HOVER-ONLY
+/// affordance: its slot is reserved whether or not it is currently painted, so
+/// revealing it can never reflow the title (see `toolbar::TabView`). The icon takes
+/// the leading slot and the status canvas the trailing one, and each is admitted
+/// only while the resulting symmetric label still clears the legibility floor.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct NativeTabContentLayout {
     pub(crate) close: [f64; 4],
@@ -344,19 +356,62 @@ pub(crate) struct NativeTabContentLayout {
     pub(crate) label: [f64; 4],
 }
 
+/// Preference order for the SOLO title band's subtitle: the durable authored
+/// description first, then where the session is, then what it is doing. Authored
+/// prose outranks anything generated, and a location outranks a status word because
+/// a one-tab window is usually asking "which shell is this?".
+///
+/// Deliberately NOT `state`: its steady value is the word "alive", which is a
+/// subtitle that says nothing — the band shows the bare title instead. Lifecycle
+/// state stays on the hover card, the context menu, and the `chrome` mirror.
+const SOLO_SUBTITLE_KEYS: [&str; 3] = ["description", "cwd", "activity"];
+
+/// The one-line DESCRIPTION a single-tab window shows beside its title, drawn from
+/// the same composed session chrome (`session_chrome::compose_tooltip`) the hover
+/// card and context menu render — never a second, drifting source of facts.
+///
+/// With exactly one tab there is no switching to do, so the strip stops being a
+/// switcher and becomes the window's title (macOS Terminal's `folder — -zsh` line):
+/// the chip, its pill, and its ✕ are all dead weight, and the space they held goes
+/// to saying WHAT this window is. `None` when the session carries nothing the title
+/// does not already say — the band then shows the bare title rather than padding it
+/// with an echo.
+#[must_use]
+pub(crate) fn solo_subtitle(title: &str, tooltip: Option<&str>) -> Option<String> {
+    let tooltip = tooltip?;
+    SOLO_SUBTITLE_KEYS.iter().find_map(|key| {
+        tooltip
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix(": "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value != &"-" && !title.contains(*value))
+            .map(str::to_string)
+    })
+}
+
+/// Lay a tab chip's interior out around `center_y` — the vertical centre the whole
+/// strip shares, MEASURED from the window's traffic lights rather than assumed to be
+/// the view's own midpoint (`toolbar::strip_metrics`). Everything vertical is derived
+/// from that one number, so the chips, the ✕, the icon, the status dots, and the
+/// trailing "+" all sit on the stoplights' optical centre line.
 #[must_use]
 pub(crate) fn native_tab_content_layout(
     width: f64,
-    height: f64,
+    center_y: f64,
     has_icon: bool,
     has_status: bool,
 ) -> NativeTabContentLayout {
+    // The ✕ is a HOVER-ONLY reveal, but its slot is reserved on BOTH edges so the
+    // reveal never reflows the centred title — which makes the slot's width a direct
+    // tax on every title, paid at all times. Hence a deliberately small target
+    // (macOS Terminal's is smaller still): 16 pt is comfortably clickable for a
+    // pointer that is already inside the chip, and buys back 2× the difference.
     const CLOSE_X: f64 = 2.0;
-    const CLOSE_SIZE: f64 = 24.0;
-    const AFTER_CLOSE: f64 = 4.0;
+    const CLOSE_SIZE: f64 = 16.0;
+    const AFTER_CLOSE: f64 = 2.0;
     const AFTER_ICON: f64 = 4.0;
     const STATUS_SIZE: f64 = 16.0;
-    const AFTER_STATUS: f64 = 4.0;
+    const BEFORE_STATUS: f64 = 4.0;
     const WIDE_TRAILING: f64 = 6.0;
     const COMPACT_INSET: f64 = 4.0;
     const LABEL_H: f64 = 17.0;
@@ -369,14 +424,15 @@ pub(crate) fn native_tab_content_layout(
     // the close target yields its slot instead of forcing an ellipsis.
     const MIN_CLOSE_RESERVING_WIDTH: f64 = 110.0;
 
-    let close = [
-        CLOSE_X,
-        (height - CLOSE_SIZE).max(0.0) * 0.5,
-        CLOSE_SIZE,
-        CLOSE_SIZE,
-    ];
+    let centred = |size: f64| center_y - size * 0.5;
+    let close = [CLOSE_X, centred(CLOSE_SIZE), CLOSE_SIZE, CLOSE_SIZE];
     let close_available = width >= MIN_CLOSE_RESERVING_WIDTH;
-    let trailing = if close_available {
+    let lead_base = if close_available {
+        CLOSE_X + CLOSE_SIZE + AFTER_CLOSE
+    } else {
+        COMPACT_INSET
+    };
+    let trail_base = if close_available {
         WIDE_TRAILING
     } else {
         COMPACT_INSET
@@ -386,43 +442,41 @@ pub(crate) fn native_tab_content_layout(
     } else {
         MIN_COMPACT_IDENTITY_LABEL
     };
-    let mut x = if close_available {
-        CLOSE_X + CLOSE_SIZE + AFTER_CLOSE
-    } else {
-        COMPACT_INSET
-    };
-    let icon_fits =
-        has_icon && width >= x + TAB_ICON_NATIVE_SIZE + AFTER_ICON + minimum_label + trailing;
-    let icon = if icon_fits {
-        let icon = [
-            x,
-            (height - TAB_ICON_NATIVE_SIZE).max(0.0) * 0.5,
+    // What the centred label would measure if the two edges cost `lead` and `trail`:
+    // the WIDER edge sets both insets, because the title is centred in the cell.
+    let symmetric_label = |lead: f64, trail: f64| (width - 2.0 * f64::max(lead, trail)).max(0.0);
+
+    let icon_lead = lead_base + TAB_ICON_NATIVE_SIZE + AFTER_ICON;
+    let icon = (has_icon && symmetric_label(icon_lead, trail_base) >= minimum_label).then(|| {
+        [
+            lead_base,
+            centred(TAB_ICON_NATIVE_SIZE),
             TAB_ICON_NATIVE_SIZE,
             TAB_ICON_NATIVE_SIZE,
-        ];
-        x += TAB_ICON_NATIVE_SIZE + AFTER_ICON;
-        Some(icon)
-    } else {
-        None
-    };
-    let status_fits =
-        has_status && width >= x + STATUS_SIZE + AFTER_STATUS + minimum_label + trailing;
-    let status = if status_fits {
-        let status = [
-            x,
-            (height - STATUS_SIZE).max(0.0) * 0.5,
+        ]
+    });
+    let lead = if icon.is_some() { icon_lead } else { lead_base };
+
+    let status_trail = trail_base + STATUS_SIZE + BEFORE_STATUS;
+    let status = (has_status && symmetric_label(lead, status_trail) >= minimum_label).then(|| {
+        [
+            width - trail_base - STATUS_SIZE,
+            centred(STATUS_SIZE),
             STATUS_SIZE,
             STATUS_SIZE,
-        ];
-        x += STATUS_SIZE + AFTER_STATUS;
-        Some(status)
+        ]
+    });
+    let trail = if status.is_some() {
+        status_trail
     } else {
-        None
+        trail_base
     };
+
+    let inset = f64::max(lead, trail);
     let label = [
-        x,
-        (height - LABEL_H).max(0.0) * 0.5,
-        (width - x - trailing).max(0.0),
+        inset,
+        centred(LABEL_H),
+        (width - 2.0 * inset).max(0.0),
         LABEL_H,
     ];
     NativeTabContentLayout {
@@ -491,6 +545,13 @@ fn tab_content_layout(seg: &TabSegment, metadata: TabStripMetadata) -> TabConten
 /// isn't shown — it stays reachable by Cmd-N / cycling). `tab_count == 0` (never,
 /// in practice — there is always ≥1 tab) yields just the `+`.
 ///
+/// SAME TWO RULES AS THE NATIVE STRIP (`toolbar::native_tab_cells` /
+/// `toolbar::set_window_tabs`), so the two renderers cannot disagree about what a
+/// tab bar IS: tabs divide the whole band into EQUAL shares with no maximum width
+/// (a wide window buys longer titles, not bare strip past a capped segment), and
+/// a LONE tab is the window's title rather than a switcher — one full-band
+/// [`TabSegment::solo`] segment with no close column.
+///
 /// Pure geometry: no window, no renderer, no `App`. `active` is accepted for
 /// symmetry / future per-tab sizing; the current MVP sizes every tab equally.
 #[must_use]
@@ -512,6 +573,7 @@ pub fn layout_segments(
             end_col: UPDATE_W,
             close_col: None,
             kind: TabHit::Update,
+            solo: false,
         });
         UPDATE_W
     } else {
@@ -520,11 +582,16 @@ pub fn layout_segments(
     // Reserve the trailing `+` when there's room for at least one tab AND the `+`.
     let plus_room = cols > lead + NEW_TAB_W;
     let avail = if plus_room { cols - NEW_TAB_W } else { cols };
+    // ONE tab is the window's TITLE, not a switcher: it takes the whole band and
+    // carries no close column (the window's own close affordance already exists).
+    let solo = tab_count == 1;
     let mut x: u16 = lead;
     if tab_count > 0 {
-        // Split the available width (past the leading update icon) evenly, capped at
-        // MAX_SEG, floored so a tab is at least 1 cell before we stop placing tabs.
-        let per = (avail.saturating_sub(lead) / tab_count as u16).clamp(0, MAX_SEG);
+        // Split the available width (past the leading update icon) into EQUAL
+        // shares — no maximum, so a wide window spends its columns on titles
+        // instead of leaving bare strip past a capped segment. Floored so a tab is
+        // at least 1 cell before we stop placing tabs.
+        let per = avail.saturating_sub(lead) / tab_count as u16;
         for i in 0..tab_count {
             if per == 0 || x >= avail {
                 break; // out of room: remaining tabs are not drawn (still reachable)
@@ -533,13 +600,15 @@ pub fn layout_segments(
             let start = x;
             let end = x + seg_w;
             // Draw a close `x` only when the segment is wide enough to also show a
-            // title; its column is the last cell minus the trailing pad.
-            let close_col = (seg_w >= MIN_SEG_WITH_CLOSE).then(|| end - 2);
+            // title; its column is the last cell minus the trailing pad. A solo
+            // title band never reserves one.
+            let close_col = (!solo && seg_w >= MIN_SEG_WITH_CLOSE).then(|| end - 2);
             segs.push(TabSegment {
                 start_col: start,
                 end_col: end,
                 close_col,
                 kind: TabHit::Select(i),
+                solo,
             });
             x = end;
         }
@@ -552,6 +621,7 @@ pub fn layout_segments(
             end_col: start + NEW_TAB_W,
             close_col: None,
             kind: TabHit::NewTab,
+            solo: false,
         });
     }
     segs
@@ -609,6 +679,10 @@ enum StripRole {
     /// The trailing `+` new-tab affordance: a BUTTON — full-strength fg on the body
     /// (NOT the dim inactive treatment), so it meets WCAG-AA contrast on every theme.
     NewTab,
+    /// The SOLO band's title: full-strength fg on the body, with no raised card and
+    /// no selection underline. A one-tab window is not choosing between anything, so
+    /// it gets a window title's treatment, not a selected chip's.
+    Title,
     /// The leading `↻` update-ready alert: a RAISED highlighted button (the active-tab
     /// treatment) so it stands out from the flat `+` and the receded tabs.
     Update,
@@ -763,6 +837,7 @@ fn strip_cell(ch: char, colors: &StripColors, role: StripRole) -> RenderCell {
             None,
         ),
         StripRole::NewTab => (colors.fg, colors.body_bg, false, UnderlineStyle::None, None),
+        StripRole::Title => (colors.fg, colors.body_bg, true, UnderlineStyle::None, None),
         // A raised, underlined highlighted button (like the active tab) so the update
         // alert draws the eye without a hardcoded chrome colour.
         StripRole::Update => (
@@ -828,10 +903,31 @@ pub fn paint_strip(
     row: &mut [RenderCell],
     segments: &[TabSegment],
     titles: &[String],
+    hovered: Option<usize>,
     active: usize,
     theme: Theme,
 ) {
-    let _ = paint_strip_impl(row, segments, titles, None, active, theme, None);
+    let paint = StripPaint {
+        hovered,
+        subtitle: None,
+    };
+    let _ = paint_strip_impl(row, segments, titles, None, paint, active, theme, None);
+}
+
+/// The per-frame paint inputs that are neither geometry nor colour: which tab the
+/// pointer is on (the only tab that shows a `✕`), and the SOLO band's description.
+/// Bundled so the two call sites and the painter cannot drift on argument order.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StripPaint<'a> {
+    /// Index of the tab under the pointer, if any. The `✕` is a HOVER-ONLY
+    /// affordance here exactly as it is on the native strip: its column is still
+    /// reserved by [`layout_segments`] whether or not it is painted, so revealing
+    /// it never reflows a title, and `hit_test` keeps closing on that column
+    /// (the pointer is necessarily ON the tab it is clicking).
+    pub hovered: Option<usize>,
+    /// The lone tab's one-line description ([`solo_subtitle`]), drawn dim after
+    /// the centred title. `None` = nothing the title does not already say.
+    pub subtitle: Option<&'a str>,
 }
 
 /// Paint the shipping strip from canonical presentation metadata and return sparse
@@ -839,11 +935,16 @@ pub fn paint_strip(
 /// images are aterm's shared render input: CPU, GPU, cached frames, and `image` consume
 /// the exact same raster bytes. The cells beneath stay part of the ordinary strip row,
 /// so active/inactive backgrounds and full tab/close hit geometry are unchanged.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the strip's paint inputs: target row, geometry, text, metadata, per-frame paint state, selection, theme, and the user's active-tab override — all genuinely independent"
+)]
 pub(crate) fn paint_strip_with_metadata(
     row: &mut [RenderCell],
     segments: &[TabSegment],
     titles: &[String],
     metadata: &[TabStripMetadata],
+    paint: StripPaint<'_>,
     active: usize,
     theme: Theme,
     active_override: Option<[u8; 3]>,
@@ -853,17 +954,23 @@ pub(crate) fn paint_strip_with_metadata(
         segments,
         titles,
         Some(metadata),
+        paint,
         active,
         theme,
         active_override,
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "see `paint_strip_with_metadata`; this is its one implementation"
+)]
 fn paint_strip_impl(
     row: &mut [RenderCell],
     segments: &[TabSegment],
     titles: &[String],
     metadata: Option<&[TabStripMetadata]>,
+    paint: StripPaint<'_>,
     active: usize,
     theme: Theme,
     active_override: Option<[u8; 3]>,
@@ -889,6 +996,51 @@ fn paint_strip_impl(
             }
         };
         match seg.kind {
+            // SOLO: the window's only tab is its TITLE, not a switcher — flat body
+            // background (no raised chip, no selection underline, no `✕`), the
+            // title CENTRED, and its description trailing in the dim tone. The
+            // native strip's solo band, in cells.
+            TabHit::Select(i) if seg.solo => {
+                let span = seg.end_col.saturating_sub(seg.start_col);
+                for c in seg.start_col..seg.end_col {
+                    put(row, c, ' ', StripRole::Inactive);
+                }
+                let title = titles.get(i).map(String::as_str).unwrap_or("");
+                let (title, subtitle) = solo_band_text(title, paint.subtitle, span as usize);
+                let width = title.chars().count()
+                    + subtitle
+                        .as_ref()
+                        .map_or(0, |s| SOLO_GAP_COLS + s.chars().count());
+                let start = seg.start_col + (span.saturating_sub(width as u16)) / 2;
+                let mut col = start;
+                for ch in title.chars() {
+                    put(row, col, strip_char(ch), StripRole::Title);
+                    col = col.saturating_add(1);
+                }
+                if let Some(subtitle) = subtitle {
+                    col = col.saturating_add(SOLO_GAP_COLS as u16);
+                    for ch in subtitle.chars() {
+                        put(row, col, strip_char(ch), StripRole::Inactive);
+                        col = col.saturating_add(1);
+                    }
+                }
+                // The lone tab still carries its app icon / state marks, in the
+                // segment's own leading and trailing cells — states are never
+                // visual-only, and the centred group must not be pushed off centre
+                // to make room for them.
+                let item = metadata.and_then(|items| items.get(i)).copied();
+                if let (Some(kind), true) = (item.and_then(|item| item.icon), span > 4) {
+                    append_icon_images(&mut images, seg.start_col + 1, kind, colors.fg);
+                }
+                if let (Some(item), true) = (item.filter(|it| it.has_status()), span > 6) {
+                    append_status_image(
+                        &mut images,
+                        seg.end_col.saturating_sub(2),
+                        item,
+                        colors.accent,
+                    );
+                }
+            }
             TabHit::Select(i) => {
                 // Background-fill the whole segment in the (in)active colour first.
                 for c in seg.start_col..seg.end_col {
@@ -938,7 +1090,14 @@ fn paint_strip_impl(
                     }
                     put(row, col, strip_char(ch), tab_role);
                 }
-                if let Some(cx) = seg.close_col {
+                if let Some(cx) = seg.close_col
+                    && paint.hovered == Some(i)
+                {
+                    // HOVER-ONLY, as on the native strip: a permanent ✕ on every tab
+                    // (the selected one included) is the one that gets mis-clicked.
+                    // The column stays reserved by `layout_segments` whether or not
+                    // the glyph is painted, so the reveal never reflows the title.
+                    //
                     // ✕ (U+2715 MULTIPLICATION X) reads as a real close affordance vs.
                     // an amateurish ASCII 'x'. U+2715 has East-Asian-Width *Neutral*, so
                     // it is single-cell in CJK and non-CJK alike — unlike × (U+00D7),
@@ -1150,6 +1309,38 @@ fn append_status_image(
     ));
 }
 
+/// Blank cells between the SOLO band's title and its description.
+const SOLO_GAP_COLS: usize = 3;
+/// Cells kept clear at EACH end of the solo band, so the centred group never
+/// touches the segment edge (and leaves the icon / status marks their cells).
+const SOLO_EDGE_COLS: usize = 2;
+/// Below this many cells a description says nothing a reader can use (`~…` is not
+/// a path), so the band drops it rather than spend the width on an ellipsis.
+const SOLO_MIN_DESC_COLS: usize = 4;
+
+/// Fit the SOLO band's title and description into `span` cells: the title is the
+/// string the band exists to show, so the DESCRIPTION is compressed first and
+/// dropped entirely before the title gives up a single cell.
+///
+/// Returns the strings to draw; both are already ellipsised by [`truncate_title`].
+/// The native strip makes the same call in points (`toolbar::relayout_solo`).
+#[must_use]
+fn solo_band_text(title: &str, subtitle: Option<&str>, span: usize) -> (String, Option<String>) {
+    let usable = span.saturating_sub(2 * SOLO_EDGE_COLS);
+    let title_len = title.chars().count().min(usable);
+    let title = truncate_title(title, title_len);
+    // Whatever the title left, minus the gap — and only if what survives is still
+    // readable ([`SOLO_MIN_DESC_COLS`]); a lone "…" says less than nothing.
+    let room = usable
+        .saturating_sub(title.chars().count())
+        .saturating_sub(SOLO_GAP_COLS);
+    let subtitle = subtitle
+        .filter(|_| room >= SOLO_MIN_DESC_COLS)
+        .map(|text| truncate_title(text, room))
+        .filter(|text| !text.is_empty() && text != "…");
+    (title, subtitle)
+}
+
 /// Truncate `title` to at most `max` display cells, appending `…` when it was cut.
 /// `max == 0` yields the empty string. Operates on chars (the strip is single
 /// width per char after [`strip_char`]); good enough for the MVP labels.
@@ -1174,21 +1365,197 @@ fn truncate_title(title: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    /// A single tab + the trailing `+` lay out left-to-right within the strip, the
-    /// tab packed at the left and the `+` flush after it (the tab is capped at
-    /// MAX_SEG so it doesn't eat the whole strip).
+    /// ONE tab is the window's TITLE, not a switcher: it takes the WHOLE band up to
+    /// the trailing `+`, carries no close column, and is marked `solo` so paint
+    /// draws a centred title instead of a raised chip. The same rule the native
+    /// strip follows (`toolbar::set_window_tabs`).
     #[test]
-    fn single_tab_plus_layout() {
+    fn single_tab_is_a_full_width_title_band_not_a_capped_chip() {
         let segs = layout_segments(80, 1, 0, false);
-        assert_eq!(segs.len(), 2, "one tab + the new-tab affordance");
+        assert_eq!(segs.len(), 2, "one title band + the new-tab affordance");
         assert_eq!(segs[0].kind, TabHit::Select(0));
         assert_eq!(segs[0].start_col, 0);
-        // Tab is capped at MAX_SEG so it doesn't eat the whole 80-col strip.
-        assert_eq!(segs[0].end_col, MAX_SEG);
-        // The `+` sits flush after the tab, NEW_TAB_W cells wide.
+        // The band is spent, not rationed: everything up to the `+`.
+        assert_eq!(segs[0].end_col, 80 - NEW_TAB_W);
+        assert!(segs[0].solo, "a lone tab is the window title");
+        assert_eq!(
+            segs[0].close_col, None,
+            "a title band has no close affordance; the window's own already exists"
+        );
+        // The `+` sits flush after it, NEW_TAB_W cells wide.
         assert_eq!(segs[1].kind, TabHit::NewTab);
-        assert_eq!(segs[1].start_col, MAX_SEG);
-        assert_eq!(segs[1].end_col, MAX_SEG + NEW_TAB_W);
+        assert!(!segs[1].solo);
+        assert_eq!(segs[1].start_col, 80 - NEW_TAB_W);
+        assert_eq!(segs[1].end_col, 80);
+    }
+
+    /// The SOLO band paints the window's title, not a chip: no raised card, no
+    /// selection underline, no `✕`, the title CENTRED and its description trailing
+    /// in the dim tone. The native strip's solo band, in cells.
+    #[test]
+    fn solo_band_paints_a_centred_title_and_description_with_no_chip() {
+        let theme = Theme::default();
+        let metadata = [TabStripMetadata::from_presentation(
+            &crate::tab_model::TabPresentation::terminal("aterm"),
+        )];
+        let segments = layout_segments_with_metadata(40, 1, &metadata, 0, false);
+        let band = segments[0];
+        assert!(band.solo);
+        let mut row = vec![blank_cell(theme); 40];
+        paint_strip_with_metadata(
+            &mut row,
+            &segments,
+            &["aterm".to_string()],
+            &metadata,
+            StripPaint {
+                // Hovered, and STILL no ✕: a title band has none to reveal.
+                hovered: Some(0),
+                subtitle: Some("~/aterm"),
+            },
+            0,
+            theme,
+            None,
+        );
+        let painted: String = row[..band.end_col as usize].iter().map(|c| c.ch).collect();
+        assert!(
+            !painted.contains('✕'),
+            "a title band has no close affordance"
+        );
+        assert!(painted.contains("aterm"), "the title is drawn");
+        assert!(painted.contains("~/aterm"), "the description trails it");
+        // CENTRED: the ink is balanced within the band, not packed against an edge.
+        let first = painted.find(|c: char| c != ' ').expect("some ink");
+        let last = painted.rfind(|c: char| c != ' ').expect("some ink");
+        let right_pad = painted.len() - 1 - last;
+        assert!(
+            first.abs_diff(right_pad) <= 1,
+            "title group centred in the band (left {first}, right {right_pad})"
+        );
+        // Flat body chrome — the raised selected-card treatment belongs to a
+        // switcher, and a lone tab is not one.
+        let colors = strip_colors(theme);
+        let title_cell = row[first];
+        assert_eq!(title_cell.bg, colors.body_bg, "no raised card");
+        assert_eq!(
+            title_cell.underline,
+            UnderlineStyle::None,
+            "no selection rule"
+        );
+        assert_eq!(title_cell.fg, colors.fg, "full-strength title ink");
+    }
+
+    /// The `✕` is HOVER-ONLY on the in-grid strip too — including on the SELECTED
+    /// tab, which is exactly the one a permanent ✕ gets mis-clicked on. Its column
+    /// is reserved either way, so the reveal never reflows the title, and
+    /// `hit_test` keeps closing there (the pointer is on the tab it clicks).
+    #[test]
+    fn the_close_mark_is_painted_only_on_the_hovered_tab() {
+        let theme = Theme::default();
+        let metadata = [
+            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("a")),
+            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("b")),
+        ];
+        let titles = ["a".to_string(), "b".to_string()];
+        let segments = layout_segments_with_metadata(60, 2, &metadata, 0, false);
+        let close_cols: Vec<u16> = segments.iter().filter_map(|seg| seg.close_col).collect();
+        assert_eq!(close_cols.len(), 2, "both chips reserve a close column");
+
+        let marks = |hovered: Option<usize>| {
+            let mut row = vec![blank_cell(theme); 60];
+            paint_strip_with_metadata(
+                &mut row,
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint {
+                    hovered,
+                    subtitle: None,
+                },
+                0,
+                theme,
+                None,
+            );
+            close_cols
+                .iter()
+                .map(|col| row[*col as usize].ch)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            marks(None),
+            [' ', ' '],
+            "no pointer, no ✕ — not even on the selected tab"
+        );
+        assert_eq!(
+            marks(Some(0)),
+            ['✕', ' '],
+            "only the hovered tab reveals it"
+        );
+        assert_eq!(marks(Some(1)), [' ', '✕']);
+        // Reserved either way: the geometry the title is laid out around does not
+        // depend on the pointer, so nothing reflows when the ✕ appears.
+        assert_eq!(
+            layout_segments_with_metadata(60, 2, &metadata, 1, false),
+            segments,
+            "selection does not move the close columns either"
+        );
+    }
+
+    /// The solo band spends its width on the TITLE: the description compresses
+    /// first and disappears entirely before the title gives up a cell.
+    #[test]
+    fn solo_band_compresses_the_description_before_the_title() {
+        let (title, subtitle) = solo_band_text("aterm", Some("~/very/long/path/here"), 40);
+        assert_eq!(title, "aterm", "a title that fits is never cut");
+        assert_eq!(
+            subtitle.as_deref(),
+            Some("~/very/long/path/here"),
+            "and a description that fits is not cut either"
+        );
+
+        // Squeezed: the title still fits whole, so the description takes the loss.
+        let (title, subtitle) = solo_band_text("aterm", Some("~/very/long/path/here"), 24);
+        assert_eq!(title, "aterm");
+        assert_eq!(subtitle.as_deref(), Some("~/very/long…"));
+
+        let (title, subtitle) = solo_band_text("aterm", Some("~/aterm"), 14);
+        assert_eq!(title, "aterm");
+        assert_eq!(
+            subtitle, None,
+            "no room for a description, so none is drawn"
+        );
+
+        let (title, subtitle) = solo_band_text("a-very-long-session-title", Some("~/aterm"), 14);
+        assert_eq!(title, "a-very-lo…", "the title takes every cell there is");
+        assert_eq!(subtitle, None);
+        assert_eq!(
+            title.chars().count(),
+            14 - 2 * SOLO_EDGE_COLS,
+            "and never overruns the band"
+        );
+    }
+
+    /// TWO OR MORE tabs split the whole band into EQUAL shares with no maximum, so
+    /// a wide strip buys longer titles rather than bare background past a capped
+    /// chip — and none of them is `solo`.
+    #[test]
+    fn multiple_tabs_split_the_whole_band_evenly() {
+        for count in 2..=6usize {
+            let segs = layout_segments(200, count, 0, false);
+            let tabs: Vec<_> = segs
+                .iter()
+                .filter(|s| matches!(s.kind, TabHit::Select(_)))
+                .collect();
+            assert_eq!(tabs.len(), count);
+            let band = 200 - NEW_TAB_W;
+            let per = band / u16::try_from(count).unwrap();
+            for (index, seg) in tabs.iter().enumerate() {
+                assert!(!seg.solo, "only a LONE tab is a title band");
+                assert_eq!(seg.start_col, per * u16::try_from(index).unwrap());
+                assert_eq!(seg.end_col - seg.start_col, per, "equal shares");
+            }
+            // Nothing but the integer-division remainder is left over.
+            assert!(band - tabs.last().unwrap().end_col < u16::try_from(count).unwrap());
+        }
     }
 
     /// RFC Rung 2: `show_update` prepends a LEADING `↻` update segment at col 0,
@@ -1320,6 +1687,12 @@ mod tests {
             &segments,
             &["Settings".to_string(), "notes.md".to_string()],
             &metadata,
+            // Tab 0 is under the pointer: the ✕ is a hover-only reveal, so its
+            // glyph assertion below is about the HOVERED tab.
+            StripPaint {
+                hovered: Some(0),
+                subtitle: None,
+            },
             0,
             theme,
             None,
@@ -1428,6 +1801,10 @@ mod tests {
                 .map(|presentation| presentation.title.clone())
                 .collect::<Vec<_>>(),
             &metadata,
+            StripPaint {
+                hovered: Some(0),
+                subtitle: None,
+            },
             0,
             theme,
             None,
@@ -1444,24 +1821,106 @@ mod tests {
         );
     }
 
+    /// The SOLO band's subtitle comes from the composed session chrome, prefers
+    /// authored prose over generated status, and never echoes the title back.
+    #[test]
+    fn solo_subtitle_prefers_authored_prose_and_never_echoes_the_title() {
+        let full = "aterm\ndescription: the release cutter\nactivity: Building\ncwd: ~/aterm\nstate: alive\n\nspawned · just now";
+        assert_eq!(
+            solo_subtitle("aterm", Some(full)).as_deref(),
+            Some("the release cutter"),
+            "an authored description outranks every generated fact"
+        );
+        assert_eq!(
+            solo_subtitle("aterm", Some("aterm\ncwd: ~/aterm\nactivity: Building")).as_deref(),
+            Some("~/aterm"),
+            "where the session is outranks what it is doing"
+        );
+        assert_eq!(
+            solo_subtitle("aterm", Some("aterm\nactivity: Building")).as_deref(),
+            Some("Building")
+        );
+        assert_eq!(
+            solo_subtitle("aterm", Some("aterm\nstate: alive")),
+            None,
+            "a lifecycle word is not a description; the bare title reads better"
+        );
+
+        // A title that already carries the fact gets no echo beside it — the common
+        // shape, since the composed label folds the activity in ("aterm · Ready").
+        assert_eq!(
+            solo_subtitle("aterm · Ready", Some("aterm · Ready\nactivity: Ready")),
+            None
+        );
+        // …and the NEXT-best fact still wins when only the first one echoes.
+        assert_eq!(
+            solo_subtitle(
+                "aterm · Ready",
+                Some("aterm · Ready\nactivity: Ready\ncwd: ~/aterm")
+            )
+            .as_deref(),
+            Some("~/aterm")
+        );
+
+        // Nothing to say stays silent rather than padding the title.
+        assert_eq!(solo_subtitle("aterm", None), None);
+        assert_eq!(solo_subtitle("aterm", Some("aterm")), None);
+        assert_eq!(solo_subtitle("aterm", Some("aterm\ncwd: ")), None);
+        assert_eq!(
+            solo_subtitle("aterm", Some("aterm\ncwd: -")),
+            None,
+            "the unset sentinel is not a description"
+        );
+        // A timeline row is not an identity line and must never be mistaken for one.
+        assert_eq!(
+            solo_subtitle("aterm", Some("aterm\n\nstate-change · just now")),
+            None
+        );
+    }
+
     #[test]
     fn native_point_layout_keeps_close_and_tab_targets_while_reserving_app_icon_only() {
-        let plain = native_tab_content_layout(220.0, 28.0, false, false);
-        let app = native_tab_content_layout(220.0, 28.0, true, true);
-        assert_eq!(plain.close, [2.0, 2.0, 24.0, 24.0]);
+        let plain = native_tab_content_layout(220.0, 14.0, false, false);
+        let app = native_tab_content_layout(220.0, 14.0, true, true);
+        assert_eq!(plain.close, [2.0, 6.0, 16.0, 16.0]);
         assert_eq!(app.close, plain.close, "close hit target never moves");
         assert!(plain.close_available);
         assert!(app.close_available);
-        assert_eq!(app.icon, Some([30.0, 7.0, 14.0, 14.0]));
-        assert_eq!(app.status, Some([48.0, 6.0, 16.0, 16.0]));
-        assert_eq!(app.label, [68.0, 5.5, 146.0, 17.0]);
-        assert_eq!(plain.label, [30.0, 5.5, 184.0, 17.0]);
+        assert_eq!(app.icon, Some([20.0, 7.0, 14.0, 14.0]));
         assert_eq!(
-            plain.label[2] - native_tab_content_layout(220.0, 28.0, true, false).label[2],
-            TAB_ICON_NATIVE_SIZE + 4.0,
+            app.status,
+            Some([198.0, 6.0, 16.0, 16.0]),
+            "the status canvas mirrors the icon on the trailing edge"
+        );
+        assert_eq!(app.label, [38.0, 5.5, 144.0, 17.0]);
+        assert_eq!(plain.label, [20.0, 5.5, 180.0, 17.0]);
+        for layout in [
+            plain,
+            app,
+            native_tab_content_layout(220.0, 14.0, true, false),
+        ] {
+            assert_eq!(
+                layout.label[0],
+                220.0 - (layout.label[0] + layout.label[2]),
+                "the title's insets are symmetric, so a centred title reads centred"
+            );
+        }
+        assert_eq!(
+            plain.label[2] - native_tab_content_layout(220.0, 14.0, true, false).label[2],
+            2.0 * (TAB_ICON_NATIVE_SIZE + 4.0),
             "a terminal gets the native icon slot and gap back for its label"
         );
-        let compact = native_tab_content_layout(48.0, 28.0, true, true);
+
+        // The ✕ is a HOVER-ONLY reveal, so its slot must be reserved unconditionally:
+        // identical geometry with and without an icon proves the title never reflows
+        // when the pointer arrives.
+        assert_eq!(
+            native_tab_content_layout(220.0, 14.0, false, false),
+            plain,
+            "close-slot geometry is independent of whether the ✕ is painted"
+        );
+
+        let compact = native_tab_content_layout(48.0, 14.0, true, true);
         assert_eq!(compact.close, app.close);
         assert!(
             !compact.close_available,
@@ -1478,15 +1937,28 @@ mod tests {
             "narrow label clips, never underflows"
         );
 
-        let phone = native_tab_content_layout(63.0, 28.0, true, false);
+        let phone = native_tab_content_layout(63.0, 14.0, true, false);
         assert!(!phone.close_available);
         assert_eq!(phone.icon, None, "full Settings title wins at phone width");
         assert_eq!(phone.label, [4.0, 5.5, 55.0, 17.0]);
 
-        let app_with_room = native_tab_content_layout(109.0, 28.0, true, false);
+        let app_with_room = native_tab_content_layout(109.0, 14.0, true, false);
         assert!(!app_with_room.close_available);
         assert_eq!(app_with_room.icon, Some([4.0, 7.0, 14.0, 14.0]));
-        assert_eq!(app_with_room.label, [22.0, 5.5, 83.0, 17.0]);
+        assert_eq!(app_with_room.label, [22.0, 5.5, 65.0, 17.0]);
+
+        // The strip's vertical centre is MEASURED from the traffic lights, so every
+        // slot must track it rather than the view's own midpoint.
+        let lowered = native_tab_content_layout(220.0, 16.0, true, true);
+        assert_eq!(lowered.close[1], app.close[1] + 2.0);
+        assert_eq!(lowered.icon.unwrap()[1], app.icon.unwrap()[1] + 2.0);
+        assert_eq!(lowered.status.unwrap()[1], app.status.unwrap()[1] + 2.0);
+        assert_eq!(lowered.label[1], app.label[1] + 2.0);
+        assert_eq!(
+            [lowered.close[0], lowered.label[0], lowered.label[2]],
+            [app.close[0], app.label[0], app.label[2]],
+            "a vertical re-centre never disturbs horizontal geometry"
+        );
     }
 
     #[test]
@@ -1575,7 +2047,8 @@ mod tests {
         let mut row = vec![strip_cell(' ', &strip_colors(theme), StripRole::Inactive); cols];
         let segs = layout_segments(cols as u16, 2, 0, false);
         let titles = vec!["zsh".to_string(), "vim".to_string()];
-        paint_strip(&mut row, &segs, &titles, 0, theme);
+        // Tab 0 is under the pointer, so its hover-only ✕ is painted.
+        paint_strip(&mut row, &segs, &titles, Some(0), 0, theme);
         let fg_rgb = [
             ((theme.fg >> 16) & 0xff) as u8,
             ((theme.fg >> 8) & 0xff) as u8,
@@ -1650,7 +2123,8 @@ mod tests {
         let segs = layout_segments(cols as u16, 2, 0, false);
         let long = "this-is-a-really-long-window-title-from-vim".to_string();
         let titles = vec![long, "x".to_string()];
-        paint_strip(&mut row, &segs, &titles, 0, theme);
+        // Tab 0 is under the pointer, so its hover-only ✕ is painted.
+        paint_strip(&mut row, &segs, &titles, Some(0), 0, theme);
         let t0 = &segs[0];
         // The cell just before tab 1 starts must still be tab 0's (close ✕ or pad),
         // never a title char that ran past the boundary.

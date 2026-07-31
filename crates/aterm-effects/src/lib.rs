@@ -50,6 +50,9 @@ pub mod cursor_glow;
 pub mod cursor_phaser;
 pub mod cursor_rainbow;
 pub mod cursor_trail;
+/// Crate-private shared render kit for the cursor emitters (the two per-cell-row
+/// quad pushers, colour ramps, and the one twinkle star).
+mod effect_util;
 /// Hardened, bounded file admission shared by every native visual-feed loader.
 pub mod file_feed;
 pub mod genome;

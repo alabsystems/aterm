@@ -3289,6 +3289,48 @@ mod tests {
         assert_ne!(err.kind(), io::ErrorKind::Interrupted);
     }
 
+    // Zero-length buffer: `read(2)` with count 0 returns 0 WITHOUT consuming any
+    // of the pending bytes. This is the third arm of the wrapper's return
+    // contract, and the one that is easy to get wrong: `buf.as_mut_ptr()` on an
+    // empty slice is a dangling-but-aligned pointer, so a wrapper that did any
+    // pointer math or passed a bogus count would fault or, worse, silently eat
+    // the queued data. We prove BOTH halves — the 0 return AND that the data is
+    // still there afterwards — so a regression cannot hide behind the 0.
+    #[test]
+    fn read_into_an_empty_buffer_reads_nothing() {
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid 2-element buffer for `pipe`.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe() failed");
+        let (rd, wr) = (fds[0], fds[1]);
+
+        // Queue data on the pipe so a "reads nothing" result is meaningful: the
+        // read end is READABLE, so a 0 return can only come from the count, not
+        // from an empty pipe. (Well under the pipe buffer, so no blocking.)
+        let pending: &[u8] = b"data-is-waiting";
+        write_all(wr, pending);
+
+        let mut empty: [u8; 0] = [];
+        let n = read(rd, &mut empty);
+        assert_eq!(n, 0, "zero-length read must return 0 even with data pending");
+
+        // The pending bytes must be UNCONSUMED — a real read still sees them all.
+        let mut buf = [0u8; 64];
+        let n = read(rd, &mut buf);
+        assert!(n > 0, "the queued bytes must survive the zero-length read");
+        assert_eq!(
+            &buf[..n as usize],
+            pending,
+            "the zero-length read must not have consumed any pending byte",
+        );
+
+        // SAFETY: closing both pipe ends we opened above.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+    }
+
     // ---- write_all drains a buffer larger than one pipe write (partial writes) ----
 
     // A pipe's kernel buffer is finite (typically 16–64 KiB), so a single

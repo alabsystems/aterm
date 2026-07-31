@@ -36,7 +36,15 @@ use sha2::{Digest, Sha256};
 /// a bug, so this returns an error rather than silently skipping it.
 pub fn tree_root(root: &Path) -> io::Result<String> {
     let mut entries: Vec<Vec<u8>> = Vec::new();
-    walk(root, root, &mut entries)?;
+    // ONE read buffer for the whole walk, threaded down the recursion. A per-file
+    // `[0u8; 64 * 1024]` local would be zero-initialized per call and LLVM cannot elide
+    // it (the buffer is handed to an opaque `Read::read`), so the emitted body carries a
+    // 16-page stack probe plus a 64 KiB `bzero` for EVERY file hashed — a rust sysroot
+    // bundle has tens of thousands of files, so that is gigabyte-scale memset laid on top
+    // of the real hashing. Heap `vec!`, not a boxed array literal: `Box::new([0u8; N])`
+    // builds the array on the stack first and reintroduces exactly what this removes.
+    let mut buf = vec![0u8; 64 * 1024];
+    walk(root, root, &mut entries, &mut buf)?;
     entries.sort();
     let mut h = Sha256::new();
     for e in &entries {
@@ -45,8 +53,9 @@ pub fn tree_root(root: &Path) -> io::Result<String> {
     Ok(hex(&h.finalize()))
 }
 
-/// Recursively collect one canonical entry line per regular file under `dir`.
-fn walk(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>) -> io::Result<()> {
+/// Recursively collect one canonical entry line per regular file under `dir`, hashing
+/// each through the caller's single reusable `buf` (see [`tree_root`]).
+fn walk(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>, buf: &mut [u8]) -> io::Result<()> {
     let mut children: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     // Deterministic recursion order (the final sort over relpaths makes this belt-and-
     // suspenders, but it keeps the walk itself reproducible).
@@ -57,13 +66,13 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>) -> io::Result<()> {
         let meta = std::fs::symlink_metadata(&path)?;
         let ft = meta.file_type();
         if ft.is_dir() {
-            walk(root, &path, out)?;
+            walk(root, &path, out, buf)?;
         } else if ft.is_file() {
             let rel = path.strip_prefix(root).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
             })?;
             let mode = crate::platform::permission_mode(&meta) & 0o7777;
-            let fsha = file_sha256(&path)?;
+            let fsha = file_sha256_with(&path, buf)?;
             // `platform::os_str_bytes` (the raw OS bytes; `OsStrExt::as_bytes` on Unix)
             // goes via `call1` (hoisted, used twice below): std's INLINED `unsafe` (the
             // `OsStr` byte-slice cast) is otherwise attributed to this function's spans
@@ -147,12 +156,22 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
 
 /// Streamed SHA-256 of a file's contents → lowercase hex. Never buffers the whole file.
 /// Reused by the install path for the downloaded-asset integrity check (§9).
+///
+/// One-shot wrapper: allocates a single read buffer and delegates. The tree walk, which
+/// hashes tens of thousands of files, calls [`file_sha256_with`] with ONE buffer instead
+/// (see [`tree_root`]).
 pub(crate) fn file_sha256(path: &Path) -> io::Result<String> {
+    let mut buf = vec![0u8; 64 * 1024];
+    file_sha256_with(path, &mut buf)
+}
+
+/// [`file_sha256`] against a caller-owned read buffer — the per-file body, verbatim, with
+/// the buffer hoisted out of the hot per-file frame.
+fn file_sha256_with(path: &Path, buf: &mut [u8]) -> io::Result<String> {
     let mut f = std::fs::File::open(path)?;
     let mut h = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = f.read(&mut buf)?;
+        let n = f.read(&mut *buf)?;
         if n == 0 {
             break;
         }

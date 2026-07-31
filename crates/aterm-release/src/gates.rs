@@ -30,12 +30,48 @@ use crate::mirror;
 /// build dies at 99% on ENOSPC.
 pub const MIN_FREE_DISK_GIB: u64 = 10;
 
-/// Where cargo resolves the `trust` toolchain from (rust-toolchain.toml pins
-/// it): the rustup toolchain link, normally a symlink at
-/// `$HOME/trust/build/host/stage2`. The gate probes THIS path — the exact
-/// resolution the build lane will use — so a broken link fails here, in
-/// seconds, with the remediation printed.
-pub const TRUST_RUSTUP_TOOLCHAIN_BIN: &str = ".rustup/toolchains/trust/bin";
+/// The Trust toolchain's stage2 tool dir (`targo`, `trustc`, `trustdoc`, …).
+/// `TRUST_STAGE2_BIN` overrides (same contract as tools/verify.sh); the default
+/// is `$HOME/trust/build/host/stage2/bin`. Resolved to the PHYSICAL path: Trust's
+/// `build/host` is commonly a target-triple symlink and the protected Trust
+/// drivers refuse a symlinked toolchain path. The stock-name rustup bridge
+/// (`~/.rustup/toolchains/trust/bin/{rustc,cargo}`) is gone — the 2026-07-30
+/// purge ships trust-named binaries only, so the gates resolve those directly.
+pub fn trust_stage2_bin() -> Result<PathBuf> {
+    let dir = match env::var_os("TRUST_STAGE2_BIN") {
+        Some(v) => PathBuf::from(v),
+        None => {
+            let home = env::var("HOME")
+                .map_err(|_| Error::new("HOME is unset — cannot locate the Trust toolchain"))?;
+            Path::new(&home).join("trust/build/host/stage2/bin")
+        }
+    };
+    fs::canonicalize(&dir).map_err(|error| {
+        Error::new(format!(
+            "Trust stage2 tool dir not resolvable at {} ({error}) — build the toolchain \
+             (`python3 x.py build --stage 2` in $HOME/trust) or point TRUST_STAGE2_BIN at a \
+             stage2 bin dir",
+            dir.display()
+        ))
+    })
+}
+
+/// The `targo` build driver from the stage2 tool dir. All native-lane builds and
+/// metadata queries go through THIS binary — never a PATH `cargo`, which since
+/// the stock-name purge resolves to a rustup shim with nothing behind it.
+pub fn resolve_targo() -> Result<PathBuf> {
+    let targo = trust_stage2_bin()?.join("targo");
+    if targo.is_file() {
+        Ok(targo)
+    } else {
+        Err(Error::new(format!(
+            "targo missing at {} — the stage2 toolchain is incomplete; rebuild it \
+             (`python3 x.py build --stage 2` in $HOME/trust) or point TRUST_STAGE2_BIN at a \
+             stage2 bin dir that carries targo",
+            targo.display()
+        )))
+    }
+}
 
 /// The gate knobs that come off the `cut` command line.
 pub struct GateOpts {
@@ -72,9 +108,9 @@ pub struct GateReport {
     pub changelog_entries: usize,
     /// The gh account name, when it could be parsed from `gh auth status`.
     pub gh_account: Option<String>,
-    /// The probed Trust rustc path (the rustup `trust` toolchain the build
-    /// lane resolves). Always probed — there is no opt-out lane.
-    pub trust_rustc: PathBuf,
+    /// The probed trustc path (the Trust stage2 compiler the native build lane
+    /// resolves via targo). Always probed — there is no opt-out lane.
+    pub trustc: PathBuf,
     /// false under `--arm64-only`.
     pub universal: bool,
     /// Free disk in GiB at gate time.
@@ -105,7 +141,7 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
     )?;
     let gh_account = gh_auth()?;
     locked_metadata_gate(repo)?;
-    let trust_rustc = trust_rustc_probe()?;
+    let trustc = trustc_probe(repo)?;
     let universal = if opts.arm64_only {
         false
     } else {
@@ -120,7 +156,7 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
         head_short: head.chars().take(8).collect(),
         changelog_entries: cl.entries,
         gh_account,
-        trust_rustc,
+        trustc,
         universal,
         free_disk_gib,
         channel_version,
@@ -146,11 +182,7 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
 /// unauthorized repository as well as a missing file, so an absent channel token
 /// would otherwise disable this gate silently. The 404 path probes the repository
 /// itself and only skips when the repository is demonstrably readable.
-pub fn channel_version_gate(
-    repo: &Path,
-    version: &str,
-    offline: bool,
-) -> Result<Option<String>> {
+pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result<Option<String>> {
     let local = fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("cannot read workspace Cargo.toml: {e}")))?;
     let Some(slug) = mirror::update_channel_slug(&local)? else {
@@ -235,11 +267,12 @@ pub fn locked_metadata_gate(repo: &Path) -> Result<()> {
             "read committed Cargo.lock before release metadata check: {error}"
         ))
     })?;
-    let out = Command::new("cargo")
+    let targo = resolve_targo()?;
+    let out = Command::new(&targo)
         .args(["metadata", "--locked", "--offline", "--format-version", "1"])
         .current_dir(repo)
         .output()
-        .map_err(|error| Error::new(format!("failed to run locked Cargo metadata: {error}")))?;
+        .map_err(|error| Error::new(format!("failed to run locked targo metadata: {error}")))?;
     let lock_after = match fs::read(&lock_path) {
         Ok(bytes) => bytes,
         Err(read_error) => {
@@ -426,63 +459,95 @@ pub fn gh_auth() -> Result<Option<String>> {
     Ok(account)
 }
 
-/// Probe the Trust rustc the native slice uses — the rustup `trust`
-/// toolchain that rust-toolchain.toml pins for the whole repo (spec §6
-/// buildplan.rs). Always on: the repo compiles with Trust, so a missing or
-/// broken toolchain is a broken toolchain, never a fallback. The exact path
-/// is printed on failure so the remediation is copy-pasteable.
+/// The native-lane rustflags the repo's `.cargo/config.toml` applies to the
+/// Trust slice's triple — the ONE temporary verification opt-out. Read from the
+/// file, never hardcoded: a hardcoded off-switch spelling drifted from the
+/// config twice (`-Zno-trust-verify=yes` vs `-Ztrust-verify=off`) and either
+/// direction of that drift kills the cut in the build step. Empty when the
+/// table is gone (the Trust-Std campaign greened): the probe then compiles
+/// batteries-on, which is exactly what the build lane will do.
+fn native_lane_rustflags(repo: &Path) -> Result<Vec<String>> {
+    let path = repo.join(".cargo/config.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(Error::new(format!("read {}: {error}", path.display())));
+        }
+    };
+    let value: toml::Value = text
+        .parse()
+        .map_err(|error| Error::new(format!("parse {}: {error}", path.display())))?;
+    Ok(value
+        .get("target")
+        .and_then(|targets| targets.get("aarch64-apple-darwin"))
+        .and_then(|target| target.get("rustflags"))
+        .and_then(|flags| flags.as_array())
+        .map(|flags| {
+            flags
+                .iter()
+                .filter_map(|flag| flag.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Probe the trustc the native slice uses — the Trust stage2 compiler that
+/// `targo` drives (spec §6 buildplan.rs). Always on: the repo compiles with
+/// Trust, so a missing or broken toolchain is a broken toolchain, never a
+/// fallback. The exact path is printed on failure so the remediation is
+/// copy-pasteable.
 ///
-/// The probe COMPILES a trivial program under the same off-switch
-/// .cargo/config.toml applies (`-Zno-trust-verify=yes`), not just
-/// `--version`: a stage2 whose library build never landed has a runnable
-/// rustc but no std rlibs in its sysroot (the 2026-07-07 dry-run failure —
-/// every crate E0463s twenty seconds into the real build). Compiling is the
-/// only honest check that the toolchain can do what the build lane is about
-/// to ask of it; the metadata-only emit keeps it fast (no codegen, no link).
-pub fn trust_rustc_probe() -> Result<PathBuf> {
-    let home = env::var("HOME")
-        .map_err(|_| Error::new("HOME is unset — cannot locate the Trust toolchain"))?;
-    let rustc = Path::new(&home)
-        .join(TRUST_RUSTUP_TOOLCHAIN_BIN)
-        .join("rustc");
-    let probe = Command::new(&rustc).arg("--version").output();
+/// The probe COMPILES a trivial program under the exact rustflags
+/// .cargo/config.toml applies to the native lane, not just `--version`: a
+/// stage2 whose library build never landed has a runnable trustc but no std
+/// rlibs in its sysroot (the 2026-07-07 dry-run failure — every crate E0463s
+/// twenty seconds into the real build), and an off-switch spelling this trustc
+/// does not parse fails every unit the same way. Compiling is the only honest
+/// check that the toolchain can do what the build lane is about to ask of it;
+/// the metadata-only emit keeps it fast (no codegen, no link).
+pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
+    let trustc = trust_stage2_bin()?.join("trustc");
+    let probe = Command::new(&trustc).arg("--version").output();
     match probe {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
             return Err(Error::new(format!(
-                "Trust rustc at {} exists but failed --version: {}",
-                rustc.display(),
+                "trustc at {} exists but failed --version: {}",
+                trustc.display(),
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
         Err(e) => {
             return Err(Error::new(format!(
-                "Trust rustc not runnable at {} ({e}) — the repo compiles with Trust \
-                 always (rust-toolchain.toml). Rebuild the stage2 toolchain \
-                 (`python3 x.py build --stage 2` in $HOME/trust) and ensure the rustup \
-                 link points at $HOME/trust/build/host/stage2",
-                rustc.display()
+                "trustc not runnable at {} ({e}) — the repo compiles with Trust always. \
+                 Rebuild the stage2 toolchain (`python3 x.py build --stage 2` in $HOME/trust) \
+                 or point TRUST_STAGE2_BIN at a stage2 bin dir that carries trustc",
+                trustc.display()
             )));
         }
     }
-    // Sysroot smoke-compile: same verify off-switch the config lane applies.
+    // Sysroot smoke-compile under the exact native-lane flags the config applies.
+    let flags = native_lane_rustflags(repo)?;
     let dir = std::env::temp_dir().join(format!("aterm-trust-probe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| Error::new(format!("probe tmpdir: {e}")))?;
     let src = dir.join("probe.rs");
     std::fs::write(&src, "fn main() {}\n").map_err(|e| Error::new(format!("probe src: {e}")))?;
-    let out = Command::new(&rustc)
-        .arg("-Zno-trust-verify=yes")
+    let out = Command::new(&trustc)
+        .args(&flags)
         .arg("--emit=metadata")
         .arg("--out-dir")
         .arg(&dir)
         .arg(&src)
         .output();
     let result = match out {
-        Ok(o) if o.status.success() => Ok(rustc),
+        Ok(o) if o.status.success() => Ok(trustc),
         Ok(o) => Err(Error::new(format!(
-            "Trust rustc at {} runs but cannot COMPILE (stage2 library missing/stale? \
-             rebuild it with `python3 x.py build --stage 2` in $HOME/trust): {}",
-            rustc.display(),
+            "trustc at {} runs but cannot COMPILE under the native-lane rustflags {flags:?} \
+             (stage2 library missing/stale — rebuild with `python3 x.py build --stage 2` in \
+             $HOME/trust — or the config's off-switch spelling does not match this trustc; \
+             `trustc -Z help | grep trust-verify` decides): {}",
+            trustc.display(),
             String::from_utf8_lossy(&o.stderr)
                 .lines()
                 .find(|l| l.starts_with("error"))

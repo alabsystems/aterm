@@ -15,37 +15,13 @@
 //! construction — it pulls the CPU renderer's exact glyph bytes). Deterministic.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{Frame, Renderer, Theme};
+use aterm_render::Theme;
 
-fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
-    let n = a.pixels.len().min(b.pixels.len());
-    let mut worst = 0i32;
-    for i in 0..n {
-        let (p, q) = (a.pixels[i], b.pixels[i]);
-        for sh in [16u32, 8, 0] {
-            let d = (((p >> sh) & 0xff) as i32 - ((q >> sh) & 0xff) as i32).abs();
-            worst = worst.max(d);
-        }
-    }
-    worst
-}
-
-/// Number of pixels whose worst channel delta exceeds `tol`.
-fn count_exceeding(a: &Frame, b: &Frame, tol: i32) -> usize {
-    let n = a.pixels.len().min(b.pixels.len());
-    let mut c = 0;
-    for i in 0..n {
-        let (p, q) = (a.pixels[i], b.pixels[i]);
-        let mut d = 0i32;
-        for sh in [16u32, 8, 0] {
-            d = d.max((((p >> sh) & 0xff) as i32 - ((q >> sh) & 0xff) as i32).abs());
-        }
-        if d > tol {
-            c += 1;
-        }
-    }
-    c
-}
+mod common;
+use common::{
+    backends, count_exceeding_frame as count_exceeding,
+    max_channel_delta_frame as max_channel_delta,
+};
 
 /// Per-pixel ceiling for the rare glyph AA-FRINGE pixel (inherent software-vs-
 /// hardware sRGB encode difference under linear-light; see `parity_fuzz.rs`).
@@ -106,22 +82,14 @@ fn emit_adversarial(s: &mut u64, buf: &mut Vec<u8>) {
 fn gpu_render_adversarial_states_never_panics_and_matches_cpu() {
     let theme = Theme::default();
     let px = 16.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
     };
     // CPU/GPU byte-parity fuzz: compare the SHARED base render. The GPU-only
     // bloom and heat shimmer are present-quality layers outside the parity
     // proof — disable them here.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
     // Deterministic parity: block on the lazy fallback parses so neither
     // renderer compares a provisional `.notdef` frame against a real glyph.
     cpu.debug_block_on_lazy_fallbacks();

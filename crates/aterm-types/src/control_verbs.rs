@@ -324,7 +324,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         App,
-        "the front window's ACTIVE-tab split-pane layout: `layout tab=<i> panes=<n> zoomed=<bool>` header, then one `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> focused=<bool>` row per visible pane (cell coords; 1-cell divider gaps between rects)",
+        "the front window's ACTIVE-tab split-pane layout: `layout tab=<i> panes=<n> zoomed=<bool>` header, then one `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> focused=<bool>` row per visible pane (cell coords; 1-cell divider gaps between rects). @<sid> describes the window whose ACTIVE tab displays that session, and errors when none does (background tab?)",
     ),
     v(
         "inspect",
@@ -378,7 +378,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         App,
-        "render/latency counters [reset|percentiles] - percentiles: p50/p95/p99 input->application-present-return / output->application-present-return / frame-render distributions; plain line carries max_frame_gap_ms= (worst successful-present-return gap since reset, the software-side scrub/stutter signal) and ends first_present_ms= (main->first successful application-present return; compositor/scanout unobserved)",
+        "render/latency counters [reset|percentiles] - percentiles: p50/p95/p99 input->application-present-return / output->application-present-return / frame-render distributions; plain line carries max_frame_gap_ms= (worst successful-present-return gap since reset), rust_main_to_first_present_ms= plus startup_phase_schema=1/startup_phase_valid= and eight exclusive startup_*_ms phases (router, GUI prepare, winit dispatch, initial surface attach, successful-redraw wait/compose/surface/finalize); startup_attach_schema=1/startup_attach_valid= drills the attach parent into dispatch/prepare/window-create/window-setup/backend-finalize/chrome-geometry/surface-create/finish, and the line ends first_present_ms= (compatibility GUI main_entry->the same successful-present publication; dyld/compositor/scanout unobserved)",
     ),
     // drive input
     v(
@@ -913,9 +913,7 @@ mod tests {
         assert!(!artifact_reply_requires_ack("image", "@s-a image read"));
         assert!(!artifact_reply_requires_ack("image", "image --bytes"));
         assert!(!artifact_reply_requires_ack("text", "text"));
-        assert!(valid_artifact_ack_nonce(
-            "00112233445566778899aabbccddeeff"
-        ));
+        assert!(valid_artifact_ack_nonce("00112233445566778899aabbccddeeff"));
         assert!(!valid_artifact_ack_nonce("artifact"));
     }
 

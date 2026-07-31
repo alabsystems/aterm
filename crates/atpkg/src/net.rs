@@ -80,6 +80,18 @@ const MANIFEST_CAP: u64 = 5_000_000; // 5 MB
 const SIG_CAP: u64 = 4_096; // an Ed25519 detached sig is 64 bytes; cap generously
 const ARTIFACT_CAP: u64 = 8u64 << 30; // 8 GiB ceiling for a toolchain bundle
 
+/// The `(slug, program, build)` triple that fully determines which asset pair a
+/// memoized manifest was downloaded from.
+type ManifestKey = (String, String, u64);
+
+/// The RAW `(manifest, signature)` bytes of one asset pair — unverified wire
+/// bytes, shared by `Arc` so a memo hit costs no copy.
+type ManifestBytes = std::sync::Arc<(Vec<u8>, Vec<u8>)>;
+
+/// The manifest memo itself: the locked map behind the fetcher's `manifests`
+/// field.
+type ManifestMemo = std::sync::Mutex<std::collections::BTreeMap<ManifestKey, ManifestBytes>>;
+
 /// The production fetcher: an `owner` account + a per-machine `token` (optional rate-limit
 /// / private-repo aid, §5.1) + the optional per-program `[packages.links]` `owner/repo`
 /// FETCH overrides. Construct with [`GithubFetcher::new`] (+ [`GithubFetcher::with_overrides`]).
@@ -93,6 +105,31 @@ pub struct GithubFetcher {
     /// every byte still passes the identical signature/sha256/`tree_root` gates — an
     /// override can only redirect WHERE bytes come from, not what verifies.
     overrides: std::collections::BTreeMap<String, String>,
+    /// PER-INVOCATION memo of the release listings, keyed by `owner/repo` slug.
+    ///
+    /// Every miss is a `curl` SUBPROCESS plus a DNS+TLS+HTTP round-trip to
+    /// api.github.com — not an in-process call — and the flow lists the same slug
+    /// repeatedly: `group_disk_required` → `stage_member` → `download_for` all resolve
+    /// the same program, and a recursive `install_inner` repeats the index listing per
+    /// transitive dependency. Memoizing collapses those to one request each, which also
+    /// matters functionally: the anonymous lane (`credential()` → `None`) gets ~60
+    /// requests/hour per IP and the layer has a dedicated `RateLimited` arm for it.
+    releases: std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<Vec<Release>>>>,
+    /// Per-invocation memo of the index candidate set — the expensive one: a miss lists
+    /// the index repo AND downloads `index.toml` + `.sig` for every release carrying the
+    /// pair (up to 20 × 2 asset downloads). `install_inner` re-resolves it once per
+    /// recursive dependency and `install_default_set` once per ungrouped member.
+    index: std::sync::Mutex<Option<std::sync::Arc<Vec<Candidate>>>>,
+    /// Per-invocation memo of the RAW `(pkg-<program>-<build>.toml, .sig)` bytes, keyed
+    /// by `(slug, program, build)` — the triple that fully determines which asset pair is
+    /// downloaded. Each miss is two more `download_bytes` round-trips, and the same
+    /// member's manifest is fetched 2–3× per apply (preflight, prescan, stage).
+    ///
+    /// The memo holds BYTES, NOT TRUST (same property as the on-disk [`crate::IndexCache`]):
+    /// entries are the unverified wire bytes, and every consumer still runs
+    /// `verify_pkg(raw, &sig, …)` → `parse_pkg` and re-binds `program`/`build_number`
+    /// itself, so a served entry is gated exactly as a freshly-downloaded one.
+    manifests: ManifestMemo,
 }
 
 impl GithubFetcher {
@@ -104,6 +141,9 @@ impl GithubFetcher {
             owner,
             token,
             overrides: std::collections::BTreeMap::new(),
+            releases: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            index: std::sync::Mutex::new(None),
+            manifests: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -141,8 +181,20 @@ impl GithubFetcher {
         slug
     }
 
-    /// List the recent releases (newest first) of `slug` (`owner/repo`).
-    fn releases_at(&self, slug: &str) -> Result<Vec<Release>, String> {
+    /// List the recent releases (newest first) of `slug` (`owner/repo`), memoized for the
+    /// life of this fetcher (see the `releases` field for the cost model).
+    ///
+    /// ONLY successes are memoized — an `Err` must stay retryable, so a transient network
+    /// failure is never frozen in. The lock is held ONLY around the map lookup/insert,
+    /// never across the request, so an in-flight fetch can neither block another lane nor
+    /// poison the mutex; a poisoned lock degrades to an uncached (correct) fetch rather
+    /// than panicking.
+    fn releases_at(&self, slug: &str) -> Result<std::sync::Arc<Vec<Release>>, String> {
+        if let Ok(memo) = self.releases.lock()
+            && let Some(hit) = memo.get(slug)
+        {
+            return Ok(std::sync::Arc::clone(hit));
+        }
         // Manual concat of the previous
         // `format!("https://api.github.com/repos/{}/releases?per_page=20", ..)`
         // — byte-identical: the `format!` expansion embeds `fmt::Arguments`
@@ -151,11 +203,18 @@ impl GithubFetcher {
         let mut url = String::from("https://api.github.com/repos/");
         url.push_str(slug);
         url.push_str("/releases?per_page=20");
-        parse_releases(&aterm_update_core::api_get(&url, self.credential())?)
+        let list = std::sync::Arc::new(parse_releases(&aterm_update_core::api_get(
+            &url,
+            self.credential(),
+        )?)?);
+        if let Ok(mut memo) = self.releases.lock() {
+            memo.insert(slug.to_string(), std::sync::Arc::clone(&list));
+        }
+        Ok(list)
     }
 
     /// List a repo's recent releases under this fetcher's own account.
-    fn releases(&self, repo: &str) -> Result<Vec<Release>, String> {
+    fn releases(&self, repo: &str) -> Result<std::sync::Arc<Vec<Release>>, String> {
         let mut slug = self.owner.clone();
         slug.push('/');
         slug.push_str(repo);
@@ -165,9 +224,20 @@ impl GithubFetcher {
 
 impl crate::flow::Fetcher for GithubFetcher {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+        // Memoized per invocation: the flow resolves the candidates once per program AND
+        // once per transitive dependency, and each miss is a listing plus TWO asset
+        // downloads per carrying release. The bytes are returned by value (a few KB of
+        // TOML + 64-byte sigs — free next to the network), so the trait signature and
+        // every downstream gate are untouched: the same raw bytes still flow through
+        // `select_index` → `verify_index_with` → `parse_index` → floor → freshness.
+        if let Ok(memo) = self.index.lock()
+            && let Some(hit) = memo.as_ref()
+        {
+            return Ok((**hit).clone());
+        }
         let releases = self.releases(&crate::discovery::index_repo())?;
         let mut out = Vec::new();
-        for r in &releases {
+        for r in releases.iter() {
             if let Some((toml_url, sig_url)) = find_pair(&r.assets, "index.toml") {
                 let index_bytes =
                     aterm_update_core::download_bytes(toml_url, self.credential(), MANIFEST_CAP)?;
@@ -179,7 +249,13 @@ impl crate::flow::Fetcher for GithubFetcher {
                 });
             }
         }
-        Ok(out)
+        // Successes only — a partial fetch that errored above never reaches here, so a
+        // transient failure stays retryable.
+        let out = std::sync::Arc::new(out);
+        if let Ok(mut memo) = self.index.lock() {
+            *memo = Some(std::sync::Arc::clone(&out));
+        }
+        Ok((*out).clone())
     }
 
     fn pkg_manifest(
@@ -188,6 +264,19 @@ impl crate::flow::Fetcher for GithubFetcher {
         program: &str,
         build: u64,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        // The program's manifest rides its release repo — the `[packages.links]`
+        // fetch override redirects it (with the same token) when declared. The slug is
+        // resolved ONCE: it keys the memo, drives the listing, and spells the error.
+        let slug = self.slug_for(program, repo);
+        // `(slug, program, build)` fully determines which asset pair is downloaded, so a
+        // hit is the same bytes the network would return. Bytes, not trust: the caller
+        // still runs verify_pkg → parse_pkg and re-binds program/build itself.
+        let key = (slug.clone(), program.to_string(), build);
+        if let Ok(memo) = self.manifests.lock()
+            && let Some(hit) = memo.get(&key)
+        {
+            return Ok((**hit).clone());
+        }
         // Manual concat of the previous `format!("pkg-{program}-{build}.toml")`
         // and `format!("no signed {name} in {repo} releases")` — byte-identical
         // (`dec_u64` renders `{build}` exactly as `u64`'s `Display`): the
@@ -198,26 +287,32 @@ impl crate::flow::Fetcher for GithubFetcher {
         name.push('-');
         name.push_str(&crate::dec_u64(build));
         name.push_str(".toml");
-        // The program's manifest rides its release repo — the `[packages.links]`
-        // fetch override redirects it (with the same token) when declared.
-        for r in &self.releases_at(&self.slug_for(program, repo))? {
+        let releases = self.releases_at(&slug)?;
+        for r in releases.iter() {
             if let Some((toml_url, sig_url)) = find_pair(&r.assets, &name) {
                 let toml =
                     aterm_update_core::download_bytes(toml_url, self.credential(), MANIFEST_CAP)?;
                 let sig = aterm_update_core::download_bytes(sig_url, self.credential(), SIG_CAP)?;
-                return Ok((toml, sig));
+                // Successes only — a not-found (below) or a failed download stays
+                // retryable.
+                let pair = std::sync::Arc::new((toml, sig));
+                if let Ok(mut memo) = self.manifests.lock() {
+                    memo.insert(key, std::sync::Arc::clone(&pair));
+                }
+                return Ok((*pair).clone());
             }
         }
         let mut msg = String::from("no signed ");
         msg.push_str(&name);
         msg.push_str(" in ");
-        msg.push_str(&self.slug_for(program, repo));
+        msg.push_str(&slug);
         msg.push_str(" releases");
         Err(msg)
     }
 
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
-        for r in &self.releases(repo)? {
+        let releases = self.releases(repo)?;
+        for r in releases.iter() {
             if let Some(a) = r.assets.iter().find(|a| a.name == asset) {
                 return aterm_update_core::download_to(
                     &a.url,
@@ -247,8 +342,11 @@ impl crate::flow::Fetcher for GithubFetcher {
         dest: &Path,
     ) -> Result<(), String> {
         // The artifact rides the SAME release repo as the program's manifest, so the
-        // `[packages.links]` fetch override redirects it identically (same token).
-        for r in &self.releases_at(&self.slug_for(program, repo))? {
+        // `[packages.links]` fetch override redirects it identically (same token). The
+        // listing is the memoized one this program's `pkg_manifest` already paid for.
+        let slug = self.slug_for(program, repo);
+        let releases = self.releases_at(&slug)?;
+        for r in releases.iter() {
             if let Some(a) = r.assets.iter().find(|a| a.name == asset) {
                 return aterm_update_core::download_to(
                     &a.url,
@@ -261,7 +359,7 @@ impl crate::flow::Fetcher for GithubFetcher {
         let mut msg = String::from("no asset ");
         msg.push_str(asset);
         msg.push_str(" in ");
-        msg.push_str(&self.slug_for(program, repo));
+        msg.push_str(&slug);
         msg.push_str(" releases");
         Err(msg)
     }
@@ -369,6 +467,113 @@ impl crate::flow::Fetcher for DirFetcher {
     fn source_id(&self) -> String {
         format!("dir:{}", self.dir.display())
     }
+}
+
+/// Two fetchers, one flow (§9.1 bundled seed): candidates from BOTH sources
+/// feed the ONE index selection (highest signature-valid `index_build` ≥ floor
+/// wins, [`crate::select_index`]), and per-asset reads try `primary` then fall
+/// back to `secondary`. This is how a network registry and the app-bundle seed
+/// coexist without a second trust path: a fresher published index outranks the
+/// sealed seed by the ordinary monotonic gate, an offline machine still
+/// resolves the seed's index, and every byte from EITHER source passes the
+/// identical verify-before-parse + floor + freshness + sha256 + `tree_root`
+/// gates. The chain is composition, never authenticity: neither side is
+/// trusted more than its signatures prove.
+pub struct ChainFetcher {
+    primary: Box<dyn crate::flow::Fetcher>,
+    secondary: Box<dyn crate::flow::Fetcher>,
+}
+
+impl ChainFetcher {
+    /// Chain `primary` (tried first for every asset) over `secondary`.
+    #[must_use]
+    pub fn new(
+        primary: Box<dyn crate::flow::Fetcher>,
+        secondary: Box<dyn crate::flow::Fetcher>,
+    ) -> Self {
+        Self { primary, secondary }
+    }
+}
+
+impl crate::flow::Fetcher for ChainFetcher {
+    fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+        // The union of both sides' candidates; a side that errors (offline
+        // GitHub, say) contributes nothing rather than failing the other side.
+        // BOTH failing is a real error — surface both reasons.
+        match (
+            self.primary.index_candidates(),
+            self.secondary.index_candidates(),
+        ) {
+            (Ok(mut a), Ok(b)) => {
+                a.extend(b);
+                Ok(a)
+            }
+            (Ok(a), Err(_)) => Ok(a),
+            (Err(_), Ok(b)) => Ok(b),
+            (Err(a), Err(b)) => Err(format!(
+                "{} failed: {a}; {} failed: {b}",
+                self.primary.source_id(),
+                self.secondary.source_id()
+            )),
+        }
+    }
+
+    fn pkg_manifest(
+        &self,
+        repo: &str,
+        program: &str,
+        build: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.primary
+            .pkg_manifest(repo, program, build)
+            .or_else(|e1| {
+                self.secondary
+                    .pkg_manifest(repo, program, build)
+                    .map_err(|e2| chain_err(&e1, &e2))
+            })
+    }
+
+    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        self.primary.download(repo, asset, dest).or_else(|e1| {
+            self.secondary
+                .download(repo, asset, dest)
+                .map_err(|e2| chain_err(&e1, &e2))
+        })
+    }
+
+    fn download_for(
+        &self,
+        program: &str,
+        repo: &str,
+        asset: &str,
+        dest: &Path,
+    ) -> Result<(), String> {
+        // Route through both sides' OWN `download_for` so the primary's
+        // per-program `[packages.links]` fetch override still applies.
+        self.primary
+            .download_for(program, repo, asset, dest)
+            .or_else(|e1| {
+                self.secondary
+                    .download_for(program, repo, asset, dest)
+                    .map_err(|e2| chain_err(&e1, &e2))
+            })
+    }
+
+    fn source_id(&self) -> String {
+        // A chain is not either source alone: a cache written under one leg's
+        // id must not satisfy the other, so the id names both.
+        format!(
+            "chain:{}+{}",
+            self.primary.source_id(),
+            self.secondary.source_id()
+        )
+    }
+}
+
+/// Both legs failed; keep both reasons (the second is usually the seed dir,
+/// whose "no such file" alone would mislead when the real story is offline).
+fn chain_err(primary: &str, secondary: &str) -> String {
+    format!("{primary}; fallback: {secondary}")
 }
 
 #[cfg(test)]
@@ -508,5 +713,84 @@ mod tests {
         std::fs::write(d.join("pkg-ay-1.toml.sig"), b"sig").unwrap();
         assert!(fetcher.pkg_manifest("ignored", "ay", 1).is_err());
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Two registry dirs, one flow: the chain unions index candidates from
+    /// both legs, serves per-asset reads from the first leg that has the
+    /// bytes, and only errors when BOTH legs fail (with both reasons kept).
+    #[test]
+    fn chain_unions_candidates_and_falls_back_per_asset() {
+        use crate::flow::Fetcher as _;
+
+        let scratch = |label: &str| {
+            let d = std::env::temp_dir().join(format!("atpkg-chain-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        // Leg A: an index pair + ay's pkg pair. Leg B: an index pair + ny's.
+        let a = scratch("a");
+        std::fs::write(a.join("index.toml"), b"schema = 1 # a").unwrap();
+        std::fs::write(a.join("index.toml.sig"), [1u8; 64]).unwrap();
+        std::fs::write(a.join("pkg-ay-1.toml"), b"pkg a").unwrap();
+        std::fs::write(a.join("pkg-ay-1.toml.sig"), [2u8; 64]).unwrap();
+        let b = scratch("b");
+        std::fs::write(b.join("index.toml"), b"schema = 1 # b").unwrap();
+        std::fs::write(b.join("index.toml.sig"), [3u8; 64]).unwrap();
+        std::fs::write(b.join("pkg-ny-2.toml"), b"pkg b").unwrap();
+        std::fs::write(b.join("pkg-ny-2.toml.sig"), [4u8; 64]).unwrap();
+
+        let chain = ChainFetcher::new(
+            Box::new(DirFetcher::new(a.clone())),
+            Box::new(DirFetcher::new(b.clone())),
+        );
+        // Union: BOTH legs' index candidates reach the one selection, PRIMARY
+        // FIRST — load-bearing, because `select_index` replaces only on a
+        // STRICTLY greater index_build, so on a tie the first candidate wins
+        // and the network index must beat an equal-build sealed seed.
+        let candidates = chain.index_candidates().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].index_bytes, b"schema = 1 # a", "primary first");
+        assert_eq!(candidates[1].index_bytes, b"schema = 1 # b");
+        // Primary serves what it has; the fallback serves what primary lacks.
+        assert_eq!(chain.pkg_manifest("r", "ay", 1).unwrap().0, b"pkg a");
+        assert_eq!(chain.pkg_manifest("r", "ny", 2).unwrap().0, b"pkg b");
+        // Both legs missing ⇒ an error carrying both stories.
+        let err = chain.pkg_manifest("r", "absent", 9).unwrap_err();
+        assert!(err.contains("fallback:"), "both reasons kept: {err}");
+        // The chain's cache identity names both legs, never one alone.
+        let id = chain.source_id();
+        assert!(id.starts_with("chain:dir:") && id.contains('+'), "{id}");
+
+        // download_for routes through each leg's OWN download_for (so the
+        // primary's per-program [packages.links] fetch override still
+        // applies), and falls back with BOTH reasons when neither has it.
+        let out = a.join("fetched.bin");
+        chain
+            .download_for("ay", "r", "pkg-ay-1.toml", &out)
+            .expect("primary serves what it has");
+        assert_eq!(std::fs::read(&out).unwrap(), b"pkg a");
+        std::fs::remove_file(&out).unwrap();
+        chain
+            .download_for("ny", "r", "pkg-ny-2.toml", &out)
+            .expect("fallback serves what the primary lacks");
+        assert_eq!(std::fs::read(&out).unwrap(), b"pkg b");
+        std::fs::remove_file(&out).unwrap();
+        let err = chain.download_for("x", "r", "absent.bin", &out).unwrap_err();
+        assert!(err.contains("fallback:"), "{err}");
+
+        // BOTH legs failing on the index is a real error naming both sources
+        // (an empty dir yields no candidates, so use two unreadable paths).
+        let dead = ChainFetcher::new(
+            Box::new(DirFetcher::new(a.join("nope-1"))),
+            Box::new(DirFetcher::new(a.join("nope-2"))),
+        );
+        // A missing dir yields NO candidates (not an Err) by DirFetcher's
+        // contract, so the chain reports an empty union rather than failing —
+        // pinned here so a future change to that contract is noticed.
+        assert!(dead.index_candidates().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
     }
 }

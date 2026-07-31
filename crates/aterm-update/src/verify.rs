@@ -26,8 +26,22 @@ use std::time::{Duration, Instant};
 /// and far below "the user thinks the app is broken".
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How often to poll for child exit while waiting.
+/// The CEILING on the child-exit poll interval (see [`HELPER_POLL_MIN`]).
 const HELPER_POLL: Duration = Duration::from_millis(25);
+
+/// The first child-exit poll interval, doubled up to [`HELPER_POLL`].
+///
+/// A fixed 25 ms tick made every helper cost `25ms * ceil(runtime / 25ms)` with a
+/// hard 25 ms floor, because the first `try_wait` runs microseconds after `spawn`
+/// and therefore always sleeps a whole tick. The helpers are local and fast —
+/// measured against the installed bundle, `PlistBuddy -c Print:CFBundleVersion`
+/// is 6 ms and `codesign --verify --deep --strict` 35-70 ms — so one
+/// `verified_bundle_identity()` (one codesign + two PlistBuddy) rounded ~50-80 ms
+/// of real work up to 75-125 ms wall, tens of milliseconds of pure sleep on the
+/// launch/apply critical path. Backing off from 1 ms removes essentially all of
+/// that floor while keeping the steady-state tick (and the syscall rate for a
+/// genuinely slow child) exactly where it was.
+const HELPER_POLL_MIN: Duration = Duration::from_millis(1);
 
 /// Run a verification helper with a bounded wall clock, killing it on timeout.
 ///
@@ -46,6 +60,7 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
         .spawn()
         .map_err(|e| format!("spawn {what}: {e}"))?;
     let deadline = Instant::now() + HELPER_TIMEOUT;
+    let mut poll = HELPER_POLL_MIN;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -60,7 +75,11 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
                         HELPER_TIMEOUT.as_secs()
                     ));
                 }
-                std::thread::sleep(HELPER_POLL);
+                // Clamp the sleep to the remaining budget so the 30s ceiling
+                // stays exact, then back off toward the steady-state tick.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(poll.min(remaining));
+                poll = (poll * 2).min(HELPER_POLL);
             }
             Err(e) => return Err(format!("wait for {what}: {e}")),
         }

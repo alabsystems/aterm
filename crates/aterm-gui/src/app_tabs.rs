@@ -2163,13 +2163,35 @@ impl App {
     }
 
     /// Re-sync window `wid`'s NATIVE toolbar tab strip to the app's current tab
-    /// state: rebuild the view-based strip's per-tab views (one per tab, the active
-    /// one accented, the whole strip hidden at ≤1 tab) from [`Self::tab_titles`] + the
+    /// state: rebuild the view-based strip's per-tab views (one per tab, splitting the
+    /// band into equal shares with the active one accented — or, at exactly one tab,
+    /// the single centred window TITLE band) from [`Self::tab_titles`] + the
     /// window's active index, via [`toolbar::set_window_tabs`]. Called from
     /// [`Self::sync_window`] so the strip tracks EVERY tab mutation (open / close /
     /// switch / detach / migrate / reorder). A no-op off macOS and for a window with no
     /// toolbar handle (headless / a window whose toolbar failed to install).
-    pub(crate) fn refresh_window_tabs(&mut self, wid: WindowId) {
+    ///
+    /// Returns the `(titles, metadata)` snapshot it just pushed to the strip, so
+    /// a caller that also needs the repaint fingerprint feeds
+    /// [`Self::tab_strip_fingerprint_from_parts`] THESE vectors instead of
+    /// recomputing them. That is exactly the invariant that function's own doc
+    /// asks for ("reads the per-tab titles ONCE and feeds the SAME `Vec` to
+    /// both"): `tab_titles` takes each tab's session meta lock and a terminal
+    /// `try_lock`, clones its presentation fallback, resolves and allocates the
+    /// title rung, and runs the summary composer — none of which should happen
+    /// twice per refresh, and doing it once also makes the pushed chrome and the
+    /// redraw decision describe ONE snapshot rather than two possibly divergent
+    /// reads. Callers that only want the push (`sync_window`, the reorder path,
+    /// the chrome-expiry sweep) just drop the tuple.
+    ///
+    /// NOTE the returned pair deliberately excludes the active index: the one
+    /// this function computes is `tab_set.active_index()` (over ALL tabs) while
+    /// the strip fingerprint's callers use `ws.tabs.active` (the TERMINAL
+    /// projection index). Those diverge the moment a native tab exists.
+    pub(crate) fn refresh_window_tabs(
+        &mut self,
+        wid: WindowId,
+    ) -> (Vec<String>, Vec<crate::tab_bar::TabStripMetadata>) {
         // Keep the session identity aligned with `titles` without taking another
         // terminal lock. This is also the bounded key set for the early title-epoch
         // cache below; native tabs carry `None` and never enter either map.
@@ -2263,6 +2285,7 @@ impl App {
                 },
             );
         }
+        (titles, metadata)
     }
 
     /// RETIRED AFFORDANCE (update-flow UX rework): the titlebar "Update" capsule is gone

@@ -12,7 +12,9 @@ use crate::bitmap::SparseBitmap;
 use super::bloom::BloomFilter;
 use super::iterators::{CandidateSource, SearchMatchIterator, SearchMatchReverseIterator};
 use super::types::{DirectedFind, SearchDirection, SearchMatch, SearchResult, SearchResults};
-use crate::grapheme::{ColumnMap, LowerByteMap, lower_fold, lower_fold_char};
+use crate::grapheme::{
+    ColumnMap, LowerByteMap, LowerNeed, lower_fold, lower_fold_char, lower_fold_into, lower_need,
+};
 use crate::literal::AsciiCaseInsensitiveMatches;
 
 /// Default maximum number of lines to keep in the search index cache.
@@ -152,6 +154,14 @@ pub struct SearchIndex {
     /// Built at index time and reused across searches to avoid O(G)-per-query
     /// reconstruction (#7373).
     pub(super) column_maps: FxHashMap<usize, ColumnMap>,
+    /// Reused lowering buffer for the non-ASCII lowered-trigram pass.
+    ///
+    /// Same trick as [`CaseInsensitiveMatcher::lower_buf`]: the lowered text is
+    /// walked once and thrown away, so keeping ONE buffer whose capacity
+    /// survives across lines turns a malloc/realloc/free chain per indexed line
+    /// into a memcpy into already-owned memory. Purely a scratch cell — never
+    /// read outside the call that fills it, so it carries no state.
+    lower_scratch: String,
     /// Total number of indexed lines.
     line_count: usize,
     /// Lowest line number currently present in `lines`.
@@ -413,6 +423,7 @@ impl SearchIndex {
             trigrams: FxHashMap::default(),
             lines: FxHashMap::default(),
             column_maps: FxHashMap::default(),
+            lower_scratch: String::new(),
             line_count: 0,
             first_cached_line: usize::MAX,
             next_line: 0,
@@ -481,6 +492,7 @@ impl SearchIndex {
             trigrams: FxHashMap::with_capacity_and_hasher(line_hint / 10, FxBuildHasher),
             lines: FxHashMap::with_capacity_and_hasher(line_hint, FxBuildHasher),
             column_maps: FxHashMap::with_capacity_and_hasher(line_hint, FxBuildHasher),
+            lower_scratch: String::new(),
             line_count: 0,
             first_cached_line: usize::MAX,
             next_line: 0,
@@ -519,16 +531,37 @@ impl SearchIndex {
         // Skip this pass entirely when lowercasing cannot change any byte: for
         // pure-ASCII text with no uppercase letter, `to_lowercase()` is the
         // identity, so the lowered trigrams equal the original-case ones already
-        // inserted above. The predicate is a pure function of the stored line
-        // text and is mirrored in `remove_trigrams`/`rebuild_bloom` so
-        // insert/remove/rebuild stay symmetric.
-        let needs_lower = !text.is_ascii() || text.bytes().any(|b| b.is_ascii_uppercase());
-        if needs_lower {
-            let lowered = lower_fold(text);
-            for window in lowered.as_bytes().windows(3) {
-                let trigram: [u8; 3] = [window[0], window[1], window[2]];
-                self.bloom.insert_bytes(&trigram);
-                self.trigrams.entry(trigram).or_default().insert(line_u32);
+        // inserted above. The predicate lives in `lower_need` and is shared with
+        // `remove_trigrams`/`rebuild_bloom` so insert/remove/rebuild stay
+        // symmetric by construction.
+        //
+        // Neither non-identity arm allocates per line any more: pure-ASCII text
+        // lowers per byte in place off the ORIGINAL window (lowering an ASCII
+        // string never changes its byte length, so the windows correspond
+        // one-to-one), and the Unicode arm folds into a reused scratch buffer.
+        // The old shape built a fresh capacity-less `String` per line — ~5
+        // reallocations for an 80-column line — only to walk it once and drop
+        // it, on the per-line primitive every index build runs.
+        match lower_need(text) {
+            LowerNeed::None => {}
+            LowerNeed::Ascii => {
+                for window in bytes.windows(3) {
+                    let trigram: [u8; 3] = [
+                        window[0].to_ascii_lowercase(),
+                        window[1].to_ascii_lowercase(),
+                        window[2].to_ascii_lowercase(),
+                    ];
+                    self.bloom.insert_bytes(&trigram);
+                    self.trigrams.entry(trigram).or_default().insert(line_u32);
+                }
+            }
+            LowerNeed::Unicode => {
+                lower_fold_into(text, &mut self.lower_scratch);
+                for window in self.lower_scratch.as_bytes().windows(3) {
+                    let trigram: [u8; 3] = [window[0], window[1], window[2]];
+                    self.bloom.insert_bytes(&trigram);
+                    self.trigrams.entry(trigram).or_default().insert(line_u32);
+                }
             }
         }
 
@@ -582,19 +615,39 @@ impl SearchIndex {
 
         // Remove Unicode-lowercased trigrams (#7398, #7470).
         //
-        // Mirrors the identical guard in `index_line`: when lowercasing is the
-        // identity (pure-ASCII, no uppercase) the lowered pass was never
-        // inserted, so it must not be removed either, or removal would double-
-        // delete shared trigrams and leak/corrupt posting lists.
-        let needs_lower = !text.is_ascii() || text.bytes().any(|b| b.is_ascii_uppercase());
-        if needs_lower {
-            let lowered = lower_fold(text);
-            for window in lowered.as_bytes().windows(3) {
-                let trigram: [u8; 3] = [window[0], window[1], window[2]];
-                if let Some(bitmap) = self.trigrams.get_mut(&trigram) {
-                    bitmap.remove(line_u32);
-                    if bitmap.is_empty() {
-                        self.trigrams.remove(&trigram);
+        // Mirrors `index_line` arm for arm through the shared `lower_need`
+        // classifier: when lowercasing is the identity (pure-ASCII, no
+        // uppercase) the lowered pass was never inserted, so it must not be
+        // removed either, or removal would double-delete shared trigrams and
+        // leak/corrupt posting lists. The ASCII arm derives the same lowered
+        // trigrams from the original bytes; the Unicode arm reuses the index's
+        // scratch buffer. Both produce byte-identical trigrams to the insert.
+        match lower_need(text) {
+            LowerNeed::None => {}
+            LowerNeed::Ascii => {
+                for window in bytes.windows(3) {
+                    let trigram: [u8; 3] = [
+                        window[0].to_ascii_lowercase(),
+                        window[1].to_ascii_lowercase(),
+                        window[2].to_ascii_lowercase(),
+                    ];
+                    if let Some(bitmap) = self.trigrams.get_mut(&trigram) {
+                        bitmap.remove(line_u32);
+                        if bitmap.is_empty() {
+                            self.trigrams.remove(&trigram);
+                        }
+                    }
+                }
+            }
+            LowerNeed::Unicode => {
+                lower_fold_into(text, &mut self.lower_scratch);
+                for window in self.lower_scratch.as_bytes().windows(3) {
+                    let trigram: [u8; 3] = [window[0], window[1], window[2]];
+                    if let Some(bitmap) = self.trigrams.get_mut(&trigram) {
+                        bitmap.remove(line_u32);
+                        if bitmap.is_empty() {
+                            self.trigrams.remove(&trigram);
+                        }
                     }
                 }
             }
@@ -720,19 +773,39 @@ impl SearchIndex {
             // Insert Unicode-lowercased trigrams for case-insensitive
             // bloom filter acceleration (#7273, #7470).
             //
-            // Mirrors the guard in `index_line`: skip the lowered pass when
-            // lowercasing is the identity so the rebuilt filter sees the same
-            // insert set the incremental path produced.
-            let needs_lower = !text.is_ascii() || text.bytes().any(|b| b.is_ascii_uppercase());
-            if needs_lower {
-                let lowered = lower_fold(text);
-                for window in lowered.as_bytes().windows(3) {
-                    let (Some(&a), Some(&b), Some(&c)) =
-                        (window.first(), window.get(1), window.get(2))
-                    else {
-                        continue;
-                    };
-                    self.bloom.insert_bytes(&[a, b, c]);
+            // Mirrors `index_line` through the shared `lower_need` classifier:
+            // skip the lowered pass when lowercasing is the identity so the
+            // rebuilt filter sees the same insert set the incremental path
+            // produced. Neither arm allocates — this loop runs over EVERY
+            // cached line (up to the 100k cap) on each rebuild, so a per-line
+            // throwaway `String` here was the same waste multiplied by the
+            // cache size.
+            match lower_need(text) {
+                LowerNeed::None => {}
+                LowerNeed::Ascii => {
+                    for window in text.as_bytes().windows(3) {
+                        let (Some(&a), Some(&b), Some(&c)) =
+                            (window.first(), window.get(1), window.get(2))
+                        else {
+                            continue;
+                        };
+                        self.bloom.insert_bytes(&[
+                            a.to_ascii_lowercase(),
+                            b.to_ascii_lowercase(),
+                            c.to_ascii_lowercase(),
+                        ]);
+                    }
+                }
+                LowerNeed::Unicode => {
+                    lower_fold_into(text, &mut self.lower_scratch);
+                    for window in self.lower_scratch.as_bytes().windows(3) {
+                        let (Some(&a), Some(&b), Some(&c)) =
+                            (window.first(), window.get(1), window.get(2))
+                        else {
+                            continue;
+                        };
+                        self.bloom.insert_bytes(&[a, b, c]);
+                    }
                 }
             }
         }
@@ -798,11 +871,7 @@ impl SearchIndex {
     }
 
     /// Build a lazy ascending candidate source for a literal query.
-    fn literal_candidates_forward(
-        &self,
-        lower_query: &str,
-        from_line: usize,
-    ) -> CandidateSource {
+    fn literal_candidates_forward(&self, lower_query: &str, from_line: usize) -> CandidateSource {
         if lower_query.is_empty() || self.lines.is_empty() {
             return CandidateSource::Empty;
         }
@@ -956,6 +1025,7 @@ impl SearchIndex {
         self.trigrams = FxHashMap::default();
         self.lines = FxHashMap::default();
         self.column_maps = FxHashMap::default();
+        self.lower_scratch = String::new();
         self.line_count = 0;
         self.first_cached_line = usize::MAX;
         self.next_line = 0;

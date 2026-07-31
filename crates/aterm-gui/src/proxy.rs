@@ -591,15 +591,13 @@ fn relay_bidirectional(client: &CtlStream, child: &CtlStream) -> std::io::Result
     let w_client = client.try_clone()?;
     let w_child = child.try_clone()?;
     // child -> client on a worker; client -> child here.
-    let worker = std::thread::spawn(move || {
-        match copy_until_eof(&mut s2c_r, &mut s2c_w) {
-            Ok(()) => {
-                let _ = w_client.shutdown(std::net::Shutdown::Write);
-            }
-            Err(_) => {
-                let _ = w_client.shutdown(std::net::Shutdown::Both);
-                let _ = w_child.shutdown(std::net::Shutdown::Both);
-            }
+    let worker = std::thread::spawn(move || match copy_until_eof(&mut s2c_r, &mut s2c_w) {
+        Ok(()) => {
+            let _ = w_client.shutdown(std::net::Shutdown::Write);
+        }
+        Err(_) => {
+            let _ = w_client.shutdown(std::net::Shutdown::Both);
+            let _ = w_child.shutdown(std::net::Shutdown::Both);
         }
     });
     match copy_until_eof(&mut c2s_r, &mut c2s_w) {
@@ -892,10 +890,7 @@ mod tests {
 
             let mut ack = String::new();
             reader.read_line(&mut ack).unwrap();
-            assert_eq!(
-                ack.trim_end(),
-                "ACK 00112233445566778899aabbccddeeff"
-            );
+            assert_eq!(ack.trim_end(), "ACK 00112233445566778899aabbccddeeff");
             let _ = child.shutdown(std::net::Shutdown::Both);
         });
 

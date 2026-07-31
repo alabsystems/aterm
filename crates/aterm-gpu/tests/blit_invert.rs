@@ -28,6 +28,9 @@ use aterm_core::terminal::Terminal;
 use aterm_gpu::GpuRenderer;
 use aterm_render::{Frame, RenderInput, Theme};
 
+mod common;
+use common::{bb, gg, rr};
+
 const ROWS: usize = 6;
 const COLS: usize = 24;
 
@@ -39,16 +42,6 @@ fn fresh_gpu() -> Option<GpuRenderer> {
             None
         }
     }
-}
-
-fn rr(p: u32) -> u32 {
-    (p >> 16) & 0xff
-}
-fn gg(p: u32) -> u32 {
-    (p >> 8) & 0xff
-}
-fn bb(p: u32) -> u32 {
-    p & 0xff
 }
 
 /// Render `input` to the renderer's offscreen, capture those pixels (the existing
@@ -135,7 +128,7 @@ fn blit_invert_is_one_minus_rgb() {
     let (source, blit) = source_and_blit(&mut gpu, &mut win, &input, true);
 
     let mut max_delta = 0u32; // tightest bound that holds across the whole frame
-    let mut worst: Option<(usize, u32, u32)> = None;
+    let mut worst: Option<(usize, i32, i32)> = None;
     for (i, (&s, &b)) in source.pixels.iter().zip(blit.pixels.iter()).enumerate() {
         for (sc, bc) in [(rr(s), rr(b)), (gg(s), gg(b)), (bb(s), bb(b))] {
             let expected = 255 - sc; // 8-bit `1.0 - rgb`

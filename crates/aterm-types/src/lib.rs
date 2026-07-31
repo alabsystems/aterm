@@ -52,6 +52,10 @@ pub mod dirs;
 mod time;
 pub use time::duration_to_nanos;
 
+// Howard Hinnant civil-calendar math + the RFC3339 UTC stamp built on it —
+// the one workspace home (update, release, gui, and atpkg all stamp this shape).
+pub mod rfc3339;
+
 pub mod app_inspection;
 pub mod color_math;
 mod color_palette;

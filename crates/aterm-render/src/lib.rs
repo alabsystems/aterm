@@ -1300,6 +1300,15 @@ pub struct Renderer {
     /// bytes. So we pick the monomorphization from a real whiteness scan, cached
     /// so steady state (stable atlas) never rescans. `None` = not yet computed.
     rain_white_cache: Option<(usize, u64, usize, bool)>,
+    /// Resident corrected-alpha memo for the CPU text blit ([`AlphaMemoBank`]) —
+    /// the `(fg, bg)`-keyed table that keeps the `LinearCorrected` remap's
+    /// `powf` out of the per-texel loop. `None` until the first corrected text
+    /// blit allocates it (so `text_blending = "linear"` and every non-text
+    /// renderer stay at zero cost); [`Self::blit`] moves it out and back so the
+    /// texel loop can hold it beside the `&mut self`-borrowed glyph image. A
+    /// pure function of the two colours, so it needs NO font/px/theme
+    /// invalidation edge, and it is fixed-size (~16 KiB) so it needs no eviction.
+    alpha_memo: Option<Box<AlphaMemoBank>>,
 }
 
 /// The resident undercurl tile cache (see the [`Renderer`] `undercurl_masks`
@@ -2770,8 +2779,63 @@ fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
 /// safe to run on a BACKGROUND thread (the render thread's later re-read hits the
 /// intern by byte equality). An EMPTY result means no candidate loaded.
 fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
+    // THE COLD-START COST, and why this is threaded.
+    //
+    // The chain is normally TWO faces on macOS — Hiragino Sans GB (23.5 MB) then
+    // Arial Unicode (23.3 MB) — and `FallbackFace::from_bytes` parses each through
+    // fontdue, which eagerly converts every glyph outline (29k + 50k of them).
+    // Measured on this machine: 187 ms + 156 ms release, 1700 ms + 1368 ms at
+    // opt-level 0. Serially that is the whole of `seal_admitted_font_sources`, which
+    // is the whole of the backend-build thread, which is what window attach blocks
+    // on before the first frame. The two parses are independent and each is
+    // single-threaded, so running them concurrently halves the wall clock (measured
+    // 2918 ms serial -> 1629 ms threaded at opt-level 0, ~2-3% contention).
+    //
+    // THE SCAN RULE IS PRESERVED EXACTLY, because it decides which faces exist:
+    // native-tier entries are ADDITIVE (keep scanning), the first non-tier face that
+    // LOADS ends the scan, and a path that fails to read or parse is skipped WITHOUT
+    // ending it. So only a bounded prefix can ever be needed — every native-tier path
+    // up to and including the first non-tier one — and that prefix is what is parsed
+    // speculatively. The results are then consumed IN ORDER under the original rule,
+    // so chain order and membership are identical to the serial form; speculation can
+    // only do redundant work (parsing a face a failure upstream would have skipped),
+    // never change the outcome. If every non-tier candidate in the prefix fails to
+    // load, the scan continues serially from there, exactly as before.
+    let speculative = paths
+        .iter()
+        .position(|p| !CJK_NATIVE_FALLBACK_CANDIDATES.contains(&p.as_str()))
+        .map_or(paths.len(), |first_broad| first_broad + 1);
+
+    let parsed: Vec<Option<FallbackFace>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = paths[..speculative]
+            .iter()
+            .map(|p| {
+                scope.spawn(move || {
+                    let bytes = font_file::read_font_file(std::path::Path::new(p)).ok()?;
+                    FallbackFace::from_bytes(&bytes, Some(p.clone())).ok()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap_or(None))
+            .collect()
+    });
+
     let mut chain = Vec::new();
-    for p in paths {
+    for (p, face) in paths.iter().zip(parsed) {
+        let Some(face) = face else {
+            continue; // unreadable or unparsable: skipped, does NOT end the scan
+        };
+        let is_native_tier = CJK_NATIVE_FALLBACK_CANDIDATES.contains(&p.as_str());
+        chain.push(face);
+        if !is_native_tier {
+            return chain;
+        }
+    }
+    // Every speculatively-parsed candidate was native-tier or failed, so no broad
+    // face has ended the scan yet. Continue serially through the remainder.
+    for p in &paths[speculative..] {
         let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
             continue;
         };
@@ -4574,6 +4638,7 @@ impl Renderer {
             rain_row_idx: Vec::new(),
             rain_row_cursor: Vec::new(),
             rain_white_cache: None,
+            alpha_memo: None,
         };
         // W9: instantiate a variable primary (SF Mono's Light default →
         // Regular) and re-derive the cell geometry at the resolved coords.
@@ -5664,6 +5729,13 @@ impl Renderer {
         }
     }
 
+    /// Whether this renderer's path-backed generation has crossed the
+    /// worker-only seal boundary and can be published without later font I/O.
+    #[must_use]
+    pub fn admitted_font_sources_sealed(&self) -> bool {
+        self.admitted_sources_sealed
+    }
+
     /// Settle and close one complete path-backed font generation.
     ///
     /// This is intentionally worker-only work: it may read and parse the
@@ -5673,9 +5745,17 @@ impl Renderer {
     /// runtime system discovery is disabled. Publication, zoom, semantic forks,
     /// and device-loss recovery can therefore use only resident bytes.
     pub fn seal_admitted_font_sources(&mut self) -> AdmittedFontSources {
+        // Cold-seal overlap (native): start BOTH independent background parses
+        // before doing the smaller styled-sibling and colour-face admissions.
+        // `block_on_lazy_fallbacks` below still joins and installs broad before
+        // symbol, preserving the deterministic cascade and final font epoch;
+        // only their wall-clock scheduling changes. On wasm (or a failed thread
+        // spawn) these helpers retain their existing synchronous fallback.
+        self.ensure_fallback();
+        self.ensure_symbol_fallback();
         self.ensure_styled_faces();
-        self.block_on_lazy_fallbacks();
         self.ensure_color_font();
+        self.block_on_lazy_fallbacks();
 
         // `ensure_*` consumes these already, but clear explicitly so this method
         // remains a hard boundary if their implementation later changes.
@@ -9777,10 +9857,12 @@ impl Renderer {
             bg_t,
             ..
         } = *ctx;
-        for (c, cell) in cells.iter().take(cols).enumerate() {
+        // The cell's resolved fill colour — identical on both arms, hoisted so
+        // the uniform arm can compare consecutive cells' colours.
+        let resolve = |c: usize, cell: &RenderCell| -> u32 {
             // A lead cell is wide iff the NEXT cell is its continuation.
             let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
-            let bg = if input.selection_contains_cell(row, c, is_wide_lead, cell.wide) {
+            if input.selection_contains_cell(row, c, is_wide_lead, cell.wide) {
                 sel_bg
             } else {
                 let cell_bg = rgb_to_u32(cell.bg);
@@ -9793,19 +9875,73 @@ impl Renderer {
                 } else {
                     cell_bg
                 }
-            };
-            if uniform {
-                self.fill_rect(pixels, w, h, self.pad + c * cw, y0, cw, self.cell_h, bg);
-            } else {
+            }
+        };
+        if uniform {
+            // PERF: emit ONE `fill_rect` per RUN of adjacent MATERIALIZED cells
+            // that resolved to the SAME colour instead of one per cell. In
+            // ordinary output nearly every cell carries the default background,
+            // so a 200-column row goes from 200 calls / 3400 slice-`fill`s of
+            // `cell_w` u32 each to (usually) one call / `cell_h` fills of the
+            // whole row — the same stores, a ~5× cut in call/loop/bounds-check
+            // overhead on this pass.
+            //
+            // Exactly byte-preserving: the per-cell rects are contiguous and
+            // disjoint, and `fill_rect` clips only on the right (`x1 = (x0 +
+            // rw).min(w)`, with an `x0 >= x1` early-out) and vertically
+            // identically for every cell of the row — so the union of the
+            // clipped per-cell fills IS the single clipped merged fill, byte for
+            // byte. `resolve` is still evaluated PER COLUMN (it consults the
+            // live selection predicate and the owning pane's default bg), so
+            // only the emitted rects are merged, never the decision.
+            let n = cells.len().min(cols);
+            let mut run_start = 0usize;
+            let mut run_bg = 0u32;
+            for (c, cell) in cells[..n].iter().enumerate() {
+                let bg = resolve(c, cell);
+                if c == run_start {
+                    run_bg = bg;
+                } else if bg != run_bg {
+                    let x = self.pad + run_start * cw;
+                    self.fill_rect(
+                        pixels,
+                        w,
+                        h,
+                        x,
+                        y0,
+                        (c - run_start) * cw,
+                        self.cell_h,
+                        run_bg,
+                    );
+                    run_start = c;
+                    run_bg = bg;
+                }
+            }
+            if n > 0 {
+                let x = self.pad + run_start * cw;
+                self.fill_rect(
+                    pixels,
+                    w,
+                    h,
+                    x,
+                    y0,
+                    (n - run_start) * cw,
+                    self.cell_h,
+                    run_bg,
+                );
+            }
+        } else {
+            for (c, cell) in cells.iter().take(cols).enumerate() {
                 // Composed row: the cell sits where ITS pane's run puts it, and
                 // the fill is clamped to that run's box. Without the clamp a
                 // DECDWL pane's doubled fills would repaint the neighbouring
                 // pane's background — the same bleed the glyphs suffer, one pass
                 // earlier and just as visible (a selection band or SGR bg
-                // marching across the split).
+                // marching across the split). Strictly PER COLUMN: each column
+                // clamps to its own DEC run box, so runs cannot be merged.
                 let p = self.mixed_cell_place(input, row, c, y0);
                 if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
-                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, bg);
+                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, resolve(c, cell));
                 }
             }
         }
@@ -10201,16 +10337,7 @@ impl Renderer {
                         fire_halo_alpha(strength),
                     );
                 }
-                self.blit(
-                    pixels,
-                    w,
-                    x as i32,
-                    anchor_y,
-                    key,
-                    fg,
-                    bg_under,
-                    scale,
-                );
+                self.blit(pixels, w, x as i32, anchor_y, key, fg, bg_under, scale);
                 // Overlay combining diacritics (é, ñ, …) on the base. A
                 // combining mark's own metrics assume the pen sits at the
                 // base's advance (a large negative left bearing backs it up
@@ -10422,6 +10549,11 @@ impl Renderer {
         // sizes) — coverage-blended AFTER every solid decoration rect of the
         // row, mirroring the GPU draw order (deco stream, then curl stream).
         if curly_mask_ok {
+            // Fresh walks for this pass: pass 3's are already advanced past the
+            // row, and `InkWalk::at`/`CharFgWalk::at` never rewind. The loop
+            // below visits `c` ascending, which is the contract they need.
+            let mut ink_walk = InkWalk::new(ink_row);
+            let mut char_fg_walk = CharFgWalk::new(char_fg_row);
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 if cell.wide || !matches!(cell.underline, UnderlineStyle::Curly) {
                     continue;
@@ -10436,12 +10568,26 @@ impl Renderer {
                 };
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
                 let dw = if is_wide_lead { 2 * cw } else { cw };
+                // Ink — and, when no ink governs the cell, char_fg — follows into
+                // the CURL exactly as it follows into the solid decorations of
+                // pass 3 above (and as the GPU does for both in one loop). A
+                // curly underline is a decoration of the same glyph; nothing
+                // about the wave makes it wear a different colour. An explicit
+                // SGR 58 underline colour still wins inside
+                // `effective_deco_color`, whose `Some(_)` arms ignore this
+                // operand entirely.
+                let base_fg = match ink_walk.at(c as u16) {
+                    Some(ink) => rgb_to_u32(ink),
+                    None => char_fg_walk
+                        .at(c as u16)
+                        .unwrap_or_else(|| rgb_to_u32(cell.fg)),
+                };
                 let selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
                 let ucolor = effective_deco_color(
                     sel_fg,
                     self.min_contrast,
                     cell.underline_color.map(rgb_to_u32),
-                    rgb_to_u32(cell.fg),
+                    base_fg,
                     rgb_to_u32(cell.bg),
                     selected,
                     sel_bg,
@@ -11859,9 +12005,18 @@ impl Renderer {
         // remap lives in `fs_glyph` and not `fs_glyph_color`. (Read before
         // `glyph_image` takes the long-lived `&mut self` borrow.)
         let corrected = self.text_blending == TextBlending::LinearCorrected;
+        // Lift the corrected-alpha memo bank OUT of `self` (one `Option<Box>`
+        // move) so it can be handed to the texel loop ALONGSIDE the `&mut
+        // self`-borrowed glyph image — the borrow checker will not split those
+        // two fields across the `glyph_image` call. Taken unconditionally so the
+        // restore at both exits is unconditional too; the `Box` itself is
+        // allocated on the first CORRECTED text blit and never again (Linear
+        // mode and the Rgba emoji path leave it `None` forever).
+        let mut bank = self.alpha_memo.take();
         let img = self.glyph_image(key);
         let (width, height, xmin, ymin) = (img.width(), img.height(), img.xmin(), img.ymin());
         if width == 0 || height == 0 {
+            self.alpha_memo = bank;
             return;
         }
         let (xs, ys) = (scale.xs.max(1), scale.ys.max(1));
@@ -11880,15 +12035,19 @@ impl Renderer {
         let one_to_one = xs == 1 && ys == 1;
         match img {
             GlyphImage::Mono { bytes, .. } => {
+                // The `(color, bg)` memo way — resolved ONCE per blit, so the
+                // texel loop only ever indexes it.
+                let memo =
+                    corrected.then(|| bank.get_or_insert_with(Box::default).way_for(color, bg));
                 if one_to_one {
                     blit_mono_1x(
                         px, stride, gx0, gy0, width, height, bytes, color, clip_y0, clip_y1,
-                        clip_x0, clip_x1, bg, corrected,
+                        clip_x0, clip_x1, memo,
                     );
                 } else {
                     blit_mono_scaled(
                         px, stride, gx0, gy0, width, height, bytes, color, xs, ys, clip_y0,
-                        clip_y1, clip_x0, clip_x1, bg, corrected,
+                        clip_y1, clip_x0, clip_x1, memo,
                     );
                 }
             }
@@ -11906,6 +12065,7 @@ impl Renderer {
                 }
             }
         }
+        self.alpha_memo = bank;
     }
 
     /// Draw the EMBERFORGE CONTRAST-HALO for a glyph engulfed by the fire: a
@@ -12045,14 +12205,12 @@ fn blit_mono_scaled(
     clip_y1: i32,
     clip_x0: i32,
     clip_x1: i32,
-    bg: u32,
-    corrected: bool,
+    // The `(color, bg)` corrected-alpha memo the caller resolved, or `None` in
+    // Linear mode, where no remap runs. See [`AlphaMemo`].
+    mut memo: Option<&mut AlphaMemo>,
 ) {
     let px_len = px.len();
     let cmasked = color & 0x00FF_FFFF;
-    // Hoist the fg/bg-only remap operands out of the per-texel loop (byte-exact;
-    // see [`TextBlendPre`]). `None` in Linear mode, where no remap runs.
-    let pre = corrected.then(|| TextBlendPre::new(color, bg));
     for j in 0..height {
         let srow = &bytes[j * width..j * width + width];
         for (i, &cov) in srow.iter().enumerate() {
@@ -12074,8 +12232,8 @@ fn blit_mono_scaled(
                     ) {
                         px[idx] = if cov == 255 {
                             cmasked
-                        } else if let Some(pre) = &pre {
-                            blend_text_pre(px[idx], color, cov, pre)
+                        } else if let Some(memo) = memo.as_deref_mut() {
+                            blend_text_pre(px[idx], color, cov, memo)
                         } else {
                             blend(px[idx], color, cov)
                         };
@@ -12105,14 +12263,12 @@ fn blit_mono_1x(
     clip_y1: i32,
     clip_x0: i32,
     clip_x1: i32,
-    bg: u32,
-    corrected: bool,
+    // The `(color, bg)` corrected-alpha memo the caller resolved, or `None` in
+    // Linear mode, where no remap runs. See [`AlphaMemo`].
+    mut memo: Option<&mut AlphaMemo>,
 ) {
     let px_len = px.len() as i64;
     let cmasked = color & 0x00FF_FFFF;
-    // Hoist the fg/bg-only remap operands out of the per-texel loop (byte-exact;
-    // see [`TextBlendPre`]). `None` in Linear mode, where no remap runs.
-    let pre = corrected.then(|| TextBlendPre::new(color, bg));
     let gx = gx0 as i64;
     let w = width as i64;
     for j in 0..height {
@@ -12140,8 +12296,8 @@ fn blit_mono_1x(
             let idx = (base + (i_lo + k) as i64) as usize;
             px[idx] = if cov == 255 {
                 cmasked
-            } else if let Some(pre) = &pre {
-                blend_text_pre(px[idx], color, cov, pre)
+            } else if let Some(memo) = memo.as_deref_mut() {
+                blend_text_pre(px[idx], color, cov, memo)
             } else {
                 blend(px[idx], color, cov)
             };
@@ -12708,12 +12864,8 @@ fn image_covers(row_images: &[(usize, aterm_core::grid::extra::ImageRef)], col: 
 /// An empty span list (every single-pane frame) reduces to exactly the old
 /// row-level scan, so the ordinary damage gate is unchanged.
 fn any_double_height(input: &RenderInput) -> bool {
-    let is_dh = |ls: &LineSize| {
-        matches!(
-            ls,
-            LineSize::DoubleHeightTop | LineSize::DoubleHeightBottom
-        )
-    };
+    let is_dh =
+        |ls: &LineSize| matches!(ls, LineSize::DoubleHeightTop | LineSize::DoubleHeightBottom);
     input.line_sizes.iter().any(is_dh)
         || input
             .line_size_spans
@@ -12728,10 +12880,7 @@ fn any_double_height(input: &RenderInput) -> bool {
 /// `line_size_spans` is legitimately left empty by producers that never compose
 /// (headless, tests), so it cannot be indexed.
 fn row_spans(input: &RenderInput, r: usize) -> &[LineSizeSpan] {
-    input
-        .line_size_spans
-        .get(r)
-        .map_or(&[][..], Vec::as_slice)
+    input.line_size_spans.get(r).map_or(&[][..], Vec::as_slice)
 }
 
 /// Row `r`'s per-pane live-default backgrounds, or an EMPTY slice when the row
@@ -12739,10 +12888,7 @@ fn row_spans(input: &RenderInput, r: usize) -> &[LineSizeSpan] {
 /// composed row can hold, with the same short-vector tolerance (hand-built
 /// snapshots that predate the field stay well-formed).
 fn default_bg_spans(input: &RenderInput, r: usize) -> &[DefaultBgSpan] {
-    input
-        .default_bg_spans
-        .get(r)
-        .map_or(&[][..], Vec::as_slice)
+    input.default_bg_spans.get(r).map_or(&[][..], Vec::as_slice)
 }
 
 /// The live default background governing viewport cell (`row`, `col`), resolved
@@ -14071,7 +14217,12 @@ pub fn cell_x_run(
     let w = row_cell_w(line_size, cell_w);
     let clip_x0 = start_col * cell_w;
     let clip_x1 = end_col * cell_w;
-    (clip_x0 + col.saturating_sub(start_col) * w, w, clip_x0, clip_x1)
+    (
+        clip_x0 + col.saturating_sub(start_col) * w,
+        w,
+        clip_x0,
+        clip_x1,
+    )
 }
 
 /// Whether `row` is uniform — i.e. one DEC line size governs every column, so a
@@ -14584,13 +14735,134 @@ fn correct_alpha_pre(pre: &TextBlendPre, a: f32) -> f32 {
     ((blend_l - pre.bg_l) / (pre.fg_l - pre.bg_l)).clamp(0.0, 1.0)
 }
 
+/// Memo of [`correct_alpha_pre`] for ONE `(fg, bg)` pair — the last `powf` left
+/// in the corrected-text texel loop.
+///
+/// PERF: [`TextBlendPre`] hoisted everything `fg`/`bg`-derived out of the loop,
+/// leaving exactly one libm `powf(2.4)` ([`srgb_to_linear`]) per texel, paid by
+/// every antialiased fringe texel of every glyph of every dirty row. But the
+/// remap's only VARYING input is `f32::from(t) / 255.0` with `t: u8`, so per
+/// `(fg, bg)` there are at most 256 distinct answers: a full repaint of a 200×50
+/// grid was recomputing ~300k of them per frame (~5–15M cycles) from at most 254
+/// distinct values, and a terminal frame holds a handful of colour pairs.
+///
+/// Filled LAZILY, and rekeyed in O(1). Both matter:
+///   * lazily, because eagerly building all 254 entries on a new pair would be a
+///     LOSS on truecolour half-block art (`chafa`/`viu`/`timg`), which hands the
+///     blitter a fresh `(fg, bg)` per cell and only a few fringe texels to spend
+///     it on;
+///   * O(1), because rekeying must not cost a 1 KiB memset for that same reason.
+///     Each slot carries its generation in the high half of a `u64`, so bumping
+///     `epoch` orphans all 256 at once and a hit is ONE load plus one compare.
+///
+/// Exactness: a hit returns the bits [`correct_alpha_pre`] itself produced for
+/// that exact `(fg, bg, t)` — same expression, same operand order, no
+/// quantization (a fine-grid `srgb_to_linear` table would NOT be byte-identical
+/// and is deliberately not used). Pinned by `blend_text_pre_equals_blend_text`.
+struct AlphaMemo {
+    /// `(fg, bg)` this way is keyed on; `None` on a never-used way.
+    key: Option<(u32, u32)>,
+    pre: TextBlendPre,
+    /// Generation a slot must carry to be live. Never `0`, so the zeroed initial
+    /// `slots` all read as empty.
+    epoch: u32,
+    /// `(epoch << 32) | correct_alpha_pre(&pre, t/255).to_bits()`, by coverage `t`.
+    slots: [u64; 256],
+}
+
+impl AlphaMemo {
+    fn new() -> Self {
+        Self {
+            key: None,
+            pre: TextBlendPre::new(0, 0),
+            epoch: 1,
+            slots: [0; 256],
+        }
+    }
+
+    /// Point this way at `(fg, bg)`, orphaning whatever it held — one compare
+    /// and one increment, no table work.
+    fn rekey(&mut self, fg: u32, bg: u32) {
+        self.key = Some((fg, bg));
+        self.pre = TextBlendPre::new(fg, bg);
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // ~4 billion rekeys later: the ONLY path that touches the slots.
+            self.slots = [0; 256];
+            self.epoch = 1;
+        }
+    }
+
+    /// `correct_alpha_pre(&self.pre, f32::from(t) / 255.0)`, memoized.
+    #[inline]
+    fn alpha(&mut self, t: u8) -> f32 {
+        let slot = self.slots[t as usize];
+        if (slot >> 32) as u32 == self.epoch {
+            f32::from_bits(slot as u32)
+        } else {
+            self.fill(t)
+        }
+    }
+
+    /// The miss arm — kept `#[cold] #[inline(never)]` so the `powf` and the
+    /// store stay OUT of the texel loop's body.
+    #[cold]
+    #[inline(never)]
+    fn fill(&mut self, t: u8) -> f32 {
+        let a = correct_alpha_pre(&self.pre, f32::from(t) / 255.0);
+        self.slots[t as usize] = (u64::from(self.epoch) << 32) | u64::from(a.to_bits());
+        a
+    }
+}
+
+/// How many `(fg, bg)` pairs the corrected-alpha memo keeps live at once. A row
+/// of syntax-highlighted text cycles through a handful of pairs; eight ways
+/// covers that while the whole bank stays ~16 KiB (and is allocated only on the
+/// first corrected text blit).
+const ALPHA_MEMO_WAYS: usize = 8;
+
+/// The [`Renderer`]-resident set of [`AlphaMemo`] ways. Replacement is
+/// round-robin: a rekey costs a compare and an increment, so thrashing degrades
+/// gracefully to exactly the pre-memo cost instead of falling off a cliff.
+struct AlphaMemoBank {
+    ways: [AlphaMemo; ALPHA_MEMO_WAYS],
+    next: usize,
+}
+
+impl Default for AlphaMemoBank {
+    fn default() -> Self {
+        Self {
+            ways: std::array::from_fn(|_| AlphaMemo::new()),
+            next: 0,
+        }
+    }
+}
+
+impl AlphaMemoBank {
+    /// The way holding `(fg, bg)`, claiming (and rekeying) one if absent. Called
+    /// once per BLIT, never per texel.
+    fn way_for(&mut self, fg: u32, bg: u32) -> &mut AlphaMemo {
+        let want = Some((fg, bg));
+        if let Some(i) = self.ways.iter().position(|way| way.key == want) {
+            return &mut self.ways[i];
+        }
+        let i = self.next;
+        self.next = (self.next + 1) % ALPHA_MEMO_WAYS;
+        self.ways[i].rekey(fg, bg);
+        &mut self.ways[i]
+    }
+}
+
 /// [`blend_text`]'s corrected inner body with the per-blit invariants precomputed
-/// ([`TextBlendPre`]). The caller guarantees `corrected == true` and `1 <= t <=
-/// 254` (endpoints/`!corrected` are handled at the blit site, exactly as
-/// [`blend_text`]'s early returns do), so this is the sole per-texel hot body.
+/// ([`TextBlendPre`]) and the coverage remap memoized ([`AlphaMemo`], keyed on
+/// the SAME `(fg, bg)` the caller resolved the way with). The caller guarantees
+/// `corrected == true` and `1 <= t <= 254` (endpoints/`!corrected` are handled at
+/// the blit site, exactly as [`blend_text`]'s early returns do), so this is the
+/// sole per-texel hot body.
 #[inline]
-fn blend_text_pre(dst: u32, fg: u32, t: u8, pre: &TextBlendPre) -> u32 {
-    let a = correct_alpha_pre(pre, f32::from(t) / 255.0);
+fn blend_text_pre(dst: u32, fg: u32, t: u8, memo: &mut AlphaMemo) -> u32 {
+    debug_assert_eq!(memo.key.map(|(f, _)| f), Some(fg), "memo keyed on other fg");
+    let a = memo.alpha(t);
     let ch = |sh: u32| blend_channel_linear((dst >> sh) & 0xff, (fg >> sh) & 0xff, a);
     let tt = (((dst >> 24) & 0xff) as f32 * (1.0 - a)).round() as u32;
     (tt << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
@@ -16619,10 +16891,23 @@ mod tests {
         for &fg in &colours {
             for &bg in &colours {
                 let pre = TextBlendPre::new(fg, bg);
+                let mut bank = AlphaMemoBank::default();
                 for &dst in &dsts {
                     for t in (1u8..=254).step_by(1) {
                         let reference = blend_text(dst, fg, bg, t, true);
-                        let hoisted = blend_text_pre(dst, fg, t, &pre);
+                        // The memo way the blit path would resolve. Re-resolved
+                        // per texel here on purpose: the FIRST `dst` pass fills
+                        // it (all misses), the later passes read it back (all
+                        // hits), so both arms are compared against the oracle.
+                        let memo = bank.way_for(fg, bg);
+                        // A memo hit must be the EXACT bits `correct_alpha_pre`
+                        // produced — no quantization anywhere in the table.
+                        assert_eq!(
+                            memo.alpha(t).to_bits(),
+                            correct_alpha_pre(&pre, f32::from(t) / 255.0).to_bits(),
+                            "memoized alpha diverged: fg={fg:#08x} bg={bg:#08x} t={t}"
+                        );
+                        let hoisted = blend_text_pre(dst, fg, t, memo);
                         assert_eq!(
                             hoisted, reference,
                             "hoisted blend diverged: fg={fg:#08x} bg={bg:#08x} dst={dst:#08x} t={t}"
@@ -16631,6 +16916,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The corrected-alpha memo must survive WAY EVICTION: with more live
+    /// `(fg, bg)` pairs than ways, round-robin replacement rekeys ways under a
+    /// bumped generation, and a stale slot read as live would silently emit
+    /// another pair's alpha. Cycles `ALPHA_MEMO_WAYS + 3` pairs several times
+    /// over so every way is reclaimed repeatedly.
+    #[test]
+    fn alpha_memo_survives_way_eviction() {
+        let pairs: Vec<(u32, u32)> = (0..ALPHA_MEMO_WAYS as u32 + 3)
+            .map(|i| (0x0011_0000 * (i + 1), 0x0000_0033 * (i + 1)))
+            .collect();
+        let mut bank = AlphaMemoBank::default();
+        for _ in 0..4 {
+            for &(fg, bg) in &pairs {
+                let pre = TextBlendPre::new(fg, bg);
+                let memo = bank.way_for(fg, bg);
+                for t in [1u8, 7, 64, 128, 200, 254] {
+                    assert_eq!(
+                        memo.alpha(t).to_bits(),
+                        correct_alpha_pre(&pre, f32::from(t) / 255.0).to_bits(),
+                        "evicted-way memo diverged: fg={fg:#08x} bg={bg:#08x} t={t}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The generation-wrap guard: a way rekeyed `u32::MAX` times must not let a
+    /// slot stamped with the wrapped-around generation read as live. Drives
+    /// `epoch` to its last value directly, then rekeys across the wrap.
+    #[test]
+    fn alpha_memo_generation_wrap_is_sound() {
+        let mut memo = AlphaMemo::new();
+        memo.rekey(0x00FF_0000, 0x0000_0000);
+        // Fill one slot, then force the generation to the value that wraps.
+        let stale = memo.alpha(128);
+        memo.epoch = u32::MAX;
+        memo.slots[128] = (u64::from(u32::MAX) << 32) | u64::from(stale.to_bits());
+        // Rekey to a DIFFERENT pair across the wrap; slot 128 must be orphaned.
+        memo.rekey(0x0000_00FF, 0x00FF_FFFF);
+        let pre = TextBlendPre::new(0x0000_00FF, 0x00FF_FFFF);
+        assert_eq!(
+            memo.alpha(128).to_bits(),
+            correct_alpha_pre(&pre, 128.0 / 255.0).to_bits(),
+            "generation wrap resurrected a stale slot"
+        );
     }
 
     /// FONT-2b: the BUNDLED Symbols Nerd Font asset is the real thing — it parses and its
@@ -17990,13 +18322,43 @@ mod tests {
                                         ] {
                                             let mut a = vec![0x0011_2233u32; px_len];
                                             let mut b = vec![0x0011_2233u32; px_len];
+                                            // Each path gets its OWN cold memo,
+                                            // so the differential also proves a
+                                            // fill-as-you-go table equals one
+                                            // populated by the other path.
+                                            let mut bank_a = AlphaMemoBank::default();
+                                            let mut bank_b = AlphaMemoBank::default();
                                             blit_mono_1x(
-                                                &mut a, stride, gx0, gy0, w, h, &bytes, color, c0,
-                                                c1, cx0, cx1, bg, corrected,
+                                                &mut a,
+                                                stride,
+                                                gx0,
+                                                gy0,
+                                                w,
+                                                h,
+                                                &bytes,
+                                                color,
+                                                c0,
+                                                c1,
+                                                cx0,
+                                                cx1,
+                                                corrected.then(|| bank_a.way_for(color, bg)),
                                             );
                                             blit_mono_scaled(
-                                                &mut b, stride, gx0, gy0, w, h, &bytes, color, 1,
-                                                1, c0, c1, cx0, cx1, bg, corrected,
+                                                &mut b,
+                                                stride,
+                                                gx0,
+                                                gy0,
+                                                w,
+                                                h,
+                                                &bytes,
+                                                color,
+                                                1,
+                                                1,
+                                                c0,
+                                                c1,
+                                                cx0,
+                                                cx1,
+                                                corrected.then(|| bank_b.way_for(color, bg)),
                                             );
                                             assert_eq!(
                                                 a, b,

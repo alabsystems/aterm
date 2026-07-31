@@ -12,15 +12,16 @@
 //                      committer Unix epoch (dev builds); "0" only w/o git.
 //   ATERM_BUILD_TIME   UTC build timestamp (RFC3339), or "unknown".
 //
-// Plus COMPILER provenance (which rustc produced this binary — matters because this
-// box carries both upstream Rust and the Trust fork, and different machines carry
-// DIFFERENT trust builds), parsed from `$RUSTC -vV` by src/compiler_probe.rs
-// (include!d below so the same parser is unit-tested under `cargo test`):
+// Plus COMPILER provenance (which compiler produced this binary — matters because
+// this box carries both upstream Rust and the Trust toolchain's trustc, and
+// different machines carry DIFFERENT trust builds), parsed from `$RUSTC -vV` by
+// src/compiler_probe.rs (include!d below so the same parser is unit-tested under
+// the test suite; RUSTC is the env name cargo AND targo hand build scripts):
 //
-//   ATERM_RUSTC_VERSION  full first line of `$RUSTC -vV`
-//   ATERM_RUSTC_COMMIT   the compiler's full git commit hash
-//   ATERM_RUSTC_HOST     the compiler's host triple
-//   ATERM_COMPILER_FLAVOR 'r' (upstream Rust) | 't' (Trust fork)
+//   ATERM_COMPILER_VERSION_LINE  full first line of `$RUSTC -vV`
+//   ATERM_COMPILER_COMMIT        the compiler's full git commit hash
+//   ATERM_COMPILER_HOST          the compiler's host triple
+//   ATERM_COMPILER_FLAVOR 'r' (upstream Rust) | 't' (Trust: trustc)
 //   ATERM_BUILD_PROFILE  cargo PROFILE ("debug"/"release")
 //   ATERM_TRUST_VERIFY   "on" iff --cfg trust_verify was active, else "off"
 //
@@ -128,13 +129,15 @@ fn main() {
     .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=ATERM_BUILD_TIME={build_time}");
 
-    // Compiler provenance: interrogate the ACTUAL compiler cargo is about to use
-    // (cargo sets RUSTC for build scripts; bare "rustc" is the no-cargo fallback)
-    // rather than trusting whatever is first on PATH — per-binary provenance is the
-    // whole point when upstream Rust and the Trust fork coexist on one machine.
-    let rustc_path = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let vv = run(&rustc_path, &["-vV"]).unwrap_or_default();
-    let rustc = parse_rustc_vv(&vv);
+    // Compiler provenance: interrogate the ACTUAL compiler the build driver is
+    // about to use (cargo and targo both set RUSTC for build scripts — targo's
+    // custom_build lane keeps the env name for drop-in compatibility; bare
+    // "rustc" is the no-driver fallback) rather than trusting whatever is first
+    // on PATH — per-binary provenance is the whole point when upstream Rust and
+    // the Trust toolchain (trustc) coexist on one machine.
+    let compiler_path = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let vv = run(&compiler_path, &["-vV"]).unwrap_or_default();
+    let compiler = parse_rustc_vv(&vv);
     // Flavor ('r' = upstream Rust, 't' = Trust fork), in priority order:
     //   1. explicit ATERM_COMPILER_FLAVOR env override ('r'|'t'; junk ignored);
     //   2. the -vV self-identification ('binary: trustc' / '(trustc)' version line
@@ -146,10 +149,13 @@ fn main() {
     // NOT inferred from '-dev' in the release — any local rustc build reports -dev.
     let explicit = std::env::var("ATERM_COMPILER_FLAVOR").ok();
     let toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
-    let flavor = detect_flavor(explicit.as_deref(), &vv, &rustc_path, toolchain.as_deref());
-    println!("cargo:rustc-env=ATERM_RUSTC_VERSION={}", rustc.version_line);
-    println!("cargo:rustc-env=ATERM_RUSTC_COMMIT={}", rustc.commit);
-    println!("cargo:rustc-env=ATERM_RUSTC_HOST={}", rustc.host);
+    let flavor = detect_flavor(explicit.as_deref(), &vv, &compiler_path, toolchain.as_deref());
+    println!(
+        "cargo:rustc-env=ATERM_COMPILER_VERSION_LINE={}",
+        compiler.version_line
+    );
+    println!("cargo:rustc-env=ATERM_COMPILER_COMMIT={}", compiler.commit);
+    println!("cargo:rustc-env=ATERM_COMPILER_HOST={}", compiler.host);
     println!("cargo:rustc-env=ATERM_COMPILER_FLAVOR={flavor}");
     println!(
         "cargo:rustc-env=ATERM_BUILD_PROFILE={}",

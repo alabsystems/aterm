@@ -12,7 +12,13 @@
 // proptest dep, like the lz4 fuzz) keeps it reproducible; gated on a GPU.
 
 use aterm_core::terminal::Terminal;
-use aterm_render::{Frame, Renderer, Theme};
+use aterm_render::Theme;
+
+mod common;
+use common::{
+    backends, count_exceeding_frame as count_exceeding,
+    max_channel_delta_frame as max_channel_delta,
+};
 
 /// A 2x2-cell RGBA PNG: left column opaque, right column 50%-alpha — so the fuzz
 /// exercises BOTH the straight-RGBA image blit and the straight-alpha-over-bg
@@ -40,33 +46,6 @@ fn image_osc(cw: u32, ch: u32) -> Vec<u8> {
     out.extend_from_slice(b64.as_bytes());
     out.extend_from_slice(b"\x1b\\");
     out
-}
-
-fn max_channel_delta(a: &Frame, b: &Frame) -> i32 {
-    let mut m = 0;
-    for (&pa, &pb) in a.pixels.iter().zip(b.pixels.iter()) {
-        for sh in [16, 8, 0] {
-            let (ca, cb) = (((pa >> sh) & 0xff) as i32, ((pb >> sh) & 0xff) as i32);
-            m = m.max((ca - cb).abs());
-        }
-    }
-    m
-}
-
-/// Number of pixels whose worst channel delta exceeds `tol`.
-fn count_exceeding(a: &Frame, b: &Frame, tol: i32) -> usize {
-    let mut n = 0;
-    for (&pa, &pb) in a.pixels.iter().zip(b.pixels.iter()) {
-        let mut d = 0;
-        for sh in [16, 8, 0] {
-            let (ca, cb) = (((pa >> sh) & 0xff) as i32, ((pb >> sh) & 0xff) as i32);
-            d = d.max((ca - cb).abs());
-        }
-        if d > tol {
-            n += 1;
-        }
-    }
-    n
 }
 
 /// Per-pixel ceiling for the rare divergent pixel. HISTORY: this bound was long
@@ -138,22 +117,14 @@ const TOKENS: &[&[u8]] = &[
 fn cpu_gpu_parity_fuzz() {
     let theme = Theme::default();
     let px = 17.0;
-    let mut gpu = match aterm_gpu::GpuRenderer::new(px, theme) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP: no GPU/font available: {e}");
-            return;
-        }
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
     };
     // CPU/GPU byte-parity fuzz: compare the SHARED base render. The GPU-only
     // bloom and heat shimmer are present-quality layers outside the parity
     // proof — disable them here.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
-    let Some(mut cpu) = Renderer::from_system(px, theme) else {
-        eprintln!("SKIP: no system monospace font");
-        return;
-    };
     // Deterministic parity: block on the lazy fallback parses so neither
     // renderer compares a provisional `.notdef` frame against a real glyph.
     cpu.debug_block_on_lazy_fallbacks();

@@ -358,9 +358,12 @@ impl Terminal {
         // How many of those records are history, as the consumer must be told.
         // Derived from the produced vector rather than from `max_history` so it is
         // exact when the ring holds fewer lines than the bound allows.
-        let history_lines =
-            u32::try_from(grid_lines.len().saturating_sub(usize::from(self.grid.rows())))
-                .unwrap_or(u32::MAX);
+        let history_lines = u32::try_from(
+            grid_lines
+                .len()
+                .saturating_sub(usize::from(self.grid.rows())),
+        )
+        .unwrap_or(u32::MAX);
         let grid_bytes = serialize_lines(&grid_lines);
         let cursor = GridCursorRepr::capture(&self.grid);
 
@@ -588,7 +591,7 @@ impl CheckpointMeta {
         let TerminalCheckpoint {
             rows,
             cols,
-            grid: _,     // sidecar blob, not meta
+            grid: _, // sidecar blob, not meta
             history_lines,
             alt_grid: _, // sidecar blob, not meta
             cursor,

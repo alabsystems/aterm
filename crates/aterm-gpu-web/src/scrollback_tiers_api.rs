@@ -15,7 +15,7 @@
 use wasm_bindgen::prelude::*;
 
 use aterm_core::terminal::scrollback_shared_budget::{
-    set_global_scrollback_budget, ScrollbackBudgetShare,
+    ScrollbackBudgetShare, set_global_scrollback_budget,
 };
 use aterm_core::terminal::{Terminal, TerminalBuilder};
 

@@ -342,7 +342,10 @@ mod tests {
             h.apply_failures, 2,
             "a healthy check must NOT vouch for the apply lane"
         );
-        assert_eq!(h.kind, "apply", "the standing failure is still the apply one");
+        assert_eq!(
+            h.kind, "apply",
+            "the standing failure is still the apply one"
+        );
         assert_eq!(
             h.last_error, "ActivityRevoked",
             "the standing streak must be described by ITS reason, not the network blip"

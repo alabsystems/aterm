@@ -16,15 +16,49 @@ use crate::Rgb;
 /// - 16-231: 6x6x6 color cube (216 colors)
 /// - 232-255: Grayscale ramp (24 shades)
 ///
-/// Uses SmallVec for memory efficiency — most terminals never customize colors,
-/// so only modified entries are stored. Memory savings: ~700 bytes per terminal
-/// (768 bytes dense vs ~64 bytes sparse).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Storage is TWO representations of the same map, kept in step by every
+/// mutator: the sparse `overrides` record (what serialization and OSC 4/104
+/// round-trips read, order-preserving) and the dense `cache` (what the per-cell
+/// `get` reads). See the field comments.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ColorPalette {
     /// Only store non-default colors: (index, color) pairs.
     /// SmallVec with inline capacity for 16 entries covers the common case
     /// of customizing just the ANSI colors (0-15).
+    ///
+    /// This stays the AUTHORITATIVE sparse record: [`ColorPalette::overrides`]
+    /// hands it out for serialization and [`ColorPalette::overrides_count`]
+    /// reports its length, both order-preserving.
     overrides: SmallVec<(u8, Rgb), 16>,
+    /// Dense resolved value for every index — a pure function of `overrides`
+    /// over [`DEFAULT_COLOR_TABLE`], kept in step by every mutator.
+    ///
+    /// [`ColorPalette::get`] is on the per-CELL color-resolve path (aterm-core's
+    /// `raw_resolve` calls it for both the fg and the bg of every indexed cell,
+    /// plus a third time for the bold→bright promotion), and the sparse record
+    /// is NOT empty in practice: any configured theme `set`s all 16 ANSI slots
+    /// (`ColorScheme::to_color_palette`), and an app that repaints via OSC 4
+    /// pushes it past its 16 inline entries onto the heap. Scanning that per
+    /// cell cost up to 16 (or 256) comparisons where one array load will do, so
+    /// the resolved value is cached densely. 768 bytes per palette, two per
+    /// terminal; clones happen only on config apply and OSC 30001 push, both
+    /// cold.
+    ///
+    /// Because `cache` is a pure function of `overrides`, deriving `PartialEq`
+    /// over both fields is exactly the old `overrides`-only equality (equal
+    /// records imply equal caches): two palettes holding the same entries in a
+    /// different insertion order stay UNEQUAL, as they are today.
+    cache: [Rgb; 256],
+}
+
+// Hand-written so a debug dump is byte-identical to what the old derive printed
+// (`overrides` only) instead of spilling 256 cache entries.
+impl core::fmt::Debug for ColorPalette {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ColorPalette")
+            .field("overrides", &self.overrides)
+            .finish()
+    }
 }
 
 impl Default for ColorPalette {
@@ -81,22 +115,21 @@ impl ColorPalette {
     pub fn new() -> Self {
         Self {
             overrides: SmallVec::new(),
+            // A copy of the compile-time table — no runtime loop.
+            cache: DEFAULT_COLOR_TABLE,
         }
     }
 
     /// Get the RGB value for an indexed color.
     ///
-    /// Looks up in overrides first (O(n) where n is typically 0-16),
-    /// falls back to computing the default.
+    /// One array load: the resolved value for every index is kept dense in
+    /// `cache` by the mutators, so this is O(1) and branchless on the per-cell
+    /// resolve path (see the `cache` field comment for why the old linear scan
+    /// over `overrides` was not free in practice).
     #[must_use]
     pub fn get(&self, index: u8) -> Rgb {
-        // Linear search is fast for small n (typically 0-16 entries)
-        for &(idx, color) in &self.overrides {
-            if idx == index {
-                return color;
-            }
-        }
-        Self::default_color(index)
+        // `u8 -> usize` is always < 256, so this index is in bounds by type.
+        self.cache[usize::from(index)]
     }
 
     /// Set the RGB value for an indexed color.
@@ -125,6 +158,11 @@ impl ColorPalette {
             // Add new override
             self.overrides.push((index, color));
         }
+
+        // Keep the dense cache in step. Correct for BOTH arms: on the
+        // remove-override arm `color == default`, which is precisely the value
+        // `get` must now return, so the single unconditional write covers it.
+        self.cache[usize::from(index)] = color;
     }
 
     /// Reset a single color to its default value.
@@ -133,11 +171,17 @@ impl ColorPalette {
         if let Some(pos) = self.overrides.iter().position(|&(idx, _)| idx == index) {
             self.overrides.swap_remove(pos);
         }
+        // Unconditional: a no-op when there was no override, matching the old
+        // "get() falls through to the default" behaviour either way. Keyed by
+        // COLOR INDEX, not by position in `overrides`, so `swap_remove`'s
+        // reshuffle needs no fixup.
+        self.cache[usize::from(index)] = Self::default_color(index);
     }
 
     /// Reset the entire palette to defaults.
     pub fn reset(&mut self) {
         self.overrides.clear();
+        self.cache = DEFAULT_COLOR_TABLE;
     }
 
     /// Returns the number of customized (non-default) colors.
@@ -772,21 +816,19 @@ mod tests {
     // ColorPalette — performance scaling proof
     // =========================================================================
 
-    /// Prove that palette lookup cost scales linearly with override count.
+    /// Prove that palette lookup cost is CONSTANT in the override count.
     ///
-    /// `ColorPalette::get()` uses linear scan over the overrides SmallVec.
-    /// This is intentional: SmallVec<(u8, Rgb), 16> stores 16 entries inline
-    /// (64 bytes, fits one cache line). The tradeoff saves ~700 bytes per
-    /// terminal vs a dense `[Rgb; 256]` array.
+    /// This test used to document the opposite: `get()` linear-scanned the
+    /// overrides SmallVec, so the per-frame cost of a full-screen redraw of
+    /// indexed-color cells was O(cells * N) — up to 16 comparisons for any
+    /// configured theme (which `set`s all 16 ANSI slots) and up to 256 across
+    /// 16 cache lines once OSC 4 pushed the vec onto the heap. `get()` now
+    /// reads the dense `cache`, so all three trials below do one array load per
+    /// lookup regardless of N.
     ///
-    /// This test documents the scaling boundary: with N overrides, each
-    /// lookup is O(N). The per-frame cost for a full-screen redraw with
-    /// all indexed-color cells is O(cells * N).
-    ///
-    /// Boundary conditions:
-    /// - 0 overrides: get() returns default_color() immediately (no scan)
-    /// - 16 overrides (typical theme): scan 64 bytes inline SmallVec
-    /// - 256 overrides (OSC 4 full palette): scan 1024 bytes heap-allocated
+    /// The sparse `overrides` record is retained unchanged — it is what
+    /// `overrides()`/`overrides_count()` expose for serialization — so the
+    /// structural assertions at the bottom still hold.
     #[test]
     fn palette_get_scaling_linear_in_overrides() {
         // Measure lookup cost via operation counter.
@@ -862,5 +904,56 @@ mod tests {
         assert_eq!(entry_size, 4, "palette entry is 4 bytes (u8 index + Rgb)");
         // 16 entries × 4 bytes = 64 bytes inline = 1 cache line
         assert_eq!(16 * entry_size, 64, "16 overrides fit in one cache line");
+    }
+
+    /// The dense `cache` behind `get()` must agree with the sparse `overrides`
+    /// record for EVERY index after any mutation sequence — that equivalence is
+    /// the whole correctness argument for the O(1) lookup. Any future mutator
+    /// that forgets its cache write fails here immediately.
+    ///
+    /// Includes the case the cache design exists to make safe: removing a
+    /// MIDDLE entry, where `swap_remove` moves an unrelated override into the
+    /// freed slot. (Keying the cache by colour index rather than by position is
+    /// what makes that reshuffle need no fixup.)
+    #[test]
+    fn palette_cache_agrees_with_overrides_after_mutations() {
+        fn assert_coherent(p: &ColorPalette, what: &str) {
+            for i in 0..=255u8 {
+                let expected = p
+                    .overrides()
+                    .iter()
+                    .find(|(idx, _)| *idx == i)
+                    .map_or_else(|| ColorPalette::default_color(i), |(_, c)| *c);
+                assert_eq!(p.get(i), expected, "{what}: index {i}");
+            }
+        }
+
+        let mut p = ColorPalette::new();
+        assert_coherent(&p, "fresh");
+
+        for i in [0u8, 7, 15, 42, 200, 255] {
+            p.set(i, Rgb::new(i ^ 0x5A, i.wrapping_add(9), 3));
+        }
+        assert_coherent(&p, "after sets");
+
+        // Update in place (existing override, not a new push).
+        p.set(7, Rgb::new(1, 1, 1));
+        assert_coherent(&p, "after in-place update");
+
+        // Remove a MIDDLE entry — `swap_remove` relocates the last override.
+        p.reset_color(15);
+        assert_coherent(&p, "after reset_color of a middle entry");
+
+        // Set-to-default is the other removal path.
+        p.set(42, ColorPalette::default_color(42));
+        assert_coherent(&p, "after set-to-default");
+
+        // Resetting an index that was never overridden must be a no-op.
+        p.reset_color(101);
+        assert_coherent(&p, "after reset_color of a non-override");
+
+        p.reset();
+        assert_eq!(p.overrides_count(), 0);
+        assert_coherent(&p, "after reset");
     }
 }

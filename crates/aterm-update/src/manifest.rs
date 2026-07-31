@@ -11,18 +11,20 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// The highest manifest `schema` version this build understands. A manifest
-/// declaring a higher schema is from a newer format we can't safely interpret, so
-/// we reject it (the client stays on its current build) rather than misread it.
-pub const SUPPORTED_SCHEMA: u32 = 1;
-
-/// The release manifest attached to a GitHub Release as `aterm-appcast.toml`.
-/// Field set is kept in lockstep with the ship tool's emitter (aterm-release
-/// `manifest_out.rs`, which serializes the shared `aterm-update-core` type).
-#[derive(Debug, Clone, Deserialize)]
+/// The client's view of the release manifest attached to a GitHub Release as
+/// `aterm-appcast.toml`: just the fields the updater consumes, filled by
+/// [`Manifest::parse`] from the shared `aterm_update_core::manifest::Manifest`
+/// wire type (the same type the ship tool's emitter serializes), so the wire
+/// schema and its validation live in exactly one place.
+#[derive(Debug, Clone)]
 pub struct Manifest {
     /// Manifest format version (the ship tool emits `schema = 1`). Absent ⇒ 0.
-    #[serde(default)]
+    ///
+    /// Carried for tests only. The authoritative copy — and the sole decision
+    /// this build makes with it, the "newer than supported" rejection — lives in
+    /// `aterm_update_core::manifest::Manifest`, which [`Manifest::parse`] runs
+    /// before this view is built; nothing downstream of the parse reads it.
+    #[cfg(test)]
     pub schema: u32,
     /// Human semver, e.g. `"0.2.0"`.
     pub version: String,
@@ -35,7 +37,6 @@ pub struct Manifest {
     /// Binds the build number to an exact source commit, so a staged (and later
     /// running) build is checkable against the repo. Absent ⇒ None (a hand-written
     /// or pre-field manifest).
-    #[serde(default)]
     pub commit: Option<String>,
     /// SHA-256 (lowercase hex) of the DMG asset.
     pub sha256: String,
@@ -47,37 +48,31 @@ pub struct Manifest {
     /// honor without a signed channel. Ratcheted monotonically client-side (see
     /// [`Floor`]); the release cutter carries a raised channel floor into every
     /// successor manifest. Absent ⇒ 0 (no floor). (F5)
-    #[serde(default)]
     pub min_build: Option<u64>,
     /// Optional human-readable "what changed" notes (the hand-written CHANGELOG.md
     /// section for this release, verbatim — the same text as the GitHub release
     /// notes). Surfaced by the in-app updater's status query + the "Check for
     /// Updates" menu so the user sees what a staged update brings. Absent ⇒ None.
-    #[serde(default)]
     pub changelog: Option<String>,
 }
 
 impl Manifest {
-    /// Parse a manifest from TOML text, rejecting a schema this build is too old
-    /// to understand.
+    /// Parse a manifest from TOML text via the shared `aterm-update-core`
+    /// validator (schema ceiling, `min_build <= build_number` floor sanity),
+    /// so publisher and client can never drift.
     pub fn parse(text: &str) -> Result<Self, String> {
-        let m: Manifest = toml::from_str(text).map_err(|e| format!("parse manifest: {e}"))?;
-        if m.schema > SUPPORTED_SCHEMA {
-            return Err(format!(
-                "manifest schema {} is newer than supported ({SUPPORTED_SCHEMA}); upgrade aterm",
-                m.schema
-            ));
-        }
-        if let Some(min_build) = m.min_build
-            && min_build > m.build_number
-        {
-            return Err(format!(
-                "manifest min_build {min_build} exceeds its build_number {}; refusing an \
-                 impossible update floor",
-                m.build_number
-            ));
-        }
-        Ok(m)
+        let m = aterm_update_core::manifest::Manifest::parse(text)?;
+        Ok(Self {
+            #[cfg(test)]
+            schema: m.schema,
+            version: m.version,
+            build_number: m.build_number,
+            commit: m.commit,
+            sha256: m.sha256,
+            dmg: m.dmg,
+            min_build: m.min_build,
+            changelog: m.changelog,
+        })
     }
 }
 
@@ -209,58 +204,19 @@ fn xml_plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Durable proof of the exact artifact installed by the most recent successful
-/// self-update swap. This is distinct from the boot-health trial marker: health
-/// confirmation may clear crash-loop state, but an overlapping old process still
-/// needs `(build, commit, DMG digest)` evidence to classify the swap as installed.
-///
-/// The receipt is useful only together with the codesign-sealed build and commit
-/// read from the canonical installed bundle. [`Self::matches_sealed`] performs that
-/// bind; an unsigned or stale receipt alone never proves an install.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ReceiptCommitKind {
-    /// Normal updater receipt: the full release-manifest commit is available.
-    #[default]
-    ModernFull,
-    /// One-time v0.52 recovery: only the exact 12-hex codesign-sealed plist/
-    /// compiled stamp survived after that updater deleted `ready.toml`.
-    LegacySealedShort,
-}
-
-impl ReceiptCommitKind {
-    fn is_modern(&self) -> bool {
-        *self == Self::ModernFull
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InstalledReceipt {
     pub(crate) build_number: u64,
     pub(crate) git_commit: String,
     pub(crate) dmg_sha256: String,
-    /// Missing on every pre-migration receipt, which remains the strict modern
-    /// full-commit format. The short form is explicit so a truncated modern
-    /// receipt can never be reinterpreted as legacy authority.
-    #[serde(default, skip_serializing_if = "ReceiptCommitKind::is_modern")]
-    commit_kind: ReceiptCommitKind,
 }
 
 impl InstalledReceipt {
-    fn canonical(
-        build_number: u64,
-        git_commit: &str,
-        dmg_sha256: &str,
-        commit_kind: ReceiptCommitKind,
-    ) -> Option<Self> {
+    fn canonical(build_number: u64, git_commit: &str, dmg_sha256: &str) -> Option<Self> {
         let git_commit = git_commit.trim();
         let dmg_sha256 = dmg_sha256.trim();
-        let commit_len_is_canonical = match commit_kind {
-            ReceiptCommitKind::ModernFull => git_commit.len() == 40,
-            ReceiptCommitKind::LegacySealedShort => git_commit.len() == 12,
-        };
         (build_number != 0
-            && commit_len_is_canonical
+            && git_commit.len() == 40
             && git_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
             && dmg_sha256.len() == 64
             && dmg_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -268,7 +224,6 @@ impl InstalledReceipt {
             build_number,
             git_commit: git_commit.to_ascii_lowercase(),
             dmg_sha256: dmg_sha256.to_ascii_lowercase(),
-            commit_kind,
         })
     }
 
@@ -276,12 +231,7 @@ impl InstalledReceipt {
     /// data fails closed as no proof.
     pub(crate) fn read(path: &Path) -> Option<Self> {
         let parsed: Self = toml::from_str(&crate::read_ledger_text(path)?).ok()?;
-        Self::canonical(
-            parsed.build_number,
-            &parsed.git_commit,
-            &parsed.dmg_sha256,
-            parsed.commit_kind,
-        )
+        Self::canonical(parsed.build_number, &parsed.git_commit, &parsed.dmg_sha256)
     }
 
     /// Atomically replace the prior installed receipt after a successful swap.
@@ -292,41 +242,16 @@ impl InstalledReceipt {
         git_commit: &str,
         dmg_sha256: &str,
     ) -> Result<(), String> {
-        Self::record_with_kind(
-            path,
-            build_number,
-            git_commit,
-            dmg_sha256,
-            ReceiptCommitKind::ModernFull,
-        )
+        Self::write_atomic(path, build_number, git_commit, dmg_sha256)
     }
 
-    /// Atomically record the one-time v0.52 recovery form. Callers must first
-    /// prove the legacy-only disk shape; this constructor merely prevents that
-    /// path from weakening the normal full-commit receipt parser.
-    pub(crate) fn record_legacy_sealed_short(
-        path: &Path,
-        build_number: u64,
-        sealed_git_commit: &str,
-        dmg_sha256: &str,
-    ) -> Result<(), String> {
-        Self::record_with_kind(
-            path,
-            build_number,
-            sealed_git_commit,
-            dmg_sha256,
-            ReceiptCommitKind::LegacySealedShort,
-        )
-    }
-
-    fn record_with_kind(
+    fn write_atomic(
         path: &Path,
         build_number: u64,
         git_commit: &str,
         dmg_sha256: &str,
-        commit_kind: ReceiptCommitKind,
     ) -> Result<(), String> {
-        let receipt = Self::canonical(build_number, git_commit, dmg_sha256, commit_kind)
+        let receipt = Self::canonical(build_number, git_commit, dmg_sha256)
             .ok_or_else(|| "installed receipt identity is malformed".to_string())?;
         let text = toml::to_string(&receipt)
             .map_err(|error| format!("serialize installed receipt: {error}"))?;
@@ -341,32 +266,16 @@ impl InstalledReceipt {
         })
     }
 
-    /// Rewrite a previously parsed receipt without changing its provenance
-    /// format. Used when an exec-failure inverse swap restores OLD: a legacy OLD
-    /// must regain its exact tagged short receipt, never be coerced through the
-    /// modern full-commit constructor.
+    /// Re-record a previously parsed receipt verbatim. Used when an exec-failure
+    /// inverse swap restores OLD and its receipt must come back unchanged.
     pub(crate) fn record_preserving_kind(&self, path: &Path) -> Result<(), String> {
-        Self::record_with_kind(
-            path,
-            self.build_number,
-            &self.git_commit,
-            &self.dmg_sha256,
-            self.commit_kind,
-        )
+        Self::write_atomic(path, self.build_number, &self.git_commit, &self.dmg_sha256)
     }
 
     /// Bind this unsigned local receipt to the codesign-sealed identity of the
     /// bundle currently at the canonical install path.
     pub(crate) fn matches_sealed(&self, build_number: u64, git_commit: &str) -> bool {
-        self.build_number == build_number
-            && match self.commit_kind {
-                ReceiptCommitKind::ModernFull => {
-                    crate::commit_matches(&self.git_commit, git_commit)
-                }
-                ReceiptCommitKind::LegacySealedShort => {
-                    self.git_commit.eq_ignore_ascii_case(git_commit.trim())
-                }
-            }
+        self.build_number == build_number && crate::commit_matches(&self.git_commit, git_commit)
     }
 
     pub(crate) fn clear(path: &Path) {
@@ -629,7 +538,8 @@ mod tests {
     /// deadline and stranded the machine on its current build forever.
     #[test]
     fn a_stage_failure_suppresses_then_expires_instead_of_being_permanent() {
-        let root = std::env::temp_dir().join(format!("aterm-failedmark-ttl-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("aterm-failedmark-ttl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("failed.toml");
@@ -717,7 +627,10 @@ mod tests {
         assert_eq!(m.attempts, 0);
         assert_eq!(m.retry_after, 0);
         assert!(m.matches(9, "ff"));
-        assert!(!m.suppresses(9, "ff", 0), "old markers must not strand a machine");
+        assert!(
+            !m.suppresses(9, "ff", 0),
+            "old markers must not strand a machine"
+        );
         // And the next failure of that same artifact starts at rung 2, not 1 —
         // it is genuinely a repeat, so it should not get the shortest backoff.
         assert_eq!(m.next_attempt(9, "ff"), 2);
@@ -759,66 +672,6 @@ mod tests {
 
         InstalledReceipt::clear(&path);
         assert!(InstalledReceipt::read(&path).is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_receipt_is_explicit_exact_twelve_hex_and_never_prefix_authority() {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-legacy-installed-receipt-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("installed.toml");
-        // Exact ATermGitCommit from the deployed v0.53 plist staged by v0.52.
-        let sealed = "c16c6fd7955b";
-        let digest = "cdfc51afab0d5212206e169047df2a23b97b396ecb22f38edaab7eb1e2c93e95";
-
-        assert!(InstalledReceipt::record(&path, 1_784_433_247, sealed, digest).is_err());
-        InstalledReceipt::record_legacy_sealed_short(&path, 1_784_433_247, sealed, digest).unwrap();
-        let receipt = InstalledReceipt::read(&path).expect("tagged legacy receipt");
-        assert!(receipt.matches_sealed(1_784_433_247, sealed));
-        assert!(receipt.matches_sealed(1_784_433_247, "C16C6FD7955B"));
-        assert!(
-            !receipt.matches_sealed(1_784_433_247, "c16c6fd7955bf565fcdc6e700548b987acce31b9"),
-            "the short sealed form is exact, never prefix-based"
-        );
-        let restored_path = root.join("restored-after-inverse-swap.toml");
-        receipt.record_preserving_kind(&restored_path).unwrap();
-        assert_eq!(
-            InstalledReceipt::read(&restored_path),
-            Some(receipt.clone()),
-            "inverse-swap restoration preserves the explicit legacy format"
-        );
-        for malformed in [
-            "c16c6fd7955",
-            "c16c6fd7955bf",
-            "c16c6fd7955g",
-            "c16c6fd7955b-dirty",
-        ] {
-            assert!(
-                InstalledReceipt::record_legacy_sealed_short(
-                    &root.join(format!("{malformed}.toml")),
-                    1_784_433_247,
-                    malformed,
-                    digest,
-                )
-                .is_err(),
-                "legacy provenance must be exactly 12 clean hex: {malformed}"
-            );
-        }
-
-        // An untagged/truncated modern wire is still invalid; only the dedicated
-        // constructor can mint the legacy representation.
-        std::fs::write(
-            root.join("truncated-modern.toml"),
-            format!(
-                "build_number = 1784433247\ngit_commit = \"{sealed}\"\ndmg_sha256 = \"{digest}\"\n"
-            ),
-        )
-        .unwrap();
-        assert!(InstalledReceipt::read(&root.join("truncated-modern.toml")).is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1055,9 +908,9 @@ changelog = '''
         assert_eq!(m.min_build, Some(7));
     }
 
-    /// This is the live parser used by the updater scan. Keep an explicit test
-    /// here (in addition to aterm-update-core's shared-type proof) so a future
-    /// refactor cannot accidentally leave the shipping duplicate permissive.
+    /// This is the live parser used by the updater scan (now delegating to the
+    /// shared aterm-update-core validator). Keep an explicit test here so a
+    /// future refactor cannot accidentally leave the client path permissive.
     #[test]
     fn manifest_rejects_min_build_above_its_own_build() {
         let err = Manifest::parse(
