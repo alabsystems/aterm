@@ -1207,13 +1207,29 @@ struct UiFontCandidate {
 #[cfg(target_os = "macos")]
 fn ui_font_candidates() -> Vec<UiFontCandidate> {
     vec![
-        // SFNS is a TrueType collection whose normal-width semibold is face 6.
-        UiFontCandidate {
-            regular_path: "/System/Library/Fonts/SFNS.ttf".into(),
-            regular_index: 0,
-            semibold_path: "/System/Library/Fonts/SFNS.ttf".into(),
-            semibold_index: 6,
-        },
+        // NO SF ENTRY, and the reason is a property of the file rather than a
+        // preference. `/System/Library/Fonts/SFNS.ttf` is NOT a TrueType
+        // collection — its magic is `0001 0000` (a plain sfnt), not `ttcf` — so
+        // it has exactly ONE face and no face index above 0 can ever resolve.
+        // SF's weights live on an `fvar` WEIGHT AXIS (the file carries fvar/gvar/
+        // avar/HVAR/MVAR/STAT), i.e. they are variable-font instances, and
+        // fontdue parses only the default instance. There is no static SF
+        // semibold on disk to point at either.
+        //
+        // This list previously led with `SFNS.ttf` face 0 + face 6 described as
+        // "a TrueType collection whose normal-width semibold is face 6". Both
+        // clauses were false, so `resolve_ui_font_assets` parsed face 0 (~81 ms),
+        // failed face 6 (~26 ms), discarded BOTH because it requires a candidate
+        // to supply regular AND semibold, and fell through to Helvetica Neue —
+        // which is therefore what has always shipped. Removing the entry changes
+        // no pixel; it stops paying ~107 ms per launch for a result that was
+        // always thrown away.
+        //
+        // Restoring the documented intent (docs/INTROSPECTABLE_SURFACES_DESIGN.md
+        // §9 says "SF Pro on macOS") needs variable-instance support in the UI
+        // face path, not another candidate entry — that is a deliberate design
+        // choice about the chrome's appearance, so it is left to the owner rather
+        // than smuggled in as a perf fix.
         UiFontCandidate {
             regular_path: "/System/Library/Fonts/HelveticaNeue.ttc".into(),
             regular_index: 0,
@@ -1312,6 +1328,28 @@ fn prepared_ui_font_assets() -> &'static UiFontAssets {
     static ASSETS: OnceLock<UiFontAssets> = OnceLock::new();
     ASSETS.get_or_init(resolve_ui_font_assets)
 }
+
+/// Populate the two process-global font `OnceLock`s that [`set_chrome_fonts`]
+/// would otherwise initialise on whichever thread calls it first.
+///
+/// Both are pure, self-contained and idempotent — the system UI face parse
+/// ([`prepared_ui_font_assets`]) and the embedded default chrome generation
+/// ([`chrome_fonts`]) — so warming them costs the caller only its own time and
+/// changes nothing about what is installed. Called on a dedicated startup thread
+/// so the first `sync_chrome_fonts` (which runs on the first-present hook, on the
+/// event loop) pays only the per-backend face handoff instead of a measured
+/// ~300 ms debug / ~30 ms release stall with the event loop blocked.
+#[cfg(not(test))]
+pub(crate) fn warm_chrome_font_assets() {
+    let _ = prepared_ui_font_assets();
+    drop(lock_fonts());
+}
+
+/// Tests keep chrome fonts per-thread (see [`TestChromeFontsGuard`]), so a
+/// process-global warm would be meaningless there — and the production warm is a
+/// pure startup optimisation with no observable effect to test.
+#[cfg(test)]
+pub(crate) fn warm_chrome_font_assets() {}
 
 /// Slight negative tracking (em) applied per glyph advance of the UI face — SF reads a
 /// touch loose at panel sizes when advanced naively. Applied IDENTICALLY by the raster

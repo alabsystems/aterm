@@ -781,6 +781,7 @@ name = "aterm-net"
 version = "0.10.0"
 dependencies = [
  "aterm-session",
+ "aterm-spec",
  "aterm-uds",
  "hmac",
  "rustls",

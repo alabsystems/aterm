@@ -17,7 +17,7 @@
 //! model — a real check, toolchain-free), and ADDITIONALLY by the external `ty`
 //! binary wherever it is installed. The tiers must agree; disagreement panics.
 
-// The 7 introspection models are iterated via `harness::instances()`, not named here.
+// The property models are iterated via `harness::instances()`, not named here.
 use aterm_spec::derive::{
     Model, aa_edge_hardening_model, active_handle_model, anchored_artifact_transaction_model,
     artifact_reader_lease_model, artifact_reply_publication_model, asymmetric_pad_layout_model,
@@ -276,8 +276,9 @@ fn derived_idle_deadline_proves_and_catches_missed_earliest() {
 }
 
 /// A valid first-present phase ledger is published only after all eight
-/// exclusive intervals exist. PROVES the ordered completion gate and CATCHES
-/// an early-valid publication.
+/// intervals exist. PROVES the abstract completeness gate and CATCHES an
+/// early-valid publication. Timestamp order and exact sums are host-level pure
+/// derivation obligations, not claims of this count model.
 #[test]
 fn derived_startup_phase_publication_requires_all_eight_intervals() {
     let model = startup_phase_publication_model();
@@ -1227,9 +1228,8 @@ fn assert_deadlock_free_and_catches_wedge(
 /// THE UMBRELLA: every property-combinator instance PROVES (Buggy=0) + CATCHES
 /// (Buggy=1) — a `Safety` invariant via [`assert_proves_and_catches`], a
 /// `Liveness` instance via [`assert_deadlock_free_and_catches_wedge`] — on both
-/// tiers. The 7 introspection models (dispatch/relay/registry/secrecy/ordering/
-/// reply-fidelity + forward-handshake) are iterated from the ONE shared table;
-/// a new property adds a row there, not a test fn here.
+/// tiers. The introspection/control-plane models are iterated from the ONE shared
+/// table; a new property adds a row there, not a test fn here.
 #[test]
 fn property_classes_prove_and_catch_under_ty() {
     for inst in harness::instances() {

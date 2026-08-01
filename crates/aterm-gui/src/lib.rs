@@ -14749,6 +14749,24 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // tail too. The build owns the GPU-or-CPU-fallback decision, so the thread
     // returns `(Backend, use_gpu)`.
     let family_for_build = font_family.clone();
+    // CHROME FACES, WARMED IN PARALLEL — off the event loop and off the backend
+    // build. `sync_chrome_fonts` runs on the first-present hook (see
+    // `finalize_backend`), and almost all of its cost is two process-global
+    // OnceLock inits it triggers on whichever thread gets there first: the system
+    // UI face parse and the embedded default chrome generation. Left cold, that
+    // whole cost lands inside the first `redraw_window` — a measured ~300 ms debug
+    // / ~30 ms release stall of the event loop, right after the first frame, where
+    // no key or PTY wake is dispatched.
+    //
+    // Warming them on their own thread here costs the event loop nothing: this
+    // starts at the same moment as the backend build, runs concurrently with it,
+    // and by the time the first frame lands both locks are populated, leaving the
+    // first-present install with only the per-backend face handoff. `OnceLock`
+    // makes the race benign — whoever arrives second gets the finished value.
+    std::thread::Builder::new()
+        .name("aterm-chrome-font-warm".into())
+        .spawn(crate::tray_raster::warm_chrome_font_assets)
+        .ok();
     let (startup_font_tx, startup_font_rx) =
         std::sync::mpsc::sync_channel::<StartupFontGeneration>(1);
     let backend_handle = std::thread::spawn(move || -> (Backend, bool) {
@@ -24787,7 +24805,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            127,
+            128,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -24821,7 +24839,7 @@ mod spec_xref_gate {
         assert_eq!(
             classify_spec_link(Some(1), &live_report),
             Some(SpecLinkDisposition::ExplicitDesignOnly),
-            "the real 127-machine DesignOnly report shape must classify honestly"
+            "the real 128-machine DesignOnly report shape must classify honestly"
         );
     }
 

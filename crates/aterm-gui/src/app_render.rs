@@ -10606,6 +10606,14 @@ impl App {
                     .ok();
             });
         }
+        // Chrome faces, deferred out of the window-attach bracket (see
+        // `finalize_backend`): ~295 ms of ChromeFace parse + semantic fork that
+        // used to sit between launch and this very frame, for faces only the
+        // Settings/About/Palette overlays read. Runs once, here, after the first
+        // frame is on the compositor and long before any overlay can be opened.
+        if !self.first_present_done {
+            self.sync_chrome_fonts();
+        }
         // Every kind of real front can satisfy the deferred-session-restore
         // first-present gate.
         self.first_present_done = true;

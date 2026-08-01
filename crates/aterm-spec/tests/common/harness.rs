@@ -42,6 +42,7 @@ pub fn instances() -> Vec<Instance> {
         authorize_soundness_model, capability_secrecy_model, dispatch_complete_model,
         forward_handshake_model, no_transitive_authority_model, proxy_registry_model,
         publish_ordering_model, relay_teardown_model, reply_fidelity_model,
+        tls_buffered_relay_model,
     };
     vec![
         Instance {
@@ -82,6 +83,12 @@ pub fn instances() -> Vec<Instance> {
             model: forward_handshake_model(),
             class: Class::Liveness {
                 is_final: |s| s.get("client_waiting") == Some(&0),
+            },
+        },
+        Instance {
+            model: tls_buffered_relay_model(),
+            class: Class::Liveness {
+                is_final: |s| s.get("service_waiting") == Some(&0),
             },
         },
     ]

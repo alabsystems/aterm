@@ -17,7 +17,7 @@
 //! Findings modelled: M1 dispatch completeness, M2 relay-teardown liveness,
 //! S1 proxy-registry leak. See docs/TRUST-introspection-audit-detection.md.
 
-// The 7 introspection models are iterated via `harness::instances()`, not named here.
+// The property models are iterated via `harness::instances()`, not named here.
 // The checker itself is the PROMOTED shared interpreter tier (aterm_spec::interp) —
 // the same functions `verify::{check_model,prove_and_catch,deadlock_free_…}_tiered`
 // discharge every derived-model gate with (VERIFY-1).

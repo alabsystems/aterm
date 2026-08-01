@@ -280,6 +280,29 @@ impl<C> RelayShared<C> {
     }
 }
 
+/// Move every plaintext byte rustls has already decrypted into `plain`.
+///
+/// `Ok(true)` means the peer's stream ended (close_notify or a normal close);
+/// `Ok(false)` means it is merely out of decrypted bytes for now. Decryption
+/// happens when TLS records are fed in, so buffered plaintext can exist before
+/// the relay has read a single byte itself.
+fn drain_decrypted<C, S>(conn: &mut C, plain: &mut Vec<u8>) -> io::Result<bool>
+where
+    C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
+    S: rustls::SideData,
+{
+    loop {
+        let mut tmp = [0u8; 4096];
+        match conn.reader().read(&mut tmp) {
+            Ok(0) => return Ok(true),
+            Ok(k) => plain.extend_from_slice(&tmp[..k]),
+            Err(e) if is_would_block(&e) => return Ok(false),
+            Err(e) if is_normal_close(&e) => return Ok(true),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Full-duplex relay between an authenticated TLS stream and a local `CtlStream`
 /// (the control socket), until both graceful half-closes complete (or a fatal
 /// error tears both directions down). This is the network analog of
@@ -313,30 +336,6 @@ impl<C> RelayShared<C> {
 /// # Errors
 /// On setup failure (socket clone) or an unexpected mid-stream I/O error (a
 /// normal peer close — EOF / `close_notify` / reset — is not an error).
-/// Move every plaintext byte rustls has ALREADY decrypted into `plain`.
-///
-/// `Ok(true)` means the peer's stream ended (close_notify or a normal close);
-/// `Ok(false)` means it is merely out of decrypted bytes for now. Decryption
-/// happens when TLS records are fed in, so buffered plaintext can exist before
-/// the relay has read a single byte itself — see the drain at the top of the
-/// downloader.
-fn drain_decrypted<C, S>(conn: &mut C, plain: &mut Vec<u8>) -> io::Result<bool>
-where
-    C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
-    S: rustls::SideData,
-{
-    loop {
-        let mut tmp = [0u8; 4096];
-        match conn.reader().read(&mut tmp) {
-            Ok(0) => return Ok(true), // close_notify
-            Ok(k) => plain.extend_from_slice(&tmp[..k]),
-            Err(e) if is_would_block(&e) => return Ok(false), // no more plaintext yet
-            Err(e) if is_normal_close(&e) => return Ok(true),
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 pub fn relay<C, S>(transport: TlsTransport<C>, local: CtlStream) -> io::Result<()>
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>> + Send + 'static,
@@ -712,8 +711,35 @@ mod tests {
         ServerName::try_from("aterm-net-test").unwrap()
     }
 
+    /// Serializes the loopback TLS tests in this module against EACH OTHER.
+    ///
+    /// Every one of them stands up a listener, a relay thread and a service
+    /// thread, then waits on real socket I/O between them. Run concurrently —
+    /// which is what the test harness does by default — the eight of them put
+    /// ~24 threads into a scheduling fight over the same loopback path, and the
+    /// relay threads lose: reads that take milliseconds when the test runs alone
+    /// stall past a 60 s bound.
+    ///
+    /// Measured under ~950 % competing load: PARALLEL 2 failed after 60 s;
+    /// SERIALIZED 22/22 in **1.56 s**. So the contention is between these tests,
+    /// not with the rest of the machine — external load alone does not break
+    /// them, and no timeout tuning fixes what is a thread-count problem.
+    ///
+    /// Poisoning is ignored on purpose (`into_inner`): a panic in one test must
+    /// fail THAT test, not cascade into every later one as a poisoned-lock
+    /// failure that hides the original cause.
+    static LOOPBACK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`LOOPBACK_TESTS`] for the rest of the calling test.
+    fn serialize_loopback() -> std::sync::MutexGuard<'static, ()> {
+        LOOPBACK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn tls_handshake_exporters_match_and_a_wrong_pin_is_rejected() {
+        let _serial = serialize_loopback();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
@@ -746,6 +772,7 @@ mod tests {
 
     #[test]
     fn end_to_end_tls_capability_handshake_then_relays_a_control_exchange() {
+        let _serial = serialize_loopback();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
@@ -822,6 +849,7 @@ mod tests {
 
     #[test]
     fn relay_streams_a_large_payload_under_send_side_backpressure_without_truncating() {
+        let _serial = serialize_loopback();
         // Regression: the uploader used to treat a transient WouldBlock from
         // write_all as fatal (record_err + break), dropping the just-read chunk
         // and tearing down a healthy relay the moment the non-blocking TLS socket
@@ -882,6 +910,7 @@ mod tests {
 
     #[test]
     fn relay_early_request_close_delivers_guarded_reply_but_not_late_ack() {
+        let _serial = serialize_loopback();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
@@ -954,6 +983,7 @@ mod tests {
 
     #[test]
     fn relay_round_trips_guarded_artifact_ack_before_request_half_close() {
+        let _serial = serialize_loopback();
         const REQUEST: &[u8] = b"image guarded-demo.png\n";
         const BODY: &[u8] = b"OK /tmp/aterm/images/guarded-demo.png\n";
         const NONCE: &[u8] = b"fedcba98765432100123456789abcdef";
@@ -977,6 +1007,8 @@ mod tests {
         svc_b
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
+        let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel();
+        let (request_flushed_tx, request_flushed_rx) = std::sync::mpsc::channel();
 
         let service = std::thread::spawn(move || {
             let mut request = vec![0; REQUEST.len()];
@@ -996,15 +1028,56 @@ mod tests {
         });
         let server = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
-            let transport = accept(tcp, scfg).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut transport = accept(tcp, scfg).unwrap();
+            server_ready_tx.send(()).unwrap();
+            request_flushed_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+
+            // Deterministically recreate the production race: consume the first
+            // application record into rustls before `relay` starts. This is the
+            // same state `accept` reaches when the peer's Finished and request
+            // share a TCP read. The relay must drain this buffered plaintext
+            // before blocking for another network record.
+            let stream = transport.stream();
+            loop {
+                let consumed = stream.conn.read_tls(&mut stream.sock).unwrap();
+                assert!(consumed > 0, "the request must seed rustls' input buffer");
+                let io = stream.conn.process_new_packets().unwrap();
+                if io.plaintext_bytes_to_read() >= REQUEST.len() {
+                    break;
+                }
+            }
+
+            // Tier-1 guard bind: the real transport is now in the model's
+            // initial `buffered=1, relayed=0, service_waiting=1` state. The
+            // shipping relay below must take `DrainBuffered`; the Buggy=1
+            // negative control demands a fresh read and is disabled here.
+            let model = aterm_spec::derive::tls_buffered_relay_model();
+            let state = model.init_state();
+            assert!(model.action_enabled("DrainBuffered", &state));
+            let mut buggy = model.clone();
+            buggy
+                .consts
+                .iter_mut()
+                .find(|(name, _)| *name == "Buggy")
+                .unwrap()
+                .1 = 1;
+            assert!(!buggy.action_enabled("DrainBuffered", &state));
+
             relay(transport, svc_a).unwrap();
         });
 
         let tcp = TcpStream::connect(addr).unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
+        server_ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
         client.stream().write_all(REQUEST).unwrap();
         client.stream().flush().unwrap();
+        request_flushed_tx.send(()).unwrap();
 
         let mut got = vec![0; expected_reply.len()];
         client.stream().read_exact(&mut got).unwrap();
@@ -1034,6 +1107,7 @@ mod tests {
 
     #[test]
     fn relay_round_trips_are_not_paced_by_a_poll_interval() {
+        let _serial = serialize_loopback();
         // Regression: the relay used to drive both directions with 20 ms
         // mutex+sleep polls, so every request/echo round-trip paid ~20-40 ms of
         // pure sleep — 300 sequential round-trips took >= ~6 s. With condvar
@@ -1113,6 +1187,7 @@ mod tests {
 
     #[test]
     fn a_wrong_fingerprint_pin_rejects_the_handshake() {
+        let _serial = serialize_loopback();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
@@ -1156,6 +1231,7 @@ mod tests {
 
     #[test]
     fn graceful_local_eof_half_closes_without_killing_the_request_direction() {
+        let _serial = serialize_loopback();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();

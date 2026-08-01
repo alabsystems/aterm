@@ -198,6 +198,8 @@ pub fn model_registry() -> Vec<Model> {
         proxy_registry_model(),
         // Liveness twin: forward-handshake deadlock-freedom (the drain_buffered class).
         forward_handshake_model(),
+        // TLS-specific bind of the same no-fresh-read-before-buffer-drain wedge.
+        tls_buffered_relay_model(),
         // Generalized error-class models (F1 info-flow, ordering, reply-fidelity).
         capability_secrecy_model(),
         publish_ordering_model(),

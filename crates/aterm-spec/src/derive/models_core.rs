@@ -797,12 +797,14 @@ pub fn surface_coverage_model() -> Model {
     }
 }
 
-/// The first successful present publishes a valid phase partition only after
-/// all eight exclusive Rust-main → present milestones have been observed in
-/// order. The shipping GUI binds each `Step` to one adjacent timestamp interval
-/// and enables `Publish` only when `derive_startup_phases` validates the exact
-/// sum. `Buggy=1` admits an early valid publication so Tier-0 must produce a
-/// counterexample rather than accepting a vacuous happy trace.
+/// Abstract completeness gate for first-present phase publication: a valid
+/// partition cannot publish until eight intervals are present. This deliberately
+/// does NOT model timestamp identity, order, or duration arithmetic: the shipping
+/// GUI's pure derivation checks those properties directly and its Tier-1 test
+/// separately carries reordered-timestamp negative controls. Here each `Step`
+/// means only "one more interval exists". `Buggy=1` admits an early publication
+/// so Tier-0 must produce a counterexample rather than accepting a vacuous happy
+/// trace.
 pub fn startup_phase_publication_model() -> Model {
     crate::ty_model! {
         StartupPhasePublication {

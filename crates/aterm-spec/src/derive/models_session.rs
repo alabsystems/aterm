@@ -1786,6 +1786,33 @@ pub fn forward_handshake_model() -> Model {
     })
 }
 
+/// TLS RELAY STARTUP LIVENESS. A peer's first application record can be
+/// decrypted by the TLS handshake driver before `tls::relay` begins. The local
+/// service is waiting for that request, while the peer is waiting for its reply.
+/// Correct (`Buggy = 0`): `DrainBuffered` forwards the already-buffered request
+/// without requiring another network read. `Buggy = 1` demands a fresh record
+/// first, leaving both parties parked in the initial state.
+///
+/// This is deliberately separate from [`forward_handshake_model`]: the abstract
+/// wedge is the same, but this model is Tier-1-bound to the genuine TLS relay by
+/// `tls::tests::relay_round_trips_guarded_artifact_ack_before_request_half_close`.
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
+// models above) — the MODEL it returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn tls_buffered_relay_model() -> Model {
+    props::no_wedge(props::Wedge {
+        name: "TlsBufferedRelay",
+        buffered: "buffered",
+        buffered_init: 1,
+        relayed: "relayed",
+        waiting: "service_waiting",
+        relay: "DrainBuffered",
+        recv: "ServiceRecv",
+        done: "Done",
+        inv: "WaitingIsBool",
+    })
+}
+
 /// AUTHORIZATION SOUNDNESS — the trust core's central predicate (`decide_edge` /
 /// `EdgeTable::authorize`): a presented token is PERMITTED only when ALL four
 /// conjuncts hold — the token is in the table, its `dst` equals the resolved

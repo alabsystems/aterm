@@ -744,30 +744,104 @@ impl Mounted {
     /// at the caller-chosen private `mp` (created fresh) so we never touch `/Volumes`
     /// and never have to parse a mount table. `mp` must be under our own `0700` dir.
     fn attach(dmg: &Path, mountpoint: &Path) -> Result<Self, String> {
-        let _ = std::fs::remove_dir_all(mountpoint);
-        std::fs::create_dir_all(mountpoint).map_err(|e| format!("create mountpoint: {e}"))?;
-        let out = Command::new("/usr/bin/hdiutil")
-            .args([
-                "attach",
-                "-nobrowse",
-                "-readonly",
-                "-noautoopen",
-                "-mountpoint",
-            ])
-            .arg(mountpoint)
+        // RETRY, THEN FALL BACK. A stage that dies here strands the whole fleet on
+        // the previous build with a verified DMG already on disk, so this step
+        // must not fail on the first refusal.
+        //
+        // 2026-07-31 (v0.10.0): every machine reported
+        //   hdiutil attach failed: hdiutil: attach failed - Device not configured
+        // (ENXIO) from inside the app, while the IDENTICAL command — same DMG,
+        // same `-mountpoint` under the same 0700 dir, same environment copied
+        // from the running process — succeeded every time from a shell. So the
+        // refusal is about the attaching PROCESS's moment, not the image: a
+        // DiskArbitration/device-attach race the app can lose and a shell does
+        // not. Both mitigations below are cheap and no-ops on the happy path.
+        let mut attempts: Vec<String> = Vec::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                // Linear backoff: the races this loses are short-lived.
+                std::thread::sleep(std::time::Duration::from_millis(
+                    500 * u64::from(attempt),
+                ));
+            }
+            match Self::attach_at(dmg, Some(mountpoint)) {
+                Ok(mounted) => return Ok(mounted),
+                Err(error) => attempts.push(error),
+            }
+        }
+        // LAST RESORT: let hdiutil pick the mount point itself. `-mountpoint` is
+        // what keeps us out of `/Volumes` (and out of the user's Finder), so it
+        // is preferred and tried first — but a mounted image we can read beats a
+        // fleet that cannot update, and the `Drop` below detaches either shape.
+        match Self::attach_at(dmg, None) {
+            Ok(mounted) => Ok(mounted),
+            Err(error) => {
+                attempts.push(error);
+                let _ = std::fs::remove_dir_all(mountpoint);
+                let size = std::fs::metadata(dmg).map_or_else(
+                    |_| "unreadable".to_string(),
+                    |meta| format!("{} bytes", meta.len()),
+                );
+                Err(format!(
+                    "hdiutil attach failed after {} attempts ({}, {size}): {}",
+                    attempts.len(),
+                    dmg.display(),
+                    attempts.join(" | ")
+                ))
+            }
+        }
+    }
+
+    /// One `hdiutil attach`. `mountpoint` = `Some(dir)` mounts there (the private
+    /// 0700 path); `None` lets hdiutil choose, and the chosen path is read back
+    /// from its output so `Drop` can detach exactly what was attached.
+    fn attach_at(dmg: &Path, mountpoint: Option<&Path>) -> Result<Self, String> {
+        let mut cmd = Command::new("/usr/bin/hdiutil");
+        cmd.args(["attach", "-nobrowse", "-readonly", "-noautoopen"]);
+        if let Some(mountpoint) = mountpoint {
+            let _ = std::fs::remove_dir_all(mountpoint);
+            std::fs::create_dir_all(mountpoint).map_err(|e| format!("create mountpoint: {e}"))?;
+            cmd.arg("-mountpoint").arg(mountpoint);
+        }
+        let out = cmd
             .arg(dmg)
             .output()
             .map_err(|e| format!("spawn hdiutil attach: {e}"))?;
         if !out.status.success() {
-            let _ = std::fs::remove_dir_all(mountpoint);
-            return Err(format!(
-                "hdiutil attach failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            if let Some(mountpoint) = mountpoint {
+                let _ = std::fs::remove_dir_all(mountpoint);
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let detail = stderr.trim();
+            let detail = if detail.is_empty() {
+                "no stderr"
+            } else {
+                detail
+            };
+            return Err(match mountpoint {
+                Some(_) => format!("private mountpoint: {detail}"),
+                None => format!("default mountpoint: {detail}"),
+            });
         }
-        Ok(Self {
-            mountpoint: mountpoint.to_path_buf(),
-        })
+        match mountpoint {
+            Some(mountpoint) => Ok(Self {
+                mountpoint: mountpoint.to_path_buf(),
+            }),
+            // hdiutil's plain output is TAB-separated `dev \t type \t mountpoint`;
+            // splitting on tabs (not whitespace) keeps a mount path with spaces —
+            // which the release DMG's `aterm X.Y.Z` volume name always has — intact.
+            None => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.split('\t').nth(2))
+                .map(str::trim)
+                .find(|candidate| !candidate.is_empty())
+                .map(|found| Self {
+                    mountpoint: PathBuf::from(found),
+                })
+                .ok_or_else(|| {
+                    "default mountpoint: hdiutil attached but named no mount point".to_string()
+                }),
+        }
     }
 }
 

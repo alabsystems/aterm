@@ -473,10 +473,24 @@ impl StartupAttachMilestones {
     }
 }
 
-/// Publish the complete internal timeline for the first successful window
-/// attach. First-write wins; later Cmd-N windows cannot replace startup data.
+/// Install a complete attach timeline into a first-write slot. Kept separate
+/// from the process-global wrapper so the first-writer-wins rule has a local,
+/// parallel negative-control test without contaminating process startup state.
+fn record_initial_attach_milestones_once(
+    slot: &OnceLock<StartupAttachMilestones>,
+    milestones: StartupAttachMilestones,
+) -> bool {
+    slot.set(milestones).is_ok()
+}
+
+/// Publish the complete internal timeline for the first successfully installed
+/// window surface. Every successful `attach_os_window` call may offer a complete
+/// candidate; `OnceLock` admits exactly the first and later Cmd-N windows cannot
+/// replace it. The winit application handler serializes production attaches on
+/// the event-loop thread, while the atomic slot remains a backstop if that
+/// lifecycle ever changes.
 pub(crate) fn record_initial_attach_milestones(milestones: StartupAttachMilestones) {
-    let _ = INITIAL_ATTACH_MILESTONES.set(milestones);
+    let _ = record_initial_attach_milestones_once(&INITIAL_ATTACH_MILESTONES, milestones);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1629,6 +1643,47 @@ mod startup_phase_tests {
     }
 
     #[test]
+    fn initial_attach_milestones_are_parallel_first_write_wins() {
+        let slot = std::sync::Arc::new(OnceLock::new());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let base = Instant::now();
+        let mut workers = Vec::new();
+        for offset in [1_u64, 2] {
+            let slot = std::sync::Arc::clone(&slot);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let point = base + std::time::Duration::from_millis(offset);
+                barrier.wait();
+                record_initial_attach_milestones_once(
+                    &slot,
+                    StartupAttachMilestones::new([point; 7]),
+                )
+            }));
+        }
+        barrier.wait();
+        let winners = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("milestone writer"))
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1, "exactly one concurrent candidate may publish");
+
+        let stored = slot.get().expect("one candidate published");
+        let replacement = base + std::time::Duration::from_millis(3);
+        assert!(
+            !record_initial_attach_milestones_once(
+                &slot,
+                StartupAttachMilestones::new([replacement; 7]),
+            ),
+            "negative control: a later window cannot replace startup milestones"
+        );
+        assert_ne!(
+            stored.points[0], replacement,
+            "the rejected candidate must not mutate the admitted timeline"
+        );
+    }
+
+    #[test]
     fn startup_phases_are_an_exact_exclusive_partition() {
         let (milestones, timing, published_at) = timeline();
         let phases = derive_startup_phases(milestones, timing, published_at);
@@ -1808,6 +1863,9 @@ mod startup_phase_tests {
 
     #[test]
     fn phase_derivation_conforms_to_the_derived_publication_gate() {
+        // The derived model intentionally covers only interval completeness.
+        // Ordering and exact arithmetic remain real host obligations exercised
+        // by the reordered controls below and the exact-partition tests above.
         let model = aterm_spec::derive::startup_phase_publication_model();
         let (milestones, timing, published_at) = timeline();
         let mut incomplete_milestones = milestones;

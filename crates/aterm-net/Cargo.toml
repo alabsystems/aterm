@@ -25,3 +25,6 @@ aterm-uds = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rustls = { workspace = true }
+
+[dev-dependencies]
+aterm-spec = { workspace = true }

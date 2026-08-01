@@ -70,6 +70,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 
 use crate::derive::Model;
 use crate::interp;
@@ -440,22 +441,187 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
     let cfgp = dir.join(format!("{}.cfg", m.name));
     std::fs::write(&spec, m.to_tla()).expect("write derived spec");
     std::fs::write(&cfgp, cfg).expect("write derived cfg");
-    let out = Command::new(ty)
-        .arg("check")
-        .arg(&spec)
-        .arg("--config")
-        .arg(&cfgp)
-        .output()
+    let mut cmd = Command::new(ty);
+    cmd.arg("check").arg(&spec).arg("--config").arg(&cfgp);
+    let out = ty_output(arm_whole_space_check(&mut cmd))
         .unwrap_or_else(|e| panic!("run ty check for {label}: {e}"));
     let _ = std::fs::remove_dir_all(&dir);
+    let built = ty_build_stamp(ty);
     let evidence = format!(
-        "ty binary: {} ({:?})\n--- ty stdout ---\n{}\n--- ty stderr ---\n{}",
+        "ty binary: {} [{built}] ({:?})\n--- ty stdout ---\n{}\n--- ty stderr ---\n{}",
         ty.display(),
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
     (out.status.success(), evidence)
+}
+
+/// The flags EVERY `ty check` of a derived model carries.
+///
+/// **Reduction off** (`--no-auto-por`, `--no-auto-symmetry`). The escalation
+/// tier's job is to walk the SAME bounded space the interpreter walked, not a
+/// cheaper one. Partial-order and symmetry reduction are speed features, and
+/// speed is not what this tier buys: the largest model in the registry has 1712
+/// reachable states, so the whole sweep costs seconds either way. What reduction
+/// DOES cost is the only thing that makes two tiers worth running —
+/// comparability. A reduced run explores a representative subset by design, so
+/// its state count carries no information, and [`assert_same_space_explored`]
+/// (the check that caught this) could not be written at all.
+///
+/// It is not hypothetical. A `ty` built 2026-07-02 explored ONE state of
+/// `NyanJumpBurstLifecycle`'s 128 with reduction on and reported "No errors
+/// found (exhaustive)" — a false proof at the committed config, and a missing
+/// counterexample at `Buggy = 1`, which is the only reason it surfaced at all.
+/// The model's stutter action (`SlowJump`, a self-loop that writes nothing)
+/// formed a singleton ample set whose only successor is the expanding state, and
+/// that build predated `ty`'s own C3 cycle proviso by four days. Two other
+/// models (`NativeConfigTransaction` 1662/1712, `CursorCatCurseWince` 30/36)
+/// were under-exploring the same way, silently, because a prove-only model has
+/// no catch half to fail. A current `ty` refuses those reductions correctly —
+/// which is exactly why aterm cannot rely on that: this tier is only as sound as
+/// whichever binary is on the machine, and nothing here may assume it is new.
+///
+/// **`--initial-capacity 8192`** — tell `ty` these models are small. Left to
+/// itself it pre-allocates fingerprint storage for a spec that might have
+/// millions of states: measured on `NativeTabIdentity` (399 reachable states),
+/// peak RSS was 4.25 GB unset versus 17 MB with the hint. 8192 is 4x the largest
+/// model; the hash set still grows on its own, so the hint bounds nothing and
+/// under-sizing it cannot truncate a search.
+///
+/// That footprint is what made the suite FLAKY rather than merely wasteful:
+/// ~4 GB per concurrent `ty` collides with the auto-detected memory ceiling,
+/// which is itself a function of how many `ty`/`cargo`/`rustc` processes are
+/// alive, so a run could be handed a share too small to start in.
+/// `NativeTabIdentity` stopped at 1 of 399 states with "memory limit reached"
+/// AND EXIT 0 — a truncated run that an exit-status-only verdict books as a
+/// proof. That is the likeliest reading of the 2026-07-20
+/// `derived_native_tab_identity` "transient toolchain drift" note above: not
+/// drift, a ceiling that moved with the load.
+///
+/// The ceiling is deliberately NOT pinned with `--memory-limit`. Pinning it was
+/// tried and made things worse under exactly the load it was meant to fix:
+/// `ty`'s limit probe is not purely per-process, so a small explicit ceiling
+/// trips on a busy machine even when this run's own RSS is 17 MB — the same
+/// false stop, now pinned on. Shrinking the footprint is the fix; the ceiling
+/// was only ever a symptom of it.
+// Skip: argument plumbing for a subprocess. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
+    cmd.arg("--no-auto-por")
+        .arg("--no-auto-symmetry")
+        .arg("--initial-capacity")
+        .arg("8192")
+}
+
+/// Run a `ty` subprocess — ONE AT A TIME, across the whole test binary.
+///
+/// Not a fairness or disk-contention measure, a CORRECTNESS one. `ty` sizes its
+/// memory budget as host RAM divided by the number of live `ty`/`cargo`/`rustc`
+/// processes, so concurrent checks shrink each other's budget until one is
+/// stopped mid-search — and a stopped search still prints "no errors" and still
+/// exits 0. That makes the verdict a function of how busy the machine was, which
+/// is not a property a proof is allowed to have. `cargo test`'s own parallelism
+/// is exactly the load that triggers it, so the tests discharging these
+/// obligations were racing the thing they were discharging.
+///
+/// The lock is around the SUBPROCESS, not the test: the interpreter tier — the
+/// expensive half — still runs fully parallel. Measured cost on the
+/// 194-obligation ring suite: ~55s, against a `--test-threads=1` upper bound of
+/// 70s.
+///
+/// Poisoning is recovered rather than propagated: a model that panics while
+/// holding this lock has already failed its own obligation loudly, and turning
+/// every LATER model into a "poisoned lock" panic would bury that one real
+/// diagnostic under a hundred fake ones.
+// Skip: spawns a subprocess under a lock. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ty_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    static TY_SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = TY_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    cmd.output()
+}
+
+/// The checker binary's AGE, for the evidence transcript.
+///
+/// `ty --version` reports a package version that does not move between builds,
+/// so it cannot tell a checker built today from one built a month ago — and on
+/// 2026-07-30 that distinction was the whole answer: the installed `ty` was four
+/// days older than the fix for the very reduction bug it was exhibiting. The
+/// mtime is the one cheap fact that would have said so on the first read.
+// Skip: filesystem metadata formatting. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ty_build_stamp(ty: &Path) -> String {
+    std::fs::metadata(ty)
+        .and_then(|md| md.modified())
+        .map_or_else(
+            |_| "mtime unknown".to_string(),
+            |t| {
+                let secs = t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                format!("mtime {secs} (unix)")
+            },
+        )
+}
+
+/// The number of distinct states `ty` reports having explored, read from the
+/// `States found: N` line of its statistics block.
+///
+/// `None` means the line was absent — a run that never reached the statistics
+/// block, or an output-format drift. Callers treat `None` as a FAILURE to
+/// establish agreement, never as agreement: this parse is the only evidence
+/// aterm has that the escalation tier looked at anything at all.
+// Skip: string scanning over another tool's output. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ty_states_explored(evidence: &str) -> Option<u64> {
+    evidence
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("States found:"))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// The EVIDENCE half of tier agreement: a CLEAN `ty` verdict must also have
+/// come from the same bounded reachable space the interpreter proved over.
+///
+/// The two tiers already had to agree on the VERDICT. That is weaker than it
+/// looks, because "no errors found" is also what a checker says about a space
+/// it never entered — and on 2026-07-30 that is exactly what happened
+/// (`NyanJumpBurstLifecycle`: interpreter 128 states, `ty` 1, both "clean").
+/// A verdict agreement between a real proof and a vacuous one is not evidence;
+/// it is a coincidence that reads like evidence.
+///
+/// So the tiers must agree on the WORK as well as the answer. Both walk the
+/// whole reachable space of the same finite machine, and `to_cfg` emits no
+/// VIEW and no SYMMETRY, so with reduction off (see `ty_check_derived`) their
+/// state counts are not merely close — they are EQUAL, verified across all 114
+/// scalar models in `xref::model_registry()` at the time this landed.
+///
+/// Applies only to a clean verdict: a `Buggy = 1` run is SUPPOSED to stop at
+/// the first counterexample, so its count is legitimately smaller and is not
+/// compared.
+// Skip: a verification-harness assert — the panic IS the gate. Not shipping
+// runtime code.
+#[cfg_attr(trust_verify, trust::skip)]
+fn assert_same_space_explored(m: &Model, interp_states: usize, evidence: &str, label: &str) {
+    let Some(ty_states) = ty_states_explored(evidence) else {
+        panic!(
+            "{label}: {} — `ty` returned a CLEAN verdict with no `States found:` line, so there \
+             is no evidence it explored anything. The escalation tier cannot be credited on an \
+             unparseable transcript (output-format drift?).\n{evidence}",
+            m.name
+        )
+    };
+    assert!(
+        ty_states == interp_states as u64,
+        "{label}: {} — TIER DISAGREEMENT ON THE EXPLORED SPACE: the interpreter walked \
+         {interp_states} reachable states, `ty` reports {ty_states}. Both tiers claim an \
+         exhaustive walk of the SAME machine, so these must be equal; they are not, which means \
+         one tier's \"clean\" is about a space the other never saw. A `ty` count that is SMALLER \
+         is a false proof (a state-space reduction that dropped reachable behaviour); a LARGER \
+         one means the emitted TLA+ admits states the model does not.\n{evidence}",
+        m.name
+    );
 }
 
 /// TIERED Tier-0 check of a derived model: the interpreter proves every
@@ -470,18 +636,25 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 // and its asserts are deliberate harness aborts. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
-    let interp_ran = if m.fn_vars.is_empty() {
+    // `Some(n)` = the interpreter ran and proved the invariants over `n`
+    // reachable states; that count is the yardstick the `ty` tier is held to
+    // below. `None` = function-valued, so there is no interpreter tier and no
+    // yardstick.
+    let interp_states = if m.fn_vars.is_empty() {
         match interp::bmc(m) {
-            Ok(n) => eprintln!("{label}: {} proven over {n} states (interpreter).", m.name),
+            Ok(n) => {
+                eprintln!("{label}: {} proven over {n} states (interpreter).", m.name);
+                Some(n)
+            }
             Err((st, inv)) => panic!(
                 "{label}: {} invariant `{inv}` VIOLATED at {st:?} (interpreter tier)",
                 m.name
             ),
         }
-        true
     } else {
-        false
+        None
     };
+    let interp_ran = interp_states.is_some();
     match find_ty() {
         Some(ty) => {
             let (ok, evidence) = ty_check_derived(&ty, m, &m.to_cfg(), label);
@@ -496,6 +669,9 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
                 },
                 m.to_tla()
             );
+            if let Some(n) = interp_states {
+                assert_same_space_explored(m, n, &evidence, label);
+            }
             eprintln!(
                 "{label}: {} additionally model-checked clean by ty.",
                 m.name
@@ -531,12 +707,27 @@ pub fn check_model_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
 // Skip: same tiered-driver class as `check_model_tiered`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun> {
-    let interp_ran = if m.fn_vars.is_empty() {
+    // `prove_and_catch` proves the `Buggy = 0` arm and catches the `Buggy = 1`
+    // one; re-walking the committed arm here is what gives the `ty` tier its
+    // yardstick (see `assert_same_space_explored`). It is a second BFS over a
+    // space `prove_and_catch` just proved terminates and holds, so it cannot
+    // fail — but it is matched anyway rather than unwrapped, because a silent
+    // `Err` here would be the interpreter contradicting itself.
+    let interp_states = if m.fn_vars.is_empty() {
         interp::prove_and_catch(m);
-        true
+        match interp::bmc(&interp::with_buggy(m, 0)) {
+            Ok(n) => Some(n),
+            Err((st, inv)) => panic!(
+                "{label}: {} invariant `{inv}` VIOLATED at {st:?} on the Buggy=0 re-walk, after \
+                 `prove_and_catch` proved the same arm clean — the interpreter tier is \
+                 self-inconsistent",
+                m.name
+            ),
+        }
     } else {
-        false
+        None
     };
+    let interp_ran = interp_states.is_some();
     match find_ty() {
         Some(ty) => {
             let (ok, evidence) = ty_check_derived(&ty, m, &m.to_cfg(), label);
@@ -551,6 +742,13 @@ pub fn prove_and_catch_tiered(m: &Model, label: &str) -> Result<Covered, NotRun>
                 },
                 m.to_tla()
             );
+            // The committed arm is the one that claims a PROOF, so it is the one
+            // held to the explored-space law. The `Buggy = 1` run below is
+            // required to stop early at its counterexample, so its count is
+            // legitimately smaller and is deliberately not compared.
+            if let Some(n) = interp_states {
+                assert_same_space_explored(m, n, &evidence, label);
+            }
             let (caught_ok, evidence) =
                 ty_check_derived(&ty, m, &m.to_cfg_with(&[("Buggy", 1)]), label);
             assert!(
@@ -1006,13 +1204,13 @@ pub fn deadlock_free_and_catches_tiered(
             let run = |cfg_name: &str, cfg: String| -> (bool, String) {
                 let cfgp = dir.join(cfg_name);
                 std::fs::write(&cfgp, cfg).expect("write cfg");
-                let out = Command::new(&ty)
-                    .arg("check")
-                    .arg(&spec)
-                    .arg("--config")
-                    .arg(&cfgp)
-                    .output()
-                    .expect("run ty check");
+                // Same arming as `ty_check_derived`, for the same reason: this
+                // arm asserts NO DEADLOCK at Buggy=0, and a run stopped early by
+                // the memory budget reports exactly that, with exit 0. A
+                // deadlock gate that a busy machine can satisfy is not a gate.
+                let mut cmd = Command::new(&ty);
+                cmd.arg("check").arg(&spec).arg("--config").arg(&cfgp);
+                let out = ty_output(arm_whole_space_check(&mut cmd)).expect("run ty check");
                 (
                     out.status.success(),
                     format!(
@@ -1116,16 +1314,20 @@ pub fn validate_transition_tiered(
         transition_trace_json(m, prev, next, action.or(admitted)),
     )
     .expect("write trace");
-    let out = Command::new(&ty)
-        .arg("trace")
+    // Serialised like every other `ty` spawn (see `ty_output`). `trace validate`
+    // walks a two-state trace, not a state space, so it takes none of the
+    // whole-space arming — but it is still a `ty` process, and while it lives it
+    // is one more divisor in every CONCURRENT checker's memory budget.
+    let mut cmd = Command::new(&ty);
+    cmd.arg("trace")
         .arg("validate")
         .arg(&trace)
         .arg("--spec")
         .arg(&spec)
         .arg("--config")
-        .arg(&cfg)
-        .output()
-        .unwrap_or_else(|e| panic!("run ty trace validate for {label}: {e}"));
+        .arg(&cfg);
+    let out =
+        ty_output(&mut cmd).unwrap_or_else(|e| panic!("run ty trace validate for {label}: {e}"));
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -1399,5 +1601,69 @@ mod tests {
             }),
             "{r:?}"
         );
+    }
+
+    /// The state count is read from `ty`'s real statistics block, and ONLY from
+    /// it. `None` on drift is the whole point: the caller turns `None` into a
+    /// failure, so a `ty` whose output format moves takes the gate RED rather
+    /// than silently retiring the explored-space obligation.
+    #[test]
+    fn ty_state_count_is_parsed_or_refused() {
+        let real = "Model checking complete: No errors found (exhaustive).\n\n\
+                    Statistics:\n  States found: 128\n  Initial states: 1\n  Transitions: 587\n";
+        assert_eq!(ty_states_explored(real), Some(128));
+        assert_eq!(ty_states_explored("Statistics:\n  States found: 1\n"), Some(1));
+        // Drift / no statistics block / non-numeric — all refusals, not zeros.
+        assert_eq!(ty_states_explored("No errors found (exhaustive)."), None);
+        assert_eq!(ty_states_explored("  States explored: 128\n"), None);
+        assert_eq!(ty_states_explored("  States found: many\n"), None);
+    }
+
+    /// REGRESSION (2026-07-30 FALSE PROOF): `ty` reported "No errors found
+    /// (exhaustive)" for `NyanJumpBurstLifecycle` after exploring ONE of its 128
+    /// reachable states — its partial-order reduction formed a singleton ample
+    /// set out of the model's stutter action, whose only successor is the
+    /// expanding state, and the C3 cycle proviso failed to reject it. The
+    /// verdicts agreed; the work behind them did not.
+    ///
+    /// This pins the CONSEQUENCE rather than the cause: a smaller `ty` count is
+    /// a false proof and must panic. The cause is fixed in `ty` itself, and this
+    /// stays green either way — reduction is off for this driver, so a `ty`
+    /// whose reduction regresses again cannot reach the gate through this door.
+    #[test]
+    #[should_panic(expected = "TIER DISAGREEMENT ON THE EXPLORED SPACE")]
+    fn a_ty_verdict_from_a_smaller_space_is_not_a_proof() {
+        let m = ring_model();
+        assert_same_space_explored(
+            &m,
+            128,
+            "--- ty stdout ---\nModel checking complete: No errors found (exhaustive).\n\
+             Statistics:\n  States found: 1\n",
+            "explored-space regression",
+        );
+    }
+
+    /// The other direction is a failure too, and for a different reason: a `ty`
+    /// count LARGER than the interpreter's means the emitted TLA+ admits states
+    /// the model does not, so the two tiers are not checking the same machine.
+    /// Neither direction may be waved through as "close enough".
+    #[test]
+    #[should_panic(expected = "TIER DISAGREEMENT ON THE EXPLORED SPACE")]
+    fn a_ty_verdict_from_a_larger_space_is_not_a_proof_either() {
+        let m = ring_model();
+        assert_same_space_explored(
+            &m,
+            128,
+            "Statistics:\n  States found: 200\n",
+            "explored-space regression",
+        );
+    }
+
+    /// A clean verdict on an unparseable transcript credits nothing.
+    #[test]
+    #[should_panic(expected = "no evidence it explored anything")]
+    fn a_clean_verdict_without_a_state_count_credits_nothing() {
+        let m = ring_model();
+        assert_same_space_explored(&m, 128, "No errors found.", "explored-space regression");
     }
 }

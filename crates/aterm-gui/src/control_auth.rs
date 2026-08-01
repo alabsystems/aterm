@@ -489,10 +489,15 @@ fn mutate_unleased_artifact<T>(path: &Path, mutate: impl FnOnce() -> T) -> Optio
 
 impl Drop for ArtifactPathLease {
     fn drop(&mut self) {
-        // Release the cross-process fence before waking a local waiter. The file
-        // remains present; dropping the handle releases its advisory lock even
-        // on crash, without a pathname deletion/recreation race.
-        drop(self.os_lock.take());
+        // Release the cross-process fence before waking a local waiter. An
+        // explicit unlock matters on Unix: `flock` follows the open-file
+        // description into duplicated/fork-inherited descriptors, so merely
+        // dropping this process's handle can leave a transient lock behind in a
+        // child between fork and exec. Crashes still release the lock when every
+        // inherited handle closes, without a pathname deletion/recreation race.
+        if let Some(os_lock) = self.os_lock.take() {
+            let _ = os_lock.unlock();
+        }
         let Some(key) = self.key.take() else {
             return;
         };
@@ -2567,6 +2572,37 @@ mod tests {
             b"explicit",
             "failure cleanup is structurally unable to unlink explicit targets"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_capture_release_unlocks_an_inherited_descriptor() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-img-inherited-lock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+
+        let first = ConfinedImage::for_test(&dir, "first.png");
+        let first_lease = acquire_capture_name_lease(&first, || false)
+            .expect("first lease acquisition")
+            .expect("first explicit lease");
+        let inherited = first_lease
+            .os_lock
+            .as_ref()
+            .expect("explicit Unix lease owns an OS lock")
+            .try_clone()
+            .expect("duplicate the descriptor as fork would");
+        drop(first_lease);
+
+        let second = ConfinedImage::for_test(&dir, "second.png");
+        let second_lease = acquire_capture_name_lease(&second, || false)
+            .expect("release must not leave a lock in an inherited descriptor")
+            .expect("second explicit lease");
+        drop(second_lease);
+        drop(inherited);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

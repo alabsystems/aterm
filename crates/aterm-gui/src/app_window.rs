@@ -52,18 +52,20 @@ pub(crate) const fn window_title_authority(
 }
 
 /// Decide the `attach_os_window` outcome at its real installation seam. A
-/// stale/missing logical window must fail closed: it cannot publish startup
-/// milestones or tell the caller that a present target exists.
+/// stale/missing logical window must fail closed: it cannot offer startup
+/// milestones or tell the caller that a present target exists. Every successful
+/// installation offers its complete timeline to the process-wide first-write
+/// slot; that slot, rather than the backend's Pending/Ready state, decides which
+/// successful surface is the startup surface.
 #[must_use]
 fn present_target_install_outcome(
-    pending_join: bool,
     present_installed: bool,
     milestones: crate::metrics::StartupAttachMilestones,
 ) -> (bool, Option<crate::metrics::StartupAttachMilestones>) {
     if !present_installed {
         return (false, None);
     }
-    (true, pending_join.then_some(milestones))
+    (true, Some(milestones))
 }
 
 impl App {
@@ -362,9 +364,16 @@ impl App {
         // Once-only font-feature diagnostics — now that the backend carries the
         // shaping AND the resolved font config, so the font probe is accurate.
         self.warn_font_feature_issues();
-        // Hand the renderer-resolved terminal face (+ its real bold sibling) to the
-        // chrome rasterizer, so Settings/About/Palette render in the user's font.
-        self.sync_chrome_fonts();
+        // NOT `sync_chrome_fonts()` here. It hands the terminal face to the chrome
+        // rasterizer so Settings/About/Palette render in the user's font, and it
+        // costs ~295 ms (a ChromeFace parse of the resolved face plus a semantic
+        // surface fork) — measured on the event-loop thread, INSIDE the window-attach
+        // bracket, i.e. squarely between launch and the first frame. Nothing the
+        // first terminal frame draws reads those faces: every `tray_raster`
+        // consumer is an overlay (Settings, About, Palette, the modal trays) that
+        // only exists after a deliberate user action. So it runs on the
+        // first-present hook in `app_render` instead, where it is off time-to-glass
+        // and still far earlier than any overlay can be opened.
     }
 
     /// Create the OS window + present surface for logical window `wid` and attach
@@ -397,9 +406,11 @@ impl App {
         // size jump on 1× displays, no unthemed flash). Every non-first attach
         // (Cmd-N) sees a Ready slot — byte-identical behavior to before.
         let pending_join = self.backend.is_pending();
-        // Startup-only drill-down. These stamps are committed to the metrics
-        // ledger only if this pending-backend attach installs a present target;
-        // later Cmd-N windows cannot publish or replace the startup sample.
+        // Startup-only drill-down. Every successful installation offers these
+        // stamps to a process-wide OnceLock. The first successful surface wins;
+        // later Cmd-N windows cannot replace it. Do NOT key this to `pending_join`:
+        // an early proxy Wake may legitimately finalize the backend before the
+        // first `resumed` attach reaches this function.
         let startup_attach_entry = Instant::now();
         // The window holds the terminal grid PLUS the tab-strip rows at the top PLUS
         // independent configured top and base bottom padding. `window_frame_px`
@@ -790,7 +801,6 @@ impl App {
                         false
                     };
                     let (attached, startup_milestones) = present_target_install_outcome(
-                        pending_join,
                         present_installed,
                         crate::metrics::StartupAttachMilestones::new([
                             startup_attach_entry,
@@ -895,7 +905,6 @@ impl App {
             false
         };
         let (attached, startup_milestones) = present_target_install_outcome(
-            pending_join,
             present_installed,
             crate::metrics::StartupAttachMilestones::new([
                 startup_attach_entry,
@@ -1935,23 +1944,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_window_cannot_publish_or_claim_a_present_target() {
+    fn first_successful_target_offers_milestones_even_after_early_backend_finalize() {
+        let app = App::headless_for_test();
+        assert!(
+            !app.backend.is_pending(),
+            "regression precondition: an early Wake already finalized the backend"
+        );
         let now = Instant::now();
         let milestones = crate::metrics::StartupAttachMilestones::new([now; 7]);
-        let (attached, publication) = present_target_install_outcome(true, false, milestones);
+        let (attached, publication) = present_target_install_outcome(false, milestones);
         assert!(
             !attached && publication.is_none(),
             "negative control: a stale wid must fail even after surface creation"
         );
-        let (attached, publication) = present_target_install_outcome(false, true, milestones);
-        assert!(
-            attached && publication.is_none(),
-            "a later successfully installed window remains a normal success"
-        );
-        let (attached, publication) = present_target_install_outcome(true, true, milestones);
+        // `pending_join == false` used to suppress this publication candidate.
+        // Its absence from this seam is the regression pin: an early Wake may
+        // finalize the backend before `resumed`, but the first surface still owns
+        // a complete attach timeline.
+        let (attached, publication) = present_target_install_outcome(true, milestones);
         assert!(
             attached && publication.is_some(),
-            "only a successfully installed initial target may publish milestones"
+            "a successfully installed target must offer its complete milestones"
         );
     }
 
