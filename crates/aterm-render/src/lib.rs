@@ -145,6 +145,34 @@ pub const MISSING_FONT_CLASS_TEXT: u8 = 1 << 0;
 /// its colour emoji face.
 pub const MISSING_FONT_CLASS_EMOJI: u8 = 1 << 1;
 
+/// Process-global source-byte intern for DISCOVERED fallback faces (the ones
+/// `build_fallback_chain` and the symbol/colour scans read off disk).
+///
+/// Separate from [`FONT_BYTES_INTERN`], which is `thread_local!` and belongs to the
+/// host-INJECTION path: that store's job is "N panes injecting the same font on the
+/// same thread cost one copy". Discovery runs on short-lived worker threads, so a
+/// thread-local store is empty every time and each generation re-allocates a 23 MB
+/// blob. Keyed by byte equality, like every other intern here.
+static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<std::sync::Arc<Vec<u8>>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Intern `bytes` in [`DISCOVERED_FONT_BYTES`], reusing an identical blob when one
+/// is already resident. Copies only a genuinely new face.
+fn intern_discovered_font_bytes(bytes: &[u8]) -> std::sync::Arc<Vec<u8>> {
+    let mut store = DISCOVERED_FONT_BYTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = store
+        .iter()
+        .find(|a| a.len() == bytes.len() && a.as_slice() == bytes)
+    {
+        return existing.clone();
+    }
+    let arc = std::sync::Arc::new(bytes.to_vec());
+    store.push(arc.clone());
+    arc
+}
+
 /// Parse a fallback `fontdue::Font` from `bytes`, sharing ONE parsed instance across
 /// all Renderers for identical bytes (a broad Unicode fallback is ~370MB parsed, so
 /// without this every pane paid it). Content-keyed by byte equality. Returns the
@@ -2180,13 +2208,95 @@ fn x_height_em_of(face: &ttf_parser::Face<'_>, upem: f32) -> Option<f32> {
     (bb.y_max > 0).then(|| f32::from(bb.y_max) / upem)
 }
 
-/// One loaded broad/symbol fallback CHAIN face (W8): the parsed fontdue face
-/// (the portable/deterministic raster), its source bytes + collection index
-/// (ttf-parser cmap/gid/metrics duty and the macOS CoreText raster build both
-/// need them), the load path (diagnostics), and the normalization facts.
+/// A chain face's `fontdue::Font`, materialised from the resident bytes on FIRST
+/// ACTUAL USE rather than at admission.
+///
+/// WHY. `fontdue::Font::from_bytes` eagerly converts every glyph outline: MEASURED
+/// on this machine at opt-level 0, 1799 ms for Hiragino Sans GB (29,352 glyphs) and
+/// 1438 ms for Arial Unicode (50,377 glyphs), against 0.043 ms / 0.018 ms for
+/// `ttf_parser::Face::parse` over the identical bytes. On the DEFAULT macOS path
+/// neither of those parses is read: `fallback_has` probes coverage through
+/// ttf-parser, and the rasterizer is CoreText, which draws from the bytes. So the
+/// eager parse was pure cold-start latency for the common case, and this defers it
+/// to the first caller that genuinely needs a fontdue face — the portable
+/// rasterizer, or the CoreText fail-safe.
+///
+/// SHAPE. The cell is `Arc`-shared, so CLONES of a `FallbackFace` (semantic forks,
+/// `rebuild_from_admitted`, publication) share one materialisation instead of
+/// racing to repeat it. `Some(None)` inside is the terminal "fontdue REJECTED these
+/// bytes" verdict, cached like any other, and is what
+/// [`Renderer::retire_unparsable_fallback`] acts on.
+///
+/// NO CONVERGENCE IS CLAIMED. The parse runs OUTSIDE the cell and a losing racer's
+/// result is discarded (the same discipline, and the same limitation, as
+/// [`intern_parsed_font`]): two threads that want the same unmaterialised face can
+/// both pay a full parse. That is deliberate — `OnceLock::get_or_init` would make
+/// one of them BLOCK on the other's parse, which is exactly what a render thread
+/// must never do behind a warm thread.
+#[derive(Clone)]
+struct LazyFontdue(std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<fontdue::Font>>>>);
+
+impl LazyFontdue {
+    /// An UNPARSED cell (the discovery path): nothing is read until [`Self::get`].
+    fn deferred() -> Self {
+        LazyFontdue(std::sync::Arc::new(std::sync::OnceLock::new()))
+    }
+
+    /// A cell that is ALREADY parsed (the eager host-injection path), so the
+    /// injected-bytes contract — "fails loudly at injection, never later" — is
+    /// unchanged and no injected face can ever parse mid-frame.
+    fn ready(font: std::sync::Arc<fontdue::Font>) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(Some(font));
+        LazyFontdue(std::sync::Arc::new(cell))
+    }
+
+    /// The parsed face, materialising it from `bytes` on first call. `None` means
+    /// fontdue rejected the bytes (cached: a second call does not re-parse).
+    fn get(&self, bytes: &[u8]) -> Option<&std::sync::Arc<fontdue::Font>> {
+        if self.0.get().is_none() {
+            // Parse OUTSIDE the cell, then publish; a racer's duplicate result is
+            // dropped by `set`. See the type docs on why this is not `get_or_init`.
+            let parsed = intern_parsed_font(bytes).ok().map(|(_, font)| font);
+            let _ = self.0.set(parsed);
+        }
+        self.0.get().and_then(Option::as_ref)
+    }
+
+    /// Whether materialisation has already been ATTEMPTED and FAILED. Never
+    /// parses — a pure read of the cached verdict, safe on the render thread.
+    fn known_bad(&self) -> bool {
+        matches!(self.0.get(), Some(None))
+    }
+
+    /// TEST ONLY: whether the deferred parse has happened yet. This is the
+    /// observable the laziness tests assert on — "startup did not fontdue-parse
+    /// the 23 MB system faces" is otherwise only visible as a wall-clock number.
+    #[cfg(test)]
+    fn is_materialised(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    /// TEST ONLY: a cell already latched to "fontdue REJECTED these bytes".
+    /// `fontdue_admissible` is written precisely so this state is unreachable
+    /// from real bytes, so the retire path it guards can only be exercised by
+    /// manufacturing the verdict.
+    #[cfg(test)]
+    fn failed_parse() -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(None);
+        LazyFontdue(std::sync::Arc::new(cell))
+    }
+}
+
+/// One loaded broad/symbol fallback CHAIN face (W8): the (lazily materialised)
+/// fontdue face — the portable/deterministic raster — its source bytes +
+/// collection index (ttf-parser cmap/gid/metrics duty and the macOS CoreText
+/// raster build both need them), the load path (diagnostics), and the
+/// normalization facts.
 #[derive(Clone)]
 struct FallbackFace {
-    font: std::sync::Arc<fontdue::Font>,
+    font: LazyFontdue,
     bytes: std::sync::Arc<Vec<u8>>,
     /// Collection face index. Chain faces load fontdue's default face 0 today;
     /// carried so the ttf-parser/CoreText side can never drift from it.
@@ -2197,19 +2307,136 @@ struct FallbackFace {
 }
 
 impl FallbackFace {
-    /// Build from raw bytes (interned), face index 0 — the same face fontdue
-    /// parses by default, so cmap/gid/raster duty all agree on one face.
+    /// Build EAGERLY from host-injected bytes (interned), face index 0 — the same
+    /// face fontdue parses by default, so cmap/gid/raster duty all agree on one
+    /// face. Injection is a host API that must fail loudly at the call, and its
+    /// blobs are the host's own (web fonts), not the 23 MB system faces that make
+    /// the discovery path slow — so it keeps the pre-existing eager parse.
     fn from_bytes(bytes: &[u8], path: Option<String>) -> Result<FallbackFace, String> {
         let (bytes, font) = intern_parsed_font(bytes)?;
         let norm = face_norm_facts(&bytes, 0);
         Ok(FallbackFace {
-            font,
+            font: LazyFontdue::ready(font),
             bytes,
             index: 0,
             path,
             norm,
         })
     }
+
+    /// Build LAZILY from bytes just read off disk: hold the bytes, validate the
+    /// face with ttf-parser, and defer the fontdue parse to first actual use.
+    ///
+    /// ADMISSION IS NOT WEAKENED. A bare `ttf_parser::Face::parse` would be a
+    /// strictly weaker test than the eager `fontdue::Font::from_bytes` it replaces,
+    /// and a face fontdue would have REJECTED could then enter the chain, shadow a
+    /// good entry, and (being non-tier) even end the candidate scan before the
+    /// broad backstop was reached. [`fontdue_admissible`] closes that: it replays
+    /// both of fontdue 0.9.3's failure modes over the parsed face without touching
+    /// an outline. [`Renderer::retire_unparsable_fallback`] is the second line of
+    /// defence if it is ever wrong.
+    fn from_path_bytes(bytes: &[u8], path: Option<String>) -> Result<FallbackFace, String> {
+        // PROCESS-GLOBAL intern, not the thread-local one. `intern_font_bytes_slice`
+        // keys off FONT_BYTES_INTERN, a `thread_local!` store documented for the
+        // injection path ("N panes injecting the same font cost one copy, not N").
+        // `build_fallback_chain` calls this from `std::thread::scope` WORKERS, so
+        // that store is always empty and every generation allocated its own copy of
+        // each 23 MB face — measured: two chain builds shared 2/2 blobs before the
+        // lazy-parse change and 0/2 after. Discovery-path faces are process-wide by
+        // nature, so they belong in a process-wide store.
+        let bytes = intern_discovered_font_bytes(bytes);
+        if !fontdue_admissible(&bytes, 0) {
+            return Err("face is not admissible as a fontdue font".to_string());
+        }
+        let norm = face_norm_facts(&bytes, 0);
+        Ok(FallbackFace {
+            font: LazyFontdue::deferred(),
+            bytes,
+            index: 0,
+            path,
+            norm,
+        })
+    }
+}
+
+/// Whether `fontdue::Font::from_bytes(bytes, FontSettings { collection_index: index,
+/// .. })` would SUCCEED — decided with ttf-parser alone, i.e. without fontdue's
+/// eager per-glyph outline conversion (the ~1.7 s of cold start this whole change
+/// exists to defer).
+///
+/// READ OFF the pinned `fontdue 0.9.3` source (`src/font.rs::from_bytes`), which
+/// can only fail in two places:
+///
+///  1. `Face::parse(data, collection_index)` returns `Err` — replayed exactly;
+///  2. `generate_glyph(index)` returns `Err("Attempted to map a codepoint out of
+///     bounds.")` for some index in `indices_to_load`, i.e. `index >=
+///     number_of_glyphs()`. `indices_to_load` is `{0}` ∪ every NONZERO glyph id any
+///     cmap subtable maps a codepoint to (∪ GSUB-reachable ids when
+///     `load_substitutions`, which the default settings enable — the GSUB side is
+///     NOT replayed; see the caveat below).
+///
+/// Everything else in that function — kerning, names, line metrics — is infallible
+/// or falls back to a default.
+///
+/// THIS IS NOT FREE, and the honest numbers matter: the cmap walk is the same
+/// enumeration fontdue does, minus the outline conversion. MEASURED on this
+/// machine at opt-level 0, against the eager `fontdue::Font::from_bytes` it
+/// replaces:
+///
+/// ```text
+///   Hiragino Sans GB.ttc  23.5 MB   admissible  203.4 ms   fontdue  1817.2 ms
+///   Arial Unicode.ttf     23.3 MB   admissible   24.5 ms   fontdue  1486.6 ms
+///   STIXTwoMath.otf        0.8 MB   admissible   24.9 ms   fontdue   135.1 ms
+///   Apple Symbols.ttf      0.9 MB   admissible    6.9 ms   fontdue    76.5 ms
+/// ```
+///
+/// So the two chain candidates cost ~228 ms of validation instead of ~3304 ms of
+/// parsing (and they run concurrently, so ~203 ms of wall clock instead of
+/// ~1817 ms). A bare `ttf_parser::Face::parse` would be ~50 µs — that difference
+/// is exactly what buys back the admission strength, and it is why this is not
+/// simply `Face::parse(..).is_ok()`.
+///
+/// CAVEATS, stated rather than glossed. This is a REPLICATION of another crate's
+/// internals, and two gaps are known: the workspace links ttf-parser 0.25 while
+/// fontdue links 0.21, so step 1 is judged by a different parser version; and the
+/// GSUB arm of `indices_to_load` is not walked. Both can only make this predicate
+/// too PERMISSIVE, never too strict, which is why
+/// [`Renderer::retire_unparsable_fallback`] exists.
+///
+/// Two tests hold it: `fontdue_admissible_agrees_with_fontdue_on_this_machines_fonts`
+/// checks it against fontdue itself over every real face it can reach (and MEASURED
+/// no disagreement, in either direction, over 33 of them — so that test alone does
+/// not prove the extra check does anything), and
+/// `admission_rejects_a_face_ttf_parser_accepts_but_fontdue_does_not` supplies the
+/// separating input that does.
+fn fontdue_admissible(bytes: &[u8], index: u32) -> bool {
+    let Ok(face) = ttf_parser::Face::parse(bytes, index) else {
+        return false;
+    };
+    let glyph_count = face.number_of_glyphs();
+    // `indices_to_load` always contains 0, so a face with no glyphs at all trips
+    // the same bound check inside fontdue.
+    if glyph_count == 0 {
+        return false;
+    }
+    let Some(cmap) = face.tables().cmap else {
+        return true; // no cmap: `indices_to_load` stays {0}, which is in range
+    };
+    let mut ok = true;
+    for subtable in cmap.subtables {
+        subtable.codepoints(|cp| {
+            if let Some(gid) = subtable.glyph_index(cp)
+                && gid.0 != 0
+                && gid.0 >= glyph_count
+            {
+                ok = false;
+            }
+        });
+        if !ok {
+            break;
+        }
+    }
+    ok
 }
 
 /// Runtime per-codepoint font-fallback resolver (M3 FONT-DISCOVERY).
@@ -2758,14 +2985,15 @@ pub fn warm_font_coverage_index() {
     let _ = font_coverage_index();
 }
 
-/// The FIRST candidate path whose bytes read AND intern-parse OK, in order —
+/// The FIRST candidate path whose bytes read AND pass admission, in order —
 /// first-success-wins, identical to the lazy `ensure_fallback` /
-/// `ensure_symbol_fallback` loops. A parsed face lands in the process-global
-/// parsed-face intern.
+/// `ensure_symbol_fallback` loops. The face's fontdue parse is DEFERRED
+/// ([`FallbackFace::from_path_bytes`]); when it happens it lands in the
+/// process-global parsed-face intern.
 fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
     paths.iter().find_map(|p| {
         let bytes = font_file::read_font_file(std::path::Path::new(p)).ok()?;
-        FallbackFace::from_bytes(&bytes, Some(p.clone())).ok()
+        FallbackFace::from_path_bytes(&bytes, Some(p.clone())).ok()
     })
 }
 
@@ -2775,21 +3003,28 @@ fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
 /// scan. On macOS this yields `[Hiragino Sans GB, Arial Unicode]` (native CJK first,
 /// broad backstop second); everywhere else a single broad face; a configured/env
 /// path still wins outright (it loads first and, not being a tier entry, ends the
-/// scan). Each parsed face lands in the process-global parsed-face intern, so it is
-/// safe to run on a BACKGROUND thread (the render thread's later re-read hits the
-/// intern by byte equality). An EMPTY result means no candidate loaded.
+/// scan). A face's bytes are interned and its fontdue parse DEFERRED, so this is
+/// safe to run on a BACKGROUND thread and cheap enough to run anywhere. An EMPTY
+/// result means no candidate loaded.
 fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
-    // THE COLD-START COST, and why this is threaded.
+    // WHAT THIS COSTS NOW, and why the threads remain.
     //
     // The chain is normally TWO faces on macOS — Hiragino Sans GB (23.5 MB) then
-    // Arial Unicode (23.3 MB) — and `FallbackFace::from_bytes` parses each through
-    // fontdue, which eagerly converts every glyph outline (29k + 50k of them).
-    // Measured on this machine: 187 ms + 156 ms release, 1700 ms + 1368 ms at
-    // opt-level 0. Serially that is the whole of `seal_admitted_font_sources`, which
-    // is the whole of the backend-build thread, which is what window attach blocks
-    // on before the first frame. The two parses are independent and each is
-    // single-threaded, so running them concurrently halves the wall clock (measured
-    // 2918 ms serial -> 1629 ms threaded at opt-level 0, ~2-3% contention).
+    // Arial Unicode (23.3 MB). This function USED to fontdue-parse both here, which
+    // eagerly converts every glyph outline (29,352 + 50,377 of them): measured on
+    // this machine 1799 ms + 1438 ms at opt-level 0, and that was the whole of
+    // `seal_admitted_font_sources`, which is the whole of the backend-build thread,
+    // which is what window attach blocks on before the first frame. Threading the
+    // two parses halved it (2918 ms serial -> 1629 ms concurrent); deferring them
+    // (`FallbackFace::from_path_bytes`) removes them from startup altogether.
+    //
+    // What is left per candidate is the file read (1.8 ms + 1.3 ms warm-cache when
+    // the predecessor change measured them) plus the `fontdue_admissible` cmap walk
+    // that keeps admission as strong as the parse it replaced — MEASURED here at
+    // 203.4 ms + 24.5 ms, opt-level 0. That is a real cost, and it is why the scope
+    // stays: those two are the dominant remaining term, they are independent, and
+    // they still overlap. Keeping the shape identical also keeps the scan-rule
+    // argument below unchanged.
     //
     // THE SCAN RULE IS PRESERVED EXACTLY, because it decides which faces exist:
     // native-tier entries are ADDITIVE (keep scanning), the first non-tier face that
@@ -2812,7 +3047,7 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
             .map(|p| {
                 scope.spawn(move || {
                     let bytes = font_file::read_font_file(std::path::Path::new(p)).ok()?;
-                    FallbackFace::from_bytes(&bytes, Some(p.clone())).ok()
+                    FallbackFace::from_path_bytes(&bytes, Some(p.clone())).ok()
                 })
             })
             .collect();
@@ -2840,7 +3075,7 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
             continue;
         };
         let is_native_tier = CJK_NATIVE_FALLBACK_CANDIDATES.contains(&p.as_str());
-        let Ok(face) = FallbackFace::from_bytes(&bytes, Some(p.clone())) else {
+        let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
             continue;
         };
         chain.push(face);
@@ -5617,11 +5852,26 @@ impl Renderer {
 
     /// Whether the symbol-fallback face has a (non-`.notdef`) glyph for `ch`
     /// (loads it lazily).
+    ///
+    /// COVERAGE FROM THE UNICODE CMAP (ttf-parser), for the two reasons
+    /// [`Self::fallback_has`] already gives at length — fontdue mis-selects a Mac
+    /// Roman subtable on Apple `.ttc` faces, and the primary tier was fixed for
+    /// this long ago — plus a third that is specific to this slot.
+    ///
+    /// This probe runs ON THE RENDER THREAD, and it is reached by exactly the code
+    /// points [`SYMBOL_FALLBACK_CANDIDATES`] exists for (U+23F8..23FA ⏸⏹⏺ and
+    /// friends). Asking fontdue would MATERIALISE the deferred parse of
+    /// STIXTwoMath right there — a synchronous stall mid-frame on the first such
+    /// char, which is precisely the cost the lazy chain exists to avoid. The cmap
+    /// is a table read over bytes that are already resident.
     fn symbol_fallback_has(&mut self, ch: char) -> bool {
         self.ensure_symbol_fallback();
-        self.symbol_fallback
-            .as_ref()
-            .is_some_and(|f| f.font.lookup_glyph_index(ch) != 0)
+        self.symbol_fallback.as_ref().is_some_and(|f| {
+            ttf_parser::Face::parse(&f.bytes, f.index)
+                .ok()
+                .and_then(|face| face.glyph_index(ch))
+                .is_some_and(|g| g.0 != 0)
+        })
     }
 
     /// Lazily load the PRIMARY face's real `[bold, italic, bold-italic]` siblings
@@ -5754,6 +6004,24 @@ impl Renderer {
         self.ensure_fallback();
         self.ensure_symbol_fallback();
         self.ensure_styled_faces();
+        // The colour-emoji admission is EAGER on purpose, and it is the largest
+        // read in the generation: MEASURED on this machine, the first macOS
+        // candidate `/System/Library/Fonts/Apple Color Emoji.ttc` is
+        // 192,123,488 B (183 MiB) and takes 9.4 ms warm-cache. It stays here
+        // because this is the LAST moment the face can be admitted at all —
+        // the clear below empties `color_font_paths`, and `ensure_color_font`
+        // early-returns on an empty list, so deferring the read is a silent
+        // loss of colour emoji for the process's lifetime, not an optimization.
+        // `tests/sealed_keeps_embedded_backstop.rs` fails (U+1F680 resolves to
+        // `FaceId::Primary`) if this line goes.
+        //
+        // It is also ALREADY overlapped: the two parses spawned above are only
+        // joined below, and the whole seal MEASURED ~1.82 s at opt-level 0 on
+        // this machine, so this read is ~0.5% of it and rides under them.
+        // What is NOT addressed here is the 183 MiB of unconditional resident
+        // bytes an ASCII-only session never draws from; a memory-mapped read
+        // would make those file-backed, which is a bigger change than the seal
+        // ordering and was deliberately left undone.
         self.ensure_color_font();
         self.block_on_lazy_fallbacks();
 
@@ -6100,42 +6368,50 @@ impl Renderer {
         source: FaceId,
         ch: char,
     ) -> (usize, usize, i32, i32, f32, Vec<u8>) {
+        // The fontdue face travels as an UNMATERIALISED handle (`LazyFontdue`, an
+        // `Arc` clone), not a parsed `Arc<fontdue::Font>`: on the default macOS
+        // path CoreText below draws from the bytes and the handle is never opened,
+        // so recovering the face here must not be what triggers a 1.4-second parse.
         #[allow(clippy::type_complexity)]
-        let parts: Option<(
-            Option<std::sync::Arc<fontdue::Font>>,
-            std::sync::Arc<Vec<u8>>,
-            u32,
-            FaceNorm,
-        )> = match source {
-            FaceId::Fallback => {
-                self.ensure_fallback();
-                // Recover the chain entry that covered `ch` (recorded by
-                // `fallback_has` when this key was built). Fail safe to the
-                // first chain face, then the primary (`.notdef`).
-                self.fallback_pick
-                    .get(&ch)
-                    .and_then(|&i| self.fallback_chain.get(i))
-                    .or_else(|| self.fallback_chain.first())
-                    .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm))
-            }
-            FaceId::SymbolFallback => {
-                self.ensure_symbol_fallback();
-                self.symbol_fallback
-                    .as_ref()
-                    .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm))
-            }
-            // The per-code-point decision was cached by `glyph_key` before this
-            // key was built, so `parts_for` recovers the exact face. `None` if
-            // the decision is somehow absent (it never is on the real path).
-            FaceId::RuntimeFallback => self.runtime_fallback.parts_for(ch),
-            // The mix pick is a pure function of the code point — recompute it
-            // (no per-char memo to recover). Fail safe to the primary below.
-            FaceId::GameMix => game_mix_face_index(ch, self.game_mix.len() + 1)
-                .checked_sub(1)
-                .and_then(|i| self.game_mix.get(i))
-                .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm)),
-            _ => None,
-        };
+        let parts: Option<(Option<LazyFontdue>, std::sync::Arc<Vec<u8>>, u32, FaceNorm)> =
+            match source {
+                FaceId::Fallback => {
+                    self.ensure_fallback();
+                    // Recover the chain entry that covered `ch` (recorded by
+                    // `fallback_has` when this key was built). Fail safe to the
+                    // first chain face, then the primary (`.notdef`).
+                    self.fallback_pick
+                        .get(&ch)
+                        .and_then(|&i| self.fallback_chain.get(i))
+                        .or_else(|| self.fallback_chain.first())
+                        .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm))
+                }
+                FaceId::SymbolFallback => {
+                    self.ensure_symbol_fallback();
+                    self.symbol_fallback
+                        .as_ref()
+                        .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm))
+                }
+                // The per-code-point decision was cached by `glyph_key` before this
+                // key was built, so `parts_for` recovers the exact face. `None` if
+                // the decision is somehow absent (it never is on the real path).
+                // Runtime-discovered faces are parsed EAGERLY (their drawability
+                // probe needs it), so this handle is already materialised.
+                FaceId::RuntimeFallback => {
+                    self.runtime_fallback
+                        .parts_for(ch)
+                        .map(|(font, bytes, index, norm)| {
+                            (font.map(LazyFontdue::ready), bytes, index, norm)
+                        })
+                }
+                // The mix pick is a pure function of the code point — recompute it
+                // (no per-char memo to recover). Fail safe to the primary below.
+                FaceId::GameMix => game_mix_face_index(ch, self.game_mix.len() + 1)
+                    .checked_sub(1)
+                    .and_then(|i| self.game_mix.get(i))
+                    .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm)),
+                _ => None,
+            };
         // `bytes`/`index` feed the CoreText-native raster below — macOS-only.
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let Some((font, bytes, index, norm)) = parts else {
@@ -6165,18 +6441,76 @@ impl Renderer {
         let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = None;
         let raw = if let Some(t) = ct {
             t
-        } else if let Some(f) = font {
+        } else if let Some(f) = font.as_ref().and_then(|lazy| lazy.get(&bytes)) {
             // The portable fontdue raster (and the CT fail-safe), by char —
-            // byte-identical to the pre-W8 path when `scale == 1.0`.
+            // byte-identical to the pre-W8 path when `scale == 1.0`. THIS is the
+            // "first actual use" that materialises a deferred chain parse: it is
+            // reached only where a fontdue face is genuinely about to draw.
             let (m, b) = f.rasterize(ch, eff_px);
             (m.width, m.height, m.xmin, m.ymin, m.advance_width, b)
         } else {
-            // A CT-only face (no fontdue parse) under the fontdue backend:
-            // honest `.notdef` rather than fake blank coverage.
+            // No usable raster from this face. Two ways to get here:
+            //
+            //  * a CT-only runtime face (`font == None`) under the fontdue
+            //    backend — honest `.notdef` rather than fake blank coverage,
+            //    unchanged;
+            //  * a CHAIN face whose DEFERRED fontdue parse just FAILED. It was
+            //    admitted by `fontdue_admissible`, a replication of another
+            //    crate's internals that can only err PERMISSIVELY, so this is
+            //    the case that has to be caught rather than assumed away: left
+            //    in place the face would keep shadowing the entries behind it
+            //    (`fallback_pick` points at it, and it may have ended the
+            //    candidate scan). Retire it, re-probe `ch` against the shortened
+            //    chain, and draw again. `retire_unparsable_fallback` returns
+            //    `true` only when it really removed an entry, so the recursion
+            //    strictly shrinks the chain and terminates.
+            //
+            // The SYMBOL slot is deliberately not retired: it holds at most one
+            // face, so it can shadow nothing, and its fail-safe below is the
+            // same `.notdef` it always was.
+            if source == FaceId::Fallback
+                && font.as_ref().is_some_and(LazyFontdue::known_bad)
+                && self.retire_unparsable_fallback(&bytes)
+            {
+                let _ = self.fallback_has(ch);
+                return self.fallback_mono_raster(source, ch);
+            }
             let (m, b) = self.font.rasterize(ch, self.px);
             (m.width, m.height, m.xmin, m.ymin, m.advance_width, b)
         };
         self.harmonize_fallback_raster(ch, raw)
+    }
+
+    /// Drop the chain entry backed by `bytes` because its DEFERRED fontdue parse
+    /// failed, returning whether an entry was actually removed.
+    ///
+    /// This is the second line of defence behind [`fontdue_admissible`]. Under the
+    /// eager parse this state was unreachable — a face fontdue rejected never
+    /// entered the chain — so the deferred parse must be able to reach the same
+    /// outcome, not merely render tofu from a face it cannot draw.
+    ///
+    /// The per-char memos are dropped exactly as [`Self::set_fallback_bytes`]
+    /// drops them, and for the same reason: `fallback_pick` holds INDICES into the
+    /// chain (removal shifts them), `keys` holds `mono_char(Fallback, ch, ..)`
+    /// decisions taken against the longer chain, and `glyphs` holds rasters under
+    /// those byte-identical keys, so clearing the first two without the third
+    /// would hand back the retired face's old bitmap. Doing this from inside
+    /// `rasterize` is safe: `glyph_image` computes the image and inserts
+    /// afterwards, so no cache iteration is in flight.
+    fn retire_unparsable_fallback(&mut self, bytes: &std::sync::Arc<Vec<u8>>) -> bool {
+        let Some(i) = self
+            .fallback_chain
+            .iter()
+            .position(|f| std::sync::Arc::ptr_eq(&f.bytes, bytes))
+        else {
+            return false;
+        };
+        self.fallback_chain.remove(i);
+        self.fallback_pick.clear();
+        self.keys.clear();
+        self.glyphs.clear();
+        self.font_epoch += 1;
+        true
     }
 
     /// W8 (c): the rasterization SCALE for a fallback face at the current
@@ -7346,8 +7680,15 @@ impl Renderer {
         // `font_chain`'s proofs pin.
         if !self.game_mix.is_empty() && !(self.procedural && procedural::covers(ch)) {
             let pick = game_mix_face_index(ch, self.game_mix.len() + 1);
+            // The mix is host-INJECTED (`set_game_mix_faces`), so its faces are
+            // parsed eagerly and this probe stays the fontdue one it has always
+            // been — no chain face is reachable here, so nothing can be
+            // materialised on the render thread by it.
             if let Some(face) = pick.checked_sub(1).and_then(|i| self.game_mix.get(i))
-                && face.font.lookup_glyph_index(ch) != 0
+                && face
+                    .font
+                    .get(&face.bytes)
+                    .is_some_and(|f| f.lookup_glyph_index(ch) != 0)
             {
                 let key = GlyphKey::mono_char(FaceId::GameMix, ch, StyleBits::REGULAR, self.px_q);
                 self.keys.insert(ch, key);
@@ -18910,6 +19251,343 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&here, &theirs),
             "a warm-thread parse must be the SAME instance the render thread sees"
+        );
+    }
+
+    /// The candidate fallback paths that EXIST on this machine (the real chain
+    /// inputs; empty on a host that ships none, which skips the lazy tests).
+    fn present_fallback_paths() -> Vec<String> {
+        fallback_discovery_paths()
+            .into_iter()
+            .filter(|p| std::path::Path::new(p).is_file())
+            .collect()
+    }
+
+    /// LAZY-FONT-PARSE, the whole point: building the broad-fallback chain must
+    /// NOT fontdue-parse the faces, and neither must probing their coverage.
+    ///
+    /// The two macOS chain faces are 23.5 MB / 23.3 MB and fontdue eagerly
+    /// converts all 29,352 + 50,377 of their glyph outlines — measured 1799 ms +
+    /// 1438 ms at opt-level 0, which used to be essentially the whole of the
+    /// backend-build thread that window attach waits on. Nothing on the default
+    /// macOS path reads those parses: `fallback_has` probes the ttf-parser cmap,
+    /// and the rasterizer is CoreText.
+    #[test]
+    fn building_the_fallback_chain_does_not_fontdue_parse_the_faces() {
+        let paths = present_fallback_paths();
+        if paths.is_empty() {
+            eprintln!("SKIP: no built-in fallback candidate exists on this machine");
+            return;
+        }
+        let chain = build_fallback_chain(&paths);
+        assert!(!chain.is_empty(), "a present candidate must load");
+        for face in &chain {
+            assert!(
+                !face.font.is_materialised(),
+                "chain entry {:?} fontdue-parsed at BUILD time",
+                face.path
+            );
+        }
+    }
+
+    /// The same, through the real startup path: `seal_admitted_font_sources` is
+    /// what the GUI's backend-build thread runs and what window attach blocks on.
+    /// It must settle the whole font generation without materialising a single
+    /// fallback or symbol fontdue parse.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn sealing_a_generation_does_not_fontdue_parse_the_fallback_or_symbol_faces() {
+        if present_fallback_paths().is_empty() {
+            eprintln!("SKIP: no built-in fallback candidate exists on this machine");
+            return;
+        }
+        let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
+            .expect("embedded font builds a renderer");
+        // `from_bytes` installs no candidate paths (only `from_system` does);
+        // seed the real ones so this seals the generation a GUI backend seals.
+        r.fallback_paths = present_fallback_paths();
+        r.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
+        let sources = r.seal_admitted_font_sources();
+        assert!(
+            !sources.fallback.is_empty(),
+            "sealing must still admit the broad fallback chain"
+        );
+        for face in &r.fallback_chain {
+            assert!(
+                !face.font.is_materialised(),
+                "seal fontdue-parsed chain entry {:?}",
+                face.path
+            );
+        }
+        if let Some(sym) = &r.symbol_fallback {
+            assert!(
+                !sym.font.is_materialised(),
+                "seal fontdue-parsed symbol entry {:?}",
+                sym.path
+            );
+        }
+    }
+
+    /// DEFECT 2 — THE SYMBOL SLOT. `symbol_fallback_has` runs on the RENDER
+    /// THREAD and is reached by exactly the code points
+    /// `SYMBOL_FALLBACK_CANDIDATES` exists for (⏸⏹⏺ U+23F8..23FA). Asking
+    /// fontdue for that coverage would materialise the STIXTwoMath parse right
+    /// there — a synchronous mid-frame stall, and the one place where going lazy
+    /// would have MOVED cost rather than removed it. The probe must read the
+    /// ttf-parser cmap, exactly as the chain's `fallback_has` already does.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn probing_symbol_coverage_does_not_fontdue_parse_the_symbol_face() {
+        let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
+            .expect("embedded font builds a renderer");
+        r.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
+        r.debug_block_on_lazy_fallbacks();
+        let Some(before) = r.symbol_fallback.as_ref().map(|f| f.font.clone()) else {
+            eprintln!("SKIP: no symbol fallback face on this machine");
+            return;
+        };
+        assert!(
+            !before.is_materialised(),
+            "the symbol face must arrive unparsed"
+        );
+        // The exact codepoint the symbol slot exists for.
+        let covered = r.symbol_fallback_has('\u{23F8}');
+        assert!(
+            !before.is_materialised(),
+            "probing ⏸ coverage fontdue-parsed the symbol face (covered={covered})"
+        );
+    }
+
+    /// LAZINESS MUST END WHERE THE FACE IS ACTUALLY USED. Under the portable
+    /// fontdue backend a fallback glyph really does need the parse, and it must
+    /// happen then — deferring it forever would be tofu, not a speed-up.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn rasterizing_through_fontdue_materialises_the_deferred_parse() {
+        let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
+            .expect("embedded font builds a renderer");
+        #[cfg(target_os = "macos")]
+        {
+            r.rasterizer = RasterKind::Fontdue;
+        }
+        r.fallback_paths = present_fallback_paths();
+        if r.fallback_paths.is_empty() {
+            eprintln!("SKIP: no built-in fallback candidate exists on this machine");
+            return;
+        }
+        r.debug_block_on_lazy_fallbacks();
+        // A CJK ideograph the primary DejaVu face cannot have.
+        let ch = '\u{4E00}';
+        if !r.fallback_has(ch) {
+            eprintln!("SKIP: no chain face covers U+4E00 here");
+            return;
+        }
+        let i = r.fallback_pick[&ch];
+        assert!(
+            !r.fallback_chain[i].font.is_materialised(),
+            "coverage alone must not parse"
+        );
+        let key = GlyphKey::mono_char(FaceId::Fallback, ch, StyleBits::REGULAR, r.px_q);
+        let _ = r.glyph_image(key);
+        assert!(
+            r.fallback_chain
+                .iter()
+                .any(|f| f.font.is_materialised() || f.path.is_none()),
+            "the fontdue raster path must materialise the face it draws from"
+        );
+    }
+
+    /// DEFECT 3, PART ONE — ADMISSION IS NOT WEAKENED. `fontdue_admissible` is
+    /// what stops a face `fontdue::Font::from_bytes` would REJECT from entering
+    /// the chain now that admission no longer runs that constructor. It replays
+    /// fontdue 0.9.3's two failure modes from ttf-parser alone, which is a
+    /// replication of another crate's internals across a ttf-parser major
+    /// version — so it is checked EMPIRICALLY, against fontdue itself, over the
+    /// real faces on this machine.
+    ///
+    /// Bounded on purpose: every built-in fallback/symbol candidate that exists
+    /// (those are the faces that actually matter, and the ones that cost seconds
+    /// to parse), plus a sample of small system faces.
+    #[test]
+    fn fontdue_admissible_agrees_with_fontdue_on_this_machines_fonts() {
+        let mut paths: Vec<String> = present_fallback_paths();
+        paths.extend(
+            symbol_discovery_paths()
+                .into_iter()
+                .filter(|p| std::path::Path::new(p).is_file()),
+        );
+        paths.extend(
+            font_files()
+                .into_iter()
+                .filter_map(|p| p.to_str().map(str::to_string))
+                .filter(|p| {
+                    std::fs::metadata(p).is_ok_and(|m| m.len() > 0 && m.len() < 2 * 1024 * 1024)
+                })
+                .take(30),
+        );
+        paths.sort();
+        paths.dedup();
+        let mut checked = 0usize;
+        for p in &paths {
+            let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
+                continue;
+            };
+            let predicted = fontdue_admissible(&bytes, 0);
+            let actual =
+                fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
+                    .is_ok();
+            assert_eq!(
+                predicted, actual,
+                "fontdue_admissible disagreed with fontdue for {p}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no font file was readable to check against");
+        eprintln!("fontdue_admissible agreed with fontdue on {checked} face(s)");
+    }
+
+    /// Rewrite `maxp.numGlyphs` in a copy of `bytes`. Used only to manufacture
+    /// the ONE input class that separates `fontdue_admissible` from a bare
+    /// `ttf_parser::Face::parse`.
+    fn patch_num_glyphs(bytes: &[u8], n: u16) -> Option<Vec<u8>> {
+        let num_tables = u16::from_be_bytes([*bytes.get(4)?, *bytes.get(5)?]) as usize;
+        for i in 0..num_tables {
+            let rec = 12 + i * 16;
+            if bytes.get(rec..rec + 16)?.starts_with(b"maxp") {
+                let off = u32::from_be_bytes(bytes[rec + 8..rec + 12].try_into().ok()?) as usize;
+                let mut out = bytes.to_vec();
+                out.get_mut(off + 4..off + 6)?
+                    .copy_from_slice(&n.to_be_bytes());
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// DEFECT 3, PART ONE, NON-VACUOUSLY. The agreement test above only proves
+    /// `fontdue_admissible` is not too STRICT — every real face on this machine
+    /// happens to satisfy both parsers, so a bare `ttf_parser::Face::parse`
+    /// would pass it too. This is the input class that actually separates them:
+    /// a face whose `cmap` maps code points to glyph ids past `maxp.numGlyphs`,
+    /// which ttf-parser ACCEPTS and `fontdue::Font::from_bytes` REJECTS
+    /// ("Attempted to map a codepoint out of bounds."). Admission must reject
+    /// it, or a face fontdue cannot rasterize enters the chain — where it can
+    /// shadow a good entry AND, being non-tier, end the candidate scan.
+    #[test]
+    fn admission_rejects_a_face_ttf_parser_accepts_but_fontdue_does_not() {
+        let patched = patch_num_glyphs(embedded_symbols_font(), 1)
+            .expect("the bundled symbols face has a maxp table");
+        assert!(
+            ttf_parser::Face::parse(&patched, 0).is_ok(),
+            "the separating input must still be a face ttf-parser ACCEPTS \
+             (otherwise this proves nothing about the extra check)"
+        );
+        assert!(
+            fontdue::Font::from_bytes(patched.as_slice(), fontdue::FontSettings::default())
+                .is_err(),
+            "the separating input must be one fontdue REJECTS"
+        );
+        assert!(
+            !fontdue_admissible(&patched, 0),
+            "admission must reject what the deferred fontdue parse would reject"
+        );
+        assert!(
+            FallbackFace::from_path_bytes(&patched, Some("patched".into())).is_err(),
+            "such a face must never enter the chain"
+        );
+    }
+
+    /// DEFECT 3, PART TWO — A FACE WHOSE DEFERRED PARSE FAILS MUST DROP OUT OF
+    /// THE CHAIN, NOT SHADOW. Under the eager parse this state was unreachable
+    /// (fontdue rejected the face before it was ever admitted), so the lazy path
+    /// has to reach the same outcome by RETIRING the entry and re-resolving,
+    /// rather than by drawing tofu from a face it cannot rasterize.
+    ///
+    /// The failed verdict is manufactured (`LazyFontdue::failed_parse`) because
+    /// `fontdue_admissible` is written precisely so real bytes cannot produce it;
+    /// what is under test is the handling, not the trigger. The fontdue backend
+    /// is forced so CoreText cannot quietly draw the bad entry on macOS.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn a_chain_face_whose_deferred_parse_fails_is_retired_not_left_shadowing() {
+        let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
+            .expect("embedded font builds a renderer");
+        #[cfg(target_os = "macos")]
+        {
+            r.rasterizer = RasterKind::Fontdue;
+        }
+        r.fallback_paths.clear();
+        r.symbol_fallback_paths.clear();
+        // A GOOD entry that really covers the char, behind a BAD one that claims
+        // the pick. Both are the bundled face, so coverage is not in question —
+        // only which entry the raster path ends up drawing from.
+        let good = FallbackFace::from_bytes(embedded_font(), Some("good".into()))
+            .expect("bundled face is admissible");
+        let bad = FallbackFace {
+            font: LazyFontdue::failed_parse(),
+            bytes: intern_font_bytes_slice(embedded_symbols_font()),
+            index: 0,
+            path: Some("bad".into()),
+            norm: FaceNorm::default(),
+        };
+        r.fallback_chain = vec![bad, good];
+        r.fallback_pick.insert('Z', 0);
+        let key = GlyphKey::mono_char(FaceId::Fallback, 'Z', StyleBits::REGULAR, r.px_q);
+        let img = r.glyph_image(key).clone();
+        assert_eq!(r.fallback_chain.len(), 1, "the bad entry must be retired");
+        assert_eq!(
+            r.fallback_chain[0].path.as_deref(),
+            Some("good"),
+            "the surviving entry must be the good one"
+        );
+        assert_eq!(
+            r.fallback_pick.get(&'Z').copied(),
+            Some(0),
+            "the pick must be re-probed against the shortened chain"
+        );
+        assert!(
+            img.bytes().iter().any(|&b| b > 0),
+            "'Z' must render real coverage from the surviving entry, not blank tofu"
+        );
+    }
+
+    /// `retire_unparsable_fallback` must drop BOTH the entry and every memo that
+    /// outlived it: `fallback_pick` holds chain INDICES (removal shifts them),
+    /// `keys` holds routing decisions taken against the longer chain, and
+    /// `glyphs` holds rasters under byte-identical keys — clearing the first two
+    /// without the third hands back the retired face's own bitmap.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn retiring_a_fallback_entry_clears_the_memos_that_outlived_it() {
+        let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
+            .expect("embedded font builds a renderer");
+        let first = FallbackFace::from_bytes(embedded_symbols_font(), Some("first".into()))
+            .expect("bundled symbols face is admissible");
+        let second = FallbackFace::from_bytes(embedded_font(), Some("second".into()))
+            .expect("bundled face is admissible");
+        let doomed = first.bytes.clone();
+        r.fallback_chain = vec![first, second];
+        r.fallback_pick.insert('Z', 0);
+        let key = GlyphKey::mono_char(FaceId::Fallback, 'Z', StyleBits::REGULAR, r.px_q);
+        r.keys.insert('Z', key);
+        let _ = r.glyph_image(key);
+        let epoch = r.font_epoch;
+
+        assert!(
+            r.retire_unparsable_fallback(&doomed),
+            "the entry backed by these bytes must be found"
+        );
+        assert_eq!(r.fallback_chain.len(), 1);
+        assert_eq!(r.fallback_chain[0].path.as_deref(), Some("second"));
+        assert!(r.fallback_pick.is_empty(), "stale indices must be dropped");
+        assert!(r.keys.is_empty(), "stale routing must be dropped");
+        assert!(r.glyphs.is_empty(), "stale rasters must be dropped");
+        assert!(r.font_epoch > epoch, "a retire must force a repaint");
+
+        // Idempotent: nothing left to remove, so no further cache churn.
+        assert!(
+            !r.retire_unparsable_fallback(&doomed),
+            "retiring an absent face must report that it removed nothing"
         );
     }
 

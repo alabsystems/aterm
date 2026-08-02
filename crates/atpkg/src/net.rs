@@ -723,7 +723,8 @@ mod tests {
         use crate::flow::Fetcher as _;
 
         let scratch = |label: &str| {
-            let d = std::env::temp_dir().join(format!("atpkg-chain-{label}-{}", std::process::id()));
+            let d =
+                std::env::temp_dir().join(format!("atpkg-chain-{label}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             d
@@ -750,7 +751,10 @@ mod tests {
         // and the network index must beat an equal-build sealed seed.
         let candidates = chain.index_candidates().unwrap();
         assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].index_bytes, b"schema = 1 # a", "primary first");
+        assert_eq!(
+            candidates[0].index_bytes, b"schema = 1 # a",
+            "primary first"
+        );
         assert_eq!(candidates[1].index_bytes, b"schema = 1 # b");
         // Primary serves what it has; the fallback serves what primary lacks.
         assert_eq!(chain.pkg_manifest("r", "ay", 1).unwrap().0, b"pkg a");
@@ -776,7 +780,9 @@ mod tests {
             .expect("fallback serves what the primary lacks");
         assert_eq!(std::fs::read(&out).unwrap(), b"pkg b");
         std::fs::remove_file(&out).unwrap();
-        let err = chain.download_for("x", "r", "absent.bin", &out).unwrap_err();
+        let err = chain
+            .download_for("x", "r", "absent.bin", &out)
+            .unwrap_err();
         assert!(err.contains("fallback:"), "{err}");
 
         // BOTH legs failing on the index is a real error naming both sources

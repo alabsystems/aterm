@@ -158,7 +158,9 @@ fn find_trust_bin(bin: &str, first_party_rel_dir: &str) -> Option<PathBuf> {
 #[cfg_attr(trust_verify, trust::skip)]
 fn atpkg_store_probe(exe: &str) -> Option<PathBuf> {
     let bin_dir = if cfg!(windows) {
-        let local = std::env::var("LOCALAPPDATA").ok().filter(|d| !d.is_empty())?;
+        let local = std::env::var("LOCALAPPDATA")
+            .ok()
+            .filter(|d| !d.is_empty())?;
         PathBuf::from(local).join("aterm").join("pkg").join("bin")
     } else {
         unix_store_bin_dir(&home_dirs().into_iter().next()?)
@@ -499,6 +501,30 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// `derived_native_tab_identity` "transient toolchain drift" note above: not
 /// drift, a ceiling that moved with the load.
 ///
+/// **`--backend interpreter`** — the same "these models are small" argument, one
+/// layer down. `ty`'s trust-codegen backend became the default engine under AUTO
+/// selection, and it compiles every action to native code before exploring: on
+/// `NativeTabIdentity` that is 9 actions and 17 invariants compiled to walk 399
+/// states, 18.5s wall / 52s CPU against 0.58s interpreted, for the identical
+/// verdict and the identical count. Native codegen pays for itself somewhere
+/// north of a million states; none of these models are within three orders of
+/// magnitude of that.
+///
+/// It buys less on the suite than that ratio suggests — 266s to 228s — and the
+/// reason is worth writing down so nobody re-measures it hoping for more. With
+/// the spawns serialised, suite wall-clock is ~390 runs times the PER-PROCESS
+/// cost, and what dominates that now is `ty`'s own startup: ~0.5s before it
+/// reads the spec, against ~0.15s for the binary this machine ran a day earlier.
+/// Backend choice cannot touch that floor; only spawning `ty` fewer times could,
+/// and the serialisation buying determinism is worth more than the seconds.
+///
+/// This is a SPEED choice, not a trust one, and it is worth being explicit about
+/// which: the native and interpreted engines are two implementations inside the
+/// same checker, not two independent oracles, so picking one buys no confidence
+/// the other would have. The independent check is the interpreter tier in this
+/// crate, and the thing that makes it independent is
+/// [`assert_same_space_explored`] — which holds either way.
+///
 /// The ceiling is deliberately NOT pinned with `--memory-limit`. Pinning it was
 /// tried and made things worse under exactly the load it was meant to fix:
 /// `ty`'s limit probe is not purely per-process, so a small explicit ceiling
@@ -512,6 +538,8 @@ fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
         .arg("--no-auto-symmetry")
         .arg("--initial-capacity")
         .arg("8192")
+        .arg("--backend")
+        .arg("interpreter")
 }
 
 /// Run a `ty` subprocess — ONE AT A TIME, across the whole test binary.
@@ -1612,7 +1640,10 @@ mod tests {
         let real = "Model checking complete: No errors found (exhaustive).\n\n\
                     Statistics:\n  States found: 128\n  Initial states: 1\n  Transitions: 587\n";
         assert_eq!(ty_states_explored(real), Some(128));
-        assert_eq!(ty_states_explored("Statistics:\n  States found: 1\n"), Some(1));
+        assert_eq!(
+            ty_states_explored("Statistics:\n  States found: 1\n"),
+            Some(1)
+        );
         // Drift / no statistics block / non-numeric — all refusals, not zeros.
         assert_eq!(ty_states_explored("No errors found (exhaustive)."), None);
         assert_eq!(ty_states_explored("  States explored: 128\n"), None);

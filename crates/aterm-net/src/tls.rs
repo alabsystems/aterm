@@ -1250,7 +1250,9 @@ mod tests {
             // are the ones the test's `recv_timeout`s are WAITING on, so an
             // unbounded read here converts a bounded channel timeout into a
             // permanent stall of the whole test run.
-            svc_b.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
+            svc_b
+                .set_read_timeout(Some(NET_TEST_LIVENESS_BOUND))
+                .unwrap();
             let mut first = vec![0u8; FIRST.len()];
             svc_b
                 .read_exact(&mut first)

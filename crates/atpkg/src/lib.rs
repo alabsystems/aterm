@@ -87,6 +87,7 @@ pub mod verify;
 pub use activate::{activate_channel, atomic_symlink, install_shims};
 pub use appgate::{AppIndexGate, app_apply_allowed};
 pub use apply::{Group, TxnOutcome, plan_groups, transact};
+pub use bundled::bundled_seed_dir;
 pub use cache::IndexCache;
 pub use compat::supports;
 pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
@@ -112,7 +113,6 @@ pub use manifest::{
     Artifact, Channel, Cost, Index, Keys, PkgManifest, Program, SUPPORTED_SCHEMA, parse_index,
     parse_pkg,
 };
-pub use bundled::bundled_seed_dir;
 pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
 pub use ops::{active_builds, list_installed, uninstall, which};
 pub use select::{Candidate, Selected, select_index};

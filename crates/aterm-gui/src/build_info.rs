@@ -138,7 +138,11 @@ fn compiler_release() -> &'static str {
 /// ecosystem contract, so the honest display name comes from the flavor — the
 /// classifier that already weighs the compiler's own self-identification.
 fn compiler_name() -> &'static str {
-    if COMPILER_FLAVOR == "t" { "trustc" } else { "rustc" }
+    if COMPILER_FLAVOR == "t" {
+        "trustc"
+    } else {
+        "rustc"
+    }
 }
 
 /// One human line of compiler provenance for the About panel, e.g.

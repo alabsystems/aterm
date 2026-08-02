@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm control verbs parameterized over a SessionHost — the headless half of the control protocol (no winit, no GUI)"
+
+[lints]
+workspace = true
+
+[features]
+# Compile the reference `MemoryHost` + verb-matrix suite into a NON-test build so
+# a downstream host (aterm-gui, orca-daemon) can run it as a dev-dependency. It
+# is always built under `cfg(test)` here, so it cannot rot when the feature is off.
+conformance = []
+
+[dependencies]
+# The engine the verbs read and mutate. Every item used here is unconditional
+# (no feature gate), so a consumer's feature selection cannot change this crate.
+aterm-core = { workspace = true }

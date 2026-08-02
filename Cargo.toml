@@ -52,7 +52,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -124,6 +124,9 @@ aterm-effects = { path = "crates/aterm-effects" }
 aterm-predict = { path = "crates/aterm-predict" }
 aterm-suggest = { path = "crates/aterm-suggest" }
 aterm-core = { path = "crates/aterm-core" }
+# The headless half of the control protocol: verb bodies over a `SessionHost`
+# trait, so a non-GUI host answers the same wire (no winit in its closure).
+aterm-control = { path = "crates/aterm-control" }
 aterm-shell-integration = { path = "crates/aterm-shell-integration" }
 aterm-search = { path = "crates/aterm-search" }
 aterm-selection = { path = "crates/aterm-selection" }

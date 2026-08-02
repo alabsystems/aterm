@@ -571,7 +571,22 @@ pub fn x86_target_probe() -> Result<()> {
         .env("RUSTUP_TOOLCHAIN", "stable")
         .args(["target", "list", "--installed"])
         .output()
-        .map_err(|e| Error::new(format!("failed to run rustup ({e}) — is rustup installed?")))?;
+        .map_err(|e| {
+            // Name the escape hatch. rustup is NOT this repo's toolchain — THE
+            // toolchain is the Trust stage2 tree — and it is wanted here for
+            // exactly one thing: upstream stable's x86_64-apple-darwin std, which
+            // Trust does not have. So on a Trust-only machine this is not a broken
+            // setup to go fix; it is a choice about what to ship, and the operator
+            // needs to be told that rather than sent to install a toolchain manager
+            // the repo otherwise refuses. Its twin in buildplan.rs already says so.
+            Error::new(format!(
+                "failed to run rustup ({e}). The x86_64 compat slice needs upstream \
+                 stable's std for that target (Trust has none — the one documented \
+                 exception to the single-Trust lane). Either install rustup and run \
+                 `rustup +stable target add x86_64-apple-darwin`, or pass --arm64-only \
+                 to ship an Apple-Silicon-only build deliberately."
+            ))
+        })?;
     if !out.status.success() {
         return Err(Error::new(format!(
             "`rustup target list --installed` failed: {}",

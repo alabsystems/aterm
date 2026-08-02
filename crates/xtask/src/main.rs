@@ -70,15 +70,75 @@ fn main() -> ExitCode {
         },
         Some("spec-link") => spec_link(),
         Some("gate") => gate::run(args.get(2).map(String::as_str)),
+        Some("verify") => verify(&args[2..]),
         _ => {
             eprintln!(
-                "usage: xtask <harness-manifest|spec-link|gate <check>>\n\
+                "usage: xtask <harness-manifest|spec-link|gate <check>|verify [args…]>\n\
                  \n\
                  harness-manifest  enumerate #[kani::proof] fns -> target/trust/harness-manifest.json\n\
                  spec-link         lower the anchor graph + run `trust-ir spec-link --require-manifest`\n\
                  gate <check>      local enforcement gate (NO CI): all|drift|dormant|lint|perf\n\
-                                   see docs/EXCEED_GHOSTTY_PLAN.md"
+                                   see docs/EXCEED_GHOSTTY_PLAN.md\n\
+                 verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
+                                   (this is what the `cargo verify` alias dispatches to)"
             );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// verify — the `cargo verify` verb
+// ---------------------------------------------------------------------------
+
+/// Dispatch to `tools/verify.sh`, forwarding every argument verbatim.
+///
+/// This exists ONLY because a cargo alias can expand to a cargo subcommand and
+/// nothing else, so the repo's one gate needs a Rust hop to become a first-class
+/// verb. It deliberately implements no policy: no default flags, no argument
+/// rewriting, no "helpful" mode selection. Everything the gate means lives in
+/// `tools/verify.sh`, and a second place that could disagree with it would
+/// reintroduce exactly the ambiguity that script's header exists to remove.
+///
+/// Fail-closed in both directions that matter:
+///   * a missing / unrunnable `tools/verify.sh` is a FAILURE, never a silent
+///     success — `cargo verify` must not be able to report "fine" without the
+///     gate having run;
+///   * a non-zero child status stays non-zero. A status that is non-zero but
+///     not representable as a non-zero `u8` (a signal death, or an exit code
+///     whose low byte is 0) maps to 1 rather than truncating to 0.
+fn verify(args: &[String]) -> ExitCode {
+    let script = workspace_root().join("tools").join("verify.sh");
+    if !script.is_file() {
+        eprintln!(
+            "xtask verify: THE GATE IS MISSING — {} does not exist. Nothing was \
+             verified; this is a failure, not a pass.",
+            script.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let status = match Command::new(&script).args(args).status() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "xtask verify: could not execute {}: {e}. Nothing was verified.",
+                script.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    match status.code() {
+        Some(0) => ExitCode::SUCCESS,
+        // Preserve the gate's own exit code where it fits; never let a non-zero
+        // status become 0 through a `as u8` truncation.
+        Some(code) => match u8::try_from(code) {
+            Ok(0) => ExitCode::FAILURE,
+            Ok(byte) => ExitCode::from(byte),
+            Err(_) => ExitCode::FAILURE,
+        },
+        // Killed by a signal: no exit code at all, and emphatically not a pass.
+        None => {
+            eprintln!("xtask verify: {} was killed by a signal", script.display());
             ExitCode::FAILURE
         }
     }

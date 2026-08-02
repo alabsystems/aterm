@@ -79,10 +79,18 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         `thread::spawn` closures are approximated (the spawn body is attributed
         to the spawning fn).
       - INTERPROCEDURAL DEPTH: exactly ONE hop — a call made while a guard is
-        held, to a same-corpus fn (free-fn `name(..)` or `self.name(..)` call
-        shapes only; `other.name(..)` is type-ambiguous and excluded) whose own
-        body directly acquires. The callee's callees are NOT followed. Same-named
-        fns merge (over-approximation, same posture as the main-loop census).
+        held, to a same-corpus fn (free-fn `name(..)` or bare `self.name(..)`
+        call shapes only) whose own body directly acquires. The callee's callees
+        are NOT followed. Same-named fns merge (over-approximation, same posture
+        as the main-loop census).
+        The callee is chosen BY NAME, so only those two shapes are sound: a free
+        fn and a method of `Self` are fns this corpus defines. `other.name(..)`
+        dispatches on a type this census cannot resolve — and so does
+        `self.field.name(..)`, which is the same ambiguity with `other` spelled
+        `self.field`. Field-receiver calls are therefore counted, not followed;
+        the count is printed in the ledger every run beside UNKNOWN. Following
+        them once bound std's `Condvar::wait` (which RELEASES its guard) to an
+        unrelated same-named fn and reported a lock cycle that does not exist.
       - BLOCKING EDGES ONLY: `try_lock`/`try_read`/`try_write` cannot block, so
         a try-guard is an edge SOURCE (once held it is held) but never an edge
         TARGET. Scope: non-test sources of the scanned crates with `#[cfg(test)]`
@@ -711,6 +719,20 @@ struct RawAcq {
 /// => `proxies` (the zero-arg accessor-fn idiom for statics); `self` /
 /// `self.0` / single-letter locals => None (UNKNOWN — honestly unresolvable).
 fn resolve_receiver(line: &str, dot: usize) -> Option<String> {
+    // `self.store?.read()` — the `?` is postfix error propagation, not part of
+    // the receiver: it unwraps an Option/Result and the lock on the other side
+    // is still the one `store` names. Without this the token before the dot is
+    // `?`, no identifier is found, and a perfectly nameable lock is reported
+    // UNKNOWN — which is the honesty gap widening for a punctuation mark rather
+    // than for anything actually unresolvable.
+    let dot = {
+        let bytes = line.as_bytes();
+        let mut d = dot;
+        while d > 0 && bytes[d - 1] == b'?' {
+            d -= 1;
+        }
+        d
+    };
     if let Some(seg) = ident_ending_at(line, dot) {
         if seg == "self" || seg.chars().all(|c| c.is_ascii_digit()) || seg.len() == 1 {
             return None;
@@ -922,12 +944,150 @@ fn classify_line(line: &str) -> LineKind {
 /// trusts: free-fn/path `name(` and `self.name(` (an `other.name(` method call
 /// is type-ambiguous and excluded — see the precision note). Returns
 /// `(byte position, name)`; keyword pseudo-calls and macro bangs excluded.
-fn held_call_targets(line: &str) -> Vec<(usize, String)> {
+/// A call the census will follow one hop: `(byte offset in the line, callee)`.
+type TrustedCall = (usize, String);
+
+/// A call through a `self.field.…` receiver: `(byte offset, field, callee)`.
+/// Whether it is followed is decided later, against [`FieldTypes`].
+type FieldRecvCall = (usize, String, String);
+
+/// What the scanned corpus declares about types and struct fields — the
+/// evidence that decides whether a `self.field.name(..)` hop can be followed.
+///
+/// Both halves are name-keyed and therefore over-approximate (two structs with a
+/// field of the same name merge). That is the census's standing posture for
+/// same-named fns, and it errs toward FOLLOWING a hop — the direction that risks
+/// a visible false positive rather than a silent missed cycle.
+#[derive(Default)]
+struct FieldTypes {
+    /// Every type NAME the corpus defines (`struct`/`enum`/`union`/`type` and
+    /// `trait`, which a `dyn`/`impl` field resolves through).
+    defined: BTreeSet<String>,
+    /// Field name -> every type identifier appearing in its declared type. A
+    /// wrapper contributes its own name too (`Arc<Shared>` -> {Arc, Shared}),
+    /// so the test is "does ANY of them name a corpus type".
+    field_tys: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl FieldTypes {
+    /// Is `field`'s declared type defined in this corpus? Unknown fields answer
+    /// `false`: with no declaration in evidence there is nothing to resolve
+    /// through, and a guess is what this whole mechanism exists to avoid.
+    fn is_corpus_typed(&self, field: &str) -> bool {
+        self.field_tys
+            .get(field)
+            .is_some_and(|tys| tys.iter().any(|t| self.defined.contains(t)))
+    }
+
+    /// Harvest declarations from one already-cfg-masked source file.
+    fn harvest(&mut self, text: &str) {
+        // Depth of the struct/enum body we are inside, if any. Field lines are
+        // collected only at depth 1 of such a body, so fn bodies, match arms
+        // and `let x: T` never masquerade as field declarations.
+        let mut body_depth: Option<i32> = None;
+        let mut depth: i32 = 0;
+        for raw in text.lines() {
+            let line = raw.split("//").next().unwrap_or(raw);
+            let t = line.trim_start();
+            let mut opens_fields = false;
+            for kw in ["struct ", "enum ", "union ", "trait ", "type "] {
+                let Some(rest) = t.strip_prefix(kw).or_else(|| {
+                    t.strip_prefix("pub ")
+                        .and_then(|p| p.trim_start().strip_prefix(kw))
+                        .or_else(|| {
+                            // `pub(crate) struct X`, `pub(super) enum Y`, …
+                            t.strip_prefix("pub(")
+                                .and_then(|p| p.split_once(')'))
+                                .and_then(|(_, p)| p.trim_start().strip_prefix(kw))
+                        })
+                }) else {
+                    continue;
+                };
+                if let Some(n) = ident_prefix(rest.trim_start()) {
+                    self.defined.insert(n.to_string());
+                    // A body opens on this line for the data types only; `type`
+                    // is an alias and `trait` bodies hold fns, not fields.
+                    opens_fields = line.contains('{') && (kw == "struct " || kw == "union ");
+                }
+                break;
+            }
+            if body_depth == Some(depth)
+                && let Some((lhs, rhs)) = t.split_once(':')
+                && !t.starts_with("//")
+                && !lhs.contains('(')
+                && !rhs.starts_with(':')
+            {
+                let name = lhs
+                    .rsplit(|c: char| c.is_whitespace() || c == ')')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    let entry = self.field_tys.entry(name.to_string()).or_default();
+                    for tok in rhs.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                        if !tok.is_empty() {
+                            entry.insert(tok.to_string());
+                        }
+                    }
+                }
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            // Fields live one level INSIDE the declaration's brace, so the depth
+            // to match is the one this line leaves us at.
+            if opens_fields {
+                body_depth = Some(depth);
+            } else if let Some(d) = body_depth
+                && depth < d
+            {
+                body_depth = None;
+            }
+        }
+    }
+}
+
+/// The leading identifier of `s`, if it starts with one.
+fn ident_prefix(s: &str) -> Option<&str> {
+    let end = s
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    (end > 0).then(|| &s[..end])
+}
+
+/// One-hop call targets on `line`: the unconditionally trusted shapes, plus the
+/// field-receiver calls that are trusted only once their FIELD TYPE is resolved.
+///
+/// Returns `(trusted, field_receiver)`, the latter as `(field, callee)`.
+///
+/// A callee is looked up by NAME across the whole corpus, so a call shape may be
+/// followed only when the name is known to belong to a same-corpus fn:
+///
+///   * `name(..)` — a free fn; if the corpus has one, that is the callee.
+///   * `self.name(..)` — a method on `Self`, whose impl is in this corpus.
+///
+/// `self.field.name(..)` is neither: it dispatches on the FIELD's type, making it
+/// exactly as ambiguous as the `other.name(..)` the header excludes, with `other`
+/// merely spelled `self.field`. Following it unconditionally once bound
+/// `self.drained.wait(guard)` — the std `Condvar::wait` that ATOMICALLY RELEASES
+/// its guard — to an unrelated same-named `wait` in another crate, and
+/// synthesized a `spill -> lock` edge that closed a two-lock cycle in
+/// `aterm-session`'s sink. OB-7 has no waiver channel by design, so that one
+/// false edge blocked every build of the gate and could not be waived.
+///
+/// Dropping the shape outright would trade that false positive for false
+/// NEGATIVES — `self.shared.spill_is_empty()` is a REAL held-acquire hop — and in
+/// a deadlock census a missed edge is the worse failure, because it is silent.
+/// So the receiver is TYPE-DIRECTED instead (see [`FieldTypes`]): the hop is
+/// followed when the field's declared type is defined in the scanned corpus (its
+/// methods are corpus fns, so the name lookup is the same over-approximation
+/// bare-`self` already makes), and counted-but-not-followed when the type is
+/// foreign (`Condvar`, `AtomicU64`, `HashMap`), where the lookup would be a guess.
+fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
     const KEYWORDS: &[&str] = &[
         "if", "while", "for", "match", "return", "fn", "loop", "unsafe", "move", "let", "else",
         "in", "as", "await", "Some", "Ok", "Err", "None", "drop",
     ];
     let mut out = Vec::new();
+    let mut field_recv = Vec::new();
     let bytes = line.as_bytes();
     for (idx, &b) in bytes.iter().enumerate() {
         if b != b'(' {
@@ -950,30 +1110,42 @@ fn held_call_targets(line: &str) -> Vec<(usize, String)> {
             continue; // a definition, not a call
         }
         if start > 0 && bytes[start - 1] == b'.' {
-            // Method call: only trust receiver chains rooted at `self`
-            // (`self.name(`, `self.field.name(` — same-object resolution);
-            // `other.name(` is type-ambiguous and excluded.
-            let mut at = start - 1;
-            let rooted_at_self = loop {
-                let Some(seg) = ident_ending_at(line, at) else {
-                    break false;
-                };
-                let seg_start = at - seg.len();
-                if seg == "self" {
-                    break true;
-                }
-                if seg_start == 0 || bytes[seg_start - 1] != b'.' {
-                    break false;
-                }
-                at = seg_start - 1;
+            // Method call. Only a BARE `self.name(` receiver names a method of
+            // the enclosing type, i.e. a fn this corpus defines. Anything else
+            // — `other.name(`, and equally `self.field.name(` — dispatches on a
+            // type we cannot resolve lexically, so the name-based callee lookup
+            // would be a guess. Field chains are counted (see the doc comment);
+            // foreign receivers were never followed and stay silent.
+            let Some(recv) = ident_ending_at(line, start - 1) else {
+                continue;
             };
-            if !rooted_at_self {
+            if recv != "self" {
+                // A `self.…field.name(` chain is resolvable through the field's
+                // declared type; a chain rooted in a foreign local is not, and
+                // was never in scope. `recv` is the LAST field of the chain —
+                // the one whose type the callee dispatches on.
+                let mut at = start - 1 - recv.len();
+                let rooted_at_self = loop {
+                    if at == 0 || bytes[at - 1] != b'.' {
+                        break false;
+                    }
+                    let Some(seg) = ident_ending_at(line, at - 1) else {
+                        break false;
+                    };
+                    if seg == "self" {
+                        break true;
+                    }
+                    at -= 1 + seg.len();
+                };
+                if rooted_at_self {
+                    field_recv.push((idx, recv.to_string(), name.to_string()));
+                }
                 continue;
             }
         }
         out.push((idx, name.to_string()));
     }
-    out
+    (out, field_recv)
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1173,11 @@ struct FnLockFacts {
     edges: Vec<(usize, usize)>,
     /// Calls made while holding: (holder site, callee name, call `file:line`).
     held_calls: Vec<(usize, String, String)>,
+    /// Calls made while holding through a FIELD receiver (`self.field.name(..)`).
+    /// Followed only once the field's type is resolved against the corpus — see
+    /// [`held_call_targets`] and [`FieldTypes`].
+    /// `(holder site, field name, callee name, call `file:line`)`.
+    field_recv_calls: Vec<(usize, String, String, String)>,
 }
 
 /// Lexical guard-return detection over the signature region (the def line up
@@ -1093,6 +1270,7 @@ fn scan_fn(
         acq: Vec::new(),
         edges: Vec::new(),
         held_calls: Vec::new(),
+        field_recv_calls: Vec::new(),
     };
     let mut live: Vec<LiveGuard> = Vec::new();
     // Locals lexically PROVEN to hold a std::fs::File: name -> (binding brace
@@ -1213,7 +1391,29 @@ fn scan_fn(
         // 4. Calls made while holding (active guards, plus same-line guards
         //    acquired at an earlier byte position than the call).
         if live.iter().any(|g| g.active) || !this_line.is_empty() {
-            for (pos, callee) in held_call_targets(line) {
+            let (trusted, field_recv) = held_call_targets(line);
+            for (pos, field, callee) in field_recv {
+                let call_span = format!("{file_rel}:{}", ll.lineno);
+                for g in live.iter().filter(|g| g.active) {
+                    facts.field_recv_calls.push((
+                        g.site,
+                        field.clone(),
+                        callee.clone(),
+                        call_span.clone(),
+                    ));
+                }
+                for (k, r) in raw.iter().enumerate() {
+                    if r.pos < pos && sites[this_line[k]].graphed() {
+                        facts.field_recv_calls.push((
+                            this_line[k],
+                            field.clone(),
+                            callee.clone(),
+                            call_span.clone(),
+                        ));
+                    }
+                }
+            }
+            for (pos, callee) in trusted {
                 let call_span = format!("{file_rel}:{}", ll.lineno);
                 for g in live.iter().filter(|g| g.active) {
                     facts
@@ -1353,6 +1553,8 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     // ---- Parse every fn in the scanned crates. ----
     let mut sites: Vec<AcqSite> = Vec::new();
     let mut fns: Vec<FnLockFacts> = Vec::new();
+    // Type evidence for the field-receiver hop, harvested from the same files.
+    let mut field_types = FieldTypes::default();
     for crate_dir in &scan.scan_dirs {
         let mut files = Vec::new();
         let _ = collect_rs_files(&root.join(crate_dir), &mut files);
@@ -1368,6 +1570,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 .to_string_lossy()
                 .into_owned();
             let masked = mask_cfg_test_items(&text);
+            field_types.harvest(&masked);
             let mut parsed = Vec::new();
             parse_source_fns(&masked, &rel, &mut parsed);
             for f in &parsed {
@@ -1465,6 +1668,36 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
 
     // fn name -> indices (ALL same-named fns — over-approximation, the same
     // fail-closed posture as the main-loop census).
+    // Held calls through a `self.field.…` receiver, split by whether the field's
+    // declared type is defined in this corpus. Corpus-typed ones are followed
+    // like any other hop; foreign-typed ones cannot be resolved by name and are
+    // counted + listed instead of guessed at.
+    let mut unresolved_field_calls: Vec<(String, String)> = Vec::new();
+    // How many fns in the corpus bear each name. A field hop is followed only
+    // when the answer is exactly ONE: with a single candidate the by-name lookup
+    // is not a guess. Two same-named fns on DIFFERENT types is precisely how a
+    // `self.drained.wait(g)` on aterm-types' `Condvar` newtype merged with an
+    // unrelated `MemoryWait::wait` and fabricated a cycle.
+    let mut name_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for f in &fns {
+        *name_counts.entry(f.name.clone()).or_default() += 1;
+    }
+    for f in &mut fns {
+        for (site, field, callee, span) in std::mem::take(&mut f.field_recv_calls) {
+            let resolvable =
+                field_types.is_corpus_typed(&field) && name_counts.get(&callee) == Some(&1);
+            if resolvable {
+                f.held_calls.push((site, callee, span));
+            } else {
+                let _ = site;
+                unresolved_field_calls.push((format!("{field}.{callee}"), span));
+            }
+        }
+    }
+    unresolved_field_calls.sort();
+    unresolved_field_calls.dedup();
+    let field_recv_calls = unresolved_field_calls.len();
+
     let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (idx, f) in fns.iter().enumerate() {
         by_name.entry(&f.name).or_default().push(idx);
@@ -1808,7 +2041,10 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
          ptr::read); {} resolved identities; {} UNKNOWN-identity site(s) + {} vendored \
          UNKNOWN site(s); {} audited vocabulary-interior site(s); {} held-acquire \
          pair(s) ({} intra-fn, {} via one-hop calls; {} distinct ordered identity \
-         pairs); 0 self-edges; global lock graph ACYCLIC.",
+         pairs); {} held call(s) through a `self.field.…` receiver NOT followed \
+         (foreign field type, or the callee name is not unique in the corpus — \
+         the census's second standing honesty gap, alongside UNKNOWN); \
+         0 self-edges; global lock graph ACYCLIC.",
         sites.len(),
         scan.scan_dirs.len(),
         scan.vendored_scanned.len(),
@@ -1824,6 +2060,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         intra_pairs,
         hop_pairs,
         edges.len(),
+        field_recv_calls,
     );
     let mut ids: Vec<(&str, usize)> = identities.into_iter().collect();
     ids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
@@ -1873,6 +2110,25 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         }
         if unknown.len() > 20 {
             let _ = writeln!(log, "      … and {} more.", unknown.len() - 20);
+        }
+    }
+    // The second honesty gap, listed for the same reason UNKNOWN is: a reader
+    // must be able to see WHICH hops the census declined to follow, and judge
+    // whether one of them hides an ordering it should have graphed.
+    let field_calls = &unresolved_field_calls;
+    if !field_calls.is_empty() {
+        let _ = writeln!(
+            log,
+            "    held calls through a `self.field.…` receiver NOT followed — either the \
+             field's declared type is not defined in this corpus, or more than one \
+             corpus fn bears the callee's name, so the by-name lookup would pick a \
+             candidate rather than resolve one (a guess, not an over-approximation):"
+        );
+        for (callee, span) in field_calls.iter().take(20) {
+            let _ = writeln!(log, "      {span}  .{callee}(…)");
+        }
+        if field_calls.len() > 20 {
+            let _ = writeln!(log, "      … and {} more.", field_calls.len() - 20);
         }
     }
     if !scan.vendored_scanned.is_empty() {
@@ -2827,6 +3083,104 @@ mod tests {
     }
 
     #[test]
+    fn a_question_mark_receiver_still_names_its_lock() {
+        // `self.store?.read()` — the `?` unwraps an Option/Result; the lock on
+        // the other side is still `store`. Reporting it UNKNOWN would widen the
+        // census's honesty gap for a punctuation mark, and UNKNOWN nodes never
+        // unify, so a real ordering through this lock could not be seen.
+        let acqs =
+            acquisitions_on("let g = self.store?.read().unwrap_or_else(|p| p.into_inner());");
+        assert_eq!(acqs.len(), 1);
+        assert_eq!(
+            acqs[0].identity.as_deref(),
+            Some("store"),
+            "a `?` before the acquisition dot must not erase the receiver"
+        );
+        // Chained `??` (Option<Result<_>>) resolves the same way.
+        let acqs = acquisitions_on("self.inner??.lock().unwrap();");
+        assert_eq!(acqs[0].identity.as_deref(), Some("inner"));
+        // And the genuinely unresolvable receivers stay UNKNOWN — the fix must
+        // not become a way to invent names.
+        let acqs = acquisitions_on("*self.0?.lock().unwrap() = None;");
+        assert!(acqs[0].identity.is_none());
+        let acqs = acquisitions_on("a?.read().unwrap().clone()");
+        assert!(acqs[0].identity.is_none());
+    }
+
+    #[test]
+    fn a_field_hop_is_followed_when_the_field_type_and_the_callee_both_resolve() {
+        // THE TRUE POSITIVE the field-receiver rule must keep. `self.shared.…`
+        // where `shared: Arc<Shared>` and `Shared` is a corpus struct, calling a
+        // callee only ONE corpus fn bears: both halves of the evidence hold, so
+        // the hop is followed and its held-acquire edge is graphed.
+        let out = run_synth(
+            "fieldhop",
+            "struct Holder {\n    shared: Arc<Shared>,\n}\nstruct Shared {\n    inner_lock: Mutex<u8>,\n}\nfn peek_shared(&self) {\n    beta_lock.lock().unwrap();\n}\nfn hold_and_hop(&self) {\n    let g = alpha_lock.lock().unwrap();\n    self.shared.peek_shared();\n}\n",
+        );
+        assert!(
+            out.log.contains("alpha_lock -> beta_lock"),
+            "a field hop with a corpus field type AND a unique callee must be \
+             FOLLOWED — dropping it is a silent missed edge:\n{}",
+            out.log
+        );
+        assert!(
+            !out.log.contains("shared.peek_shared"),
+            "a followed hop must not also be listed as not-followed:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn a_field_hop_is_not_followed_when_the_callee_name_is_ambiguous() {
+        // THE REGRESSION GUARD for the phantom cycle this rule was written for:
+        // aterm defines its own `Condvar` newtype, so the FIELD type resolves —
+        // but two corpus fns are named `wait`, so the by-name lookup would PICK
+        // one rather than resolve it. Following it bound a guard-RELEASING
+        // `Condvar::wait` to an unrelated `wait` that acquires, and closed a
+        // two-lock cycle that does not exist. OB-7 has no waiver channel, so
+        // that phantom edge blocked every build of the freeze gate.
+        let out = run_synth(
+            "fieldambig",
+            "struct Holder {\n    parked: Condvar,\n}\nstruct Condvar {\n    raw: u8,\n}\nfn wait(&self) {\n    beta_lock.lock().unwrap();\n}\nfn hold_and_hop(&self) {\n    let g = alpha_lock.lock().unwrap();\n    self.parked.wait(g);\n}\nfn wait(&self) {\n    gamma_lock.lock().unwrap();\n}\n",
+        );
+        assert!(
+            !out.log.contains("alpha_lock -> beta_lock")
+                && !out.log.contains("alpha_lock -> gamma_lock"),
+            "an ambiguous callee name must NOT be resolved by picking a \
+             candidate — that is how the phantom cycle was fabricated:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("parked.wait"),
+            "a hop the census declined to follow must be LISTED, so the \
+             narrowing is auditable rather than silent:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn a_field_hop_is_not_followed_when_the_field_type_is_foreign() {
+        // The other half of the evidence: a unique callee name is not enough if
+        // the field's type is not defined here. `open: AtomicBool` is std, so
+        // `.load(..)` is std's — not the corpus fn that happens to share a name.
+        let out = run_synth(
+            "fieldforeign",
+            "struct Holder {\n    open: AtomicBool,\n}\nfn load(&self) {\n    beta_lock.lock().unwrap();\n}\nfn hold_and_hop(&self) {\n    let g = alpha_lock.lock().unwrap();\n    self.open.load(Ordering::Relaxed);\n}\n",
+        );
+        assert!(
+            !out.log.contains("alpha_lock -> beta_lock"),
+            "a foreign field type must not resolve to a same-named corpus \
+             fn:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("open.load"),
+            "the declined hop must be listed:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
     fn synthetic_cross_boundary_abba_is_red_across_the_namespace() {
         // THE COUNTERFACTUAL CLASS the vendored mode exists for: one lock on
         // each side of the namespace boundary, taken in opposite orders (the
@@ -3171,14 +3525,14 @@ mod tests {
     #[test]
     fn scanned_set_covers_the_full_gui_process_closure() {
         // The scan set is DERIVED (scan_set::derive_gui_scan_set) — the full
-        // aterm-gui process surface, currently 45 crates. The exact member
+        // aterm-gui process surface, currently 46 crates. The exact member
         // list is pinned by scan_set's derived_closure_matches_the_pinned_canary;
         // this asserts the census actually WALKS the derived set and reports
         // its provenance + exclusions in the transcript.
         let out = run_lock_order_census(&repo_root());
         assert!(
             out.log
-                .contains("across 45 workspace crate(s) + 5 vendored crate(s)"),
+                .contains("across 46 workspace crate(s) + 5 vendored crate(s)"),
             "the census must report the full derived closure + the scanned vendored \
              crates:\n{}",
             out.log

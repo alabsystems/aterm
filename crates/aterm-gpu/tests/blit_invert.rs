@@ -24,9 +24,12 @@
 //
 // Gated: no GPU or no system font => the test no-ops (returns).
 
+use std::sync::Arc;
+
+use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::Terminal;
 use aterm_gpu::GpuRenderer;
-use aterm_render::{Frame, RenderInput, Theme};
+use aterm_render::{Frame, RenderInput, SceneAtlas, Theme};
 
 mod common;
 use common::{bb, gg, rr};
@@ -166,56 +169,285 @@ fn blit_invert_is_one_minus_rgb() {
     eprintln!("blit invert is EXACTLY 255 - x (byte-exact, no float round-trip drift)");
 }
 
-/// Drive the invert across the FULL channel range with synthetic uniform frames:
-/// pure black, pure white, mid-grey, and a saturated colour. A constant-colour
-/// terminal cell can't be forced through SGR easily, so we render normal frames
-/// whose dominant background covers the extremes and additionally probe the exact
-/// invert relation on the per-pixel level (already covered above) — here we assert
-/// the well-known anchors so the bound is exercised at 0, 128, and 255.
+/// A SYNTHETIC UNIFORM frame: SGR 48;2 truecolor background painted over every
+/// cell of the grid with spaces, cursor hidden. The grid interior is then a
+/// constant `(r,g,b)`. The window PADDING around the grid keeps the renderer's
+/// theme background — measured, not assumed: the caller asserts only that the
+/// anchor colour is PRESENT in the source, never that the whole frame is it.
+fn uniform_bg_input(r: u8, g: u8, b: u8) -> RenderInput {
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    term.process(b"\x1b[?25l"); // DECTCEM off: no cursor pixels in the mix
+    term.process(format!("\x1b[48;2;{r};{g};{b}m").as_bytes());
+    for row in 0..ROWS {
+        term.process(format!("\x1b[{};1H", row + 1).as_bytes()); // CUP, 1-based
+        term.process(" ".repeat(COLS).as_bytes());
+    }
+    term.cell_frame(ROWS, COLS)
+}
+
+/// Drive the invert across the FULL channel range with SYNTHETIC UNIFORM frames:
+/// pure black, pure white, mid-grey, mid-grey's complement, and a saturated
+/// colour. Each anchor is asserted EXACTLY — 0 → 255, 128 → 127, 255 → 0 — and
+/// the complement PAIRS compose into the double-invert identity: the black
+/// frame's 0 inverts to 255 and the white frame's 255 inverts to 0, so
+/// invert(invert(0)) == 0; likewise 128 → 127 and 127 → 128.
+///
+/// WHAT THIS USED TO DO, and why it was rewritten: the doc already made all
+/// three claims and the body made none of them. It rendered
+/// `representative_input()` — the same ordinary terminal frame as the two tests
+/// above — so no synthetic frame ever existed; the mid anchor was computed and
+/// then discarded (`let _ = spanned_mid`); the endpoints were asserted only as
+/// "<= 8" and ">= 247", never as 0 and 255; and the "double invert" leg
+/// re-blitted the SAME offscreen source a second time, which measures
+/// determinism, not involution.
+///
+/// MEASURED, not inferred, on this host (Metal, the repo's fixture font): a
+/// `fs_blit` invert made wrong ONLY at channel 255 — an exact-255 source
+/// inverting to 6 instead of 0 — passed ALL THREE tests in this file before
+/// this rewrite, and fails the pure-white anchor after it. The old fixture
+/// never reached 255; ">= 247" was as close as it got. A mid-tone-only
+/// regression, by contrast, was already caught here, because that frame happens
+/// to carry channel 127 in its glyph AA — incidentally, not by construction.
+/// The synthetic frames make every anchor structural instead of font-dependent.
+///
+/// The complement pairs compose the round trip out of two measured legs; the
+/// LITERAL involution — the blit's own output bytes fed back through the same
+/// blit — is `blit_double_invert_round_trips_the_real_output` below.
 #[test]
 fn blit_invert_hits_range_anchors() {
     let Some(mut gpu) = fresh_gpu() else { return };
     let mut win = aterm_gpu::WindowGpu::new();
 
-    // A frame with the default theme bg (a dark colour) plus bright glyph runs
-    // gives us near-black and bright pixels; add explicit 256-grey reasoning via
-    // the per-pixel check: for every pixel, invert(invert(x)) round-trips.
-    let input = representative_input();
-    let (source, inv) = source_and_blit(&mut gpu, &mut win, &input, true);
+    let anchors: [([u8; 3], &str); 5] = [
+        ([0, 0, 0], "pure black (0 -> 255)"),
+        ([255, 255, 255], "pure white (255 -> 0)"),
+        ([128, 128, 128], "mid-grey (128 -> 127)"),
+        ([127, 127, 127], "mid-grey's complement (127 -> 128)"),
+        ([255, 0, 128], "saturated (255/0/128 in one frame)"),
+    ];
+    for (rgb, name) in anchors {
+        let input = uniform_bg_input(rgb[0], rgb[1], rgb[2]);
+        let (source, inv) = source_and_blit(&mut gpu, &mut win, &input, true);
 
-    // Double-invert identity: inverting the invert must return the source within
-    // the same <= 1 LSB bound (proves the operation is a true per-channel
-    // complement across whatever range the frame spans, including dark bg and
-    // bright glyphs / saturated SGR colours).
-    let (_src2, inv2) = source_and_blit(&mut gpu, &mut win, &input, true);
+        // The relation holds EXACTLY for every pixel of the frame — grid
+        // interior AND the theme-bg padding.
+        for (&s, &o) in source.pixels.iter().zip(inv.pixels.iter()) {
+            for (sc, oc) in [(rr(s), rr(o)), (gg(s), gg(o)), (bb(s), bb(o))] {
+                assert_eq!(
+                    oc,
+                    255 - sc,
+                    "{name}: invert must be EXACTLY 255 - x (src {sc} -> out {oc})"
+                );
+            }
+        }
+
+        // NON-VACUITY: the anchor colour really is in the source. Without this
+        // the loop above is satisfied by a frame that never reaches the anchor
+        // at all — which is exactly how the mid-grey claim went unmet before.
+        let want_src = u32::from_be_bytes([0, rgb[0], rgb[1], rgb[2]]);
+        let want_out = u32::from_be_bytes([0, 255 - rgb[0], 255 - rgb[1], 255 - rgb[2]]);
+        let hit = source
+            .pixels
+            .iter()
+            .zip(inv.pixels.iter())
+            .find(|&(&s, _)| s & 0x00ff_ffff == want_src);
+        let Some((_, &out)) = hit else {
+            panic!(
+                "{name}: the synthetic frame never contained the anchor colour \
+                 {want_src:#08x} — the SGR truecolor bg did not paint the grid"
+            );
+        };
+        assert_eq!(
+            out & 0x00ff_ffff,
+            want_out,
+            "{name}: anchor {want_src:#08x} must blit-invert to {want_out:#08x}"
+        );
+        eprintln!("blit invert anchor {name}: {want_src:#08x} -> {want_out:#08x} exact");
+    }
+
+    // Separately (and it is a DIFFERENT property from the identity above): the
+    // blit is deterministic — the same offscreen source blitted twice gives the
+    // same bytes. Named for what it measures.
+    let input = representative_input();
+    let (_, inv_a) = source_and_blit(&mut gpu, &mut win, &input, true);
+    let (_, inv_b) = source_and_blit(&mut gpu, &mut win, &input, true);
     assert_eq!(
-        inv.pixels, inv2.pixels,
+        inv_a.pixels, inv_b.pixels,
         "invert must be deterministic across runs"
     );
+}
 
-    let mut spanned_low = false; // saw a channel <= 8 (near black -> ~255 out)
-    let mut spanned_high = false; // saw a channel >= 247 (near white -> ~0 out)
-    let mut spanned_mid = false; // saw a mid channel in [96, 160]
-    for (&s, &o) in source.pixels.iter().zip(inv.pixels.iter()) {
+/// A pixel ramp for `w * h` pixels that visits EVERY 8-bit value in EVERY
+/// channel: `i` for red, and odd strides (coprime with 256) for green and blue,
+/// so each channel's residues cycle through all 256 values. Whole-domain
+/// coverage is not assumed — the caller MEASURES it on the readback.
+fn full_domain_ramp(w: usize, h: usize) -> Vec<u32> {
+    (0..w * h)
+        .map(|i| {
+            let r = (i % 256) as u32;
+            let g = ((i * 5) % 256) as u32; // gcd(5, 256) == 1
+            let b = ((i * 3 + 128) % 256) as u32; // gcd(3, 256) == 1
+            (r << 16) | (g << 8) | b
+        })
+        .collect()
+}
+
+/// Put EXACT `0x00RRGGBB` bytes into the renderer's resident offscreen and
+/// return the readback, having asserted the injection was byte-exact.
+///
+/// The seam is the FREE-SPRITE layer: one opaque (`alpha == 255`, untinted)
+/// NEAREST 1:1 rect covering the whole frame, drawn `OverText` over a blank
+/// cursor-hidden grid. That is a plain replacement of every frame pixel, so the
+/// offscreen ends up carrying `pixels` verbatim — MEASURED here, per call, not
+/// assumed: if the sprite path ever stopped being a byte-exact 1:1 copy this
+/// panics on the spot instead of silently weakening the caller.
+///
+/// Bloom and shimmer are the caller's responsibility to disable; they add light
+/// to the offscreen and would break the injection.
+fn inject_offscreen(
+    gpu: &mut GpuRenderer,
+    win: &mut aterm_gpu::WindowGpu,
+    pixels: &[u32],
+    w: usize,
+    h: usize,
+) -> Frame {
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for &p in pixels {
+        rgba.extend_from_slice(&[rr(p) as u8, gg(p) as u8, bb(p) as u8, 255]);
+    }
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    term.process(b"\x1b[?25l"); // no cursor pixels over the injected art
+    let mut input = term.cell_frame(ROWS, COLS);
+    input.free_atlas = Some(Arc::new(SceneAtlas {
+        width: w as u32,
+        height: h as u32,
+        rgba,
+        version: 1,
+    }));
+    input.free_sprites.push(FreeSprite {
+        x: 0,
+        y: 0,
+        w: w as u16,
+        h: h as u16,
+        ax: 0,
+        ay: 0,
+        aw: w as u16, // bake == dest: the NEAREST 1:1 contract
+        ah: h as u16,
+        tint: 0x00FF_FFFF, // no tint
+        alpha: 255,        // fully opaque: src-over is a replacement
+        flip_x: false,
+        z: FreeZ::OverText,
+        sampler: FreeSampler::Nearest,
+    });
+    let got = gpu.render_input(win, &input, None);
+    assert_eq!(
+        (got.width, got.height),
+        (w, h),
+        "injection frame size changed under us"
+    );
+    for (i, (&want, &have)) in pixels.iter().zip(got.pixels.iter()).enumerate() {
+        assert_eq!(
+            have & 0x00ff_ffff,
+            want,
+            "PREMISE: the 1:1 opaque free sprite must inject bytes verbatim — \
+             pixel {i} wanted {want:#08x}, offscreen has {have:#08x}"
+        );
+    }
+    got
+}
+
+/// The LITERAL double invert, over the WHOLE 8-BIT DOMAIN.
+///
+/// The two legs are real inverts of the REAL blit, and the second leg's INPUT
+/// IS THE FIRST LEG'S OUTPUT BYTES — `invert(invert(x)) == x` is performed, not
+/// composed from two separately-measured frames. What makes it expressible is
+/// that the offscreen is writable from a `RenderInput` after all: a single
+/// opaque NEAREST 1:1 `FreeSprite` covering the frame replaces every pixel with
+/// atlas bytes (`inject_offscreen`, which asserts that exactness on every call).
+/// The earlier note in `blit_invert_hits_range_anchors` — that no such feedback
+/// path existed through this seam — was wrong, and is corrected there.
+///
+/// Two properties, both stronger than what the frames above could reach:
+///   * DOMAIN-COMPLETE `255 - x`: the injected ramp carries all 256 values in
+///     all three channels (MEASURED on the readback, not assumed), so the
+///     invert is checked at every input value rather than at the handful the
+///     font, theme and SGR anchors happen to produce.
+///   * INVOLUTION: re-injecting the inverted frame and inverting again returns
+///     the original frame byte-for-byte.
+#[test]
+fn blit_double_invert_round_trips_the_real_output() {
+    let Some(mut gpu) = fresh_gpu() else { return };
+    // The injected bytes must survive to the blit untouched: bloom and shimmer
+    // both write extra light into the offscreen.
+    gpu.set_bloom(false);
+    gpu.set_shimmer(false);
+    let mut win = aterm_gpu::WindowGpu::new();
+
+    // Size the ramp to the renderer's own frame (one throwaway render).
+    let probe = gpu.render_input(&mut win, &representative_input(), None);
+    let (w, h) = (probe.width, probe.height);
+
+    // LEG 1: ramp -> offscreen, blit invert.
+    let ramp = full_domain_ramp(w, h);
+    let src = inject_offscreen(&mut gpu, &mut win, &ramp, w, h);
+    let inv1 = gpu.blit_to_offscreen_for_test(&mut win, true);
+
+    // NON-VACUITY, measured on the SOURCE READBACK: every 8-bit value really is
+    // present in every channel, so the per-pixel check below is domain-complete.
+    let mut seen = [[false; 256]; 3];
+    for &p in &src.pixels {
+        seen[0][rr(p) as usize] = true;
+        seen[1][gg(p) as usize] = true;
+        seen[2][bb(p) as usize] = true;
+    }
+    for (c, name) in ["red", "green", "blue"].iter().enumerate() {
+        let missing = (0..256).filter(|&v| !seen[c][v]).count();
+        assert_eq!(
+            missing, 0,
+            "the injected ramp must cover all 256 {name} values ({missing} missing)"
+        );
+    }
+
+    for (i, (&s, &o)) in src.pixels.iter().zip(inv1.pixels.iter()).enumerate() {
         for (sc, oc) in [(rr(s), rr(o)), (gg(s), gg(o)), (bb(s), bb(o))] {
-            assert!(
-                oc.abs_diff(255 - sc) <= 1,
-                "anchor invert mismatch: src {sc} -> out {oc}, expected {}",
+            assert_eq!(
+                oc,
+                255 - sc,
+                "domain-complete invert: pixel {i} channel {sc} must invert to {} (got {oc})",
                 255 - sc
             );
-            spanned_low |= sc <= 8;
-            spanned_high |= sc >= 247;
-            spanned_mid |= (96..=160).contains(&sc);
         }
     }
-    assert!(
-        spanned_low,
-        "frame should contain near-black channels (theme bg / cut-outs)"
+
+    // LEG 2: the FIRST BLIT'S OUTPUT is what gets blitted this time.
+    let inv1_px: Vec<u32> = inv1.pixels.iter().map(|p| p & 0x00ff_ffff).collect();
+    let _ = inject_offscreen(&mut gpu, &mut win, &inv1_px, w, h);
+    let inv2 = gpu.blit_to_offscreen_for_test(&mut win, true);
+
+    // Compact failure: name the first pixel that failed to come home rather
+    // than dumping two 33k-element frames into the log.
+    if let Some((i, (&want, &have))) = src
+        .pixels
+        .iter()
+        .zip(inv2.pixels.iter())
+        .enumerate()
+        .find(|&(_, (&a, &b))| a != b)
+    {
+        let (x, y) = (i % w, i / w);
+        panic!(
+            "LITERAL DOUBLE INVERT BROKEN: blitting the invert's own output with \
+             invert on must return the original frame byte-for-byte — first \
+             mismatch at pixel {i} (x={x}, y={y}): wanted {want:#08x}, got {have:#08x}"
+        );
+    }
+    // And the intermediate really was a different image — otherwise the
+    // identity above would hold for a blit that did nothing at all.
+    assert_ne!(
+        inv1.pixels, src.pixels,
+        "NON-VACUITY: the first invert must actually change the frame"
     );
-    assert!(
-        spanned_high,
-        "frame should contain near-white channels (bright glyph coverage)"
+    eprintln!(
+        "literal double invert: {} pixels round-tripped byte-for-byte over the full 8-bit domain",
+        src.pixels.len()
     );
-    let _ = spanned_mid; // mid-grey is opportunistic (anti-aliased glyph edges)
-    eprintln!("blit invert range anchors: low={spanned_low} mid={spanned_mid} high={spanned_high}");
 }

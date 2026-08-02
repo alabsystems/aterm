@@ -108,6 +108,15 @@ fn in_rects(rects: &[[usize; 4]], x: usize, y: usize) -> bool {
 /// on a CJK lead erased the ideograph's right half; and the fill/cut-out pair
 /// mismatched on wide leads. Non-vacuity: at least one column must CHANGE
 /// pixels inside its rect (the cursor is really drawn).
+///
+/// `Bolt` is in the sweep and is the reason the word "every" is safe to write.
+/// It is the only style whose `cursor_rects` arm emits ONE strip PER PIXEL ROW
+/// with a per-row-varying x and width; every other arm emits 1 or 4
+/// axis-aligned rects. It also arrives via `set_cursor_style_override` rather
+/// than a DECSCUSR parameter, so it is invisible to anyone enumerating escape
+/// codes — it was omitted here until this sweep was audited. `CursorStyle` is
+/// `#[non_exhaustive]`, so nothing but this list forces the coverage: a NEW
+/// steady shape must be added here by hand.
 #[test]
 fn cursor_touches_only_its_rect_all_columns_and_styles() {
     let Some(mut r) = renderer() else {
@@ -121,6 +130,7 @@ fn cursor_touches_only_its_rect_all_columns_and_styles() {
         CursorStyle::SteadyUnderline,
         CursorStyle::SteadyBar,
         CursorStyle::HollowBlock,
+        CursorStyle::Bolt,
     ];
     let mut any_inside_changed = false;
     for style in styles {

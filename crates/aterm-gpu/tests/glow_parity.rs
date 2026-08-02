@@ -146,10 +146,19 @@ fn glow_over_text_matches_within_tolerance() {
 
 /// (c) The EMPTY-aurora code path is a TRUE no-op: a render whose
 /// `cursor_glow_add` is empty must be BYTE-IDENTICAL to one where a glow quad was
-/// pushed and then cleared back to empty — i.e. an emptied glow list leaves no
-/// residue in the renderer or the frame. Asserted on a SINGLE backend each (CPU,
-/// then mirrored on the GPU), so it isolates the glow no-op rather than measuring
-/// CPU/GPU parity (which the other two tests already lock).
+/// pushed, RENDERED, and then cleared back to empty — i.e. an emptied glow list
+/// leaves no residue in the renderer or the frame. Asserted on a SINGLE backend
+/// each (CPU, then mirrored on the GPU), so it isolates the glow no-op rather
+/// than measuring CPU/GPU parity (which the other two tests already lock).
+///
+/// THE RENDER BETWEEN THE PUSH AND THE CLEAR IS THE WHOLE TEST. Until this was
+/// audited, both backends' legs pushed and cleared back-to-back with no render
+/// in between, so the renderer only ever saw an empty list and the assertions
+/// reduced to "rendering the same input twice is deterministic" — the residue
+/// this test names could not be observed. Each leg now renders the POPULATED
+/// input, asserts it differs from base (so a silently-dropped glow stream cannot
+/// make the drain look clean), and only then drains — both by `clear()` and by
+/// `clear_overlays()`, the `image plain` contract.
 #[test]
 fn empty_glow_is_byte_identical_to_no_glow() {
     let theme = Theme::default();
@@ -164,8 +173,9 @@ fn empty_glow_is_byte_identical_to_no_glow() {
     let mut input = term.cell_frame(rows, cols);
     assert!(input.cursor_glow_add.is_empty());
 
-    // A full-cell quad we push then immediately clear, to exercise the
-    // emptied-glow path (not merely a never-touched empty list).
+    // A full-cell quad we push, RENDER, then clear — so the drain is exercised
+    // on a renderer that has actually carried the aurora (not merely a
+    // never-touched empty list).
     let quad = GlowQuad {
         row: 1,
         x: cw as u16,
@@ -175,27 +185,63 @@ fn empty_glow_is_byte_identical_to_no_glow() {
         color: premul_rgb(0x0050_FA7B, 255),
     };
 
-    // CPU: baseline (empty) vs pushed-then-cleared (empty again) must be byte-equal.
-    let cpu_base = cpu.render_input(&input);
+    // CPU: baseline (empty) -> painted -> drained. The painted frame must differ
+    // from base, or the drain proves nothing.
+    let cpu_base = cpu.render_input(&input).pixels.clone();
     input.cursor_glow_add.push(quad);
+    let cpu_painted = cpu.render_input(&input).pixels.clone();
+    assert_ne!(
+        cpu_base, cpu_painted,
+        "NON-VACUITY: a live cursor_glow_add frame must paint on the CPU"
+    );
     input.cursor_glow_add.clear();
-    let cpu_after = cpu.render_input(&input);
+    let cpu_after = cpu.render_input(&input).pixels.clone();
     assert_eq!(
-        max_channel_delta(&cpu_base.pixels, &cpu_after.pixels),
+        max_channel_delta(&cpu_base, &cpu_after),
         0,
         "empty-glow path is not a no-op on the CPU"
     );
-
-    // GPU: same empty-vs-emptied invariant on a single backend.
-    let mut win = aterm_gpu::WindowGpu::new();
-    let gpu_base = gpu.render_input(&mut win, &input, None);
+    // The `image plain` contract: `clear_overlays` drains the aurora too.
     input.cursor_glow_add.push(quad);
-    input.cursor_glow_add.clear();
-    let gpu_after = gpu.render_input(&mut win, &input, None);
+    let _ = cpu.render_input(&input);
+    input.clear_overlays();
+    assert!(
+        input.cursor_glow_add.is_empty(),
+        "clear_overlays must strip cursor_glow_add"
+    );
+    let cpu_stripped = cpu.render_input(&input).pixels.clone();
     assert_eq!(
-        max_channel_delta(&gpu_base.pixels, &gpu_after.pixels),
+        max_channel_delta(&cpu_base, &cpu_stripped),
+        0,
+        "clear_overlays must restore the bare frame on the CPU"
+    );
+
+    // GPU: same painted-then-emptied invariant on a single backend. This is the
+    // leg that matters most — the GPU aurora rides a persistent per-frame
+    // instance stream, so residue has somewhere to live.
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_base = gpu.render_input(&mut win, &input, None).pixels;
+    input.cursor_glow_add.push(quad);
+    let gpu_painted = gpu.render_input(&mut win, &input, None).pixels;
+    assert_ne!(
+        gpu_base, gpu_painted,
+        "NON-VACUITY: a live cursor_glow_add frame must paint on the GPU"
+    );
+    input.cursor_glow_add.clear();
+    let gpu_after = gpu.render_input(&mut win, &input, None).pixels;
+    assert_eq!(
+        max_channel_delta(&gpu_base, &gpu_after),
         0,
         "empty-glow path is not a no-op on the GPU"
+    );
+    input.cursor_glow_add.push(quad);
+    let _ = gpu.render_input(&mut win, &input, None);
+    input.clear_overlays();
+    let gpu_stripped = gpu.render_input(&mut win, &input, None).pixels;
+    assert_eq!(
+        max_channel_delta(&gpu_base, &gpu_stripped),
+        0,
+        "clear_overlays must restore the bare GPU frame"
     );
 }
 
@@ -207,7 +253,10 @@ fn empty_glow_is_byte_identical_to_no_glow() {
 /// a glow quad at P1 (priming both caches); frame B MOVES it to P2 (a real change
 /// that misses the GPU gate and re-renders). Over a glyph-free background the
 /// premultiplied-additive light is BYTE-EXACT, so CPU frame B must equal GPU
-/// frame B with max per-channel delta 0.
+/// frame B with max per-channel delta 0. Frame C then DRAINS the glow to empty
+/// and must come back to that backend's own bare pre-glow frame — the "empty
+/// glow == no glow" property (c) can only assert on the full-repaint path,
+/// exercised here where residue can actually survive.
 #[test]
 fn damaged_path_glow_parity_cpu_matches_gpu() {
     let theme = Theme::default();
@@ -232,6 +281,18 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
         h: ch as u16,
         color,
     };
+
+    // Frame 0: the BARE frame (no glow at all), through the cached path on a
+    // fresh window — with no cached prior frame to reuse, this first render is
+    // a full repaint. It is the oracle the drained frame C must come back to.
+    let cpu_bare = cpu
+        .render_input_cached(&mut win_cpu, &base_input)
+        .pixels()
+        .to_vec();
+    let gpu_bare = gpu
+        .render_input_cached(&mut win_gpu, &base_input)
+        .pixels()
+        .to_vec();
 
     // Frame A: glow at P1 (col 2, row 1) — primes both caches.
     let mut in_a = base_input.clone();
@@ -280,6 +341,91 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
     } else {
         eprintln!("SKIP damaged-path byte-exact additive gate: downlevel sRGB offscreen");
     }
+
+    // ---- Frame C: DRAIN the aurora to empty ------------------------------
+    //
+    // Test (c) pins "empty glow == no glow" on the FULL-repaint path, where it
+    // cannot really fail. It CAN fail on a damage-tracked path: the light a
+    // drained quad leaves behind survives unless the dirty set also covers the
+    // rows the PREVIOUS frame's quads occupied (the prev∪cur marking in
+    // `compute_dirty_rows`). This is a BACKEND-INTERNAL law — each backend's
+    // drained frame must return to ITS OWN pre-glow frame — so it is asserted
+    // per backend, not as a CPU-vs-GPU delta.
+    let in_c = base_input.clone(); // byte-equal to frame 0: empty cursor_glow_add
+    assert!(
+        in_c.cursor_glow_add.is_empty(),
+        "frame C must carry no glow"
+    );
+
+    // CPU: the row-preserving damaged path — the leg with teeth.
+    let cpu_c = cpu
+        .render_input_cached(&mut win_cpu, &in_c)
+        .pixels()
+        .to_vec();
+    // NON-VACUITY (the premise): frame B really was LIT relative to bare. If
+    // the glow never painted, coming back to bare would prove nothing.
+    assert_ne!(
+        max_channel_delta(&cpu_bare, &cpu_b),
+        0,
+        "NON-VACUITY: the lit frame B must differ from the bare frame on the CPU"
+    );
+    assert_eq!(
+        max_channel_delta(&cpu_bare, &cpu_c),
+        0,
+        "CPU damaged path: an emptied glow must return the bare frame — residue \
+         left on the rows the drained quad occupied"
+    );
+
+    // GPU, leg 1 — the gate path frames A/B above use. Worth stating plainly so
+    // nobody reads more into it than it carries: `GpuRenderer::render_input_cached`
+    // is gate-or-FULL-repaint (its miss arm calls `render_input`), so this path
+    // cannot strand residue in the first place. What it pins is the GATE
+    // DECISION — draining the glow is a real change, so it must MISS and hand
+    // back a freshly-rendered bare frame instead of replaying frame B. Leg 2 is
+    // where the GPU's residue law is actually tested.
+    let misses_before_c = gpu.gate_misses();
+    let gpu_c = gpu
+        .render_input_cached(&mut win_gpu, &in_c)
+        .pixels()
+        .to_vec();
+    assert!(
+        gpu.gate_misses() > misses_before_c,
+        "draining the glow must MISS the GPU dirty gate (real re-render)"
+    );
+    assert_eq!(
+        max_channel_delta(&gpu_bare, &gpu_c),
+        0,
+        "GPU gate path: an emptied glow must return the bare frame"
+    );
+
+    // GPU, leg 2 — the GPU's ACTUAL damage-tracked path: the SCISSORED present
+    // (`present_input_readback` == `present_input`'s encode, same
+    // `compute_dirty_rows` decision + `present_prev` tracking), where rows
+    // outside the dirty band are Load-preserved and stale light really can
+    // survive. Replayed on its own window: bare (primes `present_prev`) → A →
+    // B → drained, and the drained frame must land back on the bare frame.
+    let mut win_sc = aterm_gpu::WindowGpu::new();
+    let sc_bare = gpu.present_input_readback(&mut win_sc, &base_input).pixels;
+    let _ = gpu.present_input_readback(&mut win_sc, &in_a);
+    let sc_b = gpu.present_input_readback(&mut win_sc, &in_b).pixels;
+    let scissors_before = gpu.scissor_taken();
+    let sc_c = gpu.present_input_readback(&mut win_sc, &in_c).pixels;
+    assert!(
+        gpu.scissor_taken() > scissors_before,
+        "the drained frame must take the GPU SCISSORED path (else this leg proves nothing)"
+    );
+    assert_ne!(
+        max_channel_delta(&sc_bare, &sc_b),
+        0,
+        "NON-VACUITY: the lit frame B must differ from the bare frame on the GPU \
+         scissored path"
+    );
+    assert_eq!(
+        max_channel_delta(&sc_bare, &sc_c),
+        0,
+        "GPU scissored path: an emptied glow must return the bare frame — stale \
+         light survived on a Load-preserved row"
+    );
 }
 
 /// (e) GPU-only BLOOM smoke + energy check. With bloom ENABLED (the default), the

@@ -3312,7 +3312,10 @@ mod tests {
 
         let mut empty: [u8; 0] = [];
         let n = read(rd, &mut empty);
-        assert_eq!(n, 0, "zero-length read must return 0 even with data pending");
+        assert_eq!(
+            n, 0,
+            "zero-length read must return 0 even with data pending"
+        );
 
         // The pending bytes must be UNCONSUMED — a real read still sees them all.
         let mut buf = [0u8; 64];

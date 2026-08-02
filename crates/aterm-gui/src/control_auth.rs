@@ -2578,10 +2578,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn explicit_capture_release_unlocks_an_inherited_descriptor() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-img-inherited-lock-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aterm-img-inherited-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         ensure_private_dir(&dir).unwrap();
 

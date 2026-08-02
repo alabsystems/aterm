@@ -8,12 +8,12 @@
 //! dir or no `ATERM_PKG_ROOTKEY` in the environment — a fresh clone or CI box
 //! without the owner's registry must stay green.
 
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)]
-mod seedpack;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)]
+mod seedpack;
 
 #[test]
 fn the_real_seed_validates_under_the_configured_root_key() {

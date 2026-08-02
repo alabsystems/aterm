@@ -79,8 +79,17 @@ fn empty_ink_is_byte_identical_also_after_clear_overlays() {
 /// The definitive substitution proof: inking a cell is byte-identical to
 /// recolouring the SAME text via SGR truecolor fg — across a plain glyph, a
 /// combining-mark cell (é as e + U+0301), a wide CJK cell (lead-governed), an
-/// underlined cell and a struck cell. This pins every CPU consult site at once
-/// (glyph blit, combining blit, underline colour, strike/overline colour).
+/// underlined cell, a struck cell and a CURLY-underlined cell. That is all five
+/// CPU consult sites: glyph blit, combining blit, pass 3's underline colour,
+/// pass 3's strike/overline colour, and pass 3b's AA undercurl.
+///
+/// The curl is called out because it is a SEPARATE pass with its OWN colour
+/// derivation (a fresh `InkWalk`/`CharFgWalk`, not pass 3's advanced ones), and
+/// it drifted: until ed9f774b the CPU curl kept the cell's own fg after ink.
+/// The straight-underline cell does not cover it — `\x1b[4m` never reaches
+/// pass 3b. The GPU twin (`ink_gpu_matches_cpu`) gained its curly cell in that
+/// same fix; this CPU-only proof did not, and it is the only one that runs on a
+/// host without a working wgpu device.
 #[test]
 fn ink_renders_byte_identically_to_sgr_fg_recolor() {
     let Some(mut rend) = renderer() else {
@@ -91,9 +100,12 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
     let (rows, cols) = (2usize, 16usize);
 
     // Plain text, default fg, ink overrides on every lead cell.
-    // Row 0: "e<combining acute> x<SGR4 underline> s<SGR9 strike>"; row 1: 猫 (wide).
+    // Row 0: "e<combining acute> x<SGR4 underline> s<SGR9 strike> w<SGR 4:3 curl>";
+    // row 1: 猫 (wide).
     let mut term_a = Terminal::new(rows as u16, cols as u16);
-    term_a.process("\x1b[?25le\u{0301} \x1b[4mx\x1b[24m \x1b[9ms\x1b[29m\r\n猫".as_bytes());
+    term_a.process(
+        "\x1b[?25le\u{0301} \x1b[4mx\x1b[24m \x1b[9ms\x1b[29m \x1b[4:3mw\x1b[24m\r\n猫".as_bytes(),
+    );
     let mut input_a = term_a.cell_frame(rows, cols);
     input_a.ink = vec![
         InkCell {
@@ -112,6 +124,11 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
             color: ink,
         },
         InkCell {
+            row: 0,
+            col: 6,
+            color: ink,
+        }, // curly-underlined w: pass 3b, the fifth consult site
+        InkCell {
             row: 1,
             col: 0,
             color: ink,
@@ -122,7 +139,8 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
     let mut term_b = Terminal::new(rows as u16, cols as u16);
     term_b.process(
         "\x1b[?25l\x1b[38;2;124;200;255me\u{0301}\x1b[39m \x1b[38;2;124;200;255m\x1b[4mx\x1b[24m\
-\x1b[39m \x1b[38;2;124;200;255m\x1b[9ms\x1b[29m\x1b[39m\r\n\x1b[38;2;124;200;255m猫\x1b[39m"
+\x1b[39m \x1b[38;2;124;200;255m\x1b[9ms\x1b[29m\x1b[39m \x1b[38;2;124;200;255m\x1b[4:3mw\x1b[24m\
+\x1b[39m\r\n\x1b[38;2;124;200;255m猫\x1b[39m"
             .as_bytes(),
     );
     let input_b = term_b.cell_frame(rows, cols);
@@ -132,7 +150,7 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
     assert_eq!(
         fa, fb,
         "ink must substitute for the cell fg at every consult site (glyph, \
-         combining, underline, strike, wide lead)"
+         combining, straight underline, strike, AA undercurl, wide lead)"
     );
 
     // Non-vacuous: the recolour actually changed pixels vs the un-inked frame.

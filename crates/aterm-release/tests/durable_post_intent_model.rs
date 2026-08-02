@@ -6,9 +6,6 @@
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)]
-mod seedpack;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
@@ -36,6 +33,9 @@ mod mirror;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)]
+mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;

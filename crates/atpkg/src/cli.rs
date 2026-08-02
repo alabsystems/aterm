@@ -387,7 +387,10 @@ fn announce_pending_seed(
     ) {
         Ok(i) => i,
         Err(e) => {
-            println!("atpkg: bundled seed present ({}) but its index did not verify: {e}", seed_dir.display());
+            println!(
+                "atpkg: bundled seed present ({}) but its index did not verify: {e}",
+                seed_dir.display()
+            );
             return;
         }
     };

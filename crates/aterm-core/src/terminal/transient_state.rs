@@ -184,9 +184,12 @@ impl TransientState {
             sync_start: None,
             sync_end_seq: 0,
             // Placeholders; overwritten at the top of every process_at() before
-            // any reader runs. CLOCK-EXEMPT: seed only, never observed as state.
+            // any reader runs, so this value is never observed as state.
             // web_time::Instant::now(): std on native, JS clock on wasm (std panics there).
-            process_now: web_time::Instant::now(),
+            // The marker below is on the CALL line on purpose: grep_guard family C
+            // requires the exemption same-line, and on the preceding line it read as
+            // an unexplained clock read (which is what the module-wide C3 now sees).
+            process_now: web_time::Instant::now(), // CLOCK-EXEMPT: seed only
             process_wall_ms: None,
             sgr_stack: VecDeque::new(),
             pipeline_timestamps: PipelineTimestamps::default(),

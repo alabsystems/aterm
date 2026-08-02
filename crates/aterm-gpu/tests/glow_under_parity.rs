@@ -21,6 +21,9 @@
 //   * the damaged/cached path: a body quad MOVING while the charring sweeps
 //     must miss the GPU dirty gate and re-render byte-exactly (the prev∪cur
 //     row discipline);
+//   * char_fg FOLLOWS INTO LINE DECORATIONS on both backends: a charred
+//     underline / undercurl / strike / overline is byte-identical to the same
+//     text recoloured via SGR truecolor fg, WITHIN each backend;
 //   * an emptied pair (`clear_overlays`) restores the bare GPU frame.
 //
 // Gated: no GPU or no font -> the tests no-op (return), like the other parity
@@ -289,6 +292,132 @@ fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
     } else {
         eprintln!("SKIP damaged-path byte-exact glow_under gate: downlevel sRGB offscreen");
     }
+}
+
+/// char_fg FOLLOWS INTO LINE DECORATIONS, on BOTH backends. A decoration is a
+/// decoration OF the glyph's ink, and the substituted colour is re-derived at
+/// three independent sites — CPU pass 3 (solid rects), CPU pass 3b (the AA
+/// undercurl, a separate pass) and the GPU deco loop. Until this fixture every
+/// char_fg test drew blocks and flames with no SGR styling and every decoration
+/// test drew SGR styling with no overlay stream, so the `None`-with-char_fg arm
+/// at a decorated cell was never taken on either backend — the same shape that
+/// produced the confirmed ink-vs-curl divergence one stream over.
+///
+/// The proof is the `ink_gpu_matches_cpu` idiom, WITHIN each backend: a charred
+/// frame must be byte-identical to the same text recoloured via SGR 38;2. That
+/// form is deliberately not a cross-backend byte gate — real glyph AA lives
+/// under the suite's <=8 delta bar, not at 0 — but a char_fg-only difference
+/// must add exactly zero on each side, which is the property at risk here.
+///
+/// Row 1 is the per-site isolate: its cells are SPACES, so the decoration is
+/// the only ink in them. Col 2 (solid underline) and col 4 (undercurl) must
+/// each change when char_fg lands; col 0's explicit SGR 58 underline colour
+/// must not move (`effective_deco_color`'s `Some(_)` arms ignore the operand).
+#[test]
+fn char_fg_follows_into_line_decorations_on_both_backends() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    // Deterministic parity: neither backend may compare a provisional `.notdef`
+    // frame against a real glyph (the ink_gpu_matches_cpu discipline).
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (rows, cols) = (2usize, 12usize);
+    let charred_fg = 0x007C_C8FFu32;
+
+    // Row 0: underlined x, curly-underlined w, struck s, overlined o.
+    // Row 1: the deco-only isolates — SGR 58 underlined space (col 0), plain
+    // underlined space (col 2), curly-underlined space (col 4).
+    let mut term_a = Terminal::new(rows as u16, cols as u16);
+    term_a.process(
+        "\x1b[?25l\x1b[4mx\x1b[24m \x1b[4:3mw\x1b[24m \x1b[9ms\x1b[29m \
+\x1b[53mo\x1b[55m\r\n\x1b[4m\x1b[58;2;10;20;30m \x1b[59m\x1b[24m \x1b[4m \x1b[24m \
+\x1b[4:3m \x1b[24m"
+            .as_bytes(),
+    );
+    let mut charred_in = term_a.cell_frame(rows, cols);
+    charred_in.char_fg = [(0u16, 0u16), (0, 2), (0, 4), (0, 6), (1, 0), (1, 2), (1, 4)]
+        .into_iter()
+        .map(|(row, col)| CharFg {
+            row,
+            col,
+            fg: charred_fg,
+        })
+        .collect();
+
+    // The same text via SGR 38;2 — no char_fg. Row 1 col 0 stays un-recoloured:
+    // its SGR 58 underline colour wins in both frames (the precedence pin).
+    let mut term_b = Terminal::new(rows as u16, cols as u16);
+    term_b.process(
+        "\x1b[?25l\x1b[38;2;124;200;255m\x1b[4mx\x1b[24m\x1b[39m \x1b[38;2;124;200;255m\
+\x1b[4:3mw\x1b[24m\x1b[39m \x1b[38;2;124;200;255m\x1b[9ms\x1b[29m\x1b[39m \
+\x1b[38;2;124;200;255m\x1b[53mo\x1b[55m\x1b[39m\r\n\x1b[4m\x1b[58;2;10;20;30m \
+\x1b[59m\x1b[24m \x1b[38;2;124;200;255m\x1b[4m \x1b[24m\x1b[39m \x1b[38;2;124;200;255m\
+\x1b[4:3m \x1b[24m\x1b[39m"
+            .as_bytes(),
+    );
+    let recolored_in = term_b.cell_frame(rows, cols);
+    let plain_in = term_a.cell_frame(rows, cols);
+
+    let (cw, ch) = cpu.cell_size();
+    let cell = |f: &aterm_render::Frame, row: usize, col: usize| -> Vec<u32> {
+        let pad = (f.width - cols * cw) / 2;
+        let mut out = Vec::with_capacity(cw * ch);
+        for y in pad + row * ch..(pad + row * ch + ch).min(f.height) {
+            for x in pad + col * cw..(pad + col * cw + cw).min(f.width) {
+                out.push(f.pixels[y * f.width + x]);
+            }
+        }
+        out
+    };
+
+    let cpu_charred = cpu.render_input(&charred_in);
+    let cpu_recolored = cpu.render_input(&recolored_in);
+    let cpu_plain = cpu.render_input(&plain_in);
+    let gpu_charred = gpu.render_input(&mut win, &charred_in, None);
+    let gpu_recolored = gpu.render_input(&mut win, &recolored_in, None);
+    let gpu_plain = gpu.render_input(&mut win, &plain_in, None);
+
+    for (name, charred, recolored, plain) in [
+        ("CPU", &cpu_charred, &cpu_recolored, &cpu_plain),
+        ("GPU", &gpu_charred, &gpu_recolored, &gpu_plain),
+    ] {
+        assert_eq!(
+            charred.pixels, recolored.pixels,
+            "{name}: char_fg must substitute for the cell fg at EVERY deco \
+             consult site (underline, undercurl, strike, overline) — \
+             byte-identically to the SGR truecolor recolour"
+        );
+        // Non-vacuity, per site: the deco-only cells of row 1 must move.
+        assert_ne!(
+            cell(plain, 1, 2),
+            cell(charred, 1, 2),
+            "{name}: the solid underline of a charred SPACE is the only ink in \
+             that cell, so it must change colour"
+        );
+        assert_ne!(
+            cell(plain, 1, 4),
+            cell(charred, 1, 4),
+            "{name}: the AA undercurl is a separate draw with its own re-derived \
+             base_fg, and it must follow char_fg too"
+        );
+        assert_eq!(
+            cell(plain, 1, 0),
+            cell(charred, 1, 0),
+            "{name}: an explicit SGR 58 underline colour still wins over char_fg"
+        );
+    }
+
+    // Cross-backend: the charred decorated frame stays inside the suite's
+    // glyph-AA budget (this frame has real glyphs, so it is NOT a byte gate).
+    let delta = max_channel_delta(&cpu_charred.pixels, &gpu_charred.pixels);
+    eprintln!("char_fg-on-decorations GPU vs CPU max per-channel delta = {delta}");
+    assert!(
+        delta <= 8,
+        "charred decorated frame CPU/GPU diverge: delta {delta} > 8"
+    );
 }
 
 /// An emptied pair is byte-identical on the GPU: a populated

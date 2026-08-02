@@ -28,7 +28,7 @@ use aterm_types::osc::{Notification, NotificationUrgency};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-use crate::{AtermTerminal, json_string};
+use crate::{json_string, AtermTerminal};
 
 /// Drain handle shared between the binding and the engine callbacks (the
 /// callbacks must be `Send + 'static`, so `Arc<Mutex<..>>` rather than

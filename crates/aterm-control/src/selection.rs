@@ -3,57 +3,70 @@
 
 //! Selection / copy / block-aware verbs: `select` (plain ranges plus the
 //! `word`/`line`/`block`/`extend` gestures), `selection`, `copy`, and the
-//! OSC-133 command-block verbs (`blocks`/`blocktext`) plus `wait`. Moved
-//! verbatim from `control.rs` (behavior-preserving). The shared JSON/encode
-//! helpers stay in `control.rs` and are reached via `super::`.
+//! OSC-133 command-block verbs (`blocks`/`blocktext`) plus `wait`. Moved from
+//! `aterm-gui`'s `control_selection.rs` (behavior-preserving) and re-typed
+//! against [`SessionHost`], so the wire bytes are unchanged.
+//!
+//! The three GESTURE helpers (`word_cols`/`select_word`/`select_line`) keep
+//! taking a bare `&mut Terminal`: the GUI's double/triple-click calls them
+//! DIRECTLY off its lock guard, and they must share one rule set with the
+//! `select word` verb.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use aterm_core::selection::{SelectionSide, SelectionType, SmartSelection};
 use aterm_core::terminal::Terminal;
-use winit::event_loop::EventLoopProxy;
 
-use super::{json_ok, json_str_field, pct_encode, visible_char};
-use crate::{Wake, term_lock};
+use crate::host::SessionHost;
+use crate::wire::{json_ok, json_str_field, pct_encode, visible_char};
+
+/// The host does not resolve the target sid. Unreachable from a dispatcher that
+/// resolves the session before dispatch (aterm-gui's does); it exists so a
+/// multi-session host cannot answer a stale sid with another session's state.
+const NO_SESSION: &str = "ERR no such session\n";
 
 /// `blocks [N] --json` -> `{"blocks":[{...}]}`: the SAME OSC 133/633 command
 /// blocks `cmd_blocks` reports (oldest-first, optional last-N), one JSON object
 /// per block with the absolute rows, exit code, state, cwd and commandline. An
 /// absent optional row is JSON `null`; the cwd/commandline are JSON strings (not
 /// percent-encoded — JSON carries spaces natively).
-pub(crate) fn cmd_blocks_json(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
+pub fn cmd_blocks_json(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     use aterm_core::terminal::BlockState;
-    let t = term_lock(term);
-    let all: Vec<_> = t.all_blocks().collect();
-    let slice: &[_] = match rest.trim().parse::<usize>() {
-        Ok(n) if n < all.len() => &all[all.len() - n..],
-        _ => &all,
-    };
-    let opt_row = |r: Option<u64>| r.map_or_else(|| "null".to_string(), |v| v.to_string());
-    let mut items: Vec<String> = Vec::with_capacity(slice.len());
-    for b in slice {
-        let state = match b.state {
-            BlockState::PromptOnly => "prompt",
-            BlockState::EnteringCommand => "entering",
-            BlockState::Executing => "executing",
-            BlockState::Complete => "complete",
-            _ => "unknown",
+    let Some(items) = host.with_terminal(sid, |t: &Terminal| {
+        let all: Vec<_> = t.all_blocks().collect();
+        let slice: &[_] = match rest.trim().parse::<usize>() {
+            Ok(n) if n < all.len() => &all[all.len() - n..],
+            _ => &all,
         };
-        let exit = b
-            .exit_code
-            .map_or_else(|| "null".to_string(), |c| c.to_string());
-        items.push(format!(
-            "{{\"id\":{},{},\"exit\":{exit},\"prompt\":{},\"cmd\":{},\"out\":{},\"end\":{},{},{}}}",
-            b.id,
-            json_str_field("state", state),
-            b.prompt_start_row,
-            opt_row(b.command_start_row),
-            opt_row(b.output_start_row),
-            opt_row(b.end_row),
-            json_str_field("cwd", b.working_directory.as_deref().unwrap_or("")),
-            json_str_field("cmdline", b.commandline.as_deref().unwrap_or("")),
-        ));
-    }
+        let opt_row = |r: Option<u64>| r.map_or_else(|| "null".to_string(), |v| v.to_string());
+        let mut items: Vec<String> = Vec::with_capacity(slice.len());
+        for b in slice {
+            let state = match b.state {
+                BlockState::PromptOnly => "prompt",
+                BlockState::EnteringCommand => "entering",
+                BlockState::Executing => "executing",
+                BlockState::Complete => "complete",
+                _ => "unknown",
+            };
+            let exit = b
+                .exit_code
+                .map_or_else(|| "null".to_string(), |c| c.to_string());
+            items.push(format!(
+                "{{\"id\":{},{},\"exit\":{exit},\"prompt\":{},\"cmd\":{},\"out\":{},\"end\":{},{},{}}}",
+                b.id,
+                json_str_field("state", state),
+                b.prompt_start_row,
+                opt_row(b.command_start_row),
+                opt_row(b.output_start_row),
+                opt_row(b.end_row),
+                json_str_field("cwd", b.working_directory.as_deref().unwrap_or("")),
+                json_str_field("cmdline", b.commandline.as_deref().unwrap_or("")),
+            ));
+        }
+        items
+    }) else {
+        return NO_SESSION.to_string();
+    };
     json_ok(&format!("{{\"blocks\":[{}]}}", items.join(",")))
 }
 
@@ -77,41 +90,43 @@ pub(crate) fn cmd_blocks_json(term: &Arc<Mutex<Terminal>>, rest: &str) -> String
 /// cmdline=<pct>`. `state` is prompt|entering|executing|complete; cwd/cmdline
 /// are percent-encoded (single tokens even with spaces). Needs a shell emitting
 /// OSC 133 (see the `shell_integration` injection); empty otherwise.
-pub(crate) fn cmd_blocks(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
+pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     use aterm_core::terminal::BlockState;
-    let t = term_lock(term);
-    let all: Vec<_> = t.all_blocks().collect();
-    let slice: &[_] = match rest.trim().parse::<usize>() {
-        Ok(n) if n < all.len() => &all[all.len() - n..],
-        _ => &all,
-    };
-    let mut out = format!("OK {}\n", slice.len());
-    let opt_row = |r: Option<u64>| r.map_or_else(|| "-".to_string(), |v| v.to_string());
-    for b in slice {
-        let state = match b.state {
-            BlockState::PromptOnly => "prompt",
-            BlockState::EnteringCommand => "entering",
-            BlockState::Executing => "executing",
-            BlockState::Complete => "complete",
-            _ => "unknown",
+    host.with_terminal(sid, |t: &Terminal| {
+        let all: Vec<_> = t.all_blocks().collect();
+        let slice: &[_] = match rest.trim().parse::<usize>() {
+            Ok(n) if n < all.len() => &all[all.len() - n..],
+            _ => &all,
         };
-        let exit = b
-            .exit_code
-            .map_or_else(|| "-".to_string(), |c| c.to_string());
-        out.push_str(&format!(
-            "block {} {} exit={} prompt={} cmd={} out={} end={} cwd={} cmdline={}\n",
-            b.id,
-            state,
-            exit,
-            b.prompt_start_row,
-            opt_row(b.command_start_row),
-            opt_row(b.output_start_row),
-            opt_row(b.end_row),
-            pct_encode(b.working_directory.as_deref().unwrap_or("")),
-            pct_encode(b.commandline.as_deref().unwrap_or("")),
-        ));
-    }
-    out
+        let mut out = format!("OK {}\n", slice.len());
+        let opt_row = |r: Option<u64>| r.map_or_else(|| "-".to_string(), |v| v.to_string());
+        for b in slice {
+            let state = match b.state {
+                BlockState::PromptOnly => "prompt",
+                BlockState::EnteringCommand => "entering",
+                BlockState::Executing => "executing",
+                BlockState::Complete => "complete",
+                _ => "unknown",
+            };
+            let exit = b
+                .exit_code
+                .map_or_else(|| "-".to_string(), |c| c.to_string());
+            out.push_str(&format!(
+                "block {} {} exit={} prompt={} cmd={} out={} end={} cwd={} cmdline={}\n",
+                b.id,
+                state,
+                exit,
+                b.prompt_start_row,
+                opt_row(b.command_start_row),
+                opt_row(b.output_start_row),
+                opt_row(b.end_row),
+                pct_encode(b.working_directory.as_deref().unwrap_or("")),
+                pct_encode(b.commandline.as_deref().unwrap_or("")),
+            ));
+        }
+        out
+    })
+    .unwrap_or_else(|| NO_SESSION.to_string())
 }
 
 /// `blocktext <id>` -> the OUTPUT text of command block `<id>` (from `blocks`),
@@ -120,33 +135,52 @@ pub(crate) fn cmd_blocks(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
 /// NOT juggle coordinate spaces — an AI reads a specific command's output (e.g.
 /// the failed one's error) directly. `ERR` if the id is unknown or the block has
 /// not produced output yet.
-pub(crate) fn cmd_blocktext(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
+pub fn cmd_blocktext(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     let Ok(id) = rest.trim().parse::<u64>() else {
         return "ERR usage: blocktext <id>\n".to_string();
     };
-    let t = term_lock(term);
-    let Some(block) = t.block_by_id(id).cloned() else {
-        return "ERR no such block\n".to_string();
-    };
-    // Use the enum form so an EVICTED block returns an explicit signal instead
-    // of silently-shifted or empty text (B-1 / DL-1).
-    let text = match t.block_output_text(&block) {
-        aterm_core::terminal::BlockText::Text(s) => s,
-        aterm_core::terminal::BlockText::Evicted => {
-            return "ERR block output evicted from scrollback\n".to_string();
+    host.with_terminal(sid, |t: &Terminal| {
+        let Some(block) = t.block_by_id(id).cloned() else {
+            return "ERR no such block\n".to_string();
+        };
+        // Use the enum form so an EVICTED block returns an explicit signal instead
+        // of silently-shifted or empty text (B-1 / DL-1).
+        let text = match t.block_output_text(&block) {
+            aterm_core::terminal::BlockText::Text(s) => s,
+            aterm_core::terminal::BlockText::Evicted => {
+                return "ERR block output evicted from scrollback\n".to_string();
+            }
+            aterm_core::terminal::BlockText::NotAvailable => {
+                return "ERR block has no output yet\n".to_string();
+            }
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = format!("OK {}\n", lines.len());
+        for line in lines {
+            let s: String = line.chars().map(visible_char).collect();
+            out.push_str(s.trim_end());
+            out.push('\n');
         }
-        aterm_core::terminal::BlockText::NotAvailable => {
-            return "ERR block has no output yet\n".to_string();
+        out
+    })
+    .unwrap_or_else(|| NO_SESSION.to_string())
+}
+
+/// The newest COMPLETED block (ids are monotonic and blocks iterate oldest-first,
+/// so the last `Complete` seen is the newest — and an id baseline, unlike a
+/// count, survives old-block eviction) plus whether any block is still in flight.
+fn scan_blocks(t: &Terminal) -> (Option<(u64, Option<i32>)>, bool) {
+    use aterm_core::terminal::BlockState;
+    let mut newest_done: Option<(u64, Option<i32>)> = None;
+    let mut in_flight = false;
+    for b in t.all_blocks() {
+        match b.state {
+            BlockState::Complete => newest_done = Some((b.id, b.exit_code)),
+            BlockState::Executing => in_flight = true,
+            _ => {}
         }
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = format!("OK {}\n", lines.len());
-    for line in lines {
-        let s: String = line.chars().map(visible_char).collect();
-        out.push_str(s.trim_end());
-        out.push('\n');
     }
-    out
+    (newest_done, in_flight)
 }
 
 /// `wait [timeout_ms]` -> the newest COMPLETED command block as
@@ -169,49 +203,30 @@ pub(crate) fn cmd_blocktext(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
 ///
 /// EVENT-DRIVEN (no fixed-interval poll): registers a subscriber and parks on
 /// its wake — block-state transitions ride PTY output, and every output burst
-/// `notify`s (`Wake::Output`, the same machinery as `ready`/`await`) — re-
-/// checking the entry snapshot on each wake. The deadline is the backstop.
-pub(crate) fn cmd_wait(
-    term: &Arc<Mutex<Terminal>>,
-    session: u64,
-    rest: &str,
-    subscribers: &crate::subscribe::Subscribers,
-) -> String {
-    use aterm_core::terminal::BlockState;
-
-    use crate::subscribe::SubscriberSet;
+/// notifies — re-checking the entry snapshot on each wake. The deadline is the
+/// backstop.
+pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     let timeout_ms = rest.trim().parse::<u64>().unwrap_or(30_000).min(600_000);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let reply = |id: u64, exit: Option<i32>| {
         let exit = exit.map_or_else(|| "-".to_string(), |c| c.to_string());
         format!("OK complete {id} exit={exit}\n")
     };
-    // One pass under the lock: the newest completed block (ids are monotonic and
-    // blocks iterate oldest-first, so the last Complete seen is the newest — and
-    // an id baseline, unlike a count, survives old-block eviction) plus whether
-    // any block is still in flight.
-    let scan = |t: &Terminal| {
-        let mut newest_done: Option<(u64, Option<i32>)> = None;
-        let mut in_flight = false;
-        for b in t.all_blocks() {
-            match b.state {
-                BlockState::Complete => newest_done = Some((b.id, b.exit_code)),
-                BlockState::Executing => in_flight = true,
-                _ => {}
-            }
-        }
-        (newest_done, in_flight)
+    let Some((entry_done, in_flight)) = host.with_terminal(sid, scan_blocks) else {
+        return NO_SESSION.to_string();
     };
-    let (entry_done, in_flight) = scan(&term_lock(term));
     if !in_flight && let Some((id, exit)) = entry_done {
         return reply(id, exit);
     }
     let baseline = entry_done.map(|(id, _)| id);
     // Register BEFORE re-checking: a completion landing in this gap still leaves
     // its single-slot notify pending, so the first `wait` below cannot miss it.
-    let sub = SubscriberSet::register(subscribers, &[session]);
+    let sub = host.subscribe(sid);
     loop {
-        if let (Some((id, exit)), _) = scan(&term_lock(term))
+        let Some((newest, _)) = host.with_terminal(sid, scan_blocks) else {
+            return NO_SESSION.to_string();
+        };
+        if let Some((id, exit)) = newest
             && baseline.is_none_or(|b| id > b)
         {
             return reply(id, exit);
@@ -233,7 +248,7 @@ pub(crate) fn cmd_wait(
 static SMART_RULES: OnceLock<SmartSelection> = OnceLock::new();
 
 /// The engine's builtin smart-selection rules (lazy singleton).
-pub(crate) fn smart_rules() -> &'static SmartSelection {
+fn smart_rules() -> &'static SmartSelection {
     SMART_RULES.get_or_init(SmartSelection::with_builtin_rules)
 }
 
@@ -241,7 +256,8 @@ pub(crate) fn smart_rules() -> &'static SmartSelection {
 /// builtin smart-selection rules (URL/path/email/... patterns, falling back to
 /// plain alphanumeric+underscore words). `None` when the cell is whitespace or
 /// to the right of the row's text — the caller selects just the clicked cell.
-pub(crate) fn word_cols(t: &Terminal, row: i32, col: u16) -> Option<(u16, u16)> {
+#[must_use]
+pub fn word_cols(t: &Terminal, row: i32, col: u16) -> Option<(u16, u16)> {
     let text = t.get_line_text(row, None)?;
     // `word_boundaries_at_column` clamps a past-the-text column INTO the text
     // (it would snap to the LAST word); a click right of the text is whitespace.
@@ -260,7 +276,7 @@ pub(crate) fn word_cols(t: &Terminal, row: i32, col: u16) -> Option<(u16, u16)> 
 /// cells inclusive, Left/Right anchor sides), or just the clicked cell when on
 /// whitespace. Completes the selection and returns the inclusive
 /// `(start_col, end_col)` actually selected.
-pub(crate) fn select_word(t: &mut Terminal, row: i32, col: u16) -> (u16, u16) {
+pub fn select_word(t: &mut Terminal, row: i32, col: u16) -> (u16, u16) {
     let (start, end) = word_cols(t, row, col).unwrap_or((col, col));
     let sel = t.text_selection_mut();
     sel.start_selection(row, col, SelectionSide::Left, SelectionType::Semantic);
@@ -272,7 +288,7 @@ pub(crate) fn select_word(t: &mut Terminal, row: i32, col: u16) -> (u16, u16) {
 /// Line-select live-screen row `row` — the triple-click / `select line`
 /// gesture: a `Lines` selection expanded to the full row width (the extracted
 /// text is the whole row, trailing blanks trimmed). Completes the selection.
-pub(crate) fn select_line(t: &mut Terminal, row: i32) {
+pub fn select_line(t: &mut Terminal, row: i32) {
     let max_col = t.cols().saturating_sub(1);
     let sel = t.text_selection_mut();
     sel.start_selection(row, 0, SelectionSide::Left, SelectionType::Lines);
@@ -302,8 +318,8 @@ pub(crate) fn select_line(t: &mut Terminal, row: i32) {
 /// highlight and reply `OK\n`.
 ///
 /// SEAM CARVE-OUT (Phase 0.5): `select` mutates `text_selection_mut()` directly
-/// rather than through [`App::input`](crate::App::input). This is DELIBERATE and
-/// NOT a convergence gap: `select` produces NO PTY bytes (it sets ABSOLUTE
+/// rather than through the host's input seam. This is DELIBERATE and NOT a
+/// convergence gap: `select` produces NO PTY bytes (it sets ABSOLUTE
 /// coordinates, not a press/drag GESTURE), so it has no byte-indistinguishability
 /// stake. It is the controller analogue of an external "set the selection here"
 /// command — there is no human winit event that produces an absolute-coordinate
@@ -311,19 +327,19 @@ pub(crate) fn select_line(t: &mut Terminal, row: i32) {
 /// seam's `MouseButton`/`MouseMove` gesture arms). Keeping it out of the seam
 /// avoids inventing a synthetic gesture; the seam's "sole selection-mutation"
 /// claim is about the GESTURE path, which both sources share.
-pub(crate) fn cmd_select(
-    term: &Arc<Mutex<Terminal>>,
-    proxy: &EventLoopProxy<Wake>,
-    session: u64,
-    rest: &str,
-) -> String {
+pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     const USAGE: &str = "ERR usage: select <r1> <c1> <r2> <c2> | select word <r> <c> | \
                          select line <r> | select block <r1> <c1> <r2> <c2> | \
                          select extend <r> <c> | select clear\n";
     let rest = rest.trim();
     if rest == "clear" {
-        term_lock(term).text_selection_mut().clear();
-        let _ = proxy.send_event(Wake::redraw(session));
+        if host
+            .with_terminal_mut(sid, |t| t.text_selection_mut().clear())
+            .is_none()
+        {
+            return NO_SESSION.to_string();
+        }
+        host.request_redraw(sid);
         return "OK\n".to_string();
     }
     let mut it = rest.split_whitespace();
@@ -338,13 +354,22 @@ pub(crate) fn cmd_select(
             ) else {
                 return "ERR usage: select word <r> <c>\n".to_string();
             };
-            select_word(&mut term_lock(term), r, c);
+            if host
+                .with_terminal_mut(sid, |t| {
+                    select_word(t, r, c);
+                })
+                .is_none()
+            {
+                return NO_SESSION.to_string();
+            }
         }
         "line" => {
             let Some(Ok(r)) = it.next().map(str::parse::<i32>) else {
                 return "ERR usage: select line <r>\n".to_string();
             };
-            select_line(&mut term_lock(term), r);
+            if host.with_terminal_mut(sid, |t| select_line(t, r)).is_none() {
+                return NO_SESSION.to_string();
+            }
         }
         "block" => {
             let (Some(Ok(r1)), Some(Ok(c1)), Some(Ok(r2)), Some(Ok(c2))) = (
@@ -358,11 +383,17 @@ pub(crate) fn cmd_select(
             // Block normalization is corner-order agnostic (min/max per axis)
             // and forces Left/Right sides on the normalized corners, so both
             // given cells are inclusive whichever corners they are.
-            let mut t = term_lock(term);
-            let sel = t.text_selection_mut();
-            sel.start_selection(r1, c1, SelectionSide::Left, SelectionType::Block);
-            sel.update_selection(r2, c2, SelectionSide::Right);
-            sel.complete_selection();
+            if host
+                .with_terminal_mut(sid, |t| {
+                    let sel = t.text_selection_mut();
+                    sel.start_selection(r1, c1, SelectionSide::Left, SelectionType::Block);
+                    sel.update_selection(r2, c2, SelectionSide::Right);
+                    sel.complete_selection();
+                })
+                .is_none()
+            {
+                return NO_SESSION.to_string();
+            }
         }
         "extend" => {
             let (Some(Ok(r)), Some(Ok(c))) = (
@@ -371,23 +402,30 @@ pub(crate) fn cmd_select(
             ) else {
                 return "ERR usage: select extend <r> <c>\n".to_string();
             };
-            let mut t = term_lock(term);
-            let sel = t.text_selection_mut();
-            if !sel.has_selection() || sel.is_empty() {
-                return "ERR no selection\n".to_string();
+            let extended = host.with_terminal_mut(sid, |t| {
+                let sel = t.text_selection_mut();
+                if !sel.has_selection() || sel.is_empty() {
+                    return false;
+                }
+                // Side by direction so the clicked cell is INCLUDED whichever way
+                // the selection grows: extending backward the moving anchor is the
+                // normalized START (Left side includes its cell), extending
+                // forward it is the normalized END (Right side includes its cell).
+                let st = sel.start();
+                let side = if (r, c) < (st.row, st.col) {
+                    SelectionSide::Left
+                } else {
+                    SelectionSide::Right
+                };
+                sel.extend_selection(r, c, side);
+                sel.complete_selection();
+                true
+            });
+            match extended {
+                None => return NO_SESSION.to_string(),
+                Some(false) => return "ERR no selection\n".to_string(),
+                Some(true) => {}
             }
-            // Side by direction so the clicked cell is INCLUDED whichever way
-            // the selection grows: extending backward the moving anchor is the
-            // normalized START (Left side includes its cell), extending
-            // forward it is the normalized END (Right side includes its cell).
-            let st = sel.start();
-            let side = if (r, c) < (st.row, st.col) {
-                SelectionSide::Left
-            } else {
-                SelectionSide::Right
-            };
-            sel.extend_selection(r, c, side);
-            sel.complete_selection();
         }
         r1s => {
             let (Some(c1s), Some(r2s), Some(c2s)) = (it.next(), it.next(), it.next()) else {
@@ -410,14 +448,20 @@ pub(crate) fn cmd_select(
             } else {
                 ((r1, c1), (r2, c2))
             };
-            let mut t = term_lock(term);
-            let sel = t.text_selection_mut();
-            sel.start_selection(sr, sc, SelectionSide::Left, SelectionType::Simple);
-            sel.update_selection(er, ec, SelectionSide::Right);
-            sel.complete_selection();
+            if host
+                .with_terminal_mut(sid, |t| {
+                    let sel = t.text_selection_mut();
+                    sel.start_selection(sr, sc, SelectionSide::Left, SelectionType::Simple);
+                    sel.update_selection(er, ec, SelectionSide::Right);
+                    sel.complete_selection();
+                })
+                .is_none()
+            {
+                return NO_SESSION.to_string();
+            }
         }
     }
-    let _ = proxy.send_event(Wake::redraw(session));
+    host.request_redraw(sid);
     "OK\n".to_string()
 }
 
@@ -429,8 +473,11 @@ pub(crate) fn cmd_select(
 /// (`MAX_SELECTION_ROWS`/`MAX_SELECTION_BYTES`), the header carries a trailing
 /// ` incomplete` token — mirroring `cmd_search` — so a client knows the text was
 /// truncated rather than trusting a short list silently.
-pub(crate) fn cmd_selection(term: &Arc<Mutex<Terminal>>) -> String {
-    let (text, truncated) = term_lock(term).selection_to_string_bounded();
+pub fn cmd_selection(host: &impl SessionHost, sid: u64) -> String {
+    let Some((text, truncated)) = host.with_terminal(sid, Terminal::selection_to_string_bounded)
+    else {
+        return NO_SESSION.to_string();
+    };
     match text {
         Some(text) if !text.is_empty() => {
             let lines: Vec<&str> = text.split('\n').collect();
@@ -446,18 +493,30 @@ pub(crate) fn cmd_selection(term: &Arc<Mutex<Terminal>>) -> String {
     }
 }
 
-/// `copy` -> copy the currently selected text to the macOS system clipboard
-/// (`pbcopy`) and reply `OK <byte-count>[ incomplete]\n`; no or empty selection ->
-/// `OK 0\n` (the clipboard is left untouched). The selection is NOT cleared.
+/// `copy` -> copy the currently selected text to the system clipboard and reply
+/// `OK <byte-count>[ incomplete]\n`; no or empty selection -> `OK 0\n` (the
+/// clipboard is left untouched). The selection is NOT cleared.
+///
+/// UNSUPPORTED: a host with no clipboard ([`HostCapabilities::clipboard`] unset)
+/// answers `ERR unsupported` BEFORE reading the selection — the verb genuinely
+/// does not exist there, and saying so beats a write that silently goes nowhere.
 ///
 /// INCOMPLETE: as with `selection`, a copy clipped by the engine's copy caps
 /// carries a trailing ` incomplete` token so the client knows the clipboard holds
 /// a truncated prefix, not the whole selection.
-pub(crate) fn cmd_copy(term: &Arc<Mutex<Terminal>>) -> String {
-    let (text, truncated) = term_lock(term).selection_to_string_bounded();
+///
+/// [`HostCapabilities::clipboard`]: crate::HostCapabilities::clipboard
+pub fn cmd_copy(host: &impl SessionHost, sid: u64) -> String {
+    if !host.capabilities().clipboard {
+        return "ERR unsupported\n".to_string();
+    }
+    let Some((text, truncated)) = host.with_terminal(sid, Terminal::selection_to_string_bounded)
+    else {
+        return NO_SESSION.to_string();
+    };
     match text {
         Some(t) if !t.is_empty() => {
-            if pbcopy(&t) {
+            if host.clipboard_set(&t) {
                 let incomplete = if truncated { " incomplete" } else { "" };
                 format!("OK {}{incomplete}\n", t.len())
             } else {
@@ -465,136 +524,5 @@ pub(crate) fn cmd_copy(term: &Arc<Mutex<Terminal>>) -> String {
             }
         }
         _ => "OK 0\n".to_string(),
-    }
-}
-
-/// Place `text` on the system CLIPBOARD. macOS writes the general `NSPasteboard`
-/// IN-PROCESS (a subprocess `pbcopy` would cost a fork/exec + wait — tens of ms —
-/// on every Cmd-C / copy-on-select on the winit event-loop thread); Linux/X11
-/// takes ownership of the CLIPBOARD selection via the native x11rb backend
-/// ([`crate::clipboard_x11`]) — so no external helper (`xclip`/`wl-copy`) is
-/// required; Windows goes through the Win32 clipboard
-/// ([`crate::clipboard_win`]). Shared by the `copy` verb, the GUI copy shortcut, copy-on-select,
-/// and OSC 52. Returns whether the text was placed. (Named `pbcopy` for historical
-/// continuity across the stable `crate::control::pbcopy` path.)
-///
-/// LOCALE: the old subprocess path had to pin `LC_ALL`/`LC_CTYPE` to UTF-8 (a
-/// Finder/.app launch hands the process a non-UTF-8 locale and `pbcopy`/`pbpaste`
-/// transcode against the C codeset — mojibake). The in-process path has NO
-/// locale-sensitive transcode: `NSString` ⇄ Rust `String` is a direct UTF-8
-/// conversion, so multibyte text round-trips regardless of the launch locale.
-///
-/// THREADING: called off the main thread by the OSC 52 worker
-/// ([`crate::spawn`]) and the control-server `copy` verb. `NSPasteboard`
-/// string get/set from a non-main thread is established AppKit practice
-/// (Alacritty/copypasta ship exactly this) and the class is not on Apple's
-/// main-thread-only list.
-pub(crate) fn pbcopy(text: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-        use objc2_foundation::NSString;
-        // SAFETY: generalPasteboard is a valid singleton on any thread;
-        // clearContents/setString:forType: take ownership of the pasteboard
-        // before writing (the documented write protocol) and the NSString
-        // argument outlives the call.
-        unsafe {
-            let pb = NSPasteboard::generalPasteboard();
-            pb.clearContents();
-            pb.setString_forType(&NSString::from_str(text), NSPasteboardTypeString)
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        crate::clipboard_x11::X11Clipboard::get_handle()
-            .is_some_and(|c| c.set(crate::clipboard_x11::Sel::Clipboard, text))
-    }
-    #[cfg(windows)]
-    {
-        crate::clipboard_win::set(text)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        let _ = text;
-        false
-    }
-}
-
-/// Read the system CLIPBOARD as UTF-8 text, or `None` when empty / unavailable.
-/// macOS reads the general `NSPasteboard` in-process (see [`pbcopy`] for the
-/// locale + threading notes); Linux/X11 reads the CLIPBOARD selection via the
-/// native x11rb backend. The platform twin of [`pbcopy`], used by the GUI paste
-/// shortcut and the menu Paste. An empty pasteboard string maps to `None` so no
-/// Paste event fires on an empty clipboard.
-pub(crate) fn pbpaste() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-        // SAFETY: generalPasteboard is a valid singleton on any thread and
-        // stringForType: only reads it; the returned NSString is retained.
-        let s = unsafe {
-            NSPasteboard::generalPasteboard()
-                .stringForType(NSPasteboardTypeString)?
-                .to_string()
-        };
-        (!s.is_empty()).then_some(s)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        crate::clipboard_x11::X11Clipboard::get_handle()
-            .and_then(|c| c.get(crate::clipboard_x11::Sel::Clipboard))
-    }
-    #[cfg(windows)]
-    {
-        crate::clipboard_win::get()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-    {
-        None
-    }
-}
-
-/// The non-blocking twin of [`pbpaste`] for X11: return the CLIPBOARD text only when
-/// we OWN the selection (the stored slot, instant — `X11Clipboard::get_owned`),
-/// `None` when a FOREIGN client owns it. Lets the GUI paste deliver the own-selection
-/// case synchronously and offload only the blocking foreign read off the UI thread.
-/// Linux-only: macOS / Windows reads are already in-process, so those paths call
-/// [`pbpaste`] directly and never need this fast-path (an unused import off Linux).
-#[cfg(target_os = "linux")]
-pub(crate) fn pbpaste_owned() -> Option<String> {
-    crate::clipboard_x11::X11Clipboard::get_handle()
-        .and_then(|c| c.get_owned(crate::clipboard_x11::Sel::Clipboard))
-}
-
-/// Set the X11 PRIMARY selection (the select-to-copy / middle-click-paste buffer)
-/// to `text`. X11-only — PRIMARY has no macOS/Wayland-headless analogue, so this is
-/// a no-op (returns `false`) elsewhere. Distinct from the CLIPBOARD ([`pbcopy`]) so
-/// a drag-select never clobbers an explicit Ctrl+Shift+C copy.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn primary_set(text: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        crate::clipboard_x11::X11Clipboard::get_handle()
-            .is_some_and(|c| c.set(crate::clipboard_x11::Sel::Primary, text))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = text;
-        false
-    }
-}
-
-/// Read the X11 PRIMARY selection as UTF-8 text (the middle-click-paste source), or
-/// `None` when empty / off X11.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn primary_get() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        crate::clipboard_x11::X11Clipboard::get_handle()
-            .and_then(|c| c.get(crate::clipboard_x11::Sel::Primary))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
     }
 }

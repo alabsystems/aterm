@@ -760,9 +760,7 @@ impl Mounted {
         for attempt in 0..3u32 {
             if attempt > 0 {
                 // Linear backoff: the races this loses are short-lived.
-                std::thread::sleep(std::time::Duration::from_millis(
-                    500 * u64::from(attempt),
-                ));
+                std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
             }
             match Self::attach_at(dmg, Some(mountpoint)) {
                 Ok(mounted) => return Ok(mounted),

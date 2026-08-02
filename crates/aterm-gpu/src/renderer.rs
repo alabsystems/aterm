@@ -10861,28 +10861,36 @@ impl GpuRenderer {
                 // atlas pass above (a no-op for non-shade keys), so this quad
                 // references the atlas slot holding the right dither variant.
                 let key = aterm_render::shade_phase_key(key, pad + cx, grid_top + r * ch);
-                // The scale THIS cell's quads are emitted under. Uniform row: the
-                // row's `scale`, untouched. Mixed row: the same scale with its
-                // x-clip INTERSECTED with the run's pixel box (max/min — a clip is
-                // only ever narrowed, never widened), so a double-width pane's
-                // glyphs are cut at its pane boundary instead of painting over the
-                // neighbour. The CPU blit takes the identical `clip_x0`/`clip_x1`
+                // The scale and anchor THIS cell's quads are emitted under.
+                // Uniform row: the row's, untouched. Mixed row: the CPU
+                // `mixed_cell_place` rule, mirrored term for term — the ENLARGEMENT
+                // comes from the COLUMN'S OWN RUN (`line_size_run_at`), not from
+                // `line_sizes[r]`, and only then is the x-clip INTERSECTED with the
+                // run's pixel box (max/min — a clip is only ever narrowed, never
+                // widened). The CPU blit takes the identical `clip_x0`/`clip_x1`
                 // dest-column window, so the two backends drop the same texels.
                 //
-                // NOTE (known seam gap, must be closed on BOTH renderers at once):
-                // `xs`/`ys`/`anchor_y` still come from the ROW-level line size —
-                // `cell_x_run` yields placement, not a per-run `Scale`. On a
-                // composed row whose row-level value disagrees with a run, that run's
-                // glyphs get the run's ADVANCE but the row's ENLARGEMENT. Fixing it
-                // unilaterally here would break CPU/GPU parity, so it wants a shared
-                // `aterm_render` helper (run line size → `row_scale`) landed in both.
-                let scale = match run {
-                    None => scale,
-                    Some((rx0, rx1)) => aterm_render::Scale {
-                        clip_x0: scale.clip_x0.max(rx0 as i32),
-                        clip_x1: scale.clip_x1.min(rx1 as i32),
-                        ..scale
-                    },
+                // The row-level value was the bug: on a composed row `line_sizes[r]`
+                // is only the SUMMARY the compositor writes ("some pane here is a DEC
+                // line"), so taking `xs`/`ys`/`anchor_y` from it gave every OTHER
+                // pane on that row its neighbour's enlargement with its own advance —
+                // 2× glyphs overlapping inside an innocent pane, on the GPU only.
+                // Measured at max per-channel delta 255 against the CPU by
+                // `gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run`.
+                let (scale, anchor_y) = match run {
+                    None => (scale, anchor_y),
+                    Some((rx0, rx1)) => {
+                        let (run_size, _, _) = input.line_size_run_at(r, c);
+                        let (mut s, a) = aterm_render::row_scale(
+                            run_size,
+                            grid_top + r * ch,
+                            ch,
+                            r + 1 == input.rows,
+                        );
+                        s.clip_x0 = s.clip_x0.max(rx0 as i32);
+                        s.clip_x1 = s.clip_x1.min(rx1 as i32);
+                        (s, a)
+                    }
                 };
                 // W4: this column contributes a cut-out slice — the cursor cell
                 // itself, or a member of the cursor's ligated run whose covering
@@ -11171,12 +11179,44 @@ impl GpuRenderer {
                 // A Kitty z<0 image is a background layer, so the decomposed
                 // mark must paint over it exactly like the base glyph and the
                 // CPU renderer do.
-                if cell.wide || input.cluster_at(r, c).is_some() || input.image_hides_glyph_at(r, c)
+                //
+                // `Self::drawable` — not just `cell.wide`: on the CPU the base
+                // glyph and its marks share ONE guard, so a mark on a SPACE or
+                // control base draws nothing there. `add_combining_to_previous_cell`
+                // attaches unconditionally, so that base is reachable (` ` + U+0301).
+                // The atlas prepass above is itself gated on `drawable`, which HID
+                // this for a mark that appears only on a space — but once the same
+                // mark also sits on a drawable base its slot is resident and this
+                // loop painted it. Measured: max per-channel delta 228 against the
+                // CPU before this guard (`combining_mark_on_space_base_gpu_matches_cpu`).
+                if !Self::drawable(cell)
+                    || input.cluster_at(r, c).is_some()
+                    || input.image_hides_glyph_at(r, c)
                 {
                     continue;
                 }
                 let Some(marks) = input.combining_at(r, c) else {
                     continue;
+                };
+                // Per-run enlargement, exactly as in the base-glyph loop (and the
+                // CPU `mixed_cell_place`): `scale.xs` feeds the mark's CENTRING
+                // below, so it has to be the run's before `mark_cell_x` sees it —
+                // narrowing the clip afterwards would leave the mark centred for
+                // the wrong cell width.
+                let (scale, anchor_y) = match run {
+                    None => (scale, anchor_y),
+                    Some((rx0, rx1)) => {
+                        let (run_size, _, _) = input.line_size_run_at(r, c);
+                        let (mut s, a) = aterm_render::row_scale(
+                            run_size,
+                            grid_top + r * ch,
+                            ch,
+                            r + 1 == input.rows,
+                        );
+                        s.clip_x0 = s.clip_x0.max(rx0 as i32);
+                        s.clip_x1 = s.clip_x1.min(rx1 as i32);
+                        (s, a)
+                    }
                 };
                 // W2: the fill under this cell (selection band or cell bg) for
                 // the remap — same choice as the base-glyph loop. (A mark can
@@ -11232,18 +11272,10 @@ impl GpuRenderer {
                         aterm_render::mark_cell_x(0, ccw, slot.gw as usize, slot.xmin, scale)
                             + (pad + cx) as i32
                     };
-                    // Mixed row: narrow the mark's clip to the run box (never widen)
-                    // — a mark centred in a double-width run's last visible cell
-                    // must not spill into the neighbouring pane. CPU twin: the same
-                    // `clip_x0`/`clip_x1` window on its combining blit.
-                    let scale = match run {
-                        None => scale,
-                        Some((rx0, rx1)) => aterm_render::Scale {
-                            clip_x0: scale.clip_x0.max(rx0 as i32),
-                            clip_x1: scale.clip_x1.min(rx1 as i32),
-                            ..scale
-                        },
-                    };
+                    // (The run box is already folded into `scale`'s x-clip above —
+                    // a mark centred in a double-width run's last visible cell
+                    // still cannot spill into the neighbouring pane. CPU twin: the
+                    // same `clip_x0`/`clip_x1` window on its combining blit.)
                     let Some((rect, uv)) = aterm_render::glyph_quad(
                         mx as f32, anchor_y, baseline, scale, slot.ax, slot.ay, slot.gw, slot.gh,
                         slot.xmin, slot.ymin, aw, ah,

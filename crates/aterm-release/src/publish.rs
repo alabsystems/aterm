@@ -6163,7 +6163,11 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
                 .map(str::trim)
                 .filter(|k| !k.is_empty())
                 .map(str::to_string)
-                .or_else(|| std::env::var("ATERM_PKG_ROOTKEY").ok().filter(|k| !k.is_empty()));
+                .or_else(|| {
+                    std::env::var("ATERM_PKG_ROOTKEY")
+                        .ok()
+                        .filter(|k| !k.is_empty())
+                });
             let Some(root_key) = root_key else {
                 return Err(Error::new(format!(
                     "{} is present but no ATERM_PKG_ROOTKEY is configured (release.conf or env) — \
@@ -6195,7 +6199,11 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             ctx.version,
             ctx.build,
             match &spec.seed {
-                Some(s) => format!("{} program(s), index_build {}", s.programs.len(), s.index_build),
+                Some(s) => format!(
+                    "{} program(s), index_build {}",
+                    s.programs.len(),
+                    s.index_build
+                ),
                 None => "none".to_string(),
             }
         ),

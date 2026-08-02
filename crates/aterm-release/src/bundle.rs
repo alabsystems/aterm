@@ -288,8 +288,8 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     if let Some(seed) = &spec.seed {
         let dst = resources.join("toolchain-seed");
         std::fs::create_dir_all(&dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
-        for entry in std::fs::read_dir(&seed.dir)
-            .map_err(|e| format!("read {}: {e}", seed.dir.display()))?
+        for entry in
+            std::fs::read_dir(&seed.dir).map_err(|e| format!("read {}: {e}", seed.dir.display()))?
         {
             let entry = entry.map_err(|e| format!("read {}: {e}", seed.dir.display()))?;
             std::fs::copy(entry.path(), dst.join(entry.file_name()))
@@ -300,8 +300,7 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
             seed.files,
             human_bytes(seed.bytes),
             seed.index_build,
-            seed
-                .programs
+            seed.programs
                 .iter()
                 .map(|(p, b)| format!("{p}@{b}"))
                 .collect::<Vec<_>>()

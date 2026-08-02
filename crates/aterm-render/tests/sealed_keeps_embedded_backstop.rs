@@ -149,6 +149,68 @@ fn sealing_never_downgrades_a_resolved_code_point_to_notdef() {
     );
 }
 
+/// A colour emoji, `Emoji_Presentation=Yes`: only the colour face can draw it.
+const EMOJI: char = '\u{1F680}';
+
+/// CONSERVATION, applied to the one source that is admitted BY PATH and is the
+/// most expensive in the generation: the COLOUR-EMOJI face.
+///
+/// `seal_admitted_font_sources` reads and validates the colour-emoji candidate
+/// eagerly, and that is the LAST moment it can be admitted at all: the seal then
+/// clears `color_font_paths`, and `ensure_color_font` early-returns on an empty
+/// list. A generation that reached publication without those bytes resident
+/// could never acquire them — every emoji would resolve away from
+/// `FaceId::ColorEmoji` for the process's lifetime, with no diagnostic.
+///
+/// This test exists because the eager read LOOKS like waste and is not.
+/// MEASURED on this machine (macOS, opt-level 0): the candidate
+/// `/System/Library/Fonts/Apple Color Emoji.ttc` is 192,123,488 B (183 MiB),
+/// a warm-cache read of it takes 9.4 ms, and the whole seal takes ~1.82 s — so
+/// the read is ~0.5% of the seal, and it already runs concurrently with the two
+/// background fallback parses the seal spawns before it. The 183 MiB of
+/// resident bytes is real and unconditional; deferring the READ to "the first
+/// emoji that needs one" is nonetheless not an optimization available here, it
+/// is a silent feature loss, and this is the gate that says so.
+///
+/// Host-dependent by nature (the face is a system file), so the UNSEALED
+/// resolution is the precondition: a host with no colour-emoji face skips.
+#[test]
+fn sealing_a_system_generation_keeps_the_colour_emoji_face() {
+    let theme = Theme::default();
+    let Some(mut unsealed) = Renderer::from_system(18.0, theme) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    // Settle the async lazy loads first: emoji dispatch is decided only after
+    // every mono face has had its chance to miss.
+    unsealed.debug_block_on_lazy_fallbacks();
+    let before = fingerprint(&mut unsealed, EMOJI);
+    if before.0 != FaceId::ColorEmoji {
+        eprintln!(
+            "SKIP: no colour-emoji face on this host (U+1F680 -> {:?})",
+            before.0
+        );
+        return;
+    }
+
+    let mut sealed = Renderer::from_system(18.0, theme).expect("the primary resolved once already");
+    sealed.seal_admitted_font_sources();
+    let (source, w, h, ink) = fingerprint(&mut sealed, EMOJI);
+    assert_eq!(
+        source,
+        FaceId::ColorEmoji,
+        "sealing dropped the colour-emoji face: U+{:04X} resolved to {source:?} \
+         after the seal but {:?} before it. The seal clears `color_font_paths`, \
+         so a candidate not read DURING the seal is unreachable forever",
+        EMOJI as u32,
+        before.0
+    );
+    assert!(
+        w > 0 && h > 0 && ink > 0,
+        "the sealed colour glyph must actually rasterize, got {w}x{h} ink={ink}"
+    );
+}
+
 /// A sealed generation is the only kind `rebuild_from_admitted` accepts (zoom /
 /// theme flip). The rebuilt renderer must keep the backstop too — otherwise the
 /// tofu returns on the first font-size change.

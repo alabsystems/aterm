@@ -89,20 +89,45 @@ mod control_input;
 pub(crate) use control_input::{parse_ctrl, parse_key, parse_mouse};
 
 /// Selection / copy / block verbs (`select`/`selection`/`copy`/`blocks`/
-/// `blocktext`/`wait`). Child module of `control`; dispatched as
-/// `control_selection::cmd_*` from [`handle`]. The file lives flat at
-/// `src/control_selection.rs` (sibling of `control.rs`), so `#[path]` points at it.
-#[path = "control_selection.rs"]
-mod control_selection;
-// Re-export `pbcopy` (GUI OSC-52 path, `main.rs`) and the smart-selection
-// gesture helpers (`app_mouse.rs`'s double/triple-click), which both reach
-// through the stable `crate::control::NAME` path, so those paths keep resolving.
-pub(crate) use control_selection::{pbcopy, pbpaste, select_line, select_word, word_cols};
+/// `blocktext`/`wait`). They now live in the winit-free `aterm-control` crate,
+/// typed over a [`SessionHost`](aterm_control::SessionHost); the alias keeps the
+/// `control_selection::cmd_*` spelling [`handle`] dispatches by.
+use aterm_control::selection as control_selection;
+// Re-export the smart-selection gesture helpers (`app_mouse.rs`'s double/triple-
+// click), which reach through the stable `crate::control::NAME` path. They take a
+// bare `&mut Terminal` off the GUI's own lock guard — no host — so the crate move
+// left their signatures alone.
+pub(crate) use aterm_control::selection::{select_line, select_word, word_cols};
+// The response-framing primitives moved WITH the verbs (which reached them via
+// `super::`, so a duplicate here would be a second escape to drift from). Bound
+// at their pre-move visibilities, so every `crate::control::NAME` and `super::`
+// caller in this crate resolves unchanged.
+pub(crate) use aterm_control::wire::{json_escape, json_escape_into, pct_encode, visible_char};
+use aterm_control::wire::{json_ok, json_str_field};
+
+/// This crate's [`SessionHost`](aterm_control::SessionHost): a borrowed adapter
+/// over the target [`handle`] has already resolved. Child module of `control`;
+/// the file lives flat at `src/control_host.rs` (sibling of `control.rs`), so
+/// `#[path]` points at it.
+#[path = "control_host.rs"]
+mod control_host;
+use control_host::GuiHost;
+
+/// The platform CLIPBOARD layer (`pbcopy`/`pbpaste`, X11 PRIMARY). It could NOT
+/// follow the selection verbs into a winit-free crate — it is AppKit/x11rb/Win32
+/// code with callers all over the GUI — so it kept its own file under the name
+/// that describes it. The file lives flat at `src/clipboard.rs` (sibling of
+/// `control.rs`), so `#[path]` points at it.
+#[path = "clipboard.rs"]
+mod clipboard;
+// Re-export `pbcopy`/`pbpaste` (GUI OSC-52 path, `main.rs`, menu Paste), which
+// reach through the stable `crate::control::NAME` path, so those paths keep resolving.
+pub(crate) use clipboard::{pbcopy, pbpaste};
 // `primary_get`/`primary_set` (PRIMARY-selection paste/own) are wired ONLY to Linux
 // middle-click / selection-release in `app_mouse`, so their re-exports are
 // Linux-only — on macOS they would be unused imports.
 #[cfg(target_os = "linux")]
-pub(crate) use control_selection::{pbpaste_owned, primary_get, primary_set};
+pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_set};
 
 /// Media-capture verbs (`image`/`image read`/`window`/`chrome`). Child module of
 /// `control`; dispatched as `control_media::cmd_*` from [`handle`]. The file
@@ -3049,7 +3074,14 @@ fn serve_request_line(
         return None;
     }
     let resp = dispatch_request(
-        &line, active, store, subscribers, scope, proxy, queue, sock_dir,
+        &line,
+        active,
+        store,
+        subscribers,
+        scope,
+        proxy,
+        queue,
+        sock_dir,
     );
     // A dead client (broken pipe) must not crash the app — just drop it.
     match write_control_reply(writer, resp) {
@@ -4445,6 +4477,10 @@ fn handle(
         );
     }
     let term = &term;
+    // The `aterm-control` verbs take a host, not a term. Built here from the tuple
+    // already resolved above, borrowed and zero-cost, so the cross-session path
+    // hands them the RESOLVED target exactly as the per-verb args used to.
+    let host = GuiHost::new(term, Some(proxy), subscribers);
 
     // `--json` READ MODE: a structured-JSON foundation for the read verbs. The flag
     // is parsed off `rest` HERE (additive: a line without it is byte-identical text)
@@ -4465,7 +4501,7 @@ fn handle(
             "cursor" => Some(control_query::cmd_cursor_json(term)),
             "dims" => Some(control_query::cmd_dims_json(term, session, proxy)),
             "metrics" => Some(control_query::cmd_metrics_json(Some(term), &body)),
-            "blocks" => Some(control_selection::cmd_blocks_json(term, &body)),
+            "blocks" => Some(control_selection::cmd_blocks_json(&host, session, &body)),
             "edges" | "grants" => Some(control_session::cmd_edges_json(ctx)),
             _ => None,
         };
@@ -4784,13 +4820,13 @@ fn handle(
         "modes" => control_query::cmd_modes(term),
         "title" => control_query::cmd_title(term),
         "cwd" => control_query::cmd_cwd(term),
-        "blocks" => control_selection::cmd_blocks(term, rest),
-        "blocktext" => control_selection::cmd_blocktext(term, rest),
-        "wait" => control_selection::cmd_wait(term, session, rest, subscribers),
+        "blocks" => control_selection::cmd_blocks(&host, session, rest),
+        "blocktext" => control_selection::cmd_blocktext(&host, session, rest),
+        "wait" => control_selection::cmd_wait(&host, session, rest),
         "colors" => control_query::cmd_colors(term),
-        "select" => control_selection::cmd_select(term, proxy, session, rest),
-        "selection" => control_selection::cmd_selection(term),
-        "copy" => control_selection::cmd_copy(term),
+        "select" => control_selection::cmd_select(&host, session, rest),
+        "selection" => control_selection::cmd_selection(&host, session),
+        "copy" => control_selection::cmd_copy(&host, session),
         // `cast` reads the TARGET session's own asciicast recorder (its recorded
         // program-output history), not the shared renderer, so it is correct
         // cross-session — no `is_cross` guard.
@@ -4864,17 +4900,6 @@ fn stamp_input_seq(verb: &str, resp: String, term: &Arc<Mutex<Terminal>>) -> Str
     }
 }
 
-/// Map a [`RenderCell`](aterm_core::terminal::RenderCell) char to its on-screen
-/// glyph, collapsing NUL/control chars to a space. `pub(crate)` because the push
-/// face ([`crate::subscribe`]) must produce byte-identical rows to this poll face.
-pub(crate) fn visible_char(ch: char) -> char {
-    if ch == '\0' || ch.is_control() {
-        ' '
-    } else {
-        ch
-    }
-}
-
 /// The wire name of a [`CursorStyle`]: its variant in lowercase snake_case.
 pub(crate) fn cursor_style_name(style: CursorStyle) -> &'static str {
     match style {
@@ -4890,73 +4915,6 @@ pub(crate) fn cursor_style_name(style: CursorStyle) -> &'static str {
         // the enum is non-exhaustive; name future variants when they exist
         _ => "unknown",
     }
-}
-
-/// Percent-encode a string so it occupies ONE space-free token in a response
-/// line: every byte that is not ASCII-graphic (and `%` itself) becomes `%XX`.
-/// Spaces, newlines and non-ASCII are escaped; the client decodes. Empty -> "".
-pub(crate) fn pct_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_graphic() && b != b'%' {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// Escape a string as a JSON string BODY (no surrounding quotes): the two-char
-/// escapes for `"`, `\`, and the C0 whitespace controls, and `\u00XX` for the
-/// remaining control bytes. Non-ASCII UTF-8 is emitted verbatim (a JSON string is
-/// UTF-8), so this is allocation-light for ordinary text. Shared by every `*_json`
-/// emitter so the `--json` read mode produces RFC 8259-valid strings. `pub(crate)`
-/// so [`crate::cast`]'s asciicast emitter reuses the one JSON-escape (no divergence).
-pub(crate) fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    json_escape_into(&mut out, s);
-    out
-}
-
-/// [`json_escape`] APPENDING into a caller-owned buffer — byte-identical output,
-/// no allocation of its own.
-///
-/// The lossless styled frame escapes a glyph (and sometimes a hyperlink) for
-/// EVERY cell on screen — up to ~15 000 per snapshot on a large window, and
-/// again for every subscriber on every change — so the allocating twin above was
-/// paying a `String` per cell purely to be copied into the row buffer and
-/// dropped. This is the same loop writing where the answer is already going.
-pub(crate) fn json_escape_into(out: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-}
-
-/// A `"key":"<escaped>"` JSON member.
-fn json_str_field(key: &str, val: &str) -> String {
-    format!("\"{key}\":\"{}\"", json_escape(val))
-}
-
-/// Wrap a one-line JSON object body in the read-verb framing: `OK 1\n<json>\n`.
-/// The framing matches the other read verbs (`OK <n>` header + body) so the
-/// EXISTING client streams the body identically whether or not `--json` is set —
-/// only the body bytes change. A JSON reply is always a single body line.
-fn json_ok(body: &str) -> String {
-    format!("OK 1\n{body}\n")
 }
 
 /// Whether `rest` carries the `--json` / `json` read-mode flag, and the `rest`
@@ -5491,10 +5449,10 @@ mod tests {
         cmd_screen_styled_json, cmd_search, cmd_text, cmd_text_json, serialize_dims,
         serialize_dims_json, styled_image_json,
     };
-    // `cmd_selection` is drawn only by the unix-gated pipe-backed tests.
-    #[cfg(unix)]
-    use super::control_selection::cmd_selection;
+    // `cmd_select`/`cmd_selection` are drawn only by the unix-gated pipe-backed tests.
     use super::control_selection::{cmd_blocks, cmd_blocks_json, cmd_blocktext, cmd_wait};
+    #[cfg(unix)]
+    use super::control_selection::{cmd_select, cmd_selection};
     use super::control_session::{
         TurnIo, cmd_cast, cmd_edges, cmd_edges_json, cmd_family, cmd_grant, cmd_lease, cmd_meta,
         cmd_ready, cmd_revoke, cmd_sessions, cmd_timeline, cmd_turn, cmd_who, cmd_whoami,
@@ -7093,21 +7051,16 @@ mod tests {
 
         // `select` is ALREADY cross-correct and is left untouched (it has no
         // `is_cross` guard): it mutates the RESOLVED `term`'s selection and repaints
-        // by the RESOLVED `session` id. `cmd_select` needs an `EventLoopProxy` (not
-        // buildable off the main thread), so we exercise the SAME engine selection
-        // path it uses on the resolved target — `text_selection_mut()` over the rows
-        // we just drove in — and read it back via `cmd_selection` on the TARGET term,
-        // proving the resolved target is the one being selected (and that it emits no
-        // pty bytes, the read-side contract).
-        {
-            term_lock(&term).process(b"hello world");
-            let mut t = term_lock(&term);
-            let sel = t.text_selection_mut();
-            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-            sel.update_selection(0, 4, SelectionSide::Right);
-            sel.complete_selection();
-        }
-        let reply = cmd_selection(&term);
+        // by the RESOLVED `session` id. It used to be unreachable here — it took an
+        // `EventLoopProxy`, which is not buildable off the main thread — but a
+        // proxy-less `GuiHost` now drives the REAL verb against the resolved target
+        // and reads it back with `cmd_selection`, proving the resolved target is the
+        // one selected (and that it emits no pty bytes, the read-side contract).
+        let reg = subscribe::new_registry();
+        let host = GuiHost::new(&term, None, &reg);
+        term_lock(&term).process(b"hello world");
+        assert_eq!(cmd_select(&host, session, "0 0 0 4"), "OK\n");
+        let reply = cmd_selection(&host, session);
         assert!(
             reply.starts_with("OK ") && reply.contains("hello"),
             "TARGET selection: {reply}"
@@ -7530,7 +7483,10 @@ mod tests {
         let sources = [
             include_str!("control_query.rs"),
             include_str!("control_session.rs"),
-            include_str!("control_selection.rs"),
+            // The selection verbs live in `aterm-control` now; scrape them THERE
+            // or `blocks` becomes an unserved JSON_CAPABLE_VERBS entry and the
+            // non-vacuity floor below goes soft.
+            include_str!("../../aterm-control/src/selection.rs"),
         ];
         let mut found: Vec<String> = Vec::new();
         for src in sources {
@@ -8523,15 +8479,17 @@ mod tests {
     #[test]
     fn blocks_verb_surfaces_command_blocks() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let reg = subscribe::new_registry();
+        let host = GuiHost::new(&term, None, &reg);
         // No shell integration yet -> no blocks.
-        assert_eq!(cmd_blocks(&term, ""), "OK 0\n");
+        assert_eq!(cmd_blocks(&host, 0, ""), "OK 0\n");
         // Two command blocks via OSC 133 (+ OSC 633;E commandline): exit 0, exit 1.
         // Each OSC mark is BEL-terminated so the surrounding text isn't swallowed.
         term.lock().unwrap().process(
             b"\x1b]133;A\x07$ \x1b]633;E;echo hi\x07\x1b]133;B\x07echo hi\n\x1b]133;C\x07hi\n\x1b]133;D;0\x07\
 \x1b]133;A\x07$ \x1b]633;E;false\x07\x1b]133;B\x07false\n\x1b]133;C\x07\x1b]133;D;1\x07",
         );
-        let out = cmd_blocks(&term, "");
+        let out = cmd_blocks(&host, 0, "");
         assert!(out.starts_with("OK 2\n"), "expected 2 blocks: {out}");
         assert!(
             out.contains("exit=0") && out.contains("cmdline=echo%20hi"),
@@ -8542,18 +8500,18 @@ mod tests {
             "block 2 wrong: {out}"
         );
         // `blocks 1` returns only the most recent (the failed one).
-        let last = cmd_blocks(&term, "1");
+        let last = cmd_blocks(&host, 0, "1");
         assert!(
             last.starts_with("OK 1\n") && last.contains("exit=1"),
             "last block wrong: {last}"
         );
         // `blocktext 0` reads block 0's OUTPUT directly (no coordinate math).
-        let txt = cmd_blocktext(&term, "0");
+        let txt = cmd_blocktext(&host, 0, "0");
         assert!(
             txt.starts_with("OK ") && txt.contains("hi"),
             "block 0 output wrong: {txt}"
         );
-        assert_eq!(cmd_blocktext(&term, "99"), "ERR no such block\n");
+        assert_eq!(cmd_blocktext(&host, 0, "99"), "ERR no such block\n");
     }
 
     /// `wait` blocks until the in-flight command completes, then reports it; with
@@ -8562,8 +8520,9 @@ mod tests {
     fn wait_verb_blocks_until_command_completes() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let reg = subscribe::new_registry();
+        let host = GuiHost::new(&term, None, &reg);
         // No command in flight and nothing ever completed -> a short wait times out.
-        assert_eq!(cmd_wait(&term, 0, "0", &reg), "OK timeout\n");
+        assert_eq!(cmd_wait(&host, 0, "0"), "OK timeout\n");
         // Start a command (executing), then complete it from another thread,
         // firing the SAME notify the GUI's Wake::Output hook fires on output.
         term.lock()
@@ -8576,7 +8535,7 @@ mod tests {
             bg.lock().unwrap().process(b"\x1b]133;D;0\x07");
             reg_bg.lock().unwrap().notify(0);
         });
-        let resp = cmd_wait(&term, 0, "5000", &reg);
+        let resp = cmd_wait(&host, 0, "5000");
         h.join().unwrap();
         assert!(
             resp.starts_with("OK complete ") && resp.contains("exit=0"),
@@ -8592,6 +8551,7 @@ mod tests {
     fn wait_verb_returns_a_prerace_completion_immediately() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let reg = subscribe::new_registry();
+        let host = GuiHost::new(&term, None, &reg);
         // The command ran to completion (exit 1) and the shell is back at a fresh
         // IDLE prompt — including the prompt-end 133;B a real shell emits before
         // any typing, which parks the new block in `EnteringCommand`. This is the
@@ -8602,7 +8562,7 @@ mod tests {
             b"\x1b]133;A\x07$ \x1b]133;B\x07false\n\x1b]133;C\x07\x1b]133;D;1\x07\x1b]133;A\x07$ \x1b]133;B\x07",
         );
         let start = std::time::Instant::now();
-        let resp = cmd_wait(&term, 0, "30000", &reg);
+        let resp = cmd_wait(&host, 0, "30000");
         assert!(
             resp.starts_with("OK complete ") && resp.contains("exit=1"),
             "an already-completed command must be reported: {resp}"
@@ -8618,7 +8578,7 @@ mod tests {
             .unwrap()
             .process(b"\x1b]133;B\x07sleep 99\n\x1b]133;C\x07");
         assert_eq!(
-            cmd_wait(&term, 0, "50", &reg),
+            cmd_wait(&host, 0, "50"),
             "OK timeout\n",
             "an in-flight block must suppress the last-completed fast path"
         );
@@ -10350,6 +10310,8 @@ mod tests {
     #[test]
     fn cursor_dims_blocks_json_schemas() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let reg = subscribe::new_registry();
+        let host = GuiHost::new(&term, None, &reg);
         // cursor: row/col/visible/style.
         let cj = cmd_cursor_json(&term);
         let cbody = cj.strip_prefix("OK 1\n").unwrap().trim_end();
@@ -10404,7 +10366,7 @@ mod tests {
         term.lock().unwrap().process(
             b"\x1b]133;A\x07$ \x1b]633;E;echo hi\x07\x1b]133;B\x07echo hi\n\x1b]133;C\x07hi\n\x1b]133;D;0\x07",
         );
-        let bj = cmd_blocks_json(&term, "");
+        let bj = cmd_blocks_json(&host, 0, "");
         let bbody = bj.strip_prefix("OK 1\n").unwrap().trim_end();
         assert_balanced_json(bbody);
         assert!(bbody.contains("\"blocks\":[{"), "blocks array: {bbody}");

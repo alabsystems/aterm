@@ -74,8 +74,8 @@ pub fn validate(dir: &Path, root_key_b64: &str) -> Result<SeedStat, String> {
     {
         let entry = entry.map_err(|e| format!("read seed dir {}: {e}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let meta = std::fs::symlink_metadata(entry.path())
-            .map_err(|e| format!("stat {name}: {e}"))?;
+        let meta =
+            std::fs::symlink_metadata(entry.path()).map_err(|e| format!("stat {name}: {e}"))?;
         if !meta.is_file() {
             return Err(format!(
                 "seed entry {name} is not a regular file (symlinks/subdirectories do not ship)"
@@ -164,8 +164,7 @@ pub fn validate(dir: &Path, root_key_b64: &str) -> Result<SeedStat, String> {
         accounted.insert(sig_name);
 
         let pkg: toml::Value = toml::from_str(
-            std::str::from_utf8(&pkg_bytes)
-                .map_err(|_| format!("{pkg_name} is not UTF-8"))?,
+            std::str::from_utf8(&pkg_bytes).map_err(|_| format!("{pkg_name} is not UTF-8"))?,
         )
         .map_err(|e| format!("{pkg_name} parse (after verify): {e}"))?;
         // ANTI-REPLAY BIND, mirroring the client's own check (atpkg
@@ -205,7 +204,9 @@ pub fn validate(dir: &Path, root_key_b64: &str) -> Result<SeedStat, String> {
                 .get("size")
                 .and_then(toml::Value::as_integer)
                 .and_then(nonneg)
-                .ok_or_else(|| format!("{pkg_name}: artifact {asset} has no (non-negative) size"))?;
+                .ok_or_else(|| {
+                    format!("{pkg_name}: artifact {asset} has no (non-negative) size")
+                })?;
             let actual = std::fs::metadata(&path)
                 .map_err(|e| format!("stat {asset}: {e}"))?
                 .len();

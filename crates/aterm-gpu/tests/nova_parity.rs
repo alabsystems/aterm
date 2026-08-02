@@ -154,8 +154,18 @@ fn nova_over_text_matches_within_tolerance() {
 }
 
 /// (c) The EMPTY-nova code path is a TRUE no-op on both backends: a render with
-/// an empty `nova_add` is byte-identical to one where quads were pushed and
-/// then cleared — including via `clear_overlays` (the `image plain` contract).
+/// an empty `nova_add` is byte-identical to one where quads were pushed,
+/// RENDERED, and then cleared — including via `clear_overlays` (the `image
+/// plain` contract).
+///
+/// THE RENDER BETWEEN THE PUSH AND THE CLEAR IS THE WHOLE TEST. All four legs
+/// used to push and clear back-to-back, so no `render_input` ever received a
+/// populated `nova_add` and the pixel assertions reduced to "the same empty
+/// input renders the same twice". The CPU twin
+/// (crates/aterm-render/tests/nova.rs) always had the honest form; this file
+/// looked like a faithful mirror and was not. Each leg now renders the
+/// populated frame and asserts it DIFFERS from base before draining, so a
+/// silently-dropped nova stream cannot make the drain look clean.
 #[test]
 fn empty_nova_is_byte_identical_to_no_nova() {
     let theme = Theme::default();
@@ -170,9 +180,14 @@ fn empty_nova_is_byte_identical_to_no_nova() {
     let mut input = term.cell_frame(rows, cols);
     assert!(input.nova_add.is_empty());
 
-    // CPU: baseline (empty) vs pushed-then-cleared vs clear_overlays-stripped.
+    // CPU: baseline (empty) -> painted -> drained -> painted -> stripped.
     let cpu_base = cpu.render_input(&input).pixels.clone();
     push_nova(&mut input, cw, ch);
+    let cpu_painted = cpu.render_input(&input).pixels.clone();
+    assert_ne!(
+        cpu_base, cpu_painted,
+        "NON-VACUITY: a live nova_add frame must paint on the CPU"
+    );
     input.nova_add.clear();
     let cpu_after = cpu.render_input(&input).pixels.clone();
     assert_eq!(
@@ -181,6 +196,7 @@ fn empty_nova_is_byte_identical_to_no_nova() {
         "empty-nova path is not a no-op on the CPU"
     );
     push_nova(&mut input, cw, ch);
+    let _ = cpu.render_input(&input);
     input.clear_overlays();
     assert!(
         input.nova_add.is_empty(),
@@ -193,10 +209,17 @@ fn empty_nova_is_byte_identical_to_no_nova() {
         "clear_overlays must restore the bare frame on the CPU"
     );
 
-    // GPU: the same empty-vs-emptied-vs-stripped invariant.
+    // GPU: the same painted-then-emptied-then-stripped invariant, on ONE
+    // renderer+window so any per-frame instance-stream residue would survive
+    // into the drained frame.
     let mut win = aterm_gpu::WindowGpu::new();
     let gpu_base = gpu.render_input(&mut win, &input, None).pixels;
     push_nova(&mut input, cw, ch);
+    let gpu_painted = gpu.render_input(&mut win, &input, None).pixels;
+    assert_ne!(
+        gpu_base, gpu_painted,
+        "NON-VACUITY: a live nova_add frame must paint on the GPU"
+    );
     input.nova_add.clear();
     let gpu_after = gpu.render_input(&mut win, &input, None).pixels;
     assert_eq!(
@@ -205,6 +228,7 @@ fn empty_nova_is_byte_identical_to_no_nova() {
         "empty-nova path is not a no-op on the GPU"
     );
     push_nova(&mut input, cw, ch);
+    let _ = gpu.render_input(&mut win, &input, None);
     input.clear_overlays();
     let gpu_stripped = gpu.render_input(&mut win, &input, None).pixels;
     assert_eq!(
@@ -500,6 +524,23 @@ fn supernova_damaged_path_wash_to_shockwave_cached_equals_fresh() {
 /// byte-equal settled frame must take the dirty gate on BOTH backends
 /// (`is_active == false` with non-empty settled ink is the §3.1 gate-hit
 /// path; 0% idle).
+///
+/// WITH A PIXEL ORACLE, because counters alone would pass a renderer that hit
+/// the gate at the right moments and drew the wrong image. Two additions, and
+/// the FIRST is what made the second worth having:
+///   * THE WORD IS ON SCREEN. `ink` is a per-cell FOREGROUND override, and the
+///     grid this test used to render was BLANK. MEASURED on that old fixture:
+///     rendering the settled frame with the ink and without it differs in
+///     ZERO pixels, on both backends — the "frozen rainbow ink must be
+///     present" assertion was about the input vec, never about the frame. The
+///     terminal now prints `fuck` at the episode's own cells (row 2, cols
+///     4..=7 — the `super_env` word), which moves 244 CPU pixels.
+///   * THE SETTLED IMAGE IS CHECKED. Against a no-ink twin: EXACTLY the four
+///     lead cells may differ, each must differ, and each must contain its own
+///     ink colour verbatim. Then the pixels the GATE HIT hands back must equal
+///     a fresh full render of the settled frame, byte-for-byte, on both
+///     backends — a hit that replayed the debris frame, or any stale buffer,
+///     fails here even though every counter is right.
 #[test]
 fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
     let theme = Theme::default();
@@ -511,6 +552,11 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
     let (rows, cols) = (8usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
+    // The supernova word itself, at the cells `super_env`/`frozen_rainbow_ink`
+    // name: CUP is 1-based, so row 2 col 4 is `\x1b[3;5H`. Without glyphs here
+    // the ink is invisible and every pixel assertion below would be vacuous.
+    term.process(b"\x1b[3;5Hfuck");
+    let (cw, ch) = cpu.cell_size();
     let env = super_env(&cpu, rows, cols);
 
     // A late animating frame (debris motes still live), then the settled one.
@@ -533,14 +579,91 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
         "the frozen rainbow ink must be present"
     );
 
-    let _ = cpu.render_input_cached(&mut win_cpu, &in_debris);
+    // ---- PIXEL ORACLE 1: the settled frame IS the inked word ---------------
+    //
+    // The same settled input minus the ink is the differential twin: the ink
+    // must change the four lead cells and NOTHING else, and each lead cell must
+    // carry its own colour verbatim (per-cell distinct colours, so a swapped,
+    // smeared or dropped entry is caught). Fresh full renders on throwaway
+    // windows, independent of the cached path exercised below.
+    let mut settled_bare = settled.clone();
+    settled_bare.ink.clear();
+    let mut win_fresh = aterm_gpu::WindowGpu::new();
+    let cpu_frame = cpu.render_input(&settled);
+    // The cell arithmetic below is grid-relative, so pin the framing: no
+    // interior pad, no head band (both default to 0 in these backends).
+    assert_eq!(
+        (cpu_frame.width, cpu_frame.height),
+        (cols * cw, rows * ch),
+        "these renderers must be unpadded for the cell math below"
+    );
+    let width = cpu_frame.width;
+    let cpu_settled = cpu_frame.pixels;
+    let cpu_bare = cpu.render_input(&settled_bare).pixels;
+    let gpu_settled = gpu.render_input(&mut win_fresh, &settled, None).pixels;
+    let gpu_bare = gpu.render_input(&mut win_fresh, &settled_bare, None).pixels;
+    for (backend, inked, bare) in [
+        ("CPU", &cpu_settled, &cpu_bare),
+        ("GPU", &gpu_settled, &gpu_bare),
+    ] {
+        // Every pixel OUTSIDE the four lead cells is untouched by the ink.
+        for (i, (&a, &b)) in inked.iter().zip(bare.iter()).enumerate() {
+            let (row, col) = ((i / width) / ch, (i % width) / cw);
+            let is_lead = row == 2 && (4..=7).contains(&col);
+            assert!(
+                is_lead || a == b,
+                "{backend}: the frozen ink must touch ONLY the word's lead cells — \
+                 pixel {i} (row {row}, col {col}) changed {b:#08x} -> {a:#08x}"
+            );
+        }
+        // ... and each lead cell IS inked, with its own exact colour.
+        for cell in frozen_rainbow_ink() {
+            let (r, c) = (cell.row as usize, cell.col as usize);
+            let want = (u32::from(cell.color[0]) << 16)
+                | (u32::from(cell.color[1]) << 8)
+                | u32::from(cell.color[2]);
+            let (mut changed, mut exact) = (false, false);
+            for y in r * ch..(r + 1) * ch {
+                for x in c * cw..(c + 1) * cw {
+                    let i = y * width + x;
+                    changed |= inked[i] != bare[i];
+                    exact |= inked[i] & 0x00ff_ffff == want;
+                }
+            }
+            assert!(
+                changed,
+                "{backend}: lead cell (row {r}, col {c}) must be recoloured by the frozen ink \
+                 (is the word actually on screen?)"
+            );
+            assert!(
+                exact,
+                "{backend}: lead cell (row {r}, col {c}) must carry its ink colour \
+                 {want:#08x} verbatim on at least one fully-covered glyph pixel"
+            );
+        }
+    }
+
+    // ---- The gate decisions (counters), unchanged ---------------------------
+    let cpu_debris = cpu
+        .render_input_cached(&mut win_cpu, &in_debris)
+        .pixels()
+        .to_vec();
     let _ = gpu.render_input_cached(&mut win_gpu, &in_debris);
     // Debris → settled: a real change (decos vanish) — both must re-render.
-    let _ = cpu.render_input_cached(&mut win_cpu, &settled);
+    let cpu_settled_cached = cpu
+        .render_input_cached(&mut win_cpu, &settled)
+        .pixels()
+        .to_vec();
     assert_ne!(
         win_cpu.last_damage(),
         DamageOutcome::GateHit,
         "debris → settled is a real change (decos vanish)"
+    );
+    // The same claim in PIXELS, not just in the damage outcome.
+    assert_ne!(
+        max_channel_delta(&cpu_debris, &cpu_settled_cached),
+        0,
+        "debris → settled must change the image (the decos really vanish)"
     );
     let misses_before = gpu.gate_misses();
     let _ = gpu.render_input_cached(&mut win_gpu, &settled);
@@ -551,16 +674,55 @@ fn settled_after_supernova_gate_hits_with_frozen_rainbow_ink() {
 
     // Settled → settled (byte-equal ink, empty overlays): the gate must HIT.
     let settled_again = settled.clone();
-    let _ = cpu.render_input_cached(&mut win_cpu, &settled_again);
+    let cpu_hit = cpu
+        .render_input_cached(&mut win_cpu, &settled_again)
+        .pixels()
+        .to_vec();
     assert_eq!(
         win_cpu.last_damage(),
         DamageOutcome::GateHit,
         "a settled post-supernova frame with frozen rainbow ink must take the CPU dirty gate"
     );
     let hits_before = gpu.gate_hits();
-    let _ = gpu.render_input_cached(&mut win_gpu, &settled_again);
+    let gpu_hit = gpu
+        .render_input_cached(&mut win_gpu, &settled_again)
+        .pixels()
+        .to_vec();
     assert!(
         gpu.gate_hits() > hits_before,
         "a settled post-supernova frame with frozen rainbow ink must take the GPU dirty gate"
     );
+
+    // ---- PIXEL ORACLE 2: what the gate handed back is the settled IMAGE ----
+    //
+    // A gate hit returns cached pixels without rendering. They must equal a
+    // FRESH full render of the same input, byte-for-byte, on both backends —
+    // the assertion the counters above cannot make.
+    same_image("CPU", &cpu_settled, &cpu_hit, width);
+    same_image("GPU", &gpu_settled, &gpu_hit, width);
+}
+
+/// Byte-for-byte frame equality that names the FIRST divergent pixel (and its
+/// cell) instead of dumping two whole frames into the log.
+fn same_image(backend: &str, want: &[u32], got: &[u32], width: usize) {
+    assert_eq!(
+        want.len(),
+        got.len(),
+        "{backend}: gate-hit frame length {} != fresh render {}",
+        got.len(),
+        want.len()
+    );
+    if let Some((i, (&w, &g))) = want
+        .iter()
+        .zip(got.iter())
+        .enumerate()
+        .find(|&(_, (&a, &b))| a != b)
+    {
+        let (x, y) = (i % width, i / width);
+        panic!(
+            "{backend} gate hit did not hand back the settled frame's own pixels — \
+             first mismatch at pixel {i} (x={x}, y={y}): fresh render {w:#08x}, \
+             gate-hit frame {g:#08x}"
+        );
+    }
 }

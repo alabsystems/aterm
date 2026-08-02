@@ -1411,6 +1411,11 @@ mod tests {
             "crates/aterm-cap/src",
             "crates/aterm-codec/src",
             "crates/aterm-containment/src",
+            // Entered the closure with the SessionHost seam extraction (f2284d67):
+            // aterm-gui hosts the selection/block control verbs through
+            // `control_host::GuiHost`. A normal [dependencies] edge, so the
+            // whole crate is process code.
+            "crates/aterm-control/src",
             "crates/aterm-core/src",
             "crates/aterm-effects/src",
             "crates/aterm-error/src",

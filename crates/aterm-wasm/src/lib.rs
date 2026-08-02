@@ -2207,7 +2207,7 @@ pub fn encode_key_with_mode(
     base_layout_key: Option<char>,
     mode_bits: u32,
 ) -> Option<Vec<u8>> {
-    use aterm_types::keyboard::{KeyboardMode, encode_dom_key};
+    use aterm_types::keyboard::{encode_dom_key, KeyboardMode};
     let mode = KeyboardMode::from_bits_truncate(mode_bits as u16);
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }

@@ -14,6 +14,10 @@
 //     pinning a glyph near-black, the glyph stroke is DARKER than the lit
 //     background beside it — the letter reads as a dark core INSIDE the fire,
 //     because the light went UNDER the ink;
+//   * the SUBSTITUTION LAW on LINE DECORATIONS: `char_fg` follows into the
+//     underline / undercurl / strike / overline of the cell it chars, so a
+//     charred decorated cell is byte-identical to the same text recoloured via
+//     SGR truecolor fg (an explicit SGR 58 underline colour still wins);
 //   * `glow_under` light only ever brightens the pre-light frame and stays
 //     inside its quads' row bands (additive containment);
 //   * dirty gate: settled streams (equal, non-empty) gate-hit; a moved quad
@@ -222,6 +226,132 @@ fn silhouette_law_glyph_darker_than_lit_background() {
             );
         }
     }
+}
+
+/// The `char_fg` colour used by the substitution proof: a vivid blue, NOT the
+/// near-black ember of the silhouette tests. EMBERFORGE chars toward black, but
+/// a near-black operand can be indistinguishable from a floored default fg, so
+/// the substitution proof uses a colour nothing else in the frame can produce.
+const CHARRED: u32 = 0x007C_C8FF;
+
+/// One cell's pixels out of a padded frame (`Renderer::pad` is symmetric, the
+/// convention the silhouette test above already samples with).
+fn cell_pixels(
+    f: &aterm_render::Frame,
+    pad: usize,
+    cw: usize,
+    ch: usize,
+    row: usize,
+    col: usize,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(cw * ch);
+    for y in pad + row * ch..(pad + row * ch + ch).min(f.height) {
+        for x in pad + col * cw..(pad + col * cw + cw).min(f.width) {
+            out.push(f.pixels[y * f.width + x]);
+        }
+    }
+    out
+}
+
+/// SUBSTITUTION LAW ON LINE DECORATIONS: a decoration is a decoration OF the
+/// glyph's ink, so `char_fg` — the EMBERFORGE final glyph-ink override — must
+/// reach the underline, the undercurl, the strike and the overline of the cell
+/// it chars. The proof is the `ink.rs` idiom on the OTHER arm of the same
+/// `match`: a charred frame must be BYTE-IDENTICAL to the same text recoloured
+/// via SGR 38;2 truecolor fg.
+///
+/// Why this fixture exists at all: `char_fg` feeds the deco colour at three
+/// independent sites that each re-derive it — CPU pass 3 (solid rects), CPU
+/// pass 3b (the AA undercurl, a SEPARATE pass), and the GPU deco loop — and
+/// every char_fg fixture until now drew blocks and flames with no SGR styling
+/// while every decoration fixture drew SGR styling with no overlay stream.
+/// Neither suite's cells ever crossed, so the `None`-with-char_fg arm at a
+/// decorated cell was never taken. That is the shape that produced the
+/// confirmed ink-vs-curl divergence one stream over.
+///
+/// Row 1 is what makes this non-vacuous PER SITE rather than per frame: its
+/// cells are SPACES, so the decoration is the ONLY ink in them. Col 2 (solid
+/// underline → pass 3) and col 4 (undercurl → pass 3b) must each change when
+/// char_fg lands; col 0 carries an explicit SGR 58 underline colour and must
+/// NOT move, because `effective_deco_color`'s `Some(_)` arms ignore the
+/// substituted operand entirely.
+#[test]
+fn char_fg_follows_into_line_decorations() {
+    let Some(mut rend) = renderer() else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    // Deterministic pixels: a lazy fallback parse landing between two renders
+    // would recolour a frame this test compares byte-for-byte (the ink.rs
+    // discipline).
+    rend.debug_block_on_lazy_fallbacks();
+    let (cw, ch) = rend.cell_size();
+    let pad = rend.pad();
+    let (rows, cols) = (2usize, 12usize);
+
+    // Row 0: underlined x, curly-underlined w, struck s, overlined o — one
+    // glyph per decoration family, on the cells char_fg chars.
+    // Row 1: the deco-only isolates — an SGR 58 underlined space (col 0), a
+    // plain underlined space (col 2), a curly-underlined space (col 4).
+    const TEXT: &str = "\x1b[?25l\x1b[4mx\x1b[24m \x1b[4:3mw\x1b[24m \x1b[9ms\x1b[29m \
+\x1b[53mo\x1b[55m\r\n\x1b[4m\x1b[58;2;10;20;30m \x1b[59m\x1b[24m \x1b[4m \x1b[24m \
+\x1b[4:3m \x1b[24m";
+    let mut term_a = Terminal::new(rows as u16, cols as u16);
+    term_a.process(TEXT.as_bytes());
+    let mut charred_in = term_a.cell_frame(rows, cols);
+    charred_in.char_fg = [(0u16, 0u16), (0, 2), (0, 4), (0, 6), (1, 0), (1, 2), (1, 4)]
+        .into_iter()
+        .map(|(row, col)| CharFg {
+            row,
+            col,
+            fg: CHARRED,
+        })
+        .collect();
+
+    // The same text recoloured via SGR 38;2 — no char_fg. Row 1 col 0 is NOT
+    // recoloured: its SGR 58 underline colour wins in both frames, so the two
+    // must still agree there, which is the precedence pin.
+    let mut term_b = Terminal::new(rows as u16, cols as u16);
+    term_b.process(
+        "\x1b[?25l\x1b[38;2;124;200;255m\x1b[4mx\x1b[24m\x1b[39m \x1b[38;2;124;200;255m\
+\x1b[4:3mw\x1b[24m\x1b[39m \x1b[38;2;124;200;255m\x1b[9ms\x1b[29m\x1b[39m \
+\x1b[38;2;124;200;255m\x1b[53mo\x1b[55m\x1b[39m\r\n\x1b[4m\x1b[58;2;10;20;30m \
+\x1b[59m\x1b[24m \x1b[38;2;124;200;255m\x1b[4m \x1b[24m\x1b[39m \x1b[38;2;124;200;255m\
+\x1b[4:3m \x1b[24m\x1b[39m"
+            .as_bytes(),
+    );
+    let recolored_in = term_b.cell_frame(rows, cols);
+
+    let charred = rend.render_input(&charred_in);
+    let recolored = rend.render_input(&recolored_in);
+    assert_eq!(
+        charred.pixels, recolored.pixels,
+        "char_fg must substitute for the cell fg at EVERY deco consult site \
+         (underline, undercurl, strike, overline) — byte-identically to the \
+         SGR truecolor recolour"
+    );
+
+    // Non-vacuity, per site: the deco-only cells of row 1 must actually move.
+    let plain = rend.render_input(&term_a.cell_frame(rows, cols));
+    let cell = |f: &aterm_render::Frame, row, col| cell_pixels(f, pad, cw, ch, row, col);
+    assert_ne!(
+        cell(&plain, 1, 2),
+        cell(&charred, 1, 2),
+        "pass 3: the solid underline of a charred SPACE is the only ink in that \
+         cell, so it must change colour — if it does not, the char_fg arm of \
+         the deco `match` was never taken"
+    );
+    assert_ne!(
+        cell(&plain, 1, 4),
+        cell(&charred, 1, 4),
+        "pass 3b: the AA undercurl is a SEPARATE pass with its own re-derived \
+         base_fg, and it must follow char_fg too"
+    );
+    assert_eq!(
+        cell(&plain, 1, 0),
+        cell(&charred, 1, 0),
+        "an explicit SGR 58 underline colour still wins over char_fg"
+    );
 }
 
 /// DIRTY GATE: settled streams (equal, non-empty) gate-hit with nothing

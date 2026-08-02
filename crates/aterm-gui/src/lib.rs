@@ -10732,12 +10732,8 @@ impl App {
         // Watch the keys for exactly as long as this entry lives. Installed AFTER the
         // sheet is up so the monitor's own liveness test (`attachedSheet`) is already
         // true for the very first keystroke.
-        let keys = alert_keys::watch_alert_keys(
-            panel.clone(),
-            Some(ns_window.clone()),
-            accept,
-            cancel,
-        );
+        let keys =
+            alert_keys::watch_alert_keys(panel.clone(), Some(ns_window.clone()), accept, cancel);
         if keys.is_none() {
             aterm_log::warn!(
                 "multiline-paste sheet: AppKit declined a local key monitor; the sheet \
@@ -15118,8 +15114,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // its own signed channel and is inert on a build with no pinned root key. A no-op for
     // dev/`cargo run` (no co-located `atpkg`), skipped headless (no background network),
     // and gated on the `[packages]` loop flags (enabled + auto_update, default on).
-    let package_update_loop_running =
-        !headless && spawn_pkg_update_check(&config, proxy.clone());
+    let package_update_loop_running = !headless && spawn_pkg_update_check(&config, proxy.clone());
 
     // Latency self-introspection state (see App::trace_latency). The epoch is a
     // shared monotonic origin so each tab's reader thread and the UI thread

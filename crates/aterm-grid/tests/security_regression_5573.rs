@@ -264,7 +264,9 @@ fn probe_compiler() -> Option<(std::path::PathBuf, bool)> {
             std::env::var_os("HOME")
                 .map(|home| std::path::Path::new(&home).join("trust/build/host/stage2/bin"))
         });
-    if let Some(dir) = stage2 && let Ok(physical) = std::fs::canonicalize(&dir) {
+    if let Some(dir) = stage2
+        && let Ok(physical) = std::fs::canonicalize(&dir)
+    {
         candidates.push((physical.join("trustc"), true));
     }
     candidates.push((std::path::PathBuf::from("rustc"), false));

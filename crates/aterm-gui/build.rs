@@ -149,7 +149,12 @@ fn main() {
     // NOT inferred from '-dev' in the release — any local rustc build reports -dev.
     let explicit = std::env::var("ATERM_COMPILER_FLAVOR").ok();
     let toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
-    let flavor = detect_flavor(explicit.as_deref(), &vv, &compiler_path, toolchain.as_deref());
+    let flavor = detect_flavor(
+        explicit.as_deref(),
+        &vv,
+        &compiler_path,
+        toolchain.as_deref(),
+    );
     println!(
         "cargo:rustc-env=ATERM_COMPILER_VERSION_LINE={}",
         compiler.version_line

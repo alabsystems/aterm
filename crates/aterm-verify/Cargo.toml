@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-verify"
+version.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "aterm's merge gate — the ok/FAIL/skip ladder, its scheduler, and the verdict discipline, as a testable Rust driver"
+
+[[bin]]
+name = "aterm-verify"
+path = "src/main.rs"
+
+[lib]
+name = "aterm_verify"
+path = "src/lib.rs"
+
+# NO DEPENDENCIES, AND THIS IS LOAD-BEARING — not taste.
+#
+# This crate IS the merge gate. It has to build and run when the thing it is
+# gating does not: a workspace crate that fails to compile must produce a FAIL
+# line from a working gate, never a gate that cannot start. A single
+# `{ workspace = true }` path dependency would put an aterm crate between a
+# developer and the diagnostic that tells them which aterm crate broke.
+#
+# std also covers everything the ported stages need: process spawn with an
+# explicit environment, unix permissions/file types, threads for the stage
+# scheduler, and exit-status signal decoding.
+[dependencies]
+
+[lints]
+workspace = true

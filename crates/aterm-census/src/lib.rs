@@ -23,7 +23,11 @@
 //! ONE implementation, TWO consumers (so the verb and the gate cannot diverge):
 //!
 //!   * `cargo xtask gate mainloop` (crates/xtask/src/gate.rs) — the standalone
-//!     verb, part of `gate all` / the pre-push hook.
+//!     verb: part of `gate all`, and invoked by tools/verify.sh (line 495). NOT
+//!     "the pre-push hook", which this sentence used to claim: MEASURED
+//!     2026-08-01, `.githooks/pre-push` runs exactly ONE command — the
+//!     freeze-safety-gate build below (line 111 of the hook), which fuses this
+//!     same census. So the CENSUS does run pre-push; this VERB does not.
 //!   * `tools/freeze-safety-gate/build.rs` — the SAME `cargo build` that runs
 //!     the temporal proof gate runs this census and fails the compile on any
 //!     obligation violation. That fusion is what makes the census AUTOMATIC:

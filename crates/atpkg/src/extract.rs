@@ -367,9 +367,7 @@ pub fn extract_tar_zst(
             let target = entry
                 .link_name()
                 .map_err(map_tar_io)?
-                .ok_or_else(|| {
-                    ExtractError::Rejected(ExtractReject::DisallowedKind, raw.clone())
-                })?
+                .ok_or_else(|| ExtractError::Rejected(ExtractReject::DisallowedKind, raw.clone()))?
                 .into_owned();
             let (dest, target_abs) = vet_hardlink(dest_root, &raw, &target)
                 .map_err(|r| ExtractError::Rejected(r, raw.clone()))?;
@@ -378,8 +376,9 @@ pub fn extract_tar_zst(
             // directory/nothing names no valid bundle. `symlink_metadata` so a
             // (impossible-by-construction, but belt-and-suspenders) symlink at
             // the target is not followed.
-            let target_meta = std::fs::symlink_metadata(&target_abs)
-                .map_err(|_| ExtractError::Rejected(ExtractReject::HardlinkTargetMissing, raw.clone()))?;
+            let target_meta = std::fs::symlink_metadata(&target_abs).map_err(|_| {
+                ExtractError::Rejected(ExtractReject::HardlinkTargetMissing, raw.clone())
+            })?;
             if !target_meta.is_file() {
                 return Err(ExtractError::Rejected(
                     ExtractReject::HardlinkTargetMissing,
@@ -723,7 +722,10 @@ mod tests {
             ],
         );
         extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap();
-        assert_eq!(std::fs::read(root.join("bin/cargo")).unwrap(), b"the one binary");
+        assert_eq!(
+            std::fs::read(root.join("bin/cargo")).unwrap(),
+            b"the one binary"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;

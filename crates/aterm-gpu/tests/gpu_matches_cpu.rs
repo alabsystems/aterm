@@ -303,6 +303,99 @@ fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
     );
 }
 
+/// The three fixtures above install spans but only ever paint SGR-background
+/// SPACES through them, and background rects come from the cell ADVANCE — so
+/// they never observe a glyph's ENLARGEMENT (`Scale::xs`/`ys`/`anchor_y`). This
+/// one puts a real glyph in EACH pane of a composed row and reproduces the
+/// compositor's own frame shape: `line_size_spans` carries a span for the DEC
+/// pane only, and `line_sizes[row]` is that pane's size (the row-level SUMMARY
+/// `app_render` writes — NOT `SingleWidth`, which is what the other fixtures
+/// fill and is the opposite of production). A column no run claims is
+/// single-width by definition, so the innocent pane's glyph must stay 1× — on
+/// BOTH backends.
+///
+/// Row 0 tests the width axis (a DECDWL pane beside an unclaimed one), row 1 the
+/// height/anchor axis (DECDHL-bottom, whose `anchor_y` is a whole cell up).
+#[test]
+fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    let (rows, cols) = (2usize, 17usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    // One bright-red 'M' at the head of each pane on each row (cursor hidden —
+    // this fixture is pure glyph geometry). 'M' fills its advance, so a 2× copy
+    // visibly occupies the NEXT physical cell and a 1× copy does not. The
+    // assertions count RED INK rather than "not theme bg": a written-but-blank
+    // cell carries the terminal's own default background, not the theme's, so
+    // "non-bg" would be true for most of this frame.
+    term.process(b"\x1b[?25l\x1b[38;2;255;0;0m\x1b[1;1HM\x1b[1;10HM\x1b[2;1HM\x1b[2;10HM\x1b[0m");
+    let mut input = term.cell_frame(rows, cols);
+    input.line_size_spans.resize_with(rows, Vec::new);
+    // Row 0: LEFT pane is DECDWL, right pane unclaimed (the compositor emits no
+    // span for a single-width pane). Row 1: RIGHT pane is DECDHL-bottom, left
+    // unclaimed. `line_sizes[r]` is the row-level SUMMARY the compositor writes.
+    input.line_size_spans[0] = vec![LineSizeSpan::new(0, 8, LineSize::DoubleWidth)];
+    input.line_size_spans[1] = vec![LineSizeSpan::new(9, 17, LineSize::DoubleHeightBottom)];
+    input.line_sizes[0] = LineSize::DoubleWidth;
+    input.line_sizes[1] = LineSize::DoubleHeightBottom;
+
+    let (cw, ch) = cpu.cell_size();
+    let cpu_frame = cpu.render_input(&input);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    assert_eq!(
+        (gpu_frame.width, gpu_frame.height),
+        (cpu_frame.width, cpu_frame.height),
+        "mixed-run glyph dimensions differ"
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    assert!(
+        delta <= 8,
+        "per-run glyph enlargement diverges CPU/GPU: max delta {delta} > 8"
+    );
+
+    let ink = |frame: &Frame, row: usize, col: usize| {
+        cell_pixels(frame, cw, ch, row, col)
+            .iter()
+            .filter(|&&p| rr(p) > 120 && gg(p) < 80 && bb(p) < 80)
+            .count()
+    };
+    for (label, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        // NEGATIVE CONTROL: the fixture really does enlarge inside each DEC pane
+        // — the second physical cell of each spanned pane carries the 2× glyph's
+        // right half. Without this the assertions below would hold on a frame
+        // that had lost DEC scaling altogether.
+        assert!(
+            ink(frame, 0, 1) > 4,
+            "{label}: DECDWL pane's glyph did not spill into its own second cell"
+        );
+        assert!(
+            ink(frame, 1, 10) > 4,
+            "{label}: DECDHL pane's glyph did not spill into its own second cell"
+        );
+        // The claim under test: the pane with NO run of its own keeps a 1× glyph,
+        // so the cell after its 'M' carries no ink. Taking the enlargement from
+        // `line_sizes[r]` instead of the column's run puts the neighbouring
+        // pane's 2× here (measured: it did, on the GPU only).
+        assert_eq!(
+            ink(frame, 0, 10),
+            0,
+            "{label}: unspanned pane inherited the row's DECDWL enlargement"
+        );
+        assert_eq!(
+            ink(frame, 1, 1),
+            0,
+            "{label}: unspanned pane inherited the row's DECDHL enlargement"
+        );
+    }
+}
+
 /// An odd-width pane can expose only half of its final DEC double-width logical
 /// cell. Curly underlines still paint that visible remainder, while the hard
 /// pane clip keeps the wave out of the divider.
@@ -1662,6 +1755,93 @@ fn combining_marks_gpu_match_cpu() {
     assert!(
         gpu_acc.pixels != cpu_bare.pixels,
         "GPU: combining marks not drawn (accented == bare)"
+    );
+}
+
+/// Every combining fixture above hangs its mark off a printable LETTER, so none
+/// of them reaches the case where the two backends express drawability
+/// differently: the CPU wraps the base glyph AND its marks in ONE guard
+/// (`!wide && ch != ' ' && !ch.is_control()`), while the GPU has two independent
+/// loops and only the base loop consults it. `add_combining_to_previous_cell`
+/// attaches unconditionally to the previous cell, so a mark typed after a space
+/// lands on a SPACE base — reachable, and the one shape that separates the loops.
+///
+/// The base 'e' carries the SAME U+0301 as the space, which is what makes the
+/// divergence observable: the GPU's atlas prepass is itself gated on
+/// `drawable`, so a mark that appears ONLY on a space base is silently dropped
+/// downstream for want of an atlas slot (measured — that variant passes with or
+/// without the guard). Put the mark on a drawable base too and its slot exists,
+/// at which point the unguarded mark loop paints it on the space as well.
+///
+/// The oracle is the CPU: on a space base it draws nothing, so the GPU must draw
+/// nothing either. (Whether dropping it is the RIGHT rendering is a separate
+/// question about the CPU renderer; this gate only pins the two backends
+/// together.)
+#[test]
+fn combining_mark_on_space_base_gpu_matches_cpu() {
+    let theme = Theme::default();
+    let px = 18.0;
+
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    let (rows, cols) = (1usize, 8usize);
+    let frame_for = |cpu: &mut Renderer,
+                     gpu: &mut aterm_gpu::GpuRenderer,
+                     win: &mut aterm_gpu::WindowGpu,
+                     bytes: &[u8]| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(bytes);
+        let input = term.cell_frame(rows, cols);
+        let cpu_frame = cpu.render_input(&input);
+        let gpu_frame = gpu.render_input(win, &input, None);
+        (input, cpu_frame, gpu_frame)
+    };
+
+    let mut win = aterm_gpu::WindowGpu::new();
+    // "e" + U+0301 (a drawable base, so the acute reaches the atlas), then a
+    // SPACE + U+0301 — a mark does not advance the cursor, so that second acute
+    // attaches to the space at col 1 and 'b' lands at col 2.
+    let (marked, cpu_marked, gpu_marked) = frame_for(
+        &mut cpu,
+        &mut gpu,
+        &mut win,
+        "\x1b[?25le\u{0301} \u{0301}b".as_bytes(),
+    );
+    let (_, cpu_plain, _) = frame_for(
+        &mut cpu,
+        &mut gpu,
+        &mut win,
+        "\x1b[?25le\u{0301} b".as_bytes(),
+    );
+
+    // NON-VACUITY: the frame really does carry a combining mark on a ' ' base.
+    // Without this the parity assertion below could hold because nothing was
+    // ever attached.
+    assert_eq!(
+        marked.cells[0][1].ch, ' ',
+        "fixture drifted: base cell is not a space"
+    );
+    assert!(
+        marked.combining_at(0, 1).is_some(),
+        "fixture drifted: no combining mark attached to the space cell"
+    );
+    assert!(
+        marked.combining_at(0, 0).is_some(),
+        "fixture drifted: the drawable base lost its mark, so the atlas may not hold the acute"
+    );
+    // The CPU oracle drops it: the marked frame equals the unmarked one.
+    assert_eq!(
+        cpu_marked.pixels, cpu_plain.pixels,
+        "CPU: a mark on a space base is expected to be dropped by the pass-2 guard"
+    );
+    let delta = max_channel_delta(&cpu_marked, &gpu_marked);
+    assert!(
+        delta <= 8,
+        "GPU drew a combining mark the CPU dropped: max per-channel delta {delta} > 8"
     );
 }
 
