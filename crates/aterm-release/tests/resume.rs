@@ -858,9 +858,9 @@ fn detached_signature_verifier_matches_rfc8032_and_catches_mutations() {
 #[test]
 fn release_asset_digest_replay_uses_the_updater_download_bound() {
     assert!(publish::validate_release_asset_download_size(1).is_ok());
-    assert!(publish::validate_release_asset_download_size(536_870_912).is_ok());
+    assert!(publish::validate_release_asset_download_size(2_147_483_648).is_ok());
     assert!(publish::validate_release_asset_download_size(0).is_err());
-    assert!(publish::validate_release_asset_download_size(536_870_913).is_err());
+    assert!(publish::validate_release_asset_download_size(2_147_483_649).is_err());
     assert_eq!(
         publish::validate_small_release_asset_size(manifest_out::MANIFEST_ASSET, 262_144).unwrap(),
         262_144

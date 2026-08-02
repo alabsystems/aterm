@@ -3199,7 +3199,10 @@ pub struct VerifiedReleaseAsset {
     pub sha256: String,
 }
 
-const UPDATER_MAX_DMG_BYTES: u64 = 536_870_912;
+// 2 GiB = GitHub's per-asset ceiling. Raised from 512 MiB 2026-08-02: the
+// batteries-included atpkg seed (715 MiB) pushed DMGs past the old cap.
+// Must stay equal to the client cap in aterm-update/src/github.rs.
+const UPDATER_MAX_DMG_BYTES: u64 = 2_147_483_648;
 static RELEASE_ASSET_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn validate_release_asset_download_size(size: u64) -> Result<()> {

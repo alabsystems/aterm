@@ -822,7 +822,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     }
 
     // If this exact build+DMG already failed to stage and nothing newer exists, don't
-    // re-download the (up to 512 MB) DMG every interval; a re-publish under the same
+    // re-download the (up to 2 GiB) DMG every interval; a re-publish under the same
     // build with a different sha256 (or any newer build) clears the memo (F17).
     if let Some(f) = crate::manifest::FailedMark::read(&staging.failed())
         && f.suppresses(
@@ -868,7 +868,9 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     // A failed DMG download is a `pipeline`-class ledger entry: the asset provably
     // exists (the release names it) but could not be fetched.
     if let Err(e) =
-        aterm_update_core::download_to(&dmg_asset.url, tok.as_deref(), &part, 536_870_912)
+        // 2 GiB = GitHub's per-asset ceiling; must stay equal to the cutter's
+        // UPDATER_MAX_DMG_BYTES (aterm-release/src/publish.rs).
+        aterm_update_core::download_to(&dmg_asset.url, tok.as_deref(), &part, 2_147_483_648)
     {
         let _ = std::fs::remove_file(&part);
         crate::health::Health::record_failure(
