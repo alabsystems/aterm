@@ -1123,7 +1123,7 @@ mod curse_bonk_drain_tests {
             cols: 32,
         };
         let t0 = Instant::now();
-        let style = crate::cursor_glow::GlowStyle::Nyan;
+        let style = crate::cursor_glow::GlowStyle::RainbowKitty;
         let tick = |wd: &mut WordDecorations, now: Instant| {
             let (mut o, mut i, mut f, mut n) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             wd.tick(
@@ -1317,12 +1317,12 @@ mod config_asset_publication_tests {
     use crate::{App, WindowId};
 
     fn catalog(
-        nyan_sprite: crate::app_config::NyanSpriteAsset,
+        kitty_sprite: crate::app_config::KittySpriteAsset,
         themes: Arc<crate::app_config::ThemeCatalog>,
     ) -> Arc<crate::app_config::ConfigAssetCatalog> {
         Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: crate::app_config::TrailPackCatalog::empty(),
-            nyan_sprite,
+            kitty_sprite,
             themes,
             sparkle_spec_consumers: Default::default(),
         })
@@ -1350,7 +1350,7 @@ mod config_asset_publication_tests {
 
         let rgba: Arc<[u8]> = Arc::from([0x12, 0x34, 0x56, 0xff]);
         let ready = catalog(
-            crate::app_config::NyanSpriteAsset::Ready {
+            crate::app_config::KittySpriteAsset::Ready {
                 source_id: Arc::from("same.png"),
                 w: 1,
                 h: 1,
@@ -1362,9 +1362,12 @@ mod config_asset_publication_tests {
         assert_eq!(app.publish_config_assets(Arc::clone(&ready)), 2);
         assert_exact_catalog_on_every_window(&app, &ready);
         for window in app.windows.values() {
-            assert_eq!(window.word_decos.nyan_sprite_source_fingerprint(), Some(11));
+            assert_eq!(
+                window.word_decos.kitty_sprite_source_fingerprint(),
+                Some(11)
+            );
             assert!(Arc::ptr_eq(
-                window.word_decos.nyan_sprite_rgba().expect("custom RGBA"),
+                window.word_decos.kitty_sprite_rgba().expect("custom RGBA"),
                 &rgba
             ));
         }
@@ -1376,7 +1379,7 @@ mod config_asset_publication_tests {
         assert_exact_catalog_on_every_window(&app, &ready);
 
         let invalid = catalog(
-            crate::app_config::NyanSpriteAsset::Invalid {
+            crate::app_config::KittySpriteAsset::Invalid {
                 source_id: Arc::from("same.png"),
                 bounded_reason: Arc::from("replacement is invalid"),
             },
@@ -1384,14 +1387,15 @@ mod config_asset_publication_tests {
         );
         assert_eq!(app.publish_config_assets(Arc::clone(&invalid)), 2);
         assert_exact_catalog_on_every_window(&app, &invalid);
-        assert!(
-            app.windows
-                .values()
-                .all(|window| window.word_decos.nyan_sprite_source_fingerprint().is_none())
-        );
+        assert!(app.windows.values().all(|window| {
+            window
+                .word_decos
+                .kitty_sprite_source_fingerprint()
+                .is_none()
+        }));
 
         let builtin = catalog(
-            crate::app_config::NyanSpriteAsset::BuiltIn,
+            crate::app_config::KittySpriteAsset::BuiltIn,
             crate::app_config::ThemeCatalog::empty(),
         );
         assert_eq!(app.publish_config_assets(Arc::clone(&builtin)), 2);
@@ -1399,7 +1403,7 @@ mod config_asset_publication_tests {
         assert!(
             app.windows
                 .values()
-                .all(|window| { window.word_decos.nyan_sprite_source_fingerprint() == Some(0) })
+                .all(|window| { window.word_decos.kitty_sprite_source_fingerprint() == Some(0) })
         );
         assert_eq!(
             app.publish_config_assets(Arc::clone(&builtin)),
@@ -1416,7 +1420,7 @@ mod config_asset_publication_tests {
 
         let first_rgba: Arc<[u8]> = Arc::from([0x10, 0x20, 0x30, 0xff]);
         let first = catalog(
-            crate::app_config::NyanSpriteAsset::Ready {
+            crate::app_config::KittySpriteAsset::Ready {
                 source_id: Arc::from("unchanged/path.png"),
                 w: 1,
                 h: 1,
@@ -1432,7 +1436,7 @@ mod config_asset_publication_tests {
         // Arc in every existing window before capture or effects preparation.
         let second_rgba: Arc<[u8]> = Arc::from([0xaa, 0xbb, 0xcc, 0xff]);
         let replacement = catalog(
-            crate::app_config::NyanSpriteAsset::Ready {
+            crate::app_config::KittySpriteAsset::Ready {
                 source_id: Arc::from("unchanged/path.png"),
                 w: 1,
                 h: 1,
@@ -1444,11 +1448,11 @@ mod config_asset_publication_tests {
         assert_eq!(app.publish_config_assets(Arc::clone(&replacement)), 2);
         assert_exact_catalog_on_every_window(&app, &replacement);
         assert!(app.windows.values().all(|window| {
-            window.word_decos.nyan_sprite_source_fingerprint() == Some(22)
+            window.word_decos.kitty_sprite_source_fingerprint() == Some(22)
                 && Arc::ptr_eq(
                     window
                         .word_decos
-                        .nyan_sprite_rgba()
+                        .kitty_sprite_rgba()
                         .expect("replacement RGBA"),
                     &second_rgba,
                 )
@@ -1457,18 +1461,21 @@ mod config_asset_publication_tests {
         assert_exact_catalog_on_every_window(&app, &replacement);
 
         // A theme-directory-only generation still changes the outer catalog.
-        // Nyan pixels remain the same allocation, while every window adopts the
+        // Rainbow kitty pixels remain the same allocation, while every window adopts the
         // new exact outer Arc immediately.
         let themes = crate::app_config::ThemeCatalog::from_schemes([(
             "Publication Test".to_string(),
             aterm_types::scheme::builtin("Dracula").expect("builtin theme"),
         )]);
-        let theme_only = catalog(replacement.nyan_sprite.clone(), themes);
+        let theme_only = catalog(replacement.kitty_sprite.clone(), themes);
         assert_eq!(app.publish_config_assets(Arc::clone(&theme_only)), 2);
         assert_exact_catalog_on_every_window(&app, &theme_only);
         assert!(app.windows.values().all(|window| {
             Arc::ptr_eq(
-                window.word_decos.nyan_sprite_rgba().expect("retained RGBA"),
+                window
+                    .word_decos
+                    .kitty_sprite_rgba()
+                    .expect("retained RGBA"),
                 &second_rgba,
             )
         }));
@@ -2955,29 +2962,29 @@ pub(crate) fn cursor_cat_color_key(
 
 /// Whether ordinary forward-typing momentum is allowed to own the cursor cat.
 ///
-/// The trail master owns the Nyan companion just as surely as it owns the
+/// The trail master owns the kitty companion just as surely as it owns the
 /// ribbon behind it.  Collection/typed hellos deliberately do not use this
 /// predicate: they are bounded, independently promised presentations and the
 /// host ORs `collection_hello` around this ordinary-flight gate.
 #[inline]
-pub(crate) fn ordinary_nyan_cursor_cat_enabled(
+pub(crate) fn ordinary_kitty_cursor_enabled(
     cursor_trail_enabled: bool,
     style: crate::cursor_glow::GlowStyle,
 ) -> bool {
-    cursor_trail_enabled && matches!(style, crate::cursor_glow::GlowStyle::Nyan)
+    cursor_trail_enabled && matches!(style, crate::cursor_glow::GlowStyle::RainbowKitty)
 }
 
-/// Consume one echo-correlated cursor pulse and forward it only when the Nyan
+/// Consume one echo-correlated cursor pulse and forward it only when the rainbow kitty
 /// companion's trail owner is enabled. The pulse is consumed even while gated
 /// off so toggling the owner cannot replay stale typing.
 #[inline]
-pub(crate) fn forward_nyan_cursor_cat_momentum(
+pub(crate) fn forward_kitty_cursor_momentum(
     cursor_trail_enabled: bool,
     style: crate::cursor_glow::GlowStyle,
     pulse: Option<Instant>,
-    cat: &mut crate::nyan_cursor::CursorCat,
+    cat: &mut crate::kitty_cursor::CursorCat,
 ) {
-    if ordinary_nyan_cursor_cat_enabled(cursor_trail_enabled, style)
+    if ordinary_kitty_cursor_enabled(cursor_trail_enabled, style)
         && let Some(at) = pulse
     {
         cat.on_key(at, true);
@@ -2994,8 +3001,7 @@ pub(crate) fn cursor_cat_presentation_enabled(
     style: crate::cursor_glow::GlowStyle,
     collection_hello: bool,
 ) -> bool {
-    collection_hello
-        || (animate_cat && ordinary_nyan_cursor_cat_enabled(cursor_trail_enabled, style))
+    collection_hello || (animate_cat && ordinary_kitty_cursor_enabled(cursor_trail_enabled, style))
 }
 
 #[cfg(test)]
@@ -4840,7 +4846,7 @@ pub(crate) fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, p
 /// paths so the celebration sounds the same in a split as it does whole.
 fn sing_riff_event(bar: u64, gain: f32) -> aterm_effects::trail_sound::SoundEvent {
     aterm_effects::trail_sound::SoundEvent {
-        style: crate::cursor_glow::GlowStyle::Nyan,
+        style: crate::cursor_glow::GlowStyle::RainbowKitty,
         // The sing-along riff is its own authored song — the
         // `trail_sound_style` override never re-voices it.
         voice: aterm_effects::trail_sound::SoundVoice::Style,
@@ -4880,8 +4886,8 @@ pub(crate) struct ComposeDecoCtx<'a> {
     /// Whether the MOTION POLICY (W11) still animates word sparkles.
     pub(crate) animate_sparkles: bool,
     /// This frame's companion opacity (0 ⇒ no companion is drawn) and pose.
-    pub(crate) nyan_alpha: u8,
-    pub(crate) cat_frame: crate::nyan_cursor::CatFrame,
+    pub(crate) kitty_alpha: u8,
+    pub(crate) cat_frame: crate::kitty_cursor::CatFrame,
     pub(crate) accent: u32,
     pub(crate) cursor_color: u32,
     pub(crate) now: Instant,
@@ -7553,7 +7559,7 @@ pub(crate) struct CursorFxInputs {
     /// Live cursor shape (the rainbow cursor requires a BLOCK).
     pub cursor_style: CursorStyle,
     /// This window's GUI blink phase — the rainbow twinkle's flip source (its
-    /// edges become star flares once the nyan style pins the shape steady).
+    /// edges become star flares once the rainbow-kitty style pins the shape steady).
     pub blink_phase: bool,
     /// Effective live cursor colour: OSC 12 when set, otherwise the live OSC 10
     /// foreground. Rewires the glow/trail colours exactly like the cursor body.
@@ -7593,7 +7599,7 @@ pub(crate) struct CursorFxTick {
     pub trail_fp: u64,
     /// FORGE fire fill for the block cursor (`None` ⇒ ordinary themed cursor).
     pub forge_fill: Option<u32>,
-    /// Rainbow (nyan) block fill — wins over `forge_fill` at the splice.
+    /// Rainbow (rainbow kitty) block fill — wins over `forge_fill` at the splice.
     pub rainbow_fill: Option<u32>,
     /// Water DROPLET block fill — spliced after the rainbow/forge fills (the
     /// styles are mutually exclusive, so at most one is ever `Some`).
@@ -7611,7 +7617,7 @@ pub(crate) struct CursorFxTick {
     /// The bolt's flashing fill (storm violet whitening with the storm's
     /// blaze) — `Some` exactly while `bolt_cursor` holds.
     pub bolt_fill: Option<u32>,
-    /// 🌟 Whether the nyan BLINK-TWINKLE is live (the `nyan` style on a focused,
+    /// 🌟 Whether the rainbow BLINK-TWINKLE is live (the `rainbow kitty` style on a focused,
     /// visible BLINKING block): the caller pins the rendered shape to
     /// `CursorStyle::SteadyBlock` so the block never vanishes on the off phase —
     /// the blink flips become the rainbow cursor's star flares instead.
@@ -8454,25 +8460,25 @@ impl App {
         {
             return false;
         }
-        let nyan_asset_fp = assets.nyan_sprite.fingerprint();
-        let source = match &assets.nyan_sprite {
-            crate::app_config::NyanSpriteAsset::BuiltIn => {
-                aterm_effects::word_decorations::NyanSpriteSource::BuiltIn
+        let kitty_asset_fp = assets.kitty_sprite.fingerprint();
+        let source = match &assets.kitty_sprite {
+            crate::app_config::KittySpriteAsset::BuiltIn => {
+                aterm_effects::word_decorations::KittySpriteSource::BuiltIn
             }
-            crate::app_config::NyanSpriteAsset::Ready { w, h, rgba, fp, .. } => {
-                aterm_effects::word_decorations::NyanSpriteSource::Custom {
+            crate::app_config::KittySpriteAsset::Ready { w, h, rgba, fp, .. } => {
+                aterm_effects::word_decorations::KittySpriteSource::Custom {
                     source_fp: *fp,
                     w: *w,
                     h: *h,
                     rgba: std::sync::Arc::clone(rgba),
                 }
             }
-            crate::app_config::NyanSpriteAsset::Invalid { .. } => {
-                aterm_effects::word_decorations::NyanSpriteSource::Disabled
+            crate::app_config::KittySpriteAsset::Invalid { .. } => {
+                aterm_effects::word_decorations::KittySpriteSource::Disabled
             }
         };
-        window.word_decos.set_nyan_sprite_source(source);
-        window.installed_nyan_asset_fp = nyan_asset_fp;
+        window.word_decos.set_kitty_sprite_source(source);
+        window.installed_kitty_asset_fp = kitty_asset_fp;
         window.installed_config_assets = Some(assets);
         true
     }
@@ -8480,7 +8486,7 @@ impl App {
     /// Resolve the cursor-aurora (additive LIGHT) config for this frame: the style +
     /// timing + brightness from config, the base colour defaulting to the themed
     /// cursor colour, and the accent defaulting to a brightened cursor. Enabled for
-    /// the additive styles (the default nyan, plus phaser/lumen/sparkle/fire/laser/
+    /// the additive styles (the default rainbow kitty, plus phaser/lumen/sparkle/fire/laser/
     /// water and their documented aliases), the "beam" tube (no bloom crown, no
     /// ring), AND "comet" — where the aurora is the LIGHT CROWN wrapped around the
     /// [`trail_config`] cadence-comet body (best-of-both). "off" leaves it disabled
@@ -8561,7 +8567,7 @@ impl App {
     /// `redraw_window`'s single-pane path: resolve the MOTION POLICY (W11, with
     /// the `motion_focus` recording pin) and the glow/trail configs, rewire them
     /// to a live OSC-12 cursor colour, then advance the LUMEN aurora, the FORGE
-    /// fire fill, the rainbow (nyan) cursor, and the cadence-comet trail off the
+    /// fire fill, the rainbow (rainbow kitty) cursor, and the cadence-comet trail off the
     /// `fx` snapshot — filling this window's `glow_scratch`/`trail_scratch` and
     /// returning the fingerprints + fills the caller folds into its frame.
     ///
@@ -8758,13 +8764,13 @@ impl App {
         // CORRELATED FORWARD MOMENTUM (M2): the ribbon took one typed advance
         // this tick iff a real printable keystroke paired with its forward /
         // wrap / coalesced echo (the "earned by real typing only" gate). Drive
-        // the cursor cat's OWN metric from that SAME pulse — Nyan style only,
+        // the cursor cat's OWN metric from that SAME pulse — rainbow-kitty style only,
         // matching the summon gate — so the cat and the ribbon build momentum
         // from one echo-correlated source and cannot diverge. Key-only input
         // that never echoes forward (a password prompt, vim vertical nav)
         // pulses on neither, so it summons no cat over a dark ribbon.
         let momentum_pulse = ws.cursor_glow.take_momentum_pulse();
-        forward_nyan_cursor_cat_momentum(
+        forward_kitty_cursor_momentum(
             self.config.cursor_trail_or_default(),
             glow_cfg.style,
             momentum_pulse,
@@ -8818,10 +8824,10 @@ impl App {
         let forge_fill = forge_cursor_fill(cursor_body_allowed, &glow_cfg, || {
             ws.cursor_glow.forge_fill()
         });
-        // Typing-reactive RAINBOW CURSOR (the `nyan` block-cursor glow): the block
+        // Typing-reactive RAINBOW CURSOR (the `rainbow kitty` block-cursor glow): the block
         // fill evolves from white/black toward a spinning rainbow and a rainbow halo
         // blooms, both scaled by the live typing momentum, cooling to a dim ember.
-        // Active only for the `nyan` style on a FOCUSED, visible BLOCK cursor. The
+        // Active only for the `rainbow kitty` style on a FOCUSED, visible BLOCK cursor. The
         // halo joins the SAME additive aurora scratch; the fill override rides the
         // snapshot to the renderer (which floors it for glyph contrast). Reduced-
         // motion / load-shed is folded in via the same amplitude the aurora uses.
@@ -8833,7 +8839,8 @@ impl App {
                     | aterm_core::terminal::CursorStyle::SteadyBlock
             );
         let rainbow_cfg = crate::cursor_rainbow::RainbowConfig {
-            enabled: matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::Nyan) && rainbow_block,
+            enabled: matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty)
+                && rainbow_block,
             intensity: policy.amplitude(crate::motion::MotionEffect::CursorGlow) * shed_env,
             blinking: matches!(
                 cursor_style,
@@ -8852,7 +8859,7 @@ impl App {
             &mut ws.glow_scratch,
         );
         let rainbow_fill = rainbow_frame.fill;
-        // 🌟 The nyan BLINK-TWINKLE: with the rainbow live on a BLINKING block,
+        // 🌟 The rainbow kitty BLINK-TWINKLE: with the rainbow live on a BLINKING block,
         // the rendered shape is pinned steady (the caller applies the override —
         // this fn holds the window borrow, like the bolt) so the block never
         // vanishes black-and-white; the blink flips fed to the tick above fire
@@ -8971,7 +8978,7 @@ impl App {
         // style identity (beam/comet/laser defaults, lumen/sparkle = theme,
         // any explicit user colour), but the styles that PAINT their trails
         // outside the config colour get their signature shade instead —
-        // water the droplet's crest aqua, fire a warm ember, nyan the cat's
+        // water the droplet's crest aqua, fire a warm ember, rainbow kitty the cat's
         // pink, phaser the LIVE sweep hue — so rod and trail stay one light.
         let user_tinted = self.config.cursor_trail_color_u32().is_some();
         let (rod_color, rod_haze) = match glow_cfg.style {
@@ -8982,7 +8989,7 @@ impl App {
             crate::cursor_glow::GlowStyle::Fire if !user_tinted => {
                 (0x00FF_9632, 0x0078_1E00) // ember over char
             }
-            crate::cursor_glow::GlowStyle::Nyan if !user_tinted => {
+            crate::cursor_glow::GlowStyle::RainbowKitty if !user_tinted => {
                 (0x00FF_66CC, 0x0046_1E64) // the cat's pink over dusk purple
             }
             crate::cursor_glow::GlowStyle::Phaser if !user_tinted => {
@@ -11353,7 +11360,7 @@ impl App {
             {
                 let _fill = term.row_cols_into(cpos.row as usize, &mut ws.poof_row_buf);
                 // STAR-LANDING NEIGHBORS: capture the rows flanking the
-                // cursor row under the SAME lock, so the displaced nyan
+                // cursor row under the SAME lock, so the displaced rainbow kitty
                 // stars' TEXT-FIRST gate can prove their landing cells blank
                 // (they paint in the ADJACENT rows' pixel bands — the poof
                 // probe's own row says nothing about those). A grid-edge
@@ -11552,7 +11559,7 @@ impl App {
                 self.backend
                     .set_cursor_style_override(Some(CursorStyle::Bolt));
             }
-            // 🌟 The nyan twinkle pins the rendered shape STEADY on the same
+            // 🌟 The rainbow kitty twinkle pins the rendered shape STEADY on the same
             // channel (applied after the prologue's hollow reset; never live
             // together with the bolt — the styles are mutually exclusive): the
             // terminal still reports a blinking block (DECRQSS unaffected —
@@ -11583,13 +11590,13 @@ impl App {
                 win_h,
                 head: fx_head,
             };
-            // NYAN CAT in FRONT of the cursor: flies ahead while you have forward
+            // RAINBOW KITTY CAT in FRONT of the cursor: flies ahead while you have forward
             // typing momentum (a forward-vs-backspace score, tolerant of a stray
             // backspace), pulling the cursor forward so the rainbow ribbon grows
-            // behind it. Gated on the `nyan` style + focus + full motion; the
+            // behind it. Gated on the `rainbow kitty` style + focus + full motion; the
             // fade alpha (0 when momentum has decayed) both hides it and, folded
             // into the aurora key, re-presents the fade and settles at rest.
-            // A USER Nyan sprite (`cursor_nyan_sprite`) overrides the built-in
+            // A USER kitty sprite (`cursor_nyan_sprite`) overrides the built-in
             // homage. Its bounded async worker result was installed before any
             // window borrow at the top of `redraw_window`; this block is now
             // deliberately presentation-only.
@@ -11631,20 +11638,21 @@ impl App {
             // I don't want all the kitties appearing again").
             ws.word_decos
                 .set_presentable(frame_started, cat_presentable);
-            // FULL-NYAN SING-ALONG (`aterm_effects::nyan_sing`): resolve the
+            // SING-ALONG (`aterm_effects::kitty_sing`): resolve the
             // held-key celebration drive for this present. STYLE-GATED to
-            // the Nyan trail (other styles read a hard 0). While any drive
+            // the rainbow kitty trail (other styles read a hard 0). While any drive
             // is live, the documented MOMENTUM BYPASS pins the canonical
             // metric through both existing instances (`CursorGlow::celebrate`
             // → ribbon saturation/star shower via the one spine;
             // `CursorCat::set_singing` → threshold-gated summon + the beat-synced
             // dance + singing face) — no parallel render path, so every
             // legibility cap holds at full drive.
-            let sing_drive = if matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::Nyan) {
-                ws.nyan_sing.drive(frame_started)
-            } else {
-                0.0
-            };
+            let sing_drive =
+                if matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty) {
+                    ws.kitty_sing.drive(frame_started)
+                } else {
+                    0.0
+                };
             if sing_drive > 0.0 {
                 ws.cursor_glow.celebrate(frame_started, sing_drive);
                 // The RIFF: one `Celebration(RiffBar)` gesture per visual
@@ -11656,7 +11664,7 @@ impl App {
                 // contract, so the static celebration keeps its song when
                 // sound is on (unlike the bonk, whose gain models the
                 // glow's intensity-0 silence).
-                if let Some(bar) = ws.nyan_sing.bar(frame_started)
+                if let Some(bar) = ws.kitty_sing.bar(frame_started)
                     && ws.sing_riff_bar != Some(bar)
                 {
                     ws.sing_riff_bar = Some(bar);
@@ -11671,13 +11679,13 @@ impl App {
             } else {
                 // Drained: settle the detector to byte-identical rest and
                 // re-open the bar latch for the next celebration.
-                ws.nyan_sing.settle(frame_started);
+                ws.kitty_sing.settle(frame_started);
                 ws.sing_riff_bar = None;
             }
             ws.cursor_cat.set_singing(
                 frame_started,
                 sing_drive,
-                ws.nyan_sing.beat(frame_started).unwrap_or(0.0),
+                ws.kitty_sing.beat(frame_started).unwrap_or(0.0),
             );
             let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
             let cat_frame = if animate_cat {
@@ -11705,7 +11713,7 @@ impl App {
             // here would force real ~60fps presents of unchanged pixels and then
             // materialize a heart/star from nowhere on fade-out (the audit's
             // invisible-cat wake train). Gate everything on what can be drawn.
-            let nyan_enabled = win_focused
+            let kitty_enabled = win_focused
                 && !deco_suspend
                 && sparkle_on
                 && cursor_cat_presentation_enabled(
@@ -11719,11 +11727,11 @@ impl App {
                     && sparkle_on
                     // The reduced-motion STATIC CELEBRATION presents like a
                     // hello: `cat_frame.sing` is non-zero only when the host
-                    // resolved a live Nyan-gated drive above, so this arm can
-                    // never draw a non-Nyan or idle frame.
+                    // resolved a live rainbow-kitty-gated drive above, so this arm can
+                    // never draw a non-rainbow-kitty or idle frame.
                     && cat_frame.sing > 0.0);
-            let nyan_alpha = if nyan_enabled { cat_frame.alpha } else { 0 };
-            let glow_fp = glow_fp ^ if nyan_enabled { cat_frame.fp() } else { 0 };
+            let kitty_alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
+            let glow_fp = glow_fp ^ if kitty_enabled { cat_frame.fp() } else { 0 };
             // On the way out, the cat sometimes does a flourish — a heart rising
             // (heart meow) or a sparkling star (star wink). It is emitted LATER
             // (just after the halo stream is assembled below) because its
@@ -11832,14 +11840,14 @@ impl App {
                         frame_started,
                         tick_cfg,
                         effect_geom,
-                        // ONE CAT PER CARET: `nyan_alpha` (resolved above) is
+                        // ONE CAT PER CARET: `kitty_alpha` (resolved above) is
                         // this frame's companion decision, and the emission
                         // below draws it at `cur`. Handing the engine the same
                         // cell stops the ambient scanner peeking a SECOND cat
                         // at the word the caret is sitting on — the two
                         // features are otherwise blind to each other, so typing
                         // `kitty` drew both at once.
-                        cur.filter(|_| nyan_alpha > 0),
+                        cur.filter(|_| kitty_alpha > 0),
                         Some(sel_view),
                         ws.focused,
                         &mut ws.deco_scratch,
@@ -11918,16 +11926,16 @@ impl App {
                     // The rare EARNED cat leading the cursor (gated on
                     // !deco_suspend by living in this branch — an alt-screen /
                     // load-shed frame draws none).
-                    if nyan_alpha > 0
+                    if kitty_alpha > 0
                         && let Some(cell) = cur
                     {
-                        let layout = aterm_effects::word_decorations::NyanCursorLayout {
+                        let layout = aterm_effects::word_decorations::KittyCursorLayout {
                             geom: effect_geom,
                             cursor: cell,
                             look: cat_frame.render_look(),
                             bob: cat_frame.bob,
                         };
-                        if let Some(footprint) = ws.word_decos.nyan_cursor_footprint(layout) {
+                        if let Some(footprint) = ws.word_decos.kitty_cursor_footprint(layout) {
                             let colors = ws.cursor_cat.episode_colors().unwrap_or_else(|| {
                                 let sampled = cursor_cat_color_key(
                                     &ws.input_scratch.cells,
@@ -11939,14 +11947,14 @@ impl App {
                                 );
                                 ws.cursor_cat.colors_for_episode(sampled)
                             });
-                            if let Some(cursor_art_fp) = ws.word_decos.nyan_cursor(
-                                aterm_effects::word_decorations::NyanCursorFrame {
+                            if let Some(cursor_art_fp) = ws.word_decos.kitty_cursor(
+                                aterm_effects::word_decorations::KittyCursorFrame {
                                     geom: effect_geom,
                                     cursor: cell,
                                     look: layout.look,
                                     colors,
                                     bob: cat_frame.bob,
-                                    alpha: nyan_alpha,
+                                    alpha: kitty_alpha,
                                     // The living-cartoon pose: banking squash/
                                     // stretch, forward lean, and the baked eye
                                     // frame (blink/squint), all state-machine
@@ -11966,7 +11974,7 @@ impl App {
                                         ws.music_notes.update(
                                             frame_started,
                                             cat_frame.sing,
-                                            ws.nyan_sing.beat(frame_started),
+                                            ws.kitty_sing.beat(frame_started),
                                         );
                                         ws.music_notes
                                             .frame_array(frame_started, tick_cfg.reduced_motion)
@@ -12481,16 +12489,16 @@ impl App {
             // `cursor_glow_add`. `emit_exit_fx` writes exactly one sink per theme.
             // Both streams are spliced together by the tab strip below, so the
             // flourish tracks the grid exactly as it did from `glow_scratch`.
-            if nyan_alpha > 0
+            if kitty_alpha > 0
                 && cat_frame.fade_out > 0.0
-                && !matches!(cat_frame.exit, crate::nyan_cursor::CatExit::Plain)
+                && !matches!(cat_frame.exit, crate::kitty_cursor::CatExit::Plain)
                 && let Some((crow, ccol)) = cur
             {
                 // WINDOW-ABSOLUTE anchor (emit_exit_fx's contract — the effects
                 // layer adds no renderer offset).
                 let ax = i32::from(glow_geom.origin_x) + (i32::from(ccol) + 1) * glow_cw as i32;
                 let ay = i32::from(glow_geom.origin_y) + crow as i32 * glow_ch as i32;
-                crate::nyan_cursor::emit_exit_fx(
+                crate::kitty_cursor::emit_exit_fx(
                     cat_frame.exit,
                     cat_frame.fade_out,
                     ax,
@@ -12523,7 +12531,7 @@ impl App {
             ws.input_scratch
                 .fire_halo
                 .extend_from_slice(ws.cursor_glow.halo_cells());
-            // The block-fill override: the rainbow (Nyan) fill, else the fire
+            // The block-fill override: the rainbow (rainbow kitty) fill, else the fire
             // FORGE fill, else the phaser EMITTER fill, else the laser BOLT
             // fill, else the comet NUCLEUS fill, else the water DROPLET fill,
             // else the beam EMITTER fill — all ride the same contrast-floored
@@ -14130,7 +14138,7 @@ impl App {
             // ONE CAT PER CARET, sharpened per pane: only the FOCUSED pane has
             // a caret, so only there can the ambient scanner collide with the
             // companion. Every other pane hands the engine `None`.
-            let companion_at = (input.session == ctx.focus && ctx.nyan_alpha > 0)
+            let companion_at = (input.session == ctx.focus && ctx.kitty_alpha > 0)
                 .then_some(input.cursor)
                 .flatten();
             let pane_fp = ws.word_decos.tick(
@@ -14198,7 +14206,7 @@ impl App {
     /// The CURSOR COMPANION on a composed frame: ONE per window, riding the
     /// FOCUSED pane's caret.
     ///
-    /// Not per pane, and not out of caution: [`nyan_cursor::CursorCat`] holds
+    /// Not per pane, and not out of caution: [`kitty_cursor::CursorCat`] holds
     /// no grid coordinates at all (momentum, sustain, look, flight — placement
     /// comes entirely from the caller), its input is the committed KEYSTREAM,
     /// which only ever reaches the focused pane, and a window has exactly one
@@ -14209,7 +14217,7 @@ impl App {
         ctx: &ComposeDecoCtx<'_>,
         focus_place: Option<PanePlace>,
     ) -> u64 {
-        if ctx.nyan_alpha == 0 {
+        if ctx.kitty_alpha == 0 {
             return 0;
         }
         let (Some(place), Some(cell)) = (focus_place, ctx.focus_cursor) else {
@@ -14242,13 +14250,13 @@ impl App {
             rows: place.rows,
             cols: place.cols,
         };
-        let layout = aterm_effects::word_decorations::NyanCursorLayout {
+        let layout = aterm_effects::word_decorations::KittyCursorLayout {
             geom,
             cursor: cell,
             look: ctx.cat_frame.render_look(),
             bob: ctx.cat_frame.bob,
         };
-        let Some(footprint) = ws.word_decos.nyan_cursor_footprint(layout) else {
+        let Some(footprint) = ws.word_decos.kitty_cursor_footprint(layout) else {
             return 0;
         };
         let colors = match ws.cursor_cat.episode_colors() {
@@ -14277,19 +14285,19 @@ impl App {
             }
         };
         ws.pane_free.clear();
-        let fp = ws.word_decos.nyan_cursor(
-            aterm_effects::word_decorations::NyanCursorFrame {
+        let fp = ws.word_decos.kitty_cursor(
+            aterm_effects::word_decorations::KittyCursorFrame {
                 geom,
                 cursor: cell,
                 look: layout.look,
                 colors,
                 bob: ctx.cat_frame.bob,
-                alpha: ctx.nyan_alpha,
+                alpha: ctx.kitty_alpha,
                 pose: ctx.cat_frame.pose,
                 sing: ctx.cat_frame.sing,
                 notes: {
                     ws.music_notes
-                        .update(ctx.now, ctx.cat_frame.sing, ws.nyan_sing.beat(ctx.now));
+                        .update(ctx.now, ctx.cat_frame.sing, ws.kitty_sing.beat(ctx.now));
                     ws.music_notes.frame_array(ctx.now, reduced)
                 },
             },
@@ -14934,7 +14942,7 @@ impl App {
                 // STAR-LANDING NEIGHBORS: deliberately NOT wired on the
                 // compose path (the pane loop would need two more locked
                 // captures + the same column shift). Unprobed neighbors mean
-                // the displaced nyan stars take the safe IN-CELL fallback in
+                // the displaced rainbow kitty stars take the safe IN-CELL fallback in
                 // split panes — never a guess over an adjacent row's glyphs.
             }
             let glow_fp =
@@ -14991,10 +14999,10 @@ impl App {
         // sheds it with every other decoration.
         let cat_presentable = focused && !load_shed;
         let collected_look = self.kitty_log.companion_look();
-        let sing_style = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::Nyan);
+        let sing_style = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
         let sound_on = self.config.trail_sounds_or_default();
         let sound_volume = self.config.trail_sound_volume();
-        let (cat_frame, nyan_alpha, riff) =
+        let (cat_frame, kitty_alpha, riff) =
             {
                 let ws = self.windows.get_mut(&wid)?;
                 // THE SESSION KITTY: an explicitly collected companion wins;
@@ -15004,17 +15012,17 @@ impl App {
                 }));
                 ws.cursor_cat
                     .set_collection_presentable(now, cat_presentable);
-                // FULL-NYAN SING-ALONG: the held-key celebration drives the ribbon,
+                // SING-ALONG: the held-key celebration drives the ribbon,
                 // the dance and the singing face through the one canonical metric.
                 let sing_drive = if sing_style {
-                    ws.nyan_sing.drive(now)
+                    ws.kitty_sing.drive(now)
                 } else {
                     0.0
                 };
                 let mut riff: Option<(u64, f32)> = None;
                 if sing_drive > 0.0 {
                     ws.cursor_glow.celebrate(now, sing_drive);
-                    if let Some(bar) = ws.nyan_sing.bar(now)
+                    if let Some(bar) = ws.kitty_sing.bar(now)
                         && ws.sing_riff_bar != Some(bar)
                     {
                         ws.sing_riff_bar = Some(bar);
@@ -15022,11 +15030,11 @@ impl App {
                             .map(|gain| (bar, gain));
                     }
                 } else {
-                    ws.nyan_sing.settle(now);
+                    ws.kitty_sing.settle(now);
                     ws.sing_riff_bar = None;
                 }
                 ws.cursor_cat
-                    .set_singing(now, sing_drive, ws.nyan_sing.beat(now).unwrap_or(0.0));
+                    .set_singing(now, sing_drive, ws.kitty_sing.beat(now).unwrap_or(0.0));
                 let cat_frame = if animate_cat {
                     ws.cursor_cat.frame(now)
                 } else {
@@ -15035,7 +15043,7 @@ impl App {
                 // `sparkle_on` gates the sprite: with the master off an earned
                 // flight is invisible, so folding its fp would force presents of
                 // unchanged pixels (the invisible-cat wake train).
-                let nyan_enabled = cat_presentable
+                let kitty_enabled = cat_presentable
                     && sparkle_on
                     && (cursor_cat_presentation_enabled(
                         animate_cat,
@@ -15043,7 +15051,7 @@ impl App {
                         glow_cfg.style,
                         cat_frame.collection_hello,
                     ) || cat_frame.sing > 0.0);
-                let alpha = if nyan_enabled { cat_frame.alpha } else { 0 };
+                let alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
                 (cat_frame, alpha, riff)
             };
         if let Some((bar, gain)) = riff {
@@ -15061,14 +15069,14 @@ impl App {
                 focus_cursor: (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
                 win_focused: focused,
                 animate_sparkles,
-                nyan_alpha,
+                kitty_alpha,
                 cat_frame,
                 accent: glow_cfg.accent,
                 cursor_color: focus_cursor_rgb
                     .map_or(aterm_core::render::COLOR_UNSET, aterm_render::rgb_to_u32),
                 now,
             },
-        ) ^ if nyan_alpha > 0 { cat_frame.fp() } else { 0 };
+        ) ^ if kitty_alpha > 0 { cat_frame.fp() } else { 0 };
         // Keep the IME candidate/compose window anchored at the caret (only re-reports
         // to winit when the cursor cell actually moves).
         self.report_ime_cursor_area(wid, focus_cur_pos, focus_off, focus_vis);

@@ -5,7 +5,7 @@
 //!
 //! Unlike `cursor_glow_demo`, this drives `CursorGlow` itself through a hot
 //! typing run, then renders three animation phases with the shipping CPU
-//! compositor. Water and Nyan get identity-layout panels; Fire and every
+//! compositor. Water and rainbow kitty get identity-layout panels; Fire and every
 //! non-fire style also get a HEAD-BAND panel (pad 8 + head 48, row-0 run +
 //! upward jump) so top-edge freedom is pinned by PNGs for each style. The
 //! output is suitable for visual review and design diffs.
@@ -43,7 +43,7 @@ fn config(style: GlowStyle, theme: Theme) -> GlowConfig {
         beam: false,
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: aterm_effects::cursor_glow::NYAN_WAKE_PERSIST,
+        wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
     }
 }
 
@@ -263,7 +263,7 @@ fn render_fire_band(renderer: &mut Renderer, theme: Theme, dir: &Path) -> Vec<Fr
 
 /// HEAD-BAND review panel for EVERY non-fire style — the parameterized twin of
 /// [`render_fire_band`]: real chrome head band (pad 8 + head 48), dense text on
-/// the top row, a hot run ALONG row 0 (so upward-flying pixels — nyan stars,
+/// the top row, a hot run ALONG row 0 (so upward-flying pixels — rainbow kitty stars,
 /// water spray, comet debris — cross into the chrome band and clamp at the
 /// effects-box top, not the grid top), then a drop to a lower row and a >=2-cell
 /// upward JUMP landing back on row 0 (arming the jump beam / splash ring /
@@ -356,8 +356,10 @@ fn main() {
     let water = render_phases(&mut renderer, theme, GlowStyle::Water, "water", dir);
     contact_sheet(&water, &dir.join("cursor_water_contact.png"));
 
-    let nyan = render_phases(&mut renderer, theme, GlowStyle::Nyan, "nyan", dir);
-    contact_sheet(&nyan, &dir.join("cursor_nyan_contact.png"));
+    // The artifact names stay `nyan` on purpose: they are the demo's on-disk
+    // output filenames, and existing capture scripts glob for them.
+    let rainbow_kitty = render_phases(&mut renderer, theme, GlowStyle::RainbowKitty, "nyan", dir);
+    contact_sheet(&rainbow_kitty, &dir.join("cursor_nyan_contact.png"));
 
     let fire = render_fire_band(&mut renderer, theme, dir);
     contact_sheet(&fire, &dir.join("cursor_fire_contact.png"));
@@ -365,7 +367,7 @@ fn main() {
     // Head-band panels for every non-fire style: row-0 run + upward jump
     // against a real chrome band, one contact sheet per style.
     for (style, name) in [
-        (GlowStyle::Nyan, "nyan"),
+        (GlowStyle::RainbowKitty, "nyan"),
         (GlowStyle::Water, "water"),
         (GlowStyle::Comet, "comet"),
         (GlowStyle::Lumen, "lumen"),

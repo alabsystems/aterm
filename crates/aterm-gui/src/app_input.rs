@@ -672,7 +672,7 @@ struct PressClass<'ev> {
     /// a Backspace retraction. The predictor's `predict_mode` gate stays at
     /// the call site.
     predict_candidate: Option<(Option<char>, bool)>,
-    /// Forward-typing direction for the Nyan-cursor momentum (INDEPENDENT of
+    /// Forward-typing direction for the kitty-cursor momentum (INDEPENDENT of
     /// the predictor's mode gate, so the cat flies whether or not predictive
     /// echo is on): a visible char / space / newline advances the cursor
     /// (forward), a backspace moves it back; every other key leaves momentum
@@ -965,12 +965,12 @@ impl App {
     ///
     /// PRESENTATION reuses the terminal's existing cat machinery wholesale:
     /// the cursor companion's guaranteed bounded hello
-    /// ([`crate::nyan_cursor::CursorCat::on_collect`]) — the same peeking-head
+    /// ([`crate::kitty_cursor::CursorCat::on_collect`]) — the same peeking-head
     /// appearance near the cursor a collection discovery gets. No new
     /// renderer, no new art rolls: the cameo wears the CURRENT collected
     /// companion identity (or the default peeking head over a fresh ledger),
     /// draws for EVERY trail style (`collection_hello` bypasses the
-    /// Nyan-style gate in `redraw_window`), pauses while the window cannot
+    /// Rainbow kitty-style gate in `redraw_window`), pauses while the window cannot
     /// present it, renders as the one static held pose under reduced motion,
     /// and is inert with the sparkle-words master off OR the
     /// `[sparkle_words.feline]` family off — every gate the ambient
@@ -1001,7 +1001,7 @@ impl App {
             KittyMagic, KittyShownAs, KittySighting, KittyType, TRAIT_BOW, TRAIT_CROWN,
         };
         // EFFECTS MASTER GATE: with sparkle words off (config or the panic
-        // toggle) no cat machinery can draw — `nyan_enabled` requires
+        // toggle) no cat machinery can draw — `kitty_enabled` requires
         // `sparkle_on` — so the summon is wholly inert, exactly like the
         // ambient sightings it mirrors (nothing rendered ⇒ nothing logged).
         let Some(rs) = self.sparkle.as_ref() else {
@@ -1507,7 +1507,7 @@ impl App {
                         };
                     let typed_enter = is_plain_enter(&ev);
                     // Momentum can only arm the cursor cat while the trail
-                    // master is ON and the selected style is Nyan. The master
+                    // master is ON and the selected style is rainbow kitty. The master
                     // owns both the ribbon and its ordinary flying companion;
                     // collection/typed hellos are activated separately below
                     // this gate by the log and remain intentionally independent,
@@ -1515,16 +1515,16 @@ impl App {
                     // 60 fps loop.
                     // Cached like `pmode` above (invalidated by `reload_config`): the
                     // trail style only changes on a config reload.
-                    let nyan_style = match self.nyan_style_cache {
+                    let kitty_cursor_enabled = match self.kitty_cursor_enabled_cache {
                         Some(n) => n,
                         None => {
-                            let n = crate::app_render::ordinary_nyan_cursor_cat_enabled(
+                            let n = crate::app_render::ordinary_kitty_cursor_enabled(
                                 self.config.cursor_trail_or_default(),
                                 crate::cursor_glow::GlowStyle::parse(
                                     self.config.cursor_trail_style_raw(),
                                 ),
                             );
-                            self.nyan_style_cache = Some(n);
+                            self.kitty_cursor_enabled_cache = Some(n);
                             n
                         }
                     };
@@ -1765,14 +1765,14 @@ impl App {
                             // and word-backspaces erase text just as surely as
                             // Backspace, and the owner-loved tongue-out must
                             // not depend on WHICH delete spelling the hand
-                            // used. Same gate shape as the Nyan momentum feed
-                            // below: the Nyan style keeps its momentum honest
+                            // used. Same gate shape as the rainbow kitty momentum feed
+                            // below: the rainbow-kitty style keeps its momentum honest
                             // even while hidden; other styles pay the O(1)
                             // call only while a companion is actually live (a
                             // collection hello). `on_kill` never summons — the
                             // reaction is expression state on an existing
                             // flight, so the lifecycle contract is untouched.
-                            if nyan_style || ws.cursor_cat.is_active() {
+                            if kitty_cursor_enabled || ws.cursor_cat.is_active() {
                                 ws.cursor_cat.on_kill(input_now);
                             }
                         }
@@ -1781,7 +1781,7 @@ impl App {
                         // by a no-move echo (password prompt, vim x/r) must not
                         // re-anchor the NEXT legit jump. RAINBOW RETURN: plain
                         // Enter intentionally stays a real row-change jump, so
-                        // Nyan turns the submitted newline into its official
+                        // Rainbow kitty turns the submitted newline into its official
                         // short rainbow snap/ZOOM. The glow's clear_typed also
                         // drops a dangling backspace quench hint, so a no-move
                         // backspace's surviving pairing cannot "re-anchor" a
@@ -1805,7 +1805,7 @@ impl App {
                             ws.cursor_glow.note_navigation(input_now);
                             ws.cursor_trail.note_navigation(input_now);
                         }
-                        // Feed the Nyan-cursor metric — DELETES ONLY, at the key.
+                        // Feed the kitty-cursor metric — DELETES ONLY, at the key.
                         // A backspace drains the cat's momentum at the KEY instant,
                         // byte-for-byte alongside the glow's `note_backspace` beside
                         // it (same stamp ⇒ the two instances stay in lockstep), and
@@ -1820,7 +1820,8 @@ impl App {
                         // PAIRED with its forward/wrap/coalesced echo, the exact same
                         // event the ribbon spine builds from, so the cat and the
                         // ribbon can never diverge.
-                        if typed_forward == Some(false) && (nyan_style || ws.cursor_cat.is_active())
+                        if typed_forward == Some(false)
+                            && (kitty_cursor_enabled || ws.cursor_cat.is_active())
                         {
                             ws.cursor_cat.on_key(input_now, false);
                         }
@@ -2059,21 +2060,21 @@ impl App {
                                 |tone, c| tone.note_char(input_now, session, c, tone_active),
                             );
                         }
-                        // FULL-NYAN SING-ALONG feed (`aterm_effects::nyan_sing`)
+                        // SING-ALONG feed (`aterm_effects::kitty_sing`)
                         // — the SAME classified press, the same typed-
                         // provenance law as the cameo/tone feeds beside it:
                         // PTY output, `cat`, and pastes can never arm the
                         // celebration, and the detector is Source-agnostic
                         // like everything on this path. PRINTED characters
                         // extend the same-key run (16 at repeat cadence arms
-                        // FULL NYAN); Backspace RELEASES and never arms; every
+                        // SING-ALONG); Backspace RELEASES and never arms; every
                         // break key releases too — each release a graceful
                         // wind-down, never a hard cut. O(1) scalar state per
-                        // key. Style gating (the Nyan trail) is consumption-
+                        // key. Style gating (the rainbow kitty trail) is consumption-
                         // side policy in `redraw_window`.
                         if let Some(ws) = self.windows.get_mut(&wid) {
                             feed_classified_press(
-                                &mut ws.nyan_sing,
+                                &mut ws.kitty_sing,
                                 cosmetic_press,
                                 |sing| sing.note_break(input_now),
                                 |sing| sing.note_backspace(input_now),
@@ -9738,9 +9739,9 @@ mod typed_kitty_summon_tests {
     fn drive_cursor_cat_momentum(app: &mut App, wid: WindowId, enabled: bool) {
         let base = Instant::now();
         for i in 0..160 {
-            crate::app_render::forward_nyan_cursor_cat_momentum(
+            crate::app_render::forward_kitty_cursor_momentum(
                 enabled,
-                crate::cursor_glow::GlowStyle::Nyan,
+                crate::cursor_glow::GlowStyle::RainbowKitty,
                 Some(base + Duration::from_millis(i * 40)),
                 &mut app.windows.get_mut(&wid).unwrap().cursor_cat,
             );
@@ -9754,14 +9755,14 @@ mod typed_kitty_summon_tests {
     /// capable of arming. A typed/collection hello remains independently
     /// presentable with the master off.
     #[test]
-    fn cursor_trail_master_owns_ordinary_nyan_but_not_typed_hello() {
+    fn cursor_trail_master_owns_ordinary_kitty_but_not_typed_hello() {
         let model = cursor_cat_model();
         let wid = WindowId(0);
 
         let mut off_app = App::headless_for_test();
         off_app.config.cursor_trail = Some(false);
-        off_app.config.cursor_trail_style = Some("nyan rainbow".into());
-        off_app.nyan_style_cache = None;
+        off_app.config.cursor_trail_style = Some("rainbow kitty".into());
+        off_app.kitty_cursor_enabled_cache = None;
         off_app.recompute_sparkle();
         assert!(
             off_app.sparkle.is_some(),
@@ -9776,7 +9777,7 @@ mod typed_kitty_summon_tests {
             !crate::app_render::cursor_cat_presentation_enabled(
                 true,
                 false,
-                crate::cursor_glow::GlowStyle::Nyan,
+                crate::cursor_glow::GlowStyle::RainbowKitty,
                 false,
             ),
             "trail master off must also close the ordinary render branch"
@@ -9808,8 +9809,8 @@ mod typed_kitty_summon_tests {
         // otherwise the master-off assertion above could pass vacuously.
         let mut on_app = App::headless_for_test();
         on_app.config.cursor_trail = Some(true);
-        on_app.config.cursor_trail_style = Some("nyan rainbow".into());
-        on_app.nyan_style_cache = None;
+        on_app.config.cursor_trail_style = Some("rainbow kitty".into());
+        on_app.kitty_cursor_enabled_cache = None;
         on_app.recompute_sparkle();
         drive_cursor_cat_momentum(&mut on_app, wid, true);
         assert!(
@@ -9819,7 +9820,7 @@ mod typed_kitty_summon_tests {
         assert!(crate::app_render::cursor_cat_presentation_enabled(
             true,
             true,
-            crate::cursor_glow::GlowStyle::Nyan,
+            crate::cursor_glow::GlowStyle::RainbowKitty,
             false,
         ));
         let mut on_spec = model.init_state();
@@ -9843,7 +9844,7 @@ mod typed_kitty_summon_tests {
         assert!(crate::app_render::cursor_cat_presentation_enabled(
             false,
             false,
-            crate::cursor_glow::GlowStyle::Nyan,
+            crate::cursor_glow::GlowStyle::RainbowKitty,
             hello.collection_hello,
         ));
         assert!(model.fire("Collect", &mut off_spec));
@@ -10282,17 +10283,17 @@ mod favourite_session_kitty_tests {
     }
 }
 
-/// FULL-NYAN SING-ALONG press-path seams. The detector's own laws (repeat
+/// SING-ALONG press-path seams. The detector's own laws (repeat
 /// arm, interleave/backspace never arm, the wind-down crossfade, session
-/// keying, the note ring) are proven in `aterm_effects::nyan_sing`; this
+/// keying, the note ring) are proven in `aterm_effects::kitty_sing`; this
 /// module binds the App seam: the press path feeds ONLY typed keys —
 /// screen bytes can never arm the celebration — and the release keys
 /// release through the same classified press the cameo/tone feeds ride.
 #[cfg(test)]
-mod full_nyan_sing_seam_tests {
+mod full_kitty_sing_seam_tests {
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
-    use aterm_effects::nyan_sing::SING_ARM_REPEATS;
+    use aterm_effects::kitty_sing::SING_ARM_REPEATS;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
     fn key(character: char) -> InputEvent {
@@ -10304,7 +10305,7 @@ mod full_nyan_sing_seam_tests {
         }
     }
 
-    /// Holding a key through the REAL input path arms FULL NYAN at the configured
+    /// Holding a key through the REAL input path arms SING-ALONG at the configured
     /// repeat (the calls land far inside the repeat-gap window), and a PTY
     /// payload of the same repeated byte reaches the grid, not the detector.
     #[test]
@@ -10315,7 +10316,7 @@ mod full_nyan_sing_seam_tests {
         // below, and STRICTLY WORSE: that one only needed the final sample inside
         // `SING_REPEAT_GAP` (250ms) of the last repeat, while this needs all sixteen
         // inter-key gaps under it too — `note_char` resets `count` to 1 whenever a gap
-        // exceeds it (nyan_sing.rs:171-193). `App::input` reads `Instant::now()`
+        // exceeds it (kitty_sing.rs:171-193). `App::input` reads `Instant::now()`
         // internally (:1960), so a single mid-loop deschedule un-arms it legitimately
         // and the assertion then reports a product regression that did not happen.
         // Re-arm instead; `note_char` re-anchors at `count >= SING_ARM_REPEATS`.
@@ -10328,7 +10329,7 @@ mod full_nyan_sing_seam_tests {
                     if i == 0 {
                         assert!(
                             !app.windows[&wid]
-                                .nyan_sing
+                                .kitty_sing
                                 .is_armed(std::time::Instant::now()),
                             "no arm before the burst begins (attempt={attempt})"
                         );
@@ -10336,7 +10337,7 @@ mod full_nyan_sing_seam_tests {
                     app.input(wid, key('a'), Source::Human);
                 }
                 let sample = std::time::Instant::now();
-                if app.windows[&wid].nyan_sing.is_armed(sample) {
+                if app.windows[&wid].kitty_sing.is_armed(sample) {
                     break 'arm sample;
                 }
                 assert!(
@@ -10350,7 +10351,7 @@ mod full_nyan_sing_seam_tests {
             }
             unreachable!("the bounded loop either breaks or asserts")
         };
-        assert_eq!(app.windows[&wid].nyan_sing.drive(now), 1.0);
+        assert_eq!(app.windows[&wid].kitty_sing.drive(now), 1.0);
 
         // TYPED PROVENANCE: `cat` of a repeated character floods the SCREEN,
         // never the detector (fresh app so no prior arm lingers).
@@ -10359,7 +10360,7 @@ mod full_nyan_sing_seam_tests {
         term_lock(&fresh.pool.get(session).unwrap().term).process(b"aaaaaaaaaaaaaaaa");
         assert!(
             !fresh.windows[&wid]
-                .nyan_sing
+                .kitty_sing
                 .is_armed(std::time::Instant::now()),
             "PTY output must never arm the celebration"
         );
@@ -10407,7 +10408,7 @@ mod full_nyan_sing_seam_tests {
                         app.input(wid, key('x'), Source::Human);
                     }
                     let sample = std::time::Instant::now();
-                    if app.windows[&wid].nyan_sing.is_armed(sample) {
+                    if app.windows[&wid].kitty_sing.is_armed(sample) {
                         break 'arm;
                     }
                     assert!(
@@ -10421,11 +10422,11 @@ mod full_nyan_sing_seam_tests {
             app.input(wid, release, Source::Human);
             let after = std::time::Instant::now();
             assert!(
-                !app.windows[&wid].nyan_sing.is_armed(after),
+                !app.windows[&wid].kitty_sing.is_armed(after),
                 "the release key ends the armed hold"
             );
             assert!(
-                app.windows[&wid].nyan_sing.drive(after) > 0.0,
+                app.windows[&wid].kitty_sing.drive(after) > 0.0,
                 "…into the crossfade, never a hard cut"
             );
         }

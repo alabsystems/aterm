@@ -3334,7 +3334,7 @@ impl App {
         if !std::sync::Arc::ptr_eq(&prepared.assets.themes, current) {
             prepared.assets = std::sync::Arc::new(crate::app_config::ConfigAssetCatalog {
                 trail_packs: std::sync::Arc::clone(&prepared.assets.trail_packs),
-                nyan_sprite: prepared.assets.nyan_sprite.clone(),
+                kitty_sprite: prepared.assets.kitty_sprite.clone(),
                 themes: std::sync::Arc::clone(current),
                 sparkle_spec_consumers: prepared.assets.sparkle_spec_consumers.clone(),
             });

@@ -5,7 +5,7 @@
 //! redesign (`trail_sound::BedVariant`). The owner dislikes the shipping low
 //! drone ("don't keep it if it doesn't sound good"; beds ship OFF behind
 //! `trail_sound_bed`), so every candidate is rendered DETERMINISTICALLY
-//! (fixed seed, fixed 20 s script) against the real nyan melody — beds are
+//! (fixed seed, fixed 20 s script) against the real rainbow kitty melody — beds are
 //! judged in context, not in isolation — and measured, not just auditioned:
 //!
 //! per candidate, into `<out_dir>/` (default `target/bed-audition/`):
@@ -125,7 +125,7 @@ fn render_candidate(variant: BedVariant, seconds: f32) -> Vec<f32> {
         while cue_i < cues.len() && cues[cue_i].0 <= t {
             let (ct, kind, pan, heat) = cues[cue_i];
             synth.push(SoundEvent {
-                style: GlowStyle::Nyan,
+                style: GlowStyle::RainbowKitty,
                 voice: SoundVoice::Style,
                 kind: SoundGesture::Trail(kind),
                 pan,

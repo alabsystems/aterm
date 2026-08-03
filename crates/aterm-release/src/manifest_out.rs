@@ -54,6 +54,13 @@ pub struct ManifestInputs<'a> {
     pub dmg_name: &'a str,
     /// Lowercase-hex SHA-256 of the DMG bytes (computed in-process, dmg.rs).
     pub dmg_sha256: &'a str,
+    /// Exact zip asset name in the same release, e.g. "aterm-0.2.0-mac.zip" —
+    /// the container the in-app updater stages from (`ditto`, no `hdiutil`; see
+    /// `aterm_update_core::Manifest::zip`). Always emitted by this cutter; the
+    /// wire field stays optional so pre-zip manifests keep parsing.
+    pub zip_name: &'a str,
+    /// Lowercase-hex SHA-256 of the zip bytes (computed in-process, dmg.rs).
+    pub zip_sha256: &'a str,
     /// "owner/repo" for the `url` field — this must be the **public update
     /// channel** (`[workspace.metadata.aterm] update_channel`) whenever one is
     /// configured, NOT the private publish repo.
@@ -106,6 +113,8 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
             "https://github.com/{}/releases/download/v{}/{}",
             i.repo_slug, i.version, i.dmg_name
         )),
+        zip: Some(i.zip_name.to_string()),
+        zip_sha256: Some(i.zip_sha256.to_string()),
         min_os: Some(i.min_os.to_string()),
         team_id: Some(i.team_id.to_string()),
         pub_date: Some(i.pub_date.to_string()),

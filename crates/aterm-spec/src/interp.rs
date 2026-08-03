@@ -296,12 +296,12 @@ mod tests {
         assert!(fired0.contains("AdmitPatch"));
         assert!(fired0.contains("PublishOne"));
         assert!(!fired0.contains("AdmitStaleTrail"));
-        assert!(!fired0.contains("AdmitStaleNyan"));
+        assert!(!fired0.contains("AdmitStaleKitty"));
         assert!(!fired0.contains("AdmitStaleTheme"));
         assert!(!fired0.contains("AdmitStaleSparkle"));
         let fired1 = fired_actions(&with_buggy(&m, 1));
         assert!(fired1.contains("AdmitStaleTrail"));
-        assert!(fired1.contains("AdmitStaleNyan"));
+        assert!(fired1.contains("AdmitStaleKitty"));
         assert!(fired1.contains("AdmitStaleTheme"));
         assert!(fired1.contains("AdmitStaleSparkle"));
     }

@@ -40,7 +40,7 @@ use aterm_render::{
     GlowQuad, InkCell, RainHalo, SpriteQuad, TrailCell, WordDecoration, theme_is_dark,
 };
 
-use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, NYAN_WAKE_PERSIST};
+use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
 use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainConfig, RainHue, RainTickInput,
@@ -196,7 +196,7 @@ impl EffectsPipeline {
                 beam: true,
                 head_dx: 0.5,
                 pack: None,
-                wake_persist_s: NYAN_WAKE_PERSIST,
+                wake_persist_s: RAINBOW_WAKE_PERSIST,
             },
             glow_color_from_cursor: true,
             glow_accent_from_cursor: true,
@@ -471,8 +471,8 @@ impl EffectsPipeline {
 
     /// Configure the LUMEN cursor aurora (the additive `cursor_glow_add`
     /// channel). Mirrors the native knobs + clamps (`aterm-gui` accessors):
-    /// `style` ∈ lumen|phaser|nyan|sparkle|fire|laser|beam|water|comet
-    /// (unknown → lumen; `rainbow` is a back-compat alias for the Nyan banded
+    /// `style` ∈ lumen|phaser|rainbow kitty|sparkle|fire|laser|beam|water|comet
+    /// (unknown → lumen; `rainbow` is a back-compat alias for the rainbow kitty banded
     /// ribbon — the old laser-like sweep it used to name is the explicit
     /// `phaser`); `color = None` uses the native style default (Laser/Beam/
     /// Sparkle/Comet have canonical hues; other styles derive from
@@ -525,7 +525,7 @@ impl EffectsPipeline {
             intensity: intensity.clamp(0.0, 1.0),
             radius: radius.clamp(0.0, 2.0),
             ring,
-            // Water (its fluid wave wake is the streak) and Nyan (its banded
+            // Water (its fluid wave wake is the streak) and rainbow kitty (its banded
             // ribbon IS the streak) suppress the additive beam — see
             // `style_has_beam`; derived from the raw style string so the beam
             // flag can't cross the FFI boundary.
@@ -1139,7 +1139,7 @@ impl EffectsPipeline {
         // SWAPPED, not copied — for the same reason the channels above are
         // (`tick` clears every one of these scratches at entry, so the buffer
         // handed back holds the previous frame and is never read). `glow_under`
-        // is the one that pays: a hot Nyan ribbon pins 6k-14k 16-byte GlowQuad
+        // is the one that pays: a hot rainbow ribbon pins 6k-14k 16-byte GlowQuad
         // (tests/cursor_bench.rs), i.e. ~100-230 KB of memcpy per present that
         // duplicates bytes the emitter just wrote. `apply` is the sole consumer
         // of the pipeline's glow and reads each stream exactly once, which is

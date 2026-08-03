@@ -171,7 +171,7 @@ pub(crate) fn water_ramp(t: f32) -> u32 {
 
 /// THE TWINKLE'S OWN PALETTE — the white/gold pair the typing starfield and the
 /// glide sparkles have always used. Hoisted out of [`push_twinkle_star`] when the
-/// star became colour-agnostic (the Nyan landing burst draws the SAME shape in a
+/// star became colour-agnostic (the rainbow kitty landing burst draws the SAME shape in a
 /// rainbow band hue), so those two call sites stay byte-identical.
 #[inline]
 pub(crate) const fn twinkle_rgb(gold: bool) -> u32 {
@@ -180,7 +180,7 @@ pub(crate) const fn twinkle_rgb(gold: bool) -> u32 {
 
 /// THE ONE STAR. A 4-point twinkle: a horizontal and a vertical arm crossing at
 /// `(sx, sy)`, plus — when `gold` — four dim diagonal glint dots. This is the
-/// only 4-point star shape any emitter draws: the Nyan typing starfield,
+/// only 4-point star shape any emitter draws: the rainbow kitty typing starfield,
 /// glide stars, jump-landing burst and shooting-star heads, Beam's stardust,
 /// and Sparkle's star grains all come through here, so a star is a star
 /// wherever it appears and only its COLOUR and SIZE change with context

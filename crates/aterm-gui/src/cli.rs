@@ -263,14 +263,14 @@ const STARTER_CONFIG: &str = "\
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown (default ON)
-# cursor_trail_style = \"nyan rainbow\"  # nyan rainbow (banded rainbow ribbon; a blinking block twinkles like a little star; DEFAULT) | phaser (full-spectrum additive hue sweep) | comet (cadence-comet body + light crown) | lumen | sparkle | fire | laser | water | beam (steady power-down tube of cool light) | off
+# cursor_trail_style = \"rainbow kitty\"  # rainbow kitty (banded rainbow ribbon; a blinking block twinkles like a little star; DEFAULT; old spellings \"nyan rainbow\"/\"nyan\"/\"rainbow\" still work) | phaser (full-spectrum additive hue sweep) | comet (cadence-comet body + light crown) | lumen | sparkle | fire | laser | water | beam (steady power-down tube of cool light) | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
 # cursor_trail_intensity = 0.7         # aurora brightness 0.0..=1.0
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0.0..=2.0)
-# cursor_trail_wake_ms = 300           # nyan TYPING WAKE: ms of recent travel the
+# cursor_trail_wake_ms = 300           # rainbow-kitty TYPING WAKE: ms of recent travel the
 #                                      # plume under your words shows (0 = off, max 1500)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
 # trail_sounds = true              # macOS-only trail-style audio (parsed but inert elsewhere); silent whenever the trail is (default ON)

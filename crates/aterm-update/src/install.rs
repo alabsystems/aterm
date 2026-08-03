@@ -1,10 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Staging (mount → extract → verify → publish) and application (lock →
-//! re-verify → atomic swap → re-exec) of an update. The ordering here is the
+//! Staging (unpack → verify → publish) and application (lock → re-verify →
+//! atomic swap → re-exec) of an update. The ordering here is the
 //! security-critical part; see the per-step comments and the crate-level trust
 //! model.
+//!
+//! Unpacking has two shapes for the same signed bundle: [`stage_from_zip`]
+//! (`ditto -x -k`, preferred) and [`stage_from_dmg`] (`hdiutil attach`, for
+//! releases published before the zip existed). They share
+//! `verify_and_publish_incoming`, so the container never changes what is proved.
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -746,16 +751,24 @@ impl Mounted {
     fn attach(dmg: &Path, mountpoint: &Path) -> Result<Self, String> {
         // RETRY, THEN FALL BACK. A stage that dies here strands the whole fleet on
         // the previous build with a verified DMG already on disk, so this step
-        // must not fail on the first refusal.
+        // must not fail on the first refusal. Both mitigations below are cheap and
+        // no-ops on the happy path, and they are right for a genuinely transient
+        // refusal (memory pressure, a device attaching slowly).
         //
-        // 2026-07-31 (v0.10.0): every machine reported
+        // WHAT THEY DO NOT FIX. 2026-07-31 (v0.10.0): every machine reported
         //   hdiutil attach failed: hdiutil: attach failed - Device not configured
         // (ENXIO) from inside the app, while the IDENTICAL command — same DMG,
         // same `-mountpoint` under the same 0700 dir, same environment copied
-        // from the running process — succeeded every time from a shell. So the
-        // refusal is about the attaching PROCESS's moment, not the image: a
-        // DiskArbitration/device-attach race the app can lose and a shell does
-        // not. Both mitigations below are cheap and no-ops on the happy path.
+        // from the running process — succeeded every time from a shell. The cause
+        // is the attaching process's BOOTSTRAP CONTEXT, not the image and not a
+        // race: after a seamless overlap update the surviving aterm is a
+        // fork-child whose parent (the launchd job's process) has exited, so it
+        // is an orphan holding a bootstrap context for a dead job. DiskImages
+        // registers with the `com.apple.hdiejectd` XPC service through that
+        // context, and a lookup in a dead domain can never succeed — so no number
+        // of retries and no choice of mount point helps. The only fix is to not
+        // use hdiutil at all, which is what `stage_from_zip` does; this path
+        // survives for releases whose manifest carries no zip.
         let mut attempts: Vec<String> = Vec::new();
         for attempt in 0..3u32 {
             if attempt > 0 {
@@ -828,17 +841,41 @@ impl Mounted {
             // hdiutil's plain output is TAB-separated `dev \t type \t mountpoint`;
             // splitting on tabs (not whitespace) keeps a mount path with spaces —
             // which the release DMG's `aterm X.Y.Z` volume name always has — intact.
-            None => String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| line.split('\t').nth(2))
-                .map(str::trim)
-                .find(|candidate| !candidate.is_empty())
-                .map(|found| Self {
-                    mountpoint: PathBuf::from(found),
-                })
-                .ok_or_else(|| {
-                    "default mountpoint: hdiutil attached but named no mount point".to_string()
-                }),
+            None => {
+                let parsed = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| line.split('\t').nth(2))
+                    .map(str::trim)
+                    .find(|candidate| !candidate.is_empty())
+                    .map(PathBuf::from);
+                match parsed {
+                    Some(found) => Ok(Self { mountpoint: found }),
+                    // The image DID attach; only naming it failed. Returning a
+                    // bare Err here would drop the `Mounted` guard that has not
+                    // been built yet and leave the device attached for the life
+                    // of the process, so detach by DEVICE NODE — column 0 of the
+                    // same table, which is present even when the mount column is
+                    // not — before reporting the failure.
+                    None => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        for dev in stdout
+                            .lines()
+                            .filter_map(|line| line.split('\t').next())
+                            .map(str::trim)
+                            .filter(|dev| dev.starts_with("/dev/"))
+                        {
+                            let _ = Command::new("/usr/bin/hdiutil")
+                                .args(["detach", "-force"])
+                                .arg(dev)
+                                .output();
+                        }
+                        Err(
+                            "default mountpoint: hdiutil attached but named no mount point"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -869,6 +906,22 @@ fn sweep_stale_mounts(staging: &Staging) {
                 .arg(&p)
                 .output();
             let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+}
+
+/// The zip path's counterpart to [`sweep_stale_mounts`]: reclaim leftover
+/// `zx-*` extract dirs from a run that was killed mid-stage. Nothing needs
+/// detaching (that is the entire point of the zip container) — an abandoned
+/// extract is just a directory, but it can be a whole app bundle's worth of
+/// bytes inside the user's Application Support, so it must not accumulate.
+fn sweep_stale_extracts(staging: &Staging) {
+    let Ok(entries) = std::fs::read_dir(staging.staged_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("zx-") {
+            let _ = std::fs::remove_dir_all(entry.path());
         }
     }
 }
@@ -994,16 +1047,17 @@ fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> 
 /// publish `staged/aterm.app` + write `ready.toml` LAST. The ready marker's
 /// presence is the sole "ready" signal, so writing it last (atomic rename) means
 /// a reader never sees a half-staged bundle.
+///
+/// [`stage_from_zip`] is the preferred path when the release carries a zip; both
+/// share [`verify_and_publish_incoming`], so the two differ ONLY in how the
+/// bundle is unpacked.
 pub fn stage_from_dmg(
     staging: &Staging,
     dmg: &Path,
     manifest: &Manifest,
     expected_team: &str,
 ) -> Result<(), String> {
-    let manifest_commit =
-        canonical_release_commit(manifest.commit.as_deref()).ok_or_else(|| {
-            "release manifest lacks a clean, valid git commit; refusing to stage".to_string()
-        })?;
+    let manifest_commit = staging_manifest_commit(manifest)?;
     ensure_private_dir(&staging.staged_dir()).map_err(|e| format!("staged dir: {e}"))?;
     // Clean up any mount a previously-killed run leaked, then mount at a fresh private
     // mountpoint under our 0700 dir (never /Volumes).
@@ -1011,8 +1065,18 @@ pub fn stage_from_dmg(
     let mountpoint = staging.root.join(format!("mnt-{}", std::process::id()));
     let mounted = Mounted::attach(dmg, &mountpoint)?;
     let src = mounted.mountpoint.join("aterm.app");
-    if !src.is_dir() {
-        return Err(format!("{} not found on mounted DMG", src.display()));
+    // `symlink_metadata` for the same reason the zip path uses it: the container
+    // controls this entry, and a symlink here would be copied into `staged/` as
+    // a link that can never be applied but IS published as ready.
+    match std::fs::symlink_metadata(&src) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} on the mounted DMG is not a real directory",
+                src.display()
+            ));
+        }
+        Err(_) => return Err(format!("{} not found on mounted DMG", src.display())),
     }
 
     let incoming = staging.staged_dir().join("aterm.app.incoming");
@@ -1031,58 +1095,176 @@ pub fn stage_from_dmg(
     // detach the DMG now; everything we need is in `incoming`.
     drop(mounted);
 
+    verify_and_publish_incoming(staging, &incoming, manifest, &manifest_commit, expected_team)
+}
+
+/// Stage a verified copy of the bundle from a downloaded (sha256-checked) ZIP:
+/// `ditto -x -k` extract, then the IDENTICAL verification + publication
+/// [`stage_from_dmg`] performs ([`verify_and_publish_incoming`]).
+///
+/// WHY THIS EXISTS — and why it is preferred over the DMG path: `hdiutil attach`
+/// fails with ENXIO ("Device not configured") in the one process that most needs
+/// to stage. After a seamless overlap update the surviving aterm is a fork-child
+/// whose parent (the launchd job's process) has exited, so it is an orphan
+/// holding a bootstrap context for a dead job. DiskImages registers with the
+/// `com.apple.hdiejectd` XPC service through that context, and the lookup in a
+/// dead domain cannot succeed — which is why the identical command runs fine from
+/// a shell and never from the app. `ditto` needs no XPC service, so unpacking a
+/// zip works from ANY process context.
+///
+/// Nothing about the trust model changes: the zip's bytes are checked against the
+/// manifest digest before this is called, and the extracted bundle then goes
+/// through the same codesign/Team-ID/sealed-identity gate.
+pub fn stage_from_zip(
+    staging: &Staging,
+    zip: &Path,
+    manifest: &Manifest,
+    expected_team: &str,
+) -> Result<(), String> {
+    let manifest_commit = staging_manifest_commit(manifest)?;
+    ensure_private_dir(&staging.staged_dir()).map_err(|e| format!("staged dir: {e}"))?;
+    // Reclaim any extract dir a previously-killed run leaked (same intent as
+    // `sweep_stale_mounts`: nothing under our 0700 dir may accumulate).
+    sweep_stale_extracts(staging);
+    // Extract into a fresh scratch dir rather than straight into `staged/`: the
+    // archive's root entry is `aterm.app` (`--keepParent`), and unpacking that
+    // name next to the PUBLISHED `staged/aterm.app` would collide with it.
+    let extract = staging.staged_dir().join(format!("zx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&extract);
+    std::fs::create_dir_all(&extract).map_err(|e| format!("create zip extract dir: {e}"))?;
+    // `ditto -x -k` (not `unzip`) restores extended attributes and the sequestered
+    // resource forks, so the extracted bundle's codesign seal stays intact.
+    let status = Command::new("/usr/bin/ditto")
+        .args(["-x", "-k"])
+        .arg(zip)
+        .arg(&extract)
+        .status()
+        .map_err(|e| format!("spawn ditto: {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&extract);
+        return Err(format!("ditto zip extract failed ({status})"));
+    }
+    let src = extract.join("aterm.app");
+    // `symlink_metadata`, not `is_dir`: the archive controls this entry, and a
+    // SYMLINK named `aterm.app` pointing at some other bundle would follow
+    // through `is_dir` and then be renamed into `staged/` as a link. The apply
+    // path and the status reader both refuse a symlinked staged bundle
+    // (`install::…symlink_metadata`, `manifest.rs`), so it could never be
+    // installed — but it would be published as "ready", which is a staging
+    // success the DMG path would not have produced and a retry loop nobody can
+    // clear. Refuse it here, where the container's own claim is still local.
+    match std::fs::symlink_metadata(&src) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            let _ = std::fs::remove_dir_all(&extract);
+            return Err(format!(
+                "{} in the update zip is not a real directory",
+                src.display()
+            ));
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&extract);
+            return Err(format!("{} not found in the update zip", src.display()));
+        }
+    }
+
+    let incoming = staging.staged_dir().join("aterm.app.incoming");
+    let _ = std::fs::remove_dir_all(&incoming);
+    // A rename inside `staged/` (same directory, so necessarily the same volume)
+    // moves the bundle without re-copying it — nothing is re-materialized, so no
+    // extended attribute or signature byte can be lost in transit.
+    if let Err(error) = std::fs::rename(&src, &incoming) {
+        let _ = std::fs::remove_dir_all(&extract);
+        return Err(format!("move extracted bundle into place: {error}"));
+    }
+    // The `__MACOSX` sidecar and the scratch dir have served their purpose.
+    let _ = std::fs::remove_dir_all(&extract);
+
+    verify_and_publish_incoming(staging, &incoming, manifest, &manifest_commit, expected_team)
+}
+
+/// The manifest's git commit in canonical form — the one identity every stage
+/// binds the signed bundle back to. Shared so neither container path can drift
+/// into accepting a manifest the other would refuse.
+fn staging_manifest_commit(manifest: &Manifest) -> Result<String, String> {
+    canonical_release_commit(manifest.commit.as_deref()).ok_or_else(|| {
+        "release manifest lacks a clean, valid git commit; refusing to stage".to_string()
+    })
+}
+
+/// Verify an already-extracted incoming bundle and publish it as the staged
+/// update. This is the WHOLE security gate of staging — codesign policy, the
+/// manifest↔sealed-CFBundleVersion rebind, the sealed-commit rebind, then the
+/// ready marker written LAST — and it is deliberately the single copy shared by
+/// [`stage_from_dmg`] and [`stage_from_zip`]: which container the bytes arrived
+/// in must never be able to change what is proved about them.
+///
+/// Every failure path removes `incoming`, so a refused candidate leaves no
+/// half-staged bundle behind.
+fn verify_and_publish_incoming(
+    staging: &Staging,
+    incoming: &Path,
+    manifest: &Manifest,
+    manifest_commit: &str,
+    expected_team: &str,
+) -> Result<(), String> {
     // Verify the extracted bundle before publishing it (tiered: full Developer-ID
     // check when a Team ID is pinned, else structural-only — see the crate trust model).
-    if let Err(e) = verify::verify_bundle_policy(&incoming, expected_team) {
-        let _ = std::fs::remove_dir_all(&incoming);
+    if let Err(e) = verify::verify_bundle_policy(incoming, expected_team) {
+        let _ = std::fs::remove_dir_all(incoming);
         return Err(format!("staged bundle failed verification: {e}"));
     }
     // Bind the (unauthenticated) manifest build_number to the number actually inside
     // the signed bundle — otherwise a manifest could claim a high build_number while
-    // pointing at an OLD genuine signed DMG (a downgrade/replay via repo-write). The
+    // pointing at an OLD genuine signed bundle (a downgrade/replay via repo-write). The
     // CFBundleVersion is codesign-sealed, so reading it AFTER verify_bundle is sound.
-    let bundle_build = match verify::bundle_build_number(&incoming) {
+    let bundle_build = match verify::bundle_build_number(incoming) {
         Ok(n) => n,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&incoming);
+            let _ = std::fs::remove_dir_all(incoming);
             return Err(format!("staged bundle build number unreadable: {e}"));
         }
     };
     if bundle_build != manifest.build_number {
-        let _ = std::fs::remove_dir_all(&incoming);
+        let _ = std::fs::remove_dir_all(incoming);
         return Err(format!(
             "staged bundle CFBundleVersion {bundle_build} != manifest build_number {} — \
              refusing a manifest/bundle mismatch",
             manifest.build_number
         ));
     }
-    let sealed_commit = match verify::bundle_git_commit(&incoming) {
+    let sealed_commit = match verify::bundle_git_commit(incoming) {
         Ok(commit) => commit,
         Err(error) => {
-            let _ = std::fs::remove_dir_all(&incoming);
+            let _ = std::fs::remove_dir_all(incoming);
             return Err(format!("staged bundle commit unreadable: {error}"));
         }
     };
-    if !sealed_commit_matches(Some(&manifest_commit), &sealed_commit) {
-        let _ = std::fs::remove_dir_all(&incoming);
+    if !sealed_commit_matches(Some(manifest_commit), &sealed_commit) {
+        let _ = std::fs::remove_dir_all(incoming);
         return Err(format!(
             "staged bundle ATermGitCommit {sealed_commit:?} does not match manifest commit"
         ));
     }
-    let team = verify::team_id(&incoming).unwrap_or_else(|_| expected_team.to_string());
+    let team = verify::team_id(incoming).unwrap_or_else(|_| expected_team.to_string());
 
     let ready = Ready {
         build_number: manifest.build_number,
         version: manifest.version.clone(),
         // Store canonical lowercase hex (like `dmg_sha256`) so `commit_matches` and any
         // display get a clean value; `None` stays `None`.
-        commit: Some(manifest_commit),
+        commit: Some(manifest_commit.to_string()),
+        // The manifest's `sha256` — the DMG digest — stays the staged artifact's
+        // identity even when the bytes arrived as a zip: it is what the release
+        // manifest, the ready marker, the failed-candidate memo and the apply-time
+        // expected-artifact handoff all key on. Recording the container-specific
+        // digest here would silently break that one identity.
         dmg_sha256: manifest.sha256.to_ascii_lowercase(),
         team_id: team,
         staged_at: now_rfc3339(),
         changelog: manifest.changelog.clone(),
     };
-    publish_verified_stage(staging, &incoming, &ready)
+    publish_verified_stage(staging, incoming, &ready)
 }
 
 /// Publish the post-swap truth after `ready.toml` has been retired but before

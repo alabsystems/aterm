@@ -26,7 +26,7 @@ const SR: u32 = 48_000;
 const STYLES: [(&str, GlowStyle); 9] = [
     ("lumen", GlowStyle::Lumen),
     ("phaser", GlowStyle::Phaser),
-    ("nyan", GlowStyle::Nyan),
+    ("nyan", GlowStyle::RainbowKitty),
     ("sparkle", GlowStyle::Sparkle),
     ("fire", GlowStyle::Fire),
     ("laser", GlowStyle::Laser),

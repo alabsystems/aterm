@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FULL NYAN SING-ALONG — the held-key celebration (owner: "add a repeated
+//! SING-ALONG — the held-key celebration (owner: "add a repeated
 //! key detection where you go FULL NYAN SING SONG RAINBOW if you are holding
 //! the same key and music notes appear and the cursor cat is dancing and
-//! singing … really go nuts"). Style-gated to `GlowStyle::Nyan` by the host.
+//! singing … really go nuts"). Style-gated to `GlowStyle::RainbowKitty` by the host.
 //!
 //! Three pure units live here, one per concern:
 //!
-//! * [`NyanSing`] — the DETECTOR: the same printable character repeating at
+//! * [`KittySing`] — the DETECTOR: the same printable character repeating at
 //!   key-repeat cadence through the typed-provenance input seam (the
 //!   `kitty_summon` seam in `app_input` — committed key presses ONLY; PTY
 //!   output, `cat`, and pastes can never arm it, and like every effect on
 //!   that path it is Source-agnostic). [`SING_ARM_REPEATS`] consecutive
-//!   repeats arm FULL NYAN; a key change, a backspace, a break key, a session
+//!   repeats arm SING-ALONG; a key change, a backspace, a break key, a session
 //!   switch, or simply letting go (no repeat within [`SING_REPEAT_GAP`])
 //!   starts a graceful [`SING_WIND_DOWN`] crossfade — the drive eases 1 → 0,
 //!   never a hard cut. Bounded per-window state, exactly like
@@ -32,7 +32,7 @@
 //!   ([`MAX_NOTES`] = 16) pool of music-note sprites streaming from the
 //!   singing cat, spawned on half-beats, bobbing upward and fading out
 //!   ([`NoteSprite`] carries cell-relative offsets; the emission itself lives
-//!   in `word_decorations::nyan_cursor`, so notes are structurally cat-only —
+//!   in `word_decorations::kitty_cursor`, so notes are structurally cat-only —
 //!   and load-shed sheds them with the rest of the sparkle branch).
 //!   [`bake_note`] uses authored path fills and deterministic host baking,
 //!   baked WHITE and tinted per sprite through the `FreeSprite::tint` channel,
@@ -42,7 +42,7 @@
 //!
 //! * REDUCED MOTION — static celebration: the detector still arms (arming is
 //!   input classification, not animation), the cat presents a still singing
-//!   pose (no dance loop — `nyan_cursor::static_frame`), and
+//!   pose (no dance loop — `kitty_cursor::static_frame`), and
 //!   [`MusicNotes::frames`] pins every note to a fixed offset (notes without
 //!   bob, fade only). The riff still plays if sound is on.
 //! * MUTED / UNFOCUSED — visuals only: the host resolves the riff gain to
@@ -79,7 +79,7 @@ pub const SING_BAR_SECONDS: f32 = SING_BEAT_SECONDS * SING_BAR_BEATS;
 // Detector
 // ---------------------------------------------------------------------------
 
-/// Consecutive same-character repeats that arm FULL NYAN. Sixteen repeats at
+/// Consecutive same-character repeats that arm SING-ALONG. Sixteen repeats at
 /// OS key-repeat cadence is roughly half a second of deliberate holding — long
 /// enough that bursty double/triple taps ("aaa" for emphasis) never trigger,
 /// short enough that a held key blooms while the finger is still down.
@@ -98,11 +98,11 @@ pub const SING_REPEAT_GAP: Duration = Duration::from_millis(250);
 /// host-scaled riff gain ever hard-cut).
 pub const SING_WIND_DOWN: f32 = 1.0;
 
-/// Per-window FULL-NYAN detector. Bounded scalar state (no allocation), fed
+/// Per-window SING-ALONG detector. Bounded scalar state (no allocation), fed
 /// exclusively from the committed key-press path; a session switch clears the
 /// run — repeats typed into different sessions never assemble one hold.
 #[derive(Default)]
-pub struct NyanSing {
+pub struct KittySing {
     /// The character of the current same-key run.
     run: Option<char>,
     /// Consecutive at-cadence repeats of `run` (1 = first press).
@@ -125,7 +125,7 @@ pub struct NyanSing {
     wind_from: Option<Instant>,
 }
 
-impl NyanSing {
+impl KittySing {
     /// Bind the run to `session`, winding down on a switch.
     fn rekey(&mut self, now: Instant, session: u64) {
         if self.session != Some(session) {
@@ -165,7 +165,7 @@ impl NyanSing {
 
     /// Feed one committed PRINTED keystroke. The same character within
     /// [`SING_REPEAT_GAP`] extends the run; the [`SING_ARM_REPEATS`]th press
-    /// arms FULL NYAN (anchoring the beat clock); a different character —
+    /// arms SING-ALONG (anchoring the beat clock); a different character —
     /// interleaved chars never arm — releases the old run and starts a new
     /// one at count 1.
     pub fn note_char(&mut self, now: Instant, session: u64, ch: char) {
@@ -179,10 +179,10 @@ impl NyanSing {
             // KEY-REPEAT IS WALL-TIME (M4): OS auto-repeat delivers each press
             // at a distinct instant, but a single batched IME commit of a
             // repeated string ("wwwwwwww") hands every char ONE `now`. Counting
-            // those zero-gap duplicates as repeats armed FULL NYAN off one
+            // those zero-gap duplicates as repeats armed SING-ALONG off one
             // paste-like commit — jubilant HOLDING it is not. Advance the
             // repeat count only when real time has elapsed since the last
-            // press, so a batched commit is at most one step (the FULL_NYAN arm
+            // press, so a batched commit is at most one step (the sing-along arm
             // still needs [`SING_ARM_REPEATS`] genuine held repeats over time).
             if self.last.is_none_or(|l| now > l) {
                 self.count = self.count.saturating_add(1);
@@ -296,7 +296,7 @@ pub const NOTE_LIFE: f32 = 1.6;
 /// How far a note rises over its life, in cell heights.
 const NOTE_RISE_CELLS: f32 = 1.4;
 
-/// The rainbow the notes cycle through — the Nyan ribbon's six stripes
+/// The rainbow the notes cycle through — the rainbow ribbon's six stripes
 /// (red, orange, yellow, green, blue, violet), applied per sprite through the
 /// `FreeSprite::tint` multiply channel over the white-baked tile.
 pub const NOTE_TINTS: [u32; 6] = [
@@ -328,7 +328,7 @@ struct Note {
 
 /// One frame's resolved note sprite, in CELL units relative to the singing
 /// cat's mouth anchor (+x ahead of the cat, −y upward). The emitter
-/// (`word_decorations::nyan_cursor`) maps cells → pixels and multiplies
+/// (`word_decorations::kitty_cursor`) maps cells → pixels and multiplies
 /// `alpha` by the cat's own presentation alpha.
 #[derive(Clone, Copy, Debug)]
 pub struct NoteSprite {
@@ -464,7 +464,7 @@ impl MusicNotes {
     }
 
     /// This frame's sprites as the fixed `None`-padded array
-    /// `word_decorations::NyanCursorFrame` carries — allocation-free,
+    /// `word_decorations::KittyCursorFrame` carries — allocation-free,
     /// bounded at [`MAX_NOTES`] by construction.
     #[must_use]
     pub fn frame_array(
@@ -499,7 +499,7 @@ impl MusicNotes {
 // ---------------------------------------------------------------------------
 
 /// Salt for the note tiles' `host_tile` id space — its own family, scrambled
-/// away from the user Nyan sprite ids by the splitmix finalizer.
+/// away from the user kitty sprite ids by the splitmix finalizer.
 const NOTE_HOST_SALT: u64 = 0x5150_9A7E_D1B2_C4F3;
 
 /// Stable atlas identity for one baked note tile: kind + exact dimensions.
@@ -614,7 +614,7 @@ mod tests {
 
     /// Hold `ch` for `n` presses at `gap_ms` cadence starting at `t0`;
     /// returns the instant of the last press.
-    fn hold(d: &mut NyanSing, t0: Instant, ch: char, n: u32, gap_ms: u64) -> Instant {
+    fn hold(d: &mut KittySing, t0: Instant, ch: char, n: u32, gap_ms: u64) -> Instant {
         let mut t = t0;
         for i in 0..n {
             t = t0 + Duration::from_millis(u64::from(i) * gap_ms);
@@ -624,10 +624,10 @@ mod tests {
     }
 
     /// THE ARM CADENCE PROOF: one fewer than the threshold arms nothing; the
-    /// threshold press arms FULL NYAN at drive 1.0 and anchors the beat clock.
+    /// threshold press arms SING-ALONG at drive 1.0 and anchors the beat clock.
     #[test]
-    fn threshold_at_cadence_arms_full_nyan() {
-        let mut d = NyanSing::default();
+    fn threshold_at_cadence_arms_full_sing() {
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         let before = hold(&mut d, t0, 'a', SING_ARM_REPEATS - 1, 30);
         assert!(!d.is_armed(before), "a sub-threshold hold must not arm");
@@ -650,7 +650,7 @@ mod tests {
     /// spread over wall-clock repeat cadence still do.
     #[test]
     fn a_batched_ime_commit_of_repeats_does_not_arm() {
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         // One commit: 16 identical chars, all at t0 (the shared `input_now`).
         for _ in 0..16 {
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(d.drive(t0), 0.0);
         // Genuine held-key repeats of the same char over wall time DO arm at
         // the threshold press — the mechanism the batch must not counterfeit.
-        let mut held = NyanSing::default();
+        let mut held = KittySing::default();
         let armed_at = hold(&mut held, t0, 'w', SING_ARM_REPEATS, 30);
         assert!(
             held.is_armed(armed_at),
@@ -676,7 +676,7 @@ mod tests {
     /// ("lettersss…" style tails under the threshold) stays dark too.
     #[test]
     fn interleaved_chars_never_arm() {
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         for i in 0..64u64 {
             let t = t0 + Duration::from_millis(i * 30);
@@ -689,7 +689,7 @@ mod tests {
     /// which can only ever release — and it cuts a live run short of arming.
     #[test]
     fn backspace_never_arms_and_breaks_a_run() {
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         for i in 0..32u64 {
             d.note_backspace(t0 + Duration::from_millis(i * 30));
@@ -716,7 +716,7 @@ mod tests {
     /// holding: gaps beyond [`SING_REPEAT_GAP`] never accumulate a run.
     #[test]
     fn slow_same_key_striking_never_arms() {
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         for i in 0..32u64 {
             let t = t0 + Duration::from_millis(i * 400); // 2.5 Hz — deliberate
@@ -731,7 +731,7 @@ mod tests {
     /// `settle` then returns the detector to byte-identical rest.
     #[test]
     fn wind_down_crossfades_to_zero() {
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         let t = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         assert_eq!(d.drive(t), 1.0);
@@ -763,7 +763,7 @@ mod tests {
     /// derived, no release event required.
     #[test]
     fn letting_go_winds_down_without_an_event() {
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         let t = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         let still_held = t + SING_REPEAT_GAP;
@@ -783,7 +783,7 @@ mod tests {
     /// re-earn the full arm count.
     #[test]
     fn session_switch_releases_the_hold() {
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         let t = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         assert!(d.is_armed(t));
@@ -800,7 +800,7 @@ mod tests {
         );
         // (hold() feeds session S — re-feed in session 99 explicitly.)
         let _ = t2;
-        let mut fresh = NyanSing::default();
+        let mut fresh = KittySing::default();
         let mut at = t1;
         for _ in 0..SING_ARM_REPEATS {
             at += Duration::from_millis(30);
@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn re_earning_the_threshold_during_wind_down_re_arms() {
         // Path 1 — one auto-repeat hiccup (a single gap > SING_REPEAT_GAP).
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         let armed = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         assert!(d.is_armed(armed));
@@ -849,7 +849,7 @@ mod tests {
         );
 
         // Path 2 — a stray other key mid-hold, then the hold resumes.
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let armed = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         let stray = armed + Duration::from_millis(30);
         d.note_char(stray, S, 'b'); // key change → wind-down begins
@@ -863,7 +863,7 @@ mod tests {
         assert_eq!(d.drive(t), 1.0);
 
         // Path 3 — a brief pause (letting the lazy wind-down start) then resume.
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let armed = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         let resume = armed + SING_REPEAT_GAP + Duration::from_secs_f32(SING_WIND_DOWN * 0.4);
         assert!(
@@ -885,7 +885,7 @@ mod tests {
     /// is reserved for a run that lapsed into a wind-down and then re-earned it.
     #[test]
     fn a_continuous_hold_does_not_rewind_its_beat_clock() {
-        let mut d = NyanSing::default();
+        let mut d = KittySing::default();
         let t0 = Instant::now();
         let armed = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         let anchor = d.beat(armed);
@@ -1025,14 +1025,14 @@ mod tests {
         );
     }
 
-    /// Note host ids stay out of the Nyan-sprite id family in the shared atlas.
+    /// Note host ids stay out of the kitty-sprite id family in the shared atlas.
     #[test]
-    fn note_host_ids_avoid_nyan_sprite_family() {
+    fn note_host_ids_avoid_kitty_sprite_family() {
         for kind in [NoteKind::Eighth, NoteKind::Beamed] {
             for (w, h) in [(9u16, 15u16), (15, 22), (1, 1)] {
                 let id = note_host_id(kind, w, h);
                 for generation in 0..64u64 {
-                    assert_ne!(id, crate::nyan_cursor::HOST_ID ^ generation);
+                    assert_ne!(id, crate::kitty_cursor::HOST_ID ^ generation);
                 }
             }
         }

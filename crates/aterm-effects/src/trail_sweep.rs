@@ -3,7 +3,7 @@
 
 //! The SHARED cursor-trail path substrate — the cell-sweep primitives every
 //! trail engine lays its wake with, extracted so continuity is solved ONCE and
-//! every style (fire, nyan, phaser, comet, …) inherits the same guarantees
+//! every style (fire, rainbow kitty, phaser, comet, …) inherits the same guarantees
 //! while keeping its own tuning (lifetimes, coverage curves, palettes).
 //!
 //! ## The continuity contract

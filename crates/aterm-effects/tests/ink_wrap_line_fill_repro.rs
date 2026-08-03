@@ -3,7 +3,7 @@
 //! REGRESSION PIN: the Claude Code / Ink input-box WRAP must NOT fill the new
 //! line with cursor-trail art. This file began life as the bug's repro (its
 //! four tests asserted the artifact into existence: fire meteor + strike
-//! fountain, full-width Nyan ZOOM, full-vector Laser sweep); with the TYPED
+//! fountain, full-width rainbow ZOOM, full-vector Laser sweep); with the TYPED
 //! RE-ANCHOR classifier landed the same byte-faithful harness now pins the
 //! FIXED behavior — the landing row stays confined to the typed cells for
 //! every style, and the mid-band (cells only a phantom jump vector could
@@ -87,10 +87,10 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         intensity: 0.7,
         radius: 0.6,
         ring: true,
-        beam: !matches!(style, GlowStyle::Water | GlowStyle::Nyan),
+        beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: aterm_effects::cursor_glow::NYAN_WAKE_PERSIST,
+        wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
     }
 }
 
@@ -175,7 +175,7 @@ fn ink_burst_split(text: &str) -> (Vec<u8>, Vec<u8>) {
 /// the comet sweep; kept so the pin also bounds spark-rooted flames.
 /// `rows_body` gets everything EXCEPT 4-point-star geometry (1-px vertical
 /// arms, and short 1-px horizontal arms/streak slabs ≤ 6 px — under a cell):
-/// the Nyan starfield now deliberately STREAMS OFF its own row band (the
+/// the rainbow kitty starfield now deliberately STREAMS OFF its own row band (the
 /// owner's "away from the text" retune), so twinkle pluses legitimately
 /// dust neighbouring rows; the zoom-bar pins below must keep counting BODY
 /// coverage (bands/zoom slabs span full cells) without the star dust.
@@ -502,12 +502,12 @@ fn ink_wrap_fire_stays_confined_to_typed_cells() {
     );
 }
 
-/// FIXED, Nyan: no full-width ZOOM streak — the ribbon continues at the
+/// FIXED, rainbow kitty: no full-width ZOOM streak — the ribbon continues at the
 /// landing cell and the landing row stays a ribbon head, like the control.
 #[test]
-fn ink_wrap_nyan_keeps_the_ribbon_no_zoom() {
-    let ink = run_ink(GlowStyle::Nyan, WRAP_W + 5, false);
-    let zsh = run_zsh(GlowStyle::Nyan, 78 + 4);
+fn ink_wrap_rainbow_keeps_the_ribbon_no_zoom() {
+    let ink = run_ink(GlowStyle::RainbowKitty, WRAP_W + 5, false);
+    let zsh = run_zsh(GlowStyle::RainbowKitty, 78 + 4);
     report("INK nyan", &ink);
     report("ZSH nyan (control)", &zsh);
     // BODY coverage (`rows_body`): the ZOOM-bar tell is full-cell band/slab

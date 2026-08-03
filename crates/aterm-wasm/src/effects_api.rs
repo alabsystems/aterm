@@ -80,8 +80,8 @@ impl AtermTerminal {
 
     /// Configure the LUMEN cursor aurora (additive light in the cursor's
     /// wake). Mirrors the native knobs + clamps: `style` ∈
-    /// `lumen|phaser|nyan|sparkle|fire|laser|beam|water|comet` (unknown →
-    /// lumen; `rainbow` = the Nyan banded ribbon);
+    /// `lumen|phaser|rainbow kitty|sparkle|fire|laser|beam|water|comet` (unknown →
+    /// lumen; `rainbow` = the rainbow kitty banded ribbon);
     /// `color`/`accent` omitted derive from the theme cursor (accent = color
     /// brightened 1.5×) exactly like the native app; `duration_ms` clamps
     /// 30..=2000, `length` (cells) 1..=512, `intensity` 0..=1 (0 = off),

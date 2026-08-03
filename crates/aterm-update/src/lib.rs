@@ -95,7 +95,8 @@
 //!   key is compiled in ([`PINNED_UPDATE_PUBKEY`] from `ATERM_UPDATE_PUBKEY`), every
 //!   release manifest MUST carry a valid Ed25519 signature verifiable against it (the
 //!   offline private key lives in CI secrets / offline). Since the manifest pins the
-//!   DMG sha256, this authenticates the artifact even against a repo-write attacker —
+//!   sha256 of every downloadable container (DMG and zip), this authenticates the
+//!   artifact whichever one is staged, even against a repo-write attacker —
 //!   with no Apple Developer ID. Same primitive `atpkg` pins (see [`sig`]).
 //! * **Tier APPLE (a Developer ID — optional, additive).** If [`PINNED_TEAM_ID`] is
 //!   set, `codesign --verify` also runs with a designated requirement (`-R`) pinning
@@ -615,12 +616,16 @@ pub fn spawn_background_check(
                             Ok(Some(v)) => {
                                 emit(failures.success());
                                 schedule.succeeded();
+                                // "is staged", not "was staged just now": the check also
+                                // answers `Some` for a build that was already published and
+                                // is only waiting to be applied (its re-download may be
+                                // backed off — a stage backoff never gates an apply).
                                 log(&format!(
-                                    "staged update {v} — the GUI auto-applies it now (or next launch)"
+                                    "update {v} is staged — the GUI auto-applies it now (or next launch)"
                                 ));
                                 // RFC Rung 2: surface the staged build to the GUI so it can show
                                 // the "relaunch to apply" nudge. The staged build number comes
-                                // from the just-written ready marker (status reads it, no I/O).
+                                // from the ready marker (status reads it, no I/O).
                                 if let Some(cb) = on_staged.as_ref()
                                     && let Some(b) =
                                         status(current_build).and_then(|s| s.staged_build)

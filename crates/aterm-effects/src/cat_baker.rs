@@ -79,7 +79,7 @@ struct Slot {
     key: BakeKeyV4,
     last_used: u64,
     /// `Some(id)` for a HOST-authored tile ([`CatBaker::host_tile`], e.g. the
-    /// Nyan cursor) rather than a generated cat: keyed by `id`, not by `key`, so
+    /// kitty cursor) rather than a generated cat: keyed by `id`, not by `key`, so
     /// the two key spaces never alias in the shared atlas.
     host: Option<u64>,
 }
@@ -304,8 +304,8 @@ impl CatBaker {
     /// the tile doesn't fit, or the ≤2-bakes/frame budget is spent (retry next
     /// frame). Metric changes clear it exactly like a cat tile, so a caller that
     /// re-paints `rgba` at the new cell scale gets a fresh bake automatically.
-    /// Used by the Nyan cursor ([`crate::word_decorations::WordDecorations::nyan_cursor`]),
-    /// whose host-provided sprite ([`crate::nyan_cursor`]) is not a generated glyph.
+    /// Used by the kitty cursor ([`crate::word_decorations::WordDecorations::kitty_cursor`]),
+    /// whose host-provided sprite ([`crate::kitty_cursor`]) is not a generated glyph.
     pub fn host_tile(&mut self, host_id: u64, w: u16, h: u16, rgba: &[u8]) -> Option<CatTile> {
         if self.cell_h == 0 || w == 0 || h == 0 {
             return None;
@@ -793,7 +793,7 @@ fn accessory_transform(acc: CatGlyphId, w: u32, h: u32) -> PathTransform {
 
 /// v4 §2 blink/expression bake axis: the eye state baked into a cursor-cat tile.
 /// A pure frame-selection input (not per-pixel work) — the animating cursor cat
-/// ([`crate::nyan_cursor::CursorCat`]) blinks and squints by selecting a distinct
+/// ([`crate::kitty_cursor::CursorCat`]) blinks and squints by selecting a distinct
 /// `eyes` value, which bakes a distinct (but cache-cheap) tile. `Open` is the
 /// authored art verbatim, so every existing bake and word-cat stays byte-exact.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

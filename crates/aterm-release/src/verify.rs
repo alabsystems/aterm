@@ -744,6 +744,19 @@ pub fn post_publish(
         &manifest.sha256,
     )?;
     let size = verified_dmg.size;
+    // The zip gets the SAME hard gate: it is the container the in-app updater
+    // downloads and stages from (the DMG path needs `hdiutil`, which an orphaned
+    // post-handoff process cannot use), so a release whose zip is unfetchable or
+    // mis-digested is a release the fleet cannot install.
+    let zip_note = match (manifest.zip.as_deref(), manifest.zip_sha256.as_deref()) {
+        (Some(zip), Some(sha256)) => {
+            let verified = publish::verify_release_asset_digest_for_release_id(
+                slug, release_id, &tag, zip, sha256,
+            )?;
+            format!("zip via API ok ({} bytes)", verified.size)
+        }
+        _ => "no zip container (pre-zip release; clients stage from the DMG)".to_string(),
+    };
     // THEN the raw browser URL (tools/install.sh's grep-and-curl path):
     // HEAD → 200 on a public repo; on a PRIVATE repo it 404s by GitHub design
     // (true of v0.25's live URL today too), so there it degrades to a note
@@ -777,7 +790,8 @@ pub fn post_publish(
     step(
         "verify",
         &format!(
-            "live scan selects {tag} build {} · {byte_note} · {signature_note} · {dmg_note}",
+            "live scan selects {tag} build {} · {byte_note} · {signature_note} · {dmg_note} · \
+             {zip_note}",
             best.build
         ),
     );

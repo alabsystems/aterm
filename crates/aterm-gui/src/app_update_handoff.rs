@@ -745,6 +745,32 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
         return;
     }
+    // KNOWN DEFECT — the survivor is not a launchd job (macOS).
+    //
+    // `spawn` makes the successor a fork CHILD of THIS process, and on macOS
+    // this process is the process of the launchd job
+    // `application.com.aterm.aterm.<hex>.<hex>` that LaunchServices created for
+    // this app instance. `seamless::commit_and_exit` then `_exit(0)`s it, so
+    // launchd tears that job down and the successor is re-parented to pid 1
+    // while still holding a bootstrap (XPC) context belonging to a job that no
+    // longer exists. Everything it later spawns inherits the dead domain:
+    // `hdiutil` fails ENXIO ("Device not configured") — so the process that
+    // just applied an update cannot apply the next one — and the same applies
+    // to every other framework needing the app's XPC domain (user
+    // notifications, LaunchServices opens).
+    //
+    // THE FIX is to launch the successor through LaunchServices instead (the
+    // `open -n` equivalent, `NSWorkspace.openApplication` with
+    // `createsNewApplicationInstance`), which mints it its OWN application job.
+    // It is not a local edit: a LaunchServices launch inherits no descriptors,
+    // so the three inherited fd channels below — the PTY masters
+    // (`ATERM_SEAMLESS_FDS`), the readiness pipe, and the Commit pipe — must
+    // move to an out-of-band `SCM_RIGHTS` transfer over the per-user control
+    // socket, the successor stops being a waitable child (so the kill-and-reap
+    // reaper below loses `waitpid`), and the child-side `getppid()` authority
+    // check in `seamless::take_commit_fd` must become the socket's kernel-
+    // attested peer pid. `tests/handoff_launchd_job.rs` is the guard: its
+    // ignored e2e is today's reproducer and tomorrow's regression test.
     let mut child = match job.command.spawn() {
         Ok(child) => child,
         Err(error) => {

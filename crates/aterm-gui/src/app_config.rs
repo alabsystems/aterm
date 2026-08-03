@@ -83,15 +83,16 @@ pub(crate) struct Config {
     /// Cursor MOTION TRAIL — the "streaming trailer" effect. DEFAULT ON and
     /// exactly idle at rest; set `cursor_trail = false` to opt out.
     pub(crate) cursor_trail: Option<bool>,
-    /// Trail STYLE: `nyan rainbow` (DEFAULT — a momentum-driven banded rainbow
+    /// Trail STYLE: `rainbow kitty` (DEFAULT — a momentum-driven banded rainbow
     /// ribbon), `phaser` (a full-spectrum additive hue sweep along the
     /// swept path), `comet` (the cadence-comet: a directional fading comet of
     /// `TrailCell`s that ignites longer/hotter with fast sustained typing, wrapped in
     /// the additive light crown), `lumen` (the additive light crown only — comet +
-    /// bloom + ping), `nyan rainbow` (a momentum-driven BANDED rainbow ribbon), `sparkle`
+    /// bloom + ping), `sparkle`
     /// (phaser comet + spark particles), `fire` (rising embers), `laser` (white-hot
     /// beam), `water`, `beam` (a bloom-free beam-only crown, no trail body), or `off`.
-    /// (`rainbow` is a back-compat alias for `nyan`.)
+    /// (`nyan rainbow`, `nyan` and `rainbow` are back-compat aliases for
+    /// `rainbow kitty`.)
     pub(crate) cursor_trail_style: Option<String>,
     /// Trail Pack manifests — user-generated cursor trails as data (design
     /// `docs/trail-packs.md`). Each entry is a path to a `*.toml` Trail Pack
@@ -150,10 +151,15 @@ pub(crate) struct Config {
     /// styles). Defaults to a brightened cursor colour.
     pub(crate) cursor_trail_accent: Option<String>,
     /// Path to a PNG sprite for the cat that flies in front of the cursor on the
-    /// `nyan` style. Supply your own image (RGBA or RGB PNG, ideally a small
+    /// `rainbow kitty` style. Supply your own image (RGBA or RGB PNG, ideally a small
     /// transparent pixel-art sprite facing right); it is nearest-scaled to fit
     /// the cursor and flown in front. Unset ⇒ the built-in homage sprite. `~`
     /// expands to $HOME.
+    ///
+    /// The field name IS the TOML key (serde, no rename), and a config key has
+    /// no alias seam the way the trail-style VALUE does — so this one keeps the
+    /// `nyan` spelling on purpose: renaming it would orphan every
+    /// `cursor_nyan_sprite` line already sitting in a user's `config.toml`.
     pub(crate) cursor_nyan_sprite: Option<String>,
     /// How long (milliseconds) a swept cell takes to fade out. Default 260.
     pub(crate) cursor_trail_ms: Option<u64>,
@@ -166,7 +172,7 @@ pub(crate) struct Config {
     pub(crate) cursor_trail_radius: Option<f32>,
     /// Landing-ring "ping" on a jump (LUMEN styles). Default true.
     pub(crate) cursor_trail_ring: Option<bool>,
-    /// TYPING WAKE length, in milliseconds of recent travel (`nyan rainbow`
+    /// TYPING WAKE length, in milliseconds of recent travel (`rainbow kitty`
     /// style). The plume under the line you are typing shows exactly this much
     /// of your recent hand movement, so the number IS its length: raise it for a
     /// longer trail, lower it for a terser one, and set `0` to turn the wake off
@@ -1046,17 +1052,17 @@ pub(crate) struct TrailPackCatalog {
     pub(crate) diagnostics: Vec<String>,
 }
 
-/// Maximum encoded PNG bytes admitted for one custom Nyan cursor sprite.
+/// Maximum encoded PNG bytes admitted for one custom kitty cursor sprite.
 ///
 /// The general terminal image decoder deliberately accepts much larger payloads;
 /// this config asset is tiny UI chrome and therefore has a tighter independent
 /// budget.  The resolver uses a `take(MAX + 1)` read, so a misleading file
 /// metadata length can never turn config admission into an unbounded allocation.
-pub(crate) const MAX_NYAN_SPRITE_FILE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_KITTY_SPRITE_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum width or height of a decoded custom cursor sprite.
-pub(crate) const MAX_NYAN_SPRITE_DIMENSION: usize = 1024;
-const MAX_NYAN_SOURCE_ID_BYTES: usize = 2 * 1024;
-const MAX_NYAN_REASON_BYTES: usize = 320;
+pub(crate) const MAX_KITTY_SPRITE_DIMENSION: usize = 1024;
+const MAX_KITTY_SOURCE_ID_BYTES: usize = 2 * 1024;
+const MAX_KITTY_REASON_BYTES: usize = 320;
 
 /// The installed-theme directory is ambient user input.  Discovery retains a
 /// bounded, deterministic prefix and every individual file is read through a
@@ -1125,7 +1131,7 @@ impl ThemeCatalog {
         let entries = schemes
             .into_iter()
             .map(|(name, scheme)| ThemeAsset {
-                fingerprint: stable_nyan_fingerprint(0x54, name.as_bytes(), 0, 0, &[]),
+                fingerprint: stable_asset_fingerprint(0x54, name.as_bytes(), 0, 0, &[]),
                 source_id: std::sync::Arc::from(name.clone()),
                 name,
                 resolution: ThemeAssetResolution::Ready(scheme),
@@ -1234,7 +1240,7 @@ impl ThemeCatalog {
             if aterm_types::scheme::builtin(name).is_some() {
                 continue;
             }
-            let source_id = bounded_nyan_text(&path.to_string_lossy(), MAX_THEME_SOURCE_ID_BYTES);
+            let source_id = bounded_asset_text(&path.to_string_lossy(), MAX_THEME_SOURCE_ID_BYTES);
             if let Err(reason) = safe_user_theme_name(name) {
                 entries.push(invalid_theme_asset(name, &source_id, reason));
                 continue;
@@ -1268,7 +1274,7 @@ impl ThemeCatalog {
                 Ok(scheme) => entries.push(ThemeAsset {
                     name: name.to_string(),
                     source_id,
-                    fingerprint: stable_nyan_fingerprint(
+                    fingerprint: stable_asset_fingerprint(
                         0x54,
                         path.to_string_lossy().as_bytes(),
                         0,
@@ -1383,8 +1389,8 @@ fn invalid_theme_asset(name: &str, source_id: &std::sync::Arc<str>, reason: &str
     ThemeAsset {
         name: name.to_string(),
         source_id: std::sync::Arc::clone(source_id),
-        fingerprint: stable_nyan_fingerprint(0x49, source_id.as_bytes(), 0, 0, reason.as_bytes()),
-        resolution: ThemeAssetResolution::Invalid(bounded_nyan_text(
+        fingerprint: stable_asset_fingerprint(0x49, source_id.as_bytes(), 0, 0, reason.as_bytes()),
+        resolution: ThemeAssetResolution::Invalid(bounded_asset_text(
             reason,
             MAX_THEME_REASON_BYTES,
         )),
@@ -1483,14 +1489,14 @@ pub(crate) fn open_regular_theme_file(path: &std::path::Path) -> Result<std::fs:
     Ok(file)
 }
 
-/// One fully-resolved custom Nyan cursor asset for an admitted config generation.
+/// One fully-resolved custom kitty cursor asset for an admitted config generation.
 ///
 /// `Invalid` is intentionally distinct from `BuiltIn`: a bad authored sprite
 /// fails closed (the cursor companion is disabled) and remains diagnosable.  It
 /// can never silently turn into the built-in homage in app-rendered output while Settings says
 /// the custom value is active.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) enum NyanSpriteAsset {
+pub(crate) enum KittySpriteAsset {
     #[default]
     BuiltIn,
     Ready {
@@ -1506,7 +1512,7 @@ pub(crate) enum NyanSpriteAsset {
     },
 }
 
-impl NyanSpriteAsset {
+impl KittySpriteAsset {
     /// Stable paint/install identity.  The variant is part of the identity, so
     /// `Invalid` can never alias `BuiltIn` even when both carry no custom pixels.
     pub(crate) fn fingerprint(&self) -> u64 {
@@ -1516,9 +1522,13 @@ impl NyanSpriteAsset {
             Self::Invalid {
                 source_id,
                 bounded_reason,
-            } => {
-                stable_nyan_fingerprint(0x49, source_id.as_bytes(), 0, 0, bounded_reason.as_bytes())
-            }
+            } => stable_asset_fingerprint(
+                0x49,
+                source_id.as_bytes(),
+                0,
+                0,
+                bounded_reason.as_bytes(),
+            ),
         }
     }
 
@@ -1540,11 +1550,11 @@ impl NyanSpriteAsset {
 /// Every non-text config asset admitted at one revision.  `ConfigSnapshot`
 /// carries one outer `Arc<ConfigAssetCatalog>` and the live host, capture, and
 /// all Settings views clone that exact Arc; there is no independently-resolved
-/// Trail/Nyan/theme/sparkle-consumer lane that can lag the text generation.
+/// Trail/rainbow kitty/theme/sparkle-consumer lane that can lag the text generation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ConfigAssetCatalog {
     pub(crate) trail_packs: std::sync::Arc<TrailPackCatalog>,
-    pub(crate) nyan_sprite: NyanSpriteAsset,
+    pub(crate) kitty_sprite: KittySpriteAsset,
     pub(crate) themes: std::sync::Arc<ThemeCatalog>,
     /// Shared-setting consumers derived from the exact admitted inline + Toy
     /// Pack spec table and prepared lexicon. `Some(default())` is an
@@ -1562,7 +1572,7 @@ impl ConfigAssetCatalog {
     pub(crate) fn empty() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             trail_packs: TrailPackCatalog::empty(),
-            nyan_sprite: NyanSpriteAsset::BuiltIn,
+            kitty_sprite: KittySpriteAsset::BuiltIn,
             themes: ThemeCatalog::empty(),
             sparkle_spec_consumers: None,
         })
@@ -1623,7 +1633,7 @@ pub(crate) struct CursorGlowInputs<'a> {
     pub(crate) intensity: f32,
     pub(crate) radius: f32,
     pub(crate) ring: bool,
-    /// Seconds of recent travel the Nyan typing wake shows (0 ⇒ wake off).
+    /// Seconds of recent travel the rainbow kitty typing wake shows (0 ⇒ wake off).
     pub(crate) wake_persist_s: f32,
 }
 
@@ -2321,7 +2331,7 @@ impl Config {
     }
 
     /// Whether the cursor motion-trail ("streaming trailer") is on. DEFAULT ON with the
-    /// `nyan rainbow` style (owner call — batteries-on delight): the trail ignites a ~260ms
+    /// `rainbow kitty` style (owner call — batteries-on delight): the trail ignites a ~260ms
     /// additive aurora on each cursor move and decays to EXACTLY 0% idle, so a still
     /// screen costs nothing. The GPU bloom pass is effect-frame-only and load-sheds
     /// under pressure. Opt out with `cursor_trail = false`.
@@ -2508,13 +2518,14 @@ impl Config {
     /// classify it with `eq_ignore_ascii_case` / a case-insensitive `GlowStyle::parse`
     /// instead of paying a `to_ascii_lowercase` heap allocation on every frame.
     pub(crate) fn cursor_trail_style_raw(&self) -> &str {
-        // Default: the NYAN RAINBOW ribbon (the banded rainbow whose blinking block
-        // twinkles like a little star — the effect the owner made the default),
-        // under its canonical two-word spelling.
+        // Default: the RAINBOW KITTY ribbon (the banded rainbow whose blinking block
+        // twinkles like a little star — the effect the owner made the default), read
+        // from the single definition in `prefs` rather than re-typed here, so a rename
+        // of the style cannot leave this resolver pointing at a dead spelling.
         // `glow_config`/`trail_config` split the layers.
         self.cursor_trail_style
             .as_deref()
-            .unwrap_or("nyan rainbow")
+            .unwrap_or(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
             .trim()
     }
 
@@ -2533,14 +2544,14 @@ impl Config {
     }
 
     /// TYPING-WAKE length in SECONDS of recent travel, default 0.30 s (the
-    /// engine's own [`aterm_effects::cursor_glow::NYAN_WAKE_PERSIST`]), clamped
+    /// engine's own [`aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST`]), clamped
     /// to 0..=1.5 s. `0` turns the wake off and is a legitimate setting, not a
     /// failure, so — unlike the aurora's intensity — there is nothing here that
     /// can fail open: every representable `u64` maps into the closed range.
     pub(crate) fn cursor_trail_wake_persist_or_default(&self) -> f32 {
         let ms = self
             .cursor_trail_wake_ms
-            .unwrap_or((aterm_effects::cursor_glow::NYAN_WAKE_PERSIST * 1000.0) as u64)
+            .unwrap_or((aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST * 1000.0) as u64)
             .min(1_500);
         ms as f32 / 1000.0
     }
@@ -2728,7 +2739,7 @@ impl Config {
     }
 
     /// Resolve the non-feed portion of a catalog while the exact Trail/Sparkle
-    /// generation is prepared separately. This admits the custom Nyan sprite
+    /// generation is prepared separately. This admits the custom kitty sprite
     /// once and installs an intentionally empty Trail placeholder that must be
     /// replaced before publication to a live `App`.
     pub(crate) fn resolve_preliminary_asset_catalog_with_themes(
@@ -2737,7 +2748,7 @@ impl Config {
     ) -> std::sync::Arc<ConfigAssetCatalog> {
         std::sync::Arc::new(ConfigAssetCatalog {
             trail_packs: std::sync::Arc::new(TrailPackCatalog::default()),
-            nyan_sprite: resolve_nyan_sprite_asset(self.cursor_nyan_sprite.as_deref()),
+            kitty_sprite: resolve_kitty_sprite_asset(self.cursor_nyan_sprite.as_deref()),
             themes,
             sparkle_spec_consumers: None,
         })
@@ -2745,7 +2756,7 @@ impl Config {
 
     /// Resolve every filesystem-backed visual asset for one config generation.
     ///
-    /// This is the sole production Nyan PNG I/O/decode seam.  The versioned
+    /// This is the sole production rainbow kitty PNG I/O/decode seam.  The versioned
     /// config service calls it before advancing the revision, then publishes the
     /// returned outer Arc with the exact TOML text.  Present, capture, semantic
     /// Settings view construction, and effects code only clone/read the result.
@@ -2759,7 +2770,7 @@ impl Config {
         // table and must never be published as though it were complete.
         std::sync::Arc::new(ConfigAssetCatalog {
             trail_packs: self.resolve_trail_pack_catalog(),
-            nyan_sprite: resolve_nyan_sprite_asset(self.cursor_nyan_sprite.as_deref()),
+            kitty_sprite: resolve_kitty_sprite_asset(self.cursor_nyan_sprite.as_deref()),
             themes,
             sparkle_spec_consumers: None,
         })
@@ -3772,9 +3783,9 @@ impl Config {
             }
             Some(TrailStyleIssue::Unknown) => Some(format!(
                 "cursor_trail_style: unknown style {raw:?} — the cursor effect is disabled; \
-                 expected one of phaser|nyan rainbow|comet|lumen|sparkle|fire|laser|water|beam|off \
-                 (or a documented alias like nyan/rainbow/ember/ocean), or pack:<id> for a loaded \
-                 Trail Pack"
+                 expected one of phaser|rainbow kitty|comet|lumen|sparkle|fire|laser|water|beam|off \
+                 (or a documented alias like nyan rainbow/nyan/rainbow/ember/ocean), or pack:<id> \
+                 for a loaded Trail Pack"
             )),
         }
     }
@@ -4478,7 +4489,7 @@ pub(crate) fn sparkle_expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-fn bounded_nyan_text(value: &str, max_bytes: usize) -> std::sync::Arc<str> {
+fn bounded_asset_text(value: &str, max_bytes: usize) -> std::sync::Arc<str> {
     if value.len() <= max_bytes {
         return std::sync::Arc::from(value);
     }
@@ -4490,19 +4501,19 @@ fn bounded_nyan_text(value: &str, max_bytes: usize) -> std::sync::Arc<str> {
     std::sync::Arc::from(format!("{}{}", &value[..end], suffix))
 }
 
-fn invalid_nyan_sprite(source_id: &str, reason: impl AsRef<str>) -> NyanSpriteAsset {
-    NyanSpriteAsset::Invalid {
-        source_id: bounded_nyan_text(source_id, MAX_NYAN_SOURCE_ID_BYTES),
-        bounded_reason: bounded_nyan_text(reason.as_ref(), MAX_NYAN_REASON_BYTES),
+fn invalid_kitty_sprite(source_id: &str, reason: impl AsRef<str>) -> KittySpriteAsset {
+    KittySpriteAsset::Invalid {
+        source_id: bounded_asset_text(source_id, MAX_KITTY_SOURCE_ID_BYTES),
+        bounded_reason: bounded_asset_text(reason.as_ref(), MAX_KITTY_REASON_BYTES),
     }
 }
 
-fn read_bounded_nyan_png(path: &std::path::Path) -> Result<Vec<u8>, String> {
-    aterm_effects::file_feed::read_bounded_regular_file(path, MAX_NYAN_SPRITE_FILE_BYTES)
+fn read_bounded_kitty_png(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    aterm_effects::file_feed::read_bounded_regular_file(path, MAX_KITTY_SPRITE_FILE_BYTES)
         .map_err(|error| format!("unreadable ({error})"))
 }
 
-fn stable_nyan_fingerprint(tag: u8, source: &[u8], w: u16, h: u16, rgba: &[u8]) -> u64 {
+fn stable_asset_fingerprint(tag: u8, source: &[u8], w: u16, h: u16, rgba: &[u8]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;
@@ -4522,41 +4533,41 @@ fn stable_nyan_fingerprint(tag: u8, source: &[u8], w: u16, h: u16, rgba: &[u8]) 
     hash | 1
 }
 
-fn resolve_nyan_sprite_asset(raw: Option<&str>) -> NyanSpriteAsset {
+fn resolve_kitty_sprite_asset(raw: Option<&str>) -> KittySpriteAsset {
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return NyanSpriteAsset::BuiltIn;
+        return KittySpriteAsset::BuiltIn;
     };
-    if raw.len() > MAX_NYAN_SOURCE_ID_BYTES {
-        return invalid_nyan_sprite(raw, "configured sprite source is too long");
+    if raw.len() > MAX_KITTY_SOURCE_ID_BYTES {
+        return invalid_kitty_sprite(raw, "configured sprite source is too long");
     }
     let source_id = std::sync::Arc::<str>::from(raw);
     let path = sparkle_expand_tilde(raw);
-    let bytes = match read_bounded_nyan_png(&path) {
+    let bytes = match read_bounded_kitty_png(&path) {
         Ok(bytes) => bytes,
-        Err(reason) => return invalid_nyan_sprite(&source_id, reason),
+        Err(reason) => return invalid_kitty_sprite(&source_id, reason),
     };
     let Some((rgba, w, h)) = aterm_render::decode_png_rgba8(&bytes) else {
-        return invalid_nyan_sprite(&source_id, "PNG decode failed");
+        return invalid_kitty_sprite(&source_id, "PNG decode failed");
     };
     if w == 0
         || h == 0
-        || w > MAX_NYAN_SPRITE_DIMENSION
-        || h > MAX_NYAN_SPRITE_DIMENSION
+        || w > MAX_KITTY_SPRITE_DIMENSION
+        || h > MAX_KITTY_SPRITE_DIMENSION
         || rgba.len() != w.saturating_mul(h).saturating_mul(4)
     {
-        return invalid_nyan_sprite(
+        return invalid_kitty_sprite(
             &source_id,
-            format!("decoded sprite must be 1..={MAX_NYAN_SPRITE_DIMENSION} pixels per side"),
+            format!("decoded sprite must be 1..={MAX_KITTY_SPRITE_DIMENSION} pixels per side"),
         );
     }
     let Ok(w) = u16::try_from(w) else {
-        return invalid_nyan_sprite(&source_id, "decoded width is out of range");
+        return invalid_kitty_sprite(&source_id, "decoded width is out of range");
     };
     let Ok(h) = u16::try_from(h) else {
-        return invalid_nyan_sprite(&source_id, "decoded height is out of range");
+        return invalid_kitty_sprite(&source_id, "decoded height is out of range");
     };
-    let fp = stable_nyan_fingerprint(0x52, source_id.as_bytes(), w, h, &rgba);
-    NyanSpriteAsset::Ready {
+    let fp = stable_asset_fingerprint(0x52, source_id.as_bytes(), w, h, &rgba);
+    KittySpriteAsset::Ready {
         source_id,
         w,
         h,
@@ -6565,7 +6576,7 @@ impl App {
     /// before the snapshot reached this seam.
     ///
     /// Pointer identity is intentional. A fresh outer catalog can represent a
-    /// byte-identical `aterm.toml` whose same-path Nyan file changed, or a
+    /// byte-identical `aterm.toml` whose same-path rainbow kitty file changed, or a
     /// theme-directory-only generation. Both must reach every window before
     /// the next capture/effect tick. Re-publishing the same Arc is a complete
     /// no-op, including no redraw request.
@@ -6665,12 +6676,12 @@ impl App {
         self.next_font_catalog_sequence = sequence.saturating_add(1);
         self.requested_font_catalog_sequence = sequence;
         if !std::sync::Arc::ptr_eq(&prepared.assets.themes, &self.config_assets.themes) {
-            // Theme discovery can overtake a config worker. Trail/Nyan and
+            // Theme discovery can overtake a config worker. Trail/rainbow kitty and
             // Sparkle consumers do not depend on the theme catalog, so rebase
             // that Arc in memory instead of reopening any source.
             prepared.assets = std::sync::Arc::new(ConfigAssetCatalog {
                 trail_packs: std::sync::Arc::clone(&prepared.assets.trail_packs),
-                nyan_sprite: prepared.assets.nyan_sprite.clone(),
+                kitty_sprite: prepared.assets.kitty_sprite.clone(),
                 themes: std::sync::Arc::clone(&self.config_assets.themes),
                 sparkle_spec_consumers: prepared.assets.sparkle_spec_consumers.clone(),
             });
@@ -6779,7 +6790,7 @@ impl App {
     }
 
     /// Exact worker-prepared twin of [`Self::reload_config_observation`]. The
-    /// supplied feed/Nyan generation is immutable; a theme that overtook
+    /// supplied feed/rainbow kitty generation is immutable; a theme that overtook
     /// persistence is rebased in memory and guarded by the theme-generation
     /// ticket.
     pub(crate) fn reload_prepared_config_observation(
@@ -6985,7 +6996,7 @@ impl App {
         // can change either, so drop the resolved values — they re-resolve on the next
         // keystroke. Keeps a live style/predict change taking effect immediately.
         self.predict_mode_cache = None;
-        self.nyan_style_cache = None;
+        self.kitty_cursor_enabled_cache = None;
         // Sparkle words: a reload can change `languages`/category toggles/lexicon, so
         // mark the App cache stale (rebuilt before the next frame) and flush each
         // window's cached occurrence set — otherwise, on a byte-idle grid, the stale
@@ -7123,10 +7134,10 @@ impl App {
         if let Some(w) = config.cursor_trail_style_warning(&config_snapshot.assets.trail_packs) {
             warns.push(format!("config {w}"));
         }
-        if let Some(reason) = config_snapshot.assets.nyan_sprite.diagnostic() {
+        if let Some(reason) = config_snapshot.assets.kitty_sprite.diagnostic() {
             let source = config_snapshot
                 .assets
-                .nyan_sprite
+                .kitty_sprite
                 .source_id()
                 .unwrap_or("configured source");
             warns.push(format!(
@@ -7919,7 +7930,7 @@ mod descriptive_title_config_tests {
         let cfg = Config::default();
         assert!(
             (cfg.cursor_trail_wake_persist_or_default()
-                - aterm_effects::cursor_glow::NYAN_WAKE_PERSIST)
+                - aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST)
                 .abs()
                 < 1e-6,
             "an unset key takes the engine default"
@@ -8166,8 +8177,8 @@ window_title_format = "description"
 #[cfg(test)]
 mod cfg_engine_tests {
     use super::{
-        Config, MAX_NYAN_SPRITE_FILE_BYTES, MAX_USER_THEME_FILE_BYTES, MAX_USER_THEME_FILES,
-        NyanSpriteAsset, ThemeCatalog, ThemeCatalogWatchError, open_regular_theme_file,
+        Config, KittySpriteAsset, MAX_KITTY_SPRITE_FILE_BYTES, MAX_USER_THEME_FILE_BYTES,
+        MAX_USER_THEME_FILES, ThemeCatalog, ThemeCatalogWatchError, open_regular_theme_file,
     };
     use aterm_core::config::BiDiMode;
 
@@ -8195,7 +8206,7 @@ mod cfg_engine_tests {
         );
     }
 
-    fn nyan_fixture(name: &str) -> std::path::PathBuf {
+    fn kitty_fixture(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
         std::env::temp_dir().join(format!(
@@ -8205,7 +8216,7 @@ mod cfg_engine_tests {
         ))
     }
 
-    fn config_with_nyan(path: &std::path::Path) -> Config {
+    fn config_with_kitty(path: &std::path::Path) -> Config {
         cfg(&format!(
             "theme = \"Nord\"\ncursor_nyan_sprite = {:?}\n",
             path.to_string_lossy()
@@ -8384,27 +8395,27 @@ mod cfg_engine_tests {
     }
 
     #[test]
-    fn nyan_asset_resolves_once_to_shared_rgba_with_stable_identity() {
-        let path = nyan_fixture("ready");
+    fn kitty_asset_resolves_once_to_shared_rgba_with_stable_identity() {
+        let path = kitty_fixture("ready");
         let rgba = [
             0xff, 0x10, 0x20, 0xff, 0x20, 0xff, 0x30, 0x80, 0x10, 0x20, 0xff, 0x40, 0xff, 0xff,
             0xff, 0xff,
         ];
         let png = crate::app_introspect::encode_rgba8_png(&rgba, 2, 2).unwrap();
         std::fs::write(&path, png).unwrap();
-        let config = config_with_nyan(&path);
+        let config = config_with_kitty(&path);
         let first = config.resolve_asset_catalog();
         let second = config.resolve_asset_catalog();
         let (
-            NyanSpriteAsset::Ready {
+            KittySpriteAsset::Ready {
                 source_id,
                 w,
                 h,
                 rgba: resolved,
                 fp,
             },
-            NyanSpriteAsset::Ready { fp: second_fp, .. },
-        ) = (&first.nyan_sprite, &second.nyan_sprite)
+            KittySpriteAsset::Ready { fp: second_fp, .. },
+        ) = (&first.kitty_sprite, &second.kitty_sprite)
         else {
             panic!("valid PNG must resolve Ready");
         };
@@ -8440,24 +8451,24 @@ mod cfg_engine_tests {
     }
 
     #[test]
-    fn nyan_asset_missing_or_oversized_source_is_explicit_invalid() {
-        let missing = nyan_fixture("missing");
-        let catalog = config_with_nyan(&missing).resolve_asset_catalog();
+    fn kitty_asset_missing_or_oversized_source_is_explicit_invalid() {
+        let missing = kitty_fixture("missing");
+        let catalog = config_with_kitty(&missing).resolve_asset_catalog();
         assert!(matches!(
-            &catalog.nyan_sprite,
-            NyanSpriteAsset::Invalid { bounded_reason, .. }
+            &catalog.kitty_sprite,
+            KittySpriteAsset::Invalid { bounded_reason, .. }
                 if bounded_reason.contains("unreadable")
         ));
 
-        let oversized = nyan_fixture("encoded-limit");
+        let oversized = kitty_fixture("encoded-limit");
         let file = std::fs::File::create(&oversized).unwrap();
-        file.set_len((MAX_NYAN_SPRITE_FILE_BYTES as u64) + 1)
+        file.set_len((MAX_KITTY_SPRITE_FILE_BYTES as u64) + 1)
             .unwrap();
         drop(file);
-        let catalog = config_with_nyan(&oversized).resolve_asset_catalog();
+        let catalog = config_with_kitty(&oversized).resolve_asset_catalog();
         assert!(matches!(
-            &catalog.nyan_sprite,
-            NyanSpriteAsset::Invalid { bounded_reason, .. }
+            &catalog.kitty_sprite,
+            KittySpriteAsset::Invalid { bounded_reason, .. }
                 if bounded_reason.contains("exceeds")
         ));
         let _ = std::fs::remove_file(oversized);
@@ -8465,32 +8476,34 @@ mod cfg_engine_tests {
 
     #[cfg(unix)]
     #[test]
-    fn nyan_asset_refuses_writerless_fifo_and_final_symlink() {
+    fn kitty_asset_refuses_writerless_fifo_and_final_symlink() {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let fifo = nyan_fixture("writerless-fifo");
+        let fifo = kitty_fixture("writerless-fifo");
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
         // SAFETY: `fifo_c` is a live NUL-terminated pathname and mkfifo retains
-        // no pointer. `nyan_fixture` gives this test a unique final component.
+        // no pointer. `kitty_fixture` gives this test a unique final component.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert!(
             matches!(
-                config_with_nyan(&fifo).resolve_asset_catalog().nyan_sprite,
-                NyanSpriteAsset::Invalid { .. }
+                config_with_kitty(&fifo)
+                    .resolve_asset_catalog()
+                    .kitty_sprite,
+                KittySpriteAsset::Invalid { .. }
             ),
             "a writerless FIFO must fail immediately instead of parking config admission"
         );
 
-        let target = nyan_fixture("symlink-target");
-        let linked = nyan_fixture("symlink-final");
+        let target = kitty_fixture("symlink-target");
+        let linked = kitty_fixture("symlink-final");
         std::fs::write(&target, b"not consulted").expect("write symlink target");
         std::os::unix::fs::symlink(&target, &linked).expect("create final symlink");
         assert!(
             matches!(
-                config_with_nyan(&linked)
+                config_with_kitty(&linked)
                     .resolve_asset_catalog()
-                    .nyan_sprite,
-                NyanSpriteAsset::Invalid { .. }
+                    .kitty_sprite,
+                KittySpriteAsset::Invalid { .. }
             ),
             "a final-component symlink must not be followed"
         );
@@ -8501,20 +8514,20 @@ mod cfg_engine_tests {
     }
 
     #[test]
-    fn nyan_asset_dimension_cap_fails_closed() {
-        let path = nyan_fixture("dimension-limit");
-        let rgba = vec![0x7f; (super::MAX_NYAN_SPRITE_DIMENSION + 1) * 4];
+    fn kitty_asset_dimension_cap_fails_closed() {
+        let path = kitty_fixture("dimension-limit");
+        let rgba = vec![0x7f; (super::MAX_KITTY_SPRITE_DIMENSION + 1) * 4];
         let png = crate::app_introspect::encode_rgba8_png(
             &rgba,
-            (super::MAX_NYAN_SPRITE_DIMENSION + 1) as u32,
+            (super::MAX_KITTY_SPRITE_DIMENSION + 1) as u32,
             1,
         )
         .unwrap();
         std::fs::write(&path, png).unwrap();
-        let catalog = config_with_nyan(&path).resolve_asset_catalog();
+        let catalog = config_with_kitty(&path).resolve_asset_catalog();
         assert!(matches!(
-            &catalog.nyan_sprite,
-            NyanSpriteAsset::Invalid { bounded_reason, .. }
+            &catalog.kitty_sprite,
+            KittySpriteAsset::Invalid { bounded_reason, .. }
                 if bounded_reason.contains("pixels per side")
         ));
         let _ = std::fs::remove_file(path);
@@ -9346,7 +9359,7 @@ mod cfg_engine_tests {
 
     #[test]
     fn external_lexicon_cap_is_exact_and_enforced_by_the_runtime_loader() {
-        let path = nyan_fixture("lexicon-cap");
+        let path = kitty_fixture("lexicon-cap");
         let prefix = "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"boundedword\"]\n#";
         let mut exact = prefix.to_string();
         exact.push_str(
@@ -10796,7 +10809,7 @@ mod reload_dedupe_tests {
         let same_bytes = cfg("cursor_trail = true\ncursor_trail_style = \"fire\"\n");
         let reformatted =
             cfg("# a comment\ncursor_trail = true\n\ncursor_trail_style = \"fire\"\n");
-        let edited = cfg("cursor_trail = true\ncursor_trail_style = \"nyan rainbow\"\n");
+        let edited = cfg("cursor_trail = true\ncursor_trail_style = \"rainbow kitty\"\n");
         assert!(
             a == same_bytes,
             "identical bytes parse equal (dedupe fires)"
@@ -11206,7 +11219,7 @@ mod reload_dedupe_tests {
     #[test]
     fn value_only_edit_keeps_the_editable_field_catalogue_stable() {
         let a = cfg("cursor_trail_style = \"fire\"\n");
-        let b = cfg("cursor_trail_style = \"nyan rainbow\"\n");
+        let b = cfg("cursor_trail_style = \"rainbow kitty\"\n");
         let fa = crate::prefs::editable_fields(&a);
         let fb = crate::prefs::editable_fields(&b);
         assert_eq!(fa.len(), fb.len(), "the catalogue keeps its size");

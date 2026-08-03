@@ -119,7 +119,7 @@ pub(crate) enum PreviewTrailStyle {
     Lumen,
     #[default]
     Phaser,
-    Nyan,
+    RainbowKitty,
     Sparkle,
     Fire,
     Laser,
@@ -145,7 +145,7 @@ impl PreviewTrailStyle {
         match resolved.style {
             Some(GlowStyle::Lumen) => Self::Lumen,
             Some(GlowStyle::Phaser) => Self::Phaser,
-            Some(GlowStyle::Nyan) => Self::Nyan,
+            Some(GlowStyle::RainbowKitty) => Self::RainbowKitty,
             Some(GlowStyle::Sparkle) => Self::Sparkle,
             Some(GlowStyle::Fire) => Self::Fire,
             Some(GlowStyle::Laser) => Self::Laser,
@@ -165,7 +165,7 @@ impl PreviewTrailStyle {
             Self::Off => None,
             Self::Lumen => Some(GlowStyle::Lumen),
             Self::Phaser => Some(GlowStyle::Phaser),
-            Self::Nyan => Some(GlowStyle::Nyan),
+            Self::RainbowKitty => Some(GlowStyle::RainbowKitty),
             Self::Sparkle => Some(GlowStyle::Sparkle),
             Self::Fire => Some(GlowStyle::Fire),
             Self::Laser => Some(GlowStyle::Laser),
@@ -182,7 +182,7 @@ impl PreviewTrailStyle {
             Self::Off => "off",
             Self::Lumen => "lumen",
             Self::Phaser => "phaser",
-            Self::Nyan => "nyan",
+            Self::RainbowKitty => "rainbow kitty",
             Self::Sparkle => "sparkle",
             Self::Fire => "fire",
             Self::Laser => "laser",
@@ -213,7 +213,7 @@ pub(crate) struct CursorPreviewSpec {
     pub(crate) intensity: f32,
     pub(crate) radius: f32,
     pub(crate) ring: bool,
-    /// Seconds of recent travel the Nyan TYPING WAKE shows — the settings dial's
+    /// Seconds of recent travel the rainbow kitty TYPING WAKE shows — the settings dial's
     /// value, carried here so the live preview lengthens and shortens the plume
     /// exactly as the real terminal will. `0` = wake off.
     pub(crate) wake_persist_s: f32,
@@ -225,7 +225,7 @@ impl Default for CursorPreviewSpec {
             style: PreviewCursorStyle::Block,
             blink: true,
             trail_enabled: true,
-            trail_style: PreviewTrailStyle::Nyan,
+            trail_style: PreviewTrailStyle::RainbowKitty,
             trail_pack: None,
             color: None,
             accent: None,
@@ -234,7 +234,7 @@ impl Default for CursorPreviewSpec {
             intensity: 0.7,
             radius: 0.6,
             ring: true,
-            wake_persist_s: aterm_effects::cursor_glow::NYAN_WAKE_PERSIST,
+            wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
         }
     }
 }
@@ -389,10 +389,10 @@ impl Default for TypographyPreviewSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CursorPostFxSpec {
     /// Authored candidate string shown literally in introspection.
-    pub(crate) nyan_sprite: String,
+    pub(crate) kitty_sprite: String,
     /// Immutable, already-decoded asset from the same config snapshot as the
     /// view. Paint consumes this Arc-backed value and never opens a path.
-    pub(crate) nyan_asset: crate::app_config::NyanSpriteAsset,
+    pub(crate) kitty_asset: crate::app_config::KittySpriteAsset,
     pub(crate) bloom: bool,
     pub(crate) bloom_strength: f32,
     pub(crate) bloom_radius: f32,
@@ -409,8 +409,8 @@ pub(crate) struct CursorPostFxSpec {
 impl Default for CursorPostFxSpec {
     fn default() -> Self {
         Self {
-            nyan_sprite: "built-in CatBaker".to_string(),
-            nyan_asset: crate::app_config::NyanSpriteAsset::BuiltIn,
+            kitty_sprite: "built-in CatBaker".to_string(),
+            kitty_asset: crate::app_config::KittySpriteAsset::BuiltIn,
             bloom: true,
             bloom_strength: 0.35,
             bloom_radius: 2.0,
@@ -518,7 +518,7 @@ impl Default for SettingsPreviewSpec {
             post_fx: CursorPostFxSpec::default(),
             window_tabs: WindowTabsPreviewSpec::default(),
             focused_key: "cursor_trail_style".to_string(),
-            focused_value: "nyan rainbow".to_string(),
+            focused_value: crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string(),
             font_status: "host-prepared renderer snapshot unavailable".to_string(),
             font_ready_epoch: 0,
             prepared_font: crate::tray_raster::PreparedSemanticFont::unavailable(
@@ -694,8 +694,8 @@ impl SettingsPreviewSpec {
                 variations: self.typography.variations.clone(),
             },
             post_fx: CursorPostFxSpec {
-                nyan_sprite: self.post_fx.nyan_sprite.trim().to_string(),
-                nyan_asset: self.post_fx.nyan_asset.clone(),
+                kitty_sprite: self.post_fx.kitty_sprite.trim().to_string(),
+                kitty_asset: self.post_fx.kitty_asset.clone(),
                 bloom: self.post_fx.bloom,
                 bloom_strength: finite_or(self.post_fx.bloom_strength, 0.35).clamp(0.0, 3.0),
                 bloom_radius: finite_or(self.post_fx.bloom_radius, 2.0).clamp(0.5, 8.0),
@@ -956,7 +956,7 @@ impl SettingsPreviewSpec {
         } else if trail_emitted {
             if spec.cursor.trail_style == PreviewTrailStyle::Custom {
                 "The shared CursorGlow custom Trail Pack interpreter is live for the selected pack."
-            } else if spec.cursor.trail_style == PreviewTrailStyle::Nyan {
+            } else if spec.cursor.trail_style == PreviewTrailStyle::RainbowKitty {
                 "Shared CursorGlow Nyan ribbon geometry and the CatBaker cursor sprite are live."
             } else {
                 "Shared CursorGlow trail geometry is live for the selected effect."
@@ -982,26 +982,26 @@ impl SettingsPreviewSpec {
             if spec.post_fx.hdr_glow { "on" } else { "off" },
             trim_float(spec.post_fx.sdr_boost),
         );
-        let nyan_asset = match &spec.post_fx.nyan_asset {
-            crate::app_config::NyanSpriteAsset::BuiltIn => {
+        let kitty_asset = match &spec.post_fx.kitty_asset {
+            crate::app_config::KittySpriteAsset::BuiltIn => {
                 "built-in CatBaker asset ready".to_string()
             }
-            crate::app_config::NyanSpriteAsset::Ready {
+            crate::app_config::KittySpriteAsset::Ready {
                 source_id,
                 w,
                 h,
                 fp,
                 ..
             } => format!("resolved custom asset {source_id:?}, {w}×{h}, fp {fp:016x}"),
-            crate::app_config::NyanSpriteAsset::Invalid {
+            crate::app_config::KittySpriteAsset::Invalid {
                 source_id,
                 bounded_reason,
             } => format!("custom asset {source_id:?} disabled: {bounded_reason}"),
         };
-        let nyan_activation = if spec.focused_key == crate::prefs::EDIT_CURSOR_NYAN_SPRITE
-            && spec.cursor.trail_style != PreviewTrailStyle::Nyan
+        let kitty_activation = if spec.focused_key == crate::prefs::EDIT_CURSOR_NYAN_SPRITE
+            && spec.cursor.trail_style != PreviewTrailStyle::RainbowKitty
         {
-            "The chosen sprite is shown independently in this specimen; it remains dormant in terminal sessions until trail style Nyan is selected."
+            "The chosen sprite is shown independently in this specimen; it remains dormant in terminal sessions until trail style Rainbow kitty is selected."
         } else {
             "The sprite follows the selected terminal trail style."
         };
@@ -1017,7 +1017,7 @@ impl SettingsPreviewSpec {
             |(label, _)| format!("In-specimen font status: {label}."),
         );
         format!(
-            "normalized-candidate {candidate}; renderer preview: {} px monospace, {}× line height, baseline {:+} px; ligatures {}, cursor-break ligatures {}, merged ligatures {}, synthetic styles {}; {}; {font_pill} {terminal_theme}; selection foreground {selection_fg}, minimum contrast {}, selection {}; underline position {:+} thickness {:+} skip descenders {}; text blending {:?}, font thicken {}, stem gamma {}, variation requests {}; {} cursor; blink {}; {} trail; raw/effective motion {}/{} because {}; adaptive motion {} load-shed {}; {motion}. {trail_scope} {post_fx}; Nyan sprite {:?}; window {} columns × {} lines, tab strip {} row(s), build badge {}; static Smart Titles examples keep stable Title `release` separate from authored Description `shipping`; generated Activity fallback `running tests` is {}; tab format {}; window format {}; no live provider-health claim.",
+            "normalized-candidate {candidate}; renderer preview: {} px monospace, {}× line height, baseline {:+} px; ligatures {}, cursor-break ligatures {}, merged ligatures {}, synthetic styles {}; {}; {font_pill} {terminal_theme}; selection foreground {selection_fg}, minimum contrast {}, selection {}; underline position {:+} thickness {:+} skip descenders {}; text blending {:?}, font thicken {}, stem gamma {}, variation requests {}; {} cursor; blink {}; {} trail; raw/effective motion {}/{} because {}; adaptive motion {} load-shed {}; {motion}. {trail_scope} {post_fx}; Rainbow kitty sprite {:?}; window {} columns × {} lines, tab strip {} row(s), build badge {}; static Smart Titles examples keep stable Title `release` separate from authored Description `shipping`; generated Activity fallback `running tests` is {}; tab format {}; window format {}; no live provider-health claim.",
             trim_float(spec.font_px),
             trim_float(spec.line_height),
             spec.baseline_adjust,
@@ -1068,8 +1068,8 @@ impl SettingsPreviewSpec {
                 "healthy"
             },
             format_args!(
-                "{:?}; {nyan_asset}. {nyan_activation} {focus_lane}",
-                spec.post_fx.nyan_sprite
+                "{:?}; {kitty_asset}. {kitty_activation} {focus_lane}",
+                spec.post_fx.kitty_sprite
             ),
             spec.window_tabs.columns,
             spec.window_tabs.lines,
@@ -1127,8 +1127,8 @@ impl SettingsPreviewSpec {
         spec.typography.font_thicken.hash(&mut hash);
         spec.typography.stem_gamma.to_bits().hash(&mut hash);
         spec.typography.variations.hash(&mut hash);
-        spec.post_fx.nyan_sprite.hash(&mut hash);
-        spec.post_fx.nyan_asset.fingerprint().hash(&mut hash);
+        spec.post_fx.kitty_sprite.hash(&mut hash);
+        spec.post_fx.kitty_asset.fingerprint().hash(&mut hash);
         spec.post_fx.bloom.hash(&mut hash);
         spec.post_fx.bloom_strength.to_bits().hash(&mut hash);
         spec.post_fx.bloom_radius.to_bits().hash(&mut hash);
@@ -1862,10 +1862,10 @@ fn build_terminal_specimen_input(
 
     if spec.scene == PreviewScene::CursorMotion
         && spec.cursor.trail_enabled
-        && (spec.cursor.trail_style == PreviewTrailStyle::Nyan
+        && (spec.cursor.trail_style == PreviewTrailStyle::RainbowKitty
             || spec.focused_key == crate::prefs::EDIT_CURSOR_NYAN_SPRITE)
         && !spec.reduced_motion
-        && let Some((sprites, atlas)) = nyan_layer(&spec.post_fx.nyan_asset)
+        && let Some((sprites, atlas)) = kitty_layer(&spec.post_fx.kitty_asset)
     {
         input.free_sprites = sprites;
         input.free_atlas = Some(atlas);
@@ -1886,13 +1886,13 @@ fn build_terminal_specimen_input(
     (spec.cursor.style as u8).hash(&mut hash);
     spec.cursor_visible().hash(&mut hash);
     (spec.cursor.trail_style as u8).hash(&mut hash);
-    spec.post_fx.nyan_sprite.hash(&mut hash);
-    spec.post_fx.nyan_asset.fingerprint().hash(&mut hash);
+    spec.post_fx.kitty_sprite.hash(&mut hash);
+    spec.post_fx.kitty_asset.fingerprint().hash(&mut hash);
     (Arc::new(input), hash.finish() | 1)
 }
 
-fn nyan_layer(
-    source: &crate::app_config::NyanSpriteAsset,
+fn kitty_layer(
+    source: &crate::app_config::KittySpriteAsset,
 ) -> Option<(
     Vec<aterm_core::render::FreeSprite>,
     Arc<aterm_core::render::SceneAtlas>,
@@ -1900,7 +1900,7 @@ fn nyan_layer(
     use std::sync::OnceLock;
 
     use aterm_effects::word_decorations::{
-        EffectGeom, NyanCursorFrame, NyanSpriteSource, WordDecorations,
+        EffectGeom, KittyCursorFrame, KittySpriteSource, WordDecorations,
     };
 
     static BUILT_IN: OnceLock<(
@@ -1909,8 +1909,8 @@ fn nyan_layer(
     )> = OnceLock::new();
     let render = |decorations: &mut WordDecorations| {
         let mut sprites = Vec::new();
-        let _ = decorations.nyan_cursor(
-            NyanCursorFrame {
+        let _ = decorations.kitty_cursor(
+            KittyCursorFrame {
                 geom: EffectGeom {
                     cell_w: 8,
                     cell_h: 18,
@@ -1922,10 +1922,10 @@ fn nyan_layer(
                 colors: aterm_effects::cat_baker::CatColorKey::default(),
                 bob: 0.0,
                 alpha: 255,
-                pose: aterm_effects::nyan_cursor::CatPose::STILL,
+                pose: aterm_effects::kitty_cursor::CatPose::STILL,
                 // The settings preview is a still: no celebration, no notes.
                 sing: 0.0,
-                notes: [None; aterm_effects::nyan_sing::MAX_NOTES],
+                notes: [None; aterm_effects::kitty_sing::MAX_NOTES],
             },
             &mut sprites,
         );
@@ -1935,13 +1935,13 @@ fn nyan_layer(
         (sprites, atlas)
     };
     match source {
-        crate::app_config::NyanSpriteAsset::BuiltIn => BUILT_IN
+        crate::app_config::KittySpriteAsset::BuiltIn => BUILT_IN
             .get_or_init(|| render(&mut WordDecorations::default()))
             .clone()
             .into(),
-        crate::app_config::NyanSpriteAsset::Ready { w, h, rgba, fp, .. } => {
+        crate::app_config::KittySpriteAsset::Ready { w, h, rgba, fp, .. } => {
             let mut decorations = WordDecorations::default();
-            decorations.set_nyan_sprite_source(NyanSpriteSource::Custom {
+            decorations.set_kitty_sprite_source(KittySpriteSource::Custom {
                 source_fp: *fp,
                 w: *w,
                 h: *h,
@@ -1949,7 +1949,7 @@ fn nyan_layer(
             });
             Some(render(&mut decorations))
         }
-        crate::app_config::NyanSpriteAsset::Invalid { .. } => None,
+        crate::app_config::KittySpriteAsset::Invalid { .. } => None,
     }
 }
 
@@ -3451,37 +3451,37 @@ mod tests {
     }
 
     #[test]
-    fn resolved_custom_nyan_asset_is_drawn_even_while_nyan_style_is_dormant() {
+    fn resolved_custom_kitty_asset_is_drawn_even_while_the_style_is_dormant() {
         let rgba: Arc<[u8]> = Arc::from(
             [
                 255, 40, 80, 255, 20, 240, 255, 255, 255, 220, 30, 255, 80, 30, 255, 255,
             ]
             .as_slice(),
         );
-        let custom_asset = crate::app_config::NyanSpriteAsset::Ready {
+        let custom_asset = crate::app_config::KittySpriteAsset::Ready {
             source_id: Arc::from("test-cat.png"),
             w: 2,
             h: 2,
             rgba: Arc::clone(&rgba),
             fp: 0xCA7C_A7C0_1234_5678,
         };
-        // Nyan is the DEFAULT trail style now, so pin the spec to phaser — the
-        // dormant-nyan path this test exercises requires a non-nyan style.
+        // Rainbow kitty is the DEFAULT trail style now, so pin the spec to phaser — the
+        // dormant-rainbow kitty path this test exercises requires a non-rainbow-kitty style.
         let custom = SettingsPreviewSpec::cursor(CursorPreviewSpec {
             trail_style: PreviewTrailStyle::Phaser,
             ..CursorPreviewSpec::default()
         })
         .with_focus(crate::prefs::EDIT_CURSOR_NYAN_SPRITE, "test-cat.png")
         .with_post_fx(CursorPostFxSpec {
-            nyan_sprite: "test-cat.png".to_string(),
-            nyan_asset: custom_asset,
+            kitty_sprite: "test-cat.png".to_string(),
+            kitty_asset: custom_asset,
             ..CursorPostFxSpec::default()
         });
         assert_eq!(custom.cursor.trail_style, PreviewTrailStyle::Phaser);
         assert!(custom.audit_value().contains("shown independently"));
         assert!(custom.audit_value().contains("dormant"));
-        let crate::app_config::NyanSpriteAsset::Ready { rgba: carried, .. } =
-            &custom.post_fx.nyan_asset
+        let crate::app_config::KittySpriteAsset::Ready { rgba: carried, .. } =
+            &custom.post_fx.kitty_asset
         else {
             unreachable!()
         };
@@ -3579,16 +3579,16 @@ mod tests {
         assert!(value.contains("fire shimmer"));
         assert!(value.contains("no panel-headroom claim"));
         assert!(value.contains("SDR boost"));
-        assert!(value.contains("nyan trail"));
+        assert!(value.contains("rainbow kitty trail"));
 
-        let nyan = SettingsPreviewSpec::cursor(CursorPreviewSpec {
-            trail_style: PreviewTrailStyle::Nyan,
+        let rainbow_kitty = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            trail_style: PreviewTrailStyle::RainbowKitty,
             ..CursorPreviewSpec::default()
         })
         .audit_value();
-        assert!(nyan.contains("Nyan ribbon geometry"));
-        assert!(nyan.contains("built-in CatBaker asset ready"));
-        assert!(!nyan.contains("not simulated"));
+        assert!(rainbow_kitty.contains("Nyan ribbon geometry"));
+        assert!(rainbow_kitty.contains("built-in CatBaker asset ready"));
+        assert!(!rainbow_kitty.contains("not simulated"));
 
         let off = SettingsPreviewSpec::cursor(CursorPreviewSpec {
             trail_enabled: false,

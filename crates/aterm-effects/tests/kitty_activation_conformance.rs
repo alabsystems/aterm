@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding for FULL-NYAN activation thresholds.
+//! Tier-1 binding for SING-ALONG activation thresholds.
 //!
 //! The derived models exhaust the bounded detector/count spaces. These tests
 //! drive the genuine shipping state machines with injected clocks, project the
@@ -11,9 +11,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use aterm_effects::nyan_cursor::{CursorCat, MIN_RUN_KEYS};
-use aterm_effects::nyan_sing::{NyanSing, SING_ARM_REPEATS, SING_REPEAT_GAP, SING_WIND_DOWN};
-use aterm_spec::derive::{Model, cursor_cat_earn_floor_model, nyan_sing_detector_model};
+use aterm_effects::kitty_cursor::{CursorCat, MIN_RUN_KEYS};
+use aterm_effects::kitty_sing::{KittySing, SING_ARM_REPEATS, SING_REPEAT_GAP, SING_WIND_DOWN};
+use aterm_spec::derive::{Model, cursor_cat_earn_floor_model, kitty_sing_detector_model};
 use aterm_spec::{interp, verify};
 
 type State = BTreeMap<&'static str, i64>;
@@ -47,7 +47,7 @@ fn assert_tiered_step(model: &Model, prev: &State, post: &State, action: &str, l
     assert!(ok, "{label}: {why}");
 }
 
-fn sing_projection(detector: &NyanSing, now: Instant, abstract_count: u32) -> State {
+fn sing_projection(detector: &KittySing, now: Instant, abstract_count: u32) -> State {
     let armed = detector.is_armed(now);
     let drive_live = detector.drive(now) > 0.0;
     let phase = if armed {
@@ -75,8 +75,8 @@ fn sing_projection(detector: &NyanSing, now: Instant, abstract_count: u32) -> St
 }
 
 #[test]
-fn real_nyan_sing_arm_break_release_and_finish_conform() {
-    let model = nyan_sing_detector_model();
+fn real_kitty_sing_arm_break_release_and_finish_conform() {
+    let model = kitty_sing_detector_model();
     assert_eq!(
         model_const(&model, "ArmRepeats"),
         i64::from(SING_ARM_REPEATS),
@@ -84,7 +84,7 @@ fn real_nyan_sing_arm_break_release_and_finish_conform() {
     );
 
     // An unarmed break discards the genuine detector's partial run.
-    let mut partial = NyanSing::default();
+    let mut partial = KittySing::default();
     let t0 = Instant::now();
     let mut partial_spec = model.init_state();
     for i in 1..=3u32 {
@@ -107,7 +107,7 @@ fn real_nyan_sing_arm_break_release_and_finish_conform() {
 
     // A complete held run stays unarmed through press fifteen and arms on the
     // sixteenth. Every post-state is projected from the real detector.
-    let mut detector = NyanSing::default();
+    let mut detector = KittySing::default();
     let t0 = Instant::now();
     let mut spec = model.init_state();
     for i in 1..=SING_ARM_REPEATS {
@@ -117,7 +117,7 @@ fn real_nyan_sing_arm_break_release_and_finish_conform() {
         let post = sing_projection(&detector, at, i);
 
         if i == 8 {
-            // Exact historical mutant: FULL NYAN armed on the eighth press.
+            // Exact historical mutant: SING-ALONG armed on the eighth press.
             // The transition exists only under Buggy=1, and its post-state
             // demonstrably violates the healthy threshold invariant.
             let early = BTreeMap::from([("phase", 1), ("count", 8), ("drive_live", 1)]);
@@ -197,9 +197,9 @@ fn real_nyan_sing_arm_break_release_and_finish_conform() {
 }
 
 #[test]
-fn real_nyan_sing_lazy_release_maps_to_the_same_bounded_tail() {
-    let model = nyan_sing_detector_model();
-    let mut detector = NyanSing::default();
+fn real_kitty_sing_lazy_release_maps_to_the_same_bounded_tail() {
+    let model = kitty_sing_detector_model();
+    let mut detector = KittySing::default();
     let t0 = Instant::now();
     let mut spec = model.init_state();
     let mut last = t0;

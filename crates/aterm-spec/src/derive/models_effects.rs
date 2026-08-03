@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! Sparkle / ignition / cursor-cat / nyan effect models, plus the generalized error-class trio — spec-model
-//! data constructors moved verbatim out of the one-file catalog in `derive.rs`
+//! Sparkle / ignition / cursor-cat / rainbow-kitty effect models, plus the
+//! generalized error-class trio — spec-model data constructors moved verbatim
+//! out of the one-file catalog in `derive.rs`
 //! (pure code motion; every constructor keeps its `crate::derive` path via the
 //! `pub use` re-exports there).
 
@@ -864,7 +865,7 @@ pub fn one_shot_peek_model() -> Model {
     }
 }
 
-/// CURSOR-CAT host gate and collectible discovery lifecycle. Ordinary Nyan
+/// CURSOR-CAT host gate and collectible discovery lifecycle. Ordinary rainbow kitty
 /// momentum is owned by the cursor-trail master: input while that master is
 /// off cannot arm or draw an ordinary flight, and turning it off retracts an
 /// existing ordinary host arm. A collection hello is a separate bounded
@@ -889,7 +890,7 @@ pub fn one_shot_peek_model() -> Model {
 /// animation tail merely because no intermediate frame callbacks arrived.
 ///
 /// At `Buggy = 1`, `TypeWhileTrailOff` reproduces the host leak by arming an
-/// ordinary Nyan cat behind a disabled trail master. `HiddenTick` also consumes
+/// ordinary rainbow kitty cat behind a disabled trail master. `HiddenTick` also consumes
 /// the wall clock while `presented` stays
 /// fixed. Enough hidden samples therefore walk Discovery through Fade to
 /// Hidden without delivering the promised hold. The same switch makes
@@ -899,7 +900,7 @@ pub fn one_shot_peek_model() -> Model {
 ///
 /// Tier-0: `derived_cursor_cat_proves_and_catches_hidden_expiry`
 /// (aterm-spec/tests/derived_ring_ty.rs). Tier-1 drives the real
-/// `aterm_effects::nyan_cursor::CursorCat` clock and projects its public frame
+/// `aterm_effects::kitty_cursor::CursorCat` clock and projects its public frame
 /// state plus host presentability at the same lifecycle boundaries.
 #[must_use]
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
@@ -922,7 +923,7 @@ pub fn cursor_cat_model() -> Model {
             var forced = 0;      // discovery bypasses style/momentum dismissal
             var presented_once = 0; // at least one real visible frame was delivered
             var wall_expired = 0;   // presentable clock is beyond hold + fade
-            var trail_master = 0;   // host's ordinary Nyan owner gate
+            var trail_master = 0;   // host's ordinary rainbow-kitty owner gate
             var ordinary_armed = 0; // ordinary momentum owns host presentation
             var ordinary_visible = 0; // ordinary branch may be drawn
             action EnableTrail when (trail_master == 0) {
@@ -1096,7 +1097,7 @@ pub fn cursor_cat_curse_wince_model() -> Model {
     }
 }
 
-/// FULL-NYAN held-key detector. A run becomes armed only on the sixteenth
+/// SING-ALONG held-key detector. A run becomes armed only on the sixteenth
 /// distinct-in-time same-character press. Breaking an unarmed run clears its
 /// partial count; releasing an armed run enters one bounded wind-down phase,
 /// which then settles to the byte-identical idle state.
@@ -1107,13 +1108,13 @@ pub fn cursor_cat_curse_wince_model() -> Model {
 /// every armed state has accumulated all sixteen presses.
 ///
 /// Tier-0 lives in `derived_ring_ty.rs`; Tier-1 drives the genuine
-/// `aterm_effects::nyan_sing::NyanSing` press, release, and settle methods in
-/// `aterm-effects/tests/nyan_activation_conformance.rs`.
+/// `aterm_effects::kitty_sing::KittySing` press, release, and settle methods in
+/// `aterm-effects/tests/kitty_activation_conformance.rs`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn nyan_sing_detector_model() -> Model {
+pub fn kitty_sing_detector_model() -> Model {
     crate::ty_model! {
-        NyanSingDetector {
+        KittySingDetector {
             const Buggy = 0;
             const ArmRepeats = 16;
             const OldArmRepeats = 8;
@@ -1157,7 +1158,7 @@ pub fn nyan_sing_detector_model() -> Model {
     }
 }
 
-/// Cursor-cat FULL-NYAN bypass floor. Pinning the canonical momentum for a
+/// Cursor-cat SING-ALONG bypass floor. Pinning the canonical momentum for a
 /// held-key celebration starts a fresh qualifying run but may not summon the
 /// companion until sixteen correlated forward cursor events have arrived.
 /// This model deliberately isolates that travel guard from the stricter normal
@@ -1205,7 +1206,7 @@ pub fn cursor_cat_earn_floor_model() -> Model {
     }
 }
 
-/// Bounded FIFO/lifecycle for the Nyan fast-jump landing starbursts. Every
+/// Bounded FIFO/lifecycle for the rainbow kitty fast-jump landing starbursts. Every
 /// admitted fast jump retains the newest issued identity while evicting the
 /// oldest at capacity. A style switch moves (never copies or loses) the active
 /// ring into an outgoing fade owner; staggered expiry, fade completion, and
@@ -1217,9 +1218,9 @@ pub fn cursor_cat_earn_floor_model() -> Model {
 /// style-fade ownership, overlap, fade completion, cadence, and master-off.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn nyan_jump_burst_lifecycle_model() -> Model {
+pub fn rainbow_jump_burst_lifecycle_model() -> Model {
     crate::ty_model! {
-        NyanJumpBurstLifecycle {
+        RainbowJumpBurstLifecycle {
             const BurstCap = 3;
             const TotalCap = 6;
             const MaxIssued = 6;
@@ -1284,7 +1285,7 @@ pub fn nyan_jump_burst_lifecycle_model() -> Model {
     }
 }
 
-/// Bounded admission/gating model for the Nyan terminus twinkle pool. Jump
+/// Bounded admission/gating model for the rainbow terminus twinkle pool. Jump
 /// scatter requires both a live ribbon and full motion; right-margin scatter
 /// requires full motion but is already evidence of a live typing ribbon.
 /// Both paths saturate at the shared particle cap, expire to idle, and reset
@@ -1296,9 +1297,9 @@ pub fn nyan_jump_burst_lifecycle_model() -> Model {
 /// expiry, margin, and master-off behavior.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn nyan_terminus_admission_model() -> Model {
+pub fn rainbow_terminus_admission_model() -> Model {
     crate::ty_model! {
-        NyanTerminusAdmission {
+        RainbowTerminusAdmission {
             const ParticleCap = 6;
             const ScatterBurst = 2;
             const Buggy = 0;

@@ -234,7 +234,7 @@ pub fn per_window_metrics_model() -> Model {
     }
 }
 
-/// Nyan blink-flare admission. A charged cursor may translate a terminal blink
+/// Rainbow kitty blink-flare admission. A charged cursor may translate a terminal blink
 /// edge into one bounded twinkle; a settled cursor must leave the ordinary
 /// blink alone. `Buggy=1` reproduces the regression where every idle blink
 /// creates a fresh effect episode, pinning recurring animation wakes forever.
@@ -250,9 +250,9 @@ pub fn per_window_metrics_model() -> Model {
 /// even when the coarse `twinkle` boolean remains `1` on both sides.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn nyan_idle_twinkle_model() -> Model {
+pub fn rainbow_idle_twinkle_model() -> Model {
     crate::ty_model! {
-        NyanIdleTwinkle {
+        RainbowIdleTwinkle {
             const Buggy = 0;
             const MaxSteps = 6;
             const FlareTicks = 2;
@@ -323,7 +323,7 @@ pub fn nyan_idle_twinkle_model() -> Model {
     }
 }
 
-/// Sparse-frame sampling for the Nyan finger-lift exit lifecycle.
+/// Sparse-frame sampling for the rainbow kitty finger-lift exit lifecycle.
 ///
 /// Logical time may pass the complete `grace + reach + retract` deadline
 /// without any callback. On the first later observation, healthy code samples
@@ -332,14 +332,14 @@ pub fn nyan_idle_twinkle_model() -> Model {
 /// retract clock at the observation itself, resurrecting visible motion.
 ///
 /// Tier-1 binding:
-/// `cursor_glow::tests::nyan_single_late_tick_does_not_resurrect_exit_swoosh`
+/// `cursor_glow::tests::rainbow_single_late_tick_does_not_resurrect_exit_swoosh`
 /// drives the real animator from a live typing ribbon to one five-second-late
 /// tick and projects its fingerprint and scheduler state onto this model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn nyan_exit_sampling_model() -> Model {
+pub fn rainbow_exit_sampling_model() -> Model {
     crate::ty_model! {
-        NyanExitSampling {
+        RainbowExitSampling {
             const Buggy = 0;
             var logical_done = 0;
             var sampled = 0;

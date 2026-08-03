@@ -1640,6 +1640,15 @@ pub(crate) fn commit_and_exit(
         // SAFETY: one atomic write from a live fixed buffer to the private pipe.
         let wrote = unsafe { libc::write(fd.as_raw_fd(), wire.as_ptr().cast(), wire.len()) };
         if wrote == isize::try_from(wire.len()).unwrap_or(-1) {
+            // ON macOS THIS EXIT ALSO ENDS A LAUNCHD JOB. This process is the
+            // process of the `application.com.aterm.aterm.*` job LaunchServices
+            // created for the instance, so `_exit` makes launchd tear that job
+            // down. That is correct only when the successor owns a job of its
+            // own; while it is a fork child of ours (see the KNOWN DEFECT note
+            // at the `spawn` call in `app_update_handoff::run_handoff_worker`)
+            // it survives as a pid-1 orphan holding this dead job's bootstrap
+            // context. Guarded by `tests/handoff_launchd_job.rs`.
+            //
             // SAFETY: this is the protocol's point of no return. `_exit` skips
             // every App/Session destructor that could SIGHUP the handed-off PTYs.
             unsafe { libc::_exit(0) }

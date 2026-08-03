@@ -37,12 +37,13 @@ use aterm_spec::derive::{
     idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
     inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
     kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
-    layout_coordinate_reset_model, ligature_gate_model, manual_config_completion_model,
-    manual_config_diagnostics_lane_model, manual_config_handoff_model,
-    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
-    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
-    native_config_observation_handoff_model, native_config_transaction_model,
-    native_control_routing_model, native_document_publication_model, native_draft_journal_model,
+    kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
+    manual_config_completion_model, manual_config_diagnostics_lane_model,
+    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
+    motion_policy_model, native_async_delivery_model, native_capture_source_model,
+    native_close_plan_model, native_config_observation_handoff_model,
+    native_config_transaction_model, native_control_routing_model,
+    native_document_publication_model, native_draft_journal_model,
     native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
     native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
     native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
@@ -53,20 +54,20 @@ use aterm_spec::derive::{
     native_update_hidden_output_quiet_model, native_update_menu_activation_model,
     native_update_overlap_handoff_model, native_update_status_reconciliation_model,
     native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
-    net_dial_after_grant_model, nova_phase_model, nyan_exit_sampling_model,
-    nyan_idle_twinkle_model, nyan_jump_burst_lifecycle_model, nyan_sing_detector_model,
-    nyan_terminus_admission_model, one_shot_peek_model, pad_absorption_model, pane_tree_model,
-    path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
-    present_retry_model, presentation_gate_model, presented_frame_tap_model, proxy_forward_model,
-    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model, read_image_seq_model,
-    recording_model, recovery_redraw_model, release_channel_floor_model,
-    release_channel_single_head_model, release_durable_post_intent_model,
-    release_historical_recovery_model, release_journal_prefix_model,
-    release_key_epoch_transition_model, release_published_identity_model,
-    release_publisher_fence_model, release_yank_successor_first_model,
-    restore_manifest_single_use_model, ring_model, scroll_glide_model,
-    scrollback_maintenance_lane_model, seamless_nonce_model, self_governor_model,
-    semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
+    net_dial_after_grant_model, nova_phase_model, one_shot_peek_model, pad_absorption_model,
+    pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
+    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
+    presented_frame_tap_model, proxy_forward_model, rain_band_containment_model,
+    rain_ignition_model, rain_lifecycle_model, rainbow_exit_sampling_model,
+    rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
+    rainbow_terminus_admission_model, read_image_seq_model, recording_model, recovery_redraw_model,
+    release_channel_floor_model, release_channel_single_head_model,
+    release_durable_post_intent_model, release_historical_recovery_model,
+    release_journal_prefix_model, release_key_epoch_transition_model,
+    release_published_identity_model, release_publisher_fence_model,
+    release_yank_successor_first_model, restore_manifest_single_use_model, ring_model,
+    scroll_glide_model, scrollback_maintenance_lane_model, seamless_nonce_model,
+    self_governor_model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
     semantic_prewarm_request_swap_model, serious_mode_intent_queue_model, serious_mode_model,
     session_chrome_expiry_model, session_pool_model, settings_page_scroll_model, shade_phase_model,
     shared_budget_model, snapshot_generation_commit_model, snapshot_model, sparkle_identity_model,
@@ -2887,25 +2888,25 @@ fn derived_config_catalog_snapshot_proves_and_catches_split_generation() {
     let stale_trail = buggy.successors("AdmitStaleTrail", &buggy.init_state())[0].clone();
     assert!(!buggy.check_invariant("SnapshotAtomic", &stale_trail));
     assert_eq!(stale_trail["trail_generation"], 0);
-    assert_eq!(stale_trail["nyan_generation"], 1);
+    assert_eq!(stale_trail["kitty_generation"], 1);
     assert_eq!(stale_trail["theme_generation"], 1);
     assert_eq!(stale_trail["sparkle_generation"], 1);
 
-    let stale_nyan = buggy.successors("AdmitStaleNyan", &buggy.init_state())[0].clone();
-    assert!(!buggy.check_invariant("SnapshotAtomic", &stale_nyan));
-    assert_eq!(stale_nyan["trail_generation"], 1);
-    assert_eq!(stale_nyan["nyan_generation"], 0);
+    let stale_kitty = buggy.successors("AdmitStaleKitty", &buggy.init_state())[0].clone();
+    assert!(!buggy.check_invariant("SnapshotAtomic", &stale_kitty));
+    assert_eq!(stale_kitty["trail_generation"], 1);
+    assert_eq!(stale_kitty["kitty_generation"], 0);
 
     let stale_theme = buggy.successors("AdmitStaleTheme", &buggy.init_state())[0].clone();
     assert!(!buggy.check_invariant("SnapshotAtomic", &stale_theme));
     assert_eq!(stale_theme["trail_generation"], 1);
-    assert_eq!(stale_theme["nyan_generation"], 1);
+    assert_eq!(stale_theme["kitty_generation"], 1);
     assert_eq!(stale_theme["theme_generation"], 0);
 
     let stale_sparkle = buggy.successors("AdmitStaleSparkle", &buggy.init_state())[0].clone();
     assert!(!buggy.check_invariant("SnapshotAtomic", &stale_sparkle));
     assert_eq!(stale_sparkle["trail_generation"], 1);
-    assert_eq!(stale_sparkle["nyan_generation"], 1);
+    assert_eq!(stale_sparkle["kitty_generation"], 1);
     assert_eq!(stale_sparkle["theme_generation"], 1);
     assert_eq!(stale_sparkle["sparkle_generation"], 0);
 }
@@ -6716,7 +6717,7 @@ fn derived_cursor_cat_proves_and_catches_hidden_expiry() {
     assert_proves_and_catches(&cursor_cat_model());
 }
 
-/// The cursor-trail master owns only ordinary Nyan momentum. With the master
+/// The cursor-trail master owns only ordinary rainbow kitty momentum. With the master
 /// off, typing is a semantic no-op for the ordinary host arm; a collection
 /// still enters its promised visible hello. The mutant reproduces the former
 /// leak by arming and drawing the ordinary branch while its owner is off.
@@ -6782,13 +6783,13 @@ fn derived_cursor_cat_curse_wince_rejects_fuc_and_catches_preview_mutant() {
     assert_eq!(healthy.get("chain"), Some(&4));
 }
 
-/// FULL-NYAN is earned by a deliberate held key, not a short burst: the
+/// SING-ALONG is earned by a deliberate held key, not a short burst: the
 /// committed detector arms exactly on press sixteen, releases through a bounded
 /// wind-down, and the original eight-press threshold is a required
 /// counterexample rather than a dead configuration dial.
 #[test]
-fn derived_nyan_sing_detector_proves_and_catches_eight_press_arm() {
-    assert_proves_and_catches(&nyan_sing_detector_model());
+fn derived_kitty_sing_detector_proves_and_catches_eight_press_arm() {
+    assert_proves_and_catches(&kitty_sing_detector_model());
 }
 
 /// The singing momentum bypass cannot make the cursor companion skip its own
@@ -6803,16 +6804,16 @@ fn derived_cursor_cat_earn_floor_proves_and_catches_v056_threshold() {
 /// outgoing style ownership without loss, and keep the brisk scheduler armed
 /// exactly while either owner contains work.
 #[test]
-fn derived_nyan_jump_burst_lifecycle_proves_and_catches_drop_or_loss() {
-    assert_proves_and_catches(&nyan_jump_burst_lifecycle_model());
+fn derived_rainbow_jump_burst_lifecycle_proves_and_catches_drop_or_loss() {
+    assert_proves_and_catches(&rainbow_jump_burst_lifecycle_model());
 }
 
 /// Terminus twinkles are admitted only for a live, full-motion jump (or the
 /// live right-margin route), stay within the shared particle cap, and disarm
 /// after expiry/reset. The mutant bypasses both the gate and cap.
 #[test]
-fn derived_nyan_terminus_admission_proves_and_catches_false_scatter() {
-    assert_proves_and_catches(&nyan_terminus_admission_model());
+fn derived_rainbow_terminus_admission_proves_and_catches_false_scatter() {
+    assert_proves_and_catches(&rainbow_terminus_admission_model());
 }
 
 /// A delayed *presentable* callback beyond the full hello lifetime is not a
@@ -7023,21 +7024,21 @@ fn derived_flash_limiter_window_proves_catches_and_multiplies() {
     );
 }
 
-/// Nyan scheduler regression family: idle blink edges are silent, a content
+/// Rainbow kitty scheduler regression family: idle blink edges are silent, a content
 /// present consumes the stale effect timer, and brisk tails remain phase-locked
 /// instead of adding redraw cost to every interval. Each model proves the fixed
 /// rule at Buggy=0 and independently requires a counterexample at Buggy=1.
 #[test]
-fn derived_nyan_idle_twinkle_proves_and_catches_idle_wakes() {
-    assert_proves_and_catches(&nyan_idle_twinkle_model());
+fn derived_rainbow_idle_twinkle_proves_and_catches_idle_wakes() {
+    assert_proves_and_catches(&rainbow_idle_twinkle_model());
 }
 
-/// A missing compositor callback cannot restart the Nyan exit lifecycle. The
+/// A missing compositor callback cannot restart the rainbow kitty exit lifecycle. The
 /// first sample after the logical completion deadline is settled and disarmed;
 /// Buggy restarts visible reach/retract motion at callback time.
 #[test]
-fn derived_nyan_exit_sampling_proves_and_catches_sparse_restart() {
-    let healthy = nyan_exit_sampling_model();
+fn derived_rainbow_exit_sampling_proves_and_catches_sparse_restart() {
+    let healthy = rainbow_exit_sampling_model();
     assert_proves_and_catches(&healthy);
     let mut state = healthy.init_state();
     assert!(healthy.fire("ElapseDone", &mut state));
@@ -7049,7 +7050,7 @@ fn derived_nyan_exit_sampling_proves_and_catches_sparse_restart() {
     assert!(healthy.check_invariant("SettledSampleHasNoLight", &state));
     assert!(healthy.check_invariant("SettledSampleDisarms", &state));
 
-    let mut buggy = nyan_exit_sampling_model();
+    let mut buggy = rainbow_exit_sampling_model();
     for cst in &mut buggy.consts {
         if cst.0 == "Buggy" {
             cst.1 = 1;

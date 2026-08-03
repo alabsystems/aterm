@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use aterm_effects::kitty_cursor::{CatFrame, CatReaction, CursorCat};
 use aterm_effects::kitty_registry::KittyLook;
-use aterm_effects::nyan_cursor::{CatFrame, CatReaction, CursorCat};
 use aterm_spec::derive::{Model, cursor_cat_curse_wince_model, cursor_cat_model};
 use aterm_spec::verify;
 

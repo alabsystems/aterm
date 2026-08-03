@@ -457,7 +457,7 @@ pub(crate) struct SettingsViewState {
     /// unavailable rather than guessed from a loopback URL.
     title_summary_health: Option<TitleSummaryHealth>,
     /// The exact immutable non-text assets admitted with this config revision.
-    /// Holding the outer Arc keeps Trail Pack, Nyan sprite, and parsed-theme
+    /// Holding the outer Arc keeps Trail Pack, kitty sprite, and parsed-theme
     /// identity atomic:
     /// previews never independently resolve a path or observe assets from two
     /// different revisions.
@@ -4480,37 +4480,40 @@ fn renderer_preview_spec_for_key_with_font(
         }
     };
 
-    let committed_nyan = state
+    let committed_kitty_sprite = state
         .raw_value(prefs::EDIT_CURSOR_NYAN_SPRITE)
         .unwrap_or_default();
     // Asset resolution reads only AUTHORED sources — the live draft, else the
     // committed raw value. The field's DISPLAY text is presentation metadata
     // whose "built-in sprite" placeholder must never masquerade as an authored
     // (and thus unvalidated → Invalid) candidate for the DEFAULT state.
-    let nyan_value = state
+    let kitty_sprite_value = state
         .field_inputs
         .get(prefs::EDIT_CURSOR_NYAN_SPRITE)
         .filter(|_| state.editing_field.as_deref() == Some(prefs::EDIT_CURSOR_NYAN_SPRITE))
-        .map_or_else(|| committed_nyan.clone(), |input| input.projection().text);
-    let nyan_asset = if nyan_value.trim().is_empty() {
-        crate::app_config::NyanSpriteAsset::BuiltIn
-    } else if nyan_value.trim() == committed_nyan.trim() {
-        state.config_assets().nyan_sprite.clone()
+        .map_or_else(
+            || committed_kitty_sprite.clone(),
+            |input| input.projection().text,
+        );
+    let kitty_asset = if kitty_sprite_value.trim().is_empty() {
+        crate::app_config::KittySpriteAsset::BuiltIn
+    } else if kitty_sprite_value.trim() == committed_kitty_sprite.trim() {
+        state.config_assets().kitty_sprite.clone()
     } else {
-        crate::app_config::NyanSpriteAsset::Invalid {
-            source_id: Arc::from(nyan_value.as_str()),
+        crate::app_config::KittySpriteAsset::Invalid {
+            source_id: Arc::from(kitty_sprite_value.as_str()),
             bounded_reason: Arc::from(
                 "uncommitted source is disabled until config validation admits its decoded pixels",
             ),
         }
     };
     let post_fx = CursorPostFxSpec {
-        nyan_sprite: if nyan_value.is_empty() {
+        kitty_sprite: if kitty_sprite_value.is_empty() {
             "built-in CatBaker".to_string()
         } else {
-            nyan_value
+            kitty_sprite_value
         },
-        nyan_asset,
+        kitty_asset,
         bloom: !serious_preview_suppression
             && field_bool(state, prefs::EDIT_CURSOR_TRAIL_BLOOM, true),
         bloom_strength: field_number(state, prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH, 0.85_f32),
@@ -4541,7 +4544,11 @@ fn renderer_preview_spec_for_key_with_font(
         "bar" | "beam" | "underline" => PreviewCursorStyle::Bar,
         _ => PreviewCursorStyle::Block,
     };
-    let trail_style_value = field_text(state, prefs::EDIT_CURSOR_TRAIL_STYLE, "nyan rainbow");
+    let trail_style_value = field_text(
+        state,
+        prefs::EDIT_CURSOR_TRAIL_STYLE,
+        prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+    );
     let resolved_trail =
         crate::app_config::resolve_trail_style(&trail_style_value, state.trail_pack_catalog());
     let mut cursor = CursorPreviewSpec {
@@ -7372,7 +7379,11 @@ fn top_projected_toy_value(state: &SettingsViewState, key: &str) -> bool {
 
 fn top_authored_trail_value(state: &SettingsViewState) -> String {
     if field_bool(state, prefs::EDIT_CURSOR_TRAIL, true) {
-        field_text(state, prefs::EDIT_CURSOR_TRAIL_STYLE, "nyan rainbow")
+        field_text(
+            state,
+            prefs::EDIT_CURSOR_TRAIL_STYLE,
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+        )
     } else {
         "off".to_string()
     }
@@ -10309,7 +10320,12 @@ fn candidate_trail_resolution(
     state: &SettingsViewState,
     patch: Option<&ConfigPatch>,
 ) -> crate::app_config::ResolvedTrailStyle {
-    let raw = candidate_setting_text(state, patch, prefs::EDIT_CURSOR_TRAIL_STYLE, "nyan rainbow");
+    let raw = candidate_setting_text(
+        state,
+        patch,
+        prefs::EDIT_CURSOR_TRAIL_STYLE,
+        prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+    );
     crate::app_config::resolve_trail_style(&raw, state.trail_pack_catalog())
 }
 
@@ -19036,7 +19052,7 @@ mod tests {
     fn legacy_trail_master_is_authored_picker_state_but_empty_style_alone_is_reset() {
         for (text, expected) in [
             ("cursor_trail = false\n", Some("off")),
-            ("cursor_trail = true\n", Some("nyan rainbow")),
+            ("cursor_trail = true\n", Some("rainbow kitty")),
             ("cursor_trail_style = \"\"\n", None),
         ] {
             let service = VersionedConfigService::new(text.to_string()).unwrap();
@@ -19184,7 +19200,7 @@ mod tests {
                     .iter()
                     .map(|value| (*value).to_string())
                     .collect(),
-                "nyan rainbow",
+                prefs::DEFAULT_CURSOR_TRAIL_STYLE,
             ),
         ];
         for (key, options, effective_default) in cases {
@@ -30230,7 +30246,7 @@ enabled = true
 
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: crate::app_config::TrailPackCatalog::empty(),
-            nyan_sprite: crate::app_config::NyanSpriteAsset::BuiltIn,
+            kitty_sprite: crate::app_config::KittySpriteAsset::BuiltIn,
             themes: crate::app_config::ThemeCatalog::empty(),
             sparkle_spec_consumers: Some(Arc::new(consumers)),
         });
@@ -30251,7 +30267,7 @@ enabled = true
 
         let exact_all_false = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: crate::app_config::TrailPackCatalog::empty(),
-            nyan_sprite: crate::app_config::NyanSpriteAsset::BuiltIn,
+            kitty_sprite: crate::app_config::KittySpriteAsset::BuiltIn,
             themes: crate::app_config::ThemeCatalog::empty(),
             sparkle_spec_consumers: Some(Arc::new(Default::default())),
         });

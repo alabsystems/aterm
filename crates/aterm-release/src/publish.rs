@@ -3463,7 +3463,10 @@ pub fn validate_draft_asset_set(
             .filter(|observed| observed.as_str() == name)
             .count()
     };
-    for (name, expected) in [
+    // The manifest is the authority for the zip exactly as it is for the DMG: a
+    // manifest that names a container the release does not carry would publish a
+    // head every client resolves and then fails to download.
+    let mut exact_counts = vec![
         (manifest_out::MANIFEST_ASSET, 1usize),
         (
             manifest_out::MANIFEST_SIG_ASSET,
@@ -3471,7 +3474,11 @@ pub fn validate_draft_asset_set(
         ),
         (manifest.dmg.as_str(), 1usize),
         (provenance_name, 1usize),
-    ] {
+    ];
+    if let Some(zip) = manifest.zip.as_deref() {
+        exact_counts.push((zip, 1usize));
+    }
+    for (name, expected) in exact_counts {
         let observed = count(name);
         if observed != expected {
             return Err(Error::new(format!(
@@ -3495,6 +3502,9 @@ pub fn validate_draft_asset_set(
         manifest.dmg.as_str(),
         provenance_name,
     ];
+    if let Some(zip) = manifest.zip.as_deref() {
+        allowed.push(zip);
+    }
     if signature_required {
         allowed.push(manifest_out::MANIFEST_SIG_ASSET);
     }
@@ -3871,11 +3881,22 @@ pub fn validate_live_release_identity(
             expected.commit
         )));
     }
-    let expected_dmg = format!("aterm-{}.dmg", expected.version);
+    let expected_dmg = mirror::dmg_asset_name(expected.version);
     if manifest.dmg != expected_dmg {
         return Err(Error::new(format!(
             "published manifest names DMG {:?}, expected exact {expected_dmg:?}",
             manifest.dmg
+        )));
+    }
+    // The zip stays OPTIONAL on the wire (a release cut before zip staging has
+    // none), but a manifest that names one must name the canonical one: the
+    // client derives this same string from the tag and refuses anything else.
+    let expected_zip = mirror::zip_asset_name(expected.version);
+    if let Some(zip) = manifest.zip.as_deref()
+        && zip != expected_zip
+    {
+        return Err(Error::new(format!(
+            "published manifest names zip {zip:?}, expected exact {expected_zip:?}"
         )));
     }
     match (signature_required, live_signature, signature_pubkey) {
@@ -4061,7 +4082,12 @@ pub struct CutCtx {
 
 impl CutCtx {
     fn dmg_path(&self) -> PathBuf {
-        self.dist.join(format!("aterm-{}.dmg", self.version))
+        self.dist.join(mirror::dmg_asset_name(&self.version))
+    }
+    /// The updater container (`ditto` zip). Same bundle as the DMG, staged
+    /// without `hdiutil` — see `dmg::create_zip`.
+    fn zip_path(&self) -> PathBuf {
+        self.dist.join(mirror::zip_asset_name(&self.version))
     }
     fn app_path(&self) -> PathBuf {
         self.dist.join("aterm.app")
@@ -5215,6 +5241,25 @@ fn recover_published_cut(
             manifest.dmg
         )));
     }
+    // The updater container must be recoverable too: the mirror step serves the
+    // public channel from the reconstructed dist/, and the required asset set
+    // includes the zip.
+    let (recovered_zip, recovered_zip_sha256) =
+        match (manifest.zip.as_deref(), manifest.zip_sha256.as_deref()) {
+            (Some(zip), Some(sha256)) => (zip.to_string(), sha256.to_string()),
+            _ => {
+                return Err(Error::new(
+                    "published recovery release carries no zip name + digest pair; it predates \
+                     zip staging and cannot be recovered by this cutter — finish or retire it \
+                     by hand",
+                ));
+            }
+        };
+    if !exact_asset_present(&names, &recovered_zip)? {
+        return Err(Error::new(format!(
+            "published recovery release has no exact zip {recovered_zip}"
+        )));
+    }
     let provenance_name = format!("aterm-{version}-build.txt");
     if !exact_asset_present(&names, &provenance_name)? {
         return Err(Error::new(format!(
@@ -5239,6 +5284,14 @@ fn recover_published_cut(
         &manifest.dmg,
         &manifest.sha256,
         &dist.join(&manifest.dmg),
+    )?;
+    verify_release_asset_digest_for_release_id_to(
+        slug,
+        release_object.id,
+        &tag,
+        &recovered_zip,
+        &recovered_zip_sha256,
+        &dist.join(&recovered_zip),
     )?;
     fs::write(dist.join(manifest_out::MANIFEST_ASSET), &manifest_bytes)
         .map_err(|error| Error::new(format!("reconstruct manifest: {error}")))?;
@@ -6247,6 +6300,11 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     } else {
         (dout.sha256.clone(), dout.size_bytes)
     };
+    // The updater container, from the SAME signed .app. It is built here rather
+    // than from the DMG because the Dev-ID hook above rewrites only the DMG's
+    // bytes — the bundle is final the moment `sign_app` returns — and because
+    // `ditto` must archive the bundle directly to preserve its seal.
+    let zout = dmg::create_zip(&app, &ctx.dist, &ctx.version)?;
     // Provenance AFTER signing: binary_sha256 must cover the SIGNED bytes.
     let provenance_path = bundle::write_provenance(&spec, &app, &signed_by)?;
     if ctx.signature_required {
@@ -6282,6 +6340,15 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             &dmg_sha[..12.min(dmg_sha.len())]
         ),
     );
+    step(
+        "zip",
+        &format!(
+            "{} ({:.1} MB)  sha256 {}… — the container the in-app updater stages from",
+            zout.path.display(),
+            zout.size_bytes as f64 / 1_000_000.0,
+            &zout.sha256[..12.min(zout.sha256.len())]
+        ),
+    );
 
     // ---- manifest + notes (the rolled body, verbatim, once — spec §3) -----
     let cl_text = fs::read_to_string(ctx.repo.join(changelog::CHANGELOG_FILE))
@@ -6298,8 +6365,12 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         version: &ctx.version,
         build_number: ctx.build,
         commit: &ctx.commit,
-        dmg_name: &format!("aterm-{}.dmg", ctx.version),
+        dmg_name: &mirror::dmg_asset_name(&ctx.version),
         dmg_sha256: &dmg_sha,
+        zip_name: &mirror::zip_asset_name(&ctx.version),
+        // No re-hash pass: the Dev-ID hook never touches the zip, so these are
+        // the bytes clients download.
+        zip_sha256: &zout.sha256,
         // The manifest's `url` must name the repository a reader can actually
         // fetch from. These same bytes ride BOTH the private release and the
         // mirrored public one, and only the public channel is readable without
@@ -6548,6 +6619,33 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             "self-check failed: DMG sha256 {sha} != manifest {}",
             manifest.sha256
         )));
+    }
+
+    // Same proof for the updater container: it is the artifact the whole fleet
+    // downloads, so a stale/absent zip must abort the cut here, not strand every
+    // machine on a digest mismatch after publication.
+    let zip_name = mirror::zip_asset_name(&ctx.version);
+    match (manifest.zip.as_deref(), manifest.zip_sha256.as_deref()) {
+        (Some(name), Some(expected)) => {
+            if name != zip_name {
+                return Err(Error::new(format!(
+                    "self-check failed: manifest names zip {name:?}, expected {zip_name:?}"
+                )));
+            }
+            let sha = dmg::sha256_file(&ctx.zip_path())?;
+            if !sha.eq_ignore_ascii_case(expected) {
+                return Err(Error::new(format!(
+                    "self-check failed: zip sha256 {sha} != manifest {expected}"
+                )));
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                "self-check failed: manifest carries no zip name + digest pair; the in-app \
+                 updater cannot stage without `hdiutil`, which an orphaned post-handoff \
+                 process cannot use",
+            ));
+        }
     }
 
     // codesign — the hard gate (sign.rs's inline verify print is advisory).
@@ -6813,7 +6911,12 @@ fn step_upload(ctx: &mut CutCtx) -> Result<()> {
             ctx.tag, ctx.slug
         )));
     }
-    let mut files: Vec<PathBuf> = vec![ctx.dmg_path(), ctx.manifest_path(), ctx.provenance_path()];
+    let mut files: Vec<PathBuf> = vec![
+        ctx.dmg_path(),
+        ctx.zip_path(),
+        ctx.manifest_path(),
+        ctx.provenance_path(),
+    ];
     let sig = ctx.manifest_path().with_extension("toml.sig");
     match (ctx.signature_required, ctx.manifest_signed, sig.is_file()) {
         (true, true, true) => {
@@ -7021,7 +7124,12 @@ fn prove_draft_artifacts(ctx: &mut CutCtx) -> Result<()> {
         dsym_name,
     )?;
 
-    let mut files = vec![ctx.manifest_path(), ctx.dmg_path(), ctx.provenance_path()];
+    let mut files = vec![
+        ctx.manifest_path(),
+        ctx.dmg_path(),
+        ctx.zip_path(),
+        ctx.provenance_path(),
+    ];
     if ctx.signature_required {
         files.push(ctx.manifest_path().with_extension("toml.sig"));
     }
@@ -7324,6 +7432,9 @@ fn step_archive(ctx: &mut CutCtx) -> Result<()> {
         ))
     })?;
     verify_release_asset_id_matches_local(&ctx.slug, release_id, &live.dmg, &ctx.dmg_path())?;
+    if let Some(zip) = live.zip.as_deref() {
+        verify_release_asset_id_matches_local(&ctx.slug, release_id, zip, &ctx.zip_path())?;
+    }
     verify_release_asset_id_matches_local(
         &ctx.slug,
         release_id,

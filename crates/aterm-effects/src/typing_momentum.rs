@@ -2,14 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! THE canonical typing-momentum metric — one leaky integrator in `[0, 1]`
-//! that every Nyan "earned drama" consumer reads (owner: "the kitty face is a
+//! that every rainbow kitty "earned drama" consumer reads (owner: "the kitty face is a
 //! little too distracting and so are the stars. these should appear with more
 //! momentum on the cursor motion … more carefully define that metric where it
 //! decays over time and it builds up with non-delete typing activity
 //! continuously").
 //!
 //! Before this module there were THREE parallel momentum trackers feeding the
-//! Nyan family: the style-shared typing `heat` (a per-key cadence-credit
+//! Rainbow kitty family: the style-shared typing `heat` (a per-key cadence-credit
 //! envelope, also slammed to 1.0 by jump flares), the cursor cat's private
 //! `score` (0.34/key, τ 1.2 s), and the eased display spines derived from
 //! each. They disagreed about what "momentum" meant — a key-repeat flood
@@ -17,7 +17,7 @@
 //! keystroke, and the cat's earn law was a key COUNT — which is exactly how
 //! casual bursts kept buying the full fireworks. This module is the single
 //! replacement law; [`crate::cursor_glow::CursorGlow`] (ribbon spine → stars,
-//! fresh-ink pops, iridescence) and [`crate::nyan_cursor::CursorCat`] each hold
+//! fresh-ink pops, iridescence) and [`crate::kitty_cursor::CursorCat`] each hold
 //! one instance fed by the same host keystream, so every consumer reads the same
 //! number: `momentum_unifies_glow_and_cat_metrics` (cursor_glow tests) pins
 //! that the two instances evolve identically under one key script.
@@ -48,7 +48,7 @@
 //!
 //! With `RATE × τ = 1.3` the flood equilibrium clamps at 1.0, and flat-out
 //! typing crosses the cat's 0.75 band in ~1.7 s and reaches 1.0 in ~2.9 s —
-//! the arc the raised thresholds in [`crate::nyan_cursor`] are tuned against.
+//! the arc the raised thresholds in [`crate::kitty_cursor`] are tuned against.
 
 use web_time::Instant;
 

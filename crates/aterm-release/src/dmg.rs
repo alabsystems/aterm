@@ -1,22 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! DMG packaging (release spec §6 `dmg.rs`): `hdiutil create` UDZO with the
-//! `/Applications` symlink (the pretty create-dmg layout was deliberately
-//! dropped — spec decision 20), then sha256 the DMG bytes in-process via
-//! `sha2` so the digest written into the manifest is provably the digest of
-//! the file we just produced.
+//! Bundle packaging (release spec §6 `dmg.rs`). Two containers carry the SAME
+//! signed `aterm.app`:
+//!
+//! * the **DMG** — `hdiutil create` UDZO with the `/Applications` symlink (the
+//!   pretty create-dmg layout was deliberately dropped — spec decision 20). This
+//!   is the human download.
+//! * the **zip** — `ditto -c -k --sequesterRsrc --keepParent`. This is what the
+//!   in-app updater stages from, because `hdiutil attach` needs a live bootstrap
+//!   context (DiskImages registers with the `com.apple.hdiejectd` XPC service)
+//!   and the survivor of a seamless overlap update is an orphan whose launchd
+//!   job has exited — every attach from there fails ENXIO. `ditto` speaks to no
+//!   XPC service, so it works from any process context.
+//!
+//! Both digests are computed in-process via `sha2`, so the digest written into
+//! the manifest is provably the digest of the file we just produced.
 //!
 //! Port of `apps/aterm-mac/make-dmg.sh`, hdiutil branch only. The signed .app
-//! goes in AS-IS: run this AFTER `sign::sign_app` (the DMG freezes the app's
-//! bytes), and hand the result to `sign::sign_and_notarize_dmg` next.
+//! goes in AS-IS: run this AFTER `sign::sign_app` (both containers freeze the
+//! app's bytes), and hand the DMG to `sign::sign_and_notarize_dmg` next.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The packaged artifact: the release asset path, its exact byte digest (→
-/// manifest `sha256`, cask pin, publish self-check) and size (transcript).
-pub struct DmgOut {
+/// A packaged artifact (DMG or zip): the release asset path, its exact byte
+/// digest (→ manifest `sha256`/`zip_sha256`, cask pin, publish self-check) and
+/// size (transcript).
+pub struct Packaged {
     pub path: PathBuf,
     pub sha256: String,
     pub size_bytes: u64,
@@ -28,7 +39,7 @@ pub struct DmgOut {
 /// name written into the manifest's `dmg`/`url` fields, and every installed
 /// v0.25 client resolves its download by that name (a mismatch 404s the whole
 /// fleet's update).
-pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<DmgOut, String> {
+pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Packaged, String> {
     if !app.is_dir() {
         return Err(format!(
             "{} not found — assemble the bundle first",
@@ -65,11 +76,76 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<DmgOut,
         size_bytes as f64 / 1_000_000.0
     );
     println!("    sha256: {sha256}");
-    Ok(DmgOut {
+    Ok(Packaged {
         path: dmg,
         sha256,
         size_bytes,
     })
+}
+
+/// Package `<app>` into `<out_dir>/aterm-<short>-mac.zip` — the container the
+/// in-app updater downloads and extracts.
+///
+/// `ditto -c -k --sequesterRsrc --keepParent` is the ONLY supported way to
+/// archive a signed bundle: it preserves extended attributes and the
+/// `_CodeSignature` layout (so the extracted app still verifies), `--keepParent`
+/// puts `aterm.app` at the archive root (the client extracts and expects exactly
+/// that name), and `--sequesterRsrc` keeps resource forks in the standard
+/// `__MACOSX` sidecar rather than mangling them. `zip(1)` would silently drop
+/// the metadata the signature seals.
+///
+/// The artifact name MUST stay `aterm-{short}-mac.zip`: it is the exact asset
+/// name written into the manifest's `zip` field, and the client re-derives that
+/// same string from the release tag and refuses anything else.
+pub fn create_zip(app: &Path, out_dir: &Path, short_version: &str) -> Result<Packaged, String> {
+    if !app.is_dir() {
+        return Err(format!(
+            "{} not found — assemble the bundle first",
+            app.display()
+        ));
+    }
+    let zip = out_dir.join(format!("aterm-{short_version}-mac.zip"));
+    // `ditto -c -k` would overwrite an existing archive, but a stale one from an
+    // earlier attempt must not survive a FAILED run and get hashed as this cut's
+    // artifact — remove it first, exactly as `create` does for the DMG.
+    let _ = std::fs::remove_file(&zip);
+
+    println!("==> ditto -c -k {} (updater container)", zip.display());
+    archive_app(app, &zip)?;
+
+    let size_bytes = std::fs::metadata(&zip)
+        .map_err(|e| format!("stat {}: {e}", zip.display()))?
+        .len();
+    let sha256 = sha256_file(&zip)?;
+    println!(
+        "==> done: {} ({:.1} MB)",
+        zip.display(),
+        size_bytes as f64 / 1_000_000.0
+    );
+    println!("    sha256: {sha256}");
+    Ok(Packaged {
+        path: zip,
+        sha256,
+        size_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn archive_app(app: &Path, zip: &Path) -> Result<(), String> {
+    run_quiet(
+        Command::new("/usr/bin/ditto")
+            .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+            .arg(app)
+            .arg(zip),
+        "ditto -c -k app into updater zip",
+    )
+}
+
+/// Archiving a signed bundle without losing its seal is a macOS operation
+/// (`ditto`, extended attributes); refuse plainly elsewhere.
+#[cfg(not(unix))]
+fn archive_app(_app: &Path, _zip: &Path) -> Result<(), String> {
+    Err("bundle zip creation requires macOS (ditto); build releases on a Mac".into())
 }
 
 #[cfg(unix)]

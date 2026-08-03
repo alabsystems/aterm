@@ -215,7 +215,7 @@ impl CursorRainbow {
     /// Whether the host must keep arming the animation tick: while the cursor is
     /// still CHARGED (typing or cooling) or a blink-twinkle flare is mid-flight.
     /// Once settled it returns false and the idle rainbow rides the ordinary
-    /// blink cadence — no Nyan-specific wakeups on a focused idle window.
+    /// blink cadence — no rainbow-kitty-specific wakeups on a focused idle window.
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.energy > SETTLED_ENERGY || self.twinkling
@@ -1009,7 +1009,7 @@ mod tests {
     }
 
     /// IDLE-ZERO REGRESSION: recurring terminal blink flips at settled energy
-    /// never arm Nyan's effect timer. This is the exact permanent-wakeup bug:
+    /// never arm the rainbow kitty's effect timer. This is the exact permanent-wakeup bug:
     /// twenty half-periods must leave the animator idle after every flip.
     #[test]
     fn idle_blink_flips_never_arm_effect_timer() {
@@ -1046,7 +1046,7 @@ mod tests {
     /// `twinkle_seq` makes a forbidden restart observable and rejectable.
     #[test]
     fn idle_blink_transition_conforms_to_model() {
-        let model = aterm_spec::derive::nyan_idle_twinkle_model();
+        let model = aterm_spec::derive::rainbow_idle_twinkle_model();
         let state = |charged: i64,
                      twinkle: i64,
                      remaining: i64,

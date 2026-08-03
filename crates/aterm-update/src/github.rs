@@ -327,6 +327,109 @@ fn authoritative_dmg_index(
     })
 }
 
+/// Which container a stage unpacks. Both carry the same signed `aterm.app` and
+/// are verified identically once extracted; the difference is only that the zip
+/// needs no `hdiutil`, and therefore no live bootstrap context (see
+/// [`crate::install::stage_from_zip`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Container {
+    Zip,
+    Dmg,
+}
+
+impl Container {
+    /// Transcript/ledger wording — these strings reach the user through status
+    /// lines and the health ledger.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::Dmg => "DMG",
+        }
+    }
+}
+
+/// The one exact release asset this check will download and stage from: its
+/// container kind, its already-proved-unique asset index, its file name (which
+/// becomes the local scratch name), and the manifest digest its bytes must match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StageArtifact {
+    container: Container,
+    asset_index: usize,
+    name: String,
+    sha256: String,
+}
+
+/// Resolve the manifest's optional zip container to one canonical asset identity.
+///
+/// `Ok(None)` = the manifest declares no usable zip (no name, or a name with no
+/// digest to check the bytes against). `Err` = it declares one this release
+/// cannot resolve — a noncanonical name, or an asset that is missing/duplicated.
+/// Neither outcome is fatal to the check: the DMG identity is proved separately
+/// and staging falls back to it, which is what keeps releases published before
+/// zip staging installable.
+fn authoritative_zip_artifact(
+    release: &Release,
+    manifest: &Manifest,
+    canonical_version: &str,
+) -> Result<Option<StageArtifact>, String> {
+    let Some(zip) = manifest.zip.as_deref() else {
+        return Ok(None);
+    };
+    let Some(sha256) = manifest.zip_sha256.as_deref() else {
+        // A container name with no digest is not stageable — there would be
+        // nothing to check the downloaded bytes against.
+        return Ok(None);
+    };
+    let expected = format!("aterm-{canonical_version}-mac.zip");
+    if zip != expected {
+        return Err(format!(
+            "authoritative update {} names noncanonical zip {zip:?}; expected {expected:?}",
+            release.tag_name
+        ));
+    }
+    let asset_index = unique_asset_index(release, zip)?.ok_or_else(|| {
+        format!(
+            "authoritative update {} has no exact asset named {zip:?}",
+            release.tag_name
+        )
+    })?;
+    Ok(Some(StageArtifact {
+        container: Container::Zip,
+        asset_index,
+        name: zip.to_string(),
+        sha256: sha256.to_string(),
+    }))
+}
+
+/// Choose the container to stage from: the zip when the manifest carries a
+/// resolvable one, else the DMG.
+///
+/// The DMG identity is proved FIRST and unconditionally, so a release that fails
+/// that check is refused exactly as before and the fallback is always available.
+/// Preferring the zip is an availability decision, not a trust one — both digests
+/// come from the same (optionally signed) manifest and both bundles go through
+/// the same codesign/sealed-identity gate after extraction.
+fn select_stage_artifact(
+    release: &Release,
+    manifest: &Manifest,
+    canonical_version: &str,
+) -> Result<StageArtifact, String> {
+    let dmg_index = authoritative_dmg_index(release, manifest, canonical_version)?;
+    match authoritative_zip_artifact(release, manifest, canonical_version) {
+        Ok(Some(zip)) => return Ok(zip),
+        Ok(None) => {}
+        // A declared-but-unresolvable zip is a publishing defect, not a reason to
+        // stop updating: say so and take the DMG.
+        Err(error) => crate::warn(&format!("{error}; staging from the DMG instead")),
+    }
+    Ok(StageArtifact {
+        container: Container::Dmg,
+        asset_index: dmg_index,
+        name: manifest.dmg.clone(),
+        sha256: manifest.sha256.clone(),
+    })
+}
+
 struct AuthoritativeRelease {
     tag: Vec<u64>,
     version: String,
@@ -400,8 +503,9 @@ fn select_authoritative_release(
 
 #[derive(Default)]
 struct AuthoritativeFetch {
-    /// Manifest, its release, and the already-proved unique canonical DMG index.
-    selected: Option<(Manifest, Release, usize)>,
+    /// Manifest, its release, and the already-proved unique canonical container
+    /// (zip when the manifest carries a resolvable one, else the DMG).
+    selected: Option<(Manifest, Release, StageArtifact)>,
     appcast_fetch_error: bool,
     manifest_rejected: bool,
     /// Candidate-manifest fetches only. Detached-signature downloads are a
@@ -479,9 +583,9 @@ fn fetch_authoritative_release(
     };
     match Manifest::parse(&text) {
         Ok(manifest) if manifest.version == candidate.version => {
-            match authoritative_dmg_index(&candidate.release, &manifest, &candidate.version) {
-                Ok(dmg_index) => {
-                    fetched.selected = Some((manifest, candidate.release, dmg_index));
+            match select_stage_artifact(&candidate.release, &manifest, &candidate.version) {
+                Ok(artifact) => {
+                    fetched.selected = Some((manifest, candidate.release, artifact));
                 }
                 Err(error) => {
                     crate::warn(&error);
@@ -524,6 +628,89 @@ fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
                             .eq_ignore_ascii_case(manifest_commit.trim())
                     })
                 }))
+    })
+}
+
+/// An OPEN stage-failure retry window, and what it is allowed to stop.
+///
+/// The window in `failed.toml` exists for exactly one purpose: stop us
+/// re-DOWNLOADING (up to 512 MB of) bytes that already refused to become a verified
+/// bundle. It says nothing about a bundle that is ALREADY downloaded, verified,
+/// extracted and published — applying that costs no bandwidth, is not the failure
+/// the memo recorded, and is counted and remedied separately
+/// (`Health::apply_failures`, cleared only by a real apply, escalating on its own
+/// streak). The two failures must not share a timer, and this type is where that
+/// separation is expressed.
+///
+/// THE REGRESSION: a machine with `staged_build=1785510971`,
+/// `staged_version=0.10.0`, `relaunch_ready=true` and `failing_applies=0` reported
+/// `skipping build 1785510971 for another 1387m (failed to stage 4 time(s))`. Four
+/// stage failures of the release's CURRENT artifact (the shape that produces this:
+/// a re-publish of the same build under a new digest, which
+/// [`publishable_stage_covers`] no longer covers) had opened the 24 h re-download
+/// window — and that window was also refusing to apply the earlier, verified 0.10.0
+/// bundle that was sitting on disk marked ready.
+#[derive(Debug)]
+struct StageBackoff {
+    /// Seconds until the candidate named by the manifest may be downloaded again.
+    retry_in_secs: u64,
+    /// Consecutive stage failures recorded for that candidate (at least 1).
+    attempts: u32,
+    /// A published local stage that is strictly newer than the running build, if
+    /// one exists. The backoff never gates this: the check reports it so the apply
+    /// lane runs on it this cycle.
+    applicable: Option<Ready>,
+}
+
+impl StageBackoff {
+    /// The operator-facing line for an open window. It names the lane actually
+    /// being skipped — the RE-STAGE — and then says, separately, whether an apply
+    /// is being skipped along with it. The old wording ("skipping build N for
+    /// another 1387m") named neither, so it read as "nothing is happening" while
+    /// sitting beside a `staged_build` that was ready the whole time.
+    fn status_line(&self, candidate_build: u64) -> String {
+        let restage = format!(
+            "skipping re-stage of build {candidate_build} for another {}m (failed to stage \
+             {} time(s); retrying automatically, or re-publish to retry now)",
+            self.retry_in_secs.div_ceil(60),
+            self.attempts
+        );
+        match &self.applicable {
+            None => format!("{restage}; no verified stage to apply"),
+            Some(ready) => format!(
+                "{restage}; NOT skipping apply: staged {} (build {}) is verified and \
+                 applies on next launch",
+                ready.version, ready.build_number
+            ),
+        }
+    }
+}
+
+/// Read the stage-failure memo and decide what it may stop for this candidate.
+/// `None` means no window is open for it (absent memo, another artifact, or the
+/// deadline has passed) — download and stage as usual.
+///
+/// `applicable` is gated by [`Ready::read_publishable`], the same local read the
+/// status and apply surfaces share: the marker must carry a canonical identity AND
+/// name a real published bundle whose sealed `Info.plist` rebinds to it. Full
+/// codesign/Team-ID re-verification stays where it has always been — under the
+/// apply lock on the apply path itself, which is the authority — so a backed-off
+/// check never spawns a verification helper per cycle to answer this.
+fn stage_backoff(
+    staging: &Staging,
+    manifest: &Manifest,
+    current_build: u64,
+    now: u64,
+) -> Option<StageBackoff> {
+    let memo = crate::manifest::FailedMark::read(&staging.failed())?;
+    if !memo.suppresses(manifest.build_number, &manifest.sha256, now) {
+        return None;
+    }
+    Some(StageBackoff {
+        retry_in_secs: memo.retry_in_secs(now),
+        attempts: memo.attempts.max(1),
+        applicable: Ready::read_publishable(staging)
+            .filter(|ready| ready.build_number > current_build),
     })
 }
 
@@ -653,9 +840,14 @@ fn fetch_release_catalog(
     Ok(Some(release_catalog))
 }
 
-/// Background check + stage. Returns the staged version string on success, or
-/// `None` when nothing newer is available / the updater is idle. Errors are
-/// transient/operational (network, parse) and are logged by the caller.
+/// Background check + stage. Returns `Some(version)` when a strictly-newer
+/// verified build IS staged and applicable — usually because this call staged it,
+/// but also when one was already published and only the RE-stage is backed off
+/// (see [`StageBackoff`]) — or `None` when nothing newer is available / the updater
+/// is idle. The caller turns `Some` into the apply lane's cue, so the answer is
+/// deliberately about STATE ("a build is staged and can be applied") rather than
+/// about this call's activity. Errors are transient/operational (network, parse)
+/// and are logged by the caller.
 ///
 /// The running build's *version* is deliberately not a parameter: it plays no
 /// part in the decision. Selection is by numeric release tag
@@ -726,7 +918,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     crate::manifest::Floor::bump_and_write(&staging.floor(), seen_min_build, 0);
     let effective_min_build = floor.min_build.max(seen_min_build);
 
-    let Some((manifest, release, dmg_index)) = best else {
+    let Some((manifest, release, artifact)) = best else {
         let msg = if appcast_fetch_error {
             // Manifests exist but could not be downloaded while the releases list
             // succeeded — a `pipeline`-class failure. The ledger decides the honest
@@ -769,10 +961,10 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         crate::status::record(&staging, current_build, &msg);
         return Ok(None);
     };
-    // NOTE: no `record_success` yet — the DMG download/verify/stage below is still
-    // part of this check's pipeline. Success is recorded only at the terminal
-    // healthy outcomes ("up to date" / "staged"), so a DMG-only breakage ACCRUES a
-    // streak instead of being reset every cycle by its own check's manifest fetch.
+    // NOTE: no `record_success` yet — the container download/verify/stage below is
+    // still part of this check's pipeline. Success is recorded only at the terminal
+    // healthy outcomes ("up to date" / "staged"), so a download-only breakage ACCRUES
+    // a streak instead of being reset every cycle by its own check's manifest fetch.
 
     // Downgrade gate: never stage an older-or-equal build. A terminal healthy
     // outcome — the whole pipeline this check exercised worked.
@@ -821,29 +1013,31 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         return Ok(None);
     }
 
-    // If this exact build+DMG already failed to stage and nothing newer exists, don't
-    // re-download the (up to 2 GiB) DMG every interval; a re-publish under the same
-    // build with a different sha256 (or any newer build) clears the memo (F17).
-    if let Some(f) = crate::manifest::FailedMark::read(&staging.failed())
-        && f.suppresses(
-            manifest.build_number,
-            &manifest.sha256,
-            crate::install::unix_now_secs(),
-        )
-    {
-        let retry_in = f.retry_in_secs(crate::install::unix_now_secs());
+    // If this exact build already failed to stage, don't re-download the (up to
+    // 2 GiB) container every interval; a re-publish under the same build with a
+    // different sha256 (or any newer build) clears the memo (F17). The memo is keyed
+    // on the manifest's `sha256` for both containers, so a build is one candidate
+    // however its bytes arrive.
+    //
+    // The window gates THIS — the re-stage — and nothing else. An already-published,
+    // strictly-newer stage is applied from disk, so it is not the thing the memo is
+    // throttling; skipping it here is how a ready 0.10.0 was held for 1387 minutes by
+    // a failed re-publish of the same build (see [`StageBackoff`]).
+    if let Some(backoff) = stage_backoff(
+        &staging,
+        &manifest,
+        current_build,
+        crate::install::unix_now_secs(),
+    ) {
         crate::status::record(
             &staging,
             current_build,
-            &format!(
-                "skipping build {} for another {}m (failed to stage {} time(s); retrying \
-                 automatically, or re-publish to retry now)",
-                manifest.build_number,
-                retry_in.div_ceil(60),
-                f.attempts.max(1),
-            ),
+            &backoff.status_line(manifest.build_number),
         );
-        return Ok(None);
+        // Reporting the staged version is what drives the apply lane (the caller's
+        // `on_staged` hook), so a download backoff cannot strand a build that only
+        // needs applying.
+        return Ok(backoff.applicable.map(|ready| ready.version));
     }
 
     // Serialize the staging critical section (download → extract → publish) across
@@ -857,79 +1051,93 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         return Ok(None);
     }
 
-    // Download the exact unique same-release DMG identity already proven while
-    // accepting the authoritative manifest. No order-dependent asset lookup is
-    // permitted after this point.
-    let dmg_asset = &release.assets[dmg_index];
+    // Download the exact unique same-release container identity already proven
+    // while accepting the authoritative manifest — the zip when the release
+    // carries one, else the DMG. No order-dependent asset lookup is permitted
+    // after this point.
+    let asset = &release.assets[artifact.asset_index];
+    let container = artifact.container.label();
 
-    let part = staging.download.join(format!("{}.part", manifest.dmg));
-    let dmg = staging.download.join(&manifest.dmg);
+    let part = staging.download.join(format!("{}.part", artifact.name));
+    let container_path = staging.download.join(&artifact.name);
     let _ = std::fs::remove_file(&part);
-    // A failed DMG download is a `pipeline`-class ledger entry: the asset provably
+    // A failed download is a `pipeline`-class ledger entry: the asset provably
     // exists (the release names it) but could not be fetched.
-    if let Err(e) =
-        // 2 GiB = GitHub's per-asset ceiling; must stay equal to the cutter's
-        // UPDATER_MAX_DMG_BYTES (aterm-release/src/publish.rs).
-        aterm_update_core::download_to(&dmg_asset.url, tok.as_deref(), &part, 2_147_483_648)
-    {
+    if let Err(e) = aterm_update_core::download_to(&asset.url, tok.as_deref(), &part, 536_870_912) {
         let _ = std::fs::remove_file(&part);
         crate::health::Health::record_failure(
             &staging.health(),
             "pipeline",
-            &format!("DMG download failed: {e}"),
+            &format!("{container} download failed: {e}"),
         );
-        return Err(format!("DMG download failed: {e}"));
+        return Err(format!("{container} download failed: {e}"));
     }
 
     // Size sanity (when the API reported one), then atomically name it final. From
     // here failures are `stage`-class in the health ledger: the bytes ARRIVED; the
     // artifact (or local disk) is the problem, not the download pipeline.
-    if dmg_asset.size != 0 {
+    if asset.size != 0 {
         let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        if got != dmg_asset.size {
+        if got != asset.size {
             let _ = std::fs::remove_file(&part);
             let msg = format!(
-                "DMG size mismatch: got {got} bytes, expected {}",
-                dmg_asset.size
+                "{container} size mismatch: got {got} bytes, expected {}",
+                asset.size
             );
             crate::health::Health::record_failure(&staging.health(), "stage", &msg);
             return Err(msg);
         }
     }
-    if let Err(e) = std::fs::rename(&part, &dmg) {
+    if let Err(e) = std::fs::rename(&part, &container_path) {
         let msg = format!("finalize download: {e}");
         crate::health::Health::record_failure(&staging.health(), "stage", &msg);
         return Err(msg);
     }
 
-    // Integrity: SHA-256 must equal the manifest.
-    let got = aterm_update_core::sha256_file(&dmg)?;
-    if !got.eq_ignore_ascii_case(&manifest.sha256) {
-        let _ = std::fs::remove_file(&dmg);
+    // Integrity: SHA-256 must equal the manifest's digest FOR THIS CONTAINER.
+    let got = aterm_update_core::sha256_file(&container_path)?;
+    if !got.eq_ignore_ascii_case(&artifact.sha256) {
+        let _ = std::fs::remove_file(&container_path);
         let msg = format!(
-            "DMG sha256 mismatch: got {got}, manifest {}",
-            manifest.sha256
+            "{container} sha256 mismatch: got {got}, manifest {}",
+            artifact.sha256
         );
         crate::health::Health::record_failure(&staging.health(), "stage", &msg);
         return Err(msg);
     }
 
-    // Mount, extract, verify (codesign/team-id/spctl), publish the ready marker. On a
+    // Unpack, verify (codesign/team-id/spctl), publish the ready marker. On a
     // post-download stage failure (verification etc.) memoize this build+sha so we
-    // don't re-download it next cycle, and reclaim the DMG (F17).
-    if let Err(e) = install::stage_from_dmg(&staging, &dmg, &manifest, crate::effective_team_id()) {
+    // don't re-download it next cycle, and reclaim the container (F17). The memo is
+    // keyed on the MANIFEST digest, not this container's, so the two paths share one
+    // retry budget for one candidate build.
+    let staged = match artifact.container {
+        Container::Zip => install::stage_from_zip(
+            &staging,
+            &container_path,
+            &manifest,
+            crate::effective_team_id(),
+        ),
+        Container::Dmg => install::stage_from_dmg(
+            &staging,
+            &container_path,
+            &manifest,
+            crate::effective_team_id(),
+        ),
+    };
+    if let Err(e) = staged {
         crate::manifest::FailedMark::record_stage_failure(
             &staging.failed(),
             manifest.build_number,
             &manifest.sha256,
             crate::install::unix_now_secs(),
         );
-        let _ = std::fs::remove_file(&dmg);
+        let _ = std::fs::remove_file(&container_path);
         crate::health::Health::record_failure(&staging.health(), "stage", &e);
         return Err(e);
     }
-    // The verified bundle is the artifact now; reclaim the DMG and clear the memo.
-    let _ = std::fs::remove_file(&dmg);
+    // The verified bundle is the artifact now; reclaim the container and clear the memo.
+    let _ = std::fs::remove_file(&container_path);
     crate::manifest::FailedMark::clear(&staging.failed());
     // Terminal healthy outcome: this check exercised the WHOLE pipeline (manifest,
     // DMG, verify, stage) successfully — clear every failure streak.
@@ -1278,6 +1486,8 @@ mod tests {
             commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
             sha256: "ab".repeat(32),
             dmg: "aterm-0.54.0.dmg".into(),
+            zip: None,
+            zip_sha256: None,
             min_build: None,
             changelog: None,
         }
@@ -2336,6 +2546,86 @@ mod tests {
         assert_eq!(fetched.manifest_fetch_attempts, 1);
     }
 
+    /// The zip is PREFERRED whenever the manifest carries a resolvable one —
+    /// that preference IS the fix: `hdiutil attach` cannot work in the orphaned
+    /// post-handoff process that most needs to stage, and `ditto` can. Every
+    /// other shape must still fall back to the DMG rather than stop updating,
+    /// because that is what keeps already-published releases installable.
+    #[test]
+    fn stage_selection_prefers_the_zip_and_falls_back_to_the_dmg() {
+        const VERSION: &str = "0.54.0";
+        let zip_name = format!("aterm-{VERSION}-mac.zip");
+        let zip_digest = "cd".repeat(32);
+        let push_zip_asset = |release: &mut Release| {
+            release.assets.push(Asset {
+                name: zip_name.clone(),
+                url: "https://api.github.com/repos/o/r/releases/assets/9".into(),
+                size: 0,
+            });
+        };
+
+        // A manifest with no zip — every release published before zip staging —
+        // selects the DMG, exactly as it always did.
+        let dmg_only_release = release_with_appcast("v0.54.0", "https://example/appcast");
+        let dmg_only = candidate_manifest();
+        let chosen = select_stage_artifact(&dmg_only_release, &dmg_only, VERSION).unwrap();
+        assert_eq!(chosen.container, Container::Dmg);
+        assert_eq!(chosen.name, "aterm-0.54.0.dmg");
+        assert_eq!(chosen.sha256, dmg_only.sha256);
+        assert_eq!(
+            dmg_only_release.assets[chosen.asset_index].name,
+            chosen.name
+        );
+
+        // Manifest and release both carry the zip: the zip wins, carrying ITS
+        // digest (not the DMG's) as the bytes-must-match value.
+        let mut zip_release = dmg_only_release.clone();
+        push_zip_asset(&mut zip_release);
+        let mut zipped = candidate_manifest();
+        zipped.zip = Some(zip_name.clone());
+        zipped.zip_sha256 = Some(zip_digest.clone());
+        let chosen = select_stage_artifact(&zip_release, &zipped, VERSION).unwrap();
+        assert_eq!(chosen.container, Container::Zip);
+        assert_eq!(chosen.name, zip_name);
+        assert_eq!(chosen.sha256, zip_digest);
+        assert_eq!(zip_release.assets[chosen.asset_index].name, chosen.name);
+
+        // Declared but unusable, four ways — each falls back, none refuses.
+        let mut no_digest = zipped.clone();
+        no_digest.zip_sha256 = None;
+        let mut noncanonical = zipped.clone();
+        noncanonical.zip = Some("aterm-mac.zip".into());
+        let mut duplicate_zip_release = zip_release.clone();
+        push_zip_asset(&mut duplicate_zip_release);
+        for (label, release, manifest) in [
+            (
+                "no digest to check the bytes against",
+                &zip_release,
+                &no_digest,
+            ),
+            ("release carries no such asset", &dmg_only_release, &zipped),
+            ("noncanonical zip name", &zip_release, &noncanonical),
+            (
+                "ambiguous duplicate assets",
+                &duplicate_zip_release,
+                &zipped,
+            ),
+        ] {
+            let chosen = select_stage_artifact(release, manifest, VERSION)
+                .unwrap_or_else(|error| panic!("{label} must still update: {error}"));
+            assert_eq!(chosen.container, Container::Dmg, "{label}");
+            assert_eq!(chosen.sha256, manifest.sha256, "{label}");
+        }
+
+        // The DMG identity proof stays unconditional: a manifest that names a
+        // noncanonical DMG is refused outright even when its zip is perfect.
+        let mut bad_dmg = zipped.clone();
+        bad_dmg.dmg = "aterm.dmg".into();
+        let error = select_stage_artifact(&zip_release, &bad_dmg, VERSION)
+            .expect_err("a noncanonical DMG must refuse the whole release");
+        assert!(error.contains("noncanonical DMG"), "{error}");
+    }
+
     fn write_ready(staging: &Staging, build: u64, commit: &str, digest: &str) {
         let ready = Ready {
             build_number: build,
@@ -2461,6 +2751,90 @@ mod tests {
         assert!(
             !publishable_stage_covers(&staging, &manifest),
             "same build with another digest must be restaged"
+        );
+
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// THE regression this split exists for: a DOWNLOAD backoff must never hold an
+    /// already-staged build hostage.
+    ///
+    /// The observed machine had `staged_build=1785510971`, `staged_version=0.10.0`,
+    /// `relaunch_ready=true` and `failing_applies=0`, and still reported "skipping
+    /// build 1785510971 for another 1387m (failed to stage 4 time(s))": a re-publish
+    /// of the same build under a NEW digest had failed to stage four times, and its
+    /// 24 h re-download window was also refusing to apply a bundle that was already
+    /// downloaded, verified, extracted and marked ready. Different failures, different
+    /// remedies — they must not share a timer.
+    #[test]
+    fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
+        use crate::manifest::{FailedMark, RETRY_BACKOFF_SECS};
+
+        let staging = test_staging("stage-backoff-vs-apply");
+        let manifest = candidate_manifest();
+        let canonical_commit = manifest.commit.as_deref().unwrap().to_string();
+        let running = manifest.build_number - 1;
+        const NOW: u64 = 1_000_000;
+
+        // Four consecutive stage failures of this candidate: the widest window.
+        for _ in 0..4 {
+            FailedMark::record_stage_failure(
+                &staging.failed(),
+                manifest.build_number,
+                &manifest.sha256,
+                NOW,
+            );
+        }
+
+        // Nothing staged: the window stops the re-download, and there is no apply to
+        // skip — the status line has to say exactly that.
+        let backoff = stage_backoff(&staging, &manifest, running, NOW).expect("window open");
+        assert_eq!(backoff.attempts, 4);
+        assert_eq!(backoff.retry_in_secs, RETRY_BACKOFF_SECS[3]);
+        assert!(backoff.applicable.is_none());
+        let line = backoff.status_line(manifest.build_number);
+        assert!(line.starts_with("skipping re-stage of build "), "{line}");
+        assert!(line.contains("no verified stage to apply"), "{line}");
+
+        // Now reproduce the observed machine: a published, locally verified stage for
+        // a build strictly newer than the running one, while that SAME window is open.
+        // Its digest differs from the manifest's (the re-publish), so the download
+        // path really is still backed off — this is not the covered-stage shortcut.
+        write_ready(
+            &staging,
+            manifest.build_number,
+            &canonical_commit,
+            &"ef".repeat(32),
+        );
+        write_bundle_identity(&staging, manifest.build_number, &canonical_commit);
+        assert!(
+            !publishable_stage_covers(&staging, &manifest),
+            "the staged digest is not the manifest's, so the re-stage is genuinely due"
+        );
+        // A stage failure throttles DOWNLOADING; it must never gate APPLYING a bundle
+        // that is already downloaded, verified, extracted and marked ready. Today's
+        // logic returned early here and the ready build went unoffered.
+        let backoff = stage_backoff(&staging, &manifest, running, NOW).expect("window open");
+        let applicable = backoff.applicable.as_ref().expect("apply is not gated");
+        assert_eq!(applicable.build_number, manifest.build_number);
+        let line = backoff.status_line(manifest.build_number);
+        assert!(line.starts_with("skipping re-stage of build "), "{line}");
+        assert!(line.contains("NOT skipping apply"), "{line}");
+
+        // A marker that is not STRICTLY newer is residue, not an update: still nothing
+        // to apply.
+        let residue = stage_backoff(&staging, &manifest, manifest.build_number, NOW);
+        assert!(
+            residue.expect("window open").applicable.is_none(),
+            "a marker for the running build is not an applicable update"
+        );
+
+        // And the window governs only its own lane's deadline: past it, the re-stage
+        // resumes on its own.
+        let past_deadline = NOW + RETRY_BACKOFF_SECS[3];
+        assert!(
+            stage_backoff(&staging, &manifest, running, past_deadline).is_none(),
+            "an expired window throttles nothing"
         );
 
         let _ = std::fs::remove_dir_all(&staging.root);

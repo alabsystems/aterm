@@ -1128,7 +1128,7 @@ mod tests {
         let styles = [
             GlowStyle::Lumen,
             GlowStyle::Phaser,
-            GlowStyle::Nyan,
+            GlowStyle::RainbowKitty,
             GlowStyle::Sparkle,
             GlowStyle::Fire,
             GlowStyle::Laser,

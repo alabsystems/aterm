@@ -630,7 +630,7 @@ pub(crate) fn config_host_semantic_warnings_with_backend(
 
 /// Host validation against the exact immutable non-text asset generation
 /// admitted with `config`. Manual passes its [`ConfigSnapshot`](crate::native_config_service::ConfigSnapshot)
-/// catalog here so theme, Trail Pack, and Nyan diagnostics cannot race a live
+/// catalog here so theme, Trail Pack, and rainbow kitty diagnostics cannot race a live
 /// directory/file change or disagree with what the renderer actually applies.
 ///
 /// `nested` — whether this process was launched inside another aterm
@@ -733,14 +733,20 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
             message,
         });
     }
-    if let Some(reason) = assets.nyan_sprite.diagnostic() {
+    if let Some(reason) = assets.kitty_sprite.diagnostic() {
         let source = assets
-            .nyan_sprite
+            .kitty_sprite
             .source_id()
             .unwrap_or("configured source");
         warnings.push(ConfigSemanticWarning {
+            // The TOML key keeps its shipped spelling (renaming it would break every
+            // config that sets it); the message names the Settings row the user sees,
+            // which is now "Rainbow kitty sprite", so the two surfaces connect.
             key: "cursor_nyan_sprite",
-            message: format!("cursor_nyan_sprite {source:?} is invalid ({reason}); disabled"),
+            message: format!(
+                "cursor_nyan_sprite (the Rainbow kitty sprite) {source:?} is invalid ({reason}); \
+                 disabled"
+            ),
         });
     }
 

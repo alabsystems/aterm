@@ -1764,7 +1764,7 @@ impl App {
         } else {
             ws.cursor_cat.static_frame(now)
         };
-        let nyan_enabled = crate::app_render::cursor_cat_presentation_enabled(
+        let kitty_enabled = crate::app_render::cursor_cat_presentation_enabled(
             animate_cat,
             glow_cfg.enabled,
             glow_cfg.style,
@@ -1780,7 +1780,7 @@ impl App {
             focus_cursor,
             win_focused: raw_focused,
             animate_sparkles,
-            nyan_alpha: if nyan_enabled { cat_frame.alpha } else { 0 },
+            kitty_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
             cat_frame,
             accent: glow_cfg.accent,
             cursor_color: ws.input_scratch.cursor_color,
@@ -1852,7 +1852,7 @@ impl App {
         }
         // Capture and application-present install the same admitted outer catalog Arc.
         // Keep this before all feature early-outs so a capture can never retain
-        // an earlier Nyan generation merely because word sparkles are disabled.
+        // an earlier rainbow kitty generation merely because word sparkles are disabled.
         self.install_window_config_assets(wid);
         // COMPOSED (split) capture: introspection is sacred — the capture must
         // show what the GLASS shows, and the glass now decorates every visible
@@ -1927,7 +1927,7 @@ impl App {
         // Explicit captures have no animation timer. A focused/full-motion
         // window samples its live lifecycle; reduced or windowless captures
         // show a collection as one full-opacity still, never a synthetic idle
-        // animation. Ordinary earned Nyan remains focus + full-motion gated.
+        // animation. Ordinary earned rainbow kitty remains focus + full-motion gated.
         let animate_cat = !windowless
             && ws.os_window.is_some()
             && ws.focused
@@ -1937,7 +1937,7 @@ impl App {
         } else {
             ws.cursor_cat.static_frame(now)
         };
-        let nyan_enabled = crate::app_render::cursor_cat_presentation_enabled(
+        let kitty_enabled = crate::app_render::cursor_cat_presentation_enabled(
             animate_cat,
             glow_cfg.enabled,
             glow_cfg.style,
@@ -2047,7 +2047,7 @@ impl App {
         // draws under. Told which cell the companion occupies, the engine drops
         // the ambient peek for the word beneath it — a capture must show the
         // same single cat the glass does, not the pre-fix pair.
-        let companion_at = cur.filter(|_| nyan_enabled && cat_frame.alpha > 0);
+        let companion_at = cur.filter(|_| kitty_enabled && cat_frame.alpha > 0);
         // The same selection view the animated tick sees (§6.4 nova ignition
         // deferral / per-quad attenuation) — a capture must not ignite a nova
         // the window itself would defer.
@@ -2144,17 +2144,17 @@ impl App {
             // capture or application-present frame has a chance to render it.
             ws.cursor_cat.set_collection_presentable(now, false);
         }
-        if nyan_enabled
+        if kitty_enabled
             && cat_frame.alpha > 0
             && let Some(cell) = cur
         {
-            let layout = aterm_effects::word_decorations::NyanCursorLayout {
+            let layout = aterm_effects::word_decorations::KittyCursorLayout {
                 geom: effect_geom,
                 cursor: cell,
                 look: cat_frame.render_look(),
                 bob: cat_frame.bob,
             };
-            if let Some(footprint) = ws.word_decos.nyan_cursor_footprint(layout) {
+            if let Some(footprint) = ws.word_decos.kitty_cursor_footprint(layout) {
                 let colors = ws.cursor_cat.episode_colors().unwrap_or_else(|| {
                     let sampled = crate::app_render::cursor_cat_color_key(
                         &ws.input_scratch.cells,
@@ -2166,8 +2166,8 @@ impl App {
                     );
                     ws.cursor_cat.colors_for_episode(sampled)
                 });
-                let _ = ws.word_decos.nyan_cursor(
-                    aterm_effects::word_decorations::NyanCursorFrame {
+                let _ = ws.word_decos.kitty_cursor(
+                    aterm_effects::word_decorations::KittyCursorFrame {
                         geom: effect_geom,
                         cursor: cell,
                         look: layout.look,
@@ -2183,7 +2183,7 @@ impl App {
                         // no note stream: notes are an animation channel, and
                         // the windowless path draws none.
                         sing: cat_frame.sing,
-                        notes: [None; aterm_effects::nyan_sing::MAX_NOTES],
+                        notes: [None; aterm_effects::kitty_sing::MAX_NOTES],
                     },
                     &mut ws.free_scratch,
                 );
@@ -2498,7 +2498,7 @@ impl App {
                 let _fill = term.row_cols_into(cpos.row as usize, &mut ws.poof_row_buf);
                 // STAR-LANDING NEIGHBORS — the windowed LOCK A capture's
                 // twin, so a headless capture licenses (or forbids) the
-                // displaced nyan stars exactly as a windowed present would.
+                // displaced rainbow kitty stars exactly as a windowed present would.
                 if cpos.row > 0 {
                     term.row_cols_into(cpos.row as usize - 1, &mut ws.poof_row_above_buf);
                 }
@@ -8887,12 +8887,12 @@ mod encode_worker_tests {
             .static_frame(capture_at + Duration::from_millis(1));
         assert_eq!(
             frame.reaction,
-            aterm_effects::nyan_cursor::CatReaction::Wince,
+            aterm_effects::kitty_cursor::CatReaction::Wince,
             "the silent capture drain must retain the visual wince"
         );
         assert_eq!(
             frame.pose,
-            aterm_effects::nyan_cursor::CatPose::STILL,
+            aterm_effects::kitty_cursor::CatPose::STILL,
             "headless reduced-motion capture keeps the wince expression static"
         );
     }

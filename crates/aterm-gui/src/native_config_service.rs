@@ -35,7 +35,7 @@ pub(crate) struct ConfigSnapshot {
     pub(crate) semantic_values: Arc<BTreeMap<String, String>>,
     /// Exact immutable non-text assets admitted with `text` at `revision`.
     /// Cloning a snapshot clones this one outer Arc; Trail manifests and the
-    /// custom Nyan sprite are never independently re-resolved by consumers.
+    /// custom kitty sprite are never independently re-resolved by consumers.
     pub(crate) assets: Arc<crate::app_config::ConfigAssetCatalog>,
 }
 
@@ -195,7 +195,7 @@ impl VersionedConfigService {
         Self::new_with_themes(text, crate::app_config::ThemeCatalog::empty())
     }
 
-    /// Runtime constructor used only before presentation. Theme/Nyan discovery
+    /// Runtime constructor used only before presentation. Theme/rainbow kitty discovery
     /// is bounded and parsed once here; Trail/Sparkle feeds remain explicitly
     /// pending for the parallel startup worker. Tests use the deterministic
     /// test constructor and its complete synchronous catalog.
@@ -277,7 +277,7 @@ impl VersionedConfigService {
 
     /// Resolve one worker-observed generation completely before it crosses the
     /// event-loop boundary. The caller must run this on a host worker because
-    /// Trail manifests and a custom Nyan sprite may require bounded file I/O.
+    /// Trail manifests and a custom kitty sprite may require bounded file I/O.
     pub(crate) fn prepare_observation(
         observation: ConfigDiskObservation,
         themes: Arc<crate::app_config::ThemeCatalog>,
@@ -288,7 +288,7 @@ impl VersionedConfigService {
         let preliminary = config.resolve_preliminary_asset_catalog_with_themes(themes);
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&path_feeds.trail_packs),
-            nyan_sprite: preliminary.nyan_sprite.clone(),
+            kitty_sprite: preliminary.kitty_sprite.clone(),
             themes: Arc::clone(&preliminary.themes),
             sparkle_spec_consumers: Some(Arc::new(path_feeds.sparkle.consumer_capabilities())),
         });
@@ -324,7 +324,7 @@ impl VersionedConfigService {
         debug_assert_eq!(self.revision, 1);
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs,
-            nyan_sprite: self.assets.nyan_sprite.clone(),
+            kitty_sprite: self.assets.kitty_sprite.clone(),
             themes: Arc::clone(&self.assets.themes),
             sparkle_spec_consumers: Some(Arc::new(consumers)),
         });
@@ -595,7 +595,7 @@ impl VersionedConfigService {
         // state. Host-backed source keys were rejected above and are edited in
         // Manual, whose worker admits text plus decoded assets atomically.
         // Ordinary structured toggles/theme/font changes therefore reuse the
-        // admitted Trail/Nyan/theme assets with no event-thread file I/O. A
+        // admitted Trail/rainbow kitty/theme assets with no event-thread file I/O. A
         // sparkle-table change below rewraps those assets with a typed pending
         // consumer projection until its worker generation is ready.
         let next_config = match parse_config(&next) {
@@ -616,7 +616,7 @@ impl VersionedConfigService {
         {
             self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
                 trail_packs: Arc::clone(&self.assets.trail_packs),
-                nyan_sprite: self.assets.nyan_sprite.clone(),
+                kitty_sprite: self.assets.kitty_sprite.clone(),
                 themes: Arc::clone(&self.assets.themes),
                 sparkle_spec_consumers: None,
             });
@@ -717,7 +717,7 @@ impl VersionedConfigService {
         // A byte-equal explicit observation remains the documented refresh
         // signal for a touched manifest/sprite. When config text itself changed,
         // however, an unrelated external edit reuses the exact immutable asset
-        // Arc and performs no Trail/Nyan I/O on the event thread; only an actual
+        // Arc and performs no Trail/rainbow kitty I/O on the event thread; only an actual
         // source projection change resolves a new catalog. Manual diagnostics
         // use the independent generation to recheck fonts and other host state.
         let refresh_assets =
@@ -762,7 +762,7 @@ impl VersionedConfigService {
     }
 
     /// Admit a catalog parsed by the background theme-directory watcher. Text,
-    /// Trail Packs, and Nyan retain their current values; publishing a changed
+    /// Trail Packs, and rainbow kitty retain their current values; publishing a changed
     /// theme catalog advances the single outer snapshot revision atomically.
     pub(crate) fn replace_theme_catalog(
         &mut self,
@@ -775,7 +775,7 @@ impl VersionedConfigService {
         self.revision = self.revision.saturating_add(1);
         self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&self.assets.trail_packs),
-            nyan_sprite: self.assets.nyan_sprite.clone(),
+            kitty_sprite: self.assets.kitty_sprite.clone(),
             themes,
             sparkle_spec_consumers: self.assets.sparkle_spec_consumers.clone(),
         });
@@ -801,12 +801,12 @@ fn asset_sources_changed(
     before: &crate::app_config::Config,
     after: &crate::app_config::Config,
 ) -> bool {
-    fn normalized_nyan(value: Option<&str>) -> Option<&str> {
+    fn normalized_kitty_sprite(value: Option<&str>) -> Option<&str> {
         value.map(str::trim).filter(|value| !value.is_empty())
     }
     before.cursor_trail_packs != after.cursor_trail_packs
-        || normalized_nyan(before.cursor_nyan_sprite.as_deref())
-            != normalized_nyan(after.cursor_nyan_sprite.as_deref())
+        || normalized_kitty_sprite(before.cursor_nyan_sprite.as_deref())
+            != normalized_kitty_sprite(after.cursor_nyan_sprite.as_deref())
 }
 
 fn read_config_file(
@@ -1067,7 +1067,7 @@ mod tests {
         ))
         .unwrap();
         let initial = service.snapshot();
-        let initial_fp = initial.assets.nyan_sprite.fingerprint();
+        let initial_fp = initial.assets.kitty_sprite.fingerprint();
 
         // If the external-edit path accidentally resolves assets, corrupting
         // the admitted source makes the regression fail visibly.
@@ -1078,7 +1078,7 @@ mod tests {
             ))
             .unwrap();
         assert!(Arc::ptr_eq(&unrelated.assets, &initial.assets));
-        assert_eq!(unrelated.assets.nyan_sprite.fingerprint(), initial_fp);
+        assert_eq!(unrelated.assets.kitty_sprite.fingerprint(), initial_fp);
 
         let second_rgba = [0xee, 0x22, 0x66, 0xff, 0x22, 0xee, 0x66, 0xff];
         let second_png = crate::app_introspect::encode_rgba8_png(&second_rgba, 2, 1).unwrap();
@@ -1091,10 +1091,10 @@ mod tests {
             .unwrap();
         assert!(!Arc::ptr_eq(&changed.assets, &unrelated.assets));
         assert_eq!(
-            changed.assets.nyan_sprite.source_id(),
+            changed.assets.kitty_sprite.source_id(),
             Some(second_source.as_str())
         );
-        assert_ne!(changed.assets.nyan_sprite.fingerprint(), initial_fp);
+        assert_ne!(changed.assets.kitty_sprite.fingerprint(), initial_fp);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1430,10 +1430,10 @@ mod tests {
         .unwrap();
         let initial = service.snapshot();
         assert!(matches!(
-            initial.assets.nyan_sprite,
-            crate::app_config::NyanSpriteAsset::Ready { .. }
+            initial.assets.kitty_sprite,
+            crate::app_config::KittySpriteAsset::Ready { .. }
         ));
-        let initial_fp = initial.assets.nyan_sprite.fingerprint();
+        let initial_fp = initial.assets.kitty_sprite.fingerprint();
 
         // Make a re-read observable: the already-admitted source is now
         // invalid. A patch that cannot change either asset source must not
@@ -1454,8 +1454,8 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&initial.assets, &patched.assets));
         assert!(matches!(
-            patched.assets.nyan_sprite,
-            crate::app_config::NyanSpriteAsset::Ready { .. }
+            patched.assets.kitty_sprite,
+            crate::app_config::KittySpriteAsset::Ready { .. }
         ));
 
         let ConfigPatchResult::Applied {
@@ -1500,10 +1500,10 @@ mod tests {
         let source_changed = service.synchronize_prepared_observation(prepared).unwrap();
         assert!(!Arc::ptr_eq(&undone.assets, &source_changed.assets));
         assert_eq!(
-            source_changed.assets.nyan_sprite.source_id(),
+            source_changed.assets.kitty_sprite.source_id(),
             Some(second_source.as_str())
         );
-        assert_ne!(source_changed.assets.nyan_sprite.fingerprint(), initial_fp);
+        assert_ne!(source_changed.assets.kitty_sprite.fingerprint(), initial_fp);
 
         let rejected_reset = service.reset_all(
             source_changed.revision,
@@ -1522,8 +1522,8 @@ mod tests {
         let reset = service.synchronize_prepared_observation(prepared).unwrap();
         assert!(!Arc::ptr_eq(&source_changed.assets, &reset.assets));
         assert!(matches!(
-            reset.assets.nyan_sprite,
-            crate::app_config::NyanSpriteAsset::BuiltIn
+            reset.assets.kitty_sprite,
+            crate::app_config::KittySpriteAsset::BuiltIn
         ));
 
         let missing = path.with_extension("missing.png");
@@ -1534,8 +1534,8 @@ mod tests {
             ))
             .expect("a bad optional sprite does not reject unrelated config");
         assert!(matches!(
-            external.assets.nyan_sprite,
-            crate::app_config::NyanSpriteAsset::Invalid { .. }
+            external.assets.kitty_sprite,
+            crate::app_config::KittySpriteAsset::Invalid { .. }
         ));
         assert_eq!(service.value("theme").unwrap().as_deref(), Some("External"));
         let _ = std::fs::remove_file(path);

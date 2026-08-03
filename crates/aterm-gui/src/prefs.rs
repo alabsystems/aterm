@@ -71,6 +71,11 @@ pub(crate) const EDIT_TRAIL_SOUND_BED: &str = "trail_sound_bed";
 pub(crate) const EDIT_TRAIL_SOUND_STYLE: &str = "trail_sound_style";
 pub(crate) const EDIT_CURSOR_TRAIL_COLOR: &str = "cursor_trail_color";
 pub(crate) const EDIT_CURSOR_TRAIL_ACCENT: &str = "cursor_trail_accent";
+/// The rainbow kitty's user sprite. KEEPS the `nyan` spelling — unlike the
+/// trail-style VALUE (which has an alias table), a config KEY has no aliasing
+/// seam, so renaming it would silently orphan every `cursor_nyan_sprite` line
+/// already in a user's `config.toml`. The constant is named after its key so
+/// the two can never drift.
 pub(crate) const EDIT_CURSOR_NYAN_SPRITE: &str = "cursor_nyan_sprite";
 pub(crate) const EDIT_SCROLLBACK: &str = "scrollback_lines";
 pub(crate) const EDIT_COPY_ON_SELECT: &str = "copy_on_select";
@@ -318,7 +323,7 @@ pub(crate) const EDIT_PALETTE: &str = "palette";
 pub(crate) const EDIT_CURSOR_TRAIL_PACKS: &str = "cursor_trail_packs";
 /// Trail sound level 0..=1 (`Config::trail_sound_volume`, default 0.4).
 pub(crate) const EDIT_TRAIL_SOUND_VOLUME: &str = "trail_sound_volume";
-// (The trail colour/accent, Nyan sprite, comet-geometry, bloom, shimmer and
+// (The trail colour/accent, kitty sprite, comet-geometry, bloom, shimmer and
 // HDR/SDR glow keys are declared once with the core cursor-trail keys above.)
 /// M2 "ink that dries" stream fade master (`stream_fade`, default OFF).
 pub(crate) const EDIT_STREAM_FADE: &str = "stream_fade";
@@ -890,15 +895,21 @@ const DEFAULT_SCROLLBACK_LINES: usize = 100_000;
 /// cursor). The placeholder hint for the cursor-style row.
 const DEFAULT_CURSOR_STYLE: &str = "block";
 
-/// The default `cursor_trail_style` when unset — the NYAN RAINBOW ribbon (the banded
+/// The default `cursor_trail_style` when unset — the RAINBOW KITTY ribbon (the banded
 /// rainbow whose blinking block twinkles like a little star; the effect the owner
-/// made the default), under its canonical two-word spelling (the legacy `nyan` /
-/// `rainbow` spellings still resolve to it via [`CURSOR_TRAIL_STYLE_ALIASES`]). The
-/// placeholder hint for the row.
-const DEFAULT_CURSOR_TRAIL_STYLE: &str = "nyan rainbow";
+/// made the default), under its canonical spelling. The name has changed twice: the
+/// original single-word `nyan` became the two-word `nyan rainbow`, which is now
+/// `rainbow kitty` (the owner's name for it — it says what you SEE). Every historical
+/// spelling still resolves here via [`CURSOR_TRAIL_STYLE_ALIASES`], so old configs
+/// keep working. The placeholder hint for the row.
+///
+/// This is the SINGLE definition of the default: `app_config`, `native_settings` and
+/// `settings_preview` read it rather than re-typing the literal, so the next rename is
+/// one line.
+pub(crate) const DEFAULT_CURSOR_TRAIL_STYLE: &str = "rainbow kitty";
 
 /// The selectable values for `cursor_trail_style`: the additive `phaser` sweep (a
-/// full-spectrum hue streak), `nyan rainbow` (the DEFAULT — the banded rainbow
+/// full-spectrum hue streak), `rainbow kitty` (the DEFAULT — the banded rainbow
 /// ribbon), the native cadence-`comet` (a directional fading comet under the light
 /// crown), the other additive LUMEN-wake looks
 /// (lumen / sparkle / fire / laser / water), the `beam` style (a clean steady TUBE of
@@ -911,7 +922,7 @@ const DEFAULT_CURSOR_TRAIL_STYLE: &str = "nyan rainbow";
 /// (whose extra alias spellings resolve through [`CURSOR_TRAIL_STYLE_ALIASES`]).
 pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "phaser",
-    "nyan rainbow",
+    "rainbow kitty",
     "comet",
     "lumen",
     "sparkle",
@@ -958,17 +969,19 @@ pub(crate) fn cursor_trail_style_options<'a>(
 
 /// The documented ALIAS spellings `GlowStyle::parse` (and the `glow_config`
 /// enablement gate) accepts for `cursor_trail_style`, mapped to their canonical
-/// [`CURSOR_TRAIL_STYLES`] option. NOTE `nyan`/`rainbow` → `nyan rainbow`: the
-/// banded-ribbon style's canonical (displayed) name is now the two-word
-/// `nyan rainbow`; both historical single-word spellings keep working. `rainbow`
-/// maps to the ACTUAL banded rainbow ribbon, not the old laser-like sweep
-/// (which lives on as the explicit `phaser`). The single alias source shared by
-/// the Settings panel (`enum_alias`), `--validate-config`, and the load-time
-/// unknown-style warning — so the UI, the validator, and the engine can never
-/// disagree about which spellings are real.
+/// [`CURSOR_TRAIL_STYLES`] option. NOTE `nyan rainbow`/`nyan`/`rainbow` →
+/// `rainbow kitty`: the banded-ribbon style's canonical (displayed) name is now
+/// `rainbow kitty`, and EVERY name it has ever shipped under keeps resolving to
+/// it, so a config written against any past release still selects the same
+/// effect. `rainbow` maps to the ACTUAL banded rainbow ribbon, not the old
+/// laser-like sweep (which lives on as the explicit `phaser`). The single alias
+/// source shared by the Settings panel (`enum_alias`), `--validate-config`, and
+/// the load-time unknown-style warning — so the UI, the validator, and the
+/// engine can never disagree about which spellings are real.
 pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
-    ("nyan", "nyan rainbow"),
-    ("rainbow", "nyan rainbow"),
+    ("nyan rainbow", "rainbow kitty"),
+    ("nyan", "rainbow kitty"),
+    ("rainbow", "rainbow kitty"),
     ("sparkles", "sparkle"),
     ("phaser-sparkle", "sparkle"),
     ("rainbow-sparkle", "sparkle"),
@@ -2499,8 +2512,11 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         | EDIT_CURSOR_TRAIL_INTENSITY
         | EDIT_CURSOR_TRAIL_RADIUS
         | EDIT_CURSOR_TRAIL_RING => &["effect", "motion", "comet", "trail"],
+        // "nyan" stays alongside "kitty"/"rainbow": search keywords are DISCOVERY
+        // aliases, and a user who knows the effect by its old name must still find
+        // the row.
         EDIT_CURSOR_TRAIL_WAKE_MS => &[
-            "effect", "motion", "trail", "wake", "typing", "nyan", "plume",
+            "effect", "motion", "trail", "wake", "typing", "kitty", "rainbow", "nyan", "plume",
         ],
         EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT => {
             &["effect", "trail", "color", "colour", "aurora", "accent"]
@@ -2519,7 +2535,9 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "sound",
             "audio",
         ],
-        EDIT_CURSOR_NYAN_SPRITE => &["nyan", "cat", "sprite", "image", "png", "trail"],
+        EDIT_CURSOR_NYAN_SPRITE => &[
+            "kitty", "rainbow", "nyan", "cat", "sprite", "image", "png", "trail",
+        ],
         EDIT_CURSOR_TRAIL_PACKS => &["trail", "pack", "manifest", "custom", "effect"],
         EDIT_CURSOR_TRAIL_BLOOM
         | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
@@ -3267,7 +3285,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cursor_trail_accent,
         },
         EditField {
-            label: "Nyan sprite",
+            label: "Rainbow kitty sprite",
             key: EDIT_CURSOR_NYAN_SPRITE,
             kind: EditKind::Text,
             placeholder: cursor_nyan_sprite
@@ -3764,7 +3782,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 None => "0.4 (default)".to_string(),
             },
         },
-        // (The trail colour/accent, Nyan sprite, comet-geometry, bloom, shimmer
+        // (The trail colour/accent, kitty sprite, comet-geometry, bloom, shimmer
         // and HDR/SDR glow ROWS live in the core list above — one row per key.)
         EditField {
             label: "Trail Pack manifests (comma-separated)",
@@ -4217,7 +4235,7 @@ mod trail_style_tests {
         let expected = |s: &str| match s {
             "lumen" => GlowStyle::Lumen,
             "phaser" => GlowStyle::Phaser,
-            "nyan rainbow" => GlowStyle::Nyan,
+            "rainbow kitty" => GlowStyle::RainbowKitty,
             "sparkle" => GlowStyle::Sparkle,
             "fire" => GlowStyle::Fire,
             "laser" => GlowStyle::Laser,
@@ -4238,7 +4256,7 @@ mod trail_style_tests {
     /// option that is (a) actually in the picker's domain and (b) parses to the
     /// SAME engine style as the alias itself — so the Settings panel, the
     /// validator, and `GlowStyle::parse` can never disagree about what an
-    /// aliased spelling means (the "rainbow shows phaser but renders Nyan" bug).
+    /// aliased spelling means (the "rainbow shows phaser but renders rainbow kitty" bug).
     #[test]
     fn cursor_trail_style_aliases_agree_with_engine_parse() {
         for &(alias, canonical) in super::CURSOR_TRAIL_STYLE_ALIASES {
@@ -5215,7 +5233,7 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(f(EDIT_CURSOR_TRAIL_STYLE).seed, None);
         assert_eq!(
             f(EDIT_CURSOR_TRAIL_STYLE).placeholder,
-            "nyan rainbow (default)",
+            "rainbow kitty (default)",
             "style placeholder shows the effective default"
         );
         assert!(

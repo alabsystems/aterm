@@ -41,12 +41,12 @@ pub enum GlowStyle {
     #[default]
     Lumen,
     /// Phaser — a full-spectrum hue sweep along the comet and over time. Reads as
-    /// a laser/phaser sweep, not the banded rainbow `Nyan` delivers.
+    /// a laser/phaser sweep, not the banded rainbow the kitty delivers.
     Phaser,
-    /// Nyan — a momentum-driven BANDED rainbow ribbon: six crisp stacked stripes
+    /// Rainbow kitty — a momentum-driven BANDED rainbow ribbon: six crisp stacked stripes
     /// (the iconic rainbow) stream the swept path, brighter/longer with typing
     /// heat, with a sparse twinkling starfield. Additive, so text stays legible.
-    Nyan,
+    RainbowKitty,
     /// Phaser comet + a shower of additive spark particles.
     Sparkle,
     /// Black-body warm comet + rising, drifting embers.
@@ -97,8 +97,8 @@ impl GlowStyle {
         let any = |opts: &[&str]| opts.iter().any(|o| s.eq_ignore_ascii_case(o));
         if any(&["phaser"]) {
             Self::Phaser
-        } else if any(&["nyan rainbow", "nyan", "rainbow"]) {
-            Self::Nyan
+        } else if any(&["rainbow kitty", "nyan rainbow", "nyan", "rainbow"]) {
+            Self::RainbowKitty
         } else if any(&["sparkle", "sparkles", "phaser-sparkle", "rainbow-sparkle"]) {
             Self::Sparkle
         } else if any(&["fire", "ember", "embers"]) {
@@ -152,7 +152,7 @@ pub struct GlowConfig {
     /// Whether this style draws its OWN additive comet BEAM (the anti-aliased
     /// streak of light along the swept path). FALSE for the two styles whose
     /// streak is drawn elsewhere: `water` (its fluid wave wake — no laser
-    /// beam; WATER-1) and `nyan` (its banded ribbon IS the streak). The
+    /// beam; WATER-1) and `rainbow kitty` (its banded ribbon IS the streak). The
     /// default `comet` layers this beam UNDER its faint cell-body ember bed —
     /// the beam is what makes the streak spatially continuous instead of
     /// grid-quantized blocks. Derive it with [`style_has_beam`], never from
@@ -175,9 +175,9 @@ pub struct GlowConfig {
     /// fills this in.
     pub pack: Option<TrailParams>,
     /// TYPING-WAKE persistence in SECONDS: how much of your recent travel the
-    /// Nyan plume shows, and therefore how LONG it is (the plume is literally
+    /// Rainbow kitty plume shows, and therefore how LONG it is (the plume is literally
     /// the last `wake_persist_s` seconds of typing, to scale — see
-    /// [`NYAN_WAKE_PERSIST`], the default this carries). Host-tunable because it
+    /// [`RAINBOW_WAKE_PERSIST`], the default this carries). Host-tunable because it
     /// is the effect's one genuine TASTE dial: everything else about the wake is
     /// craft (what keeps it off the letters, what keeps it from lagging), but
     /// how much trail you want behind your hand is a preference. `0.0` (or any
@@ -188,7 +188,7 @@ pub struct GlowConfig {
 /// Whether a raw `cursor_trail_style` string draws its own additive comet beam.
 ///
 /// FALSE for exactly two style families: `water` (WATER-1 — water has a
-/// dedicated curved wake, not a recolored laser beam) and `nyan` (its
+/// dedicated curved wake, not a recolored laser beam) and `rainbow kitty` (its
 /// banded ribbon body IS the streak; a thin beam under it would muddy the stripes);
 /// every other style — INCLUDING the default `comet` — shows the anti-aliased
 /// pixel-space beam. The comet's [`crate::cursor_trail::CursorTrail`] cell body
@@ -214,7 +214,7 @@ pub fn style_has_beam(style_raw: &str) -> bool {
 /// be threaded here without touching call sites.
 #[must_use]
 pub fn style_has_beam_of(style: GlowStyle, _style_raw: &str) -> bool {
-    !matches!(style, GlowStyle::Water | GlowStyle::Nyan)
+    !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty)
 }
 
 /// The default LASER/lightning hue: STORM VIOLET (`0x00RRGGBB`). Applied by
@@ -247,9 +247,9 @@ pub const SPARKLE_DEFAULT_COLOR: u32 = 0x00FF_D9A0;
 /// hues, never this constant).
 pub const COMET_DEFAULT_COLOR: u32 = 0x009E_D6FF;
 
-/// The six iconic Nyan-rainbow band colours, top → bottom (`0x00RRGGBB`). Fixed
+/// The six iconic rainbow band colours, top → bottom (`0x00RRGGBB`). Fixed
 /// (not a rolling hue) so a horizontal sweep reads as the classic stacked stripes.
-const NYAN_BANDS: [u32; 6] = [
+const RAINBOW_BANDS: [u32; 6] = [
     0x00FF_0000, // red
     0x00FF_9900, // orange
     0x00FF_FF00, // yellow
@@ -273,27 +273,27 @@ const NYAN_BANDS: [u32; 6] = [
 // Each cap is derived against the same 5.25:1 bar for its own stream, so they
 // are NOT interchangeable and must not be merged.
 
-/// Hard additive-light budget for the Nyan BODY over an occupied text cell —
+/// Hard additive-light budget for the rainbow kitty BODY over an occupied text cell —
 /// the CONTINUOUS under-ink bed a whole typed line sits on.
 ///
 /// Contrast-derived: on the default dark palette (`#1A1B26` behind `#C8D3F5`,
 /// unlit 11.4:1) the worst of the six saturated bands at 56/255 leaves 5.37:1,
 /// certified by the pixel oracle in
-/// `nyan_hot_body_preserves_default_text_contrast`. The cat, off-glyph stars,
+/// `rainbow_hot_body_preserves_default_text_contrast`. The cat, off-glyph stars,
 /// and the short jump-zoom keep their own budgets, so this bound alone does not
-/// make Nyan timid. Keep the production clamp in [`nyan_occupied_coverage`] and
+/// make rainbow kitty timid. Keep the production clamp in [`rainbow_occupied_coverage`] and
 /// the derived model + real-emitter conformance tests in lockstep.
 ///
 /// Do NOT lower this to buy legibility headroom: the bed rides `glow_under`,
 /// beneath the glyph pass, so it lifts only the ground and can never wash glyph
 /// ink. Cutting it to 34 also flattens the specular glint against its own
 /// ceiling (the sweep measures `on 34 vs off 0`, failing
-/// `nyan_glint_sweeps_with_momentum`'s `on >= 50`) to buy headroom for a co-peak
-/// that does not occur: the ribbon crests at `NYAN_CREST_POS` = 0.62, four to
+/// `rainbow_glint_sweeps_with_momentum`'s `on >= 50`) to buy headroom for a co-peak
+/// that does not occur: the ribbon crests at `RAINBOW_CREST_POS` = 0.62, four to
 /// seven cells BEHIND the head, where the fresh-ink pop has expired. The
 /// legibility bound belongs on [`OVER_INK_COV_CAP`], the layers that actually
 /// land on the ink.
-const NYAN_OCCUPIED_COV_CAP: f32 = 56.0;
+const RAINBOW_OCCUPIED_COV_CAP: f32 = 56.0;
 
 /// The TRANSIENT over-ink share (fresh-ink pop, crown, starfield, and — via
 /// `crate::cursor_glow::OVER_INK_COV_CAP` — the rainbow cursor's halo and
@@ -301,21 +301,21 @@ const NYAN_OCCUPIED_COV_CAP: f32 = 56.0;
 /// ink), measured at 5.44:1 — above the 5.25 bar this crate certifies.
 pub(crate) const OVER_INK_COV_CAP: f32 = 48.0;
 
-/// Text-safety ceiling shared by Nyan's rare TRANSIENT streaks — the
+/// Text-safety ceiling shared by the rainbow kitty's rare TRANSIENT streaks — the
 /// jump-landing starburst, the fast-glide star, and the ZOOM streak. One
 /// number so the three emitters cannot drift apart; the starburst's
 /// deliberate exemption from [`OVER_INK_COV_CAP`] is argued at its use site.
-const NYAN_TRANSIENT_COV_CAP: f32 = 118.0;
+const RAINBOW_TRANSIENT_COV_CAP: f32 = 118.0;
 
-/// Single allocation-free clamp used at every dark-theme Nyan body emission
+/// Single allocation-free clamp used at every dark-theme rainbow body emission
 /// point.  Sanitising non-finite input makes the bound total over `f32`, even
 /// though the shipping inputs are already finite by construction.
 #[inline]
-fn nyan_occupied_coverage(requested: f32) -> f32 {
+fn rainbow_occupied_coverage(requested: f32) -> f32 {
     if requested.is_nan() || requested <= 0.0 {
         0.0
     } else {
-        requested.min(NYAN_OCCUPIED_COV_CAP)
+        requested.min(RAINBOW_OCCUPIED_COV_CAP)
     }
 }
 
@@ -327,16 +327,16 @@ fn nyan_occupied_coverage(requested: f32) -> f32 {
 /// by `OVER_INK_COV_CAP * 1.5` (72): stars are placed off-glyph by design, so
 /// they get more than the on-glyph share, but the clamp must actually BIND —
 /// every envelope factor here is <= 1, so a ceiling at or above
-/// [`NYAN_STAR_COV`] would be dead code. At 88 the peak is 62 at the shipping
+/// [`RAINBOW_STAR_COV`] would be dead code. At 88 the peak is 62 at the shipping
 /// 0.7 intensity — ground (26,27,38) -> (88,89,100), still clearly a starfield.
-const NYAN_STAR_COV: f32 = 88.0;
+const RAINBOW_STAR_COV: f32 = 88.0;
 
-/// The OVER-ink twin of [`nyan_occupied_coverage`], with the same totality
+/// The OVER-ink twin of [`rainbow_occupied_coverage`], with the same totality
 /// contract (NaN / negative / -inf -> 0.0, +inf -> the cap). Applied at every
 /// emitter that composites ON TOP of the glyph pass, where the additive light
 /// brightens the ink itself and not merely the ground behind it.
 #[inline]
-fn nyan_over_ink_coverage(requested: f32) -> f32 {
+fn rainbow_over_ink_coverage(requested: f32) -> f32 {
     if requested.is_nan() || requested <= 0.0 {
         0.0
     } else {
@@ -344,7 +344,7 @@ fn nyan_over_ink_coverage(requested: f32) -> f32 {
     }
 }
 
-// ---- Nyan RIBBON BRIGHTNESS PROFILE ----------------------------------------
+// ---- rainbow kitty RIBBON BRIGHTNESS PROFILE ----------------------------------------
 //
 // The profile is a function of a spark's normalized age `u = age / life`.
 // Because typed cells are laid sequentially, `u` IS distance-from-cursor in
@@ -352,31 +352,31 @@ fn nyan_over_ink_coverage(requested: f32) -> f32 {
 // farther behind. The law keeps the light off the fingertips: a LOW floor, a
 // ramp stretched to half the spark's life (a gentle near-cursor onset), and a
 // mid-tail CREST so the brightest cells sit visibly BEHIND the cursor before
-// the tail dissolve (`env` in `emit_nyan`) takes over.
+// the tail dissolve (`env` in `emit_rainbow`) takes over.
 /// Translucent floor at `u == 0` — the wash on the cell just typed. The head
 /// must stay quiet so the glyph under the cursor carries, but not so low the
 /// fresh cell drops under the emit floor (a cold head spark is
 /// `~96 born_cov × 0.7 intensity`; 0.22 keeps it a visible,
 /// clearly-saturated wisp).
-const NYAN_HEAD_FLOOR: f32 = 0.22;
+const RAINBOW_HEAD_FLOOR: f32 = 0.22;
 /// The onset spans half the spark's life: brightness climbs smoothly for the
 /// whole near-cursor stretch instead of snapping to full body two cells
 /// behind the head — "more bright further away", not "bright almost
 /// immediately".
-const NYAN_HEAD_RAMP: f32 = 0.52;
+const RAINBOW_HEAD_RAMP: f32 = 0.52;
 /// Where the crest lands on the `u` axis: past the onset, before the tail
 /// dissolve — the MID-TO-FAR tail. (At the default cadence that is roughly
 /// 4-7 cells behind the head, the band the owner pointed at.)
-const NYAN_CREST_POS: f32 = 0.62;
+const RAINBOW_CREST_POS: f32 = 0.62;
 /// Crest height over the flat body (+28%). Sized to hold the profile's MEAN
 /// over a full life at ~0.94, so the total luminance budget is unchanged (no
 /// overall dimming/blowout) and the crest only REDISTRIBUTES light away from
 /// the head. Over-cap requests on a hot ribbon clamp at
-/// [`NYAN_OCCUPIED_COV_CAP`].
-const NYAN_CREST_GAIN: f32 = 0.28;
+/// [`RAINBOW_OCCUPIED_COV_CAP`].
+const RAINBOW_CREST_GAIN: f32 = 0.28;
 /// Gaussian half-width of the crest in `u` — broad enough to read as a glow
 /// band drifting behind the cursor, not a bright bead.
-const NYAN_CREST_WIDTH: f32 = 0.30;
+const RAINBOW_CREST_WIDTH: f32 = 0.30;
 
 // ---- FEATHERED RIBBON ENDS -------------------------------------------------
 //
@@ -386,95 +386,97 @@ const NYAN_CREST_WIDTH: f32 = 0.30;
 // that last frame prints a hard vertical edge against the background. The EDGE
 // ENVELOPE below eases both ends from zero, so wherever a spark's life is cut,
 // the light it was showing was already on its way out.
-// Baked into [`nyan_ribbon_profile`] (not the emitter) so every
+// Baked into [`rainbow_ribbon_profile`] (not the emitter) so every
 // consumer — the dark-theme body, the light-theme veil rails, and crossfade
 // GHOSTS replaying the profile during a style switch — feathers identically.
 /// Birth ease-in width in ABSOLUTE seconds: the newest cell fades UP from
-/// zero over about three frames before the documented [`NYAN_HEAD_RAMP`]
+/// zero over about three frames before the documented [`RAINBOW_HEAD_RAMP`]
 /// onset takes over — the head end of the ribbon condenses out of the
 /// background instead of popping in at the floor. Absolute time, NOT a
 /// fraction of life, because a chained spark's life stretches with the typing
-/// cadence (up to [`NYAN_CHAIN_LIFE_MAX`] = 23 s at a glacial rhythm): a
+/// cadence (up to [`RAINBOW_CHAIN_LIFE_MAX`] = 23 s at a glacial rhythm): a
 /// %-of-life ease there would hide freshly typed light for over a SECOND —
 /// the opposite of a responsive head. The tail ease below IS %-of-life on
 /// purpose: the dissolve should scale with how long the ribbon lingers.
-const NYAN_EDGE_IN_S: f32 = 0.05;
+const RAINBOW_EDGE_IN_S: f32 = 0.05;
 /// Ceiling on the birth ease as a fraction of life (the "first few percent"),
 /// so a very short-lived spark still spends the overwhelming share of its
 /// life visible instead of losing a big slice to the ease-in.
-const NYAN_EDGE_IN: f32 = 0.05;
+const RAINBOW_EDGE_IN: f32 = 0.05;
 /// Tail ease-out width in `u`: the final 30% of life eases the profile from
 /// its running value to exactly zero, so a spark's LAST visible frames are
 /// vanishingly faint no matter how the frame clock lands relative to expiry.
 /// The melt occupies nearly a
-/// third of every spark's life. Deliberately kept under `1 − NYAN_CREST_POS`
+/// third of every spark's life. Deliberately kept under `1 − RAINBOW_CREST_POS`
 /// (0.38) so the taper opens BEHIND the crest and the crest position is
 /// untouched, and it still bites inside the `env` tail dissolve in
-/// `emit_nyan` (which spans ≥32% of life) — the two compose multiplicatively
+/// `emit_rainbow` (which spans ≥32% of life) — the two compose multiplicatively
 /// into a strictly softer dissolve, never a competing edge.
-const NYAN_EDGE_OUT: f32 = 0.30;
+const RAINBOW_EDGE_OUT: f32 = 0.30;
 /// Sub-linear exponent on the tail taper's smoothstep: `smoothstep^γ` with
 /// γ < 1 LIFTS the mid-taper (the light lingers, "melts out") while keeping
 /// the exact-zero endpoint (0^γ = 0) and strict monotonicity. Spelled inside
-/// [`nyan_ribbon_profile`] itself so every consumer (dark body, light-theme
+/// [`rainbow_ribbon_profile`] itself so every consumer (dark body, light-theme
 /// rails, crossfade ghosts replaying the profile) melts identically.
-const NYAN_TAIL_MELT_GAMMA: f32 = 0.6;
+const RAINBOW_TAIL_MELT_GAMMA: f32 = 0.6;
 /// Modest luminance renormalisation for the feathered profile: the two edge
 /// tapers shave part of the profile's mean over a full life, so the whole law
 /// is scaled back up to recover most of it. Sized so the mean over a full
 /// life stays at ~0.87 (within ~2% of the unfeathered law, verified
 /// numerically) and the crest height lands at ~1.41, while over-cap requests
-/// on a hot ribbon still clamp at [`NYAN_OCCUPIED_COV_CAP`] exactly as before
+/// on a hot ribbon still clamp at [`RAINBOW_OCCUPIED_COV_CAP`] exactly as before
 /// — the melt redistributes light later in life, it does not brighten the body.
-const NYAN_EDGE_RENORM: f32 = 1.10;
+const RAINBOW_EDGE_RENORM: f32 = 1.10;
 
 /// The both-ends feather at normalized age `u` for a spark of the given
 /// `life` (seconds): smoothstep from exactly 0 over the birth window — the
-/// smaller of [`NYAN_EDGE_IN_S`] absolute and [`NYAN_EDGE_IN`] of life — then
+/// smaller of [`RAINBOW_EDGE_IN_S`] absolute and [`RAINBOW_EDGE_IN`] of life — then
 /// 1 through the mid-body, then a SLOWED sub-linear melt
-/// (`smoothstep^`[`NYAN_TAIL_MELT_GAMMA`]) back to exactly 0 over the final
-/// [`NYAN_EDGE_OUT`] of life. Identity on the whole mid-body, so the
+/// (`smoothstep^`[`RAINBOW_TAIL_MELT_GAMMA`]) back to exactly 0 over the final
+/// [`RAINBOW_EDGE_OUT`] of life. Identity on the whole mid-body, so the
 /// documented onset/crest law is untouched where it matters and the crest
 /// position cannot move. Shared by the ribbon profile AND the per-cell
-/// starfield alpha (see `emit_nyan`): a star must never outlast its cell's
+/// starfield alpha (see `emit_rainbow`): a star must never outlast its cell's
 /// tapered body, or its wink-out would re-create the very edge the feather
 /// removes.
 #[inline]
-fn nyan_edge_envelope(u: f32, life: f32) -> f32 {
-    let birth = (NYAN_EDGE_IN_S / life.max(1e-3)).min(NYAN_EDGE_IN);
+fn rainbow_edge_envelope(u: f32, life: f32) -> f32 {
+    let birth = (RAINBOW_EDGE_IN_S / life.max(1e-3)).min(RAINBOW_EDGE_IN);
     // The tail taper is raised to a SUB-LINEAR power: γ < 1 slows the final
     // decay (the taper hangs high through its middle, then still lands on
     // exactly zero) — the "melts out gradually" half of the longer tail. The
     // birth ease keeps the plain smoothstep: responsiveness wants the head to
     // condense QUICKLY out of the background.
-    smoothstep01(u / birth) * smoothstep01((1.0 - u) / NYAN_EDGE_OUT).powf(NYAN_TAIL_MELT_GAMMA)
+    smoothstep01(u / birth)
+        * smoothstep01((1.0 - u) / RAINBOW_EDGE_OUT).powf(RAINBOW_TAIL_MELT_GAMMA)
 }
 
 /// The ribbon's per-cell brightness multiplier at normalized age `u` for a
 /// spark of the given `life` (see the block comments above): smoothstep onset
 /// from the translucent head floor × a Gaussian mid-tail crest × the
-/// both-ends [`nyan_edge_envelope`] feather, renormalised by
-/// [`NYAN_EDGE_RENORM`]. Zero at BOTH endpoints (a spark can never terminate
+/// both-ends [`rainbow_edge_envelope`] feather, renormalised by
+/// [`RAINBOW_EDGE_RENORM`]. Zero at BOTH endpoints (a spark can never terminate
 /// at visible alpha), monotone non-decreasing from the head to the crest,
-/// peaking at [`NYAN_CREST_POS`] — pinned by
-/// `nyan_ribbon_profile_peaks_in_the_mid_tail` and
-/// `nyan_ribbon_profile_feathers_both_ends_to_zero`.
+/// peaking at [`RAINBOW_CREST_POS`] — pinned by
+/// `rainbow_ribbon_profile_peaks_in_the_mid_tail` and
+/// `rainbow_ribbon_profile_feathers_both_ends_to_zero`.
 #[inline]
-fn nyan_ribbon_profile(u: f32, life: f32) -> f32 {
-    let onset = NYAN_HEAD_FLOOR + (1.0 - NYAN_HEAD_FLOOR) * smoothstep01(u / NYAN_HEAD_RAMP);
-    let d = (u - NYAN_CREST_POS) / NYAN_CREST_WIDTH;
+fn rainbow_ribbon_profile(u: f32, life: f32) -> f32 {
+    let onset =
+        RAINBOW_HEAD_FLOOR + (1.0 - RAINBOW_HEAD_FLOOR) * smoothstep01(u / RAINBOW_HEAD_RAMP);
+    let d = (u - RAINBOW_CREST_POS) / RAINBOW_CREST_WIDTH;
     onset
-        * (1.0 + NYAN_CREST_GAIN * (-(d * d)).exp())
-        * nyan_edge_envelope(u, life)
-        * NYAN_EDGE_RENORM
+        * (1.0 + RAINBOW_CREST_GAIN * (-(d * d)).exp())
+        * rainbow_edge_envelope(u, life)
+        * RAINBOW_EDGE_RENORM
 }
 
-// ---- Nyan HEAD CLEARANCE ---------------------------------------------------
+// ---- rainbow kitty HEAD CLEARANCE ---------------------------------------------------
 //
-// [`nyan_ribbon_profile`] already ramps brightness with a spark's normalized
+// [`rainbow_ribbon_profile`] already ramps brightness with a spark's normalized
 // AGE, but age is only a proxy for distance-from-cursor, and a poor one: a
 // spark's life CHAINS to the observed cadence (up to
-// [`CursorGlow::NYAN_CHAIN_LIFE_MAX`]), so at a fast rhythm the profile's onset
+// [`CursorGlow::RAINBOW_CHAIN_LIFE_MAX`]), so at a fast rhythm the profile's onset
 // stretches over dozens of cells and its crest sits seconds behind the hand,
 // while at a slow one the same law compresses into three. The ribbon is read in
 // SPACE — how many letters back the light gets bright — so the
@@ -488,59 +490,59 @@ fn nyan_ribbon_profile(u: f32, life: f32) -> f32 {
 // is nowhere near the letters being typed, so it keeps its full body (and a
 // hidden cursor — no known head — dims nothing at all). The emitter scales the
 // whole clearance by the momentum spine and never lets it cull a cell — see
-// the application site in `emit_nyan` for both bounds.
-// ---- Nyan LIGHT-THEME RAILS ------------------------------------------------
+// the application site in `emit_rainbow` for both bounds.
+// ---- rainbow kitty LIGHT-THEME RAILS ------------------------------------------------
 /// The light ribbon's two rails: how far from the glyph centre they sit, how
 /// THIN they are, and how far they reach sideways. `DY ± RY` (0.55 ± 0.11) keeps
 /// them wholly in the inter-line leading — clear of cap heights and descenders —
 /// while `RX` well over half a cell makes neighbouring cells' rails merge into
 /// one continuous band. Rails thick enough to span a whole cell of blur read
 /// as a smudged highlighter stroke, not a ribbon.
-const NYAN_LIGHT_RAIL_DY: f32 = 0.55;
-const NYAN_LIGHT_RAIL_RY: f32 = 0.11;
-const NYAN_LIGHT_RAIL_RX: f32 = 1.45;
+const RAINBOW_LIGHT_RAIL_DY: f32 = 0.55;
+const RAINBOW_LIGHT_RAIL_RY: f32 = 0.11;
+const RAINBOW_LIGHT_RAIL_RX: f32 = 1.45;
 /// LEGIBILITY CEILING on a rail's per-pixel centre over-alpha. The rails live
 /// outside the glyph band, so this bounds how dark the LEADING can get (and how
 /// much two overlapping rails can compound), not the ink.
-const NYAN_LIGHT_RAIL_ALPHA_CAP: f32 = 150.0;
+const RAINBOW_LIGHT_RAIL_ALPHA_CAP: f32 = 150.0;
 /// How fast the band ramp sweeps ALONG the rails: per column, and per unit of
 /// the ribbon's own shared phase clock. Slow — the spectrum should flow, not
 /// strobe — and phase-driven, so it freezes exactly when the ribbon does.
-const NYAN_LIGHT_RAIL_SPREAD: f32 = 0.045;
-const NYAN_LIGHT_RAIL_FLOW: f32 = 0.35;
+const RAINBOW_LIGHT_RAIL_SPREAD: f32 = 0.045;
+const RAINBOW_LIGHT_RAIL_FLOW: f32 = 0.35;
 
 /// Ribbon body multiplier on the cell the cursor is sitting on. Not zero: the
 /// ribbon must still visibly START at the cursor (a hard clear zone would read
 /// as the rainbow detaching from the cat), it must merely be quiet enough that
 /// the glyph is the crispest thing in the cell.
-const NYAN_CLEAR_FLOOR: f32 = 0.35;
-/// Distance in CELLS over which the body climbs from [`NYAN_CLEAR_FLOOR`] back
+const RAINBOW_CLEAR_FLOOR: f32 = 0.35;
+/// Distance in CELLS over which the body climbs from [`RAINBOW_CLEAR_FLOOR`] back
 /// to its full profile value. Three cells: the two or three letters the eye is
 /// actually reading while typing stay clean, and the ribbon is already at full
 /// strength within the four-letter span the chain guarantee lights.
-const NYAN_CLEAR_CELLS: f32 = 3.0;
+const RAINBOW_CLEAR_CELLS: f32 = 3.0;
 /// How much of the ribbon's WIDTH survives at the cursor. The same clearance
 /// that quiets the body near the hand also narrows it, so the ribbon reads as a
 /// trail being FORMED — light thrown off the cursor and widening as it settles
 /// behind you — rather than as one uniform band turned down. Never zero: the
 /// ribbon must still visibly start at the cursor.
-const NYAN_TAPER_FLOOR: f32 = 0.62;
+const RAINBOW_TAPER_FLOOR: f32 = 0.62;
 
-// ---- Nyan CROWN, tightened + leaned FORWARD --------------------------------
+// ---- rainbow kitty CROWN, tightened + leaned FORWARD --------------------------------
 //
 // The shared crown is one radial bloom centred on the cursor cell at
 // `rx = 1.25` cells — which reaches a full cell and a quarter SIDEWAYS, i.e.
 // straight over the letter just typed, adding light to the one glyph the eye is
-// checking. Nyan takes a tighter core that hugs the cursor cell (near-zero by
+// checking. Rainbow kitty takes a tighter core that hugs the cursor cell (near-zero by
 // the neighbouring glyph centres) plus a dimmer bloom leaning INTO the
 // direction of travel, over the not-yet-written cells ahead. The forward lean
 // is the "encourages me to type faster" cue: the light is always slightly ahead
 // of where the hand is, pulling forward, instead of piling up on the text
 // already committed behind it.
-/// Nyan crown core radii in cells — tight enough that the neighbouring glyph
+/// Rainbow kitty crown core radii in cells — tight enough that the neighbouring glyph
 /// centres sit at (or past) the falloff's zero.
-const NYAN_CROWN_RX: f32 = 0.92;
-const NYAN_CROWN_RY: f32 = 0.80;
+const RAINBOW_CROWN_RX: f32 = 0.92;
+const RAINBOW_CROWN_RY: f32 = 0.80;
 /// Forward THRUST: offset ahead of the cursor centre, its radii, and its share
 /// of the crown's peak. Deliberately LONG and FLAT (rx ≫ ry) rather than round —
 /// a round bloom beside a cursor is generic UI glow, whereas a low wide streak
@@ -549,47 +551,47 @@ const NYAN_CROWN_RY: f32 = 0.80;
 /// is what a constant-gain lean actually looks like at terminal size — dirt, not
 /// thrust). It appears only as the run heats up, which is also the only time
 /// "forward" means anything.
-const NYAN_CROWN_LEAD_DX: f32 = 0.90;
-const NYAN_CROWN_LEAD_RX: f32 = 1.20;
-const NYAN_CROWN_LEAD_RY: f32 = 0.26;
-const NYAN_CROWN_LEAD_GAIN: f32 = 0.62;
+const RAINBOW_CROWN_LEAD_DX: f32 = 0.90;
+const RAINBOW_CROWN_LEAD_RX: f32 = 1.20;
+const RAINBOW_CROWN_LEAD_RY: f32 = 0.26;
+const RAINBOW_CROWN_LEAD_GAIN: f32 = 0.62;
 
 /// The spatial head clearance at `cells` cells behind the cursor: exactly
-/// [`NYAN_CLEAR_FLOOR`] under the cursor itself, smoothstepping to exactly 1.0
-/// at [`NYAN_CLEAR_CELLS`] and staying there. Monotone NON-DECREASING and
-/// continuous (pinned by `nyan_head_clearance_dims_only_near_the_cursor`), so
+/// [`RAINBOW_CLEAR_FLOOR`] under the cursor itself, smoothstepping to exactly 1.0
+/// at [`RAINBOW_CLEAR_CELLS`] and staying there. Monotone NON-DECREASING and
+/// continuous (pinned by `rainbow_head_clearance_dims_only_near_the_cursor`), so
 /// the ribbon brightens smoothly backward with no step at the seam.
 #[inline]
-fn nyan_head_clearance(cells: f32) -> f32 {
-    NYAN_CLEAR_FLOOR + (1.0 - NYAN_CLEAR_FLOOR) * smoothstep01(cells / NYAN_CLEAR_CELLS)
+fn rainbow_head_clearance(cells: f32) -> f32 {
+    RAINBOW_CLEAR_FLOOR + (1.0 - RAINBOW_CLEAR_FLOOR) * smoothstep01(cells / RAINBOW_CLEAR_CELLS)
 }
 
 /// The GRACEFUL TRAIL TERMINUS feather. Where
-/// [`nyan_edge_envelope`] melts each spark's LIFE to zero (the TEMPORAL edge),
+/// [`rainbow_edge_envelope`] melts each spark's LIFE to zero (the TEMPORAL edge),
 /// this melts the ribbon's SPATIAL end: a taper `frac ∈ [0, 1]` across the
 /// terminus band — EXACTLY zero at the very end (`frac == 0`), full inside the
 /// body (`frac ≥ 1`). It reuses the edge-feather's sub-linear
-/// [`NYAN_TAIL_MELT_GAMMA`] melt so the spatial dissolve reads identically to
+/// [`RAINBOW_TAIL_MELT_GAMMA`] melt so the spatial dissolve reads identically to
 /// the temporal one: the light hangs high through the taper's middle, then
 /// still lands on EXACTLY zero (`0^γ = 0`), so a terminus can never print a
 /// hard vertical edge against the background. Monotone non-decreasing (pinned
-/// by `nyan_terminus_feather_melts_to_zero_at_the_margin`). Drives the melt-out
-/// twinkle scatter's per-spark life in [`CursorGlow::scatter_nyan_terminus`] —
+/// by `rainbow_terminus_feather_melts_to_zero_at_the_margin`). Drives the melt-out
+/// twinkle scatter's per-spark life in [`CursorGlow::scatter_rainbow_terminus`] —
 /// the outermost sparkle (smallest `frac`) gets the shortest life and winks out
 /// first, so the dissolve visibly retreats INWARD from the old hard edge.
 #[inline]
-fn nyan_terminus_feather(frac: f32) -> f32 {
-    smoothstep01(frac.clamp(0.0, 1.0)).powf(NYAN_TAIL_MELT_GAMMA)
+fn rainbow_terminus_feather(frac: f32) -> f32 {
+    smoothstep01(frac.clamp(0.0, 1.0)).powf(RAINBOW_TAIL_MELT_GAMMA)
 }
 
-// ---- Nyan STARFIELD MOMENTUM ENVELOPE --------------------------------------
-/// Brightness/size floor for every Nyan star at zero momentum. A cold sky
+// ---- rainbow kitty STARFIELD MOMENTUM ENVELOPE --------------------------------------
+/// Brightness/size floor for every rainbow kitty star at zero momentum. A cold sky
 /// twinkles at ~35% and full brightness is EARNED: the envelope rides the same
-/// eased spine (`nyan.disp`) of THE canonical typing-momentum metric
+/// eased spine (`rainbow.disp`) of THE canonical typing-momentum metric
 /// ([`crate::typing_momentum`]) that the cursor cat, the fresh-ink pop, and
 /// the ribbon's iridescence key off (no parallel heat tracker), reaching
 /// exactly the historical brightness at full spine.
-const NYAN_STAR_MOM_FLOOR: f32 = 0.35;
+const RAINBOW_STAR_MOM_FLOOR: f32 = 0.35;
 
 /// The momentum onset: below this spine value the sky
 /// spawns NO stars at all and any leftover star holds the subtle floor. The
@@ -600,26 +602,26 @@ const NYAN_STAR_MOM_FLOOR: f32 = 0.35;
 /// non-delete typing, so "a word or two" produces none even with the
 /// cold-start credit (pinned by
 /// `casual_burst_spawns_no_stars_and_no_cat_momentum`).
-const NYAN_STAR_ONSET: f32 = 0.45;
+const RAINBOW_STAR_ONSET: f32 = 0.45;
 
 /// Star brightness/size multiplier for the current momentum spine: the
-/// subtle floor up to [`NYAN_STAR_ONSET`], then linear to 1.0 (today's look)
+/// subtle floor up to [`RAINBOW_STAR_ONSET`], then linear to 1.0 (today's look)
 /// at full spine — monotone NON-DECREASING and continuous (pinned by
-/// `nyan_star_brightness_is_earned_by_momentum`), so the sky never pops
-/// across `emit_nyan`'s hot/cold branch gate (`disp < 0.005`) or across the
+/// `rainbow_star_brightness_is_earned_by_momentum`), so the sky never pops
+/// across `emit_rainbow`'s hot/cold branch gate (`disp < 0.005`) or across the
 /// onset.
 #[inline]
-fn nyan_star_momentum(disp: f32) -> f32 {
-    NYAN_STAR_MOM_FLOOR + (1.0 - NYAN_STAR_MOM_FLOOR) * nyan_star_drive(disp)
+fn rainbow_star_momentum(disp: f32) -> f32 {
+    RAINBOW_STAR_MOM_FLOOR + (1.0 - RAINBOW_STAR_MOM_FLOOR) * rainbow_star_drive(disp)
 }
 
 /// The onset-gated momentum DRIVE 0..1 shared by the star envelope and the
-/// spawn densities: zero through [`NYAN_STAR_ONSET`], then a linear ramp to
+/// spawn densities: zero through [`RAINBOW_STAR_ONSET`], then a linear ramp to
 /// 1.0 at full spine. One function so brightness and density agree about
 /// where "earned" begins.
 #[inline]
-fn nyan_star_drive(disp: f32) -> f32 {
-    ((disp - NYAN_STAR_ONSET) / (1.0 - NYAN_STAR_ONSET)).clamp(0.0, 1.0)
+fn rainbow_star_drive(disp: f32) -> f32 {
+    ((disp - RAINBOW_STAR_ONSET) / (1.0 - RAINBOW_STAR_ONSET)).clamp(0.0, 1.0)
 }
 
 // ---- FRESH-INK POP ---------------------------------------------------------
@@ -629,7 +631,7 @@ fn nyan_star_drive(disp: f32) -> f32 {
 // [`FRESH_INK_LIFE_S`], whose footprint swells ~15% and settles (the "size
 // boost" — a critically-damped spring, see [`fresh_ink_scale`]), plus a wide
 // soft halo for the first [`FRESH_INK_HALO_S`] (the birth flash). The pop is
-// Nyan-only for now (the rainbow is the style whose ribbon the letters must
+// Rainbow-kitty-only for now (the rainbow is the style whose ribbon the letters must
 // read over) and DARK-THEME only: additive warm-white cannot brighten a white
 // ground, and on light themes it would lift dark ink TOWARD the background —
 // the exact wash the light-theme rail treatment exists to avoid.
@@ -671,7 +673,7 @@ const FRESH_INK_WARM: u32 = 0x00FF_EDD2;
 /// the envelope/momentum/intensity scaling. The pop is a transient highlight
 /// on exactly the cell being typed, and it brightens the glyph ink AND its
 /// ground together, so it is bounded by [`OVER_INK_COV_CAP`] rather than by
-/// the continuous bed's [`NYAN_OCCUPIED_COV_CAP`].
+/// the continuous bed's [`RAINBOW_OCCUPIED_COV_CAP`].
 ///
 /// Lighting ink and ground together does NOT preserve their contrast once the
 /// ink saturates: `#C8D3F5` has only 55/44/10 per-channel headroom, so a
@@ -723,7 +725,7 @@ const FRESH_INK_CENTRE_CAP: f32 = OVER_INK_COV_CAP;
 /// Momentum floor, deliberately near 1: the pop is DECOUPLED from typing
 /// momentum — the FIRST casual keystroke from cold pops at ~90% brightness,
 /// and momentum becomes a small top-boost to full, not a gate. Mirrors
-/// [`nyan_star_momentum`]'s floor shape but far higher: fresh ink must ALWAYS
+/// [`rainbow_star_momentum`]'s floor shape but far higher: fresh ink must ALWAYS
 /// pop, whereas stars ramp in with the ribbon. Legibility retunes may cut
 /// magnitude, reach and life — never this floor.
 const FRESH_INK_MOM_FLOOR: f32 = 0.90;
@@ -736,81 +738,81 @@ const FRESH_INK_MOM_FLOOR: f32 = 0.90;
 /// never detached. (At a 90 ms cadence the lag is `e^(-gap/τ)/(1−e^(-gap/τ))`
 /// ≈ 0.12 cells; at 150 ms it is 0.03.) The ease is a pure exponential on the injected clock, so it
 /// is frame-rate independent and deterministic.
-const NYAN_WAKE_HEAD_TAU: f32 = 0.042;
+const RAINBOW_WAKE_HEAD_TAU: f32 = 0.042;
 /// Beyond this many cells of disagreement the head SNAPS instead of easing: a
 /// real cursor jump, a line wrap, or a fresh focus must not drag a nozzle across
 /// the screen. Sized just above one cell so ordinary typing (and a two-cell
 /// wide-glyph advance) still slides.
-const NYAN_WAKE_SNAP_CELLS: f32 = 2.25;
+const RAINBOW_WAKE_SNAP_CELLS: f32 = 2.25;
 /// Plume length `L`, in cells: `LEN_MIN + speed × PERSIST`, clamped to
 /// `LEN_MAX`. `speed` is measured in CELLS PER SECOND directly from the live
-/// keystroke ring (see `emit_nyan_wake`), so `speed × PERSIST` is literally the
-/// distance the hand covered in the last [`NYAN_WAKE_PERSIST`] seconds: the
+/// keystroke ring (see `emit_rainbow_wake`), so `speed × PERSIST` is literally the
+/// distance the hand covered in the last [`RAINBOW_WAKE_PERSIST`] seconds: the
 /// plume is exactly the recent past, and its length is a true speedometer.
 ///
-/// This deliberately does NOT ride `nyan.disp`. The canonical momentum spine
+/// This deliberately does NOT ride `rainbow.disp`. The canonical momentum spine
 /// measures how LONG a run has been going, not how FAST — by design, since the
 /// cat and the starfield want "has earned it", not "is moving quickly". Keying
 /// the plume to it produced the exact inversion of the intent: an 18-key run at
 /// 320 ms/key drew a LONGER plume than the same 18 keys at 45 ms/key, because
 /// the slow run had been going six times longer. Speed is its own measurement.
-const NYAN_WAKE_LEN_MIN: f32 = 1.2;
-const NYAN_WAKE_LEN_MAX: f32 = 8.0;
+const RAINBOW_WAKE_LEN_MIN: f32 = 1.2;
+const RAINBOW_WAKE_LEN_MAX: f32 = 8.0;
 /// How far the nozzle may drift from the newest keystroke before the plume is
 /// considered ORPHANED and drawn not at all. Two cells: ordinary typing keeps
 /// the nozzle one cell ahead of the last glyph (plus the sub-cell ease), while a
 /// navigation leap lands far outside it.
-const NYAN_WAKE_ORPHAN_CELLS: f32 = 2.0;
+const RAINBOW_WAKE_ORPHAN_CELLS: f32 = 2.0;
 /// How long a photon persists in the plume (seconds) — the DEFAULT for
 /// [`GlowConfig::wake_persist_s`], which a host may override from its own
 /// settings. The plume therefore shows the last ~0.3 s of travel — long enough to read as a trail, short enough that
 /// it tracks the hand rather than smearing a whole sentence.
-pub const NYAN_WAKE_PERSIST: f32 = 0.30;
+pub const RAINBOW_WAKE_PERSIST: f32 = 0.30;
 /// How far the HEAT RAMP travels, as a multiple of `L`: the plume must run the
 /// whole white→gold→orange→red→violet range inside the part of itself that is
 /// actually VISIBLE. Keying the ramp to the walk bound instead left every real
 /// plume stuck in the first fifth of the ramp — a uniformly pale streak with the
 /// entire cooling story off the end of it.
-const NYAN_WAKE_RAMP_SPAN: f32 = 1.45;
+const RAINBOW_WAKE_RAMP_SPAN: f32 = 1.45;
 /// Where the walk stops, as a multiple of `L` (`e^-3.2` ≈ 4% — under the emit
 /// floor at every reachable coverage, so the plume ends by fading into the
 /// background rather than at a visible cut).
-const NYAN_WAKE_EXTENT: f32 = 2.2;
+const RAINBOW_WAKE_EXTENT: f32 = 2.2;
 /// Hard cap on emitted plume segments per frame. The walk's natural length is
 /// far under this at every cadence; the cap exists so no geometry (a huge cell,
 /// a pathological `L`) can make one frame's plume unbounded.
-const NYAN_WAKE_SEG_CAP: usize = 96;
+const RAINBOW_WAKE_SEG_CAP: usize = 96;
 /// Segment length in device pixels (as a fraction of the cell, floored at 2 px).
 /// Small enough that the exponential reads as smooth, large enough that a full
 /// plume is a few dozen quads.
-const NYAN_WAKE_SEG: f32 = 0.30;
+const RAINBOW_WAKE_SEG: f32 = 0.30;
 /// Steady-plume weight versus per-keystroke PULSE weight. The plume is the
 /// continuous body; the pulses are the cadence riding on it.
-const NYAN_WAKE_BASE: f32 = 0.62;
-const NYAN_WAKE_PULSE: f32 = 0.38;
+const RAINBOW_WAKE_BASE: f32 = 0.62;
+const RAINBOW_WAKE_PULSE: f32 = 0.38;
 /// Pulse decay (seconds) and gaussian half-width (cells). ~190 ms and ~0.45 of a
 /// cell: distinct puffs at a hunt-and-peck rhythm, a merged plume at speed.
-const NYAN_WAKE_PULSE_TAU: f32 = 0.19;
-const NYAN_WAKE_PULSE_W: f32 = 0.45;
+const RAINBOW_WAKE_PULSE_TAU: f32 = 0.19;
+const RAINBOW_WAKE_PULSE_W: f32 = 0.45;
 /// Peak coverage at the nozzle (premultiplied 0..255 scale) before the
 /// throttle/momentum/intensity scaling. It may sit well above the ribbon's
-/// [`NYAN_OCCUPIED_COV_CAP`] — that cap bounds the CONTINUOUS under-ink body a
+/// [`RAINBOW_OCCUPIED_COV_CAP`] — that cap bounds the CONTINUOUS under-ink body a
 /// whole line of glyphs sits on, whereas this light never touches a glyph at
 /// all: it lands in the leading, where the only thing it can wash out is empty
 /// background.
-const NYAN_WAKE_COV: f32 = 150.0;
+const RAINBOW_WAKE_COV: f32 = 150.0;
 /// Plume THICKNESS in cells at the nozzle and at the far tail. Both are inside
 /// the inter-line leading the plume is centred on; the taper is what makes it
 /// read as a comet rather than a rule.
-const NYAN_WAKE_H_HEAD: f32 = 0.180;
-const NYAN_WAKE_H_TAIL: f32 = 0.070;
+const RAINBOW_WAKE_H_HEAD: f32 = 0.180;
+const RAINBOW_WAKE_H_TAIL: f32 = 0.070;
 /// The soft BLOOM under the plume: a wide flat halo per few segments, at this
 /// share of the segment's coverage. Gives the hard-edged core depth without
 /// blurring it — bright things stay small, big things stay dim.
-const NYAN_WAKE_BLOOM_GAIN: f32 = 0.30;
+const RAINBOW_WAKE_BLOOM_GAIN: f32 = 0.30;
 /// One bloom halo per this many core segments (the bloom is broad, so it needs
 /// far fewer samples than the core to read as continuous).
-const NYAN_WAKE_BLOOM_STRIDE: usize = 3;
+const RAINBOW_WAKE_BLOOM_STRIDE: usize = 3;
 /// COMPOSITE CEILING at the nozzle: the crisp core and its bloom share the same
 /// pixels and their light ADDS, so this bounds the pair.
 ///
@@ -819,11 +821,11 @@ const NYAN_WAKE_BLOOM_STRIDE: usize = 3;
 /// the design: the whole white-gold → yellow → orange → red → violet cooling
 /// ramp is invisible wherever the pixel saturates, so the hot half of the plume
 /// collapses into one flat white smear. Bounded here, the ramp is always the
-/// thing you see. Pinned by `nyan_wake_never_saturates_its_own_ramp`.
-const NYAN_WAKE_COMPOSITE_CAP: f32 = 190.0;
+/// thing you see. Pinned by `rainbow_wake_never_saturates_its_own_ramp`.
+const RAINBOW_WAKE_COMPOSITE_CAP: f32 = 190.0;
 
-/// The wake's colour at `s` (0 at the nozzle → 1 at the tail): THE NYAN RAINBOW
-/// itself — literally [`NYAN_BANDS`] through [`nyan_gradient_of`], the same six
+/// The wake's colour at `s` (0 at the nozzle → 1 at the tail): THE RAINBOW
+/// itself — literally [`RAINBOW_BANDS`] through [`rainbow_gradient_of`], the same six
 /// anchors the ribbon is built from.
 ///
 /// OWNER, 2026-07-29: "it needs to match the nyan rainbow theme." It did not: the
@@ -835,51 +837,51 @@ const NYAN_WAKE_COMPOSITE_CAP: f32 = 190.0;
 /// same light as the trail it feeds.
 ///
 /// The cooling READ is not lost, because it never lived in the hue: brightness
-/// falloff is carried entirely by [`nyan_wake_body`]'s `e^(-d/L)` coverage
+/// falloff is carried entirely by [`rainbow_wake_body`]'s `e^(-d/L)` coverage
 /// envelope, which is also what makes the plume drive forward. Hue and intensity
 /// were always separate; only the hue changed.
 #[inline]
-fn nyan_wake_ramp(s: f32) -> u32 {
-    nyan_gradient_of(&NYAN_BANDS, s.clamp(0.0, 1.0))
+fn rainbow_wake_ramp(s: f32) -> u32 {
+    rainbow_gradient_of(&RAINBOW_BANDS, s.clamp(0.0, 1.0))
 }
 
 /// The plume's steady body at `d` cells behind the nozzle for a plume of length
 /// `L`: `e^(-d/L)`, i.e. exactly 1 at the head and monotone to 0. Continuous in
 /// `d` — never quantised to the cell grid.
 #[inline]
-fn nyan_wake_body(d: f32, l: f32) -> f32 {
+fn rainbow_wake_body(d: f32, l: f32) -> f32 {
     if d < 0.0 {
         return 0.0;
     }
     (-(d / l.max(0.05))).exp()
 }
 
-/// The SPATIAL half of a keystroke pulse: a narrow gaussian `NYAN_WAKE_PULSE_W`
+/// The SPATIAL half of a keystroke pulse: a narrow gaussian `RAINBOW_WAKE_PULSE_W`
 /// cells wide, centred on where the key landed. Symmetric and monotone away
 /// from its centre.
 #[inline]
-fn nyan_wake_pulse_space(d: f32) -> f32 {
-    let g = d / NYAN_WAKE_PULSE_W;
+fn rainbow_wake_pulse_space(d: f32) -> f32 {
+    let g = d / RAINBOW_WAKE_PULSE_W;
     (-(g * g)).exp()
 }
 
-/// The TEMPORAL half: exponential decay on [`NYAN_WAKE_PULSE_TAU`] since the key
+/// The TEMPORAL half: exponential decay on [`RAINBOW_WAKE_PULSE_TAU`] since the key
 /// landed. Zero attack — the key's own frame is the pulse's brightest.
 #[inline]
-fn nyan_wake_pulse_decay(age: f32) -> f32 {
-    (-(age.max(0.0) / NYAN_WAKE_PULSE_TAU)).exp()
+fn rainbow_wake_pulse_decay(age: f32) -> f32 {
+    (-(age.max(0.0) / RAINBOW_WAKE_PULSE_TAU)).exp()
 }
 
 /// One keystroke PULSE at `d` cells from its injection point, `age` seconds
 /// after the key landed — the documented law in one place. The emitter does NOT
-/// call this: it evaluates [`nyan_wake_pulse_decay`] once per keystroke and
-/// [`nyan_wake_pulse_space`] once per segment, which is the same arithmetic with
-/// the clock work hoisted out of the walk. `nyan_wake_pulse_is_separable` pins
+/// call this: it evaluates [`rainbow_wake_pulse_decay`] once per keystroke and
+/// [`rainbow_wake_pulse_space`] once per segment, which is the same arithmetic with
+/// the clock work hoisted out of the walk. `rainbow_wake_pulse_is_separable` pins
 /// that the two spellings agree, so this stays the law rather than a comment.
 #[cfg(test)]
 #[inline]
-fn nyan_wake_pulse(d: f32, age: f32) -> f32 {
-    nyan_wake_pulse_space(d) * nyan_wake_pulse_decay(age)
+fn rainbow_wake_pulse(d: f32, age: f32) -> f32 {
+    rainbow_wake_pulse_space(d) * rainbow_wake_pulse_decay(age)
 }
 
 // ---- the WAKE's LIGHT-THEME arm ----
@@ -892,20 +894,20 @@ fn nyan_wake_pulse(d: f32, age: f32) -> f32 {
 /// smooth contrail. The reverse — sparse and strong — is what produces a line of
 /// discrete grey blobs, which is the light-theme spelling of exactly the
 /// quantised look this whole retune exists to kill.
-const NYAN_WAKE_LIGHT_GAIN: f32 = 0.34;
+const RAINBOW_WAKE_LIGHT_GAIN: f32 = 0.34;
 /// The light contrail's own straight RGB (source-over). Deliberately DISTINCT
 /// from the fresh-ink pop's `FRESH_INK_LIGHT_VEIL`, though both are cool-neutral
 /// near-blacks: they are two different marks that merely share a palette — the
 /// pop shadows the LETTER, the contrail is the runway BELOW the line — and each
 /// must stay independently assertable (a filter keyed on the shared colour
 /// cannot tell them apart, and neither can a human reading a capture).
-const NYAN_WAKE_LIGHT_VEIL: u32 = 0x0022_2A33;
+const RAINBOW_WAKE_LIGHT_VEIL: u32 = 0x0022_2A33;
 
 /// [`fresh_ink_veil`] for the contrail: its straight colour stamped with the
 /// per-pixel centre over-alpha CEILING in the high byte.
 #[inline]
-fn nyan_wake_veil(cap: u8) -> u32 {
-    (NYAN_WAKE_LIGHT_VEIL & 0x00FF_FFFF) | ((cap as u32) << 24)
+fn rainbow_wake_veil(cap: u8) -> u32 {
+    (RAINBOW_WAKE_LIGHT_VEIL & 0x00FF_FFFF) | ((cap as u32) << 24)
 }
 
 // ---- FRESH-INK POP, LIGHT-THEME arm ----------------------------------------
@@ -1062,7 +1064,7 @@ struct Spark {
 struct InkPop {
     row: u16,
     col: u16,
-    /// The eased momentum spine (`nyan.disp`) at birth: full momentum = the
+    /// The eased momentum spine (`rainbow.disp`) at birth: full momentum = the
     /// brightest pop (frozen at birth so a pop never re-prices mid-fade).
     mom: f32,
     born: Instant,
@@ -1096,7 +1098,7 @@ struct Ring {
     life: f32,
 }
 
-/// One Nyan cursor-JUMP "ZOOM!" streak: a straight banded rainbow beam drawn
+/// One kitty cursor-JUMP "ZOOM!" streak: a straight banded rainbow beam drawn
 /// ALONG the jump vector (grid-interior pixel endpoints), whose tail retracts
 /// into the landing point over its life — one clean linear swoosh across the
 /// screen instead of disjoint per-row segments.
@@ -1112,16 +1114,16 @@ struct JumpStreak {
     mom: f32,
 }
 
-/// One Nyan FAST-JUMP STARBURST (owner: "for fast cursor jumps a starburst
+/// One rainbow kitty FAST-JUMP STARBURST (owner: "for fast cursor jumps a starburst
 /// would be fun"): a radial spray of rainbow rays fired at the jump LANDING —
 /// bigger and more celebratory than the ZOOM streak / small landing light-burst
 /// it is ADDITIVE to (the owner explicitly likes those; they STILL fire — the
 /// starburst joins them at the landing). Born only on a FAST jump (a large
 /// single-frame displacement — the existing jump classification), scaled by
-/// that distance, gated to [`GlowStyle::Nyan`]. Purely geometric:
-/// [`CursorGlow::emit_nyan_starburst`] turns `(now − born, reach, seed)` into
+/// that distance, gated to [`GlowStyle::RainbowKitty`]. Purely geometric:
+/// [`CursorGlow::emit_rainbow_starburst`] turns `(now − born, reach, seed)` into
 /// [`comet_beam`] rays (reusing the ZOOM streak's own ray primitive), so no
-/// per-frame state is stored. Capped at [`CursorGlow::NYAN_BURST_CAP`] so a
+/// per-frame state is stored. Capped at [`CursorGlow::RAINBOW_BURST_CAP`] so a
 /// Ctrl-A/Ctrl-E mash can never unbound-allocate. Reduced-motion draws it as a
 /// single STATIC frame (full reach, no expansion — see the emitter).
 #[derive(Clone, Copy)]
@@ -1136,28 +1138,28 @@ struct Starburst {
     /// Deterministic per-burst seed (angle offset + rainbow-tint rotation) so
     /// two stacked bursts don't overlay identically.
     seed: f32,
-    /// How many stars this burst scatters (1..=[`CursorGlow::NYAN_BURST_STARS`]),
+    /// How many stars this burst scatters (1..=[`CursorGlow::RAINBOW_BURST_STARS`]),
     /// GRADUATED by the jump distance at spawn: a short Option-B/F hop throws
     /// one small star, a screen-crossing fling throws the full handful. Read by
-    /// `emit_nyan_starburst`; keeps the emitter a pure function of the burst.
+    /// `emit_rainbow_starburst`; keeps the emitter a pure function of the burst.
     stars: u8,
     /// How many 4-point TWINKLE SPARKLES this burst scatters alongside its
     /// burst stars — the owner's "sparkles aligned with the stars that appear
-    /// when I'm typing in nyan mode". ZERO for every discrete-JUMP landing (so
+    /// when I'm typing in rainbow-kitty mode". ZERO for every discrete-JUMP landing (so
     /// the shipped jump starburst stays byte-identical), non-zero only for a
     /// FAST-GLIDE landing. Rendered through `push_twinkle_star` — literally the
     /// typing starfield's own geometry.
     sparkles: u8,
 }
 
-/// One Nyan FAST-GLIDE rainbow SHOOTING STAR (owner: "some rainbow streak when
+/// One FAST-GLIDE rainbow SHOOTING STAR (owner: "some rainbow streak when
 /// the cursor moves quickly, maybe like a star"): a directional, elongated,
 /// rainbow-tinted streak fired when the cursor GLIDES fast — a sustained high
 /// [`GlideState::vel`] (cells/sec) — as opposed to a discrete far JUMP (a
 /// single large delta) or the grid-quantized typing ribbon. A white-hot leading
 /// HEAD at the new cursor cell with a tail trailing back along the velocity
 /// vector, its length scaled by the glide speed. Purely geometric:
-/// [`CursorGlow::emit_nyan_glide_stars`] turns `(now − born, endpoints, seed)`
+/// [`CursorGlow::emit_rainbow_glide_stars`] turns `(now − born, endpoints, seed)`
 /// into a [`comet_beam`] rainbow streak (DARK) or a darkened source-over streak
 /// (LIGHT), so no per-frame state is stored. Capped at
 /// [`CursorGlow::GLIDE_STAR_CAP`]; reduced-motion draws ONE static frame.
@@ -1185,7 +1187,7 @@ struct GlideStar {
 /// classifier, keeping the rate limiter.
 #[derive(Default)]
 struct GlideState {
-    /// Live Nyan FAST-GLIDE rainbow shooting stars (≤
+    /// Live FAST-GLIDE rainbow shooting stars (≤
     /// [`CursorGlow::GLIDE_STAR_CAP`]) — the directional streak fired on
     /// sustained fast cursor motion; see [`GlideStar`].
     stars: Vec<GlideStar>,
@@ -1194,7 +1196,7 @@ struct GlideState {
     /// decayed on a ~0.15 s τ in the lazy-decay block, so it RAMPS over
     /// consecutive fast frames and falls fast when motion stops. Drives the
     /// fast-glide rainbow shooting star (fires at
-    /// [`CursorGlow::GLIDE_VEL_MIN`]); Nyan-only and read by no other emitter,
+    /// [`CursorGlow::GLIDE_VEL_MIN`]); rainbow-kitty-only and read by no other emitter,
     /// so every other style stays byte-identical. Non-finite hardened at the
     /// source (a zero/absent interval never spikes it).
     vel: f32,
@@ -1234,23 +1236,23 @@ impl GlideState {
     }
 }
 
-/// The whole NYAN family as ONE state: the ribbon's tail memory and press
+/// The whole RAINBOW KITTY family as ONE state: the ribbon's tail memory and press
 /// budget, the finger-lift retract, the fresh-ink pops, the typing-wake nozzle,
 /// the jump ZOOM streaks and landing starbursts, and the momentum/phase spines
 /// that drive them all. Its members split across TWO teardown lifetimes — the
-/// transient light ([`NyanState::clear_transient`]) and the thermal spines
-/// ([`NyanState::clear_thermals`]) — because the zero-amplitude (unfocus) path
+/// transient light ([`RainbowState::clear_transient`]) and the thermal spines
+/// ([`RainbowState::clear_thermals`]) — because the zero-amplitude (unfocus) path
 /// wipes only the former: minutes of earned momentum must survive a focus blip.
 /// Each lifetime gets its own family wipe here so a newly added member cannot be
 /// missed at a teardown site.
 #[derive(Default)]
-struct NyanState {
-    /// Live Nyan jump ZOOM streaks (≤ [`CursorGlow::NYAN_JUMP_CAP`]).
+struct RainbowState {
+    /// Live rainbow kitty jump ZOOM streaks (≤ [`CursorGlow::RAINBOW_JUMP_CAP`]).
     jumps: Vec<JumpStreak>,
-    /// Live Nyan fast-jump STARBURSTs (≤ [`CursorGlow::NYAN_BURST_CAP`]) — the
+    /// Live rainbow kitty fast-jump STARBURSTs (≤ [`CursorGlow::RAINBOW_BURST_CAP`]) — the
     /// celebratory radial ray spray at a fast jump's landing; see [`Starburst`].
     bursts: Vec<Starburst>,
-    /// The last three Nyan-typed cells, most recent first — the FOUR-LETTER
+    /// The last three rainbow-typed cells, most recent first — the FOUR-LETTER
     /// GUARANTEE's memory. A fresh typing key inside the chain window re-lays
     /// these cells (extending in place when their spark is still alive), so
     /// the ribbon spans about four letters even after a rhythm change or a
@@ -1267,50 +1269,50 @@ struct NyanState {
     /// enough that the ribbon is plausibly still VISIBLE (the eased momentum
     /// proxy outlives the visible ribbon by seconds). Deliberately survives
     /// both wipes: it is an input LEDGER, not light.
-    type_press_ring: [Option<Instant>; CursorGlow::NYAN_TYPED_SWEEP_MAX],
+    type_press_ring: [Option<Instant>; CursorGlow::RAINBOW_TYPED_SWEEP_MAX],
     /// Next write slot in [`Self::type_press_ring`].
     type_press_head: usize,
-    /// Live Nyan finger-lift RETRACT: `(started, ribbon cells at start)`. Set
+    /// Live rainbow kitty finger-lift RETRACT: `(started, ribbon cells at start)`. Set
     /// once the exit swoosh finishes REACHING four letters and begins draining
     /// the ribbon tail→head; cleared by the next typing key. While `Some`, the
     /// reach phase stays off so retracted cells are never re-lit mid-drain.
     retract: Option<(Instant, usize)>,
-    /// Resident rank/kill scratch for the Nyan tail-to-head exit drain. The
+    /// Resident rank/kill scratch for the rainbow tail-to-head exit drain. The
     /// retract runs every animation frame, so these keep its bounded sort and
     /// retain pass allocation-free after first use.
     rank_scratch: Vec<(i32, usize)>,
     kill_scratch: Vec<bool>,
-    /// FRESH-INK POP ring (Nyan): the last ≤ [`FRESH_INK_CAP`] TYPED glyph
+    /// FRESH-INK POP ring (rainbow kitty): the last ≤ [`FRESH_INK_CAP`] TYPED glyph
     /// cells mid-pop, oldest first. EMPTY in the common case (nothing typed
     /// within the last ~600 ms) — the tick-path touches are all `is_empty`
-    /// gated, so an idle or non-Nyan session pays one Vec-len read per frame.
+    /// gated, so an idle or non-rainbow-kitty session pays one Vec-len read per frame.
     ink_pops: Vec<InkPop>,
     /// The TYPING WAKE's sub-cell NOZZLE: `(row, fractional column)` of the
-    /// plume's anchor, eased toward the live cursor on [`NYAN_WAKE_HEAD_TAU`] by
+    /// plume's anchor, eased toward the live cursor on [`RAINBOW_WAKE_HEAD_TAU`] by
     /// [`CursorGlow::advance_wake_head`]. This is the whole reason the wake reads
     /// as light instead of as UI: a keystroke SLIDES the nozzle across the cell
     /// over several frames rather than teleporting it a whole cell at once. A row
-    /// change or a jump beyond [`NYAN_WAKE_SNAP_CELLS`] snaps instead of easing,
-    /// so a nozzle never drags across the screen. `None` until the first Nyan
+    /// change or a jump beyond [`RAINBOW_WAKE_SNAP_CELLS`] snaps instead of easing,
+    /// so a nozzle never drags across the screen. `None` until the first rainbow kitty
     /// tick with a visible cursor.
     wake_head: Option<(u16, f32)>,
     /// Clock stamp of the last head ease (the integrator's `dt` source). `None`
     /// re-seeds without integrating, so a resumed/foreign clock cannot fling the
     /// nozzle.
     wake_at: Option<Instant>,
-    /// Nyan's EASED MOMENTUM SPINE 0..1 — a twin of [`CursorGlow::disp_t`] for
+    /// the rainbow kitty's EASED MOMENTUM SPINE 0..1 — a twin of [`CursorGlow::disp_t`] for
     /// the rainbow ribbon: it chases the CANONICAL typing-momentum metric
     /// ([`Self::momentum`]) with a short attack and a slower cinematic
     /// release, so ribbon width / wave / tail / brightness / crown all EASE as
     /// one body instead of STEPPING per keystroke (a single key swells the
     /// ribbon over ~100 ms and exhales over
-    /// ~[`CursorGlow::NYAN_DISP_RELEASE_TAU`]).
+    /// ~[`CursorGlow::RAINBOW_DISP_RELEASE_TAU`]).
     /// Deliberately NOT derived from `heat`/`flare`: heat maxes out on ~8 fast
     /// keys and a jump flare buys 1.0 with zero typing — either would let
     /// casual activity buy the full star/shimmer fireworks (the "too
     /// distracting" report). Evolved once per tick in the lazy-decay block,
-    /// gated to [`GlowStyle::Nyan`], BEFORE any spawn, so every Nyan consumer in
-    /// one frame agrees. Nyan-only (zero for every other style). Excluded from
+    /// gated to [`GlowStyle::RainbowKitty`], BEFORE any spawn, so every rainbow kitty consumer in
+    /// one frame agrees. Rainbow-kitty-only (zero for every other style). Excluded from
     /// [`CursorGlow::is_active`] like `disp_t`: it only modulates spark-drawn
     /// light, so a nonzero-but-decaying value with no live sparks produces
     /// nothing.
@@ -1319,25 +1321,25 @@ struct NyanState {
     /// leaky integrator in 0..1 that builds ONLY from non-delete printable
     /// typing advances (rate-normalized — key-repeat cannot outrun real
     /// typing), decays on a 2 s τ, and is mildly drained by deletes/kills.
-    /// [`Self::disp`] is its eased DISPLAY; every Nyan "earned drama"
+    /// [`Self::disp`] is its eased DISPLAY; every rainbow kitty "earned drama"
     /// consumer (star envelope, shooting stars, fresh-ink pop scaling,
     /// iridescence/glint, spark life/brightness) reads that spine, and the
-    /// cursor cat ([`crate::nyan_cursor::CursorCat`]) runs the SAME law on the
+    /// cursor cat ([`crate::kitty_cursor::CursorCat`]) runs the SAME law on the
     /// same keystream.
     momentum: TypingMomentum,
     /// One-tick PULSE: the instant [`Self::momentum`] took a correlated
     /// typed advance THIS tick (`None` otherwise). Cleared at the top of every
     /// [`CursorGlow::tick`] and set only on the one gated advance in
     /// [`CursorGlow::spawn`], so the host can drive the cursor cat's own metric
-    /// instance ([`crate::nyan_cursor::CursorCat`]) from the SAME
+    /// instance ([`crate::kitty_cursor::CursorCat`]) from the SAME
     /// echo-correlated event the ribbon builds from — the two instances then
     /// cannot diverge (a key-only, non-echoing keystream builds neither).
     /// Read+cleared via [`CursorGlow::take_momentum_pulse`]. Transient
     /// per-tick: never carried into a style-crossfade ghost, and cleared by the
     /// tick head rather than by either family wipe.
     momentum_pulse: Option<Instant>,
-    /// The Nyan ribbon's integrated SPECULAR PHASE (dimensionless sweeps):
-    /// advanced by `dt · NYAN_PHASE_RATE · nyan.disp` in the lazy-decay block, so
+    /// The rainbow ribbon's integrated SPECULAR PHASE (dimensionless sweeps):
+    /// advanced by `dt · RAINBOW_PHASE_RATE · rainbow.disp` in the lazy-decay block, so
     /// the iridescent value-noise scrolls and the specular glint sweeps head→tail
     /// along the ribbon at a rate PROPORTIONAL to the momentum spine (frozen when
     /// cold — where the iridescence amplitude is zero anyway). Pure function of
@@ -1345,9 +1347,9 @@ struct NyanState {
     phase: f32,
 }
 
-impl NyanState {
+impl RainbowState {
     /// Wipe the TRANSIENT half — the in-flight light and the position-bound
-    /// memory, unconditionally. THE teardown for transient Nyan state, so a
+    /// memory, unconditionally. THE teardown for transient rainbow kitty state, so a
     /// light-bearing member added above is wiped by every transient teardown
     /// for free. Deliberately untouched: the thermal spines (see
     /// [`Self::clear_thermals`]), the press LEDGER, the per-tick momentum
@@ -1377,7 +1379,7 @@ impl NyanState {
 /// third of a cell, so a landing star reads a touch larger than the typing
 /// starfield's twinkles without becoming a different object (the burst draws
 /// [`push_twinkle_star`], the one star shape).
-const NYAN_STAR_R_FRAC: f32 = 0.30;
+const RAINBOW_STAR_R_FRAC: f32 = 0.30;
 
 /// One FIRE METEOR — the fire style's inter-line / long-jump streak: a
 /// straight pixel-space line of fire drawn ALONG the true jump vector, whose
@@ -1403,7 +1405,7 @@ struct Meteor {
 
 /// Occupancy knowledge for ONE row flanking the probed cursor row — the
 /// STAR-LANDING seam ([`CursorGlow::observe_neighbor_rows`]). The displaced
-/// nyan ribbon stars paint in the pixel bands of the rows ABOVE and BELOW the
+/// rainbow ribbon stars paint in the pixel bands of the rows ABOVE and BELOW the
 /// swept row, so the legibility gate must interrogate THOSE rows, not the
 /// spark's own cell; this enum records what the host actually told us, and the
 /// gate falls back to the safe in-cell placement whenever the answer is not a
@@ -1563,10 +1565,10 @@ pub struct CursorGlow {
     path_scratch: Vec<(i32, i32)>,
     particles: Vec<Particle>,
     ring: Option<Ring>,
-    /// The whole NYAN family (ribbon tail + press ledger, retract, ink pops,
+    /// The whole RAINBOW KITTY family (ribbon tail + press ledger, retract, ink pops,
     /// wake nozzle, jump streaks + bursts, momentum/phase spines); see
-    /// [`NyanState`].
-    nyan: NyanState,
+    /// [`RainbowState`].
+    rainbow: RainbowState,
     /// The whole FAST-GLIDE family (live stars, velocity spine, straight-run
     /// classifier, landing anchor + timer); see [`GlideState`].
     glide: GlideState,
@@ -1704,7 +1706,7 @@ pub struct CursorGlow {
     /// (one hint = one echo, so the state stays bounded).
     type_hint: Option<Instant>,
     /// A fresh RETURN key-hint ([`Self::note_return`] — a main-screen Enter):
-    /// the license for the un-hinted Nyan jump choreography when typing
+    /// the license for the un-hinted rainbow kitty jump choreography when typing
     /// momentum is cold. The host deliberately does NOT arm the typed hint on
     /// Enter (the Rainbow Return snap needs the move to classify as a jump,
     /// not typing) — so with the choreography momentum-gated (anti-stray), a
@@ -1716,7 +1718,7 @@ pub struct CursorGlow {
     return_hint: Option<Instant>,
     /// A fresh REFLOW hint ([`Self::note_reflow`] — the host committed a grid
     /// GEOMETRY change: an interactive window resize, a font-zoom re-grid, a
-    /// scale-factor change): the license for the un-hinted Nyan jump
+    /// scale-factor change): the license for the un-hinted rainbow kitty jump
     /// choreography when typing momentum is cold, exactly as
     /// [`Self::return_hint`] licenses a bare Enter.
     ///
@@ -1725,7 +1727,7 @@ pub struct CursorGlow {
     /// idle-prompt Enter does. The anti-stray contract is untouched: a
     /// spinner's CUP loop, a background TUI repaint, and hours of idle output
     /// arm nothing and so still mint nothing (see
-    /// `cold_program_warp_mints_no_nyan_choreography`). The host arms this on
+    /// `cold_program_warp_mints_no_rainbow_choreography`). The host arms this on
     /// the resize SETTLE only, never on the leading edge or the mid-drag
     /// throttle steps, so one drag gestures exactly one streak rather than one
     /// per 50 ms reflow.
@@ -2003,7 +2005,7 @@ struct MoveCtx<'a> {
     echo_run: bool,
     re_anchor: bool,
     wrap: bool,
-    nyan_coalesce: bool,
+    rainbow_coalesce: bool,
     /// `raw_dist` with wrap / re-anchor / coalesced-echo moves collapsed to 1.
     dist: f32,
     typing: bool,
@@ -2036,18 +2038,18 @@ impl CursorGlow {
     /// keystroke and jump splashes can emit 26 at once, so the per-move burst is
     /// not itself a bound on resident work.
     const MAX_PARTICLES: usize = 512;
-    /// Longest the Nyan ribbon streak can grow (cells) before the oldest are
+    /// Longest the rainbow ribbon streak can grow (cells) before the oldest are
     /// dropped — bounds a flat-out multi-line streak's quad count.
-    const NYAN_MAX_CELLS: usize = 240;
+    const RAINBOW_MAX_CELLS: usize = 240;
     /// Longest same-row typed-coalesce the ribbon sweeps as CONTINUED TYPING
     /// (cells): batched echoes under fast typing / key-repeat rarely hop more
     /// than a few cells per observed frame, while a repaint re-anchor (Claude
     /// Code's inset box growing) hops the caret across cells it never visited —
     /// beyond this cap the move keeps the single landing spark.
-    const NYAN_TYPED_SWEEP_MAX: usize = 8;
+    const RAINBOW_TYPED_SWEEP_MAX: usize = 8;
     /// Same-row skips shorter than this stay on the ribbon; at/past it (or ANY
     /// row change — wrap, Enter, a jump) the move gets the linear ZOOM streak.
-    const NYAN_JUMP_MIN: i32 = 8;
+    const RAINBOW_JUMP_MIN: i32 = 8;
     /// Minimum jump distance (cells) that earns the ZOOM STREAK on a NAVIGATION
     /// jump (Ctrl-A/E, Home/End, word motions, a held-arrow fling).
     ///
@@ -2063,32 +2065,32 @@ impl CursorGlow {
     /// Set ABOVE the burst's own floor deliberately: a two-cell word-hop earns its
     /// starburst but no line, so ordinary arrow-key editing does not draw a beam on
     /// every keypress. A streak means you TRAVELLED.
-    const NYAN_STREAK_MIN_DIST: f32 = 3.0;
+    const RAINBOW_STREAK_MIN_DIST: f32 = 3.0;
     /// Minimum EASED momentum for the UN-HINTED jump choreography (ZOOM wake
     /// streak + landing payload). The un-hinted branch fires on any observed
     /// cursor delta — including PROGRAM-driven warps (a spinner's CUP loop, a
     /// TUI repaint) that carry no keystroke at all — so it must prove the user
     /// was recently TYPING before it celebrates: momentum builds only from
     /// typed forward echoes, making it exactly the "was this text?" witness.
-    /// Above [`Self::NYAN_TERMINUS_MIN_DISP`] (a barely-warm tail must not
+    /// Above [`Self::RAINBOW_TERMINUS_MIN_DISP`] (a barely-warm tail must not
     /// zoom) and low enough that type-then-Enter still celebrates (disp ≈
     /// 0.4+ after one word). Nav-HINTED jumps (Ctrl-A/E) are exempt by
     /// design: the literal gesture was a keypress.
-    const NYAN_JUMP_MIN_DISP: f32 = 0.12;
+    const RAINBOW_JUMP_MIN_DISP: f32 = 0.12;
     /// Press-budget window (seconds) for the typed-coalesce gate: the swept
     /// cell count must be covered by presses within this window. Coalescing
     /// only ever collapses echoes batched across a frame or two, so a real
     /// N-glyph sweep always has N near-simultaneous presses behind it; a
     /// burst at ≥4 chars/sec keeps 2-cell sweeps (the common case) passing.
-    const NYAN_COALESCE_PRESS_WINDOW: f32 = 0.5;
+    const RAINBOW_COALESCE_PRESS_WINDOW: f32 = 0.5;
     /// How long after the last committed press the ribbon is treated as
     /// plausibly still VISIBLE for the terminus dissolve. The visible ribbon
     /// fades in under ~3s while the eased momentum proxy stays above
-    /// [`Self::NYAN_TERMINUS_MIN_DISP`] for ~3-6s — exactly the window that
+    /// [`Self::RAINBOW_TERMINUS_MIN_DISP`] for ~3-6s — exactly the window that
     /// scattered glitter over long-empty cells (the owner's Ctrl-L blob).
-    const NYAN_TERMINUS_RIBBON_WINDOW: f32 = 2.5;
+    const RAINBOW_TERMINUS_RIBBON_WINDOW: f32 = 2.5;
     /// Most simultaneous live jump streaks (oldest evicted first).
-    const NYAN_JUMP_CAP: usize = 4;
+    const RAINBOW_JUMP_CAP: usize = 4;
     // ---- FAST-GLIDE rainbow shooting star (velocity-triggered) --------------
     /// EMA attack coefficient for [`GlideState::vel`] on each observed move: a
     /// couple of consecutive fast frames ramp the spine toward the true speed.
@@ -2120,7 +2122,7 @@ impl CursorGlow {
     /// frame mid-fling cannot split one glide into two landings.
     const GLIDE_LAND_QUIET: f32 = 0.055;
     /// Peak additive coverage of a landing SPARKLE — deliberately BELOW
-    /// [`NYAN_TRANSIENT_COV_CAP`] and far below the typing starfield's own peak,
+    /// [`RAINBOW_TRANSIENT_COV_CAP`] and far below the typing starfield's own peak,
     /// because a landing fires a handful at once on one spot and the owner
     /// cannot read text through bright art.
     const GLIDE_LAND_STAR_COV: f32 = 92.0;
@@ -2128,46 +2130,46 @@ impl CursorGlow {
     const GLIDE_LAND_SPARKLES: u8 = 5;
     /// Landing scatter reach, in cell heights.
     const GLIDE_LAND_REACH: f32 = 1.15;
-    /// Landing burst life (seconds) — matched to [`Self::NYAN_BURST_LIFE`] so
+    /// Landing burst life (seconds) — matched to [`Self::RAINBOW_BURST_LIFE`] so
     /// the colour stars and the sparkles die together.
     const GLIDE_LAND_LIFE: f32 = 0.42;
     /// Most simultaneous live fast-jump STARBURSTs (oldest evicted first). Held
-    /// well below [`Self::NYAN_JUMP_CAP`]: a burst is a fat radial payload, so a
+    /// well below [`Self::RAINBOW_JUMP_CAP`]: a burst is a fat radial payload, so a
     /// Ctrl-A/Ctrl-E MASH keeps only the freshest few landings blooming rather
     /// than piling rays into the quad budget (the owner's unbound-allocate ask).
-    const NYAN_BURST_CAP: usize = 3;
-    /// Minimum jump distance (cells) that upgrades a Nyan jump from "just the
+    const RAINBOW_BURST_CAP: usize = 3;
+    /// Minimum jump distance (cells) that upgrades a rainbow kitty jump from "just the
     /// ZOOM streak" to "ZOOM streak PLUS a landing star scatter". Low enough
     /// that ANY qualifying word-jump (an Option-B/F short hop, a two-cell leap)
     /// earns at least ONE small star of feedback. The star COUNT and reach
     /// then GRADUATE up with distance (see [`Starburst::stars`] /
-    /// `emit_nyan_jump_landing`), so a screen-crossing fling still throws the
-    /// full [`Self::NYAN_BURST_STARS`] chunky stars.
-    const NYAN_BURST_MIN_DIST: f32 = 2.0;
+    /// `emit_rainbow_jump_landing`), so a screen-crossing fling still throws the
+    /// full [`Self::RAINBOW_BURST_STARS`] chunky stars.
+    const RAINBOW_BURST_MIN_DIST: f32 = 2.0;
     /// Chunky spinning solid rainbow 5-point stars in a FULL (far-jump)
     /// starburst. A short jump throws fewer (graduated by distance, floor 1);
     /// this is the ceiling. Per-burst quad cost is a closed form (stars × ~2·R
     /// scanline rows × ≤2 spans, capped by [`Self::MAX_QUADS`]).
-    const NYAN_BURST_STARS: usize = 4;
+    const RAINBOW_BURST_STARS: usize = 4;
     /// Starburst life (seconds): a brisk celebratory bloom-and-fade, in the same
     /// register as the ZOOM streak's `0.18..0.52` so the two read as one event.
-    const NYAN_BURST_LIFE: f32 = 0.42;
+    const RAINBOW_BURST_LIFE: f32 = 0.42;
     /// Twinkle stars scattered at a dissolving ribbon TERMINUS (Feature A). A
     /// small handful — enough to MELT the end, never a cloud. Count-capped by
     /// [`Self::MAX_PARTICLES`] like every other spawn.
-    const NYAN_TERMINUS_STARS: usize = 6;
+    const RAINBOW_TERMINUS_STARS: usize = 6;
     /// How near the last column (in cells) counts as "at the far-right margin"
     /// for the graceful end-of-line terminus dissolve.
-    const NYAN_TERMINUS_MARGIN: usize = 1;
-    /// Minimum eased typing momentum ([`NyanState::disp`]) for a
+    const RAINBOW_TERMINUS_MARGIN: usize = 1;
+    /// Minimum eased typing momentum ([`RainbowState::disp`]) for a
     /// POST-JUMP terminus to scatter: below it the cursor is cold/idle and never
     /// laid a ribbon, so there is no hard leading edge to dissolve — scattering
     /// twinkles at a phantom terminus is light over nothing. A small floor, clear of the
-    /// `nyan.disp` zero-snap (0.005) so a truly cold spine is provably excluded,
+    /// `rainbow.disp` zero-snap (0.005) so a truly cold spine is provably excluded,
     /// yet low enough that any genuinely warm ribbon still feathers its end. The
     /// far-right (typing) terminus needs no such gate — it is only reached mid-
     /// typing, when a live ribbon is always present.
-    const NYAN_TERMINUS_MIN_DISP: f32 = 0.05;
+    const RAINBOW_TERMINUS_MIN_DISP: f32 = 0.05;
     /// Most simultaneous live lightning bolts, main channels + branch forks
     /// (oldest evicted first). A jump strike spawns 1 main + up to 4 branches,
     /// so this comfortably holds several overlapping strikes plus crackle.
@@ -2292,7 +2294,7 @@ impl CursorGlow {
     /// Display-temperature RELEASE τ — the fire dies down slower than it leaps.
     const DISP_RELEASE_TAU: f32 = 0.45;
     /// Bounded ring for `flame_phase` (the fire's churn clock), exactly like
-    /// `nyan.phase`'s 1024 wrap: without it the phase integrates every dt forever,
+    /// `rainbow.phase`'s 1024 wrap: without it the phase integrates every dt forever,
     /// and f32 ULP overtakes the ~0.03/frame increment near ~5e5 (quantize →
     /// freeze over a multi-day session), while the `* 1024.0 as u32` field cast
     /// saturates at u32::MAX past ~4.19e6. `TAU · 640` keeps BOTH forge sines
@@ -2313,7 +2315,7 @@ impl CursorGlow {
     /// present gate dedups anyway — see [`Self::next_change_deadline`].
     const EMBER_POLL_INTERVAL: Duration = Duration::from_millis(90);
     /// Same-row fire moves at/past this many columns become a METEOR (any row
-    /// change already does — matching Nyan's jump classification).
+    /// change already does — matching the rainbow kitty's jump classification).
     const METEOR_MIN_COLS: i32 = 8;
     /// Most simultaneous live fire meteors (oldest evicted first).
     const METEOR_CAP: usize = 4;
@@ -2340,41 +2342,41 @@ impl CursorGlow {
     /// backgrounded window resumes by easing one ordinary frame's worth instead
     /// of collapsing the whole blind interval into a single step.
     const WAKE_MAX_DT: f32 = 0.10;
-    /// NYAN FOUR-LETTER GUARANTEE: within a rhythm, a Nyan spark lives at least
+    /// RAINBOW KITTY FOUR-LETTER GUARANTEE: within a rhythm, a rainbow spark lives at least
     /// this many observed inter-key gaps, so the ribbon spans about the last
     /// four typed cells at ANY human cadence (4 cells lit needs ~3 gaps of life;
     /// the extra half-gap buys the tail-fade room in the cosine envelope).
-    const NYAN_CHAIN_KEYS: f32 = 4.5;
-    /// Nyan chains across ANY plausible typing rhythm — one key every five
+    const RAINBOW_CHAIN_KEYS: f32 = 4.5;
+    /// Rainbow kitty chains across ANY plausible typing rhythm — one key every five
     /// seconds still counts, so even glacial hunt-and-peck keeps the rainbow
     /// four letters long. (Only a truly isolated keystroke — gap beyond this —
     /// takes no floor and fades crisply.)
-    const NYAN_CHAIN_GAP_MAX: f32 = 5.0;
-    /// …capped just above `NYAN_CHAIN_KEYS × NYAN_CHAIN_GAP_MAX` so the slowest
+    const RAINBOW_CHAIN_GAP_MAX: f32 = 5.0;
+    /// …capped just above `RAINBOW_CHAIN_KEYS × RAINBOW_CHAIN_GAP_MAX` so the slowest
     /// chained rhythm still earns its full four-letter span.
-    const NYAN_CHAIN_LIFE_MAX: f32 = 23.0;
+    const RAINBOW_CHAIN_LIFE_MAX: f32 = 23.0;
     /// FINGER-LIFT ARC: no typing key for this long → the ribbon begins its
     /// exit swoosh (finish reaching four letters, then retract into the cursor).
-    const NYAN_LIFT_GRACE: f32 = 0.75;
+    const RAINBOW_LIFT_GRACE: f32 = 0.75;
     /// One extension cell lights per this step while the exit swoosh finishes
     /// REACHING four letters — extension cells may overlap letters the burst
     /// never typed (accepted by design; the ribbon is additive and capped).
-    const NYAN_REACH_STEP: f32 = 0.05;
+    const RAINBOW_REACH_STEP: f32 = 0.05;
     /// The retract then drains the ribbon tail→head over this long, whatever
     /// its length — a short hop and a hot multi-line comet both slurp cleanly
     /// back into the cursor.
-    const NYAN_RETRACT_DUR: f32 = 0.40;
-    /// Floor on a Nyan typing spark's life so the exit swoosh (grace + reach +
+    const RAINBOW_RETRACT_DUR: f32 = 0.40;
+    /// Floor on a rainbow kitty typing spark's life so the exit swoosh (grace + reach +
     /// retract ≈ 1.30s) always terminates the ribbon before the natural cosine
     /// fade can — the swoosh IS the ending, never a passive dim-out.
-    const NYAN_SWOOSH_LIFE: f32 = 1.55;
+    const RAINBOW_SWOOSH_LIFE: f32 = 1.55;
     /// FADE AS ONE, the ABANDONED ribbon: a jump (or a nav leap) resets the
     /// tail memory, which unhooks the exit swoosh — the drain that normally
     /// ends a ribbon within ~1s of the last key. Retro-clamp the abandoned
     /// typing sparks to at most this much remaining life so the whole old band
     /// fades out on the swoosh's own timescale instead of parking at its
     /// momentum-stretched natural life (up to ~8 s when hot).
-    const NYAN_ABANDON_FADE: f32 = 0.75;
+    const RAINBOW_ABANDON_FADE: f32 = 0.75;
     /// TUI RE-ANCHOR ribbon KEEP window (cells): after a repaint RELOCATES the
     /// caret BACKWARD (the wrap / box-growth shape — see the re-anchor
     /// classifier in [`Self::spawn`]) the landing row has been REWRITTEN, so
@@ -2383,60 +2385,60 @@ impl CursorGlow {
     /// a re-anchor landing beside still-legitimate light (a 3-4 cell fold) can
     /// never punch a hole in it — one less than the four-letter ribbon
     /// guarantee, so a legitimate short fold is never cut.
-    const NYAN_REANCHOR_KEEP: u16 = 3;
+    const RAINBOW_REANCHOR_KEEP: u16 = 3;
     /// …and the stranded light is retired on the FIRE/PHASER off-line timescale
     /// (their `SNUFF`): a visible gutter-out in a beat, never a hard pop, and
-    /// far shorter than [`Self::NYAN_ABANDON_FADE`] — an abandoned band is still
+    /// far shorter than [`Self::RAINBOW_ABANDON_FADE`] — an abandoned band is still
     /// over its own text, this one is over cells the repaint just rewrote.
-    const NYAN_REANCHOR_SNUFF: f32 = 0.18;
-    // ---- Nyan EASED MOMENTUM SPINE (`nyan.disp`) ------------------------------
+    const RAINBOW_REANCHOR_SNUFF: f32 = 0.18;
+    // ---- RAINBOW EASED MOMENTUM SPINE (`rainbow.disp`) ------------------------------
     /// Ribbon-momentum ATTACK ease (seconds to ~63% of a rise): a single key
     /// SWELLS the ribbon over ~100 ms instead of popping its width in one frame.
-    const NYAN_DISP_ATTACK_S: f32 = 0.10;
+    const RAINBOW_DISP_ATTACK_S: f32 = 0.10;
     /// …except a SLAM (a big fling opening a rise > 0.5, e.g. a jump flare): a
     /// fast whoosh so the eruption lands within a couple of frames.
-    const NYAN_DISP_SLAM_S: f32 = 0.08;
+    const RAINBOW_DISP_SLAM_S: f32 = 0.08;
     /// Ribbon-momentum RELEASE τ — the rainbow EXHALES after the last key,
     /// dying down much slower than it swelled: the shimmer/brightness melts
     /// over ~2 s of visible dimming (≈2.5 τ), composing with the slower profile
-    /// tail ([`NYAN_EDGE_OUT`]/[`NYAN_TAIL_MELT_GAMMA`]) into one long exhale.
+    /// tail ([`RAINBOW_EDGE_OUT`]/[`RAINBOW_TAIL_MELT_GAMMA`]) into one long exhale.
     /// An exponential with a 0.005 snap-to-zero, so idle still disarms.
-    const NYAN_DISP_RELEASE_TAU: f32 = 0.85;
-    // ---- Nyan RIBBON IRIDESCENCE (coverage-only, hue/bands stay crisp) --------
+    const RAINBOW_DISP_RELEASE_TAU: f32 = 0.85;
+    // ---- rainbow kitty RIBBON IRIDESCENCE (coverage-only, hue/bands stay crisp) --------
     /// Peak per-cell coverage swing from the two-octave value-noise at FULL
-    /// momentum (±30 %); scales with `nyan.disp`² (the "dynamic range" dial —
-    /// see the shimmer term in `emit_nyan`), so a hot ribbon shimmers distinctly
-    /// harder than a merely warm one and a cold ribbon (`nyan.disp == 0`) stays
+    /// momentum (±30 %); scales with `rainbow.disp`² (the "dynamic range" dial —
+    /// see the shimmer term in `emit_rainbow`), so a hot ribbon shimmers distinctly
+    /// harder than a merely warm one and a cold ribbon (`rainbow.disp == 0`) stays
     /// byte-identical to today's flat crisp rects.
-    const NYAN_IRID_AMP: f32 = 0.30;
+    const RAINBOW_IRID_AMP: f32 = 0.30;
     /// Peak ADDITIVE coverage of the specular GLINT at full momentum (bright
-    /// highlight that sweeps head→tail); scales with `nyan.disp`² and is bounded
-    /// by [`NYAN_OCCUPIED_COV_CAP`] like everything else, so text stays legible.
-    const NYAN_GLINT_COV: f32 = 82.0;
+    /// highlight that sweeps head→tail); scales with `rainbow.disp`² and is bounded
+    /// by [`RAINBOW_OCCUPIED_COV_CAP`] like everything else, so text stays legible.
+    const RAINBOW_GLINT_COV: f32 = 82.0;
     /// Specular glint half-width in ribbon-fraction (u = age/life, 0 head → 1
     /// tail): ~0.14 reads as a localized ~2-cell highlight at a typical ribbon
     /// length.
-    const NYAN_GLINT_WIDTH: f32 = 0.14;
+    const RAINBOW_GLINT_WIDTH: f32 = 0.14;
     /// Specular-phase advance (sweeps/second) at full momentum: the glint takes
     /// ~1/rate seconds to travel head→tail flat-out, and stalls when cold.
-    const NYAN_PHASE_RATE: f32 = 0.85;
+    const RAINBOW_PHASE_RATE: f32 = 0.85;
     /// Momentum hue-rotation amplitude for the ribbon's iridescent SPECTRUM
     /// (turns at full spine): the six anchor hues rotate gently (±~23°) around
     /// the colour wheel as the swing travels along the ribbon, so a hot ribbon
     /// shimmers through neighbouring rainbows (rose-reds, teal-greens,
     /// violet-blues) — the "dynamic range" dial. A cold ribbon keeps the exact
-    /// fixed [`NYAN_BANDS`] bytes (the crisp-flat contract).
-    const NYAN_HUE_SWING: f32 = 0.065;
-    /// Radians of travelling-wave phase per unit of `nyan.phase` (the
+    /// fixed [`RAINBOW_BANDS`] bytes (the crisp-flat contract).
+    const RAINBOW_HUE_SWING: f32 = 0.065;
+    /// Radians of travelling-wave phase per unit of `rainbow.phase` (the
     /// INTEGRATED, momentum-proportional spine clock). Chosen as 2π·1728/1024
     /// so the phase ring's 1024 wrap lands on a whole number of wave cycles —
     /// the undulation never pops at the wrap — for a full-momentum travel rate
-    /// of `NYAN_PHASE_RATE` 0.85 × this ≈ 9 rad/s. The undulation displacement
-    /// MUST come from this integrated spine (`nyan.phase * NYAN_WAVE_RAD`, the
+    /// of `RAINBOW_PHASE_RATE` 0.85 × this ≈ 9 rad/s. The undulation displacement
+    /// MUST come from this integrated spine (`rainbow.phase * RAINBOW_WAVE_RAD`, the
     /// SHARED WAVE CLOCK) and never from a per-spark `age × current-momentum`
     /// product: the latter re-prices each cell's whole age at the falling rate
     /// on cooldown, sliding old cells' phase BACKWARD.
-    const NYAN_WAVE_RAD: f32 = 10.602_875;
+    const RAINBOW_WAVE_RAD: f32 = 10.602_875;
     /// PHASER CONSTANT-DISTANCE STREAK: within a rhythm the fat band's life is
     /// this many observed inter-key gaps (+ margin), so it always spans the
     /// SAME distance at ANY cadence: THREE letters back solidly lit behind the
@@ -2444,7 +2446,7 @@ impl CursorGlow {
     /// gaps of age), the fourth ghosting out.
     const PHASER_CHAIN_KEYS: f32 = 4.5;
     /// The chain window — a REAL typing rhythm only, deliberately much
-    /// tighter than Nyan's: a longer window lets a key typed after a thinking
+    /// tighter than the rainbow kitty's: a longer window lets a key typed after a thinking
     /// pause inherit a multi-second life and park the band over old text. Past
     /// this gap a keystroke is a new burst: base time, then a crisp fade.
     const PHASER_CHAIN_GAP_MAX: f32 = 0.75;
@@ -2468,7 +2470,7 @@ impl CursorGlow {
     const FIRE_HEAD_COV_CAP: f32 = 168.0;
     /// The STRUCTURAL legibility ceiling for the Trail Pack (`Custom`) path — a
     /// NON-configurable per-sample coverage cap set to the proven streaming
-    /// posture (the phaser/nyan text-safety ceiling). Applied inside the custom
+    /// posture (the phaser/rainbow kitty text-safety ceiling). Applied inside the custom
     /// interpreter's sole emission funnels (the beam CometSample builder + the
     /// particle loop) AND to the custom birth coverage, so a pack cannot express
     /// or emit a value that would bury the glyphs beneath it — the "a pack cannot
@@ -2815,7 +2817,7 @@ impl CursorGlow {
         // spend the pending gap credit), per the one-metric law
         // ([`crate::typing_momentum`]). Stamped at the KEY, not the echo, so
         // an echo the shell swallows (start-of-line) still un-earns.
-        self.nyan.momentum.delete(now);
+        self.rainbow.momentum.delete(now);
         self.quench_hint = Some(now);
         // EVERY Backspace licenses the erase POOF (cat-independent). A dedicated
         // hint — not `kill_hint` — so it never borrows the kill hint's
@@ -2851,8 +2853,9 @@ impl CursorGlow {
     /// hosts/tests that never arm it are byte-identical.
     pub fn note_typed(&mut self, now: Instant) {
         self.type_hint = Some(now);
-        self.nyan.type_press_ring[self.nyan.type_press_head] = Some(now);
-        self.nyan.type_press_head = (self.nyan.type_press_head + 1) % Self::NYAN_TYPED_SWEEP_MAX;
+        self.rainbow.type_press_ring[self.rainbow.type_press_head] = Some(now);
+        self.rainbow.type_press_head =
+            (self.rainbow.type_press_head + 1) % Self::RAINBOW_TYPED_SWEEP_MAX;
     }
 
     /// A main-screen ENTER keypress landed — arm the RETURN license (see
@@ -2883,9 +2886,9 @@ impl CursorGlow {
 
     /// How many committed presses landed within the trailing `window`
     /// seconds — the press BUDGET consumed by the anti-stray gates (see
-    /// [`NyanState::type_press_ring`]). Capacity-bounded by the ring; reads only.
+    /// [`RainbowState::type_press_ring`]). Capacity-bounded by the ring; reads only.
     fn typed_presses_within(&self, now: Instant, window: f32) -> usize {
-        self.nyan
+        self.rainbow
             .type_press_ring
             .iter()
             .flatten()
@@ -2948,7 +2951,7 @@ impl CursorGlow {
     /// Ctrl-U/W and word-backspaces leap backward — the nav hint classifies
     /// that move so it lays no fire. A stationary kill (Ctrl-K, Alt-D, forward
     /// Delete) must NOT arm the nav hint or the leaked hint eats the NEXT
-    /// typed glyph's wake, heat, and Nyan momentum (adversarial-review
+    /// typed glyph's wake, heat, and rainbow kitty momentum (adversarial-review
     /// finding).
     pub fn note_kill(&mut self, now: Instant, moves_cursor: bool) {
         self.kill_hint = Some(now);
@@ -2957,21 +2960,21 @@ impl CursorGlow {
         self.coal *= Self::QUENCH_COOL;
         // Canonical metric: a span erased un-earns like ~two deletes (the
         // same escalation the quench above documents) — and never builds.
-        self.nyan.momentum.kill(now);
+        self.rainbow.momentum.kill(now);
         if moves_cursor {
             self.nav_hint = Some(now);
         }
     }
 
     /// THE canonical typing-momentum metric at `now`
-    /// ([`crate::typing_momentum`]) — the one number every Nyan "earned
-    /// drama" consumer keys off (the eased `nyan.disp` spine chases exactly
+    /// ([`crate::typing_momentum`]) — the one number every rainbow kitty "earned
+    /// drama" consumer keys off (the eased `rainbow.disp` spine chases exactly
     /// this). Exposed so hosts/tests can observe the unified metric; the
     /// unified-readers proof (`momentum_unifies_glow_and_cat_metrics`) pins
-    /// it against [`crate::nyan_cursor::CursorCat::momentum`].
+    /// it against [`crate::kitty_cursor::CursorCat::momentum`].
     #[must_use]
     pub fn typing_momentum(&self, now: Instant) -> f32 {
-        self.nyan.momentum.value(now)
+        self.rainbow.momentum.value(now)
     }
 
     /// Read and CLEAR this tick's momentum pulse: `Some(instant)` iff the
@@ -2979,21 +2982,21 @@ impl CursorGlow {
     /// (a real printable keystroke paired with its forward / wrap / coalesced
     /// echo — the exact "earned by real typing only" gate in [`Self::spawn`]).
     /// The host feeds this instant into the cursor cat's own metric
-    /// ([`crate::nyan_cursor::CursorCat::on_key`] with `forward = true`) so the
+    /// ([`crate::kitty_cursor::CursorCat::on_key`] with `forward = true`) so the
     /// cat and the ribbon build momentum from ONE echo-correlated source and
     /// cannot diverge — a key-only, non-echoing keystream (a password prompt,
     /// vim vertical navigation) pulses on neither.
     #[must_use]
     pub fn take_momentum_pulse(&mut self) -> Option<Instant> {
-        self.nyan.momentum_pulse.take()
+        self.rainbow.momentum_pulse.take()
     }
 
-    /// FULL-NYAN SING-ALONG drive (`crate::nyan_sing`): pin the canonical
+    /// SING-ALONG drive (`crate::kitty_sing`): pin the canonical
     /// metric to at least `drive`, called by the host once per frame while a
     /// celebration is live.
     ///
     /// THE MOMENTUM BYPASS (documented, deliberate — the twin of
-    /// [`crate::nyan_cursor::CursorCat::set_singing`]'s): an ARMED held-key
+    /// [`crate::kitty_cursor::CursorCat::set_singing`]'s): an ARMED held-key
     /// celebration IS maximal flow BY DEFINITION, so the metric that was
     /// rate-normalized precisely to stop key-repeat floods from out-earning
     /// typing is driven straight to 1.0 — full ribbon saturation, the
@@ -3001,10 +3004,10 @@ impl CursorGlow {
     /// through the one existing spine (no parallel celebration code path in
     /// the render, so every LEGIBILITY CAP — star wash, occupied-cell
     /// coverage, contrast floors — holds at full drive exactly as it holds
-    /// at genuinely earned full momentum; `full_sing_drive_holds_the_nyan_
-    /// legibility_caps` pins that). During wind-down (`drive < 1`) the floor
-    /// eases down with the crossfade and natural decay takes over — never a
-    /// hard cut. Uses the same `set_value` seam as the collection hello's
+    /// at genuinely earned full momentum;
+    /// `full_sing_drive_holds_the_rainbow_legibility_caps` pins that). During
+    /// wind-down (`drive < 1`) the floor eases down with the crossfade and
+    /// natural decay takes over — never a hard cut. Uses the same `set_value` seam as the collection hello's
     /// "guaranteed visible at full momentum" arm.
     pub fn celebrate(&mut self, now: Instant, drive: f32) {
         let drive = if drive.is_finite() {
@@ -3012,8 +3015,8 @@ impl CursorGlow {
         } else {
             0.0
         };
-        if self.nyan.momentum.value(now) < drive {
-            self.nyan.momentum.set_value(now, drive);
+        if self.rainbow.momentum.value(now) < drive {
+            self.rainbow.momentum.set_value(now, drive);
         }
     }
 
@@ -3125,7 +3128,7 @@ impl CursorGlow {
     /// STAR-LANDING NEIGHBOR PROBE: hand the engine the content of the two
     /// rows FLANKING the probed cursor row, captured under the SAME terminal
     /// lock as [`Self::observe_row`]'s row (same per-column char convention).
-    /// The displaced nyan ribbon stars paint in the pixel bands of the rows
+    /// The displaced rainbow ribbon stars paint in the pixel bands of the rows
     /// above/below the swept row, so the TEXT-FIRST gate must prove the
     /// LANDING cell blank — the spark's own cell says nothing about them.
     ///
@@ -3193,7 +3196,7 @@ impl CursorGlow {
     /// cursor's OWN row? Reads the PREV probe slot (this frame's presented
     /// truth at emit time — see [`Self::probed_cell_glyph`]) and answers
     /// `false` off-row, left of the grid, or past the captured width. The
-    /// shared text-first predicate the flying transients (Nyan star shower,
+    /// shared text-first predicate the flying transients (rainbow kitty star shower,
     /// fire embers, pack dots) key their dimming on — each site keeps its own
     /// dim factor. Deliberately narrower than `probed_cell_glyph`: the
     /// neighbor-row probes are NOT consulted, so an unprobed neighbor row
@@ -3252,7 +3255,7 @@ impl CursorGlow {
     //
     // The five `swap_*` methods below hand the host THIS frame's stream by
     // moving the buffer instead of copying it, exactly like the `out` quad
-    // scratch the host already passes into [`Self::tick`]. A hot Nyan ribbon
+    // scratch the host already passes into [`Self::tick`]. A hot rainbow ribbon
     // at retina metrics carries 6k-14k `GlowQuad` (16 B each — see the pinned
     // bounds in `tests/cursor_bench.rs`), so the copy path rewrites ~100-230 KB
     // per presented frame on top of the identical bytes the emitter just wrote.
@@ -3326,7 +3329,7 @@ impl CursorGlow {
     ///
     /// The GUI scheduler consumes this exact predicate when choosing between
     /// its phase-locked frame train and [`Self::next_change_deadline`]'s coarse
-    /// path, so a visible Nyan tail cannot silently fall into
+    /// path, so a visible rainbow kitty tail cannot silently fall into
     /// `frame cost + interval` cadence.
     ///
     /// A live OUTGOING style crossfade counts: its ~250 ms cosine ramp-down is
@@ -3337,8 +3340,8 @@ impl CursorGlow {
     pub fn needs_frame_cadence(&self) -> bool {
         !self.sparks.is_empty()
             || !self.particles.is_empty()
-            || !self.nyan.jumps.is_empty()
-            || !self.nyan.bursts.is_empty()
+            || !self.rainbow.jumps.is_empty()
+            || !self.rainbow.bursts.is_empty()
             || !self.glide.stars.is_empty()
             || !self.fire_meteors.is_empty()
             || !self.bolts.is_empty()
@@ -3347,9 +3350,9 @@ impl CursorGlow {
             || !self.fading.is_empty()
             // A live FRESH-INK pop is brisk light (its spring + ease-out move
             // every frame): keep the phase-locked train armed until the ring
-            // drains — in practice the Nyan sparks born beside every pop
+            // drains — in practice the rainbow kitty sparks born beside every pop
             // outlive it, but the pop's cadence must not depend on that.
-            || !self.nyan.ink_pops.is_empty()
+            || !self.rainbow.ink_pops.is_empty()
     }
 
     /// RESPONSIVENESS: when the NEXT visible change is due, so the host can pace
@@ -3395,7 +3398,7 @@ impl CursorGlow {
     /// Wipe every piece of TRANSIENT state: the in-flight light (sparks,
     /// particles, streaks, bursts, the whole glide-star family, meteors,
     /// vapor, bolts, ring, crossfades), the pending sound + keyed-click
-    /// credits, ALL EIGHT input hints, the row probes, and the Nyan
+    /// credits, ALL EIGHT input hints, the row probes, and the rainbow kitty
     /// tail/pop/wake machinery. The ONE teardown all three dark/reset paths
     /// compose from — never hand-maintained lists at the call sites, which drift
     /// and leave a disabled engine reporting live light or a stale hint alive to
@@ -3412,7 +3415,7 @@ impl CursorGlow {
         self.clear_keyed_clicks();
         self.sparks.clear();
         self.particles.clear();
-        self.nyan.clear_transient();
+        self.rainbow.clear_transient();
         self.glide.clear();
         self.fire_meteors.clear();
         self.vapor.clear();
@@ -3437,7 +3440,7 @@ impl CursorGlow {
     }
 
     /// Zero the THERMAL integrators (heat / flare / coal / quench, the eased
-    /// display temperatures, the Nyan momentum spine, the flame + specular
+    /// display temperatures, the rainbow kitty momentum spine, the flame + specular
     /// phases, the typing cadence clock) — the full-dark half that master-off
     /// and [`Self::reset`] add on top of [`Self::clear_transient_state`]. The
     /// zero-amplitude path deliberately does NOT call this: a momentary
@@ -3452,7 +3455,7 @@ impl CursorGlow {
         self.disp_t = 0.0;
         self.cursor_temp = 0.0;
         self.flame_phase = 0.0;
-        self.nyan.clear_thermals();
+        self.rainbow.clear_thermals();
         self.last_type = None;
     }
 
@@ -3499,7 +3502,7 @@ impl CursorGlow {
         self.fire_halo_out.clear();
         // The momentum pulse is a per-tick signal: clear it up front so the
         // host reads only THIS tick's correlated advance (set in `spawn`).
-        self.nyan.momentum_pulse = None;
+        self.rainbow.momentum_pulse = None;
         // GENUINE OFF (the master switch) or a degenerate geometry: full zero —
         // the whole struct returns to rest (idle-zero). A momentary UNFOCUS is
         // NOT wiped here: it arrives as `intensity <= 0` (the motion amplitude)
@@ -3629,7 +3632,7 @@ impl CursorGlow {
                 }
                 // The flame field's clock: integrate churn-weighted time so
                 // the fire's motion accelerates smoothly with its temperature.
-                // Wrap on a bounded ring (like `nyan.phase`) so a multi-day
+                // Wrap on a bounded ring (like `rainbow.phase`) so a multi-day
                 // session can't let f32 ULP overtake the increment (freeze) or
                 // saturate the field's `* 1024.0 as u32` cast — see FLAME_PHASE_RING.
                 self.flame_phase += dt * (1.6 + 2.2 * self.disp_t);
@@ -3653,10 +3656,10 @@ impl CursorGlow {
                 } else {
                     self.cursor_temp = 0.0;
                 }
-                // Nyan's EASED MOMENTUM SPINE + specular phase (Nyan only; a
+                // the rainbow kitty's EASED MOMENTUM SPINE + specular phase (rainbow kitty only; a
                 // handful of flops leave 0 → 0 for every other style, so their
                 // ribbon/beam stays byte-identical). The spine chases THE
-                // CANONICAL typing-momentum metric — see the `nyan.disp` field
+                // CANONICAL typing-momentum metric — see the `rainbow.disp` field
                 // doc for why heat/flare must not feed it — with a short
                 // attack, a slam for a rare big rise (`on_collect`-style
                 // seeding), and a slower cinematic release, so the whole
@@ -3664,34 +3667,34 @@ impl CursorGlow {
                 // The phase integrates at a rate PROPORTIONAL to the spine,
                 // driving the iridescence scroll and the head→tail specular
                 // glint sweep.
-                if matches!(cfg.style, GlowStyle::Nyan) {
-                    let target = self.nyan.momentum.value(now).clamp(0.0, 1.0);
-                    let rise = target - self.nyan.disp;
+                if matches!(cfg.style, GlowStyle::RainbowKitty) {
+                    let target = self.rainbow.momentum.value(now).clamp(0.0, 1.0);
+                    let rise = target - self.rainbow.disp;
                     let ease = if rise > 0.5 {
-                        Self::NYAN_DISP_SLAM_S
+                        Self::RAINBOW_DISP_SLAM_S
                     } else if rise > 0.0 {
-                        Self::NYAN_DISP_ATTACK_S
+                        Self::RAINBOW_DISP_ATTACK_S
                     } else {
-                        Self::NYAN_DISP_RELEASE_TAU
+                        Self::RAINBOW_DISP_RELEASE_TAU
                     };
-                    self.nyan.disp += rise * (1.0 - (-dt / ease).exp());
-                    if self.nyan.disp < 0.005 {
-                        self.nyan.disp = 0.0;
+                    self.rainbow.disp += rise * (1.0 - (-dt / ease).exp());
+                    if self.rainbow.disp < 0.005 {
+                        self.rainbow.disp = 0.0;
                     }
                     // FAST-GLIDE VELOCITY release: the spine attacks toward the
                     // instantaneous cells/sec in `spawn` and DECAYS here on a fast
                     // τ, so a paused cursor drops it under GLIDE_VEL_MIN within a
                     // beat and the shooting star stops (snap to 0 near the floor
-                    // so an idle Nyan engine holds nothing live).
+                    // so an idle rainbow kitty engine holds nothing live).
                     self.glide.vel *= (-dt / Self::GLIDE_VEL_DECAY_TAU).exp();
                     if self.glide.vel < 0.5 {
                         self.glide.vel = 0.0;
                     }
                     // Advance on a bounded ring (emitters read `fract`), so a long
                     // session can't bleed fp precision; frozen when cold.
-                    self.nyan.phase += dt * Self::NYAN_PHASE_RATE * self.nyan.disp;
-                    if self.nyan.phase >= 1024.0 {
-                        self.nyan.phase -= 1024.0;
+                    self.rainbow.phase += dt * Self::RAINBOW_PHASE_RATE * self.rainbow.disp;
+                    if self.rainbow.phase >= 1024.0 {
+                        self.rainbow.phase -= 1024.0;
                     }
                 }
             }
@@ -3799,11 +3802,11 @@ impl CursorGlow {
         if let Some(c) = cur {
             self.last_visible = Some((c, now));
         }
-        // The TYPING WAKE's sub-cell nozzle (Nyan only — every other style's
+        // The TYPING WAKE's sub-cell nozzle (rainbow kitty only — every other style's
         // state and emission stay byte-identical). Three float ops; the plume it
         // anchors is only ever emitted while the pop ring is non-empty, so a
         // window nobody is typing in pays for the ease and nothing else.
-        if matches!(cfg.style, GlowStyle::Nyan) {
+        if matches!(cfg.style, GlowStyle::RainbowKitty) {
             self.advance_wake_head(cur, now);
         }
 
@@ -3820,8 +3823,8 @@ impl CursorGlow {
         // as a smear behind the cursor.
         self.sparks
             .retain(|s| now.saturating_duration_since(s.born).as_secs_f32() < s.life);
-        let spark_cap = if matches!(cfg.style, GlowStyle::Nyan) {
-            Self::NYAN_MAX_CELLS
+        let spark_cap = if matches!(cfg.style, GlowStyle::RainbowKitty) {
+            Self::RAINBOW_MAX_CELLS
         } else {
             Self::MAX_SPARKS
         };
@@ -3833,15 +3836,15 @@ impl CursorGlow {
             .retain(|p| now.saturating_duration_since(p.born).as_secs_f32() < p.life);
         // FRESH-INK pops decay to EXACTLY empty on their fixed life (the
         // `is_empty` gate keeps the idle path at one Vec-len read).
-        if !self.nyan.ink_pops.is_empty() {
-            self.nyan
+        if !self.rainbow.ink_pops.is_empty() {
+            self.rainbow
                 .ink_pops
                 .retain(|p| now.saturating_duration_since(p.born).as_secs_f32() < FRESH_INK_LIFE_S);
         }
-        self.nyan
+        self.rainbow
             .jumps
             .retain(|j| now.saturating_duration_since(j.born).as_secs_f32() < j.life);
-        self.nyan
+        self.rainbow
             .bursts
             .retain(|b| now.saturating_duration_since(b.born).as_secs_f32() < b.life);
         self.glide
@@ -3849,7 +3852,7 @@ impl CursorGlow {
             .retain(|g| now.saturating_duration_since(g.born).as_secs_f32() < g.life);
         // FAST-GLIDE LANDING (owner: "The landing should be a starburst of
         // color like the cursor with sparkles aligned with the stars that
-        // appear when I'm typing in nyan mode"). A run ENDS when it goes quiet
+        // appear when I'm typing in rainbow-kitty mode"). A run ENDS when it goes quiet
         // — no qualifying glide move for `GLIDE_LAND_QUIET` — so the burst
         // fires ONCE, at the last head the run reached: not per frame, not per
         // move. There is no single move that IS the landing, so the run's end
@@ -3860,7 +3863,7 @@ impl CursorGlow {
         // light-theme fork are all inherited; `sparkles > 0` is the only
         // difference, and every jump burst carries 0 (so the shipped jump
         // landing stays byte-identical).
-        if matches!(cfg.style, GlowStyle::Nyan)
+        if matches!(cfg.style, GlowStyle::RainbowKitty)
             && let (Some(land_at), Some((hx, hy))) = (self.glide.land_at, self.glide.head)
             && now.saturating_duration_since(land_at).as_secs_f32() >= Self::GLIDE_LAND_QUIET
         {
@@ -3868,11 +3871,11 @@ impl CursorGlow {
             self.glide.head = None;
             self.glide.run = 0;
             self.glide.dir = (0, 0);
-            if self.nyan.bursts.len() >= Self::NYAN_BURST_CAP {
-                self.nyan.bursts.remove(0);
+            if self.rainbow.bursts.len() >= Self::RAINBOW_BURST_CAP {
+                self.rainbow.bursts.remove(0);
             }
             let seed = self.frand();
-            self.nyan.bursts.push(Starburst {
+            self.rainbow.bursts.push(Starburst {
                 cx: hx,
                 cy: hy,
                 born: now,
@@ -3962,10 +3965,10 @@ impl CursorGlow {
             self.crown_until = None;
         }
 
-        // NYAN exit swoosh: once the finger lifts, the ribbon finishes reaching
+        // RAINBOW KITTY exit swoosh: once the finger lifts, the ribbon finishes reaching
         // four letters, then retracts tail→head into the cursor.
-        if matches!(cfg.style, GlowStyle::Nyan) {
-            self.nyan_exit_swoosh(now, geom);
+        if matches!(cfg.style, GlowStyle::RainbowKitty) {
+            self.rainbow_exit_swoosh(now, geom);
         }
 
         // ---- emit the light layers ----
@@ -3975,7 +3978,7 @@ impl CursorGlow {
         let mut halos = std::mem::take(&mut self.halo_out);
         let mut patches = std::mem::take(&mut self.patch_out);
         // `under_out` (the glow_under stream, composited BENEATH the glyph ink)
-        // carries the Nyan ribbon body + jump ZOOMs, so freshly typed letters
+        // carries the rainbow ribbon body + jump ZOOMs, so freshly typed letters
         // draw OVER the rainbow at full contrast. (The fire's flame body left
         // this stream for the per-pixel `patch_out` field; the stream itself —
         // pipeline splice, both renderers' under pass, fp fold — stayed live.)
@@ -4001,7 +4004,7 @@ impl CursorGlow {
             out.truncate(Self::MAX_QUADS);
         } else {
             self.emit_bolts(now, cfg, geom, out, &mut bolt_verts);
-            // No-op for Water/Nyan (beam=false); on light themes the beam family
+            // No-op for Water/rainbow kitty (beam=false); on light themes the beam family
             // emits source-over veil halos instead of additive quads.
             self.emit_comet(now, cfg, geom, cur, out, &mut halos);
             out.truncate(Self::MAX_QUADS);
@@ -4028,20 +4031,20 @@ impl CursorGlow {
             if out.len() < Self::MAX_QUADS {
                 self.emit_water(now, cfg, geom, cur, out); // the dedicated fluid wake (Water only)
             }
-            // Jump ZOOMs FIRST — the bolts-first rule above, applied to Nyan: a
+            // Jump ZOOMs FIRST — the bolts-first rule above, applied to rainbow kitty: a
             // hot key-repeat ribbon can fill the whole quad budget by itself, and
             // the ZOOM streak is the star of a jump (the responsive read), so
-            // truncation must shed the ribbon's tail — which `emit_nyan` already
+            // truncation must shed the ribbon's tail — which `emit_rainbow` already
             // sheds oldest-last via its newest-first iteration — never the streak.
             // Additive premultiplied light is order-independent, so unsaturated
             // frames composite identically either way.
             if under.len() < Self::MAX_QUADS {
-                // jump ZOOM streaks (Nyan only): DARK fills the additive banded
+                // jump ZOOM streaks (rainbow kitty only): DARK fills the additive banded
                 // beam into `under`; LIGHT writes a darkened rainbow source-over
                 // streak into `halos` (additive light is invisible on white).
-                self.emit_nyan_jumps(now, cfg, geom, &mut under, &mut halos);
+                self.emit_rainbow_jumps(now, cfg, geom, &mut under, &mut halos);
             }
-            // LANDING STARBURST (Nyan only): the scattered rainbow
+            // LANDING STARBURST (rainbow kitty only): the scattered rainbow
             // stars scattered at the landing, ADDITIONAL to the ZOOM streak
             // above and the landing ring/particles below (all still fire). DARK
             // fills solid stars into `out` (over-ink, coverage-capped) so they
@@ -4049,24 +4052,24 @@ impl CursorGlow {
             // source-over veil dots into `halos` instead. Load-shed drops them
             // when the budget is spent.
             if out.len() < Self::MAX_QUADS {
-                self.emit_nyan_starburst(now, cfg, geom, out, &mut halos);
+                self.emit_rainbow_starburst(now, cfg, geom, out, &mut halos);
             }
-            // FAST-GLIDE rainbow shooting stars (Nyan only): the directional
+            // FAST-GLIDE rainbow shooting stars (rainbow kitty only): the directional
             // velocity-triggered streak fired on sustained fast cursor motion.
             // DARK draws the additive comet_beam rainbow tail + white head into
             // `out`; LIGHT writes a darkened source-over rainbow streak into
             // `halos`. Load-shed drops them when the budget is spent.
             if out.len() < Self::MAX_QUADS {
-                self.emit_nyan_glide_stars(now, cfg, geom, out, &mut halos);
+                self.emit_rainbow_glide_stars(now, cfg, geom, out, &mut halos);
             }
             if under.len() < Self::MAX_QUADS || out.len() < Self::MAX_QUADS {
-                // the banded rainbow ribbon (Nyan only), emitted into the UNDER-INK
+                // the banded rainbow ribbon (rainbow kitty only), emitted into the UNDER-INK
                 // stream so typed glyphs draw over the rainbow; its starfield stays
                 // in `out` (over-ink, probed off glyph cells) and on a LIGHT theme
                 // the body renders as source-over veil rails into `halos` instead.
-                self.emit_nyan(now, cfg, geom, &mut under, out, &mut halos);
+                self.emit_rainbow(now, cfg, geom, &mut under, out, &mut halos);
             }
-            // FRESH-INK pops (Nyan only): pure RADIAL light OVER the glyph
+            // FRESH-INK pops (rainbow kitty only): pure RADIAL light OVER the glyph
             // pass. Emitted BEFORE the crown/vapor halos, so under a saturated
             // halo budget (truncation keeps the FIRST entries) the newest
             // letters' highlight — the responsive read — sheds last. No
@@ -4078,7 +4081,7 @@ impl CursorGlow {
             // the pop above is the bounded highlight ON the letter, this is the
             // exhaust BELOW the line — so they compose without either washing
             // the text. Its walk consults the GlowQuad budget itself.
-            self.emit_nyan_wake(now, cfg, geom, out, &mut halos);
+            self.emit_rainbow_wake(now, cfg, geom, out, &mut halos);
             // The crown is pure RADIAL light (RainHalo) now — no GlowQuad budget to
             // guard, and its own MAX_HALOS cap bounds it — so it always runs.
             self.emit_crown(now, cfg, geom, cur, &mut halos);
@@ -4272,12 +4275,12 @@ impl CursorGlow {
         // the incoming style with empty collections (plus carried warmth).
         ghost.sparks = std::mem::take(&mut self.sparks);
         ghost.particles = std::mem::take(&mut self.particles);
-        ghost.nyan.jumps = std::mem::take(&mut self.nyan.jumps);
+        ghost.rainbow.jumps = std::mem::take(&mut self.rainbow.jumps);
         // The landing starburst is forged light like the ZOOM streak: it finishes
         // its bloom under the OUTGOING (rainbow) config in the ghost — the
         // incoming style never births one, so re-judging it there would hard-cut
         // it mid-bloom.
-        ghost.nyan.bursts = std::mem::take(&mut self.nyan.bursts);
+        ghost.rainbow.bursts = std::mem::take(&mut self.rainbow.bursts);
         // The fast-glide stars are forged light like the ZOOM streak: they finish
         // their brisk streak under the OUTGOING (rainbow) config in the ghost —
         // the incoming style never births one.
@@ -4291,13 +4294,13 @@ impl CursorGlow {
         ghost.crown_window_ms = self.crown_window_ms;
         ghost.last_move = self.last_move;
         ghost.last_smoke = self.last_smoke.take();
-        ghost.nyan.tail = std::mem::take(&mut self.nyan.tail);
-        ghost.nyan.retract = self.nyan.retract.take();
+        ghost.rainbow.tail = std::mem::take(&mut self.rainbow.tail);
+        ghost.rainbow.retract = self.rainbow.retract.take();
         // Fresh-ink pops are forged light exactly like the sparks: they finish
         // fading under the OUTGOING (rainbow) config in the ghost — re-judging
         // them under the incoming style would either drop them mid-pop (a hard
         // cut) or render them through a style that never births pops.
-        ghost.nyan.ink_pops = std::mem::take(&mut self.nyan.ink_pops);
+        ghost.rainbow.ink_pops = std::mem::take(&mut self.rainbow.ink_pops);
         ghost.reduced_motion = self.reduced_motion;
         // COPY the thermal/phase scalars: the residue keeps rendering at the
         // warmth it was forged with, while the live engine KEEPS heat / flare /
@@ -4312,14 +4315,14 @@ impl CursorGlow {
         ghost.disp_t = self.disp_t;
         ghost.cursor_temp = self.cursor_temp;
         ghost.flame_phase = self.flame_phase;
-        ghost.nyan.disp = self.nyan.disp;
+        ghost.rainbow.disp = self.rainbow.disp;
         // The canonical metric is carried warmth exactly like `heat`: the
         // ghost's frozen copy keeps its residue rendering at the momentum it
         // was forged with, and the LIVE engine keeps its own copy so a
-        // mid-typing switch into Nyan re-attacks the spine toward the earned
+        // mid-typing switch into rainbow kitty re-attacks the spine toward the earned
         // value instead of restarting the earn from zero.
-        ghost.nyan.momentum = self.nyan.momentum;
-        ghost.nyan.phase = self.nyan.phase;
+        ghost.rainbow.momentum = self.rainbow.momentum;
+        ghost.rainbow.phase = self.rainbow.phase;
         ghost.hue = self.hue;
         ghost.rng = self.rng;
         // The ghost's anchor: `tick_fades` feeds this SAME cell as `cur`
@@ -4337,8 +4340,8 @@ impl CursorGlow {
         // the copies above): a fresh flame field / ribbon spine attacks from 0
         // over ~100 ms — the built-in half of the ramp-in.
         self.flame_phase = 0.0;
-        self.nyan.disp = 0.0;
-        self.nyan.phase = 0.0;
+        self.rainbow.disp = 0.0;
+        self.rainbow.phase = 0.0;
         self.glide.vel = 0.0;
         // CLASSIFIER state, not forged light: the ghost already takes
         // `glide.stars`/`glide.vel`'s visible output, but a stale run direction
@@ -4432,13 +4435,13 @@ impl CursorGlow {
 
     // ----- spawning -----
 
-    /// Advance the TYPING WAKE's sub-cell nozzle one frame (Nyan only; see
-    /// [`NyanState::wake_head`]). Exponential ease on [`NYAN_WAKE_HEAD_TAU`] toward
+    /// Advance the TYPING WAKE's sub-cell nozzle one frame (rainbow kitty only; see
+    /// [`RainbowState::wake_head`]). Exponential ease on [`RAINBOW_WAKE_HEAD_TAU`] toward
     /// the live cursor column, so the plume's anchor slides across the cell over
     /// several frames instead of jumping a whole cell per keystroke.
     ///
     /// Three deliberate discontinuities, all of them "this is not typing":
-    /// a ROW change, a delta beyond [`NYAN_WAKE_SNAP_CELLS`] (a real jump, a
+    /// a ROW change, a delta beyond [`RAINBOW_WAKE_SNAP_CELLS`] (a real jump, a
     /// wrap, `Ctrl-A`), and a missing previous stamp (fresh engine, resumed
     /// clock) all SNAP. Everything else eases. `dt` is clamped like every other
     /// integrator here so a background-stalled window cannot fling the nozzle,
@@ -4446,28 +4449,30 @@ impl CursorGlow {
     /// hundredth of a cell — so a settled wake is bit-stable frame over frame
     /// and the idle fingerprint can reach zero.
     ///
-    /// Cost: three float ops and one compare per frame, on the Nyan style only.
+    /// Cost: three float ops and one compare per frame, on the rainbow-kitty style only.
     fn advance_wake_head(&mut self, cur: Option<(u16, u16)>, now: Instant) {
         let Some((cr, cc)) = cur else {
             // A hidden cursor (the ConPTY echo bridge) must not move or reseed
             // the nozzle: hold it and keep the clock current so the next visible
             // frame eases by one frame's worth, not by the whole blind window.
-            self.nyan.wake_at = Some(now);
+            self.rainbow.wake_at = Some(now);
             return;
         };
         let target = cc as f32;
         let dt = self
-            .nyan
+            .rainbow
             .wake_at
             .map(|t| now.saturating_duration_since(t).as_secs_f32())
             .unwrap_or(0.0)
             .min(Self::WAKE_MAX_DT);
-        self.nyan.wake_at = Some(now);
-        match self.nyan.wake_head {
-            Some((r, x)) if r == cr && (target - x).abs() <= NYAN_WAKE_SNAP_CELLS && dt > 0.0 => {
-                let k = 1.0 - (-dt / NYAN_WAKE_HEAD_TAU).exp();
+        self.rainbow.wake_at = Some(now);
+        match self.rainbow.wake_head {
+            Some((r, x))
+                if r == cr && (target - x).abs() <= RAINBOW_WAKE_SNAP_CELLS && dt > 0.0 =>
+            {
+                let k = 1.0 - (-dt / RAINBOW_WAKE_HEAD_TAU).exp();
                 let next = x + (target - x) * k;
-                self.nyan.wake_head = Some((
+                self.rainbow.wake_head = Some((
                     cr,
                     if (target - next).abs() < 0.01 {
                         target // latch: a settled nozzle is bit-stable
@@ -4476,7 +4481,7 @@ impl CursorGlow {
                     },
                 ));
             }
-            _ => self.nyan.wake_head = Some((cr, target)),
+            _ => self.rainbow.wake_head = Some((cr, target)),
         }
     }
 
@@ -4489,14 +4494,16 @@ impl CursorGlow {
     /// one the eye is on. The momentum spine is frozen at birth so a pop never
     /// re-prices mid-fade as the spine cools.
     fn born_ink_pop(&mut self, row: u16, col: u16, now: Instant) {
-        self.nyan.ink_pops.retain(|p| p.row != row || p.col != col);
-        if self.nyan.ink_pops.len() >= FRESH_INK_CAP {
-            self.nyan.ink_pops.remove(0);
+        self.rainbow
+            .ink_pops
+            .retain(|p| p.row != row || p.col != col);
+        if self.rainbow.ink_pops.len() >= FRESH_INK_CAP {
+            self.rainbow.ink_pops.remove(0);
         }
-        self.nyan.ink_pops.push(InkPop {
+        self.rainbow.ink_pops.push(InkPop {
             row,
             col,
-            mom: self.nyan.disp,
+            mom: self.rainbow.disp,
             born: now,
         });
     }
@@ -4531,11 +4538,11 @@ impl CursorGlow {
         } else {
             0.07
         };
-        // Nyan JUMP classification: any row change (wrap / Enter / a vertical
+        // Rainbow kitty JUMP classification: any row change (wrap / Enter / a vertical
         // move) or a big same-row skip gets the linear ZOOM streak — one clean
         // beam along the jump vector — instead of per-cell sparks (which read as
         // disjoint row segments).
-        let nyan = matches!(cfg.style, GlowStyle::Nyan);
+        let rainbow_kitty = matches!(cfg.style, GlowStyle::RainbowKitty);
         // THE RESIZE LICENSE, consumed ONCE per spawn for EVERY style (owner,
         // 2026-07-28: "all get"). `spawn` runs only on an observed move, and the
         // first move after a settled resize IS the relayout relocation, so this
@@ -4543,7 +4550,7 @@ impl CursorGlow {
         // streak no matter which style is drawing it.
         //
         // Two arms read it, because two styles refuse a cold relayout leap for
-        // their own reasons: Nyan's ZOOM is momentum-gated (the anti-stray law)
+        // their own reasons: the rainbow kitty's ZOOM is momentum-gated (the anti-stray law)
         // and Phaser CLEARS its swept path on any row change ("the band belongs
         // to typed letters only"). Every other style's jump path is already
         // ungated and needs no license. It also suppresses the landing payload —
@@ -4554,7 +4561,7 @@ impl CursorGlow {
             .is_some();
         self.track_glide_run(&mv);
         // FADE AS ONE: a spark's chained life is a BET that the rhythm that
-        // granted it continues. Nyan: a lone key after a long pause bets on a
+        // granted it continues. Rainbow kitty: a lone key after a long pause bets on a
         // glacial rhythm and takes a 12-23s life; if a faster burst then buries
         // it, that far-back cell would sit parked at constant brightness long
         // after the ribbon faded. Phaser/Beam: the FIRST key of a burst
@@ -4566,12 +4573,12 @@ impl CursorGlow {
         // untouched), while a rhythm that speeds up voids the stale long lives
         // so the whole ribbon/band fades as one. The phaser three-letter heal
         // below re-extends the near tail, so the band still spans its promised
-        // letters and only the stale far tail fades in cadence order. Nyan
+        // letters and only the stale far tail fades in cadence order. Rainbow kitty
         // clamps at ANY typing gap; phaser/beam only inside the chain window,
         // so their lone keystroke stays untouched. The style guards are
         // mutually exclusive, so one guarded loop serves both.
         if mv.typing
-            && (nyan
+            && (rainbow_kitty
                 || (matches!(cfg.style, GlowStyle::Phaser | GlowStyle::Beam)
                     && gap <= Self::PHASER_CHAIN_GAP_MAX))
         {
@@ -4610,7 +4617,7 @@ impl CursorGlow {
         self.spawn_landing_ring(&mv, fire_meteor);
         self.spawn_burst_particles(&mv, fire_meteor);
         self.spawn_pack_particles(&mv, fire_meteor);
-        self.spawn_nyan_star_shower(&mv);
+        self.spawn_rainbow_star_shower(&mv);
         if self.particles.len() > Self::MAX_PARTICLES {
             let drop = self.particles.len() - Self::MAX_PARTICLES;
             self.particles.drain(0..drop);
@@ -4641,15 +4648,15 @@ impl CursorGlow {
         let dr_abs = (cr as i32 - pr as i32).abs();
         let dc_abs = (cc as i32 - pc as i32).abs();
         let raw_dist = dr_abs.max(dc_abs) as f32;
-        // FAST-GLIDE VELOCITY SPINE (Nyan): a time-normalized cells/sec speed,
+        // FAST-GLIDE VELOCITY SPINE (rainbow kitty): a time-normalized cells/sec speed,
         // EMA-attacked here on each observed move (`raw_dist / (now − last_move)`,
         // where `last_move` is still the PREVIOUS move's clock — the caller stamps
         // it AFTER `spawn` returns) and decayed in the lazy block, so it RAMPS
-        // over consecutive fast frames and falls fast once motion stops. Nyan-only
+        // over consecutive fast frames and falls fast once motion stops. Rainbow-kitty-only
         // (no other style reads it → their output is byte-identical). NON-FINITE
         // HARDENED: no prior-move clock, a zero/negative interval, or a non-finite
         // ratio leaves the spine untouched — never inf/NaN into the field.
-        if matches!(cfg.style, GlowStyle::Nyan)
+        if matches!(cfg.style, GlowStyle::RainbowKitty)
             && let Some(t_prev) = self.last_move
         {
             let dtv = now.saturating_duration_since(t_prev).as_secs_f32();
@@ -4740,12 +4747,12 @@ impl CursorGlow {
         // classifying it as a jump slams the flare, fires the ring, and lays
         // long-lived jump sparks between short-lived typing sparks — a "picket
         // fence" burst trail. The swept cells are laid as
-        // per-key typing sparks below, so no typed cell is skipped. NYAN is
-        // EXCLUDED — its own `nyan_coalesce` classifier (below) owns the
-        // rainbow coalesce, so a 2-3 cell nyan echo is never double-classified,
-        // and the `!echo_run` re-anchor veto stays a phaser/non-nyan concern
-        // (nyan re-anchors exactly as origin intended, its path prioritising
-        // `nyan_coalesce`'s swept cells).
+        // per-key typing sparks below, so no typed cell is skipped. RAINBOW KITTY is
+        // EXCLUDED — its own `rainbow_coalesce` classifier (below) owns the
+        // rainbow coalesce, so a 2-3 cell rainbow echo is never double-classified,
+        // and the `!echo_run` re-anchor veto stays a phaser/non-rainbow-kitty concern
+        // (rainbow-kitty re-anchors exactly as origin intended, its path prioritising
+        // `rainbow_coalesce`'s swept cells).
         // Reach: the SHARED typed-bridge law (8 cells — `HIDE_BRIDGE_TYPED_MAX_DIST`),
         // not a private 3. A 4-8 cell typed advance in one observed frame is routine
         // under coalesced echo (key-repeat across a frame slip, SSH batching); a
@@ -4753,7 +4760,7 @@ impl CursorGlow {
         // a multi-cell dark notch splitting the band.
         let echo_run = typed_pair
             && !nav_paired
-            && !matches!(cfg.style, GlowStyle::Nyan)
+            && !matches!(cfg.style, GlowStyle::RainbowKitty)
             && cr == pr
             && cc > pc
             && cc - pc <= crate::cursor_trail::HIDE_BRIDGE_TYPED_MAX_DIST
@@ -4765,7 +4772,7 @@ impl CursorGlow {
             && raw_dist > 2.0
             && (!self.ctx_alt || blink_fresh);
         let wrap = shape_wrap || re_anchor;
-        // NYAN TYPED-COALESCE: a same-row FORWARD hop of 2..=NYAN_TYPED_SWEEP_MAX
+        // RAINBOW KITTY TYPED-COALESCE: a same-row FORWARD hop of 2..=RAINBOW_TYPED_SWEEP_MAX
         // cells backed by a fresh typed echo is CONTINUED TYPING observed late —
         // PTY batching / frame quantization delivers several echoed glyphs as one
         // observed move — not a jump. It collapses `dist` exactly like a wrap, so
@@ -4776,14 +4783,14 @@ impl CursorGlow {
         // discriminator: vim's hinted word-hops are deliberate jumps, only a
         // repaint-blinking app (Claude Code) coalesces. Other styles keep their
         // shipped classification byte-identically.
-        let nyan_coalesce = matches!(cfg.style, GlowStyle::Nyan)
+        let rainbow_coalesce = matches!(cfg.style, GlowStyle::RainbowKitty)
             && typed_pair
             && !bs_pair
             && !nav_paired
             && cr == pr
             && cc > pc
             && dc_abs >= 2
-            && dc_abs as usize <= Self::NYAN_TYPED_SWEEP_MAX
+            && dc_abs as usize <= Self::RAINBOW_TYPED_SWEEP_MAX
             && (!self.ctx_alt || blink_fresh)
             // PRESS BUDGET (anti-stray): N swept cells must be
             // backed by ≥N recent presses — batched echoes really deliver N
@@ -4792,13 +4799,13 @@ impl CursorGlow {
             // read as blink_fresh, defeating the alt-screen discriminator
             // alone). One press must never paint a ribbon over a word the
             // user only skimmed.
-            && self.typed_presses_within(now, Self::NYAN_COALESCE_PRESS_WINDOW)
+            && self.typed_presses_within(now, Self::RAINBOW_COALESCE_PRESS_WINDOW)
                 >= dc_abs as usize;
-        // Honour BOTH coalesce paths: `nyan_coalesce` collapses a late-observed
-        // NYAN rainbow echo, `echo_run` the same for PHASER/non-nyan (they are
-        // mutually exclusive by style — `echo_run` excludes nyan), and `wrap`
+        // Honour BOTH coalesce paths: `rainbow_coalesce` collapses a late-observed
+        // RAINBOW KITTY rainbow echo, `echo_run` the same for PHASER/non-rainbow-kitty (they are
+        // mutually exclusive by style — `echo_run` excludes rainbow kitty), and `wrap`
         // the fold/re-anchor. Any of the three classifies the move as typing.
-        let dist = if wrap || nyan_coalesce || echo_run {
+        let dist = if wrap || rainbow_coalesce || echo_run {
             1.0
         } else {
             raw_dist
@@ -4825,10 +4832,10 @@ impl CursorGlow {
         // cell from the landing to the old caret) — a pop must die WITH its
         // ink, instantly, or the warm highlight hangs over an empty cell
         // advertising the letter that was just deleted. `col >= cc` covers the
-        // coalesced run in one pass; the `is_empty` gate keeps every non-Nyan
+        // coalesced run in one pass; the `is_empty` gate keeps every non-rainbow-kitty
         // (and idle) deletion at a single Vec-len read.
-        if deletion && !self.nyan.ink_pops.is_empty() {
-            self.nyan.ink_pops.retain(|p| p.row != cr || p.col < cc);
+        if deletion && !self.rainbow.ink_pops.is_empty() {
+            self.rainbow.ink_pops.retain(|p| p.row != cr || p.col < cc);
         }
         // NAVIGATION classification (responsiveness): a same-row cursor move
         // paired with a fresh navigation key-hint ([`Self::note_navigation`] —
@@ -4864,7 +4871,7 @@ impl CursorGlow {
             echo_run,
             re_anchor,
             wrap,
-            nyan_coalesce,
+            rainbow_coalesce,
             dist,
             typing,
             fire,
@@ -4886,7 +4893,7 @@ impl CursorGlow {
             cfg,
             geom,
             wrap,
-            nyan_coalesce,
+            rainbow_coalesce,
             typing,
             fire,
             forward,
@@ -4939,8 +4946,8 @@ impl CursorGlow {
             // normalization lives inside [`TypingMomentum::advance`], so a
             // coalesced 3-glyph echo credits its one observed gap — key count
             // never buys momentum. Style-independent on purpose (a mid-run
-            // style switch to Nyan arrives with its earned warmth); only the
-            // Nyan spine consumes it today.
+            // style switch to rainbow kitty arrives with its earned warmth); only the
+            // Rainbow kitty spine consumes it today.
             //
             // TYPED CORRELATION (`typed_pair`), the "earned by real typing
             // ONLY" law: a forward same-row echo ALONE is program output — a
@@ -4957,9 +4964,9 @@ impl CursorGlow {
             // text — noted, never mode-detected. The pulse below mirrors this
             // exact correlated advance onto the cursor cat so the two momentum
             // instances read one value ([`Self::take_momentum_pulse`]).
-            if typed_pair && (forward || wrap || nyan_coalesce) && !deletion && !navigation {
-                self.nyan.momentum.advance(now);
-                self.nyan.momentum_pulse = Some(now);
+            if typed_pair && (forward || wrap || rainbow_coalesce) && !deletion && !navigation {
+                self.rainbow.momentum.advance(now);
+                self.rainbow.momentum_pulse = Some(now);
             }
             self.last_type = Some(now);
             // QUENCH STEAM: a deletion echo flashes vapor off the doused cell
@@ -5002,7 +5009,7 @@ impl CursorGlow {
         }
     }
 
-    /// A real jump slams the flare and forgets the Nyan tail memory; the
+    /// A real jump slams the flare and forgets the rainbow kitty tail memory; the
     /// abandoned ribbon and a backward TUI re-anchor's stranded ribbon are
     /// retro-clamped so stale light never parks over cells the typing left.
     fn retire_abandoned_light(&mut self, mv: &MoveCtx) {
@@ -5021,7 +5028,7 @@ impl CursorGlow {
         } = mv;
         // A real jump slams the FLARE to full: Fire ignites white-hot at the leap
         // (the payoff moment) regardless of typing heat, then cools on its own tau.
-        // It also forgets the Nyan tail memory — a jump must never resurrect
+        // It also forgets the rainbow kitty tail memory — a jump must never resurrect
         // ribbon cells from wherever the cursor used to be.
         if !typing {
             // Fire's eruption fires at the METEOR'S ARRIVAL (see tick), not at
@@ -5035,8 +5042,8 @@ impl CursorGlow {
             if !fire && !navigation {
                 self.flare = 1.0;
             }
-            self.nyan.tail = [None; 3];
-            self.nyan.retract = None;
+            self.rainbow.tail = [None; 3];
+            self.rainbow.retract = None;
             // FADE AS ONE, the ABANDONED ribbon: resetting the tail memory
             // above unhooks the exit swoosh, so without this clamp the old
             // band would sit on its momentum-stretched natural life (up to
@@ -5044,10 +5051,10 @@ impl CursorGlow {
             // Clamp the still-live typing sparks so the whole abandoned ribbon
             // fades out within about a second — the swoosh's own ending,
             // delivered even though the swoosh lost its anchor.
-            if matches!(cfg.style, GlowStyle::Nyan) {
+            if matches!(cfg.style, GlowStyle::RainbowKitty) {
                 for s in self.sparks.iter_mut().filter(|s| s.typing) {
                     let age = now.saturating_duration_since(s.born).as_secs_f32();
-                    s.life = s.life.min(age + Self::NYAN_ABANDON_FADE);
+                    s.life = s.life.min(age + Self::RAINBOW_ABANDON_FADE);
                 }
             }
         }
@@ -5059,7 +5066,7 @@ impl CursorGlow {
         // huge NEGATIVE column delta, which `re_anchor` classifies as typing
         // (no meteor, no ZOOM, no line fill).
         // But the ribbon is ABSOLUTE grid geometry (`Spark { row, col }`,
-        // painted at `(row + 0.5) * ch` by `emit_nyan`) and NOTHING translates
+        // painted at `(row + 0.5) * ch` by `emit_rainbow`) and NOTHING translates
         // it: the pre-wrap band stays on the landing row while the text it
         // decorated moved up, leaving a rainbow smear over blank cells detached
         // from the typed glyphs. `note_scroll` cannot catch it — it translates
@@ -5089,7 +5096,7 @@ impl CursorGlow {
         // The tail is REBASED, not nulled: the four-letter re-lay reads it to
         // carry the ribbon across a fold, and those three cells are the
         // PRE-relocation ones, so leaving them would RE-LIGHT the stranded cells
-        // on every following key and would point `nyan_exit_swoosh`'s travel the
+        // on every following key and would point `rainbow_exit_swoosh`'s travel the
         // wrong way. `[Some((cr, cc)), None, None]` is exactly what
         // the typing path's own rebuild produces after a clear, so that path is
         // byte-identical — while the deletion arm, which has no rebuild, keeps a
@@ -5099,18 +5106,18 @@ impl CursorGlow {
         // light on the row the caret is on, which is this one; light on the
         // box's earlier rows was already snuffed by the growth that stranded it.
         // (No particle clamp here, unlike the Fire/Phaser snuff this borrows
-        // from: the Nyan typing path pushes no particles at spawn.)
-        if matches!(cfg.style, GlowStyle::Nyan) && re_anchor && !shape_wrap && cc < pc {
+        // from: the rainbow kitty typing path pushes no particles at spawn.)
+        if matches!(cfg.style, GlowStyle::RainbowKitty) && re_anchor && !shape_wrap && cc < pc {
             for s in self.sparks.iter_mut() {
-                if s.typing && s.row == cr && s.col.abs_diff(cc) > Self::NYAN_REANCHOR_KEEP {
+                if s.typing && s.row == cr && s.col.abs_diff(cc) > Self::RAINBOW_REANCHOR_KEEP {
                     let age = now.saturating_duration_since(s.born).as_secs_f32();
-                    s.life = s.life.min(age + Self::NYAN_REANCHOR_SNUFF);
+                    s.life = s.life.min(age + Self::RAINBOW_REANCHOR_SNUFF);
                 }
             }
-            self.nyan
+            self.rainbow
                 .ink_pops
-                .retain(|p| p.row != cr || p.col.abs_diff(cc) <= Self::NYAN_REANCHOR_KEEP);
-            self.nyan.tail = [Some((cr, cc)), None, None];
+                .retain(|p| p.row != cr || p.col.abs_diff(cc) <= Self::RAINBOW_REANCHOR_KEEP);
+            self.rainbow.tail = [Some((cr, cc)), None, None];
         }
     }
 
@@ -5220,13 +5227,13 @@ impl CursorGlow {
         let &MoveCtx { cfg, typing, .. } = mv;
         if typing {
             match cfg.style {
-                // Nyan's ribbon must read as a rainbow even at a stroll, but its
+                // the rainbow kitty's ribbon must read as a rainbow even at a stroll, but its
                 // DYNAMIC RANGE is wide: a CALM cold floor (a stroll lays a quiet
                 // trail) that climbs steeply with momentum (a hot run blazes),
-                // still under the NYAN_OCCUPIED_COV_CAP that guards text in `emit_nyan`.
+                // still under the RAINBOW_OCCUPIED_COV_CAP that guards text in `emit_rainbow`.
                 // Rides the EASED spine, so a new spark's brightness swells with
                 // momentum instead of stepping to full on the first fast key.
-                GlowStyle::Nyan => 0.45 + 0.85 * self.nyan.disp,
+                GlowStyle::RainbowKitty => 0.45 + 0.85 * self.rainbow.disp,
                 // Phaser: CONSTANT brightness at any cadence — the band must
                 // look identical fast or slow (its constant-distance promise),
                 // so it skips the heat ramp entirely.
@@ -5273,7 +5280,7 @@ impl CursorGlow {
         let full_life = cfg.duration.as_secs_f32().max(0.001);
         if typing {
             match cfg.style {
-                // Nyan: a LONG persistent rainbow streak with a BIG momentum range.
+                // Rainbow kitty: a LONG persistent rainbow streak with a BIG momentum range.
                 // A visible wake from the very first keys (linear spine term) that
                 // blows up SUPERLINEARLY (spine²) flat-out — up to ~14.6× the
                 // base, so an earned hot run lingers ~8 s: ordinary typing
@@ -5281,18 +5288,18 @@ impl CursorGlow {
                 // one across many cells and wrapped lines.
                 // FOUR-LETTER GUARANTEE: within a typing rhythm the spark's life
                 // additionally chains to the OBSERVED cadence — at least
-                // [`Self::NYAN_CHAIN_KEYS`] inter-key gaps — so the ribbon always
+                // [`Self::RAINBOW_CHAIN_KEYS`] inter-key gaps — so the ribbon always
                 // spans about the last four typed cells no matter how leisurely
                 // the rhythm. The first key of a burst (gap = ∞) takes no floor,
                 // so a lone keystroke still fades crisply.
-                GlowStyle::Nyan => {
+                GlowStyle::RainbowKitty => {
                     let base = (full_life * 1.2).clamp(0.26, 0.55);
-                    let d = self.nyan.disp;
+                    let d = self.rainbow.disp;
                     let life = base * (1.0 + 2.6 * d + 11.0 * d * d);
-                    let life = if gap <= Self::NYAN_CHAIN_GAP_MAX {
+                    let life = if gap <= Self::RAINBOW_CHAIN_GAP_MAX {
                         life.max(
-                            (Self::NYAN_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
-                                .min(Self::NYAN_CHAIN_LIFE_MAX),
+                            (Self::RAINBOW_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
+                                .min(Self::RAINBOW_CHAIN_LIFE_MAX),
                         )
                     } else {
                         life
@@ -5300,7 +5307,7 @@ impl CursorGlow {
                     // The exit swoosh (finger-lift reach + retract) must get to
                     // finish before the natural fade steals the ending — even
                     // for a lone keystroke, which now earns a full mini-swoosh.
-                    life.max(Self::NYAN_SWOOSH_LIFE)
+                    life.max(Self::RAINBOW_SWOOSH_LIFE)
                 }
                 // Phaser: a CONSTANT-DISTANCE streak — the fat spectrum band
                 // always spans the last two typed cells FULLY LIT, however fast
@@ -5418,7 +5425,7 @@ impl CursorGlow {
         }
     }
 
-    /// The Nyan fast-glide straight-run tracker + rainbow shooting star.
+    /// The rainbow kitty fast-glide straight-run tracker + rainbow shooting star.
     fn track_glide_run(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             pr,
@@ -5435,12 +5442,12 @@ impl CursorGlow {
             navigation,
             ..
         } = mv;
-        let nyan = matches!(cfg.style, GlowStyle::Nyan);
+        let rainbow_kitty = matches!(cfg.style, GlowStyle::RainbowKitty);
         // FAST-GLIDE RAINBOW SHOOTING STAR (owner: "some rainbow streak when the
         // cursor moves quickly, maybe like a star"). Keyed on cells/sec SPEED
         // (`glide.vel`), not distance, so it reads as FAST MOVEMENT rather than a
         // far jump. DISTINCT from every existing arm: NOT the discrete jump
-        // (excluded by `!(dr_abs>=1 || dc_abs>=NYAN_JUMP_MIN)` — a jump is a single
+        // (excluded by `!(dr_abs>=1 || dc_abs>=RAINBOW_JUMP_MIN)` — a jump is a single
         // large delta, this is sustained same-row speed), NOT a typing advance
         // (`!typing`, so coalesced typed sweeps are excluded), NOT a delete run
         // (`!deletion` — that has its own poof). USER-driven only (`navigation`:
@@ -5451,12 +5458,12 @@ impl CursorGlow {
         // cursor can't saturate. Additive to whatever the emit chain below lays.
         // STRAIGHT-LINE RUN tracker (owner: "when the cursor moves quickly in a
         // straight line"). One axis, one direction, N consecutive observed
-        // moves. Tracked on EVERY nyan move so a flip or a diagonal breaks the
+        // moves. Tracked on EVERY rainbow-kitty move so a flip or a diagonal breaks the
         // run outright. The straightness TOLERANCE is ZERO off-axis drift: a
         // terminal cursor is grid-quantized, so a genuine held arrow / word
         // motion travels on exactly one axis; anything that does not is a jump
         // or a repaint vector, never a glide.
-        if nyan {
+        if rainbow_kitty {
             let dir = (
                 (cr as i32 - pr as i32).signum() as i8,
                 (cc as i32 - pc as i32).signum() as i8,
@@ -5484,16 +5491,16 @@ impl CursorGlow {
         //      unreachable there. That alone preserves the fix.
         //   2. Independently, on SHAPE: the Ink wrap (`dr=+1, dc=-73`) is
         //      DIAGONAL, so axis-purity refuses it and the run resets to 0; the
-        //      box-growth wrap (`dr=0, dc=+73`) has `raw_dist >= NYAN_JUMP_MIN`,
+        //      box-growth wrap (`dr=0, dc=+73`) has `raw_dist >= RAINBOW_JUMP_MIN`,
         //      so the bounded-delta conjunct refuses it. Even the adversarial
         //      case — a genuine arrow press landing on the same frame as a
         //      repaint — is refused on shape, not merely on hint.
         //   3. A single anomalous delta can never reach `GLIDE_RUN_MIN`.
-        if nyan
+        if rainbow_kitty
             && self.glide.vel >= Self::GLIDE_VEL_MIN
             && self.glide.run >= Self::GLIDE_RUN_MIN
             && !(dr_abs >= 1 && dc_abs >= 1)
-            && raw_dist < Self::NYAN_JUMP_MIN as f32
+            && raw_dist < Self::RAINBOW_JUMP_MIN as f32
             && !deletion
             && navigation
             && self.glide.last_fired.is_none_or(|t| {
@@ -5531,8 +5538,8 @@ impl CursorGlow {
         }
     }
 
-    /// The per-move LIGHT: exactly one of the style arms — fire meteor, Nyan
-    /// jump choreography, the navigation no-wake arm, the Nyan backspace
+    /// The per-move LIGHT: exactly one of the style arms — fire meteor, rainbow kitty
+    /// jump choreography, the navigation no-wake arm, the rainbow kitty backspace
     /// glitter poof, or the swept comet/ribbon path. Returns how many hue
     /// steps this move advances (a coalesced typing run counts its laid cells;
     /// every other move keeps the classic one step).
@@ -5564,14 +5571,14 @@ impl CursorGlow {
             typed_pair,
             echo_run,
             re_anchor,
-            nyan_coalesce,
+            rainbow_coalesce,
             dist,
             typing,
             deletion,
             navigation,
             ..
         } = mv;
-        let nyan = matches!(cfg.style, GlowStyle::Nyan);
+        let rainbow_kitty = matches!(cfg.style, GlowStyle::RainbowKitty);
         let mut hue_advances: f32 = 1.0;
         if fire_meteor {
             let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
@@ -5627,11 +5634,11 @@ impl CursorGlow {
                     arrived: false,
                 });
             }
-        } else if nyan
+        } else if rainbow_kitty
             && !typing
             && !navigation
-            && (dr_abs >= 1 || dc_abs >= Self::NYAN_JUMP_MIN)
-            && (self.nyan.disp >= Self::NYAN_JUMP_MIN_DISP
+            && (dr_abs >= 1 || dc_abs >= Self::RAINBOW_JUMP_MIN)
+            && (self.rainbow.disp >= Self::RAINBOW_JUMP_MIN_DISP
                 || self
                     .return_hint
                     .take_if(|t| {
@@ -5645,7 +5652,7 @@ impl CursorGlow {
             // repaint a fresh saturated ribbon over the whole cursor path even
             // after seconds of idle. Nav-paired moves fall through to the
             // no-wake navigation arm below; a real Enter/wrap/TUI jump still
-            // zooms WHILE TYPING MOMENTUM IS WARM (`NYAN_JUMP_MIN_DISP`) — a
+            // zooms WHILE TYPING MOMENTUM IS WARM (`RAINBOW_JUMP_MIN_DISP`) — a
             // COLD program-driven warp (a spinner's CUP loop, a background
             // TUI repaint, hours of idle output) mints nothing, which is the
             // anti-stray contract: no keystroke, no trail.
@@ -5669,11 +5676,11 @@ impl CursorGlow {
             self.push_jump_streak(now, geom, (pr, pc), (cr, cc), dist);
             // LANDING PAYLOAD (Features A + B) — the celebratory STARBURST at
             // the landing and the graceful dissolve of the abandoned ribbon
-            // TERMINUS at the pre-jump head. Split into `emit_nyan_jump_landing`
+            // TERMINUS at the pre-jump head. Split into `emit_rainbow_jump_landing`
             // so the navigation arm below can fire the SAME payload for a
             // Ctrl-A/E/Home/End leap (finding 1) — a big jump is a big jump —
             // while this ZOOM wake streak stays `!navigation`-gated. Inside the
-            // helper the burst is fast-jump-gated + [`Self::NYAN_BURST_CAP`]-
+            // helper the burst is fast-jump-gated + [`Self::RAINBOW_BURST_CAP`]-
             // capped (a Ctrl-A/E mash stays bounded), the terminus is ribbon-
             // gated (finding 3), and both honour reduced-motion (finding 2).
             let landing = (oxf + (cc as f32 + 0.5) * cwf, oyf + (cr as f32 + 0.5) * chf);
@@ -5691,7 +5698,7 @@ impl CursorGlow {
             // it: it feathers the ribbon end the jump abandoned, and a reflow has
             // already rewritten those cells — the re-anchor snuff owns that.)
             if !reflow_licensed {
-                self.emit_nyan_jump_landing(now, geom, dist, landing, terminus);
+                self.emit_rainbow_jump_landing(now, geom, dist, landing, terminus);
             }
             // The hue still advances and the landing ring/particles below still
             // fire; only the per-cell spark path is skipped.
@@ -5712,33 +5719,33 @@ impl CursorGlow {
             // Ctrl-E must not repaint a saturated rainbow over the line it skims
             // — the preserved design at the `!navigation` gate above); the
             // celebratory landing payload is NOT. So a qualifying large nav jump
-            // fires the SAME `emit_nyan_jump_landing` — starburst + graceful
+            // fires the SAME `emit_rainbow_jump_landing` — starburst + graceful
             // terminus — as an un-hinted jump. The helper's burst cap keeps a
             // Ctrl-A/E mash (which now actually reaches this code) bounded.
             //
             // 2026-07-29 — AND THE ZOOM STREAK, which used to be the one piece
             // withheld here (owner: "I STILL don't see rainbow streaks when I do
-            // control-a control-e"). See [`Self::NYAN_STREAK_MIN_DIST`]: the old
+            // control-a control-e"). See [`Self::RAINBOW_STREAK_MIN_DIST`]: the old
             // gate conflated the transient BEAM with the persistent per-cell
             // RIBBON. Only the ribbon was ever the defect, and the ribbon is laid
             // by the spark path further down — which this arm still skips
             // entirely. So zipping the cursor across the line now draws its
             // rainbow line, and a bare Ctrl-E still repaints no saturated ribbon
             // over the row it skims.
-            if nyan && !typing && (dr_abs >= 1 || dc_abs >= Self::NYAN_JUMP_MIN) {
+            if rainbow_kitty && !typing && (dr_abs >= 1 || dc_abs >= Self::RAINBOW_JUMP_MIN) {
                 let cwf = geom.cw as f32;
                 let chf = geom.ch as f32;
                 let oxf = geom.origin_x as f32;
                 let oyf = geom.origin_y as f32;
-                if dist >= Self::NYAN_STREAK_MIN_DIST {
+                if dist >= Self::RAINBOW_STREAK_MIN_DIST {
                     self.push_jump_streak(now, geom, (pr, pc), (cr, cc), dist);
                 }
                 let landing = (oxf + (cc as f32 + 0.5) * cwf, oyf + (cr as f32 + 0.5) * chf);
                 let terminus = (oxf + (pc as f32 + 0.5) * cwf, oyf + (pr as f32 + 0.5) * chf);
-                self.emit_nyan_jump_landing(now, geom, dist, landing, terminus);
+                self.emit_rainbow_jump_landing(now, geom, dist, landing, terminus);
             }
-        } else if nyan && deletion {
-            // BACKSPACE = SPARKLE GLITTER CLOUD POOF (Nyan only): a deletion echo
+        } else if rainbow_kitty && deletion {
+            // BACKSPACE = SPARKLE GLITTER CLOUD POOF (rainbow kitty only): a deletion echo
             // must NOT lay a rainbow ribbon cell — that read as the trail growing
             // on a delete. Heat is already quenched upstream (`note_backspace`),
             // and the FADE-AS-ONE clamp above already dims the live ribbon, so
@@ -5750,7 +5757,7 @@ impl CursorGlow {
             // tones (never a band hue), drawn as the 4-point twinkle via the
             // GLITTER sentinel (`cov_scale < 0.9`) in `emit_particles`. Repeated
             // backspaces lay a train of poofs chasing the cursor leftward.
-            // Deterministic via `frand`; MAX_PARTICLES-bounded. Non-Nyan styles
+            // Deterministic via `frand`; MAX_PARTICLES-bounded. Non-rainbow kitty styles
             // fall through to the comet path, so their deletion read is unchanged.
             let cell = geom.ch as f32;
             let (ox, oy) = geom.cell_center(cr, cc);
@@ -5780,8 +5787,8 @@ impl CursorGlow {
             }
         } else {
             // Comet path: swept cells from origin toward the destination.
-            let cap = if matches!(cfg.style, GlowStyle::Nyan) {
-                Self::NYAN_MAX_CELLS
+            let cap = if matches!(cfg.style, GlowStyle::RainbowKitty) {
+                Self::RAINBOW_MAX_CELLS
             } else {
                 Self::MAX_SPARKS
             };
@@ -5798,11 +5805,11 @@ impl CursorGlow {
                 cfg.length.clamp(1, cap)
             };
             self.path_scratch.clear();
-            if nyan && typing {
-                // NYAN: the ribbon HEAD sits UNDER the cursor (the block itself
+            if rainbow_kitty && typing {
+                // RAINBOW KITTY: the ribbon HEAD sits UNDER the cursor (the block itself
                 // is the rainbow), so its coalesce/fold sweeps are
                 // destination-INCLUSIVE via origin's trail_sweep primitives.
-                if nyan_coalesce {
+                if rainbow_coalesce {
                     // CONTINUED TYPING observed late (see the reclassification
                     // above): lay exactly the same-row cells a per-key observer
                     // would have lit, tail→head, so a batched echo leaves no
@@ -5822,12 +5829,12 @@ impl CursorGlow {
                 } else {
                     // Lay a SINGLE spark AT the cursor cell so the ribbon head
                     // sits under the cursor with no 1-cell gap (its tail
-                    // machinery re-lays the band behind it); a nyan re-anchor
+                    // machinery re-lays the band behind it); a rainbow-kitty re-anchor
                     // likewise gets only its landing.
                     self.path_scratch.push((cr as i32, cc as i32));
                 }
             } else if shape_wrap {
-                // NON-NYAN WRAP RUN (phaser/fire/…): the trail lives BEHIND the
+                // NON-RAINBOW KITTY WRAP RUN (phaser/fire/…): the trail lives BEHIND the
                 // cursor (the block draws the caret itself), so lay the TYPED
                 // cells the echo swept through the fold — the last cells of the
                 // old row and the glyphs already landed on the new one, EXCLUDING
@@ -5844,14 +5851,14 @@ impl CursorGlow {
                     self.path_scratch.push((cr as i32, c));
                 }
             } else if re_anchor {
-                // TUI RE-ANCHOR (non-nyan): the caret never travelled the
+                // TUI RE-ANCHOR (non-rainbow-kitty): the caret never travelled the
                 // interpolated cells — the repaint relocated it — so only the
                 // landing gets a wake. (A bare-terminal fold that ALSO pairs with
                 // the typed hint takes the wrap-run arm above: its cells really
                 // were typed.)
                 self.path_scratch.push((cr as i32, cc as i32));
             } else {
-                // Everything else — a real jump AND a PHASER/non-nyan COALESCED
+                // Everything else — a real jump AND a PHASER/non-rainbow-kitty COALESCED
                 // ECHO (2-3 glyphs landed in one observed move, `echo_run`
                 // above collapsed it to typing) — lays the trail BEHIND the
                 // cursor. For a short echo the destination-nearest cells are
@@ -5947,22 +5954,22 @@ impl CursorGlow {
                 // its own frame. The hue phase advances one step per cell at
                 // the bottom of spawn (`hue_advances`), keeping the spatial
                 // spectrum cadence-independent.
-                let typing_run = echo_run || (shape_wrap && !nyan);
+                let typing_run = echo_run || (shape_wrap && !rainbow_kitty);
                 if typing_run {
                     hue_advances = self.path_scratch.len() as f32;
                 }
-                // NEVER STACK (Nyan): a typed cell OWNS its spark. A
+                // NEVER STACK (rainbow kitty): a typed cell OWNS its spark. A
                 // backspace+retype (the most common edit) revisits a cell
                 // whose spark is still alive — its chained life spans at
                 // least the swoosh's 1.2s — and pushing a second spark there
                 // DOUBLED the per-pixel additive coverage straight past the
-                // NYAN_OCCUPIED_COV_CAP text-legibility ceiling (a run of corrections
+                // RAINBOW_OCCUPIED_COV_CAP text-legibility ceiling (a run of corrections
                 // stacked 3-4×, clipping the band to its pure hue and hiding
                 // same-hue glyphs). The in-place-extension promise below
                 // covers only the 3 tail cells; the head must keep it too:
                 // drop any older spark on the cells being laid — the fresh
                 // head replaces it outright. O(live sparks × ≤3 laid cells).
-                if nyan && typing {
+                if rainbow_kitty && typing {
                     let path = &self.path_scratch;
                     self.sparks.retain(|s| {
                         !path
@@ -5975,17 +5982,18 @@ impl CursorGlow {
                     if r < 0 || c < 0 || r as usize >= geom.rows || c as usize >= geom.cols {
                         continue;
                     }
-                    // Tail→head grade 0..1 — EXCEPT nyan typing sweeps/folds AND
-                    // non-nyan coalesced echo/wrap runs (`typing_run`): a per-key
+                    // Tail→head grade 0..1 — EXCEPT rainbow typing sweeps/folds AND
+                    // non-rainbow-kitty coalesced echo/wrap runs (`typing_run`): a per-key
                     // observer would have laid every one of those cells as its own
                     // single-cell head (pos 1.0), so grading them would burn a
                     // permanently dimmer notch into the ribbon / spectrum bar
                     // between full-brightness per-key neighbours.
-                    let pos = if (nyan && typing && self.path_scratch.len() > 1) || typing_run {
-                        1.0
-                    } else {
-                        (i as f32 + 1.0) / n // tail→head 0..1
-                    };
+                    let pos =
+                        if (rainbow_kitty && typing && self.path_scratch.len() > 1) || typing_run {
+                            1.0
+                        } else {
+                            (i as f32 + 1.0) / n // tail→head 0..1
+                        };
                     // Faint tail → bright head, scaled by the typing heat (jump = 1×);
                     // heat can overdrive past the static curve, so clamp into u8.
                     // LASER: a beam carries near-CONSTANT power along its length —
@@ -6030,14 +6038,14 @@ impl CursorGlow {
                         }
                         _ => ((40.0 + 175.0 * pos) * boost).min(255.0) as u8,
                     };
-                    // EXTEND-IN-PLACE for multi-cell nyan typing sweeps (the
+                    // EXTEND-IN-PLACE for multi-cell rainbow typing sweeps (the
                     // coalesce / wrap fold above): a swept cell whose typing
                     // spark is still live gets its life refreshed instead of a
                     // duplicate spark, so stacked additive coverage can't sneak
                     // past the text-legibility cap — the same discipline as the
                     // four-letter re-lay below. Single-cell head lays keep their
                     // shipped push semantics byte-identically.
-                    if nyan
+                    if rainbow_kitty
                         && typing
                         && n > 1.0
                         && let Some(s) = self
@@ -6074,7 +6082,7 @@ impl CursorGlow {
                         born: now,
                     });
                 }
-                // Bound resident path state for EVERY style. Nyan deliberately
+                // Bound resident path state for EVERY style. Rainbow kitty deliberately
                 // keeps a smaller window because each sample emits six bands.
                 if self.sparks.len() > cap {
                     let drop = self.sparks.len() - cap;
@@ -6087,16 +6095,16 @@ impl CursorGlow {
                 // sparks. A cell whose spark is still alive is extended IN
                 // PLACE — never duplicated — so stacked additive coverage can't
                 // sneak past the text-legibility cap.
-                if nyan && typing && gap <= Self::NYAN_CHAIN_GAP_MAX {
+                if rainbow_kitty && typing && gap <= Self::RAINBOW_CHAIN_GAP_MAX {
                     let head = (cr, cc);
-                    for i in 0..self.nyan.tail.len() {
-                        let Some((r, c)) = self.nyan.tail[i] else {
+                    for i in 0..self.rainbow.tail.len() {
+                        let Some((r, c)) = self.rainbow.tail[i] else {
                             continue;
                         };
-                        if (r, c) == head || self.nyan.tail[..i].contains(&Some((r, c))) {
+                        if (r, c) == head || self.rainbow.tail[..i].contains(&Some((r, c))) {
                             continue;
                         }
-                        // Full scan — the resident cap is NYAN_MAX_CELLS (240),
+                        // Full scan — the resident cap is RAINBOW_MAX_CELLS (240),
                         // so this stays O(live light); a bounded `.take(16)`
                         // window MISSED still-live sparks pushed out of the
                         // newest slots and re-laid duplicates on top of them
@@ -6136,9 +6144,9 @@ impl CursorGlow {
                 // pre-sweep head is still a legitimately typed adjacent cell).
                 // Jumps still clear the memory wholesale (handled above), so
                 // nothing here can resurrect ribbon across a real leap.
-                if nyan && typing {
+                if rainbow_kitty && typing {
                     if self.path_scratch.len() > 1 {
-                        let prev = self.nyan.tail;
+                        let prev = self.rainbow.tail;
                         let mut tail = [None; 3];
                         let mut slot = 0;
                         for &(r, c) in self.path_scratch.iter().rev() {
@@ -6159,14 +6167,15 @@ impl CursorGlow {
                                 slot += 1;
                             }
                         }
-                        self.nyan.tail = tail;
+                        self.rainbow.tail = tail;
                     } else {
-                        self.nyan.tail = [Some((cr, cc)), self.nyan.tail[0], self.nyan.tail[1]];
+                        self.rainbow.tail =
+                            [Some((cr, cc)), self.rainbow.tail[0], self.rainbow.tail[1]];
                     }
                 }
                 // FRESH-INK POP BIRTHS — the typed GLYPH cells of this move.
                 // Gates, in order of what they prove:
-                //   * `nyan` — the pop is Nyan-only;
+                //   * `rainbow_kitty` — the pop is rainbow-kitty-only;
                 //   * `typed_pair` — a fresh committed-press hint PAIRED this
                 //     move (the host's app_input seam is the only `note_typed`
                 //     caller), so PTY echo alone can NEVER pop: a program
@@ -6180,10 +6189,10 @@ impl CursorGlow {
                 //     it. (A TUI re-anchor's relocated caret is likewise
                 //     conservative: no provable glyph cell, no pop.)
                 // The freshly inked cells are the laid path MINUS the live
-                // caret cell (Nyan lays its ribbon head AT the cursor, which
+                // caret cell (rainbow kitty lays its ribbon head AT the cursor, which
                 // holds no glyph yet), PLUS the vacated origin for the plain
                 // single-cell advance, whose laid path holds ONLY the caret.
-                if nyan
+                if rainbow_kitty
                     && typing
                     && typed_pair
                     && !deletion
@@ -6251,9 +6260,9 @@ impl CursorGlow {
             navigation,
             ..
         } = mv;
-        let nyan = matches!(cfg.style, GlowStyle::Nyan);
+        let rainbow_kitty = matches!(cfg.style, GlowStyle::RainbowKitty);
         // GRACEFUL RIGHT-MARGIN TERMINUS. When a typing advance lands
-        // the ribbon HEAD at (or within [`Self::NYAN_TERMINUS_MARGIN`] of) the
+        // the ribbon HEAD at (or within [`Self::RAINBOW_TERMINUS_MARGIN`] of) the
         // last column, the leading end is up against the far-right margin;
         // scatter a few melt-out twinkle stars just past it so the rainbow
         // dissolves off the edge instead of terminating on a hard vertical cut.
@@ -6265,12 +6274,12 @@ impl CursorGlow {
         // background process printing up to the margin would spray glitter
         // with no keystroke anywhere. `typed_pair` proves the advance echoes
         // a real committed press; `!navigation` mirrors the jump-side gate.
-        if nyan
+        if rainbow_kitty
             && typing
             && typed_pair
             && !deletion
             && !navigation
-            && (cc as usize) + Self::NYAN_TERMINUS_MARGIN + 1 >= geom.cols
+            && (cc as usize) + Self::RAINBOW_TERMINUS_MARGIN + 1 >= geom.cols
             && geom.cols > 0
         {
             let cwf = geom.cw as f32;
@@ -6278,7 +6287,7 @@ impl CursorGlow {
             // Terminus sits just PAST the head cell, at the right margin.
             let tx = geom.origin_x as f32 + (geom.cols as f32) * cwf;
             let ty = geom.origin_y as f32 + (cr as f32 + 0.5) * chf;
-            self.scatter_nyan_terminus(now, geom, tx, ty);
+            self.scatter_rainbow_terminus(now, geom, tx, ty);
         }
     }
 
@@ -6916,9 +6925,9 @@ impl CursorGlow {
         }
     }
 
-    /// Nyan "star power": the momentum-earned twinkle shower + shooting-star
+    /// Rainbow kitty "star power": the momentum-earned twinkle shower + shooting-star
     /// comets flung off the wake.
-    fn spawn_nyan_star_shower(&mut self, mv: &MoveCtx) {
+    fn spawn_rainbow_star_shower(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             cr,
             cc,
@@ -6927,7 +6936,7 @@ impl CursorGlow {
             geom,
             ..
         } = mv;
-        // NYAN "star power": sustained momentum SHOOTS twinkling stars off the
+        // RAINBOW KITTY "star power": sustained momentum SHOOTS twinkling stars off the
         // wake. None at rest — they erupt with the eased spine² so only a real
         // streak sparkles (and the density swells/exhales with the ribbon rather
         // than popping per key). OFF-ROW BIRTHS: a spawn band around the row
@@ -6937,14 +6946,16 @@ impl CursorGlow {
         // crests instead of sagging straight back through the letters), a few
         // into the wake below (streaming down and back, full gravity pulling
         // them further clear). Bounded by the life prune + cap; pinned by
-        // `nyan_stars_spawn_clear_of_the_typed_row_band`.
-        if matches!(cfg.style, GlowStyle::Nyan) && self.particles.len() < Self::MAX_PARTICLES {
+        // `rainbow_stars_spawn_clear_of_the_typed_row_band`.
+        if matches!(cfg.style, GlowStyle::RainbowKitty)
+            && self.particles.len() < Self::MAX_PARTICLES
+        {
             // EARNED THRESHOLD: density rides
             // the onset-gated drive² — ZERO stars until the canonical metric
-            // has been earned past [`NYAN_STAR_ONSET`] (~a second of
+            // has been earned past [`RAINBOW_STAR_ONSET`] (~a second of
             // continuous typing), then the quadratic ramp restores today's
             // full shower only near full spine.
-            let drive = nyan_star_drive(self.nyan.disp);
+            let drive = rainbow_star_drive(self.rainbow.disp);
             let stars = (drive * drive * 5.0) as usize;
             let (ox, oy) = geom.cell_center(cr, cc);
             let cell = geom.ch as f32;
@@ -6991,13 +7002,13 @@ impl CursorGlow {
             // launch, a longer life, and a brighter head. They are marked with the
             // `cov_scale` SHOOT sentinel (> 1.25, which also brightens the head)
             // and rendered as a velocity-aligned STREAK tipped with a twinkle head
-            // (the Nyan branch of `emit_particles`) — tiny comets shooting off the
+            // (the rainbow kitty branch of `emit_particles`) — tiny comets shooting off the
             // rainbow. None below the threshold, so only a genuinely hot streak
             // throws them: the comets are the loudest star tier, so they demand
             // a run deep in the cat's own high band (~2+ s of sustained typing),
             // not merely a warm one. Deterministic via `frand`; MAX_PARTICLES-bounded.
-            if self.nyan.disp >= 0.85 {
-                let shooters = 1 + (self.nyan.disp * 2.0) as usize; // 2-3 at full spine
+            if self.rainbow.disp >= 0.85 {
+                let shooters = 1 + (self.rainbow.disp * 2.0) as usize; // 2-3 at full spine
                 for _ in 0..shooters {
                     if self.particles.len() >= Self::MAX_PARTICLES {
                         break;
@@ -7449,8 +7460,8 @@ impl CursorGlow {
                 // than hang a warm highlight over the blank advertising a letter
                 // the kill just removed. Single retain over the live pops keeps
                 // it O(live pops); the `is_empty` gate keeps the idle path free.
-                if !self.nyan.ink_pops.is_empty() {
-                    self.nyan
+                if !self.rainbow.ink_pops.is_empty() {
+                    self.rainbow
                         .ink_pops
                         .retain(|p| p.row != prev.row || !(c0..c1).contains(&p.col));
                 }
@@ -7534,7 +7545,7 @@ impl CursorGlow {
     ///   water on hot steel is fire's established deletion language, and
     ///   [`Self::note_kill`]'s quench escalation makes the standing flame die
     ///   down at the same moment;
-    /// - NYAN: the owner's "little sparkles" — star-power particles strewn
+    /// - RAINBOW KITTY: the owner's "little sparkles" — star-power particles strewn
     ///   across the span (SPARKLE shares them, its native language);
     /// - WATER: droplets spraying up and falling out of the span — the text
     ///   splashes away;
@@ -7564,7 +7575,7 @@ impl CursorGlow {
         // Puff x-centers spread across the span (k+0.5 of `puffs` slots).
         let nf = n as f32;
         // LIGHT THEMES: additive particles saturate against a white ground —
-        // the particle-only styles (Nyan/Sparkle/Water/Comet) ALSO shed a few
+        // the particle-only styles (rainbow kitty/Sparkle/Water/Comet) ALSO shed a few
         // neutral grey puffs there (rendered through `push_halo_over`'s
         // source-over veil path, which light themes already use), so the poof
         // reads on paper-white exactly as it does on black. Dark themes skip
@@ -7572,15 +7583,15 @@ impl CursorGlow {
         if !cfg.dark_theme
             && matches!(
                 cfg.style,
-                GlowStyle::Nyan | GlowStyle::Sparkle | GlowStyle::Water | GlowStyle::Comet
+                GlowStyle::RainbowKitty | GlowStyle::Sparkle | GlowStyle::Water | GlowStyle::Comet
             )
         {
             self.spawn_poof_smoke(span_x0, span_w, oy, cell, cwf, n, now);
         }
         match cfg.style {
-            GlowStyle::Nyan | GlowStyle::Sparkle => {
+            GlowStyle::RainbowKitty | GlowStyle::Sparkle => {
                 // Star-power sparkles across the vanished span — the exact
-                // particle family the Nyan momentum stars use (fly up and back,
+                // particle family the rainbow kitty momentum stars use (fly up and back,
                 // arc down under light gravity, twinkle on the hue seed);
                 // Sparkle's `_` colour arm renders the same burst white-cored
                 // rainbow. Count scales gently with the span, on a floor of 4 so
@@ -7607,7 +7618,7 @@ impl CursorGlow {
                         // a DELETION gesture, not the momentum shower, so it keeps
                         // FULL brightness regardless of typing momentum (the
                         // `emit_particles` glitter arm pins `mom = 1.0`). Plain
-                        // twinkle stars would take `nyan_star_momentum(nyan.disp)`
+                        // twinkle stars would take `rainbow_star_momentum(rainbow.disp)`
                         // instead and go barely-there on a cold delete.
                         cov_scale: 0.7,
                         born: now,
@@ -7759,7 +7770,7 @@ impl CursorGlow {
         out: &mut Vec<GlowQuad>,
         halos: &mut Vec<RainHalo>,
     ) {
-        // Styles whose streak is drawn elsewhere (Water = `emit_water`; Nyan =
+        // Styles whose streak is drawn elsewhere (Water = `emit_water`; rainbow kitty =
         // its banded ribbon) emit no shared additive beam. See `style_has_beam`.
         if !cfg.beam || self.sparks.is_empty() {
             return;
@@ -7858,7 +7869,7 @@ impl CursorGlow {
                 cov_f = cov_f.min(Self::FIRE_STREAK_COV_CAP);
             }
             // PHASER text-safety ceiling (every other streaming style has one:
-            // Nyan 150, meteor 135, zoom 118, water 76, fire 168): the
+            // Rainbow kitty 150, meteor 135, zoom 118, water 76, fire 168): the
             // PHASER_LAYERS stack overlaps to 1.45× inside the full-height
             // core, so cap the per-sample coverage at 112 — the stacked
             // per-pixel sum stays ≈162, under saturation, and a same-hue glyph
@@ -8936,15 +8947,15 @@ impl CursorGlow {
         out.truncate(Self::MAX_QUADS);
     }
 
-    /// The NYAN finger-lift exit arc, run every frame. While keys land within
-    /// [`Self::NYAN_LIFT_GRACE`] of each other this is a no-op; once the finger
+    /// The RAINBOW KITTY finger-lift exit arc, run every frame. While keys land within
+    /// [`Self::RAINBOW_LIFT_GRACE`] of each other this is a no-op; once the finger
     /// lifts, the ribbon first FINISHES REACHING four letters — one extension
-    /// cell per [`Self::NYAN_REACH_STEP`] laid behind the head, overlapping
+    /// cell per [`Self::RAINBOW_REACH_STEP`] laid behind the head, overlapping
     /// letters the burst never typed if it must — and only then RETRACTS
-    /// tail→head into the cursor over [`Self::NYAN_RETRACT_DUR`], farthest
+    /// tail→head into the cursor over [`Self::RAINBOW_RETRACT_DUR`], farthest
     /// cells first, whatever the ribbon's length. A fresh key at any point
     /// clears the retract and the ribbon re-arms seamlessly.
-    fn nyan_exit_swoosh(&mut self, now: Instant, geom: Geom) {
+    fn rainbow_exit_swoosh(&mut self, now: Instant, geom: Geom) {
         let Some(last_type) = self.last_type else {
             return;
         };
@@ -8952,25 +8963,25 @@ impl CursorGlow {
         // that happened to observe it. A compositor/focus gap may skip the
         // entire swoosh; the first late frame must sample the logically settled
         // state instead of birthing a new reach/retract animation at `now`.
-        let lift_at = last_type + Duration::from_secs_f32(Self::NYAN_LIFT_GRACE);
-        let retract_at = lift_at + Duration::from_secs_f32(3.0 * Self::NYAN_REACH_STEP);
-        let settled_at = retract_at + Duration::from_secs_f32(Self::NYAN_RETRACT_DUR);
+        let lift_at = last_type + Duration::from_secs_f32(Self::RAINBOW_LIFT_GRACE);
+        let retract_at = lift_at + Duration::from_secs_f32(3.0 * Self::RAINBOW_REACH_STEP);
+        let settled_at = retract_at + Duration::from_secs_f32(Self::RAINBOW_RETRACT_DUR);
         if now < lift_at {
-            self.nyan.retract = None;
+            self.rainbow.retract = None;
             return;
         }
-        let Some((hr, hc)) = self.nyan.tail[0] else {
-            self.nyan.retract = None;
+        let Some((hr, hc)) = self.rainbow.tail[0] else {
+            self.rainbow.retract = None;
             return;
         };
         if now >= settled_at {
             self.sparks.retain(|s| !s.typing);
-            self.nyan.retract.get_or_insert((retract_at, 0));
+            self.rainbow.retract.get_or_insert((retract_at, 0));
             return;
         }
         // Travel direction from the two most recent typed cells (default
         // rightward typing → the ribbon extends and retracts leftward).
-        let dir: i32 = match self.nyan.tail[1] {
+        let dir: i32 = match self.rainbow.tail[1] {
             Some((pr, pc)) if pr == hr && pc != hc => {
                 if hc > pc {
                     1
@@ -8982,11 +8993,11 @@ impl CursorGlow {
         };
         // REACH — only until the retract begins, so a drained cell is never
         // re-lit mid-swoosh (the retract owns the ribbon once it starts).
-        if self.nyan.retract.is_none() {
-            let boost = 0.45 + 0.85 * self.nyan.disp; // mirrors the Nyan typing floor (eased)
+        if self.rainbow.retract.is_none() {
+            let boost = 0.45 + 0.85 * self.rainbow.disp; // mirrors the rainbow typing floor (eased)
             for k in 1..=3i32 {
                 let reach_at =
-                    lift_at + Duration::from_secs_f32((k - 1) as f32 * Self::NYAN_REACH_STEP);
+                    lift_at + Duration::from_secs_f32((k - 1) as f32 * Self::RAINBOW_REACH_STEP);
                 if now < reach_at {
                     break;
                 }
@@ -8996,7 +9007,7 @@ impl CursorGlow {
                 }
                 let (r, c) = (r as u16, c as u16);
                 // Expired sparks were pruned above, so any hit here is alive.
-                // Full scan (resident cap NYAN_MAX_CELLS) — a bounded window
+                // Full scan (resident cap RAINBOW_MAX_CELLS) — a bounded window
                 // could miss a live spark and light a DUPLICATE on top of it.
                 if self
                     .sparks
@@ -9015,7 +9026,7 @@ impl CursorGlow {
                     col: c,
                     born_cov: ((40.0 + 175.0 * pos) * boost).min(255.0) as u8,
                     pos,
-                    life: Self::NYAN_SWOOSH_LIFE,
+                    life: Self::RAINBOW_SWOOSH_LIFE,
                     typing: true,
                     hue: (self.hue + pos * 0.5).fract(),
                     born: reach_at,
@@ -9028,15 +9039,15 @@ impl CursorGlow {
             if n_typing == 0 {
                 // Swoosh complete. Keep the retract marker so the reach phase
                 // stays off until the next key re-arms everything.
-                self.nyan.retract.get_or_insert((retract_at, 0));
+                self.rainbow.retract.get_or_insert((retract_at, 0));
                 return;
             }
-            let (start, n0) = *self.nyan.retract.get_or_insert((retract_at, n_typing));
+            let (start, n0) = *self.rainbow.retract.get_or_insert((retract_at, n_typing));
             let t = now.saturating_duration_since(start).as_secs_f32();
-            let keep = if t >= Self::NYAN_RETRACT_DUR {
+            let keep = if t >= Self::RAINBOW_RETRACT_DUR {
                 0
             } else {
-                (n0 as f32 * (1.0 - t / Self::NYAN_RETRACT_DUR)).ceil() as usize
+                (n0 as f32 * (1.0 - t / Self::RAINBOW_RETRACT_DUR)).ceil() as usize
             };
             let excess = n_typing.saturating_sub(keep);
             if excess > 0 {
@@ -9049,7 +9060,7 @@ impl CursorGlow {
                 // and slurped the drain BACKWARDS — eating inward first and
                 // stranding the far segment. Absolute distance always retracts
                 // from the farthest cell INTO the cursor, whichever side it lies.
-                let mut ranked = std::mem::take(&mut self.nyan.rank_scratch);
+                let mut ranked = std::mem::take(&mut self.rainbow.rank_scratch);
                 ranked.clear();
                 ranked.extend(
                     self.sparks
@@ -9064,7 +9075,7 @@ impl CursorGlow {
                 );
                 ranked.sort_unstable_by_key(|&(m, _)| std::cmp::Reverse(m));
                 ranked.truncate(excess);
-                let mut kill = std::mem::take(&mut self.nyan.kill_scratch);
+                let mut kill = std::mem::take(&mut self.rainbow.kill_scratch);
                 kill.clear();
                 kill.resize(self.sparks.len(), false);
                 for &(_, i) in &ranked {
@@ -9076,13 +9087,13 @@ impl CursorGlow {
                     idx += 1;
                     !dead
                 });
-                self.nyan.rank_scratch = ranked;
-                self.nyan.kill_scratch = kill;
+                self.rainbow.rank_scratch = ranked;
+                self.rainbow.kill_scratch = kill;
             }
         }
     }
 
-    /// Emit the Nyan JUMP "ZOOM!" streaks: each live [`JumpStreak`] is one straight
+    /// Emit the rainbow kitty JUMP "ZOOM!" streaks: each live [`JumpStreak`] is one straight
     /// anti-aliased BEAM along the jump vector, banded into the six rainbow stripes
     /// by drawing six thin parallel beams offset PERPENDICULAR to the segment —
     /// one clean linear swoosh whether the jump is horizontal, a wrap to the next
@@ -9218,7 +9229,7 @@ impl CursorGlow {
         }
     }
 
-    /// FEATURES A + B — the LANDING PAYLOAD a large Nyan cursor jump earns,
+    /// FEATURES A + B — the LANDING PAYLOAD a large kitty cursor jump earns,
     /// emitted SEPARATELY from the ZOOM wake streak so it can fire on BOTH an
     /// un-hinted jump (Enter, a folding wrap, a TUI/vim leap) AND a NAVIGATION-
     /// hinted one (Ctrl-A/E, Home/End — the literal gestures the owner named).
@@ -9228,22 +9239,22 @@ impl CursorGlow {
     /// Two payloads, each gated on its own condition:
     ///
     /// * the FAST-JUMP STARBURST: a radial ray spray AT THE LANDING, only for a
-    ///   genuinely fast jump (`dist >= NYAN_BURST_MIN_DIST`). A short one-row
+    ///   genuinely fast jump (`dist >= RAINBOW_BURST_MIN_DIST`). A short one-row
     ///   wrap keeps only the streak; a real fling earns the celebration.
-    ///   [`Self::NYAN_BURST_CAP`]-capped so a Ctrl-A/E MASH — which reaches this
+    ///   [`Self::RAINBOW_BURST_CAP`]-capped so a Ctrl-A/E MASH — which reaches this
     ///   code on the navigation path — stays bounded. The reach scales with the
     ///   jump distance, floored so a just-past-threshold fling still bursts and
     ///   capped so a screen-crossing leap can't fling rays into the padding.
-    ///   Reduced-motion still SPAWNS one — [`Self::emit_nyan_starburst`] renders
+    ///   Reduced-motion still SPAWNS one — [`Self::emit_rainbow_starburst`] renders
     ///   it as a single static frame — so the landing is marked either way.
     ///
     /// * the GRACEFUL POST-JUMP TERMINUS: the abandoned ribbon is
     ///   left at the PRE-jump head with a hard leading edge; scatter melt-out
     ///   twinkle stars there so that end FEATHERS into the background instead of
     ///   terminating on a vertical cut. Gated on a LIVE ribbon
-    ///   (`nyan.disp >= NYAN_TERMINUS_MIN_DISP`): a cold/idle cursor
+    ///   (`rainbow.disp >= RAINBOW_TERMINUS_MIN_DISP`): a cold/idle cursor
     ///   never laid a ribbon, so there is no edge to dissolve. The scatter itself
-    ///   is reduced-motion-safe (finding 2 — see [`Self::scatter_nyan_terminus`]).
+    ///   is reduced-motion-safe (finding 2 — see [`Self::scatter_rainbow_terminus`]).
     ///
     /// Push ONE transient rainbow ZOOM beam from `from` to `to`. Shared by the
     /// un-hinted jump branch and the NAVIGATION arm so a Ctrl-A/E leap and an
@@ -9263,14 +9274,14 @@ impl CursorGlow {
         to: (u16, u16),
         dist: f32,
     ) {
-        if self.nyan.jumps.len() >= Self::NYAN_JUMP_CAP {
-            self.nyan.jumps.remove(0);
+        if self.rainbow.jumps.len() >= Self::RAINBOW_JUMP_CAP {
+            self.rainbow.jumps.remove(0);
         }
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let (oxf, oyf) = (geom.origin_x as f32, geom.origin_y as f32);
         let pr_c = from.0.min(geom.rows.saturating_sub(1) as u16);
         let pc_c = from.1.min(geom.cols.saturating_sub(1) as u16);
-        self.nyan.jumps.push(JumpStreak {
+        self.rainbow.jumps.push(JumpStreak {
             x0: oxf + (pc_c as f32 + 0.5) * cwf,
             y0: oyf + (pr_c as f32 + 0.5) * chf,
             x1: oxf + (to.1 as f32 + 0.5) * cwf,
@@ -9282,11 +9293,11 @@ impl CursorGlow {
             life: (0.18 + 0.009 * dist).clamp(0.18, 0.52),
             // The fling's fatness rides the EASED momentum you HAD (a leap from a
             // hot run throws a fat rainbow), not the raw last keystroke.
-            mom: self.nyan.disp,
+            mom: self.rainbow.disp,
         });
     }
 
-    fn emit_nyan_jump_landing(
+    fn emit_rainbow_jump_landing(
         &mut self,
         now: Instant,
         geom: Geom,
@@ -9297,21 +9308,21 @@ impl CursorGlow {
         // The landing star scatter (any qualifying jump, burst-capped).
         // GRADUATED by distance: a short Option-B/F hop
         // (dist ≈ 2) throws ONE small star, a screen-crossing fling throws the
-        // full [`Self::NYAN_BURST_STARS`], with the scatter reach scaling too.
-        if dist >= Self::NYAN_BURST_MIN_DIST {
-            if self.nyan.bursts.len() >= Self::NYAN_BURST_CAP {
-                self.nyan.bursts.remove(0);
+        // full [`Self::RAINBOW_BURST_STARS`], with the scatter reach scaling too.
+        if dist >= Self::RAINBOW_BURST_MIN_DIST {
+            if self.rainbow.bursts.len() >= Self::RAINBOW_BURST_CAP {
+                self.rainbow.bursts.remove(0);
             }
             let seed = self.frand();
             let reach = (0.9 + 0.09 * dist).clamp(1.1, 2.6) * geom.ch as f32;
-            // Star count ramps 1 → NYAN_BURST_STARS across ~2..30 cells: the
+            // Star count ramps 1 → RAINBOW_BURST_STARS across ~2..30 cells: the
             // farther the leap, the more stars scatter off the landing.
-            let stars = (1 + (dist / 10.0) as usize).clamp(1, Self::NYAN_BURST_STARS) as u8;
-            self.nyan.bursts.push(Starburst {
+            let stars = (1 + (dist / 10.0) as usize).clamp(1, Self::RAINBOW_BURST_STARS) as u8;
+            self.rainbow.bursts.push(Starburst {
                 cx: landing.0,
                 cy: landing.1,
                 born: now,
-                life: Self::NYAN_BURST_LIFE,
+                life: Self::RAINBOW_BURST_LIFE,
                 reach,
                 seed,
                 stars,
@@ -9322,7 +9333,7 @@ impl CursorGlow {
             // including on the NAVIGATION arm (a hinted Ctrl-A/E leap reaches
             // this code by design). Co-locating the cue
             // with the `Starburst` push, rather than duplicating the
-            // `NYAN_BURST_MIN_DIST` gate at the call sites, makes "stars implies
+            // `RAINBOW_BURST_MIN_DIST` gate at the call sites, makes "stars implies
             // chime" true by construction.
             //
             // The landing column is recovered from the pixel centre the burst
@@ -9339,12 +9350,12 @@ impl CursorGlow {
         // stays ≥ the floor for ~3-6s while the visible ribbon fades in under
         // ~3s, and glitter scattered in that gap lands on long-empty cells
         // (the owner's Ctrl-L blob). Require a committed press recent enough
-        // ([`Self::NYAN_TERMINUS_RIBBON_WINDOW`]) that ribbon is plausibly
+        // ([`Self::RAINBOW_TERMINUS_RIBBON_WINDOW`]) that ribbon is plausibly
         // still on glass.
-        if self.nyan.disp >= Self::NYAN_TERMINUS_MIN_DISP
-            && self.typed_presses_within(now, Self::NYAN_TERMINUS_RIBBON_WINDOW) > 0
+        if self.rainbow.disp >= Self::RAINBOW_TERMINUS_MIN_DISP
+            && self.typed_presses_within(now, Self::RAINBOW_TERMINUS_RIBBON_WINDOW) > 0
         {
-            self.scatter_nyan_terminus(now, geom, terminus.0, terminus.1);
+            self.scatter_rainbow_terminus(now, geom, terminus.0, terminus.1);
         }
     }
 
@@ -9355,7 +9366,7 @@ impl CursorGlow {
     /// poof rides (`cov_scale` sentinel `< 0.9`, drawn as the cool 4-point plus
     /// in [`Self::emit_particles`]) — "a small scatter of the existing twinkle
     /// stars at the terminus", per the owner. Each star's LIFE is graded by the
-    /// shared [`nyan_terminus_feather`]: the outermost sparkle (smallest `frac`)
+    /// shared [`rainbow_terminus_feather`]: the outermost sparkle (smallest `frac`)
     /// gets the shortest life and winks out FIRST, so the dissolve retreats
     /// inward from where the old hard edge was — the feather-to-zero shape made
     /// visible in the spatial domain. Deterministic via `frand`;
@@ -9372,13 +9383,13 @@ impl CursorGlow {
     /// the starburst still marks the landing (static), so the jump still resolves
     /// — just without this decorative motion. Applies to BOTH callers (the post-
     /// jump terminus and the far-right typing terminus).
-    fn scatter_nyan_terminus(&mut self, now: Instant, geom: Geom, cx: f32, cy: f32) {
+    fn scatter_rainbow_terminus(&mut self, now: Instant, geom: Geom, cx: f32, cy: f32) {
         if self.reduced_motion {
             return;
         }
         let cell = geom.ch as f32;
         let cwf = geom.cw as f32;
-        let n = Self::NYAN_TERMINUS_STARS;
+        let n = Self::RAINBOW_TERMINUS_STARS;
         for i in 0..n {
             if self.particles.len() >= Self::MAX_PARTICLES {
                 break;
@@ -9390,7 +9401,7 @@ impl CursorGlow {
             // `frac` walks the feather from its far edge (0 → melted) inward
             // (1 → body): the closer to the terminus, the shorter the life.
             let frac = (i as f32 + 0.5) / n as f32;
-            let feather = nyan_terminus_feather(frac);
+            let feather = rainbow_terminus_feather(frac);
             // Spread OUTWARD past the terminus (biased along +x) with a little
             // vertical scatter — the sparse fringe of the dissolving end.
             let spread = (0.3 + r0 * 1.1) * cwf;
@@ -9411,23 +9422,23 @@ impl CursorGlow {
         }
     }
 
-    /// FEATURE B — emit the Nyan LANDING STARBURST: for each live [`Starburst`],
+    /// FEATURE B — emit the rainbow kitty LANDING STARBURST: for each live [`Starburst`],
     /// a handful of rainbow stars that pop-and-scatter off the landing and
     /// bounce gently, replacing the old 12-ray radial firework. Each star:
     /// - SCATTERS along an evenly-fanned, seed-rotated direction, easing OUT so
     ///   it snaps out then coasts, riding a small parabolic BOUNCE arc;
     /// - POPS in (`smoothstep`) then shrinks at death (size bounce-in/out);
-    /// - is one [`NYAN_BANDS`] hue (the handful spans the spectrum).
+    /// - is one [`RAINBOW_BANDS`] hue (the handful spans the spectrum).
     ///
     /// ONE STAR SPECIES. The shape is [`push_twinkle_star`] — the exact 4-point
     /// twinkle the typing starfield and the glide sparkles draw — so the burst
-    /// reads as the Nyan starfield FLARING at the landing rather than as a
+    /// reads as the rainbow kitty starfield FLARING at the landing rather than as a
     /// second kind of star showing up. The rainbow lives in the star's COLOUR,
     /// never in a bespoke geometry (owner: "unify on rainbows and sparkles").
     ///
     /// The count is GRADUATED by jump distance ([`Starburst::stars`]): a short
     /// Option-B/F hop scatters ONE small star, a screen-crossing fling the full
-    /// [`Self::NYAN_BURST_STARS`]. FORKED by theme: DARK draws the additive
+    /// [`Self::RAINBOW_BURST_STARS`]. FORKED by theme: DARK draws the additive
     /// twinkle into the GlowQuad `out` stream;
     /// LIGHT (additive light is invisible on white)
     /// inverts each star to a DARKENED SATURATED source-over veil dot (the
@@ -9439,7 +9450,7 @@ impl CursorGlow {
     /// full size, constant brightness — no scatter, tumble, arc, or pulse).
     /// Load-shed honours [`Self::MAX_QUADS`], so a saturated frame drops whole
     /// stars/rows cleanly.
-    fn emit_nyan_starburst(
+    fn emit_rainbow_starburst(
         &self,
         now: Instant,
         cfg: &GlowConfig,
@@ -9447,7 +9458,7 @@ impl CursorGlow {
         out: &mut Vec<GlowQuad>,
         halos: &mut Vec<RainHalo>,
     ) {
-        if !matches!(cfg.style, GlowStyle::Nyan) || self.nyan.bursts.is_empty() {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) || self.rainbow.bursts.is_empty() {
             return;
         }
         use std::f32::consts::{PI, TAU};
@@ -9458,9 +9469,9 @@ impl CursorGlow {
         // through — and the owner asked for it to be MORE prominent, not less
         // ("The landing should be a starburst of color"). The legibility
         // budget governs the layers that ride along with ordinary typing.
-        let base_r = NYAN_STAR_R_FRAC * chf;
+        let base_r = RAINBOW_STAR_R_FRAC * chf;
         let arc = 0.5 * chf; // the landing bounce height
-        for b in &self.nyan.bursts {
+        for b in &self.rainbow.bursts {
             let age = now.saturating_duration_since(b.born).as_secs_f32();
             let u = (age / b.life).clamp(0.0, 1.0);
             let n = (b.stars as usize).max(1);
@@ -9474,7 +9485,7 @@ impl CursorGlow {
             if fade <= 0.02 {
                 continue;
             }
-            let cov = (NYAN_TRANSIENT_COV_CAP * fade * cfg.intensity).clamp(0.0, 255.0);
+            let cov = (RAINBOW_TRANSIENT_COV_CAP * fade * cfg.intensity).clamp(0.0, 255.0);
             if cov < 1.0 {
                 continue;
             }
@@ -9487,7 +9498,7 @@ impl CursorGlow {
                 let ang = (i as f32 / n as f32 + b.seed * 0.5) * TAU;
                 let (dx, dy) = (ang.cos(), ang.sin());
                 // One solid hue per star; the handful spans the spectrum.
-                let hue = NYAN_BANDS[(i + (b.seed * 6.0) as usize) % NYAN_BANDS.len()];
+                let hue = RAINBOW_BANDS[(i + (b.seed * 6.0) as usize) % RAINBOW_BANDS.len()];
                 let (d, cy_i, scale) = if self.reduced_motion {
                     // One static rest frame: final scattered offset, full size —
                     // no scatter, arc, or pulse.
@@ -9529,7 +9540,7 @@ impl CursorGlow {
                 }
                 // DARK ARM: THE SHARED TWINKLE, in this star's rainbow band hue.
                 // Same shape as the typing starfield and the glide sparkles —
-                // only the colour differs — so the landing reads as the Nyan
+                // only the colour differs — so the landing reads as the rainbow kitty
                 // starfield flaring, not as a second star species arriving.
                 if !push_twinkle_star(
                     out,
@@ -9612,13 +9623,13 @@ impl CursorGlow {
         }
     }
 
-    /// Emit the Nyan FAST-GLIDE rainbow SHOOTING STARS (owner: "some rainbow
+    /// Emit the FAST-GLIDE rainbow SHOOTING STARS (owner: "some rainbow
     /// streak when the cursor moves quickly, maybe like a star"): for each live
     /// [`GlideStar`], a directional rainbow streak — a dim tail brightening into
     /// a white-hot HEAD at the new cursor cell — laid along the glide's velocity
     /// vector, the tail retracting head-ward over life (the shooting-star ZOOM
     /// read). FORKED by theme: DARK draws the tail as chained [`comet_beam`]
-    /// [`NYAN_BANDS`] segments (the ZOOM/starburst ray primitive) topped by a
+    /// [`RAINBOW_BANDS`] segments (the ZOOM/starburst ray primitive) topped by a
     /// small white twinkle head into the additive `out` stream; LIGHT (additive
     /// light is invisible on white) inverts it to a DARKENED SATURATED rainbow
     /// source-over streak ([`push_rainbow_streak_over`], the ribbon-rail recipe)
@@ -9626,7 +9637,7 @@ impl CursorGlow {
     /// driven) and the discrete jump ZOOM/burst stars (a single large delta).
     /// Reduced-motion draws ONE static frame (full length, fixed brightness, no
     /// retract/pulse). Load-shed honours [`Self::MAX_QUADS`].
-    fn emit_nyan_glide_stars(
+    fn emit_rainbow_glide_stars(
         &self,
         now: Instant,
         cfg: &GlowConfig,
@@ -9634,12 +9645,12 @@ impl CursorGlow {
         out: &mut Vec<GlowQuad>,
         halos: &mut Vec<RainHalo>,
     ) {
-        if !matches!(cfg.style, GlowStyle::Nyan) || self.glide.stars.is_empty() {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) || self.glide.stars.is_empty() {
             return;
         }
         let chf = geom.ch as f32;
         let thick = (chf * 0.18).max(1.5);
-        let bands = NYAN_BANDS.len();
+        let bands = RAINBOW_BANDS.len();
         for g in &self.glide.stars {
             let age = now.saturating_duration_since(g.born).as_secs_f32();
             let u = (age / g.life).clamp(0.0, 1.0);
@@ -9659,7 +9670,7 @@ impl CursorGlow {
             let ty = g.y0 + (hy - g.y0) * retract;
             // Brighter with speed (a faster glide streaks brighter), capped.
             let vel_k = ((g.vel - Self::GLIDE_VEL_MIN) / Self::GLIDE_VEL_MIN).clamp(0.0, 1.0);
-            let head_cov = (NYAN_TRANSIENT_COV_CAP * (0.6 + 0.4 * vel_k) * fade * cfg.intensity)
+            let head_cov = (RAINBOW_TRANSIENT_COV_CAP * (0.6 + 0.4 * vel_k) * fade * cfg.intensity)
                 .clamp(0.0, 255.0);
             if head_cov < 1.0 {
                 continue;
@@ -9681,7 +9692,7 @@ impl CursorGlow {
                 );
                 continue;
             }
-            // DARK ARM: a rainbow tail — chained NYAN_BANDS comet_beam segments,
+            // DARK ARM: a rainbow tail — chained RAINBOW_BANDS comet_beam segments,
             // dim(tail) → bright(head) — topped by a white twinkle head.
             let seed_rot = (g.seed * 6.0) as usize;
             for k in 0..bands {
@@ -9692,14 +9703,14 @@ impl CursorGlow {
                 let f1 = (k + 1) as f32 / bands as f32;
                 let p0 = (tx + (hx - tx) * f0, ty + (hy - ty) * f0);
                 let p1 = (tx + (hx - tx) * f1, ty + (hy - ty) * f1);
-                let hue = NYAN_BANDS[(k + seed_rot) % bands];
+                let hue = RAINBOW_BANDS[(k + seed_rot) % bands];
                 let c0 = (head_cov * (0.2 + 0.8 * f0)) as u8;
                 let c1 = (head_cov * (0.2 + 0.8 * f1)) as u8;
                 if c1 == 0 {
                     continue;
                 }
                 // GRADED STRIDE (the ZOOM `SEG` idiom above in
-                // `emit_nyan_jumps`): the sampling stride follows the coverage
+                // `emit_rainbow_jumps`): the sampling stride follows the coverage
                 // ramp — the dim tail haze reads identically in 3 px slabs,
                 // the mid takes 2 px, and only the bright head segment pays
                 // for 1 px sampling. Same `SEG` breakpoints (0.45 / 0.8 along
@@ -9707,7 +9718,7 @@ impl CursorGlow {
                 // rasterization density of haze changes, which roughly halves
                 // a saturated glide's (GLIDE_STAR_CAP stars at full 6-cell
                 // reach) transient quad demand — 740 vs 1440 measured in
-                // `nyan_glide_star_grades_its_slab_stride`.
+                // `rainbow_glide_star_grades_its_slab_stride`.
                 let fm = (f0 + f1) * 0.5;
                 let step = if fm < 0.45 {
                     3
@@ -9763,7 +9774,7 @@ impl CursorGlow {
         }
     }
 
-    fn emit_nyan_jumps(
+    fn emit_rainbow_jumps(
         &self,
         now: Instant,
         cfg: &GlowConfig,
@@ -9771,11 +9782,11 @@ impl CursorGlow {
         out: &mut Vec<GlowQuad>,
         halos: &mut Vec<RainHalo>,
     ) {
-        if !matches!(cfg.style, GlowStyle::Nyan) || self.nyan.jumps.is_empty() {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) || self.rainbow.jumps.is_empty() {
             return;
         }
         let chf = geom.ch as f32;
-        for j in &self.nyan.jumps {
+        for j in &self.rainbow.jumps {
             let age = now.saturating_duration_since(j.born).as_secs_f32();
             let u = (age / j.life).clamp(0.0, 1.0);
             let fade = 1.0 - u * u; // hold bright, then drop away
@@ -9803,7 +9814,7 @@ impl CursorGlow {
             }
             // Slim streak at low momentum, a fat rainbow at full heat.
             let total = chf * (0.36 + 0.34 * j.mom);
-            let head_cov = (NYAN_TRANSIENT_COV_CAP * fade * cfg.intensity).clamp(0.0, 255.0);
+            let head_cov = (RAINBOW_TRANSIENT_COV_CAP * fade * cfg.intensity).clamp(0.0, 255.0);
             if head_cov < 1.0 {
                 continue;
             }
@@ -9837,14 +9848,14 @@ impl CursorGlow {
                 // the mid takes 2 px (3 px staircases on diagonals — the
                 // LASER_LAYERS lesson), and only the bright head wedge pays
                 // for 1 px sampling. That keeps a cross-window jump at ~3.15L
-                // slabs rather than ~6L, so NYAN_JUMP_CAP live streaks cannot
+                // slabs rather than ~6L, so RAINBOW_JUMP_CAP live streaks cannot
                 // saturate MAX_QUADS on their own and starve the landing
                 // crown/ring/particles behind them.
                 (0.0, 0.45, 0.45, 0.12, 3),
                 (0.45, 0.8, 0.75, 0.55, 2),
                 (0.8, 1.0, 1.0, 1.0, 1),
             ];
-            for (band, &color) in NYAN_BANDS.iter().enumerate() {
+            for (band, &color) in RAINBOW_BANDS.iter().enumerate() {
                 for &(t0, t1, thick, covx, step) in &SEG {
                     if out.len() >= Self::MAX_QUADS {
                         return;
@@ -9896,7 +9907,7 @@ impl CursorGlow {
     // LIGHT THEMES: additive light cannot brighten a white ground — the
     // six additive stripes collapse to a near-invisible pastel per-glyph
     // TINT with no continuous band, and worse, tint
-    // the glyph fg toward the background. Give nyan the beam family's
+    // the glyph fg toward the background. Give rainbow kitty the beam family's
     // light treatment (see `emit_comet`'s veil branch): per swept cell two
     // SOURCE-OVER rails hugging the row's edges — a darkened saturated
     // rainbow bracket (warm top, cool bottom, the stacked-stripe identity)
@@ -9906,7 +9917,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "one swept cell + its shared envelope scalars; a single internal call site"
     )]
-    fn emit_nyan_rails_light(
+    fn emit_rainbow_rails_light(
         &self,
         s: &Spark,
         age: f32,
@@ -9919,30 +9930,31 @@ impl CursorGlow {
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         // The body is UNDER ink, but a bright additive background still destroys
         // contrast against an antialiased glyph: the single structural clamp
-        // holds every body sample to [`NYAN_OCCUPIED_COV_CAP`] (5.37:1
+        // holds every body sample to [`RAINBOW_OCCUPIED_COV_CAP`] (5.37:1
         // worst-band contrast). Light-theme rails live OUTSIDE the glyph band,
         // so they keep their own separate 120 budget.
-        const NYAN_LIGHT_RAIL_COV_CAP: f32 = 120.0;
+        const RAINBOW_LIGHT_RAIL_COV_CAP: f32 = 120.0;
         // Opacity in the high byte, peak always FULL: constant radii.
         let (scx, scy) = geom.cell_center(s.row, s.col);
-        let alpha = (cov_f.min(NYAN_LIGHT_RAIL_COV_CAP) * 1.9).min(NYAN_LIGHT_RAIL_ALPHA_CAP) as u8;
+        let alpha =
+            (cov_f.min(RAINBOW_LIGHT_RAIL_COV_CAP) * 1.9).min(RAINBOW_LIGHT_RAIL_ALPHA_CAP) as u8;
         if alpha >= 1 {
             // Where this cell sits on the band ramp: a slow travelling
             // sweep (the ribbon's own phase + the column) so the rails
             // read as a rainbow flowing past rather than two flat bars.
-            let sweep = (s.col as f32 * NYAN_LIGHT_RAIL_SPREAD
-                + self.nyan.phase * NYAN_LIGHT_RAIL_FLOW)
+            let sweep = (s.col as f32 * RAINBOW_LIGHT_RAIL_SPREAD
+                + self.rainbow.phase * RAINBOW_LIGHT_RAIL_FLOW)
                 .rem_euclid(1.0);
             // Warm half (red→yellow) up top, cool half (green→violet)
             // below — darkened so the saturated hue survives source-over
             // on white.
             let warm = lerp_rgb(
-                nyan_gradient_of(&NYAN_BANDS, sweep * 0.42),
+                rainbow_gradient_of(&RAINBOW_BANDS, sweep * 0.42),
                 0x0000_0000,
                 0.28,
             );
             let cool = lerp_rgb(
-                nyan_gradient_of(&NYAN_BANDS, 0.58 + sweep * 0.42),
+                rainbow_gradient_of(&RAINBOW_BANDS, 0.58 + sweep * 0.42),
                 0x0000_0000,
                 0.28,
             );
@@ -9954,9 +9966,9 @@ impl CursorGlow {
                 halos,
                 geom,
                 scx,
-                scy - chf * NYAN_LIGHT_RAIL_DY,
-                cwf * NYAN_LIGHT_RAIL_RX,
-                chf * NYAN_LIGHT_RAIL_RY,
+                scy - chf * RAINBOW_LIGHT_RAIL_DY,
+                cwf * RAINBOW_LIGHT_RAIL_RX,
+                chf * RAINBOW_LIGHT_RAIL_RY,
                 stamp(warm),
                 255,
             );
@@ -9964,9 +9976,9 @@ impl CursorGlow {
                 halos,
                 geom,
                 scx,
-                scy + chf * NYAN_LIGHT_RAIL_DY,
-                cwf * NYAN_LIGHT_RAIL_RX,
-                chf * NYAN_LIGHT_RAIL_RY,
+                scy + chf * RAINBOW_LIGHT_RAIL_DY,
+                cwf * RAINBOW_LIGHT_RAIL_RX,
+                chf * RAINBOW_LIGHT_RAIL_RY,
                 stamp(cool),
                 255,
             );
@@ -9980,18 +9992,19 @@ impl CursorGlow {
         // the dark cold-star population, skipped only over a KNOWN-occupied
         // sky cell (unknown/clear twinkle, mirroring the dark contract);
         // brightness pulses and rides the same momentum envelope as the
-        // dark stars. Pinned by `nyan_light_ribbon_twinkles`.
+        // dark stars. Pinned by `rainbow_light_ribbon_twinkles`.
         let sh = (s.row as u32).wrapping_mul(73_856_093) ^ (s.col as u32).wrapping_mul(19_349_663);
         if sh.is_multiple_of(6)
             && self.probed_cell_glyph(i32::from(s.row) - 1, s.col, geom.rows) != Some(true)
         {
             let twinkle = 0.55 + 0.45 * (age * 9.0 + (sh >> 3) as f32).sin().abs();
-            let mom = nyan_star_momentum(self.nyan.disp);
-            let scov = (NYAN_LIGHT_RAIL_COV_CAP * env * twinkle * mom * cfg.intensity).min(150.0);
+            let mom = rainbow_star_momentum(self.rainbow.disp);
+            let scov =
+                (RAINBOW_LIGHT_RAIL_COV_CAP * env * twinkle * mom * cfg.intensity).min(150.0);
             if scov >= 1.0 {
                 // A saturated darkened sparkle hue (rolls per cell so the
                 // sky isn't monochrome), capped for legibility.
-                let hue = nyan_gradient_of(&NYAN_BANDS, ((sh >> 5) & 0xff) as f32 / 255.0);
+                let hue = rainbow_gradient_of(&RAINBOW_BANDS, ((sh >> 5) & 0xff) as f32 / 255.0);
                 let dot = lerp_rgb(hue, 0x0000_0000, 0.28);
                 let cap = (scov as u32).clamp(1, 150);
                 let dot_capped = (dot & 0x00FF_FFFF) | (cap << 24);
@@ -10014,7 +10027,7 @@ impl CursorGlow {
     /// coverage, feathered gradient rows, momentum wave. Returns `false` when
     /// the quad budget ran out — the caller aborts the pass exactly as the
     /// inlined original did.
-    fn emit_nyan_body_dark(
+    fn emit_rainbow_body_dark(
         &self,
         s: &Spark,
         u: f32,
@@ -10027,33 +10040,33 @@ impl CursorGlow {
         let ch = geom.ch as i32;
         // RIBBON IRIDESCENCE — COVERAGE ONLY (the six band hues and their
         // boundary rows stay byte-crisp). A deterministic two-octave value-
-        // noise shimmers each cell's brightness (±NYAN_IRID_AMP at full
+        // noise shimmers each cell's brightness (±RAINBOW_IRID_AMP at full
         // momentum), and a bright specular GLINT (~2 cells wide) sweeps
         // head→tail along the ribbon (u = age/life, 0 head → 1 tail) as the
         // phase advances — light refracting down a glass ribbon. BOTH
         // amplitudes scale with the eased spine, so a COLD ribbon
-        // (`nyan.disp == 0`) is an exactly flat crisp rect and the strip gate
+        // (`rainbow.disp == 0`) is an exactly flat crisp rect and the strip gate
         // below keeps its 1-quad idle cost.
         // ONE multiplier rides all six bands of the cell, so the boundaries
-        // never move and every band keeps its exact `NYAN_BANDS` hue; the
+        // never move and every band keeps its exact `RAINBOW_BANDS` hue; the
         // final cap keeps the additive ribbon text-legible (never > cap). The
         // per-row feather below rides on top of this per-cell base.
-        let base = nyan_occupied_coverage(cov_f);
-        let cell_cov = if self.nyan.disp < 0.005 {
+        let base = rainbow_occupied_coverage(cov_f);
+        let cell_cov = if self.rainbow.disp < 0.005 {
             base
         } else {
-            let noise = nyan_irid_noise(s.col, s.row, self.nyan.phase); // -1..1
+            let noise = rainbow_irid_noise(s.col, s.row, self.rainbow.phase); // -1..1
             // WIDER DYNAMIC RANGE: the shimmer + glint amplitudes ride the
             // spine SQUARED, not linearly, so a hot ribbon shimmers distinctly
             // more than a warm one (the contrast between a stroll and a sprint
             // widens) while disp = 1 stays bounded by the cov cap as before.
-            let disp2 = self.nyan.disp * self.nyan.disp;
-            let shimmer = 1.0 + Self::NYAN_IRID_AMP * disp2 * noise;
-            let gc = self.nyan.phase.fract(); // glint centre: head(0)→tail(1)
-            let gd = (u - gc) / Self::NYAN_GLINT_WIDTH;
+            let disp2 = self.rainbow.disp * self.rainbow.disp;
+            let shimmer = 1.0 + Self::RAINBOW_IRID_AMP * disp2 * noise;
+            let gc = self.rainbow.phase.fract(); // glint centre: head(0)→tail(1)
+            let gd = (u - gc) / Self::RAINBOW_GLINT_WIDTH;
             let glint = (-(gd * gd)).exp(); // localized specular highlight 0..1
-            let glint_add = Self::NYAN_GLINT_COV * disp2 * glint;
-            nyan_occupied_coverage(base * shimmer + glint_add)
+            let glint_add = Self::RAINBOW_GLINT_COV * disp2 * glint;
+            rainbow_occupied_coverage(base * shimmer + glint_add)
         };
         // Window-absolute cell anchor; the ribbon stays inside its own cell,
         // so `push_rect`'s origin-anchored row tag is still the true cell row.
@@ -10069,8 +10082,8 @@ impl CursorGlow {
         // also NARROWS it there, so the ribbon reads as a trail being FORMED
         // rather than one band turned down. A cold ribbon (clearance == 1) is
         // un-tapered.
-        let width_frac = (0.58 + 0.26 * self.nyan.disp)
-            * (NYAN_TAPER_FLOOR + (1.0 - NYAN_TAPER_FLOOR) * clearance);
+        let width_frac = (0.58 + 0.26 * self.rainbow.disp)
+            * (RAINBOW_TAPER_FLOOR + (1.0 - RAINBOW_TAPER_FLOOR) * clearance);
         let max_band_h = (ch - (ch / 4).max(2)).max(1);
         let band_h = (ch as f32 * width_frac)
             .max(6.0)
@@ -10087,7 +10100,7 @@ impl CursorGlow {
         //
         // HOT SAMPLING GRAIN — the quad budget, not taste: sampling per DEVICE
         // PIXEL costs O(cw·ch) quads per swept cell (~300 at 2× retina), so
-        // NYAN_MAX_CELLS live sparks would demand ~5× MAX_QUADS, key-repeat
+        // RAINBOW_MAX_CELLS live sparks would demand ~5× MAX_QUADS, key-repeat
         // would permanently saturate the snapshot, and the visible ribbon
         // length would become DPI-dependent. The hot wave therefore samples AT
         // MOST 3 strips per cell (≥4 px each — the intra-cell wave slope is only
@@ -10096,35 +10109,35 @@ impl CursorGlow {
         // ¼-free cap above) adds rows per strip, so 3 is the ceiling that keeps a
         // cell's quad cost bounded (~3 strips × ≤14 rows at 2× retina; 240 cells
         // stays inside the 16384 cap with headroom for the ZOOM streaks + crown;
-        // pinned by `nyan_hot_retina_ribbon_stays_inside_the_quad_budget` and
-        // `nyan_hot_ribbon_cell_cost_fits_the_quad_budget`). The COLD branch
+        // pinned by `rainbow_hot_retina_ribbon_stays_inside_the_quad_budget` and
+        // `rainbow_hot_ribbon_cell_cost_fits_the_quad_budget`). The COLD branch
         // keeps its single strip and 1-px rows BYTE-EXACT — the iridescence
         // contract above pins the cold ribbon as a flat crisp rect.
-        const NYAN_FEATHER: f32 = 0.18;
-        let hot = self.nyan.disp >= 0.005;
+        const RAINBOW_FEATHER: f32 = 0.18;
+        let hot = self.rainbow.disp >= 0.005;
         // MOMENTUM IRIDESCENT SPECTRUM — the "dynamic range" dial: at speed
         // the six anchor hues rotate gently around the wheel, the swing
         // travelling along the ribbon with the specular phase, so a hot
         // ribbon shimmers through neighbouring rainbows instead of freezing
         // on six constants. Rides the eased spine exactly like the shimmer
-        // and glint: a COLD ribbon keeps the fixed NYAN_BANDS bytes (the
+        // and glint: a COLD ribbon keeps the fixed RAINBOW_BANDS bytes (the
         // crisp-flat contract), and hue rotation preserves saturation and
         // value, so the text-safety coverage math is untouched.
         let bands = if hot {
-            let swing = Self::NYAN_HUE_SWING * self.nyan.disp;
-            let hue_off =
-                swing * (self.nyan.phase * 2.2 + s.col as f32 * 0.16 + s.row as f32 * 0.37).sin();
+            let swing = Self::RAINBOW_HUE_SWING * self.rainbow.disp;
+            let hue_off = swing
+                * (self.rainbow.phase * 2.2 + s.col as f32 * 0.16 + s.row as f32 * 0.37).sin();
             if hue_off.abs() < 0.001 {
-                NYAN_BANDS
+                RAINBOW_BANDS
             } else {
-                let mut b = NYAN_BANDS;
+                let mut b = RAINBOW_BANDS;
                 for c in &mut b {
                     *c = rotate_hue(*c, hue_off);
                 }
                 b
             }
         } else {
-            NYAN_BANDS
+            RAINBOW_BANDS
         };
         let strips: i32 = if hot {
             (geom.cw.div_ceil(4) as i32).clamp(1, 3)
@@ -10140,16 +10153,16 @@ impl CursorGlow {
                 continue;
             }
             let xf = s.col as f32 + (si as f32 + 0.5) / strips as f32;
-            // SHARED WAVE CLOCK (see [`Self::NYAN_WAVE_RAD`]): the undulation
-            // rides the INTEGRATED spine clock (`nyan.phase`), never per-spark
+            // SHARED WAVE CLOCK (see [`Self::RAINBOW_WAVE_RAD`]): the undulation
+            // rides the INTEGRATED spine clock (`rainbow.phase`), never per-spark
             // `age × rate(now)`. One shared clock moves every cell in lockstep,
             // advances only with momentum, and freezes — never reverses — when
             // cold.
             let wave_phase =
-                xf * 0.62 + s.row as f32 * 0.31 - self.nyan.phase * Self::NYAN_WAVE_RAD;
+                xf * 0.62 + s.row as f32 * 0.31 - self.rainbow.phase * Self::RAINBOW_WAVE_RAD;
             // FRACTIONAL vertical displacement — no rounding, so the curve
             // is smooth across columns instead of snapping to whole pixels.
-            let wave = wave_phase.sin() * room * 0.42 * self.nyan.disp;
+            let wave = wave_phase.sin() * room * 0.42 * self.rainbow.disp;
             let top_f = (cy0 as f32 + room * 0.5 + wave).clamp(cy0 as f32, cy0 as f32 + room);
             // Walk the device rows the ribbon covers (plus a 1px feather
             // margin at each end); each row gets its gradient hue + feather.
@@ -10171,8 +10184,8 @@ impl CursorGlow {
                     continue;
                 }
                 let feather =
-                    smoothstep01(t / NYAN_FEATHER) * smoothstep01((1.0 - t) / NYAN_FEATHER);
-                let rcov = nyan_occupied_coverage(cell_cov * feather);
+                    smoothstep01(t / RAINBOW_FEATHER) * smoothstep01((1.0 - t) / RAINBOW_FEATHER);
+                let rcov = rainbow_occupied_coverage(cell_cov * feather);
                 if rcov < 1.0 {
                     continue;
                 }
@@ -10183,7 +10196,7 @@ impl CursorGlow {
                     y,
                     sw,
                     h,
-                    premul_rgb(nyan_gradient_of(&bands, t), rcov as u8),
+                    premul_rgb(rainbow_gradient_of(&bands, t), rcov as u8),
                 );
             }
         }
@@ -10197,7 +10210,7 @@ impl CursorGlow {
         clippy::too_many_arguments,
         reason = "one swept cell + its shared envelope scalars; a single internal call site"
     )]
-    fn emit_nyan_starfield(
+    fn emit_rainbow_starfield(
         &self,
         s: &Spark,
         age: f32,
@@ -10212,12 +10225,12 @@ impl CursorGlow {
         // Same window-absolute cell anchor the body derives (pure recompute).
         let x = geom.origin_x as i32 + s.col as i32 * cw;
         let cy0 = geom.origin_y as i32 + s.row as i32 * ch;
-        let hot = self.nyan.disp >= 0.005;
+        let hot = self.rainbow.disp >= 0.005;
         // Starfield twinkle: a sparse subset of cells sheds one tiny 4-point
         // star riding the ribbon. Placement is a STABLE per-cell hash (not a
         // per-frame RNG) so stars ride the ribbon without flicker, fading with
         // the spark. COLD keeps a 1-in-6 star-CELL density, but brightness and
-        // arm length ride [`nyan_star_momentum`], so a
+        // arm length ride [`rainbow_star_momentum`], so a
         // cold sky twinkles faintly and full sparkle is earned by the spine.
         // Momentum also RECRUITS more sky — the raw (row,col) hash is
         // avalanche-mixed (runs of text can hash the multiple-of-6 gate badly
@@ -10243,7 +10256,7 @@ impl CursorGlow {
             // legacy stars (the cold 1-in-6 population) are never dimmed or
             // recoloured, so the hot/cold boundary is seamless for them.
             let u = m as f32 / u32::MAX as f32;
-            let p = 0.30 * self.nyan.disp; // ~1-in-3 extra at full spine
+            let p = 0.30 * self.rainbow.disp; // ~1-in-3 extra at full spine
             let recruited = !legacy && u < p;
             let dim = if recruited {
                 (((p - u) / p.max(1e-6)) * 3.0).min(1.0)
@@ -10280,9 +10293,9 @@ impl CursorGlow {
             // SUBTLE-START: the momentum envelope scales brightness AND arm
             // size, so a cold star is a faint small glint and the shipped
             // full-punch star returns only at full spine (rationale at
-            // `nyan_star_momentum`).
-            let mom = nyan_star_momentum(self.nyan.disp);
-            // FEATHERED ENDS: the star rides the same [`nyan_edge_envelope`]
+            // `rainbow_star_momentum`).
+            let mom = rainbow_star_momentum(self.rainbow.disp);
+            // FEATHERED ENDS: the star rides the same [`rainbow_edge_envelope`]
             // as its cell's body. The body's `cov_f < 1` cull above retires
             // the star and the ribbon together, but WITHOUT this factor the
             // star could still be at visible alpha on that very last frame
@@ -10291,10 +10304,10 @@ impl CursorGlow {
             // exactly the hard edge the owner keeps seeing. With it, both
             // fade through zero in lockstep: the star is born out of the
             // background with its cell and is spent before the cell is.
-            // Pinned by `nyan_stars_fade_with_the_ribbon_edge_feather`.
-            let star_cov = (NYAN_STAR_COV
+            // Pinned by `rainbow_stars_fade_with_the_ribbon_edge_feather`.
+            let star_cov = (RAINBOW_STAR_COV
                 * env
-                * nyan_edge_envelope(u, s.life)
+                * rainbow_edge_envelope(u, s.life)
                 * twinkle
                 * cfg.intensity
                 * recruit_dim
@@ -10321,7 +10334,7 @@ impl CursorGlow {
                 // the one the gate cleared. `push_rect` clips the top
                 // row's sky band at the effects box, exactly like every
                 // other off-grid emission. Pinned by
-                // `nyan_stars_spawn_clear_of_the_typed_row_band`.
+                // `rainbow_stars_spawn_clear_of_the_typed_row_band`.
                 let sky = (h >> 13) % 3 < 2;
                 let land_row = i32::from(s.row) + if sky { -1 } else { 1 };
                 let land_clear = self.probed_cell_glyph(land_row, s.col, geom.rows) == Some(false);
@@ -10361,9 +10374,9 @@ impl CursorGlow {
         true
     }
 
-    /// Emit the NYAN banded rainbow ribbon: for every swept cell, six crisp
+    /// Emit the RAINBOW KITTY banded rainbow ribbon: for every swept cell, six crisp
     /// non-overlapping horizontal stripes (red→violet, top→bottom) in fixed
-    /// [`NYAN_BANDS`] colours, faded tail→head over each spark's own lifetime, plus a
+    /// [`RAINBOW_BANDS`] colours, faded tail→head over each spark's own lifetime, plus a
     /// sparse twinkling starfield. The ribbon BODY renders into `under` — the
     /// `glow_under` stream, composited beneath the glyph pass — so typed letters
     /// draw OVER the rainbow at full contrast (the user-review legibility ask);
@@ -10373,14 +10386,14 @@ impl CursorGlow {
     /// length + brightness ride the typing HEAT (via each spark's `born_cov`
     /// and stretched lifetime), so a fast run / big fling throws a long bright rainbow —
     /// the momentum tell — while a still cursor decays to exactly nothing.
-    /// Composed per swept cell from [`Self::emit_nyan_rails_light`] (light
-    /// themes) or [`Self::emit_nyan_body_dark`] + [`Self::emit_nyan_starfield`]
+    /// Composed per swept cell from [`Self::emit_rainbow_rails_light`] (light
+    /// themes) or [`Self::emit_rainbow_body_dark`] + [`Self::emit_rainbow_starfield`]
     /// (dark themes), which share this loop's envelope math.
     #[allow(
         clippy::too_many_arguments,
         reason = "clock + config + geometry + the under/over/veil output streams; a param struct would obscure the single internal call site"
     )]
-    fn emit_nyan(
+    fn emit_rainbow(
         &self,
         now: Instant,
         cfg: &GlowConfig,
@@ -10389,18 +10402,18 @@ impl CursorGlow {
         out: &mut Vec<GlowQuad>,
         halos: &mut Vec<RainHalo>,
     ) {
-        if !matches!(cfg.style, GlowStyle::Nyan) || self.sparks.is_empty() {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) || self.sparks.is_empty() {
             return;
         }
         // NEAR-CURSOR CLARITY: the ribbon's head cells
         // are the letters JUST typed, so per-cell coverage rides
-        // [`nyan_ribbon_profile`] — a gentle half-life onset from a translucent
+        // [`rainbow_ribbon_profile`] — a gentle half-life onset from a translucent
         // floor into a MID-TAIL CREST, so peak intensity sits visibly behind
         // the cursor instead of on the newest glyph (constants + luminance
         // bookkeeping documented at the profile). The finger-lift retract
         // drains the ribbon within ~1 s of the last key, so an idle head never
         // brightens in place.
-        // SPATIAL HEAD CLEARANCE (see [`nyan_head_clearance`]): the cells the
+        // SPATIAL HEAD CLEARANCE (see [`rainbow_head_clearance`]): the cells the
         // hand is currently on keep a quiet wash and the body climbs to full a
         // few cells back — the cadence-invariant half of "start dimmer and
         // gradually get brighter", where the age profile above is the temporal
@@ -10423,14 +10436,14 @@ impl CursorGlow {
             // interior wink-out), only the trailing TAIL fades, and the tail
             // LENGTHENS with heat (a longer, softer dissolve the faster you fly).
             let u = (age / s.life).clamp(0.0, 1.0);
-            let tail = 0.32 + 0.45 * self.nyan.disp;
+            let tail = 0.32 + 0.45 * self.rainbow.disp;
             let env = if u < 1.0 - tail {
                 1.0
             } else {
                 let k = ((u - (1.0 - tail)) / tail).clamp(0.0, 1.0);
                 0.5 * (1.0 + (std::f32::consts::PI * k).cos())
             };
-            let head = nyan_ribbon_profile(u, s.life);
+            let head = rainbow_ribbon_profile(u, s.life);
             let raw_cov = (s.born_cov as f32) * env * head * cfg.intensity;
             // The age profile (temporal) × the cell-distance CLEARANCE (spatial).
             // Off-row ribbon and an unknown head both clear to 1.0, i.e.
@@ -10446,8 +10459,8 @@ impl CursorGlow {
             // a hole in the ribbon or detach its head from the cursor.
             let clearance = match head_cell {
                 Some((hr, hc)) if hr == s.row => {
-                    let near = nyan_head_clearance(hc.abs_diff(s.col) as f32);
-                    1.0 - (1.0 - near) * self.nyan.disp.clamp(0.0, 1.0)
+                    let near = rainbow_head_clearance(hc.abs_diff(s.col) as f32);
+                    1.0 - (1.0 - near) * self.rainbow.disp.clamp(0.0, 1.0)
                 }
                 _ => 1.0,
             };
@@ -10460,13 +10473,13 @@ impl CursorGlow {
                 continue;
             }
             if !cfg.dark_theme {
-                self.emit_nyan_rails_light(s, age, env, cov_f, cfg, geom, halos);
+                self.emit_rainbow_rails_light(s, age, env, cov_f, cfg, geom, halos);
                 continue;
             }
-            if !self.emit_nyan_body_dark(s, u, cov_f, clearance, geom, under) {
+            if !self.emit_rainbow_body_dark(s, u, cov_f, clearance, geom, under) {
                 return;
             }
-            if !self.emit_nyan_starfield(s, age, u, env, cfg, geom, out) {
+            if !self.emit_rainbow_starfield(s, age, u, env, cfg, geom, out) {
                 return;
             }
         }
@@ -10484,7 +10497,7 @@ impl CursorGlow {
     ///
     /// Streams: RADIAL-ONLY (`glow_halo`, over the glyph pass) — the pop must
     /// read ON TOP of the letter while the ribbon body stays under it; it
-    /// never touches the under-ink stream. Nyan-only, then FORKED by theme:
+    /// never touches the under-ink stream. Rainbow-kitty-only, then FORKED by theme:
     /// the DARK arm is the additive warm-white light described above; the LIGHT
     /// arm (additive light does nothing on white) inverts to a SOURCE-OVER
     /// cool-neutral DARKEN veil whose CENTRE over-alpha is `env`-faded and
@@ -10502,15 +10515,15 @@ impl CursorGlow {
         geom: Geom,
         halos: &mut Vec<RainHalo>,
     ) {
-        // The pop is Nyan-only; the treatment then FORKS by theme (below): the
+        // The pop is rainbow-kitty-only; the treatment then FORKS by theme (below): the
         // dark arm brightens additively, the light arm darkens source-over. Both
         // arms share every timing/momentum/spring/reduced-motion decision — only
         // the final emit differs.
-        if !matches!(cfg.style, GlowStyle::Nyan) || self.nyan.ink_pops.is_empty() {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) || self.rainbow.ink_pops.is_empty() {
             return;
         }
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
-        for p in &self.nyan.ink_pops {
+        for p in &self.rainbow.ink_pops {
             if (p.row as usize) >= geom.rows || (p.col as usize) >= geom.cols {
                 continue;
             }
@@ -10581,7 +10594,7 @@ impl CursorGlow {
             // The CORE: tight light hugging the letterform — the glyph itself
             // reads brighter (and, via the spring on the radii, momentarily
             // LARGER) then settles to the normal look.
-            let cov = nyan_over_ink_coverage(FRESH_INK_CORE_COV * env * m * cfg.intensity);
+            let cov = rainbow_over_ink_coverage(FRESH_INK_CORE_COV * env * m * cfg.intensity);
             if cov >= 1.0 {
                 push_halo(
                     halos,
@@ -10605,7 +10618,7 @@ impl CursorGlow {
                 // this frame's core centre peak; at the 0.7 default the sum is
                 // already under the cap, so this is a no-op there (dark output
                 // byte-identical — the golden runs 0.7).
-                let hcov = nyan_over_ink_coverage(FRESH_INK_HALO_COV * fl * m * cfg.intensity)
+                let hcov = rainbow_over_ink_coverage(FRESH_INK_HALO_COV * fl * m * cfg.intensity)
                     .min((FRESH_INK_CENTRE_CAP - cov).max(0.0));
                 if hcov >= 1.0 {
                     push_halo(
@@ -10624,7 +10637,7 @@ impl CursorGlow {
 
     /// THE TYPING WAKE emitter (see the wake constants block): ONE continuous
     /// plume of light lying in the inter-line LEADING under the typed row,
-    /// anchored at the sub-cell nozzle ([`NyanState::wake_head`]) and streaming
+    /// anchored at the sub-cell nozzle ([`RainbowState::wake_head`]) and streaming
     /// backward — hottest, thickest and whitest at the nozzle, cooling and
     /// thinning as it falls behind, gone entirely a beat after you stop typing.
     ///
@@ -10639,22 +10652,22 @@ impl CursorGlow {
     /// (so the plume's LENGTH is the speedometer), and each live keystroke
     /// contributes a travelling gaussian `pulse` — distinct puffs at a
     /// hunt-and-peck rhythm, one merged plume at speed. Thickness tapers from
-    /// [`NYAN_WAKE_H_HEAD`] to [`NYAN_WAKE_H_TAIL`] and colour runs the
-    /// [`nyan_wake_ramp`] heat ramp, so the form reads as a comet rather than a
+    /// [`RAINBOW_WAKE_H_HEAD`] to [`RAINBOW_WAKE_H_TAIL`] and colour runs the
+    /// [`rainbow_wake_ramp`] heat ramp, so the form reads as a comet rather than a
     /// rule and as the ribbon's own light cooling rather than a second unrelated
     /// glow. Nothing in it is quantised to the cell grid — cell-quantised marks
     /// read as UI chrome, not as light.
     ///
     /// LEGIBILITY IS STRUCTURAL, not budgeted. The plume is at most
-    /// [`NYAN_WAKE_H_HEAD`] of a cell thick and centred exactly on the ROW
+    /// [`RAINBOW_WAKE_H_HEAD`] of a cell thick and centred exactly on the ROW
     /// BOUNDARY, i.e. wholly inside the inter-line leading. It cannot enter the
     /// glyph band at all, so a freshly typed letter keeps 100% of its
     /// ink-to-ground contrast at every instant — pinned by
-    /// `nyan_wake_never_touches_the_glyph_band`.
+    /// `rainbow_wake_never_touches_the_glyph_band`.
     ///
     /// COST, because this runs on every frame of every keystroke of a daily
     /// driver: one early `is_empty` on the idle path; a bounded walk of at most
-    /// [`NYAN_WAKE_SEG_CAP`] segments (the natural length is far shorter); the
+    /// [`RAINBOW_WAKE_SEG_CAP`] segments (the natural length is far shorter); the
     /// per-segment pulse sum is over a ring capped at [`FRESH_INK_CAP`] and
     /// short-circuits on the newest-first ordering; no allocation (it pushes
     /// into the caller's resident scratch); no RNG, no wall clock — a pure
@@ -10663,14 +10676,14 @@ impl CursorGlow {
     ///
     /// Streams: the core rides `out` and the bloom rides `glow_halo`, both OVER
     /// the glyph pass, so the plume reads on top of the ribbon while the ribbon
-    /// body stays under the ink; neither touches the under-ink stream. Nyan-only,
+    /// body stays under the ink; neither touches the under-ink stream. Rainbow-kitty-only,
     /// then forked by theme: DARK emits the additive plume, LIGHT (where additive
     /// light does nothing) emits the same path as a source-over cool-neutral
     /// DARKEN contrail. Under REDUCED MOTION the plume freezes: the nozzle is
     /// pinned to the cursor cell, the travelling pulses are dropped, the length
     /// is held at its resting value, and the brightness becomes a hard 3-step
     /// fade — a static acknowledgment with no animation anywhere.
-    fn emit_nyan_wake(
+    fn emit_rainbow_wake(
         &self,
         now: Instant,
         cfg: &GlowConfig,
@@ -10681,7 +10694,7 @@ impl CursorGlow {
         // IDLE ZERO: no style, no keystroke in the ring, no nozzle ⇒ no work at
         // all beyond these three tests. A terminal being READ rather than typed
         // in never enters the walk.
-        if !matches!(cfg.style, GlowStyle::Nyan) || self.nyan.ink_pops.is_empty() {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) || self.rainbow.ink_pops.is_empty() {
             return;
         }
         // The host's TASTE dial (Settings ▸ Cursor & Motion ▸ "Typing wake"):
@@ -10692,7 +10705,7 @@ impl CursorGlow {
         if !persist.is_finite() || persist <= 0.0 {
             return;
         }
-        let Some((hrow, hcol)) = self.nyan.wake_head else {
+        let Some((hrow, hcol)) = self.rainbow.wake_head else {
             return;
         };
         if (hrow as usize) >= geom.rows || geom.cw == 0 || geom.ch == 0 {
@@ -10706,7 +10719,7 @@ impl CursorGlow {
         let mut oldest_age = 0.0f32;
         let (mut newest_col, mut oldest_col) = (0u16, 0u16);
         let mut mom = 0.0f32;
-        for p in &self.nyan.ink_pops {
+        for p in &self.rainbow.ink_pops {
             if p.row != hrow {
                 continue;
             }
@@ -10739,7 +10752,7 @@ impl CursorGlow {
         // the old run's plume from the new nozzle would streak light backward
         // across text the user never just typed. If the nozzle is no longer
         // adjacent to the newest keystroke, there is no wake to draw.
-        if (head_col - (f32::from(newest_col) + 1.0)).abs() > NYAN_WAKE_ORPHAN_CELLS {
+        if (head_col - (f32::from(newest_col) + 1.0)).abs() > RAINBOW_WAKE_ORPHAN_CELLS {
             return;
         }
         let u = newest_age / FRESH_INK_LIFE_S;
@@ -10756,13 +10769,13 @@ impl CursorGlow {
         // Plume LENGTH in cells — the true speedometer. `speed` is cells per
         // second measured straight off the live ring (distance the hand actually
         // covered ÷ the time it took), so `speed × PERSIST` is exactly the last
-        // [`NYAN_WAKE_PERSIST`] seconds of travel: the plume IS the recent past,
+        // [`RAINBOW_WAKE_PERSIST`] seconds of travel: the plume IS the recent past,
         // to scale. A lone keystroke has no measurable speed and gets the
         // resting length — a short puff that grows into a streak as you get
         // going. Reduced motion pins the resting length so nothing can grow or
         // shrink on screen.
         let len = if self.reduced_motion {
-            NYAN_WAKE_LEN_MIN
+            RAINBOW_WAKE_LEN_MIN
         } else {
             let travelled = newest_col.saturating_sub(oldest_col) as f32;
             let elapsed = oldest_age - newest_age;
@@ -10771,7 +10784,7 @@ impl CursorGlow {
             } else {
                 0.0
             };
-            (NYAN_WAKE_LEN_MIN + speed * persist).min(NYAN_WAKE_LEN_MAX)
+            (RAINBOW_WAKE_LEN_MIN + speed * persist).min(RAINBOW_WAKE_LEN_MAX)
         };
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let head_px = geom.origin_x as f32 + head_col * cwf;
@@ -10785,7 +10798,7 @@ impl CursorGlow {
         // exactly where people type most (a shell prompt at the bottom of the
         // screen). Pull the spine inside by the plume's thickest half so the
         // whole form always fits. A no-op on every interior row.
-        let half_head = chf * NYAN_WAKE_H_HEAD * 0.5;
+        let half_head = chf * RAINBOW_WAKE_H_HEAD * 0.5;
         let spine_y = (geom.origin_y as f32 + (hrow as f32 + 1.0) * chf)
             .min(geom.fx_bot() as f32 - half_head)
             .max(geom.fx_top() as f32 + half_head);
@@ -10798,7 +10811,7 @@ impl CursorGlow {
         let mut pulses = [(0.0f32, 0.0f32); FRESH_INK_CAP];
         let mut n_pulses = 0usize;
         if !self.reduced_motion {
-            for p in &self.nyan.ink_pops {
+            for p in &self.rainbow.ink_pops {
                 if p.row != hrow || n_pulses == FRESH_INK_CAP {
                     continue;
                 }
@@ -10806,7 +10819,7 @@ impl CursorGlow {
                 if age >= FRESH_INK_LIFE_S {
                     continue;
                 }
-                let decay = nyan_wake_pulse_decay(age);
+                let decay = rainbow_wake_pulse_decay(age);
                 if decay <= 0.004 {
                     continue; // spent: it can never lift a segment over the floor
                 }
@@ -10817,12 +10830,12 @@ impl CursorGlow {
         }
         // Segment length in device pixels: fine enough that the exponential
         // reads smooth, coarse enough that a full plume is a few dozen quads.
-        let seg = ((cwf * NYAN_WAKE_SEG) as i32).max(2);
-        let reach_px = (len * NYAN_WAKE_EXTENT * cwf) as i32;
+        let seg = ((cwf * RAINBOW_WAKE_SEG) as i32).max(2);
+        let reach_px = (len * RAINBOW_WAKE_EXTENT * cwf) as i32;
         let mut segs = 0usize;
         let mut x = head_px as i32 - seg;
         let left_bound = geom.fx_left();
-        while x + seg > left_bound && segs < NYAN_WAKE_SEG_CAP {
+        while x + seg > left_bound && segs < RAINBOW_WAKE_SEG_CAP {
             if out.len() >= Self::MAX_QUADS {
                 break;
             }
@@ -10846,9 +10859,9 @@ impl CursorGlow {
             // free to read, at every cadence.
             let mut beat = 0.0f32;
             for &(pd, decay) in &pulses[..n_pulses] {
-                beat = beat.max(nyan_wake_pulse_space(d - pd) * decay);
+                beat = beat.max(rainbow_wake_pulse_space(d - pd) * decay);
             }
-            let w = NYAN_WAKE_BASE * nyan_wake_body(d, len) + NYAN_WAKE_PULSE * beat;
+            let w = RAINBOW_WAKE_BASE * rainbow_wake_body(d, len) + RAINBOW_WAKE_PULSE * beat;
             if w <= 0.004 {
                 x -= seg;
                 segs += 1;
@@ -10856,10 +10869,10 @@ impl CursorGlow {
             }
             // Thickness taper (cells → device px, floored so the plume never
             // disappears into sub-pixel nothing) and the heat ramp position.
-            let s = (d / (len * NYAN_WAKE_RAMP_SPAN)).clamp(0.0, 1.0);
-            let th = ((NYAN_WAKE_H_HEAD + (NYAN_WAKE_H_TAIL - NYAN_WAKE_H_HEAD) * s) * chf).max(2.0)
-                as i32;
-            let cov = (NYAN_WAKE_COV * w * amp).min(255.0);
+            let s = (d / (len * RAINBOW_WAKE_RAMP_SPAN)).clamp(0.0, 1.0);
+            let th = ((RAINBOW_WAKE_H_HEAD + (RAINBOW_WAKE_H_TAIL - RAINBOW_WAKE_H_HEAD) * s) * chf)
+                .max(2.0) as i32;
+            let cov = (RAINBOW_WAKE_COV * w * amp).min(255.0);
             if cov >= 1.0 {
                 if cfg.dark_theme {
                     push_rect(
@@ -10869,17 +10882,17 @@ impl CursorGlow {
                         (spine_y - th as f32 * 0.5).round() as i32,
                         seg,
                         th,
-                        premul_rgb(nyan_wake_ramp(s), cov as u8),
+                        premul_rgb(rainbow_wake_ramp(s), cov as u8),
                     );
                     // The soft BLOOM under the core, at a stride (it is broad, so
                     // it needs far fewer samples than the core to read as
                     // continuous). Bright things stay small; big things stay dim.
-                    if segs.is_multiple_of(NYAN_WAKE_BLOOM_STRIDE) {
+                    if segs.is_multiple_of(RAINBOW_WAKE_BLOOM_STRIDE) {
                         // Only the headroom the core left under the composite
                         // ceiling — the same rule the fresh-ink pop's birth
                         // flash follows.
-                        let bcov = (cov * NYAN_WAKE_BLOOM_GAIN)
-                            .min((NYAN_WAKE_COMPOSITE_CAP - cov).max(0.0))
+                        let bcov = (cov * RAINBOW_WAKE_BLOOM_GAIN)
+                            .min((RAINBOW_WAKE_COMPOSITE_CAP - cov).max(0.0))
                             as u8;
                         if bcov > 0 {
                             push_halo(
@@ -10887,9 +10900,9 @@ impl CursorGlow {
                                 geom,
                                 x as f32 + seg as f32 * 0.5,
                                 spine_y,
-                                seg as f32 * NYAN_WAKE_BLOOM_STRIDE as f32 * 0.75,
+                                seg as f32 * RAINBOW_WAKE_BLOOM_STRIDE as f32 * 0.75,
                                 th as f32 * 1.35,
-                                premul_rgb(nyan_wake_ramp(s), bcov),
+                                premul_rgb(rainbow_wake_ramp(s), bcov),
                             );
                         }
                     }
@@ -10897,10 +10910,10 @@ impl CursorGlow {
                     // LIGHT ARM — the same path as a source-over DARKEN contrail.
                     // Dimmer than the additive plume because source-over
                     // COMPOUNDS where segments overlap. NOTE: this arm takes
-                    // EVERY segment — the old `NYAN_WAKE_LIGHT_STRIDE` knob was a
+                    // EVERY segment — the old `RAINBOW_WAKE_LIGHT_STRIDE` knob was a
                     // constant 1, so the sparseness comes from the alpha below,
                     // not from skipping.
-                    let alpha = (FRESH_INK_LIGHT_VEIL_ALPHA * w * amp * NYAN_WAKE_LIGHT_GAIN)
+                    let alpha = (FRESH_INK_LIGHT_VEIL_ALPHA * w * amp * RAINBOW_WAKE_LIGHT_GAIN)
                         .min(FRESH_INK_LIGHT_ALPHA_CAP);
                     if alpha >= 1.0 {
                         push_halo_over(
@@ -10910,7 +10923,7 @@ impl CursorGlow {
                             spine_y,
                             seg as f32 * 0.95,
                             th as f32 * 0.62,
-                            nyan_wake_veil(alpha as u8),
+                            rainbow_wake_veil(alpha as u8),
                             FRESH_INK_LIGHT_VEIL_PEAK,
                         );
                     }
@@ -10989,7 +11002,7 @@ impl CursorGlow {
             ),
             GlowStyle::Water => (28.0, water_ramp(0.74)),
             GlowStyle::Phaser | GlowStyle::Sparkle => (50.0, hsv2rgb(self.hue, 0.9, 1.0)),
-            // Nyan's head crown is a soft white-warm bloom (the "engine" glow the
+            // the rainbow kitty's head crown is a soft white-warm bloom (the "engine" glow the
             // ribbon streams from), so the stripes stay the star of the show.
             // The crown is emitted at `base_cov * 1.9 * fade * intensity *
             // typing_boost` (boost <= 1.2) into `glow_halo`, i.e. OVER the
@@ -10997,7 +11010,7 @@ impl CursorGlow {
             // land on the just-typed LETTER, not only on the (usually blank)
             // cursor cell — so its base must keep the peak inside
             // `OVER_INK_COV_CAP`: 20 puts it at 20*1.9*1.2 = 45.6.
-            GlowStyle::Nyan => (20.0, 0x00FF_F2E0),
+            GlowStyle::RainbowKitty => (20.0, 0x00FF_F2E0),
             // BEAM ships with `radius: 0` from the host (the clean tube owns
             // its look — no bloom crown), so this arm only serves an embedder
             // that opts a crown back in: a tight glow in the tube's own hue.
@@ -11078,7 +11091,7 @@ impl CursorGlow {
             // they ARE the mouth-of-fire flare of a fresh move.
             return;
         }
-        // EVERY remaining style (phaser, nyan, sparkle, laser, water, beam,
+        // EVERY remaining style (phaser, rainbow kitty, sparkle, laser, water, beam,
         // lumen, comet): a compact RADIAL bloom on the cursor cell — the same
         // soft elliptical falloff the fire crown uses (both backends render
         // RainHalo identically) — so it has full punch over the empty cursor cell
@@ -11091,15 +11104,15 @@ impl CursorGlow {
         let (ccx, ccy) = (cx as f32 + cw as f32 * 0.5, cy as f32 + ch as f32 * 0.5);
         let peak = (base_cov * 1.9 * fade * cfg.intensity * boost).min(210.0);
         if peak >= 1.0 {
-            // NYAN: a tighter core that hugs the cursor cell instead of washing
+            // RAINBOW KITTY: a tighter core that hugs the cursor cell instead of washing
             // the letter behind it, plus a dim thrust leaning into the direction
-            // of travel (see the NYAN CROWN constants). The lean is TEXT-FIRST
+            // of travel (see the RAINBOW KITTY CROWN constants). The lean is TEXT-FIRST
             // like the starfield: it only lights cells the row probe reports
             // CLEAR, so inserting into the middle of an existing line never
             // blooms over the text ahead. Unknown/unprobed rows keep the lean —
             // the same fail-open the star placement uses.
-            let (core_rx, core_ry) = if matches!(cfg.style, GlowStyle::Nyan) {
-                (cw as f32 * NYAN_CROWN_RX, ch as f32 * NYAN_CROWN_RY)
+            let (core_rx, core_ry) = if matches!(cfg.style, GlowStyle::RainbowKitty) {
+                (cw as f32 * RAINBOW_CROWN_RX, ch as f32 * RAINBOW_CROWN_RY)
             } else {
                 (cw as f32 * 1.25, ch as f32 * 0.85)
             };
@@ -11112,23 +11125,23 @@ impl CursorGlow {
                 core_ry,
                 premul_rgb(color, peak as u8),
             );
-            if matches!(cfg.style, GlowStyle::Nyan)
+            if matches!(cfg.style, GlowStyle::RainbowKitty)
                 && self.probed_cell_glyph(i32::from(cr), cc.saturating_add(1), geom.rows)
                     != Some(true)
             {
                 // SPINE-GATED: no smudge at rest, real glare at speed. Squared so
                 // it stays out of the way through casual typing and arrives
                 // decisively on a genuine run.
-                let drive = self.nyan.disp.clamp(0.0, 1.0);
-                let lead = (peak * NYAN_CROWN_LEAD_GAIN * drive * drive) as u8;
+                let drive = self.rainbow.disp.clamp(0.0, 1.0);
+                let lead = (peak * RAINBOW_CROWN_LEAD_GAIN * drive * drive) as u8;
                 if lead > 0 {
                     push_halo(
                         halos,
                         geom,
-                        ccx + cw as f32 * NYAN_CROWN_LEAD_DX,
+                        ccx + cw as f32 * RAINBOW_CROWN_LEAD_DX,
                         ccy,
-                        cw as f32 * NYAN_CROWN_LEAD_RX,
-                        ch as f32 * NYAN_CROWN_LEAD_RY,
+                        cw as f32 * RAINBOW_CROWN_LEAD_RX,
+                        ch as f32 * RAINBOW_CROWN_LEAD_RY,
                         premul_rgb(color, lead),
                     );
                 }
@@ -11476,7 +11489,7 @@ impl CursorGlow {
                 }
                 // BEAM stardust: each mote is a tiny twinkling 4-point star — most
                 // white, some ice-blue, the odd one violet (catching the nebula
-                // sleeve) — hanging weightless in the wake. The Nyan star-power
+                // sleeve) — hanging weightless in the wake. The rainbow kitty star-power
                 // pattern, re-cooled for deep space.
                 GlowStyle::Beam => {
                     let twinkle = 0.45 + 0.55 * (age * 9.0 + p.hue * std::f32::consts::TAU).sin();
@@ -11544,10 +11557,10 @@ impl CursorGlow {
                     }
                     continue;
                 }
-                // Nyan "star power": render each particle as a twinkling 4-point star
+                // Rainbow kitty "star power": render each particle as a twinkling 4-point star
                 // (a small +) in white / warm gold rather than a square — the
                 // shooting-star read. Twinkle over its flight so the shower shimmers.
-                GlowStyle::Nyan => {
+                GlowStyle::RainbowKitty => {
                     // SHOOTING STAR (cov_scale SHOOT sentinel > 1.25): a tiny comet —
                     // a velocity-aligned STREAK (the Laser ablation dash: white-hot
                     // leading tip cooling to warm gold behind) tipped with a small
@@ -11635,7 +11648,7 @@ impl CursorGlow {
                     let mom = if glitter {
                         1.0
                     } else {
-                        nyan_star_momentum(self.nyan.disp)
+                        rainbow_star_momentum(self.rainbow.disp)
                     };
                     let mut scov = ((cov as f32) * twinkle * mom).clamp(0.0, 255.0) as u8;
                     // TEXT FIRST (the ribbon's star rule, applied to the flying
@@ -11743,7 +11756,7 @@ impl CursorGlow {
                     // an amber ceiling the charred ink reads through.
                     let mut ccov_f = (cov as f32) * flicker * 0.62;
                     // OCCUPIED-CELL discipline at the HEAD (the phaser's stack-budget
-                    // / nyan-star legibility law, applied to the ember shower): the
+                    // / rainbow-star legibility law, applied to the ember shower): the
                     // dense pile of freshly-born near-white embers clusters exactly
                     // over the 1-2 FRESHEST typed glyph cells and washes them to
                     // cream. An ember hovering over a cell the
@@ -11980,10 +11993,11 @@ pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, po
         // turn across the preview band.
         GlowStyle::Phaser => hsv2rgb((hue + pos).fract(), 0.95, 1.0),
         GlowStyle::Sparkle => hsv2rgb((hue + pos * 0.5).fract(), 0.95, 1.0),
-        // Nyan's ribbon body is drawn banded by `emit_nyan`; this shared ramp is only
+        // the rainbow kitty's ribbon body is drawn banded by `emit_rainbow`; this
+        // shared ramp is only
         // hit for the lone-cell fallback + the settings preview, so step `pos` into the
         // six fixed bands here too, keeping the preview honest to the striped look.
-        GlowStyle::Nyan => NYAN_BANDS[((pos * 6.0) as usize).min(5)],
+        GlowStyle::RainbowKitty => RAINBOW_BANDS[((pos * 6.0) as usize).min(5)],
         // Head capped just short of white (0.83 == the field's FIRE_IDX_MAX/1023)
         // so the bloomed comet streak is a hot AMBER glow, not a white wash that
         // swallows the letters under it (owner: "cannot read if the flame is too
@@ -12044,12 +12058,12 @@ pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -
     clippy::too_many_arguments,
     reason = "geometry + centre + radii + straight colour + peak; mirrors push_halo"
 )]
-/// LIGHT-THEME rainbow STREAK, shared by every Nyan directional beam that is an
+/// LIGHT-THEME rainbow STREAK, shared by every rainbow kitty directional beam that is an
 /// additive [`comet_beam`] on dark (the jump ZOOM, the shooting-star shower, the
 /// fast-glide star): additive rainbow light is INVISIBLE on a white ground, so a
 /// streak from `(x0,y0)` (tail) to `(x1,y1)` (head) is laid as a short chain of
 /// DARKENED SATURATED source-over dots — the ribbon-rail recipe — each dot's
-/// [`NYAN_BANDS`] hue mixed ~28 % toward black, [`HaloMode::Over`], its high-byte
+/// [`RAINBOW_BANDS`] hue mixed ~28 % toward black, [`HaloMode::Over`], its high-byte
 /// centre over-alpha CAPPED (≤ 150) for legibility so it darkens the ground into
 /// a contrast INCREASE without ever burying ink. The hue rolls tail→head across
 /// the spectrum (offset by `hue_roll`) and the alpha brightens toward the head.
@@ -12075,7 +12089,7 @@ fn push_rainbow_streak_over(
         let cy = y0 + (y1 - y0) * f;
         // Rainbow rolls along the length; darken toward black so the saturated
         // hue survives source-over on white.
-        let hue = nyan_gradient_of(&NYAN_BANDS, (f + hue_roll).rem_euclid(1.0));
+        let hue = rainbow_gradient_of(&RAINBOW_BANDS, (f + hue_roll).rem_euclid(1.0));
         let veil = lerp_rgb(hue, 0x0000_0000, 0.28);
         // Brighten into the head; cap the centre over-alpha for legibility.
         let a = (peak as f32 * (0.4 + 0.6 * f)) as u32;
@@ -12144,7 +12158,7 @@ fn push_halo_over(
 
 /// THE ONE DASH. A velocity-aligned two-vertex AA beam trailing `trail_s`
 /// seconds of a particle's LIVE ballistic motion behind its position `(x, y)`
-/// — the shared renderer behind the Laser ablation spark, the Nyan
+/// — the shared renderer behind the Laser ablation spark, the rainbow kitty
 /// shooting-star body, and the Sparkle mini-comet. `tail` colours the trailing
 /// vertex at quarter coverage, `head` the tip at full; thickness and trail
 /// seconds are the knobs the three sites disagree on.
@@ -12231,14 +12245,14 @@ fn push_halo(out: &mut Vec<RainHalo>, geom: Geom, cx: f32, cy: f32, rx: f32, ry:
     }
 }
 
-/// Two-octave integer value-noise for the Nyan ribbon's iridescence, returned
+/// Two-octave integer value-noise for the rainbow ribbon's iridescence, returned
 /// in `-1.0..=1.0`. Spatial along the ribbon (adjacent columns vary smoothly),
 /// per-row decorrelated (wrapped lines shimmer independently), and scrolled by
 /// the injected `phase` for a live shimmer. Reuses the fire field's `pub`
 /// [`aterm_render::fire_vnoise`] so there is ONE deterministic noise in the
 /// codebase; clockless (the caller passes an integrated phase). Modulates
 /// COVERAGE only — never a hue or a band boundary.
-fn nyan_irid_noise(col: u16, row: u16, phase: f32) -> f32 {
+fn rainbow_irid_noise(col: u16, row: u16, phase: f32) -> f32 {
     // fp8 lattice coords: ~2.7 cells per lattice cell spatially, each row shifted
     // into its own slice; `phase` scrolls the (masked, ring-wrapped) time axis.
     let sx = (col as u32)
@@ -12297,14 +12311,14 @@ fn smoothstep01(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// The CONTINUOUS Nyan rainbow at vertical position `t` (0 = top/red,
+/// The CONTINUOUS rainbow at vertical position `t` (0 = top/red,
 /// 1 = bottom/violet): a linear interpolation through six anchor hues, so the
 /// ribbon reads as one smooth spectrum with NO hard band seams — the owner's
 /// "smooth, no gaps between them" (v0.31). A cold cell passes the fixed
-/// [`NYAN_BANDS`] (byte-exact with the shipped gradient); a hot cell passes
+/// [`RAINBOW_BANDS`] (byte-exact with the shipped gradient); a hot cell passes
 /// its momentum-rotated spectrum, which keeps it recognizably the iconic
 /// rainbow while the whole wheel breathes with speed.
-fn nyan_gradient_of(bands: &[u32; 6], t: f32) -> u32 {
+fn rainbow_gradient_of(bands: &[u32; 6], t: f32) -> u32 {
     let p = t.clamp(0.0, 1.0) * 5.0; // 0..5 across the six anchors
     let bi = (p.floor() as usize).min(4);
     lerp_rgb(bands[bi], bands[bi + 1], p - bi as f32)
@@ -12370,13 +12384,14 @@ mod tests {
             intensity: 0.7,
             radius: 0.6,
             ring: true,
-            // Water and Nyan are beam-less (WATER-1 / Nyan draws its own banded body);
+            // Water and rainbow kitty are beam-less (WATER-1 / the kitty draws its
+            // own banded body);
             // every other enum style shows its beam. (The comet/lumen raw-string
             // distinction only exists in the GUI resolver, not at this enum helper.)
-            beam: !matches!(style, GlowStyle::Water | GlowStyle::Nyan),
+            beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
             head_dx: 0.5,
             pack: None,
-            wake_persist_s: NYAN_WAKE_PERSIST,
+            wake_persist_s: RAINBOW_WAKE_PERSIST,
         }
     }
 
@@ -12414,15 +12429,15 @@ mod tests {
         }
     }
 
-    /// Derived bounded model for the occupied-cell Nyan body budget.  `Raise`
+    /// Derived bounded model for the occupied-cell rainbow body budget.  `Raise`
     /// explores every integer request through (and beyond) the shipping 56/255
     /// ceiling.  `Buggy=1` is the historical defect shape: the body forwards an
     /// over-budget request instead of clamping it, which must produce a concrete
     /// counterexample rather than letting the proof pass vacuously.
-    fn nyan_occupied_coverage_model() -> aterm_spec::derive::Model {
+    fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
         use aterm_spec::ty_model;
         ty_model! {
-            NyanOccupiedCoverage {
+            RainbowOccupiedCoverage {
                 const Cap = 56;
                 const RequestedMax = 64;
                 const Buggy = 0;
@@ -12525,7 +12540,7 @@ mod tests {
         use crate::trail_sound::SoundKind;
         let mut glow = CursorGlow::default();
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         // Seed the engine (a live tick is what opens the key seam).
@@ -12580,7 +12595,7 @@ mod tests {
         use crate::trail_sound::SoundKind;
         let mut glow = CursorGlow::default();
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         glow.tick(Some((2, 0)), t0, &c, g, &mut out);
@@ -12902,7 +12917,7 @@ mod tests {
         use crate::trail_sound::SoundKind;
         let mut glow = CursorGlow::default();
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         glow.tick(Some((2, 0)), t0, &c, g, &mut out);
@@ -12965,7 +12980,7 @@ mod tests {
     fn key_time_click_is_silent_wherever_the_light_is() {
         let mut glow = CursorGlow::default();
         let g = geom();
-        let live = cfg(GlowStyle::Nyan, true);
+        let live = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
 
@@ -12974,7 +12989,13 @@ mod tests {
         assert_eq!(glow.drain_sound_cues().count(), 0);
 
         // Master OFF.
-        glow.tick(Some((2, 0)), t0, &cfg(GlowStyle::Nyan, false), g, &mut out);
+        glow.tick(
+            Some((2, 0)),
+            t0,
+            &cfg(GlowStyle::RainbowKitty, false),
+            g,
+            &mut out,
+        );
         assert!(!glow.cue_keystroke(t0));
         assert_eq!(glow.drain_sound_cues().count(), 0);
 
@@ -13016,7 +13037,7 @@ mod tests {
         use crate::trail_sound::SoundKind;
         let mut glow = CursorGlow::default();
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         glow.tick(Some((0, 12)), t0, &c, g, &mut out); // seed: no move, no cue
@@ -13836,7 +13857,7 @@ mod tests {
     /// one-row move beyond the typed advance — an Ink input box rewrapping its
     /// INSET prompt, launching from the interior right edge and landing right
     /// of column 1, so the bare-terminal SHAPE detector misses — is CONTINUED
-    /// TYPING for EVERY style: no fire meteor, no Nyan ZOOM, no lightning
+    /// TYPING for EVERY style: no fire meteor, no rainbow ZOOM, no lightning
     /// bolt, no landing ring, no jump-scale particle burst, and the only new
     /// wake is the single landing spark. The paired flare stays cold (nothing
     /// slams), so the next keystrokes on the new line don't erupt.
@@ -13847,7 +13868,7 @@ mod tests {
         for style in [
             GlowStyle::Lumen,
             GlowStyle::Phaser,
-            GlowStyle::Nyan,
+            GlowStyle::RainbowKitty,
             GlowStyle::Sparkle,
             GlowStyle::Fire,
             GlowStyle::Laser,
@@ -13875,7 +13896,7 @@ mod tests {
                 "{style:?}: a typed re-anchor flies no meteor"
             );
             assert!(
-                glow.nyan.jumps.is_empty(),
+                glow.rainbow.jumps.is_empty(),
                 "{style:?}: a typed re-anchor fires no ZOOM streak"
             );
             assert!(
@@ -13922,9 +13943,9 @@ mod tests {
                 "{style:?}: particle burst stays typing-scale, got {}",
                 glow.particles.len()
             );
-            if matches!(style, GlowStyle::Nyan) {
+            if matches!(style, GlowStyle::RainbowKitty) {
                 assert_eq!(
-                    glow.nyan.tail[0],
+                    glow.rainbow.tail[0],
                     Some((5, 3)),
                     "nyan: the ribbon head continues at the landing"
                 );
@@ -13995,13 +14016,13 @@ mod tests {
     }
 
     /// RAINBOW RETURN: plain Enter is intentionally NOT armed as a typed
-    /// re-anchor. Its row change gets one short Nyan ZOOM snap into the new
+    /// re-anchor. Its row change gets one short rainbow ZOOM snap into the new
     /// cursor row; ordinary typed wraps remain covered by the separate quiet
     /// wrap law. This pins the user-discovered gesture as a supported feature.
     #[test]
-    fn nyan_plain_enter_fires_the_official_rainbow_return_snap() {
+    fn rainbow_plain_enter_fires_the_official_rainbow_return_snap() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
@@ -14018,7 +14039,7 @@ mod tests {
             &mut out,
         );
         assert_eq!(
-            glow.nyan.jumps.len(),
+            glow.rainbow.jumps.len(),
             1,
             "plain Enter creates exactly one Rainbow Return snap"
         );
@@ -14108,7 +14129,7 @@ mod tests {
     /// (Claude Code negotiates NO kitty flags, so the old kitty gate never
     /// armed them there), and vim's safety moved into the engine: without a
     /// fresh REPAINT BLINK (vim/less never hide inside DEC-2026) a hinted
-    /// dr==1 big-dc move is a real jump — the fire meteor flies and the Nyan
+    /// dr==1 big-dc move is a real jump — the fire meteor flies and the rainbow kitty
     /// ZOOM streaks. WITH the blink (Claude Code's per-keystroke bracket) the
     /// same move re-anchors exactly as the wrap law pins.
     /// BOX-GROWTH WRAP (live-verified in Claude Code): the bottom-anchored
@@ -14178,32 +14199,38 @@ mod tests {
             "alt screen + typed hint + NO blink: the fire meteor still flies"
         );
 
-        // Nyan, COLD (anti-stray): one press hopping the caret across the
-        // alt screen is vim scrubbing, not typing — with momentum cold the
+        // Rainbow kitty, COLD (anti-stray): one press hopping the caret across
+        // the alt screen is vim scrubbing, not typing — with momentum cold the
         // ZOOM stays sheathed (pre-fix this streaked, and real vim `0`/`$`
         // scrubs painted stray rainbow with no text behind them).
-        let mut nyan = CursorGlow::default();
-        nyan.note_context(true);
-        nyan.tick(Some((4, 36)), t0, &cfg(GlowStyle::Nyan, true), g, &mut out);
-        nyan.note_typed(t0 + Duration::from_millis(5));
-        nyan.note_context(true);
-        nyan.tick(
+        let mut cold = CursorGlow::default();
+        cold.note_context(true);
+        cold.tick(
+            Some((4, 36)),
+            t0,
+            &cfg(GlowStyle::RainbowKitty, true),
+            g,
+            &mut out,
+        );
+        cold.note_typed(t0 + Duration::from_millis(5));
+        cold.note_context(true);
+        cold.tick(
             Some((5, 3)),
             t0 + Duration::from_millis(10),
-            &cfg(GlowStyle::Nyan, true),
+            &cfg(GlowStyle::RainbowKitty, true),
             g,
             &mut out,
         );
         assert!(
-            nyan.nyan.jumps.is_empty(),
-            "alt screen + typed hint, COLD: the Nyan ZOOM stays sheathed (anti-stray)"
+            cold.rainbow.jumps.is_empty(),
+            "alt screen + typed hint, COLD: the rainbow ZOOM stays sheathed (anti-stray)"
         );
 
-        // Nyan, WARM (the preserved drama): the same hinted no-blink hop off
+        // Rainbow kitty, WARM (the preserved drama): the same hinted no-blink hop off
         // live typing momentum still streaks — an actively-editing vim user
         // keeps the owner-mandated ZOOM.
         let mut warm = CursorGlow::default();
-        let cn = cfg(GlowStyle::Nyan, true);
+        let cn = cfg(GlowStyle::RainbowKitty, true);
         let mut tw = t0;
         warm.note_context(true);
         warm.tick(Some((4, 20)), tw, &cn, g, &mut out);
@@ -14226,7 +14253,7 @@ mod tests {
             &mut out,
         );
         assert_eq!(
-            warm.nyan.jumps.len(),
+            warm.rainbow.jumps.len(),
             1,
             "alt screen + typed hint + NO blink, WARM: the Nyan ZOOM still streaks"
         );
@@ -14345,11 +14372,11 @@ mod tests {
     }
 
     #[test]
-    fn cadence_predicate_separates_brisk_nyan_from_coarse_ember() {
+    fn cadence_predicate_separates_brisk_rainbow_from_coarse_ember() {
         let frame = Duration::from_millis(16);
         let t0 = Instant::now();
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.note_typed(t0);
@@ -14485,12 +14512,12 @@ mod tests {
     /// the erase poof via `bs_poof_hint`, so a same-row shrink puffs the vanished
     /// cell. CAT-INDEPENDENT by construction: `poof_scan` runs unconditionally
     /// and never consults the cursor cat (there is no cat in a `CursorGlow` at
-    /// all), so the burst fires whether or not the cat is flying. On Nyan/dark
+    /// all), so the burst fires whether or not the cat is flying. On rainbow kitty/dark
     /// the poof is the momentum-independent GLITTER star burst.
     #[test]
     fn plain_backspace_always_poofs_cat_independent() {
         let g = geom(); // cols 40, cw 8
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -14528,7 +14555,7 @@ mod tests {
     #[test]
     fn plain_backspace_light_theme_sheds_a_saturated_sparkle() {
         let g = geom();
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.dark_theme = false; // LIGHT
         let t0 = Instant::now();
         let mut out = Vec::new();
@@ -14603,7 +14630,7 @@ mod tests {
     #[test]
     fn no_op_backspace_poofs_nothing_but_a_real_one_does() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let row = |s: &str| -> Vec<char> {
             let mut v: Vec<char> = s.chars().collect();
             v.resize(40, ' ');
@@ -14785,12 +14812,12 @@ mod tests {
         }
     }
 
-    /// STYLE DISPATCH: a Nyan kill sheds star-power SPARKLES across the span
+    /// STYLE DISPATCH: a rainbow kitty kill sheds star-power SPARKLES across the span
     /// (particles, no vapor); a Fire kill flashes QUENCH STEAM and visibly
     /// escalates the quench meter (the standing blaze dies down at the same
     /// moment the steam rises).
     #[test]
-    fn nyan_kill_sparkles_fire_kill_steams() {
+    fn rainbow_kill_sparkles_fire_kill_steams() {
         let g = geom();
         let t0 = Instant::now();
         let mut out = Vec::new();
@@ -14800,19 +14827,19 @@ mod tests {
             v
         };
 
-        let mut nyan = CursorGlow::default();
-        let cn = cfg(GlowStyle::Nyan, true);
-        nyan.observe_row(2, 2, &row("> sparkly words"), t0);
-        nyan.tick(Some((2, 2)), t0, &cn, g, &mut out);
-        nyan.note_kill(t0 + Duration::from_millis(5), false);
+        let mut rainbow = CursorGlow::default();
+        let cn = cfg(GlowStyle::RainbowKitty, true);
+        rainbow.observe_row(2, 2, &row("> sparkly words"), t0);
+        rainbow.tick(Some((2, 2)), t0, &cn, g, &mut out);
+        rainbow.note_kill(t0 + Duration::from_millis(5), false);
         let t = t0 + Duration::from_millis(20);
-        nyan.observe_row(2, 2, &row("> "), t);
-        nyan.tick(Some((2, 2)), t, &cn, g, &mut out);
+        rainbow.observe_row(2, 2, &row("> "), t);
+        rainbow.tick(Some((2, 2)), t, &cn, g, &mut out);
         assert!(
-            !nyan.particles.is_empty(),
-            "nyan kill sheds little sparkles"
+            !rainbow.particles.is_empty(),
+            "the rainbow kill sheds little sparkles"
         );
-        assert!(nyan.vapor.is_empty(), "nyan kill sheds no smoke");
+        assert!(rainbow.vapor.is_empty(), "the rainbow kill sheds no smoke");
 
         let mut fire = CursorGlow::default();
         let cf = cfg(GlowStyle::Fire, true);
@@ -15468,16 +15495,16 @@ mod tests {
         );
     }
 
-    /// RE-JUDGE (finding 3): NYAN on a LIGHT theme renders as SOURCE-OVER veil
+    /// RE-JUDGE (finding 3): RAINBOW KITTY on a LIGHT theme renders as SOURCE-OVER veil
     /// rails, never the additive per-glyph tint that collapsed to a near-invisible
     /// pastel and lifted the glyph fg toward the white ground ("no continuous
     /// band"). Mirrors `light_theme_band_is_veils_not_additive` for the phaser:
     /// the ribbon emits NO additive `out` quads, and the band it does emit is
     /// Over-mode halos (the darkened warm/cool rainbow bracket).
     #[test]
-    fn nyan_light_is_veils_not_additive() {
+    fn rainbow_light_is_veils_not_additive() {
         let g = geom();
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.dark_theme = false;
         c.radius = 0.0; // ribbon only — no crown in the way
         c.ring = false;
@@ -15487,7 +15514,7 @@ mod tests {
         // at the push_halo_over peak floor. This test pins the RENDER MODE
         // (veils, never additive), so drive it at 1.0 where the veil is
         // unambiguously present, with a LONG 350 ms run so the oldest cells
-        // climb `nyan_ribbon_profile`'s half-life onset into its mid-tail
+        // climb `rainbow_ribbon_profile`'s half-life onset into its mid-tail
         // crest (the owner's far-tail retune keeps the newest few cells
         // translucent by design, so a 5-key stub is all head-wash on any
         // theme). The CANONICAL metric is pinned at a sub-shower 0.5 each
@@ -15503,7 +15530,7 @@ mod tests {
         let mut t = t0;
         for col in 5..=12u16 {
             t += Duration::from_millis(350);
-            glow.nyan.momentum.set_value(t, 0.5);
+            glow.rainbow.momentum.set_value(t, 0.5);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         assert!(
@@ -15885,7 +15912,7 @@ mod tests {
     /// A master-off tick is a FULL wipe — including the glide-star family the
     /// hand-maintained teardown once missed: stale glide light must not keep
     /// `is_active` (and with it the host's focused 60 fps frame train) armed
-    /// while the effect is disabled, and a later re-enable into Nyan must not
+    /// while the effect is disabled, and a later re-enable into rainbow kitty must not
     /// fire a landing starburst from the stale glide anchor.
     #[test]
     fn master_off_wipes_the_glide_family() {
@@ -15911,7 +15938,13 @@ mod tests {
         glow.glide.run = 3;
         glow.glide.dir = (0, 1);
         // One disabled tick: everything transient dies, idle-zero holds.
-        glow.tick(Some((2, 4)), t0, &cfg(GlowStyle::Nyan, false), g, &mut out);
+        glow.tick(
+            Some((2, 4)),
+            t0,
+            &cfg(GlowStyle::RainbowKitty, false),
+            g,
+            &mut out,
+        );
         assert!(!glow.is_active(), "a disabled engine must report idle-zero");
         assert!(
             glow.glide.stars.is_empty()
@@ -15926,12 +15959,12 @@ mod tests {
         glow.tick(
             Some((2, 4)),
             later,
-            &cfg(GlowStyle::Nyan, true),
+            &cfg(GlowStyle::RainbowKitty, true),
             g,
             &mut out,
         );
         assert!(
-            glow.nyan.bursts.is_empty(),
+            glow.rainbow.bursts.is_empty(),
             "no phantom landing burst on re-enable"
         );
     }
@@ -16280,11 +16313,11 @@ mod tests {
         assert!(!glow.sparks.is_empty(), "the laser run left live sparks");
         assert!(glow.heat > 0.0, "the hot run charged the heat envelope");
         let heat_before = glow.heat;
-        // HOT-SWAP to nyan on the next tick — SAME cursor cell (no move to spawn
-        // from), so every emitted photon below is the OLD style's residue.
-        let nyan = cfg(GlowStyle::Nyan, true);
+        // HOT-SWAP to rainbow kitty on the next tick — SAME cursor cell (no move
+        // to spawn from), so every emitted photon below is the OLD style's residue.
+        let rainbow_kitty = cfg(GlowStyle::RainbowKitty, true);
         t += Duration::from_millis(8);
-        glow.tick(Some((0, 30)), t, &nyan, g, &mut out);
+        glow.tick(Some((0, 30)), t, &rainbow_kitty, g, &mut out);
         assert!(
             glow.bolts.is_empty() && glow.sparks.is_empty() && glow.particles.is_empty(),
             "the LIVE engine never inherits foreign light (it moved to the fade)"
@@ -16305,7 +16338,7 @@ mod tests {
         let mass_early = frame_mass(&out, &glow);
         // Two later frames inside the ramp-down: strictly falling amplitude.
         t += Duration::from_millis(80);
-        glow.tick(Some((0, 30)), t, &nyan, g, &mut out);
+        glow.tick(Some((0, 30)), t, &rainbow_kitty, g, &mut out);
         let mass_mid = frame_mass(&out, &glow);
         assert!(
             mass_mid > 0 && mass_mid < mass_early,
@@ -16317,7 +16350,7 @@ mod tests {
         let fp = glow.tick(
             Some((0, 30)),
             t0 + Duration::from_secs(10),
-            &nyan,
+            &rainbow_kitty,
             g,
             &mut out,
         );
@@ -16962,15 +16995,15 @@ mod tests {
         assert!(!admitted, "missing-clamp transition must be rejected");
     }
 
-    /// Tier 1 for [`aterm_spec::derive::nyan_jump_burst_lifecycle_model`].
+    /// Tier 1 for [`aterm_spec::derive::rainbow_jump_burst_lifecycle_model`].
     /// Distinct landing coordinates prove oldest-first eviction retains the
     /// newest three identities; staggered births prove one-at-a-time expiry;
     /// the real style-fade move, overlapping incoming burst, fade completion,
     /// cadence, and master-off paths are projected onto the same model.
     #[test]
-    fn nyan_jump_burst_real_lifecycle_conforms_to_model() {
-        let burst_cap = i64::try_from(CursorGlow::NYAN_BURST_CAP).expect("burst cap fits i64");
-        let base_model = aterm_spec::derive::nyan_jump_burst_lifecycle_model();
+    fn rainbow_jump_burst_real_lifecycle_conforms_to_model() {
+        let burst_cap = i64::try_from(CursorGlow::RAINBOW_BURST_CAP).expect("burst cap fits i64");
+        let base_model = aterm_spec::derive::rainbow_jump_burst_lifecycle_model();
         let overrides = [
             ("BurstCap", burst_cap),
             ("TotalCap", burst_cap * 2),
@@ -16979,7 +17012,7 @@ mod tests {
         let model = aterm_spec::interp::with_consts(&base_model, &overrides);
         let mut state = model.init_state();
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut glow = CursorGlow::default();
         let mut issued_x = Vec::new();
@@ -16990,21 +17023,21 @@ mod tests {
             let x = 100.0 + step as f32 * 17.0;
             issued_x.push(x);
             let previous = state.clone();
-            glow.emit_nyan_jump_landing(
+            glow.emit_rainbow_jump_landing(
                 born,
                 g,
-                CursorGlow::NYAN_BURST_MIN_DIST,
+                CursorGlow::RAINBOW_BURST_MIN_DIST,
                 (x, 48.0),
                 (40.0, 48.0),
             );
             assert!(model.fire("FastJump", &mut state));
             assert_eq!(
-                i64::try_from(glow.nyan.bursts.len()).expect("burst count fits i64"),
+                i64::try_from(glow.rainbow.bursts.len()).expect("burst count fits i64"),
                 state["resident"],
                 "real burst count diverged at jump {step}"
             );
-            let keep_from = issued_x.len().saturating_sub(CursorGlow::NYAN_BURST_CAP);
-            let retained_x: Vec<f32> = glow.nyan.bursts.iter().map(|burst| burst.cx).collect();
+            let keep_from = issued_x.len().saturating_sub(CursorGlow::RAINBOW_BURST_CAP);
+            let retained_x: Vec<f32> = glow.rainbow.bursts.iter().map(|burst| burst.cx).collect();
             assert_eq!(
                 retained_x,
                 issued_x[keep_from..],
@@ -17015,7 +17048,7 @@ mod tests {
                 i64::try_from(step + 1).expect("step fits i64")
             );
             assert_eq!(glow.needs_frame_cadence(), state["wake"] == 1);
-            if step == CursorGlow::NYAN_BURST_CAP {
+            if step == CursorGlow::RAINBOW_BURST_CAP {
                 saturated_transition = Some((previous, state.clone()));
             }
         }
@@ -17056,28 +17089,28 @@ mod tests {
         assert!(!admitted, "drop-newest saturation must be rejected");
 
         let before_slow = state.clone();
-        let count_before_slow = glow.nyan.bursts.len();
-        glow.emit_nyan_jump_landing(
+        let count_before_slow = glow.rainbow.bursts.len();
+        glow.emit_rainbow_jump_landing(
             t0 + Duration::from_millis(450),
             g,
-            CursorGlow::NYAN_BURST_MIN_DIST - 0.1,
+            CursorGlow::RAINBOW_BURST_MIN_DIST - 0.1,
             (250.0, 48.0),
             (40.0, 48.0),
         );
         assert!(model.fire("SlowJump", &mut state));
         assert_eq!(state, before_slow, "slow jump is a modeled no-op");
-        assert_eq!(glow.nyan.bursts.len(), count_before_slow);
+        assert_eq!(glow.rainbow.bursts.len(), count_before_slow);
 
         // The retained births are t0+200/300/400 ms. At 630 ms only the
         // oldest has crossed the 420 ms life; the two younger bursts survive.
         let prune_at = t0
             + Duration::from_millis(200)
-            + Duration::from_secs_f32(CursorGlow::NYAN_BURST_LIFE + 0.01);
+            + Duration::from_secs_f32(CursorGlow::RAINBOW_BURST_LIFE + 0.01);
         let mut out = Vec::new();
         glow.tick(None, prune_at, &c, g, &mut out);
         assert!(model.fire("ExpireOne", &mut state));
         assert_eq!(
-            glow.nyan.bursts.len(),
+            glow.rainbow.bursts.len(),
             2,
             "staggered prune retains both younger bursts"
         );
@@ -17089,11 +17122,11 @@ mod tests {
         glow.begin_style_fade(prune_at);
         assert!(model.fire("BeginFade", &mut state));
         assert!(
-            glow.nyan.bursts.is_empty(),
+            glow.rainbow.bursts.is_empty(),
             "active owner was moved, not copied"
         );
         assert_eq!(glow.fading.len(), 1, "one outgoing owner receives the ring");
-        assert_eq!(glow.fading[0].engine.nyan.bursts.len(), 2);
+        assert_eq!(glow.fading[0].engine.rainbow.bursts.len(), 2);
         assert_eq!(state["resident"], 0);
         assert_eq!(state["ghost"], 2);
         assert_eq!(state["ghost_newest"], 5);
@@ -17127,16 +17160,16 @@ mod tests {
         assert!(!admitted, "lost fade payload must be rejected");
 
         let incoming_at = prune_at + Duration::from_millis(10);
-        glow.emit_nyan_jump_landing(
+        glow.emit_rainbow_jump_landing(
             incoming_at,
             g,
-            CursorGlow::NYAN_BURST_MIN_DIST,
+            CursorGlow::RAINBOW_BURST_MIN_DIST,
             (300.0, 48.0),
             (40.0, 48.0),
         );
         assert!(model.fire("FastJump", &mut state));
-        assert_eq!(glow.nyan.bursts.len(), 1);
-        assert_eq!(glow.fading[0].engine.nyan.bursts.len(), 2);
+        assert_eq!(glow.rainbow.bursts.len(), 1);
+        assert_eq!(glow.fading[0].engine.rainbow.bursts.len(), 2);
         assert_eq!(state["resident"], 1);
         assert_eq!(state["ghost"], 2);
 
@@ -17148,7 +17181,7 @@ mod tests {
             "outgoing owner retires at its envelope end"
         );
         assert_eq!(
-            glow.nyan.bursts.len(),
+            glow.rainbow.bursts.len(),
             1,
             "younger incoming burst remains live"
         );
@@ -17166,7 +17199,7 @@ mod tests {
             &mut out,
         );
         assert!(model.fire("Reset", &mut state));
-        assert!(glow.nyan.bursts.is_empty() && glow.fading.is_empty());
+        assert!(glow.rainbow.bursts.is_empty() && glow.fading.is_empty());
         assert_eq!(state["resident"] + state["ghost"], 0);
         assert!(
             !glow.needs_frame_cadence(),
@@ -17174,16 +17207,16 @@ mod tests {
         );
     }
 
-    /// Tier 1 for [`aterm_spec::derive::nyan_terminus_admission_model`]. The
+    /// Tier 1 for [`aterm_spec::derive::rainbow_terminus_admission_model`]. The
     /// exact landing helper binds the warm/cold gate, the exact scatter helper
     /// binds reduced motion, right-margin admission and cap saturation, and
     /// real tick/off paths bind expiry, reset, and scheduler disarm.
     #[test]
-    fn nyan_terminus_real_admission_conforms_to_model() {
+    fn rainbow_terminus_real_admission_conforms_to_model() {
         let particle_cap = i64::try_from(CursorGlow::MAX_PARTICLES).expect("particle cap fits i64");
         let scatter_burst =
-            i64::try_from(CursorGlow::NYAN_TERMINUS_STARS).expect("scatter count fits i64");
-        let base_model = aterm_spec::derive::nyan_terminus_admission_model();
+            i64::try_from(CursorGlow::RAINBOW_TERMINUS_STARS).expect("scatter count fits i64");
+        let base_model = aterm_spec::derive::rainbow_terminus_admission_model();
         let overrides = [
             ("ParticleCap", particle_cap),
             ("ScatterBurst", scatter_burst),
@@ -17191,15 +17224,15 @@ mod tests {
         let model = aterm_spec::interp::with_consts(&base_model, &overrides);
         let mut state = model.init_state();
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let now = Instant::now();
         let mut glow = CursorGlow::default();
 
         let cold_source = state.clone();
-        glow.emit_nyan_jump_landing(
+        glow.emit_rainbow_jump_landing(
             now,
             g,
-            CursorGlow::NYAN_BURST_MIN_DIST,
+            CursorGlow::RAINBOW_BURST_MIN_DIST,
             (120.0, 48.0),
             (40.0, 48.0),
         );
@@ -17229,14 +17262,14 @@ mod tests {
         // floor AND a committed press within the ribbon-visibility window
         // (the anti-stray witness). Arm both under one model transition.
         assert!(model.fire("Warm", &mut state));
-        glow.nyan.disp = 0.3;
+        glow.rainbow.disp = 0.3;
         glow.note_typed(now);
         assert!(model.fire("Reduce", &mut state));
         glow.set_reduced_motion(true);
-        glow.emit_nyan_jump_landing(
+        glow.emit_rainbow_jump_landing(
             now,
             g,
-            CursorGlow::NYAN_BURST_MIN_DIST - 0.1,
+            CursorGlow::RAINBOW_BURST_MIN_DIST - 0.1,
             (120.0, 48.0),
             (40.0, 48.0),
         );
@@ -17249,10 +17282,10 @@ mod tests {
 
         assert!(model.fire("Restore", &mut state));
         glow.set_reduced_motion(false);
-        glow.emit_nyan_jump_landing(
+        glow.emit_rainbow_jump_landing(
             now,
             g,
-            CursorGlow::NYAN_BURST_MIN_DIST - 0.1,
+            CursorGlow::RAINBOW_BURST_MIN_DIST - 0.1,
             (120.0, 48.0),
             (40.0, 48.0),
         );
@@ -17261,12 +17294,12 @@ mod tests {
             i64::try_from(glow.particles.len()).expect("particle count fits i64"),
             state["particles"]
         );
-        glow.nyan.bursts.clear();
+        glow.rainbow.bursts.clear();
         assert_eq!(glow.needs_frame_cadence(), state["wake"] == 1);
 
         assert!(model.fire("Cool", &mut state));
-        glow.nyan.disp = 0.0;
-        glow.scatter_nyan_terminus(now, g, 200.0, 48.0);
+        glow.rainbow.disp = 0.0;
+        glow.scatter_rainbow_terminus(now, g, 200.0, 48.0);
         assert!(model.fire("MarginTerminus", &mut state));
         assert_eq!(
             i64::try_from(glow.particles.len()).expect("particle count fits i64"),
@@ -17277,7 +17310,7 @@ mod tests {
         assert!(model.fire("Reduce", &mut state));
         glow.set_reduced_motion(true);
         let before_reduced_margin = glow.particles.len();
-        glow.scatter_nyan_terminus(now, g, 220.0, 48.0);
+        glow.scatter_rainbow_terminus(now, g, 220.0, 48.0);
         assert!(model.fire("MarginTerminus", &mut state));
         assert_eq!(glow.particles.len(), before_reduced_margin);
         assert_eq!(
@@ -17288,7 +17321,7 @@ mod tests {
         glow.set_reduced_motion(false);
 
         while glow.particles.len() < CursorGlow::MAX_PARTICLES {
-            glow.scatter_nyan_terminus(now, g, 240.0, 48.0);
+            glow.scatter_rainbow_terminus(now, g, 240.0, 48.0);
             assert!(model.fire("MarginTerminus", &mut state));
             assert_eq!(
                 i64::try_from(glow.particles.len()).expect("particle count fits i64"),
@@ -17297,7 +17330,7 @@ mod tests {
         }
         assert_eq!(state["particles"], particle_cap);
         let saturated_source = state.clone();
-        glow.scatter_nyan_terminus(now, g, 260.0, 48.0);
+        glow.scatter_rainbow_terminus(now, g, 260.0, 48.0);
         assert!(model.fire("MarginTerminus", &mut state));
         assert_eq!(
             state, saturated_source,
@@ -17327,7 +17360,7 @@ mod tests {
             "particle expiry disarms cadence"
         );
 
-        glow.scatter_nyan_terminus(expiry, g, 280.0, 48.0);
+        glow.scatter_rainbow_terminus(expiry, g, 280.0, 48.0);
         assert!(model.fire("MarginTerminus", &mut state));
         let mut off = c;
         off.enabled = false;
@@ -17354,15 +17387,20 @@ mod tests {
         );
     }
 
-    // ----- Nyan banded rainbow ribbon -----
+    // ----- rainbow kitty banded rainbow ribbon -----
 
-    /// "rainbow" now maps to the actual banded rainbow (Nyan); the old laser sweep is
-    /// the explicit "phaser"; Nyan draws no shared comet beam (its own banded body).
+    /// "rainbow kitty" is the style's user-facing name; "rainbow" maps to the actual
+    /// banded rainbow (rainbow kitty) rather than the old laser sweep, which is the explicit
+    /// "phaser"; rainbow kitty draws no shared comet beam (its own banded body). Every name the
+    /// style has ever shipped under still parses — configs written against any past
+    /// release keep selecting it.
     #[test]
-    fn nyan_parse_and_beam() {
-        assert_eq!(GlowStyle::parse("nyan"), GlowStyle::Nyan);
-        assert_eq!(GlowStyle::parse("rainbow"), GlowStyle::Nyan);
-        assert_eq!(GlowStyle::parse("RAINBOW"), GlowStyle::Nyan);
+    fn rainbow_kitty_parse_and_beam() {
+        assert_eq!(GlowStyle::parse("rainbow kitty"), GlowStyle::RainbowKitty);
+        assert_eq!(GlowStyle::parse("nyan rainbow"), GlowStyle::RainbowKitty);
+        assert_eq!(GlowStyle::parse("nyan"), GlowStyle::RainbowKitty);
+        assert_eq!(GlowStyle::parse("rainbow"), GlowStyle::RainbowKitty);
+        assert_eq!(GlowStyle::parse("RAINBOW"), GlowStyle::RainbowKitty);
         assert_eq!(GlowStyle::parse("phaser"), GlowStyle::Phaser);
         assert!(
             !style_has_beam("nyan"),
@@ -17375,8 +17413,8 @@ mod tests {
     /// clamp proves the occupied-cell budget, while the historical pass-through
     /// mutant must fail as soon as request 57 is reachable.
     #[test]
-    fn nyan_occupied_coverage_derived_model_proves_and_catches_regression() {
-        let model = nyan_occupied_coverage_model();
+    fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
+        let model = rainbow_occupied_coverage_model();
         aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
@@ -17385,8 +17423,8 @@ mod tests {
     /// this test cannot stay green if validation silently accepts the old 120
     /// pass-through behavior.
     #[test]
-    fn nyan_real_occupied_coverage_conforms_to_model() {
-        let model = nyan_occupied_coverage_model();
+    fn rainbow_real_occupied_coverage_conforms_to_model() {
+        let model = rainbow_occupied_coverage_model();
         let mut state = model.init_state();
         let mut cap_source = None;
         for requested in 1..=64i64 {
@@ -17394,12 +17432,12 @@ mod tests {
                 cap_source = Some(state.clone());
             }
             assert!(model.fire("Raise", &mut state));
-            let real = nyan_occupied_coverage(requested as f32) as i64;
+            let real = rainbow_occupied_coverage(requested as f32) as i64;
             assert_eq!(state["requested"], requested);
             assert_eq!(state["emitted"], real, "real clamp diverged at {requested}");
             assert!(model.check_invariant("OccupiedBodyBounded", &state));
         }
-        assert_eq!(state["emitted"], NYAN_OCCUPIED_COV_CAP as i64);
+        assert_eq!(state["emitted"], RAINBOW_OCCUPIED_COV_CAP as i64);
 
         let previous = cap_source.expect("captured the first over-cap source");
         let mut overflow = previous.clone();
@@ -17417,9 +17455,12 @@ mod tests {
 
         // Total-f32 pins: malformed state can never turn the visual ceiling into
         // NaN/overflow energy.
-        assert_eq!(nyan_occupied_coverage(f32::NAN), 0.0);
-        assert_eq!(nyan_occupied_coverage(f32::NEG_INFINITY), 0.0);
-        assert_eq!(nyan_occupied_coverage(f32::INFINITY), NYAN_OCCUPIED_COV_CAP);
+        assert_eq!(rainbow_occupied_coverage(f32::NAN), 0.0);
+        assert_eq!(rainbow_occupied_coverage(f32::NEG_INFINITY), 0.0);
+        assert_eq!(
+            rainbow_occupied_coverage(f32::INFINITY),
+            RAINBOW_OCCUPIED_COV_CAP
+        );
     }
 
     fn srgb_relative_luminance(rgb: u32) -> f64 {
@@ -17447,21 +17488,21 @@ mod tests {
     /// to the default foreground.  The former 120/255 value is explicitly shown
     /// to fail the same pixel oracle (<3:1).
     #[test]
-    fn nyan_hot_body_preserves_default_text_contrast() {
+    fn rainbow_hot_body_preserves_default_text_contrast() {
         const DEFAULT_BG: u32 = 0x001A_1B26;
         const DEFAULT_FG: u32 = 0x00C8_D3F5;
         let g = geom();
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.intensity = 1.0;
         c.radius = 0.0;
         c.ring = false;
         let born = Instant::now();
         let mut glow = CursorGlow::default();
-        nyan_uniform_ribbon(&mut glow, born, 255, 0..32);
-        glow.nyan.disp = 1.0;
-        glow.nyan.phase = 0.37;
+        rainbow_uniform_ribbon(&mut glow, born, 255, 0..32);
+        glow.rainbow.disp = 1.0;
+        glow.rainbow.phase = 0.37;
         let mut under = Vec::new();
-        glow.emit_nyan(
+        glow.emit_rainbow(
             born + Duration::from_millis(300),
             &c,
             g,
@@ -17488,7 +17529,7 @@ mod tests {
             "exercise a sustained multi-cell hot body"
         );
         assert_eq!(
-            max_chan, NYAN_OCCUPIED_COV_CAP as u32,
+            max_chan, RAINBOW_OCCUPIED_COV_CAP as u32,
             "the ceiling must be exercised, not merely asserted above a dim fixture"
         );
         assert!(
@@ -17508,34 +17549,34 @@ mod tests {
     /// timing assertion (CI clocks are noisy); the checksum prevents elimination
     /// and `--nocapture --release` reports a directly comparable throughput.
     #[test]
-    fn nyan_occupied_coverage_hot_path_microbench() {
+    fn rainbow_occupied_coverage_hot_path_microbench() {
         const ITERATIONS: u64 = 1_000_000;
         let started = std::time::Instant::now();
         let mut checksum = 0u64;
         for i in 0..ITERATIONS {
             let requested = std::hint::black_box((i & 0xff) as f32);
-            checksum += std::hint::black_box(nyan_occupied_coverage(requested)) as u64;
+            checksum += std::hint::black_box(rainbow_occupied_coverage(requested)) as u64;
         }
         let elapsed = started.elapsed();
         assert!(checksum > ITERATIONS);
-        assert!(checksum <= ITERATIONS * NYAN_OCCUPIED_COV_CAP as u64);
+        assert!(checksum <= ITERATIONS * RAINBOW_OCCUPIED_COV_CAP as u64);
         eprintln!(
-            "NYAN_COVERAGE_BENCH iterations={ITERATIONS} total_us={} ns_per_sample={:.3}",
+            "RAINBOW_COVERAGE_BENCH iterations={ITERATIONS} total_us={} ns_per_sample={:.3}",
             elapsed.as_micros(),
             elapsed.as_nanos() as f64 / ITERATIONS as f64
         );
     }
 
-    /// A Nyan move lays a ribbon of SIX crisp stripes per swept cell that tile a
+    /// A rainbow kitty move lays a ribbon of SIX crisp stripes per swept cell that tile a
     /// CONTIGUOUS band (no seam/overlap) centred in the cell. The band's height is
     /// VARIABLE — narrow at low momentum and still slim flat-out, retaining
     /// substantial headroom for the travelling wave — so we assert contiguity +
     /// centring + containment rather than full-cell coverage.
     #[test]
-    fn nyan_emits_six_crisp_bands_per_cell() {
+    fn rainbow_emits_six_crisp_bands_per_cell() {
         let g = geom();
         let mut glow = CursorGlow::default();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t = Instant::now();
         let mut out = Vec::new();
         // Seed the previous position, then a 4-cell horizontal move lays a ribbon.
@@ -17548,7 +17589,7 @@ mod tests {
         // ticking forward: a third tick would advance the eased momentum
         // spine and lift the ribbon into the hot multi-strip path, and this
         // proof pins the COLD full-cell-width crisp stack.
-        glow.emit_nyan(
+        glow.emit_rainbow(
             t + Duration::from_millis(120),
             &c,
             g,
@@ -17601,11 +17642,11 @@ mod tests {
     /// coverage is capped below full, so a solid ribbon only tints — never washes out —
     /// the glyphs beneath it.
     #[test]
-    fn nyan_coverage_is_capped_for_legibility() {
+    fn rainbow_coverage_is_capped_for_legibility() {
         let g = geom();
         let mut glow = CursorGlow::default();
         // Max drive: full intensity + a hot typing run to push born_cov high.
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.intensity = 1.0;
         let mut t = Instant::now();
         let mut out = Vec::new();
@@ -17637,18 +17678,18 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(
-            max_chan <= NYAN_OCCUPIED_COV_CAP as u32,
+            max_chan <= RAINBOW_OCCUPIED_COV_CAP as u32,
             "additive band coverage capped for text legibility, got {max_chan}"
         );
     }
 
-    /// Hot Nyan samples bank up/down as a coherent travelling ribbon. The six
+    /// Hot rainbow kitty samples bank up/down as a coherent travelling ribbon. The six
     /// stripes remain ordered and contained; this pin checks the new motion is
     /// visible rather than a no-op hidden by integer rounding.
     #[test]
-    fn nyan_hot_ribbon_has_visible_travelling_wave() {
+    fn rainbow_hot_ribbon_has_visible_travelling_wave() {
         let g = geom();
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.intensity = 1.0;
         c.radius = 0.0;
         c.ring = false;
@@ -17692,7 +17733,7 @@ mod tests {
     /// the shipped perf gate ticks a frozen clock, so it never leaves the cold
     /// 1-strip path and cannot catch a regression here.
     #[test]
-    fn nyan_hot_retina_ribbon_stays_inside_the_quad_budget() {
+    fn rainbow_hot_retina_ribbon_stays_inside_the_quad_budget() {
         // 2× retina metrics on a wide row.
         let g = Geom {
             cw: 18,
@@ -17705,7 +17746,7 @@ mod tests {
             win_h: 160,
             head: 0,
         };
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.intensity = 1.0;
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
@@ -17714,12 +17755,12 @@ mod tests {
         // A robotic 12ms/key sweep across the full row at an EARNED full
         // metric (seeded — the canonical law builds by wall time, and this
         // 2.4 s sweep alone would only reach ~0.9): momentum pins hot
-        // (nyan.disp ≈ 1) and the momentum-stretched lives (~8s) keep every
+        // (rainbow.disp ≈ 1) and the momentum-stretched lives (~8s) keep every
         // swept cell alive — ~200 live sparks, the resident worst case.
-        glow.nyan.momentum.set_value(t, 1.0);
+        glow.rainbow.momentum.set_value(t, 1.0);
         for col in 1..200u16 {
             t += Duration::from_millis(12);
-            glow.nyan.momentum.set_value(t, 1.0);
+            glow.rainbow.momentum.set_value(t, 1.0);
             glow.tick(Some((1, col)), t, &c, g, &mut out);
         }
         assert!(glow.heat > 0.9, "fixture must reach full momentum");
@@ -17747,9 +17788,9 @@ mod tests {
     /// `None` at emit time) silently disables it, which is exactly how the
     /// first cut of this fix failed live.
     #[test]
-    fn nyan_stars_keep_off_probed_glyph_cells() {
+    fn rainbow_stars_keep_off_probed_glyph_cells() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let row = |s: &str| -> Vec<char> {
             let mut v: Vec<char> = s.chars().collect();
             v.resize(40, ' ');
@@ -17780,7 +17821,7 @@ mod tests {
             glow.tick(Some((3, 2)), t, &c, g, &mut out);
             for col in 3..=14u16 {
                 t += Duration::from_millis(350);
-                glow.nyan.momentum.set_value(t, 0.5);
+                glow.rainbow.momentum.set_value(t, 0.5);
                 if let Some(s) = probe {
                     glow.observe_row(3, col, &row(s), t);
                 }
@@ -17813,9 +17854,9 @@ mod tests {
     /// Momentum: a sustained FAST run makes the ribbon brighter than a lone slow move
     /// (typing heat rides through to the band coverage) — the acceleration tell.
     #[test]
-    fn nyan_ribbon_brightens_with_typing_momentum() {
+    fn rainbow_ribbon_brightens_with_typing_momentum() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let band_ink = |glow: &mut CursorGlow, out: &Vec<GlowQuad>| -> u64 {
             let _ = glow;
             // Weight by area so the strip subdivision of hot bands (the wave
@@ -17862,9 +17903,9 @@ mod tests {
     /// heat window) the ribbon still spans at least the last four typed cells when
     /// a key lands — the spark life chains to the observed cadence, not the clock.
     #[test]
-    fn nyan_ribbon_spans_four_letters_at_any_rhythm() {
+    fn rainbow_ribbon_spans_four_letters_at_any_rhythm() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -17885,9 +17926,9 @@ mod tests {
     /// The four-letter guarantee holds at a GLACIAL rhythm too (~0.55 cps): the
     /// chain window covers any plausible typing cadence, not just brisk ones.
     #[test]
-    fn nyan_ribbon_four_letters_even_glacial() {
+    fn rainbow_ribbon_four_letters_even_glacial() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -17908,9 +17949,9 @@ mod tests {
     /// re-arms the previous still-lit cells to fade with the new head, so a
     /// fast burst followed by slow keys keeps the four-letter span throughout.
     #[test]
-    fn nyan_ribbon_survives_a_rhythm_change() {
+    fn rainbow_ribbon_survives_a_rhythm_change() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -17946,9 +17987,9 @@ mod tests {
     /// EVERY skipped cell as a typing spark. The old single-landing-spark rule
     /// left the skipped cells dark: the "rainbow has gaps" report.
     #[test]
-    fn nyan_coalesced_typing_sweeps_every_skipped_cell() {
+    fn rainbow_coalesced_typing_sweeps_every_skipped_cell() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t = Instant::now();
@@ -18003,9 +18044,9 @@ mod tests {
     /// arrives as, the live typing sparks on the row form ONE contiguous run —
     /// no interior holes, ever.
     #[test]
-    fn nyan_typed_row_has_no_interior_gaps() {
+    fn rainbow_typed_row_has_no_interior_gaps() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -18038,9 +18079,9 @@ mod tests {
     /// edge — instead of leaving the rows disjoint (and never a diagonal
     /// sweep across unvisited cells).
     #[test]
-    fn nyan_typing_wrap_folds_around_the_line_end() {
+    fn rainbow_typing_wrap_folds_around_the_line_end() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t = Instant::now();
@@ -18081,9 +18122,9 @@ mod tests {
     /// The SAME choreography without the hint stays byte-inert (the pinned
     /// unhinted bridge law).
     #[test]
-    fn nyan_typed_hide_bridge_spans_the_batch() {
+    fn rainbow_typed_hide_bridge_spans_the_batch() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t = Instant::now();
 
         let run = |hint: bool| -> std::collections::BTreeSet<u16> {
@@ -18130,9 +18171,9 @@ mod tests {
     /// then retracts tail→head into the cursor — head last — and is gone well
     /// before the sparks' natural fade would have emptied it.
     #[test]
-    fn nyan_streak_reaches_four_then_retracts_on_finger_lift() {
+    fn rainbow_streak_reaches_four_then_retracts_on_finger_lift() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -18169,7 +18210,7 @@ mod tests {
         };
         // Past the grace + reach window: the streak has FINISHED reaching four
         // letters — two typed cells plus two overlap cells behind them.
-        let retract_at = CursorGlow::NYAN_LIFT_GRACE + 3.0 * CursorGlow::NYAN_REACH_STEP;
+        let retract_at = CursorGlow::RAINBOW_LIFT_GRACE + 3.0 * CursorGlow::RAINBOW_REACH_STEP;
         glow.tick(
             Some((3, 10)),
             t_last + Duration::from_secs_f32(retract_at + 0.01),
@@ -18185,7 +18226,7 @@ mod tests {
         // Mid-retract: the span shrinks from the tail while the head survives.
         glow.tick(
             Some((3, 10)),
-            t_last + Duration::from_secs_f32(retract_at + CursorGlow::NYAN_RETRACT_DUR * 0.62),
+            t_last + Duration::from_secs_f32(retract_at + CursorGlow::RAINBOW_RETRACT_DUR * 0.62),
             &c,
             g,
             &mut out,
@@ -18200,7 +18241,7 @@ mod tests {
         // have emptied it — the swoosh is the ending, not a passive dim-out.
         glow.tick(
             Some((3, 10)),
-            t_last + Duration::from_secs_f32(retract_at + CursorGlow::NYAN_RETRACT_DUR + 0.05),
+            t_last + Duration::from_secs_f32(retract_at + CursorGlow::RAINBOW_RETRACT_DUR + 0.05),
             &c,
             g,
             &mut out,
@@ -18217,10 +18258,10 @@ mod tests {
     /// samples the settled state. It must not create reach sparks at callback
     /// time and replay another ribbon after an arbitrarily long idle gap.
     #[test]
-    fn nyan_single_late_tick_does_not_resurrect_exit_swoosh() {
-        let model = aterm_spec::derive::nyan_exit_sampling_model();
+    fn rainbow_single_late_tick_does_not_resurrect_exit_swoosh() {
+        let model = aterm_spec::derive::rainbow_exit_sampling_model();
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -18245,7 +18286,7 @@ mod tests {
         assert_eq!(fp, 0, "the first late sample is already settled");
         assert!(glow.under_quads().is_empty());
         assert!(glow.sparks.iter().all(|s| !s.typing));
-        assert_eq!(glow.nyan.retract.map(|(_, count)| count), Some(0));
+        assert_eq!(glow.rainbow.retract.map(|(_, count)| count), Some(0));
         assert_eq!(i64::from(glow.is_active()), state[&"active"]);
         assert!(!glow.is_active(), "no follow-up cadence is armed");
         assert!(!glow.needs_frame_cadence());
@@ -18269,9 +18310,9 @@ mod tests {
     /// already-elapsed arc rather than restart it from that callback. With a
     /// four-cell ribbon at half-time, exactly two cells remain.
     #[test]
-    fn nyan_single_mid_retract_tick_uses_last_type_clock() {
+    fn rainbow_single_mid_retract_tick_uses_last_type_clock() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -18286,16 +18327,16 @@ mod tests {
         let t_last = t0 + Duration::from_millis(200);
         glow.tick(Some((3, 10)), t_last, &c, g, &mut out);
 
-        let lift_at = t_last + Duration::from_secs_f32(CursorGlow::NYAN_LIFT_GRACE);
-        let retract_at = lift_at + Duration::from_secs_f32(3.0 * CursorGlow::NYAN_REACH_STEP);
+        let lift_at = t_last + Duration::from_secs_f32(CursorGlow::RAINBOW_LIFT_GRACE);
+        let retract_at = lift_at + Duration::from_secs_f32(3.0 * CursorGlow::RAINBOW_REACH_STEP);
         glow.tick(
             Some((3, 10)),
-            retract_at + Duration::from_secs_f32(CursorGlow::NYAN_RETRACT_DUR * 0.5),
+            retract_at + Duration::from_secs_f32(CursorGlow::RAINBOW_RETRACT_DUR * 0.5),
             &c,
             g,
             &mut out,
         );
-        let (start, initial) = glow.nyan.retract.expect("retraction is sampled");
+        let (start, initial) = glow.rainbow.retract.expect("retraction is sampled");
         assert_eq!(start, retract_at, "clock is anchored to the last key");
         assert_eq!(initial, 4, "three typed cells plus one reach cell");
         assert_eq!(
@@ -18309,9 +18350,9 @@ mod tests {
     /// ribbon. The next word resumes the same flight, while genuine silence
     /// still gets the bounded reach-and-retract ending above.
     #[test]
-    fn nyan_word_pause_keeps_the_ribbon_continuous() {
+    fn rainbow_word_pause_keeps_the_ribbon_continuous() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -18327,7 +18368,7 @@ mod tests {
         let resume = t + Duration::from_millis(750);
         glow.tick(Some((3, 10)), resume, &c, g, &mut out);
         assert!(
-            glow.nyan.retract.is_none(),
+            glow.rainbow.retract.is_none(),
             "ordinary word pause must not enter ribbon retraction"
         );
         assert!(
@@ -18351,7 +18392,7 @@ mod tests {
             &mut out,
         );
         assert!(
-            glow.nyan.retract.is_none(),
+            glow.rainbow.retract.is_none(),
             "the next word seamlessly rearms the exit arc"
         );
         assert!(
@@ -18368,9 +18409,9 @@ mod tests {
     /// the far segment floating detached (the old signed-direction metric played
     /// the slurp backwards).
     #[test]
-    fn nyan_back_jump_drain_retracts_toward_the_cursor() {
+    fn rainbow_back_jump_drain_retracts_toward_the_cursor() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let cw = g.cw as u16;
@@ -18423,8 +18464,8 @@ mod tests {
         let mut prev_maxdist = i32::MAX;
         let mut initial_maxdist = None;
         let mut mid_seen = false;
-        let retract_ms =
-            ((CursorGlow::NYAN_LIFT_GRACE + 3.0 * CursorGlow::NYAN_REACH_STEP) * 1000.0) as u64;
+        let retract_ms = ((CursorGlow::RAINBOW_LIFT_GRACE + 3.0 * CursorGlow::RAINBOW_REACH_STEP)
+            * 1000.0) as u64;
         for ms in [
             retract_ms,
             retract_ms + 100,
@@ -18485,9 +18526,9 @@ mod tests {
             Some((3, head as u16)),
             t_last
                 + Duration::from_secs_f32(
-                    CursorGlow::NYAN_LIFT_GRACE
-                        + 3.0 * CursorGlow::NYAN_REACH_STEP
-                        + CursorGlow::NYAN_RETRACT_DUR
+                    CursorGlow::RAINBOW_LIFT_GRACE
+                        + 3.0 * CursorGlow::RAINBOW_REACH_STEP
+                        + CursorGlow::RAINBOW_RETRACT_DUR
                         + 0.15,
                 ),
             &c,
@@ -18510,9 +18551,9 @@ mod tests {
     /// stale life, so the whole ribbon — the first key's cell included — fades
     /// as one.
     #[test]
-    fn nyan_first_key_orphan_does_not_outlive_the_ribbon() {
+    fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let cw = g.cw as u16;
@@ -18576,9 +18617,9 @@ mod tests {
 
     /// The ribbon decays to EXACTLY empty when the cursor rests — 0% idle, fingerprint 0.
     #[test]
-    fn nyan_decays_to_empty_when_idle() {
+    fn rainbow_decays_to_empty_when_idle() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let t = Instant::now();
         let mut out = Vec::new();
@@ -18599,9 +18640,9 @@ mod tests {
     /// and destination too (a diagonal beam, not disjoint per-row ribbon
     /// segments) — and decays to exactly empty.
     #[test]
-    fn nyan_jump_zooms_a_linear_streak() {
+    fn rainbow_jump_zooms_a_linear_streak() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let t = Instant::now();
         let mut out = Vec::new();
@@ -18609,7 +18650,7 @@ mod tests {
         // A big diagonal jump: 5 rows down, 30 cols right — licensed by a
         // real Enter press (the host's return license; a cold PROGRAM warp
         // of the same shape mints nothing, pinned by
-        // `cold_program_warp_mints_no_nyan_choreography`).
+        // `cold_program_warp_mints_no_rainbow_choreography`).
         glow.note_return(t + Duration::from_millis(10));
         glow.tick(
             Some((5, 32)),
@@ -18639,14 +18680,14 @@ mod tests {
 
     /// CANONICAL BAND ORDER: the ZOOM streak's rainbow reads RED-on-top for
     /// BOTH jump directions (the audit found a down-left Enter beam inverted
-    /// vs the red-top ribbon). Red (NYAN_BANDS[0]) quads must sit ABOVE violet
-    /// (NYAN_BANDS[5]) quads whether the jump goes up-right or down-left.
+    /// vs the red-top ribbon). Red (RAINBOW_BANDS[0]) quads must sit ABOVE violet
+    /// (RAINBOW_BANDS[5]) quads whether the jump goes up-right or down-left.
     #[test]
-    fn nyan_zoom_bands_stay_red_on_top_both_directions() {
+    fn rainbow_zoom_bands_stay_red_on_top_both_directions() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
-        let red = NYAN_BANDS[0];
-        let violet = NYAN_BANDS[5];
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let red = RAINBOW_BANDS[0];
+        let violet = RAINBOW_BANDS[5];
         // Mean y of the reddest vs violetest quads (match the premultiplied hue
         // by its dominant channel: red band = R≫B, violet band = B≫R).
         let mean_y = |out: &[GlowQuad], want_red: bool| -> f32 {
@@ -18678,16 +18719,16 @@ mod tests {
         }
     }
 
-    /// PRIORITY (the bolts-first rule, applied to Nyan): the jump ZOOM emits
+    /// PRIORITY (the bolts-first rule, applied to rainbow kitty): the jump ZOOM emits
     /// BEFORE the ribbon, so when a hot key-repeat ribbon saturates MAX_QUADS
     /// the truncation sheds the ribbon's tail — never the star streak (the
     /// audited inversion rendered NO ZOOM at all on an Enter that followed a
     /// long key-repeat run). Order is observable in the snapshot vec: every
     /// intermediate-row streak quad must precede every origin-row ribbon quad.
     #[test]
-    fn nyan_jump_zoom_emits_before_the_ribbon() {
+    fn rainbow_jump_zoom_emits_before_the_ribbon() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut t = Instant::now();
         let mut out = Vec::new();
@@ -18731,12 +18772,12 @@ mod tests {
     /// HOT-RIBBON QUAD BUDGET (the per-device-pixel audit): at 2× retina
     /// metrics (cw 16 / ch 32) one hot swept cell must cost ≤ 44 ribbon quads
     /// (≤ 4 four-px strips × ≤ 11 two-px rows). The old per-device-pixel
-    /// sampling cost ~300+/cell, so a NYAN_MAX_CELLS ribbon demanded ~5×
+    /// sampling cost ~300+/cell, so a RAINBOW_MAX_CELLS ribbon demanded ~5×
     /// MAX_QUADS — key-repeat permanently saturated the snapshot and the
     /// visible ribbon length became DPI-dependent. A full-length hot ribbon
     /// must fit the global budget with headroom for the ZOOM + star layers.
     #[test]
-    fn nyan_hot_ribbon_cell_cost_fits_the_quad_budget() {
+    fn rainbow_hot_ribbon_cell_cost_fits_the_quad_budget() {
         let g = Geom {
             cw: 16,
             ch: 32,
@@ -18748,14 +18789,14 @@ mod tests {
             win_h: 192,
             head: 0,
         };
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let born = Instant::now();
-        nyan_uniform_ribbon(&mut glow, born, 255, 0..32);
-        glow.nyan.disp = 1.0; // hottest wave: max band width, strips live
-        glow.nyan.phase = 0.37; // arbitrary live phase (shimmer + glint on)
+        rainbow_uniform_ribbon(&mut glow, born, 255, 0..32);
+        glow.rainbow.disp = 1.0; // hottest wave: max band width, strips live
+        glow.rainbow.phase = 0.37; // arbitrary live phase (shimmer + glint on)
         let mut out = Vec::new();
-        glow.emit_nyan(
+        glow.emit_rainbow(
             born + Duration::from_millis(100),
             &c,
             g,
@@ -18783,9 +18824,9 @@ mod tests {
             "hot cell cost bounded at 2× retina (≤ 3 strips × ≤ 14 rows): {max}"
         );
         assert!(
-            CursorGlow::NYAN_MAX_CELLS * max < CursorGlow::MAX_QUADS,
+            CursorGlow::RAINBOW_MAX_CELLS * max < CursorGlow::MAX_QUADS,
             "a full-length hot ribbon fits MAX_QUADS: {} × {max}",
-            CursorGlow::NYAN_MAX_CELLS,
+            CursorGlow::RAINBOW_MAX_CELLS,
         );
     }
 
@@ -18793,15 +18834,15 @@ mod tests {
     /// meteor (step-2 aura) and COMET_LAYERS: 3 px slabs on the dim tail,
     /// 2 px on the mid, 1 px only on the bright head wedge. A cross-window
     /// jump then demands ~3.15L slabs instead of the audited ~6L, so
-    /// NYAN_JUMP_CAP live streaks can no longer saturate MAX_QUADS by
+    /// RAINBOW_JUMP_CAP live streaks can no longer saturate MAX_QUADS by
     /// themselves and starve the landing crown/ring/particles behind them.
     #[test]
-    fn nyan_jump_zoom_grades_its_slab_stride() {
+    fn rainbow_jump_zoom_grades_its_slab_stride() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let born = Instant::now();
-        glow.nyan.jumps.push(JumpStreak {
+        glow.rainbow.jumps.push(JumpStreak {
             x0: 4.0,
             y0: 8.0,
             x1: 292.0, // 288 px major axis — a full-width leap
@@ -18812,7 +18853,7 @@ mod tests {
         });
         let mut zoom = Vec::new();
         let mut zoom_halos = Vec::new();
-        glow.emit_nyan_jumps(born, &c, g, &mut zoom, &mut zoom_halos); // u = 0: full length
+        glow.emit_rainbow_jumps(born, &c, g, &mut zoom, &mut zoom_halos); // u = 0: full length
         assert!(!zoom.is_empty(), "a fresh streak draws at full length");
         // Measured demand: 2208 quads graded vs 3829 at the old uniform
         // step 1 (slab cores plus AA edges and cell-row splits) — the bound
@@ -18834,9 +18875,9 @@ mod tests {
     /// stride 1 and its ramp still ends at `head_cov` ON the tip pixel, so
     /// the streak's bright leading edge is untouched.
     #[test]
-    fn nyan_glide_star_grades_its_slab_stride() {
+    fn rainbow_glide_star_grades_its_slab_stride() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let born = Instant::now();
         let mut glow = CursorGlow::default();
         // A saturated glide: the full star cap, every star at the maximum
@@ -18856,7 +18897,7 @@ mod tests {
             });
         }
         let (mut out, mut halos) = (Vec::new(), Vec::new());
-        glow.emit_nyan_glide_stars(born, &c, g, &mut out, &mut halos); // u = 0: full length
+        glow.emit_rainbow_glide_stars(born, &c, g, &mut out, &mut halos); // u = 0: full length
         assert_invariants(&out, g);
         assert!(!out.is_empty(), "a fresh saturated glide draws");
         // Measured demand: 740 quads graded vs 1440 at the old uniform
@@ -19264,11 +19305,11 @@ mod tests {
         }
     }
 
-    /// Lay a UNIFORM Nyan ribbon (identical sparks born at `born`, one per column
+    /// Lay a UNIFORM rainbow ribbon (identical sparks born at `born`, one per column
     /// over `cols`) so every cell shares the same age/env — the only per-cell
     /// difference the emitters can introduce is the iridescence, which lets the
     /// tests isolate it.
-    fn nyan_uniform_ribbon(
+    fn rainbow_uniform_ribbon(
         glow: &mut CursorGlow,
         born: Instant,
         born_cov: u8,
@@ -19322,9 +19363,9 @@ mod tests {
     /// raw keystroke heat (no per-key width pop); it then SWELLS over ~100 ms of
     /// held cursor. (The exhale + snap-to-zero are pinned separately below.)
     #[test]
-    fn nyan_momentum_spine_eases_not_steps() {
+    fn rainbow_momentum_spine_eases_not_steps() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -19338,7 +19379,7 @@ mod tests {
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         let heat_peak = glow.heat;
-        let disp_after_burst = glow.nyan.disp;
+        let disp_after_burst = glow.rainbow.disp;
         assert!(
             heat_peak > 0.5,
             "burst must build real heat, got {heat_peak}"
@@ -19353,7 +19394,7 @@ mod tests {
             t += Duration::from_millis(15);
             glow.tick(Some((3, 8)), t, &c, g, &mut out);
         }
-        let disp_swell = glow.nyan.disp;
+        let disp_swell = glow.rainbow.disp;
         assert!(
             disp_swell > disp_after_burst * 1.15,
             "spine swells over ~120 ms (eased attack, not a step): {disp_after_burst} -> {disp_swell}"
@@ -19364,23 +19405,23 @@ mod tests {
     /// spine EXHALES (monotonically, on the ~0.45 s release τ) and then snaps to
     /// EXACTLY zero, so an idle ribbon disarms to nothing.
     #[test]
-    fn nyan_momentum_spine_releases_and_snaps_to_zero() {
+    fn rainbow_momentum_spine_releases_and_snaps_to_zero() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
         glow.tick(Some((3, 2)), t, &c, g, &mut out);
         // Warm the CANONICAL metric to full (the earned state a long sustained
         // run reaches), let the spine catch up, then remove all momentum.
-        glow.nyan.momentum.set_value(t, 1.0);
+        glow.rainbow.momentum.set_value(t, 1.0);
         for _ in 0..30 {
             t += Duration::from_millis(15);
-            glow.nyan.momentum.set_value(t, 1.0);
+            glow.rainbow.momentum.set_value(t, 1.0);
             glow.tick(Some((3, 2)), t, &c, g, &mut out);
         }
-        glow.nyan.momentum.reset();
-        let peak = glow.nyan.disp;
+        glow.rainbow.momentum.reset();
+        let peak = glow.rainbow.disp;
         assert!(peak > 0.3, "spine warmed to a real peak, got {peak}");
         // The spine falls monotonically while idle (never a re-heat), on the
         // SLOWER longer-tail release τ (0.85 s — the owner's "more gradual
@@ -19390,31 +19431,31 @@ mod tests {
             t += Duration::from_millis(15);
             glow.tick(Some((3, 2)), t, &c, g, &mut out);
             assert!(
-                glow.nyan.disp <= prev + 1e-6,
+                glow.rainbow.disp <= prev + 1e-6,
                 "spine exhales monotonically while idle ({prev} -> {})",
-                glow.nyan.disp
+                glow.rainbow.disp
             );
-            prev = glow.nyan.disp;
+            prev = glow.rainbow.disp;
         }
         assert!(
-            glow.nyan.disp < peak * 0.55,
+            glow.rainbow.disp < peak * 0.55,
             "spine exhales over the ~0.85 s release ({peak} -> {})",
-            glow.nyan.disp
+            glow.rainbow.disp
         );
         assert!(
-            glow.nyan.disp > peak * 0.15,
+            glow.rainbow.disp > peak * 0.15,
             "…but the longer tail is still visibly alive at ~1 τ ({peak} -> {})",
-            glow.nyan.disp
+            glow.rainbow.disp
         );
         // Far idle: it snaps to EXACTLY zero (the idle-disarm invariant), and the
         // specular phase FREEZES (advances only while the spine is live). The
         // horizon moved 3 s → 6+3 s with the slower τ (0.005 needs ~4.5 τ).
         glow.tick(Some((3, 2)), t + Duration::from_secs(6), &c, g, &mut out);
-        assert_eq!(glow.nyan.disp, 0.0, "spine snaps to exactly 0 when idle");
-        let frozen = glow.nyan.phase;
+        assert_eq!(glow.rainbow.disp, 0.0, "spine snaps to exactly 0 when idle");
+        let frozen = glow.rainbow.phase;
         glow.tick(Some((3, 2)), t + Duration::from_secs(9), &c, g, &mut out);
         assert_eq!(
-            glow.nyan.phase, frozen,
+            glow.rainbow.phase, frozen,
             "phase freezes once the spine is cold (advances ∝ momentum only)"
         );
     }
@@ -19425,9 +19466,9 @@ mod tests {
     /// the legibility cap — in BOTH the cold and warm states, and it SHIMMERS
     /// cell-to-cell when warm (iridescence).
     #[test]
-    fn nyan_ribbon_is_a_smooth_feathered_gradient() {
+    fn rainbow_ribbon_is_a_smooth_feathered_gradient() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let cw = g.cw as u16;
         let born = Instant::now();
         let cov = |color: u32| {
@@ -19439,16 +19480,16 @@ mod tests {
         // COLD: still a smooth gradient (the owner wants smooth ALWAYS), not
         // crisp bands. Read one cell column's ribbon rows top→bottom.
         let mut cold = CursorGlow::default();
-        nyan_uniform_ribbon(&mut cold, born, 150, 5..20);
-        cold.nyan.disp = 0.0;
-        cold.nyan.phase = 0.0;
+        rainbow_uniform_ribbon(&mut cold, born, 150, 5..20);
+        cold.rainbow.disp = 0.0;
+        cold.rainbow.phase = 0.0;
         let mut out = Vec::new();
         // Emit at u = 0.30: well up the (now half-life) near-cursor onset —
         // the over-bright cold born_cov (150) pins the body at the coverage
         // cap here, so band-transition rows clear `is_ribbon_quad`'s
         // brightness floor — and still before either envelope tail begins.
         let sample = born + Duration::from_millis(300);
-        cold.emit_nyan(sample, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
+        cold.emit_rainbow(sample, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
         let mut rows: Vec<&GlowQuad> = out
             .iter()
             .filter(|q| q.x / cw == 10 && q.row == 3 && is_ribbon_quad(q.color))
@@ -19490,7 +19531,7 @@ mod tests {
         // Coverage cap held everywhere.
         for q in out.iter().filter(|q| is_ribbon_quad(q.color)) {
             assert!(
-                cov(q.color) <= NYAN_OCCUPIED_COV_CAP as u32,
+                cov(q.color) <= RAINBOW_OCCUPIED_COV_CAP as u32,
                 "cold ribbon under cap: {:#08x}",
                 q.color
             );
@@ -19503,14 +19544,14 @@ mod tests {
         // ride visibly UNDER the ceiling. (The old 150 saturated: pre-existing
         // failure this fixes.)
         let mut warm = CursorGlow::default();
-        nyan_uniform_ribbon(&mut warm, born, 30, 5..20);
-        warm.nyan.disp = 0.8;
+        rainbow_uniform_ribbon(&mut warm, born, 30, 5..20);
+        warm.rainbow.disp = 0.8;
         // Keep the uniform ribbon's shared u=0.30 away from the shared glint
         // centre so the body does not cap every cell; this isolates the
         // per-cell iridescence noise the test is intended to observe.
-        warm.nyan.phase = 0.8;
+        warm.rainbow.phase = 0.8;
         out.clear();
-        warm.emit_nyan(sample, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
+        warm.emit_rainbow(sample, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
         use std::collections::{BTreeMap, BTreeSet};
         let mut per_cell: BTreeMap<u16, u32> = BTreeMap::new();
         for q in out.iter().filter(|q| q.row == 3 && is_ribbon_quad(q.color)) {
@@ -19524,7 +19565,7 @@ mod tests {
         );
         for q in out.iter().filter(|q| is_ribbon_quad(q.color)) {
             assert!(
-                cov(q.color) <= NYAN_OCCUPIED_COV_CAP as u32,
+                cov(q.color) <= RAINBOW_OCCUPIED_COV_CAP as u32,
                 "iridescence under cap: {:#08x}",
                 q.color
             );
@@ -19534,26 +19575,26 @@ mod tests {
     /// IRIDESCENCE — NEVER EXCEEDS THE COVERAGE CAP even at maximum drive and any
     /// glint phase (the specular highlight is bounded like everything else).
     #[test]
-    fn nyan_iridescence_never_exceeds_cov_cap() {
+    fn rainbow_iridescence_never_exceeds_cov_cap() {
         let g = geom();
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.intensity = 1.0;
         let born = Instant::now();
         let mut glow = CursorGlow::default();
-        nyan_uniform_ribbon(&mut glow, born, 255, 5..20); // over-bright: base pins at cap
-        glow.nyan.disp = 1.0;
+        rainbow_uniform_ribbon(&mut glow, born, 255, 5..20); // over-bright: base pins at cap
+        glow.rainbow.disp = 1.0;
         // Sample at u = 0.30, inside the profile's untapered mid-body: the
         // feathered-ends retune zeroes the profile at u == 0, so emitting at
         // `born` would render NOTHING and pass this cap proof vacuously. The
-        // glint centre (`nyan.phase.fract()`) still sweeps 0..1 across the
+        // glint centre (`rainbow.phase.fract()`) still sweeps 0..1 across the
         // steps below, so it crosses the ribbon's shared u and the specular
         // add is genuinely exercised against the cap.
         let sample = born + Duration::from_millis(300);
         let mut out = Vec::new();
         for step in 0..12 {
-            glow.nyan.phase = step as f32 * 0.11; // sweep the glint across the ribbon
+            glow.rainbow.phase = step as f32 * 0.11; // sweep the glint across the ribbon
             out.clear();
-            glow.emit_nyan(sample, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
+            glow.emit_rainbow(sample, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
             assert!(
                 out.iter().any(|q| is_ribbon_quad(q.color)),
                 "cap proof must not pass vacuously: no ribbon quads at step {step}"
@@ -19571,20 +19612,20 @@ mod tests {
                 .max()
                 .unwrap_or(0);
             assert!(
-                max_chan <= NYAN_OCCUPIED_COV_CAP as u32,
+                max_chan <= RAINBOW_OCCUPIED_COV_CAP as u32,
                 "band coverage capped at any glint phase, got {max_chan} at step {step}"
             );
         }
     }
 
     /// FULL SING DRIVE HOLDS THE LEGIBILITY CAPS: `celebrate(1.0)` (the
-    /// FULL-NYAN momentum bypass) pins the canonical metric to exactly 1.0 —
+    /// SING-ALONG momentum bypass) pins the canonical metric to exactly 1.0 —
     /// a FLOOR, never a decrease — and because the celebration reuses the one
     /// existing momentum spine (no parallel render path), a ribbon emitted at
-    /// that ceiling clamps at [`NYAN_OCCUPIED_COV_CAP`] exactly as an earned
+    /// that ceiling clamps at [`RAINBOW_OCCUPIED_COV_CAP`] exactly as an earned
     /// full-momentum ribbon does. Text stays legible at maximum celebration.
     #[test]
-    fn full_sing_drive_holds_the_nyan_legibility_caps() {
+    fn full_sing_drive_holds_the_rainbow_legibility_caps() {
         let now = Instant::now();
         let mut glow = CursorGlow::default();
         glow.celebrate(now, 1.0);
@@ -19601,14 +19642,14 @@ mod tests {
         // The caps at full drive: an over-bright ribbon with the spine at
         // the celebration ceiling still clamps every channel at the cap.
         let g = geom();
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.intensity = 1.0;
         let born = Instant::now();
-        nyan_uniform_ribbon(&mut glow, born, 255, 5..20);
-        glow.nyan.disp = 1.0; // the spine's steady state under drive 1.0
+        rainbow_uniform_ribbon(&mut glow, born, 255, 5..20);
+        glow.rainbow.disp = 1.0; // the spine's steady state under drive 1.0
         let sample = born + Duration::from_millis(300);
         let mut out = Vec::new();
-        glow.emit_nyan(sample, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
+        glow.emit_rainbow(sample, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
         assert!(
             out.iter().any(|q| is_ribbon_quad(q.color)),
             "cap proof must not pass vacuously"
@@ -19626,7 +19667,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(
-            max_chan <= NYAN_OCCUPIED_COV_CAP as u32,
+            max_chan <= RAINBOW_OCCUPIED_COV_CAP as u32,
             "legibility cap must hold at full sing drive, got {max_chan}"
         );
     }
@@ -19634,12 +19675,12 @@ mod tests {
     /// SPECULAR GLINT — SWEEPS WITH MOMENTUM: the phase advances at a rate ∝ the
     /// spine, and the bright specular highlight brightens the cell it sweeps
     /// over. Measured at a MID-RIBBON cell: the head cell itself now stays
-    /// translucent by design (`NYAN_HEAD_RAMP` — near-cursor clarity), so the
+    /// translucent by design (`RAINBOW_HEAD_RAMP` — near-cursor clarity), so the
     /// glint's punch is asserted where the head ramp has fully released.
     #[test]
-    fn nyan_glint_sweeps_with_momentum() {
+    fn rainbow_glint_sweeps_with_momentum() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let cw = g.cw as u16;
         // A STAGGERED ribbon: head (col 14) born at `now` (u == 0), older cells
         // laid progressively earlier, so u increases toward the tail.
@@ -19662,14 +19703,14 @@ mod tests {
                 born: base + Duration::from_millis(500 - age_ms),
             });
         }
-        glow.nyan.disp = 1.0;
+        glow.rainbow.disp = 1.0;
         // Mid-ribbon cell col 8 (u = 6 × 0.03 = 0.18 — partway up the gentle
         // head onset; the momentum glint pins the swept cell at the coverage
         // cap regardless): its red-band coverage at a given glint phase.
         let mid_cov = |glow: &mut CursorGlow, phase: f32| -> u32 {
-            glow.nyan.phase = phase;
+            glow.rainbow.phase = phase;
             let mut out = Vec::new();
-            glow.emit_nyan(now, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
+            glow.emit_rainbow(now, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
             out.iter()
                 .filter(|q| q.row == 3 && q.x / cw == 8 && is_ribbon_quad(q.color))
                 .map(|q| {
@@ -19697,15 +19738,15 @@ mod tests {
             warm.note_typed(t); // real typing arms the correlated advance (M1)
             warm.tick(Some((3, col)), t, &c, g, &mut out);
         }
-        let p0 = warm.nyan.phase;
+        let p0 = warm.rainbow.phase;
         for _ in 0..10 {
             t += Duration::from_millis(15);
             warm.tick(Some((3, 14)), t, &c, g, &mut out);
         }
         assert!(
-            warm.nyan.phase - p0 > 0.02,
+            warm.rainbow.phase - p0 > 0.02,
             "phase scrolls while momentum is live ({p0} -> {})",
-            warm.nyan.phase
+            warm.rainbow.phase
         );
     }
 
@@ -19715,7 +19756,7 @@ mod tests {
     /// geometry so the hot path emits a SINGLE strip — one clean vertical band to
     /// span-measure without the multi-strip wave offsets confusing the extent.
     #[test]
-    fn nyan_fatter_band_grows_with_disp_and_respects_the_quarter_free_cap() {
+    fn rainbow_fatter_band_grows_with_disp_and_respects_the_quarter_free_cap() {
         let g = Geom {
             cw: 4,
             ch: 24,
@@ -19727,17 +19768,17 @@ mod tests {
             win_h: 144,
             head: 0,
         };
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let born = Instant::now();
         // Over-bright born_cov so even the feathered edge rows clear the ribbon
         // colour floor — the measured span then tracks the true band height.
         let band_height = |disp: f32| -> u16 {
             let mut glow = CursorGlow::default();
-            nyan_uniform_ribbon(&mut glow, born, 255, 5..7);
-            glow.nyan.disp = disp;
-            glow.nyan.phase = 0.0;
+            rainbow_uniform_ribbon(&mut glow, born, 255, 5..7);
+            glow.rainbow.disp = disp;
+            glow.rainbow.phase = 0.0;
             let mut out = Vec::new();
-            glow.emit_nyan(
+            glow.emit_rainbow(
                 born + Duration::from_millis(120),
                 &c,
                 g,
@@ -19764,7 +19805,7 @@ mod tests {
             hot_h > cold_h,
             "the ribbon fattens with momentum: cold {cold_h} vs hot {hot_h}"
         );
-        // ¼-FREE cap: this mirrors `emit_nyan`'s `max_band_h` exactly.
+        // ¼-FREE cap: this mirrors `emit_rainbow`'s `max_band_h` exactly.
         let ch = g.ch as u16;
         let quarter_free_cap = ch - (ch / 4).max(2);
         assert!(
@@ -19785,9 +19826,9 @@ mod tests {
     /// hot head at 255); the new calmer cold floor (215·0.45 ≈ 96) blows that
     /// spread open.
     #[test]
-    fn nyan_intensity_range_is_wider_than_the_old_curve() {
+    fn rainbow_intensity_range_is_wider_than_the_old_curve() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         // COLD: one isolated move from rest — the spine is 0 at spawn, so the
         // fresh head spark takes the CALM cold floor.
         let mut cold = CursorGlow::default();
@@ -19809,16 +19850,16 @@ mod tests {
         let mut hot = CursorGlow::default();
         let mut t = Instant::now();
         hot.tick(Some((3, 2)), t, &c, g, &mut out);
-        hot.nyan.momentum.set_value(t, 1.0);
+        hot.rainbow.momentum.set_value(t, 1.0);
         for col in 3..=18u16 {
             t += Duration::from_millis(12);
-            hot.nyan.momentum.set_value(t, 1.0);
+            hot.rainbow.momentum.set_value(t, 1.0);
             hot.tick(Some((3, col)), t, &c, g, &mut out);
         }
         assert!(
-            hot.nyan.disp > 0.7,
+            hot.rainbow.disp > 0.7,
             "hot fixture reaches high momentum: {}",
-            hot.nyan.disp
+            hot.rainbow.disp
         );
         let hot_cov = hot.sparks.iter().map(|s| s.born_cov).max().unwrap();
         // Calmer cold than the old 0.7 floor produced (215·0.7 = 150).
@@ -19834,18 +19875,18 @@ mod tests {
         );
     }
 
-    /// SHOOTING STARS: at HIGH momentum a Nyan move additionally flings a few
+    /// SHOOTING STARS: at HIGH momentum a rainbow kitty move additionally flings a few
     /// true comets (the SHOOT sentinel `cov_scale > 1.25`, rendered as a velocity
     /// streak) — fast and BACKWARD along the wake, long-lived. Below the
     /// threshold the wake throws none.
     #[test]
-    fn nyan_high_disp_flings_streaked_shooting_stars() {
+    fn rainbow_high_disp_flings_streaked_shooting_stars() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let now = Instant::now();
         // LOW momentum: no shooting stars.
         let mut cold = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 0.2,
                 ..Default::default()
             },
@@ -19858,7 +19899,7 @@ mod tests {
         );
         // HIGH momentum: the same move flings streaked shooting stars.
         let mut hot = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 1.0,
                 ..Default::default()
             },
@@ -19904,7 +19945,7 @@ mod tests {
     #[test]
     fn casual_burst_spawns_no_stars_and_no_cat_momentum() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -19921,11 +19962,11 @@ mod tests {
         // The onset-gated quadratic density floors to ZERO whole stars for
         // this spine value (the cold-start credit front-loads the metric a
         // little, but nowhere near the ~0.7 spine a first whole star needs).
-        let density = nyan_star_drive(glow.nyan.disp).powi(2) * 5.0;
+        let density = rainbow_star_drive(glow.rainbow.disp).powi(2) * 5.0;
         assert!(
             density < 1.0,
             "a casual burst's star density floors to zero: {density} (disp {})",
-            glow.nyan.disp
+            glow.rainbow.disp
         );
         assert!(
             glow.particles.is_empty(),
@@ -19956,18 +19997,18 @@ mod tests {
     }
 
     /// UNIFIED-READERS PROOF: ONE canonical metric ([`crate::typing_momentum`])
-    /// drives all three Nyan "earned drama" consumer groups. The glow engine's
+    /// drives all three rainbow kitty "earned drama" consumer groups. The glow engine's
     /// instance and the cursor cat's instance evolve IDENTICALLY under one
     /// keystream (same law, same stamps), and each consumer keys off it:
-    /// (1) the star envelope/density via the eased `nyan.disp` spine,
+    /// (1) the star envelope/density via the eased `rainbow.disp` spine,
     /// (2) the fresh-ink pop via the spine frozen at birth (`InkPop::mom`),
     /// (3) the one-body cat wake via its band+dwell over the same value.
     #[test]
     fn momentum_unifies_glow_and_cat_metrics() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
-        let mut cat = crate::nyan_cursor::CursorCat::default();
+        let mut cat = crate::kitty_cursor::CursorCat::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
         glow.tick(Some((3, 0)), t, &c, g, &mut out);
@@ -19996,12 +20037,12 @@ mod tests {
             "cat visibility: an unearned run has no live companion frame"
         );
         let pop = glow
-            .nyan
+            .rainbow
             .ink_pops
             .last()
             .expect("typed cells birth ink pops");
         assert_eq!(
-            pop.mom, glow.nyan.disp,
+            pop.mom, glow.rainbow.disp,
             "fresh-ink pop scaling froze the SAME spine at birth"
         );
         // A delete drains BOTH instances identically (never builds).
@@ -20021,7 +20062,7 @@ mod tests {
         // Phase 2 — sustained flow (~6.6 s): the shared value crosses the
         // star onset and then the (raised 0.90) cat band, so the shower AND the
         // one-body cat are earned together off the one metric. The cat's earn law
-        // was raised (band 0.90, dwell 3.0 s in nyan_cursor.rs) so this run must
+        // was raised (band 0.90, dwell 3.0 s in kitty_cursor.rs) so this run must
         // be longer than the old ~4.5 s to summon. Line ends continue via the
         // wrap-shaped move, which classifies as typing — every key builds BOTH
         // instances.
@@ -20066,7 +20107,7 @@ mod tests {
     #[test]
     fn program_output_alone_builds_no_momentum() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -20116,9 +20157,9 @@ mod tests {
     /// so the retune redistributes light without dimming or blowing out the
     /// ribbon overall.
     #[test]
-    fn nyan_ribbon_profile_peaks_in_the_mid_tail() {
+    fn rainbow_ribbon_profile_peaks_in_the_mid_tail() {
         let prof: Vec<f32> = (0..=100)
-            .map(|i| nyan_ribbon_profile(i as f32 / 100.0, 1.0))
+            .map(|i| rainbow_ribbon_profile(i as f32 / 100.0, 1.0))
             .collect();
         let (peak_i, peak) =
             prof.iter().enumerate().fold(
@@ -20163,36 +20204,36 @@ mod tests {
     /// fluid into the background, I still see what looks like a hard edge
     /// sometimes"): the profile now reaches EXACTLY zero at both ends of a
     /// spark's life — eased in over the real-time birth window
-    /// ([`NYAN_EDGE_IN_S`], capped at [`NYAN_EDGE_IN`] of life) and eased out
-    /// over the final [`NYAN_EDGE_OUT`] — so a spark cut at ANY moment
+    /// ([`RAINBOW_EDGE_IN_S`], capped at [`RAINBOW_EDGE_IN`] of life) and eased out
+    /// over the final [`RAINBOW_EDGE_OUT`] — so a spark cut at ANY moment
     /// (natural expiry between frames, quad-budget shedding, the exit-swoosh
     /// drain) was already fading, never a hard edge. The feather must not
     /// disturb the mid-tail law: the crest stays where the previous retune
     /// put it, the mid-body is the retired law to within the modest
-    /// [`NYAN_EDGE_RENORM`], and the mean over a full life stays within 10%
+    /// [`RAINBOW_EDGE_RENORM`], and the mean over a full life stays within 10%
     /// of the pre-feather profile.
     #[test]
-    fn nyan_ribbon_profile_feathers_both_ends_to_zero() {
+    fn rainbow_ribbon_profile_feathers_both_ends_to_zero() {
         // The PRE-FEATHER law, reconstructed from the same constants: the
         // reference for "the feather only touches the ends".
         let unfeathered = |u: f32| -> f32 {
-            let onset =
-                NYAN_HEAD_FLOOR + (1.0 - NYAN_HEAD_FLOOR) * smoothstep01(u / NYAN_HEAD_RAMP);
-            let d = (u - NYAN_CREST_POS) / NYAN_CREST_WIDTH;
-            onset * (1.0 + NYAN_CREST_GAIN * (-(d * d)).exp())
+            let onset = RAINBOW_HEAD_FLOOR
+                + (1.0 - RAINBOW_HEAD_FLOOR) * smoothstep01(u / RAINBOW_HEAD_RAMP);
+            let d = (u - RAINBOW_CREST_POS) / RAINBOW_CREST_WIDTH;
+            onset * (1.0 + RAINBOW_CREST_GAIN * (-(d * d)).exp())
         };
         // Endpoints: exactly-zero terminations (the whole point of the fix) —
         // at the canonical 1 s life and at a glacial 23 s chained life alike.
-        for life in [1.0f32, CursorGlow::NYAN_SWOOSH_LIFE, 23.0] {
+        for life in [1.0f32, CursorGlow::RAINBOW_SWOOSH_LIFE, 23.0] {
             assert!(
-                nyan_ribbon_profile(0.0, life) <= 0.01,
+                rainbow_ribbon_profile(0.0, life) <= 0.01,
                 "the newest end condenses out of the background (life {life}): {}",
-                nyan_ribbon_profile(0.0, life)
+                rainbow_ribbon_profile(0.0, life)
             );
             assert!(
-                nyan_ribbon_profile(1.0, life) <= 0.01,
+                rainbow_ribbon_profile(1.0, life) <= 0.01,
                 "the expiring end dissolves into the background (life {life}): {}",
-                nyan_ribbon_profile(1.0, life)
+                rainbow_ribbon_profile(1.0, life)
             );
         }
         // ABSOLUTE-TIME birth law: a chained spark's life stretches with the
@@ -20201,7 +20242,7 @@ mod tests {
         // real time: ~60 ms into a 10 s chained spark (u = 0.006) the ease has
         // fully released and the head is on the documented onset ramp.
         assert!(
-            (nyan_ribbon_profile(0.006, 10.0) - unfeathered(0.006) * NYAN_EDGE_RENORM).abs()
+            (rainbow_ribbon_profile(0.006, 10.0) - unfeathered(0.006) * RAINBOW_EDGE_RENORM).abs()
                 <= 1e-4,
             "the birth ease releases on a real-time clock, not a life fraction"
         );
@@ -20210,13 +20251,13 @@ mod tests {
         // never a wobble that would read as a re-brightening edge.
         let n = 1000;
         let prof: Vec<f32> = (0..=n)
-            .map(|i| nyan_ribbon_profile(i as f32 / n as f32, 1.0))
+            .map(|i| rainbow_ribbon_profile(i as f32 / n as f32, 1.0))
             .collect();
-        let birth_end = (NYAN_EDGE_IN * n as f32) as usize;
+        let birth_end = (RAINBOW_EDGE_IN * n as f32) as usize;
         for w in prof[..=birth_end].windows(2) {
             assert!(w[1] >= w[0] - 1e-5, "birth taper rises monotonically");
         }
-        let tail_start = ((1.0 - NYAN_EDGE_OUT) * n as f32) as usize;
+        let tail_start = ((1.0 - RAINBOW_EDGE_OUT) * n as f32) as usize;
         for w in prof[tail_start..].windows(2) {
             assert!(w[1] <= w[0] + 1e-5, "tail taper falls monotonically");
         }
@@ -20225,7 +20266,7 @@ mod tests {
         // the crest POSITION) cannot have moved.
         for (i, &got) in prof.iter().enumerate().take(tail_start).skip(birth_end + 1) {
             let u = i as f32 / n as f32;
-            let want = unfeathered(u) * NYAN_EDGE_RENORM;
+            let want = unfeathered(u) * RAINBOW_EDGE_RENORM;
             assert!(
                 (got - want).abs() <= 1e-4,
                 "mid-body untouched at u = {u}: {got} vs {want}"
@@ -20261,20 +20302,20 @@ mod tests {
 
     /// FEATURE A — the SPATIAL terminus feather melts to EXACTLY zero at the
     /// margin (owner: "the ends of the rainbow … not just have a hard edge …
-    /// specifically on the far right"). The pin: `nyan_terminus_feather(0) == 0`
+    /// specifically on the far right"). The pin: `rainbow_terminus_feather(0) == 0`
     /// (the very end is background, never a hard vertical edge), it rises to 1
     /// inside the body, is monotone non-decreasing, and — reusing the ribbon's
-    /// sub-linear [`NYAN_TAIL_MELT_GAMMA`] — HANGS HIGH through the taper's
+    /// sub-linear [`RAINBOW_TAIL_MELT_GAMMA`] — HANGS HIGH through the taper's
     /// middle (`feather(0.5) > 0.5`), the "melts out gradually" read.
     #[test]
-    fn nyan_terminus_feather_melts_to_zero_at_the_margin() {
+    fn rainbow_terminus_feather_melts_to_zero_at_the_margin() {
         assert_eq!(
-            nyan_terminus_feather(0.0),
+            rainbow_terminus_feather(0.0),
             0.0,
             "the very terminus is exactly background — no hard edge"
         );
         assert!(
-            nyan_terminus_feather(1.0) >= 0.999,
+            rainbow_terminus_feather(1.0) >= 0.999,
             "the feather reaches full brightness inside the ribbon body"
         );
         // Monotone non-decreasing across the whole band — one smooth gradient,
@@ -20282,30 +20323,30 @@ mod tests {
         let n = 500;
         let mut prev = -1.0f32;
         for i in 0..=n {
-            let v = nyan_terminus_feather(i as f32 / n as f32);
+            let v = rainbow_terminus_feather(i as f32 / n as f32);
             assert!(v >= prev - 1e-6, "terminus feather rises monotonically");
             prev = v;
         }
         // Sub-linear melt: the light lingers past the halfway mark (the gamma
         // lift), so the dissolve is a gentle fade-out, not a linear ramp.
         assert!(
-            nyan_terminus_feather(0.5) > 0.5,
+            rainbow_terminus_feather(0.5) > 0.5,
             "the melt hangs high through its middle (the longer-tail read): {}",
-            nyan_terminus_feather(0.5)
+            rainbow_terminus_feather(0.5)
         );
         // Clamped below zero: a spurious negative frac still floors at zero,
         // never a sign flip.
-        assert_eq!(nyan_terminus_feather(-1.0), 0.0);
+        assert_eq!(rainbow_terminus_feather(-1.0), 0.0);
     }
 
-    /// FEATURE B — a FAST Nyan jump fires BOTH the ZOOM streak (preserved) AND a
+    /// FEATURE B — a FAST rainbow kitty jump fires BOTH the ZOOM streak (preserved) AND a
     /// landing starburst (new), scaled by jump distance. The owner likes the
     /// ZOOM/light-burst and it must stay; the starburst is ADDITIONAL. A short
-    /// jump under [`CursorGlow::NYAN_BURST_MIN_DIST`] keeps only the ZOOM.
+    /// jump under [`CursorGlow::RAINBOW_BURST_MIN_DIST`] keeps only the ZOOM.
     #[test]
-    fn fast_nyan_jump_fires_zoom_and_starburst_scaled_by_distance() {
+    fn fast_rainbow_jump_fires_zoom_and_starburst_scaled_by_distance() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
 
         // Warm TYPING momentum, then jump: the un-hinted choreography is
@@ -20329,11 +20370,11 @@ mod tests {
         // A big fling off a warm run: ZOOM streak AND starburst both fire.
         let far = warm_jump(0, 38);
         assert!(
-            !far.nyan.jumps.is_empty(),
+            !far.rainbow.jumps.is_empty(),
             "the ZOOM streak still fires on a fast jump off warm typing"
         );
         assert_eq!(
-            far.nyan.bursts.len(),
+            far.rainbow.bursts.len(),
             1,
             "a fast jump ALSO blooms exactly one landing starburst"
         );
@@ -20343,23 +20384,23 @@ mod tests {
         // star (the old 6-cell cliff that gave short jumps nothing is gone).
         let near = warm_jump(3, 5); // chebyshev-3 from (5, 8), >= MIN_DIST(2.0)
         assert!(
-            !near.nyan.jumps.is_empty(),
+            !near.rainbow.jumps.is_empty(),
             "a modest jump keeps its ZOOM streak"
         );
         assert_eq!(
-            near.nyan.bursts.len(),
+            near.rainbow.bursts.len(),
             1,
             "a modest jump now blooms a landing burst too (feedback on any hop)"
         );
         assert_eq!(
-            near.nyan.bursts[0].stars, 1,
+            near.rainbow.bursts[0].stars, 1,
             "a short hop scatters exactly ONE small star (graduated by distance)"
         );
 
         // Reach scales with distance: a farther leap throws a wider burst.
         let reach_at = |cr: u16, cc: u16| -> f32 {
             warm_jump(cr, cc)
-                .nyan
+                .rainbow
                 .bursts
                 .first()
                 .map_or(0.0, |b| b.reach)
@@ -20370,10 +20411,10 @@ mod tests {
         );
         // Star COUNT graduates too: the full fling throws MORE stars than a hop.
         assert!(
-            far.nyan.bursts[0].stars > near.nyan.bursts[0].stars,
+            far.rainbow.bursts[0].stars > near.rainbow.bursts[0].stars,
             "star count graduates with distance: far {} > near {}",
-            far.nyan.bursts[0].stars,
-            near.nyan.bursts[0].stars
+            far.rainbow.bursts[0].stars,
+            near.rainbow.bursts[0].stars
         );
     }
 
@@ -20381,12 +20422,12 @@ mod tests {
     /// COLD cursor delta — the shape of a program-driven warp (a spinner's
     /// CUP loop, a background TUI repaint), with zero typed presses anywhere
     /// near it — mints NO jump choreography: no ZOOM streak, no starburst,
-    /// no terminus glitter. The momentum gate (`NYAN_JUMP_MIN_DISP`) is the
+    /// no terminus glitter. The momentum gate (`RAINBOW_JUMP_MIN_DISP`) is the
     /// "was this text?" witness; program output can never warm it.
     #[test]
-    fn cold_program_warp_mints_no_nyan_choreography() {
+    fn cold_program_warp_mints_no_rainbow_choreography() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -20398,11 +20439,11 @@ mod tests {
             glow.tick(Some((cr, cc)), t, &c, g, &mut out);
         }
         assert!(
-            glow.nyan.jumps.is_empty(),
+            glow.rainbow.jumps.is_empty(),
             "a cold program warp must not throw the ZOOM streak"
         );
         assert!(
-            glow.nyan.bursts.is_empty(),
+            glow.rainbow.bursts.is_empty(),
             "a cold program warp must not bloom a starburst"
         );
         assert!(
@@ -20416,29 +20457,32 @@ mod tests {
     /// [`CursorGlow::note_reflow`], and the relayout leap that follows throws
     /// the ZOOM streak even though typing momentum is stone cold — the hand
     /// dragged the window edge, so the gesture is witnessed. This is the exact
-    /// counterpart of `cold_program_warp_mints_no_nyan_choreography`: same cold
+    /// counterpart of `cold_program_warp_mints_no_rainbow_choreography`: same cold
     /// spine, same move shape, opposite verdict, and the ONLY difference is the
     /// hint.
     #[test]
     fn a_hinted_reflow_throws_the_zoom_streak_from_cold() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((0, 0)), t0, &c, g, &mut out);
-        assert_eq!(glow.nyan.disp, 0.0, "the spine must be cold for this law");
+        assert_eq!(
+            glow.rainbow.disp, 0.0,
+            "the spine must be cold for this law"
+        );
         // The host committed a settled resize, then the reflow relocated the caret.
         let t1 = t0 + Duration::from_millis(120);
         glow.note_reflow(t1);
         glow.tick(Some((3, 30)), t1, &c, g, &mut out);
         assert_eq!(
-            glow.nyan.jumps.len(),
+            glow.rainbow.jumps.len(),
             1,
             "a reflow-hinted relayout leap must throw exactly one ZOOM streak"
         );
         assert!(
-            glow.nyan.bursts.is_empty(),
+            glow.rainbow.bursts.is_empty(),
             "a resize gets the BEAM ONLY — no landing starburst"
         );
     }
@@ -20451,13 +20495,13 @@ mod tests {
     #[test]
     fn a_resize_streak_carries_no_starburst_but_a_warm_jump_still_does() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
 
         // WARM spine, no reflow hint: the identical leap keeps its celebration.
         let mut warm = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 0.9,
                 ..Default::default()
             },
@@ -20466,9 +20510,9 @@ mod tests {
         warm.tick(Some((0, 0)), t0, &c, g, &mut out);
         let t1 = t0 + Duration::from_millis(120);
         warm.tick(Some((3, 30)), t1, &c, g, &mut out);
-        assert_eq!(warm.nyan.jumps.len(), 1, "a warm jump still zooms");
+        assert_eq!(warm.rainbow.jumps.len(), 1, "a warm jump still zooms");
         assert!(
-            !warm.nyan.bursts.is_empty(),
+            !warm.rainbow.bursts.is_empty(),
             "a warm jump still bursts — the suppression must not leak to ordinary jumps"
         );
 
@@ -20477,15 +20521,15 @@ mod tests {
         cold.tick(Some((0, 0)), t0, &c, g, &mut out);
         cold.note_reflow(t1);
         cold.tick(Some((3, 30)), t1, &c, g, &mut out);
-        assert_eq!(cold.nyan.jumps.len(), 1, "the resize still zooms");
+        assert_eq!(cold.rainbow.jumps.len(), 1, "the resize still zooms");
         assert!(
-            cold.nyan.bursts.is_empty(),
+            cold.rainbow.bursts.is_empty(),
             "a reflow-licensed zoom must not burst"
         );
     }
 
-    /// "ALL GET" (owner, 2026-07-28): the resize streak is not a Nyan privilege.
-    /// Nyan needed an explicit reflow LICENSE only because its ZOOM is the one
+    /// "ALL GET" (owner, 2026-07-28): the resize streak is not a rainbow kitty privilege.
+    /// Rainbow kitty needed an explicit reflow LICENSE only because its ZOOM is the one
     /// arm gated on typing momentum (the anti-stray law); every other style's
     /// jump path is ungated, so a cold relayout leap already lays that style's
     /// own streak. This pins the property for the whole built-in set, so a future
@@ -20498,7 +20542,7 @@ mod tests {
         for style in [
             GlowStyle::Lumen,
             GlowStyle::Phaser,
-            GlowStyle::Nyan,
+            GlowStyle::RainbowKitty,
             GlowStyle::Sparkle,
             GlowStyle::Fire,
             GlowStyle::Laser,
@@ -20511,11 +20555,11 @@ mod tests {
             let mut glow = CursorGlow::default();
             glow.tick(Some((0, 0)), t0, &c, g, &mut out);
             // The host arms the license for EVERY style (`apply_term_resize` is
-            // style-blind); only Nyan's gate reads it.
+            // style-blind); only the rainbow kitty's gate reads it.
             glow.note_reflow(t1);
             glow.tick(Some((3, 30)), t1, &c, g, &mut out);
             let laid = !glow.sparks.is_empty()
-                || !glow.nyan.jumps.is_empty()
+                || !glow.rainbow.jumps.is_empty()
                 || !glow.fire_meteors.is_empty()
                 || !glow.particles.is_empty();
             assert!(laid, "{style:?}: a cold relayout leap must lay a streak");
@@ -20529,7 +20573,7 @@ mod tests {
     #[test]
     fn one_reflow_hint_licenses_exactly_one_streak() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -20542,7 +20586,7 @@ mod tests {
             glow.tick(Some((cr, cc)), t, &c, g, &mut out);
         }
         assert_eq!(
-            glow.nyan.jumps.len(),
+            glow.rainbow.jumps.len(),
             1,
             "one reflow hint must license exactly one streak, not one per reflow"
         );
@@ -20555,7 +20599,7 @@ mod tests {
     #[test]
     fn a_stale_reflow_hint_licenses_nothing() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -20564,7 +20608,7 @@ mod tests {
         let t1 = t0 + Duration::from_secs_f32(CursorGlow::REFLOW_HINT_FRESH + 0.05);
         glow.tick(Some((3, 30)), t1, &c, g, &mut out);
         assert!(
-            glow.nyan.jumps.is_empty(),
+            glow.rainbow.jumps.is_empty(),
             "a reflow hint past its freshness window must license no streak"
         );
     }
@@ -20576,7 +20620,7 @@ mod tests {
     #[test]
     fn a_reflow_streak_from_a_shrunk_grid_stays_inside_the_effects_box() {
         let big = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -20593,7 +20637,7 @@ mod tests {
         glow.note_reflow(t1);
         glow.tick(Some((2, 4)), t1, &c, small, &mut out);
         let s = glow
-            .nyan
+            .rainbow
             .jumps
             .first()
             .expect("the shrink's relayout leap must still throw its streak");
@@ -20614,36 +20658,36 @@ mod tests {
     /// blob). Momentum warm + presses stale ⇒ no scatter; press fresh ⇒
     /// scatter.
     #[test]
-    fn nyan_terminus_requires_a_recent_press_not_just_warm_disp() {
+    fn rainbow_terminus_requires_a_recent_press_not_just_warm_disp() {
         let g = geom();
         let t0 = Instant::now();
         let mut stale = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 0.3, // proxy warm, but NO recorded press at all
                 ..Default::default()
             },
             ..Default::default()
         };
-        stale.emit_nyan_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
+        stale.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
         assert!(
             stale.particles.is_empty(),
             "warm disp without a recent press scatters nothing"
         );
         assert_eq!(
-            stale.nyan.bursts.len(),
+            stale.rainbow.bursts.len(),
             1,
             "the landing burst is disp-gated at the CALLER, not here"
         );
 
         let mut fresh = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 0.3,
                 ..Default::default()
             },
             ..Default::default()
         };
         fresh.note_typed(t0); // press just landed — ribbon plausibly visible
-        fresh.emit_nyan_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
+        fresh.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
         assert!(
             !fresh.particles.is_empty(),
             "a recent press licenses the terminus scatter"
@@ -20658,7 +20702,7 @@ mod tests {
     #[test]
     fn one_press_multi_cell_hop_is_not_coalesced_typing() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
 
@@ -20701,12 +20745,12 @@ mod tests {
 
     /// FEATURE B — the starburst is capped so a Ctrl-A/Ctrl-E MASH can never
     /// unbound-allocate: many fast jumps in a row keep at most
-    /// [`CursorGlow::NYAN_BURST_CAP`] live bursts, and the terminus scatter stays
+    /// [`CursorGlow::RAINBOW_BURST_CAP`] live bursts, and the terminus scatter stays
     /// under [`CursorGlow::MAX_PARTICLES`].
     #[test]
-    fn nyan_starburst_capped_under_a_jump_mash() {
+    fn rainbow_starburst_capped_under_a_jump_mash() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -20717,7 +20761,7 @@ mod tests {
         // scatters a terminus — the particle cap is then really under load,
         // not vacuously satisfied by a cold cursor that scatters nothing.
         glow.note_typed(t0);
-        glow.nyan.disp = 0.3;
+        glow.rainbow.disp = 0.3;
         // Cycle through far-apart landings so each move is a fresh fast jump.
         let landings = [(3, 30), (0, 5), (4, 35), (1, 12), (5, 20), (2, 38), (0, 0)];
         for _ in 0..6 {
@@ -20726,9 +20770,9 @@ mod tests {
             }
         }
         assert!(
-            glow.nyan.bursts.len() <= CursorGlow::NYAN_BURST_CAP,
+            glow.rainbow.bursts.len() <= CursorGlow::RAINBOW_BURST_CAP,
             "a jump mash stays within the starburst cap: {}",
-            glow.nyan.bursts.len()
+            glow.rainbow.bursts.len()
         );
         assert!(
             !glow.particles.is_empty(),
@@ -20747,20 +20791,20 @@ mod tests {
     /// byte-identical. The animated burst, by contrast, expands — its ray extent
     /// grows with age. Same start/end discipline as the fresh-ink reduced arm.
     #[test]
-    fn nyan_starburst_reduced_motion_is_a_static_burst() {
+    fn rainbow_starburst_reduced_motion_is_a_static_burst() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let born = Instant::now();
         let (cx, cy) = (160.0f32, 48.0f32);
         let push_burst = |glow: &mut CursorGlow| {
-            glow.nyan.bursts.push(Starburst {
+            glow.rainbow.bursts.push(Starburst {
                 cx,
                 cy,
                 born,
-                life: CursorGlow::NYAN_BURST_LIFE,
+                life: CursorGlow::RAINBOW_BURST_LIFE,
                 reach: 2.0 * g.ch as f32,
                 seed: 0.3,
-                stars: CursorGlow::NYAN_BURST_STARS as u8,
+                stars: CursorGlow::RAINBOW_BURST_STARS as u8,
                 sparkles: 0,
             });
         };
@@ -20777,8 +20821,8 @@ mod tests {
         push_burst(&mut r);
         let (mut e0, mut e1) = (Vec::new(), Vec::new());
         let mut eh = Vec::new();
-        r.emit_nyan_starburst(born, &c, g, &mut e0, &mut eh);
-        r.emit_nyan_starburst(late, &c, g, &mut e1, &mut eh);
+        r.emit_rainbow_starburst(born, &c, g, &mut e0, &mut eh);
+        r.emit_rainbow_starburst(late, &c, g, &mut e1, &mut eh);
         assert!(!e0.is_empty(), "a reduced-motion burst still draws stars");
         assert_eq!(
             format!("{e0:?}"),
@@ -20791,8 +20835,8 @@ mod tests {
         push_burst(&mut a);
         let (mut a0, mut a1) = (Vec::new(), Vec::new());
         let mut ah = Vec::new();
-        a.emit_nyan_starburst(born, &c, g, &mut a0, &mut ah);
-        a.emit_nyan_starburst(late, &c, g, &mut a1, &mut ah);
+        a.emit_rainbow_starburst(born, &c, g, &mut a0, &mut ah);
+        a.emit_rainbow_starburst(late, &c, g, &mut a1, &mut ah);
         assert!(
             extent(&a1) > extent(&a0),
             "an animated burst EXPANDS: {} → {}",
@@ -20804,33 +20848,33 @@ mod tests {
     /// BURST STARS — the count GRADUATES with jump distance (owner: any
     /// qualifying word-jump gives feedback, the old 6-cell cliff is gone): a
     /// short Option-B/F hop (`dist == MIN_DIST`) scatters exactly ONE small
-    /// star, a screen-crossing fling the full [`CursorGlow::NYAN_BURST_STARS`],
+    /// star, a screen-crossing fling the full [`CursorGlow::RAINBOW_BURST_STARS`],
     /// and a sub-threshold move still nothing.
     #[test]
-    fn nyan_burst_star_count_graduates_with_jump_distance() {
+    fn rainbow_burst_star_count_graduates_with_jump_distance() {
         let g = geom();
         let born = Instant::now();
         let stars_for = |dist: f32| -> u8 {
             let mut glow = CursorGlow::default();
-            glow.emit_nyan_jump_landing(born, g, dist, (100.0, 40.0), (40.0, 40.0));
-            glow.nyan.bursts.first().map_or(0, |b| b.stars)
+            glow.emit_rainbow_jump_landing(born, g, dist, (100.0, 40.0), (40.0, 40.0));
+            glow.rainbow.bursts.first().map_or(0, |b| b.stars)
         };
         assert_eq!(
-            stars_for(CursorGlow::NYAN_BURST_MIN_DIST),
+            stars_for(CursorGlow::RAINBOW_BURST_MIN_DIST),
             1,
             "a short hop at the threshold still gives ONE star (no more cliff)"
         );
         assert!(
-            stars_for(20.0) > stars_for(CursorGlow::NYAN_BURST_MIN_DIST),
+            stars_for(20.0) > stars_for(CursorGlow::RAINBOW_BURST_MIN_DIST),
             "the count rises with distance"
         );
         assert_eq!(
             stars_for(30.0),
-            CursorGlow::NYAN_BURST_STARS as u8,
+            CursorGlow::RAINBOW_BURST_STARS as u8,
             "a screen-crossing fling throws the full handful"
         );
         assert_eq!(
-            stars_for(CursorGlow::NYAN_BURST_MIN_DIST - 0.1),
+            stars_for(CursorGlow::RAINBOW_BURST_MIN_DIST - 0.1),
             0,
             "a sub-threshold move earns no burst at all"
         );
@@ -20842,30 +20886,30 @@ mod tests {
     /// DARKENED SATURATED source-over veil dot, capped for legibility, in the
     /// halo stream — and the additive stream stays empty.
     #[test]
-    fn nyan_burst_stars_light_theme_forks_to_source_over() {
+    fn rainbow_burst_stars_light_theme_forks_to_source_over() {
         let g = geom();
         let born = Instant::now();
         let mid = born + Duration::from_millis(150); // u≈0.36: stars popped-in
         let push = |glow: &mut CursorGlow| {
-            glow.nyan.bursts.push(Starburst {
+            glow.rainbow.bursts.push(Starburst {
                 cx: 160.0,
                 cy: 48.0,
                 born,
-                life: CursorGlow::NYAN_BURST_LIFE,
+                life: CursorGlow::RAINBOW_BURST_LIFE,
                 reach: 2.0 * g.ch as f32,
                 seed: 0.3,
-                stars: CursorGlow::NYAN_BURST_STARS as u8,
+                stars: CursorGlow::RAINBOW_BURST_STARS as u8,
                 sparkles: 0,
             });
         };
 
         // LIGHT: source-over veil dots, no additive quads.
-        let mut c_light = cfg(GlowStyle::Nyan, true);
+        let mut c_light = cfg(GlowStyle::RainbowKitty, true);
         c_light.dark_theme = false;
         let mut light = CursorGlow::default();
         push(&mut light);
         let (mut lo, mut lh) = (Vec::new(), Vec::new());
-        light.emit_nyan_starburst(mid, &c_light, g, &mut lo, &mut lh);
+        light.emit_rainbow_starburst(mid, &c_light, g, &mut lo, &mut lh);
         assert!(
             lo.is_empty(),
             "additive stars are suppressed on light (invisible on white)"
@@ -20899,11 +20943,11 @@ mod tests {
         );
 
         // DARK control: solid additive star fill, never a source-over veil.
-        let c_dark = cfg(GlowStyle::Nyan, true);
+        let c_dark = cfg(GlowStyle::RainbowKitty, true);
         let mut dark = CursorGlow::default();
         push(&mut dark);
         let (mut d_out, mut d_h) = (Vec::new(), Vec::new());
-        dark.emit_nyan_starburst(mid, &c_dark, g, &mut d_out, &mut d_h);
+        dark.emit_rainbow_starburst(mid, &c_dark, g, &mut d_out, &mut d_h);
         assert!(!d_out.is_empty(), "dark fills SOLID additive stars");
         assert!(d_h.is_empty(), "dark stars never source-over");
     }
@@ -20913,7 +20957,7 @@ mod tests {
     /// on white) it inverts to an expanding DARKENED source-over veil ring in the
     /// halo stream, capped for legibility — and the additive stream stays empty.
     #[test]
-    fn nyan_landing_ring_light_theme_forks_to_source_over() {
+    fn rainbow_landing_ring_light_theme_forks_to_source_over() {
         let g = geom();
         let born = Instant::now();
         let at = born + Duration::from_millis(60);
@@ -20925,7 +20969,7 @@ mod tests {
         };
 
         // DARK: additive square outline, never a source-over veil.
-        let c_dark = cfg(GlowStyle::Nyan, true);
+        let c_dark = cfg(GlowStyle::RainbowKitty, true);
         let dark = CursorGlow {
             ring: Some(ring),
             ..Default::default()
@@ -20942,7 +20986,7 @@ mod tests {
         );
 
         // LIGHT: source-over veil ring, no additive quads.
-        let mut c_light = cfg(GlowStyle::Nyan, true);
+        let mut c_light = cfg(GlowStyle::RainbowKitty, true);
         c_light.dark_theme = false;
         let light = CursorGlow {
             ring: Some(ring),
@@ -20974,7 +21018,7 @@ mod tests {
     #[test]
     fn glide_star_fires_on_sustained_fast_motion_not_slow_or_jump() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let mut out = Vec::new();
 
         // SUSTAINED FAST GLIDE: a run of same-row nav-hinted 3-cell hops at
@@ -21013,7 +21057,7 @@ mod tests {
             slow.glide.vel
         );
 
-        // SINGLE BIG JUMP: one Ctrl-A-style leap (dc_abs ≥ NYAN_JUMP_MIN) is the
+        // SINGLE BIG JUMP: one Ctrl-A-style leap (dc_abs ≥ RAINBOW_JUMP_MIN) is the
         // discrete-jump case — excluded from the glide arm even though its
         // single-frame velocity is enormous.
         let mut jump = CursorGlow::default();
@@ -21049,7 +21093,7 @@ mod tests {
             seed: 0.3,
         };
         // DARK: additive rainbow beam + head, never a source-over veil.
-        let c_dark = cfg(GlowStyle::Nyan, true);
+        let c_dark = cfg(GlowStyle::RainbowKitty, true);
         let dark = CursorGlow {
             glide: GlideState {
                 stars: vec![star],
@@ -21058,7 +21102,7 @@ mod tests {
             ..Default::default()
         };
         let (mut d_out, mut d_h) = (Vec::new(), Vec::new());
-        dark.emit_nyan_glide_stars(at, &c_dark, g, &mut d_out, &mut d_h);
+        dark.emit_rainbow_glide_stars(at, &c_dark, g, &mut d_out, &mut d_h);
         assert!(
             !d_out.is_empty(),
             "dark glide star draws additive rainbow quads"
@@ -21068,7 +21112,7 @@ mod tests {
             "dark glide star is additive, never source-over"
         );
         // LIGHT: source-over darkened rainbow streak, no additive quads.
-        let mut c_light = cfg(GlowStyle::Nyan, true);
+        let mut c_light = cfg(GlowStyle::RainbowKitty, true);
         c_light.dark_theme = false;
         let light = CursorGlow {
             glide: GlideState {
@@ -21078,7 +21122,7 @@ mod tests {
             ..Default::default()
         };
         let (mut l_out, mut l_h) = (Vec::new(), Vec::new());
-        light.emit_nyan_glide_stars(at, &c_light, g, &mut l_out, &mut l_h);
+        light.emit_rainbow_glide_stars(at, &c_light, g, &mut l_out, &mut l_h);
         assert!(
             l_out.is_empty(),
             "light suppresses the additive glide quads"
@@ -21098,7 +21142,7 @@ mod tests {
     /// additive banded beam (GlowQuads); LIGHT inverts it to a DARKENED SATURATED
     /// rainbow source-over streak (halos), capped, with the additive stream empty.
     #[test]
-    fn nyan_jump_zoom_light_theme_forks_to_source_over() {
+    fn rainbow_jump_zoom_light_theme_forks_to_source_over() {
         let g = geom();
         let born = Instant::now();
         let at = born + Duration::from_millis(30);
@@ -21111,16 +21155,16 @@ mod tests {
             life: 0.4,
             mom: 1.0,
         };
-        let c_dark = cfg(GlowStyle::Nyan, true);
+        let c_dark = cfg(GlowStyle::RainbowKitty, true);
         let dark = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 jumps: vec![jump],
                 ..Default::default()
             },
             ..Default::default()
         };
         let (mut d_out, mut d_h) = (Vec::new(), Vec::new());
-        dark.emit_nyan_jumps(at, &c_dark, g, &mut d_out, &mut d_h);
+        dark.emit_rainbow_jumps(at, &c_dark, g, &mut d_out, &mut d_h);
         assert!(
             !d_out.is_empty(),
             "dark ZOOM draws the additive banded beam"
@@ -21129,17 +21173,17 @@ mod tests {
             d_h.iter().all(|h| h.mode != HaloMode::Over),
             "dark ZOOM is additive, never source-over"
         );
-        let mut c_light = cfg(GlowStyle::Nyan, true);
+        let mut c_light = cfg(GlowStyle::RainbowKitty, true);
         c_light.dark_theme = false;
         let light = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 jumps: vec![jump],
                 ..Default::default()
             },
             ..Default::default()
         };
         let (mut l_out, mut l_h) = (Vec::new(), Vec::new());
-        light.emit_nyan_jumps(at, &c_light, g, &mut l_out, &mut l_h);
+        light.emit_rainbow_jumps(at, &c_light, g, &mut l_out, &mut l_h);
         assert!(
             l_out.is_empty(),
             "light suppresses the additive banded beam"
@@ -21155,12 +21199,12 @@ mod tests {
         );
     }
 
-    /// TASK 5 P1 — the SHOOTING-STAR shower (the `cov_scale > 1.25` Nyan comet)
+    /// TASK 5 P1 — the SHOOTING-STAR shower (the `cov_scale > 1.25` rainbow kitty comet)
     /// is LIGHT-MODE FORKED: DARK draws the additive `comet_beam` + twinkle head
     /// (GlowQuads); LIGHT inverts it to a DARKENED SATURATED rainbow source-over
     /// streak (halos), capped, with no additive quads.
     #[test]
-    fn nyan_shooting_star_light_theme_forks_to_source_over() {
+    fn rainbow_shooting_star_light_theme_forks_to_source_over() {
         let g = geom();
         let born = Instant::now();
         let at = born + Duration::from_millis(30);
@@ -21175,7 +21219,7 @@ mod tests {
             cov_scale: 1.6, // SHOOT sentinel (> 1.25)
             born,
         };
-        let c_dark = cfg(GlowStyle::Nyan, true);
+        let c_dark = cfg(GlowStyle::RainbowKitty, true);
         let dark = CursorGlow {
             particles: vec![comet],
             ..Default::default()
@@ -21187,7 +21231,7 @@ mod tests {
             d_h.iter().all(|h| h.mode != HaloMode::Over),
             "dark shooting star is additive, never source-over"
         );
-        let mut c_light = cfg(GlowStyle::Nyan, true);
+        let mut c_light = cfg(GlowStyle::RainbowKitty, true);
         c_light.dark_theme = false;
         let light = CursorGlow {
             particles: vec![comet],
@@ -21216,9 +21260,9 @@ mod tests {
     /// twinkle dot (`rx ≤ 5`, distinct from the wide rails `rx ≥ 7`) now sits in
     /// the sky above a starred cell — the light ribbon sparkles too.
     #[test]
-    fn nyan_light_ribbon_twinkles() {
+    fn rainbow_light_ribbon_twinkles() {
         let g = geom();
-        let mut c = cfg(GlowStyle::Nyan, true);
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.dark_theme = false;
         c.radius = 0.0; // no crown halos
         c.ring = false; // no landing ring
@@ -21259,9 +21303,9 @@ mod tests {
     /// lives are GRADED by the terminus feather — a spread of lifetimes, not one
     /// synchronized wink-out — so the end feathers away instead of cutting.
     #[test]
-    fn nyan_post_jump_terminus_dissolves_not_hard_cut() {
+    fn rainbow_post_jump_terminus_dissolves_not_hard_cut() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -21269,15 +21313,15 @@ mod tests {
         // A LIVE ribbon exists to dissolve (finding 3): a real ribbon has just
         // been laid at the pre-jump head — a fresh committed PRESS backs it
         // (the anti-stray press witness), and the proxy is WARM but below the
-        // star-shower onset (`NYAN_STAR_ONSET` = 0.45), so the ONLY particles
+        // star-shower onset (`RAINBOW_STAR_ONSET` = 0.45), so the ONLY particles
         // emitted are the terminus glitter — the momentum shower would
         // otherwise add non-glitter stars. (Without any momentum the cursor is
         // COLD and correctly scatters nothing — see
         // `cold_cursor_jump_scatters_no_terminus`.)
         glow.note_typed(t0);
-        glow.nyan.disp = 0.3;
+        glow.rainbow.disp = 0.3;
         glow.tick(Some((5, 0)), t0, &c, g, &mut out); // jump away
-        // Nyan has no general jump particle burst (not in has_particles), so the
+        // Rainbow kitty has no general jump particle burst (not in has_particles), so the
         // only particles are the terminus dissolve scatter.
         assert!(
             !glow.particles.is_empty(),
@@ -21301,14 +21345,14 @@ mod tests {
     /// `navigation == true`. Before the fix that dropped the whole jump into a
     /// no-op arm and fired NEITHER the landing starburst NOR the terminus
     /// dissolve — the hard-cut the owner reported. It must fire BOTH, and (since
-    /// 2026-07-29) the ZOOM BEAM as well: see [`Self::NYAN_STREAK_MIN_DIST`]. What
+    /// 2026-07-29) the ZOOM BEAM as well: see [`Self::RAINBOW_STREAK_MIN_DIST`]. What
     /// stays navigation-excluded is the per-cell RIBBON — a bare Ctrl-E must not
     /// repaint a saturated rainbow over the line it skims, and that light is laid
     /// by the spark path, which the navigation arm still skips entirely.
     #[test]
     fn nav_hinted_jump_still_bursts_and_dissolves_the_terminus() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -21317,13 +21361,13 @@ mod tests {
         // witness), below the star-shower onset (0.45) so the terminus
         // glitter is the only particle source (finding 3 gate open, no shower).
         glow.note_typed(t0 - Duration::from_millis(200));
-        glow.nyan.disp = 0.3;
+        glow.rainbow.disp = 0.3;
         glow.note_navigation(t0); // the Ctrl-A key-hint — this is the real path
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A: leap to column 0
 
         // FEATURE B fires even though navigation is hinted (finding 1).
         assert_eq!(
-            glow.nyan.bursts.len(),
+            glow.rainbow.bursts.len(),
             1,
             "a navigation-hinted fast jump STILL blooms a landing starburst"
         );
@@ -21335,9 +21379,9 @@ mod tests {
         );
         // 2026-07-29: the ZOOM BEAM now fires here too — this 30-cell Ctrl-A IS
         // travelling, and drawing its rainbow line is the whole point of the
-        // gesture (`nyan_navigation_jump_draws_the_rainbow_streak_both_ways`).
+        // gesture (`rainbow_navigation_jump_draws_the_rainbow_streak_both_ways`).
         assert_eq!(
-            glow.nyan.jumps.len(),
+            glow.rainbow.jumps.len(),
             1,
             "a large navigation leap draws its rainbow ZOOM beam"
         );
@@ -21356,28 +21400,28 @@ mod tests {
         // by construction.
         let mut plain = CursorGlow::default();
         plain.tick(Some((2, 30)), t0, &c, g, &mut out);
-        plain.nyan.disp = 0.3;
+        plain.rainbow.disp = 0.3;
         plain.tick(Some((2, 0)), t0, &c, g, &mut out); // un-hinted leap
         assert!(
-            !plain.nyan.jumps.is_empty(),
+            !plain.rainbow.jumps.is_empty(),
             "an UN-hinted large jump lays the ZOOM streak too"
         );
     }
 
     /// FINDING 3 — a jump on a COLD/idle cursor (no ribbon ever laid,
-    /// `nyan.disp ~ 0`) must NOT scatter a terminus: there is no hard leading
+    /// `rainbow.disp ~ 0`) must NOT scatter a terminus: there is no hard leading
     /// edge to dissolve, so sparkling there is light over nothing (the audited
     /// spurious sparkle on a cold Ctrl-A). The LANDING starburst is unaffected —
     /// it marks the jump itself, not a ribbon end.
     #[test]
     fn cold_cursor_jump_scatters_no_terminus() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((2, 30)), t0, &c, g, &mut out); // seed — cursor stays COLD
-        // (nyan.disp left at its default 0.0 — no typing momentum, no ribbon.)
+        // (rainbow.disp left at its default 0.0 — no typing momentum, no ribbon.)
         glow.note_navigation(t0);
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A leap on a cold cursor
         assert!(
@@ -21386,7 +21430,7 @@ mod tests {
         );
         // The starburst still marks the fast landing — it is not ribbon-gated.
         assert_eq!(
-            glow.nyan.bursts.len(),
+            glow.rainbow.bursts.len(),
             1,
             "the landing starburst still fires on a cold-cursor fast jump"
         );
@@ -21401,7 +21445,7 @@ mod tests {
     #[test]
     fn reduced_motion_suppresses_the_terminus_scatter() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -21411,7 +21455,7 @@ mod tests {
         // the terminus scatter is the ONLY particle source, so an empty pool
         // proves it was suppressed.
         glow.note_typed(t0);
-        glow.nyan.disp = 0.3;
+        glow.rainbow.disp = 0.3;
         glow.note_navigation(t0);
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A leap
         assert!(
@@ -21423,7 +21467,7 @@ mod tests {
         let mut motion = CursorGlow::default();
         motion.tick(Some((2, 30)), t0, &c, g, &mut out);
         motion.note_typed(t0);
-        motion.nyan.disp = 0.3;
+        motion.rainbow.disp = 0.3;
         motion.note_navigation(t0);
         motion.tick(Some((2, 0)), t0, &c, g, &mut out);
         assert!(
@@ -21432,7 +21476,7 @@ mod tests {
         );
         // The starburst fires either way (rendered static under reduced motion).
         assert_eq!(
-            glow.nyan.bursts.len(),
+            glow.rainbow.bursts.len(),
             1,
             "reduced motion keeps the starburst (drawn static); only the particle \
              terminus is suppressed"
@@ -21444,9 +21488,9 @@ mod tests {
     /// off the edge instead of terminating on a hard vertical cut. A typing
     /// advance that stays mid-line scatters none.
     #[test]
-    fn nyan_right_margin_terminus_feathers() {
+    fn rainbow_right_margin_terminus_feathers() {
         let g = geom(); // 40 cols
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
 
@@ -21480,17 +21524,17 @@ mod tests {
     /// `born_cov` so the tapered BODY provably still emits at every sampled
     /// age — the star's absence at the tail is the taper, never the body cull.
     #[test]
-    fn nyan_stars_fade_with_the_ribbon_edge_feather() {
+    fn rainbow_stars_fade_with_the_ribbon_edge_feather() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let born = Instant::now();
         let emit_at = |ms: u64| -> (Vec<GlowQuad>, Vec<GlowQuad>) {
             let mut glow = CursorGlow::default();
-            nyan_uniform_ribbon(&mut glow, born, 255, 0..40);
-            glow.nyan.disp = 0.0;
-            glow.nyan.phase = 0.0;
+            rainbow_uniform_ribbon(&mut glow, born, 255, 0..40);
+            glow.rainbow.disp = 0.0;
+            glow.rainbow.phase = 0.0;
             let (mut under, mut out) = (Vec::new(), Vec::new());
-            glow.emit_nyan(
+            glow.emit_rainbow(
                 born + Duration::from_millis(ms),
                 &c,
                 g,
@@ -21498,7 +21542,7 @@ mod tests {
                 &mut out,
                 &mut Vec::new(),
             );
-            (under, out) // dark-theme nyan: body rides `under`, stars ride `out`
+            (under, out) // dark-theme rainbow: body rides `under`, stars ride `out`
         };
         let chan = |q: &GlowQuad| {
             ((q.color >> 16) & 0xff)
@@ -21557,16 +21601,16 @@ mod tests {
     /// every star ≥ 0.55 cells off the row centre (the glyph band edge is
     /// 0.5), with vertical velocity pointing further away from the line.
     #[test]
-    fn nyan_stars_spawn_clear_of_the_typed_row_band() {
+    fn rainbow_stars_spawn_clear_of_the_typed_row_band() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         // (a) Ribbon starfield: a full-spine uniform ribbon on row 3 (max star
         // recruitment), driven against every landing-knowledge state the probe
         // seam can hold. `drive` lays the ribbon, feeds ONE row probe (row 3
         // blank — the swept cells stay star-eligible) plus the given flanking
         // rows, rotates it into the presented slot (`poof_scan`, exactly as a
         // real tick does before its emit phase), and collects the star quads —
-        // stars are the only quads emit_nyan writes to `out` (the ribbon body
+        // stars are the only quads emit_rainbow writes to `out` (the ribbon body
         // rides `under`).
         let row = |s: &str| -> Vec<char> {
             let mut v: Vec<char> = s.chars().collect();
@@ -21578,16 +21622,16 @@ mod tests {
         let drive = |nbrs: Option<(&[char], &[char])>| -> Vec<GlowQuad> {
             let born = Instant::now();
             let mut glow = CursorGlow::default();
-            nyan_uniform_ribbon(&mut glow, born, 200, 0..40);
-            glow.nyan.disp = 1.0;
-            glow.nyan.phase = 0.3;
+            rainbow_uniform_ribbon(&mut glow, born, 200, 0..40);
+            glow.rainbow.disp = 1.0;
+            glow.rainbow.phase = 0.3;
             if let Some((above, below)) = nbrs {
                 glow.observe_row(3, 0, &blank, born);
                 glow.observe_neighbor_rows(Some(above), Some(below));
                 glow.poof_scan(born, &c, g);
             }
             let mut out = Vec::new();
-            glow.emit_nyan(
+            glow.emit_rainbow(
                 born + Duration::from_millis(200),
                 &c,
                 g,
@@ -21659,7 +21703,7 @@ mod tests {
         // (b) Momentum shower births: a hot single-cell typing advance.
         let now = Instant::now();
         let mut hot = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 1.0,
                 ..Default::default()
             },
@@ -21695,29 +21739,29 @@ mod tests {
     /// the shipped brightness only at full spine. Same sparks, same clock,
     /// same hash sky: only the spine differs between measurements.
     #[test]
-    fn nyan_star_brightness_is_earned_by_momentum() {
+    fn rainbow_star_brightness_is_earned_by_momentum() {
         // The envelope itself: monotone NON-DECREASING with the RAISED onset
         // (owner: "higher thresholds for typing momentum") — the subtle floor
-        // holds flat through `NYAN_STAR_ONSET`, then a strict climb to full
+        // holds flat through `RAINBOW_STAR_ONSET`, then a strict climb to full
         // punch at spine 1.
-        assert!(nyan_star_momentum(0.0) <= 0.40, "cold stars open subtle");
+        assert!(rainbow_star_momentum(0.0) <= 0.40, "cold stars open subtle");
         assert!(
-            (nyan_star_momentum(NYAN_STAR_ONSET) - NYAN_STAR_MOM_FLOOR).abs() < 1e-6,
+            (rainbow_star_momentum(RAINBOW_STAR_ONSET) - RAINBOW_STAR_MOM_FLOOR).abs() < 1e-6,
             "brightness is still at the floor AT the onset — nothing is earned early"
         );
         assert!(
-            (nyan_star_momentum(1.0) - 1.0).abs() < 1e-6,
+            (rainbow_star_momentum(1.0) - 1.0).abs() < 1e-6,
             "full spine restores today's brightness exactly"
         );
         let mut prev = -1.0f32;
         for i in 0..=10 {
             let d = i as f32 / 10.0;
-            let m = nyan_star_momentum(d);
+            let m = rainbow_star_momentum(d);
             assert!(
                 m >= prev,
                 "envelope is monotone non-decreasing in the spine"
             );
-            if d > NYAN_STAR_ONSET {
+            if d > RAINBOW_STAR_ONSET {
                 assert!(m > prev, "above the onset the climb is strict");
             }
             prev = m;
@@ -21726,16 +21770,16 @@ mod tests {
         // the spine. (Legacy 1-in-6 stars exist at every spine value and ride
         // the envelope directly; recruits only ever render dimmer.)
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let born = Instant::now();
         let sample = born + Duration::from_millis(150);
         let max_star = |disp: f32| -> u32 {
             let mut glow = CursorGlow::default();
-            nyan_uniform_ribbon(&mut glow, born, 200, 0..40);
-            glow.nyan.disp = disp;
-            glow.nyan.phase = 0.3;
+            rainbow_uniform_ribbon(&mut glow, born, 200, 0..40);
+            glow.rainbow.disp = disp;
+            glow.rainbow.phase = 0.3;
             let mut out = Vec::new();
-            glow.emit_nyan(sample, &c, g, &mut Vec::new(), &mut out, &mut Vec::new());
+            glow.emit_rainbow(sample, &c, g, &mut Vec::new(), &mut out, &mut Vec::new());
             out.iter()
                 .map(|q| {
                     ((q.color >> 16) & 0xff)
@@ -21756,13 +21800,13 @@ mod tests {
         );
     }
 
-    /// BACKSPACE = GLITTER POOF, NOT RIBBON (Nyan): a deletion echo lays NO new
+    /// BACKSPACE = GLITTER POOF, NOT RIBBON (rainbow kitty): a deletion echo lays NO new
     /// rainbow ribbon cell at the vacated position and instead puffs a 6-10
     /// particle glitter cloud (the GLITTER sentinel `cov_scale < 0.9`).
     #[test]
-    fn nyan_backspace_poofs_glitter_not_ribbon() {
+    fn rainbow_backspace_poofs_glitter_not_ribbon() {
         let g = geom();
-        let c = cfg(GlowStyle::Nyan, true);
+        let c = cfg(GlowStyle::RainbowKitty, true);
         let now = Instant::now();
         let mut glow = CursorGlow::default();
         // A standing ribbon cell elsewhere (col 9) — the poof must not disturb it.
@@ -21790,7 +21834,7 @@ mod tests {
         );
         // And the ribbon body (under-ink stream) has no band at the vacated cell.
         let mut under = Vec::new();
-        glow.emit_nyan(
+        glow.emit_rainbow(
             now + Duration::from_millis(1),
             &c,
             g,
@@ -21857,7 +21901,7 @@ mod tests {
     const BUILTINS: [GlowStyle; 10] = [
         GlowStyle::Lumen,
         GlowStyle::Phaser,
-        GlowStyle::Nyan,
+        GlowStyle::RainbowKitty,
         GlowStyle::Sparkle,
         GlowStyle::Fire,
         GlowStyle::Laser,
@@ -21917,7 +21961,7 @@ mod tests {
     #[test]
     fn builtins_are_byte_identical_and_never_touch_the_custom_path() {
         let g = geom();
-        // GOLDEN whole-frame folds for Lumen/Phaser/Nyan/Sparkle/Fire/Laser/
+        // GOLDEN whole-frame folds for Lumen/Phaser/rainbow kitty/Sparkle/Fire/Laser/
         // Beam/Water/Comet, captured from this very script. Pins every built-in
         // emit path against unintended perturbation.
         //
@@ -21928,7 +21972,7 @@ mod tests {
         // that no other index drifted.
         //
         // The script feeds NO row probe and lays NO committed-press hint
-        // (`note_typed`), so for Nyan it is PROGRAM OUTPUT by definition: the
+        // (`note_typed`), so for rainbow kitty it is PROGRAM OUTPUT by definition: the
         // momentum spine stays at zero, the wake and the spine-scaled
         // clearance/taper/star-shower are provably inert, and displaced stars
         // take the in-cell fallback because their landing rows are UNKNOWN.
@@ -21946,7 +21990,7 @@ mod tests {
         let styles = [
             GlowStyle::Lumen,
             GlowStyle::Phaser,
-            GlowStyle::Nyan,
+            GlowStyle::RainbowKitty,
             GlowStyle::Sparkle,
             GlowStyle::Fire,
             GlowStyle::Laser,
@@ -22318,7 +22362,7 @@ halo = "add"
 
     /// A halo is a FRESH-INK pop iff its premultiplied colour keeps the warm
     /// [`FRESH_INK_WARM`] channel ratios (g ≈ r·0xED/0xFF, b ≈ r·0xD2/0xFF).
-    /// The other Nyan halo emitters can't fake it: stars are pure white
+    /// The other rainbow kitty halo emitters can't fake it: stars are pure white
     /// (equal channels) or gold (b ≈ 0), light-theme rails are saturated band
     /// hues, and these tests disable the crown (`radius = 0`).
     fn is_fresh_ink_halo(premul: u32) -> bool {
@@ -22338,11 +22382,11 @@ halo = "add"
             .collect()
     }
 
-    /// A crown-free, ring-free Nyan config so the halo stream carries ONLY
+    /// A crown-free, ring-free rainbow kitty config so the halo stream carries ONLY
     /// fresh-ink pops (plus, on a hot run, nothing: stars/particles emit into
     /// `out`, and the dark theme emits no rail veils).
-    fn nyan_pop_cfg() -> GlowConfig {
-        let mut c = cfg(GlowStyle::Nyan, true);
+    fn rainbow_pop_cfg() -> GlowConfig {
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.radius = 0.0;
         c.ring = false;
         c
@@ -22447,7 +22491,7 @@ halo = "add"
     #[test]
     fn fresh_ink_pops_born_only_from_typed_keys() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -22460,7 +22504,10 @@ halo = "add"
             g,
             &mut out,
         );
-        assert!(glow.nyan.ink_pops.is_empty(), "PTY echo alone never pops");
+        assert!(
+            glow.rainbow.ink_pops.is_empty(),
+            "PTY echo alone never pops"
+        );
         assert!(pop_halos(&glow).is_empty(), "no pop light either");
         // Observe one beat later: the feathered birth ease keeps the freshly
         // laid ribbon cell near-zero on its landing frame, so the control
@@ -22473,7 +22520,10 @@ halo = "add"
             g,
             &mut out,
         );
-        assert!(glow.nyan.ink_pops.is_empty(), "still no pop without a hint");
+        assert!(
+            glow.rainbow.ink_pops.is_empty(),
+            "still no pop without a hint"
+        );
         assert!(
             !glow.under_quads().is_empty(),
             "control: the same move DID lay ribbon light (the move was seen)"
@@ -22482,9 +22532,9 @@ halo = "add"
         let t1 = t0 + Duration::from_millis(200);
         glow.note_typed(t1);
         glow.tick(Some((2, 4)), t1, &c, g, &mut out);
-        assert_eq!(glow.nyan.ink_pops.len(), 1, "one typed key = one pop");
+        assert_eq!(glow.rainbow.ink_pops.len(), 1, "one typed key = one pop");
         assert_eq!(
-            (glow.nyan.ink_pops[0].row, glow.nyan.ink_pops[0].col),
+            (glow.rainbow.ink_pops[0].row, glow.rainbow.ink_pops[0].col),
             (2, 3),
             "the pop sits on the vacated glyph cell, not the caret"
         );
@@ -22505,7 +22555,7 @@ halo = "add"
     #[test]
     fn fresh_ink_first_casual_keystroke_pops_decoupled_from_momentum() {
         let g = geom();
-        let mut c = nyan_pop_cfg();
+        let mut c = rainbow_pop_cfg();
         c.intensity = 1.0; // measure the pop coverage directly, unscaled
         let peak_r = |glow: &CursorGlow| -> u32 {
             pop_halos(glow)
@@ -22524,7 +22574,7 @@ halo = "add"
         let cold_r = peak_r(&cold);
         // HOT: the same single keystroke off a fully-warmed spine.
         let mut hot = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 1.0,
                 ..Default::default()
             },
@@ -22554,7 +22604,7 @@ halo = "add"
     #[test]
     fn fresh_ink_composite_centre_is_capped_at_full_intensity() {
         let g = geom();
-        let mut c = nyan_pop_cfg();
+        let mut c = rainbow_pop_cfg();
         c.intensity = 1.0;
         // The DISTINCT logical pop halos (dedup the per-cell-row band split) all
         // share the glyph centre, so summing their peak red bytes = the additive
@@ -22577,7 +22627,7 @@ halo = "add"
         let birth = |disp: f32| -> (u32, u32) {
             let t = Instant::now();
             let mut glow = CursorGlow {
-                nyan: NyanState {
+                rainbow: RainbowState {
                     disp,
                     ..Default::default()
                 },
@@ -22625,7 +22675,7 @@ halo = "add"
     #[test]
     fn fresh_ink_pop_rides_over_ink_and_ribbon_body_rides_under() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -22639,7 +22689,7 @@ halo = "add"
             glow.observe_row(2, col, &row, t);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
-        assert!(!glow.nyan.ink_pops.is_empty());
+        assert!(!glow.rainbow.ink_pops.is_empty());
         // The ribbon body lives UNDER the ink (hot cells emit per-cell wave
         // strips narrower than the cell; the stream itself is the proof)…
         assert!(
@@ -22668,7 +22718,7 @@ halo = "add"
     #[test]
     fn fresh_ink_decay_completes_and_ring_caps() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -22681,34 +22731,34 @@ halo = "add"
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         assert!(
-            glow.nyan.ink_pops.len() <= FRESH_INK_CAP,
+            glow.rainbow.ink_pops.len() <= FRESH_INK_CAP,
             "ring bounded at the cap, got {}",
-            glow.nyan.ink_pops.len()
+            glow.rainbow.ink_pops.len()
         );
         assert_eq!(
-            glow.nyan.ink_pops.len(),
+            glow.rainbow.ink_pops.len(),
             FRESH_INK_CAP,
             "cap exercised, not slack"
         );
         // The newest cells survived the shed (oldest-first discipline).
-        assert!(glow.nyan.ink_pops.iter().any(|p| p.col == 38));
-        assert!(!glow.nyan.ink_pops.iter().any(|p| p.col < 7));
+        assert!(glow.rainbow.ink_pops.iter().any(|p| p.col == 38));
+        assert!(!glow.rainbow.ink_pops.iter().any(|p| p.col < 7));
         // One pop-life later: every pop has decayed to exactly empty.
         t += Duration::from_secs_f32(FRESH_INK_LIFE_S + 0.05);
         glow.tick(Some((2, 39)), t, &c, g, &mut out);
-        assert!(glow.nyan.ink_pops.is_empty(), "decay completes to empty");
+        assert!(glow.rainbow.ink_pops.is_empty(), "decay completes to empty");
         assert!(pop_halos(&glow).is_empty(), "no residual pop light");
         // Zero amplitude drops pops with the other moving light.
         let mut glow2 = CursorGlow::default();
         glow2.tick(Some((2, 0)), t, &c, g, &mut out);
         glow2.note_typed(t);
         glow2.tick(Some((2, 1)), t, &c, g, &mut out);
-        assert!(!glow2.nyan.ink_pops.is_empty());
+        assert!(!glow2.rainbow.ink_pops.is_empty());
         let mut dark = c;
         dark.intensity = 0.0;
         glow2.tick(Some((2, 1)), t, &dark, g, &mut out);
         assert!(
-            glow2.nyan.ink_pops.is_empty(),
+            glow2.rainbow.ink_pops.is_empty(),
             "zero amplitude (unfocus/reduced/shed) drops the pops too"
         );
     }
@@ -22723,7 +22773,7 @@ halo = "add"
         g: Geom,
     ) -> (Vec<GlowQuad>, Vec<RainHalo>) {
         let (mut out, mut halos) = (Vec::new(), Vec::new());
-        glow.emit_nyan_wake(now, c, g, &mut out, &mut halos);
+        glow.emit_rainbow_wake(now, c, g, &mut out, &mut halos);
         (out, halos)
     }
 
@@ -22779,17 +22829,17 @@ halo = "add"
     /// that it converges and LATCHES exactly (so a settled wake is bit-stable
     /// and the idle fingerprint can reach zero), and that the three
     /// "this is not typing" discontinuities — a row change, a jump beyond
-    /// [`NYAN_WAKE_SNAP_CELLS`], a missing clock — all snap instead.
+    /// [`RAINBOW_WAKE_SNAP_CELLS`], a missing clock — all snap instead.
     #[test]
-    fn nyan_wake_head_slides_sub_cell_and_snaps_on_a_jump() {
+    fn rainbow_wake_head_slides_sub_cell_and_snaps_on_a_jump() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let t0 = Instant::now();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.tick(Some((2, 5)), t0, &c, g, &mut out);
         assert_eq!(
-            glow.nyan.wake_head,
+            glow.rainbow.wake_head,
             Some((2, 5.0)),
             "the first sighting seeds"
         );
@@ -22805,7 +22855,7 @@ halo = "add"
                 g,
                 &mut out,
             );
-            seen.push(glow.nyan.wake_head.unwrap().1);
+            seen.push(glow.rainbow.wake_head.unwrap().1);
         }
         assert!(
             seen[0] > 5.0 && seen[0] < 6.0,
@@ -22838,7 +22888,7 @@ halo = "add"
             g,
             &mut out,
         );
-        assert_eq!(glow.nyan.wake_head, Some((2, 30.0)), "a jump snaps");
+        assert_eq!(glow.rainbow.wake_head, Some((2, 30.0)), "a jump snaps");
         // A ROW change snaps (a wrap is a new run, not a 60-cell slide).
         glow.tick(
             Some((3, 31)),
@@ -22847,13 +22897,17 @@ halo = "add"
             g,
             &mut out,
         );
-        assert_eq!(glow.nyan.wake_head, Some((3, 31.0)), "a row change snaps");
+        assert_eq!(
+            glow.rainbow.wake_head,
+            Some((3, 31.0)),
+            "a row change snaps"
+        );
         // A HIDDEN cursor (the ConPTY echo bridge) holds the nozzle rather than
         // moving or re-seeding it.
-        let held = glow.nyan.wake_head;
+        let held = glow.rainbow.wake_head;
         glow.tick(None, t0 + Duration::from_millis(632), &c, g, &mut out);
         assert_eq!(
-            glow.nyan.wake_head, held,
+            glow.rainbow.wake_head, held,
             "a hidden cursor holds the nozzle"
         );
     }
@@ -22865,9 +22919,9 @@ halo = "add"
     /// at 120 fps, which is exactly the class of bug that makes an effect feel
     /// different on different machines.
     #[test]
-    fn nyan_wake_head_ease_is_frame_rate_independent() {
+    fn rainbow_wake_head_ease_is_frame_rate_independent() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let t0 = Instant::now();
         let at = |step_ms: u64, steps: u64| -> f32 {
             let mut glow = CursorGlow::default();
@@ -22882,7 +22936,7 @@ halo = "add"
                     &mut out,
                 );
             }
-            glow.nyan.wake_head.unwrap().1
+            glow.rainbow.wake_head.unwrap().1
         };
         let slow = at(32, 2); // 30 fps, 64 ms
         let fast = at(8, 8); //  120 fps, 64 ms
@@ -22897,24 +22951,28 @@ halo = "add"
     /// what makes a slow rhythm read as distinct puffs and a fast one as a
     /// single merged plume — one mechanism, both cadences.
     #[test]
-    fn nyan_wake_pulse_is_a_travelling_transient() {
-        assert_eq!(nyan_wake_pulse(0.0, 0.0), 1.0, "zero attack at the nozzle");
+    fn rainbow_wake_pulse_is_a_travelling_transient() {
+        assert_eq!(
+            rainbow_wake_pulse(0.0, 0.0),
+            1.0,
+            "zero attack at the nozzle"
+        );
         assert!(
-            nyan_wake_pulse(0.3, 0.0) > nyan_wake_pulse(0.9, 0.0),
+            rainbow_wake_pulse(0.3, 0.0) > rainbow_wake_pulse(0.9, 0.0),
             "monotone falloff in space"
         );
         assert!(
-            (nyan_wake_pulse(0.4, 0.0) - nyan_wake_pulse(-0.4, 0.0)).abs() < 1e-6,
+            (rainbow_wake_pulse(0.4, 0.0) - rainbow_wake_pulse(-0.4, 0.0)).abs() < 1e-6,
             "symmetric about its injection point"
         );
         let mut prev = f32::INFINITY;
         for i in 0..=40 {
-            let e = nyan_wake_pulse(0.0, i as f32 * 0.02);
+            let e = rainbow_wake_pulse(0.0, i as f32 * 0.02);
             assert!(e <= prev, "monotone decay in time");
             prev = e;
         }
         assert!(
-            nyan_wake_pulse(0.0, 5.0 * NYAN_WAKE_PULSE_TAU) < 0.01,
+            rainbow_wake_pulse(0.0, 5.0 * RAINBOW_WAKE_PULSE_TAU) < 0.01,
             "spent within a few tau — a beat, not a fence"
         );
     }
@@ -22923,27 +22981,27 @@ halo = "add"
     /// behind it, and nothing at all ahead of it. Continuity in `d` is the whole
     /// point — it is what replaced the retired per-cell quantisation.
     #[test]
-    fn nyan_wake_body_is_continuous_and_monotone() {
-        assert_eq!(nyan_wake_body(0.0, 3.0), 1.0, "full at the nozzle");
+    fn rainbow_wake_body_is_continuous_and_monotone() {
+        assert_eq!(rainbow_wake_body(0.0, 3.0), 1.0, "full at the nozzle");
         assert_eq!(
-            nyan_wake_body(-0.5, 3.0),
+            rainbow_wake_body(-0.5, 3.0),
             0.0,
             "nothing ahead of the nozzle"
         );
         let mut prev = f32::INFINITY;
         for i in 0..=400 {
             let d = i as f32 * 0.05;
-            let v = nyan_wake_body(d, 3.0);
+            let v = rainbow_wake_body(d, 3.0);
             assert!(v < prev, "strictly decreasing (d={d})");
             assert!((0.0..=1.0).contains(&v));
             prev = v;
         }
         // Longer plume ⇒ brighter at the same distance: the length IS the gauge.
-        assert!(nyan_wake_body(4.0, 6.0) > nyan_wake_body(4.0, 2.0));
+        assert!(rainbow_wake_body(4.0, 6.0) > rainbow_wake_body(4.0, 2.0));
     }
 
     /// The wake IS the ribbon's rainbow — not a lookalike. Every sample equals
-    /// [`nyan_gradient_of`] over [`NYAN_BANDS`], so the plume and the trail it
+    /// [`rainbow_gradient_of`] over [`RAINBOW_BANDS`], so the plume and the trail it
     /// feeds can never drift apart: change the ribbon's anchors and the wake
     /// follows, by construction rather than by a second table someone has to
     /// remember to edit.
@@ -22951,28 +23009,28 @@ halo = "add"
     /// Deliberately NOT a monotone-luminance assertion. The previous ramp was a
     /// bespoke cooling table and this test pinned it hot-to-cold; the rainbow is
     /// not monotone in luminance (yellow outshines red) and must not be forced to
-    /// be. The cooling READ lives in `nyan_wake_body`'s coverage envelope, which
+    /// be. The cooling READ lives in `rainbow_wake_body`'s coverage envelope, which
     /// `wake_body_is_monotone_and_length_scaled` pins separately — hue and
     /// intensity were always independent.
     #[test]
-    fn nyan_wake_ramp_is_the_ribbon_rainbow() {
+    fn rainbow_wake_ramp_is_the_ribbon_rainbow() {
         for i in 0..=100 {
             let s = i as f32 / 100.0;
             assert_eq!(
-                nyan_wake_ramp(s),
-                nyan_gradient_of(&NYAN_BANDS, s),
+                rainbow_wake_ramp(s),
+                rainbow_gradient_of(&RAINBOW_BANDS, s),
                 "the wake samples the ribbon's own spectrum at s={s}"
             );
         }
         // The endpoints ARE the rainbow's endpoints.
-        assert_eq!(nyan_wake_ramp(0.0), NYAN_BANDS[0], "nozzle = red");
-        assert_eq!(nyan_wake_ramp(1.0), NYAN_BANDS[5], "tail = violet");
+        assert_eq!(rainbow_wake_ramp(0.0), RAINBOW_BANDS[0], "nozzle = red");
+        assert_eq!(rainbow_wake_ramp(1.0), RAINBOW_BANDS[5], "tail = violet");
         // Clamped outside [0,1] — no wraparound colour at the extremes.
-        assert_eq!(nyan_wake_ramp(-1.0), nyan_wake_ramp(0.0));
-        assert_eq!(nyan_wake_ramp(2.0), nyan_wake_ramp(1.0));
+        assert_eq!(rainbow_wake_ramp(-1.0), rainbow_wake_ramp(0.0));
+        assert_eq!(rainbow_wake_ramp(2.0), rainbow_wake_ramp(1.0));
         // And it is a SPECTRUM, not a tint: the plume passes through every band.
         let distinct = (0..=100)
-            .map(|i| nyan_wake_ramp(i as f32 / 100.0))
+            .map(|i| rainbow_wake_ramp(i as f32 / 100.0))
             .collect::<std::collections::BTreeSet<_>>();
         assert!(
             distinct.len() > 40,
@@ -22995,7 +23053,7 @@ halo = "add"
     /// ~200 ms — "difficulty seeing the character when it's typed". No coverage
     /// cap could have fixed that, because the defect was the geometry.
     #[test]
-    fn nyan_wake_never_touches_the_glyph_band() {
+    fn rainbow_wake_never_touches_the_glyph_band() {
         for (cw, ch) in [(8usize, 16usize), (11, 25), (20, 44)] {
             let g = Geom {
                 cw,
@@ -23008,7 +23066,7 @@ halo = "add"
                 win_h: (ch * 6) as u16,
                 head: 0,
             };
-            let mut c = nyan_pop_cfg();
+            let mut c = rainbow_pop_cfg();
             c.intensity = 1.0; // the brightest the host can ever ask for
             for gap in [40u64, 120, 400] {
                 let mut glow = CursorGlow::default();
@@ -23030,7 +23088,7 @@ halo = "add"
                     let (quads, halos) = wake_of(&glow, now, &c, g);
                     // The GLYPH BAND: the cell interior, minus the leading the
                     // plume is allowed to occupy at the row boundaries.
-                    let pad = (ch as f32 * NYAN_WAKE_H_HEAD * 0.5).ceil() as i32;
+                    let pad = (ch as f32 * RAINBOW_WAKE_H_HEAD * 0.5).ceil() as i32;
                     for q in &quads {
                         let (top, bot) = (q.y as i32, q.y as i32 + q.h as i32);
                         let row_top = (q.row as i32) * ch as i32;
@@ -23074,9 +23132,9 @@ halo = "add"
     /// pulses have decayed, that it starts AT the cursor, and that it is
     /// strictly behind it — light never runs ahead of the hand.
     #[test]
-    fn nyan_wake_is_one_continuous_plume_anchored_at_the_nozzle() {
+    fn rainbow_wake_is_one_continuous_plume_anchored_at_the_nozzle() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let t0 = Instant::now();
         // A hot run, sampled a beat after the last key so the travelling pulses
@@ -23096,7 +23154,7 @@ halo = "add"
         let now = end + Duration::from_millis(140);
         let (quads, _) = wake_of(&glow, now, &c, g);
         assert!(!quads.is_empty(), "a hot run leaves a plume");
-        let head_px = (glow.nyan.wake_head.unwrap().1 * g.cw as f32) as i32;
+        let head_px = (glow.rainbow.wake_head.unwrap().1 * g.cw as f32) as i32;
         // Nothing ahead of the nozzle.
         for q in &quads {
             assert!(
@@ -23160,9 +23218,9 @@ halo = "add"
     /// keystroke must still produce its ring entry, and the plume must still
     /// measure a real speed off them.
     #[test]
-    fn nyan_wake_pairs_with_a_delayed_pty_echo() {
+    fn rainbow_wake_pairs_with_a_delayed_pty_echo() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         for echo_ms in [0u64, 8, 16, 33, 60] {
             let mut glow = CursorGlow::default();
             let mut out = Vec::new();
@@ -23187,7 +23245,7 @@ halo = "add"
             // 0.45 s and the run is 4 keys at 90 ms, so the ring is never what
             // sheds here — echo latency is the only variable under test.)
             assert_eq!(
-                glow.nyan.ink_pops.len(),
+                glow.rainbow.ink_pops.len(),
                 4,
                 "echo latency {echo_ms} ms lost keystrokes"
             );
@@ -23212,10 +23270,10 @@ halo = "add"
     /// into the length math (the `sdr_glow_budget` "NaN fails OFF" posture the
     /// aurora's intensity already takes).
     #[test]
-    fn nyan_wake_persistence_is_a_host_dial_that_fails_off() {
+    fn rainbow_wake_persistence_is_a_host_dial_that_fails_off() {
         let g = geom();
         let span = |persist: f32| -> i32 {
-            let mut c = nyan_pop_cfg();
+            let mut c = rainbow_pop_cfg();
             c.wake_persist_s = persist;
             let mut glow = CursorGlow::default();
             let t0 = Instant::now();
@@ -23243,7 +23301,7 @@ halo = "add"
                 - quads.iter().map(|q| q.x as i32).min().unwrap_or(0)
         };
         let short = span(0.12);
-        let mid = span(NYAN_WAKE_PERSIST);
+        let mid = span(RAINBOW_WAKE_PERSIST);
         let long = span(0.90);
         assert!(short > 0, "a short setting still draws a plume");
         assert!(
@@ -23253,7 +23311,7 @@ halo = "add"
         // …and OFF is genuinely off: no light, and provably no work either (the
         // walk is never entered).
         for off in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
-            let mut c = nyan_pop_cfg();
+            let mut c = rainbow_pop_cfg();
             c.wake_persist_s = off;
             let mut glow = CursorGlow::default();
             let t0 = Instant::now();
@@ -23301,22 +23359,22 @@ halo = "add"
     ///    read "bright", it reads WHITE — and the entire white-gold → orange →
     ///    violet cooling story is invisible wherever that happens.
     #[test]
-    fn nyan_wake_never_saturates_its_own_ramp() {
+    fn rainbow_wake_never_saturates_its_own_ramp() {
         assert!(
-            (NYAN_WAKE_BASE + NYAN_WAKE_PULSE - 1.0).abs() < 1e-6,
+            (RAINBOW_WAKE_BASE + RAINBOW_WAKE_PULSE - 1.0).abs() < 1e-6,
             "the weight must be bounded by construction, not by a clamp: \
-             {NYAN_WAKE_BASE} + {NYAN_WAKE_PULSE}"
+             {RAINBOW_WAKE_BASE} + {RAINBOW_WAKE_PULSE}"
         );
         // Every operand is a const, so this one is a BUILD failure rather than a
         // test failure — the ceiling can never be breached even unobserved.
         const {
             assert!(
-                NYAN_WAKE_COV * (1.0 + NYAN_WAKE_BLOOM_GAIN) <= 255.0,
+                RAINBOW_WAKE_COV * (1.0 + RAINBOW_WAKE_BLOOM_GAIN) <= 255.0,
                 "core + bloom must stay inside a byte before any cap even applies"
             );
         }
         let g = geom();
-        let mut c = nyan_pop_cfg();
+        let mut c = rainbow_pop_cfg();
         c.intensity = 1.0; // the brightest the host can ever ask for
         // A SPRINT: keys far faster than a human types, which is the cadence that
         // used to saturate every segment of the plume.
@@ -23340,7 +23398,7 @@ halo = "add"
         for q in &quads {
             let r = (q.color >> 16) & 0xff;
             assert!(
-                r <= NYAN_WAKE_COMPOSITE_CAP as u32,
+                r <= RAINBOW_WAKE_COMPOSITE_CAP as u32,
                 "a core sample breached the composite ceiling: {q:?}"
             );
         }
@@ -23357,14 +23415,14 @@ halo = "add"
                 .max()
                 .unwrap_or(0);
             assert!(
-                core + bloom <= NYAN_WAKE_COMPOSITE_CAP as u32 + 1,
+                core + bloom <= RAINBOW_WAKE_COMPOSITE_CAP as u32 + 1,
                 "core {core} + bloom {bloom} breached the composite ceiling"
             );
         }
         // (c) THE RAMP SURVIVES: the plume is not one flat colour. Sample the
         // hot end and the cool end and require a real hue journey — this is the
         // property saturation destroys, and the reason the cap exists.
-        let head_px = (glow.nyan.wake_head.unwrap().1 * g.cw as f32) as i32;
+        let head_px = (glow.rainbow.wake_head.unwrap().1 * g.cw as f32) as i32;
         let at = |lo: i32, hi: i32| -> Option<u32> {
             quads
                 .iter()
@@ -23398,9 +23456,9 @@ halo = "add"
     /// thickness survives on the last row (and on the first, for the symmetric
     /// case), and that nothing escapes the box.
     #[test]
-    fn nyan_wake_keeps_its_full_thickness_on_the_last_row() {
+    fn rainbow_wake_keeps_its_full_thickness_on_the_last_row() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let thickest = |row: u16| -> u16 {
             let mut glow = CursorGlow::default();
             let t0 = Instant::now();
@@ -23444,11 +23502,11 @@ halo = "add"
     /// ever stopped multiplying back to the documented law, the plume would
     /// silently diverge from its own specification — so pin the identity.
     #[test]
-    fn nyan_wake_pulse_is_separable() {
+    fn rainbow_wake_pulse_is_separable() {
         for &d in &[-1.2f32, -0.3, 0.0, 0.25, 0.9, 2.5] {
             for &age in &[0.0f32, 0.05, 0.2, 0.6] {
-                let whole = nyan_wake_pulse(d, age);
-                let split = nyan_wake_pulse_space(d) * nyan_wake_pulse_decay(age);
+                let whole = rainbow_wake_pulse(d, age);
+                let split = rainbow_wake_pulse_space(d) * rainbow_wake_pulse_decay(age);
                 assert!(
                     (whole - split).abs() < 1e-6,
                     "pulse(d={d}, age={age}) must equal space × decay"
@@ -23462,9 +23520,9 @@ halo = "add"
     /// streaking backward from the NEW cursor, across text nobody just typed.
     /// After a jump there is no wake at all until fresh keys land.
     #[test]
-    fn nyan_wake_never_streaks_out_of_a_cursor_jump() {
+    fn rainbow_wake_never_streaks_out_of_a_cursor_jump() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let t0 = Instant::now();
         let end = type_run(
@@ -23493,7 +23551,10 @@ halo = "add"
         let jump = end + Duration::from_millis(16);
         glow.note_navigation(jump);
         glow.tick(Some((2, 30)), jump, &c, g, &mut out);
-        assert!(!glow.nyan.ink_pops.is_empty(), "the ring survives the leap");
+        assert!(
+            !glow.rainbow.ink_pops.is_empty(),
+            "the ring survives the leap"
+        );
         let (q, h) = wake_of(&glow, jump, &c, g);
         assert!(
             q.is_empty() && h.is_empty(),
@@ -23512,13 +23573,13 @@ halo = "add"
     /// would read as broken half the time.
     ///
     /// Also pins the two things the beam must NOT bring back: a short hop draws no
-    /// line ([`Self::NYAN_STREAK_MIN_DIST`] — ordinary arrow editing stays quiet),
+    /// line ([`Self::RAINBOW_STREAK_MIN_DIST`] — ordinary arrow editing stays quiet),
     /// and no navigation jump lays a per-cell ribbon over the row it skims, which
     /// was the real defect the old blanket gate was aimed at.
     #[test]
-    fn nyan_navigation_jump_draws_the_rainbow_streak_both_ways() {
+    fn rainbow_navigation_jump_draws_the_rainbow_streak_both_ways() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let streaks_for = |from: u16, to: u16| {
             let mut glow = CursorGlow::default();
             let t0 = Instant::now();
@@ -23541,12 +23602,12 @@ halo = "add"
             let ribbon_before = glow.sparks.len().max(before);
             // Count what the SETUP move already minted (it is itself a jump), so the
             // assertion measures only the navigation leap under test.
-            let streaks_before = glow.nyan.jumps.len();
+            let streaks_before = glow.rainbow.jumps.len();
             let jump = jump + Duration::from_millis(16);
             glow.note_navigation(jump);
             glow.tick(Some((2, to)), jump, &c, g, &mut out);
             (
-                glow.nyan.jumps.len() - streaks_before,
+                glow.rainbow.jumps.len() - streaks_before,
                 glow.sparks.len(),
                 ribbon_before,
             )
@@ -23573,9 +23634,9 @@ halo = "add"
     /// sustained run streams a visibly longer trail than a hunt-and-peck one.
     /// Same clock, same keys, same cell — only the cadence differs.
     #[test]
-    fn nyan_wake_length_is_the_speedometer() {
+    fn rainbow_wake_length_is_the_speedometer() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let span = |gap: u64| -> i32 {
             let mut glow = CursorGlow::default();
             let t0 = Instant::now();
@@ -23613,7 +23674,7 @@ halo = "add"
     /// respects the shared quad budget, and a saturated budget sheds the plume
     /// rather than overrunning.
     #[test]
-    fn nyan_wake_is_bounded_by_its_segment_cap_and_the_quad_budget() {
+    fn rainbow_wake_is_bounded_by_its_segment_cap_and_the_quad_budget() {
         // A pathologically wide grid at full spine: the cap, not the window,
         // decides the cost.
         let g = Geom {
@@ -23627,10 +23688,10 @@ halo = "add"
             win_h: 56,
             head: 0,
         };
-        let mut c = nyan_pop_cfg();
+        let mut c = rainbow_pop_cfg();
         c.intensity = 1.0;
         let mut glow = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 1.0,
                 ..Default::default()
             },
@@ -23652,12 +23713,12 @@ halo = "add"
         let (quads, halos) = wake_of(&glow, end, &c, g);
         // Each segment can split across at most the two rows it straddles.
         assert!(
-            quads.len() <= NYAN_WAKE_SEG_CAP * 2,
+            quads.len() <= RAINBOW_WAKE_SEG_CAP * 2,
             "core bounded by the segment cap: {} quads",
             quads.len()
         );
         assert!(
-            halos.len() <= NYAN_WAKE_SEG_CAP,
+            halos.len() <= RAINBOW_WAKE_SEG_CAP,
             "bloom bounded too: {} halos",
             halos.len()
         );
@@ -23674,7 +23735,7 @@ halo = "add"
             CursorGlow::MAX_QUADS
         ];
         let mut halos2 = Vec::new();
-        glow.emit_nyan_wake(end, &c, g, &mut full, &mut halos2);
+        glow.emit_rainbow_wake(end, &c, g, &mut full, &mut halos2);
         assert_eq!(
             full.len(),
             CursorGlow::MAX_QUADS,
@@ -23686,9 +23747,9 @@ halo = "add"
     /// program moving the cursor one cell exactly like a typed glyph's echo,
     /// with no committed-press hint — lays ribbon light but never a plume.
     #[test]
-    fn nyan_wake_is_born_only_from_typed_keys() {
+    fn rainbow_wake_is_born_only_from_typed_keys() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -23700,7 +23761,10 @@ halo = "add"
             g,
             &mut out,
         );
-        assert!(glow.nyan.ink_pops.is_empty(), "PTY echo alone never pops");
+        assert!(
+            glow.rainbow.ink_pops.is_empty(),
+            "PTY echo alone never pops"
+        );
         let (q, h) = wake_of(&glow, t0 + Duration::from_millis(30), &c, g);
         assert!(q.is_empty() && h.is_empty(), "and lays no plume");
         // Read the control one beat later: the ribbon's own birth ease keeps a
@@ -23712,7 +23776,10 @@ halo = "add"
             g,
             &mut out,
         );
-        assert!(glow.nyan.ink_pops.is_empty(), "still no pop without a hint");
+        assert!(
+            glow.rainbow.ink_pops.is_empty(),
+            "still no pop without a hint"
+        );
         assert!(
             !glow.under_quads().is_empty(),
             "control: the same move DID lay ribbon light"
@@ -23728,9 +23795,9 @@ halo = "add"
     /// fires the plume at ~90% brightness — momentum is a small top-boost, not a
     /// gate — so a single keypress in a quiet terminal is still acknowledged.
     #[test]
-    fn nyan_wake_first_casual_keystroke_is_acknowledged() {
+    fn rainbow_wake_first_casual_keystroke_is_acknowledged() {
         let g = geom();
-        let mut c = nyan_pop_cfg();
+        let mut c = rainbow_pop_cfg();
         c.intensity = 1.0;
         let peak = |glow: &CursorGlow, now: Instant| -> u32 {
             wake_of(glow, now, &c, g)
@@ -23748,7 +23815,7 @@ halo = "add"
         cold.tick(Some((2, 3)), t, &c, g, &mut out);
         let cold_r = peak(&cold, t);
         let mut hot = CursorGlow {
-            nyan: NyanState {
+            rainbow: RainbowState {
                 disp: 1.0,
                 ..Default::default()
             },
@@ -23772,9 +23839,9 @@ halo = "add"
     /// rides exclusively the under-ink stream while the plume rides exclusively
     /// the OVER-ink streams — never the reverse.
     #[test]
-    fn nyan_wake_rides_over_ink_and_the_ribbon_body_rides_under() {
+    fn rainbow_wake_rides_over_ink_and_the_ribbon_body_rides_under() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let t0 = Instant::now();
         let end = type_run(
@@ -23789,7 +23856,7 @@ halo = "add"
             g,
             t0,
         );
-        assert!(!glow.nyan.ink_pops.is_empty());
+        assert!(!glow.rainbow.ink_pops.is_empty());
         assert!(
             !glow.under_quads().is_empty(),
             "ribbon body present in the under-ink stream"
@@ -23799,7 +23866,7 @@ halo = "add"
         // Every plume quad lives in the leading; no under-ink quad does — the
         // two streams are disjoint in space as well as in routing.
         let boundary = 3 * g.ch as i32;
-        let pad = (g.ch as f32 * NYAN_WAKE_H_HEAD * 0.5).ceil() as i32;
+        let pad = (g.ch as f32 * RAINBOW_WAKE_H_HEAD * 0.5).ceil() as i32;
         assert!(
             core.iter()
                 .all(|q| (q.y as i32 - boundary).abs() <= pad + 1),
@@ -23817,9 +23884,9 @@ halo = "add"
     /// keeps no timer armed; one ring life after the last key it is EXACTLY gone
     /// — no residue, no lingering fingerprint.
     #[test]
-    fn nyan_wake_decays_to_exactly_nothing_and_idles_free() {
+    fn rainbow_wake_decays_to_exactly_nothing_and_idles_free() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -23831,7 +23898,7 @@ halo = "add"
             g,
             &mut out,
         ); // a jump, not typing
-        assert!(glow.nyan.ink_pops.is_empty(), "a jump never pops");
+        assert!(glow.rainbow.ink_pops.is_empty(), "a jump never pops");
         let (q, h) = wake_of(&glow, t0 + Duration::from_millis(50), &c, g);
         assert!(q.is_empty() && h.is_empty(), "no plume without typing");
         // Type, then wait out the ring life.
@@ -23858,16 +23925,16 @@ halo = "add"
             q.is_empty() && h.is_empty(),
             "the plume decays to EXACTLY nothing"
         );
-        assert!(typed.nyan.ink_pops.is_empty(), "and its ring is empty");
+        assert!(typed.rainbow.ink_pops.is_empty(), "and its ring is empty");
     }
 
     /// DETERMINISM: identical clocks and identical key trains produce
     /// byte-identical light. No RNG and no wall clock anywhere in the wake — the
     /// contract both backends' byte-exactness rests on.
     #[test]
-    fn nyan_wake_is_deterministic() {
+    fn rainbow_wake_is_deterministic() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let run = || {
             let mut glow = CursorGlow::default();
             let t0 = Instant::now();
@@ -23897,9 +23964,9 @@ halo = "add"
     /// resting length (it cannot grow or shrink on screen), and the brightness
     /// becomes a hard three-step fade.
     #[test]
-    fn nyan_wake_reduced_motion_is_frozen_and_step_faded() {
+    fn rainbow_wake_reduced_motion_is_frozen_and_step_faded() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let t0 = Instant::now();
         let mut reduced = CursorGlow::default();
         reduced.set_reduced_motion(true);
@@ -23970,9 +24037,9 @@ halo = "add"
     /// per-pixel centre alpha is CAPPED, so it greys the leading without ever
     /// laying a black bar under the text.
     #[test]
-    fn nyan_wake_light_theme_is_a_capped_darken_contrail() {
+    fn rainbow_wake_light_theme_is_a_capped_darken_contrail() {
         let g = geom();
-        let mut c = nyan_pop_cfg();
+        let mut c = rainbow_pop_cfg();
         c.dark_theme = false;
         c.intensity = 1.0;
         let mut glow = CursorGlow::default();
@@ -23999,7 +24066,7 @@ halo = "add"
             assert_eq!(h.mode, HaloMode::Over, "source-over, not additive");
             assert_eq!(
                 h.color & 0x00FF_FFFF,
-                NYAN_WAKE_LIGHT_VEIL,
+                RAINBOW_WAKE_LIGHT_VEIL,
                 "cool-neutral: the contrail never colours the ground"
             );
             let cap = aterm_render::halo_over_cap(h.color);
@@ -24034,7 +24101,7 @@ halo = "add"
     #[test]
     fn fresh_ink_backspace_kills_the_pop_instantly() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let mut t = Instant::now();
@@ -24044,16 +24111,16 @@ halo = "add"
             glow.note_typed(t);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
-        assert_eq!(glow.nyan.ink_pops.len(), 3, "pops on cells 2, 3, 4");
+        assert_eq!(glow.rainbow.ink_pops.len(), 3, "pops on cells 2, 3, 4");
         t += Duration::from_millis(40);
         glow.note_backspace(t);
         glow.tick(Some((2, 4)), t, &c, g, &mut out); // retreat 5 → 4 erases cell 4
         assert!(
-            !glow.nyan.ink_pops.iter().any(|p| p.col >= 4),
+            !glow.rainbow.ink_pops.iter().any(|p| p.col >= 4),
             "the erased cell's pop dies with its ink, instantly"
         );
         assert_eq!(
-            glow.nyan.ink_pops.len(),
+            glow.rainbow.ink_pops.len(),
             2,
             "pops behind the landing keep fading normally"
         );
@@ -24067,7 +24134,7 @@ halo = "add"
     #[test]
     fn fresh_ink_span_kill_kills_the_pops_in_its_range() {
         let g = geom(); // cols 40, cw 8
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -24088,10 +24155,18 @@ halo = "add"
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         assert!(
-            glow.nyan.ink_pops.iter().filter(|p| p.col < 3).count() == 3
-                && glow.nyan.ink_pops.iter().any(|p| (3..10).contains(&p.col)),
+            glow.rainbow.ink_pops.iter().filter(|p| p.col < 3).count() == 3
+                && glow
+                    .rainbow
+                    .ink_pops
+                    .iter()
+                    .any(|p| (3..10).contains(&p.col)),
             "pops sit on both sides of the coming kill boundary: {:?}",
-            glow.nyan.ink_pops.iter().map(|p| p.col).collect::<Vec<_>>()
+            glow.rainbow
+                .ink_pops
+                .iter()
+                .map(|p| p.col)
+                .collect::<Vec<_>>()
         );
         // Ctrl-K back to caret 3: "abcdefghij" -> "abc" (cols 3..10 vanish).
         let tk = t0 + Duration::from_millis(30 * (text.len() as u64 + 1));
@@ -24100,14 +24175,22 @@ halo = "add"
         glow.tick(Some((2, 3)), tk, &c, g, &mut out);
         assert_eq!(glow.last_poof, Some(tk), "the precise span poof fired");
         assert!(
-            !glow.nyan.ink_pops.iter().any(|p| (3..10).contains(&p.col)),
+            !glow
+                .rainbow
+                .ink_pops
+                .iter()
+                .any(|p| (3..10).contains(&p.col)),
             "every pop inside the vanished span died with its ink at the poof edge"
         );
         assert_eq!(
-            glow.nyan.ink_pops.iter().filter(|p| p.col < 3).count(),
+            glow.rainbow.ink_pops.iter().filter(|p| p.col < 3).count(),
             3,
             "the three surviving-prefix pops keep fading naturally: {:?}",
-            glow.nyan.ink_pops.iter().map(|p| p.col).collect::<Vec<_>>()
+            glow.rainbow
+                .ink_pops
+                .iter()
+                .map(|p| p.col)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -24116,7 +24199,7 @@ halo = "add"
     #[test]
     fn fresh_ink_overwrite_rebirths_the_pop() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -24124,32 +24207,38 @@ halo = "add"
         let t1 = t0 + Duration::from_millis(40);
         glow.note_typed(t1);
         glow.tick(Some((2, 3)), t1, &c, g, &mut out);
-        assert_eq!(glow.nyan.ink_pops.len(), 1);
-        assert_eq!(glow.nyan.ink_pops[0].born, t1);
+        assert_eq!(glow.rainbow.ink_pops.len(), 1);
+        assert_eq!(glow.rainbow.ink_pops[0].born, t1);
         // The caret scrubs back onto the cell (navigation — no pop, no kill)…
         let t2 = t1 + Duration::from_millis(300);
         glow.note_navigation(t2);
         glow.tick(Some((2, 2)), t2, &c, g, &mut out);
         assert_eq!(
-            glow.nyan.ink_pops.len(),
+            glow.rainbow.ink_pops.len(),
             1,
             "navigation neither pops nor kills"
         );
-        assert_eq!(glow.nyan.ink_pops[0].born, t1, "the old pop kept its age");
+        assert_eq!(
+            glow.rainbow.ink_pops[0].born, t1,
+            "the old pop kept its age"
+        );
         // …and OVERWRITES the glyph: the pop is reborn, never duplicated.
         let t3 = t2 + Duration::from_millis(40);
         glow.note_typed(t3);
         glow.tick(Some((2, 3)), t3, &c, g, &mut out);
         assert_eq!(
-            glow.nyan.ink_pops.len(),
+            glow.rainbow.ink_pops.len(),
             1,
             "one pop per cell — no stacking"
         );
         assert_eq!(
-            (glow.nyan.ink_pops[0].row, glow.nyan.ink_pops[0].col),
+            (glow.rainbow.ink_pops[0].row, glow.rainbow.ink_pops[0].col),
             (2, 2)
         );
-        assert_eq!(glow.nyan.ink_pops[0].born, t3, "overwrite rebirths the pop");
+        assert_eq!(
+            glow.rainbow.ink_pops[0].born, t3,
+            "overwrite rebirths the pop"
+        );
     }
 
     /// MOMENTUM SYNERGY: pops ride the typing-momentum spine — a pop born
@@ -24158,7 +24247,7 @@ halo = "add"
     #[test]
     fn fresh_ink_pop_brightness_rides_the_momentum_spine() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let max_pop_chan = |glow: &CursorGlow| -> u32 {
             pop_halos(glow)
                 .iter()
@@ -24174,7 +24263,7 @@ halo = "add"
         let t1 = t0 + Duration::from_millis(16);
         cold.note_typed(t1);
         cold.tick(Some((3, 3)), t1, &c, g, &mut out);
-        let cold_mom = cold.nyan.ink_pops[0].mom;
+        let cold_mom = cold.rainbow.ink_pops[0].mom;
         let cold_bright = max_pop_chan(&cold);
         assert!(cold_bright > 0, "a cold lone keystroke still pops visibly");
         // HOT: a sustained fast run builds the spine before the last pop.
@@ -24186,7 +24275,7 @@ halo = "add"
             hot.note_typed(t);
             hot.tick(Some((3, col)), t, &c, g, &mut out);
         }
-        let hot_mom = hot.nyan.ink_pops.last().unwrap().mom;
+        let hot_mom = hot.rainbow.ink_pops.last().unwrap().mom;
         let hot_bright = max_pop_chan(&hot);
         assert!(
             hot_mom > cold_mom + 0.2,
@@ -24205,7 +24294,7 @@ halo = "add"
     #[test]
     fn fresh_ink_reduced_motion_is_a_step_fade_without_scale() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut out = Vec::new();
         let t0 = Instant::now();
         let mut drive = |glow: &mut CursorGlow| {
@@ -24286,11 +24375,11 @@ halo = "add"
         );
     }
 
-    /// A crown-free, ring-free Nyan config on a LIGHT theme — the light-arm twin
-    /// of [`nyan_pop_cfg`], so the halo stream carries the fresh-ink DARKEN
+    /// A crown-free, ring-free rainbow kitty config on a LIGHT theme — the light-arm twin
+    /// of [`rainbow_pop_cfg`], so the halo stream carries the fresh-ink DARKEN
     /// veils (isolated from other halos by their exact veil colour below).
-    fn nyan_pop_light_cfg() -> GlowConfig {
-        let mut c = nyan_pop_cfg();
+    fn rainbow_pop_light_cfg() -> GlowConfig {
+        let mut c = rainbow_pop_cfg();
         c.dark_theme = false;
         c
     }
@@ -24316,7 +24405,7 @@ halo = "add"
     #[test]
     fn fresh_ink_light_theme_pops_with_a_darken_veil() {
         let g = geom();
-        let c = nyan_pop_light_cfg();
+        let c = rainbow_pop_light_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -24325,7 +24414,7 @@ halo = "add"
         glow.note_typed(t1);
         glow.tick(Some((3, 3)), t1, &c, g, &mut out);
         assert_eq!(
-            glow.nyan.ink_pops.len(),
+            glow.rainbow.ink_pops.len(),
             1,
             "a typed cell pops on a light theme too"
         );
@@ -24406,7 +24495,7 @@ halo = "add"
         // bites; compile-time because both operands are consts.
         const { assert!(FRESH_INK_LIGHT_VEIL_ALPHA > FRESH_INK_LIGHT_ALPHA_CAP) };
         let g = geom();
-        let mut c = nyan_pop_light_cfg();
+        let mut c = rainbow_pop_light_cfg();
         c.intensity = 1.0; // full amplitude — the darken reaches the ceiling
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
@@ -24458,7 +24547,7 @@ halo = "add"
     #[test]
     fn fresh_ink_light_veil_lives_the_full_life_with_a_smooth_opacity_fade() {
         let g = geom();
-        let c = nyan_pop_light_cfg();
+        let c = rainbow_pop_light_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -24530,7 +24619,7 @@ halo = "add"
     #[test]
     fn fresh_ink_light_theme_reduced_motion_step_fades() {
         let g = geom();
-        let c = nyan_pop_light_cfg();
+        let c = rainbow_pop_light_cfg();
         let mut out = Vec::new();
         let t0 = Instant::now();
         let mut glow = CursorGlow::default();
@@ -24574,7 +24663,7 @@ halo = "add"
     #[test]
     fn fresh_ink_dark_arm_is_unchanged_by_the_light_veil() {
         let g = geom();
-        let c = nyan_pop_cfg(); // dark theme
+        let c = rainbow_pop_cfg(); // dark theme
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -24602,7 +24691,7 @@ halo = "add"
     #[test]
     fn fresh_ink_is_inert_without_typing() {
         let g = geom();
-        let c = nyan_pop_cfg();
+        let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -24614,7 +24703,7 @@ halo = "add"
             g,
             &mut out,
         ); // jump
-        assert!(glow.nyan.ink_pops.is_empty(), "a jump never pops");
+        assert!(glow.rainbow.ink_pops.is_empty(), "a jump never pops");
         assert!(pop_halos(&glow).is_empty());
         // And pops keep the cadence armed only while live.
         let mut typed = CursorGlow::default();

@@ -7,7 +7,7 @@
 //! emitters/channels: the additive [`aterm_render::custom_beam_quads`] beam,
 //! the [`aterm_render::RainHalo`] crown, ≤3 particle populations, and a colour
 //! ramp. It introduces NO new compositing and NO new output channel — the
-//! per-pixel fire field, the Nyan ribbon/exit-swoosh state machine, the cursor
+//! per-pixel fire field, the rainbow ribbon/exit-swoosh state machine, the cursor
 //! cat, and the forge fill stay BUILTIN-ONLY (simulations, not parameters).
 //!
 //! ## The safety envelope (mirrors the sparkle Toy Pack lane in `spec.rs`)
@@ -193,7 +193,7 @@ pub enum RampParams {
         val: f32,
         hue_step: f32,
     },
-    /// Fixed stacked bands (the Nyan-stripe read, generalized).
+    /// Fixed stacked bands (the rainbow-stripe read, generalized).
     Bands { bands: [u32; MAX_RAMP_BANDS], n: u8 },
 }
 

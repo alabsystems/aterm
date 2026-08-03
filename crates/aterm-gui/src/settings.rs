@@ -1272,7 +1272,7 @@ impl SettingsState {
 /// cursor_style `beam` == `bar`); without this native Settings would misclassify the
 /// authored value as a custom option. Returns `None` when `token` is not a known alias.
 fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
-    // Trail-style aliases (rainbow → nyan, ember → fire, …) resolve through the
+    // Trail-style aliases (nyan rainbow → rainbow kitty, ember → fire, …) resolve through the
     // shared table in `prefs` — the same source `--validate-config` and the
     // load-time unknown-style warning consult, so the native row, preview lane,
     // and the live effect can never disagree about an aliased spelling.
@@ -2851,7 +2851,7 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
 /// vocabulary (Dots + hairline Strokes — no new raster op). Breeds 0..6 pop from
 /// behind `y_base` (rise → wiggle → sink, with a late alpha fade for hosts with
 /// no occluder); breed 6 is the rainbow FLYBY, travelling the whole band with a
-/// five-stripe wake — the nyan cursor-trail homage.
+/// five-stripe wake — the rainbow kitty cursor-trail homage.
 // One free-position painter, two hosts: the geometry really is seven scalars
 // (band, base, peak, head radius) — a one-off struct would just rename them.
 #[allow(clippy::too_many_arguments)]
@@ -6038,9 +6038,9 @@ mod tests {
         assert_eq!(enum_current(&field("zzz")), "block");
 
         // Trail-style aliases resolve through the shared prefs table: a
-        // configured "rainbow" (or legacy "nyan") renders the Nyan banded
-        // ribbon LIVE, so the panel row (and the demo lane + cycle anchor
-        // riding on it) must show the canonical "nyan rainbow" — previously
+        // configured "rainbow" (or legacy "nyan"/"nyan rainbow") renders the
+        // banded ribbon LIVE, so the panel row (and the demo lane + cycle anchor
+        // riding on it) must show the canonical "rainbow kitty" — previously
         // every alias clobbered to options[0] = "phaser" while the glass
         // played a different effect.
         let trail = |seed: &str| EditField {
@@ -6052,8 +6052,9 @@ mod tests {
             seed: Some(seed.to_string()),
             placeholder: String::new(),
         };
-        assert_eq!(enum_current(&trail("rainbow")), "nyan rainbow");
-        assert_eq!(enum_current(&trail("nyan")), "nyan rainbow");
+        assert_eq!(enum_current(&trail("rainbow")), "rainbow kitty");
+        assert_eq!(enum_current(&trail("nyan")), "rainbow kitty");
+        assert_eq!(enum_current(&trail("nyan rainbow")), "rainbow kitty");
         assert_eq!(enum_current(&trail("embers")), "fire");
         assert_eq!(enum_current(&trail("ocean")), "water");
         assert_eq!(enum_current(&trail("light-beam")), "beam");
@@ -6156,14 +6157,14 @@ mod tests {
                 options: crate::prefs::CURSOR_TRAIL_STYLES,
             },
             seed: None,
-            placeholder: "nyan rainbow (default)".to_string(),
+            placeholder: "rainbow kitty (default)".to_string(),
         };
         assert_eq!(
             SettingsState::display_value(&trail),
-            "nyan rainbow (default)",
+            "rainbow kitty (default)",
             "native display keeps the explanatory default annotation"
         );
-        assert_eq!(enum_current(&trail), "nyan rainbow");
+        assert_eq!(enum_current(&trail), "rainbow kitty");
         assert_eq!(
             popup_options(&trail).len(),
             crate::prefs::CURSOR_TRAIL_STYLES.len(),
@@ -6977,7 +6978,7 @@ mod tests {
         s.selected = idx;
         assert_eq!(
             demo_style(&s),
-            Some("nyan rainbow"),
+            Some("rainbow kitty"),
             "focus demos the resolved default"
         );
         // The master toggle demos the selected style too.
@@ -6986,7 +6987,7 @@ mod tests {
             .iter()
             .position(|f| f.key == crate::prefs::EDIT_CURSOR_TRAIL)
             .unwrap();
-        assert_eq!(demo_style(&s), Some("nyan rainbow"));
+        assert_eq!(demo_style(&s), Some("rainbow kitty"));
 
         // Open the menu and move the highlight: the HIGHLIGHTED (uncommitted)
         // option drives the demo — and only Enter would persist it.
@@ -7016,7 +7017,7 @@ mod tests {
         );
         // Esc restores: cancel leaves the effective style in charge again.
         s.menu_cancel();
-        assert_eq!(demo_style(&s), Some("nyan rainbow"));
+        assert_eq!(demo_style(&s), Some("rainbow kitty"));
 
         // While filtering (menu closed) the card rests on the default mock: no demo.
         s.searching = true;
@@ -7036,7 +7037,7 @@ mod tests {
 
     #[test]
     fn enum_current_strips_default_placeholder_suffix() {
-        // An unset style seeds None, so display_value is the "nyan rainbow (default)"
+        // An unset style seeds None, so display_value is the "rainbow kitty (default)"
         // placeholder and enum_current strips the suffix to the canonical option —
         // this is what the "Trail effect" popup chip and the demo lane resolve.
         let s = SettingsState::from_config(&cfg());
@@ -7046,7 +7047,7 @@ mod tests {
             .find(|f| f.key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE)
             .unwrap();
         assert!(f.seed.is_none());
-        assert_eq!(enum_current(f), "nyan rainbow");
+        assert_eq!(enum_current(f), "rainbow kitty");
     }
 
     #[test]
@@ -7389,7 +7390,7 @@ mod tests {
             "at the min rail: no-op"
         );
 
-        // Enum steps backward from the unset default (nyan, options[1]) to options[0].
+        // Enum steps backward from the unset default (rainbow kitty, options[1]) to options[0].
         let (_k, v) = step_edit(by_key(crate::prefs::EDIT_CURSOR_TRAIL_STYLE), -1, false).unwrap();
         assert_eq!(v.as_deref(), Some("phaser"));
         // …and from options[0] it wraps to the last option.

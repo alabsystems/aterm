@@ -123,7 +123,7 @@ fn main() {
         beam: true,
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: aterm_effects::cursor_glow::NYAN_WAKE_PERSIST,
+        wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
         dark_theme: true,
     };
     let fb_cfg = FireballConfig {

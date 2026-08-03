@@ -207,7 +207,7 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
             },
             Replica {
                 file: "crates/aterm-gui/src/settings_preview.rs",
-                owner: "nyan_layer",
+                owner: "kitty_layer",
                 decl: "WordDecorations::default()",
                 kind: ReplicaKind::SeparateScope,
                 justification: "An offscreen still: the preview engine bakes ONE Nyan \

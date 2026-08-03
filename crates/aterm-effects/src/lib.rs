@@ -56,16 +56,18 @@ mod effect_util;
 /// Hardened, bounded file admission shared by every native visual-feed loader.
 pub mod file_feed;
 pub mod genome;
+/// The rainbow kitty that flies in front of the cursor on the `rainbow kitty`
+/// trail style — its art, pose, and exit choreography.
+pub mod kitty_cursor;
 pub mod kitty_registry;
+/// The kitty's SING-ALONG — the held-key celebration: repeat detector +
+/// beat clock + the ♪/♫ music-note sprite field (see the module doc).
+pub mod kitty_sing;
 pub mod matrix_overlay;
 pub mod matrix_rain;
 pub mod nova;
 /// The mushroom cloud — the rarest f-bomb detonation tier.
 pub mod nuke;
-pub mod nyan_cursor;
-/// FULL NYAN SING-ALONG — the held-key celebration: repeat detector +
-/// beat clock + the ♪/♫ music-note sprite field (see the module doc).
-pub mod nyan_sing;
 pub mod pipeline;
 pub mod spec;
 pub mod supernova;

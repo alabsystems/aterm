@@ -1947,7 +1947,7 @@ mod tests {
                 // The feline word can also report a collectible. Keep this arm
                 // isolated so omitting WordDecorations from the shared set could
                 // not be masked by the cat predicate.
-                ws.cursor_cat = crate::nyan_cursor::CursorCat::default();
+                ws.cursor_cat = crate::kitty_cursor::CursorCat::default();
             }
             let dependents = ws.cursor_dependents_need_frame_cadence(now, true);
             assert!(dependents, "{effect:?} must request frame cadence");

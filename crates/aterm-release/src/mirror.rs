@@ -24,7 +24,9 @@
 //! is a NAME requirement. It keeps non-draft releases whose tag is canonical
 //! `vMAJOR.MINOR.PATCH`, needs EXACTLY ONE asset named `aterm-appcast.toml`, and
 //! then needs exactly one asset named `aterm-<version>.dmg` where `<version>` is
-//! derived from the TAG and cross-checked against the manifest's own `dmg` field.
+//! derived from the TAG and cross-checked against the manifest's own `dmg` field,
+//! plus exactly one `aterm-<version>-mac.zip` (the container it actually stages
+//! from) cross-checked against the manifest's `zip` field the same way.
 //! A mirror that uploaded, say, `aterm.dmg`, or two appcasts, or a release under
 //! a two-component tag, would produce a channel that is live, plausible, and
 //! permanently unelectable — the exact silent-never-updates failure this whole
@@ -34,11 +36,11 @@
 //!
 //! ## What is deliberately NOT mirrored
 //!
-//! Exactly the client-required set crosses over: the manifest, the DMG, and the
-//! detached signature when the cut is signed. The provenance text and the dSYM
-//! archive stay private — they are debugging aids for the owner, the client never
-//! reads them, and a public channel should carry the smallest surface that still
-//! satisfies the updater. Keeping the set exact also makes
+//! Exactly the client-required set crosses over: the manifest, the DMG, the
+//! updater zip, and the detached signature when the cut is signed. The provenance
+//! text and the dSYM archive stay private — they are debugging aids for the owner,
+//! the client never reads them, and a public channel should carry the smallest
+//! surface that still satisfies the updater. Keeping the set exact also makes
 //! [`validate_mirror_asset_set`] a total check (no "and maybe some extras" hole).
 
 use crate::ledger::{Error, Result};
@@ -192,14 +194,28 @@ pub fn dmg_asset_name(version: &str) -> String {
     format!("aterm-{version}.dmg")
 }
 
+/// The canonical updater-container (zip) asset name for a release version. Same
+/// contract as [`dmg_asset_name`]: the client re-derives this string from the TAG
+/// and refuses a manifest whose `zip` field disagrees.
+#[must_use]
+pub fn zip_asset_name(version: &str) -> String {
+    format!("aterm-{version}-mac.zip")
+}
+
 /// The EXACT asset set a mirrored release must carry, sorted, as the deployed
-/// updater requires it: the appcast, the version-bound DMG, and — only when the
-/// cut is signed — the detached signature the pinned client demands.
+/// updater requires it: the appcast, the version-bound DMG, the version-bound
+/// updater zip, and — only when the cut is signed — the detached signature the
+/// pinned client demands.
+///
+/// The zip is unconditional because every manifest this cutter emits names one,
+/// and a manifest naming an asset the channel does not carry is exactly the
+/// live-but-unelectable state this module exists to prevent.
 #[must_use]
 pub fn required_asset_names(version: &str, signed: bool) -> Vec<String> {
     let mut names = vec![
         manifest_out::MANIFEST_ASSET.to_string(),
         dmg_asset_name(version),
+        zip_asset_name(version),
     ];
     if signed {
         names.push(manifest_out::MANIFEST_SIG_ASSET.to_string());
@@ -437,10 +453,12 @@ update_channel = \"someone/else\"
 
     #[test]
     fn required_asset_set_is_exactly_what_the_updater_elects() {
-        // Unsigned (Tier REPO, the default): appcast + version-bound DMG.
+        // Unsigned (Tier REPO, the default): appcast + version-bound DMG + the
+        // version-bound zip the in-app updater actually stages from.
         assert_eq!(
             required_asset_names("0.5.0", false),
             vec![
+                "aterm-0.5.0-mac.zip".to_string(),
                 "aterm-0.5.0.dmg".to_string(),
                 "aterm-appcast.toml".to_string()
             ]
@@ -449,6 +467,7 @@ update_channel = \"someone/else\"
         assert_eq!(
             required_asset_names("0.5.0", true),
             vec![
+                "aterm-0.5.0-mac.zip".to_string(),
                 "aterm-0.5.0.dmg".to_string(),
                 "aterm-appcast.toml".to_string(),
                 "aterm-appcast.toml.sig".to_string(),
@@ -458,6 +477,7 @@ update_channel = \"someone/else\"
         assert_eq!(manifest_out::MANIFEST_ASSET, "aterm-appcast.toml");
         assert_eq!(manifest_out::MANIFEST_SIG_ASSET, "aterm-appcast.toml.sig");
         assert_eq!(dmg_asset_name("1.2.3"), "aterm-1.2.3.dmg");
+        assert_eq!(zip_asset_name("1.2.3"), "aterm-1.2.3-mac.zip");
     }
 
     #[test]
@@ -465,10 +485,12 @@ update_channel = \"someone/else\"
         let ok = vec![
             "aterm-appcast.toml".to_string(),
             "aterm-0.5.0.dmg".to_string(),
+            "aterm-0.5.0-mac.zip".to_string(),
         ];
         validate_mirror_asset_set(&ok, "0.5.0", false).unwrap();
         // Order is irrelevant — GitHub does not promise listing order.
         let reordered = vec![
+            "aterm-0.5.0-mac.zip".to_string(),
             "aterm-0.5.0.dmg".to_string(),
             "aterm-appcast.toml".to_string(),
         ];
@@ -478,7 +500,7 @@ update_channel = \"someone/else\"
         let cases: Vec<(Vec<&str>, &str, bool, &str)> = vec![
             // no appcast at all -> the release is skipped by selection
             (
-                vec!["aterm-0.5.0.dmg"],
+                vec!["aterm-0.5.0.dmg", "aterm-0.5.0-mac.zip"],
                 "0.5.0",
                 false,
                 "aterm-appcast.toml",
@@ -489,6 +511,7 @@ update_channel = \"someone/else\"
                     "aterm-appcast.toml",
                     "aterm-appcast.toml",
                     "aterm-0.5.0.dmg",
+                    "aterm-0.5.0-mac.zip",
                 ],
                 "0.5.0",
                 false,
@@ -496,21 +519,48 @@ update_channel = \"someone/else\"
             ),
             // DMG named for the WRONG version -> manifest/tag disagreement
             (
-                vec!["aterm-appcast.toml", "aterm-0.61.0.dmg"],
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-0.61.0.dmg",
+                    "aterm-0.5.0-mac.zip",
+                ],
                 "0.5.0",
                 false,
                 "aterm-0.5.0.dmg",
             ),
             // generic DMG name -> no asset matches manifest.dmg
             (
-                vec!["aterm-appcast.toml", "aterm.dmg"],
+                vec!["aterm-appcast.toml", "aterm.dmg", "aterm-0.5.0-mac.zip"],
                 "0.5.0",
                 false,
                 "aterm-0.5.0.dmg",
             ),
-            // signed cut whose signature never crossed -> pinned clients refuse
+            // the updater container never crossed -> the manifest names a zip the
+            // channel does not carry, and every in-app stage 404s
             (
                 vec!["aterm-appcast.toml", "aterm-0.5.0.dmg"],
+                "0.5.0",
+                false,
+                "aterm-0.5.0-mac.zip",
+            ),
+            // zip named for the WRONG version -> same, with a plausible decoy
+            (
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-0.5.0.dmg",
+                    "aterm-0.61.0-mac.zip",
+                ],
+                "0.5.0",
+                false,
+                "aterm-0.5.0-mac.zip",
+            ),
+            // signed cut whose signature never crossed -> pinned clients refuse
+            (
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-0.5.0.dmg",
+                    "aterm-0.5.0-mac.zip",
+                ],
                 "0.5.0",
                 true,
                 "aterm-appcast.toml.sig",
@@ -520,6 +570,7 @@ update_channel = \"someone/else\"
                 vec![
                     "aterm-appcast.toml",
                     "aterm-0.5.0.dmg",
+                    "aterm-0.5.0-mac.zip",
                     "aterm-0.5.0-dSYM.zip",
                 ],
                 "0.5.0",

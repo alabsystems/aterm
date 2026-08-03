@@ -2325,7 +2325,7 @@ pub fn config_file_commit_cas_model() -> Model {
 }
 
 /// Every admitted config revision publishes text, its validated Trail Pack
-/// catalog, resolved Nyan sprite, parsed custom-theme catalog, and exact
+/// catalog, resolved kitty sprite, parsed custom-theme catalog, and exact
 /// inline + Toy Pack consumer projection as one immutable snapshot. Settings,
 /// the live host, and capture may observe a generation only after every
 /// payload reaches it. Explicit mutant actions
@@ -2341,7 +2341,7 @@ pub fn config_catalog_snapshot_model() -> Model {
             var revision = 0;
             var text_generation = 0;
             var trail_generation = 0;
-            var nyan_generation = 0;
+            var kitty_generation = 0;
             var theme_generation = 0;
             var sparkle_generation = 0;
             // Distinguishes a byte-identical path-asset refresh from an
@@ -2356,7 +2356,7 @@ pub fn config_catalog_snapshot_model() -> Model {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
-                nyan_generation = revision + 1;
+                kitty_generation = revision + 1;
                 theme_generation = revision + 1;
                 sparkle_generation = revision + 1;
                 asset_refresh = 0;
@@ -2365,7 +2365,7 @@ pub fn config_catalog_snapshot_model() -> Model {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
-                nyan_generation = revision + 1;
+                kitty_generation = revision + 1;
                 theme_generation = revision + 1;
                 sparkle_generation = revision + 1;
                 asset_refresh = 0;
@@ -2378,7 +2378,7 @@ pub fn config_catalog_snapshot_model() -> Model {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
-                nyan_generation = revision + 1;
+                kitty_generation = revision + 1;
                 theme_generation = revision + 1;
                 sparkle_generation = revision + 1;
                 asset_refresh = 1;
@@ -2389,7 +2389,7 @@ pub fn config_catalog_snapshot_model() -> Model {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
-                nyan_generation = revision + 1;
+                kitty_generation = revision + 1;
                 theme_generation = revision + 1;
                 sparkle_generation = revision + 1;
                 asset_refresh = 2;
@@ -2398,16 +2398,16 @@ pub fn config_catalog_snapshot_model() -> Model {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = trail_generation;
-                nyan_generation = revision + 1;
+                kitty_generation = revision + 1;
                 theme_generation = revision + 1;
                 sparkle_generation = revision + 1;
                 asset_refresh = 0;
             }
-            action AdmitStaleNyan when (Buggy == 1 && revision == 0) {
+            action AdmitStaleKitty when (Buggy == 1 && revision == 0) {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
-                nyan_generation = nyan_generation;
+                kitty_generation = kitty_generation;
                 theme_generation = revision + 1;
                 sparkle_generation = revision + 1;
                 asset_refresh = 0;
@@ -2416,7 +2416,7 @@ pub fn config_catalog_snapshot_model() -> Model {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
-                nyan_generation = revision + 1;
+                kitty_generation = revision + 1;
                 theme_generation = theme_generation;
                 sparkle_generation = revision + 1;
                 asset_refresh = 0;
@@ -2425,42 +2425,42 @@ pub fn config_catalog_snapshot_model() -> Model {
                 revision = revision + 1;
                 text_generation = revision + 1;
                 trail_generation = revision + 1;
-                nyan_generation = revision + 1;
+                kitty_generation = revision + 1;
                 theme_generation = revision + 1;
                 sparkle_generation = sparkle_generation;
                 asset_refresh = 0;
             }
             action PublishOne when (
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision && theme_generation == revision &&
+                kitty_generation == revision && theme_generation == revision &&
                 sparkle_generation == revision
             ) {
                 view_one_generation = revision;
             }
             action PublishTwo when (
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision && theme_generation == revision &&
+                kitty_generation == revision && theme_generation == revision &&
                 sparkle_generation == revision
             ) {
                 view_two_generation = revision;
             }
             action PublishLive when (
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision && theme_generation == revision &&
+                kitty_generation == revision && theme_generation == revision &&
                 sparkle_generation == revision
             ) {
                 live_generation = revision;
             }
             action PublishCapture when (
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision && theme_generation == revision &&
+                kitty_generation == revision && theme_generation == revision &&
                 sparkle_generation == revision
             ) {
                 capture_generation = revision;
             }
             invariant SnapshotAtomic:
                 text_generation == revision && trail_generation == revision &&
-                nyan_generation == revision && theme_generation == revision &&
+                kitty_generation == revision && theme_generation == revision &&
                 sparkle_generation == revision;
             invariant ViewsNeverAhead:
                 view_one_generation <= revision && view_two_generation <= revision &&
@@ -2468,22 +2468,22 @@ pub fn config_catalog_snapshot_model() -> Model {
             invariant ConsumersUseCompleteSnapshot:
                 view_one_generation <= text_generation &&
                 view_one_generation <= trail_generation &&
-                view_one_generation <= nyan_generation &&
+                view_one_generation <= kitty_generation &&
                 view_one_generation <= theme_generation &&
                 view_one_generation <= sparkle_generation &&
                 view_two_generation <= text_generation &&
                 view_two_generation <= trail_generation &&
-                view_two_generation <= nyan_generation &&
+                view_two_generation <= kitty_generation &&
                 view_two_generation <= theme_generation &&
                 view_two_generation <= sparkle_generation &&
                 live_generation <= text_generation &&
                 live_generation <= trail_generation &&
-                live_generation <= nyan_generation &&
+                live_generation <= kitty_generation &&
                 live_generation <= theme_generation &&
                 live_generation <= sparkle_generation &&
                 capture_generation <= text_generation &&
                 capture_generation <= trail_generation &&
-                capture_generation <= nyan_generation &&
+                capture_generation <= kitty_generation &&
                 capture_generation <= theme_generation &&
                 capture_generation <= sparkle_generation;
             invariant RevisionBounded: revision <= MaxRevision && asset_refresh <= 2;

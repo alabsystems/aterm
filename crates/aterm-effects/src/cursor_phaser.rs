@@ -17,7 +17,7 @@
 //!   breathe/swell with the typing cadence: the capacitor charging as you fire.
 //! * **a prism fringe** — the outer wing layers split slightly off the core hue
 //!   (trailing spectrum on the left lobe, leading on the right), so the emitter
-//!   reads as a prism focusing the sweep, distinct from the nyan rainbow ring.
+//!   reads as a prism focusing the sweep, distinct from the rainbow kitty's banded ring.
 //!
 //! Text-safe by construction, mirroring [`crate::cursor_rainbow`] /
 //! [`crate::cursor_fireball`]: the block FILL is returned for the renderer's
@@ -91,7 +91,7 @@ const COV_CAP: f32 = 96.0;
 /// sit). The per-layer [`COV_CAP`] alone let the layered sum reach ~250 at full
 /// charge, saturating those glyphs white (the audited head white-out); capping
 /// the shared core so `Σ(layer × core) ≤ budget` keeps the stacked coverage at
-/// the Nyan-ribbon text-safety ceiling while the lens SHAPE is untouched.
+/// the rainbow-ribbon text-safety ceiling while the lens SHAPE is untouched.
 const WING_STACK_BUDGET: f32 = 150.0;
 /// Σ of the [`WING_LAYERS`] coverage multipliers (the worst-case overlap).
 const WING_STACK_OVERLAP: f32 = 2.24;

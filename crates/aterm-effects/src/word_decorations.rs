@@ -272,35 +272,35 @@ pub struct EffectGeom {
 /// the render call stable as companion art gains context without growing a
 /// positional argument list.
 #[derive(Clone, Copy, Debug)]
-pub struct NyanCursorFrame {
+pub struct KittyCursorFrame {
     pub geom: EffectGeom,
     pub cursor: (u16, u16),
     pub look: KittyLook,
     pub colors: CatColorKey,
     pub bob: f32,
     pub alpha: u8,
-    /// The living-cartoon pose ([`crate::nyan_cursor::CatPose`]): a banking
+    /// The living-cartoon pose ([`crate::kitty_cursor::CatPose`]): a banking
     /// squash/stretch and forward lean applied to the dest rect, plus the baked
     /// eye frame. The cat bakes at its natural size (a stable, cache-cheap key per
     /// eye frame) and is scaled/leaned only at draw, so an animating pose never
     /// thrashes the atlas.
-    pub pose: crate::nyan_cursor::CatPose,
-    /// FULL-NYAN SING-ALONG drive 0..=1 (`crate::nyan_sing`): scales the
+    pub pose: crate::kitty_cursor::CatPose,
+    /// SING-ALONG drive 0..=1 (`crate::kitty_sing`): scales the
     /// music-note alpha so the wind-down crossfade eases the stream out.
     /// 0.0 (with an empty `notes` ring) is byte-identical to the pre-feature
     /// frame — no note work at all.
     pub sing: f32,
     /// This frame's resolved ♪/♫ sprites (cell-relative to the cat's mouth
-    /// anchor), ring-capped at [`crate::nyan_sing::MAX_NOTES`] by the field
+    /// anchor), ring-capped at [`crate::kitty_sing::MAX_NOTES`] by the field
     /// that produced them. Emitted immediately before the body, so notes are
     /// structurally cursor-cat-only and load-shed with the sparkle branch.
-    pub notes: [Option<crate::nyan_sing::NoteSprite>; crate::nyan_sing::MAX_NOTES],
+    pub notes: [Option<crate::kitty_sing::NoteSprite>; crate::kitty_sing::MAX_NOTES],
 }
 
 /// Geometry-only inputs for resolving the cursor companion before its local
 /// palette is sampled.
 #[derive(Clone, Copy, Debug)]
-pub struct NyanCursorLayout {
+pub struct KittyCursorLayout {
     pub geom: EffectGeom,
     pub cursor: (u16, u16),
     pub look: KittyLook,
@@ -1286,9 +1286,9 @@ impl DoneMarkLru {
 }
 
 /// Host-side sparkle-words state for one window.
-/// A user-supplied Nyan-cursor sprite: the decoded native RGBA plus a cache of
+/// A user-supplied kitty-cursor sprite: the decoded native RGBA plus a cache of
 /// the last nearest-resample to the current cursor target size.
-struct NyanCustom {
+struct KittyCustom {
     source_fp: u64,
     w: u16,
     h: u16,
@@ -1310,14 +1310,14 @@ struct NotePaintCache {
     rgba: Vec<u8>,
 }
 
-/// Immutable host-authored source for the Nyan cursor companion.
+/// Immutable host-authored source for the kitty cursor companion.
 ///
 /// `Disabled` is distinct from `BuiltIn` so an invalid configured custom asset
 /// fails closed instead of silently presenting different art.  Custom pixels
 /// stay shared with the host's admitted config catalog; only target-size
 /// resamples are private mutable cache entries.
 #[derive(Clone, Debug)]
-pub enum NyanSpriteSource {
+pub enum KittySpriteSource {
     BuiltIn,
     Disabled,
     Custom {
@@ -1721,15 +1721,15 @@ pub struct WordDecorations {
     /// A USER-supplied cursor sprite (via `cursor_nyan_sprite`), overriding the
     /// built-in CatBaker cat: the decoded native RGBA `(w, h, rgba)` plus a cache
     /// of the last nearest-resample to the current target size `(tw, th, rgba)`.
-    nyan_custom: Option<NyanCustom>,
+    kitty_custom: Option<KittyCustom>,
     /// Invalid authored sprite assets fail closed rather than falling back to
     /// built-in art while the UI reports a custom source.
-    nyan_disabled: bool,
+    kitty_disabled: bool,
     /// Bumped whenever the cursor sprite SOURCE changes (custom set/cleared), so
     /// the shared-atlas host key changes and the stale tile is re-baked.
-    nyan_gen: u64,
+    kitty_gen: u64,
     /// The sing-along's resident ♪/♫ note paints, one per
-    /// [`crate::nyan_sing::NoteKind`]. Re-painted only when the host id (kind +
+    /// [`crate::kitty_sing::NoteKind`]. Re-painted only when the host id (kind +
     /// cell-metric-derived size) changes.
     note_cache: [Option<NotePaintCache>; 2],
     /// The NUKE CLOUD's resident paints, one per [`crate::nuke::NukePart`].
@@ -1779,6 +1779,42 @@ pub struct WordDecorations {
     /// v3 §1.1 alignment scratch: the seed group's old episodes, pulled out of
     /// the persist map for rekeying (resident).
     align_old: Vec<(u64, Episode)>,
+    /// ONE CAT PER CARET, as a per-EPISODE claim: the occurrence ident the live
+    /// cursor companion is answering, latched while the caret still sits on
+    /// that word's span and released when the companion leaves glass.
+    ///
+    /// WHY a claim rather than a per-frame caret test: the companion OUTLIVES
+    /// the caret's visit. It holds for a fixed `DISCOVERY_HOLD` = 2.8 s
+    /// (`kitty_cursor.rs`), while a single keystroke moves the caret off the
+    /// word in milliseconds. A position-only veto therefore lifted mid-flight,
+    /// and the word's own peek clock — which runs off wall time, not off the
+    /// veto — popped its ambient cat out beside the companion still hanging
+    /// there. On a first discovery both bake the same `KittyLook`, so the pair
+    /// were literal twins: the "double cursor cat" bug.
+    ///
+    /// PANE-SCOPED (parked in [`ParkedPane`]): pane A's claim must never veto
+    /// pane B's word — the feline scanner runs in every pane.
+    companion_claim: Option<u64>,
+    /// The occurrence the CARET was last seen sitting on, recorded by the
+    /// rescan (which is the only pass that is handed the caret unconditionally).
+    ///
+    /// WHY it exists: [`Self::companion_claim`] can only be taken on a frame
+    /// where the companion is ALREADY on glass, and the companion is summoned
+    /// by the very tick that first sees the word — `on_collect` runs AFTER
+    /// `tick` returns (`app_render`'s Kitty Log drain), and the typed summon's
+    /// alpha is not resolved until the next redraw. So the first frame with a
+    /// live companion is the frame AFTER the one that earned it, and by then
+    /// one more keystroke (a space, the next word) has walked the caret past
+    /// `end_col + 1`. The claim window closed before it ever opened, and the
+    /// twin cat came back for exactly the case the claim was written for.
+    ///
+    /// Recorded on every rescan — i.e. on every echoed keystroke — and only
+    /// OVERWRITTEN by a fresh hit, so it survives the keystrokes that walk the
+    /// caret away. Consulted only as the claim's fallback, and only for an
+    /// ident still present in `occ`, so it can never silence a word that has
+    /// left the screen. Pane-scoped and reset-cleared for the same reasons the
+    /// claim is.
+    caret_word: Option<u64>,
     /// v3 §1.1 alignment scratch: the DP's traceback decisions, one byte per
     /// (old, candidate) cell — [`ALIGN_DECISION_CELLS`] = 66,177 of them.
     ///
@@ -1888,6 +1924,14 @@ struct ParkedPane {
     rescan_seq: u64,
     pending: Vec<PendingBirth>,
     align_old: Vec<(u64, Episode)>,
+    /// Parked because it is an OCCURRENCE ident: pane A's claim would name a
+    /// word pane B never scanned, so leaving it live would let one pane's
+    /// companion silence another pane's cat (see
+    /// [`WordDecorations::companion_claim`]).
+    companion_claim: Option<u64>,
+    /// Parked for the same reason as `companion_claim` — it is an OCCURRENCE
+    /// ident (see [`WordDecorations::caret_word`]).
+    caret_word: Option<u64>,
 }
 
 impl ParkedPane {
@@ -1930,6 +1974,8 @@ impl ParkedPane {
         std::mem::swap(&mut self.rescan_seq, &mut wd.rescan_seq);
         std::mem::swap(&mut self.pending, &mut wd.pending);
         std::mem::swap(&mut self.align_old, &mut wd.align_old);
+        std::mem::swap(&mut self.companion_claim, &mut wd.companion_claim);
+        std::mem::swap(&mut self.caret_word, &mut wd.caret_word);
     }
 }
 
@@ -2178,6 +2224,14 @@ impl WordDecorations {
         self.seed_ordinals.clear();
         self.pending.clear();
         self.align_old.clear();
+        // The claim names an ident from the occurrence set that just died. A
+        // rescan after a reset can mint that same ident for a DIFFERENT word
+        // (idents fold text + context, not identity), and a stale claim would
+        // then silence a cat nobody ever summoned a companion for. Its
+        // pre-companion memory carries exactly the same stale ident and so
+        // dies with it.
+        self.companion_claim = None;
+        self.caret_word = None;
         self.frozen_at = None;
         self.settle_until = None;
         // §5.5 invalidation: config reload / toggle drop the bake cache
@@ -2391,9 +2445,9 @@ impl WordDecorations {
     }
 
     /// Emit the rare cat flying IN FRONT of the cursor, pulling it forward while
-    /// the `nyan` ribbon streams behind as its rainbow wake. The
+    /// the `rainbow kitty` ribbon streams behind as its rainbow wake. The
     /// earn/fade/exit lifecycle lives host-side
-    /// ([`crate::nyan_cursor::CursorCat`]); this bakes the smooth CatBaker cat
+    /// ([`crate::kitty_cursor::CursorCat`]); this bakes the smooth CatBaker cat
     /// (happy, or a wink) — or a user sprite — into the SAME free atlas the cats
     /// share and stamps exactly one companion-body `OverText`/NEAREST
     /// [`FreeSprite`] just ahead of the cursor cell, vertically centred on its
@@ -2412,27 +2466,27 @@ impl WordDecorations {
     ///
     /// Call AFTER `tick`, appending into the same `free` buffer it filled.
     ///
-    /// HORIZONTAL ANCHOR ([`Self::NYAN_LEAD_NUM`]/[`Self::NYAN_LEAD_DEN`]):
+    /// HORIZONTAL ANCHOR ([`Self::KITTY_LEAD_NUM`]/[`Self::KITTY_LEAD_DEN`]):
     /// the companion leads the cursor by 3/4 of a cell, measured from the
     /// cursor cell's right edge: far enough that the sprite reads as ESCORTING
     /// the cursor rather than crowding the glyph being typed, while staying
     /// inside one cell of it so the pair still reads as a unit (and the
     /// flourish anchor at the cell boundary stays honest).
     #[must_use]
-    pub fn nyan_cursor_footprint(&self, layout: NyanCursorLayout) -> Option<CatFootprint> {
-        let NyanCursorLayout {
+    pub fn kitty_cursor_footprint(&self, layout: KittyCursorLayout) -> Option<CatFootprint> {
+        let KittyCursorLayout {
             geom,
             cursor: (crow, ccol),
             look,
             bob,
         } = layout;
-        if self.nyan_disabled || geom.cell_w == 0 || geom.cell_h == 0 {
+        if self.kitty_disabled || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
         let ch = usize::from(geom.cell_h);
         let slot_w = 4 * ch;
         let slot_h = 2 * ch;
-        let (w, h) = if let Some(cust) = self.nyan_custom.as_ref() {
+        let (w, h) = if let Some(cust) = self.kitty_custom.as_ref() {
             let (nw, nh) = (usize::from(cust.w).max(1), usize::from(cust.h).max(1));
             let max_h = (ch * 9 / 5).clamp(1, slot_h);
             let s = (slot_w as f32 / nw as f32).min(max_h as f32 / nh as f32);
@@ -2455,7 +2509,7 @@ impl WordDecorations {
         // until the wrap gives it room again.
         let grid_w = i32::from(geom.cols).saturating_mul(cw);
         let cursor_right = i32::from(ccol).saturating_add(1).saturating_mul(cw);
-        let lead = cw.saturating_mul(Self::NYAN_LEAD_NUM) / Self::NYAN_LEAD_DEN;
+        let lead = cw.saturating_mul(Self::KITTY_LEAD_NUM) / Self::KITTY_LEAD_DEN;
         let x = cursor_right
             .saturating_add(lead)
             .min(grid_w.saturating_sub(i32::from(w)));
@@ -2483,16 +2537,16 @@ impl WordDecorations {
 
     /// The companion's horizontal lead ahead of the cursor cell's right edge,
     /// as a fraction of a cell: `cell_w · NUM / DEN` = 3/4 cell. See
-    /// [`Self::nyan_cursor_footprint`] for the placement rationale.
-    const NYAN_LEAD_NUM: i32 = 3;
-    const NYAN_LEAD_DEN: i32 = 4;
+    /// [`Self::kitty_cursor_footprint`] for the placement rationale.
+    const KITTY_LEAD_NUM: i32 = 3;
+    const KITTY_LEAD_DEN: i32 = 4;
 
-    pub fn nyan_cursor(
+    pub fn kitty_cursor(
         &mut self,
-        frame: NyanCursorFrame,
+        frame: KittyCursorFrame,
         free: &mut Vec<FreeSprite>,
     ) -> Option<u64> {
-        let NyanCursorFrame {
+        let KittyCursorFrame {
             geom,
             cursor,
             look,
@@ -2506,7 +2560,7 @@ impl WordDecorations {
         if alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
-        let footprint = self.nyan_cursor_footprint(NyanCursorLayout {
+        let footprint = self.kitty_cursor_footprint(KittyCursorLayout {
             geom,
             cursor,
             look,
@@ -2523,10 +2577,10 @@ impl WordDecorations {
         // overrides the built-in cat, which is baked by the SMOOTH anti-aliased
         // CatBaker (same renderer as the peeking word-cats) with a HAPPY face —
         // or a WINK on the star-wink exit.
-        let (ax, ay, w, h) = if let Some(cust) = self.nyan_custom.as_mut() {
+        let (ax, ay, w, h) = if let Some(cust) = self.kitty_custom.as_mut() {
             let (nw, nh) = (usize::from(cust.w).max(1), usize::from(cust.h).max(1));
             if cust.cache.as_ref().map(|(cw, chh, _)| (*cw, *chh)) != Some((w, h)) {
-                let r = crate::nyan_cursor::resample_nearest(
+                let r = crate::kitty_cursor::resample_nearest(
                     &cust.rgba,
                     nw,
                     nh,
@@ -2535,7 +2589,7 @@ impl WordDecorations {
                 );
                 cust.cache = Some((w, h, r));
             }
-            let host = crate::nyan_cursor::HOST_ID ^ self.nyan_gen;
+            let host = crate::kitty_cursor::HOST_ID ^ self.kitty_gen;
             let Some(tile) =
                 self.cat_baker
                     .host_tile(host, w, h, &cust.cache.as_ref().expect("set above").2)
@@ -2615,33 +2669,33 @@ impl WordDecorations {
             sampler: FreeSampler::Nearest,
         };
 
-        // ── the sing-along's ♪/♫ music notes (`crate::nyan_sing`) ───────────
+        // ── the sing-along's ♪/♫ music notes (`crate::kitty_sing`) ──────────
         // Streaming from the singing cat's mouth (its leading edge), pushed
         // BEFORE the body so a freshly spawned note slides out from behind the
         // head. Notes are structurally cursor-cat-only (word-cats never reach
         // this function) and load-shed with the whole sparkle branch. The ring
-        // that produced `notes` caps them at `nyan_sing::MAX_NOTES`; the two
+        // that produced `notes` caps them at `kitty_sing::MAX_NOTES`; the two
         // WHITE-baked tiles are rainbow-tinted per sprite through the
         // `FreeSprite::tint` channel, so the whole shower is two atlas slots.
         // A note whose tile cannot bake within the shared two-bake budget is
         // dropped for one frame and lands on the next.
-        let mut note_sprites: [Option<FreeSprite>; crate::nyan_sing::MAX_NOTES] =
-            [None; crate::nyan_sing::MAX_NOTES];
+        let mut note_sprites: [Option<FreeSprite>; crate::kitty_sing::MAX_NOTES] =
+            [None; crate::kitty_sing::MAX_NOTES];
         if sing > 0.0 {
             let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
             let mouth_x = sprite.x + i32::from(sprite.w);
             let mouth_y = cy;
             for (slot, note) in note_sprites.iter_mut().zip(notes.iter().flatten()) {
                 let kind_idx = match note.kind {
-                    crate::nyan_sing::NoteKind::Eighth => 0usize,
-                    crate::nyan_sing::NoteKind::Beamed => 1,
+                    crate::kitty_sing::NoteKind::Eighth => 0usize,
+                    crate::kitty_sing::NoteKind::Beamed => 1,
                 };
-                let (nw, nh) = crate::nyan_sing::note_nat_size(note.kind, geom.cell_h);
-                let host = crate::nyan_sing::note_host_id(note.kind, nw, nh);
+                let (nw, nh) = crate::kitty_sing::note_nat_size(note.kind, geom.cell_h);
+                let host = crate::kitty_sing::note_host_id(note.kind, nw, nh);
                 if self.note_cache[kind_idx].as_ref().map(|c| c.host) != Some(host) {
                     self.note_cache[kind_idx] = Some(NotePaintCache {
                         host,
-                        rgba: crate::nyan_sing::bake_note(nw, nh, note.kind)
+                        rgba: crate::kitty_sing::bake_note(nw, nh, note.kind)
                             .pixels()
                             .to_vec(),
                     });
@@ -2710,19 +2764,19 @@ impl WordDecorations {
     /// no filesystem access or image decoding and never clones custom source
     /// bytes.  The stable source fingerprint keys the shared-atlas tile; a
     /// target metric change still rebuilds only the bounded resample cache.
-    pub fn set_nyan_sprite_source(&mut self, source: NyanSpriteSource) {
+    pub fn set_kitty_sprite_source(&mut self, source: KittySpriteSource) {
         match source {
-            NyanSpriteSource::BuiltIn => {
-                self.nyan_custom = None;
-                self.nyan_disabled = false;
-                self.nyan_gen = 0;
+            KittySpriteSource::BuiltIn => {
+                self.kitty_custom = None;
+                self.kitty_disabled = false;
+                self.kitty_gen = 0;
             }
-            NyanSpriteSource::Disabled => {
-                self.nyan_custom = None;
-                self.nyan_disabled = true;
-                self.nyan_gen = u64::MAX;
+            KittySpriteSource::Disabled => {
+                self.kitty_custom = None;
+                self.kitty_disabled = true;
+                self.kitty_gen = u64::MAX;
             }
-            NyanSpriteSource::Custom {
+            KittySpriteSource::Custom {
                 source_fp,
                 w,
                 h,
@@ -2735,20 +2789,20 @@ impl WordDecorations {
                         .and_then(|pixels| pixels.checked_mul(4))
                         == Some(rgba.len());
                 if !valid {
-                    self.nyan_custom = None;
-                    self.nyan_disabled = true;
-                    self.nyan_gen = u64::MAX;
+                    self.kitty_custom = None;
+                    self.kitty_disabled = true;
+                    self.kitty_gen = u64::MAX;
                     return;
                 }
-                self.nyan_custom = Some(NyanCustom {
+                self.kitty_custom = Some(KittyCustom {
                     source_fp,
                     w,
                     h,
                     rgba,
                     cache: None,
                 });
-                self.nyan_disabled = false;
-                self.nyan_gen = source_fp;
+                self.kitty_disabled = false;
+                self.kitty_gen = source_fp;
             }
         }
     }
@@ -2756,12 +2810,12 @@ impl WordDecorations {
     /// Diagnosable, allocation-free installed source identity for host
     /// conformance tests and capture/glass generation checks.
     #[doc(hidden)]
-    pub fn nyan_sprite_source_fingerprint(&self) -> Option<u64> {
-        if self.nyan_disabled {
+    pub fn kitty_sprite_source_fingerprint(&self) -> Option<u64> {
+        if self.kitty_disabled {
             None
         } else {
             Some(
-                self.nyan_custom
+                self.kitty_custom
                     .as_ref()
                     .map_or(0, |custom| custom.source_fp),
             )
@@ -2770,15 +2824,15 @@ impl WordDecorations {
 
     /// Borrow the exact immutable RGBA Arc supplied by the host.
     #[doc(hidden)]
-    pub fn nyan_sprite_rgba(&self) -> Option<&Arc<[u8]>> {
-        self.nyan_custom.as_ref().map(|custom| &custom.rgba)
+    pub fn kitty_sprite_rgba(&self) -> Option<&Arc<[u8]>> {
+        self.kitty_custom.as_ref().map(|custom| &custom.rgba)
     }
 
-    /// Whether a user-configured Nyan sprite currently overrides the built-in
+    /// Whether a user-configured kitty sprite currently overrides the built-in
     /// homage. Exposed for host conformance checks and diagnostics.
     #[must_use]
-    pub fn has_custom_nyan_sprite(&self) -> bool {
-        self.nyan_custom.is_some()
+    pub fn has_custom_kitty_sprite(&self) -> bool {
+        self.kitty_custom.is_some()
     }
 
     /// True if the grid changed since the last scan and a rescan is due.
@@ -2877,7 +2931,7 @@ impl WordDecorations {
             break;
         }
         self.scan_cells = row_cells;
-        self.rescan_end(out, cols, epoch, now, None);
+        self.rescan_end(out, cols, epoch, now, None, None);
     }
 
     /// [`rescan`](Self::rescan) over an already-extracted frame snapshot: the
@@ -3049,6 +3103,7 @@ impl WordDecorations {
                 geom,
                 feline_magic: cfg.feline_magic,
             }),
+            cursor,
         );
     }
 
@@ -3539,6 +3594,10 @@ impl WordDecorations {
         epoch: u64,
         now: Instant,
         cat_surface: Option<CatSurface<'_>>,
+        // The caret at rescan time, when the caller knows it. `None` from the
+        // cell-less `rescan` path, which has no cursor to offer — that path
+        // simply leaves the last observation standing.
+        cursor: Option<(u16, u16)>,
     ) {
         // v3 §1.1 fix #4 resize-settle: a cols change opens (or extends) the
         // settle window; births inside it are born-settled (no entrance, no
@@ -3625,6 +3684,23 @@ impl WordDecorations {
         }
 
         self.occ = out;
+        // ONE CAT PER CARET, the PRE-COMPANION half: remember the word the
+        // caret is sitting on NOW, while we still have the caret. `tick` only
+        // learns the caret once a companion is already on glass, which is one
+        // frame — and for a typist one keystroke — too late to see the word
+        // that summoned it (see [`Self::caret_word`]). A rescan runs on every
+        // echoed keystroke, so this is the last observation before the claim
+        // needs it. Only a HIT overwrites: the keystrokes that walk the caret
+        // off the word must not erase which word it just left.
+        if let Some(cell) = cursor
+            && let Some(ident) = self
+                .occ
+                .iter()
+                .find(|occ| caret_on_span(cell, occ.row, occ.start_col, occ.end_col))
+                .map(|occ| occ.ident)
+        {
+            self.caret_word = Some(ident);
+        }
         self.last_epoch = epoch;
         self.have_scanned = true;
         self.cols = cols as u16;
@@ -3941,12 +4017,13 @@ impl WordDecorations {
     ///
     /// `companion_at` is the cursor cell `(row, col)` in pre-splice grid coords
     /// WHEN the host is also drawing the cursor companion
-    /// ([`WordDecorations::nyan_cursor`]) into this same `free` stream this
+    /// ([`WordDecorations::kitty_cursor`]) into this same `free` stream this
     /// frame — `None` whenever no companion is on glass. It drives the
-    /// ONE-CAT-PER-CARET suppression (rationale at the gate in the graphic
-    /// arm below); callers read it under the Terminal lock they already hold
-    /// (`term.cursor()`, app_render) — no new lock is taken. `sel` is the
-    /// selection view read under the same
+    /// ONE-CAT-PER-CARET suppression — both the per-episode claim taken at the
+    /// top of this tick ([`WordDecorations::companion_claim`]) and the gate in
+    /// the graphic arm below; callers read it under the Terminal lock they
+    /// already hold (`term.cursor()`, app_render) — no new lock is taken.
+    /// `sel` is the selection view read under the same
     /// lock (§6.4: ignition defers while the word is selected; active nova
     /// quads attenuate over selected cells). `_focused` is accepted but
     /// currently unused — nothing in the tick reads it (native hosts demote
@@ -3997,6 +4074,46 @@ impl WordDecorations {
         // its own period + min-gap clocks so nearly every tick pays one compare.
         // Runs BEFORE the emission pass so a granted revisit draws this frame.
         self.roll_revisit(now, cfg);
+        // ONE CAT PER CARET, part 1 of 2: maintain the companion's CLAIM (see
+        // [`Self::companion_claim`]) before anything emits — and before the
+        // early returns below, so a companion that leaves glass over an empty
+        // or frozen grid still releases its claim. The claim is taken once per
+        // companion episode, while the caret is still on the word the companion
+        // answers, and released the moment the companion goes away — so a
+        // keystroke that walks the caret past the word cannot lift the veto
+        // while the companion is still flying. Bounded scan: `self.occ` is
+        // capped at MAX_OCCURRENCES and stops at the first hit.
+        match companion_at {
+            // No companion on glass: the episode is over, the claim releases.
+            None => self.companion_claim = None,
+            // Unclaimed companion: take the word under the caret if there is
+            // one. Retried each frame while it finds nothing, so a companion
+            // that appeared for some OTHER reason still claims the feline word
+            // the caret lands on next.
+            //
+            // THE ONE-FRAME LAG (see [`Self::caret_word`]): a companion earned
+            // by typing the word is NEVER on glass on the tick that scanned it
+            // — the host summons it after `tick` returns — so by the first
+            // frame this arm runs, one more keystroke has already carried the
+            // caret past `end_col + 1` and the live scan above finds nothing.
+            // Fall back to the word the caret was last seen on, which the
+            // rescan recorded while it still could. Guarded on the ident still
+            // being ON SCREEN so a remembered word that scrolled away cannot
+            // hold a veto over a set it no longer belongs to.
+            Some(cell) if self.companion_claim.is_none() => {
+                let live = self
+                    .occ
+                    .iter()
+                    .find(|occ| caret_on_span(cell, occ.row, occ.start_col, occ.end_col))
+                    .map(|occ| occ.ident);
+                self.companion_claim = live.or_else(|| {
+                    self.caret_word
+                        .filter(|id| self.occ.iter().any(|occ| occ.ident == *id))
+                });
+            }
+            // Claim held: it deliberately outlasts the caret's visit.
+            Some(_) => {}
+        }
         // v3 §1.1 fix #3: a frozen engine emits nothing and advances nothing
         // (defensive — hosts skip the tick while suspended; `thaw` restores).
         if self.frozen_at.is_some() {
@@ -4017,7 +4134,7 @@ impl WordDecorations {
         self.cat_baker.set_free_tiles(true);
         // Per-FRAME baker prologue: LRU clock + bake budget; a cell-metric
         // change wholesale-clears + version-bumps here (§5.5). Guarded like
-        // `nyan_cursor`'s, so a window compositing N panes runs it once and the
+        // `kitty_cursor`'s, so a window compositing N panes runs it once and the
         // panes share one two-bake budget (one window, one atlas, one cell
         // size). Unbracketed hosts clear the flag at tick start, which is the
         // historical one-prologue-per-tick behaviour verbatim.
@@ -4087,6 +4204,9 @@ impl WordDecorations {
         // (&mut baker) while the loop reads occurrences + the resident ink
         // capture buffers + the prepass's nova scratch.
         let frame = self.frame;
+        // Read out before the loop takes its field borrows (the graphic arm's
+        // one-cat-per-caret gate reads it per occurrence).
+        let claim = self.companion_claim;
         // §F4.2 pre-loop: the unlogged-episode scratch, from a shared
         // `&persist` borrow (the loop below holds `persist` immutably for
         // ink_fx, so the logged commit must wait for the post-loop pass).
@@ -4104,6 +4224,24 @@ impl WordDecorations {
             baker: &mut self.cat_baker,
             unlogged: &self.unlogged,
             sightings: &mut self.sightings,
+            // The companion's own footprint — see `CatTick::companion_px`.
+            companion_px: companion_at.map(|(row, col)| {
+                let cw = i32::from(geom.cell_w);
+                let ch = i32::from(geom.cell_h);
+                let x0 = i32::from(col) * cw;
+                let y0 = i32::from(row) * ch;
+                // Two cells wide from the caret column — the 3/4-cell lead plus
+                // the body — and exactly the caret's own row band.
+                //
+                // The band is deliberately NOT grown upward to the companion's
+                // full ~1.45-cell height. An ambient cat peeking UP from a word
+                // several rows below legitimately passes through the rows above
+                // the caret, and `a_feline_word_away_from_the_caret_still_peeks_
+                // beside_the_companion` pins that it must still draw. What must
+                // not happen is a cat landing ON the caret, and a cat that
+                // reaches the caret's own band is doing exactly that.
+                (x0, x0 + 2 * cw, y0, y0 + ch)
+            }),
         };
         let mut cats = 0usize;
 
@@ -4196,23 +4334,37 @@ impl WordDecorations {
                     if peek.peek_done {
                         break 'graphic; // Done: zero quads forever (duty pin)
                     }
-                    // ONE CAT PER CARET: the companion the host is drawing at
-                    // this cell IS this word's cat — typing `kitty` summons it
+                    // ONE CAT PER CARET, part 2 of 2: the companion the host is
+                    // drawing IS this word's cat — typing `kitty` summons it
                     // (`CursorCat::on_collect`) at the very caret the echoed
                     // word sits under, so without this the same keystroke put
-                    // two cats a couple of cells apart. Same span predicate as
-                    // the rescan's `at_live_cursor` (caret ON the token or in
-                    // the cell right after it). Suppression is per-occurrence
-                    // and graphic-only: every OTHER feline word on screen still
-                    // peeks, and this word's own ink/sparkle still plays.
+                    // two cats a couple of cells apart. Two ways to be that
+                    // word:
+                    //
+                    // - the CLAIM: this companion was summoned over this very
+                    //   occurrence. Held for the companion's whole life, so the
+                    //   next keystroke walking the caret one cell past the word
+                    //   cannot lift the veto while the companion still flies —
+                    //   that gap is the "double cursor cat" bug.
+                    // - the CARET still on the span (same predicate as the
+                    //   rescan's `at_live_cursor`: on the token or in the cell
+                    //   right after it). Kept as its own arm because a
+                    //   companion that appears while the caret is parked on a
+                    //   DIFFERENT feline word must veto that one too — one
+                    //   claim cannot cover every word the caret visits.
+                    //
+                    // Suppression is per-occurrence and graphic-only: every
+                    // OTHER feline word on screen still peeks, and this word's
+                    // own ink/sparkle still plays.
                     //
                     // Gated here rather than inside `cat_eligible` so the arm
                     // census and the Kitty Log stay untouched — `emit_cat` logs
                     // a sighting only for sprites that actually landed, and the
                     // typed word is already logged synthetically by the host.
-                    if companion_at.is_some_and(|cell| {
-                        caret_on_span(cell, occ.row, occ.start_col, occ.end_col)
-                    }) {
+                    if let Some(cell) = companion_at
+                        && (claim == Some(occ.ident)
+                            || caret_on_span(cell, occ.row, occ.start_col, occ.end_col))
+                    {
                         break 'graphic;
                     }
                     let eligible = cat_eligible(occ, cfg, geom);
@@ -6108,6 +6260,50 @@ struct CatTick<'a> {
     unlogged: &'a [u64],
     /// §F4.2: this tick's recorded sightings (resident, cap MAX_OCCURRENCES).
     sightings: &'a mut Vec<KittySighting>,
+    /// The pixels the live cursor companion occupies, if one is up.
+    ///
+    /// WHY A PIXEL BOX AND NOT A WORD TEST: the older veto asked "is the caret
+    /// ON this word", which is a question about the OCCURRENCE's position. The
+    /// collision it prevents happens in PIXELS, and an ambient cat does not
+    /// draw over its own word — it peeks two rows up, or down
+    /// (`cat_peek_down`). So a word on a completely different row can land its
+    /// head exactly on the companion, which is the "two overlapping kitties"
+    /// the owner reported: two DIFFERENT coats stacked at the caret, because
+    /// they are two different cats, not one drawn twice.
+    ///
+    /// Sized to the companion's REAL extent, not to whole cells: it flies
+    /// `KITTY_LEAD_NUM/DEN` of a cell ahead of the caret and stands ~1.45 cells
+    /// tall, so it reaches about two cells right of the caret column and about
+    /// half a cell above the caret row. A cell-granular box was tried first and
+    /// was too greedy — it swallowed the legitimate "peeks BESIDE the
+    /// companion" case that `a_feline_word_away_from_the_caret_still_peeks_
+    /// beside_the_companion` pins, where the away cat lands one row clear.
+    companion_px: Option<(i32, i32, i32, i32)>,
+}
+
+/// Is the cat rect `(x, w, top..bottom)` STACKED on the companion box `a` —
+/// covered enough to read as a second kitty in the same place, rather than one
+/// merely passing nearby? `bottom`/`y1` are exclusive, matching the
+/// `top..bottom` spans `emit_cat` computes.
+///
+/// Judged by intersected AREA as a fraction of the cat's own area, because
+/// mere touching is normal and common: an ambient cat peeking UP from a word
+/// several rows below sweeps through the caret's row on its way, grazing it by
+/// a few pixels. Measured, that near-miss is ~5% coverage, while the reported
+/// bug — two coats drawn on top of each other at the caret — is most of the
+/// sprite. A third is far above the former and far below the latter.
+fn cat_is_stacked_on(a: (i32, i32, i32, i32), x: i32, w: i32, top: i32, bottom: i32) -> bool {
+    let (x0, x1, y0, y1) = a;
+    let iw = (x + w).min(x1) - x.max(x0);
+    let ih = bottom.min(y1) - top.max(y0);
+    if iw <= 0 || ih <= 0 {
+        return false;
+    }
+    let cat_area = i64::from(w) * i64::from(bottom - top);
+    if cat_area <= 0 {
+        return false;
+    }
+    i64::from(iw) * i64::from(ih) * 3 >= cat_area
 }
 
 /// v3 §1.2: the episode-backed view of one feline occurrence's peek state,
@@ -6344,6 +6540,25 @@ fn emit_cat(
     // Atlas y shown at dest `top`: the art's top edge lives at tile row 0 in
     // the free-overlay EXACT-SIZE tile (integer-translated bake, NEAREST 1:1).
     let src_y0 = i32::from(tile.ay);
+    // YIELD TO THE COMPANION, IN PIXELS. An ambient cat does not draw over its
+    // own word — it peeks two rows up or down — so a word anywhere on screen
+    // can land its head exactly where the cursor companion is flying, and the
+    // owner sees two DIFFERENT coats stacked at the caret. The word-space veto
+    // in `tick` cannot see this: it only knows where the OCCURRENCE is, and by
+    // then the drawn position has moved rows. Decide it here, where the dest
+    // rect is final. Returning here is exactly equivalent to not pushing: the
+    // only work below is the Kitty Log sighting, and that is already gated on a
+    // body having landed (`free.len() > n_free`), so a yielded cat logs no
+    // sighting — which is the honest reading of a log whose entry means "this
+    // cat was SEEN". The episode and its one-shot live in the caller and are
+    // untouched. A cat that merely stands NEXT to the companion still draws;
+    // only a genuine overlap yields.
+    if ctx
+        .companion_px
+        .is_some_and(|box_px| cat_is_stacked_on(box_px, i32::from(g.x), i32::from(g.w), top, bottom))
+    {
+        return;
+    }
     let n_free = free.len();
     // Free overlay: ONE FreeSprite per cat — the whole dest rect `[top, bottom)`
     // in one arbitrary (row-free) rectangle; the dirty row-union and the
@@ -7306,6 +7521,40 @@ fn scale_u8(v: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The "two overlapping kitties" the owner photographed: a cat drawn on top
+    /// of the companion yields, one merely passing nearby does not.
+    ///
+    /// The near-miss numbers are MEASURED, not invented — they are the away cat
+    /// from `a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`
+    /// (x=8, y=76, w=33, h=28) against that test's caret box, where an ambient
+    /// cat peeking up from a word three rows below grazes the caret's row by 4
+    /// of its 28 pixels. Vetoing on ANY touch would silence it, which is why
+    /// the gate is a coverage fraction rather than a plain rect intersection.
+    #[test]
+    fn only_a_cat_stacked_on_the_companion_yields() {
+        // A caret box two cells wide by one cell tall at (row 3, col 0),
+        // cell 10x20 — the geometry the sibling companion tests use.
+        let companion = (0, 20, 60, 80);
+
+        // MEASURED near miss: 4px of a 28px-tall cat, ~5% of its area.
+        assert!(
+            !cat_is_stacked_on(companion, 8, 33, 76, 104),
+            "a cat peeking up from a word rows below only grazes the caret row"
+        );
+        // Squarely on the companion — the reported bug.
+        assert!(
+            cat_is_stacked_on(companion, 2, 20, 58, 82),
+            "a cat drawn over the companion must yield"
+        );
+        // Same row, one cell clear to the right: touching nothing.
+        assert!(
+            !cat_is_stacked_on(companion, 30, 20, 60, 80),
+            "a cat beside the companion keeps its peek"
+        );
+        // Degenerate rects can never be judged stacked (no divide by zero).
+        assert!(!cat_is_stacked_on(companion, 0, 0, 60, 60));
+    }
 
     // The ignored performance gates share the same test binary. `cargo test`
     // otherwise runs them concurrently, so one benchmark can steal CPU from
@@ -11581,14 +11830,16 @@ mod tests {
     /// while the echoed word is simultaneously matched by the ambient scanner,
     /// which peeks its OWN cat over that word — a couple of cells away, on the
     /// same rows, for an overlapping ~3 s. Neither feature knew the other
-    /// existed: [`WordDecorations::tick`] and [`WordDecorations::nyan_cursor`]
+    /// existed: [`WordDecorations::tick`] and [`WordDecorations::kitty_cursor`]
     /// simply append to the same `free` stream, and nothing in either reads the
     /// other's placement. On a first-ever discovery the companion even adopts
     /// the word-cat's own look, so the pair are literal twins.
     ///
-    /// The companion IS this word's cat, so the ambient peek yields to it. The
-    /// scope of that yielding is pinned by its sibling test
-    /// ([`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`]).
+    /// The companion IS this word's cat, so the ambient peek yields to it. Two
+    /// sibling tests pin the scope of that yielding: its WIDTH
+    /// ([`a_feline_word_away_from_the_caret_still_peeks_beside_the_companion`])
+    /// and its DURATION
+    /// ([`the_claimed_word_stays_quiet_while_the_companion_holds`]).
     #[test]
     fn a_word_under_the_companion_never_peeks_a_second_cat() {
         let lex = lex();
@@ -11637,17 +11888,17 @@ mod tests {
         let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
             let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
             if let Some(cell) = companion {
-                wd.nyan_cursor(
-                    NyanCursorFrame {
+                wd.kitty_cursor(
+                    KittyCursorFrame {
                         geom: g,
                         cursor: cell,
                         look: KittyLook::default(),
                         colors: CatColorKey::default(),
                         bob: 0.0,
                         alpha: 255,
-                        pose: crate::nyan_cursor::CatPose::STILL,
+                        pose: crate::kitty_cursor::CatPose::STILL,
                         sing: 0.0,
-                        notes: [None; crate::nyan_sing::MAX_NOTES],
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
                     },
                     &mut free,
                 );
@@ -11687,6 +11938,326 @@ mod tests {
         assert!(
             matches!(fixed[0].z, FreeZ::OverText),
             "the one cat at the caret is the companion itself"
+        );
+    }
+
+    /// THE DOUBLE CURSOR CAT — the regression pin for the claim.
+    ///
+    /// The companion OUTLIVES the caret's visit: it holds for a fixed
+    /// `DISCOVERY_HOLD` = 2.8 s, while the very next keystroke walks the caret
+    /// one cell past the word it was summoned over. A veto that only asked
+    /// "is the caret on this span RIGHT NOW" therefore lifted mid-flight, and
+    /// the word's own peek clock — running off wall time, unaware it had ever
+    /// been vetoed — popped its ambient cat out beside the companion still
+    /// hanging there. On a first discovery both bake the same `KittyLook`, so
+    /// the pair were literal twins.
+    ///
+    /// [`WordDecorations::companion_claim`] makes the yielding last exactly as
+    /// long as the companion does.
+    #[test]
+    fn the_claimed_word_stays_quiet_while_the_companion_holds() {
+        let lex = lex();
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
+        // `kitty` echoed at a prompt: row 3, cols 5..=9, caret parked one past
+        // its last — the shape a typed word has the instant it completes.
+        let mut term = Terminal::new(g.rows, g.cols);
+        term.process(b"\x1b[4;6Hkitty");
+        let on_span = (3u16, 10u16);
+        // One keystroke later: off the span by exactly one cell — the smallest
+        // move there is, and the one that used to lift the old per-frame veto.
+        let past_span = (3u16, 11u16);
+        assert!(
+            caret_on_span(on_span, 3, 5, 9) && !caret_on_span(past_span, 3, 5, 9),
+            "the caret starts on the word's span and ends one cell off it"
+        );
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let bg = snap
+            .cells
+            .iter()
+            .find_map(|line| line.first())
+            .map_or(0, |cell| rgb3_to_u32(cell.bg));
+        let scan = || {
+            let mut wd = WordDecorations::default();
+            wd.rescan_from_cells_with_geom_at_cursor(
+                &snap.cells,
+                &snap.line_sizes,
+                rows,
+                cols,
+                &lex,
+                &c,
+                1,
+                t0,
+                g,
+                bg,
+                Some(on_span),
+            );
+            let occ = feline(&wd);
+            assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
+            wd
+        };
+        // One host frame in `redraw_window` order: the engine tick, then the
+        // companion emission, sharing ONE free stream.
+        let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
+            let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
+            if let Some(cell) = companion {
+                wd.kitty_cursor(
+                    KittyCursorFrame {
+                        geom: g,
+                        cursor: cell,
+                        look: KittyLook::default(),
+                        colors: CatColorKey::default(),
+                        bob: 0.0,
+                        alpha: 255,
+                        pose: crate::kitty_cursor::CatPose::STILL,
+                        sing: 0.0,
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
+                    },
+                    &mut free,
+                );
+            }
+            free
+        };
+        let mut wd = scan();
+        let mut ctl = scan();
+        // The companion arrives while the caret is still on the word — these
+        // are the frames that must take the claim.
+        for k in 0..6u64 {
+            let now = t0 + Duration::from_millis(100 + 16 * k);
+            frame(&mut wd, now, Some(on_span));
+        }
+        // The keystroke lands: the caret has moved on, the companion has not.
+        // Settled over several frames so the assertion reads the EMISSION
+        // decision, never a transient two-tile bake budget.
+        let (mut held, mut control) = (Vec::new(), Vec::new());
+        for k in 0..6u64 {
+            let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
+            held = frame(&mut wd, now, Some(past_span));
+            control = frame(&mut ctl, now, None);
+        }
+        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
+            free.iter()
+                .filter(|s| matches!(s.z, FreeZ::UnderText))
+                .copied()
+                .collect()
+        };
+        // The control pins the clock: at these very instants the word's peek is
+        // still live, so the silence below is the claim doing the work and not
+        // the one-shot having quietly run out under us.
+        assert_eq!(
+            ambient(&control).len(),
+            1,
+            "the word is still mid-peek at the sample instants"
+        );
+        assert!(
+            ambient(&held).is_empty(),
+            "the companion still holds its claim — the word must not peek a twin"
+        );
+        assert_eq!(held.len(), 1, "exactly one cat on glass");
+        assert!(
+            matches!(held[0].z, FreeZ::OverText),
+            "and it is the companion, not a second ambient cat"
+        );
+    }
+
+    /// THE LAG — the half of the double cursor cat the claim alone could not
+    /// reach, and the shape the owner actually sees.
+    ///
+    /// The claim can only be taken on a tick where the companion is ALREADY on
+    /// glass. But the companion is summoned BY the tick that first scans the
+    /// word: the host drains the Kitty Log and calls `on_collect` after `tick`
+    /// returns, and the typed summon's alpha is not resolved until the next
+    /// redraw. So the earliest tick that can claim is the one AFTER the earn —
+    /// by which time the very next keystroke (the space, the next word) has
+    /// carried the caret past `end_col + 1`. Every frame of the companion's
+    /// 2.8 s life then reads "caret not on any word", the claim never latches,
+    /// and the word's own wall-clock peek pops its twin out.
+    ///
+    /// This test is the timeline with NO on-span companion frame at all: the
+    /// caret is already one cell past the word before the companion ever
+    /// exists. [`WordDecorations::caret_word`] — recorded by the rescan, which
+    /// is the last pass that still has the caret — is what closes it.
+    ///
+    /// Where the twins STACK rather than sit side by side: both placements
+    /// clamp to `grid_w - w` at the right margin
+    /// ([`WordDecorations::kitty_cursor_footprint`] and [`cat_geometry_for`]),
+    /// so a feline word typed near the end of a line puts the ambient cat and
+    /// the companion at the SAME x, one above the other — two copies of the
+    /// same kitty on top of each other.
+    #[test]
+    fn the_summoning_word_is_claimed_even_after_the_caret_moved_on() {
+        let lex = lex();
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
+        // `kitty` echoed at a prompt: row 3, cols 5..=9. The RESCAN sees the
+        // caret parked one past its last — the shape a typed word has the
+        // instant it completes, and the only observation that can name the
+        // summoning word.
+        let mut term = Terminal::new(g.rows, g.cols);
+        term.process(b"\x1b[4;6Hkitty");
+        let on_span = (3u16, 10u16);
+        // One keystroke later — and this is the FIRST caret any companion frame
+        // ever sees.
+        let past_span = (3u16, 11u16);
+        assert!(
+            caret_on_span(on_span, 3, 5, 9) && !caret_on_span(past_span, 3, 5, 9),
+            "the rescan caret is on the word's span and the companion's is not"
+        );
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let bg = snap
+            .cells
+            .iter()
+            .find_map(|line| line.first())
+            .map_or(0, |cell| rgb3_to_u32(cell.bg));
+        let scan = || {
+            let mut wd = WordDecorations::default();
+            wd.rescan_from_cells_with_geom_at_cursor(
+                &snap.cells,
+                &snap.line_sizes,
+                rows,
+                cols,
+                &lex,
+                &c,
+                1,
+                t0,
+                g,
+                bg,
+                Some(on_span),
+            );
+            let occ = feline(&wd);
+            assert_eq!((occ.row, occ.start_col, occ.end_col), (3, 5, 9));
+            wd
+        };
+        let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
+            let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
+            if let Some(cell) = companion {
+                wd.kitty_cursor(
+                    KittyCursorFrame {
+                        geom: g,
+                        cursor: cell,
+                        look: KittyLook::default(),
+                        colors: CatColorKey::default(),
+                        bob: 0.0,
+                        alpha: 255,
+                        pose: crate::kitty_cursor::CatPose::STILL,
+                        sing: 0.0,
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
+                    },
+                    &mut free,
+                );
+            }
+            free
+        };
+        let mut wd = scan();
+        let mut ctl = scan();
+        // No warm-up: the companion's FIRST frame already has the caret off the
+        // span, exactly as a typist produces it.
+        let (mut held, mut control) = (Vec::new(), Vec::new());
+        for k in 0..6u64 {
+            let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
+            held = frame(&mut wd, now, Some(past_span));
+            control = frame(&mut ctl, now, None);
+        }
+        let ambient = |free: &[FreeSprite]| -> Vec<FreeSprite> {
+            free.iter()
+                .filter(|s| matches!(s.z, FreeZ::UnderText))
+                .copied()
+                .collect()
+        };
+        // The control pins the clock: the word is genuinely still mid-peek at
+        // these instants, so silence below is the claim, not an expiry.
+        assert_eq!(
+            ambient(&control).len(),
+            1,
+            "the word is still mid-peek at the sample instants"
+        );
+        assert!(
+            ambient(&held).is_empty(),
+            "the caret left the span before the companion existed — the claim \
+             must still reach the word that summoned it"
+        );
+        assert_eq!(held.len(), 1, "exactly one cat on glass");
+    }
+
+    /// COUNT, not presence — the census every earlier companion test was
+    /// missing.
+    ///
+    /// The reported bug is TWO COMPANION BODIES STACKED AT ONE POSITION, and
+    /// nothing in this file could have caught it: the assertions are
+    /// non-emptiness (`!free.is_empty()`) and placement (`free[0]` lands where
+    /// the footprint says). A second identical body passes both — it hides
+    /// exactly underneath the first. So the invariant has to be a COUNT, taken
+    /// on EVERY frame of a run rather than on one sampled frame.
+    ///
+    /// The frame here is the shipping host order (`app_render::redraw_window`):
+    /// ONE `tick` into the shared free stream, then ONE `kitty_cursor` appending
+    /// to the SAME stream. `tick` is the only thing that CLEARS that stream, so
+    /// this also fences the structural hazard behind the report — a host that
+    /// emitted the companion twice for one frame, or emitted it onto a stream no
+    /// tick had cleared, accumulates bodies here and nowhere else.
+    ///
+    /// Ambient word-cats share the stream as `FreeZ::UnderText`; with no sing
+    /// drive and no supernova the companion is the stream's only `OverText`
+    /// emitter, so the z-slot IS the census key.
+    #[test]
+    fn every_host_frame_emits_exactly_one_companion_body() {
+        let (rows, cols) = (6usize, 20usize);
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        // Row 2, with clear rows above it so the ambient peek is eligible — the
+        // stream is meant to carry BOTH families here.
+        term.process(b"\r\n\r\nkitty on a wire");
+        let mut wd = scan_grid(&mut term, rows, cols, &c, g, t0);
+        // Row 4 is blank and off every occurrence's span, so the one-cat-per-
+        // caret veto never fires: the census has to come out at one body on its
+        // own, not because the ambient cat was suppressed.
+        let caret = (4u16, 2u16);
+        let mut bodies_seen = 0usize;
+        for k in 0..16u64 {
+            let now = t0 + Duration::from_millis(100 + 40 * k);
+            let (mut free, _, _) = tick_cat_at(&mut wd, now, &c, g, Some(caret), true);
+            wd.kitty_cursor(
+                KittyCursorFrame {
+                    geom: g,
+                    cursor: caret,
+                    look: KittyLook::default(),
+                    colors: CatColorKey::default(),
+                    bob: 0.0,
+                    alpha: 255,
+                    pose: crate::kitty_cursor::CatPose::STILL,
+                    sing: 0.0,
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                },
+                &mut free,
+            );
+            let bodies: Vec<FreeSprite> = free
+                .iter()
+                .filter(|s| matches!(s.z, FreeZ::OverText))
+                .copied()
+                .collect();
+            assert!(
+                bodies.len() <= 1,
+                "frame {k}: {} companion bodies at {:?} — the double cursor cat \
+                 is a COUNT failure, invisible to a placement assertion",
+                bodies.len(),
+                bodies.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>()
+            );
+            bodies_seen += bodies.len();
+        }
+        // Non-vacuity: the companion really does reach the shared stream (a
+        // frame or two may legitimately defer on the shared two-bake budget,
+        // so this is a floor, not an equality).
+        assert!(
+            bodies_seen > 0,
+            "the companion never reached the free stream — the census is vacuous"
         );
     }
 
@@ -11732,17 +12303,17 @@ mod tests {
         let frame = |wd: &mut WordDecorations, now: Instant, companion: Option<(u16, u16)>| {
             let (mut free, _, _) = tick_cat_at(wd, now, &c, g, companion, true);
             if let Some(cell) = companion {
-                wd.nyan_cursor(
-                    NyanCursorFrame {
+                wd.kitty_cursor(
+                    KittyCursorFrame {
                         geom: g,
                         cursor: cell,
                         look: KittyLook::default(),
                         colors: CatColorKey::default(),
                         bob: 0.0,
                         alpha: 255,
-                        pose: crate::nyan_cursor::CatPose::STILL,
+                        pose: crate::kitty_cursor::CatPose::STILL,
                         sing: 0.0,
-                        notes: [None; crate::nyan_sing::MAX_NOTES],
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
                     },
                     &mut free,
                 );
@@ -15741,17 +16312,17 @@ mod tests {
         );
     }
 
-    /// The Nyan cursor ([`WordDecorations::nyan_cursor`]) bakes the sprite into
+    /// The kitty cursor ([`WordDecorations::kitty_cursor`]) bakes the sprite into
     /// the shared free atlas and stamps the companion just AHEAD of the cursor
     /// cell, vertically centred on its row. Shipping emission is exactly the
     /// BODY sprite—no auxiliary decoration sprites. Deterministic + headless.
     #[test]
-    fn nyan_cursor_emits_only_its_body_in_front_of_the_cursor() {
+    fn kitty_emits_only_its_body_in_front_of_the_cursor() {
         let g = geom20(); // 10×20 cells, 6×20 grid.
         let mut wd = WordDecorations::default();
         let mut free = Vec::new();
         let footprint = wd
-            .nyan_cursor_footprint(NyanCursorLayout {
+            .kitty_cursor_footprint(KittyCursorLayout {
                 geom: g,
                 cursor: (3, 5),
                 look: KittyLook::default(),
@@ -15759,17 +16330,17 @@ mod tests {
             })
             .expect("visible footprint");
 
-        wd.nyan_cursor(
-            NyanCursorFrame {
+        wd.kitty_cursor(
+            KittyCursorFrame {
                 geom: g,
                 cursor: (3, 5),
                 look: KittyLook::default(),
                 colors: CatColorKey::default(),
                 bob: 0.0,
                 alpha: 200,
-                pose: crate::nyan_cursor::CatPose::STILL,
+                pose: crate::kitty_cursor::CatPose::STILL,
                 sing: 0.0,
-                notes: [None; crate::nyan_sing::MAX_NOTES],
+                notes: [None; crate::kitty_sing::MAX_NOTES],
             },
             &mut free,
         );
@@ -15815,17 +16386,17 @@ mod tests {
 
         // alpha 0 ⇒ nothing.
         let mut none = Vec::new();
-        wd.nyan_cursor(
-            NyanCursorFrame {
+        wd.kitty_cursor(
+            KittyCursorFrame {
                 geom: g,
                 cursor: (3, 5),
                 look: KittyLook::default(),
                 colors: CatColorKey::default(),
                 bob: 0.0,
                 alpha: 0,
-                pose: crate::nyan_cursor::CatPose::STILL,
+                pose: crate::kitty_cursor::CatPose::STILL,
                 sing: 0.0,
-                notes: [None; crate::nyan_sing::MAX_NOTES],
+                notes: [None; crate::kitty_sing::MAX_NOTES],
             },
             &mut none,
         );
@@ -15842,10 +16413,10 @@ mod tests {
     /// by one frame.)
     #[test]
     fn singing_notes_stream_ring_capped_tinted_and_drive_scaled() {
-        use crate::nyan_sing::{MAX_NOTES, NOTE_TINTS, NoteKind, NoteSprite};
+        use crate::kitty_sing::{MAX_NOTES, NOTE_TINTS, NoteKind, NoteSprite};
         let g = geom20();
         let mut wd = WordDecorations::default();
-        wd.set_nyan_sprite_source(NyanSpriteSource::Custom {
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
             source_fp: 1,
             w: 4,
             h: 4,
@@ -15861,19 +16432,19 @@ mod tests {
                 tint: NOTE_TINTS[i % NOTE_TINTS.len()],
             });
         }
-        let frame = |sing: f32, notes| NyanCursorFrame {
+        let frame = |sing: f32, notes| KittyCursorFrame {
             geom: g,
             cursor: (3, 2),
             look: KittyLook::default(),
             colors: CatColorKey::default(),
             bob: 0.0,
             alpha: 255,
-            pose: crate::nyan_cursor::CatPose::STILL,
+            pose: crate::kitty_cursor::CatPose::STILL,
             sing,
             notes,
         };
         let mut free = Vec::new();
-        wd.nyan_cursor(frame(1.0, notes), &mut free);
+        wd.kitty_cursor(frame(1.0, notes), &mut free);
         let body = *free.last().expect("the body emits last (topmost)");
         let emitted = &free[..free.len() - 1];
         assert_eq!(
@@ -15896,7 +16467,7 @@ mod tests {
 
         // Wind-down: the SAME notes at half drive emit at half alpha.
         let mut fading = Vec::new();
-        wd.nyan_cursor(frame(0.5, notes), &mut fading);
+        wd.kitty_cursor(frame(0.5, notes), &mut fading);
         let faded = &fading[..fading.len() - 1];
         assert_eq!(faded.len(), MAX_NOTES);
         assert!(
@@ -15906,7 +16477,7 @@ mod tests {
 
         // Zero drive (with a drained ring): byte-identical to a plain frame.
         let mut plain = Vec::new();
-        wd.nyan_cursor(frame(0.0, [None; MAX_NOTES]), &mut plain);
+        wd.kitty_cursor(frame(0.0, [None; MAX_NOTES]), &mut plain);
         assert_eq!(plain.len(), 1, "no note work at rest — just the body");
     }
 
@@ -15925,8 +16496,8 @@ mod tests {
         let mut wd = WordDecorations::default();
         let emit = |wd: &mut WordDecorations, age| {
             let mut sprites = Vec::new();
-            wd.nyan_cursor(
-                NyanCursorFrame {
+            wd.kitty_cursor(
+                KittyCursorFrame {
                     geom,
                     cursor: (3, 5),
                     look: KittyLook {
@@ -15936,9 +16507,9 @@ mod tests {
                     colors: CatColorKey::default(),
                     bob: 0.0,
                     alpha: 255,
-                    pose: crate::nyan_cursor::CatPose::STILL,
+                    pose: crate::kitty_cursor::CatPose::STILL,
                     sing: 0.0,
-                    notes: [None; crate::nyan_sing::MAX_NOTES],
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
                 },
                 &mut sprites,
             );
@@ -15957,11 +16528,11 @@ mod tests {
         );
     }
 
-    /// A user-supplied sprite ([`WordDecorations::set_nyan_sprite_source`]) overrides the
+    /// A user-supplied sprite ([`WordDecorations::set_kitty_sprite_source`]) overrides the
     /// built-in homage: it is nearest-resampled to fit the slot (aspect
     /// preserved) and flown; clearing it restores the homage. Headless.
     #[test]
-    fn nyan_cursor_flies_a_user_sprite_when_set() {
+    fn kitty_flies_a_user_sprite_when_set() {
         let g = geom20(); // ch = 20 ⇒ slot 80×40, height cap 1.8·ch = 36.
         let mut wd = WordDecorations::default();
         // A 4×2 opaque sprite (aspect 2:1). fit s = min(80/4, 36/2) = 18 ⇒ 72×36.
@@ -15970,28 +16541,28 @@ mod tests {
             native.extend_from_slice(&[255, 0, 0, 255]);
         }
         let native: Arc<[u8]> = Arc::from(native);
-        wd.set_nyan_sprite_source(NyanSpriteSource::Custom {
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
             source_fp: 7,
             w: 4,
             h: 2,
             rgba: Arc::clone(&native),
         });
         assert!(Arc::ptr_eq(
-            wd.nyan_sprite_rgba().expect("custom source"),
+            wd.kitty_sprite_rgba().expect("custom source"),
             &native
         ));
         let mut free = Vec::new();
-        wd.nyan_cursor(
-            NyanCursorFrame {
+        wd.kitty_cursor(
+            KittyCursorFrame {
                 geom: g,
                 cursor: (3, 5),
                 look: KittyLook::default(),
                 colors: CatColorKey::default(),
                 bob: 0.0,
                 alpha: 255,
-                pose: crate::nyan_cursor::CatPose::STILL,
+                pose: crate::kitty_cursor::CatPose::STILL,
                 sing: 0.0,
-                notes: [None; crate::nyan_sing::MAX_NOTES],
+                notes: [None; crate::kitty_sing::MAX_NOTES],
             },
             &mut free,
         );
@@ -16008,19 +16579,19 @@ mod tests {
         assert!(wd.free_atlas().is_some(), "baked into the shared atlas");
 
         // Clearing restores the one-body homage at its own, different size.
-        wd.set_nyan_sprite_source(NyanSpriteSource::BuiltIn);
+        wd.set_kitty_sprite_source(KittySpriteSource::BuiltIn);
         let mut homage = Vec::new();
-        wd.nyan_cursor(
-            NyanCursorFrame {
+        wd.kitty_cursor(
+            KittyCursorFrame {
                 geom: g,
                 cursor: (3, 5),
                 look: KittyLook::default(),
                 colors: CatColorKey::default(),
                 bob: 0.0,
                 alpha: 255,
-                pose: crate::nyan_cursor::CatPose::STILL,
+                pose: crate::kitty_cursor::CatPose::STILL,
                 sing: 0.0,
-                notes: [None; crate::nyan_sing::MAX_NOTES],
+                notes: [None; crate::kitty_sing::MAX_NOTES],
             },
             &mut homage,
         );
@@ -16038,21 +16609,21 @@ mod tests {
         let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
         let mut wd = WordDecorations::default();
         let mut free = Vec::new();
-        wd.nyan_cursor(
-            NyanCursorFrame {
+        wd.kitty_cursor(
+            KittyCursorFrame {
                 geom: g,
                 cursor: (3, g.cols - 1), // last column: the body clamps to the edge
                 look: KittyLook::default(),
                 colors: CatColorKey::default(),
                 bob: 0.0,
                 alpha: 255,
-                pose: crate::nyan_cursor::CatPose {
+                pose: crate::kitty_cursor::CatPose {
                     scale_x: 1.17,
                     lead: 0.22,
-                    ..crate::nyan_cursor::CatPose::STILL
+                    ..crate::kitty_cursor::CatPose::STILL
                 },
                 sing: 0.0,
-                notes: [None; crate::nyan_sing::MAX_NOTES],
+                notes: [None; crate::kitty_sing::MAX_NOTES],
             },
             &mut free,
         );
@@ -16067,15 +16638,15 @@ mod tests {
     }
 
     /// OFFSET CONSTANT PROOF: the horizontal anchor is exactly the cursor
-    /// cell's right edge plus [`WordDecorations::NYAN_LEAD_NUM`]/
-    /// [`WordDecorations::NYAN_LEAD_DEN`] = 3/4 of a cell. Pins the constants
+    /// cell's right edge plus [`WordDecorations::KITTY_LEAD_NUM`]/
+    /// [`WordDecorations::KITTY_LEAD_DEN`] = 3/4 of a cell. Pins the constants
     /// and the placement they produce together, so neither can drift alone.
     #[test]
     fn companion_leads_the_cursor_by_three_quarters_of_a_cell() {
         let g = geom20();
         let wd = WordDecorations::default();
         let fp = wd
-            .nyan_cursor_footprint(NyanCursorLayout {
+            .kitty_cursor_footprint(KittyCursorLayout {
                 geom: g,
                 cursor: (3, 5),
                 look: KittyLook::default(),
@@ -16085,8 +16656,8 @@ mod tests {
         let cursor_right = 6 * i32::from(g.cell_w);
         assert_eq!(
             (
-                WordDecorations::NYAN_LEAD_NUM,
-                WordDecorations::NYAN_LEAD_DEN
+                WordDecorations::KITTY_LEAD_NUM,
+                WordDecorations::KITTY_LEAD_DEN
             ),
             (3, 4),
             "the documented 3/4-cell lead is the constant actually flown"
@@ -16108,7 +16679,7 @@ mod tests {
         let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
         let wd = WordDecorations::default();
         let fp_at = |cursor: (u16, u16)| {
-            wd.nyan_cursor_footprint(NyanCursorLayout {
+            wd.kitty_cursor_footprint(KittyCursorLayout {
                 geom: g,
                 cursor,
                 look: KittyLook::default(),
@@ -16134,17 +16705,17 @@ mod tests {
         let mut wd = WordDecorations::default();
         let emit = |wd: &mut WordDecorations, cursor: (u16, u16)| {
             let mut free = Vec::new();
-            wd.nyan_cursor(
-                NyanCursorFrame {
+            wd.kitty_cursor(
+                KittyCursorFrame {
                     geom: g,
                     cursor,
                     look: KittyLook::default(),
                     colors: CatColorKey::default(),
                     bob: 0.0,
                     alpha: 255,
-                    pose: crate::nyan_cursor::CatPose::STILL,
+                    pose: crate::kitty_cursor::CatPose::STILL,
                     sing: 0.0,
-                    notes: [None; crate::nyan_sing::MAX_NOTES],
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
                 },
                 &mut free,
             );
@@ -16179,13 +16750,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_nyan_source_fails_closed_instead_of_using_builtin_art() {
+    fn invalid_kitty_source_fails_closed_instead_of_using_builtin_art() {
         let g = geom20();
         let mut wd = WordDecorations::default();
-        wd.set_nyan_sprite_source(NyanSpriteSource::Disabled);
-        assert_eq!(wd.nyan_sprite_source_fingerprint(), None);
+        wd.set_kitty_sprite_source(KittySpriteSource::Disabled);
+        assert_eq!(wd.kitty_sprite_source_fingerprint(), None);
         assert!(
-            wd.nyan_cursor_footprint(NyanCursorLayout {
+            wd.kitty_cursor_footprint(KittyCursorLayout {
                 geom: g,
                 cursor: (3, 5),
                 look: KittyLook::default(),
@@ -16195,17 +16766,17 @@ mod tests {
         );
         let mut free = Vec::new();
         assert!(
-            wd.nyan_cursor(
-                NyanCursorFrame {
+            wd.kitty_cursor(
+                KittyCursorFrame {
                     geom: g,
                     cursor: (3, 5),
                     look: KittyLook::default(),
                     colors: CatColorKey::default(),
                     bob: 0.0,
                     alpha: 255,
-                    pose: crate::nyan_cursor::CatPose::STILL,
+                    pose: crate::kitty_cursor::CatPose::STILL,
                     sing: 0.0,
-                    notes: [None; crate::nyan_sing::MAX_NOTES],
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
                 },
                 &mut free,
             )

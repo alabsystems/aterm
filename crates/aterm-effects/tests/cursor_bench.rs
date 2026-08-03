@@ -28,7 +28,7 @@ fn config(style: GlowStyle) -> GlowConfig {
         beam: false,
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: aterm_effects::cursor_glow::NYAN_WAKE_PERSIST,
+        wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
     }
 }
 
@@ -66,8 +66,8 @@ fn saturated(style: GlowStyle) -> (CursorGlow, Instant, (u16, u16)) {
     (glow, now, cursor)
 }
 
-/// Nyan's hostile pre-decay fixture: a same-instant ping-pong SWEEP across 160
-/// distinct columns. The two-cell alternation above no longer saturates nyan —
+/// the rainbow kitty's hostile pre-decay fixture: a same-instant ping-pong SWEEP across 160
+/// distinct columns. The two-cell alternation above no longer saturates rainbow kitty —
 /// its cell-ownership dedup collapses revisits into ONE live spark per cell
 /// (exactly the stacking the audit caught), so alternating two cells now
 /// measures ~2 sparks. Sweeping distinct cells fills the resident spark store
@@ -148,21 +148,21 @@ fn bench_cursor_water_worstcase() {
 
 #[test]
 #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
-fn bench_cursor_nyan_worstcase() {
-    benchmark_with(GlowStyle::Nyan, "nyan", saturated_sweep);
+fn bench_cursor_rainbow_worstcase() {
+    benchmark_with(GlowStyle::RainbowKitty, "nyan", saturated_sweep);
 }
 
 /// The HOT ribbon gate the frozen-clock fixture above cannot reach: `saturated`
 /// re-ticks one Instant, so `dt == 0` never runs the momentum integrator,
-/// `nyan_disp` stays 0, and only the cold 1-strip path is measured — while the
+/// `rainbow.disp` stays 0, and only the cold 1-strip path is measured — while the
 /// real worst case is the per-strip wave at RETINA cell metrics under sustained
 /// typing (the audited ~6× cost / quad-budget saturation). This fixture warms
 /// the clock 8 ms per keystroke and keeps typing THROUGH the measured window,
 /// pinning both the frame cost and the no-truncation budget headroom.
 #[test]
 #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
-fn bench_cursor_nyan_hot_ribbon_worstcase() {
-    let config = config(GlowStyle::Nyan);
+fn bench_cursor_rainbow_hot_ribbon_worstcase() {
+    let config = config(GlowStyle::RainbowKitty);
     // 2× retina cell metrics — the hot path's cost scales with device pixels.
     let geometry = Geom {
         cw: 18,
@@ -213,7 +213,7 @@ fn bench_cursor_nyan_hot_ribbon_worstcase() {
     let median = samples[ITERATIONS / 2];
     let p90 = samples[ITERATIONS * 9 / 10];
     println!(
-        "bench_cursor_nyan_hot_ribbon_worstcase: median {median:?} (p90 {p90:?}), \
+        "bench_cursor_rainbow_hot_ribbon_worstcase: median {median:?} (p90 {p90:?}), \
          max quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over)"
     );
     assert!(

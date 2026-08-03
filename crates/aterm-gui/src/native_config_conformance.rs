@@ -735,7 +735,7 @@ fn trail_pack_asset(name: &str) -> String {
         .into_owned()
 }
 
-fn trail_config(path: &str, id: &str, theme: &str, nyan_sprite: &str) -> String {
+fn trail_config(path: &str, id: &str, theme: &str, kitty_sprite: &str) -> String {
     let sparkle = if theme == "Dracula" {
         concat!(
             "[[sparkle_words.custom]]\n",
@@ -747,18 +747,18 @@ fn trail_config(path: &str, id: &str, theme: &str, nyan_sprite: &str) -> String 
     };
     format!(
         "theme = {theme:?}\ncursor_trail_style = {:?}\ncursor_trail_packs = [{:?}]\n\
-         cursor_nyan_sprite = {nyan_sprite:?}\n{sparkle}",
+         cursor_nyan_sprite = {kitty_sprite:?}\n{sparkle}",
         format!("pack:{id}"),
         path,
     )
 }
 
-struct NyanFixtures {
+struct KittyFixtures {
     root: std::path::PathBuf,
     sources: [String; 3],
 }
 
-impl NyanFixtures {
+impl KittyFixtures {
     fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -787,7 +787,7 @@ impl NyanFixtures {
     }
 }
 
-impl Drop for NyanFixtures {
+impl Drop for KittyFixtures {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
@@ -801,16 +801,16 @@ fn snapshot_catalog_is_generation_consistent(snapshot: &ConfigSnapshot) -> bool 
         config.cursor_trail_style_raw(),
         &snapshot.assets.trail_packs,
     );
-    let nyan_consistent = match &snapshot.assets.nyan_sprite {
-        crate::app_config::NyanSpriteAsset::Ready { source_id, .. } => config
+    let kitty_consistent = match &snapshot.assets.kitty_sprite {
+        crate::app_config::KittySpriteAsset::Ready { source_id, .. } => config
             .cursor_nyan_sprite
             .as_deref()
             .is_some_and(|source| source.trim() == source_id.as_ref()),
-        crate::app_config::NyanSpriteAsset::BuiltIn => config
+        crate::app_config::KittySpriteAsset::BuiltIn => config
             .cursor_nyan_sprite
             .as_deref()
             .is_none_or(|source| source.trim().is_empty()),
-        crate::app_config::NyanSpriteAsset::Invalid { .. } => false,
+        crate::app_config::KittySpriteAsset::Invalid { .. } => false,
     };
     let sparkle_consistent = snapshot
         .assets
@@ -823,7 +823,7 @@ fn snapshot_catalog_is_generation_consistent(snapshot: &ConfigSnapshot) -> bool 
                     .prepare_sparkle_runtime()
                     .consumer_capabilities()
         });
-    nyan_consistent
+    kitty_consistent
         && resolved.issue.is_none()
         && sparkle_consistent
         && resolved.pack.is_some_and(|pack| {
@@ -871,10 +871,10 @@ fn config_catalog_projection(
             std::sync::Arc::ptr_eq(&candidate.trail_packs, &snapshot.assets.trail_packs)
         })
         .map_or(-1, |index| index as i64);
-    let nyan_generation = catalogs
+    let kitty_generation = catalogs
         .iter()
         .rposition(|candidate| {
-            candidate.nyan_sprite.fingerprint() == snapshot.assets.nyan_sprite.fingerprint()
+            candidate.kitty_sprite.fingerprint() == snapshot.assets.kitty_sprite.fingerprint()
         })
         .map_or(-1, |index| index as i64);
     let theme_generation = catalogs
@@ -902,7 +902,7 @@ fn config_catalog_projection(
     state.insert("revision", relative(snapshot.revision, baseline_revision));
     state.insert("text_generation", text_generation);
     state.insert("trail_generation", trail_generation);
-    state.insert("nyan_generation", nyan_generation);
+    state.insert("kitty_generation", kitty_generation);
     state.insert("theme_generation", theme_generation);
     state.insert("sparkle_generation", sparkle_generation);
     state.insert(
@@ -927,7 +927,7 @@ fn config_catalog_projection(
 /// Tier-1 binding for the revisioned snapshot/catalog protocol. This drives the
 /// genuine config reducer, Settings runtime, live host/window installer, and
 /// capture preparation seam. Every consumer receives the exact same outer Arc;
-/// independent stale-Trail and stale-Nyan negative controls prove the path-asset
+/// independent stale-Trail and stale-rainbow kitty negative controls prove the path-asset
 /// aggregate is not vacuous. Theme-directory staleness has its own parsed-catalog
 /// Tier-1 test below because config edits deliberately retain that independent
 /// immutable catalog.
@@ -942,7 +942,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
 
     let synthwave = trail_pack_asset("synthwave.toml");
     let emberfall = trail_pack_asset("emberfall.toml");
-    let sprites = NyanFixtures::new();
+    let sprites = KittyFixtures::new();
     let model = aterm_spec::derive::config_catalog_snapshot_model();
     let initial_text = trail_config(&synthwave, "synthwave", "Default", &sprites.sources[0]);
     let mut service = VersionedConfigService::new(initial_text).expect("valid initial config");
@@ -955,7 +955,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     );
     initial.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
         trail_packs: Arc::clone(&initial.assets.trail_packs),
-        nyan_sprite: initial.assets.nyan_sprite.clone(),
+        kitty_sprite: initial.assets.kitty_sprite.clone(),
         themes: Arc::clone(&initial.assets.themes),
         sparkle_spec_consumers: Some(Arc::clone(&initial_consumers)),
     });
@@ -983,7 +983,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     };
     patched.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
         trail_packs: Arc::clone(&patched.assets.trail_packs),
-        nyan_sprite: patched.assets.nyan_sprite.clone(),
+        kitty_sprite: patched.assets.kitty_sprite.clone(),
         themes: Arc::clone(&patched.assets.themes),
         sparkle_spec_consumers: Some(Arc::clone(&initial_consumers)),
     });
@@ -1014,8 +1014,8 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         "a config patch retains the independently watched immutable theme catalog"
     );
     assert_eq!(
-        initial.assets.nyan_sprite.fingerprint(),
-        patched.assets.nyan_sprite.fingerprint()
+        initial.assets.kitty_sprite.fingerprint(),
+        patched.assets.kitty_sprite.fingerprint()
     );
 
     let patched_state = config_catalog_projection(
@@ -1043,7 +1043,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     );
     external.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
         trail_packs: Arc::clone(&external.assets.trail_packs),
-        nyan_sprite: external.assets.nyan_sprite.clone(),
+        kitty_sprite: external.assets.kitty_sprite.clone(),
         themes: Arc::clone(&external.assets.themes),
         sparkle_spec_consumers: Some(Arc::clone(&external_consumers)),
     });
@@ -1159,23 +1159,23 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
             .as_ref()
             .expect("external exact sparkle projection")
     ));
-    let crate::app_config::NyanSpriteAsset::Ready { rgba, fp, .. } = &external.assets.nyan_sprite
+    let crate::app_config::KittySpriteAsset::Ready { rgba, fp, .. } = &external.assets.kitty_sprite
     else {
         panic!("external custom Nyan asset must be Ready");
     };
     let window = app.windows.get(&wid).expect("headless window");
     assert_eq!(
-        window.installed_nyan_asset_fp,
-        external.assets.nyan_sprite.fingerprint()
+        window.installed_kitty_asset_fp,
+        external.assets.kitty_sprite.fingerprint()
     );
     assert_eq!(
-        window.word_decos.nyan_sprite_source_fingerprint(),
+        window.word_decos.kitty_sprite_source_fingerprint(),
         Some(*fp)
     );
     assert!(Arc::ptr_eq(
         window
             .word_decos
-            .nyan_sprite_rgba()
+            .kitty_sprite_rgba()
             .expect("installed RGBA"),
         rgba
     ));
@@ -1200,7 +1200,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         window.installed_config_assets = None;
         window
             .word_decos
-            .set_nyan_sprite_source(aterm_effects::word_decorations::NyanSpriteSource::BuiltIn);
+            .set_kitty_sprite_source(aterm_effects::word_decorations::KittySpriteSource::BuiltIn);
     }
     app.splice_word_decorations(wid, std::time::Instant::now());
     let capture_assets = app
@@ -1224,7 +1224,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert!(Arc::ptr_eq(
         app.windows[&wid]
             .word_decos
-            .nyan_sprite_rgba()
+            .kitty_sprite_rgba()
             .expect("capture RGBA"),
         rgba
     ));
@@ -1242,7 +1242,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     );
     assert_transition(&model, &after_live, &after_capture, "PublishCapture");
 
-    // Independent negative control 1: external text/Nyan paired with the stale
+    // Independent negative control 1: external text/rainbow kitty paired with the stale
     // initial Trail generation must be rejected.
     let stale_trail = ConfigSnapshot {
         revision: external.revision,
@@ -1252,7 +1252,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         semantic_values: Arc::clone(&external.semantic_values),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&initial.assets.trail_packs),
-            nyan_sprite: external.assets.nyan_sprite.clone(),
+            kitty_sprite: external.assets.kitty_sprite.clone(),
             themes: Arc::clone(&external.assets.themes),
             sparkle_spec_consumers: external.assets.sparkle_spec_consumers.clone(),
         }),
@@ -1266,15 +1266,15 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         CatalogConsumers::default(),
     );
     assert_eq!(stale_trail_state["trail_generation"], 1);
-    assert_eq!(stale_trail_state["nyan_generation"], 2);
+    assert_eq!(stale_trail_state["kitty_generation"], 2);
     assert_eq!(stale_trail_state["theme_generation"], 2);
     assert_eq!(stale_trail_state["sparkle_generation"], 2);
     assert_eq!(admits(&model, &patched_state, &stale_trail_state), None);
     assert!(!model.check_invariant("SnapshotAtomic", &stale_trail_state));
 
     // Independent negative control 2: external text/Trail paired with the stale
-    // initial Nyan generation must also be rejected.
-    let stale_nyan = ConfigSnapshot {
+    // initial rainbow kitty generation must also be rejected.
+    let stale_kitty = ConfigSnapshot {
         revision: external.revision,
         analysis_generation: external.analysis_generation,
         text: Arc::clone(&external.text),
@@ -1282,25 +1282,25 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         semantic_values: Arc::clone(&external.semantic_values),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&external.assets.trail_packs),
-            nyan_sprite: initial.assets.nyan_sprite.clone(),
+            kitty_sprite: initial.assets.kitty_sprite.clone(),
             themes: Arc::clone(&external.assets.themes),
             sparkle_spec_consumers: external.assets.sparkle_spec_consumers.clone(),
         }),
     };
-    assert!(!snapshot_catalog_is_generation_consistent(&stale_nyan));
-    let stale_nyan_state = config_catalog_projection(
+    assert!(!snapshot_catalog_is_generation_consistent(&stale_kitty));
+    let stale_kitty_state = config_catalog_projection(
         &model,
-        &stale_nyan,
+        &stale_kitty,
         initial.revision,
         &catalogs,
         CatalogConsumers::default(),
     );
-    assert_eq!(stale_nyan_state["trail_generation"], 2);
-    assert_eq!(stale_nyan_state["nyan_generation"], 1);
-    assert_eq!(stale_nyan_state["theme_generation"], 2);
-    assert_eq!(stale_nyan_state["sparkle_generation"], 2);
-    assert_eq!(admits(&model, &patched_state, &stale_nyan_state), None);
-    assert!(!model.check_invariant("SnapshotAtomic", &stale_nyan_state));
+    assert_eq!(stale_kitty_state["trail_generation"], 2);
+    assert_eq!(stale_kitty_state["kitty_generation"], 1);
+    assert_eq!(stale_kitty_state["theme_generation"], 2);
+    assert_eq!(stale_kitty_state["sparkle_generation"], 2);
+    assert_eq!(admits(&model, &patched_state, &stale_kitty_state), None);
+    assert!(!model.check_invariant("SnapshotAtomic", &stale_kitty_state));
 
     // Independent negative control 3: every visual asset from the external
     // generation paired with the stale initial custom-spec projection must be
@@ -1313,7 +1313,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         semantic_values: Arc::clone(&external.semantic_values),
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&external.assets.trail_packs),
-            nyan_sprite: external.assets.nyan_sprite.clone(),
+            kitty_sprite: external.assets.kitty_sprite.clone(),
             themes: Arc::clone(&external.assets.themes),
             sparkle_spec_consumers: initial.assets.sparkle_spec_consumers.clone(),
         }),
@@ -1327,7 +1327,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         CatalogConsumers::default(),
     );
     assert_eq!(stale_sparkle_state["trail_generation"], 2);
-    assert_eq!(stale_sparkle_state["nyan_generation"], 2);
+    assert_eq!(stale_sparkle_state["kitty_generation"], 2);
     assert_eq!(stale_sparkle_state["theme_generation"], 2);
     assert_eq!(stale_sparkle_state["sparkle_generation"], 1);
     assert_eq!(admits(&model, &patched_state, &stale_sparkle_state), None);
@@ -1377,7 +1377,7 @@ fn byte_equal_external_refresh_conforms_to_atomic_catalog_model() {
         "revision",
         "text_generation",
         "trail_generation",
-        "nyan_generation",
+        "kitty_generation",
         "theme_generation",
         "sparkle_generation",
     ] {
@@ -1416,8 +1416,8 @@ fn parsed_theme_catalog_refresh_conforms_to_atomic_catalog_model() {
         &initial.assets.trail_packs
     ));
     assert_eq!(
-        refreshed.assets.nyan_sprite.fingerprint(),
-        initial.assets.nyan_sprite.fingerprint()
+        refreshed.assets.kitty_sprite.fingerprint(),
+        initial.assets.kitty_sprite.fingerprint()
     );
     assert_eq!(refreshed.assets.themes.resolve("Work"), Ok(scheme));
 
@@ -1427,7 +1427,7 @@ fn parsed_theme_catalog_refresh_conforms_to_atomic_catalog_model() {
         "revision",
         "text_generation",
         "trail_generation",
-        "nyan_generation",
+        "kitty_generation",
         "theme_generation",
         "sparkle_generation",
     ] {

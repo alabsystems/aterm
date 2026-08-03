@@ -119,7 +119,7 @@ mod relaunch_notice;
 // `trail_config`), driven from the render tick alongside the aurora.
 use aterm_effects::{
     cursor_beam, cursor_comet, cursor_droplet, cursor_fireball, cursor_glow, cursor_phaser,
-    cursor_rainbow, cursor_trail, matrix_rain, nyan_cursor, word_decorations,
+    cursor_rainbow, cursor_trail, kitty_cursor, matrix_rain, word_decorations,
 };
 mod app_control;
 mod app_documents;
@@ -5377,7 +5377,7 @@ struct WindowState {
     /// LUMEN cursor-aurora animation state (additive light comet/bloom/ring/sparks).
     /// Empty/idle when no recent move, so it costs nothing on a steady screen.
     cursor_glow: crate::cursor_glow::CursorGlow,
-    /// Typing-reactive RAINBOW-CURSOR state (the `nyan` block-cursor glow): a hue that
+    /// Typing-reactive RAINBOW-CURSOR state (the `rainbow kitty` block-cursor glow): a hue that
     /// spins + saturates with typing momentum and cools to a dim ember. Settles to
     /// inactive so a still cursor rides the blink cadence at no extra idle cost — and
     /// on a BLINKING block each blink flip fires one bounded star-twinkle flare (the
@@ -5473,25 +5473,25 @@ struct WindowState {
     /// a fade/exit state machine. It is EARNED — appears only after sustained fast
     /// forward typing AND a rarity roll, then fades out completely (sometimes with
     /// a star wink or heart meow). Stamped on the input thread, ticked each frame.
-    cursor_cat: crate::nyan_cursor::CursorCat,
+    cursor_cat: crate::kitty_cursor::CursorCat,
     /// TYPED-"kitty" summon detector (see [`crate::kitty_summon`]): a bounded
     /// rolling window of this window's recent printed keystrokes (keyed to the
     /// session they were typed into) plus the per-window summon cooldown. Fed
     /// only on the committed key-press path — it never sees screen content, so
     /// `cat`ing a file full of "kitty" cannot summon the cameo.
     kitty_summon: crate::kitty_summon::TypedKittySummon,
-    /// FULL-NYAN SING-ALONG detector (`aterm_effects::nyan_sing`): the
+    /// SING-ALONG detector (`aterm_effects::kitty_sing`): the
     /// held-key repeat run, fed on the SAME committed key-press path as
     /// `kitty_summon` (typed provenance only — PTY output and pastes can
-    /// never arm the celebration). Style gating (the Nyan trail) is applied
+    /// never arm the celebration). Style gating (the rainbow kitty trail) is applied
     /// where the drive is CONSUMED (`redraw_native_window`), not at the
     /// feed: the detector is O(1) scalar state, and feeding it always keeps
     /// arming correct across a mid-hold style switch.
-    nyan_sing: aterm_effects::nyan_sing::NyanSing,
+    kitty_sing: aterm_effects::kitty_sing::KittySing,
     /// The celebration's ♪/♫ music-note ring (bounded at
-    /// `nyan_sing::MAX_NOTES`): spawned on the shared beat clock while
+    /// `kitty_sing::MAX_NOTES`): spawned on the shared beat clock while
     /// armed, drained through its own lifetimes on wind-down.
-    music_notes: aterm_effects::nyan_sing::MusicNotes,
+    music_notes: aterm_effects::kitty_sing::MusicNotes,
     /// Last riff bar index pushed to the synth — the once-per-bar latch for
     /// `SoundGesture::Celebration(RiffBar)` (cleared when the drive rests).
     sing_riff_bar: Option<u64>,
@@ -5513,12 +5513,12 @@ struct WindowState {
     /// still drain to idle while its OSC phase remains Executing.
     rain_shell_executing: Option<(u64, bool)>,
     /// Exact admitted config-asset generation installed into `word_decos`.
-    /// Pointer identity is the generation fence; the catalog owns decoded Nyan
+    /// Pointer identity is the generation fence; the catalog owns decoded rainbow kitty
     /// bytes, so present/capture never read a path or decode an image.
     installed_config_assets: Option<std::sync::Arc<app_config::ConfigAssetCatalog>>,
     /// Stable variant+payload identity paired with `installed_config_assets`.
     /// Exposed to diagnostics/conformance without retaining a path string.
-    installed_nyan_asset_fp: u64,
+    installed_kitty_asset_fp: u64,
     /// Reusable scratch for this frame's motion-trail cells, copied into
     /// `input_scratch.cursor_trail` before the present (resident → no per-frame
     /// alloc while the comet is streaming).
@@ -5533,7 +5533,7 @@ struct WindowState {
     /// alloc): the rows flanking the probed cursor row, captured under the
     /// SAME term lock as `poof_row_buf` and fed to
     /// `CursorGlow::observe_neighbor_rows` right after its `observe_row`. The
-    /// displaced nyan ribbon stars paint in the ADJACENT rows' pixel bands,
+    /// displaced rainbow ribbon stars paint in the ADJACENT rows' pixel bands,
     /// so their TEXT-FIRST gate needs those rows' occupancy — the spark's own
     /// cell (the poof probe) says nothing about them. A grid-edge neighbor is
     /// simply not captured; the seam encodes it as provably glyph-free.
@@ -6377,7 +6377,7 @@ impl WindowState {
         self.cursor_phaser = crate::cursor_phaser::CursorPhaser::default();
         self.cursor_trail.reset();
         self.typing_cadence = crate::cursor_trail::TypingCadence::default();
-        self.cursor_cat = crate::nyan_cursor::CursorCat::default();
+        self.cursor_cat = crate::kitty_cursor::CursorCat::default();
         self.kitty_summon = crate::kitty_summon::TypedKittySummon::default();
         self.word_decos.hard_reset();
         self.matrix_rain = None;
@@ -6732,14 +6732,14 @@ impl WindowState {
             cursor_fireball: crate::cursor_fireball::CursorFireball::default(),
             cursor_comet: crate::cursor_comet::CursorComet::default(),
             cursor_phaser: crate::cursor_phaser::CursorPhaser::default(),
-            cursor_cat: crate::nyan_cursor::CursorCat::default(),
+            cursor_cat: crate::kitty_cursor::CursorCat::default(),
             kitty_summon: crate::kitty_summon::TypedKittySummon::default(),
-            nyan_sing: aterm_effects::nyan_sing::NyanSing::default(),
-            music_notes: aterm_effects::nyan_sing::MusicNotes::default(),
+            kitty_sing: aterm_effects::kitty_sing::KittySing::default(),
+            music_notes: aterm_effects::kitty_sing::MusicNotes::default(),
             sing_riff_bar: None,
             tone_tracker: crate::tone_infer::ToneTracker::default(),
             installed_config_assets: None,
-            installed_nyan_asset_fp: 0,
+            installed_kitty_asset_fp: 0,
             rain_last_cmd: None,
             rain_shell_executing: None,
             cursor_trail: crate::cursor_trail::CursorTrail::default(),
@@ -7844,7 +7844,7 @@ struct App {
     /// `cursor_trail_style = "pack:<id>"` against `config_assets.trail_packs`,
     /// off the frame path). The live renderer, capture, every window, and
     /// Settings views clone this same outer Arc; Trail manifests and custom
-    /// Nyan pixels cannot publish on different generations.
+    /// Rainbow kitty pixels cannot publish on different generations.
     config_assets: std::sync::Arc<app_config::ConfigAssetCatalog>,
     /// Per-keystroke config caches: `predictive_echo` and `cursor_trail_style` are
     /// parsed on the HOT typing path (once each per non-release key), yet only
@@ -7853,9 +7853,9 @@ struct App {
     /// instead of re-scanning the config strings every keystroke. `None` ⇒ not yet
     /// resolved this config generation.
     predict_mode_cache: Option<crate::predict::PredictMode>,
-    /// Whether the resolved `cursor_trail_style` is `Nyan` (the only style that arms
+    /// Whether the resolved `cursor_trail_style` is `rainbow kitty` (the only style that arms
     /// the cursor-cat momentum) — the cached twin of [`Self::predict_mode_cache`].
-    nyan_style_cache: Option<bool>,
+    kitty_cursor_enabled_cache: Option<bool>,
     /// App-cached resolved matrix-rain PARAMETERS, rebuilt only when
     /// `rain_dirty` is set (config reload / appearance flip / toggle) — the
     /// per-frame path never re-resolves. `None` only before the first
@@ -9765,7 +9765,7 @@ impl App {
             path_feed_fps,
             config_assets,
             predict_mode_cache: None,
-            nyan_style_cache: None,
+            kitty_cursor_enabled_cache: None,
             rain: None,
             rain_dirty: true,
             // In-memory only: tests must never read/write the user's real ledger.
@@ -11877,7 +11877,7 @@ impl ApplicationHandler<Wake> for App {
         // Cursor companions follow the same focused-window motion policy as
         // the render path. Reduced mode does not join the 60 fps effect pump;
         // a collection hello contributes one static erase deadline below.
-        // SPARKLE MASTER OFF ⇒ the cat sprite can never be drawn (`nyan_enabled`
+        // SPARKLE MASTER OFF ⇒ the cat sprite can never be drawn (`kitty_enabled`
         // folds the same gate, and the emitter lives inside the sparkle branch)
         // — an earned-but-invisible flight must not arm real ~60fps presents
         // (the audit's invisible-cat wake train). The static erase deadline
@@ -14625,7 +14625,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // mutations above (`remove_var`, `seamless::take_incoming`) still holds: NO
     // process-env mutation past this line, and no thread spawns before it.
     // Capture user config ONCE. The service validates the text and resolves the
-    // bounded theme/Nyan portion; the parallel config-runtime worker below
+    // bounded theme/rainbow kitty portion; the parallel config-runtime worker below
     // admits Trail/Sparkle feeds as one exact generation before publication.
     // Startup derives App.config from this same text snapshot, so a concurrent
     // config-file edit cannot pair config A with assets for config B.
@@ -15622,7 +15622,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         path_feed_fps,
         config_assets,
         predict_mode_cache: None,
-        nyan_style_cache: None,
+        kitty_cursor_enabled_cache: None,
         rain: None,
         rain_dirty: true,
         // One fail-open startup read of `kitty-log.toml` (a config_path sibling);

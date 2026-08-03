@@ -42,6 +42,18 @@ pub struct Manifest {
     pub sha256: String,
     /// The DMG asset's file name within the release, e.g. `"aterm-0.2.0.dmg"`.
     pub dmg: String,
+    /// The updater container's file name, e.g. `"aterm-0.2.0-mac.zip"` — the same
+    /// signed bundle as the DMG, packed with `ditto` instead of `hdiutil`. PREFERRED
+    /// for staging when present (see [`crate::install::stage_from_zip`]): after a
+    /// seamless overlap update the surviving process is an orphan whose launchd job
+    /// exited, and `hdiutil attach` fails ENXIO there because DiskImages needs a live
+    /// bootstrap context. Absent ⇒ None (a manifest cut before zip staging), and the
+    /// client falls back to the DMG.
+    pub zip: Option<String>,
+    /// SHA-256 (lowercase hex) of the zip asset. Absent ⇒ None. A zip without a
+    /// digest is never staged from — there would be nothing to check the bytes
+    /// against — so the client falls back to the DMG.
+    pub zip_sha256: Option<String>,
     /// Optional operator **apply floor**: clients refuse to stage/apply ANY build
     /// whose `build_number` is below this, even a genuine signed one. Lets the owner
     /// retire a bad-but-genuine release after the fact — a "yank" a silent updater can
@@ -70,6 +82,8 @@ impl Manifest {
             commit: m.commit,
             sha256: m.sha256,
             dmg: m.dmg,
+            zip: m.zip,
+            zip_sha256: m.zip_sha256,
             min_build: m.min_build,
             changelog: m.changelog,
         })
@@ -726,6 +740,39 @@ mod tests {
         assert_eq!(m.version, "0.2.0");
         assert_eq!(m.build_number, 1234);
         assert_eq!(m.dmg, "aterm-0.2.0.dmg");
+    }
+
+    /// The zip container is optional in BOTH directions. A manifest that carries
+    /// one must surface it (that is what lets the client stage without `hdiutil`),
+    /// and every already-published manifest — which has no such keys — must keep
+    /// parsing exactly as before, or shipping zip staging would strand the fleet
+    /// on the release that introduced it.
+    #[test]
+    fn zip_container_is_parsed_when_present_and_optional_when_not() {
+        let with_zip = Manifest::parse(
+            r#"schema = 1
+               version = "0.10.0"
+               build_number = 1234
+               sha256 = "abc123"
+               dmg = "aterm-0.10.0.dmg"
+               zip = "aterm-0.10.0-mac.zip"
+               zip_sha256 = "def456""#,
+        )
+        .unwrap();
+        assert_eq!(with_zip.zip.as_deref(), Some("aterm-0.10.0-mac.zip"));
+        assert_eq!(with_zip.zip_sha256.as_deref(), Some("def456"));
+
+        let without_zip = Manifest::parse(
+            r#"schema = 1
+               version = "0.10.0"
+               build_number = 1234
+               sha256 = "abc123"
+               dmg = "aterm-0.10.0.dmg""#,
+        )
+        .unwrap();
+        assert_eq!(without_zip.zip, None);
+        assert_eq!(without_zip.zip_sha256, None);
+        assert_eq!(without_zip.dmg, "aterm-0.10.0.dmg");
     }
 
     /// Lock the published wire shape (the historical gen-appcast.sh output, which

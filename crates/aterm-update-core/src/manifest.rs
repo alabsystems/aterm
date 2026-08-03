@@ -90,6 +90,28 @@ pub struct Manifest {
     /// emitting it so that script stays byte-compatible. Absent ⇒ None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The ZIP asset's file name within the same release, e.g.
+    /// `"aterm-0.10.0-mac.zip"` — a `ditto -c -k --sequesterRsrc --keepParent`
+    /// archive of the very same signed `aterm.app` the DMG carries. Absent ⇒ None
+    /// (a manifest cut before zip staging existed); such a release still updates
+    /// through the DMG.
+    ///
+    /// WHY A SECOND CONTAINER FOR THE SAME BUNDLE: `hdiutil attach` needs a live
+    /// bootstrap context — DiskImages registers with the `com.apple.hdiejectd` XPC
+    /// service — and the survivor of a seamless overlap update is a fork-child
+    /// whose launchd job has exited, i.e. an orphan holding a bootstrap context
+    /// for a dead job. Every attach from there fails ENXIO ("Device not
+    /// configured"), so the whole fleet stops updating one handoff after it starts
+    /// using handoffs. `ditto -x -k` speaks to no XPC service and therefore works
+    /// from ANY process context. The DMG stays the human download; the zip is what
+    /// the in-app updater stages from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zip: Option<String>,
+    /// SHA-256 (lowercase hex) of [`Self::zip`]'s bytes. Absent ⇒ None. A zip name
+    /// without a digest is never staged from: there would be nothing to check the
+    /// downloaded bytes against, so the client falls back to the DMG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zip_sha256: Option<String>,
     /// Minimum macOS version the bundle declares (`LSMinimumSystemVersion`),
     /// e.g. `"11.0"`. Display/tooling only. Absent ⇒ None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,6 +250,10 @@ mod tests {
                 "https://github.com/alabsystems/aterm/releases/download/v0.26/aterm-0.26.dmg"
                     .into(),
             ),
+            zip: Some("aterm-0.26-mac.zip".into()),
+            zip_sha256: Some(
+                "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+            ),
             min_os: Some("11.0".into()),
             team_id: Some(String::new()),
             pub_date: Some("2026-07-06T21:29:44Z".into()),
@@ -256,6 +282,11 @@ mod tests {
         );
         assert_eq!(m.commit, None);
         assert_eq!(m.url, None);
+        assert_eq!(
+            (m.zip.as_deref(), m.zip_sha256.as_deref()),
+            (None, None),
+            "a manifest cut before zip staging must still parse, with no zip"
+        );
         assert_eq!(m.min_os, None);
         assert_eq!(m.team_id, None);
         assert_eq!(m.pub_date, None);
@@ -312,6 +343,8 @@ mod tests {
             dmg: "a.dmg".into(),
             sha256: "x".into(),
             url: None,
+            zip: None,
+            zip_sha256: None,
             min_os: None,
             team_id: None,
             pub_date: None,
@@ -323,6 +356,8 @@ mod tests {
             "min_build",
             "commit",
             "url",
+            "zip",
+            "zip_sha256",
             "min_os",
             "team_id",
             "pub_date",
@@ -348,6 +383,33 @@ mod tests {
             Manifest::parse(&text).unwrap().min_build,
             Some(1_783_354_740)
         );
+    }
+
+    /// The zip container is OPTIONAL on the wire in both directions: a manifest
+    /// that carries one must round-trip it, and one that does not must still be a
+    /// perfectly valid manifest (that is what keeps every already-published
+    /// release installable after zip staging shipped).
+    #[test]
+    fn zip_container_round_trips_and_stays_optional() {
+        let m = full();
+        let text = m.to_toml().unwrap();
+        assert!(
+            text.contains("zip = \"aterm-0.26-mac.zip\"") && text.contains("zip_sha256 = "),
+            "the zip name/digest pair must be emitted next to the DMG's, got:\n{text}"
+        );
+        let back = Manifest::parse(&text).unwrap();
+        assert_eq!(back.zip, m.zip);
+        assert_eq!(back.zip_sha256, m.zip_sha256);
+
+        // The same manifest without the pair is valid, and its DMG is untouched.
+        let mut dmg_only = full();
+        dmg_only.zip = None;
+        dmg_only.zip_sha256 = None;
+        let text = dmg_only.to_toml().unwrap();
+        assert!(!text.contains("zip"), "got:\n{text}");
+        let back = Manifest::parse(&text).unwrap();
+        assert_eq!(back, dmg_only);
+        assert_eq!(back.dmg, "aterm-0.26.dmg");
     }
 
     /// A floor above the manifest's own build is not merely unusable: clients

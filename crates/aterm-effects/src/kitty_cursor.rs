@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The rare cat that flies in FRONT of the cursor on a rainbow (the
-//! [`crate::cursor_glow`] `nyan` ribbon is the wake). The cat itself is baked by
+//! [`crate::cursor_glow`] `rainbow kitty` ribbon is the wake). The cat itself is baked by
 //! the smooth anti-aliased [`crate::cat_baker::CatBaker`] (the same renderer as
 //! the peeking word-cats) with a HAPPY face — or replaced by a user PNG
 //! (`cursor_nyan_sprite`), resampled here via [`resample_nearest`].
@@ -31,7 +31,7 @@ use crate::cursor_glow::Geom;
 use crate::kitty_registry::KittyLook;
 use crate::typing_momentum::TypingMomentum;
 
-/// Stable atlas key for a USER Nyan sprite tile — the host bakes it into the
+/// Stable atlas key for a USER kitty sprite tile — the host bakes it into the
 /// shared free atlas via `CatBaker::host_tile`.
 pub const HOST_ID: u64 = 0x6E79_616E;
 
@@ -214,7 +214,7 @@ const LAND_AMP: f32 = 0.26;
 const LAND_FREQ: f32 = 1.35;
 const LAND_DECAY: f32 = 3.0;
 
-/// SING-ALONG dance depths at full drive (`crate::nyan_sing`): the ON-BEAT
+/// SING-ALONG dance depths at full drive (`crate::kitty_sing`): the ON-BEAT
 /// squash pulse (each beat lands as a bounce that relaxes across the beat)
 /// and the two-beat side-to-side lean sway. Both scale with the drive, so
 /// the wind-down crossfade eases the whole dance out — never a hard cut.
@@ -312,7 +312,7 @@ pub struct CatFrame {
     /// Current bounded reaction.
     pub reaction: CatReaction,
     /// True during the guaranteed discovery hold. The host may show this even
-    /// when the selected cursor trail is not `nyan`.
+    /// when the selected cursor trail is not `rainbow kitty`.
     pub discovery: bool,
     /// True for the complete collection hello, including its bounded fade.
     /// This is distinct from `discovery`: only the hold is forced, but the
@@ -324,7 +324,7 @@ pub struct CatFrame {
     /// The living-cartoon pose for this present: squash/stretch, forward lean,
     /// and the baked eye frame. [`CatPose::STILL`] when hidden or reduced-motion.
     pub pose: CatPose,
-    /// FULL-NYAN SING-ALONG drive 0..=1 (`crate::nyan_sing`): 1.0 while the
+    /// SING-ALONG drive 0..=1 (`crate::kitty_sing`): 1.0 while the
     /// held-key celebration is armed, easing through its ~1 s wind-down
     /// crossfade, exactly 0.0 otherwise. Non-zero swaps the face to the
     /// singing head ([`CatFrame::render_look`]) and carries the beat-synced
@@ -511,8 +511,8 @@ pub struct CursorCat {
     delight_last: Option<Instant>,
     /// Burst-scaled hop strength, bounded at [`MAX_DELIGHT_CHAIN`].
     delight_chain: u8,
-    /// FULL-NYAN SING-ALONG drive 0..=1, synced by the host each frame
-    /// ([`Self::set_singing`]) from the `nyan_sing` detector: 1.0 armed,
+    /// SING-ALONG drive 0..=1, synced by the host each frame
+    /// ([`Self::set_singing`]) from the `kitty_sing` detector: 1.0 armed,
     /// crossfading through wind-down, 0.0 idle.
     sing: f32,
     /// The shared dance-beat phase in beats (fractional), from the same
@@ -532,7 +532,7 @@ impl Default for CursorCat {
             exit: CatExit::Plain,
             flight: None,
             // Toastbyte is designed for the cursor's 16–32 px band and pairs
-            // with the Nyan trail; the first collectible replaces it.
+            // with the rainbow kitty trail; the first collectible replaces it.
             look: KittyLook {
                 variant: CatGlyphId::SpecStretch,
                 ..KittyLook::default()
@@ -773,7 +773,7 @@ impl CursorCat {
         }
     }
 
-    /// Host sync for the FULL-NYAN SING-ALONG (`crate::nyan_sing`): once per
+    /// Host sync for the SING-ALONG (`crate::kitty_sing`): once per
     /// frame, BEFORE [`Self::frame`]/[`Self::static_frame`], with the
     /// detector's current drive and the shared dance-beat phase.
     ///
@@ -1172,7 +1172,7 @@ impl CursorCat {
             // A small forward lean into the hop — eagerness, not banking.
             lead += 0.05 * stretch;
         }
-        // SING-ALONG DANCE overlay (`crate::nyan_sing`): a beat-synced loop
+        // SING-ALONG DANCE overlay (`crate::kitty_sing`): a beat-synced loop
         // over the banking spine — each beat lands as a squash bounce that
         // relaxes across the beat, and the body sways side to side once per
         // two beats. Everything scales with the drive, so the wind-down
@@ -3281,7 +3281,7 @@ mod tests {
         armed_at
     }
 
-    /// FULL-NYAN SING-ALONG: an armed celebration pins the canonical metric
+    /// SING-ALONG: an armed celebration pins the canonical metric
     /// to 1.0 (the documented momentum bypass — an armed hold IS maximal flow
     /// by definition), bypasses dwell only AFTER sixteen qualifying events,
     /// wears the authored open-mouth meow head as its singing face, and DANCES

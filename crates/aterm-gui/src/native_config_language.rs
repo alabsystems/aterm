@@ -1481,7 +1481,7 @@ pub(crate) fn analyze_host_with_assets(
     let Ok(config) = toml::from_str::<crate::app_config::Config>(source) else {
         return Vec::new();
     };
-    // Draft-authored Trail/Nyan paths must be validated against the draft, while
+    // Draft-authored Trail/rainbow kitty paths must be validated against the draft, while
     // custom themes stay pinned to the exact parsed catalog admitted by the live
     // service. This runs only on the host worker (or explicit CLI/test wrapper).
     let draft_assets =

@@ -120,9 +120,9 @@ pub enum SoundKind {
     /// delays rate-limit it. The first note has `delay = 0`, so it speaks in
     /// the first post-cue synth buffer.
     Sweep { dir: i8 },
-    /// The cursor LANDED — the aural twin of the Nyan fast-jump STARBURST
+    /// The cursor LANDED — the aural twin of the rainbow kitty fast-jump STARBURST
     /// (`cursor_glow`'s `Starburst`, cued at the same edge under the same
-    /// `NYAN_BURST_MIN_DIST` gate, so stars and chime can never diverge). A
+    /// `RAINBOW_BURST_MIN_DIST` gate, so stars and chime can never diverge). A
     /// bright IN-KEY star chime over a soft arrival body: the biggest thing
     /// the trail vocabulary says, because it accompanies the biggest thing the
     /// trail DRAWS.
@@ -149,8 +149,8 @@ pub enum WordGesture {
     Bonk,
 }
 
-/// The FULL-NYAN celebration gesture vocabulary (the held-key sing-along —
-/// `crate::nyan_sing`).
+/// The SING-ALONG celebration gesture vocabulary (the held-key sing-along —
+/// `crate::kitty_sing`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CelebrationGesture {
     /// One BAR of the sing-along riff. The host pushes exactly one per
@@ -165,8 +165,8 @@ pub enum CelebrationGesture {
     /// internal timing is SAMPLES-based and deterministic; the visual dance
     /// clock shares the same tempo anchored at the same arm instant
     /// ([`CELEBRATION_BAR_SECONDS`] is pinned equal to
-    /// `nyan_sing::SING_BAR_SECONDS`), with the documented ± ~60 ms host
-    /// buffer/scheduling tolerance (`nyan_sing` module doc).
+    /// `kitty_sing::SING_BAR_SECONDS`), with the documented ± ~60 ms host
+    /// buffer/scheduling tolerance (`kitty_sing` module doc).
     /// The payload is `u16`, not `u8`, for the ESCALATION: a `u8` wraps every
     /// 256 bars (409.6 s of held key) and would restart the build ramp. `u16`
     /// wraps at 65 536 bars (~29 h) and, because `CELEBRATION_PHRASE_BARS` is a
@@ -186,7 +186,7 @@ pub enum SoundGesture {
     Trail(SoundKind),
     /// Sparkle-words gestures.
     Words(WordGesture),
-    /// FULL-NYAN sing-along gestures (`crate::nyan_sing`'s celebration).
+    /// SING-ALONG sing-along gestures (`crate::kitty_sing`'s celebration).
     Celebration(CelebrationGesture),
 }
 
@@ -476,7 +476,7 @@ const LAND_ANCHOR_HZ: f32 = 784.0;
 /// one — not from its gain. Raised to the ceiling the chime measures
 /// -12.8 dBFS, LOUDER than the bonk it is meant to sit under; 0.865 lands it on
 /// tier 4 at -16.0 dBFS, 2 dB under the bonk. Its margin over a keystroke
-/// varies by palette (+5.9 dB against Laser, +10.9 against Nyan) because Land
+/// varies by palette (+5.9 dB against Laser, +10.9 against rainbow kitty) because Land
 /// is style-agnostic while the keystroke is not.
 const LAND_KIND_GAIN: f32 = 0.865;
 /// Star tones per landing, [`LAND_STAR_DEGREE_STEP`] scale-degrees apart and
@@ -495,7 +495,7 @@ const BONK_DUCK_DEPTH: f32 = 0.55;
 const BONK_DUCK_TAU: f32 = 0.28;
 
 /// One celebration riff bar in seconds — 4 beats at the sing-along's
-/// 150 BPM. Pinned equal to the VISUAL clock's `nyan_sing::SING_BAR_SECONDS`
+/// 150 BPM. Pinned equal to the VISUAL clock's `kitty_sing::SING_BAR_SECONDS`
 /// by `celebration_bar_matches_the_visual_clock`, so the host can schedule
 /// one [`CelebrationGesture::RiffBar`] per visual bar and the two clocks
 /// share one tempo (sync tolerance documented on the gesture).
@@ -601,7 +601,7 @@ const CELEBRATION_BUILD_BARS: f32 = 6.0;
 /// costs no extra voice.
 const CELEBRATION_CLAP_BAR: u16 = 8;
 
-/// Riff register root — C5, the Nyan palette's own chip register.
+/// Riff register root — C5, the rainbow kitty palette's own chip register.
 const CELEBRATION_BASE_HZ: f32 = 523.25;
 
 /// TIER 5 — the sing-along riff's place on the loudness ladder. The riff is the
@@ -898,7 +898,7 @@ const BREATH_SWELL_MAX: f32 = 0.2;
 const BREATH_DEGREES: [i32; 4] = [0, 2, 4, 5];
 
 /// C3 wash voicing: HIGH lattice degrees on the palette anchor itself —
-/// degree 10 is 4× the anchor (≈2.1 kHz on the nyan chip register), 15 is
+/// degree 10 is 4× the anchor (≈2.1 kHz on the rainbow kitty chip register), 15 is
 /// 8×. Nothing lower exists in this candidate; "no low fundamental" is the
 /// voicing, not a filter.
 const SHIMMER_DEGREES: [i32; 4] = [10, 12, 14, 15];
@@ -1032,7 +1032,7 @@ fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
         SoundVoice::Style => match style {
             GlowStyle::Lumen | GlowStyle::Custom => 0.95,
             GlowStyle::Phaser => 0.94,
-            GlowStyle::Nyan => 1.39,
+            GlowStyle::RainbowKitty => 1.39,
             GlowStyle::Sparkle => 1.27,
             GlowStyle::Fire => 0.88,
             GlowStyle::Laser => 0.77,
@@ -1544,7 +1544,7 @@ impl TrailSynth {
         }
     }
 
-    /// The cursor-LANDING star chime — the aural twin of the Nyan fast-jump
+    /// The cursor-LANDING star chime — the aural twin of the rainbow kitty fast-jump
     /// STARBURST. Three IN-KEY star tones stepping [`LAND_STAR_DEGREE_STEP`]
     /// scale-degrees apart in [`LAND_ANCHOR_HZ`]'s bright register, scattered
     /// alternately either side of the landing column and pre-delayed
@@ -1702,7 +1702,7 @@ impl TrailSynth {
         self.duck = 1.0;
     }
 
-    /// One BAR of the FULL-NYAN sing-along riff — one bar of the eight-bar
+    /// One BAR of the SING-ALONG sing-along riff — one bar of the eight-bar
     /// [`CELEBRATION_PHRASE`] form (see that constant's "not the Nyan Cat
     /// melody" note). Up to eight SWUNG eighth-note pulse-wave voices scheduled
     /// as pre-delayed spawns (the engine's arpeggio idiom — samples-based, no
@@ -2313,7 +2313,7 @@ fn palette_for(voice: SoundVoice, style: GlowStyle) -> &'static dyn Palette {
         SoundVoice::Style => match style {
             GlowStyle::Lumen | GlowStyle::Custom => &LumenPalette,
             GlowStyle::Phaser => &PhaserPalette,
-            GlowStyle::Nyan => &NyanPalette,
+            GlowStyle::RainbowKitty => &RainbowKittyPalette,
             GlowStyle::Sparkle => &SparklePalette,
             GlowStyle::Fire => &FirePalette,
             GlowStyle::Laser => &LaserPalette,
@@ -2586,13 +2586,13 @@ impl Palette for PhaserPalette {
     }
 }
 
-/// NYAN — the chiptune ribbon: quantized pulse-wave blips walking the
+/// RAINBOW KITTY — the chiptune ribbon: quantized pulse-wave blips walking the
 /// pentatonic, straight off a 8-bit sound chip but tiny and lowpassed.
 /// Jump = a fast major-arpeggio run up, the classic power-up (and, under
 /// rapid line feeds, the beloved "brrrring!" — see [`SoundKind::Jump`]).
-struct NyanPalette;
+struct RainbowKittyPalette;
 
-impl Palette for NyanPalette {
+impl Palette for RainbowKittyPalette {
     fn design(
         &self,
         s: &mut TrailSynth,
@@ -3948,7 +3948,7 @@ mod tests {
     const STYLES: [GlowStyle; 9] = [
         GlowStyle::Lumen,
         GlowStyle::Phaser,
-        GlowStyle::Nyan,
+        GlowStyle::RainbowKitty,
         GlowStyle::Sparkle,
         GlowStyle::Fire,
         GlowStyle::Laser,
@@ -4033,7 +4033,7 @@ mod tests {
     /// regardless of which visual style the events ride.
     #[test]
     fn mech_voice_sounds_and_decays() {
-        for style in [GlowStyle::Lumen, GlowStyle::Nyan] {
+        for style in [GlowStyle::Lumen, GlowStyle::RainbowKitty] {
             for gesture in [
                 SoundGesture::Trail(SoundKind::Typed),
                 SoundGesture::Trail(SoundKind::Backspace),
@@ -4129,7 +4129,7 @@ mod tests {
             let mut out = Vec::new();
             let mut buf = [0.0f32; 960];
             for _ in 0..20 {
-                let mut e = mech(GlowStyle::Nyan, SoundKind::Typed);
+                let mut e = mech(GlowStyle::RainbowKitty, SoundKind::Typed);
                 e.bed = bed;
                 s.push(e);
                 for _ in 0..4 {
@@ -4403,7 +4403,7 @@ mod tests {
             // Single event peak…
             let mut s1 = TrailSynth::new(48_000.0, 3);
             s1.set_bed_variant(variant);
-            s1.push(ev(GlowStyle::Nyan, SoundKind::Typed));
+            s1.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
             let mut single = 0.0f32;
             let mut buf = [0.0f32; 960];
             for _ in 0..100 {
@@ -4417,7 +4417,7 @@ mod tests {
             s2.set_bed_variant(variant);
             let mut flood = 0.0f32;
             for i in 0..75 {
-                let mut e = ev(GlowStyle::Nyan, SoundKind::Typed);
+                let mut e = ev(GlowStyle::RainbowKitty, SoundKind::Typed);
                 e.pan = ((i % 20) as f32) / 10.0 - 1.0;
                 s2.push(e);
                 for _ in 0..2 {
@@ -4455,7 +4455,7 @@ mod tests {
                 let mut buf = [0.0f32; 512];
                 for i in 0..40 {
                     if i % 2 == 0 {
-                        s.push(ev(GlowStyle::Nyan, SoundKind::Typed));
+                        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
                     }
                     s.render(&mut buf);
                     for &x in &buf {
@@ -4490,7 +4490,7 @@ mod tests {
             let mut buf = [0.0f32; 512];
             for i in 0..40 {
                 if i % 2 == 0 {
-                    s.push(ev(GlowStyle::Nyan, SoundKind::Typed));
+                    s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
                 }
                 s.render(&mut buf);
                 for &x in &buf {
@@ -4523,7 +4523,7 @@ mod tests {
         s.set_bed_variant(BedVariant::Silence);
         let mut buf = [0.0f32; 960];
         for _ in 0..10 {
-            s.push(ev(GlowStyle::Nyan, SoundKind::Typed));
+            s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
             s.render(&mut buf);
         }
         let (energy, level) = s.debug_bed();
@@ -4677,10 +4677,10 @@ mod tests {
     fn bonk_is_discordant_against_the_walk_and_moves_nothing() {
         let mut s = TrailSynth::new(48_000.0, 33);
         let walk_before = s.walk;
-        // Nyan's bonk anchor (G4) at the current degree — the anchor tracks
+        // the rainbow kitty's bonk anchor (G4) at the current degree — the anchor tracks
         // the palette's own melodic register.
         let root = penta(392.0, walk_before);
-        s.push(bonk(GlowStyle::Nyan));
+        s.push(bonk(GlowStyle::RainbowKitty));
         assert_eq!(s.walk, walk_before, "a bonk must not step the melody walk");
         assert_eq!(
             s.debug_bed(),
@@ -4783,7 +4783,7 @@ mod tests {
         assert_eq!(bonked.duck, 0.0, "the duck must snap back to exact rest");
     }
 
-    // -- FULL-NYAN sing-along proofs ----------------------------------------
+    // -- SING-ALONG sing-along proofs ----------------------------------------
 
     /// One sing-along riff bar (the celebration gesture helper). `heat` 1.0:
     /// the host pins momentum to full while armed — that IS maximal flow.
@@ -4813,7 +4813,7 @@ mod tests {
             let mut out = Vec::new();
             let mut buf = [0.0f32; 960]; // 10 ms blocks
             for bar in 0..(CELEBRATION_PHRASE_BARS as u16 * 2) {
-                s.push(riff(GlowStyle::Nyan, bar));
+                s.push(riff(GlowStyle::RainbowKitty, bar));
                 for _ in 0..160 {
                     // one bar = 1.6 s
                     s.render(&mut buf);
@@ -4836,9 +4836,9 @@ mod tests {
     #[test]
     fn celebration_bypasses_min_gap_thinning() {
         let mut s = TrailSynth::new(48_000.0, 5);
-        s.push(ev(GlowStyle::Nyan, SoundKind::Typed));
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
         let before = s.live_voices();
-        s.push(riff(GlowStyle::Nyan, 0)); // zero gap — would be thinned
+        s.push(riff(GlowStyle::RainbowKitty, 0)); // zero gap — would be thinned
         assert_eq!(
             s.live_voices(),
             before + 8,
@@ -4852,13 +4852,13 @@ mod tests {
     /// rest (the same snap-to-zero bit-identity contract as the bonk duck).
     #[test]
     fn celebration_ducks_the_melody_and_hands_back() {
-        // Identical lone Nyan typed notes; one renders under a pinned sing
+        // Identical lone rainbow kitty typed notes; one renders under a pinned sing
         // duck. Bed OFF so the energy compared is exactly the melody voice.
         let quiet_note = |sing: bool| {
             let mut s = TrailSynth::new(48_000.0, 9);
             s.push(SoundEvent {
                 bed: false,
-                ..ev(GlowStyle::Nyan, SoundKind::Typed)
+                ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
             });
             if sing {
                 s.sing = 1.0;
@@ -4883,7 +4883,7 @@ mod tests {
 
         // Admission arms + holds the envelope…
         let mut s = TrailSynth::new(48_000.0, 9);
-        s.push(riff(GlowStyle::Nyan, 0));
+        s.push(riff(GlowStyle::RainbowKitty, 0));
         assert_eq!(s.sing, 1.0, "a riff bar must arm the sing duck");
         assert!(s.sing_hold > 0.0, "…and hold it for the bar");
         // …and with no further bars it hands back: after the bar + tails +
@@ -4895,7 +4895,7 @@ mod tests {
             if block % 20 == 0 {
                 s.push(SoundEvent {
                     bed: false,
-                    ..ev(GlowStyle::Nyan, SoundKind::Navigation)
+                    ..ev(GlowStyle::RainbowKitty, SoundKind::Navigation)
                 });
             }
             s.render(&mut buf);
@@ -4911,7 +4911,7 @@ mod tests {
         let mut s = TrailSynth::new(48_000.0, 3);
         s.push(SoundEvent {
             bed: true,
-            ..riff(GlowStyle::Nyan, 0)
+            ..riff(GlowStyle::RainbowKitty, 0)
         });
         assert_eq!(
             s.debug_bed(),
@@ -4921,14 +4921,14 @@ mod tests {
     }
 
     /// The audio bar and the visual dance clock are ONE tempo: the samples-
-    /// based bar length is pinned equal to `nyan_sing`'s wall-clock bar (the
+    /// based bar length is pinned equal to `kitty_sing`'s wall-clock bar (the
     /// documented ± ~60 ms host-buffer skew is tolerance, not tempo drift).
     #[test]
     fn celebration_bar_matches_the_visual_clock() {
-        assert_eq!(CELEBRATION_BAR_SECONDS, crate::nyan_sing::SING_BAR_SECONDS);
+        assert_eq!(CELEBRATION_BAR_SECONDS, crate::kitty_sing::SING_BAR_SECONDS);
         assert_eq!(
             CELEBRATION_EIGHTH,
-            crate::nyan_sing::SING_BEAT_SECONDS / 2.0
+            crate::kitty_sing::SING_BEAT_SECONDS / 2.0
         );
     }
 
@@ -4981,12 +4981,12 @@ mod tests {
         let mut s = TrailSynth::new(48_000.0, 11);
         let mut buf = [0.0f32; 960];
         for bar in 0..16u16 {
-            s.push(riff(GlowStyle::Nyan, bar));
+            s.push(riff(GlowStyle::RainbowKitty, bar));
             for block in 0..160 {
                 if block % 5 == 0 {
                     s.push(SoundEvent {
                         bed: false,
-                        ..ev(GlowStyle::Nyan, SoundKind::Typed)
+                        ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
                     });
                 }
                 s.render(&mut buf);
@@ -5042,7 +5042,7 @@ mod tests {
         let render_toned = |tone: Tone| {
             let mut s = TrailSynth::new(48_000.0, 42);
             s.tone = tone;
-            s.push(riff(GlowStyle::Nyan, 0));
+            s.push(riff(GlowStyle::RainbowKitty, 0));
             let mut acc = 0u64;
             let mut buf = [0.0f32; 960];
             for _ in 0..160 {
@@ -5244,7 +5244,7 @@ mod tests {
     fn bonk_path_ignores_tone() {
         let run = |tone: Tone| {
             let mut s = TrailSynth::new(48_000.0, 0x0B0B);
-            let mut e = bonk(GlowStyle::Nyan);
+            let mut e = bonk(GlowStyle::RainbowKitty);
             e.tone = tone;
             s.push(e);
             let mut acc = 0u64;
@@ -5918,8 +5918,8 @@ mod tests {
                         }
                     }
 
-                    // NYAN — see `NyanPalette::design`.
-                    GlowStyle::Nyan => {
+                    // RAINBOW KITTY — see `RainbowKittyPalette::design`.
+                    GlowStyle::RainbowKitty => {
                         let base = 392.0; // G4 — the mellow chip register
                         let d = deg + if kind == SoundKind::Backspace { -3 } else { 0 };
                         let f = penta(base, d);
@@ -7012,8 +7012,8 @@ mod tests {
                         b.lp1 += k * (s - b.lp1);
                         (b.lp1 * lvl * 0.05, 0.0)
                     }
-                    // NYAN: faint detuned pulse pad — the chip's idle hum.
-                    GlowStyle::Nyan => {
+                    // RAINBOW KITTY: faint detuned pulse pad — the chip's idle hum.
+                    GlowStyle::RainbowKitty => {
                         b.ph1 = (b.ph1 + 261.6 * dt).fract();
                         b.ph2 = (b.ph2 + 262.6 * dt).fract();
                         let s = (if b.ph1 < 0.5 { 1.0 } else { -1.0f32 })
@@ -7147,11 +7147,11 @@ mod tests {
     /// thinning,
     /// and their overlapping flourishes ARE the brrrring. This pins the whole
     /// cue path bit-exactly against the frozen v0.56 synth for the default
-    /// (Lumen) and Nyan palettes, and proves every jump in the burst actually
+    /// (Lumen) and rainbow kitty palettes, and proves every jump in the burst actually
     /// speaks.
     #[test]
     fn brrrring_of_rapid_line_feeds_is_pinned() {
-        for style in [GlowStyle::Lumen, GlowStyle::Nyan] {
+        for style in [GlowStyle::Lumen, GlowStyle::RainbowKitty] {
             let mut new = TrailSynth::new(48_000.0, 0x5EED_50FD);
             let mut old = v056_reference::RefSynth::new(48_000.0, 0x5EED_50FD);
             let mut nb = [0.0f32; 960];
@@ -7171,8 +7171,12 @@ mod tests {
                 });
                 old.push(style, SoundKind::Jump, -0.8, 0.3, 0.0, 0.4);
                 // Every jump must actually speak (min-gap bypass): Lumen's
-                // pluck + grace note, Nyan's blip + 3-note arpeggio run.
-                let per_jump = if style == GlowStyle::Nyan { 4 } else { 2 };
+                // pluck + grace note, the rainbow kitty's blip + 3-note arpeggio run.
+                let per_jump = if style == GlowStyle::RainbowKitty {
+                    4
+                } else {
+                    2
+                };
                 assert!(
                     new.live_voices() >= per_jump,
                     "{style:?}: a rapid jump was thinned out of the brrrring"

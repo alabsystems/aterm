@@ -6,7 +6,7 @@
 //! be a nuke-cloud").
 //!
 //! Three STATIC baked tiles (cap / stem / base surge) animated purely by
-//! dest-rect transform, alpha and tint — exactly the Nyan cursor's pose trick,
+//! dest-rect transform, alpha and tint — exactly the kitty cursor's pose trick,
 //! where `aw/ah` stay the natural source size and the renderer NEAREST-scales a
 //! fixed tile. The tiles are cache-stable per `(part, w, h)`, so an animating
 //! cloud NEVER rebakes and never spends the shared two-bakes-per-frame budget

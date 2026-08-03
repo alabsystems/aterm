@@ -472,7 +472,7 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// (the check that caught this) could not be written at all.
 ///
 /// It is not hypothetical. A `ty` built 2026-07-02 explored ONE state of
-/// `NyanJumpBurstLifecycle`'s 128 with reduction on and reported "No errors
+/// `RainbowJumpBurstLifecycle`'s 128 with reduction on and reported "No errors
 /// found (exhaustive)" — a false proof at the committed config, and a missing
 /// counterexample at `Buggy = 1`, which is the only reason it surfaced at all.
 /// The model's stutter action (`SlowJump`, a self-loop that writes nothing)
@@ -615,7 +615,7 @@ fn ty_states_explored(evidence: &str) -> Option<u64> {
 /// The two tiers already had to agree on the VERDICT. That is weaker than it
 /// looks, because "no errors found" is also what a checker says about a space
 /// it never entered — and on 2026-07-30 that is exactly what happened
-/// (`NyanJumpBurstLifecycle`: interpreter 128 states, `ty` 1, both "clean").
+/// (`RainbowJumpBurstLifecycle`: interpreter 128 states, `ty` 1, both "clean").
 /// A verdict agreement between a real proof and a vacuous one is not evidence;
 /// it is a coincidence that reads like evidence.
 ///
@@ -1492,7 +1492,7 @@ mod tests {
                 &m,
                 &[
                     "AdmitStaleTrail",
-                    "AdmitStaleNyan",
+                    "AdmitStaleKitty",
                     "AdmitStaleTheme",
                     "AdmitStaleSparkle",
                 ],
@@ -1549,7 +1549,7 @@ mod tests {
             &m,
             &[
                 "AdmitStaleTrail",
-                "AdmitStaleNyan",
+                "AdmitStaleKitty",
                 "AdmitStaleTheme",
                 "AdmitStaleSparkle",
             ],
@@ -1651,7 +1651,7 @@ mod tests {
     }
 
     /// REGRESSION (2026-07-30 FALSE PROOF): `ty` reported "No errors found
-    /// (exhaustive)" for `NyanJumpBurstLifecycle` after exploring ONE of its 128
+    /// (exhaustive)" for `RainbowJumpBurstLifecycle` after exploring ONE of its 128
     /// reachable states — its partial-order reduction formed a singleton ample
     /// set out of the model's stutter action, whose only successor is the
     /// expanding state, and the C3 cycle proviso failed to reject it. The

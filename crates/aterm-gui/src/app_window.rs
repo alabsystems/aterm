@@ -1998,7 +1998,7 @@ mod tests {
         let rgba: Arc<[u8]> = Arc::from([0xff, 0x22, 0xaa, 0xff]);
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: crate::app_config::TrailPackCatalog::empty(),
-            nyan_sprite: crate::app_config::NyanSpriteAsset::Ready {
+            kitty_sprite: crate::app_config::KittySpriteAsset::Ready {
                 source_id: Arc::from("test.png"),
                 w: 1,
                 h: 1,
@@ -2012,11 +2012,11 @@ mod tests {
         let sid = app.next_session_id;
         let wid = app.insert_logical_window(crate::stub_session(sid), 24, 80);
         assert!(
-            app.windows[&wid].word_decos.has_custom_nyan_sprite(),
+            app.windows[&wid].word_decos.has_custom_kitty_sprite(),
             "a post-publication window must not silently fall back to built-in art"
         );
         assert!(Arc::ptr_eq(
-            app.windows[&wid].word_decos.nyan_sprite_rgba().unwrap(),
+            app.windows[&wid].word_decos.kitty_sprite_rgba().unwrap(),
             &rgba
         ));
     }
