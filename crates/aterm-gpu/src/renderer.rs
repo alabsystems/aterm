@@ -6532,6 +6532,22 @@ impl GpuRenderer {
     /// `RENDER_ATTACHMENT`, plus `COPY_SRC` only while a VIDEO tap is live AND the
     /// surface caps offer it. Pure so the reconcile below and the test can share
     /// one definition.
+    /// Does ANY tap need to read the swapchain back this present? Both do, and
+    /// forgetting the second one is the whole bug this exists to prevent:
+    /// `presented_snapshot` is deliberately independent of `video` (a still taken
+    /// mid-recording must not perturb the recording's ring), and that independence
+    /// silently extended to the usage reconcile — so a one-shot capture armed
+    /// `COPY_SRC` nowhere and its copy out of a `RENDER_ATTACHMENT`-only swapchain
+    /// was a wgpu validation error, which is a main-thread PANIC in the present
+    /// path. `aterm ctl window front` killed the window on the first capture, every
+    /// time, on a backend where `copyable` is true and the design says it cannot.
+    ///
+    /// Naming the disjunction makes the reconcile's input testable without a GPU.
+    #[must_use]
+    fn tap_wants_copy_src(recording: bool, snapshot: bool) -> bool {
+        recording || snapshot
+    }
+
     fn swapchain_usage_for(copyable: bool, recording: bool) -> wgpu::TextureUsages {
         if copyable && recording {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
@@ -6989,7 +7005,17 @@ impl GpuRenderer {
         // copyable swapchain on that same present, and `video_finish` drops back to
         // the compressed default on the next one.
         let want_alpha = Self::present_alpha_mode(self.cpu.background_opacity(), surf.post_mult);
-        let want_usage = Self::swapchain_usage_for(surf.copyable, win.video.is_some());
+        // BOTH taps, not just the recording. `presented_snapshot` is deliberately
+        // independent of `win.video` (a still taken mid-recording must not perturb
+        // the ring), and that independence used to extend to this reconcile — so a
+        // one-shot capture armed COPY_SRC nowhere, and its copy out of a
+        // `RENDER_ATTACHMENT`-only swapchain was a wgpu validation error, i.e. a
+        // main-thread panic in the present path. Measured on Metal: `aterm ctl
+        // window front` killed the window on the first capture, every time.
+        let want_usage = Self::swapchain_usage_for(
+            surf.copyable,
+            Self::tap_wants_copy_src(win.video.is_some(), win.presented_snapshot.is_some()),
+        );
         if surf.config.alpha_mode != want_alpha || surf.config.usage != want_usage {
             surf.config.alpha_mode = want_alpha;
             surf.config.usage = want_usage;
@@ -7524,7 +7550,28 @@ impl GpuRenderer {
         // the ring is saturated (never blocks). See `video_tap`.
         let capture_color_space = win.capture_color_space();
         let capture_sdr_white_scale = win.sdr_white_scale();
-        if let Some(tap) = win.video.as_mut() {
+        // GATED ON THE USAGE THE SWAPCHAIN ACTUALLY HAS, not on the tap alone.
+        //
+        // The reconcile above derives `want_usage` from `win.video` precisely so the
+        // two cannot desync — but it runs ONCE, near the top of present, while a tap
+        // can be armed from the control thread at any instant. A tap that arms after
+        // that reconcile and before this copy hits a swapchain still configured
+        // `RENDER_ATTACHMENT`-only, and `copy_texture_to_texture` out of it is a wgpu
+        // VALIDATION ERROR — which is a PANIC, on the main thread, in the present
+        // path: the whole window dies. Measured: `aterm ctl window front` killed the
+        // app on the first capture, every time, on Metal where `copyable` is true and
+        // the design says this cannot happen.
+        //
+        // Asking the DESTINATION TEXTURE what it can do closes the gap by
+        // construction, and asks the only object whose answer is authoritative: it is
+        // the very texture the copy reads from, so this is true for the swapchain arm
+        // and for the virtual/offscreen arms alike, with nothing threaded through the
+        // signature to fall out of date. The frame that races the arming simply is
+        // not captured, and the NEXT present — after the reconcile has seen
+        // `win.video` — copies normally. A dropped first frame is what the ring's
+        // counted-drop already models; a dead window is not.
+        let copy_armed = dest.tex.usage().contains(wgpu::TextureUsages::COPY_SRC);
+        if let Some(tap) = win.video.as_mut().filter(|_| copy_armed) {
             tap.enqueue_copy(
                 &mut enc,
                 dest.tex,
@@ -7536,7 +7583,11 @@ impl GpuRenderer {
         // deliberately neither borrows nor consumes the video tap, so a still
         // snapshot taken during recording observes the same exact destination
         // without perturbing the recording's ring, counters, or fps gate.
-        if let Some(tap) = win.presented_snapshot.as_mut() {
+        // Same usage gate as the recording tap above: the reconcile arms COPY_SRC
+        // for this tap now, but it runs once near the top of present while a still
+        // can be armed from the control thread at any instant. A frame that loses
+        // that race is skipped and the next one captures; it must never panic.
+        if let Some(tap) = win.presented_snapshot.as_mut().filter(|_| copy_armed) {
             tap.enqueue_copy(
                 &mut enc,
                 dest.tex,
@@ -13754,6 +13805,47 @@ mod tests {
             super::GpuRenderer::swapchain_usage_for(false, true),
             U::RENDER_ATTACHMENT,
             "a surface with no COPY_SRC cap must never be asked for it"
+        );
+    }
+
+    /// REGRESSION — `aterm ctl window front` killed the window on the FIRST
+    /// capture, every time, on Metal. The still tap (`presented_snapshot`) is
+    /// deliberately independent of the recording tap (`video`) so a snapshot taken
+    /// mid-recording cannot perturb the ring — and that independence had silently
+    /// extended to the swapchain USAGE reconcile, which asked only about `video`.
+    /// So a one-shot capture armed `COPY_SRC` nowhere, and copying out of a
+    /// `RENDER_ATTACHMENT`-only swapchain is a wgpu validation error: a panic, on
+    /// the main thread, inside present. The introspection verb the whole AI-facing
+    /// surface depends on could not be used without killing the app.
+    ///
+    /// EITHER tap must arm it; NEITHER tap must leave it armed (on Metal the bit
+    /// costs the drawable its lossless compression on every frame, which is why it
+    /// is not simply always on).
+    #[test]
+    fn either_tap_arms_copy_src_and_an_idle_window_arms_neither() {
+        let wants = super::GpuRenderer::tap_wants_copy_src;
+        assert!(!wants(false, false), "idle: no readback, no cost");
+        assert!(wants(true, false), "a live recording needs the readback");
+        assert!(
+            wants(false, true),
+            "a ONE-SHOT still needs it just as much — the regression"
+        );
+        assert!(
+            wants(true, true),
+            "a still taken mid-recording needs it too"
+        );
+
+        // And the usage actually derived from it, end to end.
+        use wgpu::TextureUsages as U;
+        assert_eq!(
+            super::GpuRenderer::swapchain_usage_for(true, wants(false, true)),
+            U::RENDER_ATTACHMENT | U::COPY_SRC,
+            "arming a still must configure a copyable swapchain"
+        );
+        assert_eq!(
+            super::GpuRenderer::swapchain_usage_for(true, wants(false, false)),
+            U::RENDER_ATTACHMENT,
+            "and dropping both taps must give the compression back"
         );
     }
 

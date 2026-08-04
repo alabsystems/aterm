@@ -713,8 +713,14 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
             crate::seamless::encode_target_identity(job.target_build, &job.target_commit),
         )
         .env("ATERM_HANDOFF_READY_FD", proof_wr.as_raw_fd().to_string())
-        .env("ATERM_HANDOFF_COMMIT_FD", commit_rd.as_raw_fd().to_string())
-        .env("ATERM_HANDOFF_PARENT_PID", std::process::id().to_string());
+        .env("ATERM_HANDOFF_COMMIT_FD", commit_rd.as_raw_fd().to_string());
+    // Parental authority: our pid AND the kernel's birth record for it. The
+    // record is what lets the successor watch us without being our fork child —
+    // see `seamless::AttestedParent`. Encoded there, beside its decoder, so the
+    // two halves of the wire cannot drift.
+    for (key, value) in crate::seamless::outgoing_parent_env() {
+        job.command.env(key, value);
+    }
     // Parent descriptors remain CLOEXEC for the WHOLE asynchronous interval.
     // Clear only the fork child's copies immediately before its exec image.
     let mut child_inherit = job
@@ -762,15 +768,29 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     // THE FIX is to launch the successor through LaunchServices instead (the
     // `open -n` equivalent, `NSWorkspace.openApplication` with
     // `createsNewApplicationInstance`), which mints it its OWN application job.
-    // It is not a local edit: a LaunchServices launch inherits no descriptors,
-    // so the three inherited fd channels below — the PTY masters
-    // (`ATERM_SEAMLESS_FDS`), the readiness pipe, and the Commit pipe — must
-    // move to an out-of-band `SCM_RIGHTS` transfer over the per-user control
-    // socket, the successor stops being a waitable child (so the kill-and-reap
-    // reaper below loses `waitpid`), and the child-side `getppid()` authority
-    // check in `seamless::take_commit_fd` must become the socket's kernel-
-    // attested peer pid. `tests/handoff_launchd_job.rs` is the guard: its
-    // ignored e2e is today's reproducer and tomorrow's regression test.
+    // It is not a local edit: four properties this `spawn` gets for free must be
+    // re-established first. `tests/handoff_launchd_job.rs` states all four and
+    // is the guard — its ignored e2e is today's reproducer and tomorrow's
+    // regression test. Their status here:
+    //
+    // * B1 — parent attestation. DONE (0.13): the successor's admission and its
+    //   `_exit(74)` fail-stop no longer read `getppid()`, which a
+    //   LaunchServices-launched process cannot answer (ppid 1 from birth). They
+    //   watch the outgoing process's kernel BIRTH RECORD, published just above
+    //   by `seamless::outgoing_parent_env` — see `seamless::AttestedParent` for
+    //   the property and for what B4's socket adds on top of it.
+    // * B2 — reap authority. `kill_and_reap_handoff_child` resumes the parked
+    //   readers only once `wait` proved the rejected candidate gone and reaped;
+    //   `waitpid` on a non-child answers `ECHILD` and that proof is lost.
+    // * B3 — process-group containment. The `pre_exec` `setpgid(0, 0)` above,
+    //   which is what makes `kill(-pid)` sweep the candidate's own updater
+    //   helpers, has no LaunchServices equivalent.
+    // * B4 — transport. A LaunchServices launch inherits no descriptors, so the
+    //   three inherited fd channels below — the PTY masters
+    //   (`ATERM_SEAMLESS_FDS`), the readiness pipe, and the Commit pipe — must
+    //   move to an out-of-band `SCM_RIGHTS` transfer over the per-user control
+    //   socket, which also changes what `seamless::adoption_proof` may hash (it
+    //   hashes fd NUMBERS, and `SCM_RIGHTS` does not preserve them).
     let mut child = match job.command.spawn() {
         Ok(child) => child,
         Err(error) => {

@@ -1056,6 +1056,344 @@ pub(crate) fn discard_outgoing(nonce: &str) {
 const ENV_READY_FD: &str = "ATERM_HANDOFF_READY_FD";
 const ENV_COMMIT_FD: &str = "ATERM_HANDOFF_COMMIT_FD";
 const ENV_PARENT_PID: &str = "ATERM_HANDOFF_PARENT_PID";
+/// The outgoing process's KERNEL BIRTH RECORD, published beside its pid. A pid
+/// alone is a recyclable number; this is what makes it an identity the
+/// successor can verify without being the outgoing process's fork child. See
+/// [`AttestedParent`] for why that distinction is the whole point.
+const ENV_PARENT_BIRTH: &str = "ATERM_HANDOFF_PARENT_BIRTH";
+
+/// The kernel's own birth record for a process: the microsecond-resolution
+/// instant `fork` created it. Assigned by the kernel, so no process can choose
+/// its own; and two processes that reuse a pid cannot share it, which is
+/// exactly the property a bare pid lacks. Compared for EQUALITY only — it is an
+/// identity token, never a clock reading.
+///
+/// The same idea already guards the managed-Ollama daemon
+/// (`title_summary::managed_ollama::ManagedProcessIdentity`, "a bare PID is not
+/// an identity: it can be reused after exit"); this is the update lane's copy,
+/// kept local because the handoff needs the probe on its own hot path and must
+/// not gain a dependency on the summary subsystem.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessBirth {
+    seconds: u64,
+    microseconds: u64,
+}
+
+#[cfg(unix)]
+impl ProcessBirth {
+    fn to_wire(self) -> String {
+        format!("{}.{}", self.seconds, self.microseconds)
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        let (seconds, microseconds) = raw.trim().split_once('.')?;
+        Some(Self {
+            seconds: seconds.parse().ok()?,
+            microseconds: microseconds.parse().ok()?,
+        })
+    }
+}
+
+/// Read the kernel's record for `pid`, or `None` when there is no process we
+/// may treat as a handoff parent there.
+///
+/// `None` covers four distinct facts on purpose, because the caller's response
+/// to all four is identical — refuse:
+///
+/// * no such process (the parent already exited AND was reaped);
+/// * a ZOMBIE. Treating it as dead keeps this probe's edge NEAR the predicate
+///   it replaces, not exactly on it: XNU's `proc_exit()` reparents children to
+///   initproc BEFORE setting `p_stat = SZOMB`, so `getppid()` flips first and
+///   this probe goes false strictly later — same event, a few instructions
+///   apart. The gap is on the safe side (the successor keeps running slightly
+///   longer than the old predicate would have allowed, and the commit pipe
+///   still bounds it); claiming the two edges coincide would be wrong. libproc
+///   may already refuse zombies outright, in which case this arm never runs;
+/// * a process owned by another uid. Every other authority in the overlap
+///   protocol is uid-bounded (the 0700 control dir, `control_auth::peer_check`),
+///   and a cross-uid "parent" is not a shape this lane has;
+/// * the kernel disagreeing about the pid it just reported on.
+#[cfg(target_os = "macos")]
+fn read_process_birth(pid: libc::pid_t) -> Option<ProcessBirth> {
+    if pid <= 1 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure
+    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: the exact-size success above initialized the whole record.
+    let info = unsafe { info.assume_init() };
+    // SAFETY: `geteuid` is a side-effect-free libc getter.
+    let ours = unsafe { libc::geteuid() };
+    if u32::try_from(pid).ok()? != info.pbi_pid || info.pbi_uid != ours {
+        return None;
+    }
+    if info.pbi_status == libc::SZOMB {
+        return None;
+    }
+    Some(ProcessBirth {
+        seconds: info.pbi_start_tvsec,
+        microseconds: info.pbi_start_tvusec,
+    })
+}
+
+/// Other unixes have no birth-record primitive wired here, so they can only
+/// ever attest through the kernel parent link — which is sound there because
+/// they have no LaunchServices lane: off macOS the successor is unconditionally
+/// a fork child of the outgoing process (`Command::spawn` in
+/// `app_update_handoff::run_handoff_worker` is the only launch shape), so the
+/// parent link always exists. If a non-fork transport is ever added off macOS,
+/// this function must gain a real implementation FIRST — `/proc/<pid>/stat`
+/// field 22 is Linux's equivalent — because [`attest_handoff_parent`] then has
+/// no witness left to offer.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_process_birth(_pid: libc::pid_t) -> Option<ProcessBirth> {
+    None
+}
+
+/// This process's own birth record, for publication to a successor.
+#[cfg(unix)]
+#[must_use]
+fn own_process_birth() -> Option<ProcessBirth> {
+    read_process_birth(libc::pid_t::try_from(std::process::id()).ok()?)
+}
+
+/// How the successor learned WHICH process its handoff parent is. The two arms
+/// are not interchangeable implementations of one probe: they are the two
+/// mutually exclusive situations a successor can be born into, each carrying
+/// the strongest identity primitive available in it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentWitness {
+    /// The kernel's birth record for the attested pid, verified at admission.
+    /// Independent of the process tree, so it keeps answering for a successor
+    /// launchd owns — this is the arm B1 needs.
+    Birth(ProcessBirth),
+    /// The kernel parent link. Carries no information once `getppid()` is 1, so
+    /// it is only ever chosen while the attested pid IS our live creator. Used
+    /// when libproc declined to produce a birth record, so that a machine where
+    /// the update lane's liveness probe is unavailable still updates.
+    ForkLink,
+}
+
+/// PARENTAL ATTESTATION — the ONE witness the overlap protocol trusts about who
+/// the outgoing process is and whether it is still alive. Both halves are
+/// load-bearing, and they fail in opposite directions:
+///
+/// 1. IDENTITY — established ONCE, at admission. [`ENV_PARENT_PID`] is an
+///    environment variable, so anything that can exec this binary can write any
+///    number into it. Admission must therefore make the claim agree with a fact
+///    the writer of an environment does not control, or a stale `ATERM_HANDOFF_*`
+///    block that leaked into a user shell (the case [`clear_handoff_env`] exists
+///    to prevent, and this is its backstop) could point a fresh instance at some
+///    unrelated live process. That instance would then treat a recognizable
+///    handoff as VALID and carry the stale wire's descriptor numbers — which in
+///    the new process name unrelated resources — through to the updater's exec.
+///
+/// 2. LIVENESS — re-evaluated continuously, for the whole overlap. Its edge must
+///    be the parent's `exit`, and it must be immune to PID REUSE. This is the
+///    dangerous direction: a false "alive" does not lose a handoff, it strands a
+///    readerless candidate holding duplicated masters of the user's live shells
+///    that can never be committed — see the `_exit(74)` in
+///    [`CommitReceiver::start_watch`], for which this is the backstop underneath
+///    pipe EOF (EOF cannot fire if a write end leaked, which Darwin's
+///    non-atomic pipe+`FD_CLOEXEC` sequence permits).
+///
+/// `getppid() == pid` used to provide both at once, which is why it read as a
+/// single cheap check: the parent link is kernel state no environment can
+/// forge (1), it flips inside the parent's `exit(2)` — at exit, NOT at reap, so
+/// strictly before the pid can be recycled — and on macOS its only replacement
+/// value is 1, permanently (2). But it provides both ONLY to a fork child.
+///
+/// BLOCKER B1 (see the KNOWN DEFECT note at the `spawn` in
+/// `app_update_handoff::run_handoff_worker`): a successor launched through
+/// LaunchServices has ppid 1 from birth, so `getppid()` cannot name its parent
+/// and the old predicate refused it at admission and then fail-stopped it.
+/// The repair is to stop conflating the two properties:
+///
+/// * LIVENESS moves to the birth record, which is transport-independent. It
+///   discriminates by a kernel-assigned microsecond stamp rather than by a pid,
+///   so a recycled pid fails it, and it treats a zombie as dead, so its edge is
+///   still the parent's `exit`.
+///
+///   ONE PLACE IT IS GENUINELY WEAKER, stated because the alternative is a
+///   comment that lies about a security property: the LEGACY-CAPTURE arm
+///   (`creator == pid`, i.e. today's fork transport) reads `getppid()` and then
+///   `read_process_birth(pid)` as TWO calls, where the predicate it replaces
+///   was a single kernel-atomic comparison. That is a TOCTOU window. Exploiting
+///   it needs the parent to exit, be reaped, and the pid space to wrap ~100k
+///   sequential allocations onto that exact number, all between two adjacent
+///   syscalls — and the commit-pipe EOF backstops it independently. Small, but
+///   not zero, and it is the same race the earlier attempt cited when it
+///   refused to touch B1 at all.
+/// * IDENTITY stays with the strongest primitive the successor's actual birth
+///   situation offers. With a live creator that is still the parent link, and
+///   the published claim must AGREE with it — unchanged, and unchanged
+///   deliberately: this is the arm that refuses the leaked-env case. With no
+///   live creator (`getppid() == 1`) the link says nothing at all, and the
+///   witness is the birth record the outgoing process published for itself,
+///   which a stale or accidental value cannot match unless it names a process
+///   that is genuinely still alive at that exact pid and birth instant.
+///
+/// The remaining gap is honest and bounded: against a SAME-UID adversary the
+/// published birth record is copyable (it is public via `ps`), so the no-live-
+/// creator arm rests on the uid boundary that the rest of this protocol already
+/// rests on — the 0700 control dir the manifest must live in, and
+/// `control_auth::peer_check`. B4's `SCM_RIGHTS` transport closes even that: a
+/// socket's kernel-attested peer pid (`getsockopt(SOL_LOCAL, LOCAL_PEERPID)`,
+/// recorded by the kernel at `connect(2)`) is unforgeable identity, and pairing
+/// it with the birth record already implemented here also closes the
+/// registration race that a peer pid alone would leave — a peer that died and
+/// had its pid recycled before the receive fails the birth comparison. So this
+/// function's shape is what B4 extends, not something B4 replaces.
+///
+/// `creator` is the kernel parent link, taken by the caller so the decision is
+/// testable at both of its arms without needing a ppid-1 process.
+#[cfg(unix)]
+#[must_use]
+fn attest_handoff_parent_from(
+    pid: libc::pid_t,
+    published: Option<ProcessBirth>,
+    creator: libc::pid_t,
+) -> Option<AttestedParent> {
+    // pid 1 is never a real handoff parent: it is what reparenting produces.
+    if pid <= 1 {
+        return None;
+    }
+    if creator > 1 && creator != pid {
+        // We HAVE a live creator and it is not who the environment named. No
+        // amount of published detail may override the kernel here: this is the
+        // arm that refuses a stale handoff block re-entering through a shell.
+        return None;
+    }
+    let live = read_process_birth(pid);
+    let witness = match (published, live) {
+        // The outgoing process named its own birth instant and the kernel
+        // agrees. Sound whether or not we are its child, which is all of B1.
+        (Some(published), Some(live)) if published == live => ParentWitness::Birth(live),
+        // A claim the kernel does not corroborate is corrupt authority, not a
+        // reason to fall back to something weaker.
+        (Some(_), _) => return None,
+        // Legacy outgoing build: it published no birth record, but the parent
+        // link proves this pid is our creator, so the record we read now is
+        // provably the parent's own. Capturing it here is what lets the watch
+        // below stop consulting the process tree.
+        (None, Some(live)) if creator == pid => ParentWitness::Birth(live),
+        (None, None) if creator == pid => {
+            // On macOS a live same-uid process with no readable birth record is
+            // a real anomaly (libproc answers for other processes here — the
+            // managed-Ollama attestation depends on it), so say so: it is the
+            // only signal that this machine's handoffs are running on the
+            // weaker witness. Off macOS the parent link IS the documented
+            // witness, so there is nothing to report.
+            #[cfg(target_os = "macos")]
+            eprintln!(
+                "aterm-gui: seamless handoff: no kernel birth record for parent {pid}; \
+                 falling back to the process link for parent-death detection"
+            );
+            ParentWitness::ForkLink
+        }
+        // No live creator and nothing published: there is no witness at all.
+        (None, _) => return None,
+    };
+    Some(AttestedParent { pid, witness })
+}
+
+#[cfg(unix)]
+#[must_use]
+fn attest_handoff_parent(
+    pid: libc::pid_t,
+    published: Option<ProcessBirth>,
+) -> Option<AttestedParent> {
+    // SAFETY: `getppid` is a side-effect-free libc getter.
+    attest_handoff_parent_from(pid, published, unsafe { libc::getppid() })
+}
+
+/// A handoff parent whose identity was proven at admission. Its fields are
+/// private to this module and [`attest_handoff_parent_from`] is the only
+/// producer, so outside the attestation code above, HOLDING one is the proof —
+/// the only question a holder can still ask is whether that process is alive.
+/// This is why the value, not a bare pid, is what travels from
+/// [`prearm_incoming_fds`] through [`take_commit_fd`] into [`CommitReceiver`]:
+/// no later stage can accidentally re-derive a weaker claim.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttestedParent {
+    pid: libc::pid_t,
+    witness: ParentWitness,
+}
+
+#[cfg(unix)]
+impl AttestedParent {
+    /// Is the attested process — that exact process, not merely something at
+    /// its pid — still running?
+    #[must_use]
+    fn still_alive(self) -> bool {
+        match self.witness {
+            ParentWitness::Birth(birth) => read_process_birth(self.pid) == Some(birth),
+            ParentWitness::ForkLink => {
+                // SAFETY: `getppid` is a side-effect-free libc getter.
+                let creator = unsafe { libc::getppid() };
+                creator == self.pid
+            }
+        }
+    }
+
+    /// The authority pairs to restore onto the boot-apply re-exec image.
+    ///
+    /// A `Birth` witness republishes the record, so the re-exec'd image can
+    /// re-attest without a parent link even when the ORIGINAL outgoing process
+    /// published none — we only ever hold a `Birth` witness we proved, so
+    /// publishing it forward is passing on a proof, not inventing one.
+    fn exec_env(self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let mut pairs = vec![(
+            std::ffi::OsString::from(ENV_PARENT_PID),
+            std::ffi::OsString::from(self.pid.to_string()),
+        )];
+        if let ParentWitness::Birth(birth) = self.witness {
+            pairs.push((
+                std::ffi::OsString::from(ENV_PARENT_BIRTH),
+                std::ffi::OsString::from(birth.to_wire()),
+            ));
+        }
+        pairs
+    }
+}
+
+/// The parental-authority environment an OUTGOING process publishes to its
+/// successor. Encoding lives here, next to the decoding in
+/// [`prearm_incoming_fds`], so the two cannot drift.
+///
+/// The birth record is omitted when the kernel will not give us our own. That
+/// omission is what keeps the two sides symmetric on a machine where libproc is
+/// unavailable: the successor refuses a published record it cannot corroborate,
+/// so publishing one we could not read ourselves would turn an unavailable
+/// probe into a failed update. Omitting it instead costs a legacy-shaped
+/// handoff — the successor attests through the parent link, exactly as every
+/// build before 0.13 did — and never a broken one.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn outgoing_parent_env() -> Vec<(&'static str, String)> {
+    let mut pairs = vec![(ENV_PARENT_PID, std::process::id().to_string())];
+    if let Some(birth) = own_process_birth() {
+        pairs.push((ENV_PARENT_BIRTH, birth.to_wire()));
+    }
+    pairs
+}
 
 /// Re-arm every descriptor named by an incoming handoff immediately on process
 /// entry, before the updater can spawn codesign/PlistBuddy/spctl helpers. The
@@ -1068,7 +1406,7 @@ pub(crate) struct PrearmedIncomingFds {
     fds: Vec<i32>,
     recognizable: bool,
     valid: bool,
-    parent_pid: Option<libc::pid_t>,
+    parent: Option<AttestedParent>,
 }
 
 #[cfg(unix)]
@@ -1090,13 +1428,8 @@ impl PrearmedIncomingFds {
         if !self.valid {
             return Vec::new();
         }
-        self.parent_pid
-            .map(|pid| {
-                vec![(
-                    std::ffi::OsString::from(ENV_PARENT_PID),
-                    std::ffi::OsString::from(pid.to_string()),
-                )]
-            })
+        self.parent
+            .map(AttestedParent::exec_env)
             .unwrap_or_default()
     }
 
@@ -1113,8 +1446,12 @@ impl PrearmedIncomingFds {
         self.blocks_boot_apply()
     }
 
-    pub(crate) fn parent_pid(&self) -> Option<libc::pid_t> {
-        self.valid.then_some(self.parent_pid).flatten()
+    /// The attested handoff parent. Named for the pid because that is what
+    /// identifies it to a reader; what it actually carries is the proof, so
+    /// that no later stage has to re-derive one from an environment that has
+    /// since been scrubbed.
+    pub(crate) fn parent_pid(&self) -> Option<AttestedParent> {
+        self.valid.then_some(self.parent).flatten()
     }
 }
 
@@ -1132,6 +1469,7 @@ fn clear_handoff_env() {
         ENV_READY_FD,
         ENV_COMMIT_FD,
         ENV_PARENT_PID,
+        ENV_PARENT_BIRTH,
     ] {
         aterm_log::env::unset(key);
     }
@@ -1158,20 +1496,26 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
     let ready_present = std::env::var_os(ENV_READY_FD).is_some();
     let commit_present = std::env::var_os(ENV_COMMIT_FD).is_some();
     let parent_present = std::env::var_os(ENV_PARENT_PID).is_some();
-    let parent_pid = std::env::var(ENV_PARENT_PID)
+    let birth_present = std::env::var_os(ENV_PARENT_BIRTH).is_some();
+    let published_birth = std::env::var(ENV_PARENT_BIRTH)
+        .ok()
+        .and_then(|value| ProcessBirth::from_wire(&value));
+    let parent = std::env::var(ENV_PARENT_PID)
         .ok()
         .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
-        .filter(|pid| *pid > 1 && unsafe { libc::getppid() } == *pid);
+        .and_then(|pid| attest_handoff_parent(pid, published_birth));
     // Parent identity is now process-local typed state; never let the raw env
     // reach updater verification helpers or user shells.
     aterm_log::env::unset(ENV_PARENT_PID);
+    aterm_log::env::unset(ENV_PARENT_BIRTH);
     let recognizable = manifest_present
         || fds_present
         || nonce_present
         || layout_present
         || ready_present
         || commit_present
-        || parent_present;
+        || parent_present
+        || birth_present;
     let mut authority_valid = true;
     let mut fds = Vec::new();
     // Keep every syntactically enumerable descriptor separate from the set that
@@ -1263,7 +1607,13 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
     if recognizable && !modern {
         authority_valid = false;
     }
-    if modern != parent_pid.is_some() || (parent_present && parent_pid.is_none()) {
+    if modern != parent.is_some() || (parent_present && parent.is_none()) {
+        authority_valid = false;
+    }
+    // The birth record is OPTIONAL authority — a legacy outgoing build publishes
+    // none — but an unparseable one is corruption, not absence, and must not
+    // silently degrade admission to the weaker witness it exists to replace.
+    if birth_present && published_birth.is_none() {
         authority_valid = false;
     }
     fds.sort_unstable();
@@ -1286,7 +1636,7 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
         fds,
         recognizable,
         valid: authority_valid,
-        parent_pid,
+        parent,
     }
 }
 
@@ -1469,17 +1819,17 @@ pub(crate) struct CommitReceiver {
     fd: Option<std::os::fd::OwnedFd>,
     wire: Option<std::sync::mpsc::Receiver<Option<[u8; READY_WIRE_LEN]>>>,
     fail_stop: bool,
-    expected_parent_pid: libc::pid_t,
+    parent: AttestedParent,
 }
 
 #[cfg(unix)]
 impl CommitReceiver {
-    fn raw(fd: std::os::fd::OwnedFd, fail_stop: bool, expected_parent_pid: libc::pid_t) -> Self {
+    fn raw(fd: std::os::fd::OwnedFd, fail_stop: bool, parent: AttestedParent) -> Self {
         Self {
             fd: Some(fd),
             wire: None,
             fail_stop,
-            expected_parent_pid,
+            parent,
         }
     }
 
@@ -1489,7 +1839,7 @@ impl CommitReceiver {
     pub(crate) fn start_watch(mut self) -> Option<Self> {
         let fd = self.fd.take()?;
         let fail_stop = self.fail_stop;
-        let expected_parent_pid = self.expected_parent_pid;
+        let parent = self.parent;
         let (send, wire) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("aterm-handoff-parent-watch".to_string())
@@ -1520,9 +1870,16 @@ impl CommitReceiver {
                     {
                         break None;
                     }
-                    // getppid changes permanently when the direct parent exits;
-                    // PID reuse cannot make this child belong to a new process.
-                    if unsafe { libc::getppid() } != expected_parent_pid {
+                    // The fail-stop's liveness witness. It no longer ASSUMES the
+                    // process tree can answer: a successor launchd owns has ppid
+                    // 1 from birth and this loop used to kill it on the first
+                    // pass (blocker B1). See [`AttestedParent`] for the property
+                    // being preserved — edge at the parent's `exit`, not its
+                    // reap, and immune to PID reuse. The probe is one libproc
+                    // call per 10ms tick for the bounded life of the overlap,
+                    // which is the same cadence the leaked-writer backstop
+                    // already required.
+                    if !parent.still_alive() {
                         // Close the write-before-exit race with one final
                         // nonblocking data check before fail-stop.
                         pollfd.revents = 0;
@@ -1552,7 +1909,17 @@ impl CommitReceiver {
 
     #[cfg(test)]
     pub(crate) fn for_test(fd: std::os::fd::OwnedFd) -> Self {
-        Self::raw(fd, false, unsafe { libc::getppid() })
+        // Attest the harness's own parent through the real admission path, so
+        // fixtures hold the same kind of witness production does. These
+        // receivers are `fail_stop: false` and exercise Commit WIRE delivery,
+        // not the death edge — that is
+        // `leaked_commit_writer_cannot_hide_parent_death`, which uses a real
+        // parent it then kills.
+        // SAFETY: `getppid` is a side-effect-free libc getter.
+        let creator = unsafe { libc::getppid() };
+        let parent = attest_handoff_parent(creator, None)
+            .expect("unit fixtures need a live parent process — run under `cargo test`");
+        Self::raw(fd, false, parent)
             .start_watch()
             .expect("test commit watcher")
     }
@@ -1721,14 +2088,19 @@ pub(crate) fn take_commit_fd(
     nonce: Option<String>,
     adopted_fds: &[i32],
     ready_fd: Option<i32>,
-    expected_parent_pid: Option<libc::pid_t>,
+    parent: Option<AttestedParent>,
 ) -> Option<CommitReceiver> {
     // Read and cleared in ONE critical section (caller contract: single-threaded
     // launcher); a one-shot descriptor handoff must never be consumable twice.
     let raw = aterm_log::env::take(ENV_COMMIT_FD).and_then(|v| v.into_string().ok());
     let _nonce = nonce?;
-    let expected_parent_pid = expected_parent_pid?;
-    if expected_parent_pid <= 1 || unsafe { libc::getppid() } != expected_parent_pid {
+    // Identity was proven when this value was minted (holding an
+    // [`AttestedParent`] IS that proof); the open question at admission is only
+    // whether that same process is still there to send a Commit. Startup between
+    // `prearm_incoming_fds` and here is long enough — it re-runs the whole
+    // codesign gate on a boot-apply — for the answer to have changed.
+    let parent = parent?;
+    if !parent.still_alive() {
         return None;
     }
     let fd: i32 = raw?.trim().parse().ok()?;
@@ -1747,7 +2119,7 @@ pub(crate) fn take_commit_fd(
     if adopted_fds.contains(&fd.as_raw_fd()) || aterm_pty::fd_is_tty(fd.as_raw_fd()) {
         return None;
     }
-    Some(CommitReceiver::raw(fd, true, expected_parent_pid))
+    Some(CommitReceiver::raw(fd, true, parent))
 }
 
 /// Non-unix stub: the overlap handoff is a unix mechanism (the Windows update
@@ -1768,7 +2140,7 @@ pub(crate) fn take_commit_fd(
     _nonce: Option<String>,
     _adopted_fds: &[i32],
     _ready_fd: Option<i32>,
-    _expected_parent_pid: Option<i32>,
+    _parent: Option<i32>,
 ) -> Option<CommitReceiver> {
     None
 }
@@ -2441,11 +2813,15 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn final_exec_env_requires_valid_parent_authority() {
+        let attested = AttestedParent {
+            pid: 4242,
+            witness: ParentWitness::ForkLink,
+        };
         let valid = PrearmedIncomingFds {
             fds: Vec::new(),
             recognizable: true,
             valid: true,
-            parent_pid: Some(4242),
+            parent: Some(attested),
         };
         assert_eq!(
             valid.final_exec_env(),
@@ -2454,20 +2830,222 @@ mod tests {
                 std::ffi::OsString::from("4242"),
             )]
         );
+        // A birth witness republishes the record too, so the re-exec'd image can
+        // re-attest without a parent link — the property a LaunchServices
+        // successor depends on.
+        let with_birth = PrearmedIncomingFds {
+            fds: Vec::new(),
+            recognizable: true,
+            valid: true,
+            parent: Some(AttestedParent {
+                pid: 4242,
+                witness: ParentWitness::Birth(ProcessBirth {
+                    seconds: 17,
+                    microseconds: 42,
+                }),
+            }),
+        };
+        assert_eq!(
+            with_birth.final_exec_env(),
+            vec![
+                (
+                    std::ffi::OsString::from(ENV_PARENT_PID),
+                    std::ffi::OsString::from("4242"),
+                ),
+                (
+                    std::ffi::OsString::from(ENV_PARENT_BIRTH),
+                    std::ffi::OsString::from("17.42"),
+                ),
+            ]
+        );
         let invalid = PrearmedIncomingFds {
             fds: Vec::new(),
             recognizable: true,
             valid: false,
-            parent_pid: Some(4242),
+            parent: Some(attested),
         };
         assert!(invalid.final_exec_env().is_empty());
         let parentless = PrearmedIncomingFds {
             fds: Vec::new(),
             recognizable: false,
             valid: true,
-            parent_pid: None,
+            parent: None,
         };
         assert!(parentless.final_exec_env().is_empty());
+    }
+
+    /// The birth record crosses a process boundary as text, so its encoding is
+    /// protocol. A value that does not round-trip would silently demote every
+    /// modern handoff to the legacy witness; a malformed one must be refused
+    /// outright rather than read as "absent" (see the `birth_present` arm of
+    /// `prearm_incoming_fds`).
+    #[test]
+    #[cfg(unix)]
+    fn process_birth_wire_round_trips_and_rejects_malformed_values() {
+        let birth = ProcessBirth {
+            seconds: 1_784_100_000,
+            microseconds: 7,
+        };
+        assert_eq!(birth.to_wire(), "1784100000.7");
+        assert_eq!(ProcessBirth::from_wire(&birth.to_wire()), Some(birth));
+        assert_eq!(ProcessBirth::from_wire("  1784100000.7  "), Some(birth));
+        for bad in [
+            "",
+            "1784100000",
+            "1784100000.",
+            ".7",
+            "a.b",
+            "-1.7",
+            "1.2.3",
+        ] {
+            assert_eq!(ProcessBirth::from_wire(bad), None, "malformed: {bad:?}");
+        }
+    }
+
+    /// IDENTITY, the half of parental attestation that must NOT weaken when
+    /// `getppid()` stops being the liveness probe (blocker B1).
+    ///
+    /// While this process has a live creator, the kernel parent link is the
+    /// authority and an environment-supplied claim may only AGREE with it. This
+    /// is the arm that refuses a stale `ATERM_HANDOFF_*` block that leaked into
+    /// a user shell which later runs `aterm`: such a process has a live creator
+    /// (the shell), so no published detail can make an unrelated pid pass.
+    #[test]
+    #[cfg(unix)]
+    fn attestation_refuses_any_pid_that_is_not_our_live_creator() {
+        // SAFETY: `getppid` is a side-effect-free libc getter.
+        let creator = unsafe { libc::getppid() };
+        assert!(creator > 1, "the test harness must have a real parent");
+        let ours = libc::pid_t::try_from(std::process::id()).expect("our own pid");
+
+        assert!(
+            attest_handoff_parent_from(creator, None, creator).is_some(),
+            "the live creator itself is always attestable"
+        );
+        assert_eq!(
+            attest_handoff_parent_from(ours, None, creator),
+            None,
+            "a live creator that is not the claimed pid refuses the claim"
+        );
+        for claimed in [0, 1] {
+            assert_eq!(
+                attest_handoff_parent_from(claimed, None, claimed),
+                None,
+                "pid {claimed} is what reparenting produces, never a parent"
+            );
+        }
+    }
+
+    /// BLOCKER B1, stated as a test: a successor with NO live creator — which is
+    /// what a LaunchServices-launched process is from birth, `getppid() == 1`
+    /// before it runs its first instruction — is admissible exactly when the
+    /// outgoing process published its own kernel birth record, and not
+    /// otherwise. The old `getppid()`-only predicate refused it unconditionally
+    /// and then fail-stopped it, which is why the launchd-job repair could not
+    /// start.
+    ///
+    /// The stand-in parent is a real spawned process rather than this one, so
+    /// the "wrong record at a live pid" case below is the pid-reuse scenario
+    /// itself: a live process sitting at the attested pid that is NOT the
+    /// attested process.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_creatorless_successor_is_admitted_only_by_a_published_birth_record() {
+        const NO_LIVE_CREATOR: libc::pid_t = 1;
+        let mut stand_in = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in parent");
+        let pid = libc::pid_t::try_from(stand_in.id()).expect("stand-in pid");
+        let birth = read_process_birth(pid).expect("a live process has a birth record");
+        let ours = libc::pid_t::try_from(std::process::id()).expect("our own pid");
+        let not_its_birth = read_process_birth(ours).expect("our own birth record");
+        assert_ne!(
+            birth, not_its_birth,
+            "two processes never share a birth instant"
+        );
+
+        assert_eq!(
+            attest_handoff_parent_from(pid, Some(birth), NO_LIVE_CREATOR),
+            Some(AttestedParent {
+                pid,
+                witness: ParentWitness::Birth(birth),
+            }),
+            "a published record the kernel corroborates is a complete witness"
+        );
+        assert_eq!(
+            attest_handoff_parent_from(pid, None, NO_LIVE_CREATOR),
+            None,
+            "with no creator and nothing published there is no witness at all"
+        );
+        assert_eq!(
+            attest_handoff_parent_from(pid, Some(not_its_birth), NO_LIVE_CREATOR),
+            None,
+            "a live pid carrying the WRONG birth record is the pid-reuse case, \
+             and it must refuse rather than fall back to something weaker"
+        );
+
+        stand_in.kill().expect("kill the stand-in parent");
+        stand_in.wait().expect("reap the stand-in parent");
+        assert_eq!(
+            attest_handoff_parent_from(pid, Some(birth), NO_LIVE_CREATOR),
+            None,
+            "a dead parent is not admissible however well it was described"
+        );
+    }
+
+    /// LIVENESS, the half that runs for the whole overlap and whose false
+    /// "alive" is the dangerous one: it would strand a readerless successor
+    /// holding duplicated masters of the user's live shells.
+    ///
+    /// The witness discriminates by the kernel's birth record, so it survives
+    /// the successor not being a child of the process it watches, and a
+    /// different process at the same pid does not satisfy it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn parent_liveness_tracks_the_process_not_the_pid() {
+        let mut watched = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the watched process");
+        let pid = libc::pid_t::try_from(watched.id()).expect("watched pid");
+        let birth = read_process_birth(pid).expect("a live process has a birth record");
+        let attested = AttestedParent {
+            pid,
+            witness: ParentWitness::Birth(birth),
+        };
+        assert!(
+            attested.still_alive(),
+            "the watched process is running and is not this process's parent, \
+             which is exactly the situation a launchd-owned successor is in"
+        );
+
+        // The same pid, described by a record that belongs to someone else: what
+        // a recycled pid looks like from here.
+        let ours = libc::pid_t::try_from(std::process::id()).expect("our own pid");
+        let our_birth = read_process_birth(ours).expect("our own birth record");
+        let impostor = AttestedParent {
+            pid,
+            witness: ParentWitness::Birth(our_birth),
+        };
+        assert!(
+            !impostor.still_alive(),
+            "a live pid alone must never satisfy the liveness witness"
+        );
+
+        watched.kill().expect("kill the watched process");
+        watched.wait().expect("reap the watched process");
+        assert!(
+            !attested.still_alive(),
+            "the witness must go false when the attested process exits — this is \
+             the fail-stop that stops a readerless candidate outliving its parent"
+        );
     }
 
     /// THE ChildDied regression (2026-07-22): a valid OverlapModern prearm
@@ -2476,8 +3054,8 @@ mod tests {
     /// re-exec must be able to RESTORE that authority onto the successor
     /// image, or the new build's own prearm rejects the inherited handoff and
     /// the parked parent reads EOF. This proves the round trip: prearm is
-    /// valid, the ambient variable is gone, and `final_exec_env` carries the
-    /// exact pair the successor's prearm requires.
+    /// valid, the ambient variables are gone, and `final_exec_env` carries the
+    /// exact pairs the successor's prearm requires.
     #[test]
     #[cfg(unix)]
     fn valid_overlap_prearm_scrubs_ambient_parent_but_restores_it_for_exec() {
@@ -2489,6 +3067,7 @@ mod tests {
         let _restore_ready = RestoreVar::new(ENV_READY_FD);
         let _restore_commit = RestoreVar::new(ENV_COMMIT_FD);
         let _restore_parent = RestoreVar::new(ENV_PARENT_PID);
+        let _restore_birth = RestoreVar::new(ENV_PARENT_BIRTH);
 
         let mut master_pipe = [0i32; 2];
         let mut ready_pipe = [0i32; 2];
@@ -2505,6 +3084,7 @@ mod tests {
         aterm_log::env::set(ENV_READY_FD, ready_pipe[1].to_string());
         aterm_log::env::set(ENV_COMMIT_FD, commit_pipe[0].to_string());
         aterm_log::env::set(ENV_PARENT_PID, parent.to_string());
+        aterm_log::env::unset(ENV_PARENT_BIRTH);
 
         let prearmed = prearm_incoming_fds();
         assert!(
@@ -2515,16 +3095,30 @@ mod tests {
             !prearmed.final_exec_fds().is_empty(),
             "descriptors survive for the final exec"
         );
-        assert!(
-            std::env::var_os(ENV_PARENT_PID).is_none(),
-            "ambient parent authority is scrubbed before any helper can spawn"
-        );
+        for key in [ENV_PARENT_PID, ENV_PARENT_BIRTH] {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "ambient parent authority ({key}) is scrubbed before any helper can spawn"
+            );
+        }
+        // This handoff was published in the LEGACY shape — pid only, exactly what
+        // a pre-0.13 outgoing build sends. Admission still succeeds, because the
+        // parent link proves this pid is our creator; and where the kernel offers
+        // a birth record the successor CAPTURES it under that proof and hands it
+        // forward, so the re-exec'd image no longer needs a parent link either.
+        let mut expected = vec![(
+            std::ffi::OsString::from(ENV_PARENT_PID),
+            std::ffi::OsString::from(parent.to_string()),
+        )];
+        if let Some(birth) = read_process_birth(parent) {
+            expected.push((
+                std::ffi::OsString::from(ENV_PARENT_BIRTH),
+                std::ffi::OsString::from(birth.to_wire()),
+            ));
+        }
         assert_eq!(
             prearmed.final_exec_env(),
-            vec![(
-                std::ffi::OsString::from(ENV_PARENT_PID),
-                std::ffi::OsString::from(parent.to_string()),
-            )],
+            expected,
             "the exec image gets the exact validated authority back"
         );
 
@@ -2808,7 +3402,13 @@ mod tests {
         // this exec. Holding the writer is the Darwin CLOEXEC-leak regression.
         let read_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) };
         let _leaked_writer = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
-        let receiver = CommitReceiver::raw(read_fd, true, expected_parent)
+        // Attest through the real admission path: the launcher is still blocked
+        // on our readiness marker, so it is a live creator and the birth record
+        // captured here is provably its own. That makes this fixture exercise
+        // the SAME witness production is admitted with.
+        let parent = attest_handoff_parent(expected_parent, None)
+            .expect("the launcher fixture is alive and is this process's parent");
+        let receiver = CommitReceiver::raw(read_fd, true, parent)
             .start_watch()
             .expect("start commit parent watch");
         std::fs::write(
@@ -3094,6 +3694,14 @@ mod tests {
             aterm_log::env::set(ENV_READY_FD, ready_write.to_string());
             aterm_log::env::set(ENV_COMMIT_FD, commit_read.to_string());
             aterm_log::env::set(ENV_PARENT_PID, parent_pid.to_string());
+            // The MODERN shape: publish the parent's birth record alongside its
+            // pid, exactly as `outgoing_parent_env` does in production, so the
+            // happy-path tests drive the witness a LaunchServices successor will
+            // depend on rather than only the legacy pid-plus-parent-link one.
+            match read_process_birth(parent_pid) {
+                Some(birth) => aterm_log::env::set(ENV_PARENT_BIRTH, birth.to_wire()),
+                None => aterm_log::env::unset(ENV_PARENT_BIRTH),
+            }
             match target {
                 Some(value) => aterm_log::env::set(ENV_TARGET, value),
                 None => aterm_log::env::unset(ENV_TARGET),
@@ -3175,6 +3783,7 @@ mod tests {
             RestoreVar::new(ENV_READY_FD),
             RestoreVar::new(ENV_COMMIT_FD),
             RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
         ];
         let staged = stage_outgoing_handoff("ok", 3, None);
         let (ready_read, ready_write) = pipe_pair("ready");
@@ -3251,6 +3860,7 @@ mod tests {
             RestoreVar::new(ENV_READY_FD),
             RestoreVar::new(ENV_COMMIT_FD),
             RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
         ];
         let older_codec = |wire: &str| {
             assert!(wire.contains("schema = 2"), "today's wire: {wire}");
@@ -3323,6 +3933,7 @@ mod tests {
             RestoreVar::new(ENV_READY_FD),
             RestoreVar::new(ENV_COMMIT_FD),
             RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
         ];
         // One additive key, exactly as a newer build's meta codec would emit it.
         let newer_meta_codec = |meta: &str| {
@@ -3378,6 +3989,7 @@ mod tests {
             RestoreVar::new(ENV_READY_FD),
             RestoreVar::new(ENV_COMMIT_FD),
             RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
         ];
         let staged = stage_outgoing_handoff("wrongbuild", 1, None);
         let (ready_read, ready_write) = pipe_pair("ready");
@@ -3419,6 +4031,7 @@ mod tests {
             RestoreVar::new(ENV_READY_FD),
             RestoreVar::new(ENV_COMMIT_FD),
             RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
         ];
         let staged = stage_outgoing_handoff("wrongset", 3, None);
         let (ready_read, ready_write) = pipe_pair("ready");
@@ -3478,6 +4091,7 @@ mod tests {
             RestoreVar::new(ENV_READY_FD),
             RestoreVar::new(ENV_COMMIT_FD),
             RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
         ];
         let staged = stage_outgoing_handoff("nocommit", 2, None);
         let (ready_read, ready_write) = pipe_pair("ready");

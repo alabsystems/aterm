@@ -10,6 +10,9 @@
 //! (`ditto -x -k`, preferred) and [`stage_from_dmg`] (`hdiutil attach`, for
 //! releases published before the zip existed). They share
 //! `verify_and_publish_incoming`, so the container never changes what is proved.
+//! What IS container-specific is the cost of unpacking: the zip path reads the
+//! archive's central directory and refuses one that would fill the volume before
+//! `ditto` is spawned — see [`checked_zip_extraction_claim`].
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -1098,6 +1101,413 @@ pub fn stage_from_dmg(
     verify_and_publish_incoming(staging, &incoming, manifest, &manifest_commit, expected_team)
 }
 
+// ---------------------------------------------------------------------------
+// Bounding the zip extract — what unpacking this archive would cost, read out
+// of the archive's own central directory BEFORE `ditto` is allowed to run.
+// ---------------------------------------------------------------------------
+
+// Trait/type imports scoped to the zip reader below; the rest of this file
+// spells its occasional `std::io` use out in full, but four repetitions of
+// `std::io::SeekFrom::Start` earn the import.
+use std::io::{BufReader, Read, Seek, SeekFrom};
+
+/// Hard ceiling on the UNCOMPRESSED bytes an update archive may DECLARE before
+/// [`stage_from_zip`] will hand it to `ditto`.
+///
+/// WHY A CEILING EXISTS AT ALL. The download is capped (`github.rs` passes 512
+/// MiB to `download_to`) and the archive's sha256 is checked against the release
+/// manifest before extraction, so nothing reaches this point that the publisher
+/// did not sign for. But deflate EXPANDS, `ditto` has no size limit of its own,
+/// and one bad release is unpacked by every machine on the channel at once. A
+/// volume with no free space cannot stage the fix that would undo it, so the
+/// failure has no in-band recovery — it is a fleet-wide availability event, not
+/// a per-machine annoyance. Refusing on the archive's own declared size turns
+/// "every disk is full" into "the fleet stayed on the previous build and said
+/// why", which the caller's stage-failure path already knows how to sit on.
+///
+/// WHY THIS NUMBER. The signed bundle is well under 100 MB uncompressed today (a
+/// handful of stripped Mach-O binaries, an icon, the help pages and the
+/// shell-integration scripts), so 1 GiB leaves more than a tenfold growth of
+/// headroom — aterm would have to become a different kind of program before an
+/// honest release tripped this — while staying an amount of scratch space any
+/// Mac that can run aterm can spare inside Application Support. If the bundle
+/// ever legitimately approaches it, raise the number in one deliberate commit;
+/// do not delete the check.
+const MAX_EXTRACT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Companion ceiling on the archive's entry COUNT, because bytes alone do not
+/// bound the damage: a million empty files declare zero uncompressed bytes and
+/// still cost a filesystem block and an inode apiece. MEASURED, not estimated:
+/// the shipped `aterm-0.12.0-mac.zip` declares 48 entries / 51,203,501
+/// uncompressed bytes, and a fresh `ditto -c -k --sequesterRsrc --keepParent`
+/// of the installed bundle gives 48 / 51,154,253 — so
+/// this leaves three orders of magnitude of headroom while holding the
+/// block-overhead worst case near 200 MiB (50k entries × one 4 KiB block).
+const MAX_EXTRACT_ENTRIES: u64 = 50_000;
+
+/// The little-endian record signatures this reader walks, as the `u32` each
+/// decodes to (`PK\x05\x06` reads back as `0x0605_4b50`).
+const EOCD_SIGNATURE: u32 = 0x0605_4b50;
+const ZIP64_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
+const ZIP64_EOCD_SIGNATURE: u32 = 0x0606_4b50;
+const CENTRAL_HEADER_SIGNATURE: u32 = 0x0201_4b50;
+
+/// Fixed (pre-comment) length of an End Of Central Directory record.
+const EOCD_FIXED_LEN: u64 = 22;
+/// Maximum archive comment length, i.e. how far back from EOF the EOCD can hide.
+const MAX_ZIP_COMMENT: u64 = 65_535;
+/// Length of the ZIP64 EOCD locator, which sits immediately before the EOCD.
+const ZIP64_LOCATOR_LEN: u64 = 20;
+/// Length of the ZIP64 EOCD record through its central-directory offset field
+/// (the last field this reader needs; the record may legally be longer).
+const ZIP64_EOCD_LEN: u64 = 56;
+/// Fixed (pre-name/extra/comment) length of one central directory file header.
+const CENTRAL_HEADER_FIXED_LEN: usize = 46;
+/// Header id of the ZIP64 extended information extra field.
+const ZIP64_EXTRA_ID: u16 = 0x0001;
+
+/// What an archive's own central directory says unpacking it will cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ZipExtractClaim {
+    entries: u64,
+    uncompressed_bytes: u64,
+}
+
+/// The three central-directory facts an end record carries, widened to the `u64`
+/// the ZIP64 record uses so the classic and ZIP64 shapes share one walker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectoryExtent {
+    entries: u64,
+    offset: u64,
+    size: u64,
+}
+
+fn le_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    let end = at.checked_add(2)?;
+    Some(u16::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    Some(u32::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    let end = at.checked_add(8)?;
+    Some(u64::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+/// Read exactly `len` bytes at an absolute offset. A short read is an error, not
+/// a short buffer: every caller here is reading a FIXED-layout record, so "the
+/// file ended early" means the record is not there.
+fn read_exact_at(file: &mut std::fs::File, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+    let len = usize::try_from(len)
+        .map_err(|_| format!("update zip record of {len} bytes does not fit in memory"))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("seek update zip to {offset}: {error}"))?;
+    let mut buffer = vec![0u8; len];
+    file.read_exact(&mut buffer)
+        .map_err(|error| format!("read {len} bytes of update zip at {offset}: {error}"))?;
+    Ok(buffer)
+}
+
+/// Locate the End Of Central Directory record and read its classic 32-bit view
+/// of the directory. Returns the record's absolute offset alongside it, because
+/// everything the directory describes must lie strictly before it.
+fn find_end_of_central_directory(
+    file: &mut std::fs::File,
+    file_len: u64,
+) -> Result<(u64, DirectoryExtent), String> {
+    let window = file_len.min(EOCD_FIXED_LEN.saturating_add(MAX_ZIP_COMMENT));
+    // `window <= file_len` by construction, so this cannot underflow.
+    let start = file_len - window;
+    let tail = read_exact_at(file, start, window)?;
+    let fixed = usize::try_from(EOCD_FIXED_LEN)
+        .map_err(|_| "update zip end record length does not fit in memory".to_string())?;
+    let Some(highest) = tail.len().checked_sub(fixed) else {
+        return Err("update zip is smaller than an end-of-central-directory record".to_string());
+    };
+    // A four-byte signature also occurs inside compressed data and inside the
+    // archive comment, so the signature alone identifies nothing. What makes a
+    // candidate real is that its declared comment length runs EXACTLY to end of
+    // file.
+    let mut found: Option<(u64, DirectoryExtent)> = None;
+    for index in (0..=highest).rev() {
+        let Some(record) = tail.get(index..) else {
+            continue;
+        };
+        if le_u32(record, 0) != Some(EOCD_SIGNATURE) {
+            continue;
+        }
+        let (Some(entries), Some(size), Some(offset), Some(comment_len)) = (
+            le_u16(record, 10),
+            le_u32(record, 12),
+            le_u32(record, 16),
+            le_u16(record, 20),
+        ) else {
+            continue;
+        };
+        if usize::from(comment_len) != record.len().saturating_sub(fixed) {
+            continue;
+        }
+        // TWO valid candidates means the archive has a decoy trailer, and
+        // nothing here can know which one `ditto` will follow — so the bound
+        // would be measured off a record that is not the one being extracted.
+        // Refuse. An honest archive cannot hit this by accident: it needs the
+        // four signature bytes AND a comment length that lands exactly on EOF,
+        // which is ~2^-48 per position over a ~64 KiB scan.
+        if found.is_some() {
+            return Err(
+                "update zip has more than one end-of-central-directory record; refusing \
+                 an archive whose trailer is ambiguous"
+                    .to_string(),
+            );
+        }
+        let index = u64::try_from(index)
+            .map_err(|_| "update zip end record offset does not fit in u64".to_string())?;
+        found = Some((
+            start.saturating_add(index),
+            DirectoryExtent {
+                entries: u64::from(entries),
+                offset: u64::from(offset),
+                size: u64::from(size),
+            },
+        ));
+    }
+    found.ok_or_else(|| "update zip has no end-of-central-directory record".to_string())
+}
+
+/// The ZIP64 view of the directory, when the archive carries one. `Ok(None)`
+/// means there is no ZIP64 locator at all (an ordinary small archive); once a
+/// locator IS present every further problem is a refusal, because the archive
+/// has declared that the 32-bit record cannot describe it.
+fn zip64_directory_extent(
+    file: &mut std::fs::File,
+    eocd_offset: u64,
+) -> Result<Option<DirectoryExtent>, String> {
+    let Some(locator_offset) = eocd_offset.checked_sub(ZIP64_LOCATOR_LEN) else {
+        return Ok(None);
+    };
+    let locator = read_exact_at(file, locator_offset, ZIP64_LOCATOR_LEN)?;
+    if le_u32(&locator, 0) != Some(ZIP64_LOCATOR_SIGNATURE) {
+        return Ok(None);
+    }
+    let record_offset =
+        le_u64(&locator, 8).ok_or_else(|| "update zip ZIP64 locator is truncated".to_string())?;
+    let record_end = record_offset
+        .checked_add(ZIP64_EOCD_LEN)
+        .ok_or_else(|| "update zip ZIP64 end record offset overflows".to_string())?;
+    if record_end > locator_offset {
+        return Err("update zip ZIP64 end record does not lie before its locator".to_string());
+    }
+    let record = read_exact_at(file, record_offset, ZIP64_EOCD_LEN)?;
+    if le_u32(&record, 0) != Some(ZIP64_EOCD_SIGNATURE) {
+        return Err("update zip ZIP64 locator does not point at a ZIP64 end record".to_string());
+    }
+    let (Some(entries), Some(size), Some(offset)) = (
+        le_u64(&record, 32),
+        le_u64(&record, 40),
+        le_u64(&record, 48),
+    ) else {
+        return Err("update zip ZIP64 end record is truncated".to_string());
+    };
+    Ok(Some(DirectoryExtent {
+        entries,
+        offset,
+        size,
+    }))
+}
+
+/// The uncompressed size out of a central directory entry's ZIP64 extended
+/// information field. That field carries ONLY the values that overflowed 32
+/// bits, in a fixed order with the uncompressed ("original") size first — so an
+/// entry that reaches here (its 32-bit size saturated) has it at data offset 0.
+fn zip64_uncompressed_size(extra: &[u8]) -> Option<u64> {
+    let mut at = 0usize;
+    while at < extra.len() {
+        let id = le_u16(extra, at)?;
+        let len = le_u16(extra, at.checked_add(2)?)?;
+        let data_at = at.checked_add(4)?;
+        let data_end = data_at.checked_add(usize::from(len))?;
+        let data = extra.get(data_at..data_end)?;
+        if id == ZIP64_EXTRA_ID {
+            return le_u64(data, 0);
+        }
+        // `data_end >= at + 4`, so this is strictly increasing and terminates.
+        at = data_end;
+    }
+    None
+}
+
+/// Walk the central directory, summing uncompressed sizes and counting entries.
+///
+/// The caps are enforced INSIDE the walk, not after it: a directory claiming a
+/// billion entries has to cost a bounded read, not a billion iterations.
+fn central_directory_claim(
+    file: &mut std::fs::File,
+    extent: DirectoryExtent,
+) -> Result<ZipExtractClaim, String> {
+    file.seek(SeekFrom::Start(extent.offset))
+        .map_err(|error| format!("seek update zip central directory: {error}"))?;
+    let mut reader = BufReader::new(file);
+    // The caller proved the extent lies inside a file the download cap held
+    // under 512 MiB, so this cannot fail on any host aterm runs on; written as a
+    // conversion rather than a cast so a narrower target refuses instead of
+    // wrapping.
+    let mut remaining = usize::try_from(extent.size)
+        .map_err(|_| "update zip central directory does not fit in memory".to_string())?;
+    let mut claim = ZipExtractClaim {
+        entries: 0,
+        uncompressed_bytes: 0,
+    };
+    while remaining > 0 {
+        let Some(after_fixed) = remaining.checked_sub(CENTRAL_HEADER_FIXED_LEN) else {
+            return Err("update zip central directory ends inside a file header".to_string());
+        };
+        let mut header = [0u8; CENTRAL_HEADER_FIXED_LEN];
+        reader
+            .read_exact(&mut header)
+            .map_err(|error| format!("read update zip central directory header: {error}"))?;
+        if le_u32(&header, 0) != Some(CENTRAL_HEADER_SIGNATURE) {
+            return Err("update zip central directory is not a chain of file headers".to_string());
+        }
+        let (Some(uncompressed), Some(name_len), Some(extra_len), Some(comment_len)) = (
+            le_u32(&header, 24),
+            le_u16(&header, 28),
+            le_u16(&header, 30),
+            le_u16(&header, 32),
+        ) else {
+            return Err("update zip central directory header is truncated".to_string());
+        };
+        // Three `u16` lengths sum to at most 196_605; no overflow on any target.
+        let variable = usize::from(name_len) + usize::from(extra_len) + usize::from(comment_len);
+        if variable > after_fixed {
+            return Err(
+                "update zip central directory entry runs past its declared extent".to_string(),
+            );
+        }
+        let mut variable_bytes = vec![0u8; variable];
+        reader
+            .read_exact(&mut variable_bytes)
+            .map_err(|error| format!("read update zip central directory entry: {error}"))?;
+        let uncompressed = if uncompressed == u32::MAX {
+            // 0xFFFFFFFF is the ZIP64 escape. It is also a legal literal size,
+            // but a ~4 GiB member already blows MAX_EXTRACT_BYTES on its own, so
+            // reading it as the escape can only make this stricter, never laxer.
+            let extra = variable_bytes
+                .get(usize::from(name_len)..)
+                .and_then(|rest| rest.get(..usize::from(extra_len)))
+                .ok_or_else(|| "update zip central directory entry is truncated".to_string())?;
+            zip64_uncompressed_size(extra).ok_or_else(|| {
+                "update zip entry escapes to a ZIP64 size but carries no ZIP64 extra field"
+                    .to_string()
+            })?
+        } else {
+            u64::from(uncompressed)
+        };
+        claim.entries = claim.entries.saturating_add(1);
+        claim.uncompressed_bytes = claim.uncompressed_bytes.saturating_add(uncompressed);
+        if claim.entries > MAX_EXTRACT_ENTRIES {
+            return Err(format!(
+                "update zip declares more than {MAX_EXTRACT_ENTRIES} entries; \
+                 refusing to extract it"
+            ));
+        }
+        if claim.uncompressed_bytes > MAX_EXTRACT_BYTES {
+            return Err(format!(
+                "update zip declares at least {} uncompressed bytes, over the \
+                 {MAX_EXTRACT_BYTES}-byte extraction cap; refusing to extract it",
+                claim.uncompressed_bytes
+            ));
+        }
+        // `variable <= after_fixed` was just checked.
+        remaining = after_fixed - variable;
+    }
+    if claim.entries != extent.entries {
+        return Err(format!(
+            "update zip central directory holds {} entries but its end record declares {}",
+            claim.entries, extent.entries
+        ));
+    }
+    Ok(claim)
+}
+
+/// Read the archive's CENTRAL DIRECTORY and refuse anything claiming to unpack
+/// to more than [`MAX_EXTRACT_BYTES`] or [`MAX_EXTRACT_ENTRIES`].
+///
+/// HAND-ROLLED ON PURPOSE. This reads four fixed-layout records and never
+/// inflates a byte. The update path is the one place in aterm where a new
+/// dependency is also a new way to lose the whole fleet, so a page of
+/// little-endian field reads beats pulling a zip crate in behind it.
+///
+/// FAIL CLOSED. Every malformed, truncated, ambiguous or unreadable directory is
+/// a refusal, never an "assume fine" — a bound the archive can opt out of by
+/// being broken is not a bound. In particular the entry count the walk observes
+/// must equal the count the end record declares, so a directory that describes a
+/// different archive than its own trailer cannot slip past on either reading.
+///
+/// WHAT THIS DOES AND DOES NOT PROVE. It bounds what the archive DECLARES, read
+/// out of the record any extractor must consult to know what the archive holds.
+/// It is not a proof about `ditto`: an extractor that streamed local file headers
+/// and ignored the directory could still be fed members the directory never
+/// mentions, and that residue is bounded only by the download cap times deflate's
+/// expansion. Closing it needs a watchdog that kills `ditto` when the extract
+/// directory crosses the cap, which is a separate change. What this DOES close is
+/// every archive that honestly says it is enormous plus every malformed shape in
+/// between — the realistic failure being a release built wrong, not a signer gone
+/// hostile (a hostile signer already ships the binary).
+fn checked_zip_extraction_claim(zip: &Path) -> Result<ZipExtractClaim, String> {
+    let mut file = std::fs::File::open(zip).map_err(|error| format!("open update zip: {error}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat update zip: {error}"))?
+        .len();
+    let (eocd_offset, classic) = find_end_of_central_directory(&mut file, file_len)?;
+    let extent = match zip64_directory_extent(&mut file, eocd_offset)? {
+        Some(zip64) => {
+            // Where the 32-bit record is NOT saturated it must agree with the
+            // 64-bit one. A disagreement means the two records describe
+            // different archives, and nothing here can know which one `ditto`
+            // will follow — so neither is trusted.
+            let disagrees = (classic.entries != u64::from(u16::MAX)
+                && classic.entries != zip64.entries)
+                || (classic.size != u64::from(u32::MAX) && classic.size != zip64.size)
+                || (classic.offset != u64::from(u32::MAX) && classic.offset != zip64.offset);
+            if disagrees {
+                return Err(
+                    "update zip ZIP64 and 32-bit end-of-central-directory records disagree"
+                        .to_string(),
+                );
+            }
+            zip64
+        }
+        None => {
+            // A sentinel with no ZIP64 record behind it is an archive shape this
+            // reader cannot describe. Unhandled is a REFUSAL, never "assume
+            // fine": the saturated field is exactly the one the cap is measured
+            // against.
+            if classic.entries == u64::from(u16::MAX)
+                || classic.size == u64::from(u32::MAX)
+                || classic.offset == u64::from(u32::MAX)
+            {
+                return Err(
+                    "update zip saturates its 32-bit end record but carries no ZIP64 one"
+                        .to_string(),
+                );
+            }
+            classic
+        }
+    };
+    let directory_end = extent
+        .offset
+        .checked_add(extent.size)
+        .ok_or_else(|| "update zip central directory extent overflows".to_string())?;
+    if directory_end > eocd_offset {
+        return Err("update zip central directory does not lie before its end record".to_string());
+    }
+    central_directory_claim(&mut file, extent)
+}
+
 /// Stage a verified copy of the bundle from a downloaded (sha256-checked) ZIP:
 /// `ditto -x -k` extract, then the IDENTICAL verification + publication
 /// [`stage_from_dmg`] performs ([`verify_and_publish_incoming`]).
@@ -1114,7 +1524,10 @@ pub fn stage_from_dmg(
 ///
 /// Nothing about the trust model changes: the zip's bytes are checked against the
 /// manifest digest before this is called, and the extracted bundle then goes
-/// through the same codesign/Team-ID/sealed-identity gate.
+/// through the same codesign/Team-ID/sealed-identity gate. What the digest does
+/// NOT bound is how far those bytes EXPAND, so the unpack is gated on
+/// [`checked_zip_extraction_claim`] first — see [`MAX_EXTRACT_BYTES`] for why an
+/// authentic-but-malformed archive is still a fleet-wide availability problem.
 pub fn stage_from_zip(
     staging: &Staging,
     zip: &Path,
@@ -1122,6 +1535,16 @@ pub fn stage_from_zip(
     expected_team: &str,
 ) -> Result<(), String> {
     let manifest_commit = staging_manifest_commit(manifest)?;
+    // Bound the unpack BEFORE any filesystem work: `ditto` has no size limit of
+    // its own, so the archive's own central directory is the only place to learn
+    // what extracting it would cost — and refusing here costs nothing, because
+    // not one byte has been written yet.
+    let claim = checked_zip_extraction_claim(zip)?;
+    crate::log(&format!(
+        "update zip declares {} entries / {} uncompressed bytes \
+         (caps {MAX_EXTRACT_ENTRIES} / {MAX_EXTRACT_BYTES})",
+        claim.entries, claim.uncompressed_bytes
+    ));
     ensure_private_dir(&staging.staged_dir()).map_err(|e| format!("staged dir: {e}"))?;
     // Reclaim any extract dir a previously-killed run leaked (same intent as
     // `sweep_stale_mounts`: nothing under our 0700 dir may accumulate).
@@ -3205,5 +3628,285 @@ mod tests {
         // One second before the epoch of the last known instant, to catch an
         // off-by-one in the day/second boundary: 2024-02-28T23:59:59Z.
         assert_eq!(format_rfc3339(1_709_164_799), "2024-02-28T23:59:59Z");
+    }
+
+    // -----------------------------------------------------------------------
+    // The zip extraction bound. These build central directories BY HAND rather
+    // than shelling out to `ditto -c -k`, because the shapes that matter are
+    // exactly the ones a real archiver will not produce: a saturated ZIP64
+    // sentinel with nothing behind it, a directory cut mid-header, a size field
+    // no filesystem could satisfy.
+    // -----------------------------------------------------------------------
+
+    /// One central directory file header for `name`, declaring `uncompressed`
+    /// bytes and carrying `extra` as its extra field.
+    fn central_header(name: &str, uncompressed: u32, extra: &[u8]) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(&CENTRAL_HEADER_SIGNATURE.to_le_bytes());
+        header.extend_from_slice(&[0u8; 4]); // version made by + version needed
+        header.extend_from_slice(&[0u8; 2]); // general purpose flags
+        header.extend_from_slice(&[0u8; 2]); // method (stored)
+        header.extend_from_slice(&[0u8; 4]); // mod time + mod date
+        header.extend_from_slice(&[0u8; 4]); // crc32
+        header.extend_from_slice(&0u32.to_le_bytes()); // compressed size
+        header.extend_from_slice(&uncompressed.to_le_bytes());
+        header.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        header.extend_from_slice(&u16::try_from(extra.len()).unwrap().to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes()); // file comment length
+        header.extend_from_slice(&[0u8; 2]); // disk number start
+        header.extend_from_slice(&[0u8; 2]); // internal attributes
+        header.extend_from_slice(&[0u8; 4]); // external attributes
+        header.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        assert_eq!(header.len(), CENTRAL_HEADER_FIXED_LEN, "fixed header layout");
+        header.extend_from_slice(name.as_bytes());
+        header.extend_from_slice(extra);
+        header
+    }
+
+    /// An End Of Central Directory record with the given (already-encoded)
+    /// fields, so a test can declare a sentinel or a deliberate mismatch.
+    fn eocd(entries: u16, size: u32, offset: u32, comment: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&EOCD_SIGNATURE.to_le_bytes());
+        record.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        record.extend_from_slice(&0u16.to_le_bytes()); // disk with the directory
+        record.extend_from_slice(&entries.to_le_bytes()); // entries on this disk
+        record.extend_from_slice(&entries.to_le_bytes()); // total entries
+        record.extend_from_slice(&size.to_le_bytes());
+        record.extend_from_slice(&offset.to_le_bytes());
+        record.extend_from_slice(&u16::try_from(comment.len()).unwrap().to_le_bytes());
+        record.extend_from_slice(comment);
+        record
+    }
+
+    /// A stand-in for the local-file-header area, so the directory offset under
+    /// test is never the degenerate zero.
+    const ZIP_PREFIX: &[u8] = b"PK\x03\x04stub!!";
+
+    /// Write `bytes` to a fresh temp path and hand back a guard that removes it.
+    struct TempZip(std::path::PathBuf);
+
+    impl TempZip {
+        fn new(label: &str, bytes: &[u8]) -> Self {
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aterm-zipbound-{label}-{}-{n}.zip",
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempZip {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Assemble prefix + headers + an EOCD whose extent and count match them —
+    /// the shape every refusal test then perturbs in exactly one place.
+    fn well_formed_zip(entries: &[(&str, u32)]) -> Vec<u8> {
+        let mut bytes = ZIP_PREFIX.to_vec();
+        let offset = u32::try_from(bytes.len()).unwrap();
+        for &(name, uncompressed) in entries {
+            bytes.extend_from_slice(&central_header(name, uncompressed, &[]));
+        }
+        let size = u32::try_from(bytes.len()).unwrap() - offset;
+        let count = u16::try_from(entries.len()).unwrap();
+        bytes.extend_from_slice(&eocd(count, size, offset, b""));
+        bytes
+    }
+
+    /// The happy path: a directory `ditto -c -k` could plausibly have written is
+    /// read exactly — entry count and summed uncompressed bytes both.
+    #[test]
+    fn zip_claim_reads_a_well_formed_central_directory() {
+        let zip = TempZip::new(
+            "ok",
+            &well_formed_zip(&[
+                ("aterm.app/", 0),
+                ("aterm.app/Contents/Info.plist", 1_024),
+                ("aterm.app/Contents/MacOS/aterm", 40_000_000),
+            ]),
+        );
+        let claim = checked_zip_extraction_claim(&zip.0).expect("well-formed directory is read");
+        assert_eq!(
+            claim,
+            ZipExtractClaim {
+                entries: 3,
+                uncompressed_bytes: 40_001_024,
+            }
+        );
+    }
+
+    /// An archive comment does not hide the end record: the scan must mind the
+    /// variable-length tail rather than assume the record sits at EOF - 22.
+    #[test]
+    fn zip_claim_finds_the_end_record_behind_an_archive_comment() {
+        let mut bytes = ZIP_PREFIX.to_vec();
+        let offset = u32::try_from(bytes.len()).unwrap();
+        bytes.extend_from_slice(&central_header("only", 7, &[]));
+        let size = u32::try_from(bytes.len()).unwrap() - offset;
+        // A 4 KiB comment of bytes that are NOT a signature, so the only valid
+        // candidate is the real record.
+        let comment = [b'c'; 4096];
+        bytes.extend_from_slice(&eocd(1, size, offset, &comment));
+        let zip = TempZip::new("comment", &bytes);
+        assert_eq!(
+            checked_zip_extraction_claim(&zip.0).expect("comment does not hide the end record"),
+            ZipExtractClaim {
+                entries: 1,
+                uncompressed_bytes: 7,
+            }
+        );
+    }
+
+    /// An absurd declared size is refused. `u32::MAX - 1` is the largest size a
+    /// classic entry can state without tripping the ZIP64 escape, and it is
+    /// already four times the cap, so this is refused on BYTES — no
+    /// filesystem, no `ditto`, nothing written.
+    #[test]
+    fn zip_claim_refuses_an_absurd_declared_size() {
+        let zip = TempZip::new("huge", &well_formed_zip(&[("aterm.app/huge", u32::MAX - 1)]));
+        let error = checked_zip_extraction_claim(&zip.0).expect_err("absurd size is refused");
+        assert!(
+            error.contains("uncompressed bytes") && error.contains("extraction cap"),
+            "refusal names the byte cap: {error}"
+        );
+    }
+
+    /// Many small entries are refused on COUNT even though their declared bytes
+    /// are zero — the inode/block cost bytes alone cannot see.
+    #[test]
+    fn zip_claim_refuses_an_absurd_entry_count() {
+        let over = usize::try_from(MAX_EXTRACT_ENTRIES).unwrap() + 1;
+        let mut bytes = ZIP_PREFIX.to_vec();
+        let offset = u32::try_from(bytes.len()).unwrap();
+        for _ in 0..over {
+            bytes.extend_from_slice(&central_header("e", 0, &[]));
+        }
+        let size = u32::try_from(bytes.len()).unwrap() - offset;
+        bytes.extend_from_slice(&eocd(u16::try_from(over).unwrap(), size, offset, b""));
+        let zip = TempZip::new("many", &bytes);
+        let error = checked_zip_extraction_claim(&zip.0).expect_err("absurd count is refused");
+        assert!(
+            error.contains("entries"),
+            "refusal names the entry cap: {error}"
+        );
+    }
+
+    /// A directory cut mid-header is refused. The end record still declares the
+    /// full extent, so the walk runs out of header before it runs out of extent
+    /// — the shape a truncated upload produces.
+    #[test]
+    fn zip_claim_refuses_a_truncated_central_directory() {
+        let mut bytes = ZIP_PREFIX.to_vec();
+        let offset = u32::try_from(bytes.len()).unwrap();
+        bytes.extend_from_slice(&central_header("first", 10, &[]));
+        let full = central_header("second", 20, &[]);
+        let present = u32::try_from(bytes.len()).unwrap() - offset;
+        // Half of the second header survives; the extent still claims both.
+        let size = present + u32::try_from(full.len()).unwrap();
+        bytes.extend_from_slice(&full[..full.len() / 2]);
+        bytes.extend_from_slice(&eocd(2, size, offset, b""));
+        let zip = TempZip::new("cut", &bytes);
+        let error = checked_zip_extraction_claim(&zip.0).expect_err("truncation is refused");
+        assert!(
+            error.contains("does not lie before its end record")
+                || error.contains("ends inside a file header"),
+            "refusal names the truncation: {error}"
+        );
+    }
+
+    /// A directory whose walked entry count disagrees with the trailer is
+    /// refused: the two records must describe the SAME archive, or the bound was
+    /// measured off something other than what is about to be unpacked.
+    #[test]
+    fn zip_claim_refuses_a_directory_that_contradicts_its_trailer() {
+        let mut bytes = ZIP_PREFIX.to_vec();
+        let offset = u32::try_from(bytes.len()).unwrap();
+        bytes.extend_from_slice(&central_header("one", 1, &[]));
+        bytes.extend_from_slice(&central_header("two", 2, &[]));
+        let size = u32::try_from(bytes.len()).unwrap() - offset;
+        // Two headers present, seven declared.
+        bytes.extend_from_slice(&eocd(7, size, offset, b""));
+        let zip = TempZip::new("miscount", &bytes);
+        let error = checked_zip_extraction_claim(&zip.0).expect_err("miscount is refused");
+        assert!(
+            error.contains("end record declares"),
+            "refusal names the disagreement: {error}"
+        );
+    }
+
+    /// A ZIP64 sentinel with no locator behind it is a shape this reader cannot
+    /// describe, and the saturated field is exactly the one the cap is measured
+    /// against — so it is a REFUSAL, never "assume fine".
+    #[test]
+    fn zip_claim_refuses_a_zip64_sentinel_without_a_locator() {
+        for (label, entries, size, offset) in [
+            ("count", u16::MAX, 46u32, 12u32),
+            ("size", 1u16, u32::MAX, 12u32),
+            ("offset", 1u16, 46u32, u32::MAX),
+        ] {
+            let mut bytes = ZIP_PREFIX.to_vec();
+            bytes.extend_from_slice(&central_header("one", 1, &[]));
+            bytes.extend_from_slice(&eocd(entries, size, offset, b""));
+            let zip = TempZip::new(label, &bytes);
+            let error = checked_zip_extraction_claim(&zip.0)
+                .expect_err("a sentinel with no ZIP64 record is refused");
+            assert!(
+                error.contains("carries no ZIP64 one"),
+                "{label}: refusal names the missing ZIP64 record: {error}"
+            );
+        }
+    }
+
+    /// An entry escaping to a ZIP64 size with no ZIP64 extra field to hold it is
+    /// refused rather than read as a literal ~4 GiB (which would also fail, but
+    /// for the wrong reason — the point is that the escape is UNRESOLVED).
+    #[test]
+    fn zip_claim_refuses_a_zip64_escape_with_no_extra_field() {
+        let zip = TempZip::new("escape", &well_formed_zip(&[("aterm.app/x", u32::MAX)]));
+        let error = checked_zip_extraction_claim(&zip.0).expect_err("bare escape is refused");
+        assert!(
+            error.contains("carries no ZIP64 extra field"),
+            "refusal names the missing extra field: {error}"
+        );
+    }
+
+    /// Two trailers that both run exactly to EOF are ambiguous: the bound would
+    /// be measured off a record that may not be the one `ditto` follows.
+    #[test]
+    fn zip_claim_refuses_an_ambiguous_pair_of_end_records() {
+        let mut bytes = ZIP_PREFIX.to_vec();
+        let offset = u32::try_from(bytes.len()).unwrap();
+        bytes.extend_from_slice(&central_header("one", 1, &[]));
+        let size = u32::try_from(bytes.len()).unwrap() - offset;
+        // The decoy's comment swallows the real record, so BOTH end exactly at
+        // EOF and both parse.
+        let real = eocd(1, size, offset, b"");
+        let filler = vec![0u8; real.len()];
+        bytes.extend_from_slice(&eocd(1, size, offset, &filler));
+        let decoy_comment_start = bytes.len() - real.len();
+        bytes[decoy_comment_start..].copy_from_slice(&real);
+        let zip = TempZip::new("ambiguous", &bytes);
+        let error = checked_zip_extraction_claim(&zip.0).expect_err("ambiguity is refused");
+        assert!(
+            error.contains("more than one end-of-central-directory record"),
+            "refusal names the ambiguity: {error}"
+        );
+    }
+
+    /// A file too short to hold an end record at all is refused, not read as an
+    /// empty archive.
+    #[test]
+    fn zip_claim_refuses_a_file_with_no_end_record() {
+        let zip = TempZip::new("stub", b"PK\x03\x04not-a-zip");
+        let error = checked_zip_extraction_claim(&zip.0).expect_err("a non-archive is refused");
+        assert!(
+            error.contains("end-of-central-directory"),
+            "refusal names the missing end record: {error}"
+        );
     }
 }

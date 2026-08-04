@@ -79,18 +79,36 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         `thread::spawn` closures are approximated (the spawn body is attributed
         to the spawning fn).
       - INTERPROCEDURAL DEPTH: exactly ONE hop — a call made while a guard is
-        held, to a same-corpus fn (free-fn `name(..)` or bare `self.name(..)`
-        call shapes only) whose own body directly acquires. The callee's callees
-        are NOT followed. Same-named fns merge (over-approximation, same posture
-        as the main-loop census).
-        The callee is chosen BY NAME, so only those two shapes are sound: a free
-        fn and a method of `Self` are fns this corpus defines. `other.name(..)`
-        dispatches on a type this census cannot resolve — and so does
-        `self.field.name(..)`, which is the same ambiguity with `other` spelled
-        `self.field`. Field-receiver calls are therefore counted, not followed;
-        the count is printed in the ledger every run beside UNKNOWN. Following
-        them once bound std's `Condvar::wait` (which RELEASES its guard) to an
-        unrelated same-named fn and reported a lock cycle that does not exist.
+        held, to a same-corpus fn (free-fn `name(..)`, bare `self.name(..)`, or
+        a TYPE-DIRECTED `self.field.name(..)`) whose own body directly
+        acquires. The callee's callees are NOT followed. Same-named fns merge
+        WITHIN a namespace (over-approximation, same posture as the main-loop
+        census); across one they do not — see NAMESPACE BOUNDARY ON THE HOP.
+        The callee is chosen BY NAME, so the shapes are limited: a free fn and
+        a method of `Self` are fns this corpus defines, while `other.name(..)`
+        dispatches on a type this census cannot resolve and is never followed.
+        `self.field.name(..)` is followed only when the FIELD's declared type is
+        defined in this corpus AND exactly one corpus fn bears the callee's
+        name AND that fn is in the call site's own namespace; otherwise the hop
+        is counted and LISTED beside UNKNOWN. Following it unconditionally once
+        bound std's `Condvar::wait` (which RELEASES its guard) to an unrelated
+        same-named fn and reported a lock cycle that does not exist.
+      - NAMESPACE BOUNDARY ON THE HOP: the by-name callee table spans the
+        workspace crates AND every scanned vendored fork, so a name shared
+        across that boundary must not resolve across it. A definition in the
+        CALL SITE's own namespace SHADOWS the foreign ones — a bare `start(..)`
+        beside a local `fn start` is the local one, never winnow's `fn start`
+        (which locks `winnow::writer`); a bare call cannot mean an import that
+        collides with a local definition, because that does not compile. Only
+        an UNSHADOWED name — one the caller's namespace does not define at all
+        — resolves across the boundary, because such a call must be to an
+        IMPORT, and that is exactly how the real aterm↔winit hops are seen.
+        Refusing the unshadowed ones as well would trade a false edge for a
+        SILENT missing one — the worse failure in a deadlock census. Following
+        the shadowed ones fails the other way, and worse: an edge minted from a
+        name collision can touch a vendored identity, and a cycle through
+        vendored code is unrepairable — that code may not be edited, and this
+        obligation has no waiver channel.
       - BLOCKING EDGES ONLY: `try_lock`/`try_read`/`try_write` cannot block, so
         a try-guard is an edge SOURCE (once held it is held) but never an edge
         TARGET. Scope: non-test sources of the scanned crates with `#[cfg(test)]`
@@ -130,7 +148,11 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
       - VENDORED-IDENTITY MODE: the vendored [patch] crates that link into the
         GUI process (REVIEWED_VENDORED_CRATES) are scanned with every identity
         in a per-crate namespace (`winit::…`), so a foreign receiver name can
-        never merge with an aterm identity or another vendored crate's.
+        never merge with an aterm identity or another vendored crate's. The
+        namespace is carried by the fn TABLE as well as by the identities, so a
+        foreign fn NAME cannot capture an aterm call site either (see NAMESPACE
+        BOUNDARY ON THE HOP — identity namespacing alone would not have stopped
+        aterm's `start(..)` from inheriting `winnow::writer`).
         Vendored UNKNOWNs keep the per-site-node discipline (counted,
         summarized per crate, never able to close a cycle). Cross-boundary
         holds are subject to the same ONE-hop limit — and the trusted call
@@ -473,6 +495,13 @@ const STANDARD_METHOD_NAMES: &[&str] = &[
 // ---------------------------------------------------------------------------
 // Site model
 // ---------------------------------------------------------------------------
+
+/// The identity namespace of the aterm WORKSPACE crates: they are this
+/// census's home corpus and carry no prefix — only the vendored `[patch]`
+/// forks do (`winit::…`, `winnow::…`). Spelled once, because several places
+/// must ask "which side of the namespace boundary is this?" and a bare `None`
+/// at each of them says nothing about which boundary is meant.
+const WORKSPACE_NS: Option<&'static str> = None;
 
 /// One lock-acquisition site.
 struct AcqSite {
@@ -958,6 +987,11 @@ type FieldRecvCall = (usize, String, String);
 /// field of the same name merge). That is the census's standing posture for
 /// same-named fns, and it errs toward FOLLOWING a hop — the direction that risks
 /// a visible false positive rather than a silent missed cycle.
+///
+/// The harvest runs over the WORKSPACE crates only (the vendored `[patch]`
+/// sources are parsed for lock SITES, never for declarations), so this evidence
+/// describes [`WORKSPACE_NS`] types and nothing else — see
+/// [`FieldTypes::is_corpus_typed`].
 #[derive(Default)]
 struct FieldTypes {
     /// Every type NAME the corpus defines (`struct`/`enum`/`union`/`type` and
@@ -970,13 +1004,23 @@ struct FieldTypes {
 }
 
 impl FieldTypes {
-    /// Is `field`'s declared type defined in this corpus? Unknown fields answer
-    /// `false`: with no declaration in evidence there is nothing to resolve
-    /// through, and a guess is what this whole mechanism exists to avoid.
-    fn is_corpus_typed(&self, field: &str) -> bool {
-        self.field_tys
-            .get(field)
-            .is_some_and(|tys| tys.iter().any(|t| self.defined.contains(t)))
+    /// Is `field`'s declared type defined in this corpus, where `at` is the
+    /// namespace of the CALL SITE asking? Unknown fields answer `false`: with
+    /// no declaration in evidence there is nothing to resolve through, and a
+    /// guess is what this whole mechanism exists to avoid.
+    ///
+    /// A call site outside [`WORKSPACE_NS`] answers `false` for the same
+    /// reason: the harvest only ever read the workspace crates, so every
+    /// declaration in here is aterm's. That a struct aterm declares has a field
+    /// named `state` is not evidence about the type of the field winit spells
+    /// `self.state` — resolving a vendored hop through it would be the very
+    /// guess the mechanism refuses, dressed as evidence.
+    fn is_corpus_typed(&self, at: Option<&'static str>, field: &str) -> bool {
+        at == WORKSPACE_NS
+            && self
+                .field_tys
+                .get(field)
+                .is_some_and(|tys| tys.iter().any(|t| self.defined.contains(t)))
     }
 
     /// Harvest declarations from one already-cfg-masked source file.
@@ -1157,6 +1201,12 @@ struct FnLockFacts {
     name: String,
     /// Repo-relative `file:line` of the definition.
     span: String,
+    /// The identity namespace of the crate DEFINING this fn: [`WORKSPACE_NS`]
+    /// for the aterm crates, `Some("winnow")` etc. for a scanned vendored fork.
+    /// One-hop callee lookup is by NAME over a table that spans both sides, so
+    /// the name alone cannot be the key — a definition's namespace is half of
+    /// its identity as a callee.
+    namespace: Option<&'static str>,
     /// Does the signature return a `…Guard` (lexical match)? Combined with a
     /// direct acquisition, this is the acquire-and-return helper shape whose
     /// callers hold invisibly — it must be registered in [`GUARD_HELPERS`].
@@ -1265,6 +1315,7 @@ fn scan_fn(
     let mut facts = FnLockFacts {
         name: name.to_string(),
         span: span.to_string(),
+        namespace,
         returns_guard: returns_guard(body),
         takes_self: takes_self(body),
         acq: Vec::new(),
@@ -1553,7 +1604,12 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     // ---- Parse every fn in the scanned crates. ----
     let mut sites: Vec<AcqSite> = Vec::new();
     let mut fns: Vec<FnLockFacts> = Vec::new();
-    // Type evidence for the field-receiver hop, harvested from the same files.
+    // Type evidence for the field-receiver hop, harvested from the same files —
+    // the WORKSPACE files only. The vendored loop below deliberately does not
+    // harvest: pooling winit's declarations with aterm's would let one crate's
+    // struct answer for the other's fields, and giving each fork its own
+    // evidence would EXTEND which hops are followed (more edges), which is a
+    // coverage change to review on its own, not a side effect of namespacing.
     let mut field_types = FieldTypes::default();
     for crate_dir in &scan.scan_dirs {
         let mut files = Vec::new();
@@ -1666,26 +1722,37 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         return CensusOutcome { ok: false, log };
     }
 
-    // fn name -> indices (ALL same-named fns — over-approximation, the same
-    // fail-closed posture as the main-loop census).
     // Held calls through a `self.field.…` receiver, split by whether the field's
     // declared type is defined in this corpus. Corpus-typed ones are followed
     // like any other hop; foreign-typed ones cannot be resolved by name and are
     // counted + listed instead of guessed at.
     let mut unresolved_field_calls: Vec<(String, String)> = Vec::new();
-    // How many fns in the corpus bear each name. A field hop is followed only
-    // when the answer is exactly ONE: with a single candidate the by-name lookup
-    // is not a guess. Two same-named fns on DIFFERENT types is precisely how a
-    // `self.drained.wait(g)` on aterm-types' `Condvar` newtype merged with an
-    // unrelated `MemoryWait::wait` and fabricated a cycle.
-    let mut name_counts: BTreeMap<String, usize> = BTreeMap::new();
+    // Per fn name, how many fns bear it IN EACH NAMESPACE. A field hop is
+    // followed only when the whole corpus holds exactly ONE such fn AND it is
+    // the call site's own namespace that defines it. Both halves are the same
+    // requirement seen twice: the hop's entire justification is that the field's
+    // declared type is a corpus type, so its methods are corpus fns — a second
+    // candidate makes the by-name lookup a PICK (that is how `self.drained
+    // .wait(g)` on aterm-types' `Condvar` newtype merged with an unrelated
+    // `MemoryWait::wait` and fabricated a cycle), and a lone candidate on the far
+    // side of a vendored namespace boundary is not a method of that type at all
+    // (an aterm struct's method is an aterm fn; winnow's unique `fn start` can
+    // never be the callee of an aterm `self.trace.start(..)`).
+    let mut name_counts: BTreeMap<String, BTreeMap<Option<&'static str>, usize>> = BTreeMap::new();
     for f in &fns {
-        *name_counts.entry(f.name.clone()).or_default() += 1;
+        *name_counts
+            .entry(f.name.clone())
+            .or_default()
+            .entry(f.namespace)
+            .or_default() += 1;
     }
     for f in &mut fns {
+        let caller_ns = f.namespace;
         for (site, field, callee, span) in std::mem::take(&mut f.field_recv_calls) {
-            let resolvable =
-                field_types.is_corpus_typed(&field) && name_counts.get(&callee) == Some(&1);
+            let uniquely_local = name_counts
+                .get(&callee)
+                .is_some_and(|per_ns| per_ns.len() == 1 && per_ns.get(&caller_ns) == Some(&1));
+            let resolvable = field_types.is_corpus_typed(caller_ns, &field) && uniquely_local;
             if resolvable {
                 f.held_calls.push((site, callee, span));
             } else {
@@ -1698,9 +1765,35 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     unresolved_field_calls.dedup();
     let field_recv_calls = unresolved_field_calls.len();
 
-    let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    // Callee lookup for the one-hop pass: fn name -> definitions, GROUPED by the
+    // namespace of the crate defining each. The name alone cannot be the key.
+    // The table merges the workspace crates with every scanned vendored fork,
+    // and the vendored crates' identities are namespaced but their fn NAMES are
+    // not: winnow's `fn start` and `fn end` both lock `winnow::writer`, and
+    // aterm has its own `start`/`end` with hop-eligible call sites. Resolving a
+    // bare `start()` in aterm code against the merged table would mint an
+    // aterm-lock -> `winnow::writer` edge out of nothing but a name collision —
+    // and a cycle closed that way could not be repaired AT ALL, since the
+    // vendored half of it may not be edited and OB-7 has no waiver channel.
+    //
+    // The boundary rule, applied per call site (see the precision note):
+    //   * the caller's OWN namespace defines the name => those definitions are
+    //     the candidates and the foreign ones are dropped. Rust agrees: a bare
+    //     `start(..)` beside a local `fn start` is the local one, because an
+    //     import colliding with a local definition does not compile.
+    //   * it does not => the call must be to something IMPORTED, which may well
+    //     be the vendored fork (aterm holding a lock across a call into winit;
+    //     winit calling back out). Those hops stay followed — refusing them
+    //     would trade a false edge for a SILENT missing one, and in a deadlock
+    //     census the silent failure is the worse one.
+    let mut by_name: BTreeMap<&str, BTreeMap<Option<&'static str>, Vec<usize>>> = BTreeMap::new();
     for (idx, f) in fns.iter().enumerate() {
-        by_name.entry(&f.name).or_default().push(idx);
+        by_name
+            .entry(&f.name)
+            .or_default()
+            .entry(f.namespace)
+            .or_default()
+            .push(idx);
     }
 
     // [OB-7] Guard-helper registry, fail-closed BOTH ways (the OB-1/OB-3
@@ -1721,14 +1814,21 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             failures += 1;
             continue;
         }
-        let interior_ok = by_name.get(h.symbol).is_some_and(|idxs| {
-            idxs.iter().any(|&i| {
-                fns[i]
-                    .acq
-                    .iter()
-                    .any(|&s| sites[s].identity.as_deref() == Some(h.identity))
-            })
-        });
+        // Only the WORKSPACE definitions can satisfy the interior check: a
+        // registered helper is aterm's own (its `def_file` is verified above),
+        // so a same-named fn inside a vendored fork is a different fn and must
+        // not be able to vouch for the registration.
+        let interior_ok = by_name
+            .get(h.symbol)
+            .and_then(|per_ns| per_ns.get(&WORKSPACE_NS))
+            .is_some_and(|idxs| {
+                idxs.iter().any(|&i| {
+                    fns[i]
+                        .acq
+                        .iter()
+                        .any(|&s| sites[s].identity.as_deref() == Some(h.identity))
+                })
+            });
         if !interior_ok {
             let _ = writeln!(
                 log,
@@ -1790,7 +1890,14 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 .all(|&s| !sites[s].blocking || !sites[s].graphed())
             || f.acq.is_empty()
             || (STANDARD_METHOD_NAMES.contains(&f.name.as_str()) && f.takes_self)
-            || GUARD_HELPERS.iter().any(|h| h.symbol == f.name)
+            // The registry exemption is the WORKSPACE's: every GUARD_HELPERS
+            // entry names an aterm fn (its `def_file` is verified above), so a
+            // vendored fn that merely shares the name is a DIFFERENT
+            // guard-returning helper and still hides its own callers' holds.
+            // Letting the name alone excuse it would be the same
+            // boundary-blind by-name match the one-hop table just stopped
+            // making — here failing OPEN instead of closed.
+            || (f.namespace == WORKSPACE_NS && GUARD_HELPERS.iter().any(|h| h.symbol == f.name))
         {
             continue;
         }
@@ -1841,33 +1948,42 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 });
         }
         for (hold, callee, call_span) in &f.held_calls {
-            let Some(callee_fns) = by_name.get(callee.as_str()) else {
+            let Some(per_ns) = by_name.get(callee.as_str()) else {
                 continue;
             };
+            // The namespace boundary (see `by_name`): definitions in the
+            // caller's own namespace SHADOW every foreign one, so a name the
+            // caller's crate defines never reaches across the boundary.
+            let shadowed = per_ns.contains_key(&f.namespace);
             // One hop: every DIRECT blocking acquisition in every same-named
             // callee (distinct identities once per call site).
             let mut seen: BTreeSet<String> = BTreeSet::new();
-            for &g in callee_fns {
-                for &acq in &fns[g].acq {
-                    if !sites[acq].blocking
-                        || !sites[acq].graphed()
-                        || !seen.insert(sites[acq].node())
-                    {
-                        continue;
+            for (def_ns, callee_fns) in per_ns {
+                if shadowed && *def_ns != f.namespace {
+                    continue;
+                }
+                for &g in callee_fns {
+                    for &acq in &fns[g].acq {
+                        if !sites[acq].blocking
+                            || !sites[acq].graphed()
+                            || !seen.insert(sites[acq].node())
+                        {
+                            continue;
+                        }
+                        hop_pairs += 1;
+                        edges
+                            .entry((sites[*hold].node(), sites[acq].node()))
+                            .or_default()
+                            .push(EdgeWitness {
+                                hold_span: sites[*hold].span.clone(),
+                                hold_fn: sites[*hold].fn_name.clone(),
+                                hold_excerpt: sites[*hold].excerpt.clone(),
+                                acq_span: sites[acq].span.clone(),
+                                acq_fn: sites[acq].fn_name.clone(),
+                                acq_excerpt: sites[acq].excerpt.clone(),
+                                via: Some(format!("call to `{callee}` at {call_span}")),
+                            });
                     }
-                    hop_pairs += 1;
-                    edges
-                        .entry((sites[*hold].node(), sites[acq].node()))
-                        .or_default()
-                        .push(EdgeWitness {
-                            hold_span: sites[*hold].span.clone(),
-                            hold_fn: sites[*hold].fn_name.clone(),
-                            hold_excerpt: sites[*hold].excerpt.clone(),
-                            acq_span: sites[acq].span.clone(),
-                            acq_fn: sites[acq].fn_name.clone(),
-                            acq_excerpt: sites[acq].excerpt.clone(),
-                            via: Some(format!("call to `{callee}` at {call_span}")),
-                        });
                 }
             }
         }
@@ -2042,8 +2158,9 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
          UNKNOWN site(s); {} audited vocabulary-interior site(s); {} held-acquire \
          pair(s) ({} intra-fn, {} via one-hop calls; {} distinct ordered identity \
          pairs); {} held call(s) through a `self.field.…` receiver NOT followed \
-         (foreign field type, or the callee name is not unique in the corpus — \
-         the census's second standing honesty gap, alongside UNKNOWN); \
+         (foreign field type, callee name not unique in the corpus, or its one \
+         definition on the far side of a vendored namespace boundary — the \
+         census's second standing honesty gap, alongside UNKNOWN); \
          0 self-edges; global lock graph ACYCLIC.",
         sites.len(),
         scan.scan_dirs.len(),
@@ -2119,10 +2236,12 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     if !field_calls.is_empty() {
         let _ = writeln!(
             log,
-            "    held calls through a `self.field.…` receiver NOT followed — either the \
-             field's declared type is not defined in this corpus, or more than one \
-             corpus fn bears the callee's name, so the by-name lookup would pick a \
-             candidate rather than resolve one (a guess, not an over-approximation):"
+            "    held calls through a `self.field.…` receiver NOT followed — the field's \
+             declared type is not defined in this corpus, or more than one corpus fn \
+             bears the callee's name (the by-name lookup would pick a candidate rather \
+             than resolve one), or the one fn that bears it is defined in another \
+             crate's namespace, where a method of THIS field's type cannot live — each \
+             a guess, not an over-approximation:"
         );
         for (callee, span) in field_calls.iter().take(20) {
             let _ = writeln!(log, "      {span}  .{callee}(…)");
@@ -3078,6 +3197,58 @@ mod tests {
         assert!(
             out.log.contains("alpha_lock -> winit::event_state"),
             "the aterm-held -> winit-acquire edge must be in the ledger:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn a_vendored_fn_name_cannot_capture_an_aterm_one_hop_call() {
+        // THE LOADED GUN the namespace boundary disarms. Vendored-identity mode
+        // namespaces the vendored crates' lock IDENTITIES, but their fn NAMES
+        // land in the same by-name callee table as aterm's — and the real
+        // winnow does define `fn start` and `fn end` (combinator/debug/
+        // internals.rs), both of which take `writer.lock()`, while aterm has its
+        // own `start`/`end` with hop-eligible call sites. Each side must resolve
+        // to ITS OWN definition: an aterm hold that inherited `winnow::writer`
+        // could close a cycle NOTHING could repair, because vendored sources may
+        // not be edited and OB-7 has no waiver channel.
+        //
+        // The complementary case — a name the caller's namespace does NOT define,
+        // which must still resolve across the boundary — is
+        // `synthetic_cross_boundary_one_hop_edge_is_graphed` above.
+        let out = run_synth_files(
+            "nsshadow",
+            "fn start() {\n    aterm_trace.lock().unwrap().push(1);\n}\n\
+             fn aterm_hold_and_call() {\n    let g = alpha_lock.lock().unwrap();\n    \
+             start();\n}\n",
+            &[(
+                "vendor/winnow/src/planted.rs",
+                "fn start() {\n    writer.lock().unwrap().push(1);\n}\n\
+                 fn winnow_hold_and_call() {\n    let g = stream.lock().unwrap();\n    \
+                 start();\n}\n",
+            )],
+        );
+        assert!(out.ok, "GREEN expected:\n{}", out.log);
+        assert!(
+            out.log.contains("alpha_lock -> aterm_trace"),
+            "the aterm call site must still resolve to ATERM's `start`:\n{}",
+            out.log
+        );
+        assert!(
+            !out.log.contains("alpha_lock -> winnow::writer"),
+            "an aterm hold must NOT inherit a vendored lock identity through a \
+             shared fn name:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("winnow::stream -> winnow::writer"),
+            "the vendored call site must resolve to WINNOW's `start`:\n{}",
+            out.log
+        );
+        assert!(
+            !out.log.contains("winnow::stream -> aterm_trace"),
+            "and the boundary holds in both directions — a vendored hold must \
+             not reach an aterm fn of the same name:\n{}",
             out.log
         );
     }

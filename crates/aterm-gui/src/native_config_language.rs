@@ -82,6 +82,11 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Keyword Kitty opacity control",
         effect_label: "No effect",
     },
+    RetiredConfigKeyMetadata {
+        key: "cursor_trail_wake_ms",
+        feature: "Nyan typing wake",
+        effect_label: "No effect",
+    },
 ];
 
 pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyMetadata> {

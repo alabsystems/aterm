@@ -39,13 +39,66 @@
 //! carries the per-instance bootstrap subset the app's frameworks resolve
 //! against.
 //!
-//! # Status
+//! # What has to become true for this to pass
 //!
-//! [`survivor_is_a_live_launchd_application_job`] is the end-to-end guard. It is
-//! `#[ignore]`d because it drives a real LaunchServices launch and a real
-//! update handoff of a built `aterm.app`, and it FAILS today — it is the
-//! reproducer for the defect above, and becomes the standing regression guard
-//! the moment the successor is launched as its own launchd job. Run it with:
+//! [`survivor_is_a_live_launchd_application_job`] FAILS today, and is `#[ignore]`d
+//! for that reason as much as for needing a real app bundle. It is a
+//! SPECIFICATION, not a disabled test: it passes exactly when the overlap
+//! successor stops being a `fork` child of the outgoing process and is launched
+//! through LaunchServices (`NSWorkspace.openApplication` with
+//! `createsNewApplicationInstance`, the `open -n` equivalent), so launchd mints
+//! it its OWN `application.com.aterm.aterm.<hex>.<hex>` job whose bootstrap
+//! context outlives the outgoing job's teardown.
+//!
+//! That launch cannot be swapped in on its own. A LaunchServices launch inherits
+//! no descriptors and is launchd's child rather than ours, so four properties
+//! the current `fork` gets for free must be re-established FIRST. Each is
+//! documented at the call site that owns it; all four are prerequisites of the
+//! launch-shape change, not follow-ups.
+//!
+//! * **B1 — parent attestation. DONE (0.13).** The successor's admission check
+//!   and its `_exit(74)` fail-stop used to be `getppid()`-based, and a
+//!   LaunchServices-launched process has ppid 1 from birth, so it would have
+//!   refused the handoff and then killed itself on its first watch pass. Both
+//!   now rest on the outgoing process's kernel BIRTH RECORD
+//!   (`seamless::AttestedParent`), which is independent of the process tree,
+//!   immune to pid reuse, and edged on the parent's `exit` rather than its
+//!   reap.
+//!
+//!   `getppid()` has NOT left the code, and claiming otherwise would misread
+//!   what B1 needs. Admission still consults it — `attest_handoff_parent`
+//!   refuses a candidate whose creator is a live process OTHER than the pid it
+//!   was told to trust — and the `ForkLink` witness IS `getppid() == pid`,
+//!   re-evaluated on every watch tick. What changed is that neither is now
+//!   REQUIRED to be satisfiable: a successor born with ppid 1 has a vacuous
+//!   identity rule and takes the `Birth` witness instead, so it no longer
+//!   fail-stops on its first pass. On a non-macOS unix `read_process_birth` is
+//!   a `None` stub, so `ForkLink` is the only witness there and the fail-stop
+//!   remains entirely ppid-based — which is correct for a platform whose
+//!   successor is still a fork child.
+//! * **B2 — reap authority.** `app_update_handoff::kill_and_reap_handoff_child`
+//!   resumes the parked readers only once `wait` proved the rejected candidate
+//!   gone and reaped; `waitpid` on a non-child answers `ECHILD` and that proof
+//!   is lost. Needs a replacement that does not depend on being the parent.
+//! * **B3 — process-group containment.** The `pre_exec` `setpgid(0, 0)` in
+//!   `run_handoff_worker` is what makes `kill(-pid)` sweep the candidate's own
+//!   codesign/PlistBuddy/spctl helpers. A LaunchServices launch has no
+//!   equivalent hook, so the containment has to move into the successor's own
+//!   startup.
+//! * **B4 — transport.** The PTY masters (`ATERM_SEAMLESS_FDS`), the readiness
+//!   pipe and the Commit pipe must move to an out-of-band `SCM_RIGHTS` transfer
+//!   over the per-user control socket. That also changes what
+//!   `seamless::adoption_proof` may hash: it hashes fd NUMBERS today, and
+//!   `SCM_RIGHTS` installs descriptors at whatever numbers the receiver has
+//!   free, so the two sides would hash different values and every handoff would
+//!   end in `AdoptionMismatch`. The fd term cannot simply be dropped — it is
+//!   what stops an identity-only subset claiming a different PTY — so it needs
+//!   a term both sides compute independently of their own fd tables, such as
+//!   the descriptor's ordinal in the parent-declared transfer order.
+//!
+//! So: B1 is closed; B2, B3 and B4 remain, and this test FAILING is still the
+//! expected outcome until all three land and the `spawn` in
+//! `app_update_handoff::run_handoff_worker` is replaced. Run it with:
 //!
 //! ```text
 //! ATERM_HANDOFF_E2E_APP=/path/to/aterm.app \
@@ -244,9 +297,16 @@ fn running_application_job_reads_the_launchctl_table() {
     assert_eq!(labels, vec!["application.com.aterm.aterm.0x10a5f.0x10a5f"]);
 }
 
+/// PASSES WHEN: the overlap successor is launched through LaunchServices
+/// (`createsNewApplicationInstance`) instead of `Command::spawn`, so launchd
+/// gives it an `application.com.aterm.aterm.*` job of its own. That requires
+/// blockers B2, B3 and B4 (this file's module docs name the call site that owns
+/// each; B1 is done). Until then, failing is the expected outcome and the
+/// failure IS the reproducer for the orphaned-XPC-domain defect.
 #[test]
 #[ignore = "live LaunchServices/launchd e2e (needs ATERM_HANDOFF_E2E_APP); \
-            FAILS until the overlap successor is launched as its own launchd job"]
+            FAILS by design until blockers B2-B4 land and the overlap successor \
+            is launched through LaunchServices as its own launchd job"]
 fn survivor_is_a_live_launchd_application_job() {
     let app = PathBuf::from(
         std::env::var_os("ATERM_HANDOFF_E2E_APP")
@@ -284,11 +344,17 @@ fn survivor_is_a_live_launchd_application_job() {
         "the LaunchServices-launched instance",
     );
     let mut owned = KillOnDrop(Some(original));
-    assert!(
-        running_application_job(&launchctl_print_gui(uid), BUNDLE_ID, original).is_some(),
-        "the freshly opened instance is not a launchd application job — the \
-         FIXTURE is broken, not the handoff"
-    );
+    // Bound by name, not merely asserted: this is the job whose teardown at
+    // `seamless::commit_and_exit`'s `_exit(0)` is what strands the survivor, so
+    // the closing assertion can report exactly which context was lost.
+    let Some(original_job) =
+        running_application_job(&launchctl_print_gui(uid), BUNDLE_ID, original)
+    else {
+        panic!(
+            "the freshly opened instance {original} is not a launchd application \
+             job — the FIXTURE is broken, not the handoff"
+        );
+    };
     // The seamless lane refuses to start without a live PTY, so wait for the
     // first window's shell to exist before asking for an apply.
     wait_until(
@@ -328,10 +394,20 @@ fn survivor_is_a_live_launchd_application_job() {
     let printout = launchctl_print_gui(uid);
     assert!(
         running_application_job(&printout, BUNDLE_ID, survivor).is_some(),
-        "survivor {survivor} is alive but is not an `{}*` job in gui/{uid}: the \
-         handoff left a pid-1 orphan holding a dead job's bootstrap context, so \
-         every XPC-backed framework call it makes (hdiutil attach, user \
-         notifications, LaunchServices opens) will fail",
-        application_job_prefix(BUNDLE_ID)
+        "survivor {survivor} is alive but owns no `{prefix}*` job in gui/{uid}.\n\
+         EXPECTED: the successor was launched through LaunchServices \
+         (createsNewApplicationInstance), so launchd minted it a job of its own \
+         whose bootstrap context outlives the outgoing job — the outgoing \
+         process held `{original_job}`, which launchd tore down the moment \
+         `seamless::commit_and_exit` called `_exit(0)`.\n\
+         ACTUAL: the successor is a `Command::spawn` fork child, so it is now a \
+         pid-1 orphan still holding that dead job's bootstrap context, and every \
+         XPC-backed framework call it makes fails — `hdiutil attach` (the update \
+         lane's own DMG attach, so it can never apply the NEXT update) with \
+         ENXIO, plus user notifications and LaunchServices opens.\n\
+         TO FIX: land blockers B2, B3 and B4 (this file's module docs name the \
+         call site that owns each; B1 is already done), then replace the \
+         `spawn` in `app_update_handoff::run_handoff_worker`.",
+        prefix = application_job_prefix(BUNDLE_ID)
     );
 }
