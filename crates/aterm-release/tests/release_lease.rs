@@ -482,24 +482,16 @@ fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
 }
 
 #[test]
-fn recovery_admits_only_the_exact_cask_write_or_stage_left_by_a_crash() {
-    let fixture = bare_fixture("dirty-cask-recovery");
+fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
+    // Format 6 admitted one dirty state: the exact cask pin written/staged by a
+    // crash mid-`step_cask`. Format 7 removed that step, so recovery now admits
+    // NOTHING — a clean tree passes and any dirty path at all fails closed.
+    let fixture = bare_fixture("clean-tree-recovery");
     let repo = fixture.repo_a.clone();
-    let cask_rel = "packaging/homebrew/aterm.rb";
-    let cask = repo.join(cask_rel);
-    std::fs::create_dir_all(cask.parent().unwrap()).unwrap();
-    let baseline = format!(
-        "cask \"aterm\" do\n  version \"0.54.0\"\n  sha256 \"{}\"\nend\n",
-        "0".repeat(64)
-    );
-    std::fs::write(&cask, &baseline).unwrap();
     std::fs::write(repo.join(".gitignore"), "dist/\n").unwrap();
-    command(&repo, &["add", cask_rel, ".gitignore"]);
-    command(&repo, &["commit", "-m", "add cask fixture"]);
+    command(&repo, &["add", ".gitignore"]);
+    command(&repo, &["commit", "-m", "add ignore fixture"]);
 
-    let dist = repo.join("dist");
-    std::fs::create_dir_all(&dist).unwrap();
-    std::fs::write(dist.join("aterm-0.55.0.dmg"), b"exact recovered dmg bytes").unwrap();
     let owner = command(&repo, &["rev-parse", "HEAD"]);
     let journal = publish::Journal {
         format: publish::JOURNAL_FORMAT,
@@ -519,38 +511,24 @@ fn recovery_admits_only_the_exact_cask_write_or_stage_left_by_a_crash() {
         mirror_upload_intents: Vec::new(),
         done: publish::STEPS
             .iter()
-            .take_while(|step| **step != "cask")
+            .take_while(|step| **step != "verify")
             .map(|step| (*step).to_string())
             .collect(),
     };
-    let sha = dmg::sha256_file(&dist.join("aterm-0.55.0.dmg")).unwrap();
-    std::fs::write(
-        dist.join(manifest_out::MANIFEST_ASSET),
-        format!(
-            "schema = 1\nversion = \"0.55.0\"\nbuild_number = 55\ncommit = \"{}\"\n\
-             dmg = \"aterm-0.55.0.dmg\"\nsha256 = \"{sha}\"\n",
-            journal.commit
-        ),
-    )
-    .unwrap();
-    let expected = publish::repin_cask_text(&baseline, "0.55.0", &sha).unwrap();
 
-    // Crash immediately after fs::write.
-    std::fs::write(&cask, &expected).unwrap();
+    // A clean tree is the only accepted state.
     publish::recovery_resume_worktree_preflight(&repo, &GitCli::new(&repo), &journal).unwrap();
 
-    // Crash immediately after git add.
-    command(&repo, &["add", cask_rel]);
-    publish::recovery_resume_worktree_preflight(&repo, &GitCli::new(&repo), &journal).unwrap();
-
-    // A byte outside the derived pin, or any unrelated dirty path, is never
-    // explained away as a cask crash.
-    std::fs::write(&cask, format!("{expected}# injected\n")).unwrap();
+    // An untracked path fails closed.
+    std::fs::write(repo.join("claim"), "unrelated mutation\n").unwrap();
     assert!(
         publish::recovery_resume_worktree_preflight(&repo, &GitCli::new(&repo), &journal).is_err()
     );
-    std::fs::write(&cask, &expected).unwrap();
-    std::fs::write(repo.join("claim"), "unrelated mutation\n").unwrap();
+    std::fs::remove_file(repo.join("claim")).unwrap();
+
+    // So does a modification to a tracked path — there is no longer any
+    // journal-derived write that recovery will explain away.
+    std::fs::write(repo.join(".gitignore"), "dist/\nextra/\n").unwrap();
     assert!(
         publish::recovery_resume_worktree_preflight(&repo, &GitCli::new(&repo), &journal).is_err()
     );

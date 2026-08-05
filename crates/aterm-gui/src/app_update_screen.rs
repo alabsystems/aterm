@@ -172,10 +172,18 @@ impl App {
         // time for three releases while `health.toml` stayed all-zero and status
         // said "up to date", because only the download lane was ever recorded.
         //
-        // Only terminal verdicts are recorded. `Deferred`/`Blocked` mean "not yet,
-        // conditions were not met" — a normal, self-correcting state that would
-        // otherwise manufacture a failure streak every time the user happened to be
-        // typing.
+        // `Deferred`/`Blocked` mean "not yet, conditions were not met" — normal and
+        // self-correcting, so they must NOT touch the failure streak: doing that
+        // would manufacture an escalation every time the user happened to be typing.
+        //
+        // But silent was the wrong other extreme, and it is what the owner actually
+        // hit: a staged build sat unapplied across two releases while `update
+        // status` reported `failing=0 failing_applies=0` and advised a relaunch,
+        // because the refusal reached this arm and stopped here. "Nothing is wrong"
+        // and "we declined, here is why" are different answers and the file could
+        // only say the first. `record_apply_refusal` is the separate, non-streak
+        // slot for the second; it is expiry-bound to the RUNNING build, since a
+        // successful in-session apply execs away and never returns to clear it.
         let current_build = self.native_updater_service.snapshot().current_build;
         match &outcome {
             crate::native_app::UpdateOutcome::Failed { message } => {
@@ -184,9 +192,16 @@ impl App {
             crate::native_app::UpdateOutcome::Accepted => {
                 aterm_update::record_apply_success(current_build);
             }
-            crate::native_app::UpdateOutcome::InstalledNeedsRelaunch { .. }
-            | crate::native_app::UpdateOutcome::Deferred { .. }
-            | crate::native_app::UpdateOutcome::Blocked { .. } => {}
+            crate::native_app::UpdateOutcome::Blocked { reasons } => {
+                aterm_update::record_apply_refusal(current_build, &reasons.join(" · "));
+            }
+            crate::native_app::UpdateOutcome::Deferred { reason } => {
+                aterm_update::record_apply_refusal(current_build, reason);
+            }
+            // Installed-but-needs-relaunch is neither a refusal nor a completion:
+            // the bytes ARE in place and the next launch runs them, which the
+            // status line already reports from the staged marker.
+            crate::native_app::UpdateOutcome::InstalledNeedsRelaunch { .. } => {}
         }
         match outcome {
             crate::native_app::UpdateOutcome::Accepted => {

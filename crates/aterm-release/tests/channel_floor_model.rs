@@ -595,8 +595,7 @@ fn release_lease_seams_conform_through_final_unlock() {
     assert!(admitted, "model rejected lease-retaining visibility: {why}");
 
     let archived = model.successors("ArchiveAfterPublish", &published)[0].clone();
-    let pinned = model.successors("PinCask", &archived)[0].clone();
-    let verified = model.successors("VerifyRelease", &pinned)[0].clone();
+    let verified = model.successors("VerifyRelease", &archived)[0].clone();
     assert_eq!(verified["lease_owned"], 1);
 
     // Exact-CAS deletion observes our owner, succeeds, then confirms absence.
@@ -606,7 +605,7 @@ fn release_lease_seams_conform_through_final_unlock() {
         publish::LeaseRelease::Released
     );
     let unlocked = model.successors("Unlock", &verified)[0].clone();
-    assert_eq!(unlocked["phase"], 9);
+    assert_eq!(unlocked["phase"], 8);
     assert_eq!(unlocked["lease_owned"], 0);
     let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
         &model,

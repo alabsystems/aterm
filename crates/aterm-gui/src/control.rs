@@ -113,6 +113,17 @@ use aterm_control::wire::{json_ok, json_str_field};
 mod control_host;
 use control_host::GuiHost;
 
+/// The MAIN-THREAD conformance gate: the verb matrix against a [`GuiHost`] holding
+/// a real `EventLoopProxy`, which no `#[test]` can build (see the module). A child
+/// module of `control` because `control_host` is private to it — putting the gate
+/// anywhere else would mean widening the shipped API for a test. Behind the
+/// off-by-default `control-conformance` feature, so the shipped GUI never carries
+/// the suite. The file lives flat at `src/control_redraw_conformance.rs`, so
+/// `#[path]` points at it.
+#[cfg(feature = "control-conformance")]
+#[path = "control_redraw_conformance.rs"]
+pub(crate) mod control_redraw_conformance;
+
 /// The platform CLIPBOARD layer (`pbcopy`/`pbpaste`, X11 PRIMARY). It could NOT
 /// follow the selection verbs into a winit-free crate — it is AppKit/x11rb/Win32
 /// code with callers all over the GUI — so it kept its own file under the name
@@ -775,6 +786,31 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         st.is_failing_persistently(),
         st.outcome
     );
+    // THE APPLY LANE, in the same one-glance line. `failing_applies=` counts hard
+    // failures only, and by design a REFUSAL (blocked/deferred/held) is not one —
+    // which is how a machine could sit on `staged_build=<new> relaunch_ready=true
+    // failing_applies=0` for hours while every single `update apply` was turned
+    // away. `apply_refusal=` is that missing answer: the reason the apply lane
+    // last declined, pct-encoded because it is prose on a single-line reply.
+    // `apply_failure=` does the same for the streak `failing_applies=` counts but
+    // never explained. Every token is emitted only when its value is non-empty, so
+    // a healthy updater's line is byte-identical to before.
+    if let Some(apply) = aterm_update::apply_lane_report(st.current_build) {
+        // Every value here is prose read back from a ledger, so every value is
+        // pct-encoded: an embedded space or newline would split this single-line
+        // Status reply and desync every following read on a pipelined connection
+        // (the same hazard `changelog=` below is encoded for).
+        for (name, value) in [
+            ("apply_refusal", apply.last_refusal.as_str()),
+            ("apply_refusal_at", apply.last_refusal_at.as_str()),
+            ("apply_failure", apply.last_failure.as_str()),
+        ] {
+            if !value.is_empty() {
+                let line = out.trim_end_matches('\n');
+                out = format!("{line} {name}={}\n", pct_encode(value));
+            }
+        }
+    }
     // Fold the staged build's "what changed" notes into the SAME status line as a
     // pct-encoded `changelog=` token. `update` is Status-framed (the client reads
     // exactly ONE line), so the old trailing `changelog:\n<multi-line notes>` block
@@ -4479,8 +4515,13 @@ fn handle(
     let term = &term;
     // The `aterm-control` verbs take a host, not a term. Built here from the tuple
     // already resolved above, borrowed and zero-cost, so the cross-session path
-    // hands them the RESOLVED target exactly as the per-verb args used to.
-    let host = GuiHost::new(term, Some(proxy), subscribers);
+    // hands them the RESOLVED target exactly as the per-verb args used to. The
+    // FLEET handles are this dispatcher's to give — the registry it was called
+    // with and the resolved target's own sink — so the trait's roster/resolve/
+    // write_input answer for the real process, not as a host that keeps none; and
+    // `session` BINDS the host, so a sid from elsewhere is refused rather than
+    // served against this target.
+    let host = GuiHost::with_fleet(session, term, Some(proxy), subscribers, store, &ctx.sink);
 
     // `--json` READ MODE: a structured-JSON foundation for the read verbs. The flag
     // is parsed off `rest` HERE (additive: a line without it is byte-identical text)
@@ -7057,7 +7098,7 @@ mod tests {
         // and reads it back with `cmd_selection`, proving the resolved target is the
         // one selected (and that it emits no pty bytes, the read-side contract).
         let reg = subscribe::new_registry();
-        let host = GuiHost::new(&term, None, &reg);
+        let host = GuiHost::new(session, &term, None, &reg);
         term_lock(&term).process(b"hello world");
         assert_eq!(cmd_select(&host, session, "0 0 0 4"), "OK\n");
         let reply = cmd_selection(&host, session);
@@ -8480,7 +8521,7 @@ mod tests {
     fn blocks_verb_surfaces_command_blocks() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let reg = subscribe::new_registry();
-        let host = GuiHost::new(&term, None, &reg);
+        let host = GuiHost::new(0, &term, None, &reg);
         // No shell integration yet -> no blocks.
         assert_eq!(cmd_blocks(&host, 0, ""), "OK 0\n");
         // Two command blocks via OSC 133 (+ OSC 633;E commandline): exit 0, exit 1.
@@ -8520,7 +8561,7 @@ mod tests {
     fn wait_verb_blocks_until_command_completes() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let reg = subscribe::new_registry();
-        let host = GuiHost::new(&term, None, &reg);
+        let host = GuiHost::new(0, &term, None, &reg);
         // No command in flight and nothing ever completed -> a short wait times out.
         assert_eq!(cmd_wait(&host, 0, "0"), "OK timeout\n");
         // Start a command (executing), then complete it from another thread,
@@ -8551,7 +8592,7 @@ mod tests {
     fn wait_verb_returns_a_prerace_completion_immediately() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let reg = subscribe::new_registry();
-        let host = GuiHost::new(&term, None, &reg);
+        let host = GuiHost::new(0, &term, None, &reg);
         // The command ran to completion (exit 1) and the shell is back at a fresh
         // IDLE prompt — including the prompt-end 133;B a real shell emits before
         // any typing, which parks the new block in `EnteringCommand`. This is the
@@ -10311,7 +10352,7 @@ mod tests {
     fn cursor_dims_blocks_json_schemas() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let reg = subscribe::new_registry();
-        let host = GuiHost::new(&term, None, &reg);
+        let host = GuiHost::new(0, &term, None, &reg);
         // cursor: row/col/visible/style.
         let cj = cmd_cursor_json(&term);
         let cbody = cj.strip_prefix("OK 1\n").unwrap().trim_end();

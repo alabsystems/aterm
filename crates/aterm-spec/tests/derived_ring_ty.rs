@@ -3523,7 +3523,7 @@ fn derived_release_post_intents_are_durable_and_one_shot() {
 
 /// A release floor is frozen as channel state, survives resume unchanged, and is
 /// revalidated against a potentially newer live floor immediately before publish.
-/// The exact-commit lease remains held through archive, cask, and verify and is
+/// The exact-commit lease remains held through archive and verify and is
 /// released only by the final unlock. The healthy lifecycle can neither forget an
 /// observed floor, publish through a late ratchet, nor unlock early.
 #[test]
@@ -3580,12 +3580,10 @@ fn derived_release_channel_floor_proves_carry_forward_and_late_guard() {
     assert!(model.check_invariant("VisibleWorkOwnsLease", &complete));
     assert!(model.fire("ArchiveAfterPublish", &mut complete));
     assert_eq!(complete["lease_owned"], 1);
-    assert!(model.fire("PinCask", &mut complete));
-    assert_eq!(complete["lease_owned"], 1);
     assert!(model.fire("VerifyRelease", &mut complete));
     assert_eq!(complete["lease_owned"], 1);
     assert!(model.fire("Unlock", &mut complete));
-    assert_eq!(complete["phase"], 9);
+    assert_eq!(complete["phase"], 8);
     assert_eq!(complete["lease_owned"], 0);
     assert!(model.check_invariant("CompletionRequiresPostPublishSteps", &complete));
 
@@ -3632,7 +3630,7 @@ fn derived_release_channel_floor_proves_carry_forward_and_late_guard() {
     assert!(!buggy.check_invariant("PublishedNeverLowersLatest", &lease_bug));
 
     // Mutant 4: releasing the remote owner immediately after flip exposes the
-    // archive/cask/verify suffix to a competing cut.
+    // archive/verify suffix to a competing cut.
     let mut early_unlock = buggy.init_state();
     assert!(buggy.fire("RaiseClaim", &mut early_unlock));
     assert!(buggy.fire("Resolve", &mut early_unlock));

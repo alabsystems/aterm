@@ -120,6 +120,35 @@ pub struct Health {
     /// when it clears the acquisition streaks and the apply streak survives.
     #[serde(default)]
     pub last_apply_error: String,
+    /// The most recent apply-lane REFUSAL: a verdict that stopped an apply
+    /// BEFORE it could fail, in the words of whichever caller refused it.
+    ///
+    /// Deliberately not a streak and deliberately absent from
+    /// [`Self::total_failures`]/[`Self::is_persistent`]: a refusal is a normal,
+    /// self-correcting state, and counting one would manufacture a persistent-
+    /// failure escalation out of ordinary terminal use. That reasoning is why
+    /// refusals were recorded NOWHERE — which is the defect this field closes.
+    /// In the field, `update apply` answered "OK apply requested", the reducer
+    /// refused it, and `update status` went on reporting a healthy updater with
+    /// a staged build for hours: a refusal that records nothing is
+    /// indistinguishable from an updater that never ran at all.
+    #[serde(default)]
+    pub last_apply_refusal: String,
+    /// RFC3339 UTC of [`Self::last_apply_refusal`] (empty when there is none).
+    /// A refusal without a time cannot be told apart from a stale one.
+    #[serde(default)]
+    pub last_apply_refusal_at: String,
+    /// The build that was RUNNING when [`Self::last_apply_refusal`] was recorded
+    /// (0 when there is none).
+    ///
+    /// A successful in-session apply never returns to clear anything — it execs
+    /// into the new image — so without this the last refusal would follow the
+    /// machine into the build that proves it was overcome, and `update status`
+    /// would explain a fixed problem forever. A refusal is only ever about the
+    /// build that could not move; readers drop it once a different build is
+    /// running.
+    #[serde(default)]
+    pub last_apply_refusal_build: u64,
 }
 
 impl Health {
@@ -242,8 +271,45 @@ impl Health {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
         h.last_apply_error = reason.chars().take(400).collect();
+        // A terminal verdict supersedes whatever refusal preceded it: leaving the
+        // old "the terminal was busy" standing beside a hard failure would offer
+        // an operator two competing answers to one question.
+        h.clear_apply_refusal();
         h.write(path);
         h
+    }
+
+    /// Record one apply-lane REFUSAL — a block/deferral that stopped an apply
+    /// before it became a failure — as observed by `current_build`. `reason` must
+    /// say WHAT refused and WHY, since it is the whole answer an operator gets to
+    /// "the build is staged, so why is it not running?".
+    ///
+    /// Every streak is untouched by construction (see [`Self::last_apply_refusal`]);
+    /// this only replaces the standing explanation, so a refusal can never
+    /// escalate to the persistent-failure notification on its own.
+    pub fn record_apply_refusal(path: &Path, current_build: u64, reason: &str) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        h.last_apply_refusal = reason.chars().take(400).collect();
+        h.last_apply_refusal_at = crate::install::now_rfc3339();
+        h.last_apply_refusal_build = current_build;
+        h.write(path);
+        h
+    }
+
+    /// Whether the stored refusal is still the answer for `current_build`. A
+    /// refusal recorded by a build that is no longer running was overcome by
+    /// definition — most often by the very apply that execed away without
+    /// returning to clear it.
+    #[must_use]
+    pub fn apply_refusal_applies_to(&self, current_build: u64) -> bool {
+        !self.last_apply_refusal.is_empty() && self.last_apply_refusal_build == current_build
+    }
+
+    fn clear_apply_refusal(&mut self) {
+        self.last_apply_refusal = String::new();
+        self.last_apply_refusal_at = String::new();
+        self.last_apply_refusal_build = 0;
     }
 
     /// Record that an apply actually succeeded — the staged build is now the
@@ -252,20 +318,26 @@ impl Health {
     pub fn record_apply_success(path: &Path) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
-        if h.apply_failures == 0 {
+        // An apply that actually went through answers every standing apply-lane
+        // question, refusals included: a "the terminal was busy" left behind by an
+        // earlier attempt must not outlive the attempt that succeeded.
+        if h.apply_failures == 0 && h.last_apply_refusal.is_empty() {
             return h;
         }
-        h.apply_failures = 0;
-        h.last_apply_error = String::new();
-        if h.total_failures() == 0 {
-            h.kind = String::new();
-            h.failing_since = String::new();
-            h.last_failure_at = String::new();
-            h.last_error = String::new();
-        } else if h.kind == "apply" {
-            // Acquisition failures are still standing; stop describing the ledger
-            // by the apply failure that just resolved.
-            h.kind = String::new();
+        h.clear_apply_refusal();
+        if h.apply_failures > 0 {
+            h.apply_failures = 0;
+            h.last_apply_error = String::new();
+            if h.total_failures() == 0 {
+                h.kind = String::new();
+                h.failing_since = String::new();
+                h.last_failure_at = String::new();
+                h.last_error = String::new();
+            } else if h.kind == "apply" {
+                // Acquisition failures are still standing; stop describing the ledger
+                // by the apply failure that just resolved.
+                h.kind = String::new();
+            }
         }
         h.write(path);
         h
@@ -357,6 +429,59 @@ mod tests {
         assert_eq!(h.apply_failures, 0);
         assert_eq!(h.total_failures(), 0);
         assert!(h.kind.is_empty(), "fully healthy ledger reports no class");
+    }
+
+    /// A refusal is the answer to "the build is staged, so why is it not
+    /// running?" — it must be durable, must NOT manufacture a failure streak (or
+    /// ordinary terminal use would escalate to the persistent-failure
+    /// notification), and must not outlive the apply that finally succeeds.
+    #[test]
+    fn a_refusal_is_recorded_without_inventing_a_failure_streak() {
+        let p = tmp("apply-refusal");
+        let quiet = "terminal input/output is still inside the quiet epoch";
+        Health::record_apply_refusal(&p, 812, quiet);
+        let h = Health::read(&p);
+        assert_eq!(h.last_apply_refusal, quiet);
+        assert!(!h.last_apply_refusal_at.is_empty(), "a refusal is timed");
+        assert!(h.apply_refusal_applies_to(812));
+        assert_eq!(h.total_failures(), 0, "a refusal is not a failure");
+        assert!(!h.is_persistent(), "a refusal never escalates on its own");
+        assert!(
+            h.kind.is_empty(),
+            "a refusal does not claim a failure class"
+        );
+
+        // A successful in-session apply execs away and never returns to clear the
+        // slot, so the running build is what retires a refusal: build 813 is proof
+        // that whatever stopped 812 was overcome.
+        assert!(
+            !h.apply_refusal_applies_to(813),
+            "a refusal must not follow the machine into the build that overcame it"
+        );
+
+        // A healthy CHECK must leave it alone for the same reason it leaves the
+        // apply streak alone: downloading proves nothing about applying.
+        Health::record_failure(&p, "network", "dns");
+        Health::record_success(&p);
+        assert_eq!(Health::read(&p).last_apply_refusal, quiet);
+
+        // A hard failure supersedes it — one standing answer, never two.
+        Health::record_apply_failure(&p, "ChildDied");
+        let h = Health::read(&p);
+        assert!(!h.apply_refusal_applies_to(812));
+        assert!(h.last_apply_refusal.is_empty());
+        assert!(h.last_apply_refusal_at.is_empty());
+        assert_eq!(h.last_apply_error, "ChildDied");
+
+        // And a success clears the whole lane, refusal slot included.
+        Health::record_apply_refusal(&p, 812, "updater work is in flight");
+        Health::record_apply_success(&p);
+        let h = Health::read(&p);
+        assert!(h.last_apply_refusal.is_empty());
+        assert!(h.last_apply_refusal_at.is_empty());
+        assert_eq!(h.last_apply_refusal_build, 0);
+        assert_eq!(h.apply_failures, 0);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     /// A stranded apply lane must escalate as loudly as a stranded download lane:

@@ -21,7 +21,7 @@ USAGE
                  [--min-build N] [--gate] [--rehearse OWNER/REPO]
                  [--arm64-only]
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
-      → draft-first publish → late tag → flip → cask pin → verify.
+      → draft-first publish → late tag → flip → verify.
         --dry-run          gates + provisional number + full local build into
                            dist/; zero commits, zero uploads
         --resume           re-enter the journaled cut (dist/cut-state.toml) at
@@ -34,11 +34,11 @@ USAGE
         --min-build N      emit an operator apply floor into the manifest
         --gate             additionally run tools/verify.sh --full inline
         --rehearse O/R     full real cut published to the scratch repo O/R
-                           (provisional number, no ledger push, no tag/cask)
+                           (provisional number, no ledger push, no tag)
         --arm64-only       ship a single-arch build (explicit opt-out)
 
   cargo ship status        version · ledger tail · dangling claims · newest
-                           published build · cask-pin freshness
+                           published build
   cargo ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
                            explicit killed-machine recovery: exact-CAS rotate
                            its fence only after operator stop proof; abandon

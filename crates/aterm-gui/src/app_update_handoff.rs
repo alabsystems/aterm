@@ -3,7 +3,8 @@
 
 //! Seamless update handoff: `apply_staged_update_now` and the unix overlap
 //! worker it starts (`run_handoff_worker`, the bounded readiness wait, the
-//! unique-reaper and rejection plumbing), the Commit-time admission facts, and
+//! unique-reaper and rejection plumbing), the reap authority that licenses a
+//! rollback (`HandoffRollbackWarrant`), the Commit-time admission facts, and
 //! `finish_update_handoff`'s drain gate, Commit, and rollback.
 //! A verbatim inherent-impl split of `App`.
 
@@ -181,9 +182,11 @@ fn handoff_rejection_activity_shaped(facts: HandoffCommitFacts) -> bool {
 }
 
 /// The emergency reaper's one job, shared verbatim by the spawned reaper
-/// thread and the spawn-failed inline fallback: kill/reap the readerless
-/// child, release the emergency reaper claim, run the worker cleanup, and
-/// report the rejected completion back to the event loop.
+/// thread and the spawn-failed inline fallback: kill the readerless candidate
+/// and PROVE it terminated, release the emergency reaper claim, run the worker
+/// cleanup, and report the rejected completion back to the event loop. The
+/// completion is what licenses rollback, so it is emitted only after the
+/// warrant exists.
 #[cfg(unix)]
 fn emergency_reap_and_report(
     child_pid: u32,
@@ -194,7 +197,7 @@ fn emergency_reap_and_report(
     detail: String,
     proxy: &winit::event_loop::EventLoopProxy<Wake>,
 ) {
-    emergency_kill_and_reap_handoff_child(child_pid);
+    emergency_kill_and_reap_handoff_child(child_pid).announce(Some(child_pid));
     let completed = arbiter.finish_reap(crate::HandoffReaperOwner::Emergency);
     debug_assert!(completed, "emergency reaper retained sole ownership");
     cleanup.complete(nonce.as_deref());
@@ -254,17 +257,328 @@ fn make_cloexec_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     Some((rd, wr))
 }
 
+/// WHY a parked PTY reader may be resumed. Rollback restarts a reader on every
+/// handed-off master, so it is sound only while nothing else can still be
+/// reading those masters: two readers on one master silently interleave and
+/// destroy the stream, which is unrecoverable and invisible. Each variant names
+/// a fact that rules the overlap candidate out as such a reader.
+///
+/// There is deliberately NO variant for "we waited as long as we were willing
+/// to". A candidate that MIGHT still be alive is exactly the case rollback must
+/// not run in, so the functions below have no give-up path — `Child::wait`, the
+/// authority they generalize, has none either.
 #[cfg(unix)]
-fn kill_and_reap_handoff_child(child: &mut std::process::Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        // The candidate is placed in its own process group in `pre_exec`.
-        // Kill the whole group so ditto/codesign/spctl descendants cannot keep
-        // mutating fixed updater paths after the direct child is reaped.
-        unsafe { libc::kill(-pid, libc::SIGKILL) };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+enum HandoffRollbackWarrant {
+    /// The attempt failed before any candidate was spawned, so nothing outside
+    /// this process has ever held a handed-off master.
+    NoCandidate,
+    /// `wait` consumed the candidate: it terminated and THIS process reaped it.
+    /// Available only to its parent, and strictly the best answer — reaping is
+    /// what frees the pid, so nothing can recycle it between proof and use.
+    Reaped,
+    /// We were not the candidate's parent, so no `wait` could answer for it, and
+    /// the pid it was born at provably no longer names it. See
+    /// [`handoff_candidate_terminated`] for the two proofs and why they
+    /// establish the same fact `Reaped` does.
+    Vanished,
+}
+
+#[cfg(unix)]
+impl HandoffRollbackWarrant {
+    /// Say which authority licensed a rollback, once, at the moment it is used.
+    /// The outside proof is worth a line — it is the difference between "we
+    /// reaped the candidate" and "the candidate was never ours to reap", i.e.
+    /// which launch shape this build actually ran — while the ordinary parent
+    /// reap stays as quiet as it has always been.
+    fn announce(self, candidate_pid: Option<u32>) {
+        if self == Self::Vanished {
+            aterm_log::info!(
+                "update apply: rollback licensed by outside proof; candidate {candidate_pid:?} \
+                 terminated without being ours to reap"
+            );
+        }
     }
-    // This runs only on the handoff worker. `wait` is load-bearing: no rollback
-    // Wake is emitted until the group was killed and its direct child reaped.
-    let _ = child.wait();
+}
+
+/// The kernel's birth record for whatever process currently occupies a pid: the
+/// microsecond instant it was created. The kernel assigns it, so no process can
+/// choose its own, and two processes that reuse a pid cannot share one. Compared
+/// for EQUALITY only — it is an identity token, never a clock reading.
+///
+/// `seamless::ProcessBirth` reads the same kernel fact for the OPPOSITE
+/// conclusion — "is my handoff parent still ALIVE" — and the two are not
+/// negations of each other. An unreadable record must make that probe answer
+/// dead (fail-safe there: the readerless successor kills itself) and must make
+/// this one answer "not proven" (fail-safe here: the parent keeps its readers
+/// parked). One shared probe would put one of the two lanes on the dangerous
+/// default, so this lane carries its own with its own failure direction.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandoffCandidateBirth {
+    seconds: u64,
+    microseconds: u64,
+}
+
+/// WHICH process is at `pid` right now — not whether it is alive. Liveness is
+/// `kill(2)`'s answer; this is the identity half, and it is deliberately not
+/// filtered by process status, because every reason the kernel might decline to
+/// answer — including a zombie, which libproc may or may not report — carries
+/// the same meaning for this lane: nothing is concluded either way.
+#[cfg(target_os = "macos")]
+fn read_candidate_birth(pid: u32) -> Option<HandoffCandidateBirth> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    if pid <= 1 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure
+    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: the exact-size success above initialized the whole record.
+    let info = unsafe { info.assume_init() };
+    // A record about some OTHER pid could only mislead the comparison this
+    // feeds, so a kernel that disagrees about the pid it was asked about is no
+    // witness at all.
+    if u32::try_from(pid).ok()? != info.pbi_pid {
+        return None;
+    }
+    Some(HandoffCandidateBirth {
+        seconds: info.pbi_start_tvsec,
+        microseconds: info.pbi_start_tvusec,
+    })
+}
+
+/// Off macOS there is no birth-record primitive wired here, and none is needed:
+/// the successor is unconditionally a fork child there (the `spawn` in
+/// [`run_handoff_worker`] is the only launch shape, as the matching stub in
+/// `seamless::read_process_birth` records), so `wait` always answers and the
+/// fallback authority never has to. A non-fork transport off macOS must
+/// implement this FIRST — `/proc/<pid>/stat` field 22 is Linux's equivalent —
+/// because without it the fallback can prove termination only by pid vacancy.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_candidate_birth(_pid: u32) -> Option<HandoffCandidateBirth> {
+    None
+}
+
+/// The process that must be proven terminated before any parked reader resumes,
+/// plus whatever identity keeps a RECYCLED pid from impersonating it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandoffCandidate {
+    pid: u32,
+    /// The kernel birth stamp for `pid`, captured while the pid provably still
+    /// named the candidate. `None` never weakens the PROOF (pid vacancy alone is
+    /// sound — see [`handoff_candidate_terminated`]); it costs only the two
+    /// things identity buys: concluding termination from a recycled pid instead
+    /// of waiting for a number that will never come free, and keeping a SIGKILL
+    /// off whoever recycled it.
+    birth: Option<HandoffCandidateBirth>,
+}
+
+/// What the kernel says about the pid the candidate was born at, right now.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffCandidateIdentity {
+    /// The pid still names the candidate: the kernel's stamp for it equals the
+    /// captured one.
+    Corroborated,
+    /// The pid names a DIFFERENT process. The kernel does not reallocate a pid
+    /// before its previous owner is reaped, so the candidate has terminated.
+    Recycled,
+    /// No stamp was captured, or the kernel will not produce one now. Nothing is
+    /// concluded in either direction.
+    Unwitnessed,
+}
+
+#[cfg(unix)]
+impl HandoffCandidate {
+    /// Capture the identity of a fork child this process has NOT reaped. The
+    /// unreaped entry pins the number — the kernel cannot reallocate a pid a
+    /// zombie still owns — so the stamp read here is provably that child's own.
+    fn of_unreaped_child(child: &std::process::Child) -> Self {
+        let pid = child.id();
+        Self {
+            pid,
+            birth: read_candidate_birth(pid),
+        }
+    }
+
+    /// A candidate known only by its pid. This is what the emergency reaper gets:
+    /// the completion wire carries `child_pid`, a bare number, so no stamp can
+    /// ride along with it. Sound — vacancy is what proves termination — but it
+    /// cannot conclude termination FROM a recycled pid, and it signals exactly
+    /// as the pre-0.14 code did (the process group only).
+    fn from_bare_pid(pid: u32) -> Self {
+        Self { pid, birth: None }
+    }
+
+    fn identity(self) -> HandoffCandidateIdentity {
+        match (self.birth, read_candidate_birth(self.pid)) {
+            (Some(captured), Some(current)) if captured == current => {
+                HandoffCandidateIdentity::Corroborated
+            }
+            (Some(_), Some(_)) => HandoffCandidateIdentity::Recycled,
+            _ => HandoffCandidateIdentity::Unwitnessed,
+        }
+    }
+}
+
+/// Has the candidate TERMINATED — can it no longer be holding, let alone
+/// reading, the handed-off PTY masters?
+///
+/// Two independent proofs, each about the candidate itself:
+///
+/// * PID VACANCY. `kill(pid, 0)` answering ESRCH means the kernel will deliver
+///   nothing at that number. A running process's pid never changes, so the only
+///   way to get that answer about the candidate is for the candidate to have
+///   terminated — and a terminated process runs no further user code and holds
+///   no descriptors. pid REUSE can only HIDE this answer (somebody else now
+///   answers to the number), never fabricate it, so this proof needs no identity
+///   check to be sound.
+/// * IDENTITY. Something does answer at the pid, but the kernel's birth stamp
+///   for it disagrees with the candidate's. A pid is not reallocated until its
+///   previous owner has been reaped, so the candidate terminated.
+///
+/// Both therefore establish what `Child::wait` establishes; they differ only in
+/// WHO reaped it. Every other answer — a zombie, an unreadable record, a pid
+/// this build cannot convert — is UNPROVEN, and unproven never resumes a reader.
+#[cfg(unix)]
+#[must_use]
+fn handoff_candidate_terminated(candidate: HandoffCandidate) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs kill(2)'s existence/permission check only and
+    // delivers nothing.
+    if unsafe { libc::kill(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return true;
+    }
+    candidate.identity() == HandoffCandidateIdentity::Recycled
+}
+
+/// SIGKILL the candidate, before anything waits on it.
+///
+/// The GROUP sweep (`-pid`) is the pre-existing behaviour and the reason
+/// `pre_exec` puts the candidate in a group of its own: it is what stops the
+/// candidate's ditto/codesign/spctl descendants from continuing to mutate fixed
+/// updater paths after the leader is gone.
+///
+/// The DIRECT signal is what a candidate this process did not fork needs. Such a
+/// candidate may not be a group leader at all (blocker B3 below), and then
+/// `-pid` names no group and sweeps nothing. It is withheld unless the identity
+/// is CORROBORATED, because a bare pid that has been recycled names a stranger
+/// and this lane must never SIGKILL one. With no witness the behaviour is
+/// exactly what it has always been: the group sweep alone, aimed at a pid that
+/// today's unreaped fork child keeps pinned.
+#[cfg(unix)]
+fn signal_handoff_candidate(candidate: HandoffCandidate) {
+    let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
+        return;
+    };
+    // `-pid` is kill(2)'s process-GROUP target and -1 is its BROADCAST target,
+    // so a pid below 2 must never reach it.
+    if pid <= 1 {
+        return;
+    }
+    match candidate.identity() {
+        // Somebody else answers to the number now. There is nothing of ours to
+        // signal, and signalling would land on them.
+        HandoffCandidateIdentity::Recycled => (),
+        HandoffCandidateIdentity::Corroborated => {
+            // SAFETY: SIGKILL to the candidate's process group and then to the
+            // candidate itself, both against a pid just proven to name it.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        HandoffCandidateIdentity::Unwitnessed => {
+            // SAFETY: SIGKILL to the candidate's process group.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Block until the candidate is provably terminated, then license rollback.
+///
+/// UNBOUNDED ON PURPOSE. The proof is a PRECONDITION for resuming the parent's
+/// parked readers, not a preference: resuming while the candidate might still be
+/// reading the masters is the two-readers-on-one-master corruption the overlap
+/// protocol exists to prevent, and it is silent when it happens. So there is no
+/// deadline after which this returns anyway — `Child::wait`, the authority it
+/// stands in for, blocks without one for exactly the same reason, and a bounded
+/// probe that gave up would be strictly weaker than the code it replaces.
+///
+/// The interval below therefore decides only when a candidate that will not die
+/// starts SAYING SO. The parked terminal is the visible symptom either way; the
+/// log line is what makes it diagnosable rather than mysterious.
+#[cfg(unix)]
+fn wait_for_handoff_candidate_to_terminate(candidate: HandoffCandidate) -> HandoffRollbackWarrant {
+    /// Probe cadence — the same ~2 ms yield the worker's decision loop uses.
+    const PROBE: std::time::Duration = std::time::Duration::from_millis(2);
+    /// How long a SIGKILLed candidate may take before this becomes loud, and how
+    /// often it repeats afterwards.
+    const COMPLAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut complain_at = std::time::Instant::now() + COMPLAIN_EVERY;
+    loop {
+        if handoff_candidate_terminated(candidate) {
+            return HandoffRollbackWarrant::Vanished;
+        }
+        let now = std::time::Instant::now();
+        if now >= complain_at {
+            aterm_log::warn!(
+                "update apply: handoff candidate {} has not terminated; the parked PTY readers \
+                 stay parked until it does",
+                candidate.pid
+            );
+            complain_at = now + COMPLAIN_EVERY;
+        }
+        std::thread::sleep(PROBE);
+    }
+}
+
+/// Kill the rejected candidate and prove it gone. Runs only on the handoff
+/// worker, and the returned warrant is what licenses [`App::rollback_overlap`]
+/// to resume the parked readers.
+#[cfg(unix)]
+fn kill_and_reap_handoff_child(
+    candidate: HandoffCandidate,
+    child: &mut std::process::Child,
+) -> HandoffRollbackWarrant {
+    // Signal BEFORE any wait, so descendants are already condemned when the
+    // direct child is reaped.
+    signal_handoff_candidate(candidate);
+    let child_is_candidate = child.id() == candidate.pid;
+    // PREFERRED AUTHORITY: `wait` on our own fork child proves termination AND
+    // consumes the identity in one step, so nothing can recycle the pid between
+    // the proof and its use. It answers only for a child of THIS process
+    // (`ECHILD` otherwise), and only about the candidate when the child IS the
+    // candidate — a launcher-shaped child (`open -n`, which exits as soon as
+    // LaunchServices holds the successor) would be reaped here while proving
+    // nothing about the process holding the masters.
+    let reaped = child.wait().is_ok();
+    if reaped && child_is_candidate {
+        return HandoffRollbackWarrant::Reaped;
+    }
+    // FALLBACK: no `wait` of ours answers for the candidate. Prove it terminated
+    // from the outside instead.
+    wait_for_handoff_candidate_to_terminate(candidate)
 }
 
 /// Acquire the worker's unique reaper capability.  Losing to `Committing`
@@ -287,32 +601,42 @@ fn worker_claim_handoff_reaper(arbiter: &crate::HandoffAttemptArbiter) -> bool {
 }
 
 #[cfg(unix)]
-fn emergency_kill_and_reap_handoff_child(pid: u32) {
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    let mut status = 0i32;
-    // PRECONDITION: the caller won the attempt-wide Emergency reaper CAS. That
-    // is the unique capability proving `pid` is still this attempt's unreaped
-    // direct child; no worker can concurrently consume/reuse its identity.
-    // Signal the process group BEFORE any wait: `waitpid(WNOHANG)` also reaps an
+fn emergency_kill_and_reap_handoff_child(pid: u32) -> HandoffRollbackWarrant {
+    // PRECONDITION: the caller won the attempt-wide Emergency reaper CAS, so no
+    // worker can concurrently consume the candidate's identity. While the
+    // candidate is a fork child, that claim also pins `pid` to it (an unreaped
+    // zombie owns its number); a candidate launchd owns has no such pin, which
+    // is why the fallback below re-derives the fact rather than assuming it.
+    // Signal the process group BEFORE any wait: `waitpid` also reaps an
     // already-dead leader, and the old ordering then returned while its
     // ditto/codesign/spctl descendants continued mutating fixed updater paths.
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    loop {
-        // SAFETY: wait for this process's exact child. Under the unique reaper
-        // capability ECHILD can only mean the child was already consumed during
-        // process teardown; either way the group signal happened first.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited == pid
-            || (waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-        {
-            return;
+    let candidate = HandoffCandidate::from_bare_pid(pid);
+    signal_handoff_candidate(candidate);
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return wait_for_handoff_candidate_to_terminate(candidate);
+    };
+    let mut status = 0i32;
+    let reaped = loop {
+        // SAFETY: blocking wait for one exact pid into a local status slot.
+        let waited = unsafe { libc::waitpid(raw, &mut status, 0) };
+        if waited == raw {
+            break true;
         }
-        if waited < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return;
+        if waited < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
         }
+        // ECHILD — and, defensively, any other refusal. In the fork lane this
+        // can only be a teardown-time reap that already happened. A candidate
+        // launchd owns answers this way from the start, and THAT is blocker B2:
+        // `waitpid` is simply not an authority about somebody else's child, so
+        // the outside proof has to stand in for it. What must never happen is
+        // treating the refusal itself as evidence the candidate is gone.
+        break false;
+    };
+    if reaped {
+        return HandoffRollbackWarrant::Reaped;
     }
+    wait_for_handoff_candidate_to_terminate(candidate)
 }
 
 /// PRE-PARK admission peek only: any readable byte OR error/hangup counts.
@@ -429,16 +753,24 @@ impl crate::UpdateHandoffCompletion {
     }
 }
 
+/// Publish a non-ready completion — the event-loop message that runs
+/// [`App::rollback_overlap`] and therefore RESUMES the parked readers. The
+/// warrant is the point of the name: this must not be called until the caller
+/// holds one, because the completion crosses a channel and cannot carry the
+/// proof with it.
 #[cfg(unix)]
-fn send_reaped_handoff_failure(
+fn send_warranted_handoff_failure(
+    warrant: HandoffRollbackWarrant,
     cleanup: &HandoffWorkerCleanup,
     proxy: &winit::event_loop::EventLoopProxy<Wake>,
     current_build: u64,
     completion: crate::UpdateHandoffCompletion,
 ) {
+    warrant.announce(completion.child_pid);
     cleanup.complete(completion.nonce.as_deref());
     // Reader rollback and reducer re-arm are latency-critical. Publish the
-    // child-reaped fact before waiting behind the updater FIFO for disk facts.
+    // candidate-terminated fact before waiting behind the updater FIFO for disk
+    // facts.
     if proxy
         .send_event(Wake::UpdateHandoffFinished(completion))
         .is_err()
@@ -455,36 +787,38 @@ fn send_reaped_handoff_failure(
     }
 }
 
-/// Reject, kill, and reap on the worker only after winning the attempt-wide
-/// arbiter. `false` means Commit won the race and the caller must keep the child
-/// untouched while waiting for Commit success or its explicit failure transfer.
+/// Reject, kill, and prove terminated on the worker, only after winning the
+/// attempt-wide arbiter. `false` means Commit won the race and the caller must
+/// keep the candidate untouched while waiting for Commit success or its explicit
+/// failure transfer.
 #[cfg(unix)]
 fn worker_reject_and_reap_handoff_child(
     job: &HandoffWorkerJob,
     proxy: &winit::event_loop::EventLoopProxy<Wake>,
     child: &mut std::process::Child,
+    candidate: HandoffCandidate,
     nonce: &str,
-    child_pid: u32,
     outcome: crate::UpdateHandoffOutcome,
     detail: String,
 ) -> bool {
     if !worker_claim_handoff_reaper(&job.arbiter) {
         return false;
     }
-    kill_and_reap_handoff_child(child);
+    let warrant = kill_and_reap_handoff_child(candidate, child);
     let completed = job.arbiter.finish_reap(crate::HandoffReaperOwner::Worker);
     debug_assert!(
         completed,
         "the worker must retain its unique reaper ownership"
     );
-    send_reaped_handoff_failure(
+    send_warranted_handoff_failure(
+        warrant,
         &job.cleanup,
         proxy,
         job.current_build,
         crate::UpdateHandoffCompletion::failure(
             job.attempt_id,
             Some(nonce.to_string()),
-            Some(child_pid),
+            Some(candidate.pid),
             outcome,
             detail,
         ),
@@ -524,7 +858,10 @@ fn handoff_preparation_cancelled(
     if job.cancel.try_recv().is_err() {
         return false;
     }
-    send_reaped_handoff_failure(
+    // Cancellation during PREPARATION precedes the spawn, so there is no
+    // candidate to prove anything about.
+    send_warranted_handoff_failure(
+        HandoffRollbackWarrant::NoCandidate,
         &job.cleanup,
         proxy,
         job.current_build,
@@ -542,6 +879,8 @@ fn handoff_preparation_cancelled(
     true
 }
 
+/// Every preparation failure is raised BEFORE `spawn`, including the one for a
+/// `spawn` that itself failed, so no candidate has ever held a master.
 #[cfg(unix)]
 fn send_handoff_preparation_failure(
     job: &HandoffWorkerJob,
@@ -549,7 +888,8 @@ fn send_handoff_preparation_failure(
     nonce: Option<String>,
     detail: impl Into<String>,
 ) {
-    send_reaped_handoff_failure(
+    send_warranted_handoff_failure(
+        HandoffRollbackWarrant::NoCandidate,
         &job.cleanup,
         proxy,
         job.current_build,
@@ -779,9 +1119,14 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     //   watch the outgoing process's kernel BIRTH RECORD, published just above
     //   by `seamless::outgoing_parent_env` — see `seamless::AttestedParent` for
     //   the property and for what B4's socket adds on top of it.
-    // * B2 — reap authority. `kill_and_reap_handoff_child` resumes the parked
-    //   readers only once `wait` proved the rejected candidate gone and reaped;
-    //   `waitpid` on a non-child answers `ECHILD` and that proof is lost.
+    // * B2 — reap authority. DONE (0.14): rollback is licensed by a typed
+    //   `HandoffRollbackWarrant` instead of by `wait` alone. `waitpid` still
+    //   mints one while the candidate IS our fork child — it remains strictly
+    //   the best answer — and when it is not, `kill(pid, 0)` vacancy or a
+    //   disagreeing kernel birth stamp mints the same fact from the outside;
+    //   see `handoff_candidate_terminated` for why those establish what `wait`
+    //   establishes. `ECHILD` is no longer read as evidence of anything, and no
+    //   path resumes a reader without a warrant.
     // * B3 — process-group containment. The `pre_exec` `setpgid(0, 0)` above,
     //   which is what makes `kill(-pid)` sweep the candidate's own updater
     //   helpers, has no LaunchServices equivalent.
@@ -804,6 +1149,13 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         }
     };
     let child_pid = child.id();
+    // Capture the candidate's kernel identity while its pid is still PINNED by
+    // being an unreaped child of ours. Every later reap authority reads it, so
+    // it has to be taken at the one instant the pid provably names the
+    // candidate; once a LaunchServices launch replaces this `spawn` (B2/B3/B4)
+    // the identity arrives from the successor instead, and nothing downstream
+    // of here changes.
+    let candidate = HandoffCandidate::of_unreaped_child(&child);
     drop(proof_wr);
     drop(commit_rd);
     let proof_outcome = wait_handoff_ready(
@@ -817,8 +1169,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
             &job,
             &proxy,
             &mut child,
+            candidate,
             &nonce,
-            child_pid,
             proof_outcome,
             format!("handoff proof ended {proof_outcome:?}"),
         );
@@ -845,8 +1197,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
             &job,
             &proxy,
             &mut child,
+            candidate,
             &nonce,
-            child_pid,
             crate::UpdateHandoffOutcome::Rejected,
             "event loop closed before final handoff admission".to_string(),
         );
@@ -866,8 +1218,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
                 &job,
                 &proxy,
                 &mut child,
+                candidate,
                 &nonce,
-                child_pid,
                 crate::UpdateHandoffOutcome::ActivityRevoked,
                 "structural activity revoked handoff before Commit".to_string(),
             )
@@ -879,8 +1231,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
                 &job,
                 &proxy,
                 &mut child,
+                candidate,
                 &nonce,
-                child_pid,
                 crate::UpdateHandoffOutcome::Rejected,
                 "a handed-off PTY session closed before Commit".to_string(),
             )
@@ -893,8 +1245,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
                     &job,
                     &proxy,
                     &mut child,
+                    candidate,
                     &nonce,
-                    child_pid,
                     crate::UpdateHandoffOutcome::Rejected,
                     "final handoff admission rejected before Commit".to_string(),
                 ) {
@@ -908,8 +1260,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
                 &job,
                 &proxy,
                 &mut child,
+                candidate,
                 &nonce,
-                child_pid,
                 crate::UpdateHandoffOutcome::Rejected,
                 "main-thread final handoff decision timed out".to_string(),
             )
@@ -2007,9 +2359,19 @@ impl App {
     }
 
     /// OVERLAP-HANDOFF failure rollback: restore this (still-running) parent to
-    /// a fully-working terminal after a child that never became ready. The
-    /// caller has already KILLED + reaped the child (kill-before-resume — see
-    /// the call site), so exactly zero readers exist when ours restart:
+    /// a fully-working terminal after a candidate that never became ready.
+    ///
+    /// PRECONDITION — the candidate was SIGNALLED and then proven TERMINATED, so
+    /// exactly zero readers exist when ours restart. The proof is a
+    /// [`HandoffRollbackWarrant`], minted on the worker (or the emergency
+    /// reaper) before the completion that reaches this function is ever sent —
+    /// see [`send_warranted_handoff_failure`]. It cannot be re-checked here: the
+    /// completion crosses a channel and a warrant is not a value that survives
+    /// the trip, so the ordering at the send site IS the guarantee. The
+    /// pre-spawn failure paths in [`App::start_unix_update_handoff`] call this
+    /// directly under the same rule, with no candidate to prove anything about.
+    ///
+    /// With that established:
     /// * the worker has already retired attempt artifacts and republished the
     ///   parent socket link before emitting this completion;
     /// * re-arm CLOEXEC on every master (the exact pre-apply fd posture);
@@ -2190,10 +2552,12 @@ fn wait_handoff_ready(
 #[cfg(all(test, unix))]
 mod handoff_process_group_tests {
     use super::{
-        HandoffCommitFacts, HandoffRejectDelivery, ReadyPollAction, classify_ready_poll,
-        deliver_handoff_rejection, emergency_kill_and_reap_handoff_child, handoff_commit_admitted,
-        handoff_masters_closed, handoff_masters_have_activity, kill_and_reap_handoff_child,
-        make_cloexec_pipe, wait_handoff_ready, worker_claim_handoff_reaper,
+        HandoffCandidate, HandoffCommitFacts, HandoffRejectDelivery, HandoffRollbackWarrant,
+        ReadyPollAction, classify_ready_poll, deliver_handoff_rejection,
+        emergency_kill_and_reap_handoff_child, handoff_candidate_terminated,
+        handoff_commit_admitted, handoff_masters_closed, handoff_masters_have_activity,
+        kill_and_reap_handoff_child, make_cloexec_pipe, wait_handoff_ready,
+        worker_claim_handoff_reaper,
     };
     use std::io::{BufRead as _, Read as _};
     use std::os::unix::process::CommandExt as _;
@@ -2672,7 +3036,12 @@ mod handoff_process_group_tests {
             .expect("numeric descendant pid");
         assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant live");
 
-        kill_and_reap_handoff_child(&mut child);
+        let candidate = HandoffCandidate::of_unreaped_child(&child);
+        assert_eq!(
+            kill_and_reap_handoff_child(candidate, &mut child),
+            HandoffRollbackWarrant::Reaped,
+            "our own fork child must be licensed by the strongest authority"
+        );
         cleanup.disarm();
         assert_process_group_gone(
             leader,
@@ -2763,7 +3132,12 @@ mod handoff_process_group_tests {
         assert!(!buggy.check_invariant("ProcessGroupSignalPrecedesDirectChildReap", &old_order,));
         assert_eq!(old_order["descendant_live"], 1);
 
-        kill_and_reap_handoff_child(&mut child);
+        let candidate = HandoffCandidate::of_unreaped_child(&child);
+        assert_eq!(
+            kill_and_reap_handoff_child(candidate, &mut child),
+            HandoffRollbackWarrant::Reaped,
+            "an exited-but-unreaped fork child is still ours to wait"
+        );
         assert!(model.fire("KillRejectedChild", &mut model_state));
         assert!(model.fire("ReapKilledChild", &mut model_state));
         assert!(arbiter.finish_reap(crate::HandoffReaperOwner::Worker));
@@ -2823,7 +3197,11 @@ mod handoff_process_group_tests {
         let arbiter = crate::HandoffAttemptArbiter::new();
         assert!(arbiter.try_begin_reject());
         assert!(arbiter.claim_reaper(crate::HandoffReaperOwner::Emergency));
-        emergency_kill_and_reap_handoff_child(child.id());
+        assert_eq!(
+            emergency_kill_and_reap_handoff_child(child.id()),
+            HandoffRollbackWarrant::Reaped,
+            "the emergency reaper still prefers `waitpid` when the candidate is ours"
+        );
         // The raw emergency reaper consumed this exact child. An explicit wait
         // observes ECHILD and documents the `Child` handle's completed lifecycle.
         let _ = child.wait();
@@ -2834,5 +3212,145 @@ mod handoff_process_group_tests {
             descendant,
             "emergency reap returned but exited leader left a live descendant",
         );
+    }
+
+    /// B2, soundness half: the fallback authority's PID-VACANCY proof, in both
+    /// directions. A running candidate must never satisfy it (resuming a reader
+    /// then is the corruption the overlap exists to prevent), and a candidate
+    /// whose pid has come free must always satisfy it — that vacancy is the
+    /// same fact `wait` returns, reached without being the parent.
+    #[test]
+    fn a_running_candidate_is_unproven_and_a_vacant_pid_is_the_proof() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn a live candidate");
+        let candidate = HandoffCandidate::of_unreaped_child(&child);
+        assert!(
+            !handoff_candidate_terminated(candidate),
+            "a running candidate must never license a reader resume"
+        );
+
+        let pid = i32::try_from(child.id()).expect("bounded child pid");
+        // SAFETY: SIGKILL to the test's own child.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill fixture");
+        child.wait().expect("reap the test candidate");
+        assert!(
+            handoff_candidate_terminated(candidate),
+            "a candidate whose pid is vacant has terminated, whoever reaped it"
+        );
+    }
+
+    /// B2, the blocker itself: a candidate this process did NOT fork — the shape
+    /// a LaunchServices-launched successor has — is proven terminated anyway.
+    /// `waitpid` answers `ECHILD` for it (asserted below, because that ECHILD is
+    /// exactly what costs the old authority its proof), and the orphan is not a
+    /// process-group leader either (`sh -c` runs without job control), so
+    /// `kill(-pid)` names no group and sweeps nothing: only the
+    /// identity-corroborated DIRECT signal can end it. Both halves of the
+    /// fallback are therefore load-bearing here.
+    ///
+    /// Fixture cleanup is the `sleep` itself: every process this spawns exits on
+    /// its own within 30 s even if an assertion panics first.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_candidate_we_never_forked_is_still_proven_terminated() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit 0")
+            .stdout(std::process::Stdio::piped());
+        let mut parent = command.spawn().expect("spawn the orphan's parent");
+        let mut stdout = std::io::BufReader::new(parent.stdout.take().expect("parent stdout"));
+        let mut orphan_line = String::new();
+        stdout.read_line(&mut orphan_line).expect("orphan pid line");
+        let orphan: u32 = orphan_line.trim().parse().expect("numeric orphan pid");
+        // Reaping the middle process is what reparents the orphan to launchd.
+        parent.wait().expect("reap the orphan's parent");
+        let raw = i32::try_from(orphan).expect("bounded orphan pid");
+
+        let candidate = HandoffCandidate {
+            pid: orphan,
+            birth: super::read_candidate_birth(orphan),
+        };
+        assert!(
+            candidate.birth.is_some(),
+            "a live process has a kernel birth record"
+        );
+        let mut status = 0i32;
+        // SAFETY: a non-blocking wait for a pid that is not our child.
+        let waited = unsafe { libc::waitpid(raw, &mut status, libc::WNOHANG) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(waited, -1, "the orphan must not be waitable by us");
+        assert_eq!(errno, Some(libc::ECHILD), "…and the refusal is ECHILD");
+        assert!(
+            !handoff_candidate_terminated(candidate),
+            "the orphan is still running"
+        );
+
+        super::signal_handoff_candidate(candidate);
+        // Bounded HERE ONLY: a broken fallback must fail this test rather than
+        // hang the suite. `wait_for_handoff_candidate_to_terminate` deliberately
+        // carries no such bound, because in production the alternative to
+        // waiting is resuming a reader without proof.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !handoff_candidate_terminated(candidate) {
+            if std::time::Instant::now() >= deadline {
+                // Fail clean: no fixture outlives its assertion.
+                // SAFETY: SIGKILL to the fixture's own orphan.
+                unsafe { libc::kill(raw, libc::SIGKILL) };
+                panic!("the outside proof never established that orphan {orphan} terminated");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The other edge of the identity check: a pid whose kernel birth stamp
+    /// DISAGREES with the candidate's was recycled, which both proves the
+    /// candidate terminated and makes signalling that pid an attack on a
+    /// bystander. Without a parent's unreaped-child pin — the LaunchServices
+    /// shape — this is the only thing standing between the reap path and
+    /// SIGKILLing whatever inherited the number.
+    ///
+    /// Fixture cleanup is the `sleep` itself: the bystander exits on its own
+    /// within 30 s even if an assertion panics before the explicit kill.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pid_whose_birth_record_disagrees_is_proof_of_death_and_is_never_signalled() {
+        let mut bystander = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn a stand-in for whoever recycled the pid");
+        let candidate = HandoffCandidate {
+            pid: bystander.id(),
+            // The pid the candidate was born at, paired with a birth instant
+            // that is not the one the kernel reports for it now.
+            birth: Some(super::HandoffCandidateBirth {
+                seconds: 1,
+                microseconds: 1,
+            }),
+        };
+        assert!(
+            handoff_candidate_terminated(candidate),
+            "a disagreeing birth stamp proves the pid was reallocated"
+        );
+
+        super::signal_handoff_candidate(candidate);
+        // SIGKILL delivery is not synchronous with `kill(2)` returning, so give
+        // a wrongly-sent signal time to actually land before concluding none was.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let pid = i32::try_from(bystander.id()).expect("bounded child pid");
+        // SAFETY: signal 0 is kill(2)'s existence check; it delivers nothing.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the process that recycled the pid must survive the reap path"
+        );
+
+        // SAFETY: SIGKILL to the test's own child.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill fixture");
+        bystander.wait().expect("reap the test child");
     }
 }

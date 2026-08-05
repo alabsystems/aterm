@@ -109,6 +109,16 @@ impl Report {
         }
     }
 
+    /// Record an already-computed outcome — for the stages whose child reports
+    /// more than pass/fail, so the mapping stays a pure, testable function
+    /// instead of control flow spread through the stage.
+    pub fn record(&mut self, outcome: Outcome, label: impl Into<String>) {
+        self.entries.push(Entry::Ladder {
+            outcome,
+            label: label.into(),
+        });
+    }
+
     /// Record an outcome by boolean, the shape most ported stages want.
     pub fn decide(&mut self, ok: bool, label: impl Into<String>) {
         if ok {

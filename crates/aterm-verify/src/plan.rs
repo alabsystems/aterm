@@ -46,6 +46,7 @@ pub enum StageId {
     ProofInventory,
     ControlSocketSmoke,
     GuiSmoke,
+    RedrawConformance,
     DifferentialOracle,
     KaniFloor,
 }
@@ -139,6 +140,16 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "gui typing-pacing smoke",
         Lane::MainTarget,
     ));
+    // LAST in the main-target lane: it builds aterm-gui under a non-default
+    // feature, so it runs after the two smokes have finished with the default
+    // binaries. Never conditional on the scope — the claim it makes is about the
+    // shipped GUI, and a gate that a narrowing can remove is a gate that stops
+    // running exactly when someone is in a hurry.
+    v.push(spec(
+        StageId::RedrawConformance,
+        "control redraw conformance (a select repaints a real window)",
+        Lane::MainTarget,
+    ));
     if ctx.mode == Mode::Full {
         v.push(spec(
             StageId::DifferentialOracle,
@@ -195,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fast_ladder_is_the_fourteen_stages_in_the_documented_order() {
+    fn the_fast_ladder_is_the_documented_stages_in_the_documented_order() {
         assert_eq!(
             ids(&ctx(Mode::Fast, Scope::workspace())),
             [
@@ -214,8 +225,31 @@ mod tests {
                 StageId::ProofInventory,
                 StageId::ControlSocketSmoke,
                 StageId::GuiSmoke,
+                StageId::RedrawConformance,
             ]
         );
+    }
+
+    /// A GATE NOBODY INVOKES IS NOT A GATE. The redraw harness is the only check
+    /// in the tree that can see a control `select` actually repaint a window —
+    /// every `#[test]` builds its host with `proxy: None` — and for a while it
+    /// sat behind an off-by-default feature that no workflow, script or stage
+    /// ever named. Dropping it from the plan is how that state returns.
+    #[test]
+    fn the_redraw_gate_runs_in_every_tier_and_every_scope() {
+        for mode in [Mode::Fast, Mode::Full] {
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("aterm-grid"),
+                Scope::changed("main", vec![], true),
+            ] {
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::RedrawConformance),
+                    "{mode:?} / {} lost the redraw gate",
+                    scope.label()
+                );
+            }
+        }
     }
 
     #[test]
@@ -290,6 +324,6 @@ mod tests {
         // names it. A stage that disappeared would be a stage nobody missed.
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
-        assert_eq!(plan(&nothing_installed).len(), 17);
+        assert_eq!(plan(&nothing_installed).len(), 18);
     }
 }

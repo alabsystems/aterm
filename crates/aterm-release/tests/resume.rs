@@ -4,7 +4,7 @@
 //! Resume/recut logic proofs (release spec §5): the journal's re-entry
 //! contract and the remote-derived cut-mode decision table, as PURE logic
 //! over fake remote state — no network, no git. Plus the pure publish
-//! helpers the pipeline hangs off (version bump, cask re-pin, monotonic
+//! helpers the pipeline hangs off (version bump, monotonic
 //! gate, channel-floor carry-forward, exhaustive status selection) and the
 //! hand-rolled CLI parse table.
 
@@ -210,7 +210,6 @@ fn pipeline_step_order_is_the_spec_7_order() {
             "tag",
             "flip",
             "archive",
-            "cask",
             "verify",
             // The public-channel mirror runs AFTER the private release is
             // fully verified and BEFORE the lease is released, so a mirror
@@ -248,7 +247,7 @@ fn first_incomplete_walks_the_step_order() {
     assert_eq!(
         j.first_incomplete(),
         Some("archive"),
-        "a crash after visibility resumes into channel convergence before cask/verify"
+        "a crash after visibility resumes into channel convergence before verify"
     );
     // Completion ORDER in the file is irrelevant — only membership counts.
     j.done = vec![
@@ -337,6 +336,68 @@ fn completed_legacy_journal_stays_complete_instead_of_reclassifying_archive() {
     legacy.ensure_resumable().unwrap();
 }
 
+/// Format 7 REMOVED the `cask` step. A finished v6 journal still lists it, so
+/// walking one against the current 12-step list must not reclassify it — the
+/// mirror of the v1/v5 guarantees above, for a removal rather than an insertion.
+#[test]
+fn completed_v6_journal_with_cask_stays_complete_after_the_step_was_removed() {
+    let dir = tmpdir("journal-v6-complete");
+    let path = dir.join("cut-state.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "format = 6\nversion = \"0.11.0\"\nbuild_number = 1785698378\n\
+             commit = \"{}\"\n\
+             done = [\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
+             \"preflip\", \"tag\", \"flip\", \"archive\", \"cask\", \"verify\", \
+             \"mirror\", \"unlock\"]\n",
+            "b".repeat(40)
+        ),
+    )
+    .unwrap();
+
+    let v6 = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(v6.format, 6);
+    assert_eq!(
+        v6.first_incomplete(),
+        None,
+        "a completed v6 journal must stay complete once `cask` left STEPS"
+    );
+    v6.ensure_resumable().unwrap();
+}
+
+/// The other half of the removal: an UNFINISHED v6 journal that still owes the
+/// retired `cask` step must not be silently reported as further along than it
+/// is. It walks STEPS_V6, so `cask` is still its next step, and — being below
+/// the current format — it fails closed into stopped-publisher recovery.
+#[test]
+fn unfinished_v6_journal_still_owes_cask_and_fails_closed() {
+    let dir = tmpdir("journal-v6-incomplete");
+    let path = dir.join("cut-state.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "format = 6\nversion = \"0.11.0\"\nbuild_number = 1785698378\n\
+             commit = \"{}\"\n\
+             done = [\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
+             \"preflip\", \"tag\", \"flip\", \"archive\"]\n",
+            "c".repeat(40)
+        ),
+    )
+    .unwrap();
+
+    let v6 = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(
+        v6.first_incomplete(),
+        Some("cask"),
+        "an unfinished v6 journal walks the step list it was written against"
+    );
+    assert!(
+        v6.ensure_resumable().is_err(),
+        "a below-current-format unfinished journal must fail closed"
+    );
+}
+
 #[test]
 fn unfinished_legacy_journal_fails_closed_before_remote_resume() {
     let dir = tmpdir("journal-legacy-incomplete");
@@ -364,15 +425,16 @@ fn unfinished_legacy_journal_fails_closed_before_remote_resume() {
 fn completed_v4_loads_but_unfinished_v4_fails_closed() {
     let dir = tmpdir("journal-v4-policy");
     let path = dir.join("cut-state.toml");
+    // Spelled out rather than derived from STEPS: a v4 journal is walked
+    // against the FORMAT-5 list, so it must carry the v5-era steps —
+    // including the retired `cask`. Deriving it from the current STEPS
+    // would silently under-fill the fixture whenever a step is removed.
     let completed = format!(
         "format = 4\nversion = \"0.54.0\"\nbuild_number = 540\ncommit = \"{}\"\n\
-         release_id = 54\ndone = [{}]\n",
-        "c".repeat(40),
-        STEPS
-            .iter()
-            .map(|step| format!("\"{step}\""))
-            .collect::<Vec<_>>()
-            .join(", ")
+         release_id = 54\ndone = [\"lock\", \"build\", \"selfcheck\", \"draft\", \
+         \"upload\", \"preflip\", \"tag\", \"flip\", \"archive\", \"cask\", \
+         \"verify\", \"unlock\"]\n",
+        "c".repeat(40)
     );
     std::fs::write(&path, completed).unwrap();
     let loaded = Journal::load(&path).unwrap().unwrap();
@@ -1673,63 +1735,6 @@ fn archive_listing_preserves_duplicates_for_fail_closed_preflight() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("duplicate assets"), "{err}");
-}
-
-/// Cask re-pin (spec §7 step 6) against the REAL committed cask: exactly the
-/// version and sha256 stanzas change; the `#{version}`-templated url line and
-/// everything else are byte-untouched.
-#[test]
-fn cask_repin_rewrites_exactly_two_lines_of_the_real_cask() {
-    let real = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../packaging/homebrew/aterm.rb"
-    ))
-    .expect("read the real cask");
-    let sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    let pinned = publish::repin_cask_text(&real, "0.26.0", sha).expect("re-pin");
-
-    let old: Vec<&str> = real.lines().collect();
-    let new: Vec<&str> = pinned.lines().collect();
-    assert_eq!(old.len(), new.len(), "re-pin must not add/remove lines");
-    let diff: Vec<usize> = (0..old.len()).filter(|&i| old[i] != new[i]).collect();
-    assert_eq!(
-        diff.len(),
-        2,
-        "exactly version + sha256 lines change: {diff:?}"
-    );
-    assert!(new[diff[0]].trim_start().starts_with("version \"0.26.0\""));
-    assert!(
-        new[diff[1]]
-            .trim_start()
-            .starts_with(&format!("sha256 \"{sha}\""))
-    );
-    assert!(
-        pinned.contains("url \"https://github.com/"),
-        "url template untouched"
-    );
-
-    // Re-pinning the same values again is a byte no-op — that is how the
-    // cask step detects "someone already landed this pin" after a reset.
-    assert_eq!(
-        publish::repin_cask_text(&pinned, "0.26.0", sha).unwrap(),
-        pinned
-    );
-    // And the freshness probe reads the pin back.
-    assert_eq!(verify::cask_version(&pinned).as_deref(), Some("0.26.0"));
-
-    assert!(publish::repin_cask_text("cask \"aterm\" do\nend\n", "0.26.0", sha).is_err());
-}
-
-#[test]
-fn cask_retry_rederives_live_digest_and_rejects_stale_attempt_mutant() {
-    let old = "a".repeat(64);
-    let new = "b".repeat(64);
-    // Attempt one is fresh but its branch CAS is rejected by a moving main.
-    publish::validate_cask_attempt_freshness(&old, &old).unwrap();
-    // Production re-enters the loop and derives the changed live digest.
-    publish::validate_cask_attempt_freshness(&new, &new).unwrap();
-    // Negative control: hoisting the old digest outside the retry loop is stale.
-    assert!(publish::validate_cask_attempt_freshness(&old, &new).is_err());
 }
 
 /// Status exhaustively scans every historical manifest, then reports the

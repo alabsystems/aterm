@@ -104,6 +104,13 @@ fn handoff_is_modern_overlap(
 /// [`validated_identities`] proves is a bijection against the manifest, and the
 /// unit [`adoption_proof`] hashes — naming it keeps those three agreeing on
 /// field ORDER, which a bare tuple of three integers cannot enforce.
+///
+/// The middle field is a TRANSPORT COORDINATE, not an identity. `local_id` and
+/// `pid` mean the same thing in any process; a descriptor number means "the slot
+/// this PTY occupies in one process's descriptor table", and the two sides only
+/// agree on it because `fork`+`execve` copies that table verbatim. See
+/// [`adoption_proof`] for what that costs the proof and what replaces it once
+/// the masters travel over `SCM_RIGHTS`.
 pub(crate) type SessionIdentity = (u64, i32, i32);
 
 /// Exact, attempt-bound proof of the PTYs the incoming process really adopted.
@@ -155,9 +162,61 @@ impl AdoptionProof {
     }
 }
 
-/// Canonical SHA-256 commitment to a complete adopted session set. The fd number
-/// is stable across fork/exec and joins the pool id + shell pid, preventing an
-/// identity-only subset from claiming a different inherited PTY.
+/// Canonical SHA-256 commitment to one complete adopted session set: the attempt
+/// nonce, the authorized target build/commit, the layout and screen digests, and
+/// the sorted [`SessionIdentity`] triples. Sorting makes it order-free; hashing
+/// the count beside the members is what makes zero/subset/duplicate adoption
+/// unmistakable rather than merely unlikely.
+///
+/// FROZEN CROSS-VERSION WIRE. The parent runs the OUTGOING build's copy of this
+/// function, the child runs the INCOMING build's, and the two digests must be
+/// equal — an update crosses a version boundary by definition. Nothing in the
+/// protocol negotiates the format or even notices a disagreement: the parent
+/// reports `AdoptionMismatch`, which `finish_update_handoff` classifies as a
+/// genuine failure and latches manual-only, and every apply mode goes through
+/// this same overlap. So changing ANY hashed byte retires the automatic update
+/// lane for every parent already in the field. `f4_adoption_proof_asymmetry`
+/// below is what happened the last time an input to this digest drifted between
+/// two builds, and it is why the fd term survives the B4 section below.
+///
+/// WHAT THE FD TERM ACTUALLY PROVES. A descriptor number is not a property of a
+/// PTY; it is the slot the PTY occupies in one process's descriptor table. Both
+/// sides compute the same value only because `fork`+`execve` copies that table
+/// verbatim, so the child's inherited master keeps the parent's number, and our
+/// child never relocates these descriptors. Under that transport the term does
+/// exclude a substituted or partial adoption — but the exclusion is supplied by
+/// the transport plus our own code, and merely WITNESSED by the digest, which
+/// checks an integer that any process may put on any descriptor with `dup2`.
+/// Move the masters to `SCM_RIGHTS` (B4, `tests/handoff_launchd_job.rs`) and the
+/// kernel picks the receiver's numbers: the term stops agreeing, and the only
+/// way to keep it would be `dup2` surgery onto parent-chosen numbers at process
+/// entry, where one mistake destroys a live descriptor.
+///
+/// B4 — THE REPLACEMENT TERM. What survives a descriptor transfer is the PTY
+/// ITSELF. On macOS that is `fstat(2)`'s `st_rdev` on the master: `/dev/ptmx` is
+/// a cloning device, so every open takes its own minor, that minor is the
+/// `/dev/ttysNNN` its slave gets, and `dup`/`SCM_RIGHTS` hand over the same open
+/// file description and therefore the same value (observed: three
+/// simultaneously-open masters at minors 3/98/119, each matching its slave's
+/// name, `dup` preserving the value). `st_ino`/`st_dev` are NOT usable there —
+/// every master shares the single `/dev/ptmx` devfs node. Linux exposes the same
+/// number as `ioctl(fd, TIOCGPTN)`. That term is strictly stronger than the fd
+/// number: a same-uid process cannot make `fstat` lie about a descriptor the
+/// caller already holds, and to ANSWER a given minor it has to hold that very
+/// PTY — minting a character device with a chosen `st_rdev` needs `mknod(2)`,
+/// i.e. root. The "descriptor's ordinal in the parent-declared transfer order"
+/// sketched in `tests/handoff_launchd_job.rs` is transport-portable but as
+/// content-free as the number: it names a slot, so it detects a permutation and
+/// never a substitution.
+///
+/// It is not landed here because it IS the frozen-wire change above. It needs a
+/// version advertisement, and [`outgoing_parent_env`] is the seam that already
+/// has one (`run_handoff_worker` applies its pairs wholesale): a parent that
+/// advertises v2 demands v2 exactly when its authorized `target_build` is at
+/// least its own build, and a child emits v2 only when the advertisement is
+/// present. That covers old-parent/new-child and new-parent/old-child in a
+/// single release — but the acceptance half lives in `app_update_handoff`, so
+/// the swap cannot be made from this file alone.
 #[must_use]
 pub(crate) fn adoption_proof(
     nonce: &str,
@@ -1487,6 +1546,49 @@ fn parse_named_fd_bytes(entry: &[u8]) -> Option<i32> {
         .ok()
 }
 
+/// The successor's entry-point posture repair — `main_entry` calls it before any
+/// helper, session, window, or user code: re-arm CLOEXEC on every descriptor an
+/// incoming handoff names, attest the outgoing parent, and scrub the authority
+/// environment.
+///
+/// B3 — PROCESS-GROUP CONTAINMENT, RESIDUAL GAP (see
+/// `tests/handoff_launchd_job.rs`). Today the parent puts the candidate in its
+/// own process group with `setpgid(0, 0)` in `run_handoff_worker`'s `pre_exec`,
+/// which is what makes that file's `kill(-pid, SIGKILL)` sweep the candidate's
+/// `ditto`/`codesign`/`spctl` helpers instead of only its leader. A
+/// LaunchServices launch has no pre-exec hook, so the call has to move HERE:
+/// this function already runs before the successor can spawn anything, so every
+/// helper would still inherit the group. That disposes of the stated
+/// "helpers spawned before the call escape it" race, and of the
+/// EPERM worry too — `setpgid(0, 0)` can only fail EPERM because the caller is a
+/// session leader, and a session leader's group id already equals its pid, so
+/// `getpgrp() == getpid()` holds either way and is the postcondition to assert
+/// rather than the call's return value.
+///
+/// What does NOT survive the move, and cannot be repaired in this file:
+///
+/// * THE ORDERING GUARANTEE. `pre_exec` establishes the group BEFORE the
+///   candidate's image runs, so `kill(-pid)` is a valid handle from the instant
+///   `spawn` returns. Successor-side, there is a window between the launch and
+///   this instruction in which the successor sits in whatever group the launcher
+///   left it, and a rejection issued then signals a group the candidate is not
+///   in. Process-group ids also share the pid number space, so if the
+///   successor's pid was recycled from a reaped group leader whose group still
+///   has members, `kill(-pid)` reaches strangers — the same pid-reuse hazard
+///   [`AttestedParent`] closes for the parent's identity, except that a process
+///   GROUP has no kernel birth record to attest.
+/// * THE PARENT CANNOT LEARN THE GROUP EXISTS. The readiness wire is a fixed
+///   proof record the parent computes for itself, so the successor has nowhere
+///   to report its pgid. Until B4's control socket carries that attestation the
+///   parent must treat `kill(pid)` as its only sound signal and `kill(-pid)` as
+///   an unproven optimization — which is precisely the helper sweep B3 exists
+///   for, and it also costs `emergency_kill_and_reap_handoff_child` its
+///   "signal the group before any wait" ordering, whose whole point is that
+///   reaping the leader releases the pid.
+///
+/// So B3 is achievable but not equivalent, and closing the difference is B2/B4
+/// work (name the non-child successor, then carry its attested pgid), not a
+/// local edit to this function.
 #[cfg(unix)]
 pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
     let manifest_present = std::env::var_os(ENV_MANIFEST).is_some();

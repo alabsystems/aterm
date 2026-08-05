@@ -94,6 +94,12 @@ mod compiler_probe;
 mod config_notice;
 mod config_watcher;
 mod control;
+/// The main-thread redraw conformance gate, for the `aterm-redraw-conformance`
+/// binary. Re-exported here because a `[[bin]]` is its own crate and everything
+/// the gate touches (`GuiHost`, `Wake`, the registry) is library-private — the bin
+/// supplies only the main thread, exactly as `main.rs` supplies only the process.
+#[cfg(feature = "control-conformance")]
+pub use control::control_redraw_conformance::run_redraw_conformance;
 mod control_auth;
 #[cfg(test)]
 mod control_connection_conformance;
@@ -11792,6 +11798,29 @@ impl ApplicationHandler<Wake> for App {
         // facts FIFO full. Completions themselves drive event-loop turns, so this
         // nonblocking retry converges as the sole worker drains without a timer.
         self.retry_pending_native_update_reconcile();
+        // A fact completion that arrived while updater work was in flight is HELD
+        // (`NativeUpdateFactsResult::Deferred`), and an `update apply` request
+        // carries its entire authority in that held record — so a hold that is
+        // never re-driven is a request that silently never happens.
+        //
+        // The COMMON hold is already covered: `finish_native_update_check` drains
+        // it on every reduced check completion, and a background check is the only
+        // thing that sets `snapshot.active`. What is NOT covered is a hold left
+        // behind `phase == Applying` by a path that abandons the attempt without
+        // returning one — `abort_unstarted_native_apply`,
+        // `abort_reaped_native_apply_before_reconcile`, and the activity-deferred
+        // branch all leave the phase set and none of them drain. This is the
+        // backstop for that class: it makes the loop, rather than any single
+        // caller, responsible for never stranding a held request.
+        //
+        // Cheap enough to sit on the idle path: the guard is one `Option` test, and
+        // the drain reads only `active`/`phase` off a BORROWED snapshot — no clone,
+        // no allocation. Self-guarded, so it no-ops while work is genuinely active
+        // and needs no deadline of its own (clearing that work is itself an event,
+        // which brings the loop back through here).
+        if self.deferred_native_update_reconcile.is_some() {
+            self.finish_deferred_native_update_reconcile();
+        }
         if should_dispatch_boot_health_confirmation(
             self.headless,
             self.first_present_done,
@@ -12360,6 +12389,27 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline,
                 &mut deadline_owner,
                 d,
+                metrics::DeadlineOwner::AutoApply,
+            );
+        }
+        // The OTHER automatic-apply deadline. While a manual-only latch is held
+        // there is no intent to fold above — the latch is what replaced it — so
+        // folding only the intent left nothing scheduled to release the latch.
+        // `about_to_wait` lapses it on the way into every park, which hid this on
+        // a machine in use (any keystroke or byte of PTY output is a wake), but an
+        // IDLE machine produces no wake at all, so the latch outlived the session
+        // and the staged build waited for a relaunch. That is precisely the case
+        // `ACTIVITY_MANUAL_ONLY_LAPSE` is sized for ("left running overnight").
+        // Genuine-failure latches that carry no deadline fold nothing and still
+        // cost zero wakes.
+        if let Some(lapse_at) = self
+            .auto_apply_manual_only
+            .and_then(|manual| manual.retry_at)
+        {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                lapse_at,
                 metrics::DeadlineOwner::AutoApply,
             );
         }
@@ -13529,18 +13579,54 @@ impl ApplicationHandler<Wake> for App {
                 if std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some() {
                     let outcome = self.apply_debug_seamless_update();
                     self.surface_update_apply_outcome("debug control request", outcome, false);
-                } else if !self.request_native_update_reconcile(
-                    app_native::NativeUpdateReconcilePurpose::ApplyControl,
-                ) {
-                    self.surface_update_apply_outcome(
-                        "control request",
-                        native_app::UpdateOutcome::Blocked {
-                            reasons: vec![
-                                "Updater facts could not be collected safely".to_string(),
-                            ],
-                        },
-                        false,
-                    );
+                } else {
+                    // The controller has ALREADY been told "OK apply requested" —
+                    // that reply acknowledges delivery, nothing more — so every way
+                    // this request can fail to produce an apply has to answer for
+                    // itself here, durably. Two of them used to answer nowhere at
+                    // all, and that is the reported bug: `update apply` returned OK
+                    // and the process stayed on the old build indefinitely, with
+                    // `update status` still reporting a healthy updater and a
+                    // ready stage.
+                    let (current_build, phase, work_active) = {
+                        let updater = self.native_updater_service.snapshot();
+                        (
+                            updater.current_build,
+                            updater.phase,
+                            updater.active.is_some(),
+                        )
+                    };
+                    // HELD, not dropped: `reconcile_native_update_facts` defers any
+                    // fact completion that lands while updater work is in flight,
+                    // and an ApplyControl request carries its whole authority in
+                    // that deferred record. It is re-driven from `about_to_wait`
+                    // once the reducer is free, so this is a delay and not a
+                    // refusal — but a delay nobody can observe is exactly what
+                    // "nothing happened" looked like from the outside.
+                    if work_active || phase == native_updater_service::UpdaterPhase::Applying {
+                        let reason = format!(
+                            "updater work is already in flight (phase {phase:?}); the apply \
+                             request is held until it finishes"
+                        );
+                        aterm_log::info!("update apply (control request) held: {reason}");
+                        aterm_update::record_apply_refusal(current_build, &reason);
+                    }
+                    if !self.request_native_update_reconcile(
+                        app_native::NativeUpdateReconcilePurpose::ApplyControl,
+                    ) {
+                        let reason = "Updater facts could not be collected safely";
+                        // `surface_update_apply_outcome` paints a pill and logs, but
+                        // a Blocked verdict is deliberately not a ledger FAILURE, so
+                        // this refusal left no durable trace whatsoever.
+                        aterm_update::record_apply_refusal(current_build, reason);
+                        self.surface_update_apply_outcome(
+                            "control request",
+                            native_app::UpdateOutcome::Blocked {
+                                reasons: vec![reason.to_string()],
+                            },
+                            false,
+                        );
+                    }
                 }
             }
             // Proof-carrying DSU (RFC Rung 2): a strictly-newer build staged — show the

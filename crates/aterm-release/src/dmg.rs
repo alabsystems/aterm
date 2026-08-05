@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A packaged artifact (DMG or zip): the release asset path, its exact byte
-/// digest (→ manifest `sha256`/`zip_sha256`, cask pin, publish self-check) and
-/// size (transcript).
+/// digest (→ manifest `sha256`/`zip_sha256`, publish self-check) and size
+/// (transcript).
 pub struct Packaged {
     pub path: PathBuf,
     pub sha256: String,
@@ -68,7 +68,7 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
         .map_err(|e| format!("stat {}: {e}", dmg.display()))?
         .len();
     // In-process digest of the final bytes (spec §6): this exact string feeds
-    // the manifest, the cask pin and the post-publish byte-identity check.
+    // the manifest and the post-publish byte-identity check.
     let sha256 = sha256_file(&dmg)?;
     println!(
         "==> done: {} ({:.1} MB)",

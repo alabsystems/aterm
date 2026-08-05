@@ -172,7 +172,7 @@ pub enum CelebrationGesture {
     /// wraps at 65 536 bars (~29 h) and, because `CELEBRATION_PHRASE_BARS` is a
     /// power of two, the FORM survives even that wrap in phase (pinned by
     /// `celebration_form_is_wrap_safe`).
-    RiffBar { bar: u16 },
+    RiffBar { bar: u16, key: i8 },
 }
 
 /// One namespaced gesture: WHICH effect spoke, and WHAT it said. The
@@ -1242,8 +1242,8 @@ impl TrailSynth {
                 self.design_trail(ev, kind, duck);
             }
             SoundGesture::Words(WordGesture::Bonk) => self.design_bonk(ev, duck),
-            SoundGesture::Celebration(CelebrationGesture::RiffBar { bar }) => {
-                self.design_celebration(ev, bar);
+            SoundGesture::Celebration(CelebrationGesture::RiffBar { bar, key }) => {
+                self.design_celebration(ev, bar, key);
             }
         }
     }
@@ -1734,7 +1734,7 @@ impl TrailSynth {
     /// PENTA, transpose ×1.0) — every pinned neutral-path celebration proof is
     /// byte-untouched. The bonk alone keeps the raw `penta` (its clash is
     /// anchored to the untransposed lattice by design).
-    fn design_celebration(&mut self, ev: SoundEvent, bar: u16) {
+    fn design_celebration(&mut self, ev: SoundEvent, bar: u16, key: i8) {
         let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
         let idx = usize::from(bar) % CELEBRATION_PHRASE_BARS;
         let phrase = &CELEBRATION_PHRASE[idx];
@@ -1756,12 +1756,18 @@ impl TrailSynth {
                 continue; // held by the note before it
             }
             let span = celebration_span(phrase, i, sustain_limit);
-            let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg);
+            // THE HELD KEY PICKS THE ROOT (owner: "when I changed the repeating
+            // key, the song played needs to also change seamlessly"). `key` is a
+            // pentatonic scale-degree offset from `KittySing::key`, bounded to one
+            // octave, applied to every note of the authored phrase — so the tune,
+            // its rhythm and its bar grid are untouched and only the KEY moves.
+            // The riff used to be bit-identical for every held character.
+            let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + i32::from(key));
             // The BASSLINE rides the lead voice that opens its beat — third
             // partial, no extra voice. `build` fades the low end in over the
             // opening bars.
             let sub = if i.is_multiple_of(2) && bass_bar[i / 2] != REST {
-                let b = self.melody_hz(CELEBRATION_BASE_HZ, bass_bar[i / 2]);
+                let b = self.melody_hz(CELEBRATION_BASE_HZ, bass_bar[i / 2] + i32::from(key));
                 Partial {
                     lvl: 0.42 * build,
                     f0: b,
@@ -4793,7 +4799,7 @@ mod tests {
         SoundEvent {
             style,
             voice: SoundVoice::Style,
-            kind: SoundGesture::Celebration(CelebrationGesture::RiffBar { bar }),
+            kind: SoundGesture::Celebration(CelebrationGesture::RiffBar { bar, key: 0 }),
             pan: 0.0,
             heat: 1.0,
             hue: 0.0,

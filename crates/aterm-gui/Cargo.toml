@@ -13,6 +13,17 @@ description = "aterm — a native windowed terminal: winit + softbuffer presenti
 name = "aterm-gui"
 path = "src/main.rs"
 
+# The Phase 1a redraw gate. A BINARY because `EventLoop` construction panics off
+# the process main thread and libtest runs every `#[test]` on a spawned one, so
+# only a target owning `fn main` can hand `GuiHost` a real `EventLoopProxy` — see
+# `src/control_redraw_conformance.rs`. `required-features` keeps it (and the verb
+# matrix it links) out of every default build; run it with
+# `cargo run -p aterm-gui --features control-conformance --bin aterm-redraw-conformance`.
+[[bin]]
+name = "aterm-redraw-conformance"
+path = "src/bin/aterm-redraw-conformance.rs"
+required-features = ["control-conformance"]
+
 [features]
 # `sixel` is ON by default so the SHIPPED GUI binary decodes + renders sixel
 # graphics and DA1 advertises code 4. It forwards to aterm-core's `sixel`
@@ -59,6 +70,11 @@ a11y-appkit = [
 # `a11y-appkit` on macOS (both would claim the content view's accessibility tree), enforced
 # by a `compile_error!` in `accesskit_tree.rs`.
 a11y-accesskit = ["dep:accesskit", "dep:accesskit_winit"]
+# Compiles the `aterm-redraw-conformance` gate and, through it, aterm-control's
+# verb matrix into a NON-test build — the only way a target with its own `fn main`
+# can run the suite (a bin gets no dev-dependencies). OFF by default: the shipped
+# GUI carries neither the gate nor the suite.
+control-conformance = ["aterm-control/conformance"]
 
 [dependencies]
 # `bidi`: compile in the UAX #9 visual-reordering bridge so RTL (Hebrew/Arabic)

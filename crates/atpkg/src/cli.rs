@@ -746,7 +746,14 @@ pub(crate) fn resolve_pkg_token(layout: &crate::store::Layout) -> (String, Optio
             .parent()
             .unwrap_or(&layout.prefix)
             .to_path_buf();
-        aterm_update_core::token::resolve_with_source(&support).map(|(t, src)| (t, src.to_string()))
+        // atpkg's signed index lives in the PRIVATE publish account, never the public
+        // update channel, so it always needs the full credential chain.
+        aterm_update_core::token::resolve_with_source(
+            &support,
+            aterm_update_core::PUBLISH_OWNER,
+            aterm_update_core::PUBLISH_REPO,
+        )
+        .map(|(t, src)| (t, src.to_string()))
     })
 }
 

@@ -194,11 +194,10 @@ const THIN_Y: f32 = 0.10;
 /// anchor — leaning into the motion.
 const LEAD_MAX: f32 = 0.22;
 /// Sustained-fast display momentum at/above which the cruising face squints
-/// happily; below `BLINK_CEIL` (and visible) the idle blink is eligible. The
+/// happily; a brief blink interrupts either face while visible. The
 /// ceiling sits high enough that a lingering cat — which still carries real
 /// residual momentum under the metric's 2 s τ — is blink-eligible.
 const HAPPY_GATE: f32 = 0.80;
-const BLINK_CEIL: f32 = 0.50;
 /// Deterministic idle-blink cadence: a full closure of `BLINK_DUR` every
 /// `BLINK_PERIOD`, phased off the flight clock (never at the entrance).
 const BLINK_PERIOD: f32 = 1.7;
@@ -207,6 +206,29 @@ const BLINK_DUR: f32 = 0.13;
 /// ([`CursorCat::static_frame`], hidden, [`CatPose::STILL`]) pins `bob = 0`,
 /// keeping reduced-motion presentation structurally static.
 const BOB_AMP: f32 = 0.09;
+/// THE STRIDE PUMP (owner: "the cursor cat can be more dynamic").
+///
+/// The cat's whole animation vocabulary — banking, stretch, thin, lead, the
+/// happy/blink eyes — is driven by ONE input, an eased follower of the canonical
+/// [`crate::typing_momentum::TypingMomentum`]. That metric is deliberately
+/// RATE-NORMALIZED, so at every human cadence from 50 ms to 500 ms per key it
+/// sits at its 1.0 clamp; and the cat's own visibility gate already requires
+/// sustained momentum. So whenever the cat is on screen AND you are actually
+/// typing, `bank == 1.0` exactly: every channel frozen, and the only live thing
+/// a wall-clock sine the renderer then rounds to whole pixels.
+///
+/// The pump restores CADENCE as an animation driver, which is the one thing a
+/// rate-normalized level structurally cannot carry: each committed forward
+/// keystroke advances a stride phase, so the cat takes a visible step per key
+/// and gallops when you type fast.
+const STRIDE_PER_KEY: f32 = 0.5;
+/// Idle drift (cycles/sec) between keystrokes, so a pause eases the cat through
+/// its step instead of freezing it mid-stride. Deliberately the retired
+/// wall-clock bob rate, so a RESTING cat reads exactly as it did before.
+const STRIDE_IDLE_HZ: f32 = 1.4;
+/// Body compression on each footfall. Small: the step should read as weight, not
+/// as a bounce competing with the sing dance or the landing settle.
+const STRIDE_SQUASH: f32 = 0.05;
 /// Landing squash→stretch settle: a damped bounce of length `LAND_DUR`,
 /// amplitude `LAND_AMP`, `LAND_FREQ` oscillations, decaying at `LAND_DECAY`.
 const LAND_DUR: f32 = 0.42;
@@ -462,6 +484,15 @@ pub struct CursorCat {
     exit: CatExit,
     /// When the current flight began (FadeIn entry) — the hover-bob clock.
     flight: Option<Instant>,
+    /// THE STRIDE PUMP's phase, in CYCLES (see [`STRIDE_PER_KEY`]). Advanced by
+    /// every committed forward keystroke and drifting at [`STRIDE_IDLE_HZ`]
+    /// between them, so the cat's step is driven by your cadence rather than by
+    /// a level that is pinned whenever the cat is visible at all.
+    stride: f32,
+    /// Clock stamp of the last stride advance — the idle-drift `dt` source.
+    /// `None` re-seeds without integrating, so a resumed or foreign clock cannot
+    /// fling the phase forward.
+    stride_at: Option<Instant>,
     /// The collected identity currently accompanying the cursor.
     look: KittyLook,
     /// APPEARANCE LATCH: a look change arriving while the companion is on
@@ -531,6 +562,8 @@ impl Default for CursorCat {
             state: State::Hidden,
             exit: CatExit::Plain,
             flight: None,
+            stride: 0.0,
+            stride_at: None,
             // Toastbyte is designed for the cursor's 16–32 px band and pairs
             // with the rainbow kitty trail; the first collectible replaces it.
             look: KittyLook {
@@ -593,6 +626,12 @@ impl CursorCat {
             }
             // Build the canonical metric: rate-normalized inside `advance`,
             // so key-repeat floods earn no faster than real typing.
+            // THE STRIDE PUMP: one step per key. Deliberately fed by the
+            // keystroke and NOT by the momentum level, because the level is
+            // already pinned whenever the cat is on screen — the cadence is the
+            // only signal left that still varies with how you are typing.
+            self.stride_advance(now);
+            self.stride = (self.stride + STRIDE_PER_KEY).rem_euclid(1024.0);
             self.momentum.advance(now);
             // A FADING cat is LOYAL: resumed typing at speed revives it
             // mid-fade rather than forcing a complete re-earn. Re-enter FadeIn
@@ -970,14 +1009,32 @@ impl CursorCat {
         self.reaction
     }
 
-    /// The gentle airborne hover-bob (fraction of cell height) at `now`, plus
-    /// the feline-delight LEAP when one is live.
+    /// Drift the STRIDE phase to `now` at [`STRIDE_IDLE_HZ`]. Called before each
+    /// per-key advance and once per pose resolve. `dt` is clamped so a
+    /// backgrounded window resumes with one ordinary frame's worth instead of
+    /// collapsing the whole blind interval into a single jump.
+    fn stride_advance(&mut self, now: Instant) {
+        let dt = self
+            .stride_at
+            .map(|l| now.saturating_duration_since(l).as_secs_f32())
+            .unwrap_or(0.0)
+            .min(0.10);
+        self.stride_at = Some(now);
+        if dt > 0.0 {
+            self.stride = (self.stride + dt * STRIDE_IDLE_HZ).rem_euclid(1024.0);
+        }
+    }
+
+    /// The airborne hover-bob (fraction of cell height) at `now`, plus the
+    /// feline-delight LEAP when one is live.
     fn bob(&self, now: Instant) -> f32 {
+        // The HOVER rides the STRIDE PUMP rather than a wall clock, so the cat
+        // steps in time with your keys: it gallops under a fast run and eases
+        // through its step during a pause. A resting cat's drift rate is the
+        // retired 1.4 Hz, so the idle read is unchanged and only the TYPING read
+        // gained a beat. The delight leap below composes on top of it.
         let hover = match self.flight {
-            Some(t0) => {
-                let t = now.saturating_duration_since(t0).as_secs_f32();
-                (std::f32::consts::TAU * 1.4 * t).sin() * BOB_AMP
-            }
+            Some(_) => (std::f32::consts::TAU * self.stride).sin() * BOB_AMP,
             None => 0.0,
         };
         // NEGATIVE is up: `bob` is a signed fraction of cell height and the
@@ -1061,6 +1118,19 @@ impl CursorCat {
         let mut scale_x = 1.0 + STRETCH_X * bank;
         let mut scale_y = 1.0 - THIN_Y * bank;
         let mut lead = LEAD_MAX * bank;
+        // THE STRIDE PUMP's body compression: the cat gathers on each footfall.
+        // Phase-locked to `bob`, so the squash lands with the bottom of the step
+        // and the two read as ONE motion. Gated by the SAME `bank` the rest of
+        // the pose uses, so a resting cat keeps its natural silhouette. That the
+        // gate saturates is the point of the split: the LEVEL says whether to
+        // show a step at all, the CADENCE says where in the step we are — and
+        // the pinned metric could only ever answer the first.
+        self.stride_advance(now);
+        if self.flight.is_some() {
+            let foot = (std::f32::consts::TAU * self.stride).cos().max(0.0) * bank;
+            scale_y *= 1.0 - STRIDE_SQUASH * foot;
+            scale_x *= 1.0 + STRIDE_SQUASH * 0.7 * foot;
+        }
         // Landing: a damped squash→stretch bounce. `q > 0` at the impact frame
         // (shorter + wider), overshoots to a stretch, then settles to zero.
         if let Some(t0) = self.land_at {
@@ -1198,12 +1268,21 @@ impl CursorCat {
             EyesFrame::Happy
         } else if !plain_face {
             EyesFrame::Open
+        } else if self.blink_active(now) && self.sing <= 0.33 {
+            // A BLINK OUTRANKS THE CRUISING FACE. This arm used to sit BELOW the
+            // happy face and was additionally gated on `disp < BLINK_CEIL` — but
+            // `disp` is pinned at 1.0 at every human cadence whenever the cat is
+            // visible, so BOTH conditions failed together and the cat could not
+            // blink at any point during actual typing. It stared, wide-eyed, for
+            // the entire flight. A 130 ms blink every 1.7 s costs nothing and is
+            // the cheapest life in the sprite. SINGING still outranks it: the
+            // open-mouth meow head is a different baked head, and blinking
+            // through a song reads as a glitch rather than as breathing.
+            EyesFrame::Blink
         } else if self.sing > 0.33 || self.disp >= HAPPY_GATE {
             // Singing is sung with happy eyes (over the open-mouth meow head
             // `render_look` swaps in — the same gate value).
             EyesFrame::Happy
-        } else if self.disp < BLINK_CEIL && self.blink_active(now) {
-            EyesFrame::Blink
         } else {
             EyesFrame::Open
         };
@@ -2876,6 +2955,100 @@ mod tests {
     }
 
     // ───────────────────── living-cartoon pose animation ─────────────────────
+
+
+    /// THE STRIDE PUMP (owner: "the cursor cat can be more dynamic"). The core
+    /// defect was that every pose channel is driven by a RATE-NORMALIZED metric
+    /// which pins at its 1.0 clamp at every human cadence, so once the cat was
+    /// visible the whole banking/stretch system was frozen and the only live
+    /// channel was a wall-clock sine. Pins the fix: the pose MOVES as you type,
+    /// and it moves because of the KEYS rather than the level.
+    #[test]
+    fn stride_pump_animates_from_cadence_not_from_the_pinned_level() {
+        let look = KittyLook::default();
+        let t = Instant::now();
+        let mut cat = CursorCat::default();
+        cat.on_collect(t, look);
+
+        let mut poses = Vec::new();
+        let mut disps = Vec::new();
+        for i in 0..30 {
+            let ti = t + Duration::from_millis(40 + i * 16);
+            cat.on_key(ti, true);
+            let f = cat.frame(ti);
+            poses.push((f.pose.scale_y, f.bob));
+            disps.push(cat.disp);
+        }
+        // The tail of the run is where the metric is pinned — exactly the window
+        // in which the cat used to be frozen.
+        let tail = &poses[15..];
+        assert!(
+            disps[15..].iter().all(|d| *d > 0.99),
+            "precondition: the canonical metric IS pinned during a real run, so a \
+             level-driven pose cannot animate here"
+        );
+        let squash: std::collections::BTreeSet<i64> =
+            tail.iter().map(|(sy, _)| (sy * 4096.0) as i64).collect();
+        assert!(
+            squash.len() > 2,
+            "the body must still pump while the level is pinned, got {} distinct \
+             values from {} frames",
+            squash.len(),
+            tail.len()
+        );
+        let bobs: std::collections::BTreeSet<i64> =
+            tail.iter().map(|(_, b)| (b * 4096.0) as i64).collect();
+        assert!(bobs.len() > 2, "and the bob steps with it: {bobs:?}");
+
+        // CADENCE, not the clock: the same elapsed time with FEWER keys advances
+        // the stride LESS — a property a wall-clock sine cannot have.
+        let mut fast = CursorCat::default();
+        fast.on_collect(t, look);
+        let mut slow = CursorCat::default();
+        slow.on_collect(t, look);
+        for i in 0..20 {
+            fast.on_key(t + Duration::from_millis(40 + i * 16), true);
+        }
+        for i in 0..5 {
+            slow.on_key(t + Duration::from_millis(40 + i * 64), true);
+        }
+        let at = t + Duration::from_millis(400);
+        let _ = fast.frame(at);
+        let _ = slow.frame(at);
+        assert!(
+            fast.stride > slow.stride,
+            "more keys in the same wall time = more strides ({} vs {})",
+            fast.stride,
+            slow.stride
+        );
+
+        // THE CAT BLINKS WHILE YOU TYPE. Before, this arm sat below the happy
+        // face AND was gated on a level pinned during any real run, so both
+        // conditions failed together and the cat stared for the whole flight.
+        let mut blinky = CursorCat::default();
+        blinky.on_collect(t, look);
+        let mut saw_blink = false;
+        for i in 0..140 {
+            let ti = t + Duration::from_millis(40 + i * 16);
+            blinky.on_key(ti, true);
+            if blinky.frame(ti).pose.eyes == EyesFrame::Blink {
+                saw_blink = true;
+            }
+        }
+        assert!(saw_blink, "a cat in sustained flight must still blink");
+
+        // And a RESTING cat is unchanged: the pump is gated by the same bank the
+        // rest of the pose uses, so it cannot alter the idle silhouette.
+        let mut rest = CursorCat::default();
+        rest.on_collect(t, look);
+        let r = rest.frame(t + Duration::from_millis(1600));
+        assert!(
+            r.pose.scale_x < 1.03 && r.pose.scale_y > 0.97,
+            "a resting cat keeps its natural silhouette ({} x {})",
+            r.pose.scale_x,
+            r.pose.scale_y
+        );
+    }
 
     /// Banking is a pure function of the eased spine: sustained forward momentum
     /// leans + stretches the cat along its motion axis; a resting cat rides level.

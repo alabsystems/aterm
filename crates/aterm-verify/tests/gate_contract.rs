@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 
 use aterm_verify::changed::{self, Selection};
 use aterm_verify::cli::Mode;
-use aterm_verify::ladder::{Report, tally};
-use aterm_verify::plan::{Lane, StageSpec};
+use aterm_verify::ladder::{Report, Tally, tally};
+use aterm_verify::plan::{Lane, StageId, StageSpec};
 use aterm_verify::verdict::{MERGE_CONTRACT_SENTENCE, verdict};
-use aterm_verify::{Ctx, EnvSnapshot, Scope, exit, mktemp_dir, plan, sched};
+use aterm_verify::{Ctx, EnvSnapshot, Scope, exit, mktemp_dir, plan, sched, stages};
 
 /// A repo-shaped directory: the helper scripts the gate calls, all passing.
 struct FakeRepo {
@@ -50,7 +50,24 @@ impl FakeRepo {
         me.script("tools/test-install-channel.sh", "exit 0");
         me.script("tools/test-trust-gate-verdict.sh", "exit 0");
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
+        // The redraw harness the gate builds and then DRIVES. Present and passing
+        // by default so an unrelated test never reads a missing binary as a
+        // finding; `redraw_harness` re-writes it for the tests that are about
+        // what its exit code means.
+        me.redraw_harness(0);
         me
+    }
+
+    /// A stand-in `aterm-redraw-conformance` that exits `code` — the harness's
+    /// own contract is `0` pass / `1` fail / `2` could-not-run, and what these
+    /// tests exercise is the STAGE's reading of it, not cargo's.
+    fn redraw_harness(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug")).expect("mkdir");
+        self.script(
+            "target/debug/aterm-redraw-conformance",
+            &format!("echo 'aterm-redraw-conformance: stub'; exit {code}"),
+        );
+        self
     }
 
     fn script(&self, rel: &str, body: &str) {
@@ -184,8 +201,8 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        17,
-        "15 gate stages plus the two --full tiers"
+        18,
+        "16 gate stages plus the two --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -288,6 +305,49 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     assert!(
         ladder.contains("unknown unstable option"),
         "the diagnostic reaches the reader"
+    );
+}
+
+#[test]
+fn the_redraw_gate_reads_its_harness_exit_code_and_a_two_is_never_green() {
+    // The regression this stage exists for lives one layer down: drop the
+    // production `EventLoopProxy` and the harness exits 1. What is tested HERE is
+    // the layer that was missing entirely — whether anything LOOKS. Above all
+    // `2`, the harness saying no event loop is constructible on this machine: a
+    // headless box reading that as green would be the same false pass in a new
+    // place.
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::RedrawConformance)
+        .expect("the redraw gate is planned");
+
+    repo.redraw_harness(0);
+    assert_eq!(
+        tally(&[stages::run_stage(&ctx, &spec)]),
+        Tally::default(),
+        "a passing harness leaves the run clean"
+    );
+
+    repo.redraw_harness(1);
+    let t = tally(&[stages::run_stage(&ctx, &spec)]);
+    assert_eq!(t.gate_failures, 1, "exit 1 is a finding about the tree");
+    assert_eq!(t.could_not_run, 0);
+
+    repo.redraw_harness(2);
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(&[r.clone()]);
+    assert_eq!(t.could_not_run, 1, "exit 2 decided nothing");
+    assert_eq!(t.gate_failures, 0, "…and is not a finding about the tree");
+    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
+    assert!(t.failed(), "so the run cannot end green");
+    assert!(
+        r.render()
+            .contains("  FAIL  aterm-redraw-conformance: NOT RUN"),
+        "{}",
+        r.render()
     );
 }
 
@@ -552,6 +612,7 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ),
             ("skip", "control-socket smoke (selftest)"),
             ("skip", "gui typing-pacing smoke (selftest)"),
+            ("skip", "redraw conformance (selftest: not executed)"),
             // The six verdict cases the bash gate printed here too. They are the
             // selftest's actual evidence: every other row above says "not
             // executed", so without these the ladder shows a run that checked

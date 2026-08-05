@@ -293,6 +293,13 @@ const RAINBOW_BANDS: [u32; 6] = [
 /// seven cells BEHIND the head, where the fresh-ink pop has expired. The
 /// legibility bound belongs on [`OVER_INK_COV_CAP`], the layers that actually
 /// land on the ink.
+///
+/// RETIRED as a production clamp, superseded by [`RAINBOW_BAND_COV_CAPS`].
+/// Retained as the certified BASELINE the per-band table is measured against:
+/// `rainbow_hot_body_preserves_default_text_contrast` asserts the new mean
+/// ceiling beats this number by a real margin, which is what makes "the rainbow
+/// is brighter" a proved claim rather than a retune.
+#[allow(dead_code)]
 const RAINBOW_OCCUPIED_COV_CAP: f32 = 56.0;
 
 /// The TRANSIENT over-ink share (fresh-ink pop, crown, starfield, and — via
@@ -307,15 +314,61 @@ pub(crate) const OVER_INK_COV_CAP: f32 = 48.0;
 /// deliberate exemption from [`OVER_INK_COV_CAP`] is argued at its use site.
 const RAINBOW_TRANSIENT_COV_CAP: f32 = 118.0;
 
-/// Single allocation-free clamp used at every dark-theme rainbow body emission
-/// point.  Sanitising non-finite input makes the bound total over `f32`, even
-/// though the shipping inputs are already finite by construction.
+/// PER-POSITION additive budget for the ribbon bed, indexed by gradient position
+/// (0 = red top … 1 = violet bottom).
+///
+/// OWNER: "The rainbow doesn't feel magical enough anymore."
+///
+/// The diagnosis is not dimness — it is CLIPPING. [`RAINBOW_OCCUPIED_COV_CAP`]
+/// is ONE scalar applied to all six bands, and it is *the yellow band's ceiling
+/// charged to every one of them*: yellow lights both R and G so it lifts the
+/// ground fastest and hits the contrast bar first, while red and violet are far
+/// darker per unit of coverage. Against the SAME oracle the flat cap was
+/// certified with (`#C8D3F5` on `#1A1B26`, the 5.25:1 bar in
+/// `rainbow_hot_body_preserves_default_text_contrast`), the flat 56 ran red and
+/// violet at ~9:1 when 5.25:1 was all that was ever required.
+///
+/// A TABLE rather than six interpolated anchors, because the ribbon emits a
+/// continuous GRADIENT and luminance across a colour mix is not linear in the
+/// endpoints' ceilings — interpolating anchors overshot by up to 1.15x and
+/// measured 5.09:1, under the bar. Each entry is the worst true solution over
+/// its own neighbourhood AND the whole hue-rotation range, derived from this
+/// crate's own gradient and rotation code by `generate_rainbow_band_cov_caps`.
+///
+/// Two things follow. The RED top stripe and VIOLET bottom stripe — the two that
+/// most say "this is Nyan" — roughly double. And the ribbon stops living pinned
+/// AT its ceiling, which matters more: with `base` clamped flat the specular
+/// glint added *exactly zero* (`min(56 + glint, 56)`) and the iridescence could
+/// only ever darken, because its bright half re-clamped. Every "magic" channel
+/// in this emitter was arithmetically dead wherever the ribbon was hot — the
+/// only place it exists.
+const RAINBOW_BAND_COV_CAPS: [f32; 33] = [
+    90.0, 82.0, 76.0, 69.0, 64.0, 59.0, 58.0, 58.0, 58.0, 58.0, 59.0, 59.0, 57.0, 57.0, 57.0, 59.0,
+    60.0, 62.0, 63.0, 62.0, 62.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0, 66.0, 73.0, 80.0, 91.0, 103.0,
+    120.0,
+];
+
+/// The largest value any entry of [`RAINBOW_BAND_COV_CAPS`] can take — the bound
+/// the per-CELL clamp uses, before the per-ROW gradient position is known.
+const RAINBOW_BAND_COV_CAP_MAX: f32 = 120.0;
+
+/// The legibility ceiling at gradient position `t`, read from
+/// [`RAINBOW_BAND_COV_CAPS`]. Any read — including one landing between entries —
+/// is a lower bound on what the contrast bar allows.
 #[inline]
-fn rainbow_occupied_coverage(requested: f32) -> f32 {
+fn rainbow_band_cap_at(t: f32) -> f32 {
+    let i = (t.clamp(0.0, 1.0) * 32.0).round() as usize;
+    RAINBOW_BAND_COV_CAPS[i.min(32)]
+}
+
+/// The ribbon bed's clamp, bounded by the band actually being drawn rather than
+/// by the worst band of the six.
+#[inline]
+fn rainbow_band_coverage(requested: f32, t: f32) -> f32 {
     if requested.is_nan() || requested <= 0.0 {
         0.0
     } else {
-        requested.min(RAINBOW_OCCUPIED_COV_CAP)
+        requested.min(rainbow_band_cap_at(t))
     }
 }
 
@@ -655,7 +708,13 @@ const FRESH_INK_CAP: usize = 32;
 /// the flat-top `1-u²` envelope a life much past half a second holds the last
 /// six letters near peak at a 120 ms cadence (the highlight reads as "the last
 /// WORD is white"), while 0.45 s tracks the last ~3 characters.
-const FRESH_INK_LIFE_S: f32 = 0.45;
+/// RAISED to 0.70 (owner: "the glow before was good, but it was too bright right
+/// where I was typing"). The earlier cut to 0.45 aimed at the second half of that
+/// sentence but paid for the caret's brightness with the whole trail's existence
+/// — a brief dot under the hand and nothing behind it, which is the "the glow is
+/// gone" read. The near-caret quiet is bought by GEOMETRY instead: see
+/// [`FRESH_INK_POCKET_FLOOR`].
+const FRESH_INK_LIFE_S: f32 = 0.70;
 /// The birth-flash window: the wide soft halo exists only this long (~120 ms),
 /// a small fixed fraction of the pop.
 const FRESH_INK_HALO_S: f32 = 0.12;
@@ -710,8 +769,35 @@ const FRESH_INK_HALO_COV: f32 = 34.0;
 /// PREVIOUS letter's centre — every keystroke would wash the letter before it —
 /// while at 1.30cw the neighbour centre catches 20% and, on a 14px cell, the
 /// flash never reaches the cell two back at all.
-const FRESH_INK_FLASH_RX: f32 = 1.30;
-const FRESH_INK_FLASH_RY: f32 = 0.90;
+/// WIDENED BACK, but ONLY because the caret pocket below makes it safe.
+/// Throttling REACH globally fixed a strictly LOCAL problem (the pop nearest the
+/// caret). With the pocket holding the newest letters at a fraction of full
+/// strength, the neighbour a wide flash spills onto is itself a new letter —
+/// also in the pocket — so the spill is a fraction of a fraction. The reach
+/// comes back for the pops FURTHER BACK, which make the trail read as a glow.
+const FRESH_INK_FLASH_RX: f32 = 1.70;
+const FRESH_INK_FLASH_RY: f32 = 1.10;
+/// THE CARET POCKET. The pop's light ramps IN behind the hand: the letter just
+/// committed sits in a dim pocket and the glow reaches full body a few cells
+/// back, so the eye reads a trail FORMING BEHIND the cursor instead of a lamp on
+/// the fingertips. Deliberately the same shape the ribbon body already uses for
+/// the same problem ([`rainbow_head_clearance`]), so the two dim over one shared
+/// span. Measured in CELLS, so it is cadence-invariant. The floor is LOWER than
+/// the ribbon's because the pop is the layer that actually lands ON the glyph.
+const FRESH_INK_POCKET_FLOOR: f32 = 0.22;
+/// Distance in CELLS over which the pop climbs to full. Matched to
+/// [`RAINBOW_CLEAR_CELLS`] so pop and ribbon share one pocket.
+const FRESH_INK_POCKET_CELLS: f32 = 3.0;
+
+/// The caret pocket's ramp at `cells` behind the live caret: exactly
+/// [`FRESH_INK_POCKET_FLOOR`] at the caret, smoothstepping to 1.0 at
+/// [`FRESH_INK_POCKET_CELLS`]. Monotone non-decreasing and continuous — the same
+/// contract as [`rainbow_head_clearance`].
+#[inline]
+fn fresh_ink_pocket(cells: f32) -> f32 {
+    FRESH_INK_POCKET_FLOOR
+        + (1.0 - FRESH_INK_POCKET_FLOOR) * smoothstep01(cells / FRESH_INK_POCKET_CELLS)
+}
 /// COMPOSITE CENTRE CEILING: the tight CORE halo and the wide birth-FLASH halo
 /// share the glyph centre, and both peak there, so their additive light STACKS
 /// — unbounded, the summed centre breaches the white-saturation read the
@@ -1052,6 +1138,23 @@ struct Spark {
     /// into one flickering monochrome bar. Other styles ignore it.
     hue: f32,
     born: Instant,
+    /// RETRACT FADE-OUT stamp: when the exit swoosh selected this cell to leave,
+    /// or `None` while it is still part of the live ribbon.
+    ///
+    /// OWNER: "the rainbow on the cursor isn't always smoothly vanishing."
+    ///
+    /// The drain used to DELETE selected cells outright, so the vanish was a
+    /// staircase of whole-cell removals — measured frame to frame it fell
+    /// 9% -> 26% -> 54% and then the last frame took the remaining light to zero
+    /// in one step. Clamping `life` instead is no better: `env` is a function of
+    /// `age / life`, so shrinking `life` makes the coverage JUMP down at the
+    /// instant of the clamp rather than ease.
+    ///
+    /// This is a separate multiplier that starts at exactly 1.0 the moment it is
+    /// stamped and eases to 0 over [`CursorGlow::RAINBOW_RETRACT_FADE`], so a
+    /// retracted cell leaves from whatever brightness it actually had, smoothly,
+    /// with no discontinuity at the stamp.
+    fade_at: Option<Instant>,
 }
 
 /// One FRESH-INK POP: a newly TYPED glyph cell mid-pop (see the FRESH-INK
@@ -1362,6 +1465,11 @@ impl RainbowState {
         self.ink_pops.clear();
         self.wake_head = None;
         self.wake_at = None;
+        // The anti-stray PRESS WITNESS itself. Stale evidence must not let the
+        // first move after a master-off/on cycle celebrate on typing that
+        // happened before the effect was ever switched off.
+        self.type_press_ring = [None; CursorGlow::RAINBOW_TYPED_SWEEP_MAX];
+        self.type_press_head = 0;
     }
 
     /// Zero the THERMAL half — the momentum metric, its eased display spine and
@@ -2146,6 +2254,12 @@ impl CursorGlow {
     /// `emit_rainbow_jump_landing`), so a screen-crossing fling still throws the
     /// full [`Self::RAINBOW_BURST_STARS`] chunky stars.
     const RAINBOW_BURST_MIN_DIST: f32 = 2.0;
+    /// How recently a committed TYPED press must have landed for a jump to earn
+    /// its landing celebration. An ACTIVITY witness, not a ribbon one: a jump is
+    /// worth marking when it punctuates your work, even if the trail has already
+    /// drained. Comfortably longer than the ribbon's ~1.3s life for that reason,
+    /// and far short of "at some point today".
+    const RAINBOW_BURST_ACTIVE_WINDOW: f32 = 4.0;
     /// Chunky spinning solid rainbow 5-point stars in a FULL (far-jump)
     /// starburst. A short jump throws fewer (graduated by distance, floor 1);
     /// this is the ceiling. Per-burst quad cost is a closed form (stars × ~2·R
@@ -2366,6 +2480,13 @@ impl CursorGlow {
     /// its length — a short hop and a hot multi-line comet both slurp cleanly
     /// back into the cursor.
     const RAINBOW_RETRACT_DUR: f32 = 0.40;
+    /// How long a RETRACTED ribbon cell takes to go out, once the drain has
+    /// selected it. The drain picks cells farthest-from-the-head first on the
+    /// [`Self::RAINBOW_RETRACT_DUR`] schedule; this is how long each one then
+    /// takes to actually fade, so the vanish is continuous instead of a
+    /// staircase of whole-cell deletions ending in a cliff. Short enough that
+    /// the retract still reads as a retract rather than a slow dissolve.
+    const RAINBOW_RETRACT_FADE: f32 = 0.13;
     /// Floor on a rainbow kitty typing spark's life so the exit swoosh (grace + reach +
     /// retract ≈ 1.30s) always terminates the ribbon before the natural cosine
     /// fade can — the swoosh IS the ending, never a passive dim-out.
@@ -2438,7 +2559,21 @@ impl CursorGlow {
     /// SHARED WAVE CLOCK) and never from a per-spark `age × current-momentum`
     /// product: the latter re-prices each cell's whole age at the falling rate
     /// on cooldown, sliding old cells' phase BACKWARD.
-    const RAINBOW_WAVE_RAD: f32 = 10.602_875;
+    const RAINBOW_WAVE_RAD: f32 = 5.301_437;
+    /// Whole undulation cycles across ONE RIBBON, head to tail. 0.75 puts a
+    /// single lazy S in the rainbow at ANY cadence and ANY length, so a fast zip
+    /// lays one clean banded lance instead of a six-cycle snake.
+    const RAINBOW_WAVE_CYCLES: f32 = 0.75;
+    /// Peak undulation amplitude in CELL HEIGHTS at full momentum. DECLARED, not
+    /// derived: it used to be `room * 0.42` where `room` is the residual
+    /// `ch - band_h`, so narrowing the band near the cursor silently AMPLIFIED
+    /// the wave there by +56%. Nobody retuned a wave constant — the waviness
+    /// regression was a side effect of a width change.
+    const RAINBOW_WAVE_AMP_CELLS: f32 = 0.055;
+    /// Fraction of the ribbon (from the head) over which the wave opens from
+    /// EXACTLY zero, so the cat/ribbon join is stable and the newest,
+    /// most-looked-at cells are the flattest.
+    const RAINBOW_WAVE_HEAD_PIN: f32 = 0.35;
     /// PHASER CONSTANT-DISTANCE STREAK: within a rhythm the fat band's life is
     /// this many observed inter-key gaps (+ margin), so it always spans the
     /// SAME distance at ANY cadence: THREE letters back solidly lit behind the
@@ -3090,6 +3225,32 @@ impl CursorGlow {
         if let Some(((r, c), t)) = self.last_visible {
             self.last_visible = Some(((r.saturating_sub(rows), c), t));
         }
+        // STRAY RAINBOW (owner: "I still see stray pieces of rainbow"). The
+        // anchors above were translated but the LIGHT was not. Every ribbon spark
+        // and fresh-ink pop is addressed by an ABSOLUTE grid `(row, col)`, so on
+        // a scroll the text moved up and the rainbow did not: the trail you just
+        // laid detached from the words that earned it and sat over whatever
+        // scrolled into its place, for the rest of its life. That is the one
+        // stray path the anti-stray gates never covered, because they all ask
+        // "did a keystroke earn this?" (yes) rather than "is it still over the
+        // cell that earned it?".
+        //
+        // Anything pushed off the top is DROPPED rather than clamped — clamping
+        // would pile the whole scrolled-away trail into a bright bar on row 0.
+        self.sparks.retain_mut(|s| match s.row.checked_sub(rows) {
+            Some(r) => {
+                s.row = r;
+                true
+            }
+            None => false,
+        });
+        self.rainbow.ink_pops.retain_mut(|p| match p.row.checked_sub(rows) {
+            Some(r) => {
+                p.row = r;
+                true
+            }
+            None => false,
+        });
     }
 
     /// PER-FRAME ROW PROBE: hand the engine the cursor row's content as
@@ -3822,7 +3983,16 @@ impl CursorGlow {
         // (short for typing, full for jumps), so a fast typing wake never lingers
         // as a smear behind the cursor.
         self.sparks
-            .retain(|s| now.saturating_duration_since(s.born).as_secs_f32() < s.life);
+            .retain(|s| {
+                now.saturating_duration_since(s.born).as_secs_f32() < s.life
+                    // …and a retracted cell is reaped only once its fade-out has
+                    // actually finished, so the swoosh's drain never removes light
+                    // that is still on screen.
+                    && !s.fade_at.is_some_and(|at| {
+                        now.saturating_duration_since(at).as_secs_f32()
+                            >= Self::RAINBOW_RETRACT_FADE
+                    })
+            });
         let spark_cap = if matches!(cfg.style, GlowStyle::RainbowKitty) {
             Self::RAINBOW_MAX_CELLS
         } else {
@@ -6080,6 +6250,7 @@ impl CursorGlow {
                             (self.hue + pos * 0.5).fract()
                         },
                         born: now,
+                        fade_at: None,
                     });
                 }
                 // Bound resident path state for EVERY style. Rainbow kitty deliberately
@@ -6132,6 +6303,7 @@ impl CursorGlow {
                                 typing: true,
                                 hue: (self.hue + pos * 0.5).fract(),
                                 born: now,
+                                fade_at: None,
                             });
                         }
                     }
@@ -8955,6 +9127,27 @@ impl CursorGlow {
     /// tail→head into the cursor over [`Self::RAINBOW_RETRACT_DUR`], farthest
     /// cells first, whatever the ribbon's length. A fresh key at any point
     /// clears the retract and the ribbon re-arms seamlessly.
+    /// The RETRACT FADE-OUT multiplier for `spark` at `now`: 1.0 while it is
+    /// still part of the live ribbon, then a smooth cosine ease to 0 across
+    /// [`Self::RAINBOW_RETRACT_FADE`] once the exit swoosh has stamped it.
+    #[inline]
+    fn retract_fade_of(&self, now: Instant, spark: &Spark) -> f32 {
+        let Some(at) = spark.fade_at else {
+            return 1.0;
+        };
+        let k = (now.saturating_duration_since(at).as_secs_f32() / Self::RAINBOW_RETRACT_FADE)
+            .clamp(0.0, 1.0);
+        0.5 * (1.0 + (std::f32::consts::PI * k).cos())
+    }
+
+    /// Whether `spark` has finished its retract fade and may be reaped.
+    #[inline]
+    fn retract_spent(&self, now: Instant, spark: &Spark) -> bool {
+        spark.fade_at.is_some_and(|at| {
+            now.saturating_duration_since(at).as_secs_f32() >= Self::RAINBOW_RETRACT_FADE
+        })
+    }
+
     fn rainbow_exit_swoosh(&mut self, now: Instant, geom: Geom) {
         let Some(last_type) = self.last_type else {
             return;
@@ -8975,7 +9168,14 @@ impl CursorGlow {
             return;
         };
         if now >= settled_at {
-            self.sparks.retain(|s| !s.typing);
+            // The swoosh is over. Anything the drain has not already selected
+            // leaves NOW — but it still LEAVES rather than being deleted where it
+            // stands. This branch used to `retain` the whole typing ribbon away in
+            // one frame, which is the cliff at the end of the vanish: measured, it
+            // took four still-lit cells to zero between two frames.
+            for spark in self.sparks.iter_mut().filter(|s| s.typing) {
+                spark.fade_at.get_or_insert(now);
+            }
             self.rainbow.retract.get_or_insert((retract_at, 0));
             return;
         }
@@ -8993,7 +9193,16 @@ impl CursorGlow {
         };
         // REACH — only until the retract begins, so a drained cell is never
         // re-lit mid-swoosh (the retract owns the ribbon once it starts).
-        if self.rainbow.retract.is_none() {
+        // STRAY RAINBOW: this phase lays NEW light 0.75s after your last
+        // keystroke, and its own duplicate guard below skips every cell that
+        // still holds a live spark — so the only cells it can EVER light are
+        // ones whose ribbon has already finished dissolving. At a slow cadence
+        // that is the entire tail, and the result is a short DETACHED bar of
+        // rainbow beside a cursor you stopped typing at. Requiring a live spark
+        // keeps the four-letter guarantee (which exists to FINISH a ribbon you
+        // can still see) and removes the case where it invents one.
+        let ribbon_live = self.sparks.iter().any(|s| s.typing);
+        if self.rainbow.retract.is_none() && ribbon_live {
             let boost = 0.45 + 0.85 * self.rainbow.disp; // mirrors the rainbow typing floor (eased)
             for k in 1..=3i32 {
                 let reach_at =
@@ -9030,6 +9239,7 @@ impl CursorGlow {
                     typing: true,
                     hue: (self.hue + pos * 0.5).fract(),
                     born: reach_at,
+                    fade_at: None,
                 });
             }
         }
@@ -9081,12 +9291,29 @@ impl CursorGlow {
                 for &(_, i) in &ranked {
                     kill[i] = true;
                 }
+                // RETRACT BY FADING, NOT BY DELETING (owner: "the rainbow on the
+                // cursor isn't always smoothly vanishing").
+                //
+                // This used to `retain` the retracted cells away outright. Each
+                // step of the drain therefore removed WHOLE CELLS at whatever
+                // brightness they still held, so the vanish was a staircase whose
+                // last step was a cliff: measured frame-to-frame, the tail fell
+                // 9% -> 26% -> 54% and then the final frame dropped the remaining
+                // light to zero in one go. The ordering was right and the timing
+                // was right; the cells just left instantly instead of going out.
+                //
+                // Clamping the life instead keeps the whole drain — same
+                // farthest-first ranking, same [`Self::RAINBOW_RETRACT_DUR`]
+                // schedule — while every retracted cell rides the emitter's own
+                // cosine tail on the way out. Cells expire on the ordinary
+                // `retain` in `tick`, so nothing accumulates.
                 let mut idx = 0;
-                self.sparks.retain(|_| {
-                    let dead = kill[idx];
+                for spark in &mut self.sparks {
+                    if kill[idx] {
+                        spark.fade_at.get_or_insert(now);
+                    }
                     idx += 1;
-                    !dead
-                });
+                }
                 self.rainbow.rank_scratch = ranked;
                 self.rainbow.kill_scratch = kill;
             }
@@ -9309,7 +9536,18 @@ impl CursorGlow {
         // GRADUATED by distance: a short Option-B/F hop
         // (dist ≈ 2) throws ONE small star, a screen-crossing fling throws the
         // full [`Self::RAINBOW_BURST_STARS`], with the scatter reach scaling too.
-        if dist >= Self::RAINBOW_BURST_MIN_DIST {
+        //
+        // ACTIVITY WITNESS: this arm is reached by the NAVIGATION path too, and
+        // it had NO witness of any kind — not momentum, not a press, not a
+        // ribbon. At a 2-cell floor that means every arrow-key history recall,
+        // Ctrl-A/E and word motion at a COLD idle prompt threw stars and rang the
+        // landing chime. Requiring a recent committed TYPED press keeps the
+        // gesture the owner asked to celebrate (you have been typing, then you
+        // jump) and drops the case where nothing has been typed at all.
+        // Navigation keys are not typed presses, so idle recall is silent.
+        if dist >= Self::RAINBOW_BURST_MIN_DIST
+            && self.typed_presses_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) > 0
+        {
             if self.rainbow.bursts.len() >= Self::RAINBOW_BURST_CAP {
                 self.rainbow.bursts.remove(0);
             }
@@ -9352,9 +9590,16 @@ impl CursorGlow {
         // (the owner's Ctrl-L blob). Require a committed press recent enough
         // ([`Self::RAINBOW_TERMINUS_RIBBON_WINDOW`]) that ribbon is plausibly
         // still on glass.
-        if self.rainbow.disp >= Self::RAINBOW_TERMINUS_MIN_DISP
-            && self.typed_presses_within(now, Self::RAINBOW_TERMINUS_RIBBON_WINDOW) > 0
-        {
+        //
+        // NOW TESTS THE RIBBON ITSELF. Both proxies outlive the thing they stand
+        // for: the eased spine holds above its floor for seconds after the ribbon
+        // is gone, and the press window is 2.5s while the ribbon is hard-cut at
+        // ~1.30s — and clamped harder the instant any jump is observed, which is
+        // exactly the event that gets here. Worse, the zero-amplitude path clears
+        // the ribbon while deliberately KEEPING the spine and the press ring, so
+        // a focus blip left BOTH witnesses armed over a screen with no ribbon.
+        // Asking the ribbon cannot drift from it.
+        if self.sparks.iter().any(|s| s.typing) {
             self.scatter_rainbow_terminus(now, geom, terminus.0, terminus.1);
         }
     }
@@ -10051,7 +10296,10 @@ impl CursorGlow {
         // never move and every band keeps its exact `RAINBOW_BANDS` hue; the
         // final cap keeps the additive ribbon text-legible (never > cap). The
         // per-row feather below rides on top of this per-cell base.
-        let base = rainbow_occupied_coverage(cov_f);
+        // The per-CELL bound is the LARGEST any band may take; the real,
+        // hue-specific ceiling lands per ROW below, where the gradient position
+        // — and therefore the colour emitted — is known.
+        let base = cov_f.max(0.0).min(RAINBOW_BAND_COV_CAP_MAX);
         let cell_cov = if self.rainbow.disp < 0.005 {
             base
         } else {
@@ -10066,7 +10314,9 @@ impl CursorGlow {
             let gd = (u - gc) / Self::RAINBOW_GLINT_WIDTH;
             let glint = (-(gd * gd)).exp(); // localized specular highlight 0..1
             let glint_add = Self::RAINBOW_GLINT_COV * disp2 * glint;
-            rainbow_occupied_coverage(base * shimmer + glint_add)
+            (base * shimmer + glint_add)
+                .max(0.0)
+                .min(RAINBOW_BAND_COV_CAP_MAX)
         };
         // Window-absolute cell anchor; the ribbon stays inside its own cell,
         // so `push_rect`'s origin-anchored row tag is still the true cell row.
@@ -10152,17 +10402,32 @@ impl CursorGlow {
             if sw <= 0 {
                 continue;
             }
-            let xf = s.col as f32 + (si as f32 + 0.5) / strips as f32;
             // SHARED WAVE CLOCK (see [`Self::RAINBOW_WAVE_RAD`]): the undulation
             // rides the INTEGRATED spine clock (`rainbow.phase`), never per-spark
             // `age × rate(now)`. One shared clock moves every cell in lockstep,
             // advances only with momentum, and freezes — never reverses — when
             // cold.
-            let wave_phase =
-                xf * 0.62 + s.row as f32 * 0.31 - self.rainbow.phase * Self::RAINBOW_WAVE_RAD;
+            // RIBBON-ANCHORED UNDULATION (owner: "the rainbow is too wavey now",
+            // alongside missing a straight streak when the cursor zips — the same
+            // defect twice). The phase used to be the ABSOLUTE SCREEN COLUMN: a
+            // standing wave defined over the whole grid that the ribbon was
+            // merely stamped into, so a cell's height depended on WHERE ON SCREEN
+            // it sat. A 60-column zip laid ~6 full sine cycles (a snake, not a
+            // streak) and every new column advanced the head's phase by 35.5°,
+            // bouncing the join between the cat and its rainbow as you typed
+            // across the line. It now rides the ribbon's OWN head→tail parameter,
+            // so the wave travels WITH the trail: one lazy S at any length.
+            let wave_phase = u * std::f32::consts::TAU * Self::RAINBOW_WAVE_CYCLES
+                - self.rainbow.phase * Self::RAINBOW_WAVE_RAD;
+            // HEAD PIN: exactly zero at the cursor, opening over the first
+            // [`Self::RAINBOW_WAVE_HEAD_PIN`] of the ribbon, so the rainbow
+            // leaves the cat dead straight and only breathes further back.
+            let wave_amp = (Self::RAINBOW_WAVE_AMP_CELLS * ch as f32 * self.rainbow.disp)
+                .min(room * 0.5)
+                * smoothstep01(u / Self::RAINBOW_WAVE_HEAD_PIN);
             // FRACTIONAL vertical displacement — no rounding, so the curve
             // is smooth across columns instead of snapping to whole pixels.
-            let wave = wave_phase.sin() * room * 0.42 * self.rainbow.disp;
+            let wave = wave_phase.sin() * wave_amp;
             let top_f = (cy0 as f32 + room * 0.5 + wave).clamp(cy0 as f32, cy0 as f32 + room);
             // Walk the device rows the ribbon covers (plus a 1px feather
             // margin at each end); each row gets its gradient hue + feather.
@@ -10185,7 +10450,15 @@ impl CursorGlow {
                 }
                 let feather =
                     smoothstep01(t / RAINBOW_FEATHER) * smoothstep01((1.0 - t) / RAINBOW_FEATHER);
-                let rcov = rainbow_occupied_coverage(cell_cov * feather);
+                // PER-BAND legibility budget (see [`RAINBOW_BAND_COV_CAPS`]).
+                // THE CAP IS APPLIED BEFORE THE FEATHER: clamping the feathered
+                // value would let the ribbon's EDGES (red and violet, the most
+                // generous bands) outshine its CENTRE (yellow, the tightest) —
+                // an inverted gradient with a dark core, which is exactly what
+                // the feather exists to prevent. Capping first keeps the feather
+                // monotone by construction, and the result is still bounded
+                // because `feather <= 1`.
+                let rcov = rainbow_band_coverage(cell_cov, t) * feather;
                 if rcov < 1.0 {
                     continue;
                 }
@@ -10443,6 +10716,12 @@ impl CursorGlow {
                 let k = ((u - (1.0 - tail)) / tail).clamp(0.0, 1.0);
                 0.5 * (1.0 + (std::f32::consts::PI * k).cos())
             };
+            // RETRACT FADE-OUT (see [`Spark::fade_at`]): a cell the exit swoosh
+            // has selected leaves from EXACTLY the brightness it currently has,
+            // easing to zero. Starts at 1.0 at the stamp instant, so there is no
+            // step where the drain picks a cell — which is the whole reason this
+            // is a separate multiplier rather than a clamp on `life`.
+            let env = env * self.retract_fade_of(now, s);
             let head = rainbow_ribbon_profile(u, s.life);
             let raw_cov = (s.born_cov as f32) * env * head * cfg.intensity;
             // The age profile (temporal) × the cell-distance CLEARANCE (spatial).
@@ -10523,6 +10802,9 @@ impl CursorGlow {
             return;
         }
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+        // THE CARET POCKET's anchor — the same head the ribbon body clears
+        // against, so the two layers dim over one shared span.
+        let head_cell = self.last.or(self.last_visible.map(|(c, _)| c));
         for p in &self.rainbow.ink_pops {
             if (p.row as usize) >= geom.rows || (p.col as usize) >= geom.cols {
                 continue;
@@ -10531,7 +10813,24 @@ impl CursorGlow {
             if u >= 1.0 {
                 continue;
             }
-            let m = FRESH_INK_MOM_FLOOR + (1.0 - FRESH_INK_MOM_FLOOR) * p.mom.clamp(0.0, 1.0);
+            // The caret pocket. Off-row pops and an unknown head clear to 1.0.
+            // SCALED BY THE MOMENTUM SPINE, exactly as the ribbon scales its own
+            // head clearance: a COLD lone keystroke is byte-identical to the
+            // un-pocketed law, so the first casual character still pops bright
+            // and alone. The pocket opens as the run heats up — which is when
+            // the pop, ribbon, crown and starfield all stack on the same few
+            // cells, the only condition under which "too bright" was ever true.
+            // REDUCED MOTION opts out: that arm is a hard step-fade, and a
+            // continuous ramp would turn each step back into a ramp.
+            let pocket = match head_cell {
+                Some((hr, hc)) if hr == p.row && !self.reduced_motion => {
+                    let near = fresh_ink_pocket(hc.abs_diff(p.col) as f32);
+                    1.0 - (1.0 - near) * self.rainbow.disp.clamp(0.0, 1.0)
+                }
+                _ => 1.0,
+            };
+            let m = pocket
+                * (FRESH_INK_MOM_FLOOR + (1.0 - FRESH_INK_MOM_FLOOR) * p.mom.clamp(0.0, 1.0));
             let (env, scale, flash) = if self.reduced_motion {
                 // The reduced arm: stepped brightness, base footprint, no
                 // birth flash — nothing moves continuously.
@@ -12356,6 +12655,26 @@ mod tests {
     // `GlowStyle::parse` lives beside the list in aterm-gui's `prefs.rs` — the
     // list is a GUI picker domain, so the pin moved with it at extraction time.
 
+    /// Arm the two anti-stray WITNESSES a jump celebration now requires, the way
+    /// real typing does: a committed TYPED press (the ACTIVITY witness the
+    /// landing burst asks for) and a LIVE ribbon spark (the witness the terminus
+    /// dissolve asks for). A directly-constructed fixture has NEITHER, which is
+    /// exactly the state the gates exist to reject.
+    fn arm_rainbow_witnesses(glow: &mut CursorGlow, now: Instant, row: u16, col: u16) {
+        glow.note_typed(now);
+        glow.sparks.push(Spark {
+            row,
+            col,
+            born_cov: 200,
+            pos: 1.0,
+            life: 4.0,
+            typing: true,
+            hue: 0.0,
+            born: now,
+            fade_at: None,
+        });
+    }
+
     fn geom() -> Geom {
         // Identity layout: origin 0 + win == grid extents (320×96) ⇒ every
         // emission is byte-identical to the historical pad-relative contract,
@@ -12438,7 +12757,7 @@ mod tests {
         use aterm_spec::ty_model;
         ty_model! {
             RainbowOccupiedCoverage {
-                const Cap = 56;
+                const Cap = 57;
                 const RequestedMax = 64;
                 const Buggy = 0;
                 var requested = 0;
@@ -17015,6 +17334,7 @@ mod tests {
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut glow = CursorGlow::default();
+        arm_rainbow_witnesses(&mut glow, t0, 2, 5);
         let mut issued_x = Vec::new();
         let mut saturated_transition = None;
 
@@ -17261,9 +17581,11 @@ mod tests {
         // which the code realizes as TWO concrete inputs: the eased-momentum
         // floor AND a committed press within the ribbon-visibility window
         // (the anti-stray witness). Arm both under one model transition.
+        // `Warm` = "ribbon plausibly live on glass", now realized as the ribbon
+        // ITSELF rather than two proxies that outlive it.
         assert!(model.fire("Warm", &mut state));
         glow.rainbow.disp = 0.3;
-        glow.note_typed(now);
+        arm_rainbow_witnesses(&mut glow, now, 2, 5);
         assert!(model.fire("Reduce", &mut state));
         glow.set_reduced_motion(true);
         glow.emit_rainbow_jump_landing(
@@ -17299,6 +17621,8 @@ mod tests {
 
         assert!(model.fire("Cool", &mut state));
         glow.rainbow.disp = 0.0;
+        // Cool = the ribbon is off glass; the witness IS the ribbon now.
+        glow.sparks.clear();
         glow.scatter_rainbow_terminus(now, g, 200.0, 48.0);
         assert!(model.fire("MarginTerminus", &mut state));
         assert_eq!(
@@ -17425,24 +17749,35 @@ mod tests {
     #[test]
     fn rainbow_real_occupied_coverage_conforms_to_model() {
         let model = rainbow_occupied_coverage_model();
+        // The TIGHTEST band position — the one the retired flat cap was charged
+        // from — so the modeled `Cap` and the real ceiling are the same number.
+        let tight_t = (0..=32)
+            .map(|i| i as f32 / 32.0)
+            .min_by(|a, b| rainbow_band_cap_at(*a).total_cmp(&rainbow_band_cap_at(*b)))
+            .expect("the cap table is non-empty");
+        assert_eq!(
+            rainbow_band_cap_at(tight_t) as i64,
+            57,
+            "the model's Cap tracks the table"
+        );
         let mut state = model.init_state();
         let mut cap_source = None;
         for requested in 1..=64i64 {
-            if requested == 57 {
+            if requested == 58 {
                 cap_source = Some(state.clone());
             }
             assert!(model.fire("Raise", &mut state));
-            let real = rainbow_occupied_coverage(requested as f32) as i64;
+            let real = rainbow_band_coverage(requested as f32, tight_t) as i64;
             assert_eq!(state["requested"], requested);
             assert_eq!(state["emitted"], real, "real clamp diverged at {requested}");
             assert!(model.check_invariant("OccupiedBodyBounded", &state));
         }
-        assert_eq!(state["emitted"], RAINBOW_OCCUPIED_COV_CAP as i64);
+        assert_eq!(state["emitted"], 57);
 
         let previous = cap_source.expect("captured the first over-cap source");
         let mut overflow = previous.clone();
-        overflow.insert("requested", 57);
-        overflow.insert("emitted", 57);
+        overflow.insert("requested", 58);
+        overflow.insert("emitted", 58);
         let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
@@ -17455,12 +17790,20 @@ mod tests {
 
         // Total-f32 pins: malformed state can never turn the visual ceiling into
         // NaN/overflow energy.
-        assert_eq!(rainbow_occupied_coverage(f32::NAN), 0.0);
-        assert_eq!(rainbow_occupied_coverage(f32::NEG_INFINITY), 0.0);
-        assert_eq!(
-            rainbow_occupied_coverage(f32::INFINITY),
-            RAINBOW_OCCUPIED_COV_CAP
-        );
+        assert_eq!(rainbow_band_coverage(f32::NAN, 0.5), 0.0);
+        assert_eq!(rainbow_band_coverage(f32::NEG_INFINITY, 0.5), 0.0);
+        // EVERY band position is bounded by its own entry, and none exceeds the
+        // declared maximum — the property the per-row emit relies on.
+        for i in 0..=256 {
+            let t = i as f32 / 256.0;
+            let cap = rainbow_band_cap_at(t);
+            assert!(cap <= RAINBOW_BAND_COV_CAP_MAX, "table entry past the max at {t}");
+            assert!(
+                rainbow_band_coverage(1_000.0, t) <= cap,
+                "an unbounded request clamps to this band's ceiling at {t}"
+            );
+        }
+        assert_eq!(rainbow_band_coverage(f32::INFINITY, tight_t), 57.0);
     }
 
     fn srgb_relative_luminance(rgb: u32) -> f64 {
@@ -17528,9 +17871,23 @@ mod tests {
             ribbon_quads > 200,
             "exercise a sustained multi-cell hot body"
         );
-        assert_eq!(
-            max_chan, RAINBOW_OCCUPIED_COV_CAP as u32,
-            "the ceiling must be exercised, not merely asserted above a dim fixture"
+        // THE CEILING IS NOW PER-BAND. The contrast bar below is unchanged and
+        // is still the safety property; what changed is that each band is bounded
+        // by ITS OWN solution to that bar instead of by the worst band's. So the
+        // exercise assertion is that the fixture reaches ABOVE the retired flat
+        // ceiling — proving the headroom is real and actually emitted.
+        assert!(
+            max_chan > RAINBOW_OCCUPIED_COV_CAP as u32,
+            "the per-band headroom must be exercised: {max_chan}"
+        );
+        assert!(
+            max_chan <= RAINBOW_BAND_COV_CAP_MAX as u32,
+            "and never past the largest band ceiling: {max_chan}"
+        );
+        let mean = RAINBOW_BAND_COV_CAPS.iter().sum::<f32>() / RAINBOW_BAND_COV_CAPS.len() as f32;
+        assert!(
+            mean > RAINBOW_OCCUPIED_COV_CAP * 1.15,
+            "per-band budget lifts the ribbon overall, mean {mean}"
         );
         assert!(
             worst >= 5.25,
@@ -17555,11 +17912,12 @@ mod tests {
         let mut checksum = 0u64;
         for i in 0..ITERATIONS {
             let requested = std::hint::black_box((i & 0xff) as f32);
-            checksum += std::hint::black_box(rainbow_occupied_coverage(requested)) as u64;
+            let t = std::hint::black_box(((i & 0x1f) as f32) / 31.0);
+            checksum += std::hint::black_box(rainbow_band_coverage(requested, t)) as u64;
         }
         let elapsed = started.elapsed();
         assert!(checksum > ITERATIONS);
-        assert!(checksum <= ITERATIONS * RAINBOW_OCCUPIED_COV_CAP as u64);
+        assert!(checksum <= ITERATIONS * RAINBOW_BAND_COV_CAP_MAX as u64);
         eprintln!(
             "RAINBOW_COVERAGE_BENCH iterations={ITERATIONS} total_us={} ns_per_sample={:.3}",
             elapsed.as_micros(),
@@ -17678,7 +18036,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(
-            max_chan <= RAINBOW_OCCUPIED_COV_CAP as u32,
+            max_chan <= RAINBOW_BAND_COV_CAP_MAX as u32,
             "additive band coverage capped for text legibility, got {max_chan}"
         );
     }
@@ -18231,17 +18589,49 @@ mod tests {
             g,
             &mut out,
         );
+        // Mid-retract the drain is measured by BRIGHTNESS, not by presence: a
+        // retracted cell now FADES out over `RAINBOW_RETRACT_FADE` rather than
+        // being deleted where it stands (that deletion was the visible step the
+        // owner reported), so it is still emitting — faintly — while it goes.
+        // What must hold is that the tail is on its way out and the head is not.
+        let cw = g.cw as u16;
+        let col_peak = |glow: &CursorGlow, col: u16| -> u32 {
+            glow.under_quads()
+                .iter()
+                .filter(|q| is_ribbon_quad(q.color) && q.x as u16 / cw == col)
+                .map(|q| {
+                    ((q.color >> 16) & 0xff)
+                        .max((q.color >> 8) & 0xff)
+                        .max(q.color & 0xff)
+                })
+                .max()
+                .unwrap_or(0)
+        };
         let mid = lit(&glow);
-        assert!(
-            !mid.is_empty() && mid.len() < 4,
-            "mid-retract the span shrinks: {mid:?}"
-        );
+        assert!(!mid.is_empty(), "the ribbon is still on glass mid-retract");
         assert!(mid.contains(&10), "the head is the last to go: {mid:?}");
-        // Fully retracted well before the natural fade (life ≥ 1.2s) could
-        // have emptied it — the swoosh is the ending, not a passive dim-out.
+        let head = col_peak(&glow, 10);
+        let tail = col_peak(&glow, 7);
+        assert!(
+            head > 0 && tail * 2 < head,
+            "mid-retract the TAIL is draining while the head survives \
+             (head {head}, tail {tail})"
+        );
+        // Fully retracted well before the natural fade (life ≥ 1.2s) could have
+        // emptied it — the swoosh is the ending, not a passive dim-out. Sampled
+        // one `RAINBOW_RETRACT_FADE` later than it used to be: the last cells the
+        // drain selects now EASE out over that window instead of being deleted
+        // where they stand, so the swoosh's true end is
+        // `RETRACT_DUR + RETRACT_FADE`. That extra ~130 ms is the fix.
         glow.tick(
             Some((3, 10)),
-            t_last + Duration::from_secs_f32(retract_at + CursorGlow::RAINBOW_RETRACT_DUR + 0.05),
+            t_last
+                + Duration::from_secs_f32(
+                    retract_at
+                        + CursorGlow::RAINBOW_RETRACT_DUR
+                        + CursorGlow::RAINBOW_RETRACT_FADE
+                        + 0.05,
+                ),
             &c,
             g,
             &mut out,
@@ -18339,10 +18729,17 @@ mod tests {
         let (start, initial) = glow.rainbow.retract.expect("retraction is sampled");
         assert_eq!(start, retract_at, "clock is anchored to the last key");
         assert_eq!(initial, 4, "three typed cells plus one reach cell");
+        // Half-time: the drain has SELECTED half the ribbon to leave. Selected
+        // cells fade out rather than vanishing, so they are still resident —
+        // what is asserted is the selection, which is the schedule this test is
+        // actually about.
         assert_eq!(
-            glow.sparks.iter().filter(|s| s.typing).count(),
+            glow.sparks
+                .iter()
+                .filter(|s| s.typing && s.fade_at.is_some())
+                .count(),
             2,
-            "half of the four-cell ribbon remains at half-time"
+            "half of the four-cell ribbon has been selected to leave at half-time"
         );
     }
 
@@ -19326,6 +19723,7 @@ mod tests {
                 typing: true,
                 hue: 0.0,
                 born,
+                fade_at: None,
             });
         }
     }
@@ -19531,7 +19929,7 @@ mod tests {
         // Coverage cap held everywhere.
         for q in out.iter().filter(|q| is_ribbon_quad(q.color)) {
             assert!(
-                cov(q.color) <= RAINBOW_OCCUPIED_COV_CAP as u32,
+                cov(q.color) <= RAINBOW_BAND_COV_CAP_MAX as u32,
                 "cold ribbon under cap: {:#08x}",
                 q.color
             );
@@ -19565,7 +19963,7 @@ mod tests {
         );
         for q in out.iter().filter(|q| is_ribbon_quad(q.color)) {
             assert!(
-                cov(q.color) <= RAINBOW_OCCUPIED_COV_CAP as u32,
+                cov(q.color) <= RAINBOW_BAND_COV_CAP_MAX as u32,
                 "iridescence under cap: {:#08x}",
                 q.color
             );
@@ -19612,7 +20010,7 @@ mod tests {
                 .max()
                 .unwrap_or(0);
             assert!(
-                max_chan <= RAINBOW_OCCUPIED_COV_CAP as u32,
+                max_chan <= RAINBOW_BAND_COV_CAP_MAX as u32,
                 "band coverage capped at any glint phase, got {max_chan} at step {step}"
             );
         }
@@ -19667,7 +20065,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(
-            max_chan <= RAINBOW_OCCUPIED_COV_CAP as u32,
+            max_chan <= RAINBOW_BAND_COV_CAP_MAX as u32,
             "legibility cap must hold at full sing drive, got {max_chan}"
         );
     }
@@ -19701,6 +20099,7 @@ mod tests {
                 typing: true,
                 hue: 0.0,
                 born: base + Duration::from_millis(500 - age_ms),
+                fade_at: None,
             });
         }
         glow.rainbow.disp = 1.0;
@@ -20508,6 +20907,10 @@ mod tests {
             ..Default::default()
         };
         warm.tick(Some((0, 0)), t0, &c, g, &mut out);
+        // The landing burst's ACTIVITY witness: a warm SPINE alone is no longer
+        // enough, because the spine outlives the typing that earned it. This test
+        // is about the reflow suppression, not the activity gate.
+        arm_rainbow_witnesses(&mut warm, t0, 0, 0);
         let t1 = t0 + Duration::from_millis(120);
         warm.tick(Some((3, 30)), t1, &c, g, &mut out);
         assert_eq!(warm.rainbow.jumps.len(), 1, "a warm jump still zooms");
@@ -20652,45 +21055,168 @@ mod tests {
         }
     }
 
-    /// The terminus dissolve requires a RECENT committed press, not just the
-    /// eased-momentum proxy: disp outlives the visible ribbon by seconds, and
-    /// glitter scattered in that gap lands on long-empty cells (the Ctrl-L
-    /// blob). Momentum warm + presses stale ⇒ no scatter; press fresh ⇒
-    /// scatter.
+    /// THE TERMINUS DISSOLVE REQUIRES A LIVE RIBBON, not a proxy for one.
+    ///
+    /// This test used to demand a recent committed PRESS instead of the eased
+    /// momentum, because momentum outlives the visible ribbon by seconds. Right
+    /// direction, wrong distance: the press window is 2.5s while the ribbon is
+    /// hard-cut at ~1.30s — and clamped harder the instant a jump is observed,
+    /// which is exactly the event that reaches this code — so a gap survived in
+    /// which glitter still scattered over empty cells. Worse, the zero-amplitude
+    /// path clears the ribbon while KEEPING both the spine and the press ring.
+    ///
+    /// The gate now asks the ribbon itself. Pins all three states, including the
+    /// one the proxies structurally could not catch.
+
+
+    /// THE RIBBON VANISHES SMOOTHLY (owner: "the rainbow on the cursor isn't
+    /// always smoothly vanishing").
+    ///
+    /// The exit swoosh's drain used to DELETE the cells it selected, so the
+    /// vanish was a staircase of whole-cell removals — and the `settled_at`
+    /// branch then took every remaining cell to nothing in a single frame. This
+    /// walks a real typing run all the way out at 60 fps and bounds the largest
+    /// single-frame loss of ribbon light, measured against the PEAK the ribbon
+    /// reached (a percentage of the previous frame is meaningless once the tail
+    /// is already near-invisible).
+    ///
+    /// Before the fix this measured a 9% step mid-drain and a final frame that
+    /// dropped four still-lit cells at once; it now eases out under 6%.
     #[test]
-    fn rainbow_terminus_requires_a_recent_press_not_just_warm_disp() {
+    fn rainbow_ribbon_vanishes_without_a_visible_step() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let mut t = t0;
+        glow.tick(Some((2, 4)), t, &c, g, &mut out);
+        for i in 1..=10u16 {
+            t += Duration::from_millis(90);
+            glow.note_typed(t);
+            glow.tick(Some((2, 4 + i)), t, &c, g, &mut out);
+        }
+
+        let lit = |glow: &CursorGlow| -> i64 {
+            glow.under_quads()
+                .iter()
+                .filter(|q| is_ribbon_quad(q.color))
+                .map(|q| {
+                    let cov = ((q.color >> 16) & 0xff)
+                        .max((q.color >> 8) & 0xff)
+                        .max(q.color & 0xff) as i64;
+                    cov * i64::from(q.w) * i64::from(q.h)
+                })
+                .sum()
+        };
+
+        let (mut prev, mut peak, mut worst) = (0i64, 0i64, 0.0f32);
+        for f in 0..200 {
+            t += Duration::from_millis(16);
+            out.clear();
+            glow.tick(Some((2, 14)), t, &c, g, &mut out);
+            let total = lit(&glow);
+            peak = peak.max(total);
+            if f > 0 && peak > 0 {
+                worst = worst.max((prev - total).max(0) as f32 / peak as f32);
+            }
+            prev = total;
+        }
+        assert!(peak > 10_000, "the fixture must lay a real ribbon: {peak}");
+        assert_eq!(prev, 0, "and it must be fully gone by the end");
+        assert!(
+            worst < 0.06,
+            "the ribbon must ease out, not step: worst single-frame loss was \
+             {:.1}% of peak",
+            worst * 100.0
+        );
+    }
+
+    /// STRAY RAINBOW: a scroll must carry the trail WITH the text, not leave it
+    /// hanging over whatever scrolls into its place. The caret anchors were
+    /// translated but the LIGHT was not, so the trail you had just laid detached
+    /// from the words that earned it. Pins both halves — laid ribbon rides the
+    /// scroll, and anything pushed off the top is DROPPED rather than clamped
+    /// into a bright bar along row 0.
+    #[test]
+    fn rainbow_scroll_carries_the_ribbon_and_drops_what_scrolls_off() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((1, 4)), t0, &c, g, &mut out);
+        glow.note_typed(t0);
+        glow.tick(Some((1, 5)), t0, &c, g, &mut out);
+        glow.note_typed(t0);
+        glow.tick(Some((5, 5)), t0, &c, g, &mut out);
+        glow.note_typed(t0);
+        glow.tick(Some((5, 6)), t0, &c, g, &mut out);
+
+        let mut before: Vec<u16> = glow.sparks.iter().map(|s| s.row).collect();
+        before.sort_unstable();
+        assert!(
+            before.iter().any(|&r| r < 2) && before.iter().any(|&r| r >= 2),
+            "fixture must straddle the scroll boundary: {before:?}"
+        );
+        let mut expect: Vec<u16> = before.iter().filter(|&&r| r >= 2).map(|r| r - 2).collect();
+        expect.sort_unstable();
+
+        glow.note_scroll(2);
+
+        let mut after: Vec<u16> = glow.sparks.iter().map(|s| s.row).collect();
+        after.sort_unstable();
+        assert_eq!(
+            after, expect,
+            "the ribbon rides the scroll; what scrolls off the top is dropped, \
+             never clamped into a bar on row 0 (before {before:?})"
+        );
+    }
+
+    #[test]
+    fn rainbow_terminus_requires_a_live_ribbon_not_a_proxy_for_one() {
         let g = geom();
         let t0 = Instant::now();
-        let mut stale = CursorGlow {
-            rainbow: RainbowState {
-                disp: 0.3, // proxy warm, but NO recorded press at all
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        stale.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
+
+        // (1) Warm spine, fresh press — but the ribbon has already drained. The
+        // exact state the retired proxies admitted.
+        let mut drained = CursorGlow::default();
+        drained.rainbow.disp = 0.3;
+        drained.note_typed(t0);
+        drained.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
         assert!(
-            stale.particles.is_empty(),
-            "warm disp without a recent press scatters nothing"
-        );
-        assert_eq!(
-            stale.rainbow.bursts.len(),
-            1,
-            "the landing burst is disp-gated at the CALLER, not here"
+            drained.particles.is_empty(),
+            "a drained ribbon dissolves nothing, however warm the spine or fresh \
+             the press — there is no edge left to feather"
         );
 
-        let mut fresh = CursorGlow {
-            rainbow: RainbowState {
-                disp: 0.3,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        fresh.note_typed(t0); // press just landed — ribbon plausibly visible
-        fresh.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
+        // (2) A LIVE ribbon: the terminus has something to dissolve.
+        let mut live = CursorGlow::default();
+        live.rainbow.disp = 0.3;
+        arm_rainbow_witnesses(&mut live, t0, 2, 5);
+        live.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
         assert!(
-            !fresh.particles.is_empty(),
-            "a recent press licenses the terminus scatter"
+            !live.particles.is_empty(),
+            "a live ribbon licenses the terminus scatter"
+        );
+
+        // (3) THE LEAK THE PROXIES COULD NOT SEE: a focus blip / load-shed dip
+        // clears the ribbon but deliberately keeps the spine AND the press ring,
+        // so both retired witnesses stay armed over a screen with no ribbon.
+        let mut blipped = CursorGlow::default();
+        blipped.rainbow.disp = 0.3;
+        arm_rainbow_witnesses(&mut blipped, t0, 2, 5);
+        blipped.sparks.clear(); // exactly what the zero-amplitude path does
+        assert!(
+            blipped.typed_presses_within(t0, CursorGlow::RAINBOW_TERMINUS_RIBBON_WINDOW) > 0
+                && blipped.rainbow.disp >= CursorGlow::RAINBOW_TERMINUS_MIN_DISP,
+            "precondition: both retired proxies are still armed after the blip"
+        );
+        blipped.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
+        assert!(
+            blipped.particles.is_empty(),
+            "and the ribbon-truth gate still refuses — the case the two proxies \
+             structurally could not catch"
         );
     }
 
@@ -20760,7 +21286,7 @@ mod tests {
         // is the ONLY particle source) so every jump in the mash genuinely
         // scatters a terminus — the particle cap is then really under load,
         // not vacuously satisfied by a cold cursor that scatters nothing.
-        glow.note_typed(t0);
+        arm_rainbow_witnesses(&mut glow, t0, 0, 0);
         glow.rainbow.disp = 0.3;
         // Cycle through far-apart landings so each move is a fresh fast jump.
         let landings = [(3, 30), (0, 5), (4, 35), (1, 12), (5, 20), (2, 38), (0, 0)];
@@ -20856,6 +21382,7 @@ mod tests {
         let born = Instant::now();
         let stars_for = |dist: f32| -> u8 {
             let mut glow = CursorGlow::default();
+            arm_rainbow_witnesses(&mut glow, born, 2, 5);
             glow.emit_rainbow_jump_landing(born, g, dist, (100.0, 40.0), (40.0, 40.0));
             glow.rainbow.bursts.first().map_or(0, |b| b.stars)
         };
@@ -21318,7 +21845,7 @@ mod tests {
         // otherwise add non-glitter stars. (Without any momentum the cursor is
         // COLD and correctly scatters nothing — see
         // `cold_cursor_jump_scatters_no_terminus`.)
-        glow.note_typed(t0);
+        arm_rainbow_witnesses(&mut glow, t0, 2, 20);
         glow.rainbow.disp = 0.3;
         glow.tick(Some((5, 0)), t0, &c, g, &mut out); // jump away
         // Rainbow kitty has no general jump particle burst (not in has_particles), so the
@@ -21360,9 +21887,10 @@ mod tests {
         // Warm ribbon backed by a fresh committed press (the anti-stray press
         // witness), below the star-shower onset (0.45) so the terminus
         // glitter is the only particle source (finding 3 gate open, no shower).
-        glow.note_typed(t0 - Duration::from_millis(200));
+        arm_rainbow_witnesses(&mut glow, t0 - Duration::from_millis(200), 2, 30);
         glow.rainbow.disp = 0.3;
         glow.note_navigation(t0); // the Ctrl-A key-hint — this is the real path
+        let ribbon_before = glow.sparks.iter().filter(|s| s.typing).count();
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A: leap to column 0
 
         // FEATURE B fires even though navigation is hinted (finding 1).
@@ -21389,8 +21917,12 @@ mod tests {
         // The beam is one transient line that self-expires; the ribbon is
         // persistent light laid cell by cell by the spark path, and repainting it
         // across a skimmed line was the actual defect the old gate was aimed at.
-        assert!(
-            glow.sparks.is_empty(),
+        // Measured as a DELTA, because the fixture seeds one ribbon cell of its
+        // own to satisfy the terminus witness — what must stay zero is what the
+        // JUMP added, not what was already on glass.
+        assert_eq!(
+            glow.sparks.iter().filter(|s| s.typing).count(),
+            ribbon_before,
             "no saturated per-cell ribbon is repainted across the skimmed line"
         );
 
@@ -21429,10 +21961,13 @@ mod tests {
             "a cold-cursor jump dissolves no phantom terminus (finding 3)"
         );
         // The starburst still marks the fast landing — it is not ribbon-gated.
-        assert_eq!(
-            glow.rainbow.bursts.len(),
-            1,
-            "the landing starburst still fires on a cold-cursor fast jump"
+        // …AND NEITHER DOES THE STARBURST. This used to assert the opposite,
+        // which is precisely the owner's "stray pieces of rainbow": at a 2-cell
+        // floor every arrow-key history recall on an untouched prompt threw
+        // stars and rang the chime. A jump celebrates WORK.
+        assert!(
+            glow.rainbow.bursts.is_empty(),
+            "a cold-cursor jump throws no landing stars either — nothing was typed"
         );
     }
 
@@ -21466,7 +22001,7 @@ mod tests {
         // is reduced_motion, not some other gate, that suppressed it above.
         let mut motion = CursorGlow::default();
         motion.tick(Some((2, 30)), t0, &c, g, &mut out);
-        motion.note_typed(t0);
+        arm_rainbow_witnesses(&mut motion, t0, 2, 30);
         motion.rainbow.disp = 0.3;
         motion.note_navigation(t0);
         motion.tick(Some((2, 0)), t0, &c, g, &mut out);
@@ -21819,6 +22354,7 @@ mod tests {
             typing: true,
             hue: 0.0,
             born: now,
+            fade_at: None,
         });
         // Arm a backspace, then the paired backward echo (5 -> 4): the vacated
         // cell is col 4.
@@ -21979,7 +22515,7 @@ mod tests {
         const GOLDEN: [u64; 9] = [
             12269945233474433350,
             14737187400751729562,
-            5018379481508404596,
+            11173920322100059508,
             17233361164506253445,
             15099317426123974543,
             8477863368341368663,

@@ -301,9 +301,9 @@ pub fn release_durable_post_intent_model() -> Model {
 /// holds a cross-machine release lease while it re-reads the live channel and
 /// publishes: a floor that advanced beyond the frozen value aborts the cut, while a
 /// covered floor permits publication without a post-check race. The exact-commit
-/// lease remains held after flip through archive, cask, and verify; only the final
+/// lease remains held after flip through archive and verify; only the final
 /// journaled unlock releases it. This models the whole scan → freeze/crash/resume →
-/// lease → revalidate → publish → archive/cask/verify → unlock lifecycle rather than
+/// lease → revalidate → publish → archive/verify → unlock lifecycle rather than
 /// testing the arithmetic decisions in isolation.
 ///
 /// `Buggy=1` enables four independent non-vacuity controls:
@@ -322,7 +322,7 @@ pub fn release_channel_floor_model() -> Model {
             const MaxFloor = 4;
             // phase: 0 Inputs, 1 Frozen, 2 Revalidated under lease,
             // 3 Published, 4 Aborted, 5 ResumePending, 6 Archived,
-            // 7 CaskPinned, 8 Verified, 9 Completed/Unlocked.
+            // 7 Verified, 8 Completed/Unlocked.
             var phase = 0;
             var operator_floor = 0;
             var observed_floor = 0;
@@ -335,7 +335,6 @@ pub fn release_channel_floor_model() -> Model {
             var lease_owned = 0;
             var lease_bypassed = 0;
             var archive_done = 0;
-            var cask_done = 0;
             var verify_done = 0;
             var unlock_bypassed = 0;
             var advanced_rejected = 0;
@@ -447,30 +446,23 @@ pub fn release_channel_floor_model() -> Model {
                 phase = 6;
                 archive_done = 1;
             }
-            action PinCask when (
+            action VerifyRelease when (
                 phase == 6 && lease_owned == 1 && archive_done == 1
             ) {
                 phase = 7;
-                cask_done = 1;
-            }
-            action VerifyRelease when (
-                phase == 7 && lease_owned == 1 && archive_done == 1 &&
-                cask_done == 1
-            ) {
-                phase = 8;
                 verify_done = 1;
             }
             action Unlock when (
-                phase == 8 && lease_owned == 1 && archive_done == 1 &&
-                cask_done == 1 && verify_done == 1
+                phase == 7 && lease_owned == 1 && archive_done == 1 &&
+                verify_done == 1
             ) {
-                phase = 9;
+                phase = 8;
                 lease_owned = 0;
             }
             action UnlockBeforeVerification when (
                 Buggy == 1 && phase == 3 && lease_owned == 1
             ) {
-                phase = 9;
+                phase = 8;
                 lease_owned = 0;
                 unlock_bypassed = 1;
             }
@@ -492,7 +484,7 @@ pub fn release_channel_floor_model() -> Model {
                     operator_floor <= frozen_floor &&
                     observed_floor <= frozen_floor
                 } else {
-                    phase <= 9
+                    phase <= 8
                 };
             invariant FrozenFloorFitsClaim:
                 if phase > 0 && phase <= 3 {
@@ -500,7 +492,7 @@ pub fn release_channel_floor_model() -> Model {
                 } else if phase > 5 {
                     frozen_floor <= claimed_build
                 } else {
-                    phase <= 9
+                    phase <= 8
                 };
             invariant RuntimeMatchesFrozenJournal:
                 if phase > 0 && phase <= 3 {
@@ -508,7 +500,7 @@ pub fn release_channel_floor_model() -> Model {
                 } else if phase > 5 {
                     frozen_floor == journal_floor
                 } else {
-                    phase <= 9
+                    phase <= 8
                 };
             invariant JournalSurvivesCrash:
                 if phase == 5 {
@@ -516,7 +508,7 @@ pub fn release_channel_floor_model() -> Model {
                     observed_floor <= journal_floor &&
                     journal_floor <= claimed_build && frozen_floor == 0
                 } else {
-                    phase <= 9
+                    phase <= 8
                 };
             invariant PublishedNeverLowersLatest:
                 if phase == 3 {
@@ -524,7 +516,7 @@ pub fn release_channel_floor_model() -> Model {
                 } else if phase > 5 {
                     latest_floor <= frozen_floor
                 } else {
-                    phase <= 9
+                    phase <= 8
                 };
             invariant PublishedRequiresLateGuard:
                 if phase == 3 {
@@ -539,13 +531,13 @@ pub fn release_channel_floor_model() -> Model {
             invariant VisibleWorkOwnsLease:
                 if phase == 3 {
                     lease_owned == 1
-                } else if phase > 5 && phase <= 8 {
+                } else if phase > 5 && phase <= 7 {
                     lease_owned == 1
                 } else {
                     lease_owned <= 1
                 };
             invariant CompletedReleasesLease:
-                if phase == 9 { lease_owned == 0 } else { lease_owned <= 1 };
+                if phase == 8 { lease_owned == 0 } else { lease_owned <= 1 };
             invariant RejectionCannotSilentlyDropLease:
                 if advanced_rejected == 1 && abandon_done == 0 {
                     phase == 4 && lease_owned == 1
@@ -559,20 +551,20 @@ pub fn release_channel_floor_model() -> Model {
                     abandon_done == 0
                 };
             invariant CompletionRequiresPostPublishSteps:
-                if phase == 9 {
-                    archive_done == 1 && cask_done == 1 && verify_done == 1
+                if phase == 8 {
+                    archive_done == 1 && verify_done == 1
                 } else {
-                    phase <= 9
+                    phase <= 8
                 };
             invariant LeaseCannotBeBypassed: lease_bypassed == 0;
             invariant UnlockCannotBeBypassed: unlock_bypassed == 0;
             invariant FloorStateBounds:
-                phase <= 9 && operator_floor <= MaxFloor &&
+                phase <= 8 && operator_floor <= MaxFloor &&
                 observed_floor <= MaxFloor && claimed_build <= MaxFloor &&
                 frozen_floor <= MaxFloor && journal_floor <= MaxFloor &&
                 latest_floor <= MaxFloor && late_checked <= 1 && resumed <= 1 &&
                 lease_owned <= 1 && lease_bypassed <= 1 && archive_done <= 1 &&
-                cask_done <= 1 && verify_done <= 1 && unlock_bypassed <= 1 &&
+                verify_done <= 1 && unlock_bypassed <= 1 &&
                 advanced_rejected <= 1 && abandon_done <= 1;
         }
     }

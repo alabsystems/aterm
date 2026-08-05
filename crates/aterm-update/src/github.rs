@@ -679,7 +679,7 @@ impl StageBackoff {
             None => format!("{restage}; no verified stage to apply"),
             Some(ready) => format!(
                 "{restage}; NOT skipping apply: staged {} (build {}) is verified and \
-                 applies on next launch",
+                 ready to apply",
                 ready.version, ready.build_number
             ),
         }
@@ -873,7 +873,7 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     // RESOLVE, DO NOT GATE: the absence of a token may never end a check here — only
     // a network response may declare this machine unable to update (`plan_credential`,
     // `classify_list_error`).
-    let (mut tok, diagnosis) = plan_credential(token::resolve_or_diagnose(&support));
+    let (mut tok, diagnosis) = plan_credential(token::resolve_or_diagnose(&support, &source.owner, &source.repo));
 
     // Persisted monotonic recency floor (operator yank + rollback guard, F5/F6).
     let floor = crate::manifest::Floor::read(&staging.floor());
@@ -1146,11 +1146,22 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     // to roll us back below it is refused above (F6).
     crate::manifest::Floor::bump_and_write(&staging.floor(), 0, manifest.build_number);
 
+    // NOT "applies on next launch". The stager has no idea whether it does: the
+    // in-session apply lane owns that decision, is on by default, and when it
+    // runs no relaunch happens at all. Emitting the relaunch advice
+    // unconditionally made this line ADVICE rather than a record — and when the
+    // apply lane then refused silently, that advice was the only thing an
+    // operator could see, so "quit aterm" looked like the answer. This says what
+    // the stager actually did. When an apply is refused AND that refusal reaches
+    // `record_apply_refusal`, this line is overwritten with the reason — every
+    // refusal funnel now does so, but the guarantee lives in those call sites,
+    // not here, so read this as "the last thing the STAGER knew", never as proof
+    // that no apply has been attempted since.
     crate::status::record(
         &staging,
         current_build,
         &format!(
-            "staged {} (build {}) — applies on next launch",
+            "staged {} (build {}) — verified and ready to apply",
             manifest.version, manifest.build_number
         ),
     );

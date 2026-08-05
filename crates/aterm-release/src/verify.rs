@@ -10,7 +10,7 @@
 //! Absorbs the deleted tools/check-published.sh.
 //!
 //! This module also owns the OTHER read-side surfaces built on the same scan:
-//! `ship status` (ledger tail vs releases API — dangling claims, cask-pin
+//! `ship status` (ledger tail vs releases API — dangling claims,
 //! freshness), the remote-derived resume/recut decision of spec §5 (pure —
 //! tests/resume.rs pins the table), `cut --abandon`, and `ship yank`.
 
@@ -879,7 +879,7 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
 }
 
 /// `cargo ship status` — version, ledger tail, dangling claims (ledger vs
-/// releases API), latest published build, cask-pin freshness (spec §5).
+/// releases API) and latest published build (spec §5).
 pub fn run_status(repo: &Path) -> Result<()> {
     let slug = slug_of(repo)?;
     println!("aterm-release · status ({slug})");
@@ -977,36 +977,7 @@ pub fn run_status(repo: &Path) -> Result<()> {
         }),
     );
 
-    // Cask pin freshness (spec §7 step 6 keeps it re-pinned per cut).
-    let cask_path = repo.join("packaging/homebrew/aterm.rb");
-    match fs::read_to_string(&cask_path) {
-        Ok(text) => {
-            let pin = cask_version(&text).unwrap_or_else(|| "?".to_string());
-            let fresh = select_newest(&scanned).map(|b| b.tag.trim_start_matches('v') == pin);
-            step(
-                "cask",
-                &match fresh {
-                    Some(true) => format!("aterm.rb pins {pin} — fresh"),
-                    Some(false) => format!("aterm.rb pins {pin} — STALE (next cut re-pins it)"),
-                    None => format!("aterm.rb pins {pin} (nothing published to compare)"),
-                },
-            );
-        }
-        Err(e) => step(
-            "cask",
-            &format!("packaging/homebrew/aterm.rb unreadable: {e}"),
-        ),
-    }
     Ok(())
-}
-
-/// The cask's pinned `version "…"` (pure — tests/resume.rs).
-pub fn cask_version(cask: &str) -> Option<String> {
-    cask.lines()
-        .map(str::trim_start)
-        .find_map(|l| l.strip_prefix("version \""))
-        .and_then(|rest| rest.split('"').next())
-        .map(str::to_string)
 }
 
 fn validate_published_identity(published: &Published) -> Result<Manifest> {

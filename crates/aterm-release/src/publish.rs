@@ -7,15 +7,14 @@
 //! re-run the pre-flip monotonic check against the client's exact selection
 //! rule → push the annotated tag (late — a failed cut never leaves a public
 //! tag, spec decision 5) → `--draft=false` flip → metadata-archive every
-//! historical exact-name appcast → cask pin
-//! rewrite/commit/push from a fresh isolated worktree with an exact CAS retry. No
+//! historical exact-name appcast. No
 //! client can ever observe a half-uploaded release. Every step is journaled
 //! in `dist/cut-state.toml` for `--resume`/recut/abandon (spec §5).
 //!
 //! One orchestrator ([`run_cut`]) drives all four cut flavors — real, resume,
 //! `--dry-run`, `--rehearse` — through the SAME step list, so the rehearsal
 //! (spec decision 17) exercises the exact code path of the real cut, minus
-//! the ledger push and the origin-mutating steps (tag/cask).
+//! the ledger push and the origin-mutating steps (tag).
 
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -67,11 +66,11 @@ pub struct CutOptions {
 /// Which cut flavor is running — decided once, checked per step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CutKind {
-    /// The real thing: claim pushed, publish to origin, tag + cask.
+    /// The real thing: claim pushed, publish to origin, tag.
     Real,
     /// Stop after the self-check; nothing pushed or uploaded anywhere.
     DryRun,
-    /// Publish to the scratch repo; no ledger push, no tag/cask on origin.
+    /// Publish to the scratch repo; no ledger push, no tag on origin.
     Rehearse,
 }
 
@@ -1029,7 +1028,7 @@ fn release_release_lease_inner(
 /// journal's existence (a journal on disk MEANS the claim is verified);
 /// "build" covers build+bundle+sign+dmg+manifest as one re-enterable unit
 /// (its outputs are all derived from `(version, build_number)` on disk).
-pub const STEPS: [&str; 13] = [
+pub const STEPS: [&str; 12] = [
     "lock",
     "build",
     "selfcheck",
@@ -1039,7 +1038,6 @@ pub const STEPS: [&str; 13] = [
     "tag",
     "flip",
     "archive",
-    "cask",
     "verify",
     "mirror",
     "unlock",
@@ -1077,7 +1075,30 @@ const STEPS_V5: [&str; 12] = [
     "unlock",
 ];
 
-pub const JOURNAL_FORMAT: u32 = 6;
+/// Format-6 step order — identical to [`STEPS`] plus the retired Homebrew
+/// `cask` step, which format 7 removed from between `archive` and `verify`.
+/// Frozen for the same reason as [`STEPS_V5`]: a COMPLETED v6 journal must
+/// still read back as complete. Walking one against the current list is
+/// harmless (a removed step can only make an old journal look *more*
+/// complete), but walking an UNFINISHED v6 journal against it would skip the
+/// cask entry it legitimately still owes, so the historical list stays.
+const STEPS_V6: [&str; 13] = [
+    "lock",
+    "build",
+    "selfcheck",
+    "draft",
+    "upload",
+    "preflip",
+    "tag",
+    "flip",
+    "archive",
+    "cask",
+    "verify",
+    "mirror",
+    "unlock",
+];
+
+pub const JOURNAL_FORMAT: u32 = 7;
 
 const fn legacy_journal_format() -> u32 {
     1
@@ -1391,11 +1412,13 @@ impl Journal {
     /// The first [`STEPS`] entry not yet journaled — where `--resume` re-enters.
     /// `None` ⇒ the cut completed. Older formats walk the step list they were
     /// written against, so a completed journal stays completed across a format
-    /// bump that inserted a step (`mirror`, in format 6).
+    /// bump that inserted a step (`mirror`, in format 6) or removed one
+    /// (`cask`, in format 7).
     pub fn first_incomplete(&self) -> Option<&'static str> {
         let steps: &[&'static str] = match self.format {
             1 => &LEGACY_STEPS,
             ..=5 => &STEPS_V5,
+            6 => &STEPS_V6,
             _ => &STEPS,
         };
         steps.iter().copied().find(|step| !self.is_done(step))
@@ -3994,39 +4017,6 @@ pub fn monotonic_ok(n: u64, our_tag: &str, best: Option<(&str, u64)>) -> Result<
     }
 }
 
-/// Rewrite the cask pin (spec §7 step 6): the `version "…"` and `sha256 "…"`
-/// stanza lines of packaging/homebrew/aterm.rb. Pure; the caller owns the
-/// commit/push/reset-retry loop. The `url` line stays untouched — it is
-/// templated on `#{version}`, which is exactly why the tag/DMG naming must
-/// never change shape.
-pub fn repin_cask_text(cask: &str, version: &str, sha256: &str) -> Result<String> {
-    let mut out = Vec::new();
-    let (mut saw_version, mut saw_sha) = (false, false);
-    for line in cask.lines() {
-        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-        let t = line.trim_start();
-        if !saw_version && t.starts_with("version \"") {
-            out.push(format!("{indent}version \"{version}\""));
-            saw_version = true;
-        } else if !saw_sha && t.starts_with("sha256 \"") {
-            out.push(format!("{indent}sha256 \"{sha256}\""));
-            saw_sha = true;
-        } else {
-            out.push(line.to_string());
-        }
-    }
-    if !saw_version || !saw_sha {
-        return Err(Error::new(
-            "packaging/homebrew/aterm.rb has no version/sha256 stanza to re-pin".to_string(),
-        ));
-    }
-    let mut text = out.join("\n");
-    if cask.ends_with('\n') {
-        text.push('\n');
-    }
-    Ok(text)
-}
-
 // ---------------------------------------------------------------------------
 // the cut orchestrator
 // ---------------------------------------------------------------------------
@@ -4677,129 +4667,33 @@ fn recovery_worktree_preflight(git: &dyn GitRunner) -> Result<()> {
     Ok(())
 }
 
-/// Resume normally requires a clean tree, except for the one dirty state the
-/// cask step itself can leave behind: a crash after writing/staging the exact
-/// derived pin but before committing it.  Admit only that byte-for-byte state;
-/// every other tracked or untracked path still fails closed before fence
-/// rotation.
+/// Resume requires a clean tree, with no exceptions.
+///
+/// Format 6 and earlier carried one: the `cask` step wrote and staged a derived
+/// pin into the shared checkout before committing it, so a crash in that window
+/// left a legitimately dirty tree that resume had to admit byte-for-byte. That
+/// step is gone (format 7), and no current step mutates the checkout before
+/// committing, so the exception has no state left to admit. It is not merely
+/// unused: an unfinished v6 journal cannot reach here at all, because
+/// [`Journal::ensure_resumable`] refuses any unfinished journal below
+/// [`JOURNAL_FORMAT`] and routes it to stopped-publisher recovery.
 pub fn recovery_resume_worktree_preflight(
-    repo: &Path,
+    _repo: &Path,
     git: &dyn GitRunner,
-    journal: &Journal,
+    _journal: &Journal,
 ) -> Result<()> {
-    let status = git_ok(git, &["status", "--porcelain", "--untracked-files=all"])?;
-    if status.stdout_utf8().trim().is_empty() {
-        return Ok(());
-    }
-    if journal.first_incomplete() != Some("cask") {
-        return gates::clean_tree(git);
-    }
-
-    const CASK: &str = "packaging/homebrew/aterm.rb";
-    let changed = |args: &[&str]| -> Result<Vec<String>> {
-        let out = git_ok(git, args)?;
-        let text = std::str::from_utf8(&out.stdout)
-            .map_err(|_| Error::new("git path listing is not UTF-8"))?;
-        Ok(text
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect())
-    };
-    let unstaged = changed(&["diff", "--name-only", "--"])?;
-    let staged = changed(&["diff", "--cached", "--name-only", "--"])?;
-    let untracked = changed(&["ls-files", "--others", "--exclude-standard"])?;
-    if unstaged
-        .iter()
-        .chain(&staged)
-        .chain(&untracked)
-        .any(|path| path != CASK)
-        || untracked.iter().any(|path| path == CASK)
-    {
-        return gates::clean_tree(git);
-    }
-
-    let manifest_path = repo.join("dist").join(manifest_out::MANIFEST_ASSET);
-    let manifest_text = fs::read_to_string(&manifest_path).map_err(|error| {
-        Error::new(format!(
-            "dirty-cask recovery cannot read the self-checked manifest {}: {error}",
-            manifest_path.display()
-        ))
-    })?;
-    let manifest = Manifest::parse(&manifest_text)
-        .map_err(|error| Error::new(format!("dirty-cask recovery manifest is invalid: {error}")))?;
-    if manifest.version != journal.version
-        || manifest.build_number != journal.build_number
-        || manifest.commit.as_deref() != Some(journal.commit.as_str())
-    {
-        return Err(Error::new(
-            "dirty-cask recovery manifest identity differs from the exact journal claim",
-        ));
-    }
-    if journal.signature_required {
-        let signature = fs::read(manifest_path.with_extension("toml.sig")).map_err(|error| {
-            Error::new(format!(
-                "dirty-cask recovery cannot read manifest signature: {error}"
-            ))
-        })?;
-        verify_detached_manifest_signature(
-            journal.signature_pubkey.as_deref().ok_or_else(|| {
-                Error::new("dirty-cask recovery signed journal has no public key")
-            })?,
-            manifest_text.as_bytes(),
-            &signature,
-        )?;
-    }
-    let dmg_path = repo.join("dist").join(&manifest.dmg);
-    let local_sha = dmg::sha256_file(&dmg_path).map_err(|error| {
-        Error::new(format!(
-            "dirty-cask recovery cannot hash {}: {error}",
-            dmg_path.display()
-        ))
-    })?;
-    if !local_sha.eq_ignore_ascii_case(&manifest.sha256) {
-        return Err(Error::new(
-            "dirty-cask recovery local DMG differs from the signed journal manifest",
-        ));
-    }
-    let sha = manifest.sha256;
-    let baseline = git_ok(git, &["show", &format!("HEAD:{CASK}")])?;
-    let baseline = String::from_utf8(baseline.stdout)
-        .map_err(|_| Error::new("committed cask baseline is not UTF-8"))?;
-    let expected = repin_cask_text(&baseline, &journal.version, &sha)?;
-    let worktree = fs::read_to_string(repo.join(CASK))
-        .map_err(|error| Error::new(format!("read recovery cask {CASK}: {error}")))?;
-    if worktree != expected {
-        return Err(Error::new(
-            "dirty cask is not the exact version+DMG-digest pin derived by the journaled cask \
-             step; refusing recovery before publisher-fence rotation",
-        ));
-    }
-    if staged.iter().any(|path| path == CASK) {
-        let index = git_ok(git, &["show", &format!(":{CASK}")])?;
-        if index.stdout != expected.as_bytes() {
-            return Err(Error::new(
-                "staged cask bytes differ from the exact journal-derived pin; refusing recovery",
-            ));
-        }
-    }
-    step(
-        "recover",
-        "admitting exact interrupted cask write/stage; no other worktree change present",
-    );
-    Ok(())
+    gates::clean_tree(git)
 }
 
 /// Bind an ordinary `--resume` to the immutable claim before the pipeline can
 /// reacquire either publication ref.  The journal is only a crash cursor: it
 /// is never authority for `(version, build, commit)`, and a structurally valid
-/// file edited by hand must not be able to steer a late upload/cask/flip.
+/// file edited by hand must not be able to steer a late upload/flip.
 ///
-/// This preflight deliberately performs the worktree check first.  Therefore
-/// an unrelated staged/unstaged/untracked path is rejected before even the
-/// read-only fetch, and in particular before `step_cask` can commit or run its
-/// retrying `reset --hard` path.  The sole dirty state admitted is the exact
-/// journal-derived cask write/stage recognized above.
+/// This preflight deliberately performs the worktree check first, so an
+/// unrelated staged/unstaged/untracked path is rejected before even the
+/// read-only fetch. No dirty state is admitted (see
+/// [`recovery_resume_worktree_preflight`]).
 pub fn ordinary_resume_claim_preflight(
     repo: &Path,
     git: &dyn GitRunner,
@@ -4913,7 +4807,7 @@ fn combine_with_fence_release(
 
 /// Explicit cross-machine recovery for a persistent lease whose local journal
 /// was lost.  Draft/absent cuts are safely abandoned; an already-published
-/// exact-identity cut is reconstructed at `archive` and finished through cask,
+/// exact-identity cut is reconstructed at `archive` and finished through
 /// verification, and unlock.  A published release is never deleted here. The
 /// boolean is the caller/operator's explicit stopped-process assertion, not a
 /// machine proof; false refuses before reading repository or remote state.
@@ -5273,7 +5167,7 @@ fn recover_published_cut(
 
     // Reconstruct only authoritative, remotely validated bytes.  The journal
     // begins after flip: build/upload are never replayed from guesses, while
-    // archive/cask/verify remain convergent production steps.
+    // archive/verify remain convergent production steps.
     let dist = repo.join("dist");
     fs::create_dir_all(&dist)
         .map_err(|error| Error::new(format!("create {}: {error}", dist.display())))?;
@@ -5390,7 +5284,7 @@ fn recover_published_cut(
 }
 
 /// The whole `cargo ship cut` (spec §7 order): gates → claim → build+package
-/// → self-check → draft-first publish → cask pin → post-publish verify.
+/// → self-check → draft-first publish → post-publish verify.
 ///
 /// The version comes from `[workspace.package] version` with the DEV
 /// component reset to 0 ([`release_version_from_workspace`]) — NOT from the
@@ -5814,12 +5708,12 @@ fn resume_cut(
     // A journal is a crash cursor, never publication authority.  Bind every
     // ordinary resume to its exact claim-commit ledger tail and origin/main,
     // and reject every unexplained worktree change before acquiring a remote
-    // lease/fence (or reaching cask's commit/reset retry path).
+    // lease/fence.
     ordinary_resume_claim_preflight(repo, &git, &journal)?;
 
     // Steps that (re)bake artifact bytes additionally require the recovered
     // signing key. The claim-commit/clean-tree proof above applies to every
-    // resume, including late upload/flip/cask/verify entries.
+    // resume, including late upload/flip/verify entries.
     if !journal.is_done("build") && journal.signature_required {
         let material = load_signing_material(repo)?.ok_or_else(|| {
             Error::new(
@@ -5945,13 +5839,6 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
             }
             "flip" => step_flip(ctx)?,
             "archive" => step_archive(ctx)?,
-            "cask" => {
-                // The cask pins the REAL repo's release — rehearsals must not
-                // touch it.
-                if ctx.kind == CutKind::Real {
-                    step_cask(ctx)?;
-                }
-            }
             "verify" => step_verify(ctx)?,
             "mirror" => step_mirror(ctx)?,
             "unlock" => {
@@ -6285,7 +6172,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     sign::sign_and_notarize_dmg(&dout.path, conf.as_ref())?;
     // Re-hash AFTER the Dev-ID hook: codesign REWRITES the DMG bytes (and the
     // notarization staple appends its ticket), so the digest dmg::create
-    // minted covers the pre-hook bytes only. The manifest/cask sha256 must be
+    // minted covers the pre-hook bytes only. The manifest sha256 must be
     // the digest of the exact bytes clients download — a stale one would
     // hard-abort the self-check after the whole build+notarize, and (were the
     // self-check ever skipped) fail the sha256 gate on every v0.25 client.
@@ -7368,7 +7255,7 @@ fn step_flip(ctx: &mut CutCtx) -> Result<()> {
 /// continuously discoverable while every older published manifest/signature
 /// is metadata-renamed to its deterministic per-tag archive name. The step is
 /// journaled as a unit; each individual PATCH is itself convergent, and the
-/// final fresh listing proves the invariant before cask/verify may proceed.
+/// final fresh listing proves the invariant before verify may proceed.
 fn step_archive(ctx: &mut CutCtx) -> Result<()> {
     let release_id = ctx.required_release_id("archive")?;
     let release = release_object_by_id(&ctx.slug, release_id)?;
@@ -7492,309 +7379,6 @@ fn published_build(ctx: &CutCtx) -> Result<Option<u64>> {
         return Ok(None);
     };
     Ok(Manifest::parse(&text).ok().map(|m| m.build_number))
-}
-
-fn verified_cask_sha(ctx: &CutCtx) -> Result<String> {
-    let release_id = ctx.required_release_id("cask pin")?;
-    let release_before = release_object_by_id(&ctx.slug, release_id)?;
-    validate_release_object_capability(
-        release_before.as_ref(),
-        release_id,
-        &ctx.tag,
-        &ctx.commit,
-        false,
-    )?;
-    let inventory_before = release_asset_inventory_for_release_id(&ctx.slug, release_id)?;
-    let local_manifest = fs::read(ctx.manifest_path())
-        .map_err(|error| Error::new(format!("read cask manifest: {error}")))?;
-    let remote_manifest =
-        download_release_asset_for_release_id(&ctx.slug, release_id, manifest_out::MANIFEST_ASSET)?;
-    let local_signature = if ctx.signature_required {
-        Some(
-            fs::read(ctx.manifest_path().with_extension("toml.sig"))
-                .map_err(|error| Error::new(format!("read cask manifest signature: {error}")))?,
-        )
-    } else {
-        None
-    };
-    let remote_signature = if ctx.signature_required {
-        Some(download_release_asset_for_release_id(
-            &ctx.slug,
-            release_id,
-            manifest_out::MANIFEST_SIG_ASSET,
-        )?)
-    } else {
-        None
-    };
-    let manifest = validate_live_release_identity(
-        ExpectedReleaseIdentity {
-            version: &ctx.version,
-            build: ctx.build,
-            commit: &ctx.commit,
-        },
-        &remote_manifest,
-        remote_signature.as_deref(),
-        Some(&local_manifest),
-        local_signature.as_deref(),
-        ctx.signature_required,
-        ctx.signature_pubkey.as_deref(),
-    )?;
-    let verified = verify_release_asset_id_matches_local(
-        &ctx.slug,
-        release_id,
-        &manifest.dmg,
-        &ctx.dmg_path(),
-    )?;
-    if !verified.sha256.eq_ignore_ascii_case(&manifest.sha256) {
-        return Err(Error::new(
-            "exact live DMG digest differs from the signed journal manifest; refusing cask mutation",
-        ));
-    }
-    let names: Vec<String> = inventory_before
-        .iter()
-        .map(|asset| asset.name.clone())
-        .collect();
-    let provenance_path = ctx.provenance_path();
-    let provenance_name = provenance_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::new("cask provenance filename is not UTF-8"))?;
-    let dsym_path = ctx.dsym_zip_path();
-    let dsym_name = dsym_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| names.iter().any(|observed| observed == name));
-    validate_draft_asset_set(
-        &names,
-        &manifest,
-        ctx.signature_required,
-        provenance_name,
-        dsym_name,
-    )?;
-    let inventory_after = release_asset_inventory_for_release_id(&ctx.slug, release_id)?;
-    if inventory_after != inventory_before {
-        return Err(Error::new(
-            "published release asset name/immutable-ID/size inventory changed during cask proof",
-        ));
-    }
-    let release_after = release_object_by_id(&ctx.slug, release_id)?;
-    validate_release_object_capability(
-        release_after.as_ref(),
-        release_id,
-        &ctx.tag,
-        &ctx.commit,
-        false,
-    )?;
-    if release_after != release_before {
-        return Err(Error::new(
-            "published release object capability changed during cask proof",
-        ));
-    }
-    Ok(manifest.sha256.to_ascii_lowercase())
-}
-
-pub fn validate_cask_attempt_freshness(derived_sha: &str, adjacent_sha: &str) -> Result<()> {
-    if derived_sha != adjacent_sha {
-        return Err(Error::new(
-            "live release identity changed during one cask publication attempt",
-        ));
-    }
-    Ok(())
-}
-
-/// Step "cask" (spec §7 step 6): re-pin packaging/homebrew/aterm.rb and push
-/// an exact cask-only child from a fresh isolated worktree on each CAS retry.
-/// "Done" therefore means the pin is on
-/// ORIGIN: a worktree — or even a local commit — that carries the pin proves
-/// nothing (a crash anywhere between the fs::write and the push would
-/// otherwise resume straight into a false "already pinned" success, and the
-/// divergence would only surface at the NEXT cut's HEAD gate, weeks later,
-/// with a "pull first" message pointing away from the cause).
-fn step_cask(ctx: &mut CutCtx) -> Result<()> {
-    let git = GitCli::new(&ctx.repo);
-    let cask_rel = "packaging/homebrew/aterm.rb";
-    for attempt in 1..=3u32 {
-        // A retry is a new publication attempt, not permission to reuse an
-        // earlier observation. Rebind the cask bytes to the exact live release
-        // object and immutable asset IDs before deriving this attempt's commit.
-        let sha = verified_cask_sha(ctx)?;
-        ensure_ctx_release_lease(ctx)?;
-        git_ok(&git, &["fetch", "origin", "main"])?;
-        let base = rev_parse(&git, "origin/main")?;
-        let ancestor = git.git(&["merge-base", "--is-ancestor", &ctx.commit, &base])?;
-        if !ancestor.success() {
-            return Err(Error::new(format!(
-                "release claim {} is no longer an ancestor of origin/main {base}; refusing cask publication",
-                ctx.commit
-            )));
-        }
-        let remote_text = git_ok(&git, &["show", &format!("{base}:{cask_rel}")])?;
-        let remote_text = String::from_utf8(remote_text.stdout)
-            .map_err(|_| Error::new("origin cask is not UTF-8"))?;
-        let pinned = repin_cask_text(&remote_text, &ctx.version, &sha)?;
-        if pinned == remote_text {
-            let adjacent_sha = verified_cask_sha(ctx)?;
-            validate_cask_attempt_freshness(&sha, &adjacent_sha)?;
-            ensure_ctx_release_lease(ctx)?;
-            git_ok(&git, &["fetch", "origin", "main"])?;
-            prove_origin_cask_pin(&git, cask_rel, &pinned)?;
-            step(
-                "cask",
-                &format!("{cask_rel} already pinned to {} on origin", ctx.version),
-            );
-            return Ok(());
-        }
-
-        // Never commit/reset/push the shared integration checkout. A private
-        // detached worktree rooted at the exact fetched origin tip makes
-        // concurrent user/agent edits irrelevant and makes the pushed commit
-        // structurally provable as one cask-only child.
-        let temp = PrivateTempDir::create(std::env::temp_dir().join(format!(
-            "aterm-cask-worktree-{}-{}",
-            std::process::id(),
-            RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        )))?;
-        let checkout = temp.path().join("checkout");
-        git_ok(
-            &git,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                checkout.to_str().unwrap_or_default(),
-                &base,
-            ],
-        )?;
-        let work_git = GitCli::new(&checkout);
-        let attempt_result = (|| -> Result<bool> {
-            fs::write(checkout.join(cask_rel), &pinned)
-                .map_err(|error| Error::new(format!("write isolated cask: {error}")))?;
-            git_ok(&work_git, &["add", "--", cask_rel])?;
-            let status = git_ok(
-                &work_git,
-                &["status", "--porcelain", "--untracked-files=all"],
-            )?;
-            let status = status.stdout_utf8();
-            if status.lines().collect::<Vec<_>>() != [format!("M  {cask_rel}")] {
-                return Err(Error::new(format!(
-                    "isolated cask worktree has unexpected staged paths: {status:?}"
-                )));
-            }
-            ensure_ctx_release_lease(ctx)?;
-            let message = format!("release: v{} cask pin", ctx.version);
-            git_ok(
-                &work_git,
-                &["commit", "-q", "-m", &message, "--only", "--", cask_rel],
-            )?;
-            let head = rev_parse(&work_git, "HEAD")?;
-            prove_exact_cask_commit(&work_git, &head, &base, cask_rel, &pinned, &message)?;
-
-            // Exact CAS against the fetched base. A moving main rejects; the
-            // next isolated attempt rebuilds from the new tip without ever
-            // resetting or committing the shared checkout.
-            let adjacent_sha = verified_cask_sha(ctx)?;
-            validate_cask_attempt_freshness(&sha, &adjacent_sha)?;
-            ensure_ctx_release_lease(ctx)?;
-            let lease = format!("--force-with-lease=refs/heads/main:{base}");
-            let push = work_git.git(&["push", &lease, "origin", "HEAD:refs/heads/main"])?;
-            git_ok(&git, &["fetch", "origin", "main"])?;
-            let landed = rev_parse(&git, "origin/main")? == head;
-            if landed {
-                prove_origin_cask_pin(&git, cask_rel, &pinned)?;
-                return Ok(true);
-            }
-            if push.success() {
-                return Err(Error::new(
-                    "cask CAS push reported success but origin/main is not the exact cask-only commit",
-                ));
-            }
-            Ok(false)
-        })();
-        let cleanup = git.git(&[
-            "worktree",
-            "remove",
-            "--force",
-            checkout.to_str().unwrap_or_default(),
-        ])?;
-        if !cleanup.success() {
-            return Err(Error::new(format!(
-                "remove isolated cask worktree failed: {}",
-                cleanup.stderr_utf8().trim()
-            )));
-        }
-        temp.cleanup()?;
-        if attempt_result? {
-            step(
-                "cask",
-                &format!(
-                    "{cask_rel} → {} / {}… (isolated exact cask-only CAS commit)",
-                    ctx.version,
-                    &sha[..12]
-                ),
-            );
-            return Ok(());
-        }
-        if attempt < 3 {
-            eprintln!(
-                "    cask CAS rejected (attempt {attempt}/3) — rebuilding in a fresh isolated worktree"
-            );
-        }
-    }
-    Err(Error::new(
-        "cask pin push rejected 3 times — origin/main is moving faster than the retry; \
-         re-run `cargo ship cut --resume` when it settles (the release itself is live)"
-            .to_string(),
-    ))
-}
-
-pub fn prove_exact_cask_commit(
-    git: &dyn GitRunner,
-    head: &str,
-    expected_parent: &str,
-    cask_rel: &str,
-    expected_bytes: &str,
-    expected_message: &str,
-) -> Result<()> {
-    let parents = git_ok(git, &["rev-list", "--parents", "-n", "1", head])?;
-    let parents_stdout = parents.stdout_utf8();
-    let fields: Vec<&str> = parents_stdout.split_whitespace().collect();
-    if fields != [head, expected_parent] {
-        return Err(Error::new(
-            "cask publication commit is not an exact single-parent child of fetched origin/main",
-        ));
-    }
-    let paths = git_ok(
-        git,
-        &["diff-tree", "--no-commit-id", "--name-only", "-r", head],
-    )?;
-    if paths.stdout_utf8().lines().collect::<Vec<_>>() != [cask_rel] {
-        return Err(Error::new(
-            "cask publication commit changes paths other than the canonical cask",
-        ));
-    }
-    let message = git_ok(git, &["show", "-s", "--format=%s", head])?;
-    if message.stdout_utf8().trim() != expected_message {
-        return Err(Error::new(
-            "cask publication commit message is not canonical",
-        ));
-    }
-    let blob = git_ok(git, &["show", &format!("{head}:{cask_rel}")])?;
-    if blob.stdout != expected_bytes.as_bytes() {
-        return Err(Error::new(
-            "cask publication commit does not carry the exact derived version/digest pin",
-        ));
-    }
-    Ok(())
-}
-
-fn prove_origin_cask_pin(git: &dyn GitRunner, cask_rel: &str, expected: &str) -> Result<()> {
-    let remote = git_ok(git, &["show", &format!("origin/main:{cask_rel}")])?;
-    if remote.stdout != expected.as_bytes() {
-        return Err(Error::new(
-            "origin/main does not carry the exact derived cask pin after publication",
-        ));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

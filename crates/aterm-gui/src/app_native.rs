@@ -4730,22 +4730,42 @@ impl App {
             };
         }
 
-        let installed_floor = installed
-            .as_ref()
-            .map_or(0, |installed| installed.build)
-            .max(build)
-            .max(observed_stage_floor);
+        // Newness is the STAGER's test and only the stager's: strictly newer than the
+        // RUNNING image. observed_stage_floor is in-pass hysteresis against
+        // re-importing a stage this pass just retired — not a second opinion on
+        // newness. The installed BUNDLE gets no vote: its plist can be replaced under
+        // a live process (a seamless update's surviving process, or a rebuild in
+        // place), and folding it into the floor made a staged build the bundle
+        // already carries compare as "not newer" — permanently, because a sealed
+        // plist cannot change under a running process. That was a fixed point: every
+        // later reconcile blanked the stage and reported no update was staged.
+        let stage_floor = build.max(observed_stage_floor);
+        // The same bundle state is still meaningful — as a DISPOSITION, not as
+        // silence. The bytes are already on disk; only a relaunch activates them.
+        let installed_stage_build = installed.as_ref().and_then(|installed| {
+            (installed.build > build && durable_build == Some(installed.build))
+                .then_some(installed.build)
+        });
         if let Some(mut durable) = durable {
             let eligible = durable.enabled
-                && durable
-                    .staged_build
-                    .is_some_and(|staged| staged > installed_floor);
+                && installed_stage_build.is_none()
+                && durable.staged_build.is_some_and(|staged| staged > stage_floor);
             if !eligible {
                 durable.staged_build = None;
                 durable.staged_version = None;
                 durable.staged_commit = None;
                 durable.staged_dmg_sha256 = None;
                 durable.changelog = None;
+            }
+            // Why not import it as an applicable stage: the apply would reach the
+            // rollback-source proof and Defer forever, since the installed bundle no
+            // longer matches the running build. Retire and say "relaunch" instead —
+            // and SAY it, so `update status` stops attributing this to a broken
+            // download pipeline when the bytes are already on disk.
+            if let Some(installed_build) = installed_stage_build {
+                durable.outcome =
+                    format!("build {installed_build} is installed; relaunch once to activate it");
+                aterm_log::warn!("update sync: {}", durable.outcome);
             }
             if let CheckStart::Start(ticket) = self.native_updater_service.request_check() {
                 let _ = self.native_updater_service.finish_check(ticket, durable);
@@ -6851,12 +6871,95 @@ mod tests {
         observation_sequence: u64,
         durable: Option<DurableUpdateStatus>,
     ) -> NativeUpdateReconcileFacts {
+        reconcile_facts_with_installed(request_sequence, observation_sequence, durable, None)
+    }
+
+    // The installed-bundle term was never exercised: every reconcile test passed
+    // `installed: None`, which is exactly why a floor that folded it in shipped.
+    fn reconcile_facts_with_installed(
+        request_sequence: u64,
+        observation_sequence: u64,
+        durable: Option<DurableUpdateStatus>,
+        installed: Option<InstalledUpdate>,
+    ) -> NativeUpdateReconcileFacts {
         NativeUpdateReconcileFacts {
             _ticket: NativeUpdateReconcileTicket { request_sequence },
             observation_sequence,
             durable,
-            installed: None,
+            installed,
         }
+    }
+
+    fn installed_update(build: u64) -> InstalledUpdate {
+        InstalledUpdate {
+            build,
+            commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            receipt_build: None,
+            receipt_dmg_sha256: None,
+        }
+    }
+
+    #[test]
+    fn a_bundle_already_carrying_the_stage_asks_for_a_relaunch_instead_of_going_silent() {
+        // The post-seamless-update survivor state: the on-disk bundle's sealed plist
+        // is ALREADY the staged build while the process still executes the older
+        // image. Folding that bundle into the newness floor made `staged > floor`
+        // false, so the reducer blanked the stage and reported that nothing newer was
+        // staged — permanently, because a sealed plist cannot change under a running
+        // process. Observed in the field: 0.12.0 held for 17.6 hours this way.
+        let mut app = App::headless_for_test();
+        let running = app.native_updater_service.snapshot().current_build;
+        assert!(running < 12, "fixture must model a newer staged build");
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            1,
+            1,
+            Some(status(Some(12), 0)),
+            Some(installed_update(12)),
+        ));
+        let outcome = app.native_updater_service.snapshot().outcome.clone();
+        assert!(
+            outcome.contains("relaunch"),
+            "an on-disk stage must be reported as needing a relaunch, got {outcome:?}"
+        );
+
+        // It must be a STABLE answer. The original defect was a fixed point: every
+        // later reconcile recomputed the same floor and blanked the stage again.
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            2,
+            2,
+            Some(status(Some(12), 0)),
+            Some(installed_update(12)),
+        ));
+        assert!(
+            app.native_updater_service
+                .snapshot()
+                .outcome
+                .contains("relaunch"),
+            "repeating the reconcile must not fall back to reporting nothing staged"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_installed_bundle_cannot_suppress_a_newer_stage() {
+        // The regression the floor was accidentally providing cover for: an installed
+        // bundle NEWER than the running image but NOT the staged artifact must not
+        // veto the stage. Newness is the stager's test against the running image.
+        let mut app = App::headless_for_test();
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            1,
+            1,
+            Some(status(Some(12), 0)),
+            Some(installed_update(11)),
+        ));
+        assert_eq!(
+            app.native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .map(|stage| stage.build),
+            Some(12),
+            "a newer stage must still import when the installed bundle is not that stage"
+        );
     }
 
     #[test]

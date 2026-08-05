@@ -123,6 +123,30 @@ pub struct KittySing {
     /// An EAGER wind-down start (key change / backspace / break / session
     /// switch). The lazy release path needs no stamp — it is derived.
     wind_from: Option<Instant>,
+    /// A PROVISIONAL key hand-over: the instant a LIVE celebration changed which
+    /// character it rides, held until the new key proves itself with one genuine
+    /// at-cadence repeat.
+    ///
+    /// OWNER: "when I changed the repeating key, the song played needs to also
+    /// change seamlessly."
+    ///
+    /// Moving from one held key to another used to `release()` the run outright.
+    /// `bar()` is gated on [`Self::is_armed`], so the instant the crossfade began
+    /// NO further bars were scheduled; the new key then had to re-earn all
+    /// [`SING_ARM_REPEATS`] repeats, which at OS key-repeat cadence takes longer
+    /// than [`SING_WIND_DOWN`] — so the drive reached 0 first, the host called
+    /// [`Self::settle`], and the celebration COLD-STARTED at bar 0 with the build
+    /// ramp and the clap reset. Audibly: the song stopped, went quiet, and began
+    /// again from the top.
+    ///
+    /// The hand-over carries the run instead. The run IDENTITY changes (so
+    /// [`Self::key`] moves and the song transposes); the arm anchor, the bar grid
+    /// and the beat phase do NOT — the tune keeps playing and changes key on the
+    /// next bar boundary. Provisional because two different characters in a row
+    /// is TYPING: if a third arrives before the promise is kept, the crossfade is
+    /// anchored at the DEPARTURE stored here, so ordinary typing loses exactly
+    /// what it lost before this existed.
+    handover_from: Option<Instant>,
 }
 
 impl KittySing {
@@ -146,6 +170,29 @@ impl KittySing {
         self.run = None;
         self.count = 0;
         self.last = None;
+        self.handover_from = None;
+    }
+
+    /// The MUSICAL KEY the held character sings in: a pentatonic scale-degree
+    /// offset applied to every note of the authored riff.
+    ///
+    /// OWNER: "when I changed the repeating key, the song played needs to ALSO
+    /// change seamlessly." The song used to be IDENTICAL for every held
+    /// character — `run` was private with no accessor and the host passed a
+    /// hardcoded voicing, so holding `a` and holding `z` produced bit-identical
+    /// audio. Now the character picks the root: the SAME authored tune, rhythm
+    /// and bars, transposed. That is what makes the change audible as a change
+    /// rather than as a restart.
+    ///
+    /// Deterministic and bounded to one pentatonic octave (-2..=2), so no key can
+    /// transpose the riff into a register that reads as a different instrument.
+    /// `0` when nothing is held — the untransposed reference voicing.
+    #[must_use]
+    pub fn key(&self) -> i8 {
+        match self.run {
+            Some(ch) => (ch as u32 % 5) as i8 - 2,
+            None => 0,
+        }
     }
 
     /// The derived "finger lifted" instant: one repeat gap after the last
@@ -175,6 +222,23 @@ impl KittySing {
         if self.lazy_release().is_some_and(|release| now > release) {
             self.release(now);
         }
+        if self.run != Some(ch)
+            && self.armed_at.is_some()
+            && self.wind_from.is_none()
+            && self.run.is_some()
+            && self.handover_from.is_none()
+        {
+            // KEY HAND-OVER: a LIVE celebration and the user moving from one held
+            // key to another. Carry the song — swap which character it rides,
+            // keep the arm anchor, the bar grid and the beat phase — so the tune
+            // changes key without stopping. Provisional until the new key shows
+            // one genuine at-cadence repeat.
+            self.run = Some(ch);
+            self.count = SING_ARM_REPEATS;
+            self.handover_from = Some(now);
+            self.last = Some(now);
+            return;
+        }
         if self.run == Some(ch) {
             // KEY-REPEAT IS WALL-TIME (M4): OS auto-repeat delivers each press
             // at a distinct instant, but a single batched IME commit of a
@@ -187,7 +251,17 @@ impl KittySing {
             if self.last.is_none_or(|l| now > l) {
                 self.count = self.count.saturating_add(1);
             }
+            // PROMISE KEPT: the handed-over key genuinely repeated, so this is a
+            // hold and not typing. Nothing left to roll back to.
+            self.handover_from = None;
         } else {
+            // PROMISE BROKEN: a THIRD character before the handed-over key ever
+            // repeated. That was typing, so wind down from the DEPARTURE — the
+            // instant the original held key was abandoned — rather than from
+            // here, so ordinary typing loses exactly what it lost before.
+            if let Some(left) = self.handover_from.take() {
+                self.wind_from = Some(left);
+            }
             self.release(now);
             self.run = Some(ch);
             self.count = 1;
@@ -276,6 +350,7 @@ impl KittySing {
         if self.armed_at.is_some() && self.drive(now) <= 0.0 {
             self.armed_at = None;
             self.wind_from = None;
+            self.handover_from = None;
         }
     }
 }
@@ -725,6 +800,71 @@ mod tests {
         }
     }
 
+
+    /// THE OWNER'S SCENARIO: hold one key until FULL NYAN, then hold a DIFFERENT
+    /// key. Both halves of "change seamlessly" are pinned here.
+    ///
+    ///  * SEAMLESS — the drive never dips, the beat clock never rewinds, and the
+    ///    bar index keeps counting UP across the switch. The old behaviour
+    ///    released the run, stopped scheduling bars immediately, and then cold
+    ///    started at bar 0 once the crossfade drained.
+    ///  * CHANGES — the musical key actually moves, so the switch is audible as a
+    ///    modulation rather than as nothing at all. The riff used to be
+    ///    bit-identical for every held character.
+    #[test]
+    fn changing_the_held_key_transposes_the_song_without_a_seam() {
+        let mut d = KittySing::default();
+        let t0 = Instant::now();
+        let armed = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
+        assert!(d.is_armed(armed));
+        let bar_before = d.bar(armed).expect("armed runs schedule bars");
+        let beat_before = d.beat(armed).expect("armed runs have a beat");
+        let key_before = d.key();
+
+        let mut t = armed;
+        for _ in 0..SING_ARM_REPEATS {
+            t += Duration::from_millis(30);
+            d.note_char(t, S, 'q');
+            assert_eq!(
+                d.drive(t),
+                1.0,
+                "the song never dips while the hold moves from one key to another"
+            );
+            assert!(d.is_armed(t), "and never stops scheduling bars");
+        }
+
+        let beat_after = d.beat(t).expect("still singing");
+        assert!(
+            beat_after > beat_before,
+            "the beat clock advanced across the switch instead of rewinding \
+             ({beat_before} -> {beat_after})"
+        );
+        assert!(
+            d.bar(t).expect("still scheduling") >= bar_before,
+            "the bar grid kept counting up — no cold start at bar 0"
+        );
+        assert_ne!(d.key(), key_before, "'q' and 'a' must not sing the same song");
+        assert!(
+            (-2..=2).contains(&d.key()),
+            "the transposition stays inside one pentatonic octave, got {}",
+            d.key()
+        );
+
+        // The promise is enforced: two different characters in a row is TYPING,
+        // and typing still loses the celebration.
+        let mut typing = KittySing::default();
+        let armed = hold(&mut typing, t0, 'a', SING_ARM_REPEATS, 30);
+        let b = armed + Duration::from_millis(30);
+        typing.note_char(b, S, 'b');
+        let c = b + Duration::from_millis(30);
+        typing.note_char(c, S, 'c');
+        assert!(
+            typing.drive(c) < 1.0,
+            "a third character proves it was typing, and the wind-down is \
+             anchored back at the departure"
+        );
+    }
+
     /// THE WIND-DOWN CROSSFADE COMPLETES: on key change the drive leaves 1.0
     /// immediately but eases — strictly between 0 and 1 mid-fade,
     /// monotonically decreasing, exactly 0.0 by [`SING_WIND_DOWN`] — and
@@ -735,9 +875,17 @@ mod tests {
         let t0 = Instant::now();
         let t = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         assert_eq!(d.drive(t), 1.0);
-        let release = t + Duration::from_millis(30);
-        d.note_char(release, S, 'b'); // key change → wind-down
-        assert!(!d.is_armed(release));
+        let change = t + Duration::from_millis(30);
+        d.note_char(change, S, 'b'); // key change → PROVISIONAL hand-over
+        // The hand-over holds the song at full for one cadence window: a single
+        // different character cannot yet be distinguished from the start of a new
+        // hold, and cutting the song on that guess is exactly the seam the owner
+        // reported. The wind-down begins when the new key fails to repeat.
+        assert!(
+            d.is_armed(change),
+            "a key change hands the song over rather than cutting it"
+        );
+        let release = change + SING_REPEAT_GAP;
         let mut prev = d.drive(release);
         assert!(prev <= 1.0);
         for step in 1..=10u64 {
@@ -852,8 +1000,11 @@ mod tests {
         let mut d = KittySing::default();
         let armed = hold(&mut d, t0, 'a', SING_ARM_REPEATS, 30);
         let stray = armed + Duration::from_millis(30);
-        d.note_char(stray, S, 'b'); // key change → wind-down begins
-        assert!(!d.is_armed(stray));
+        d.note_char(stray, S, 'b'); // provisional hand-over to 'b'
+        assert!(
+            d.is_armed(stray),
+            "the hand-over keeps the song alive while 'b' is still unproven"
+        );
         let mut t = stray;
         for _ in 0..SING_ARM_REPEATS {
             t += Duration::from_millis(30);

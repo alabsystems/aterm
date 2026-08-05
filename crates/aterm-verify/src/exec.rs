@@ -110,6 +110,10 @@ pub struct Run {
     /// True only on exit status 0 — a signal death is a failure, as in the shell.
     pub ok: bool,
     pub output: String,
+    /// The exit code, for the stages whose child says MORE than pass/fail — the
+    /// redraw gate answers `2` for "could not run here", which must not read as
+    /// either. `None` for a signal death or a child that never spawned.
+    pub code: Option<i32>,
     /// Set when the child could not be spawned at all (tool vanished mid-run).
     pub spawn_error: Option<String>,
 }
@@ -176,11 +180,13 @@ fn finish(mut c: Command, output: String) -> Run {
         Ok(st) => Run {
             ok: st.success(),
             output,
+            code: st.code(),
             spawn_error: None,
         },
         Err(e) => Run {
             ok: false,
             output,
+            code: None,
             spawn_error: Some(e.to_string()),
         },
     }
@@ -190,6 +196,7 @@ fn spawn_failure(cmd: &Cmd, why: &str) -> Run {
     Run {
         ok: false,
         output: format!("aterm-verify: cannot run {}: {why}", cmd.program.display()),
+        code: None,
         spawn_error: Some(why.to_string()),
     }
 }
@@ -260,6 +267,9 @@ mod tests {
         let r = run(&cmd, env_in(&tmp));
         assert!(!r.ok);
         assert_eq!(r.trimmed_output(), "why");
+        // The CODE survives too: a child that distinguishes "failed" from "could
+        // not run" says so here and nowhere else.
+        assert_eq!(r.code, Some(3));
         std::fs::remove_dir_all(&tmp).ok();
     }
 

@@ -4844,7 +4844,11 @@ pub(crate) fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, p
 
 /// The sing-along's once-per-visual-bar RIFF gesture. Shared by both render
 /// paths so the celebration sounds the same in a split as it does whole.
-fn sing_riff_event(bar: u64, gain: f32) -> aterm_effects::trail_sound::SoundEvent {
+///
+/// `key` is the held character's pentatonic transposition (`KittySing::key`):
+/// the SAME authored tune in a different key, so changing which key you hold
+/// changes the song over one continuous bar grid instead of restarting it.
+fn sing_riff_event(bar: u64, gain: f32, key: i8) -> aterm_effects::trail_sound::SoundEvent {
     aterm_effects::trail_sound::SoundEvent {
         style: crate::cursor_glow::GlowStyle::RainbowKitty,
         // The sing-along riff is its own authored song — the
@@ -4853,6 +4857,7 @@ fn sing_riff_event(bar: u64, gain: f32) -> aterm_effects::trail_sound::SoundEven
         kind: aterm_effects::trail_sound::SoundGesture::Celebration(
             aterm_effects::trail_sound::CelebrationGesture::RiffBar {
                 bar: (bar & 0xffff) as u16,
+                key,
             },
         ),
         pan: 0.0,
@@ -11673,7 +11678,11 @@ impl App {
                         self.config.trail_sounds_or_default(),
                         self.config.trail_sound_volume(),
                     ) {
-                        self.trail_audio.push(sing_riff_event(bar, gain));
+                        // The HELD CHARACTER picks the key, so switching which
+                        // key you hold changes the song — over the same bar
+                        // grid, so the change is seamless rather than a restart.
+                        self.trail_audio
+                            .push(sing_riff_event(bar, gain, ws.kitty_sing.key()));
                     }
                 }
             } else {
@@ -15019,7 +15028,7 @@ impl App {
                 } else {
                     0.0
                 };
-                let mut riff: Option<(u64, f32)> = None;
+                let mut riff: Option<(u64, f32, i8)> = None;
                 if sing_drive > 0.0 {
                     ws.cursor_glow.celebrate(now, sing_drive);
                     if let Some(bar) = ws.kitty_sing.bar(now)
@@ -15027,7 +15036,7 @@ impl App {
                     {
                         ws.sing_riff_bar = Some(bar);
                         riff = trail_sound_gain(ws.focused, sound_on, sound_volume)
-                            .map(|gain| (bar, gain));
+                            .map(|gain| (bar, gain, ws.kitty_sing.key()));
                     }
                 } else {
                     ws.kitty_sing.settle(now);
@@ -15054,8 +15063,8 @@ impl App {
                 let alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
                 (cat_frame, alpha, riff)
             };
-        if let Some((bar, gain)) = riff {
-            self.trail_audio.push(sing_riff_event(bar, gain));
+        if let Some((bar, gain, key)) = riff {
+            self.trail_audio.push(sing_riff_event(bar, gain, key));
         }
         let deco_fp = self.compose_word_decorations(
             wid,

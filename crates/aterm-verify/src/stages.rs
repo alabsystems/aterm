@@ -14,9 +14,10 @@
 //! verb precisely so a gate cannot be quietly unverified).
 
 use crate::exec::{self, Capture, Cmd};
-use crate::ladder::Report;
+use crate::ladder::{Outcome, Report, Severity};
 use crate::plan::{StageId, StageSpec};
 use crate::scope::Scope;
+use crate::smoke::debug_bin;
 use crate::smoke_stages;
 use crate::{Ctx, have_on_path, is_executable_file};
 
@@ -40,6 +41,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::ProofInventory => proof_inventory(ctx, &mut r),
         StageId::ControlSocketSmoke => smoke_stages::control_socket_smoke(ctx, &mut r),
         StageId::GuiSmoke => smoke_stages::gui_typing_smoke(ctx, &mut r),
+        StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
         StageId::DifferentialOracle => differential_oracle(ctx, &mut r),
         StageId::KaniFloor => kani_floor(ctx, &mut r),
     }
@@ -151,6 +153,34 @@ fn kani_cmd(gate: &std::path::Path, krate: &str) -> Cmd {
     Cmd::new(gate)
         .env("KANI_CRATE", krate)
         .capture(Capture::Emit)
+}
+
+/// The redraw harness's target name — the `[[bin]]`, the built file and the
+/// argv below all have to agree, so they read it from here.
+pub const REDRAW_CONFORMANCE_BIN: &str = "aterm-redraw-conformance";
+
+/// `targo --unverified build -q -p aterm-gui --features control-conformance
+///  --bin aterm-redraw-conformance`
+///
+/// The feature is the whole reason the argv is spelled out and tested: it is
+/// `required-features` on the target, so without it cargo silently builds
+/// NOTHING and the stage would gate on a binary from some previous run.
+#[must_use]
+pub fn redraw_conformance_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "--features",
+        "control-conformance",
+        "--bin",
+        REDRAW_CONFORMANCE_BIN,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// `targo --unverified test -p aterm-bench --test differential`
@@ -527,6 +557,92 @@ fn proof_inventory(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
+// 5c) CONTROL REDRAW CONFORMANCE — the one check that can see a control-socket
+//    `select` actually repaint a window. `EventLoop` construction panics off the
+//    process main thread and libtest runs every `#[test]` on a spawned one, so
+//    every unit test in aterm-gui builds its host with `proxy: None`: a
+//    regression that drops the production `EventLoopProxy` compiles and passes
+//    the whole default suite. Only a target owning `fn main` can hold a real
+//    proxy, which is what `aterm-redraw-conformance` is — and it is behind
+//    `required-features`, so this stage is the only thing that ever builds it.
+// ---------------------------------------------------------------------------
+
+/// How the ladder reads one harness exit code (`0` pass / `1` fail / `2` NOT RUN,
+/// declared in `aterm_gui::control_redraw_conformance`).
+///
+/// A FUNCTION, and tested, because of `2`. The harness answers it when no event
+/// loop is constructible here — headless, no display — and a `2` read as green
+/// would restore, one layer up, exactly the false pass this gate exists to
+/// remove. It is COULD-NOT-RUN: the run decided nothing, which is neither a pass
+/// nor a finding about the tree. Any OTHER code is a finding — the harness drives
+/// shipped code, so dying is something the tree did.
+#[must_use]
+pub fn redraw_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "aterm-redraw-conformance: the verb matrix passed against a real proxy, and a select reached the event loop".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "aterm-redraw-conformance: a check failed, or a redraw the host accepted never arrived".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "aterm-redraw-conformance: NOT RUN — no event loop is constructible here, so nothing was proven about redraws (exit 2, never a pass)".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("aterm-redraw-conformance: unexpected exit {c} (the harness answers only 0/1/2)"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "aterm-redraw-conformance: no exit status — killed by a signal, or never spawned".to_string(),
+        ),
+    }
+}
+
+fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
+    if ctx.selftest {
+        r.skip("redraw conformance (selftest: not executed)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        // The build stage already reported COULD-NOT-RUN for the same absence;
+        // naming it again here keeps the skip counted and the verdict narrowed.
+        r.skip("redraw conformance (no targo)");
+        return;
+    }
+    let build = exec::run(
+        &targo(ctx, redraw_conformance_build_args()),
+        ctx.exec_env(),
+    );
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!("targo build --bin {REDRAW_CONFORMANCE_BIN}"));
+        return;
+    }
+    let bin = debug_bin(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        REDRAW_CONFORMANCE_BIN,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "redraw conformance: just-built harness missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // Driven as a BINARY, never `targo run`: the driver's lane banner goes to
+    // stderr and cargo's own codes would collide with the harness's 0/1/2.
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = redraw_outcome(out.code);
+    r.record(outcome, label);
+}
+
+// ---------------------------------------------------------------------------
 // 6) --full ONLY: differential oracle
 // ---------------------------------------------------------------------------
 fn differential_oracle(ctx: &Ctx, r: &mut Report) {
@@ -642,6 +758,7 @@ mod tests {
             xtask_gate_args("drift"),
             freeze_gate_args(),
             differential_args(),
+            redraw_conformance_build_args(),
         ] {
             assert_eq!(
                 argv.first().map(String::as_str),
@@ -960,13 +1077,14 @@ mod tests {
 
         // The dependent stages then skip — honestly, and named, so the verdict
         // refuses the merge contract for the whole run.
-        let dependent: [fn(&Ctx, &mut Report); 6] = [
+        let dependent: [fn(&Ctx, &mut Report); 7] = [
             test,
             doctests,
             regex_lane,
             feature_gates,
             freeze_gate,
             proof_inventory,
+            redraw_conformance,
         ];
         for stage in dependent {
             let mut r = Report::new("s");
@@ -993,6 +1111,54 @@ mod tests {
                 "{label} must fail closed"
             );
             assert!(label.contains("missing or not executable"), "{label}");
+        }
+    }
+
+    #[test]
+    fn the_redraw_gate_builds_the_feature_without_which_it_builds_nothing() {
+        // `aterm-redraw-conformance` carries `required-features =
+        // ["control-conformance"]`. Drop the feature and cargo does not error —
+        // it matches no target and exits 0, so the stage would sail on and
+        // decide on whatever binary an earlier run happened to leave behind.
+        let a = redraw_conformance_build_args();
+        let feat = a
+            .iter()
+            .position(|x| x == "--features")
+            .expect("the gate must ask for the feature that compiles it");
+        assert_eq!(a[feat + 1], "control-conformance");
+        let bin = a.iter().position(|x| x == "--bin").expect("a --bin");
+        assert_eq!(a[bin + 1], REDRAW_CONFORMANCE_BIN);
+        assert!(a.contains(&"aterm-gui".to_string()));
+    }
+
+    #[test]
+    fn a_redraw_gate_that_could_not_run_is_never_a_pass_and_never_a_skip() {
+        // THE WHOLE POINT OF THE MAPPING. Exit 2 is the harness saying no event
+        // loop is constructible here; a headless box must not read that as green,
+        // and it must not read as a quiet skip either — that is the same false
+        // green one layer up.
+        let (outcome, label) = redraw_outcome(Some(2));
+        assert_eq!(outcome, Outcome::Fail(Severity::CouldNotRun));
+        assert_ne!(outcome, Outcome::Ok);
+        assert_ne!(outcome, Outcome::Skip);
+        assert!(label.contains("NOT RUN"), "{label}");
+
+        assert_eq!(redraw_outcome(Some(0)).0, Outcome::Ok);
+        assert_eq!(
+            redraw_outcome(Some(1)).0,
+            Outcome::Fail(Severity::GateFailed)
+        );
+        // A panic (101) or a signal is a finding/that-decided-nothing, never green.
+        assert_eq!(
+            redraw_outcome(Some(101)).0,
+            Outcome::Fail(Severity::GateFailed)
+        );
+        assert_eq!(
+            redraw_outcome(None).0,
+            Outcome::Fail(Severity::CouldNotRun)
+        );
+        for code in [None, Some(1), Some(2), Some(101), Some(-1)] {
+            assert_ne!(redraw_outcome(code).0, Outcome::Ok, "{code:?}");
         }
     }
 

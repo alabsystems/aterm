@@ -18,6 +18,13 @@ pub struct HostCapabilities {
     pub event_loop: bool,
     /// A system clipboard is reachable (`copy`).
     pub clipboard: bool,
+    /// A ROSTER is kept, so [`SessionHost::sessions`] and [`SessionHost::resolve`]
+    /// answer for real. FALSE is what makes an empty roster readable: it says "I
+    /// keep no index", which is NOT "no sessions exist" — without this bit the two
+    /// spell the same empty `Vec`.
+    pub roster: bool,
+    /// An input sink is reachable ([`SessionHost::write_input`] can land bytes).
+    pub input_sink: bool,
 }
 
 /// A session's lifecycle as its host observes it. This is the `sessions` wire
@@ -108,24 +115,24 @@ pub trait ChangeWait {
 
 /// A host of one or more terminal sessions, addressed by process-local sid.
 ///
-/// # The sid contract is SPLIT, and mixing the halves writes to the wrong session
+/// # The roster answers fleet-wide; every other method FAILS CLOSED on a foreign sid
 ///
 /// [`SessionHost::sessions`] and [`SessionHost::resolve`] answer for the whole
-/// roster. The per-session methods do NOT: a host may be SESSION-SCOPED, built
-/// against one session the dispatcher already resolved, in which case it serves
-/// that session whatever sid you pass — `aterm-gui`'s host is exactly this shape.
+/// roster. The per-session methods answer only for the sids this host actually
+/// SERVES — possibly exactly one, since a host may be SESSION-SCOPED, built against
+/// the session the dispatcher already resolved (`aterm-gui`'s host is that shape).
+/// A sid it does not serve gets `None` (a no-op for the returnless methods), NEVER
+/// its own session under a borrowed number.
 ///
-/// So this is a bug, not an idiom:
+/// That is what makes the cross-host sequence safe rather than a silent misroute:
 ///
 /// ```ignore
 /// let sid = host.resolve(sel)?;      // fleet-wide answer
-/// host.write_input(sid, bytes);      // may land on a DIFFERENT session
+/// host.write_input(sid, bytes);      // None unless THIS host serves that sid
 /// ```
 ///
-/// Resolve to pick a target, then obtain a host bound to it. A future
-/// fleet-scoped host must honor sid on every method; until one exists,
-/// [`HostCapabilities`] does not distinguish the two shapes and the caller is
-/// what keeps them apart.
+/// Resolve to pick a target, then obtain a host bound to it: the refusal is the
+/// signal that you are holding the wrong one.
 ///
 /// NOT OBJECT-SAFE, deliberately: the `impl FnOnce` accessors cost no `Box` per
 /// verb and keep the host's lock guard (and, in `aterm-gui`, its debug
@@ -139,19 +146,22 @@ pub trait SessionHost {
     /// The roster behind `sessions`/`ls`: every session this host serves, in the
     /// order the wire lists them (ascending `sid`). A host serving exactly one
     /// session returns one entry — never an empty roster standing in for "I don't
-    /// keep one".
+    /// keep one". A host that keeps NO roster says so
+    /// ([`HostCapabilities::roster`] false) and is the only one that may answer
+    /// empty.
     fn sessions(&self) -> Vec<SessionEntry>;
 
     /// Resolve a `@<selector>` against the ROSTER; `None` when it holds no such
     /// session (fail closed — the caller answers `ERR no such session` rather
-    /// than falling back to some other session).
+    /// than falling back to some other session), and `None` for EVERY selector on
+    /// a host with no roster.
     ///
-    /// Not necessarily a sid the per-session methods honor: see the split-contract
-    /// warning on [`SessionHost`].
+    /// Not necessarily a sid THIS host's per-session methods serve: see the
+    /// fleet-vs-session note on [`SessionHost`].
     fn resolve(&self, selector: Selector<'_>) -> Option<u64>;
 
-    /// Run `f` against session `sid`'s terminal, or `None` if the host does not
-    /// resolve `sid`. Closure-based so the host owns the guard type.
+    /// Run `f` against session `sid`'s terminal, or `None` if this host does not
+    /// serve `sid`. Closure-based so the host owns the guard type.
     fn with_terminal<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R>;
 
     /// [`SessionHost::with_terminal`] with mutable access.
@@ -161,18 +171,28 @@ pub trait SessionHost {
     /// `feed` take to the child, whole frames only (no interleaving with another
     /// writer's bytes).
     ///
-    /// `None` when the host does not resolve `sid`; `Some(false)` when the write
-    /// did NOT happen, so a wedged or absent sink cannot answer `OK`. The
-    /// human-vocabulary verbs (`key`/`ctrl`/`mouse`/`paste`/`focus`) are NOT this
-    /// method — they need an encoder reading live keyboard/mouse mode, which stays
-    /// on the host's side of the seam.
+    /// `None` when this host does not serve `sid` — checked BEFORE the sink, so a
+    /// foreign sid can never reach one. `Some(false)` when the write did NOT
+    /// happen, so a wedged or absent sink ([`HostCapabilities::input_sink`] false)
+    /// cannot answer `OK`.
+    ///
+    /// EMPTY `bytes` is the checkable no-op: it moves nothing and answers
+    /// `Some(true)` iff a sink is there, which is how a conformance run proves the
+    /// honest-reporting contract without injecting a byte into a live session.
+    ///
+    /// The human-vocabulary verbs (`key`/`ctrl`/`mouse`/`paste`/`focus`) are NOT
+    /// this method — they need an encoder reading live keyboard/mouse mode, which
+    /// stays on the host's side of the seam.
     fn write_input(&self, sid: u64, bytes: &[u8]) -> Option<bool>;
 
-    /// Ask the host to repaint `sid`. A no-op on a host with no event loop.
+    /// Ask the host to repaint `sid`. A no-op on a host with no event loop, and on
+    /// a sid it does not serve.
     fn request_redraw(&self, sid: u64);
 
     /// Register interest in `sid`'s changes. Registration lasts as long as the
-    /// returned handle (see [`ChangeWait`] for why that is load-bearing).
+    /// returned handle (see [`ChangeWait`] for why that is load-bearing). A sid
+    /// this host does not serve gets a handle that only ever times out — never one
+    /// wired to some other session's changes.
     fn subscribe(&self, sid: u64) -> Box<dyn ChangeWait + '_>;
 
     /// Place `text` on the system clipboard; `false` if the write failed. Only

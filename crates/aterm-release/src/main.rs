@@ -7,7 +7,7 @@
 //! One binary owns the whole cut: pre-claim gates → build-number ledger claim
 //! (fetch/push compare-and-swap on `RELEASES.ledger`) → universal build with
 //! `SOURCE_DATE_EPOCH=n` → .app bundle → sign → DMG → manifest → draft-first
-//! GitHub publish with a late tag → cask pin → post-publish verify. It is run
+//! GitHub publish with a late tag → post-publish verify. It is run
 //! via the `.cargo/config.toml` alias (`ship = "run -q --release -p
 //! aterm-release --"`), never `cargo install` — a stale installed binary must
 //! not be able to cut a release (spec decision 13).

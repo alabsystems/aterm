@@ -427,6 +427,52 @@ pub fn record_apply_success(_current_build: u64) {
     health::Health::record_apply_success(&staging.health());
 }
 
+/// Record that an apply was REFUSED — blocked, deferred, or held — rather than
+/// attempted and failed.
+///
+/// This exists because the opposite policy produced a silent updater. Refusals
+/// are correctly excluded from the failure streaks (a busy terminal must not
+/// manufacture a persistent-failure escalation), and that meant they were
+/// recorded nowhere at all: on the machine this was written for, `update apply`
+/// answered "OK apply requested", the request was refused, and `update status`
+/// kept reporting a healthy updater with a build "staged … applies on next
+/// launch" for hours. A refusal nobody can observe reads exactly like an updater
+/// that is not running.
+///
+/// So this writes BOTH surfaces an operator actually looks at: the reason lands
+/// in the health ledger ([`apply_lane_report`], the control socket's
+/// `apply_refusal=`), and the status outcome stops advertising a stage as though
+/// nothing had tried to apply it.
+///
+/// `reason` must name what refused and why — it is the entire answer to "the
+/// build is staged, so why is it not running?".
+///
+/// Best-effort, and REQUEST-RATE only: this takes the ledger lock and writes two
+/// small files, so it belongs on explicit apply requests and terminal verdicts,
+/// never on a per-frame or per-poll path.
+#[cfg(target_os = "macos")]
+pub fn record_apply_refusal(current_build: u64, reason: &str) {
+    let Some(staging) = paths::Staging::resolve() else {
+        return;
+    };
+    health::Health::record_apply_refusal(&staging.health(), current_build, reason);
+    // Name the artifact when one is genuinely publishable, so the line answers
+    // "which build, and why is it not running" in one read. `status::record`
+    // re-derives `staged_build` from the same publishable marker — two
+    // independent reads of the same source, so they agree unless the marker
+    // changes BETWEEN them. That window is real but harmless: a marker that
+    // moved mid-refusal means a newer stage just landed, and the next status
+    // write re-derives both halves from it.
+    let outcome = match manifest::Ready::read_publishable(&staging) {
+        Some(ready) => format!(
+            "staged {} (build {}) — NOT applied: {reason}",
+            ready.version, ready.build_number
+        ),
+        None => format!("apply refused: {reason}"),
+    };
+    status::record(&staging, current_build, &outcome);
+}
+
 /// Non-macOS: no apply lane exists, so there is nothing to record.
 #[cfg(not(target_os = "macos"))]
 pub fn record_apply_failure(_current_build: u64, _reason: &str) {}
@@ -434,6 +480,66 @@ pub fn record_apply_failure(_current_build: u64, _reason: &str) {}
 /// Non-macOS counterpart to [`record_apply_success`].
 #[cfg(not(target_os = "macos"))]
 pub fn record_apply_success(_current_build: u64) {}
+
+/// Non-macOS counterpart to [`record_apply_refusal`].
+#[cfg(not(target_os = "macos"))]
+pub fn record_apply_refusal(_current_build: u64, _reason: &str) {}
+
+/// The apply lane's own answer to "a build is staged — why is it not running?".
+///
+/// Kept OUT of [`UpdateStatus`] on purpose: that value is the CHECK lane's
+/// projection, every consumer builds it field-by-field, and the two lanes fail
+/// independently. Consumers that need apply-lane detail (today: the control
+/// socket's `update` reply) read this alongside it.
+///
+/// The apply-failure STREAK is deliberately absent: `UpdateStatus::failing_applies`
+/// already carries it, and two reads of one ledger racing each other could disagree
+/// about a number that has exactly one source of truth. This carries only what
+/// nothing else reports — the REASONS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyLaneReport {
+    /// Reason of the most recent apply failure; empty when none is standing.
+    pub last_failure: String,
+    /// Reason of the most recent apply REFUSAL — a verdict that stopped an apply
+    /// before it could fail. Empty once an apply succeeds or hard-fails.
+    pub last_refusal: String,
+    /// RFC3339 UTC of [`Self::last_refusal`]; empty when there is none.
+    pub last_refusal_at: String,
+}
+
+/// Read the apply lane's durable record as it applies to `current_build`.
+///
+/// A refusal recorded by a build that is no longer running is dropped here: a
+/// successful in-session apply execs away and never returns to clear the slot, so
+/// the running build is the only honest expiry. `None` only when there is no
+/// staging root to read.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn apply_lane_report(current_build: u64) -> Option<ApplyLaneReport> {
+    let staging = paths::Staging::resolve()?;
+    let ledger = health::Health::read(&staging.health());
+    let standing = ledger.apply_refusal_applies_to(current_build);
+    Some(ApplyLaneReport {
+        last_failure: ledger.last_apply_error,
+        last_refusal: if standing {
+            ledger.last_apply_refusal
+        } else {
+            String::new()
+        },
+        last_refusal_at: if standing {
+            ledger.last_apply_refusal_at
+        } else {
+            String::new()
+        },
+    })
+}
+
+/// Non-macOS: there is no apply lane, so there is nothing to report.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn apply_lane_report(_current_build: u64) -> Option<ApplyLaneReport> {
+    None
+}
 
 /// Non-macOS no-op: there is no `.app` bundle to swap.
 #[cfg(not(target_os = "macos"))]
@@ -847,8 +953,12 @@ impl UpdateStatus {
     #[must_use]
     pub fn summary(&self) -> String {
         match (&self.staged_version, self.staged_build) {
+            // NOT "applies on next launch": a relaunch is the FALLBACK, not the
+            // delivery mechanism. The staged build is verified and ready for the
+            // in-session apply lane right now, and telling the user to quit is
+            // exactly the advice this updater exists to make unnecessary.
             (Some(v), Some(b)) => {
-                format!("update {v} (build {b}) staged — applies on next launch")
+                format!("update {v} (build {b}) staged and ready to apply")
             }
             _ if !self.outcome.is_empty() => self.outcome.clone(),
             _ if !self.enabled => "auto-update is disabled on this build".to_string(),
@@ -932,7 +1042,15 @@ pub fn commit_matches(a: &str, b: &str) -> bool {
 /// `HOME`); otherwise returns a snapshot even if no check has run yet.
 #[cfg(any(target_os = "macos", test, feature = "spec-anchors"))]
 fn persisted_claims_stage(persisted: &str) -> bool {
-    persisted.trim_start().starts_with("staged ") || persisted.contains("applies on next launch")
+    // Every phrasing that asserts "a build is staged" must be listed here, or a
+    // stale line survives `reconcile_status_outcome` and keeps advertising a
+    // stage that no longer exists. "applies on next launch" is RETIRED wording
+    // and stays only because a status.toml written by an older build still says
+    // it; "ready to apply" is what the stage/backoff lanes write now.
+    let persisted = persisted.trim_start();
+    persisted.starts_with("staged ")
+        || persisted.contains("applies on next launch")
+        || persisted.contains("ready to apply")
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1478,6 +1596,19 @@ mod commit_match_tests {
                 53,
                 None,
                 "staged 0.54 (build 54) — applies on next launch",
+                false,
+            ),
+            // The wording the stage/backoff lanes write NOW. It makes the same
+            // claim as the retired "applies on next launch" phrasing, and the
+            // claim — not the phrasing — is what must be suppressed once the
+            // marker is gone; otherwise renaming the line would have quietly
+            // resurrected stale staged prose on every machine.
+            (
+                53,
+                53,
+                None,
+                "skipping re-stage of build 54 for another 5m; NOT skipping apply: \
+                 staged 0.54 (build 54) is verified and ready to apply",
                 false,
             ),
         ];

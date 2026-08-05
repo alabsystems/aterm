@@ -173,9 +173,9 @@ impl Diagnosis {
 /// Both run the identical [`walk`], so a diagnosis and a resolution can never
 /// disagree about the chain.
 #[must_use]
-pub fn diagnose(support_dir: &Path) -> Diagnosis {
+pub fn diagnose(support_dir: &Path, owner: &str, repo: &str) -> Diagnosis {
     let mut probes = Vec::new();
-    let resolved = walk(support_dir, &mut probes).map(|(_, source)| source);
+    let resolved = walk(support_dir, owner, repo, &mut probes).map(|(_, source)| source);
     Diagnosis { resolved, probes }
 }
 
@@ -186,9 +186,13 @@ pub fn diagnose(support_dir: &Path) -> Diagnosis {
 /// (resolve, then diagnose because it returned `None`) would re-spawn `security`
 /// and `gh` on every unprovisioned check — the exact machines that get checked
 /// forever without ever succeeding.
-pub fn resolve_or_diagnose(support_dir: &Path) -> Result<(String, &'static str), Diagnosis> {
+pub fn resolve_or_diagnose(
+    support_dir: &Path,
+    owner: &str,
+    repo: &str,
+) -> Result<(String, &'static str), Diagnosis> {
     let mut probes = Vec::new();
-    match walk(support_dir, &mut probes) {
+    match walk(support_dir, owner, repo, &mut probes) {
         Some(hit) => Ok(hit),
         None => Err(Diagnosis {
             resolved: None,
@@ -234,21 +238,42 @@ impl Probe {
             Self::Supplied(_) => ProbeOutcome::Supplied,
         }
     }
+
+    fn supplied(self) -> Option<String> {
+        match self {
+            Self::Supplied(token) => Some(token),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the update source has been pointed away from the compiled-in channel.
+///
+/// Only an overridden source can be a repo that requires authentication; the
+/// compiled-in default is the public channel by construction. Uses the same
+/// [`crate::source::Source`] precedence the fetcher itself uses, so the token
+/// chain can never disagree with where the bytes are actually coming from.
+fn needs_ambient_credential(owner: &str, repo: &str) -> bool {
+    owner != crate::source::DEFAULT_OWNER || repo != crate::source::DEFAULT_REPO
 }
 
 /// Resolve the token, or `None` when none is provisioned (the updater then stays
 /// idle rather than hammering the API unauthenticated against a private repo).
 /// `support_dir` is `…/Library/Application Support/aterm` (the `Updates` parent).
-pub fn resolve(support_dir: &Path) -> Option<String> {
-    resolve_with_source(support_dir).map(|(t, _)| t)
+pub fn resolve(support_dir: &Path, owner: &str, repo: &str) -> Option<String> {
+    resolve_with_source(support_dir, owner, repo).map(|(t, _)| t)
 }
 
 /// [`resolve`], additionally reporting WHICH source supplied the token — a short
 /// operator-facing label (NEVER the token itself), so loud diagnostic surfaces
 /// (`atpkg doctor`) can say where a credential came from without ever printing
 /// it. Same chain, same order, first hit wins.
-pub fn resolve_with_source(support_dir: &Path) -> Option<(String, &'static str)> {
-    walk(support_dir, &mut Vec::new())
+pub fn resolve_with_source(
+    support_dir: &Path,
+    owner: &str,
+    repo: &str,
+) -> Option<(String, &'static str)> {
+    walk(support_dir, owner, repo, &mut Vec::new())
 }
 
 /// THE resolution chain — the single walk [`resolve_with_source`] and [`diagnose`]
@@ -258,7 +283,40 @@ pub fn resolve_with_source(support_dir: &Path) -> Option<(String, &'static str)>
 /// Order: dedicated sources first — a power user's scoped Contents:read PAT wins over
 /// any broader ambient credential — then the ambient GitHub credential the machine may
 /// already have, so an already-authenticated developer needs no additional secret.
-fn walk(support_dir: &Path, probes: &mut Vec<SourceProbe>) -> Option<(String, &'static str)> {
+fn walk(
+    support_dir: &Path,
+    owner: &str,
+    repo: &str,
+    probes: &mut Vec<SourceProbe>,
+) -> Option<(String, &'static str)> {
+    // The compiled-in channel is public and readable with no credential at all —
+    // that is its entire purpose (`aterm-update-core/build.rs`). Consulting the
+    // chain for it would gather a credential nothing then uses, and the ambient
+    // rungs below would happily surface a broad developer PAT to do it. So the
+    // chain runs ONLY when the source has been pointed somewhere else, which is
+    // the only way to reach a repo that can actually require authentication.
+    //
+    // A token is still usable on the default channel for anonymous API rate
+    // limits — but that is opt-in, via the explicit `$ATERM_UPDATE_TOKEN` rung,
+    // never something ambient we go looking for.
+    //
+    // LIMIT, deliberate: "pointed somewhere else" means the ENV override only
+    // (`ATERM_UPDATE_OWNER`/`_REPO`). This crate cannot see the GUI's `[update]
+    // owner/repo`, which the GUI threads into `Source::resolve` itself
+    // (aterm-gui/src/lib.rs, app_native.rs) — reading it here would invert the
+    // crate dependency. A machine that repoints at a PRIVATE repo via the CONFIG
+    // FILE must therefore also export `$ATERM_UPDATE_TOKEN`; the ambient rungs
+    // will not be consulted for it. The env override needs nothing extra.
+    if !needs_ambient_credential(owner, repo) {
+        // Record the one consulted rung either way, so `diagnose` still describes
+        // the chain that actually ran rather than an empty one.
+        let probe = probe_env("ATERM_UPDATE_TOKEN");
+        probes.push(SourceProbe {
+            source: "$ATERM_UPDATE_TOKEN",
+            outcome: probe.outcome(),
+        });
+        return probe.supplied().map(|token| (token, "$ATERM_UPDATE_TOKEN"));
+    }
     let chain: [(&'static str, &dyn Fn() -> Probe); 6] = [
         ("$ATERM_UPDATE_TOKEN", &|| probe_env("ATERM_UPDATE_TOKEN")),
         ("keychain item aterm-update-token", &probe_keychain),
@@ -296,35 +354,32 @@ fn probe_env(key: &str) -> Probe {
     probe_raw(&raw.to_string_lossy(), &format!("${key}"))
 }
 
-/// Last-resort fallback: the `gh` CLI's stored token (`gh auth token`). Tries `gh` on
-/// `PATH` then the two Homebrew/local install prefixes, because a Finder-launched
-/// `.app` inherits a minimal `PATH` that usually lacks `/opt/homebrew/bin`. Returns
-/// `None` if `gh` is absent, unauthenticated, or prints a malformed token.
+/// Last-resort fallback: the `gh` CLI's stored token (`gh auth token`), found on
+/// `PATH`. Returns `None` if `gh` is absent, unauthenticated, or prints a malformed
+/// token.
+///
+/// Deliberately does NOT probe `/opt/homebrew/bin` or `/usr/local/bin` by hand. Those
+/// prefixes were here because a Finder-launched `.app` inherits a minimal `PATH`, but
+/// hard-coding one package manager's macOS prefixes is the wrong shape for a
+/// cross-platform product, and this whole chain is now reached only when the update
+/// source has been pointed away from the public channel ([`walk`]) — a deliberate act
+/// by someone who can also export a token or run from a shell with a real `PATH`.
 // Skip: same audited display/validation byte_loss class as `probe_env`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn probe_gh_cli() -> Probe {
     // Distinguish "gh isn't installed" from "gh is installed but not logged in" —
     // the two need different remedies (`brew install gh` vs `gh auth login`), and
     // only the diagnosis surface can tell the user which one applies.
-    let mut found_gh = false;
-    for gh in ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
-        let Ok(out) = Command::new(gh).args(["auth", "token"]).output() else {
-            continue; // gh not found at this path
-        };
-        found_gh = true;
-        if !out.status.success() {
-            continue;
-        }
-        match probe_raw(&String::from_utf8_lossy(&out.stdout), "gh auth token") {
-            Probe::Supplied(t) => return Probe::Supplied(t),
-            Probe::Rejected(why) => return Probe::Rejected(why),
-            Probe::Absent => {}
-        }
+    let Ok(out) = Command::new("gh").args(["auth", "token"]).output() else {
+        return Probe::Absent; // gh not on PATH
+    };
+    if !out.status.success() {
+        return Probe::Rejected("`gh` is installed but has no token — run `gh auth login`");
     }
-    if found_gh {
-        Probe::Rejected("`gh` is installed but has no token — run `gh auth login`")
-    } else {
-        Probe::Absent
+    match probe_raw(&String::from_utf8_lossy(&out.stdout), "gh auth token") {
+        Probe::Supplied(t) => Probe::Supplied(t),
+        Probe::Rejected(why) => Probe::Rejected(why),
+        Probe::Absent => Probe::Rejected("`gh` is installed but has no token — run `gh auth login`"),
     }
 }
 
@@ -789,13 +844,18 @@ mod tests {
         // how far the chain ran. This is the property that makes the diagnostic
         // trustworthy: it describes the executed chain, not a second copy of it.
         let dir = support("diag");
-        let d = diagnose(&dir);
-        let r = resolve_with_source(&dir);
+        let d = diagnose(&dir, crate::source::DEFAULT_OWNER, crate::source::DEFAULT_REPO);
+        // The DEFAULT (public) channel: one rung. Use a deliberately non-default
+        // slug where the full chain is the subject.
+        let r = resolve_with_source(&dir, crate::source::DEFAULT_OWNER, crate::source::DEFAULT_REPO);
         assert_eq!(d.resolved, r.as_ref().map(|(_, s)| *s));
         assert_eq!(d.is_provisioned(), r.is_some());
         // …and the single-walk combinator agrees with both, so the caller that must
         // explain a failure never has to walk (and re-spawn `security`/`gh`) twice.
-        match (resolve_or_diagnose(&dir), &r) {
+        match (
+            resolve_or_diagnose(&dir, crate::source::DEFAULT_OWNER, crate::source::DEFAULT_REPO),
+            &r,
+        ) {
             (Ok((_, source)), Some((_, expected))) => assert_eq!(source, *expected),
             (Err(diagnosis), None) => {
                 assert_eq!(diagnosis.probes, d.probes);
@@ -817,11 +877,42 @@ mod tests {
                 );
             }
             None => {
-                assert_eq!(d.probes.len(), 6, "an unprovisioned machine consults all 6");
+                // On the DEFAULT (public) channel the walk consults exactly one
+                // rung — the explicit env token — and never goes looking for an
+                // ambient credential the public channel cannot need. Only an
+                // env-overridden source opens the full six-rung chain.
+                let expected = 1;
+                assert_eq!(
+                    d.probes.len(),
+                    expected,
+                    "unprovisioned machine consults {expected} rung(s) for this source"
+                );
                 assert!(d.probes.iter().all(|p| p.outcome != ProbeOutcome::Supplied));
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate is per-TARGET, not global. atpkg reads its signed index from the
+    /// PRIVATE publish account, so it must still get the full ambient chain even
+    /// though the app's default update channel is public. Gating on "is the update
+    /// channel overridden?" instead of "which repo is this token for?" silently
+    /// starved atpkg of the 0600 file token.
+    #[test]
+    fn private_publish_account_still_gets_the_full_chain() {
+        assert!(
+            !needs_ambient_credential(crate::source::DEFAULT_OWNER, crate::source::DEFAULT_REPO),
+            "the compiled-in public channel needs no ambient credential"
+        );
+        assert!(
+            needs_ambient_credential(crate::PUBLISH_OWNER, crate::PUBLISH_REPO)
+                || crate::PUBLISH_OWNER == crate::source::DEFAULT_OWNER,
+            "the private publish account must reach the ambient rungs"
+        );
+        assert!(
+            needs_ambient_credential("someone-else", crate::source::DEFAULT_REPO),
+            "any repointed source needs the full chain"
+        );
     }
 
     #[test]
