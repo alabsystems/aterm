@@ -5480,6 +5480,11 @@ struct WindowState {
     /// forward typing AND a rarity roll, then fades out completely (sometimes with
     /// a star wink or heart meow). Stamped on the input thread, ticked each frame.
     cursor_cat: crate::kitty_cursor::CursorCat,
+    /// The full-body PET companion's brain (`cursor_trail_style = "rainbow
+    /// kitty pet"`). Unlike `cursor_cat` it owns a POSITION, so it persists
+    /// per-window across frames whether or not it is currently drawn — the pet
+    /// has to remember where it was standing, and how long it has been quiet.
+    cursor_pet: aterm_effects::kitty_pet::PetBrain,
     /// TYPED-"kitty" summon detector (see [`crate::kitty_summon`]): a bounded
     /// rolling window of this window's recent printed keystrokes (keyed to the
     /// session they were typed into) plus the per-window summon cooldown. Fed
@@ -6232,6 +6237,47 @@ impl WindowState {
         }
     }
 
+    /// How long after this window's last CONTENT present its next one may land —
+    /// the ONE frame-pacing floor, so the site that DEFERS a frame and the sites
+    /// that later release it cannot disagree about when it is due.
+    ///
+    /// `app_default` is `App::frame_interval` (the primary monitor's period); a
+    /// window that knows its own monitor's refresh uses that instead.
+    ///
+    /// Two floors, one law:
+    /// * IDLE — a full refresh period. Bulk output coalesces to the display's
+    ///   cadence; presenting faster is wasted CPU/GPU no panel can show.
+    /// * `input_hot` — HALF a period. A keystroke's echo is the one frame a human
+    ///   is actively waiting on, so it is allowed to land mid-interval and still
+    ///   catch the next vblank. Half, not zero: an unbounded bypass outruns vsync
+    ///   under a TUI repaint storm, exhausts the Metal drawable pool (no Mailbox
+    ///   on macOS) and parks the event loop in `nextDrawable` with the next keyDown
+    ///   queued behind it — the bypass would buy a park, not a frame.
+    ///
+    /// WHY THIS IS A METHOD. The bypass used to be applied at ONE of the three
+    /// sites that need it: `Wake::Output` admitted a hot echo at the half floor,
+    /// but the deferral it fell back to — the `about_to_wait` deadline and the
+    /// `new_events` flush that consumes it — both re-derived a FULL interval. So an
+    /// echo that missed the half floor by a microsecond did not wait the ~half
+    /// period the policy promises; it waited the whole one, roughly doubling the
+    /// added latency on precisely the frame the user is watching their own
+    /// keystroke appear in (~8 ms of it on a 60 Hz panel).
+    ///
+    /// The floor is NOT constant across a deferral, and does not need to be.
+    /// `input_hot` retires on the `INPUT_HOT_WINDOW` deadline checked at the next
+    /// content present, and `redraw_pending` is not cleared by a present, so an
+    /// unrelated frame CAN land mid-deferral and move both `last_present_at` and the
+    /// hot state. What makes the three sites agree is that the deadline is not a
+    /// promise made once: `about_to_wait` re-derives it from this same method on
+    /// every park, so a floor that changed under a deferral is simply re-armed at
+    /// the new value on the very next turn. The worst case is one extra wake that
+    /// finds the flush test not yet true and re-parks — never a frame left pending,
+    /// because the deferral outlives the wake and the next park re-arms it.
+    fn content_pace_floor(&self, app_default: Duration) -> Duration {
+        let interval = self.frame_interval.unwrap_or(app_default);
+        if self.input_hot { interval / 2 } else { interval }
+    }
+
     /// SUCCESS — record any frame that genuinely reached the platform present
     /// seam, regardless of whether it carried terminal content. A successful
     /// effect-only, native, or heterogeneous frame is sufficient to acknowledge
@@ -6305,6 +6351,16 @@ impl WindowState {
             // ticks them there, so a split must keep their cadence armed —
             // without it a correct emitter renders one frame and freezes.
             || (animate_cursor_cat && self.cursor_cat.is_active())
+            // The PET is a resident, so its cadence gate is `needs_frames()`
+            // (something is moving), never `is_active()` (a cat exists) — see
+            // the module note on idle-to-zero. Under reduced motion it never
+            // animates at all, so the demotion also drops the wake train.
+            // No `!is_split()`: the composed path ticks the brain and draws the
+            // pet in the focused pane (`compose_pet_companion`), so a split
+            // needs the cadence exactly as much as a single pane does — the
+            // same "a correct emitter renders one frame and freezes" rule the
+            // word-decoration arm above carries.
+            || (animate_cursor_cat && self.cursor_pet.needs_frames())
             || self.word_decos.is_active(now)
             || (!self.is_split()
                 && (self.cursor_rainbow.is_active()
@@ -6739,6 +6795,7 @@ impl WindowState {
             cursor_comet: crate::cursor_comet::CursorComet::default(),
             cursor_phaser: crate::cursor_phaser::CursorPhaser::default(),
             cursor_cat: crate::kitty_cursor::CursorCat::default(),
+            cursor_pet: aterm_effects::kitty_pet::PetBrain::default(),
             kitty_summon: crate::kitty_summon::TypedKittySummon::default(),
             kitty_sing: aterm_effects::kitty_sing::KittySing::default(),
             music_notes: aterm_effects::kitty_sing::MusicNotes::default(),
@@ -11623,15 +11680,18 @@ impl ApplicationHandler<Wake> for App {
                     }
                 }
                 // Frame-cap boundary reached: flush the coalesced bulk-output redraw
-                // deferred by the soft cap in the `Wake::Output` handler. Paced by
-                // THIS window's monitor refresh when known (app default otherwise).
-                if ws.redraw_pending
-                    && ws.last_present_at.is_some_and(|t| {
-                        now.duration_since(t) >= ws.frame_interval.unwrap_or(frame_interval)
-                    })
-                {
-                    ws.redraw_pending = false;
-                    dirty = true;
+                // deferred by the soft cap in the `Wake::Output` handler. Released at
+                // the SAME `content_pace_floor` that deferred it — so a keystroke echo
+                // waits the half interval its bypass promised, not the full one.
+                if ws.redraw_pending {
+                    let pace_floor = ws.content_pace_floor(frame_interval);
+                    if ws
+                        .last_present_at
+                        .is_some_and(|t| now.duration_since(t) >= pace_floor)
+                    {
+                        ws.redraw_pending = false;
+                        dirty = true;
+                    }
                 }
                 if dirty {
                     to_redraw.push(*id);
@@ -12085,14 +12145,16 @@ impl ApplicationHandler<Wake> for App {
                 continue;
             }
             // Frame-cap: a bulk-output redraw was deferred; arm the boundary at
-            // `last_present + MIN_FRAME_INTERVAL` so `new_events` flushes it.
+            // `last_present + content_pace_floor` so `new_events` flushes it.
             // (`redraw_pending` is only set after a present, so `last_present` is
-            // always `Some` here — the deadline is always armable.) Paced by THIS
-            // window's monitor refresh when known.
+            // always `Some` here — the deadline is always armable.) The floor is the
+            // SAME one the `Wake::Output` deferral and the `new_events` flush use, so
+            // a keystroke echo is woken at its half interval instead of sleeping
+            // through to a full one.
             if ws.redraw_pending
                 && let Some(t) = ws.last_present_at
             {
-                let d = t + ws.frame_interval.unwrap_or(frame_interval);
+                let d = t + ws.content_pace_floor(frame_interval);
                 fold_owned_deadline(
                     &mut deadline,
                     &mut deadline_owner,
@@ -12939,13 +13001,17 @@ impl ApplicationHandler<Wake> for App {
                     // keyDown behind the park ate up to ~84ms. At ≥ half the
                     // refresh the echo still catches the next vblank; past the
                     // pool the bypass only ever bought a park.
-                    let hot_floor = ws.frame_interval.unwrap_or(frame_interval) / 2;
-                    let paced_ok = |floor: std::time::Duration| {
-                        ws.last_present_at
-                            .is_none_or(|t| now.duration_since(t) >= floor)
-                    };
-                    if (ws.input_hot && paced_ok(hot_floor))
-                        || paced_ok(ws.frame_interval.unwrap_or(frame_interval))
+                    //
+                    // ONE floor, resolved through `content_pace_floor` — the SAME
+                    // call the `about_to_wait` deadline and the `new_events` flush
+                    // make. When this admits the frame nothing is deferred; when it
+                    // does not, the frame is released at exactly this floor rather
+                    // than at a full interval those two sites used to re-derive
+                    // independently (see the method's own note).
+                    let floor = ws.content_pace_floor(frame_interval);
+                    if ws
+                        .last_present_at
+                        .is_none_or(|t| now.duration_since(t) >= floor)
                     {
                         ws.redraw_pending = false;
                         w.request_redraw();
@@ -14042,6 +14108,17 @@ impl ApplicationHandler<Wake> for App {
                 // swapchain at the old quantized size, so the compositor rescaled
                 // the frame (~1.005x, permanent softness). A surface reconfigure is
                 // cheap; the remainder is absorbed into theme-bg bands at present.
+                // Open the stale-frame slice BEFORE the surface reconfigure
+                // below, so it spans the whole interval in which the layer is
+                // already the new size and the newest drawable is still the old
+                // one — the interval CoreAnimation fills by rescaling the last
+                // frame onto the new bounds. `metrics` reports it as
+                // `last_/max_resize_present_ms` (+ `resize_p50/p95/p99` under
+                // `metrics percentiles`), which is how a live-drag repaint gap is
+                // checked in milliseconds rather than by eye. The `video` tap
+                // cannot answer this: its ring is allocated for one geometry and
+                // sets `resized_early_stop` on the first size change.
+                crate::metrics::note_resize_arrival();
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.win_px = Some(size);
                     // The hand is demonstrably still on the window edge RIGHT NOW.
@@ -14066,13 +14143,51 @@ impl ApplicationHandler<Wake> for App {
                 self.resize_live_drag = true;
                 self.on_resize_throttled(wid, size);
                 self.resize_live_drag = false;
+                // REPAINT IN THE SAME TURN AS THE BOUNDS CHANGE — do not merely
+                // REQUEST it. `request_redraw` only pushes onto winit's pending
+                // list, which the macOS backend drains from its
+                // `kCFRunLoopBeforeWaiting` observer; the resulting frame lands in
+                // a LATER CoreAnimation transaction than the one AppKit used to
+                // move the layer. For every drag step in between, the compositor
+                // has new bounds and an old drawable — which is precisely the
+                // window the `topLeft` anchor keeps from being a stretch, and
+                // which this keeps from existing at all. Drawing here puts the
+                // correctly-sized frame in the same turn as the resize, so the
+                // terminal tracks the window edge instead of trailing it.
+                //
+                // EXACTLY ONE FRAME PER EVENT. The retry gate is reopened and
+                // `recovery_redraw_outstanding` set FIRST, because that flag is what
+                // forces the repaint through: the RepaintKey describes screen
+                // CONTENT, not surface geometry, so a resize whose content is
+                // unchanged would otherwise early-out and never repaint at the new
+                // size. That also means the in-turn draw can never be the "cheap
+                // skip" — it is a full frame, every time — so the queued
+                // `RedrawRequested` is armed ONLY when the in-turn draw produced no
+                // present. Arming both (the obvious shape) drew the window TWICE per
+                // `Resized`, and winit does NOT coalesce `Resized` the way it
+                // coalesces redraw requests, so that was a full extra frame per mouse
+                // sample for the whole drag.
+                //
+                // `capture_present_serial` is the existing "a frame genuinely reached
+                // the platform present seam" counter (bumped by `on_present_succeeded`),
+                // so it answers "did that draw land?" without a new signal. It stays
+                // `None` for an unknown window, which compares unequal and takes the
+                // safe branch.
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    let window = ws.os_window.clone();
-                    let _ = rearm_present_and_request(&mut ws.present_retry, true, || {
-                        if let Some(window) = window {
-                            window.request_redraw();
-                        }
-                    });
+                    let _ = ws.present_retry.on_external_stimulus();
+                    ws.present_retry.recovery_redraw_outstanding = true;
+                }
+                let presented_before = self.windows.get(&wid).map(|ws| ws.capture_present_serial);
+                self.redraw_window(wid);
+                let presented_after = self.windows.get(&wid).map(|ws| ws.capture_present_serial);
+                if presented_after == presented_before
+                    && let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone())
+                {
+                    // The in-turn draw presented nothing — no present target yet (a
+                    // `Resized` can land between window creation and surface attach),
+                    // a backend rebuild in flight, or a dropped acquire. Fall back to
+                    // the queued redraw that covered this before.
+                    window.request_redraw();
                 }
             }
             // HiDPI follow-through: the window moved to a display with a different

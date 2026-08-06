@@ -749,6 +749,14 @@ impl App {
                     let effective_colorspace = self
                         .apprt
                         .window_set_surface_colorspace(&window, surface_colorspace);
+                    // LIVE-RESIZE ANCHOR: the same freshly-attached CAMetalLayer
+                    // keeps CoreAnimation's default `contentsGravity` (`resize`),
+                    // which STRETCHES the last presented frame onto the new bounds
+                    // for every drag step we have not repainted yet — text smears,
+                    // then snaps back. Pin it to `topLeft` so an un-repainted frame
+                    // stays at 1:1 where it was drawn. Once per window, here,
+                    // because the layer does not exist before the surface does.
+                    self.apprt.window_anchor_surface_top_left(&window);
                     // M5 TRUE VIBRANCY: with the wgpu CAMetalLayer now attached,
                     // install the NSVisualEffectView backdrop + flip the window /
                     // Metal-layer opacity when `background_opacity < 1.0`, so this

@@ -237,6 +237,16 @@ pub(crate) struct DimsSnapshot {
     pub(crate) present_retry_count: u32,
     pub(crate) present_retry_remaining: u32,
     pub(crate) present_retry_in_ms: Option<u64>,
+    /// The GPU swapchain layer's live presentation state, where the platform has
+    /// such a layer: `(contentsGravity, contentsScale, contentsAreFlipped)`.
+    ///
+    /// The live-resize ANCHOR is the one thing in the resize path that no
+    /// in-process instrument can score — the artifact it prevents is a compositor
+    /// rescale that happens after aterm's frame reaches the WSI. This reports
+    /// whether the anchor is in effect, which is both the check and the regression
+    /// guard: the layer is owned by `raw-window-metal`, whose docs reserve the right
+    /// to overwrite common `CALayer` properties.
+    pub(crate) layer_presentation: Option<(String, f64, bool)>,
 }
 
 /// Snapshot the current active engine + PTY master + id for one request.
@@ -8696,6 +8706,24 @@ mod tests {
             Err("ERR usage: resize <r> <c>\n".to_string())
         );
         assert_eq!(parse_resize("x y"), Err("ERR bad args\n".to_string()));
+    }
+
+    /// The `px` form must NOT be parsed as a cell geometry.
+    ///
+    /// `resize px <w> <h>` exists because the cell form cannot reach the live-drag
+    /// path: it applies the grid first and echoes the pixel size after, so the
+    /// window event arrives with the columns already correct and the width throttle
+    /// sees no reflow. Routing `px` through `parse_resize` would silently reinstate
+    /// exactly that — and worse, a plausible pixel size like `1400 900` is a VALID
+    /// cell geometry only by accident of the range check, so the mistake would not
+    /// announce itself. Pin the discrimination at the parser.
+    #[test]
+    fn resize_px_is_not_a_cell_geometry() {
+        // Whatever `px …` means, it is never "30 rows by 100 cols".
+        assert!(parse_resize("px 1400 900").is_err());
+        // A pixel pair that is ALSO in cell range must still not be mistaken for
+        // one: it is the `px` token, not the magnitudes, that decides.
+        assert!(parse_resize("px 100 40").is_err());
     }
 
     /// `tab` parses each form to its `TabAction`; the actual App mutation happens on

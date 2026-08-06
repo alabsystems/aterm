@@ -84,6 +84,72 @@ pub(crate) trait AppRt {
         cs: SurfaceColorspace,
     ) -> Option<SurfaceColorspace>;
 
+    /// LIVE-RESIZE ANCHOR: stop the compositor from RESCALING the last presented
+    /// frame while the window is being dragged.
+    ///
+    /// wgpu (via `raw-window-metal`) does not render into the view's own backing
+    /// layer — it installs a `CAMetalLayer` as a SUBLAYER and keeps its frame in
+    /// sync with the super layer through a KVO observer on `bounds`. That layer
+    /// keeps CoreAnimation's default `contentsGravity` (`resize`), and
+    /// `raw-window-metal` deliberately leaves it there ("masks / alleviates issues
+    /// with resizing", `observer.rs`).
+    ///
+    /// For a terminal that default is exactly wrong. Every step of a live drag
+    /// changes the layer's bounds inside AppKit's own CoreAnimation transaction,
+    /// while our next present lands in a LATER one — so for the frames in between,
+    /// the compositor stretches the previous drawable onto the new bounds. Text
+    /// rasterized for one pixel size and then non-uniformly rescaled is the
+    /// smeared, shredded look the drag shows, and it snaps back the moment a real
+    /// frame arrives. Anchoring at the top-left instead makes a not-yet-repainted
+    /// frame stay at 1:1 exactly where it was drawn — the content sits still and
+    /// the newly exposed strip is simply uncovered until the next present fills
+    /// it, which is the behaviour iTerm2 gets from owning its view's layer.
+    ///
+    /// The cost is confined to the frames we have not repainted yet, and it is a
+    /// scale-factor change (dragging a window between a Retina and a non-Retina
+    /// display) that pays it: `raw-window-metal` syncs `contentsScale` from the
+    /// root layer immediately, and gravity is computed on the LOGICAL size
+    /// (`physical / contentsScale`), so until the next frame lands a stale image
+    /// reads at the WRONG size rather than merely soft — 2x oversized and cropped
+    /// to the anchored corner going Retina→non-Retina, half-sized going the other
+    /// way. That is one artifact, for one frame, on a rare event, traded against a
+    /// continuous artifact on a very common one. Upstream keeps the stretching
+    /// default precisely to blur over that case; a terminal would rather the text
+    /// it is showing be the right size than smoothly the wrong one.
+    ///
+    /// This deliberately goes against `raw-window-metal`'s documented request that
+    /// consumers not set `contentsGravity` on the layer it owns (its `lib.rs`
+    /// "Semantics" note). The reasoning there is that layer presentation belongs to
+    /// the windowing library — but here aterm IS the windowing integration, it
+    /// already sets `colorspace` and `opaque` on this same layer through
+    /// [`layer_colorspace`], and the property is never written back by the crate's
+    /// KVO observer (which syncs only `bounds` and `contentsScale`), so the value
+    /// set at attach stands for the layer's life.
+    ///
+    /// Applied ONCE per window, right after the wgpu surface (and therefore the
+    /// layer) exists. Best-effort and a no-op off macOS.
+    fn window_anchor_surface_top_left(&self, window: &Window);
+
+    /// READ BACK the live presentation state of the window's GPU swapchain layer:
+    /// `(contents_gravity, contents_scale, contents_are_flipped)`.
+    ///
+    /// [`AppRt::window_anchor_surface_top_left`] is the one change in the resize
+    /// path that NO in-process instrument can score, because the artifact it
+    /// prevents happens in the compositor, after aterm has submitted its frame —
+    /// `image`/`video`/`metrics` all stop at the WSI boundary by construction. What
+    /// IS observable, and what this exposes, is whether the anchor is actually in
+    /// effect on the live layer.
+    ///
+    /// That turns an unverifiable claim into a checkable one and, more usefully,
+    /// into a regression guard: the layer belongs to `raw-window-metal`, whose docs
+    /// reserve the right to overwrite common `CALayer` properties, and wgpu
+    /// reconfigures the surface on every resize. If either ever reverts the gravity,
+    /// `dims` says so instead of the smear quietly coming back.
+    ///
+    /// `None` where there is no such layer (off macOS, CPU backend, no window).
+    /// Read-only: it must never be the thing that establishes the state it reports.
+    fn window_surface_presentation(&self, window: &Window) -> Option<(String, f64, bool)>;
+
     /// M5 TRUE VIBRANCY: install / update / remove the window-level
     /// `NSVisualEffectView` blurred backdrop and flip the window + CAMetalLayer to
     /// non-opaque so the GPU's translucent (PostMultiplied) present composites over
@@ -477,6 +543,20 @@ impl AppRt for AppRtMacOS {
         layer_colorspace::set(window, cs.cg_name()).then_some(cs)
     }
 
+    /// Pin the CAMetalLayer's `contentsGravity` to `topLeft` so a live drag never
+    /// shows a rescaled stale frame (see [`AppRt::window_anchor_surface_top_left`]).
+    /// Best-effort like the other chrome methods: no AppKit window / no metal
+    /// layer → a silent no-op.
+    fn window_anchor_surface_top_left(&self, window: &Window) {
+        layer_colorspace::anchor_contents_top_left(window);
+    }
+
+    /// Read back the CAMetalLayer's live gravity / scale / flip. See
+    /// [`AppRt::window_surface_presentation`].
+    fn window_surface_presentation(&self, window: &Window) -> Option<(String, f64, bool)> {
+        layer_colorspace::read_contents_presentation(window)
+    }
+
     /// Install / update / remove the window-level `NSVisualEffectView` and flip the
     /// window + CAMetalLayer opacity for M5 true vibrancy. All the AppKit work lives
     /// in the `vibrancy` module (hand-rolled `msg_send`, like `layer_colorspace`).
@@ -866,6 +946,20 @@ impl AppRt for AppRtLinux {
         }
     }
 
+    /// INTENTIONAL no-op: `contentsGravity` is a CoreAnimation concept, and the
+    /// stale-frame rescale it defends against is specific to the `CAMetalLayer`
+    /// SUBLAYER `raw-window-metal` installs. The Vulkan/Wayland path presents the
+    /// swapchain directly, so there is no intermediate layer to anchor.
+    /// Documented rather than silently empty.
+    fn window_anchor_surface_top_left(&self, _window: &Window) {}
+
+    /// No CoreAnimation layer to read: the Vulkan/Wayland path presents the
+    /// swapchain directly, so there is no intermediate layer whose gravity could
+    /// rescale a stale frame — and therefore nothing to report.
+    fn window_surface_presentation(&self, _window: &Window) -> Option<(String, f64, bool)> {
+        None
+    }
+
     /// INTENTIONAL no-op: the `NSVisualEffectView` behind-window blur is an AppKit
     /// concept. The Linux analogue is winit `set_transparent` / `set_blur` plus a
     /// Wayland `blur` protocol (KDE) / GTK4 backdrop, deferred with the rest of the
@@ -1209,6 +1303,105 @@ mod layer_colorspace {
             let _: () = msg_send![layer, setColorspace: cs];
             CGColorSpaceRelease(cs);
             true
+        }
+    }
+
+    /// LIVE-RESIZE ANCHOR: set the window's CAMetalLayer `contentsGravity` to
+    /// `topLeft`, so a bounds change the app has not yet repainted leaves the
+    /// previous drawable at 1:1 in place instead of stretching it to fit (see
+    /// [`super::AppRt::window_anchor_surface_top_left`] for the full rationale).
+    /// Best-effort: no metal layer → a silent no-op. Shares [`find_metal_layer`]
+    /// with the colour-space tagger.
+    pub(crate) fn anchor_contents_top_left(window: &Window) {
+        // SAFETY: the `CALayerContentsGravity` constants are stable exported
+        // QuartzCore symbols; these are reads of immutable `CFStringRef` globals,
+        // never freed or mutated here.
+        #[link(name = "QuartzCore", kind = "framework")]
+        unsafe extern "C" {
+            /// Pins unrescaled contents to the layer's MAXIMUM-Y left corner.
+            static kCAGravityTopLeft: *const AnyObject;
+            /// Pins unrescaled contents to the layer's MINIMUM-Y left corner.
+            static kCAGravityBottomLeft: *const AnyObject;
+        }
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            return;
+        };
+        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
+        // window's lifetime), borrowed on the main thread as AppKit requires;
+        // `contentsAreFlipped` is a side-effect-free read and
+        // `setContentsGravity:` is a plain property write that RETAINS the
+        // string, which is a framework constant that outlives us.
+        unsafe {
+            let view = h.ns_view.as_ptr() as *mut AnyObject;
+            let Some(layer) = find_metal_layer(view) else {
+                return;
+            };
+            // WHICH CORNER IS "VISUALLY TOP" IS NOT A CONSTANT — ASK THE LAYER.
+            //
+            // CoreAnimation defines these names on the layer's own Y axis, not on
+            // the screen: `CALayer.h` states "'bottom' always means Minimum Y and
+            // 'top' always means Maximum Y". winit's NSView reports
+            // `isFlipped == true` (it uses an upper-left origin), and the layer we
+            // are writing is a `raw-window-metal` SUBLAYER of that flipped view's
+            // backing layer — so assuming `kCAGravityTopLeft` is the visual top-left
+            // is exactly the kind of guess that anchors a stale frame to the WRONG
+            // edge and makes it slide during a drag instead of sitting still.
+            //
+            // `-[CALayer contentsAreFlipped]` is the API for precisely this: it
+            // reports whether contents are implicitly flipped when rendered, i.e.
+            // whether minimum-Y is the visual top. Read it and pick the constant
+            // that lands on the visual TOP-LEFT either way, which is the corner a
+            // terminal grows from.
+            let flipped: bool = msg_send![layer, contentsAreFlipped];
+            let gravity = if flipped {
+                kCAGravityBottomLeft
+            } else {
+                kCAGravityTopLeft
+            };
+            if gravity.is_null() {
+                return;
+            }
+            let _: () = msg_send![layer, setContentsGravity: gravity];
+        }
+    }
+
+    /// Read back the CAMetalLayer's live `contentsGravity`, `contentsScale` and
+    /// `contentsAreFlipped` — the state
+    /// [`anchor_contents_top_left`](Self::anchor_contents_top_left) established, so
+    /// it can be asserted rather than assumed (see
+    /// [`super::AppRt::window_surface_presentation`]). Pure reads; `None` when there
+    /// is no metal layer.
+    pub(crate) fn read_contents_presentation(window: &Window) -> Option<(String, f64, bool)> {
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            return None;
+        };
+        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
+        // window's lifetime), borrowed on the main thread as AppKit requires. Every
+        // message below is a side-effect-free property read; the returned
+        // `contentsGravity` is an autoreleased NSString we copy out immediately.
+        unsafe {
+            let view = h.ns_view.as_ptr() as *mut AnyObject;
+            let layer = find_metal_layer(view)?;
+            let gravity: *mut AnyObject = msg_send![layer, contentsGravity];
+            let gravity = if gravity.is_null() {
+                "none".to_string()
+            } else {
+                let utf8: *const std::ffi::c_char = msg_send![gravity, UTF8String];
+                if utf8.is_null() {
+                    "none".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(utf8)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            let scale: f64 = msg_send![layer, contentsScale];
+            let flipped: bool = msg_send![layer, contentsAreFlipped];
+            Some((gravity, scale, flipped))
         }
     }
 

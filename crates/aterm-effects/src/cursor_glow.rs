@@ -82,6 +82,22 @@ pub enum GlowStyle {
 
 impl GlowStyle {
     /// Parse a config string (case-insensitive); unknown → `Lumen`.
+    /// Whether this style string asks for the full-body **pet** companion
+    /// ([`crate::kitty_pet`]) rather than the flying kitty.
+    ///
+    /// A separate predicate rather than a [`GlowStyle`] variant on purpose: both
+    /// spellings resolve to [`GlowStyle::RainbowKitty`], so every style-keyed
+    /// table in the engine — the ribbon geometry, the starfield, the sound
+    /// palette, the momentum law — is untouched, and the two companions are a
+    /// pure swap at the one place that draws one.
+    #[must_use]
+    pub fn style_names_kitty_pet(s: &str) -> bool {
+        let s = s.trim();
+        ["rainbow kitty pet", "kitty pet", "pet kitty"]
+            .iter()
+            .any(|o| s.eq_ignore_ascii_case(o))
+    }
+
     pub fn parse(s: &str) -> Self {
         // Case-insensitive WITHOUT allocating (called every redraw via `glow_config`):
         // `eq_ignore_ascii_case` instead of a `to_ascii_lowercase()` heap alloc per frame.
@@ -97,7 +113,21 @@ impl GlowStyle {
         let any = |opts: &[&str]| opts.iter().any(|o| s.eq_ignore_ascii_case(o));
         if any(&["phaser"]) {
             Self::Phaser
-        } else if any(&["rainbow kitty", "nyan rainbow", "nyan", "rainbow"]) {
+        } else if any(&[
+            "rainbow kitty",
+            "nyan rainbow",
+            "nyan",
+            "rainbow",
+            // The PET spellings resolve to the SAME style: the pet swaps the
+            // companion, not the trail. The ribbon, the starfield, the chip
+            // melody and the whole sound palette are the rainbow kitty's and
+            // stay exactly as they are — only the animal riding in front of the
+            // caret changes, which is why this is a companion predicate
+            // (`style_names_kitty_pet`) and not an eleventh GlowStyle.
+            "rainbow kitty pet",
+            "kitty pet",
+            "pet kitty",
+        ]) {
             Self::RainbowKitty
         } else if any(&["sparkle", "sparkles", "phaser-sparkle", "rainbow-sparkle"]) {
             Self::Sparkle
@@ -842,8 +872,15 @@ const RAINBOW_WAKE_SNAP_CELLS: f32 = 2.25;
 /// the plume to it produced the exact inversion of the intent: an 18-key run at
 /// 320 ms/key drew a LONGER plume than the same 18 keys at 45 ms/key, because
 /// the slow run had been going six times longer. Speed is its own measurement.
-const RAINBOW_WAKE_LEN_MIN: f32 = 1.2;
-const RAINBOW_WAKE_LEN_MAX: f32 = 8.0;
+///
+/// HISTORY. 2026-08-06 (owner: "make the rainbow kitty cursor movement streak
+/// much brighter and with bigger impacts and fancy, not dim"): the resting length
+/// went 1.2 → 1.8 cells and the sprint clamp 8.0 → 11.0. 1.2 is what a LONE
+/// keystroke in a quiet terminal gets — and, because reduced motion pins the whole
+/// plume to `LEN_MIN`, it is also the entire length a reduced-motion user ever
+/// sees. It read as a nub rather than a streak.
+const RAINBOW_WAKE_LEN_MIN: f32 = 1.8;
+const RAINBOW_WAKE_LEN_MAX: f32 = 11.0;
 /// How far the nozzle may drift from the newest keystroke before the plume is
 /// considered ORPHANED and drawn not at all. Two cells: ordinary typing keeps
 /// the nozzle one cell ahead of the last glyph (plus the sub-cell ease), while a
@@ -859,15 +896,35 @@ pub const RAINBOW_WAKE_PERSIST: f32 = 0.30;
 /// actually VISIBLE. Keying the ramp to the walk bound instead left every real
 /// plume stuck in the first fifth of the ramp — a uniformly pale streak with the
 /// entire cooling story off the end of it.
-const RAINBOW_WAKE_RAMP_SPAN: f32 = 1.45;
-/// Where the walk stops, as a multiple of `L` (`e^-3.2` ≈ 4% — under the emit
-/// floor at every reachable coverage, so the plume ends by fading into the
-/// background rather than at a visible cut).
-const RAINBOW_WAKE_EXTENT: f32 = 2.2;
+///
+/// 2026-08-06: 1.45 → 1.95. The walk runs out to [`RAINBOW_WAKE_EXTENT`] × `L`, so
+/// at 1.45 the ramp COMPLETED at 1.45·L and the last third of every plume was one
+/// flat colour — the cooling story crammed into the front half with a dead tail
+/// behind it. At 1.95 of a 2.5·L walk the whole spectrum reads across ~78% of the
+/// visible streak.
+const RAINBOW_WAKE_RAMP_SPAN: f32 = 1.95;
+/// Where the walk stops, as a multiple of `L`. At 2.5 the body is at `e^-2.5` ≈
+/// 8%, which is still VISIBLE at the shipped coverage — the fade to nothing is
+/// delivered explicitly by [`RAINBOW_WAKE_FADE_OUT`], not by the exponential.
+///
+/// HISTORY. This doc used to claim `e^-3.2` ≈ 4%, "under the emit floor, so the
+/// plume ends by fading into the background rather than at a visible cut" — while
+/// the constant shipped at 2.2, where the body is at 11% and the plume ended at a
+/// coverage of ~7/255, i.e. at a visible CUT. The comment was simply false.
+/// 2026-08-06 raised it to 2.5 and added the explicit melt, which is the honest
+/// way to get what the doc always promised.
+const RAINBOW_WAKE_EXTENT: f32 = 2.5;
 /// Hard cap on emitted plume segments per frame. The walk's natural length is
 /// far under this at every cadence; the cap exists so no geometry (a huge cell,
 /// a pathological `L`) can make one frame's plume unbounded.
-const RAINBOW_WAKE_SEG_CAP: usize = 96;
+///
+/// 2026-08-06: 96 → 160. With [`RAINBOW_WAKE_LEN_MAX`] 11 and
+/// [`RAINBOW_WAKE_EXTENT`] 2.5 the natural walk wants `11 × 2.5 × (cw/seg)`
+/// segments, and the worst cell aspect (cw 9, where `seg` truncates to its 2 px
+/// floor) makes that ratio 4.5 — i.e. 124 segments. At 96 the cap would have
+/// started SILENTLY AMPUTATING the new tail on exactly the small-cell displays
+/// that need it most. This stays a RESOURCE bound, never an aesthetic one.
+const RAINBOW_WAKE_SEG_CAP: usize = 160;
 /// Segment length in device pixels (as a fraction of the cell, floored at 2 px).
 /// Small enough that the exponential reads as smooth, large enough that a full
 /// plume is a few dozen quads.
@@ -878,27 +935,76 @@ const RAINBOW_WAKE_BASE: f32 = 0.62;
 const RAINBOW_WAKE_PULSE: f32 = 0.38;
 /// Pulse decay (seconds) and gaussian half-width (cells). ~190 ms and ~0.45 of a
 /// cell: distinct puffs at a hunt-and-peck rhythm, a merged plume at speed.
-const RAINBOW_WAKE_PULSE_TAU: f32 = 0.19;
-const RAINBOW_WAKE_PULSE_W: f32 = 0.45;
+///
+/// 2026-08-06 (owner: "bigger impacts"): 0.19/0.45 → 0.22/0.60. Each keystroke now
+/// lights ~33% more of the plume's length and lingers ~16% longer, so a real
+/// cadence overlaps its beats into one bright body instead of visibly pulsing dark
+/// between keys. Both are pure WEIGHT terms inside `w`, which
+/// `RAINBOW_WAKE_BASE + RAINBOW_WAKE_PULSE == 1` bounds by construction, so
+/// neither can lift a pixel past [`RAINBOW_WAKE_COV`].
+const RAINBOW_WAKE_PULSE_TAU: f32 = 0.22;
+const RAINBOW_WAKE_PULSE_W: f32 = 0.60;
 /// Peak coverage at the nozzle (premultiplied 0..255 scale) before the
 /// throttle/momentum/intensity scaling. It may sit well above the ribbon's
 /// [`RAINBOW_OCCUPIED_COV_CAP`] — that cap bounds the CONTINUOUS under-ink body a
 /// whole line of glyphs sits on, whereas this light never touches a glyph at
 /// all: it lands in the leading, where the only thing it can wash out is empty
 /// background.
-const RAINBOW_WAKE_COV: f32 = 150.0;
+///
+/// HISTORY. 2026-08-06 (owner: "much brighter … not dim"): 150 → 180. At 150 the
+/// nozzle measured 101/255 at the shipping 0.7 intensity — 53% of the plume's OWN
+/// certified composite ceiling, with the rest of the budget simply never spent.
+/// Raising it lifts the cold and hot arms TOGETHER, which is why this rather than
+/// a momentum overdrive: `rainbow_wake_first_casual_keystroke_is_acknowledged`
+/// deliberately pins cold ≥ 0.85 × hot, and a momentum term would eat into that.
+///
+/// CEILING: 180 × (1 + [`RAINBOW_WAKE_BLOOM_GAIN`] 0.41) = 253.8, so the source
+/// assertion in `rainbow_wake_never_saturates_its_own_ramp` stays literally true
+/// with no test edit.
+const RAINBOW_WAKE_COV: f32 = 180.0;
 /// Plume THICKNESS in cells at the nozzle and at the far tail. Both are inside
 /// the inter-line leading the plume is centred on; the taper is what makes it
 /// read as a comet rather than a rule.
-const RAINBOW_WAKE_H_HEAD: f32 = 0.180;
-const RAINBOW_WAKE_H_TAIL: f32 = 0.070;
+///
+/// [`RAINBOW_WAKE_H_HEAD`] denotes the SWOLLEN MAXIMUM — the thickness a segment
+/// reaches when a keystroke beat is directly on it (see
+/// [`RAINBOW_WAKE_BEAT_FLOOR`]). Every bound in the file is written against this
+/// widest case: the last-row spine clamp reserves `half_head` from it, and
+/// `rainbow_wake_never_touches_the_glyph_band` derives its `pad` from it, so both
+/// self-scale.
+///
+/// HISTORY. 2026-08-06: 0.180/0.070 → 0.25/0.11. At 0.180 on an 8×16 cell the
+/// thickness truncated to the emitter's own `.max(2.0)` FLOOR — the plume was a
+/// literal 2 px hairline on every 1× display, which is most of why it read dim.
+/// 0.25 takes it to 4 px, doubling the emitted light AREA at zero coverage cost.
+///
+/// WHY EXACTLY A QUARTER CELL. The ribbon body keeps a QUARTER of every cell free
+/// (`max_band_h = ch − (ch/4).max(2)`), so a quarter cell is precisely the leading
+/// the ribbon guarantees it will not claim, and
+/// `rainbow_wake_rides_over_ink_and_the_ribbon_body_rides_under` measures the two
+/// against each other through this constant.
+const RAINBOW_WAKE_H_HEAD: f32 = 0.25;
+const RAINBOW_WAKE_H_TAIL: f32 = 0.11;
 /// The soft BLOOM under the plume: a wide flat halo per few segments, at this
 /// share of the segment's coverage. Gives the hard-edged core depth without
 /// blurring it — bright things stay small, big things stay dim.
-const RAINBOW_WAKE_BLOOM_GAIN: f32 = 0.30;
+///
+/// 2026-08-06: 0.30 → 0.41. The freest dial in the wake — the emitter's own
+/// `min()` against the remaining composite headroom self-protects, so raising it
+/// can only ever consume budget the ceiling has ALREADY certified. Bloom, not
+/// core, is what the eye reads as GLOWING rather than as a bright line.
+const RAINBOW_WAKE_BLOOM_GAIN: f32 = 0.41;
 /// One bloom halo per this many core segments (the bloom is broad, so it needs
 /// far fewer samples than the core to read as continuous).
-const RAINBOW_WAKE_BLOOM_STRIDE: usize = 3;
+///
+/// 2026-08-06: 3 → 2, paired with [`RAINBOW_WAKE_BLOOM_RX`] so each halo keeps its
+/// physical width. 50% more samples means consecutive blooms genuinely overlap and
+/// compound into one continuous atmosphere instead of a dotted line of beads.
+const RAINBOW_WAKE_BLOOM_STRIDE: usize = 2;
+/// The bloom's horizontal reach, as a multiple of `seg × STRIDE`. Named (it was a
+/// bare `0.75`) so stride and width retune independently — 1.15 at stride 2
+/// reproduces the shipped 2.25 × `seg` footprint at 1.5× the density.
+const RAINBOW_WAKE_BLOOM_RX: f32 = 1.15;
 /// COMPOSITE CEILING at the nozzle: the crisp core and its bloom share the same
 /// pixels and their light ADDS, so this bounds the pair.
 ///
@@ -908,7 +1014,74 @@ const RAINBOW_WAKE_BLOOM_STRIDE: usize = 3;
 /// ramp is invisible wherever the pixel saturates, so the hot half of the plume
 /// collapses into one flat white smear. Bounded here, the ramp is always the
 /// thing you see. Pinned by `rainbow_wake_never_saturates_its_own_ramp`.
-const RAINBOW_WAKE_COMPOSITE_CAP: f32 = 190.0;
+///
+/// HISTORY. 2026-08-06 (owner: "much brighter … not dim"): 190 → 228, and the pair
+/// it bounds became a STACK — core, filament, bloom, aura and shock ring all
+/// composite on the same pixels, and each now claims only what the previous
+/// claimant left.
+///
+/// At 190 this was very nearly DEAD CODE: the bloom expression picks the gain
+/// branch for every `cov < 146.2` and the maximum reachable `cov` was 144.3, so
+/// ~46 counts of certified headroom had never reached a pixel. 228 is the honest
+/// edge, not a round number: a 228-coverage nozzle over the default ground
+/// (26, 27, 38) composites without clipping any channel; at 232 red overflows and
+/// the ramp starts dying exactly where this constant exists to protect it.
+///
+/// THIS IS NOT A CONTRAST BOUND. The plume never routes through
+/// `rainbow_over_ink_coverage` and never writes the under-ink stream — it lands in
+/// the inter-line leading, where the only thing it can wash out is empty
+/// background (pinned by `rainbow_wake_never_touches_the_glyph_band`).
+const RAINBOW_WAKE_COMPOSITE_CAP: f32 = 228.0;
+
+/// BEAT SWELL — the fraction of the full thickness a QUIET stretch of plume runs
+/// at. Until 2026-08-06 a keystroke changed only BRIGHTNESS: the plume's
+/// cross-section was identical whether a key had just landed there or not. Riding
+/// the beat into the THICKNESS makes each key punch a visible bulge into the
+/// exhaust that then travels backward and relaxes — the literal reading of the
+/// owner's "bigger impacts", at zero extra quads. `beat` is 0 under reduced motion
+/// (the pulse ring is left empty), so the thickness there is a frozen constant.
+const RAINBOW_WAKE_BEAT_FLOOR: f32 = 0.78;
+/// The final share of the reach over which the plume melts to EXACTLY zero. The
+/// walk stops at `reach_px` where the body is still ~8%, i.e. at a visible CUT;
+/// this is what actually delivers the fade the [`RAINBOW_WAKE_EXTENT`] doc always
+/// claimed. Purely a downward multiplier on light the composite ceiling has
+/// already bounded, so it can only ever reduce coverage.
+const RAINBOW_WAKE_FADE_OUT: f32 = 0.22;
+/// THE FILAMENT — a thin near-white nucleus laid on the spine inside the coloured
+/// body, fading out over the hot half. Real comets have one, and CONTRAST WITHIN
+/// the effect is what reads as incandescent: a flat-coverage rect reads as a bar
+/// however bright it is.
+const RAINBOW_WAKE_FIL_STRIDE: usize = 2;
+const RAINBOW_WAKE_FIL_GAIN: f32 = 0.34;
+const RAINBOW_WAKE_FIL_FRAC: f32 = 0.38;
+const RAINBOW_WAKE_FIL_FADE: f32 = 1.6;
+const RAINBOW_WAKE_FIL_WHITE: f32 = 0.55;
+/// THE AURA — a long, flat, dim glow lying in the leading under the streak:
+/// atmosphere, where the bloom is a rim. Halos are ELLIPTICAL and `halo_weight`
+/// zeroes as soon as the VERTICAL term alone reaches 256, so a wide horizontal
+/// spread over the inter-line gap is free — the tier spends its budget on LENGTH
+/// and stays vertically inside the emitter's `ry_safe`. The stride ALSO gates the
+/// first sample (`segs >= STRIDE`), which is what proves the widest halo's
+/// bounding box can never overhang the nozzle.
+const RAINBOW_WAKE_AURA_STRIDE: usize = 6;
+const RAINBOW_WAKE_AURA_RX: f32 = 0.90;
+const RAINBOW_WAKE_AURA_RY: f32 = 2.6;
+const RAINBOW_WAKE_AURA_GAIN: f32 = 0.18;
+/// SHOCK RINGS — one expanding elliptical puff per live keystroke, thrown from the
+/// segment that key landed on. `punch = 4 × decay × (1 − decay)` peaks at decay 0.5
+/// (~150 ms after the strike), deliberately a beat LATE so the ring lights its own
+/// cooler stretch of plume once the nozzle has moved on.
+///
+/// PHOTOSENSITIVITY: a one-shot rise-and-fall envelope per keystroke at a DIFFERENT
+/// screen position each time — the same temporal class as the fresh-ink birth flash
+/// — not a periodic oscillator. It adds no entry to the luminance-frequency
+/// inventory and cannot repeat-flash a fixed area. Driven entirely off the pulse
+/// ring, which is populated only when motion is allowed, so reduced motion emits
+/// none at all.
+const RAINBOW_WAKE_SHOCK_COV: f32 = 130.0;
+const RAINBOW_WAKE_SHOCK_GROW: f32 = 1.6;
+const RAINBOW_WAKE_SHOCK_RY: f32 = 1.6;
+const RAINBOW_WAKE_SHOCK_MAX: usize = 6;
 
 /// The wake's colour at `s` (0 at the nozzle → 1 at the tail): THE RAINBOW
 /// itself — literally [`RAINBOW_BANDS`] through [`rainbow_gradient_of`], the same six
@@ -2233,14 +2406,14 @@ impl CursorGlow {
     /// [`RAINBOW_TRANSIENT_COV_CAP`] and far below the typing starfield's own peak,
     /// because a landing fires a handful at once on one spot and the owner
     /// cannot read text through bright art.
-    const GLIDE_LAND_STAR_COV: f32 = 92.0;
+    const GLIDE_LAND_STAR_COV: f32 = 118.0;
     /// Twinkle sparkles scattered at a glide landing.
     const GLIDE_LAND_SPARKLES: u8 = 5;
     /// Landing scatter reach, in cell heights.
     const GLIDE_LAND_REACH: f32 = 1.15;
     /// Landing burst life (seconds) — matched to [`Self::RAINBOW_BURST_LIFE`] so
     /// the colour stars and the sparkles die together.
-    const GLIDE_LAND_LIFE: f32 = 0.42;
+    const GLIDE_LAND_LIFE: f32 = 0.55;
     /// Most simultaneous live fast-jump STARBURSTs (oldest evicted first). Held
     /// well below [`Self::RAINBOW_JUMP_CAP`]: a burst is a fat radial payload, so a
     /// Ctrl-A/Ctrl-E MASH keeps only the freshest few landings blooming rather
@@ -2264,14 +2437,14 @@ impl CursorGlow {
     /// starburst. A short jump throws fewer (graduated by distance, floor 1);
     /// this is the ceiling. Per-burst quad cost is a closed form (stars × ~2·R
     /// scanline rows × ≤2 spans, capped by [`Self::MAX_QUADS`]).
-    const RAINBOW_BURST_STARS: usize = 4;
+    const RAINBOW_BURST_STARS: usize = 10;
     /// Starburst life (seconds): a brisk celebratory bloom-and-fade, in the same
     /// register as the ZOOM streak's `0.18..0.52` so the two read as one event.
-    const RAINBOW_BURST_LIFE: f32 = 0.42;
+    const RAINBOW_BURST_LIFE: f32 = 0.55;
     /// Twinkle stars scattered at a dissolving ribbon TERMINUS (Feature A). A
     /// small handful — enough to MELT the end, never a cloud. Count-capped by
     /// [`Self::MAX_PARTICLES`] like every other spawn.
-    const RAINBOW_TERMINUS_STARS: usize = 6;
+    const RAINBOW_TERMINUS_STARS: usize = 14;
     /// How near the last column (in cells) counts as "at the far-right margin"
     /// for the graceful end-of-line terminus dissolve.
     const RAINBOW_TERMINUS_MARGIN: usize = 1;
@@ -4055,7 +4228,7 @@ impl CursorGlow {
                 // A MODEST colour payload: the owner is simultaneously asking
                 // for less brightness, so a glide landing throws 2 burst stars
                 // where a screen-crossing jump throws the full handful.
-                stars: 2,
+                stars: 6,
                 sparkles: Self::GLIDE_LAND_SPARKLES,
             });
         }
@@ -9555,7 +9728,7 @@ impl CursorGlow {
             let reach = (0.9 + 0.09 * dist).clamp(1.1, 2.6) * geom.ch as f32;
             // Star count ramps 1 → RAINBOW_BURST_STARS across ~2..30 cells: the
             // farther the leap, the more stars scatter off the landing.
-            let stars = (1 + (dist / 10.0) as usize).clamp(1, Self::RAINBOW_BURST_STARS) as u8;
+            let stars = (1 + (dist / 3.2) as usize).clamp(1, Self::RAINBOW_BURST_STARS) as u8;
             self.rainbow.bursts.push(Starburst {
                 cx: landing.0,
                 cy: landing.1,
@@ -11101,6 +11274,22 @@ impl CursorGlow {
         let spine_y = (geom.origin_y as f32 + (hrow as f32 + 1.0) * chf)
             .min(geom.fx_bot() as f32 - half_head)
             .max(geom.fx_top() as f32 + half_head);
+        // THE OFF-GLYPH BOUND, made STRUCTURAL. `halo_weight` zeroes as soon as the
+        // VERTICAL term alone reaches 256, i.e. as soon as |dy| >= ry — so a halo
+        // centred on the spine cannot light ANY glyph centre while its ry stays
+        // inside the distance from the spine to the nearest one. That distance
+        // SHRINKS on the last row (the spine is pulled inside by `half_head`
+        // above), which is precisely the case
+        // `rainbow_wake_never_touches_the_glyph_band` does not sweep. Computing it
+        // here turns a numeric coincidence into an emitter-side invariant, and is
+        // what licenses the thicker plume and the new halo tiers.
+        let ry_safe = {
+            let oy = geom.origin_y as i32;
+            let chi = geom.ch as i32;
+            let cyi = spine_y.round() as i32;
+            let k = (((cyi - oy) as f32 / chf) - 0.5).round() as i32;
+            ((cyi - (oy + k * chi + chi / 2)).abs() as f32).max(1.0)
+        };
         // PULSE PRECOMPUTE. Every segment needs every live pulse's contribution,
         // but a pulse's POSITION and TIME DECAY do not vary along the walk — only
         // the gaussian's distance argument does. Hoisting them out turns an
@@ -11169,9 +11358,24 @@ impl CursorGlow {
             // Thickness taper (cells → device px, floored so the plume never
             // disappears into sub-pixel nothing) and the heat ramp position.
             let s = (d / (len * RAINBOW_WAKE_RAMP_SPAN)).clamp(0.0, 1.0);
-            let th = ((RAINBOW_WAKE_H_HEAD + (RAINBOW_WAKE_H_TAIL - RAINBOW_WAKE_H_HEAD) * s) * chf)
+            // BEAT SWELL: a keystroke does not merely brighten its stretch of
+            // plume, it PUNCHES it. `beat` is 0 under reduced motion (the pulse
+            // ring is left empty there), so the thickness is a frozen constant.
+            let swell = RAINBOW_WAKE_BEAT_FLOOR + (1.0 - RAINBOW_WAKE_BEAT_FLOOR) * beat;
+            let th = ((RAINBOW_WAKE_H_HEAD + (RAINBOW_WAKE_H_TAIL - RAINBOW_WAKE_H_HEAD) * s)
+                * swell
+                * chf)
                 .max(2.0) as i32;
-            let cov = (RAINBOW_WAKE_COV * w * amp).min(255.0);
+            // TAIL MELT: the walk stops at `reach_px`, where the body is still
+            // visible — a cut, not a fade. Melt the last `RAINBOW_WAKE_FADE_OUT` of
+            // the reach to exactly zero, which is what the `RAINBOW_WAKE_EXTENT`
+            // doc always claimed the exponential alone delivered.
+            let back = head_px - x as f32;
+            let edge = smoothstep01(
+                (reach_px as f32 - back) / (reach_px as f32 * RAINBOW_WAKE_FADE_OUT).max(1.0),
+            );
+            let cov = (RAINBOW_WAKE_COV * w * amp * edge).min(255.0);
+            let cxf = x as f32 + seg as f32 * 0.5;
             if cov >= 1.0 {
                 if cfg.dark_theme {
                     push_rect(
@@ -11183,28 +11387,114 @@ impl CursorGlow {
                         th,
                         premul_rgb(rainbow_wake_ramp(s), cov as u8),
                     );
+                    // ONE SHARED HEADROOM. Core, filament, bloom, aura and shock
+                    // ring composite on the SAME pixels, so each claims only what
+                    // the ceiling has left: `cov + spent <= COMPOSITE_CAP` is true
+                    // by construction at every pixel, which is exactly the property
+                    // `rainbow_wake_never_saturates_its_own_ramp` measures.
+                    let mut spent = 0.0f32;
+                    // THE FILAMENT: a thin near-white nucleus inside the coloured
+                    // body. Contrast WITHIN the effect is what reads as
+                    // incandescent — a flat rect reads as a bar however bright.
+                    if segs.is_multiple_of(RAINBOW_WAKE_FIL_STRIDE) {
+                        let fil_k = (1.0 - s * RAINBOW_WAKE_FIL_FADE).max(0.0);
+                        let fil = (cov * RAINBOW_WAKE_FIL_GAIN * fil_k)
+                            .min((RAINBOW_WAKE_COMPOSITE_CAP - cov - spent).max(0.0));
+                        if fil >= 1.0 {
+                            let fth = ((th as f32 * RAINBOW_WAKE_FIL_FRAC).round() as i32).max(1);
+                            push_rect(
+                                out,
+                                geom,
+                                x,
+                                (spine_y - fth as f32 * 0.5).round() as i32,
+                                seg,
+                                fth,
+                                premul_rgb(
+                                    lerp_rgb(
+                                        rainbow_wake_ramp(s),
+                                        0x00FF_FFFF,
+                                        RAINBOW_WAKE_FIL_WHITE,
+                                    ),
+                                    fil as u8,
+                                ),
+                            );
+                            spent += fil;
+                        }
+                    }
                     // The soft BLOOM under the core, at a stride (it is broad, so
                     // it needs far fewer samples than the core to read as
                     // continuous). Bright things stay small; big things stay dim.
                     if segs.is_multiple_of(RAINBOW_WAKE_BLOOM_STRIDE) {
-                        // Only the headroom the core left under the composite
-                        // ceiling — the same rule the fresh-ink pop's birth
-                        // flash follows.
+                        // Only the headroom the layers above left under the
+                        // composite ceiling — the same rule the fresh-ink pop's
+                        // birth flash follows.
                         let bcov = (cov * RAINBOW_WAKE_BLOOM_GAIN)
-                            .min((RAINBOW_WAKE_COMPOSITE_CAP - cov).max(0.0))
-                            as u8;
-                        if bcov > 0 {
+                            .min((RAINBOW_WAKE_COMPOSITE_CAP - cov - spent).max(0.0));
+                        if bcov >= 1.0 {
                             push_halo(
                                 halos,
                                 geom,
-                                x as f32 + seg as f32 * 0.5,
+                                cxf,
                                 spine_y,
-                                seg as f32 * RAINBOW_WAKE_BLOOM_STRIDE as f32 * 0.75,
+                                seg as f32
+                                    * RAINBOW_WAKE_BLOOM_STRIDE as f32
+                                    * RAINBOW_WAKE_BLOOM_RX,
                                 th as f32 * 1.35,
-                                premul_rgb(rainbow_wake_ramp(s), bcov),
+                                premul_rgb(rainbow_wake_ramp(s), bcov as u8),
                             );
+                            spent += bcov;
                         }
                     }
+                    // THE AURA — atmosphere, where the bloom is a rim. Gated to
+                    // start a full stride in, which is what proves its bounding box
+                    // can never overhang the nozzle.
+                    if segs >= RAINBOW_WAKE_AURA_STRIDE
+                        && segs.is_multiple_of(RAINBOW_WAKE_AURA_STRIDE)
+                    {
+                        let acov = (cov * RAINBOW_WAKE_AURA_GAIN)
+                            .min((RAINBOW_WAKE_COMPOSITE_CAP - cov - spent).max(0.0));
+                        if acov >= 1.0 {
+                            push_halo(
+                                halos,
+                                geom,
+                                cxf,
+                                spine_y,
+                                seg as f32 * RAINBOW_WAKE_AURA_STRIDE as f32 * RAINBOW_WAKE_AURA_RX,
+                                (th as f32 * RAINBOW_WAKE_AURA_RY).min(ry_safe),
+                                premul_rgb(rainbow_wake_ramp(s), acov as u8),
+                            );
+                            spent += acov;
+                        }
+                    }
+                    // SHOCK RINGS — the "bigger impacts". Empty under reduced
+                    // motion: `pulses` is populated only when motion is allowed.
+                    for &(pd, decay) in &pulses[..n_pulses.min(RAINBOW_WAKE_SHOCK_MAX)] {
+                        if ((d - pd) * cwf).abs() > seg as f32 * 0.5 {
+                            continue;
+                        }
+                        let e = 1.0 - decay;
+                        let scov = (RAINBOW_WAKE_SHOCK_COV * 4.0 * decay * e * amp * edge)
+                            .min((RAINBOW_WAKE_COMPOSITE_CAP - cov - spent).max(0.0));
+                        if scov < 1.0 {
+                            continue;
+                        }
+                        push_halo(
+                            halos,
+                            geom,
+                            cxf,
+                            spine_y,
+                            (cwf * (0.35 + RAINBOW_WAKE_SHOCK_GROW * e))
+                                .min((head_px - cxf).max(seg as f32)),
+                            (chf * RAINBOW_WAKE_H_HEAD * (0.9 + RAINBOW_WAKE_SHOCK_RY * e))
+                                .min(ry_safe),
+                            premul_rgb(rainbow_wake_ramp(s * 0.5), scov as u8),
+                        );
+                        spent += scov;
+                    }
+                    debug_assert!(
+                        cov + spent <= RAINBOW_WAKE_COMPOSITE_CAP + 1.0,
+                        "the plume's layers overspent their shared ceiling: {cov} + {spent}"
+                    );
                 } else {
                     // LIGHT ARM — the same path as a source-over DARKEN contrail.
                     // Dimmer than the additive plume because source-over
@@ -11218,10 +11508,10 @@ impl CursorGlow {
                         push_halo_over(
                             halos,
                             geom,
-                            x as f32 + seg as f32 * 0.5,
+                            cxf,
                             spine_y,
                             seg as f32 * 0.95,
-                            th as f32 * 0.62,
+                            (th as f32 * 0.62).min(ry_safe),
                             rainbow_wake_veil(alpha as u8),
                             FRESH_INK_LIGHT_VEIL_PEAK,
                         );
@@ -11426,8 +11716,18 @@ impl CursorGlow {
             );
             if matches!(cfg.style, GlowStyle::RainbowKitty)
                 && self.probed_cell_glyph(i32::from(cr), cc.saturating_add(1), geom.rows)
-                    != Some(true)
+                    == Some(false)
+                && self.probed_cell_glyph(i32::from(cr), cc.saturating_add(2), geom.rows)
+                    == Some(false)
             {
+                // FAIL-CLOSED, and it probes BOTH cells the ellipse reaches. The
+                // gate was `!= Some(true)` on cc+1 alone: fail-OPEN (an unprobed
+                // row got a bright guess) AND one cell short of its own geometry —
+                // at `LEAD_DX` 0.90 with `LEAD_RX` 1.20 the ellipse already reached
+                // cc+2. Only the star LANDING gate's `== Some(false)` posture is
+                // defensible for light thrown over cells the host may not have
+                // captured; an unprobed row now gets NO thrust at all. That is the
+                // correct failure direction — do not "fix" it back to fail-open.
                 // SPINE-GATED: no smudge at rest, real glare at speed. Squared so
                 // it stays out of the way through casual typing and arrives
                 // decisively on a genuine run.

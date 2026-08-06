@@ -930,6 +930,36 @@ pub(crate) fn parse_resize(rest: &str) -> Result<(u16, u16), String> {
 /// interactive winit `Resized` path uses `echo_to_window: false` (the window is
 /// already that size). `echo_to_window` is a transport flag, NOT a `Source` branch.
 pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    // `resize px <w> <h>` — resize the WINDOW, in physical pixels, and let the grid
+    // follow from the platform's `Resized` exactly as an edge drag does.
+    //
+    // The cell form below cannot reach the drag path: it applies the grid first and
+    // echoes the pixel size after, so the window event arrives with the columns
+    // already correct and the live-resize throttle sees no reflow. That left the
+    // width-throttle arms — coalescing, the trailing settle, the leading-edge apply
+    // — drivable only by a hand on the window edge, and therefore unmeasurable.
+    // Fire several of these back to back to reproduce a drag's event pressure.
+    if let Some(px) = rest.trim().strip_prefix("px") {
+        let mut it = px.split_whitespace();
+        let (Some(ws), Some(hs)) = (it.next(), it.next()) else {
+            return "ERR usage: resize px <w> <h>\n".to_string();
+        };
+        let (Ok(w), Ok(h)) = (ws.parse::<u32>(), hs.parse::<u32>()) else {
+            return "ERR bad args\n".to_string();
+        };
+        return match post_input_reply(
+            proxy,
+            Op::WriteInput,
+            vec![InputEvent::ResizeWindowPx {
+                width: w,
+                height: h,
+            }],
+        ) {
+            Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
+            Ok(_) => "OK\n".to_string(),
+            Err(e) => e,
+        };
+    }
     // Range-check up front (keeps the precise `ERR out of range` / usage strings),
     // then post a reply-bearing Resize through the seam. The seam re-clamps and
     // reports `RangeRejected` if somehow out of range — but a valid request here

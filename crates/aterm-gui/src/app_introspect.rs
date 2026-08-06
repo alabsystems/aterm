@@ -1700,6 +1700,9 @@ impl App {
             present_retry_count,
             present_retry_remaining,
             present_retry_in_ms,
+            layer_presentation: selected
+                .and_then(|wid| self.windows[&wid].os_window.as_ref())
+                .and_then(|w| self.apprt.window_surface_presentation(w)),
         }
     }
 
@@ -1770,6 +1773,27 @@ impl App {
             glow_cfg.style,
             cat_frame.collection_hello,
         );
+        // The PET companion. A capture is a presentation boundary, so it
+        // resolves the pet the same way the composed present does — otherwise
+        // `aterm-ctl image` on a split window would be blind to the one
+        // companion the user actually selected.
+        let pet_mode = crate::cursor_glow::GlowStyle::style_names_kitty_pet(
+            self.config.cursor_trail_style_raw(),
+        );
+        let pet_visible = pet_mode && kitty_enabled;
+        let (pane_rows, pane_cols) = panes
+            .iter()
+            .find(|(r, _)| r.session == focus)
+            .map_or((0, 0), |(r, _)| (r.rows, r.cols));
+        let pet = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+            now,
+            caret: if pet_visible { focus_cursor } else { None },
+            rows: pane_rows,
+            cols: pane_cols,
+            cell_w: cell_w.min(usize::from(u16::MAX)) as u16,
+            cell_h: cell_h.min(usize::from(u16::MAX)) as u16,
+            reduced_motion: !animate_cat,
+        });
         let ctx = crate::app_render::ComposeDecoCtx {
             panes: &panes,
             focus,
@@ -1780,8 +1804,14 @@ impl App {
             focus_cursor,
             win_focused: raw_focused,
             animate_sparkles,
-            kitty_alpha: if kitty_enabled { cat_frame.alpha } else { 0 },
+            kitty_alpha: if kitty_enabled && !pet_mode {
+                cat_frame.alpha
+            } else {
+                0
+            },
             cat_frame,
+            pet,
+            pet_visible,
             accent: glow_cfg.accent,
             cursor_color: ws.input_scratch.cursor_color,
             now,

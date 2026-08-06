@@ -285,6 +285,17 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
     let present_retry_in_ms = snapshot
         .present_retry_in_ms
         .map_or_else(|| "none".to_string(), |delay| delay.to_string());
+    // The swapchain layer's live presentation state. `none` where the platform has
+    // no such layer at all (off macOS, CPU backend, no window) — deliberately the
+    // same spelling as every other absent keyed fact here, so a driver reads it
+    // without a special case.
+    let (layer_gravity, layer_scale, layer_flipped) = snapshot
+        .layer_presentation
+        .as_ref()
+        .map_or_else(
+            || ("none".to_string(), "none".to_string(), "none".to_string()),
+            |(g, s, f)| (g.clone(), format!("{s:.2}"), f.to_string()),
+        );
     format!(
         "OK {} {} {} {} session={} cell_w={} cell_h={} font_px={:.2} window={} \
          window_rows={} window_cols={} composed_rows={} grid_w={} grid_h={} \
@@ -293,7 +304,8 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
          crop_right={} crop_top={} crop_bottom={} pad={} pad_top={} pad_bottom={} head={} \
          tab_rows={} viewers={} visible_viewers={} geometry={} \
          present_retry_state={} present_retry_count={} present_retry_remaining={} \
-         present_retry_in_ms={}\n",
+         present_retry_in_ms={} \
+         layer_gravity={} layer_scale={} layer_flipped={}\n",
         snapshot.rows,
         snapshot.cols,
         snapshot.pixel_w,
@@ -334,6 +346,9 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
         snapshot.present_retry_count,
         snapshot.present_retry_remaining,
         present_retry_in_ms,
+        layer_gravity,
+        layer_scale,
+        layer_flipped,
     )
 }
 
@@ -422,6 +437,17 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // stall could only be estimated as `redraw_total - compose - render`, mixed
         // with the post-present tail — so a regression in it moved no published number.
         let acquire = crate::metrics::acquire_wait_distribution();
+        // The live-drag STALE-FRAME window: bounds change → first frame submitted
+        // at the new size. For that interval the compositor has new bounds and an
+        // old drawable, so it shows the previous frame rescaled — the smear a drag
+        // reads as "shredded" text. The `video` tap cannot measure it (its ring is
+        // one geometry and it early-stops on the first resize), so this is the only
+        // millisecond-resolution read of it.
+        let resize = crate::metrics::resize_present_distribution();
+        // Its twin: bounds change -> the engine committing the new GRID. The text
+        // trails the window edge for exactly this long, and a width drag keeps it
+        // deliberately long (the throttle bounding scrollback rewrap).
+        let reflow = crate::metrics::resize_reflow_distribution();
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
         return format!(
             "OK n_input={} input_p50_ms={:.2} input_p95_ms={:.2} input_p99_ms={:.2} \
@@ -430,7 +456,9 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              n_key_write={} key_write_p50_ms={:.2} key_write_p95_ms={:.2} \
              key_write_p99_ms={:.2} n_pre_present={} pre_present_p50_ms={:.2} \
              pre_present_p95_ms={:.2} pre_present_p99_ms={:.2} \
-             n_acquire={} acquire_p50_ms={:.2} acquire_p95_ms={:.2} acquire_p99_ms={:.2}\n",
+             n_acquire={} acquire_p50_ms={:.2} acquire_p95_ms={:.2} acquire_p99_ms={:.2} \
+             n_resize={} resize_p50_ms={:.2} resize_p95_ms={:.2} resize_p99_ms={:.2} \
+             n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2}\n",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -455,6 +483,14 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             p(acquire, 0.50),
             p(acquire, 0.95),
             p(acquire, 0.99),
+            resize.count(),
+            p(resize, 0.50),
+            p(resize, 0.95),
+            p(resize, 0.99),
+            reflow.count(),
+            p(reflow, 0.50),
+            p(reflow, 0.95),
+            p(reflow, 0.99),
         );
     }
     if rest.trim() == "reset" {
@@ -473,6 +509,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          slow_frames={} slow_threshold_ms={:.1} \
          last_input_present_ms={:.2} max_input_present_ms={:.2} \
          last_key_write_ms={:.2} max_key_write_ms={:.2} \
+         last_resize_present_ms={:.2} max_resize_present_ms={:.2} \
+         last_resize_reflow_ms={:.2} max_resize_reflow_ms={:.2} \
          sync_armed={} sync_rel_end={} sync_rel_timeout={} sync_holding={} \
          perf_reduced={} shed_transitions={} wake_heals={} \
          last_redraw_total_ms={:.2} max_redraw_total_ms={:.2} \
@@ -510,6 +548,10 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.max_input_present_ns),
         ms(m.last_key_write_ns),
         ms(m.max_key_write_ns),
+        ms(m.last_resize_present_ns),
+        ms(m.max_resize_present_ns),
+        ms(m.last_resize_reflow_ns),
+        ms(m.max_resize_reflow_ns),
         m.sync_holds_armed,
         m.sync_releases_end,
         m.sync_releases_timeout,
@@ -576,6 +618,11 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         let (input, present, render) = crate::metrics::distributions();
         let key_write = crate::metrics::key_write_distribution();
         let pre_present = crate::metrics::pre_present_distribution();
+        // `acquire` was published by the TEXT form and omitted here, so a JSON
+        // driver could not read the drawable-park slice at all; `resize` is new.
+        // Both forms now carry the same set.
+        let acquire = crate::metrics::acquire_wait_distribution();
+        let resize = crate::metrics::resize_present_distribution();
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
         return json_ok(&format!(
             "{{\"n_input\":{},\"input_p50_ms\":{:.2},\"input_p95_ms\":{:.2},\
@@ -585,7 +632,11 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
              \"n_key_write\":{},\"key_write_p50_ms\":{:.2},\"key_write_p95_ms\":{:.2},\
              \"key_write_p99_ms\":{:.2},\"n_pre_present\":{},\
              \"pre_present_p50_ms\":{:.2},\"pre_present_p95_ms\":{:.2},\
-             \"pre_present_p99_ms\":{:.2}}}",
+             \"pre_present_p99_ms\":{:.2},\"n_acquire\":{},\
+             \"acquire_p50_ms\":{:.2},\"acquire_p95_ms\":{:.2},\
+             \"acquire_p99_ms\":{:.2},\"n_resize\":{},\
+             \"resize_p50_ms\":{:.2},\"resize_p95_ms\":{:.2},\
+             \"resize_p99_ms\":{:.2}}}",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -606,6 +657,14 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             p(pre_present, 0.50),
             p(pre_present, 0.95),
             p(pre_present, 0.99),
+            acquire.count(),
+            p(acquire, 0.50),
+            p(acquire, 0.95),
+            p(acquire, 0.99),
+            resize.count(),
+            p(resize, 0.50),
+            p(resize, 0.95),
+            p(resize, 0.99),
         ));
     }
     if command.trim() == "reset" {
@@ -623,7 +682,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"last_frame_render_ms\":{:.2},\"max_frame_render_ms\":{:.2},\"slow_frames\":{},\
          \"slow_threshold_ms\":{:.1},\"last_input_present_ms\":{:.2},\
          \"max_input_present_ms\":{:.2},\"last_key_write_ms\":{:.2},\
-         \"max_key_write_ms\":{:.2},\"sync_armed\":{},\"sync_rel_end\":{},\
+         \"max_key_write_ms\":{:.2},\"last_resize_present_ms\":{:.2},\
+         \"max_resize_present_ms\":{:.2},\"last_resize_reflow_ms\":{:.2},\
+         \"max_resize_reflow_ms\":{:.2},\"sync_armed\":{},\"sync_rel_end\":{},\
          \"sync_rel_timeout\":{},\"sync_holding\":{},\"perf_reduced\":{},\
          \"shed_transitions\":{},\"wake_heals\":{},\"last_redraw_total_ms\":{:.2},\
          \"max_redraw_total_ms\":{:.2},\"redraw_attempts\":{},\"redraw_early_outs\":{},\
@@ -661,6 +722,10 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.max_input_present_ns),
         ms(m.last_key_write_ns),
         ms(m.max_key_write_ns),
+        ms(m.last_resize_present_ns),
+        ms(m.max_resize_present_ns),
+        ms(m.last_resize_reflow_ns),
+        ms(m.max_resize_reflow_ns),
         m.sync_holds_armed,
         m.sync_releases_end,
         m.sync_releases_timeout,
@@ -2885,6 +2950,10 @@ mod tests {
             "key_write_p99_ms",
             "n_pre_present",
             "pre_present_p99_ms",
+            "n_acquire",
+            "acquire_p99_ms",
+            "n_resize",
+            "resize_p99_ms",
         ] {
             assert!(
                 pct_value.get(key).is_some(),
@@ -2893,7 +2962,14 @@ mod tests {
         }
 
         let text_pct = super::cmd_metrics(None, "percentiles");
-        for field in ["n_key_write=", "n_pre_present=", "pre_present_p99_ms="] {
+        for field in [
+            "n_key_write=",
+            "n_pre_present=",
+            "pre_present_p99_ms=",
+            "n_acquire=",
+            "n_resize=",
+            "resize_p99_ms=",
+        ] {
             assert!(
                 text_pct.contains(field),
                 "text percentiles omitted `{field}`: {text_pct}"

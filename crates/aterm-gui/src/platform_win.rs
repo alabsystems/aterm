@@ -398,6 +398,20 @@ impl AppRt for AppRtWindows {
         })
     }
 
+    /// INTENTIONAL no-op: `contentsGravity` models CoreAnimation's rescale of a
+    /// not-yet-repainted layer, which is macOS-specific. The DXGI swapchain is
+    /// presented into the HWND's client area directly — there is no intermediate
+    /// layer holding a stale drawable to anchor. Documented rather than silently
+    /// empty.
+    fn window_anchor_surface_top_left(&self, _window: &Window) {}
+
+    /// No CoreAnimation layer to read: the DXGI swapchain is presented into the
+    /// HWND's client area directly, so no intermediate layer holds a stale drawable
+    /// whose gravity could rescale it — nothing to report.
+    fn window_surface_presentation(&self, _window: &Window) -> Option<(String, f64, bool)> {
+        None
+    }
+
     /// Install / update / remove the DWM **system backdrop** (`DWMWA_SYSTEMBACKDROP_TYPE`):
     /// `background_material` maps to Mica (`UnderWindow`) / Mica-Alt (`Sidebar`) /
     /// Acrylic (`Hud`), and `None` (the default) to `DWMSBT_NONE` — a plain opaque

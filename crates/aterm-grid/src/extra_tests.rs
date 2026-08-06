@@ -1109,8 +1109,9 @@ fn test_hyperlink_limit_evicts_oldest_when_exceeded() {
         "hyperlink count should be at most {MAX_HYPERLINK_ENTRIES}, got {after}"
     );
     assert_eq!(
-        after, MAX_HYPERLINK_ENTRIES,
-        "should evict exactly the excess"
+        after,
+        MAX_HYPERLINK_ENTRIES * 3 / 4,
+        "should evict down to the low-water mark, buying headroom for later inserts"
     );
 }
 
@@ -1134,16 +1135,30 @@ fn test_hyperlink_limit_evicts_oldest_rows_first() {
 
     extras.enforce_hyperlink_limit();
 
-    // The evicted entries should be from row 0 (the oldest row).
-    // Row 0 had 200 entries. We evicted 100, so row 0 should have 100 left.
-    let row0_hyperlinks = extras
+    // ORDER, not batch size. Entries were inserted so their (row, col) sort key is
+    // monotonic in `i`, so "oldest first" means the SURVIVORS are exactly the
+    // newest suffix and the evicted set is a clean prefix — no younger entry may
+    // outlive an older one. Asserting the whole surviving set is strictly stronger
+    // than the old row-0 headcount, and unlike that headcount it does not silently
+    // re-encode how much ONE pass trims (which changed when the pass gained its
+    // low-water mark).
+    let low_water = MAX_HYPERLINK_ENTRIES * 3 / 4;
+    let mut surviving: Vec<usize> = extras
         .data
         .iter()
-        .filter(|(coord, extra)| coord.row == 0 && extra.hyperlink().is_some())
-        .count();
+        .filter(|(_, extra)| extra.hyperlink().is_some())
+        .map(|(coord, _)| usize::from(coord.row) * 200 + usize::from(coord.col))
+        .collect();
+    surviving.sort_unstable();
     assert_eq!(
-        row0_hyperlinks, 100,
-        "100 of the 200 entries in row 0 should have been evicted"
+        surviving.len(),
+        low_water,
+        "one pass trims to the low-water mark"
+    );
+    let expected: Vec<usize> = (total - low_water..total).collect();
+    assert_eq!(
+        surviving, expected,
+        "eviction must remove the oldest rows first, as an unbroken prefix"
     );
 }
 

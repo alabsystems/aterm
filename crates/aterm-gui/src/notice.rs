@@ -148,8 +148,15 @@ impl TransientNotice {
     /// The pill caption.
     fn text(&self) -> String {
         match &self.kind {
-            NoticeKind::UpdateReady { version, .. } => {
-                format!("\u{2191} Update ready \u{2014} v{version}")
+            // A staged build can share the running build's display version (the
+            // updater orders by build number — see `menu::staged_apply_label`), so
+            // naming only the version would announce the version already running.
+            NoticeKind::UpdateReady { version, build } => {
+                if version == crate::build_info::version_display() {
+                    format!("\u{2191} Update ready \u{2014} build {build}")
+                } else {
+                    format!("\u{2191} Update ready \u{2014} v{version}")
+                }
             }
             NoticeKind::LevelUp { build } => {
                 format!("\u{2726} Updated \u{2014} now on build {build}")

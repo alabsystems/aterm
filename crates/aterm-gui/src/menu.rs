@@ -938,6 +938,31 @@ pub(crate) fn version_menu_bar_title(attention: bool) -> String {
     }
 }
 
+/// The apply-now label for a staged build, given the arrow glyph the calling surface
+/// can actually render (`⬆️` in an NSMenu, plain `↑` in own-rendered overlay text).
+///
+/// WHY THE BUILD NUMBER IS NOT COSMETIC HERE. The updater orders releases by the
+/// monotonic BUILD NUMBER, never by the display version — `build_info` states the
+/// version is "display-only by contract" and "can never affect an update comparison".
+/// So a strictly-newer build may legally carry the SAME `MAJOR.MINOR.PATCH` as the
+/// running one, and the ledger really does ship such pairs (two distinct 0.11.0
+/// builds). Meanwhile the menu-bar badge prints the RUNNING version and this row
+/// printed the STAGED version, both dropping the one field that distinguishes them —
+/// so a machine running a 0.14.0 build with the 0.14.0 RELEASE staged over it showed
+/// "v0.14.0 ⬆️" above "Update to v0.14.0", i.e. an offer to update itself to itself.
+/// Nothing was wrong with the update; the label just could not express it.
+///
+/// So: name the version when it actually differs, and fall back to the build number
+/// — the thing the updater is really comparing — when it does not.
+#[must_use]
+pub(crate) fn staged_apply_label(arrow: &str, build: u64, version: &str) -> String {
+    if version == crate::build_info::version_display() {
+        format!("{arrow} Update to build {build} — restart now")
+    } else {
+        format!("{arrow} Update to v{version} — restart now")
+    }
+}
+
 /// Whether the always-visible menu-bar Version arrow should show. It tracks a STAGED
 /// update ONLY (action needed) — deliberately NOT the post-update `realized`
 /// celebration. The celebration is carried by self-dismissing surfaces (the menu's
@@ -1322,12 +1347,12 @@ mod macos {
         realized: bool,
     ) -> Retained<NSMenu> {
         let menu = NSMenu::new(mtm);
-        if let Some((_, version)) = staged {
+        if let Some((build, version)) = staged {
             add_item(
                 mtm,
                 &menu,
                 target,
-                &format!("\u{2B06}\u{FE0F} Update to v{version} — restart now"),
+                &super::staged_apply_label("\u{2B06}\u{FE0F}", build, version),
                 MenuAction::ApplyUpdate,
                 "",
                 false,
@@ -1975,8 +2000,44 @@ mod macos {
 mod tests {
     use super::{
         MENU_MODEL, MenuAction, MenuEntry, menu_chrome_lines, native_menu_action_enabled,
-        set_active_tab_is_terminal,
+        set_active_tab_is_terminal, staged_apply_label, version_menu_bar_title,
     };
+
+    /// REGRESSION: the menu bar badged "v0.14.0 ⬆️" over a row reading "Update to
+    /// v0.14.0 — restart now", which reads as an offer to update a build to itself.
+    ///
+    /// Nothing was wrong with the update. The updater orders by BUILD NUMBER (the
+    /// display version is documented as never affecting an update comparison), so a
+    /// strictly-newer staged build may legally share the running build's version
+    /// string — the ledger ships such pairs. The badge printed the running version
+    /// and the row printed the staged version, and BOTH dropped the build, which was
+    /// the only field that told them apart.
+    ///
+    /// The invariant: the apply row must never be spellable as the badge.
+    #[test]
+    fn the_apply_row_can_never_read_as_the_version_already_running() {
+        let running = crate::build_info::version_display();
+        let badge = version_menu_bar_title(true);
+
+        // The colliding case: staged build carries the SAME version string.
+        let same = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, running);
+        assert!(
+            same.contains("build 1785910394"),
+            "a same-version staged build must be identified by its build number: {same}"
+        );
+        assert!(
+            !same.contains(&format!("v{running}")),
+            "the offer must not name the version the badge already shows \
+             (badge {badge:?}, offer {same:?})"
+        );
+
+        // The ordinary case is untouched: a genuinely different version is named.
+        let newer = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, "9.9.9");
+        assert!(
+            newer.contains("v9.9.9") && !newer.contains("build"),
+            "a differing version is still named directly: {newer}"
+        );
+    }
 
     /// The canonical set of every menu command — shared by the tag round-trip test and
     /// the `MENU_MODEL` completeness test (so adding a command means updating one list).

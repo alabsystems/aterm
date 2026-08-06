@@ -59,6 +59,11 @@ pub mod genome;
 /// The rainbow kitty that flies in front of the cursor on the `rainbow kitty`
 /// trail style — its art, pose, and exit choreography.
 pub mod kitty_cursor;
+/// The rainbow kitty **pet** — the full-body companion that inhabits the text
+/// plane and chases the caret: gait, behaviour, and screen awareness. The
+/// decision twin of [`kitty_cursor`], for the pet art roster rather than the
+/// flying head.
+pub mod kitty_pet;
 pub mod kitty_registry;
 /// The kitty's SING-ALONG — the held-key celebration: repeat detector +
 /// beat clock + the ♪/♫ music-note sprite field (see the module doc).
@@ -68,6 +73,16 @@ pub mod matrix_rain;
 pub mod nova;
 /// The mushroom cloud — the rarest f-bomb detonation tier.
 pub mod nuke;
+/// The pet roster's bake path: one authored full-body pose → an exact-size
+/// RGBA tile, handed to the shared cat atlas through `CatBaker::host_tile`.
+pub mod pet_baker;
+/// `@generated` — the checked-in const drawlists for the PET roster (do not edit
+/// by hand). Produced by `cargo run -p aterm-effects --example gen_pet_glyphs`;
+/// kept honest by the `pet_glyphs_gen_matches_assets` drift test. `include!`d for
+/// the same reason [`cat_glyphs_gen`] is.
+pub mod pet_glyphs_gen {
+    include!("pet_glyphs_gen.rs");
+}
 pub mod pipeline;
 pub mod spec;
 pub mod supernova;

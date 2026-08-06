@@ -356,9 +356,13 @@ impl PaletteState {
         self.pointer_armed = None;
         self.realized_since = None;
         self.realized_frozen = live.reduced_motion;
-        let dynamic_label: Option<Cow<'static, str>> = if let Some((_, v)) = &live.staged {
-            Some(Cow::Owned(format!(
-                "\u{2191} Update to v{v} \u{2014} restart now"
+        // Same label law as the menu row (`menu::staged_apply_label`): a staged build
+        // may share the running build's display version, so fall back to the build
+        // number rather than offer to update to the version already on screen. Plain
+        // `↑`, not the colour emoji — this is own-rendered text with no emoji face.
+        let dynamic_label: Option<Cow<'static, str>> = if let Some((build, v)) = &live.staged {
+            Some(Cow::Owned(crate::menu::staged_apply_label(
+                "\u{2191}", *build, v,
             )))
         } else if let Some((v, since)) = &live.realized {
             self.realized_since = Some(*since);

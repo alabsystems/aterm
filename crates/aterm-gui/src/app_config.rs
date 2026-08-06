@@ -5774,12 +5774,36 @@ impl App {
     /// relative to PTY output, so a recorded session replays byte-identically. Only
     /// interactive `WindowEvent::Resized` routes here; the control-socket `resize` verb
     /// (`apply_term_resize`, echo_to_window) stays immediate + exact.
+    ///
+    /// WIDTH IS WHAT THE THROTTLE IS FOR, and now that is what it costs. The whole
+    /// justification above — "rewraps the entire off-screen history" — is a property
+    /// of a COLUMN change: reflow is what rewrapping means. A height-only drag (the
+    /// bottom edge, the common vertical resize) rewraps nothing; it adds or drops
+    /// grid rows and pushes the difference into scrollback. Coalescing those at
+    /// 20 Hz bought no work back and made the terminal body visibly trail the window
+    /// edge by up to a throttle window before snapping — the vertical half of the
+    /// "shredded, then redrawn" drag. So the throttle now gates on the reflow it
+    /// exists to bound: a resize that leaves the column count alone applies
+    /// immediately, and only genuine width changes coalesce.
+    ///
+    /// Columns are derived through the SAME [`Self::grid_dims_for`] law `on_resize`
+    /// uses, off the window's authoritative `inner_size()` (the winit macOS `Resized`
+    /// payload can lie — see `on_resize`), so this decision cannot disagree with the
+    /// resize it is deciding about. Only `cols` is compared: `rows` additionally
+    /// depends on the chrome headroom `on_resize` re-derives, while `cols` is a pure
+    /// function of width, pad and cell width.
+    ///
+    /// Recorder determinism is unchanged: applying MORE of the drag's real sizes only
+    /// adds genuine resizes to the spine in the order they happened; the engine still
+    /// never sees a coalesced size.
     pub(crate) fn on_resize_throttled(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
         let now = std::time::Instant::now();
-        let apply_now = self.windows.get(&wid).is_none_or(|ws| {
-            ws.last_resize_at
-                .is_none_or(|t| now.saturating_duration_since(t) >= crate::RESIZE_THROTTLE)
-        });
+        let reflows = self.resize_changes_columns(wid, size);
+        let apply_now = !reflows
+            || self.windows.get(&wid).is_none_or(|ws| {
+                ws.last_resize_at
+                    .is_none_or(|t| now.saturating_duration_since(t) >= crate::RESIZE_THROTTLE)
+            });
         if apply_now {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.last_resize_at = Some(now);
@@ -5787,6 +5811,32 @@ impl App {
                 ws.next_resize_settle = None;
             }
             self.on_resize(wid, size);
+            // RE-ARM THE SETTLE AFTER A ROW-ONLY APPLY — it is the payer for the
+            // active-tab-only scope this apply just ran under.
+            //
+            // A leading-edge apply runs with `resize_live_drag` set, which sizes only
+            // the ACTIVE tab's panes and marks the window `panes_stale`; the other
+            // tabs' engines and PTY winsize are settled by the eager AllTabs pass the
+            // trailing settle performs. On the WIDTH path a settle is guaranteed —
+            // the next coalesced event arms one. A row-only drag now coalesces
+            // NOTHING, so without this nothing would ever arm one and background tabs
+            // would sit at the pre-drag row count until the user switched to them.
+            //
+            // It must run AFTER `on_resize`: a committing `apply_term_resize` clears
+            // both fields itself (a committed resize supersedes a stale coalesce), so
+            // arming before the call would simply be wiped.
+            //
+            // Re-arming with the CURRENT size is not lossy for a still-pending width
+            // change: `flush_pending_resize` -> `on_resize` re-reads the window's
+            // authoritative `inner_size()`, so the settle always applies the geometry
+            // the window really has, not whatever was recorded when it was armed.
+            if !reflows
+                && let Some(ws) = self.windows.get_mut(&wid)
+                && ws.next_resize_settle.is_none()
+            {
+                ws.pending_resize = Some(size);
+                ws.next_resize_settle = Some(now + crate::RESIZE_THROTTLE);
+            }
         } else if let Some(ws) = self.windows.get_mut(&wid) {
             // Inside the throttle window: keep only the LATEST size and arm the trailing
             // reflow so the final size always lands even if the drag stops right here.
@@ -5798,6 +5848,11 @@ impl App {
 
     /// Apply a coalesced resize whose trailing-settle deadline fired (`new_events`):
     /// reflow the final pending size once, and clear the throttle state.
+    ///
+    /// This is also where the drag's DEBT is settled. Every leading-edge apply during
+    /// a drag runs under `resize_live_drag`, which sizes only the ACTIVE tab's panes
+    /// and leaves the window `panes_stale`; the background tabs' engines and PTY
+    /// winsize are owed an eager AllTabs pass, and this is the one place that pays it.
     pub(crate) fn flush_pending_resize(&mut self, wid: WindowId) {
         let Some(size) = self.windows.get(&wid).and_then(|ws| ws.pending_resize) else {
             return;
@@ -5808,6 +5863,18 @@ impl App {
             ws.next_resize_settle = None;
         }
         self.on_resize(wid, size);
+        // PAY THE DEBT EXPLICITLY. `on_resize` clears `panes_stale` only as a side
+        // effect of `apply_term_resize` reaching `resize_panes`, and that call
+        // early-returns whenever the derived grid already equals the applied one — so
+        // a drag whose settle lands on a size already applied (the common case: the
+        // hand stops, the final size was the last one applied) performed NO AllTabs
+        // pass and stranded every background tab at the pre-drag geometry until the
+        // user happened to switch to one. Deliberately gated on the flag rather than
+        // run unconditionally: with a single tab `panes_stale` is never set (the
+        // scope has nothing to defer), so this is inert for the common window.
+        if self.windows.get(&wid).is_some_and(|ws| ws.panes_stale) {
+            self.resize_panes_scoped(wid, false);
+        }
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
             w.request_redraw();
         }
@@ -5936,6 +6003,37 @@ impl App {
         ) as u16;
         let rows = win_rows.saturating_sub(self.tab_strip_rows).max(1);
         (rows, cols)
+    }
+
+    /// Whether applying `size` to window `wid` would change its COLUMN count —
+    /// i.e. whether the resize about to be applied carries a scrollback rewrap.
+    ///
+    /// This is the throttle's real predicate (see [`Self::on_resize_throttled`]).
+    /// It reads the window's authoritative `inner_size()` exactly as
+    /// [`Self::on_resize`] does, because the winit macOS `Resized` payload is
+    /// documented-unreliable and a spurious width there would otherwise coalesce a
+    /// resize that is not actually a reflow (or vice versa). Headless windows
+    /// (no `os_window`) keep the caller's `size`, matching `on_resize`.
+    ///
+    /// Comparing COLS only is what makes this agree with the resize it is deciding
+    /// about even though `on_resize` re-derives the macOS titlebar band first: the
+    /// band is reserved out of the HEIGHT, so it can move `rows` but never `cols`,
+    /// which is a pure function of width, pad and cell width.
+    ///
+    /// Conservative on the unknown, and on disagreement: a window we cannot find is
+    /// treated as reflowing, so an unrecognized id keeps the old throttled behaviour
+    /// rather than bypassing a guard on a guess. The same applies to the one case
+    /// where `ws.cols` cannot track the derived value — a grid outside
+    /// `MAX_GRID_ROWS`/`MAX_GRID_COLS` is `RangeRejected` before `apply_term_resize`
+    /// runs, so `ws.cols` never catches up and this reports "reflows" forever. That
+    /// is the safe direction (the window keeps the throttle it had), not a defect.
+    fn resize_changes_columns(&self, wid: WindowId, size: PhysicalSize<u32>) -> bool {
+        let Some(ws) = self.windows.get(&wid) else {
+            return true;
+        };
+        let size = ws.os_window.as_ref().map_or(size, |w| w.inner_size());
+        let (_rows, cols) = self.grid_dims_for(wid, size);
+        cols != ws.cols
     }
 
     /// Live font zoom (Cmd-+/Cmd--/Cmd-0): rebuild the [`Backend`] at `px`, then

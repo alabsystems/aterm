@@ -438,7 +438,13 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         Session,
-        "resize <r> <c>: resize the engine + PTY",
+        "resize <r> <c>: resize the engine + PTY (grid first, window echoed to match). \
+         `resize px <w> <h>` instead resizes the WINDOW in physical pixels and lets the \
+         grid follow from the platform resize event — the same path an edge drag takes, \
+         so it is the form that exercises the live-resize width throttle (the cell form \
+         pre-applies the grid, so the window event never sees a column change). Drive \
+         several back to back to reproduce a drag's event pressure; read the result with \
+         `metrics` (`resize_present`) and `dims` (`layer_*`)",
     ),
     v("focus", Write, Status, Session, "send focus in/out"),
     v(

@@ -2740,6 +2740,77 @@ mod tests {
         assert_eq!(aggregate, MAX_HANDOFF_AGGREGATE_GRID_CELLS);
     }
 
+    /// REGRESSION (the update that would not install). A real machine had a staged
+    /// build refuse to apply 38 consecutive times with a capture-admission failure,
+    /// because carrying scrollback made an ORDINARY session set exceed the aggregate
+    /// cell budget — and the capture loop treated that refusal as fatal instead of
+    /// dropping the history it was carrying.
+    ///
+    /// This pins the arithmetic that makes the degrade load-bearing rather than
+    /// theoretical: at one real window geometry, carried history admits only a
+    /// couple of sessions while visible-only admits many times more. If a future
+    /// change raises the aggregate enough that history alone can no longer exhaust
+    /// it, this test goes red and should be retired deliberately — not silently
+    /// weakened, because the degrade is what upholds `checkpoint_carry`'s documented
+    /// "the failure mode is *less scrollback*, never *the update did not apply*".
+    #[test]
+    fn carried_history_can_exhaust_the_aggregate_that_visible_only_admits() {
+        // The reported window: 49 rows x 110 cols, several tabs/panes.
+        let (rows, cols) = (49u16, 110u16);
+        let history = MAX_HANDOFF_HISTORY_LINES;
+
+        let admits = |history: u32| {
+            let mut used = 0u64;
+            let mut n = 0;
+            while admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_some() {
+                n += 1;
+                assert!(n < 10_000, "admission must terminate");
+            }
+            n
+        };
+
+        let with_history = admits(history);
+        let visible_only = admits(0);
+
+        assert!(
+            with_history < visible_only,
+            "carrying history must cost aggregate budget \
+             (with={with_history}, without={visible_only})"
+        );
+        assert!(
+            with_history <= 4,
+            "a handful of ordinary sessions must be enough to exhaust the aggregate \
+             WITH history — that is what made the refusal reachable in the field \
+             (admitted {with_history})"
+        );
+        assert!(
+            visible_only >= with_history * 2,
+            "dropping history must buy back real headroom, not a rounding error \
+             (with={with_history}, without={visible_only})"
+        );
+
+        // THE FIX, in miniature: the exact session that is refused WITH history must
+        // be admitted WITHOUT it against the SAME aggregate — otherwise degrading
+        // could not rescue the handoff. This also pins the transactional property the
+        // degrade relies on: a refused admission leaves the aggregate untouched, so
+        // the re-probe is exact rather than approximate.
+        let mut used = 0u64;
+        for _ in 0..with_history {
+            assert!(admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_some());
+        }
+        let saturated = used;
+        assert!(
+            admit_checkpoint_dimensions(&mut used, rows, cols, history, true).is_none(),
+            "the next session must be the one that trips the budget"
+        );
+        assert_eq!(used, saturated, "a refused admission is transactional");
+        assert!(
+            admit_checkpoint_dimensions(&mut used, rows, cols, 0, true).is_some(),
+            "the same session must be admissible visible-only — this is precisely \
+             the retry that turns 'the update did not apply' back into 'less scrollback'"
+        );
+    }
+
     #[test]
     fn max_admitted_visible_capture_meets_release_park_budget() {
         let (rows, cols) = (256u16, 128u16);

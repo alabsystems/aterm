@@ -11,6 +11,17 @@
 //! by the [`cat_glyphs_gen_matches_assets`](tests) drift test that regenerates into a
 //! string and asserts byte-equality with the checked-in file.
 //!
+//! ## Two rosters, one parser
+//!
+//! [`generate_pet_from_dir`] runs the SAME parse/quantize/fail-closed path over the
+//! full-body cursor-pet poses in `art/pet/` and emits [`crate::pet_glyphs_gen`]. The
+//! pet deliberately does NOT join `GLYPHS`: every `GlyphKind::Special` there is a
+//! collectible roster row in the GUI's kitty log, and the spec model pins its
+//! `RosterCap` to `GLYPH_IDS.len()`, so 23 animation frames landing in that table
+//! would corrupt the collection. Only the *shape vocabulary* is shared — the pet
+//! module imports `GlyphDef`/`Layer`/`GlyphRole`/`Recolor`/`GlyphKind` from the cat
+//! module instead of redeclaring them, so one drawlist walker paints both rosters.
+//!
 //! ## What crosses the boundary
 //!
 //! Only glyphs whose `kind` is a roster kind (`head`, `special`, `accessory`) and that
@@ -116,8 +127,30 @@ struct Glyph {
 /// viewbox/anchor, unknown roster-schema key, unparseable path `d`-string, or
 /// colliding variant name.
 pub fn generate_from_dir(glyph_dir: &Path) -> Result<String, String> {
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(glyph_dir)
-        .map_err(|e| format!("read_dir {}: {e}", glyph_dir.display()))?
+    Ok(emit(&load_glyphs(glyph_dir)?))
+}
+
+/// Generate the full `pet_glyphs_gen.rs` source from the pose TOMLs in `pet_dir` — the
+/// same parse, the same quantization, the same fail-closed key rejection as
+/// [`generate_from_dir`], but emitted as the SEPARATE `PetGlyphId` / `PET_GLYPHS`
+/// roster that reuses the cat module's types (see the module doc). The poses are all
+/// one kind, so the shared (kind, id) order collapses to a plain id order.
+///
+/// # Errors
+/// Identical to [`generate_from_dir`]: any unreadable dir, malformed TOML, unknown
+/// role/recolor/kind, missing viewbox/anchor, unknown roster-schema key, unparseable
+/// path `d`-string, or colliding variant name.
+pub fn generate_pet_from_dir(pet_dir: &Path) -> Result<String, String> {
+    Ok(emit_pet(&load_glyphs(pet_dir)?))
+}
+
+/// Read, parse, order, and collision-check every roster asset in `dir` — the half of
+/// codegen the two rosters share verbatim. Non-`.toml` files (the authoring scripts
+/// that live beside the pet poses) are skipped by extension, and non-roster kinds /
+/// `excluded = true` assets are dropped by [`glyph_from_doc`].
+fn load_glyphs(dir: &Path) -> Result<Vec<Glyph>, String> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("read_dir {}: {e}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
         .collect();
@@ -148,7 +181,7 @@ pub fn generate_from_dir(glyph_dir: &Path) -> Result<String, String> {
         }
     }
 
-    Ok(emit(&glyphs))
+    Ok(glyphs)
 }
 
 /// Parse one asset doc into a [`Glyph`], or `Ok(None)` if it is not a roster glyph
@@ -428,6 +461,65 @@ fn emit(glyphs: &[Glyph]) -> String {
     // GLYPHS table.
     s.push_str("/// Every roster glyph's const drawlist, indexed by [`CatGlyphId`] order.\n");
     s.push_str("pub const GLYPHS: &[GlyphDef] = &[\n");
+    emit_glyph_rows(&mut s, glyphs);
+    s.push_str("];\n\n");
+
+    // HEADS roster.
+    s.push_str("/// The head variants (the roster the genome's `variant` field indexes, §3).\n");
+    s.push_str("pub const HEADS: &[CatGlyphId] = &[\n");
+    for g in glyphs.iter().filter(|g| g.kind == "Head") {
+        s.push_str(&format!("    CatGlyphId::{},\n", g.variant));
+    }
+    s.push_str("];\n");
+
+    s
+}
+
+/// Render the pet roster source. Same drawlist rows as [`emit`], but a separate
+/// `PetGlyphId` / `PET_GLYPH_IDS` / `PET_GLYPHS` roster that *imports* the cat module's
+/// shape types rather than redeclaring them — so the pet can never be mistaken for a
+/// collectible cat row, and there is exactly one `GlyphDef` shape in the crate.
+fn emit_pet(glyphs: &[Glyph]) -> String {
+    let mut s = String::new();
+    s.push_str(PET_HEADER);
+
+    // PetGlyphId roster enum.
+    s.push_str("/// The pet roster: every authored full-body pose, ordered by id. Indexes\n");
+    s.push_str("/// [`PET_GLYPHS`]. Not a collectible — the pet is one cat wearing the caret's\n");
+    s.push_str("/// genome, so these are animation frames, not roster rows.\n");
+    s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
+    s.push_str("pub enum PetGlyphId {\n");
+    for g in glyphs {
+        s.push_str("    ");
+        s.push_str(&g.variant);
+        s.push_str(",\n");
+    }
+    s.push_str("}\n\n");
+
+    // Stable enum-value roster (same reason as the cat's GLYPH_IDS: pose selection
+    // resolves through `PET_GLYPHS[i].id` strings, never a Rust discriminant).
+    s.push_str(
+        "/// Every pose id in [`PET_GLYPHS`] order. Pair with `PET_GLYPHS[i].id` for stable\n",
+    );
+    s.push_str("/// string lookup.\n");
+    s.push_str("pub const PET_GLYPH_IDS: &[PetGlyphId] = &[\n");
+    for g in glyphs {
+        s.push_str(&format!("    PetGlyphId::{},\n", g.variant));
+    }
+    s.push_str("];\n\n");
+
+    // PET_GLYPHS table.
+    s.push_str("/// Every pet pose's const drawlist, indexed by [`PetGlyphId`] order.\n");
+    s.push_str("pub const PET_GLYPHS: &[GlyphDef] = &[\n");
+    emit_glyph_rows(&mut s, glyphs);
+    s.push_str("];\n");
+
+    s
+}
+
+/// The `GlyphDef { … }` rows both roster tables are built from — identical bytes for
+/// identical assets, so the pet and the cat can never drift in drawlist encoding.
+fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {
     for g in glyphs {
         s.push_str(&format!("    // {} ({})\n", g.variant, g.id));
         s.push_str(&format!(
@@ -448,17 +540,6 @@ fn emit(glyphs: &[Glyph]) -> String {
         }
         s.push_str("    ] },\n");
     }
-    s.push_str("];\n\n");
-
-    // HEADS roster.
-    s.push_str("/// The head variants (the roster the genome's `variant` field indexes, §3).\n");
-    s.push_str("pub const HEADS: &[CatGlyphId] = &[\n");
-    for g in glyphs.iter().filter(|g| g.kind == "Head") {
-        s.push_str(&format!("    CatGlyphId::{},\n", g.variant));
-    }
-    s.push_str("];\n");
-
-    s
 }
 
 /// The canonical-ordered subset of `vocab` variants that appear in `used`.
@@ -498,6 +579,28 @@ use aterm_scene::vector::PathSeg;
 
 ";
 
+const PET_HEADER: &str = "\
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+//
+// @generated by: cargo run -p aterm-effects --example gen_pet_glyphs
+//
+// DO NOT EDIT BY HAND. Regenerated from the full-body pose asset TOMLs under
+// crates/aterm-effects/art/pet/. The drift test `pet_glyphs_gen_matches_assets`
+// fails if this file is stale relative to those assets.
+//
+// A SEPARATE roster on purpose: every `GlyphKind::Special` in the cat module's
+// `GLYPHS` is a collectible row in the GUI's kitty log, and the spec model pins its
+// roster cap to `GLYPH_IDS.len()` — so these animation frames must not join that
+// table. Only the shape vocabulary is shared: the types below are the cat module's,
+// imported rather than redeclared, so one drawlist walker paints both rosters.
+
+use aterm_scene::vector::PathSeg;
+
+use crate::cat_glyphs_gen::{GlyphDef, GlyphKind, GlyphRole, Layer, Recolor};
+
+";
+
 const STRUCTS: &str = "\
 /// One glyph layer: a painter-order fill of `paths` in the glyph's fixed-point frame.
 pub struct Layer {
@@ -532,6 +635,11 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/glyphs")
     }
 
+    /// The pet-pose asset dir shipped with the crate.
+    fn pet_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("art/pet")
+    }
+
     /// The drift gate (§1): regenerate the source from the assets and assert it equals
     /// the checked-in `cat_glyphs_gen.rs`. Regenerate with
     /// `cargo run -p aterm-effects --example gen_cat_glyphs` after touching any asset.
@@ -542,6 +650,19 @@ mod tests {
         assert_eq!(
             generated, checked_in,
             "cat_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_cat_glyphs`"
+        );
+    }
+
+    /// The pet half of the same gate: regenerate the pet roster from `art/pet/` and
+    /// assert it equals the checked-in `pet_glyphs_gen.rs`. Regenerate with
+    /// `cargo run -p aterm-effects --example gen_pet_glyphs` after touching any pose.
+    #[test]
+    fn pet_glyphs_gen_matches_assets() {
+        let generated = generate_pet_from_dir(&pet_dir()).expect("generate pet glyph drawlists");
+        let checked_in = include_str!("pet_glyphs_gen.rs");
+        assert_eq!(
+            generated, checked_in,
+            "pet_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_pet_glyphs`"
         );
     }
 

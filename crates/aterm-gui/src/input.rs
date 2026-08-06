@@ -165,6 +165,30 @@ pub enum InputEvent {
         cols: u16,
         echo_to_window: bool,
     },
+    /// A WINDOW-PIXEL geometry change: ask the OS window for this inner size and
+    /// let the grid follow from the `Resized` event the platform delivers, exactly
+    /// as an edge drag does.
+    ///
+    /// THIS IS NOT `Resize` WITH DIFFERENT UNITS, and the difference is the whole
+    /// point. `Resize` applies the grid FIRST and then echoes the matching pixel
+    /// size to the window, so by the time the window event arrives the columns
+    /// already agree — which means it can never traverse the live-drag path:
+    /// `on_resize_throttled` sees no column change, takes the row-only branch, and
+    /// the width throttle, its coalescing, and its trailing settle are all
+    /// unreachable from the control surface. Every socket-driven resize was
+    /// therefore testing the one arm a drag does not use, and the drag arms could
+    /// only be exercised by a hand on the window edge.
+    ///
+    /// This variant inverts that order: nothing is pre-applied, so the grid is
+    /// derived from the window event by the same code a human's drag runs. Fire a
+    /// few of these in a row and the event loop sees the back-to-back bounds
+    /// changes that make a drag a drag. The residual difference from a hand drag is
+    /// that AppKit is not in its event-tracking run-loop mode; everything inside
+    /// aterm is the same path.
+    ResizeWindowPx {
+        width: u32,
+        height: u32,
+    },
     /// Focus gained/lost — DEC 1004 focus reporting (kills j). `true` = focus-in.
     Focus(bool),
 }
@@ -629,9 +653,14 @@ pub fn seam_egress(
             }
             Egress::Reported(d)
         }
-        // ScrollView / Resize produce no PTY bytes here; `App::input` handles their
-        // (viewport / geometry) side-effects directly.
-        InputEvent::ScrollView(_) | InputEvent::Resize { .. } => Egress::Reported(Delivery::Full),
+        // ScrollView / Resize / ResizeWindowPx produce no PTY bytes here;
+        // `App::input` handles their (viewport / geometry) side-effects directly.
+        // `ResizeWindowPx` in particular writes NOTHING to the engine: it only asks
+        // the window for a size, and the PTY learns the new geometry from the
+        // platform's `Resized` event like it does for a drag.
+        InputEvent::ScrollView(_)
+        | InputEvent::Resize { .. }
+        | InputEvent::ResizeWindowPx { .. } => Egress::Reported(Delivery::Full),
     }
 }
 
@@ -885,6 +914,7 @@ mod tests {
             | InputEvent::ScrollView(_)
             | InputEvent::Paste(_)
             | InputEvent::Resize { .. }
+            | InputEvent::ResizeWindowPx { .. }
             | InputEvent::Focus(_) => {}
         }
     }

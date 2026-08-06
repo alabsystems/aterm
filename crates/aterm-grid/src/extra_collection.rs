@@ -2074,7 +2074,24 @@ impl CellExtras {
                 continue;
             }
 
-            let to_evict = hyperlink_coords.len() - MAX_HYPERLINK_ENTRIES;
+            // EVICT TO A LOW-WATER MARK, not to the ceiling. The single walk and
+            // the `select_nth_unstable_by` below already made ONE pass cheap; what
+            // remains is HOW OFTEN a pass runs. Trimming to exactly
+            // `MAX_HYPERLINK_ENTRIES` leaves the map one insertion over the line,
+            // so the very next insert re-enters this cold path to evict a single
+            // entry — and the hot caller is CHECKPOINT RESTORE:
+            // `Grid::fill_row_from_line` (`grid/scroll_fill.rs`) calls this once
+            // PER ROW, so a tall carried grid pays a full collect-and-partition on
+            // nearly every row of the adoption.
+            //
+            // Trimming to 75% amortizes that: one pass buys
+            // `MAX_HYPERLINK_ENTRIES / 4` inserts of headroom, which on a tall
+            // restore turns tens of thousands of passes into single digits. The
+            // bound callers rely on is UNCHANGED and in fact strictly stronger —
+            // this evicts more, never less, so the map still never exceeds
+            // `MAX_HYPERLINK_ENTRIES`.
+            const HYPERLINK_LOW_WATER: usize = MAX_HYPERLINK_ENTRIES * 3 / 4;
+            let to_evict = hyperlink_coords.len() - HYPERLINK_LOW_WATER;
 
             // Only the `to_evict` SMALLEST coords are needed, so partition
             // instead of sorting: O(n) rather than O(n log n), and the evicted

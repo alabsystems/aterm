@@ -175,6 +175,72 @@ static MAX_FRAME_GAP_NS: AtomicU64 = AtomicU64::new(0);
 /// prompt, ignoring app), not a pacing measurement: discard, don't record.
 const INPUT_SLICE_CAP_NS: u64 = 5_000_000_000;
 
+// ---- RESIZE → PRESENT: the stale-frame (compositor stretch) window ----------
+//
+// THE THING THIS MEASURES, precisely: from a window-bounds change arriving
+// (`WindowEvent::Resized`) to aterm having SUBMITTED a frame drawn at the new
+// size. For that whole interval the layer is already the new size while the most
+// recent drawable is the old one, so CoreAnimation shows the previous frame
+// rescaled onto the new bounds — the smeared "shredded" text of a live drag.
+// Shrinking this interval IS the fix; this is how you check it in milliseconds
+// instead of by eye.
+//
+// WHY A METRIC AND NOT THE `video` LEDGER. The swapchain tap allocates its ring
+// for one fixed geometry and sets `resized_early_stop` the instant the frame
+// texture changes size (`aterm-gpu/src/video_tap.rs`), so a recording DIES on
+// the first resize — the one event it would need to observe. A counter pair on
+// the present path has no geometry to outgrow, costs two relaxed atomics, and is
+// always on like every other slice here.
+//
+// KEEP-OLDEST, like `INPUT_STAMP_NS`. A drag delivers a burst of bounds changes;
+// the honest number is how long the window spent showing a frame that did not
+// match it, so a later change must not reset the clock and shrink the slice.
+// The stamp is armed BEFORE the surface reconfigure, so it cannot miss the gap
+// it is measuring.
+//
+// HONESTY BOUND: the close is "the next present after a bounds change", and the
+// resize handler reconfigures the swapchain to the new size before that present
+// happens — so the frame is at the new size by construction. It does NOT prove
+// the grid REFLOWED to the new size (a width drag reflows on the throttle's own
+// schedule); it proves a correctly-SIZED frame was submitted, which is exactly
+// what ends the compositor's rescale. A slice past the cap is a window that
+// stopped presenting entirely (occluded, parked surface) and is discarded rather
+// than booked as a resize stall.
+static RESIZE_STAMP_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_RESIZE_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_RESIZE_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+
+// ---- RESIZE → REFLOW: the stale-GRID window -------------------------------
+//
+// THE SECOND HALF, and the one `resize_present` structurally cannot see.
+//
+// `resize_present` closes on a frame at the new SURFACE size, and the surface is
+// reconfigured in the `Resized` handler BEFORE the reflow throttle runs — so it
+// goes green the moment the swapchain matches the window, whether or not the GRID
+// has caught up. What a dragging user actually watches is the text: the columns
+// and rows the engine committed. Between a bounds change and that commit the
+// terminal body is the OLD grid letterboxed into the NEW window, which is the
+// content trailing the window edge before it snaps.
+//
+// So this is armed with the same event and closed at the engine commit
+// (`apply_term_resize` returning that it changed the geometry). The two together
+// bracket a resize: `resize_present` = "did a correctly-sized frame go out",
+// `resize_reflow` = "did the text catch up". A width drag deliberately keeps the
+// second one long — that is the throttle bounding scrollback rewrap — while a
+// row-only drag should have it near zero, because nothing needs rewrapping.
+//
+// KEEP-OLDEST and capped for the same reasons as its twin. A drag that coalesces
+// several bounds changes into one commit reports the whole span it was stale, not
+// just the tail; a resize whose commit never comes (the geometry did not change)
+// is discarded rather than booked against whatever commits next.
+static RESIZE_REFLOW_STAMP_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_RESIZE_REFLOW_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_RESIZE_REFLOW_NS: AtomicU64 = AtomicU64::new(0);
+
+/// A pending resize slice older than this is a window that stopped presenting
+/// (occluded / parked surface), not a resize stall: discard, don't record.
+const RESIZE_SLICE_CAP_NS: u64 = 2_000_000_000;
+
 /// Monotonic nanoseconds since the first call (process-lifetime clock for the
 /// input→present stamps). Saturates far beyond any session length.
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -860,6 +926,8 @@ static H_FRAME_RENDER: Histogram = Histogram::new();
 static H_KEY_WRITE: Histogram = Histogram::new();
 static H_PRE_PRESENT: Histogram = Histogram::new();
 static H_ACQUIRE_WAIT: Histogram = Histogram::new();
+static H_RESIZE_PRESENT: Histogram = Histogram::new();
+static H_RESIZE_REFLOW: Histogram = Histogram::new();
 
 /// The three live distributions, for the `metrics percentiles` verb:
 /// input→application-present-return (a software-side typing proxy),
@@ -877,6 +945,20 @@ pub fn distributions() -> (&'static Histogram, &'static Histogram, &'static Hist
 #[must_use]
 pub fn key_write_distribution() -> &'static Histogram {
     &H_KEY_WRITE
+}
+
+/// Window-bounds-change → first submitted frame at the new size. The live-drag
+/// stale-frame (compositor rescale) window; see [`note_resize_arrival`].
+#[must_use]
+pub fn resize_present_distribution() -> &'static Histogram {
+    &H_RESIZE_PRESENT
+}
+
+/// Window-bounds change → the engine committing the new GRID. The interval the
+/// terminal body spends trailing the window edge; see [`note_grid_committed`].
+#[must_use]
+pub fn resize_reflow_distribution() -> &'static Histogram {
+    &H_RESIZE_REFLOW
 }
 
 /// Redraw-entry → surface-acquire-seam distribution, including terminal grid
@@ -962,6 +1044,19 @@ pub(crate) fn record_present(
         }
     });
     FRAMES_PRESENTED.fetch_add(1, Ordering::Release);
+    // Close the RESIZE→PRESENT slice on ANY successful present, not only a
+    // content one: what ends the compositor's rescale is a frame at the new
+    // size reaching the WSI, whatever drew it. (The input slice below is
+    // deliberately content-gated instead — a blink repaint is not an echo.)
+    let resize_stamp = RESIZE_STAMP_NS.swap(0, Ordering::Relaxed);
+    if resize_stamp != 0 {
+        let d = now_ns().saturating_sub(resize_stamp);
+        if d <= RESIZE_SLICE_CAP_NS {
+            LAST_RESIZE_PRESENT_NS.store(d, Ordering::Relaxed);
+            MAX_RESIZE_PRESENT_NS.fetch_max(d, Ordering::Relaxed);
+            H_RESIZE_PRESENT.record(d);
+        }
+    }
     if latency_ns != 0 {
         LAST_PRESENT_LATENCY_NS.store(latency_ns, Ordering::Relaxed);
         MAX_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed);
@@ -1043,6 +1138,41 @@ pub fn note_input() {
     };
     let _ = INPUT_STAMP_NS.compare_exchange(0, stamp, Ordering::Relaxed, Ordering::Relaxed);
     note_typing_hot();
+}
+
+/// Stamp the arrival of a window-bounds change (`WindowEvent::Resized`), opening
+/// the stale-frame window that the next present closes.
+///
+/// Call this BEFORE the swapchain is reconfigured, so the slice contains the
+/// whole interval during which the layer is the new size and the newest drawable
+/// is still the old one — the interval CoreAnimation fills by rescaling the
+/// previous frame. Keeps the OLDEST unpresented change (see `RESIZE_STAMP_NS`):
+/// a drag burst reports how long the window was actually mismatched, not just
+/// the tail after its final event.
+pub fn note_resize_arrival() {
+    let now = now_ns();
+    let _ = RESIZE_STAMP_NS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+    let _ = RESIZE_REFLOW_STAMP_NS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// The engine just COMMITTED a new grid geometry (`apply_term_resize` reported a
+/// real change), closing the stale-grid slice a bounds change opened.
+///
+/// Closed here rather than at a present because this is the moment the text stops
+/// trailing the window: the rows/cols the user is reading are now the ones the
+/// window has. A commit with no bounds change behind it (the control `resize`
+/// verb, a font zoom, a config re-grid) finds no stamp and records nothing.
+pub fn note_grid_committed() {
+    let stamp = RESIZE_REFLOW_STAMP_NS.swap(0, Ordering::Relaxed);
+    if stamp == 0 {
+        return;
+    }
+    let d = now_ns().saturating_sub(stamp);
+    if d <= RESIZE_SLICE_CAP_NS {
+        LAST_RESIZE_REFLOW_NS.store(d, Ordering::Relaxed);
+        MAX_RESIZE_REFLOW_NS.fetch_max(d, Ordering::Relaxed);
+        H_RESIZE_REFLOW.record(d);
+    }
 }
 
 /// Arm the THRU-2 interactivity window: a human just pressed a key, so the PTY
@@ -1399,6 +1529,12 @@ pub fn reset() {
     LAST_PRESENT_STAMP_NS.store(0, Ordering::Relaxed);
     // A stale no-echo stamp must not leak a bogus slice into the fresh window.
     INPUT_STAMP_NS.store(0, Ordering::Relaxed);
+    // Likewise a bounds change whose present never came: it must not book its
+    // whole pre-reset wait against the first present of the new window.
+    RESIZE_STAMP_NS.store(0, Ordering::Relaxed);
+    MAX_RESIZE_PRESENT_NS.store(0, Ordering::Relaxed);
+    RESIZE_REFLOW_STAMP_NS.store(0, Ordering::Relaxed);
+    MAX_RESIZE_REFLOW_NS.store(0, Ordering::Relaxed);
     // MEASUREMENT-WINDOW HONESTY (touch-to-glass audit): every `last_*` that is an
     // OBSERVATION of the window clears with it, so a `0.00` unambiguously means "no
     // sample in this window" instead of silently reprinting the PREVIOUS run's
@@ -1413,6 +1549,8 @@ pub fn reset() {
     MAX_ACQUIRE_WAIT_NS.store(0, Ordering::Relaxed);
     H_ACQUIRE_WAIT.reset();
     LAST_INPUT_PRESENT_NS.store(0, Ordering::Relaxed);
+    LAST_RESIZE_PRESENT_NS.store(0, Ordering::Relaxed);
+    LAST_RESIZE_REFLOW_NS.store(0, Ordering::Relaxed);
     LAST_KEY_WRITE_NS.store(0, Ordering::Relaxed);
     LAST_PRESENT_LATENCY_NS.store(0, Ordering::Relaxed);
     LAST_FRAME_RENDER_NS.store(0, Ordering::Relaxed);
@@ -1423,6 +1561,8 @@ pub fn reset() {
     H_FRAME_RENDER.reset();
     H_KEY_WRITE.reset();
     H_PRE_PRESENT.reset();
+    H_RESIZE_PRESENT.reset();
+    H_RESIZE_REFLOW.reset();
     // Gauges (`SYNC_HOLDING`, `PERF_REDUCED`), legacy momentary `last_*`
     // readings, and `first_present` (a startup FACT, not a window stat) survive
     // a reset, like `backend`. Redraw-audit last/drop fields intentionally reset
@@ -1453,6 +1593,15 @@ pub struct Snapshot {
     /// `input_present` as though the slices were disjoint.
     pub last_key_write_ns: u64,
     pub max_key_write_ns: u64,
+    /// Window-bounds change → first frame SUBMITTED at the new size: the
+    /// interval a live drag spends showing the previous frame rescaled onto the
+    /// new bounds. See [`note_resize_arrival`].
+    pub last_resize_present_ns: u64,
+    pub max_resize_present_ns: u64,
+    /// Window-bounds change → the engine committing the new GRID: the interval the
+    /// terminal body spends trailing the window edge. See [`note_grid_committed`].
+    pub last_resize_reflow_ns: u64,
+    pub max_resize_reflow_ns: u64,
     pub wake_heals: u64,
     pub last_redraw_total_ns: u64,
     pub max_redraw_total_ns: u64,
@@ -1545,6 +1694,10 @@ pub fn snapshot() -> Snapshot {
         max_input_present_ns: MAX_INPUT_PRESENT_NS.load(Ordering::Relaxed),
         last_key_write_ns: LAST_KEY_WRITE_NS.load(Ordering::Relaxed),
         max_key_write_ns: MAX_KEY_WRITE_NS.load(Ordering::Relaxed),
+        last_resize_present_ns: LAST_RESIZE_PRESENT_NS.load(Ordering::Relaxed),
+        max_resize_present_ns: MAX_RESIZE_PRESENT_NS.load(Ordering::Relaxed),
+        last_resize_reflow_ns: LAST_RESIZE_REFLOW_NS.load(Ordering::Relaxed),
+        max_resize_reflow_ns: MAX_RESIZE_REFLOW_NS.load(Ordering::Relaxed),
         wake_heals: WAKE_HEALS.load(Ordering::Relaxed),
         last_redraw_total_ns: LAST_REDRAW_TOTAL_NS.load(Ordering::Relaxed),
         max_redraw_total_ns: MAX_REDRAW_TOTAL_NS.load(Ordering::Relaxed),

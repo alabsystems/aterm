@@ -92,6 +92,12 @@ const REVIVE_GATE: f32 = 0.35;
 /// Fade-in / fade-out durations (seconds).
 const FADE_IN: f32 = 0.35;
 const FADE_OUT: f32 = 0.75;
+/// Scintillation rate of the exit StarWink, in radians across the whole fade-out.
+///
+/// INVARIANT: keep `EXIT_STAR_SCINT / FADE_OUT / TAU <= 3.2` Hz — the same bound
+/// [`crate::cursor_rainbow`]'s `TWINKLE_SCINT` certifies for its own twinkle.
+/// Pinned by `cat_exit_starwink_flash_rate_stays_under_the_photosensitivity_bound`.
+const EXIT_STAR_SCINT: f32 = 13.0;
 /// A newly unlocked collectible gets one guaranteed, bounded hello. This is
 /// independent of cursor style so every user can see what they discovered.
 const DISCOVERY_HOLD: f32 = 2.8;
@@ -1777,7 +1783,16 @@ pub fn emit_exit_fx(
             }
         }
         CatExit::StarWink => {
-            let twinkle = 0.6 + 0.4 * (fade_out * 18.0).sin();
+            // PHOTOSENSITIVITY. `fade_out` is `elapsed / FADE_OUT` with FADE_OUT =
+            // 0.75, so the retired 18.0 advanced at 24 rad/s = 3.82 Hz — a 40%
+            // amplitude swing on a 255-coverage pure-white star, the FASTEST
+            // luminance oscillator in this family, and it EXCEEDED the 3.2 Hz
+            // invariant its sibling module certifies (`cursor_rainbow::
+            // TWINKLE_SCINT`) with nothing pinning it. Lowered to 13.0 = 2.76 Hz:
+            // a pass that makes everything else brighter must not leave this one
+            // hotter AND faster. Visually indistinguishable — the wink still glints
+            // once over its exit, it simply no longer strobes.
+            let twinkle = 0.6 + 0.4 * (fade_out * EXIT_STAR_SCINT).sin();
             let sx = ax + geom.cw as i32; // by the cat's face
             let sy = ay - ch / 3;
             let a = (ch / 5).max(2);
@@ -1951,6 +1966,18 @@ mod tests {
 
     const V056_MIN_RUN_KEYS: u32 = 10;
     const _: () = assert!(MIN_RUN_KEYS > V056_MIN_RUN_KEYS);
+
+    /// PHOTOSENSITIVITY, pinned. The cat's exit StarWink is a 255-coverage
+    /// pure-white star carrying a 40% amplitude swing, and it was the FASTEST
+    /// luminance oscillator anywhere in this family at 3.82 Hz — over the 3.2 Hz
+    /// bound [`crate::cursor_rainbow`] certifies for its own twinkle, with nothing
+    /// pinning it. Same invariant, same shape of test as that sibling.
+    #[test]
+    fn cat_exit_starwink_flash_rate_stays_under_the_photosensitivity_bound() {
+        let hz = EXIT_STAR_SCINT / FADE_OUT / std::f32::consts::TAU;
+        assert!(hz <= 3.2, "the exit wink flashes at {hz} Hz");
+        assert!(EXIT_STAR_SCINT > 0.0, "the wink still glints");
+    }
 
     fn geom() -> Geom {
         // Identity layout: origin 0, window extents == grid extents.

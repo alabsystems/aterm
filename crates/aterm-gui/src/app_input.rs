@@ -1441,6 +1441,9 @@ impl App {
                     cols,
                     echo_to_window,
                 } => self.input_resize(wid, rows, cols, echo_to_window),
+                InputEvent::ResizeWindowPx { width, height } => {
+                    self.input_resize_window_px(wid, width, height)
+                }
                 InputEvent::Focus(_) => InputOutcome::Ok,
                 _ => InputOutcome::Ok,
             };
@@ -2175,6 +2178,12 @@ impl App {
                 cols,
                 echo_to_window,
             } => self.input_resize(wid, rows, cols, echo_to_window),
+            // A WINDOW-pixel resize: nothing is applied here, the window is simply
+            // asked for the size and the grid follows from the platform's `Resized`
+            // — the drag path, reachable from the control surface.
+            InputEvent::ResizeWindowPx { width, height } => {
+                self.input_resize_window_px(wid, width, height)
+            }
             // --- Focus reporting (kills j) -------------------------------------
             ev @ InputEvent::Focus(_) => {
                 // SOLE focus-report egress (in `seam_egress`): identical bytes to
@@ -2805,6 +2814,43 @@ impl App {
             wid
         };
         let _ = self.reconcile_active_editor_viewport(target);
+        InputOutcome::Ok
+    }
+
+    /// [`InputEvent::ResizeWindowPx`] arm of [`App::input`]: ask the OS window for
+    /// an inner size and apply NOTHING — the grid, the PTY and the swapchain all
+    /// follow from the `Resized` event the platform delivers, through the same
+    /// `on_resize_throttled` path a human's edge drag runs.
+    ///
+    /// That inversion is the whole reason this exists. [`Self::input_resize`]
+    /// (the `resize <r> <c>` verb) applies the grid first and echoes the pixel size
+    /// after, so the window event arrives with the columns already correct and
+    /// `resize_changes_columns` reports no reflow — the width throttle, its
+    /// coalescing and its trailing settle were unreachable from the control socket,
+    /// and every driven resize measured the one arm a drag never takes.
+    ///
+    /// Bounds are the WINDOW's business, not the grid's, so there is no
+    /// `MAX_GRID_*` check here: a request the window manager clamps or refuses is
+    /// reported honestly by the `Resized` (or absent `Resized`) that follows, and
+    /// `pad_split` already floors the derived grid at one cell. Zero in either axis
+    /// is rejected — nothing is presentable at zero, and the `Resized` handler
+    /// discards such an event anyway, so accepting it would return `Ok` for a
+    /// request that provably does nothing.
+    ///
+    /// Headless (no `os_window`) is a no-op rather than an error: the same shape as
+    /// every other window-directed verb in a windowless run.
+    fn input_resize_window_px(&mut self, wid: WindowId, width: u32, height: u32) -> InputOutcome {
+        if width == 0 || height == 0 {
+            return InputOutcome::RangeRejected;
+        }
+        // The control verb follows the front window, matching `apply_grid_resize`.
+        let target = self.frontmost_window.unwrap_or(wid);
+        if let Some(w) = self.windows.get(&target).and_then(|ws| ws.os_window.as_ref()) {
+            // Best-effort by contract: the WM may clamp or ignore it. Deliberately
+            // NOT followed by any local geometry write — believing our own request
+            // is exactly the pre-application this variant exists to avoid.
+            let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+        }
         InputOutcome::Ok
     }
 

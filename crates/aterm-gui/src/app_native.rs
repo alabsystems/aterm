@@ -2169,7 +2169,13 @@ impl App {
         }
 
         let app_event = match event {
-            InputEvent::Resize { .. } | InputEvent::Focus(_) => return false,
+            // Geometry and focus are window-level facts, not text input: a native
+            // view never consumes them, so they fall through to the ordinary path.
+            // `ResizeWindowPx` belongs here for the same reason and doubly so — it
+            // carries no engine state at all, only a request to the OS window.
+            InputEvent::Resize { .. }
+            | InputEvent::ResizeWindowPx { .. }
+            | InputEvent::Focus(_) => return false,
             InputEvent::Text(text) | InputEvent::Paste(text) => {
                 Some(AppEvent::TextInput(TextInputEvent::Commit(text.clone())))
             }

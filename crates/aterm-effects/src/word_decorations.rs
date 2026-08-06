@@ -268,10 +268,25 @@ pub struct EffectGeom {
     pub cols: u16,
 }
 
+/// One frame of the full-body pet, ready to draw. The brain
+/// ([`crate::kitty_pet::PetBrain`]) resolves everything about the animal; this
+/// carries only what the *emitter* additionally needs — the cell metrics, the
+/// local colour context, and the collected coat/iris identity.
+#[derive(Clone, Copy, Debug)]
+pub struct PetCursorFrame {
+    pub geom: EffectGeom,
+    /// Quantized local foreground/background context (drives the contrast ink).
+    pub colors: CatColorKey,
+    /// `COAT_RAMP` / `EYE_RAMP` indices — the pet wears the session's collected
+    /// kitty identity, so switching companions does not change who the cat is.
+    pub coat: u8,
+    pub iris: u8,
+    pub pet: crate::kitty_pet::PetFrame,
+}
+
 /// One resolved cursor-companion emission. Grouping these scalar inputs keeps
 /// the render call stable as companion art gains context without growing a
 /// positional argument list.
-#[derive(Clone, Copy, Debug)]
 pub struct KittyCursorFrame {
     pub geom: EffectGeom,
     pub cursor: (u16, u16),
@@ -1718,6 +1733,16 @@ pub struct WordDecorations {
     /// Whether `tick` already ran the baker prologue for this host frame. The
     /// cursor companion shares that budget; it must not reset the two-bake cap.
     cat_baker_ready: bool,
+    /// The PET roster's own exact-size tile cache ([`crate::pet_baker`]). Its
+    /// tiles reach the screen through the shared atlas's `host_tile` door, so
+    /// the pet costs the atlas one slot per resident pose and nothing at all
+    /// when the pet is off.
+    pet_baker: crate::pet_baker::PetBaker,
+    /// The last pet tile that actually resolved: `(ax, ay, pose)`. Held so a
+    /// frame whose bake was deferred re-draws the previous pose instead of
+    /// dropping the sprite (see [`WordDecorations::pet_cursor`]). Cleared with
+    /// the atlas, so it can never name a tile that no longer exists.
+    pet_last_tile: Option<(u16, u16, crate::pet_glyphs_gen::PetGlyphId)>,
     /// A USER-supplied cursor sprite (via `cursor_nyan_sprite`), overriding the
     /// built-in CatBaker cat: the decoded native RGBA `(w, h, rgba)` plus a cache
     /// of the last nearest-resample to the current target size `(tw, th, rgba)`.
@@ -2237,6 +2262,10 @@ impl WordDecorations {
         // §5.5 invalidation: config reload / toggle drop the bake cache
         // wholesale (version bump inside; a no-op when already empty).
         self.cat_baker.clear();
+        // The pet's tiles are keyed on the same cell metrics and the same local
+        // palette, so they go stale for exactly the reasons the cat's do.
+        self.pet_baker.clear();
+        self.pet_last_tile = None;
         // §F4.2: pending sightings die with the state.
         self.sightings.clear();
         self.unlogged.clear();
@@ -2755,6 +2784,118 @@ impl WordDecorations {
             fp = fold_free(fp, note);
         }
         fp = fold_u64(fp, self.cat_baker.version());
+        fp = fold_u64(fp, u64::from(colors.accent));
+        fp = fold_u64(fp, u64::from(colors.background));
+        Some(fp)
+    }
+
+    /// Emit the full-body **pet** ([`crate::kitty_pet`]) as one free sprite.
+    ///
+    /// The placement law is the whole difference between this and
+    /// [`Self::kitty_cursor`]. The flying companion is anchored to the caret and
+    /// centred on its row; the pet is anchored to a position of its OWN and
+    /// stands on the row's **baseline**, because it is an animal on a floor:
+    ///
+    /// * `x` comes from the brain's fractional column, not from the cursor cell.
+    /// * The sprite's BOTTOM edge sits on `(row + 1)·cell_h`, lifted by the
+    ///   brain's arc. Squash and stretch therefore scale about the **feet**, not
+    ///   the sprite centre — a cat absorbing a landing compresses downward onto
+    ///   the floor; scaling about the centre would sink it through the line.
+    /// * `flip_x` carries facing, so the art is authored once, facing right.
+    ///
+    /// Returns `None` (drawing nothing this frame) when the pet is invisible or
+    /// its tile has not baked yet — the shared two-bake budget may already be
+    /// spent on word-cats, and the pose lands on the next frame.
+    pub fn pet_cursor(&mut self, frame: PetCursorFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
+        let PetCursorFrame {
+            geom,
+            colors,
+            coat,
+            iris,
+            pet,
+        } = frame;
+        if pet.alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
+            return None;
+        }
+        self.cat_baker.set_free_tiles(true);
+        if !self.cat_baker_ready {
+            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+            self.cat_baker_ready = true;
+        }
+        self.pet_baker.begin_frame(geom.cell_w, geom.cell_h);
+
+        // Natural size from the authored art height. `host_tile` requires
+        // `w <= 4·cell_h` and `h <= 2·cell_h`; the roster's 1.70-row height and
+        // 1.706 aspect give 1.70·ch and 2.90·ch, inside both by construction —
+        // the assertion lives in the pet-art quality test, not here.
+        let nat_h = (crate::kitty_pet::ART_ROWS * f32::from(geom.cell_h)).round();
+        let nat_w = (nat_h * crate::kitty_pet::ART_ASPECT).round();
+        let nat_h = (nat_h as i32).clamp(1, i32::from(u16::MAX)) as u16;
+        let nat_w = (nat_w as i32).clamp(1, i32::from(u16::MAX)) as u16;
+
+        let key = crate::pet_baker::PetBakeKey {
+            pose: pet.pose,
+            coat,
+            iris,
+            colors,
+            w: nat_w,
+            h: nat_h,
+        };
+        // `host_id` already carries its own high-bit tag, so a pet tile can
+        // never alias the kitty-cursor sprite's small hand-assigned host id in
+        // the shared atlas.
+        let host = key.host_id();
+        // Two doors, one budget: bake the pose into the pet's own exact-size
+        // cache, then hand those texels to the shared atlas.
+        //
+        // A miss on either door must NOT drop the sprite. `pet_cursor` runs after
+        // `tick`, which has first claim on the shared two-bakes-per-frame budget,
+        // so a frame where word-cats took both is entirely ordinary — and a pose
+        // change lands on almost every frame while the pet is walking. Skipping
+        // the emission there would blink the cat out for that frame: a companion
+        // that strobes exactly when it is most active. So the LAST successfully
+        // resolved pose is held and re-emitted, and the new one lands next frame.
+        // The held pose is invalidated with the atlas itself (`reset`), so it can
+        // never outlive the tile it names.
+        let resolved = self
+            .pet_baker
+            .tile(&key)
+            .and_then(|rgba| self.cat_baker.host_tile(host, nat_w, nat_h, rgba))
+            .map(|t| (t.ax, t.ay, key.pose));
+        if let Some(r) = resolved {
+            self.pet_last_tile = Some(r);
+        }
+        let (ax, ay, _) = resolved.or(self.pet_last_tile)?;
+
+        // Dest rect: squash/stretch about the FEET (see the doc note).
+        let dest_w = ((f32::from(nat_w) * pet.scale_x).round() as i32)
+            .clamp(1, i32::from(u16::MAX)) as u16;
+        let dest_h = ((f32::from(nat_h) * pet.scale_y).round() as i32)
+            .clamp(1, i32::from(u16::MAX)) as u16;
+        let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
+        let cx = (pet.col * f32::from(geom.cell_w)).round() as i32 + i32::from(nat_w) / 2;
+        let baseline = ((pet.row + 1.0) * f32::from(geom.cell_h)).round() as i32
+            - (pet.lift * f32::from(geom.cell_h)).round() as i32;
+        let sprite = FreeSprite {
+            x: (cx - i32::from(dest_w) / 2).clamp(0, (grid_w - i32::from(dest_w)).max(0)),
+            y: baseline - i32::from(dest_h),
+            w: dest_w,
+            h: dest_h,
+            ax,
+            ay,
+            aw: nat_w,
+            ah: nat_h,
+            tint: 0x00FF_FFFF,
+            alpha: pet.alpha,
+            flip_x: pet.facing_left,
+            z: FreeZ::OverText,
+            sampler: FreeSampler::Nearest,
+        };
+        free.push(sprite);
+
+        let mut fp = fold_free(0xCBF2_9CE4_8422_2325, &sprite);
+        fp = fold_u64(fp, self.cat_baker.version());
+        fp = fold_u64(fp, self.pet_baker.version());
         fp = fold_u64(fp, u64::from(colors.accent));
         fp = fold_u64(fp, u64::from(colors.background));
         Some(fp)

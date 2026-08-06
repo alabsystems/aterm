@@ -4767,6 +4767,110 @@ pub(crate) fn translate_ink_into_pane(ink: &mut Vec<aterm_render::InkCell>, plac
 /// companion outright the moment it touched an interior pane edge — the kitty
 /// vanished near every divider. Scaling the crop by `aw/w` keeps both regimes
 /// correct: at 1:1 it reduces exactly to the old texel arithmetic.
+#[cfg(test)]
+mod pane_free_crop_tests {
+    use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
+
+    use super::{PanePlace, translate_free_into_pane};
+
+    fn sprite(x: i32, w: u16, ax: u16, aw: u16, flip_x: bool) -> FreeSprite {
+        FreeSprite {
+            x,
+            y: 0,
+            w,
+            h: 4,
+            ax,
+            ay: 0,
+            aw,
+            ah: 4,
+            tint: 0x00FF_FFFF,
+            alpha: 255,
+            flip_x,
+            z: FreeZ::OverText,
+            sampler: FreeSampler::Nearest,
+        }
+    }
+
+    /// The atlas column each destination column samples, by the CPU renderer's
+    /// own rule (`aterm-render`: `sx = if flip_x { aw - 1 - sx0 } else { sx0 }`).
+    /// 1:1 scale, so `sx0` is the destination column.
+    fn sampled(s: &FreeSprite) -> Vec<u16> {
+        (0..s.w)
+            .map(|i| {
+                let sx = if s.flip_x { s.aw - 1 - i } else { i };
+                s.ax + sx
+            })
+            .collect()
+    }
+
+    /// An INTERIOR pane: `cols` cells starting at window column 4, inside a
+    /// 40-column window, cell 1x1 px. Interior matters — `px_box` leaves any
+    /// edge that touches the window open, because a sprite may legitimately
+    /// overhang the window and the renderer clips that. Only a divider crops,
+    /// which is exactly the case a split creates.
+    fn place(cols: u16) -> PanePlace {
+        PanePlace {
+            row_off: 1,
+            col_off: 4,
+            rows: 4,
+            cols,
+            win_rows: 40,
+            win_cols: 40,
+            cell_w: 1,
+            cell_h: 1,
+        }
+    }
+
+    /// The invariant the crop owes every sprite: the pixels that survive must be
+    /// the SAME pixels they were before the crop. Asserted against the renderer's
+    /// sampling rule rather than against the crop's own arithmetic, so the test
+    /// cannot agree with a bug by sharing it.
+    #[test]
+    fn cropping_preserves_which_texels_the_surviving_pixels_sample() {
+        for flip in [false, true] {
+            // 8 px wide starting 2 px left of the pane: the left 2 are cut.
+            let full = sprite(-2, 8, 100, 8, flip);
+            let want: Vec<u16> = sampled(&full).into_iter().skip(2).collect();
+            let mut v = vec![full];
+            translate_free_into_pane(&mut v, place(6));
+            let got = sampled(&v[0]);
+            assert_eq!(
+                got, want,
+                "flip_x={flip}: a left crop must keep the same texels"
+            );
+        }
+    }
+
+    /// The asymmetric case is the one that separates a mirror-aware crop from a
+    /// mirror-blind one: trim only the LEFT of a mirrored sprite and the source
+    /// window must shrink from its RIGHT, leaving `ax` alone. Advancing `ax`
+    /// here — the pre-fix behaviour — slides the window off the end of the tile
+    /// and draws the cat sliced from its own middle.
+    #[test]
+    fn a_mirrored_sprite_trims_its_source_from_the_opposite_end() {
+        let mut v = vec![sprite(-1, 8, 100, 8, true)];
+        translate_free_into_pane(&mut v, place(16)); // wide pane: left crop only
+        let s = &v[0];
+        assert_eq!(s.w, 7, "one column was cut");
+        assert_eq!(
+            s.ax, 100,
+            "a mirrored sprite cropped on the left keeps its atlas origin"
+        );
+        assert_eq!(s.aw, 7);
+        // And an unmirrored twin still advances, exactly as it always did.
+        let mut u = vec![sprite(-1, 8, 100, 8, false)];
+        translate_free_into_pane(&mut u, place(16));
+        assert_eq!(u[0].ax, 101, "the unmirrored crop is unchanged");
+    }
+
+    #[test]
+    fn a_sprite_wholly_outside_its_pane_is_dropped() {
+        let mut v = vec![sprite(50, 8, 100, 8, true)];
+        translate_free_into_pane(&mut v, place(6));
+        assert!(v.is_empty());
+    }
+}
+
 pub(crate) fn translate_free_into_pane(
     free: &mut Vec<aterm_core::render::FreeSprite>,
     place: PanePlace,
@@ -4801,7 +4905,22 @@ pub(crate) fn translate_free_into_pane(
         };
         let (aw0, ah0) = (s.aw, s.ah);
         let (w0, h0) = (s.w, s.h);
-        s.ax = s.ax.saturating_add(scale(cx0 - x0, w0, aw0));
+        // A MIRRORED sprite runs its atlas window the other way: both backends
+        // start sampling at `ax + aw` and walk backwards (`aterm-render`'s
+        // `aw - 1 - sx`, the GPU's negative `du`). So dest x = 0 is the atlas's
+        // RIGHT edge, and trimming pixels off the LEFT of the destination must
+        // trim them off the RIGHT of the source — leaving `ax` where it is. The
+        // unmirrored formula would advance `ax` into the wrong half of the tile
+        // and draw a cat sliced from its own middle. Only the pet mirrors today
+        // (facing), and only a pet straddling a pane divider is cropped at all,
+        // which is exactly the case a split makes ordinary.
+        let left_trim = cx0 - x0;
+        let right_trim = x1 - cx1;
+        s.ax = s.ax.saturating_add(scale(
+            if s.flip_x { right_trim } else { left_trim },
+            w0,
+            aw0,
+        ));
         s.ay = s.ay.saturating_add(scale(cy0 - y0, h0, ah0));
         s.w = (cx1 - cx0) as u16;
         s.h = (cy1 - cy0) as u16;
@@ -4893,6 +5012,12 @@ pub(crate) struct ComposeDecoCtx<'a> {
     /// This frame's companion opacity (0 ⇒ no companion is drawn) and pose.
     pub(crate) kitty_alpha: u8,
     pub(crate) cat_frame: crate::kitty_cursor::CatFrame,
+    /// The PET companion's resolved frame, already ticked for this composed
+    /// present (the brain advances outside this path so it can never freeze —
+    /// see the tick site). Emitted only when `pet_visible`; `kitty_alpha` is 0
+    /// whenever it is, so the two companions can never both be drawn.
+    pub(crate) pet: aterm_effects::kitty_pet::PetFrame,
+    pub(crate) pet_visible: bool,
     pub(crate) accent: u32,
     pub(crate) cursor_color: u32,
     pub(crate) now: Instant,
@@ -8534,6 +8659,14 @@ impl App {
             .eq_ignore_ascii_case("comet")
     }
 
+    /// Whether the active trail style asks for the full-body PET companion
+    /// (`cursor_trail_style = "rainbow kitty pet"`) instead of the flying kitty.
+    /// Both spellings resolve to the same `GlowStyle::RainbowKitty` trail —
+    /// mirrors `trail_is_comet`'s style-string idiom.
+    pub(crate) fn trail_is_kitty_pet(&self) -> bool {
+        crate::cursor_glow::GlowStyle::style_names_kitty_pet(self.config.cursor_trail_style_raw())
+    }
+
     /// Resolve the cadence-comet MOTION-TRAIL config for this frame: the directional
     /// comet of fading [`aterm_render::TrailCell`]s the cursor sweeps (the body the
     /// additive [`glow_config`] crown wraps). Enabled ONLY for the "comet"
@@ -11579,6 +11712,9 @@ impl App {
             // pure function of the focused pane's session id.
             let front_session = self.focused_session_id(id).unwrap_or(0);
             let collected_look = self.kitty_log.companion_look();
+            // Likewise a pure config read, hoisted above the window borrow: it
+            // selects WHICH companion the draw block below emits.
+            let pet_mode = self.trail_is_kitty_pet();
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
@@ -11739,8 +11875,61 @@ impl App {
                     // resolved a live rainbow-kitty-gated drive above, so this arm can
                     // never draw a non-rainbow-kitty or idle frame.
                     && cat_frame.sing > 0.0);
-            let kitty_alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
-            let glow_fp = glow_fp ^ if kitty_enabled { cat_frame.fp() } else { 0 };
+            // `!pet_mode` folded in HERE, not just at the sprite. `kitty_alpha`
+            // is the flying companion's "can this be drawn" answer, and three
+            // other things read it: the exit-flourish emitter, the `glow_fp`
+            // fold, and the ambient scanner's one-cat-per-caret gate. Suppressing
+            // only the sprite would leave an INVISIBLE earned episode still
+            // firing a heart/star flourish from nowhere, still moving the repaint
+            // key at 60 fps for pixels that never change, and still telling the
+            // scanner to hide a word-cat for a companion that is not there —
+            // exactly the "invisible-cat wake train" the comment above warns
+            // against. Gate everything on what can be drawn.
+            let kitty_alpha = if kitty_enabled && !pet_mode {
+                cat_frame.alpha
+            } else {
+                0
+            };
+            // THE PET IS NOT EARNED. The flying kitty is a reward for a sustained
+            // typing run and fades out when the run ends; the pet is a resident
+            // — that is the whole point of a creature that *sleeps*, and an
+            // earned companion can never be seen doing it. So the pet takes the
+            // PRESENTATION gate (focused, master on, not load-shed, the trail
+            // style actually selected) and none of the momentum gate. Its own
+            // fade envelope, driven by whether the caret is visible at all, is
+            // the only thing that turns it off.
+            let pet_visible = pet_mode
+                && win_focused
+                && !deco_suspend
+                && sparkle_on
+                && glow_cfg.enabled
+                && matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
+            // THE BRAIN TICKS UNCONDITIONALLY, exactly like `cursor_cat.frame`
+            // above and for exactly the same reason: the scheduler asks
+            // `cursor_pet.needs_frames()` (lib.rs) whether to keep the 60 fps
+            // lane armed, and that is a pure read of brain state which only
+            // `tick` advances. Ticking inside the draw gate would freeze the
+            // brain the instant the pet stopped being drawable — an alt-screen
+            // app, an unfocused window, the trail switched off — and the
+            // predicate would latch at whatever it last said, pinning a full
+            // frame rate on a window with no cat on it, forever.
+            //
+            // A pet that cannot be drawn is fed `caret: None`, which is the
+            // truth (there is no caret it could be chasing on this surface):
+            // it fades out, settles, and releases the lane on its own.
+            let pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+                now: frame_started,
+                caret: if pet_visible { cur } else { None },
+                rows: glow_geom.rows.min(usize::from(u16::MAX)) as u16,
+                cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
+                cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
+                cell_h: glow_geom.ch.min(usize::from(u16::MAX)) as u16,
+                // The same demotion the cat frame took two lines above, from the
+                // one motion policy — so a reduced-motion window cannot animate
+                // one companion and freeze the other.
+                reduced_motion: !animate_cat,
+            });
+            let glow_fp = glow_fp ^ if kitty_alpha > 0 { cat_frame.fp() } else { 0 };
             // On the way out, the cat sometimes does a flourish — a heart rising
             // (heart meow) or a sparkling star (star wink). It is emitted LATER
             // (just after the halo stream is assembled below) because its
@@ -11856,7 +12045,9 @@ impl App {
                         // at the word the caret is sitting on — the two
                         // features are otherwise blind to each other, so typing
                         // `kitty` drew both at once.
-                        cur.filter(|_| kitty_alpha > 0),
+                        // ONE COMPANION PER CARET: whichever animal is actually
+                        // on screen claims the cell, so the pet counts here too.
+                        cur.filter(|_| kitty_alpha > 0 || (pet_visible && pet_frame.alpha > 0)),
                         Some(sel_view),
                         ws.focused,
                         &mut ws.deco_scratch,
@@ -11935,7 +12126,59 @@ impl App {
                     // The rare EARNED cat leading the cursor (gated on
                     // !deco_suspend by living in this branch — an alt-screen /
                     // load-shed frame draws none).
-                    if kitty_alpha > 0
+                    // ── the PET companion ──────────────────────────────────
+                    // Same guard, same load-shed branch, same alpha gate as the
+                    // flying kitty — a pure swap of which animal is drawn. It
+                    // ticks from the caret cell alone (the pet is its own move
+                    // sensor, see `kitty_pet::PetSense`), so it keeps behaving
+                    // through every trail-config state the glow classifier
+                    // early-outs on.
+                    if pet_visible && pet_frame.alpha > 0 {
+                        let colors = ws.cursor_cat.episode_colors().unwrap_or_else(|| {
+                            // The footprint must be the rect the pet ACTUALLY
+                            // covers, or the contrast ink is resolved against
+                            // cells the cat is not standing on. It is
+                            // `ART_ROWS` tall with its BOTTOM on the row
+                            // baseline (not its top on the row), and
+                            // `art_cols` wide — which is ~5.8 columns at a
+                            // typical cell aspect, not three.
+                            let pet_h = (aterm_effects::kitty_pet::ART_ROWS
+                                * f32::from(effect_geom.cell_h))
+                            .round();
+                            let pet_w = (pet_h * aterm_effects::kitty_pet::ART_ASPECT).round();
+                            let sampled = cursor_cat_color_key(
+                                &ws.input_scratch.cells,
+                                effect_geom,
+                                aterm_effects::word_decorations::CatFootprint {
+                                    x: (pet_frame.col * f32::from(effect_geom.cell_w)) as i32,
+                                    y: ((pet_frame.row + 1.0) * f32::from(effect_geom.cell_h))
+                                        as i32
+                                        - pet_h as i32,
+                                    w: (pet_w as i32).clamp(1, i32::from(u16::MAX)) as u16,
+                                    h: (pet_h as i32).clamp(1, i32::from(u16::MAX)) as u16,
+                                },
+                                default_bg_u32,
+                                cursor_color_u32,
+                                glow_cfg.accent,
+                            );
+                            ws.cursor_cat.colors_for_episode(sampled)
+                        });
+                        let look = cat_frame.look.normalized();
+                        if let Some(pet_fp) = ws.word_decos.pet_cursor(
+                            aterm_effects::word_decorations::PetCursorFrame {
+                                geom: effect_geom,
+                                colors,
+                                coat: look.coat,
+                                iris: look.iris,
+                                pet: pet_frame,
+                            },
+                            &mut ws.free_scratch,
+                        ) {
+                            fp ^= pet_fp.rotate_left(29);
+                        }
+                    }
+                    if !pet_mode
+                        && kitty_alpha > 0
                         && let Some(cell) = cur
                     {
                         let layout = aterm_effects::word_decorations::KittyCursorLayout {
@@ -14220,12 +14463,109 @@ impl App {
     /// comes entirely from the caller), its input is the committed KEYSTREAM,
     /// which only ever reaches the focused pane, and a window has exactly one
     /// caret. A background pane's companion could never be earned.
+    /// The full-body PET on a composed frame — the split twin of the pet branch
+    /// in `redraw_window`.
+    ///
+    /// The pet needs no window-space coordinates and no second placement law:
+    /// its world IS the focused pane. It is emitted at that pane's geometry
+    /// (the same `EffectGeom` the pane's word-cats use), then translated and
+    /// cropped by [`translate_free_into_pane`] like every other pane sprite, so
+    /// a cat that walks toward a divider is clipped at it rather than drawn over
+    /// the neighbour. The clamp inside the brain keeps it inside the pane in the
+    /// first place; the crop is the belt to that braces.
+    fn compose_pet_companion(
+        &mut self,
+        wid: WindowId,
+        ctx: &ComposeDecoCtx<'_>,
+        focus_place: Option<PanePlace>,
+    ) -> u64 {
+        if ctx.pet.alpha == 0 {
+            return 0;
+        }
+        let Some(place) = focus_place else {
+            return 0;
+        };
+        let default_bg = self.theme.bg;
+        let (accent, cursor_color) = (ctx.accent, ctx.cursor_color);
+        let term = self.pool.get(ctx.focus).map(|s| s.term.clone());
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return 0;
+        };
+        ws.word_decos.bind_pane(
+            ctx.focus,
+            (
+                i32::from(place.col_off) * ctx.cell_w as i32,
+                i32::from(place.row_off) * ctx.cell_h as i32,
+            ),
+        );
+        let geom = crate::word_decorations::EffectGeom {
+            cell_w: ctx.cell_w as u16,
+            cell_h: ctx.cell_h as u16,
+            rows: place.rows,
+            cols: place.cols,
+        };
+        // The palette samples the rect the pet actually covers, in PANE cells —
+        // `ART_ROWS` tall with its bottom on the row baseline, `art_cols` wide.
+        let pet_h = (aterm_effects::kitty_pet::ART_ROWS * f32::from(geom.cell_h)).round();
+        let pet_w = (pet_h * aterm_effects::kitty_pet::ART_ASPECT).round();
+        let colors = match ws.cursor_cat.episode_colors() {
+            Some(colors) => colors,
+            None => {
+                if let Some(term) = term.as_ref() {
+                    let mut t = term_lock(term);
+                    t.cell_frame_into(
+                        &mut ws.deco_pane_cells,
+                        usize::from(place.rows),
+                        usize::from(place.cols),
+                    );
+                }
+                let sampled = cursor_cat_color_key(
+                    &ws.deco_pane_cells.cells,
+                    geom,
+                    aterm_effects::word_decorations::CatFootprint {
+                        x: (ctx.pet.col * f32::from(geom.cell_w)) as i32,
+                        y: ((ctx.pet.row + 1.0) * f32::from(geom.cell_h)) as i32 - pet_h as i32,
+                        w: (pet_w as i32).clamp(1, i32::from(u16::MAX)) as u16,
+                        h: (pet_h as i32).clamp(1, i32::from(u16::MAX)) as u16,
+                    },
+                    default_bg,
+                    cursor_color,
+                    accent,
+                );
+                ws.cursor_cat.colors_for_episode(sampled)
+            }
+        };
+        let look = ctx.cat_frame.look.normalized();
+        ws.pane_free.clear();
+        let fp = ws.word_decos.pet_cursor(
+            aterm_effects::word_decorations::PetCursorFrame {
+                geom,
+                colors,
+                coat: look.coat,
+                iris: look.iris,
+                pet: ctx.pet,
+            },
+            &mut ws.pane_free,
+        );
+        translate_free_into_pane(&mut ws.pane_free, place);
+        ws.free_scratch.extend_from_slice(&ws.pane_free);
+        fp.map_or(0, |f| f.rotate_left(29))
+    }
+
     fn compose_cursor_companion(
         &mut self,
         wid: WindowId,
         ctx: &ComposeDecoCtx<'_>,
         focus_place: Option<PanePlace>,
     ) -> u64 {
+        // THE PET rides the focused pane exactly like the flying kitty does:
+        // emitted at that pane's geometry into `pane_free`, then put through the
+        // one translate/crop helper. Its brain was already ticked for this
+        // present (outside this function, which the sparkle master can skip), so
+        // this is pure emission.
+        if ctx.pet_visible {
+            return self.compose_pet_companion(wid, ctx, focus_place);
+        }
         if ctx.kitty_alpha == 0 {
             return 0;
         }
@@ -15011,7 +15351,21 @@ impl App {
         let sing_style = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
         let sound_on = self.config.trail_sounds_or_default();
         let sound_volume = self.config.trail_sound_volume();
-        let (cat_frame, kitty_alpha, riff) =
+        // The PET companion, resolved on the SAME terms as the single-pane path
+        // (a pure config read, hoisted above the `ws` borrow) — and drawable
+        // under the same presentation gate the flying kitty takes here.
+        let pet_mode = self.trail_is_kitty_pet();
+        let pet_visible =
+            pet_mode && cat_presentable && sparkle_on && glow_cfg.enabled && sing_style;
+        // The pet's WORLD is the focused pane, not the window: it chases that
+        // pane's caret, and its viewport clamp is that pane's grid. Anything
+        // else and a cat in the left half of a vertical split would happily walk
+        // over the divider into the right one.
+        let focus_pane_dims = panes
+            .iter()
+            .find(|(r, _)| r.session == focus)
+            .map(|(r, _)| (r.rows, r.cols));
+        let (cat_frame, kitty_alpha, riff, pet_frame) =
             {
                 let ws = self.windows.get_mut(&wid)?;
                 // THE SESSION KITTY: an explicitly collected companion wins;
@@ -15060,8 +15414,37 @@ impl App {
                         glow_cfg.style,
                         cat_frame.collection_hello,
                     ) || cat_frame.sing > 0.0);
-                let alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
-                (cat_frame, alpha, riff)
+                // `!pet_mode` for the same reason as the single-pane path: an
+                // un-drawable flying kitty must not fire an exit flourish, move
+                // the RepaintKey, or claim the caret cell from a word-cat.
+                let alpha = if kitty_enabled && !pet_mode {
+                    cat_frame.alpha
+                } else {
+                    0
+                };
+                // THE PET BRAIN TICKS HERE, unconditionally and exactly once per
+                // composed frame — outside `compose_word_decorations`, which
+                // early-returns whenever the sparkle master is off. The scheduler
+                // reads `needs_frames()`, and only `tick` advances it: freezing
+                // the brain anywhere the predicate is still consulted latches a
+                // permanent wake train (the single-pane path learned this the
+                // hard way). A pet that cannot be drawn is fed `caret: None`, so
+                // it fades out and releases the lane honestly.
+                let (pane_rows, pane_cols) = focus_pane_dims.unwrap_or((0, 0));
+                let pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+                    now,
+                    caret: if pet_visible && focus_pane_dims.is_some() {
+                        (focus_vis && !focus_scrolled).then_some(focus_cur_pos)
+                    } else {
+                        None
+                    },
+                    rows: pane_rows,
+                    cols: pane_cols,
+                    cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
+                    cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
+                    reduced_motion: !animate_cat,
+                });
+                (cat_frame, alpha, riff, pet_frame)
             };
         if let Some((bar, gain, key)) = riff {
             self.trail_audio.push(sing_riff_event(bar, gain, key));
@@ -15080,6 +15463,8 @@ impl App {
                 animate_sparkles,
                 kitty_alpha,
                 cat_frame,
+                pet: pet_frame,
+                pet_visible,
                 accent: glow_cfg.accent,
                 cursor_color: focus_cursor_rgb
                     .map_or(aterm_core::render::COLOR_UNSET, aterm_render::rgb_to_u32),
@@ -16690,6 +17075,14 @@ impl App {
             ws.pending_resize = None;
             ws.next_resize_settle = None;
         }
+        // THE GRID IS NOW THE WINDOW'S. Close the stale-grid slice a bounds change
+        // opened: this is the moment the text a user is reading stops trailing the
+        // window edge, which `resize_present` cannot observe (it goes green as soon
+        // as a correctly-SIZED frame is submitted, and the surface is reconfigured
+        // before the reflow throttle even runs). A commit with no window event
+        // behind it — the control `resize` verb, a font zoom, a config re-grid —
+        // finds no armed stamp and records nothing.
+        crate::metrics::note_grid_committed();
         // Resize every pane (of every tab of THIS window) to its computed sub-rect;
         // with no splits each pane fills its whole tab = the full window grid.
         // `resize_panes` records each pane's asciicast + temporal-spine resize event.

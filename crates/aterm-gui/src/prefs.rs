@@ -923,6 +923,11 @@ pub(crate) const DEFAULT_CURSOR_TRAIL_STYLE: &str = "rainbow kitty";
 pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "phaser",
     "rainbow kitty",
+    // The same banded-ribbon trail, with the full-body PET companion instead of
+    // the flying kitty (`GlowStyle::style_names_kitty_pet`). A first-class
+    // option rather than an alias: it is a real choice the picker must offer,
+    // even though both spellings resolve to one `GlowStyle`.
+    "rainbow kitty pet",
     "comet",
     "lumen",
     "sparkle",
@@ -982,6 +987,8 @@ pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("nyan rainbow", "rainbow kitty"),
     ("nyan", "rainbow kitty"),
     ("rainbow", "rainbow kitty"),
+    ("kitty pet", "rainbow kitty pet"),
+    ("pet kitty", "rainbow kitty pet"),
     ("sparkles", "sparkle"),
     ("phaser-sparkle", "sparkle"),
     ("rainbow-sparkle", "sparkle"),
@@ -4236,6 +4243,11 @@ mod trail_style_tests {
             "lumen" => GlowStyle::Lumen,
             "phaser" => GlowStyle::Phaser,
             "rainbow kitty" => GlowStyle::RainbowKitty,
+            // The pet is a COMPANION swap, not a trail: it deliberately shares
+            // `RainbowKitty` so the ribbon, starfield and sound palette are
+            // literally the same code. `GlowStyle::style_names_kitty_pet` is
+            // what separates them, and its own pin is below.
+            "rainbow kitty pet" => GlowStyle::RainbowKitty,
             "sparkle" => GlowStyle::Sparkle,
             "fire" => GlowStyle::Fire,
             "laser" => GlowStyle::Laser,
@@ -4249,6 +4261,35 @@ mod trail_style_tests {
         };
         for &s in CURSOR_TRAIL_STYLES {
             assert_eq!(GlowStyle::parse(s), expected(s), "style {s:?}");
+        }
+    }
+
+    /// The pet's twin pin: exactly one canonical style (and its documented
+    /// aliases) selects the full-body companion, and every other spelling —
+    /// including the plain `rainbow kitty` it shares a `GlowStyle` with — does
+    /// not. Without this, the two rainbow-kitty entries would be
+    /// indistinguishable to the picker and the draw path could never disagree
+    /// with the trail.
+    #[test]
+    fn exactly_one_trail_style_selects_the_full_body_pet() {
+        for &s in CURSOR_TRAIL_STYLES {
+            assert_eq!(
+                GlowStyle::style_names_kitty_pet(s),
+                s == "rainbow kitty pet",
+                "style {s:?}"
+            );
+        }
+        for alias in ["kitty pet", "pet kitty", "  Kitty Pet  "] {
+            assert!(
+                GlowStyle::style_names_kitty_pet(alias),
+                "documented alias {alias:?} must select the pet"
+            );
+        }
+        for other in ["rainbow", "nyan", "pet", "kitty", "rainbowkittypet"] {
+            assert!(
+                !GlowStyle::style_names_kitty_pet(other),
+                "{other:?} must NOT select the pet"
+            );
         }
     }
 

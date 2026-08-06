@@ -1692,6 +1692,10 @@ impl App {
         let mut capture_failed = None;
         let mut capture_budget = 0_u64;
         let mut capture_cells = 0_u64;
+        // Latched once the aggregate cell budget has refused a carried-history
+        // checkpoint: every later session goes straight to visible-only rather than
+        // paying an admission probe that the budget has already proven cannot pass.
+        let mut history_over_budget = false;
         for session in self.pool.iter() {
             if std::time::Instant::now() >= deadline {
                 capture_failed = Some("bounded visible-screen capture exceeded 20 ms");
@@ -1718,7 +1722,7 @@ impl App {
             // more than half spent. Failing the handoff to protect scrollback would
             // trade the whole update for the thing the update was carrying.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let history = if remaining >= HANDOFF_HISTORY_COMFORT {
+            let mut history = if remaining >= HANDOFF_HISTORY_COMFORT && !history_over_budget {
                 crate::seamless::max_handoff_history_lines()
             } else {
                 0
@@ -1727,13 +1731,56 @@ impl App {
             // anything. Conservatively reserve main+alt because querying the copied
             // checkpoint to discover alt presence is exactly the potentially
             // expensive work this admission must precede.
-            let per_grid = crate::seamless::admit_checkpoint_dimensions(
+            let mut per_grid = crate::seamless::admit_checkpoint_dimensions(
                 &mut capture_cells,
                 terminal.rows(),
                 terminal.cols(),
                 history,
                 true,
             );
+            // DEGRADE ON BUDGET, exactly as the note above promises — this is the
+            // arm that was missing, and its absence is why an update could refuse
+            // to install forever.
+            //
+            // The ladder above reacts only to TIME. `admit_checkpoint_dimensions`
+            // also refuses on SPACE: the process-wide
+            // `MAX_HANDOFF_AGGREGATE_GRID_CELLS` is charged
+            // `cols * (2*rows + history)` per session across every tab and pane of
+            // every window, and carrying 256 history lines multiplies what a session
+            // costs. So a handful of ordinary sessions exhausts it — and a refusal
+            // there used to fall straight through to `capture_failed`, trading the
+            // whole update for the scrollback it was carrying. That is the precise
+            // failure this comment's own "MUST NEVER COST THE HANDOFF" forbids, and
+            // it is deterministic: same sessions, same geometry, same constants
+            // every attempt, so the automatic lane retried it indefinitely.
+            //
+            // A refusal costs nothing to recover from: the admission mutates the
+            // aggregate ONLY on success ("an over-budget checkpoint cannot leave
+            // partial authority"), so re-probing visible-only is exact, not
+            // approximate. The latch stops every later session paying the same
+            // doomed probe once the budget is known to be tight.
+            if per_grid.is_none() && history != 0 {
+                history = 0;
+                history_over_budget = true;
+                per_grid = crate::seamless::admit_checkpoint_dimensions(
+                    &mut capture_cells,
+                    terminal.rows(),
+                    terminal.cols(),
+                    0,
+                    true,
+                );
+            }
+            // Only now is a refusal real: the VISIBLE screen is what adoption
+            // requires, so a checkpoint that cannot be admitted even without history
+            // is a genuine blocker rather than a carried bonus. Name the cap that
+            // actually bound — the aggregate is in grid CELLS, and reporting every
+            // refusal as the byte cap sent this exact investigation looking for a
+            // 256 MiB allocation that was never involved.
+            if per_grid.is_none() {
+                capture_failed =
+                    Some("visible-screen capture exceeded the aggregate grid-cell budget");
+                break;
+            }
             capture_budget = per_grid
                 .and_then(|bytes| bytes.checked_mul(2))
                 .and_then(|bytes| capture_budget.checked_add(bytes))
