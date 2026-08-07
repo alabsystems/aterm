@@ -338,7 +338,10 @@ fn the_redraw_gate_reads_its_harness_exit_code_and_a_two_is_never_green() {
 
     repo.redraw_harness(2);
     let r = stages::run_stage(&ctx, &spec);
-    let t = tally(&[r.clone()]);
+    // `from_ref`, not `[r.clone()]`: `r` is read again below, so the clone was
+    // only ever there to make a one-element slice — and cloning a stage Run to
+    // count it invites the reading that `tally` consumes what it is given.
+    let t = tally(std::slice::from_ref(&r));
     assert_eq!(t.could_not_run, 1, "exit 2 decided nothing");
     assert_eq!(t.gate_failures, 0, "…and is not a finding about the tree");
     assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");

@@ -67,13 +67,15 @@ fn run_ty(ty: &PathBuf, m: &Model, cfg_overrides: &[(&'static str, i64)]) -> (bo
     let cfg = dir.join(format!("{}.cfg", m.name));
     std::fs::write(&spec, m.to_tla()).expect("write derived spec");
     std::fs::write(&cfg, m.to_cfg_with(cfg_overrides)).expect("write derived cfg");
-    let out = Command::new(ty)
-        .arg("check")
-        .arg(&spec)
-        .arg("--config")
-        .arg(&cfg)
-        .output()
-        .expect("run ty check");
+    let mut cmd = Command::new(ty);
+    cmd.arg("check").arg(&spec).arg("--config").arg(&cfg);
+    // ARMED: partial-order reduction is a speed feature that does not
+    // preserve coverage, and the `ty` this machine discovers has an
+    // UNSOUND one (it reduced a 128-state model to 1 and still printed
+    // "No errors found (exhaustive)"). Every `ty check` in this workspace
+    // arms the whole space through the one shared place.
+    aterm_spec::verify::arm_whole_space_check(&mut cmd);
+    let out = cmd.output().expect("run ty check");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

@@ -2845,7 +2845,11 @@ impl App {
         }
         // The control verb follows the front window, matching `apply_grid_resize`.
         let target = self.frontmost_window.unwrap_or(wid);
-        if let Some(w) = self.windows.get(&target).and_then(|ws| ws.os_window.as_ref()) {
+        if let Some(w) = self
+            .windows
+            .get(&target)
+            .and_then(|ws| ws.os_window.as_ref())
+        {
             // Best-effort by contract: the WM may clamp or ignore it. Deliberately
             // NOT followed by any local geometry write — believing our own request
             // is exactly the pre-application this variant exists to avoid.

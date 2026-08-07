@@ -6957,13 +6957,13 @@ fn derived_flash_limiter_proves_and_catches_overlap_blindness() {
         let run = |cfg_name: &str, cfg: String| -> (bool, String) {
             let cfgp = dir.join(cfg_name);
             std::fs::write(&cfgp, cfg).expect("write cfg");
-            let out = Command::new(&typ)
-                .arg("check")
-                .arg(&spec)
-                .arg("--config")
-                .arg(&cfgp)
-                .output()
-                .expect("run ty check");
+            let mut cmd = Command::new(&typ);
+            cmd.arg("check").arg(&spec).arg("--config").arg(&cfgp);
+            // ARMED: `FlashLimiter` is a derived model that is NOT in
+            // `model_registry()`, so the xref sweep never covered it and its
+            // prove halves would fail open under a bad reduction.
+            aterm_spec::verify::arm_whole_space_check(&mut cmd);
+            let out = cmd.output().expect("run ty check");
             let combined = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),

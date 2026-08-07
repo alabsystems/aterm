@@ -56,11 +56,18 @@ fn ty_model_checks_every_spec() {
         let cfg = path.with_extension("cfg");
         assert!(cfg.exists(), "spec {path:?} has no matching .cfg");
 
-        let out = Command::new(&ty)
-            .arg("check")
-            .arg(&path)
-            .arg("--config")
-            .arg(&cfg)
+        let mut cmd = Command::new(&ty);
+        cmd.arg("check").arg(&path).arg("--config").arg(&cfg);
+        // ARMED. These are the ISOLATION family — Sandbox, PathConfine, ForkExec,
+        // WriteAll, AltScreen, GpuEncode: security-boundary specs. The `ty` this
+        // machine discovers has an unsound partial-order reduction that prints
+        // "No errors found (exhaustive)" and exits 0 on a spec whose invariant is
+        // violated three steps from Init. These specs happen to agree POR-on and
+        // POR-off today, so this is a latent hole rather than an active false
+        // proof — armed anyway, because "not currently tripping" is not a
+        // property a security gate may rest on.
+        aterm_spec::verify::arm_whole_space_check(&mut cmd);
+        let out = cmd
             .output()
             .unwrap_or_else(|e| panic!("failed to run {ty:?}: {e}"));
 

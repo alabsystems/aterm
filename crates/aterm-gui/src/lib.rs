@@ -6275,7 +6275,11 @@ impl WindowState {
     /// because the deferral outlives the wake and the next park re-arms it.
     fn content_pace_floor(&self, app_default: Duration) -> Duration {
         let interval = self.frame_interval.unwrap_or(app_default);
-        if self.input_hot { interval / 2 } else { interval }
+        if self.input_hot {
+            interval / 2
+        } else {
+            interval
+        }
     }
 
     /// SUCCESS — record any frame that genuinely reached the platform present
@@ -14649,6 +14653,60 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Diagnostics first, before any thread spawns: without a logger every
     // aterm_log record — including containment_audit denials — is discarded.
     logging::init();
+    // B3 — PROCESS-GROUP CONTAINMENT, successor side (see
+    // `tests/handoff_launchd_job.rs` and `app_update_handoff`). A process that
+    // arrived through an update handoff is a CANDIDATE: the parent that started
+    // it may reject it and reap it with `kill(-pid)`, and that sweep reaches the
+    // ditto/codesign/spctl helpers the update logic forks only while this process
+    // leads its own process group. A candidate we were FORKED as already leads
+    // one — `run_handoff_worker`'s `pre_exec` established it before this image
+    // ran, so the call below is a second, no-op success — but a candidate LAUNCHED
+    // through LaunchServices is launchd's child, where no pre-exec hook of the
+    // parent's can run, so it has to contain ITSELF.
+    //
+    // ORDERING, which is the obligation `contain_own_process_group` names: the
+    // NEXT statement is the boot apply, and that is the first point at which this
+    // process runs another program at all (`aterm_update::install` runs
+    // /usr/bin/ditto, /usr/bin/hdiutil and codesign, then re-execs). Nothing
+    // ahead of it does: the one-binary router that dispatched here matches argv0,
+    // resolves a store shim by readlink and probes the TTY; this entry then marks
+    // the clock, repairs fd/env posture, parses the CLI and starts the logger. So
+    // there is no instant at which an updater helper of ours is outside the group
+    // — which is the whole of what the parent's sweep has to reach.
+    //
+    // GATE: `parent_pid()` is `Some` exactly for a recognized AND validated
+    // incoming handoff (the malformed shape already returned at `rejects_boot`),
+    // which is exactly the set of processes somebody may `kill(-pid)`. A cold
+    // start keeps whatever group its launcher chose: moving one out would take a
+    // shell-launched window out of its job-control group — out of reach of that
+    // terminal's Ctrl-C, and out of a test harness's group cleanup — and buys
+    // nothing, since nobody sweeps a group for a process that is not a candidate.
+    // A future lane that names the candidate over the control socket instead of
+    // through the environment (B4) has to extend this gate with it.
+    //
+    // FAIL CLOSED: a candidate that cannot lead its own group would fork helpers
+    // that no reaper could sweep, so it does not run the update logic at all. It
+    // returns here — before the boot apply, with no helper forked and no adopted
+    // descriptor consumed — and the parked parent sees proof EOF (`ChildDied`),
+    // rejects, and resumes its own readers. That is the same shape as the
+    // malformed-handoff refusal above, and it keeps the property by making the
+    // set of helpers empty rather than by claiming a sweep that would not work.
+    #[cfg(unix)]
+    if incoming_exec_fds.parent_pid().is_some()
+        && let app_update_handoff::ProcessGroupContainment::Foreign { group, own } =
+            app_update_handoff::contain_own_process_group()
+    {
+        // Both destinations deliberately: the log file is all a launchd-launched
+        // app leaves behind, and stderr is what a developer running the binary
+        // from a shell actually sees. A silent refusal here would present as an
+        // update that simply never happened.
+        aterm_log::error!(
+            "handoff candidate cannot lead its own process group (kernel reports pgid {group} for \
+             pid {own}); refusing to start update logic whose helpers no reaper could sweep"
+        );
+        eprintln!("aterm-gui: handoff candidate could not contain its own process group");
+        return;
+    }
     // Self-update apply, BEFORE any thread spawn or window: if a previous run
     // staged a verified, strictly-newer build, swap aterm.app in place and re-exec
     // the new binary (never returns on success). A no-op for dev/`cargo run`
@@ -25727,10 +25785,21 @@ mod spec_xref_gate {
                     // V2 evidence is an oracle obligation, not a performance
                     // lane: the current trust-cg fused path compiles every
                     // action but does not feed its counters into the vacuity
-                    // report. Force `ty`'s independent interpreter checker and
-                    // explicit sequential coverage so allow mode records the
-                    // exact dead set for the fail-closed tier comparison.
-                    .args(["--workers", "1", "--backend", "interpreter", "--coverage"]);
+                    // report. Force explicit sequential coverage so allow mode
+                    // records the exact dead set for the fail-closed tier
+                    // comparison. (`--backend interpreter` comes from the shared
+                    // arming below, which is also where it belongs.)
+                    .args(["--workers", "1", "--coverage"]);
+                // THE WHOLE SPACE, from the ONE place that defines what that
+                // means. This gate used to hand-roll its flag list and omitted
+                // `--no-auto-por`, so it ran the entire registry with
+                // partial-order reduction ON — 128 reachable states of
+                // `RainbowJumpBurstLifecycle` collapsed to 1, four of its six
+                // actions never fired, and `--strict-vacuity` called them dead.
+                // A dead set measured on a reduced space is not evidence about
+                // the model, and `aterm-spec`'s driver had already learned that
+                // (see `arm_whole_space_check`). Two drivers, one arming.
+                aterm_spec::verify::arm_whole_space_check(&mut cmd);
                 // Scalar models earn the dead-action relaxation via the interpreter
                 // audit below; function-valued models CANNOT be audited (the
                 // interpreter can't evaluate them), so they stay fully strict.
@@ -25741,8 +25810,12 @@ mod spec_xref_gate {
                 let out = cmd
                     .output()
                     .unwrap_or_else(|e| panic!("failed to run {ty:?}: {e}"));
+                // The transcript names its own checker: every panic below quotes
+                // this text, and "which `ty` produced this?" was the single most
+                // expensive question in diagnosing the 2026-08-06 red gate.
                 let text = format!(
-                    "{}\n{}",
+                    "{}{}\n{}",
+                    aterm_spec::verify::ty_evidence_header(&ty),
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
                 );
@@ -25759,6 +25832,13 @@ mod spec_xref_gate {
                     },
                 );
                 if auditable {
+                    // BEFORE trusting anything in this transcript: prove `ty`
+                    // walked the same space the interpreter does. A dead set
+                    // carries no record of the space it was measured on, so
+                    // without this a reduced run's phantom dead actions are
+                    // indistinguishable from real ones — which is exactly how
+                    // this gate shipped red.
+                    aterm_spec::verify::assert_ty_saw_whole_space(&m, &text, "spec_xref_closure");
                     // ALWAYS audited (not only when ty reports dead actions): the
                     // interpreter recomputes the dead set itself, so a silently
                     // under-reported/unparsed ty warning cannot fail open.

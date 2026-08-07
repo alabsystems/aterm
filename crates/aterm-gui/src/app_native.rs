@@ -4755,7 +4755,9 @@ impl App {
         if let Some(mut durable) = durable {
             let eligible = durable.enabled
                 && installed_stage_build.is_none()
-                && durable.staged_build.is_some_and(|staged| staged > stage_floor);
+                && durable
+                    .staged_build
+                    .is_some_and(|staged| staged > stage_floor);
             if !eligible {
                 durable.staged_build = None;
                 durable.staged_version = None;

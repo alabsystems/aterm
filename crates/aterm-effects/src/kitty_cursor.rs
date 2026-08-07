@@ -1976,7 +1976,11 @@ mod tests {
     fn cat_exit_starwink_flash_rate_stays_under_the_photosensitivity_bound() {
         let hz = EXIT_STAR_SCINT / FADE_OUT / std::f32::consts::TAU;
         assert!(hz <= 3.2, "the exit wink flashes at {hz} Hz");
-        assert!(EXIT_STAR_SCINT > 0.0, "the wink still glints");
+        // Anti-vacuity: the bound above is also satisfied by EXIT_STAR_SCINT = 0,
+        // which passes by DELETING the wink rather than pacing it. Compile-time
+        // (the file's own idiom, see `V056_MIN_RUN_KEYS`) because both operands
+        // are constants — a runtime assert over constants is what tippy rejects.
+        const { assert!(EXIT_STAR_SCINT > 0.0, "the wink still glints") };
     }
 
     fn geom() -> Geom {

@@ -2353,7 +2353,7 @@ impl CursorGlow {
     /// TUI repaint) that carry no keystroke at all — so it must prove the user
     /// was recently TYPING before it celebrates: momentum builds only from
     /// typed forward echoes, making it exactly the "was this text?" witness.
-    /// Above [`Self::RAINBOW_TERMINUS_MIN_DISP`] (a barely-warm tail must not
+    /// Above `RAINBOW_TERMINUS_MIN_DISP` (a barely-warm tail must not
     /// zoom) and low enough that type-then-Enter still celebrates (disp ≈
     /// 0.4+ after one word). Nav-HINTED jumps (Ctrl-A/E) are exempt by
     /// design: the literal gesture was a keypress.
@@ -2367,8 +2367,14 @@ impl CursorGlow {
     /// How long after the last committed press the ribbon is treated as
     /// plausibly still VISIBLE for the terminus dissolve. The visible ribbon
     /// fades in under ~3s while the eased momentum proxy stays above
-    /// [`Self::RAINBOW_TERMINUS_MIN_DISP`] for ~3-6s — exactly the window that
+    /// `RAINBOW_TERMINUS_MIN_DISP` for ~3-6s — exactly the window that
     /// scattered glitter over long-empty cells (the owner's Ctrl-L blob).
+    /// RETIRED PROXY, kept only for the test that proves it was insufficient.
+    /// Production no longer consults it — the ribbon is asked directly — so this
+    /// is `cfg(test)`: leaving it in the shipped build would advertise a tuning
+    /// knob nothing reads. Referenced in prose below without an intra-doc link,
+    /// because rustdoc builds without `cfg(test)` and could not resolve it.
+    #[cfg(test)]
     const RAINBOW_TERMINUS_RIBBON_WINDOW: f32 = 2.5;
     /// Most simultaneous live jump streaks (oldest evicted first).
     const RAINBOW_JUMP_CAP: usize = 4;
@@ -2456,6 +2462,12 @@ impl CursorGlow {
     /// yet low enough that any genuinely warm ribbon still feathers its end. The
     /// far-right (typing) terminus needs no such gate — it is only reached mid-
     /// typing, when a live ribbon is always present.
+    /// RETIRED PROXY, kept only for the test that proves it was insufficient.
+    /// Production no longer consults it — the ribbon is asked directly — so this
+    /// is `cfg(test)`: leaving it in the shipped build would advertise a tuning
+    /// knob nothing reads. Referenced in prose below without an intra-doc link,
+    /// because rustdoc builds without `cfg(test)` and could not resolve it.
+    #[cfg(test)]
     const RAINBOW_TERMINUS_MIN_DISP: f32 = 0.05;
     /// Most simultaneous live lightning bolts, main channels + branch forks
     /// (oldest evicted first). A jump strike spawns 1 main + up to 4 branches,
@@ -9313,14 +9325,6 @@ impl CursorGlow {
         0.5 * (1.0 + (std::f32::consts::PI * k).cos())
     }
 
-    /// Whether `spark` has finished its retract fade and may be reaped.
-    #[inline]
-    fn retract_spent(&self, now: Instant, spark: &Spark) -> bool {
-        spark.fade_at.is_some_and(|at| {
-            now.saturating_duration_since(at).as_secs_f32() >= Self::RAINBOW_RETRACT_FADE
-        })
-    }
-
     fn rainbow_exit_swoosh(&mut self, now: Instant, geom: Geom) {
         let Some(last_type) = self.last_type else {
             return;
@@ -9480,12 +9484,10 @@ impl CursorGlow {
                 // schedule — while every retracted cell rides the emitter's own
                 // cosine tail on the way out. Cells expire on the ordinary
                 // `retain` in `tick`, so nothing accumulates.
-                let mut idx = 0;
-                for spark in &mut self.sparks {
+                for (idx, spark) in self.sparks.iter_mut().enumerate() {
                     if kill[idx] {
                         spark.fade_at.get_or_insert(now);
                     }
-                    idx += 1;
                 }
                 self.rainbow.rank_scratch = ranked;
                 self.rainbow.kill_scratch = kill;
@@ -9761,7 +9763,7 @@ impl CursorGlow {
         // stays ≥ the floor for ~3-6s while the visible ribbon fades in under
         // ~3s, and glitter scattered in that gap lands on long-empty cells
         // (the owner's Ctrl-L blob). Require a committed press recent enough
-        // ([`Self::RAINBOW_TERMINUS_RIBBON_WINDOW`]) that ribbon is plausibly
+        // (`RAINBOW_TERMINUS_RIBBON_WINDOW`) that ribbon is plausibly
         // still on glass.
         //
         // NOW TESTS THE RIBBON ITSELF. Both proxies outlive the thing they stand
@@ -10472,7 +10474,7 @@ impl CursorGlow {
         // The per-CELL bound is the LARGEST any band may take; the real,
         // hue-specific ceiling lands per ROW below, where the gradient position
         // — and therefore the colour emitted — is known.
-        let base = cov_f.max(0.0).min(RAINBOW_BAND_COV_CAP_MAX);
+        let base = cov_f.clamp(0.0, RAINBOW_BAND_COV_CAP_MAX);
         let cell_cov = if self.rainbow.disp < 0.005 {
             base
         } else {
@@ -10487,9 +10489,7 @@ impl CursorGlow {
             let gd = (u - gc) / Self::RAINBOW_GLINT_WIDTH;
             let glint = (-(gd * gd)).exp(); // localized specular highlight 0..1
             let glint_add = Self::RAINBOW_GLINT_COV * disp2 * glint;
-            (base * shimmer + glint_add)
-                .max(0.0)
-                .min(RAINBOW_BAND_COV_CAP_MAX)
+            (base * shimmer + glint_add).clamp(0.0, RAINBOW_BAND_COV_CAP_MAX)
         };
         // Window-absolute cell anchor; the ribbon stays inside its own cell,
         // so `push_rect`'s origin-anchored row tag is still the true cell row.
@@ -18898,7 +18898,7 @@ mod tests {
         let col_peak = |glow: &CursorGlow, col: u16| -> u32 {
             glow.under_quads()
                 .iter()
-                .filter(|q| is_ribbon_quad(q.color) && q.x as u16 / cw == col)
+                .filter(|q| is_ribbon_quad(q.color) && q.x / cw == col)
                 .map(|q| {
                     ((q.color >> 16) & 0xff)
                         .max((q.color >> 8) & 0xff)
@@ -21355,20 +21355,6 @@ mod tests {
         }
     }
 
-    /// THE TERMINUS DISSOLVE REQUIRES A LIVE RIBBON, not a proxy for one.
-    ///
-    /// This test used to demand a recent committed PRESS instead of the eased
-    /// momentum, because momentum outlives the visible ribbon by seconds. Right
-    /// direction, wrong distance: the press window is 2.5s while the ribbon is
-    /// hard-cut at ~1.30s — and clamped harder the instant a jump is observed,
-    /// which is exactly the event that reaches this code — so a gap survived in
-    /// which glitter still scattered over empty cells. Worse, the zero-amplitude
-    /// path clears the ribbon while KEEPING both the spine and the press ring.
-    ///
-    /// The gate now asks the ribbon itself. Pins all three states, including the
-    /// one the proxies structurally could not catch.
-
-
     /// THE RIBBON VANISHES SMOOTHLY (owner: "the rainbow on the cursor isn't
     /// always smoothly vanishing").
     ///
@@ -21473,6 +21459,18 @@ mod tests {
         );
     }
 
+    /// THE TERMINUS DISSOLVE REQUIRES A LIVE RIBBON, not a proxy for one.
+    ///
+    /// This test used to demand a recent committed PRESS instead of the eased
+    /// momentum, because momentum outlives the visible ribbon by seconds. Right
+    /// direction, wrong distance: the press window is 2.5s while the ribbon is
+    /// hard-cut at ~1.30s — and clamped harder the instant a jump is observed,
+    /// which is exactly the event that reaches this code — so a gap survived in
+    /// which glitter still scattered over empty cells. Worse, the zero-amplitude
+    /// path clears the ribbon while KEEPING both the spine and the press ring.
+    ///
+    /// The gate now asks the ribbon itself. Pins all three states, including the
+    /// one the proxies structurally could not catch.
     #[test]
     fn rainbow_terminus_requires_a_live_ribbon_not_a_proxy_for_one() {
         let g = geom();

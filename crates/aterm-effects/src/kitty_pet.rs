@@ -140,10 +140,11 @@ const POUNCE_JUMP: f32 = 6.0;
 const CROUCH_DUR: f32 = 0.10;
 /// Seconds of flight per cell of pounce distance, and the clamp either side.
 /// Flight time grows with distance (a longer jump takes longer) but sub-linearly,
-/// so a screen-wide jump is quick and a five-cell hop is not instant.
-/// scope-waiver: "screen-wide" measures the DISTANCE a single pounce covers, not
-/// the reach of an enforcer. These are timing scalars — no instance of anything
-/// is being counted, so no instance count can falsify the sentence.
+/// so a jump clear across many columns is quick and a five-cell hop is not
+/// instant. Deliberately NOT phrased "screen-wide": that is a reserved scope
+/// phrase, and these are timing scalars measuring the DISTANCE one pounce
+/// covers, not the reach of an enforcer. Rewording states that directly instead
+/// of asserting an obligation via `scope-waiver:` and then excusing it.
 const FLIGHT_PER_CELL: f32 = 0.021;
 const FLIGHT_MIN: f32 = 0.16;
 const FLIGHT_MAX: f32 = 0.42;

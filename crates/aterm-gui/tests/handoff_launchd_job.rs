@@ -76,15 +76,48 @@
 //!   a `None` stub, so `ForkLink` is the only witness there and the fail-stop
 //!   remains entirely ppid-based — which is correct for a platform whose
 //!   successor is still a fork child.
-//! * **B2 — reap authority.** `app_update_handoff::kill_and_reap_handoff_child`
-//!   resumes the parked readers only once `wait` proved the rejected candidate
-//!   gone and reaped; `waitpid` on a non-child answers `ECHILD` and that proof
-//!   is lost. Needs a replacement that does not depend on being the parent.
-//! * **B3 — process-group containment.** The `pre_exec` `setpgid(0, 0)` in
+//! * **B2 — reap authority. DONE (0.14).** `kill_and_reap_handoff_child` used
+//!   to resume the parked readers only on a `wait` that proved the rejected
+//!   candidate gone, and `waitpid` on a non-child answers `ECHILD`, losing that
+//!   proof. Rollback is now licensed by a typed `HandoffRollbackWarrant`:
+//!   `waitpid` still mints one while the candidate IS our fork child, and when
+//!   it is not, `kill(pid, 0)` vacancy or a disagreeing kernel birth stamp mints
+//!   the same fact from outside the process tree. `ECHILD` is no longer read as
+//!   evidence of anything.
+//! * **B3 — process-group containment. Mechanism BUILT (0.15), not yet REACHED
+//!   on the launched lane.** The `pre_exec` `setpgid(0, 0)` in
 //!   `run_handoff_worker` is what makes `kill(-pid)` sweep the candidate's own
-//!   codesign/PlistBuddy/spctl helpers. A LaunchServices launch has no
-//!   equivalent hook, so the containment has to move into the successor's own
-//!   startup.
+//!   codesign/PlistBuddy/spctl helpers, and a LaunchServices launch has no
+//!   equivalent hook — so a successor is given the means to contain ITSELF:
+//!   `app_update_handoff::contain_own_process_group`, called from
+//!   `aterm_gui::main_entry` ahead of the boot apply, which is the first point
+//!   at which that process runs another program. `setpgid`'s EPERM is not read
+//!   as failure (the one process it refuses is a session leader, which already
+//!   leads its own group), but neither is it read as success: the postcondition
+//!   `getpgrp() == getpid()` is read back from the kernel, and a candidate that
+//!   cannot satisfy it exits before forking anything rather than leaving helpers
+//!   no reaper could sweep.
+//!
+//!   BE PRECISE ABOUT WHAT THAT BUYS TODAY, because the obvious reading is
+//!   wrong. The call is gated on `incoming_exec_fds.parent_pid().is_some()`,
+//!   i.e. a VALIDATED incoming handoff — and validation requires all six
+//!   handoff env vars plus a live `F_GETFD` on every named descriptor
+//!   (`seamless::handoff_is_modern_overlap`, `authority_valid`). A
+//!   LaunchServices launch inherits no descriptors, which is B4's whole premise
+//!   below, so such a successor fails validation and RETURNS before this call
+//!   rather than reaching it. On today's fork lane the call is therefore
+//!   redundant (`pre_exec` already did it, strictly earlier); on the launched
+//!   lane it is unreachable until B4's transport revalidates the handoff over
+//!   the socket. The mechanism is correct and probe-verified; it simply cannot
+//!   fire for the launch shape it was written for until B4 lands, and B4 must
+//!   extend that gate to a socket-named candidate.
+//!
+//!   What does NOT carry over is the PARENT's knowledge of the group. `pre_exec`
+//!   establishes it before `spawn` returns; a launched successor has no wire on
+//!   which to report its pgid, so on that lane `kill(-pid)` is an unproven sweep
+//!   until B4's socket carries an attested group id — see
+//!   `app_update_handoff::signal_handoff_candidate` for what each reaper may
+//!   conclude from it meanwhile.
 //! * **B4 — transport.** The PTY masters (`ATERM_SEAMLESS_FDS`), the readiness
 //!   pipe and the Commit pipe must move to an out-of-band `SCM_RIGHTS` transfer
 //!   over the per-user control socket. That also changes what
@@ -96,8 +129,15 @@
 //!   a term both sides compute independently of their own fd tables, such as
 //!   the descriptor's ordinal in the parent-declared transfer order.
 //!
-//! So: B1 is closed; B2, B3 and B4 remain, and this test FAILING is still the
-//! expected outcome until all three land and the `spawn` in
+//! So: B1 and B2 are closed. B3's mechanism is built and verified but cannot be
+//! REACHED on the launched lane until B4 revalidates a handoff that arrives
+//! without inherited descriptors — so B4 gates the remainder of B3 twice over:
+//! once for the successor's own containment call, and once for the attested
+//! group id the parent needs in order to aim `kill(-pid)` at a candidate it did
+//! not fork. Everything left is therefore B4.
+//!
+//! This test FAILING is still the expected outcome until that lands and the
+//! `spawn` in
 //! `app_update_handoff::run_handoff_worker` is replaced. Run it with:
 //!
 //! ```text

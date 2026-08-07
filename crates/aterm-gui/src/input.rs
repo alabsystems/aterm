@@ -185,10 +185,7 @@ pub enum InputEvent {
     /// changes that make a drag a drag. The residual difference from a hand drag is
     /// that AppKit is not in its event-tracking run-loop mode; everything inside
     /// aterm is the same path.
-    ResizeWindowPx {
-        width: u32,
-        height: u32,
-    },
+    ResizeWindowPx { width: u32, height: u32 },
     /// Focus gained/lost — DEC 1004 focus reporting (kills j). `true` = focus-in.
     Focus(bool),
 }

@@ -971,7 +971,19 @@ impl SessionHost for MemoryHost {
         } else {
             Arc::new((Mutex::new(0), Condvar::new()))
         };
-        let registered_at = *changed.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Bound to a NAME rather than acquired through `changed.0` directly: the
+        // L0 lock-order census resolves a lock's identity from its receiver, and a
+        // tuple field has no name to resolve — the site becomes a per-site UNKNOWN
+        // node, which by construction can never participate in a cycle, so a real
+        // ABBA through this mutex would be invisible to the gate.
+        //
+        // `change_epoch` and not `lock`: identities are keyed by receiver NAME
+        // across the whole scan set, so a generic name merges this counter with
+        // every other `lock` in the workspace. That merge is not hypothetical —
+        // it is half of the false {lock, spill} cycle this crate's extraction
+        // triggered on 2026-08-01.
+        let (change_epoch, _) = &*changed;
+        let registered_at = *change_epoch.lock().unwrap_or_else(|p| p.into_inner());
         Box::new(MemoryWait {
             changed,
             registered_at,

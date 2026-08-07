@@ -2013,22 +2013,19 @@ impl App {
         if !self.windows.contains_key(&window) {
             return Ok(true);
         }
-        if !self
-            .native_documents
+        // Re-derive the plan on EVERY gesture, not only the first. The window
+        // whose barrier is already armed stays interactive, so a repeated close
+        // — exactly what a user does when the window does not appear to close —
+        // can arrive after a document was opened into it. Reusing the plan
+        // captured by the first gesture would report the window ready while that
+        // later document is still dirty and authorize a teardown that strands
+        // its view in `view_store` with no tab to reach it from. Re-deriving is
+        // not extra work in the common case: an unchanged window yields an equal
+        // plan, and `drive_document_close_plan` was already re-run per gesture.
+        let plan = self.document_close_plan_for_window(window)?;
+        self.native_documents
             .pending_window_closes
-            .contains_key(&window)
-        {
-            let plan = self.document_close_plan_for_window(window)?;
-            self.native_documents
-                .pending_window_closes
-                .insert(window, plan);
-        }
-        let plan = self
-            .native_documents
-            .pending_window_closes
-            .get(&window)
-            .cloned()
-            .expect("window close plan was just installed");
+            .insert(window, plan.clone());
         let ready = self.drive_document_close_plan(&plan, start_saves)?;
         if ready {
             self.commit_pending_window_document_shutdown(window)?;
@@ -2144,6 +2141,28 @@ impl App {
                     .prepare_window_native_shutdown(window, crate::native_app::CloseScope::Window)?
                 {
                     continue;
+                }
+                // `plan` froze when the barrier armed, and the window stayed
+                // interactive for the whole checkpoint, so a document opened
+                // after that instant is absent from it. Nothing else proves such
+                // a document durable: the editor reducer answers `Ready`
+                // unconditionally and delegates durability to this host, so the
+                // native sweep above cannot see its unsaved edits either.
+                // Committing the frozen plan would detach only the documents it
+                // lists and then drop the tab tree, stranding the late
+                // document's view in `view_store` with no tab and no window to
+                // reach it from — permanently dirty, and permanently refusing
+                // every update apply. Re-plan against the window's CURRENT
+                // leaves; an unchanged plan takes exactly the path it did
+                // before.
+                let fresh = self.document_close_plan_for_window(window)?;
+                if fresh != plan {
+                    self.native_documents
+                        .pending_window_closes
+                        .insert(window, fresh.clone());
+                    if !self.drive_document_close_plan(&fresh, true)? {
+                        continue;
+                    }
                 }
                 self.commit_pending_window_document_shutdown(window)?;
                 ready.push(window);
@@ -5619,6 +5638,166 @@ mod tests {
                 .contains_key(&wid)
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), latest.text.as_ref());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The window-close document plan is captured once, when the barrier arms,
+    /// and the window deliberately stays interactive while its checkpoint runs.
+    /// A document opened in that same window afterwards is therefore absent from
+    /// the frozen plan, so nothing proves its durability before
+    /// `escalate_document_shutdown` hands the window to `close_window_logical`.
+    /// That teardown drops the tab tree and the `WindowState` regardless, and the
+    /// only refusal it can raise — `remove_view_link` returning `None` — is
+    /// discarded, leaving the unsaved document's view in `view_store` with no tab
+    /// and no window to reach it from.
+    #[test]
+    fn window_close_plan_frozen_before_a_later_document_cannot_orphan_its_dirty_view() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-window-close-late-document-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let planned = dir.join("planned.md");
+        let late = dir.join("late.md");
+        fs::write(&planned, "planned\n").unwrap();
+        fs::write(&late, "late\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&planned))
+            .unwrap();
+        let (planned_instance, planned_view) = app.active_native_view(wid).unwrap();
+        let planned_document = app.native_runtime.document_id(planned_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("planned edit ".into())),
+        )
+        .unwrap();
+
+        // Close the window. Its one dirty document arms the barrier, which keeps
+        // the complete window installed while the checkpoint runs.
+        assert!(
+            !app.prepare_window_document_shutdown_inner(wid, false)
+                .unwrap()
+        );
+
+        // The still-interactive window opens a SECOND document and dirties it.
+        app.open_document_tab(AppKind::Editor, &file_uri(&late))
+            .unwrap();
+        let (late_instance, late_view) = app.active_native_view(wid).unwrap();
+        let late_document = app.native_runtime.document_id(late_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("late edit ".into())),
+        )
+        .unwrap();
+        assert_eq!(app.document_store.dirty(late_document), Some(true));
+
+        // The planned document becomes durable, so the frozen plan reports the
+        // window ready and the event loop performs the structural teardown.
+        app.save_document_checkpoint(planned_document, planned_view)
+            .unwrap();
+        assert_eq!(
+            app.take_ready_document_shutdowns().unwrap(),
+            (false, vec![wid])
+        );
+        assert_eq!(app.document_store.view_count(planned_document), Some(0));
+        assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Exit);
+
+        assert!(
+            !app.view_store.contains(late_view),
+            "window teardown left an unreachable native view for a dirty document"
+        );
+        assert_eq!(
+            app.document_store.view_count(late_document),
+            Some(0),
+            "a retired window must not keep a document reference edge"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The armed window-close plan is reachable from two boundaries, and both
+    /// commit it. `take_ready_document_shutdowns` re-plans against the window's
+    /// current leaves before committing; this one — the close GESTURE repeated
+    /// while the first checkpoint is still running, which is what a user does
+    /// when the window does not close — reuses the stored plan verbatim
+    /// (`pending_window_closes` is only filled when absent). A ready verdict here
+    /// authorizes `close_window` to run `close_window_logical` immediately, so it
+    /// must not be granted while a document opened after the arming is dirty.
+    #[test]
+    fn repeated_window_close_gesture_cannot_commit_a_stale_document_plan() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-window-close-repeat-gesture-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let planned = dir.join("planned.md");
+        let late = dir.join("late.md");
+        fs::write(&planned, "planned\n").unwrap();
+        fs::write(&late, "late\n").unwrap();
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&planned))
+            .unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("planned edit ".into())),
+        )
+        .unwrap();
+
+        // First close gesture: the barrier arms and the window stays installed.
+        assert!(
+            !app.prepare_window_document_shutdown_inner(wid, false)
+                .unwrap()
+        );
+
+        // The still-interactive window opens a SECOND document and dirties it.
+        app.open_document_tab(AppKind::Editor, &file_uri(&late))
+            .unwrap();
+        let (late_instance, late_view) = app.active_native_view(wid).unwrap();
+        let late_document = app.native_runtime.document_id(late_instance).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("late edit ".into())),
+        )
+        .unwrap();
+        assert_eq!(app.document_store.dirty(late_document), Some(true));
+
+        // Second close gesture, this one authorized to save. Readiness alone is
+        // not the property under test: because the plan is re-derived, this
+        // gesture legitimately checkpoints the late document alongside the
+        // planned one and may clear the window. What must never happen is the
+        // window reporting ready while that document is still unsaved, or a
+        // teardown that leaves its view behind with no tab to reach it from.
+        let ready = app
+            .prepare_window_document_shutdown_inner(wid, true)
+            .unwrap();
+        if ready {
+            assert_eq!(
+                app.document_store.dirty(late_document),
+                Some(false),
+                "the window cleared while a document opened after the plan armed \
+                 was still unsaved"
+            );
+            assert_eq!(
+                app.document_store.view_count(late_document),
+                Some(0),
+                "a cleared window must not keep a document reference edge"
+            );
+            assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Exit);
+            assert!(
+                !app.view_store.contains(late_view),
+                "window teardown left an unreachable native view for a document \
+                 opened after the close plan armed"
+            );
+        } else {
+            // The alternative honest outcome: the window stays installed and the
+            // late document keeps a live view the user can still reach and save.
+            assert!(app.view_store.contains(late_view));
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

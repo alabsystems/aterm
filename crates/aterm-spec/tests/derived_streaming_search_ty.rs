@@ -61,13 +61,12 @@ fn derived_streaming_search_holds_with_wrap_disabled() {
     let cfg = dir.join("StreamingSearch.cfg");
     std::fs::write(&spec, base.to_tla()).expect("write derived spec");
     std::fs::write(&cfg, base.to_cfg_with(&[("Wrap", 0)])).expect("write derived cfg");
-    let out = std::process::Command::new(&ty)
-        .arg("check")
-        .arg(&spec)
-        .arg("--config")
-        .arg(&cfg)
-        .output()
-        .expect("run ty check");
+    let mut cmd = std::process::Command::new(&ty);
+    cmd.arg("check").arg(&spec).arg("--config").arg(&cfg);
+    // ARMED: partial-order reduction does not preserve coverage, and the `ty`
+    // this machine discovers has an UNSOUND one — see `arm_whole_space_check`.
+    aterm_spec::verify::arm_whole_space_check(&mut cmd);
+    let out = cmd.output().expect("run ty check");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

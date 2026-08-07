@@ -472,6 +472,80 @@ fn handoff_candidate_terminated(candidate: HandoffCandidate) -> bool {
     candidate.identity() == HandoffCandidateIdentity::Recycled
 }
 
+/// Does THIS process lead its own process group — the precondition that makes a
+/// rejecting parent's `kill(-pid)` reach the updater helpers a candidate forks,
+/// and not only the candidate itself?
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessGroupContainment {
+    /// The kernel reports `getpgrp() == getpid()`. A child forked from here
+    /// inherits that group, so `kill(-pid)` names a group whose every member
+    /// descends from this process.
+    OwnGroupLeader,
+    /// The kernel reports a group this process does not lead. Two things fail at
+    /// once: `kill(-pid)` would not reach a helper forked from here (it is in
+    /// the OTHER group), and the group it does name belongs to whoever leads it.
+    /// Nothing may fork an updater helper from this state. The two numbers are
+    /// carried so the refusal can say what the kernel actually answered — the
+    /// errno cannot, since it is not what this decision is read from.
+    Foreign {
+        group: libc::pid_t,
+        own: libc::pid_t,
+    },
+}
+
+/// Put the calling process in a process group of its own and PROVE it, so that
+/// helpers it forks later are inside the group a rejecting parent sweeps.
+///
+/// This is the successor-side twin of the `pre_exec` `setpgid(0, 0)` in
+/// [`run_handoff_worker`], for the launch shape that has no pre-exec hook: a
+/// successor started through LaunchServices is launchd's child rather than a
+/// fork of ours, so no fork-time hook of the parent's can run inside it and the
+/// process has to contain ITSELF. `seamless::prearm_incoming_fds` carries the
+/// design note that proposed this, but the call lands in [`crate::main_entry`]
+/// instead — still ahead of everything in that process able to run another
+/// program — because `prearm_incoming_fds` is also exercised IN-PROCESS by unit
+/// tests, and a process-wide, irreversible `setpgid` inside it would move the
+/// test binary out of its harness's process group. The ordering obligation the
+/// call site owes is stated at that call site.
+///
+/// THE RETURN VALUE OF `setpgid` IS NOT THE ANSWER; `getpgrp()` IS. At this one
+/// call shape — target self, requested group "my own pid" — the only failure the
+/// macOS contract admits is EPERM "the process indicated by the pid argument is a
+/// session leader". Every other documented error is out of reach here: `EACCES`
+/// and `ESRCH` need `pid` to name a CHILD, the other two `EPERM` clauses need a
+/// different euid or a `pgid` naming somebody else's group, and `EINVAL` needs a
+/// negative or unsupported `pgid`, which 0 — "the target's own pid" — is not.
+/// That one refusal reports the property already holding rather than denying it,
+/// because a session leader has `pgid == sid == pid`: `setsid` sets the three
+/// equal, and `setpgid` refusing session leaders is exactly what stops anything
+/// from moving one out again. But this function does not rest on that reading, or
+/// on any other enumeration of errnos: it reads the postcondition back from the
+/// kernel, so an errno this code did not anticipate is caught by the check
+/// instead of being argued away.
+///
+/// Idempotent, which is what lets callers run it unconditionally on their lane:
+/// a process already leading its own group gets a second no-op success, and the
+/// updater's boot-apply re-exec preserves the process group across `execve`, so
+/// the re-exec'd image re-running this sees the group it established before.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn contain_own_process_group() -> ProcessGroupContainment {
+    // SAFETY: `setpgid(0, 0)` acts on the calling process only; `getpgrp` and
+    // `getpid` are side-effect-free getters. The `setpgid` result is discarded
+    // deliberately — what this function answers with is the postcondition read
+    // back from the kernel immediately after it, for the reason stated above.
+    let (group, own) = unsafe {
+        let _ = libc::setpgid(0, 0);
+        (libc::getpgrp(), libc::getpid())
+    };
+    if group == own {
+        ProcessGroupContainment::OwnGroupLeader
+    } else {
+        ProcessGroupContainment::Foreign { group, own }
+    }
+}
+
 /// SIGKILL the candidate, before anything waits on it.
 ///
 /// The GROUP sweep (`-pid`) is the pre-existing behaviour and the reason
@@ -479,13 +553,38 @@ fn handoff_candidate_terminated(candidate: HandoffCandidate) -> bool {
 /// candidate's ditto/codesign/spctl descendants from continuing to mutate fixed
 /// updater paths after the leader is gone.
 ///
+/// WHICH CONTAINMENT THE SWEEP RELIES ON — the two are not equally strong, and a
+/// reader must not assume the second one is the first:
+///
+/// * A CANDIDATE WE FORKED (today's `spawn`). `run_handoff_worker`'s `pre_exec`
+///   `setpgid(0, 0)` runs between fork and exec, so the candidate leads its own
+///   group BEFORE its image runs: `-pid` is a valid handle from the instant
+///   `spawn` returns, and there is provably no instant at which a helper of the
+///   candidate's exists outside that group.
+/// * A CANDIDATE WE DID NOT FORK (the LaunchServices lane B3 exists for). The
+///   candidate contains ITSELF with [`contain_own_process_group`] on entry,
+///   before its own update logic can fork the first helper, and refuses to
+///   continue when it cannot — so the "no helper outside the group" property is
+///   the same one. What is NOT the same is our knowledge of it: the readiness
+///   wire is a fixed proof record with no field for a process-group id, so this
+///   process cannot distinguish "the successor contained itself" from "the
+///   successor never reached that instruction". On that lane `-pid` is an
+///   UNPROVEN sweep and nothing may be concluded from it; what licenses rollback
+///   is [`handoff_candidate_terminated`], never the group signal. Carrying an
+///   attested pgid is B4's control-socket work.
+///
 /// The DIRECT signal is what a candidate this process did not fork needs. Such a
-/// candidate may not be a group leader at all (blocker B3 below), and then
-/// `-pid` names no group and sweeps nothing. It is withheld unless the identity
-/// is CORROBORATED, because a bare pid that has been recycled names a stranger
-/// and this lane must never SIGKILL one. With no witness the behaviour is
-/// exactly what it has always been: the group sweep alone, aimed at a pid that
-/// today's unreaped fork child keeps pinned.
+/// candidate may not be a group leader at all, and then `-pid` names no group and
+/// sweeps nothing. It is withheld unless the identity is CORROBORATED, because a
+/// bare pid that has been recycled names a stranger and this lane must never
+/// SIGKILL one. With no witness the behaviour is exactly what it has always been:
+/// the group sweep alone, aimed at a pid that today's unreaped fork child keeps
+/// pinned. That PIN is what keeps an unwitnessed sweep aimed at us, and it is
+/// precisely what a candidate launchd owns lacks — once launchd reaps it the
+/// number is free, and `-pid` then names whatever group its new owner leads. So
+/// on that lane an unwitnessed sweep is not merely unproven, it is unsafe, and
+/// the candidate has to arrive with an identity (B2/B4) rather than as a bare
+/// pid.
 #[cfg(unix)]
 fn signal_handoff_candidate(candidate: HandoffCandidate) {
     let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
@@ -556,6 +655,16 @@ fn wait_for_handoff_candidate_to_terminate(candidate: HandoffCandidate) -> Hando
 /// Kill the rejected candidate and prove it gone. Runs only on the handoff
 /// worker, and the returned warrant is what licenses [`App::rollback_overlap`]
 /// to resume the parked readers.
+///
+/// CONTAINMENT THIS RELIES ON: the FORK lane's. `child` is our own `spawn`, so
+/// `run_handoff_worker`'s `pre_exec` `setpgid(0, 0)` established the candidate's
+/// group before its image ran, and the opening group sweep in
+/// [`signal_handoff_candidate`] therefore reaches its ditto/codesign/spctl
+/// helpers. Reached with a candidate this process did not fork, that sweep would
+/// be the weaker, unobserved kind — read [`signal_handoff_candidate`] before
+/// assuming otherwise. The warrant returned here never rests on the sweep either
+/// way: it comes from `wait` on our own child, or from
+/// [`wait_for_handoff_candidate_to_terminate`]'s outside proof.
 #[cfg(unix)]
 fn kill_and_reap_handoff_child(
     candidate: HandoffCandidate,
@@ -600,6 +709,18 @@ fn worker_claim_handoff_reaper(arbiter: &crate::HandoffAttemptArbiter) -> bool {
     }
 }
 
+/// The emergency reaper's kill, off a bare `child_pid` from the completion wire
+/// (on its own thread, or inline when that thread cannot be created).
+///
+/// CONTAINMENT THIS RELIES ON: whichever one made the candidate a group leader —
+/// and this function cannot tell which, because a bare pid carries no evidence
+/// of either. On the fork lane it is `pre_exec`'s, established before the
+/// candidate's image ran. On a lane where the candidate was launched instead of
+/// forked it would be the candidate's own [`contain_own_process_group`], which
+/// no wire reports to us, so the group sweep below would be an unproven
+/// best-effort rather than the helper kill it is today. The returned warrant is
+/// unaffected either way: it comes from `waitpid` or from the outside proof, and
+/// [`signal_handoff_candidate`] states what the sweep does and does not buy.
 #[cfg(unix)]
 fn emergency_kill_and_reap_handoff_child(pid: u32) -> HandoffRollbackWarrant {
     // PRECONDITION: the caller won the attempt-wide Emergency reaper CAS, so no
@@ -1076,6 +1197,15 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         job.command.pre_exec(move || {
             // Candidate and every helper it later launches inherit a dedicated
             // process group. Adopted shell PTYs/process groups are unrelated.
+            //
+            // STRICTLY STRONGER than the successor-side
+            // `contain_own_process_group` that covers the launch shape with no
+            // pre-exec hook, and the reason this stays here rather than being
+            // replaced by it: this runs between fork and exec, so the group
+            // exists before the candidate's image does — no ordering argument
+            // about "the first thing that can fork a helper" is needed, and the
+            // failure below aborts the spawn instead of having to be handled by
+            // a process that is already running. Keep both.
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1127,9 +1257,20 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     //   see `handoff_candidate_terminated` for why those establish what `wait`
     //   establishes. `ECHILD` is no longer read as evidence of anything, and no
     //   path resumes a reader without a warrant.
-    // * B3 — process-group containment. The `pre_exec` `setpgid(0, 0)` above,
-    //   which is what makes `kill(-pid)` sweep the candidate's own updater
-    //   helpers, has no LaunchServices equivalent.
+    // * B3 — process-group containment. The ESTABLISHING half is DONE (0.15):
+    //   the `pre_exec` `setpgid(0, 0)` above has no LaunchServices equivalent,
+    //   so a successor that was launched rather than forked contains itself
+    //   with `contain_own_process_group` on entry — `main_entry` calls it
+    //   before the boot apply, the first thing in that process able to fork a
+    //   ditto/codesign/spctl helper, and a successor that cannot lead its own
+    //   group exits there instead of running update logic. So "every helper is
+    //   inside the group" holds on both launch shapes.
+    //   What does NOT carry over is our KNOWLEDGE of it: `pre_exec` establishes
+    //   the group before `spawn` returns, so this process knows `-pid` is a
+    //   valid handle, whereas a launched successor has no wire on which to
+    //   report its group. Until B4 carries that attestation the sweep on that
+    //   lane is unproven — `signal_handoff_candidate` states exactly what each
+    //   reaper may conclude from it.
     // * B4 — transport. A LaunchServices launch inherits no descriptors, so the
     //   three inherited fd channels below — the PTY masters
     //   (`ATERM_SEAMLESS_FDS`), the readiness pipe, and the Commit pipe — must
@@ -2600,11 +2741,11 @@ fn wait_handoff_ready(
 mod handoff_process_group_tests {
     use super::{
         HandoffCandidate, HandoffCommitFacts, HandoffRejectDelivery, HandoffRollbackWarrant,
-        ReadyPollAction, classify_ready_poll, deliver_handoff_rejection,
-        emergency_kill_and_reap_handoff_child, handoff_candidate_terminated,
-        handoff_commit_admitted, handoff_masters_closed, handoff_masters_have_activity,
-        kill_and_reap_handoff_child, make_cloexec_pipe, wait_handoff_ready,
-        worker_claim_handoff_reaper,
+        ProcessGroupContainment, ReadyPollAction, classify_ready_poll, contain_own_process_group,
+        deliver_handoff_rejection, emergency_kill_and_reap_handoff_child,
+        handoff_candidate_terminated, handoff_commit_admitted, handoff_masters_closed,
+        handoff_masters_have_activity, kill_and_reap_handoff_child, make_cloexec_pipe,
+        wait_handoff_ready, worker_claim_handoff_reaper,
     };
     use std::io::{BufRead as _, Read as _};
     use std::os::unix::process::CommandExt as _;
@@ -3399,5 +3540,88 @@ mod handoff_process_group_tests {
         // SAFETY: SIGKILL to the test's own child.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill fixture");
         bystander.wait().expect("reap the test child");
+    }
+
+    /// Run [`contain_own_process_group`] in a FORKED CHILD and report whether the
+    /// child came out leading its own process group.
+    ///
+    /// The fork is not incidental: `setpgid` is a process-wide, irreversible
+    /// change, so calling it on the test binary itself would move `cargo test`
+    /// out of the process group whoever launched it may later sweep. The child
+    /// answers through its exit status instead.
+    ///
+    /// `become_session_leader` selects the shape under test, and the child also
+    /// checks that a SECOND identical `setpgid(0, 0)` is refused exactly when it
+    /// is a session leader. That second call changes nothing (the process already
+    /// leads its own group either way); it is a witness of WHICH kernel path the
+    /// first call took, which is what makes ignoring the errno legitimate.
+    ///
+    /// libtest runs tests on a THREAD POOL, so this process is multi-threaded at
+    /// fork time. That is safe here only because the child touches nothing but
+    /// async-signal-safe calls — `setsid`, the `setpgid`/`getpgrp`/`getpid`
+    /// inside `contain_own_process_group`, and `_exit`. It never allocates,
+    /// locks, or calls back into std.
+    fn forked_child_contains_itself(become_session_leader: bool) -> bool {
+        // SAFETY: fork from a multi-threaded harness, with a child that performs
+        // async-signal-safe calls only — see the doc comment above.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            if become_session_leader {
+                // SAFETY: async-signal-safe. The child inherited the harness's
+                // process group and its own pid is fresh, so it cannot be that
+                // group's leader and `setsid` is permitted. Should it fail
+                // anyway, the child is not a session leader, the refusal check
+                // below disagrees with the requested shape, and the test fails.
+                unsafe { libc::setsid() };
+            }
+            let contained = contain_own_process_group() == ProcessGroupContainment::OwnGroupLeader;
+            // SAFETY: async-signal-safe; targets the calling process only.
+            let refused = unsafe { libc::setpgid(0, 0) } != 0;
+            let as_expected = contained && refused == become_session_leader;
+            // SAFETY: async-signal-safe process exit; nothing is unwound and no
+            // atexit handler of the harness's may run in this child.
+            unsafe { libc::_exit(i32::from(!as_expected)) }
+        }
+        let mut status = 0i32;
+        loop {
+            // SAFETY: blocking wait for one exact child pid into a local status slot.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited == pid {
+                break;
+            }
+            assert!(
+                waited < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted,
+                "waitpid refused to answer for the forked child"
+            );
+        }
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+
+    /// The launch shape with no `pre_exec` hook: a successor that starts inside
+    /// somebody else's process group must end up leading its own, or a rejecting
+    /// parent's `kill(-pid)` reaches none of the helpers it forks afterwards.
+    #[test]
+    fn a_successor_started_in_a_foreign_group_contains_itself() {
+        assert!(
+            forked_child_contains_itself(false),
+            "setpgid(0, 0) must have moved the child into a group of its own, and \
+             a repeat call must be ACCEPTED because it is not a session leader"
+        );
+    }
+
+    /// The objection this closes: `setpgid(0, 0)` can be refused, and the refusal
+    /// is not a failure to contain. A session leader is the one process the call
+    /// refuses, and it already has `pgid == sid == pid` — so the postcondition
+    /// this code reads back from the kernel holds on exactly the path where the
+    /// return value says it does not.
+    #[test]
+    fn a_session_leader_is_already_contained_when_the_call_refuses_it() {
+        assert!(
+            forked_child_contains_itself(true),
+            "a session leader must both REFUSE the repeat setpgid and still lead \
+             its own process group"
+        );
     }
 }

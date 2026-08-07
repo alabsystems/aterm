@@ -480,9 +480,27 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// that build predated `ty`'s own C3 cycle proviso by four days. Two other
 /// models (`NativeConfigTransaction` 1662/1712, `CursorCatCurseWince` 30/36)
 /// were under-exploring the same way, silently, because a prove-only model has
-/// no catch half to fail. A current `ty` refuses those reductions correctly —
-/// which is exactly why aterm cannot rely on that: this tier is only as sound as
-/// whichever binary is on the machine, and nothing here may assume it is new.
+/// no catch half to fail.
+///
+/// **That was written as past tense and it should not have been.** Re-measured
+/// 2026-08-06 against the binary [`find_trust_bin`] actually selects on this
+/// machine — `$HOME/trust/first-party/ty/target/release/ty`, `tla 0.10.0` — all
+/// three are STILL under-explored by exactly the old amounts
+/// (`RainbowJumpBurstLifecycle` 1/128, `NativeConfigTransaction` 1662/1712,
+/// `CursorCatCurseWince` 30/36), and it is worse than a coverage gap: at
+/// `Buggy = 1`, where `NoLostFadePayload` is violated three steps from `Init`,
+/// that build prints `No errors found (exhaustive)` and exits 0. A FALSE PROOF,
+/// under a `Soundness mode: Sound` banner. The trigger is the same singleton
+/// ample set — drop the stutter action from `Next` and the full 128 states
+/// appear. A 2026-07-20 bootstrap stage build on the same disk is correct
+/// (`POR: 0/127 states reduced`), but `find_trust_bin` probes the first-party
+/// path first and therefore always takes the broken one.
+///
+/// So this is not a historical note and not a belt-and-braces flag. It is the
+/// only thing standing between this workspace and a checker that answers
+/// "proved" about spaces it never entered — which is exactly why every `ty
+/// check` in the workspace arms through [`arm_whole_space_check`], and why
+/// nothing here may assume the binary is new.
 ///
 /// **`--initial-capacity 8192`** — tell `ty` these models are small. Left to
 /// itself it pre-allocates fingerprint storage for a spec that might have
@@ -531,9 +549,22 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// trips on a busy machine even when this run's own RSS is 17 MB — the same
 /// false stop, now pinned on. Shrinking the footprint is the fix; the ceiling
 /// was only ever a symptom of it.
+/// PUBLIC because there is more than one `ty` driver in this workspace, and the
+/// only way two drivers cannot disagree about what "armed" means is for there to
+/// be one place that says it.
+///
+/// That is not a style preference; it is the fix for a real escape. The
+/// `spec_xref_closure` gate in `aterm-gui` built its own `ty` command and simply
+/// did not carry these flags, so it ran the whole registry with partial-order
+/// reduction ON while every doc here described reduction as off. On
+/// `RainbowJumpBurstLifecycle` that reduced 128 reachable states to **1**
+/// (`POR: 1/1 states reduced (100.0%)`), which meant four of its six actions
+/// never fired and `--strict-vacuity` reported them dead — a dead set that is an
+/// artifact of the reduction, not a property of the model. Anything reaching for
+/// `ty` on a derived model must arm it through here.
 // Skip: argument plumbing for a subprocess. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
-fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
+pub fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
     cmd.arg("--no-auto-por")
         .arg("--no-auto-symmetry")
         .arg("--initial-capacity")
@@ -579,6 +610,27 @@ fn ty_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
 /// mtime is the one cheap fact that would have said so on the first read.
 // Skip: filesystem metadata formatting. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
+/// The identity of the checker a transcript came from — path AND build stamp —
+/// so a gate panic names the binary an operator has to act on, not merely its
+/// output.
+///
+/// Diagnosing the 2026-08-06 red gate took four parallel investigations, and a
+/// good part of each was rediscovering, by hand, WHICH `ty` had produced the
+/// transcript in the panic. Every driver printed stdout+stderr and nothing about
+/// the process that wrote them. `--version` does not distinguish these builds
+/// (the broken one says `tla 0.10.0`, the correct one `ty 0.10.0`, both "0.10.0");
+/// the mtime does.
+///
+/// Safe to prepend to a transcript: [`ty_states_explored`] keys on a
+/// `States found:` line and the dead-action parsers on
+/// `dead action(s) (never fired): `. This line matches neither.
+#[must_use]
+// Skip: diagnostic string formatting for a verification harness.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn ty_evidence_header(ty: &Path) -> String {
+    format!("ty binary: {} [{}]\n", ty.display(), ty_build_stamp(ty))
+}
+
 fn ty_build_stamp(ty: &Path) -> String {
     std::fs::metadata(ty)
         .and_then(|md| md.modified())
@@ -1101,6 +1153,49 @@ fn assert_scalar(m: &Model, label: &str, caller: &str) {
 // Skip: verification-harness driver over the interpreter tier (BTreeSet ops +
 // deliberate audit-failure strings). Not shipping runtime code.
 #[cfg_attr(trust_verify, trust::skip)]
+/// Refuse a `ty` dead set that was measured on a SMALLER space than the
+/// interpreter walked — the companion guard to [`arm_whole_space_check`], for
+/// any driver that reads a dead set out of a `ty` transcript.
+///
+/// Arming and checking are two different obligations and only one of them
+/// survives a flag being dropped. `aterm-gui`'s gate hand-rolled its flags,
+/// omitted `--no-auto-por`, and got a dead set off a 1-state reduction of a
+/// 128-state model; nothing downstream could tell, because a dead set carries no
+/// record of the space it was measured on. It does now: pass the transcript here
+/// and a reduced run is a hard failure instead of four phantom dead actions.
+///
+/// Deliberately separate from [`audit_dead_negative_controls`] rather than folded
+/// into its signature: the audit has a dozen call sites that pass a dead set from
+/// somewhere other than a live `ty` run (fixtures, hand-written expectations),
+/// and those have no transcript to offer.
+///
+/// # Panics
+/// If `ty`'s transcript has no parsable `States found:` line, or reports a
+/// different count than the interpreter's reachable space at `Buggy = 0`.
+// Skip: a verification-harness assert — the panic IS the gate.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn assert_ty_saw_whole_space(m: &Model, evidence: &str, label: &str) {
+    let committed = interp::with_buggy(m, 0);
+    let interp_states = match interp::bmc(&committed) {
+        Ok(n) => n,
+        // NOT an early return. The tempting reading — "a violation is a louder
+        // failure the caller already reports" — is wrong, and wrong in the exact
+        // direction that matters: the caller's report is `ty`'s exit status, and
+        // the whole reason this guard exists is that the discovered `ty` returns
+        // CLEAN, exit 0, "exhaustive" on specs it never explored. So the caller
+        // sees success, this returns silently, the dead sets agree at `{}`, and a
+        // model the interpreter knows is violated is booked as proved. Failing
+        // open here would reintroduce the false proof one layer down.
+        Err((state, invariant)) => panic!(
+            "{label}: {} — the interpreter finds invariant `{invariant}` VIOLATED at {state:?} \
+             at the committed config, while `ty` returned a clean verdict. A clean `ty` over a \
+             violated model is a false proof, not a disagreement about coverage.\n{evidence}",
+            m.name
+        ),
+    };
+    assert_same_space_explored(m, interp_states, evidence, label);
+}
+
 pub fn audit_dead_negative_controls(m: &Model, ty_reported_dead: &[&str]) -> Result<usize, String> {
     if !m.fn_vars.is_empty() {
         return Err(format!(
@@ -1661,6 +1756,106 @@ mod tests {
     /// a false proof and must panic. The cause is fixed in `ty` itself, and this
     /// stays green either way — reduction is off for this driver, so a `ty`
     /// whose reduction regresses again cannot reach the gate through this door.
+    /// REGRESSION (2026-08-06 RED GATE): `spec_xref_closure` hand-rolled its own
+    /// `ty` flag list and omitted `--no-auto-por`, so it ran the whole registry
+    /// with partial-order reduction ON. On `RainbowJumpBurstLifecycle` that was
+    /// `POR: 1/1 states reduced (100.0%)` — 128 reachable states explored as 1 —
+    /// and four of its six actions therefore "never fired". `--strict-vacuity`
+    /// duly called them dead, and the tier comparison blew up on a dead set that
+    /// was an artifact of the reduction.
+    ///
+    /// The arming is now shared ([`arm_whole_space_check`]) so no driver can
+    /// omit it, and this is the second lock: a dead set carries no record of the
+    /// space it was measured on, so the transcript must be shown to have covered
+    /// the whole thing before anything in it is believed.
+    /// The guard must not fail OPEN on the one input that matters most: a clean
+    /// `ty` verdict over a model the interpreter knows is violated.
+    ///
+    /// This looks like a case the caller already reports — it is not. The
+    /// caller's report is `ty`'s exit status, and the whole premise of this guard
+    /// is that the discovered `ty` returns clean/exit-0 on spaces it never
+    /// entered. Returning early here would let exactly that combination through.
+    #[test]
+    fn a_clean_ty_verdict_over_a_violated_model_is_a_false_proof_not_a_coverage_gap() {
+        // The guard forces `Buggy = 0` itself, so the violation has to come from
+        // somewhere it does not override. `LenBounded` is `seq - lo + 1 <= Cap`,
+        // and the ring starts at `seq = 0, lo = 1` — so `Cap = -1` is violated in
+        // the INITIAL state, which is as committed as a config gets.
+        let m = interp::with_consts(&ring_model(), &[("Cap", -1)]);
+        assert!(
+            interp::bmc(&interp::with_buggy(&m, 0)).is_err(),
+            "fixture must be a model whose committed config is violated"
+        );
+        let panicked = std::panic::catch_unwind(|| {
+            assert_ty_saw_whole_space(
+                &m,
+                "Model checking complete: No errors found (exhaustive).\n\
+                 Statistics:\n  States found: 1\n",
+                "false-proof guard",
+            );
+        });
+        assert!(
+            panicked.is_err(),
+            "a clean ty verdict over a violated committed config must never pass silently"
+        );
+    }
+
+    /// The checker-identity header rides along with the transcript, so it must be
+    /// invisible to everything that reads one.
+    #[test]
+    fn the_ty_evidence_header_is_invisible_to_the_transcript_parsers() {
+        let body = "Model checking complete: No errors found (exhaustive).\n\
+                    WARNING: 2 dead action(s) (never fired): Alpha, Beta\n\
+                    Statistics:\n  States found: 128\n";
+        let header = ty_evidence_header(Path::new("/some/where/ty"));
+        assert!(header.contains("/some/where/ty"), "names the binary");
+        assert!(header.ends_with('\n'), "must not run into the first line");
+        let with = format!("{header}{body}");
+        assert_eq!(
+            ty_states_explored(&with),
+            ty_states_explored(body),
+            "the header must not disturb the state count"
+        );
+        assert_eq!(ty_states_explored(&with), Some(128));
+        // And the dead-action marker still resolves to the same first match.
+        const MARKER: &str = "dead action(s) (never fired): ";
+        let pick = |t: &str| -> Option<String> {
+            t.lines()
+                .find_map(|l| l.find(MARKER).map(|i| l[i + MARKER.len()..].to_string()))
+        };
+        assert_eq!(pick(&with), pick(body));
+        assert_eq!(pick(&with).as_deref(), Some("Alpha, Beta"));
+    }
+
+    #[test]
+    fn a_dead_set_from_a_reduced_run_is_refused_by_the_space_guard() {
+        let m = ring_model();
+        let full = interp::bmc(&interp::with_buggy(&m, 0)).expect("committed config is clean");
+        // The honest transcript passes.
+        assert_ty_saw_whole_space(
+            &m,
+            &format!(
+                "Model checking complete: No errors found (exhaustive).\n\
+                 Statistics:\n  States found: {full}\n"
+            ),
+            "whole-space guard",
+        );
+        // The reduced one — ty's real shape when POR collapses the space — does not.
+        let reduced = std::panic::catch_unwind(|| {
+            assert_ty_saw_whole_space(
+                &m,
+                "POR: 1/1 states reduced (100.0%), 1 actions skipped\n\
+                 Model checking complete: No errors found (exhaustive).\n\
+                 Statistics:\n  States found: 1\n",
+                "whole-space guard",
+            );
+        });
+        assert!(
+            reduced.is_err(),
+            "a dead set measured on a 1-state reduction of a {full}-state model must be refused"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "TIER DISAGREEMENT ON THE EXPLORED SPACE")]
     fn a_ty_verdict_from_a_smaller_space_is_not_a_proof() {

@@ -91,12 +91,13 @@ impl Verdict {
 
 /// Run `ty check spec --config cfg`, returning combined stdout+stderr.
 fn run_ty(ty: &PathBuf, spec: &PathBuf, cfg: &PathBuf) -> std::io::Result<String> {
-    let out = Command::new(ty)
-        .arg("check")
-        .arg(spec)
-        .arg("--config")
-        .arg(cfg)
-        .output()?;
+    let mut cmd = Command::new(ty);
+    cmd.arg("check").arg(spec).arg("--config").arg(cfg);
+    // ARMED like every other `ty check` in the workspace — see
+    // `aterm_spec::verify::arm_whole_space_check`. This one reports verdicts a
+    // human reads, which is exactly the audience a false "Proved" misleads.
+    aterm_spec::verify::arm_whole_space_check(&mut cmd);
+    let out = cmd.output()?;
     Ok(format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

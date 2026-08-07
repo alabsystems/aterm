@@ -289,10 +289,8 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
     // no such layer at all (off macOS, CPU backend, no window) — deliberately the
     // same spelling as every other absent keyed fact here, so a driver reads it
     // without a special case.
-    let (layer_gravity, layer_scale, layer_flipped) = snapshot
-        .layer_presentation
-        .as_ref()
-        .map_or_else(
+    let (layer_gravity, layer_scale, layer_flipped) =
+        snapshot.layer_presentation.as_ref().map_or_else(
             || ("none".to_string(), "none".to_string(), "none".to_string()),
             |(g, s, f)| (g.clone(), format!("{s:.2}"), f.to_string()),
         );

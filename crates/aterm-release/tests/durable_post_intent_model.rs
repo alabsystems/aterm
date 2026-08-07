@@ -48,7 +48,6 @@ use aterm_spec::derive::{
 };
 use publish::{CutCtx, CutKind, DurablePostDecision, Journal};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn journal() -> Journal {
     Journal {
@@ -334,21 +333,5 @@ fn strict_draft_delete_never_converges_on_pre_delete_absence() {
     assert!(publish::exact_delete_absence_is_converged(false, true));
     assert!(publish::exact_delete_absence_is_converged(true, false));
     assert!(publish::exact_delete_absence_is_converged(true, true));
-}
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
